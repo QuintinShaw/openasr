@@ -944,11 +944,17 @@ fn import_qwen_forced_aligner_local_command(
     license_source: &str,
     quantization: ImportQwenForcedAlignerQuantization,
 ) -> Result<()> {
+    let package_variant = match quantization {
+        ImportQwenForcedAlignerQuantization::Q4_K => {
+            Some(package_variant.unwrap_or("q4_k").to_string())
+        }
+        _ => package_variant.map(ToOwned::to_owned),
+    };
     let request = Qwen3ForcedAlignerLocalSourceImportRequest {
         source_root: source_root.to_path_buf(),
         output_root: output_root.to_path_buf(),
         package_id: package_id.to_string(),
-        package_variant: package_variant.map(ToOwned::to_owned),
+        package_variant,
         source_name: source_name.to_string(),
         source_revision: source_revision.to_string(),
         license_name: license_name.to_string(),
@@ -959,6 +965,9 @@ fn import_qwen_forced_aligner_local_command(
             }
             ImportQwenForcedAlignerQuantization::Q8_0 => {
                 openasr_core::Qwen3AsrRuntimeQuantizationMode::Q8_0
+            }
+            ImportQwenForcedAlignerQuantization::Q4_K => {
+                openasr_core::Qwen3AsrRuntimeQuantizationMode::Q4_K
             }
         },
     };
@@ -1550,6 +1559,15 @@ mod tests {
                 None => unsafe { std::env::remove_var(self.name) },
             }
         }
+    }
+
+    #[test]
+    fn pack_filename_tier_recognizes_q4_k_suffix() {
+        use openasr_core::models::pack_quant::PackQuant;
+        assert_eq!(
+            pack_tier_from_pack_filename(Path::new("forced-aligner-q4_k.oasr")),
+            Some(PackQuant::Q4_K)
+        );
     }
 
     #[test]

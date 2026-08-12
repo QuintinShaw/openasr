@@ -59,6 +59,7 @@ use crate::models::mapped_token_embedding::{MappedTokenEmbeddingError, MappedTok
 /// byte-for-byte (see `forced_aligner_import.rs`), so it uses the same value.
 const FORCED_ALIGNER_ROPE_THETA: f32 = 1_000_000.0;
 const DEFAULT_RMS_NORM_EPSILON: f32 = 1.0e-6;
+const OPENASR_MODEL_ID_KEY: &str = "openasr.model.id";
 /// Upper bound for one timestamp-classification graph. At the current 5k
 /// vocabulary this keeps each f32 logits matrix at or below 1.25 MiB while
 /// still amortizing graph construction and GPU submission across many words.
@@ -783,8 +784,14 @@ pub(crate) struct Qwen3ForcedAlignerSession {
 }
 
 pub(crate) fn validate_forced_aligner_quantization_contract(
+    metadata: &GgufMetadata,
     tensor_index: &crate::ggml_runtime::GgufTensorIndex,
 ) -> Result<(), Qwen3ForcedAlignerRuntimeError> {
+    let model_id = metadata.get_string(OPENASR_MODEL_ID_KEY).ok_or(
+        Qwen3ForcedAlignerRuntimeError::MissingMetadata {
+            key: OPENASR_MODEL_ID_KEY,
+        },
+    )?;
     let violations = runtime_tensor_index_q8_floor_violations(
         super::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
         tensor_index,
@@ -797,10 +804,118 @@ pub(crate) fn validate_forced_aligner_quantization_contract(
         return Err(Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
             key: "<quantization floor>",
             reason: format!(
-                "forced-aligner packs require Q8_0 or higher for every quantizable matrix; pack has {} violation(s), first tensor '{}' is {}",
+                "forced-aligner packs require Q8_0 or higher for the audio encoder, token embedding, and timestamp head; pack has {} violation(s), first tensor '{}' is {}",
                 violations.len(),
                 first.tensor,
                 crate::models::pack_quant_audit::ggml_type_name(first.ggml_type),
+            ),
+        });
+    }
+    let declared_variant = model_id.rsplit_once(':').map(|(_, variant)| variant);
+    if matches!(
+        declared_variant,
+        Some("q3")
+            | Some("q3_k")
+            | Some("q3k")
+            | Some("q4")
+            | Some("q4k")
+            | Some("q4_k_m")
+            | Some("q4km")
+    ) {
+        return Err(Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+            key: OPENASR_MODEL_ID_KEY,
+            reason: format!(
+                "forced-aligner pack '{model_id}' uses a disallowed low-precision variant; the only supported Q4 product identity is ':q4_k'",
+            ),
+        });
+    }
+    let q4_k_contract = crate::models::pack_quant::TensorQuantizationContract::SemanticRolesV1 {
+        model_architecture: super::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
+        classify: super::forced_aligner_tensor_role,
+        quantized_axis: crate::models::pack_quant::QuantizedAxis::First,
+    };
+    let mut expected_q4_decoder_matrices = 0usize;
+    for tensor in tensor_index.tensors() {
+        if tensor.dims.len() != 2
+            || super::forced_aligner_tensor_role(&tensor.name)
+                != crate::models::pack_quant::TensorRole::TextDecoderMatrix
+        {
+            continue;
+        }
+        let ggml_type = u32::try_from(tensor.ggml_type).unwrap_or(u32::MAX);
+        if !matches!(
+            ggml_type,
+            crate::models::pack_quant_audit::GGML_TYPE_F32
+                | crate::models::pack_quant_audit::GGML_TYPE_F16
+                | crate::models::pack_quant_audit::GGML_TYPE_Q8_0
+                | crate::models::pack_quant_audit::GGML_TYPE_Q4_K
+        ) {
+            return Err(Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+                key: "<quantization floor>",
+                reason: format!(
+                    "forced-aligner q4_k decoder matrices require q4_k, q8_0, f16, or f32; tensor '{}' is {}",
+                    tensor.name,
+                    crate::models::pack_quant_audit::ggml_type_name(ggml_type),
+                ),
+            });
+        }
+        if declared_variant == Some("q4_k") {
+            let expected = q4_k_contract.target_write_type(
+                &tensor.name,
+                &tensor.dims,
+                crate::models::pack_quant::PackQuant::Q4_K,
+            );
+            let expected_ggml_type = match expected {
+                Some(crate::ggml_runtime::GgufWriteTensorType::Q4_K) => {
+                    expected_q4_decoder_matrices += 1;
+                    Some(crate::models::pack_quant_audit::GGML_TYPE_Q4_K)
+                }
+                Some(crate::ggml_runtime::GgufWriteTensorType::Q8_0) => {
+                    Some(crate::models::pack_quant_audit::GGML_TYPE_Q8_0)
+                }
+                Some(crate::ggml_runtime::GgufWriteTensorType::F16) => {
+                    Some(crate::models::pack_quant_audit::GGML_TYPE_F16)
+                }
+                Some(crate::ggml_runtime::GgufWriteTensorType::F32) => {
+                    Some(crate::models::pack_quant_audit::GGML_TYPE_F32)
+                }
+                Some(_) | None => None,
+            };
+            if let Some(expected_ggml_type) = expected_ggml_type
+                && ggml_type != expected_ggml_type
+            {
+                return Err(Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+                    key: "<quantization floor>",
+                    reason: format!(
+                        "forced-aligner q4_k tensor '{}' must match the importer policy type {}, got {}",
+                        tensor.name,
+                        crate::models::pack_quant_audit::ggml_type_name(expected_ggml_type),
+                        crate::models::pack_quant_audit::ggml_type_name(ggml_type),
+                    ),
+                });
+            }
+        }
+    }
+    let has_q4_decoder_matrix = tensor_index.tensors().iter().any(|tensor| {
+        tensor.dims.len() == 2
+            && super::forced_aligner_tensor_role(&tensor.name)
+                == crate::models::pack_quant::TensorRole::TextDecoderMatrix
+            && u32::try_from(tensor.ggml_type).ok()
+                == Some(crate::models::pack_quant_audit::GGML_TYPE_Q4_K)
+    });
+    if has_q4_decoder_matrix && declared_variant != Some("q4_k") {
+        return Err(Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+            key: OPENASR_MODEL_ID_KEY,
+            reason: format!(
+                "forced-aligner packs containing Q4_K decoder matrices must declare the public ':q4_k' variant; got '{model_id}'",
+            ),
+        });
+    }
+    if declared_variant == Some("q4_k") && expected_q4_decoder_matrices == 0 {
+        return Err(Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+            key: OPENASR_MODEL_ID_KEY,
+            reason: format!(
+                "forced-aligner pack '{model_id}' claims q4_k but contains no importer-eligible Q4_K decoder matrix",
             ),
         });
     }
@@ -1039,55 +1154,134 @@ mod tests {
         token_embedding_type: i32,
         decoder_type: i32,
     ) -> crate::ggml_runtime::GgufTensorIndex {
+        quant_floor_index_with_decoders(output_type, token_embedding_type, &[decoder_type])
+    }
+
+    fn quant_floor_index_with_decoders(
+        output_type: i32,
+        token_embedding_type: i32,
+        decoder_types: &[i32],
+    ) -> crate::ggml_runtime::GgufTensorIndex {
+        let mut tensors = vec![
+            crate::ggml_runtime::GgufTensorMetadata {
+                name: "output.weight".to_string(),
+                dims: vec![1024, 5000],
+                ggml_type: output_type,
+                type_name: "synthetic".to_string(),
+                size_bytes: 0,
+                offset_bytes: 0,
+            },
+            crate::ggml_runtime::GgufTensorMetadata {
+                name: "token_embd.weight".to_string(),
+                dims: vec![1024, 152_064],
+                ggml_type: token_embedding_type,
+                type_name: "synthetic".to_string(),
+                size_bytes: 0,
+                offset_bytes: 0,
+            },
+        ];
+        tensors.extend(decoder_types.iter().enumerate().map(|(index, ggml_type)| {
+            crate::ggml_runtime::GgufTensorMetadata {
+                name: format!("blk.{index}.ffn_gate.weight"),
+                dims: vec![1024, 3072],
+                ggml_type: *ggml_type,
+                type_name: "synthetic".to_string(),
+                size_bytes: 0,
+                offset_bytes: 0,
+            }
+        }));
         crate::ggml_runtime::GgufTensorIndex::from_snapshot(
             crate::ggml_runtime::GgufTensorIndexSnapshot {
                 path: "/nonexistent/forced-aligner-policy.oasr".into(),
                 data_section_offset_bytes: 0,
-                tensors: vec![
-                    crate::ggml_runtime::GgufTensorMetadata {
-                        name: "output.weight".to_string(),
-                        dims: vec![1024, 5000],
-                        ggml_type: output_type,
-                        type_name: "synthetic".to_string(),
-                        size_bytes: 0,
-                        offset_bytes: 0,
-                    },
-                    crate::ggml_runtime::GgufTensorMetadata {
-                        name: "token_embd.weight".to_string(),
-                        dims: vec![1024, 152_064],
-                        ggml_type: token_embedding_type,
-                        type_name: "synthetic".to_string(),
-                        size_bytes: 0,
-                        offset_bytes: 0,
-                    },
-                    crate::ggml_runtime::GgufTensorMetadata {
-                        name: "blk.0.ffn_gate.weight".to_string(),
-                        dims: vec![1024, 3072],
-                        ggml_type: decoder_type,
-                        type_name: "synthetic".to_string(),
-                        size_bytes: 0,
-                        offset_bytes: 0,
-                    },
-                ],
+                tensors,
             },
         )
         .expect("valid synthetic tensor index")
     }
 
+    fn quant_floor_metadata(model_id: &str) -> GgufMetadata {
+        let mut values = std::collections::BTreeMap::new();
+        values.insert(
+            OPENASR_MODEL_ID_KEY.to_string(),
+            crate::ggml_runtime::GgufMetadataValue::String(model_id.to_string()),
+        );
+        GgufMetadata::from_values_for_test(values)
+    }
+
     #[test]
-    fn forced_aligner_pack_contract_requires_q8_for_every_matrix() {
+    fn forced_aligner_pack_contract_accepts_policy_guarded_q4_k_or_higher() {
         let q8 = crate::models::pack_quant_audit::GGML_TYPE_Q8_0 as i32;
         let q4 = crate::models::pack_quant_audit::GGML_TYPE_Q4_K as i32;
-        validate_forced_aligner_quantization_contract(&quant_floor_index(q8, q8, q8))
-            .expect("current Q8 contract must remain eligible on every backend");
+        let q3 = crate::models::pack_quant_audit::GGML_TYPE_Q3_K as i32;
+        let q8_metadata = quant_floor_metadata("qwen3-forced-aligner-0.6b");
+        let q4_metadata = quant_floor_metadata("qwen3-forced-aligner-0.6b:q4_k");
+        validate_forced_aligner_quantization_contract(&q8_metadata, &quant_floor_index(q8, q8, q8))
+            .expect("Q8 contract must remain eligible on every backend");
+        validate_forced_aligner_quantization_contract(&q4_metadata, &quant_floor_index(q8, q8, q4))
+            .expect("policy-guarded q4_k decoder weights must remain eligible on every backend");
         assert!(
-            validate_forced_aligner_quantization_contract(&quant_floor_index(q4, q8, q8)).is_err()
+            validate_forced_aligner_quantization_contract(
+                &q4_metadata,
+                &quant_floor_index(q4, q8, q8),
+            )
+            .is_err()
         );
         assert!(
-            validate_forced_aligner_quantization_contract(&quant_floor_index(q8, q4, q8)).is_err()
+            validate_forced_aligner_quantization_contract(
+                &q4_metadata,
+                &quant_floor_index(q8, q4, q8),
+            )
+            .is_err()
         );
         assert!(
-            validate_forced_aligner_quantization_contract(&quant_floor_index(q8, q8, q4)).is_err()
+            validate_forced_aligner_quantization_contract(
+                &q4_metadata,
+                &quant_floor_index(q8, q8, q3),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_forced_aligner_quantization_contract(
+                &q8_metadata,
+                &quant_floor_index(q8, q8, q4),
+            )
+            .is_err(),
+            "a mixed pack must not omit the q4_k identity"
+        );
+        assert!(
+            validate_forced_aligner_quantization_contract(
+                &q4_metadata,
+                &quant_floor_index(q8, q8, q8),
+            )
+            .is_err(),
+            "an all-Q8 pack must not masquerade as q4_k"
+        );
+        assert!(
+            validate_forced_aligner_quantization_contract(
+                &q4_metadata,
+                &quant_floor_index_with_decoders(q8, q8, &[q4, q8]),
+            )
+            .is_err(),
+            "one Q4 decoy must not let an otherwise-Q8 decoder masquerade as q4_k"
+        );
+        let misleading_q3 = quant_floor_metadata("qwen3-forced-aligner-0.6b:q3_k");
+        assert!(
+            validate_forced_aligner_quantization_contract(
+                &misleading_q3,
+                &quant_floor_index(q8, q8, q8),
+            )
+            .is_err(),
+            "an all-Q8 pack must not carry a Q3 label"
+        );
+        let legacy_q4m = quant_floor_metadata("qwen3-forced-aligner-0.6b:q4_k_m");
+        assert!(
+            validate_forced_aligner_quantization_contract(
+                &legacy_q4m,
+                &quant_floor_index(q8, q8, q4),
+            )
+            .is_err(),
+            "the unpublished q4_k_m experiment name must not become a second public identity"
         );
     }
 
@@ -1340,6 +1534,66 @@ mod tests {
             max_ms <= 320.0,
             "CPU/Metal maximum timestamp drift {max_ms:.3}ms exceeds four 80ms model bins"
         );
+    }
+
+    #[test]
+    #[ignore = "host-local: compares policy-guarded q4_k against the released q8_0 pack on CPU and Metal"]
+    fn forced_aligner_q4_k_matches_q8_0_within_one_bin() {
+        let q4_pack = crate::testing::external_test_fixture_path(
+            "OPENASR_FORCED_ALIGNER_Q4_K_PACK",
+            "Qwen3 forced-aligner q4_k pack",
+        )
+        .expect("OPENASR_FORCED_ALIGNER_Q4_K_PACK");
+        let q8_pack = crate::testing::external_test_fixture_path(
+            "OPENASR_FORCED_ALIGNER_Q8_PACK",
+            "released Qwen3 forced-aligner q8_0 pack",
+        )
+        .expect("OPENASR_FORCED_ALIGNER_Q8_PACK");
+        let audio = crate::testing::external_test_fixture_path(
+            "OPENASR_AUX_BENCH_AUDIO",
+            "private auxiliary-model benchmark audio",
+        )
+        .expect("OPENASR_AUX_BENCH_AUDIO");
+        let text_path = crate::testing::external_test_fixture_path(
+            "OPENASR_AUX_BENCH_TEXT",
+            "private auxiliary-model benchmark transcript",
+        )
+        .expect("OPENASR_AUX_BENCH_TEXT");
+        let text = std::fs::read_to_string(text_path).expect("read parity transcript");
+        let language =
+            std::env::var("OPENASR_AUX_BENCH_LANGUAGE").unwrap_or_else(|_| "Chinese".to_string());
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            &audio,
+            "forced-aligner quant-tier parity",
+            "forced-aligner quant-tier parity",
+        )
+        .expect("load parity audio");
+        let pcm = crate::PcmBuffer::from_vec(samples);
+        for backend in [
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
+        ] {
+            let run = |pack: &std::path::Path| {
+                Qwen3ForcedAlignerSession::load(pack, backend)
+                    .expect("load aligner")
+                    .align(pcm.full_slice(), text.trim(), &language)
+                    .expect("align parity audio")
+            };
+            let q8 = run(&q8_pack);
+            let q4 = run(&q4_pack);
+            let (median_ms, p95_ms, max_ms) = forced_aligner_timestamp_drift_stats(&q8, &q4);
+            eprintln!(
+                "FORCED_ALIGNER_QUANT_PARITY backend={backend:?} items={} endpoints={} median_ms={median_ms:.3} p95_ms={p95_ms:.3} max_ms={max_ms:.3}",
+                q8.len(),
+                q8.len() * 2,
+            );
+            assert_eq!(median_ms, 0.0, "q4_k/q8_0 median drift");
+            assert_eq!(p95_ms, 0.0, "q4_k/q8_0 p95 drift");
+            assert!(
+                max_ms <= 80.001,
+                "q4_k/q8_0 maximum drift {max_ms:.3}ms exceeds one model bin"
+            );
+        }
     }
 
     fn forced_aligner_timestamp_drift_stats(

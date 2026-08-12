@@ -580,17 +580,13 @@ mod tests {
     }
 
     #[test]
-    fn semantic_q8_floor_preserves_every_forced_aligner_matrix() {
+    fn semantic_q8_floor_preserves_forced_aligner_sensitive_matrices() {
         let contract = TensorQuantizationContract::SemanticRolesV1 {
             model_architecture: crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
             classify: crate::models::qwen::forced_aligner_tensor_role,
             quantized_axis: crate::models::pack_quant::QuantizedAxis::First,
         };
-        for tensor in [
-            "output.weight",
-            "token_embd.weight",
-            "blk.0.ffn_gate.weight",
-        ] {
+        for tensor in ["output.weight", "token_embd.weight"] {
             assert!(
                 preserve_q8_floor_source_tensor(
                     contract,
@@ -608,9 +604,17 @@ mod tests {
                 Err(PackRequantError::SourceBelowQ8Floor { .. })
             ));
         }
+        assert!(
+            !preserve_q8_floor_source_tensor(
+                contract,
+                "blk.0.ffn_gate.weight",
+                GgufWriteTensorType::Q8_0.ggml_type(),
+            )
+            .expect("decoder blocks do not carry the Q8 floor")
+        );
         assert_eq!(
             contract.target_write_type("blk.0.ffn_gate.weight", &[256, 256], PackQuant::Q4_K,),
-            Some(GgufWriteTensorType::Q8_0)
+            Some(GgufWriteTensorType::Q4_K)
         );
     }
 

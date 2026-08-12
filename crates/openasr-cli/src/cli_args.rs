@@ -722,9 +722,9 @@ pub(crate) enum ModelPackCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Audit a pack's tensor quantization against the current policy: the
-    /// audio-encoder Q8_0 floor (unconditional) plus, when `--quant` names the
-    /// tier the pack claims, the declared-tier ceiling. Reads only the GGUF
+    /// Audit a pack's tensor quantization against the current policy: every
+    /// family-specific semantic precision floor plus, when `--quant` names
+    /// the tier the pack claims, the declared-tier ceiling. Reads only the GGUF
     /// header, so it also works on published, remotely-hosted packs via an
     /// HTTP `Range` prefix fetch -- no source weights, no download, no
     /// inference.
@@ -1185,6 +1185,7 @@ pub(crate) enum ImportQwen3AsrQuantization {
 pub(crate) enum ImportQwenForcedAlignerQuantization {
     Fp16,
     Q8_0,
+    Q4_K,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

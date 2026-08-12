@@ -213,7 +213,10 @@ fn validate_forced_aligner(
 ) -> Result<(), String> {
     crate::models::qwen::validate_forced_aligner_runtime_pack_contract(metadata)
         .and_then(|()| {
-            crate::models::qwen::validate_forced_aligner_quantization_contract(tensor_index)
+            crate::models::qwen::validate_forced_aligner_quantization_contract(
+                metadata,
+                tensor_index,
+            )
         })
         .map_err(|error| error.to_string())
 }
@@ -302,12 +305,15 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
         architecture_id: crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
         catalog_family_id: "qwen3-forced-aligner",
         kind: AuxPackKind::ForcedAlignment,
-        // Every published pack satisfies the runtime's semantic Q8 floor.
-        // Metal retains its validated precise FullDevice graph. CUDA and
-        // Vulkan share a Hybrid topology that runs the audio encoder without
-        // flash attention on the selected GPU while retaining numerically
-        // sensitive decoder/logits state on CPU. HIP remains fail-closed until
-        // the same timestamp and performance gates have passed there.
+        // Every published pack satisfies the runtime's semantic mixed-precision
+        // floor: precision-sensitive matrices stay Q8_0 or higher while the
+        // policy-guarded q4_k tier may quantize eligible decoder matrices.
+        // Metal retains its validated precise FullDevice graph. CUDA and Vulkan
+        // share a Hybrid topology that runs the audio encoder without flash
+        // attention on the selected GPU while retaining numerically sensitive
+        // decoder/logits state on CPU. HIP remains fail-closed until the same
+        // timestamp and performance gates have passed there. Auto stays off
+        // Metal because its near-tie timestamp drift still exceeds the envelope.
         execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
             capabilities: AUX_CPU_METAL_FULL_DEVICE_CUDA_VULKAN_HYBRID_EXECUTION,
             auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
@@ -701,7 +707,7 @@ mod tests {
 
     /// A complete, minimal set of `qwen3_forced_aligner.*` + tokenizer keys --
     /// mirrors exactly what a real published pack carries (verified against
-    /// the rebuilt `qwen3-forced-aligner-0.6b-q8_0.oasr` pack's GGUF header:
+    /// the rebuilt `qwen3-forced-aligner-0.6b` packs' shared GGUF header:
     /// no `openasr.audio.frontend` / `openasr.decode.policy`, only these).
     fn valid_forced_aligner_metadata() -> GgufMetadata {
         use crate::ggml_runtime::GgufMetadataValue;
@@ -711,6 +717,10 @@ mod tests {
             GgufMetadataValue::String(
                 crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID.to_string(),
             ),
+        );
+        values.insert(
+            "openasr.model.id".to_string(),
+            GgufMetadataValue::String("qwen3-forced-aligner-0.6b".to_string()),
         );
         for key in [
             "qwen3_forced_aligner.audio.sample_rate_hz",
@@ -768,10 +778,11 @@ mod tests {
     }
 
     #[test]
-    fn forced_aligner_pack_rejects_sub_q8_decoder_weights_on_every_route() {
+    fn forced_aligner_pack_accepts_policy_guarded_q4_k_and_rejects_q3_decoder_weights() {
         let metadata = valid_forced_aligner_metadata();
         let q8 = crate::models::pack_quant_audit::GGML_TYPE_Q8_0 as i32;
         let q4 = crate::models::pack_quant_audit::GGML_TYPE_Q4_K as i32;
+        let q3 = crate::models::pack_quant_audit::GGML_TYPE_Q3_K as i32;
         let (_, q8_result) = validate_aux_runtime_pack_contract(
             Path::new("/nonexistent"),
             &metadata,
@@ -780,14 +791,30 @@ mod tests {
         .expect("forced-aligner architecture must be claimed");
         q8_result.expect("Q8 decoder weight must satisfy the pack contract");
 
+        let mut q4_values = metadata.values().clone();
+        q4_values.insert(
+            "openasr.model.id".to_string(),
+            crate::ggml_runtime::GgufMetadataValue::String(
+                "qwen3-forced-aligner-0.6b:q4_k".to_string(),
+            ),
+        );
+        let q4_metadata = GgufMetadata::from_values_for_test(q4_values);
         let (_, q4_result) = validate_aux_runtime_pack_contract(
             Path::new("/nonexistent"),
-            &metadata,
+            &q4_metadata,
             &forced_aligner_tensor_index(q4),
         )
         .expect("forced-aligner architecture must be claimed");
-        let error = q4_result.expect_err("Q4 decoder weight must fail closed");
-        assert!(error.contains("require Q8_0 or higher"), "got: {error}");
+        q4_result.expect("Q4_K decoder weight must satisfy the q4_k contract");
+
+        let (_, q3_result) = validate_aux_runtime_pack_contract(
+            Path::new("/nonexistent"),
+            &q4_metadata,
+            &forced_aligner_tensor_index(q3),
+        )
+        .expect("forced-aligner architecture must be claimed");
+        let error = q3_result.expect_err("Q3 decoder weight must fail closed");
+        assert!(error.contains("require q4_k"), "got: {error}");
     }
 
     /// Negative direction: a forced-aligner pack missing a required

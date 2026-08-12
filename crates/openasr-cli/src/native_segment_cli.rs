@@ -1047,7 +1047,7 @@ pub(super) fn ensure_cli_word_timestamps_pack_installed(
         std::env::var_os("OPENASR_FORCED_ALIGNER_PACK").filter(|value| !value.is_empty())
     {
         bail!(
-            "OPENASR_FORCED_ALIGNER_PACK points to a missing or incompatible forced-alignment pack: {}\nReplace it with a qwen3-forced-aligner-0.6b Q8_0 pack, or unset OPENASR_FORCED_ALIGNER_PACK and run: openasr pull qwen3-forced-aligner-0.6b:q8_0",
+            "OPENASR_FORCED_ALIGNER_PACK points to a missing or incompatible forced-alignment pack: {}\nReplace it with a current qwen3-forced-aligner-0.6b pack, or unset OPENASR_FORCED_ALIGNER_PACK and run: openasr pull qwen3-forced-aligner-0.6b",
             Path::new(&path).display()
         );
     }
@@ -1055,7 +1055,7 @@ pub(super) fn ensure_cli_word_timestamps_pack_installed(
     if consent.offline {
         return Err(crate::consent::CliExit::new(
             crate::consent::ExitCode::ModelNotInstalled,
-            "The Qwen3 forced-alignment capability pack is missing or incompatible with the current Q8_0 contract, and OpenASR is offline.\nRun: openasr pull qwen3-forced-aligner-0.6b:q8_0",
+            "The Qwen3 forced-alignment capability pack is missing or incompatible with the current precision contract, and OpenASR is offline.\nRun: openasr pull qwen3-forced-aligner-0.6b",
         )
         .into());
     }
@@ -2015,11 +2015,12 @@ mod tests {
             .expect("offline capability failure must preserve the stable CLI exit contract");
         assert_eq!(exit.code, crate::consent::ExitCode::ModelNotInstalled);
         assert!(exit.message.contains("OpenASR is offline"));
-        assert!(exit.message.contains("qwen3-forced-aligner-0.6b:q8_0"));
+        assert!(exit.message.contains("qwen3-forced-aligner-0.6b"));
+        assert!(!exit.message.contains(":q8_0"));
     }
 
     #[test]
-    fn invalid_forced_aligner_override_fails_with_q8_replacement_instructions() {
+    fn invalid_forced_aligner_override_points_to_the_catalog_default() {
         let _guard = env_lock();
         let temp = tempfile::tempdir().unwrap();
         let _home = EnvVarRestore::set_os("OPENASR_HOME", temp.path());
@@ -2043,15 +2044,15 @@ mod tests {
             error.contains(&invalid_pack.display().to_string()),
             "{error}"
         );
-        assert!(error.contains("Q8_0"), "{error}");
         assert!(
             error.contains("unset OPENASR_FORCED_ALIGNER_PACK"),
             "{error}"
         );
         assert!(
-            error.contains("openasr pull qwen3-forced-aligner-0.6b:q8_0"),
+            error.contains("openasr pull qwen3-forced-aligner-0.6b"),
             "{error}"
         );
+        assert!(!error.contains(":q8_0"), "{error}");
     }
 
     #[test]

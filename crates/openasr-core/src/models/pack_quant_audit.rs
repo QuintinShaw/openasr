@@ -758,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_aligner_matrix_below_q8_fails_the_same_floor() {
+    fn forced_aligner_q4_k_keeps_only_sensitive_matrices_at_q8() {
         let view = view_with(
             Some(crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID),
             vec![
@@ -769,10 +769,9 @@ mod tests {
         );
         let report = audit_quant_floor(&view, Some(PackQuant::Q4_K)).expect("auditable");
         assert_eq!(report.block_quant_tensors, 3);
-        assert_eq!(report.q8_floor_block_quant_tensors, 3);
-        assert_eq!(report.violations.len(), 2);
+        assert_eq!(report.q8_floor_block_quant_tensors, 2);
+        assert_eq!(report.violations.len(), 1);
         assert_eq!(report.violations[0].tensor, "output.weight");
-        assert_eq!(report.violations[1].tensor, "blk.0.ffn_gate.weight");
         assert!(
             report
                 .violations
@@ -782,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_index_uses_the_same_forced_aligner_q8_floor() {
+    fn runtime_index_uses_the_same_forced_aligner_mixed_floor() {
         let architecture = crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID;
         let compliant = runtime_index(&[
             ("output.weight", GGML_TYPE_Q8_0 as i32),
@@ -807,11 +806,7 @@ mod tests {
                 .iter()
                 .map(|violation| violation.tensor.as_str())
                 .collect::<Vec<_>>(),
-            [
-                "output.weight",
-                "token_embd.weight",
-                "blk.0.ffn_gate.weight"
-            ]
+            ["output.weight", "token_embd.weight"]
         );
     }
 

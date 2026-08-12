@@ -221,11 +221,16 @@ pub fn convert_local_qwen_forced_aligner_source_to_runtime_pack(
 }
 
 /// Forced alignment takes discrete argmax decisions over 80 ms timestamp bins.
-/// Sub-Q8 perturbations anywhere in the audio/text forward pass can move a word
-/// boundary by many bins, so every quantizable matrix carries the Q8_0 floor.
+/// The audio encoder, token embedding, and timestamp head keep the Q8_0 floor;
+/// only the text decoder blocks may use Q4_K in the public `q4_k` tier. The
+/// tier name follows OpenASR's unified quant naming; the per-tensor precision
+/// policy, rather than the label alone, is the authoritative contract.
 /// Rank, alignment, bias/norm, and F32 eligibility remain owned by the shared
 /// Qwen writer; this classifier only states the model-level precision contract.
-pub(crate) fn forced_aligner_tensor_role(_name: &str) -> TensorRole {
+pub(crate) fn forced_aligner_tensor_role(name: &str) -> TensorRole {
+    if name.starts_with("blk.") && name.ends_with(".weight") {
+        return TensorRole::TextDecoderMatrix;
+    }
     TensorRole::PrecisionCriticalMatrix
 }
 
@@ -451,14 +456,25 @@ fn discover_safetensor_files(
 fn validate_request(
     request: &Qwen3ForcedAlignerLocalSourceImportRequest,
 ) -> Result<(), LocalSourceImportError> {
-    if matches!(
-        request.quantization,
-        Qwen3AsrRuntimeQuantizationMode::Q3_K | Qwen3AsrRuntimeQuantizationMode::Q4_K
-    ) {
+    if request.quantization == Qwen3AsrRuntimeQuantizationMode::Q3_K {
         return Err(validate_error(format!(
-            "Qwen3-ForcedAligner requires fp16 or q8_0 output; {} can cause multi-bin word-boundary drift",
+            "Qwen3-ForcedAligner requires fp16, q8_0, or policy-guarded q4_k output; {} can cause multi-bin word-boundary drift",
             request.quantization.label()
         )));
+    }
+    if request.quantization == Qwen3AsrRuntimeQuantizationMode::Q4_K
+        && request.package_variant.as_deref() != Some("q4_k")
+    {
+        return Err(validate_error(
+            "Qwen3-ForcedAligner Q4_K output must use package_variant 'q4_k'; this is the unified public tier name while the audio encoder, token embedding, and timestamp head remain Q8_0",
+        ));
+    }
+    if request.quantization != Qwen3AsrRuntimeQuantizationMode::Q4_K
+        && request.package_variant.as_deref() == Some("q4_k")
+    {
+        return Err(validate_error(
+            "Qwen3-ForcedAligner package_variant 'q4_k' requires Q4_K output",
+        ));
     }
     if request.package_id.trim().is_empty() {
         return Err(validate_error(
@@ -496,7 +512,39 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
-    fn every_forced_aligner_matrix_carries_the_q8_floor() {
+    #[ignore = "host-local: builds the policy-guarded q4_k forced-aligner pack from the pinned source checkpoint"]
+    fn build_forced_aligner_q4_k_pack() {
+        let source_root = crate::testing::external_test_fixture_path(
+            "OPENASR_FORCED_ALIGNER_EXPERIMENT_SOURCE",
+            "Qwen3 forced-aligner source checkpoint",
+        )
+        .expect("OPENASR_FORCED_ALIGNER_EXPERIMENT_SOURCE");
+        let output_root = std::env::var_os("OPENASR_FORCED_ALIGNER_EXPERIMENT_OUTPUT")
+            .map(PathBuf::from)
+            .expect("OPENASR_FORCED_ALIGNER_EXPERIMENT_OUTPUT");
+        let request = Qwen3ForcedAlignerLocalSourceImportRequest {
+            source_root,
+            output_root,
+            package_id: "qwen3-forced-aligner-0.6b".to_string(),
+            package_variant: Some("q4_k".to_string()),
+            source_name: "Qwen/Qwen3-ForcedAligner-0.6B".to_string(),
+            source_revision: "c7cbfc2048c462b0d63a45797104fc9db3ad62b7".to_string(),
+            license_name: "Apache-2.0".to_string(),
+            license_source: "https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B/blob/c7cbfc2048c462b0d63a45797104fc9db3ad62b7/LICENSE".to_string(),
+            quantization: Qwen3AsrRuntimeQuantizationMode::Q4_K,
+        };
+        let result = convert_local_qwen_forced_aligner_source_to_runtime_pack(&request)
+            .expect("build forced-aligner q4_k pack");
+        eprintln!(
+            "FORCED_ALIGNER_Q4_K_BUILD output={} model_id={} tensors={}",
+            result.output_path.display(),
+            result.model_id,
+            result.tensor_count,
+        );
+    }
+
+    #[test]
+    fn forced_aligner_q4_k_keeps_sensitive_matrices_at_q8() {
         let contract = crate::models::pack_quant::TensorQuantizationContract::SemanticRolesV1 {
             model_architecture: QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
             classify: forced_aligner_tensor_role,
@@ -524,30 +572,40 @@ mod tests {
                 &[1024, 1024],
                 crate::models::pack_quant::PackQuant::Q4_K,
             ),
-            Some(crate::ggml_runtime::GgufWriteTensorType::Q8_0),
+            Some(crate::ggml_runtime::GgufWriteTensorType::Q4_K),
         );
     }
 
     #[test]
-    fn importer_rejects_q3_and_q4_before_reading_source_files() {
-        for quantization in [
-            Qwen3AsrRuntimeQuantizationMode::Q3_K,
-            Qwen3AsrRuntimeQuantizationMode::Q4_K,
-        ] {
-            let request = Qwen3ForcedAlignerLocalSourceImportRequest {
-                source_root: PathBuf::from("/nonexistent/forced-aligner-source"),
-                output_root: PathBuf::from("/nonexistent/forced-aligner.oasr"),
-                package_id: "qwen3-forced-aligner-0.6b".to_string(),
-                package_variant: None,
-                source_name: "Qwen/Qwen3-ForcedAligner-0.6B".to_string(),
-                source_revision: "test".to_string(),
-                license_name: "Apache-2.0".to_string(),
-                license_source: "https://example.invalid/license".to_string(),
-                quantization,
-            };
-            let error = validate_request(&request).expect_err("sub-Q8 import must fail closed");
-            assert!(error.to_string().contains("requires fp16 or q8_0"));
-        }
+    fn importer_accepts_only_policy_guarded_q4_k() {
+        let mut request = Qwen3ForcedAlignerLocalSourceImportRequest {
+            source_root: PathBuf::from("/nonexistent/forced-aligner-source"),
+            output_root: PathBuf::from("/nonexistent/forced-aligner.oasr"),
+            package_id: "qwen3-forced-aligner-0.6b".to_string(),
+            package_variant: None,
+            source_name: "Qwen/Qwen3-ForcedAligner-0.6B".to_string(),
+            source_revision: "test".to_string(),
+            license_name: "Apache-2.0".to_string(),
+            license_source: "https://example.invalid/license".to_string(),
+            quantization: Qwen3AsrRuntimeQuantizationMode::Q3_K,
+        };
+        let error = validate_request(&request).expect_err("q3_k import must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("fp16, q8_0, or policy-guarded q4_k")
+        );
+
+        request.quantization = Qwen3AsrRuntimeQuantizationMode::Q4_K;
+        let error = validate_request(&request).expect_err("unlabeled q4_k must fail closed");
+        assert!(error.to_string().contains("package_variant 'q4_k'"));
+
+        request.package_variant = Some("q4_k".to_string());
+        validate_request(&request).expect("policy-guarded q4_k must be accepted");
+
+        request.quantization = Qwen3AsrRuntimeQuantizationMode::Q8_0;
+        let error = validate_request(&request).expect_err("Q8 must not claim q4_k");
+        assert!(error.to_string().contains("requires Q4_K output"));
     }
 
     /// Stage 1 gate: convert the real downloaded Qwen3-ForcedAligner-0.6B

@@ -1715,7 +1715,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_aligner_import_cli_accepts_q8_and_rejects_q4() {
+    fn forced_aligner_import_cli_accepts_q8_and_policy_guarded_q4_k() {
         let base = [
             "openasr",
             "model-pack",
@@ -1744,9 +1744,42 @@ mod tests {
         };
         assert_eq!(quantization, ImportQwenForcedAlignerQuantization::Q8_0);
 
-        let error = Cli::try_parse_from(base.into_iter().chain(["q4-k"]))
-            .expect_err("q4_k must not be exposed for forced-aligner imports");
-        assert!(error.to_string().contains("invalid value 'q4-k'"));
+        let cli = Cli::try_parse_from(base.into_iter().chain(["q4-k"]))
+            .expect("the policy-guarded q4_k tier must parse");
+        let Command::ModelPack {
+            command: ModelPackCommand::Import { command },
+        } = cli.command
+        else {
+            panic!("expected forced-aligner import command");
+        };
+        let ImportCommand::QwenForcedAligner { quantization, .. } = *command else {
+            panic!("expected forced-aligner import command");
+        };
+        assert_eq!(quantization, ImportQwenForcedAlignerQuantization::Q4_K);
+
+        let error = Cli::try_parse_from(base.into_iter().chain(["q4-k-m"]))
+            .expect_err("q4_k_m must not become a second forced-aligner product identity");
+        assert!(error.to_string().contains("invalid value 'q4-k-m'"));
+    }
+
+    #[test]
+    fn audit_quant_cli_accepts_the_policy_guarded_q4_k_tier() {
+        let cli = Cli::try_parse_from([
+            "openasr",
+            "model-pack",
+            "audit-quant",
+            "forced-aligner-q4_k.oasr",
+            "--quant",
+            "q4-k",
+        ])
+        .expect("q4-k must be an auditable declared tier");
+        let Command::ModelPack {
+            command: ModelPackCommand::AuditQuant { quant, .. },
+        } = cli.command
+        else {
+            panic!("expected audit-quant command");
+        };
+        assert_eq!(quant, Some(AuditQuantTier::Q4_K));
     }
 
     #[test]
