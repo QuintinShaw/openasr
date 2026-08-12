@@ -722,7 +722,7 @@ min_cli_version = "0.1.17"
 # qwen3-asr autoregressive runtime -- see
 # crates/openasr-core/src/models/qwen/forced_aligner_import.rs.
 # release_public=true allows the public projection only after public_gate.py
-# verifies the same anonymous HF repository and pinned Q4_K artifact that end
+# verifies the same anonymous HF repository and pinned Q8_0 artifact that end
 # users download. Repository visibility alone never bypasses that gate.
 ["qwen3-forced-aligner-0.6b"]
 kind = "capability-pack"
@@ -733,7 +733,7 @@ size = "0.6b"
 registry_id = "qwen3-forced-aligner-0.6b"
 display_name = "Qwen3-ForcedAligner 0.6B"
 license_name = "Apache-2.0"
-license_source = "https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B/blob/main/README.md"
+license_source = "https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B/blob/c7cbfc2048c462b0d63a45797104fc9db3ad62b7/LICENSE"
 license_class = "permissive"
 # Language-agnostic support pack (like the diarization embedder/segmenter
 # above): it aligns whatever text/audio pair a base ASR model already
@@ -742,21 +742,15 @@ license_class = "permissive"
 # far (see the align-text word-splitting support for en/zh).
 languages = ["en", "zh"]
 #
-# q4_k history: the 2026-07 audio-encoder over-quantization incident (#240)
-# affected this pack too (147 audio.* tensors at Q4_K), but the republish pass
-# in 4d81fad1 could not rebuild it -- the HF repo is private and the audit
-# script's tokenless probe silently recorded a 29-byte error page as "ok", and
-# separately `model-pack import qwen-forced-aligner` did not exist yet -- so
-# that pass only dropped q4_k from `quants` below rather than rebuilding it.
-# Rebuilt after `openasr model-pack import qwen-forced-aligner` landed: the new
-# q4_k pack passes `model-pack audit-quant` (147/147 audio tensors floored at
-# Q8_0) and is 529,003,104 bytes. It is the production Voice ID dependency:
-# local real-audio verification covers segmented zh alignment and speaker-text
-# attribution, while keeping the download at roughly half the old q8_0 tier.
-# Only the verified Q4_K tier is advertised; older HF artifacts are not catalog
-# targets and are never selected by `openasr pull`.
-quants = ["q4_k"]
-recommended_quant = "q4_k"
+# Forced alignment makes discrete decisions over 80 ms timestamp bins. Real
+# oracle runs showed that Q4_K perturbations can move a boundary by many bins,
+# even when the audio tower and the two boundary projections remain at Q8_0.
+# The production contract therefore requires Q8_0 or higher for every
+# quantizable matrix. Q8_0 is the recommended production tier and fp16 remains
+# available as the full-precision reference tier; older Q4_K artifacts are not
+# catalog targets and are rejected by pack verification.
+quants = ["fp16", "q8_0"]
+recommended_quant = "q8_0"
 upstream_release_date = "2026-01-28"
 min_core_version = "0.1.9"
 min_cli_version = "0.1.9"

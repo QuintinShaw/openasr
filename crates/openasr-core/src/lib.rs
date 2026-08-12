@@ -95,9 +95,15 @@ pub mod testing;
 pub(crate) mod translation;
 
 /// Whether the optional forced-aligner pack resolves from the explicit
-/// environment override or the installed content-addressed model store.
+/// environment override or installed content-addressed model store and
+/// satisfies the current runtime contract.
+///
+/// This intentionally verifies the resolved pack instead of checking only
+/// that a file exists. Older Q3/Q4 installs must be treated as unavailable so
+/// callers can replace them with the supported Q8_0 tier before inference.
 pub fn word_timestamp_forced_aligner_available() -> bool {
-    models::qwen::forced_aligner_pack::resolve_forced_aligner_pack_path().is_some()
+    models::qwen::forced_aligner_pack::resolve_forced_aligner_pack_path()
+        .is_some_and(|path| models::qwen::verify_forced_aligner_pack(&path).is_ok())
 }
 
 pub use api::backend::{

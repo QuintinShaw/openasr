@@ -1040,10 +1040,19 @@ pub(super) fn ensure_cli_word_timestamps_pack_installed(
         return Ok(());
     }
 
+    if let Some(path) =
+        std::env::var_os("OPENASR_FORCED_ALIGNER_PACK").filter(|value| !value.is_empty())
+    {
+        bail!(
+            "OPENASR_FORCED_ALIGNER_PACK points to a missing or incompatible forced-alignment pack: {}\nReplace it with a qwen3-forced-aligner-0.6b Q8_0 pack, or unset OPENASR_FORCED_ALIGNER_PACK and run: openasr pull qwen3-forced-aligner-0.6b:q8_0",
+            Path::new(&path).display()
+        );
+    }
+
     if consent.offline {
         return Err(crate::consent::CliExit::new(
             crate::consent::ExitCode::ModelNotInstalled,
-            "The Qwen3 forced-alignment capability pack is not installed and OpenASR is offline.\nRun: openasr pull qwen3-forced-aligner-0.6b:q4_k",
+            "The Qwen3 forced-alignment capability pack is missing or incompatible with the current Q8_0 contract, and OpenASR is offline.\nRun: openasr pull qwen3-forced-aligner-0.6b:q8_0",
         )
         .into());
     }
@@ -1979,7 +1988,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _home = EnvVarRestore::set_os("OPENASR_HOME", temp.path());
         let _models_dir = EnvVarRestore::remove("OPENASR_MODELS_DIR");
-        let _aligner_pack = EnvVarRestore::remove("OPENASR_FORCED_ALIGNER_PACK");
+        let _aligner_pack = EnvVarRestore::set_os("OPENASR_FORCED_ALIGNER_PACK", "");
         let consent = crate::consent::PullConsent {
             offline: true,
             ..Default::default()
@@ -1994,14 +2003,52 @@ mod tests {
             false,
             &consent,
         )
-        .expect_err("offline aligned timestamps must fail before constructing a downloader");
+        .expect_err(
+            "an empty pack override is unset and offline alignment fails before constructing a downloader",
+        );
 
         let exit = error
             .downcast_ref::<crate::consent::CliExit>()
             .expect("offline capability failure must preserve the stable CLI exit contract");
         assert_eq!(exit.code, crate::consent::ExitCode::ModelNotInstalled);
         assert!(exit.message.contains("OpenASR is offline"));
-        assert!(exit.message.contains("qwen3-forced-aligner-0.6b:q4_k"));
+        assert!(exit.message.contains("qwen3-forced-aligner-0.6b:q8_0"));
+    }
+
+    #[test]
+    fn invalid_forced_aligner_override_fails_with_q8_replacement_instructions() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvVarRestore::set_os("OPENASR_HOME", temp.path());
+        let invalid_pack = temp.path().join("legacy-q4.oasr");
+        let _aligner_pack = EnvVarRestore::set_os("OPENASR_FORCED_ALIGNER_PACK", &invalid_pack);
+
+        let error = ensure_cli_word_timestamps_pack_installed(
+            &test_native_execution_services(),
+            BackendKind::Native,
+            None,
+            false,
+            Some(WordTimestampsMode::Aligned),
+            false,
+            &crate::consent::PullConsent::default(),
+        )
+        .expect_err("an invalid explicit override must fail before catalog pull")
+        .to_string();
+
+        assert!(error.contains("OPENASR_FORCED_ALIGNER_PACK"), "{error}");
+        assert!(
+            error.contains(&invalid_pack.display().to_string()),
+            "{error}"
+        );
+        assert!(error.contains("Q8_0"), "{error}");
+        assert!(
+            error.contains("unset OPENASR_FORCED_ALIGNER_PACK"),
+            "{error}"
+        );
+        assert!(
+            error.contains("openasr pull qwen3-forced-aligner-0.6b:q8_0"),
+            "{error}"
+        );
     }
 
     #[test]

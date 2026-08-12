@@ -53,10 +53,10 @@ pub(crate) enum TensorRole {
     TextDecoderMatrix,
     EmbeddingTable,
     OutputProjection,
-    /// A model-specific boundary matrix whose downstream decisions are
-    /// unusually sensitive to K-quant perturbations. It carries the same Q8_0
-    /// floor as the acoustic encoder without being misclassified as acoustic.
-    PrecisionCriticalBoundaryMatrix,
+    /// A model-specific matrix whose downstream decisions are unusually
+    /// sensitive to K-quant perturbations. It carries the same Q8_0 floor as
+    /// the acoustic encoder without being misclassified as acoustic.
+    PrecisionCriticalMatrix,
     NonQuantizable,
 }
 
@@ -155,7 +155,7 @@ impl TensorRole {
         Self::TextDecoderMatrix,
         Self::EmbeddingTable,
         Self::OutputProjection,
-        Self::PrecisionCriticalBoundaryMatrix,
+        Self::PrecisionCriticalMatrix,
     ];
 
     /// Whether this semantic role carries the shared Q8_0 safety floor.
@@ -164,7 +164,7 @@ impl TensorRole {
     pub(crate) const fn requires_q8_floor(self) -> bool {
         matches!(
             self,
-            Self::AcousticEncoderMatrix | Self::PrecisionCriticalBoundaryMatrix
+            Self::AcousticEncoderMatrix | Self::PrecisionCriticalMatrix
         )
     }
 
@@ -389,13 +389,13 @@ mod tests {
     }
 
     #[test]
-    fn precision_critical_boundaries_share_the_q8_floor_policy() {
-        assert!(TensorRole::PrecisionCriticalBoundaryMatrix.requires_q8_floor());
+    fn precision_critical_matrices_share_the_q8_floor_policy() {
+        assert!(TensorRole::PrecisionCriticalMatrix.requires_q8_floor());
         assert_eq!(
             classify_quant_tensor_role(
                 &[256, 5_000],
                 PackQuant::Q4_K,
-                TensorRole::PrecisionCriticalBoundaryMatrix,
+                TensorRole::PrecisionCriticalMatrix,
                 QuantizedAxis::First,
             ),
             Some(GgufWriteTensorType::Q8_0)

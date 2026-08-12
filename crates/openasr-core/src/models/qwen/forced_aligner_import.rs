@@ -41,8 +41,6 @@ use super::package_import::{
     insert_metadata_string_array, insert_metadata_u32, load_merges, load_vocab_tokens,
     patch_added_tokens,
 };
-use super::tensor_names::{OUTPUT_WEIGHT, TOKEN_EMBD_WEIGHT};
-
 const SOURCE_CONFIG_JSON: &str = "config.json";
 const TOKENIZER_GGML_MODEL_KEY: &str = "tokenizer.ggml.model";
 const TOKENIZER_GGML_MODEL_VALUE_GPT2: &str = "gpt2";
@@ -222,16 +220,13 @@ pub fn convert_local_qwen_forced_aligner_source_to_runtime_pack(
     })
 }
 
-/// Forced alignment reads prompt-token states and takes an argmax over the
-/// independent 5,000-bin timestamp head. Keeping both boundary projections at
-/// Q8_0 avoids rare multi-second jumps observed when an otherwise-Q4_K pack
-/// quantizes them to Q4_K. The large decoder-layer matrices remain Q4_K.
-pub(crate) fn forced_aligner_tensor_role(name: &str) -> TensorRole {
-    if name == OUTPUT_WEIGHT || name == TOKEN_EMBD_WEIGHT {
-        TensorRole::PrecisionCriticalBoundaryMatrix
-    } else {
-        super::package_import::qwen_tensor_role(name)
-    }
+/// Forced alignment takes discrete argmax decisions over 80 ms timestamp bins.
+/// Sub-Q8 perturbations anywhere in the audio/text forward pass can move a word
+/// boundary by many bins, so every quantizable matrix carries the Q8_0 floor.
+/// Rank, alignment, bias/norm, and F32 eligibility remain owned by the shared
+/// Qwen writer; this classifier only states the model-level precision contract.
+pub(crate) fn forced_aligner_tensor_role(_name: &str) -> TensorRole {
+    TensorRole::PrecisionCriticalMatrix
 }
 
 fn forced_aligner_metadata_fields(config: &ForcedAlignerConfigJson) -> ForcedAlignerMetadataFields {
@@ -456,6 +451,15 @@ fn discover_safetensor_files(
 fn validate_request(
     request: &Qwen3ForcedAlignerLocalSourceImportRequest,
 ) -> Result<(), LocalSourceImportError> {
+    if matches!(
+        request.quantization,
+        Qwen3AsrRuntimeQuantizationMode::Q3_K | Qwen3AsrRuntimeQuantizationMode::Q4_K
+    ) {
+        return Err(validate_error(format!(
+            "Qwen3-ForcedAligner requires fp16 or q8_0 output; {} can cause multi-bin word-boundary drift",
+            request.quantization.label()
+        )));
+    }
     if request.package_id.trim().is_empty() {
         return Err(validate_error(
             "Qwen3-ForcedAligner local-source converter requires non-empty package_id",
@@ -488,10 +492,11 @@ fn validate_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::qwen::tensor_names::{OUTPUT_WEIGHT, TOKEN_EMBD_WEIGHT};
     use std::collections::BTreeSet;
 
     #[test]
-    fn q4_pack_keeps_alignment_boundary_projections_at_q8() {
+    fn every_forced_aligner_matrix_carries_the_q8_floor() {
         let contract = crate::models::pack_quant::TensorQuantizationContract::SemanticRolesV1 {
             model_architecture: QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
             classify: forced_aligner_tensor_role,
@@ -519,8 +524,30 @@ mod tests {
                 &[1024, 1024],
                 crate::models::pack_quant::PackQuant::Q4_K,
             ),
-            Some(crate::ggml_runtime::GgufWriteTensorType::Q4_K),
+            Some(crate::ggml_runtime::GgufWriteTensorType::Q8_0),
         );
+    }
+
+    #[test]
+    fn importer_rejects_q3_and_q4_before_reading_source_files() {
+        for quantization in [
+            Qwen3AsrRuntimeQuantizationMode::Q3_K,
+            Qwen3AsrRuntimeQuantizationMode::Q4_K,
+        ] {
+            let request = Qwen3ForcedAlignerLocalSourceImportRequest {
+                source_root: PathBuf::from("/nonexistent/forced-aligner-source"),
+                output_root: PathBuf::from("/nonexistent/forced-aligner.oasr"),
+                package_id: "qwen3-forced-aligner-0.6b".to_string(),
+                package_variant: None,
+                source_name: "Qwen/Qwen3-ForcedAligner-0.6B".to_string(),
+                source_revision: "test".to_string(),
+                license_name: "Apache-2.0".to_string(),
+                license_source: "https://example.invalid/license".to_string(),
+                quantization,
+            };
+            let error = validate_request(&request).expect_err("sub-Q8 import must fail closed");
+            assert!(error.to_string().contains("requires fp16 or q8_0"));
+        }
     }
 
     /// Stage 1 gate: convert the real downloaded Qwen3-ForcedAligner-0.6B

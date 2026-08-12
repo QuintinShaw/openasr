@@ -295,6 +295,31 @@ pub(crate) fn validate_forced_aligner_runtime_pack_contract(
     Ok(())
 }
 
+pub(crate) fn validate_forced_aligner_quantization_contract(
+    tensor_index: &crate::ggml_runtime::GgufTensorIndex,
+) -> Result<(), Qwen3ForcedAlignerRuntimeError> {
+    let violations = runtime_tensor_index_q8_floor_violations(
+        super::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
+        tensor_index,
+    )
+    .map_err(|error| Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+        key: "<quantization floor>",
+        reason: error.to_string(),
+    })?;
+    if let Some(first) = violations.first() {
+        return Err(Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
+            key: "<quantization floor>",
+            reason: format!(
+                "forced-aligner packs require Q8_0 or higher for every quantizable matrix; pack has {} violation(s), first tensor '{}' is {}",
+                violations.len(),
+                first.tensor,
+                crate::models::pack_quant_audit::ggml_type_name(first.ggml_type),
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// One item of forced-alignment output: a word (or CJK character) span in
 /// seconds. Mirrors the reference's `ForcedAlignItem`.
 #[derive(Debug, Clone, PartialEq)]
@@ -720,31 +745,6 @@ pub(crate) struct Qwen3ForcedAlignerSession {
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 }
 
-fn validate_forced_aligner_metal_quant_floor(
-    preflight: &GgufRuntimeSourcePreflight,
-) -> Result<(), String> {
-    validate_forced_aligner_metal_tensor_index(preflight.tensor_index())
-}
-
-fn validate_forced_aligner_metal_tensor_index(
-    tensor_index: &crate::ggml_runtime::GgufTensorIndex,
-) -> Result<(), String> {
-    let violations = runtime_tensor_index_q8_floor_violations(
-        super::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
-        tensor_index,
-    )
-    .map_err(|error| error.to_string())?;
-    if let Some(first) = violations.first() {
-        return Err(format!(
-            "Metal requires the current forced-aligner Q8 safety floor; pack has {} violation(s), first tensor '{}' is {}",
-            violations.len(),
-            first.tensor,
-            crate::models::pack_quant_audit::ggml_type_name(first.ggml_type),
-        ));
-    }
-    Ok(())
-}
-
 pub(crate) fn verify_forced_aligner_pack(
     pack_path: &std::path::Path,
 ) -> Result<VerifiedPack, Qwen3ForcedAlignerRuntimeError> {
@@ -785,14 +785,6 @@ impl Qwen3ForcedAlignerSession {
         verified: VerifiedPack,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, Qwen3ForcedAlignerRuntimeError> {
-        if matches!(backend, crate::ggml_runtime::GgmlCpuGraphBackend::Metal) {
-            validate_forced_aligner_metal_quant_floor(verified.preflight()).map_err(|reason| {
-                Qwen3ForcedAlignerRuntimeError::InvalidMetadata {
-                    key: "<metal quantization floor>",
-                    reason,
-                }
-            })?;
-        }
         let assets = load_forced_aligner_prepared_assets(verified.preflight(), backend)?;
         Ok(Self {
             verified,
@@ -853,6 +845,7 @@ mod tests {
     fn quant_floor_index(
         output_type: i32,
         token_embedding_type: i32,
+        decoder_type: i32,
     ) -> crate::ggml_runtime::GgufTensorIndex {
         crate::ggml_runtime::GgufTensorIndex::from_snapshot(
             crate::ggml_runtime::GgufTensorIndexSnapshot {
@@ -878,7 +871,7 @@ mod tests {
                     crate::ggml_runtime::GgufTensorMetadata {
                         name: "blk.0.ffn_gate.weight".to_string(),
                         dims: vec![1024, 3072],
-                        ggml_type: crate::models::pack_quant_audit::GGML_TYPE_Q4_K as i32,
+                        ggml_type: decoder_type,
                         type_name: "synthetic".to_string(),
                         size_bytes: 0,
                         offset_bytes: 0,
@@ -890,13 +883,20 @@ mod tests {
     }
 
     #[test]
-    fn forced_aligner_explicit_metal_requires_the_semantic_q8_floor() {
+    fn forced_aligner_pack_contract_requires_q8_for_every_matrix() {
         let q8 = crate::models::pack_quant_audit::GGML_TYPE_Q8_0 as i32;
         let q4 = crate::models::pack_quant_audit::GGML_TYPE_Q4_K as i32;
-        validate_forced_aligner_metal_tensor_index(&quant_floor_index(q8, q8))
-            .expect("current Q8 contract must remain eligible for explicit Metal");
-        assert!(validate_forced_aligner_metal_tensor_index(&quant_floor_index(q4, q8)).is_err());
-        assert!(validate_forced_aligner_metal_tensor_index(&quant_floor_index(q8, q4)).is_err());
+        validate_forced_aligner_quantization_contract(&quant_floor_index(q8, q8, q8))
+            .expect("current Q8 contract must remain eligible on every backend");
+        assert!(
+            validate_forced_aligner_quantization_contract(&quant_floor_index(q4, q8, q8)).is_err()
+        );
+        assert!(
+            validate_forced_aligner_quantization_contract(&quant_floor_index(q8, q4, q8)).is_err()
+        );
+        assert!(
+            validate_forced_aligner_quantization_contract(&quant_floor_index(q8, q8, q4)).is_err()
+        );
     }
 
     #[test]

@@ -3708,7 +3708,7 @@ mod tests {
     /// pack is claimed by the aux table (never ASR selection) yet still
     /// rejected.
     #[test]
-    fn pull_contract_validation_accepts_complete_forced_aligner_pack_and_rejects_bare_one() {
+    fn pull_contract_validation_enforces_forced_aligner_q8_floor_and_metadata() {
         let temp = tempfile::tempdir().unwrap();
 
         let mut complete_metadata = std::collections::BTreeMap::new();
@@ -3754,10 +3754,10 @@ mod tests {
             crate::ggml_runtime::GgufWriteValue::StringArray(Vec::new()),
         );
         let tensors = [crate::ggml_runtime::GgufWriteTensor {
-            name: "stub.weight".to_string(),
-            dims: vec![1],
-            tensor_type: crate::ggml_runtime::GgufWriteTensorType::F32,
-            data: vec![0u8; 4],
+            name: "blk.0.attn_q.weight".to_string(),
+            dims: vec![32, 32],
+            tensor_type: crate::ggml_runtime::GgufWriteTensorType::F16,
+            data: vec![0u8; 32 * 32 * 2],
         }];
         let complete_path = temp.path().join("forced-aligner-complete.oasr");
         crate::ggml_runtime::write_gguf_file_v0(&complete_path, &complete_metadata, &tensors)
@@ -3766,6 +3766,49 @@ mod tests {
             verify_native_runtime_model_pack_path(&complete_path).is_ok(),
             "a pack carrying every qwen3_forced_aligner.* key plus the BPE tokenizer arrays \
              must pass install-time validation"
+        );
+
+        let q4_values = vec![0.0f32; 256 * 256];
+        let q4_tensors = [crate::ggml_runtime::GgufWriteTensor {
+            name: "blk.0.attn_q.weight".to_string(),
+            dims: vec![256, 256],
+            tensor_type: crate::ggml_runtime::GgufWriteTensorType::Q4_K,
+            data: crate::ggml_runtime::quantize_f32_to_ggml_tensor_data(
+                crate::ggml_runtime::GgufWriteTensorType::Q4_K,
+                &[256, 256],
+                &q4_values,
+            )
+            .expect("quantize forced-aligner Q4 fixture"),
+        }];
+        let q4_path = temp.path().join("forced-aligner-q4.oasr");
+        crate::ggml_runtime::write_gguf_file_v0(&q4_path, &complete_metadata, &q4_tensors).unwrap();
+        let q4_error = verify_native_runtime_model_pack_path(&q4_path)
+            .expect_err("a Q4 forced-aligner matrix must fail the public pack verifier");
+        assert!(q4_error.contains("Q8_0"), "got: {q4_error}");
+
+        crate::test_process_env::with_test_process_env(
+            [(
+                "OPENASR_FORCED_ALIGNER_PACK",
+                Some(q4_path.into_os_string()),
+            )],
+            || {
+                assert!(
+                    !crate::word_timestamp_forced_aligner_available(),
+                    "an installed legacy Q4 pack must not suppress Q8_0 replacement"
+                );
+            },
+        );
+        crate::test_process_env::with_test_process_env(
+            [(
+                "OPENASR_FORCED_ALIGNER_PACK",
+                Some(complete_path.clone().into_os_string()),
+            )],
+            || {
+                assert!(
+                    crate::word_timestamp_forced_aligner_available(),
+                    "an FP16 matrix satisfies the Q8 floor"
+                );
+            },
         );
 
         let mut bare_metadata = std::collections::BTreeMap::new();

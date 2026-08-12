@@ -992,7 +992,7 @@ fn import_qwen_forced_aligner_local_command(
     source_revision: &str,
     license_name: &str,
     license_source: &str,
-    quantization: ImportQwen3AsrQuantization,
+    quantization: ImportQwenForcedAlignerQuantization,
 ) -> Result<()> {
     let request = Qwen3ForcedAlignerLocalSourceImportRequest {
         source_root: source_root.to_path_buf(),
@@ -1004,10 +1004,12 @@ fn import_qwen_forced_aligner_local_command(
         license_name: license_name.to_string(),
         license_source: license_source.to_string(),
         quantization: match quantization {
-            ImportQwen3AsrQuantization::Fp16 => openasr_core::Qwen3AsrRuntimeQuantizationMode::Fp16,
-            ImportQwen3AsrQuantization::Q8_0 => openasr_core::Qwen3AsrRuntimeQuantizationMode::Q8_0,
-            ImportQwen3AsrQuantization::Q3_K => openasr_core::Qwen3AsrRuntimeQuantizationMode::Q3_K,
-            ImportQwen3AsrQuantization::Q4_K => openasr_core::Qwen3AsrRuntimeQuantizationMode::Q4_K,
+            ImportQwenForcedAlignerQuantization::Fp16 => {
+                openasr_core::Qwen3AsrRuntimeQuantizationMode::Fp16
+            }
+            ImportQwenForcedAlignerQuantization::Q8_0 => {
+                openasr_core::Qwen3AsrRuntimeQuantizationMode::Q8_0
+            }
         },
     };
 

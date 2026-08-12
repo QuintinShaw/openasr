@@ -11,7 +11,7 @@ use std::path::PathBuf;
 const FORCED_ALIGNER_PACK_ENV: &str = "OPENASR_FORCED_ALIGNER_PACK";
 const FORCED_ALIGNER_INSTALLED_MODEL_ID_HINT: &str = "forced-aligner";
 const FORCED_ALIGNER_MODEL_ID: &str = "qwen3-forced-aligner-0.6b";
-const FORCED_ALIGNER_PREFERRED_QUANT: &str = "q4_k";
+const FORCED_ALIGNER_PREFERRED_QUANT: &str = "q8_0";
 pub(crate) const FORCED_ALIGNER_PACK_PREFERENCE: crate::capability_pack::CapabilityPackPreference =
     crate::capability_pack::CapabilityPackPreference::new(
         FORCED_ALIGNER_MODEL_ID,

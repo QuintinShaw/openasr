@@ -57,8 +57,8 @@ STATS_SUFFIXES = (".npz", ".ark", ".mvn")
 # Deliberately low: several of these are legitimately tiny, so this floor
 # exists only to catch a captured HTTP error page landing on the expected
 # filename (the class of incident this module fixes -- see module docstring
-# and the 2026-07 qwen3-forced-aligner q4_k rebuild, where a tokenless fetch
-# of a private repo landed a 29-byte error page under a required filename).
+# and the original qwen3-forced-aligner import, where a tokenless fetch of a
+# private repo landed a 29-byte error page under a required filename).
 #
 # Sized against the smallest LEGITIMATE file in this category, not against the
 # incident: this repo's own staged inputs include a 21-byte hf_repo.txt and a

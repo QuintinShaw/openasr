@@ -1142,8 +1142,8 @@ pub(crate) enum ImportCommand {
         #[arg(long)]
         license_source: String,
         /// Runtime tensor quantization for GGUF-backed `.oasr` output.
-        #[arg(long, value_enum, default_value_t = ImportQwen3AsrQuantization::Fp16)]
-        quantization: ImportQwen3AsrQuantization,
+        #[arg(long, value_enum, default_value_t = ImportQwenForcedAlignerQuantization::Fp16)]
+        quantization: ImportQwenForcedAlignerQuantization,
     },
     /// Import one local MOSS-Transcribe-Diarize HF-style source directory into one runtime pack file (`.oasr`).
     #[command(name = "moss")]
@@ -1199,6 +1199,13 @@ pub(crate) enum ImportQwen3AsrQuantization {
     Q8_0,
     Q3_K,
     Q4_K,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[allow(non_camel_case_types)]
+pub(crate) enum ImportQwenForcedAlignerQuantization {
+    Fp16,
+    Q8_0,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

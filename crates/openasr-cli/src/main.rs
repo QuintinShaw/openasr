@@ -1715,6 +1715,41 @@ mod tests {
     }
 
     #[test]
+    fn forced_aligner_import_cli_accepts_q8_and_rejects_q4() {
+        let base = [
+            "openasr",
+            "model-pack",
+            "import",
+            "qwen-forced-aligner",
+            "source",
+            "forced-aligner.oasr",
+            "--package-id",
+            "qwen3-forced-aligner-0.6b",
+            "--source-revision",
+            "test",
+            "--license-source",
+            "https://example.invalid/license",
+            "--quantization",
+        ];
+        let cli = Cli::try_parse_from(base.into_iter().chain(["q8-0"]))
+            .expect("the production q8_0 tier must parse");
+        let Command::ModelPack {
+            command: ModelPackCommand::Import { command },
+        } = cli.command
+        else {
+            panic!("expected forced-aligner import command");
+        };
+        let ImportCommand::QwenForcedAligner { quantization, .. } = *command else {
+            panic!("expected forced-aligner import command");
+        };
+        assert_eq!(quantization, ImportQwenForcedAlignerQuantization::Q8_0);
+
+        let error = Cli::try_parse_from(base.into_iter().chain(["q4-k"]))
+            .expect_err("q4_k must not be exposed for forced-aligner imports");
+        assert!(error.to_string().contains("invalid value 'q4-k'"));
+    }
+
+    #[test]
     fn transcribe_cli_accepts_repeated_hotwords_and_boost() {
         let cli = Cli::try_parse_from([
             "openasr",

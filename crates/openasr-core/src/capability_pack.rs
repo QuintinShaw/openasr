@@ -101,8 +101,8 @@ pub(crate) fn resolve_installed_capability_pack_in(
 /// The family hint remains a substring so an older compatible revision can be
 /// used when the current catalog model is absent. Within those matches, the
 /// current model id wins, then its catalog-recommended quant, then stable
-/// `(model id, quant)` order. This prevents stale FP16/Q8 refs from silently
-/// beating a production Q4 pack merely because their quant tag sorts first.
+/// `(model id, quant)` order. This prevents a stale alternate-quant ref from
+/// silently beating the production pack merely because its tag sorts first.
 fn installed_capability_pack(home: &Path, preference: CapabilityPackPreference) -> Option<PathBuf> {
     let store = crate::InstalledModelStore::read(home).ok()?;
     let mut matches: Vec<&crate::InstalledPack> = store
@@ -427,25 +427,25 @@ mod tests {
             "fp16",
             b"GGUFstale-fp16",
         );
-        let production_q4 = install_content_addressed(
+        let production_q8 = install_content_addressed(
             home.path(),
             "qwen3-forced-aligner-0.6b",
-            "q4_k",
-            b"GGUFproduction-q4",
+            "q8_0",
+            b"GGUFproduction-q8",
         );
-        let older_family_q4 = install_content_addressed(
+        let older_family_q8 = install_content_addressed(
             home.path(),
             "qwen3-forced-aligner-0.5b",
-            "q4_k",
-            b"GGUFolder-family-q4",
+            "q8_0",
+            b"GGUFolder-family-q8",
         );
         let preference =
-            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q4_k");
+            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q8_0");
 
         let resolved = resolve_installed_capability_pack_in(home.path(), preference).unwrap();
-        assert_eq!(resolved, production_q4);
+        assert_eq!(resolved, production_q8);
         assert_ne!(resolved, stale_fp16);
-        assert_ne!(resolved, older_family_q4);
+        assert_ne!(resolved, older_family_q8);
     }
 
     #[test]
@@ -457,17 +457,17 @@ mod tests {
             "fp16",
             b"GGUFstale-fp16",
         );
-        let production_q4 = install_content_addressed(
+        let production_q8 = install_content_addressed(
             home.path(),
             "qwen3-forced-aligner-0.6b",
-            "q4",
-            b"GGUFproduction-q4-suffix",
+            "q8",
+            b"GGUFproduction-q8-suffix",
         );
         let preference =
-            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q4_k");
+            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q8_0");
 
         let resolved = resolve_installed_capability_pack_in(home.path(), preference).unwrap();
-        assert_eq!(resolved, production_q4);
+        assert_eq!(resolved, production_q8);
         assert_ne!(resolved, stale_fp16);
     }
 
@@ -480,17 +480,17 @@ mod tests {
             "fp16",
             b"GGUFolder-stale-fp16",
         );
-        let compatible_q4 = install_content_addressed(
+        let compatible_q8 = install_content_addressed(
             home.path(),
             "qwen3-forced-aligner-0.5b",
-            "q4_k",
-            b"GGUFolder-compatible-q4",
+            "q8_0",
+            b"GGUFolder-compatible-q8",
         );
         let preference =
-            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q4_k");
+            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q8_0");
 
         let resolved = resolve_installed_capability_pack_in(home.path(), preference).unwrap();
-        assert_eq!(resolved, compatible_q4);
+        assert_eq!(resolved, compatible_q8);
         assert_ne!(resolved, stale_fp16);
     }
 
@@ -503,17 +503,17 @@ mod tests {
             "fp16",
             b"GGUFstale-fp16",
         );
-        let production_q4 = install_legacy(
+        let production_q8 = install_legacy(
             home.path(),
             "qwen3-forced-aligner-0.6b",
-            "q4_k",
-            b"GGUFproduction-q4",
+            "q8_0",
+            b"GGUFproduction-q8",
         );
         let preference =
-            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q4_k");
+            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q8_0");
 
         let resolved = resolve_installed_capability_pack_in(home.path(), preference).unwrap();
-        assert_eq!(resolved, production_q4);
+        assert_eq!(resolved, production_q8);
         assert_ne!(resolved, stale_fp16);
     }
 

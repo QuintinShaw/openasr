@@ -4,8 +4,9 @@
 # state; re-verify against the upstream card when the upstream weights
 # change.
 #
-# Public release source for the Q4_K capability pack. The generated catalog is
-# still guarded by the anonymous HF listing and artifact-integrity checks.
+# Public release source for the Q8_0 and FP16 capability packs. The generated
+# catalog is still guarded by the anonymous HF listing and artifact-integrity
+# checks.
 
 tagline = "Word-level forced alignment for OpenASR transcripts -- a non-autoregressive Qwen3 audio+text model that refines per-word timestamps"
 tagline_zh = "为 OpenASR 转写结果提供词级强制对齐 — 非自回归的 Qwen3 音频+文本模型，用于精修逐词时间戳"
@@ -15,7 +16,7 @@ highlights = [
   "⚡ **Non-autoregressive** — a single forward pass over interleaved audio/text with argmax at `<timestamp>` positions (5000 80ms-wide bins), not incremental greedy decoding, so it is not dispatched through the qwen3-asr runtime",
   "🧩 **Shares its backbone with Qwen3-ASR** — the same audio-encoder + LM `thinker` tensor layout, byte-for-byte; only the final head differs (an independent 5000-way classification head instead of the tied vocabulary head)",
   "🔌 **Shared attribution dependency** — used explicitly by `--word-timestamps=aligned` and internally when external diarization must split a coarse ASR segment at speaker changes",
-  "🦀 **Native Q4_K runtime** — the single production tier runs locally with no Python; Auto uses CPU on Apple Metal and retains supported discrete-GPU paths",
+  "🦀 **Native Q8_0 + FP16 runtimes** — Q8_0 is recommended for production, while FP16 remains available as the full-precision reference tier; both run locally with no Python",
 ]
 
 highlights_zh = [
@@ -23,7 +24,7 @@ highlights_zh = [
   "⚡ **非自回归** — 对交错的音频/文本做单次前向计算，在 `<timestamp>` 位置取 argmax（5000 个 80ms 宽的分箱），不是逐步贪心解码，因此不通过 qwen3-asr 运行时派发",
   "🧩 **与 Qwen3-ASR 共享骨干** — 音频编码器 + LM 的 `thinker` 张量布局逐位相同，仅末端输出头不同（独立的 5000 分类头，而非共享词表的绑定头）",
   "🔌 **统一归属依赖** — 既支持显式 `--word-timestamps=aligned`，也会在外置说话人分离需要把粗粒度 ASR 段切到换人边界时由内部调用",
-  "🦀 **原生 Q4_K 运行时** — 唯一生产档完全本地运行且无需 Python；Auto 在 Apple Metal 上使用 CPU，并保留受支持的独立 GPU 路径",
+  "🦀 **原生 Q8_0 + FP16 运行时** — 推荐生产使用 Q8_0，同时保留 FP16 作为全精度参考档；两者均完全本地运行且无需 Python",
 ]
 
 intro = """
@@ -36,7 +37,9 @@ source audio, it runs a single non-autoregressive forward pass and reads off wor
 timestamps at argmax `<timestamp>` positions -- refining a model family's own (typically
 decode-time-approximate) per-word timestamps. This OpenASR repo repackages the weights as
 `.oasr` packs that run natively in the OpenASR runtime -- no Python at inference, all decoding
-local. OpenASR ships one production **q4_k** tier for this capability pack.
+local. OpenASR recommends **q8_0** for production and also ships an **fp16** full-precision
+reference tier. Lower-precision Q3/Q4 packs are rejected because small logit perturbations can
+move a word boundary across multiple 80ms bins.
 
 **Not a standalone transcription model.** This pack cannot transcribe audio by itself; it is an
 alignment dependency consumed explicitly via `openasr transcribe <audio> --model <asr-model>
@@ -46,8 +49,8 @@ removed again unless the caller asked to receive them.
 
 **Verification:** local verification covers a tensor-parity check against the real upstream
 checkpoint -- every source safetensors tensor maps 1:1 to a destination tensor, plus the two
-synthesized frontend tensors. The production q4_k pack additionally passes the quant-floor
-audit and real Chinese meeting-audio attribution verification.
+synthesized frontend tensors. Both published tiers pass the all-matrix quantization-floor audit;
+the recommended q8_0 pack additionally passes real Chinese meeting-audio attribution verification.
 """
 
 intro_zh = """
@@ -59,7 +62,8 @@ Qwen3-ForcedAligner-0.6B 是 **Qwen** 推出的**词级强制对齐**模型，�
 （通常是解码时的近似值）的逐词时间戳。
 
 这个仓库提供 OpenASR `.oasr` 格式包。OpenASR 会在本地完成加载、校验和推理，不会把音频上传到
-云端。当前仅提供经过真实中文会议音频验证的生产 `q4_k` 档。
+云端。推荐生产使用经过真实中文会议音频验证的 `q8_0` 档，并提供 `fp16` 全精度参考档。
+Q3/Q4 低精度包会被拒绝，因为细小的输出扰动也可能让词边界跨越多个 80ms 时间分箱。
 
 **不是独立的转写模型。** 本模型包本身无法转写音频；它是通过
 `openasr transcribe <audio> --model <asr-model> --word-timestamps=aligned` 显式调用；当外置说话人
@@ -67,7 +71,7 @@ Qwen3-ForcedAligner-0.6B 是 **Qwen** 推出的**词级强制对齐**模型，�
 内部生成的词锚点会在说话人归属完成后移除。
 
 **验证情况:** 本地验证已覆盖对照真实上游检查点的张量对齐检查——每个源 safetensors 张量均一一
-映射至目标张量，外加两个合成前端张量；生产 q4_k 包另通过量化下限审计与真实中文会议音频归属验证。
+映射至目标张量，外加两个合成前端张量；两个发布档均通过全矩阵量化下限审计，推荐的 q8_0 包另通过真实中文会议音频归属验证。
 """
 
 acknowledgement = """
@@ -93,7 +97,7 @@ highlights = [
   "⚡ **非自回归** — 对交错的音频/文本做单次前向计算，在 `<timestamp>` 位置取 argmax（5000 个 80ms 宽的分箱），不是逐步贪心解码，因此不通过 qwen3-asr 运行时派发",
   "🧩 **与 Qwen3-ASR 共享骨干** — 音频编码器 + LM 的 `thinker` 张量布局逐位相同，仅末端输出头不同（独立的 5000 分类头，而非共享词表的绑定头）",
   "🔌 **统一归属依赖** — 既支持显式 `--word-timestamps=aligned`，也会在外置说话人分离需要把粗粒度 ASR 段切到换人边界时由内部调用",
-  "🦀 **原生 Q4_K 运行时** — 唯一生产档完全本地运行且无需 Python；Auto 在 Apple Metal 上使用 CPU，并保留受支持的独立 GPU 路径",
+  "🦀 **原生 Q8_0 + FP16 运行时** — 推荐生产使用 Q8_0，同时保留 FP16 作为全精度参考档；两者均完全本地运行且无需 Python",
 ]
 
-source_sha256 = "15b8e59cc809afcfb4cacc72ef6b5fa17394affad31f21e8c23abb5dc048161d"
+source_sha256 = "b6803793f8ee8f66a6821a792350fbcea5754d67111923a54897e0bcf303e7b3"

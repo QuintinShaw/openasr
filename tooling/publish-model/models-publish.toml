@@ -407,13 +407,15 @@ requant_source_quant = "fp16"
 # qwen-forced-aligner` subcommand (same request shape as qwen). The CLI
 # defaults for source-name/license-name are stated explicitly anyway: the
 # pipeline never relies on argument defaults.
+# Forced-aligner imports intentionally expose only fp16 and q8_0. Publishing
+# builds both supported tiers; models-core.toml keeps q8_0 recommended.
 ["qwen3-forced-aligner-0.6b"]
 import_subcommand = "import qwen-forced-aligner"
 upstream_repo = "Qwen/Qwen3-ForcedAligner-0.6B"
-source_revision = "main"
+source_revision = "c7cbfc2048c462b0d63a45797104fc9db3ad62b7"
 needs_license_flags = false
-required_source_files = ["config.json", "model.safetensors"]
-import_command = "model-pack import qwen-forced-aligner {src} {out} --package-id {registry_id} --quantization {quant} --source-name Qwen/Qwen3-ForcedAligner-0.6B --source-revision main --license-name Apache-2.0 --license-source https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B/blob/main/LICENSE"
+required_source_files = ["config.json", "model.safetensors", "vocab.json", "merges.txt"]
+import_command = "model-pack import qwen-forced-aligner {src} {out} --package-id {registry_id} --quantization {quant} --source-name Qwen/Qwen3-ForcedAligner-0.6B --source-revision c7cbfc2048c462b0d63a45797104fc9db3ad62b7 --license-name Apache-2.0 --license-source https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B/blob/c7cbfc2048c462b0d63a45797104fc9db3ad62b7/LICENSE"
 
 # FireRedPunc punctuation capability pack. Imported via the public
 # `openasr model-pack import firered-punc` subcommand from the upstream

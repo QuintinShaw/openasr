@@ -16,9 +16,9 @@ from _require_files import (
 
 # The real 2026-07 incident: a tokenless fetch of a private HF repo landed a
 # 29-byte captured error body at the filename the pipeline expected, and a
-# plain glob-existence check recorded it as "ok" (see models-core.toml's
-# qwen3-forced-aligner-0.6b q4_k history note). Reconstruct that exact size
-# here as a JSON error envelope, the shape hf-mirror/HF actually return.
+# plain glob-existence check recorded it as "ok" during the original
+# qwen3-forced-aligner-0.6b import. Reconstruct that exact size here as a JSON
+# error envelope, the shape hf-mirror/HF actually return.
 TWENTY_NINE_BYTE_ERROR_PAGE = b'{"error":"no such repo!!"}'.ljust(29, b" ")
 assert len(TWENTY_NINE_BYTE_ERROR_PAGE) == 29
 

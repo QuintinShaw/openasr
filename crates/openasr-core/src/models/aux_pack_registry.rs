@@ -198,9 +198,12 @@ fn validate_firered_punc(
 fn validate_forced_aligner(
     _path: &Path,
     metadata: &GgufMetadata,
-    _tensor_index: &GgufTensorIndex,
+    tensor_index: &GgufTensorIndex,
 ) -> Result<(), String> {
     crate::models::qwen::validate_forced_aligner_runtime_pack_contract(metadata)
+        .and_then(|()| {
+            crate::models::qwen::validate_forced_aligner_quantization_contract(tensor_index)
+        })
         .map_err(|error| error.to_string())
 }
 
@@ -406,6 +409,22 @@ mod tests {
 
     fn empty_tensor_index() -> GgufTensorIndex {
         GgufTensorIndex::empty_for_test(PathBuf::from("/nonexistent"))
+    }
+
+    fn forced_aligner_tensor_index(ggml_type: i32) -> GgufTensorIndex {
+        GgufTensorIndex::from_snapshot(crate::ggml_runtime::GgufTensorIndexSnapshot {
+            path: PathBuf::from("/nonexistent/forced-aligner-policy.oasr"),
+            data_section_offset_bytes: 0,
+            tensors: vec![crate::ggml_runtime::GgufTensorMetadata {
+                name: "blk.0.ffn_gate.weight".to_string(),
+                dims: vec![1024, 3072],
+                ggml_type,
+                type_name: "synthetic".to_string(),
+                size_bytes: 0,
+                offset_bytes: 0,
+            }],
+        })
+        .expect("valid forced-aligner tensor index")
     }
 
     /// Fail-closed safety net the previous hand-rolled `if let Some(...)` chain
@@ -670,7 +689,7 @@ mod tests {
 
     /// A complete, minimal set of `qwen3_forced_aligner.*` + tokenizer keys --
     /// mirrors exactly what a real published pack carries (verified against
-    /// the rebuilt `qwen3-forced-aligner-0.6b-q4_k.oasr` pack's GGUF header:
+    /// the rebuilt `qwen3-forced-aligner-0.6b-q8_0.oasr` pack's GGUF header:
     /// no `openasr.audio.frontend` / `openasr.decode.policy`, only these).
     fn valid_forced_aligner_metadata() -> GgufMetadata {
         use crate::ggml_runtime::GgufMetadataValue;
@@ -734,6 +753,29 @@ mod tests {
         .expect("forced-aligner architecture must be claimed by the aux table");
         assert_eq!(kind, AuxPackKind::ForcedAlignment);
         assert!(result.is_ok(), "got: {result:?}");
+    }
+
+    #[test]
+    fn forced_aligner_pack_rejects_sub_q8_decoder_weights_on_every_route() {
+        let metadata = valid_forced_aligner_metadata();
+        let q8 = crate::models::pack_quant_audit::GGML_TYPE_Q8_0 as i32;
+        let q4 = crate::models::pack_quant_audit::GGML_TYPE_Q4_K as i32;
+        let (_, q8_result) = validate_aux_runtime_pack_contract(
+            Path::new("/nonexistent"),
+            &metadata,
+            &forced_aligner_tensor_index(q8),
+        )
+        .expect("forced-aligner architecture must be claimed");
+        q8_result.expect("Q8 decoder weight must satisfy the pack contract");
+
+        let (_, q4_result) = validate_aux_runtime_pack_contract(
+            Path::new("/nonexistent"),
+            &metadata,
+            &forced_aligner_tensor_index(q4),
+        )
+        .expect("forced-aligner architecture must be claimed");
+        let error = q4_result.expect_err("Q4 decoder weight must fail closed");
+        assert!(error.contains("require Q8_0 or higher"), "got: {error}");
     }
 
     /// Negative direction: a forced-aligner pack missing a required
