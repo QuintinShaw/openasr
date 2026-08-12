@@ -208,7 +208,7 @@ impl MimoAudiotokEncoderRuntime {
         Self::new_from_preflight_with_rvq_fusion(preflight, metadata, backend, true)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn new_from_preflight_without_rvq_fusion_for_test(
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         metadata: MimoAudiotokMetadata,
