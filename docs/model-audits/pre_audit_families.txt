@@ -5,7 +5,6 @@
 cohere
 dolphin
 firered-punc
-hymt2
 mimo-asr
 moonshine
 parakeet-tdt

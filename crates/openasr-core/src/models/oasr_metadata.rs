@@ -289,34 +289,6 @@ impl OasrPackWriter {
         })
     }
 
-    /// Starts a transaction for a byte-preserving GGUF repack. Protected keys
-    /// already present in the source must be supplied here and match the
-    /// envelope exactly; missing protected keys are returned in
-    /// `sealed_metadata()` for the custom splicer to append.
-    pub(crate) fn begin_repack(
-        output_path: &Path,
-        envelope: PackEnvelope,
-        family_metadata: BTreeMap<String, GgufWriteValue>,
-        existing_metadata: &BTreeMap<String, GgufWriteValue>,
-    ) -> Result<OasrPackTransaction, OasrPackWriteError> {
-        if output_path.exists() {
-            return Err(OasrPackWriteError::OutputExists {
-                path: output_path.to_path_buf(),
-            });
-        }
-        Ok(OasrPackTransaction {
-            output_path: output_path.to_path_buf(),
-            staging_path: staging_path_for(output_path)?,
-            envelope,
-            sealed_metadata: Self::seal_output_metadata(
-                envelope,
-                family_metadata,
-                existing_metadata,
-            )?,
-            committed: false,
-        })
-    }
-
     pub(crate) fn write(
         output_path: &Path,
         envelope: PackEnvelope,
@@ -421,7 +393,7 @@ fn staging_path_for(output_path: &Path) -> Result<PathBuf, OasrPackWriteError> {
 }
 
 /// Shared `tokenizer.ggml.*` GGUF key names. Every builtin tokenizer family
-/// (cohere, hymt2, moonshine, whisper, qwen) reads/writes the same three keys
+/// (cohere, moonshine, whisper, qwen) reads/writes the same three keys
 /// under these exact names; only the accepted `tokenizer.ggml.model` *value*
 /// differs per family (llama/SentencePiece vs gpt2/BPE) and stays declared
 /// locally in each family, since merging the values would collapse a real
@@ -509,7 +481,7 @@ impl OasrMetadataBuilder {
 // --- Read-side accessors -------------------------------------------------
 //
 // Every builtin tokenizer family's `from_gguf_metadata` loader (cohere,
-// hymt2, moonshine, whisper, qwen) parsed its GGUF metadata through a
+// moonshine, whisper, qwen) parsed its GGUF metadata through a
 // byte-for-byte copy of these helpers, differing only in the family name
 // spliced into the error text. Centralizing them here (mirroring the
 // write-side `insert_metadata*` helpers above) means a metadata-parsing fix

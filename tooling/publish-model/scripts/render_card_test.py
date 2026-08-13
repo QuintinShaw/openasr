@@ -30,16 +30,14 @@ class RenderCardTest(unittest.TestCase):
 
     def test_card_type_and_pipeline_are_derived_from_catalog_semantics(self) -> None:
         self.assertEqual(card_type_for_catalog({"kind": "asr-model"}), "asr")
-        self.assertEqual(
+        with self.assertRaisesRegex(ValueError, "catalog kind is reserved"):
             card_type_for_catalog(
                 {
                     "kind": "translation-model",
                     "source_langs": ["zh"],
                     "target_langs": ["en"],
                 }
-            ),
-            "translation",
-        )
+            )
         self.assertEqual(
             card_type_for_catalog(
                 {
@@ -85,10 +83,8 @@ class RenderCardTest(unittest.TestCase):
             ),
             "automatic-speech-recognition",
         )
-        self.assertEqual(
-            pipeline_tag_for_catalog({"kind": "translation-model"}, {}),
-            "translation",
-        )
+        with self.assertRaisesRegex(ValueError, "catalog kind is reserved"):
+            pipeline_tag_for_catalog({"kind": "translation-model"}, {})
 
     def test_renderer_fails_closed_without_semantic_catalog_fields(self) -> None:
         with self.assertRaisesRegex(ValueError, "supported catalog kind"):

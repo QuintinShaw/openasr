@@ -46,8 +46,8 @@
 //! structs being exported here. ts-rs resolves every type's committed file
 //! location as `<this test's Config::out_dir>` joined with that type's own
 //! `#[ts(export_to = "...")]` attribute; `RealtimeBackendCapabilities` (and
-//! its own dependents `RealtimeTranslationCapability`, `RealtimeBackendMode`,
-//! `BackendFeatureCapability`, `BackendCapabilityBehavior`) already carry
+//! its own dependents `RealtimeBackendMode`, `BackendFeatureCapability`, and
+//! `BackendCapabilityBehavior`) already carry
 //! `export_to = "generated/realtime-wire/"` from the realtime wire PR. Since
 //! this test's `Config::out_dir` is *this crate's own* `CARGO_MANIFEST_DIR`
 //! (matching the established per-crate convention -- see the realtime test),
@@ -145,6 +145,7 @@ fn http_wire_bindings_regenerate_to_match_committed() {
             .with_out_dir(manifest_dir)
             .with_large_int("number");
         export_http_wire_bindings(&cfg);
+        normalize_generated_typescript(&manifest_dir.join(COMMITTED_RELATIVE_DIR));
         return;
     }
 
@@ -156,7 +157,35 @@ fn http_wire_bindings_regenerate_to_match_committed() {
     export_http_wire_bindings(&cfg);
 
     let regenerated_dir = scratch.path().join(COMMITTED_RELATIVE_DIR);
+    normalize_generated_typescript(&regenerated_dir);
     assert_directory_trees_match(&regenerated_dir, &committed_dir);
+}
+
+/// ts-rs leaves a space at the end of a field line when the next exported
+/// field has a Rust doc comment. Normalize that generator artifact in both
+/// regenerate and golden-check modes so committed output is reproducible and
+/// passes Git's whitespace checks without hand-editing generated files.
+fn normalize_generated_typescript(dir: &Path) {
+    for relative_path in list_files_relative(dir) {
+        let path = dir.join(&relative_path);
+        if path.extension().and_then(|extension| extension.to_str()) != Some("ts") {
+            continue;
+        }
+        let content = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {relative_path}: {error}"));
+        let mut normalized = content
+            .lines()
+            .map(|line| line.trim_end_matches([' ', '\t']))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if content.ends_with('\n') {
+            normalized.push('\n');
+        }
+        if normalized != content {
+            fs::write(&path, normalized)
+                .unwrap_or_else(|error| panic!("failed to normalize {relative_path}: {error}"));
+        }
+    }
 }
 
 /// Compares two directory trees of generated `.ts` files byte-for-byte,

@@ -56,19 +56,6 @@ pyannote community-1 PLDA/LDA parameters
   resegmentation logic independently in Rust; no BUT VBx source code is
   vendored or copied.
 
-Hy-MT2 1.8B translation model packs (staged metadata only)
-  Upstream GGUF repository: tencent/Hy-MT2-1.8B-GGUF
-  Upstream GGUF revision: 1cd5208700acedef4ef93019b6cfc148b8522d45
-  Base model repository: tencent/Hy-MT2-1.8B
-  Base model revision: 9a341cd1b679d3efd23b46e847b01745a71ed792
-  License: Apache-2.0
-
-  OpenASR does not vendor Hy-MT2 weights in this source tree. If OpenASR
-  distributes Hy-MT2 .oasr packs, each pack must include the upstream
-  LICENSE.txt and the OpenASR NOTICE.openasr.txt modification notice. The
-  staged PR1 recipe repackages upstream GGUF weights for local .oasr execution
-  and does not modify model weights.
-
 JFK inaugural address audio (jfk.wav)
   Path: fixtures/jfk.wav
   License: public domain (US Government work); distributed via the MIT-licensed

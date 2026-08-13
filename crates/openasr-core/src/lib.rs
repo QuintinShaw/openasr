@@ -94,7 +94,6 @@ mod tensor;
 mod test_process_env;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
-pub(crate) mod translation;
 
 /// Whether the optional forced-aligner pack resolves from the explicit
 /// environment override or installed content-addressed model store and
@@ -297,13 +296,6 @@ pub use models::{
         GgmlFamilyAdapterDescriptor, GgmlFamilyAdapterSelectionFields,
         GgmlFamilyAdapterSelectionSpec, OasrV1AdapterSelectionMetadata, OasrV1MetadataError,
     },
-    hymt2::{
-        HYMT2_PINNED_SOURCE_GGUF_SHA256, Hymt2ConfigError, Hymt2DecodeResult, Hymt2DecodeTimings,
-        Hymt2ExecutionMetadata, Hymt2ImportError, Hymt2ImportRequest, Hymt2ImportResult,
-        Hymt2PrefixCacheConfig, Hymt2PrefixReuseReport, Hymt2Runtime, Hymt2RuntimeError,
-        Hymt2TranslationSessionCache, PolicyResolvedHymt2Error,
-        PolicyResolvedHymt2TranslationRuntime, import_hymt2_gguf_to_runtime_pack,
-    },
     moonshine::{
         MOONSHINE_MODEL_FAMILY, MoonshineLocalSourceError, MoonshineLocalSourceImportRequest,
         MoonshineLocalSourceImportRuntimeResult, MoonshineRuntimeQuantizationMode,
@@ -379,15 +371,12 @@ pub use realtime::{
     RealtimePostProcessor, RealtimeSessionConfig, RealtimeSessionController, RealtimeSessionError,
     RealtimeSessionId, RealtimeSessionState, RealtimeTranscriptEvent, RealtimeTranscriptFinal,
     RealtimeTranscriptHistory, RealtimeTranscriptPartial, RealtimeTranscriptRevision,
-    RealtimeTranscriptWord, RealtimeTranslationCapability, RealtimeTranslationEvent,
-    RealtimeTranslationFinal, RealtimeTranslationPartial, RealtimeTranslationStatus,
-    RealtimeTranslationTombstone, RealtimeUtteranceEndReason, RealtimeVadEvent,
-    SessionCapabilitiesEvent, SessionTranslationSummary, SpeechBoundaryEvent,
-    TRANSCRIPT_REVISION_REASON_POST_FINAL_CORRECTION, TRANSCRIPT_REVISION_REASONS,
-    TranscriptLifecycle, TranscriptLifecycleResult, TranscriptRevisionPolicy, TranscriptSegmentId,
-    TranscriptUpdate, TranscriptUtteranceId, VadConfig, VadConfigError, VadDecision,
-    VadFrameDecision, VadMode, VadSpeechStartedEvent, VadSpeechStoppedEvent, VadState,
-    VadStateMachine,
+    RealtimeTranscriptWord, RealtimeUtteranceEndReason, RealtimeVadEvent, SessionCapabilitiesEvent,
+    SpeechBoundaryEvent, TRANSCRIPT_REVISION_REASON_POST_FINAL_CORRECTION,
+    TRANSCRIPT_REVISION_REASONS, TranscriptLifecycle, TranscriptLifecycleResult,
+    TranscriptRevisionPolicy, TranscriptSegmentId, TranscriptUpdate, TranscriptUtteranceId,
+    VadConfig, VadConfigError, VadDecision, VadFrameDecision, VadMode, VadSpeechStartedEvent,
+    VadSpeechStoppedEvent, VadState, VadStateMachine,
 };
 pub use registry::{
     BackendResolutionError, CATALOG_FEATURE_SPEAKER_DIARIZATION, CATALOG_FEATURE_WORD_TIMESTAMPS,
@@ -417,12 +406,4 @@ pub use remote_compute::{
 pub use safety::{
     current_platform_key, validate_platform_key, validate_platform_key_field,
     validate_safe_relative_path, validate_sha256,
-};
-pub use translation::{
-    ClauseBoundaryReason, ClauseId, ClauseSegment, ClauseSegmentationConfig,
-    ClauseSegmentationUpdate, ClauseSegmenter, ClauseStatus, FinalizedTranslationContext,
-    LatestOnlyTranslationQueue, StabilityGate, StabilityGateConfig, StabilityGateDecision,
-    StabilityGateInput, StabilityGateReason, TargetLang, TranslationOutput, TranslationQueueError,
-    TranslationQueueSubmit, TranslationRequest, TranslationSession, TranslationSessionError,
-    TranslationTimings, TranslationWorkerOutput, TranslationWorkerReadiness,
 };

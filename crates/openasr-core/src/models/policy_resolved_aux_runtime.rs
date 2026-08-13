@@ -176,14 +176,13 @@ where
             Self::CandidateFailed {
                 source: Some(error),
                 ..
-            }
-            | Self::CandidatesExhausted {
+            } => Some(error),
+            Self::CandidatesExhausted {
                 source: Some(error),
                 ..
             } => Some(error),
-            Self::CandidateFailed { source: None, .. }
-            | Self::CandidatesExhausted { source: None, .. }
-            | Self::EmptyPlan { .. } => None,
+            Self::CandidateFailed { source: None, .. } => None,
+            Self::CandidatesExhausted { source: None, .. } | Self::EmptyPlan { .. } => None,
         }
     }
 }
@@ -404,6 +403,7 @@ impl<R, E> PolicyResolvedStatefulAuxRuntime<R, E> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn invoke<T>(
         &mut self,
         mut operation: impl FnMut(&R) -> Result<T, E>,
@@ -515,7 +515,6 @@ pub(crate) struct AuxiliaryPinnedRuntimeCacheKey {
     pack_content_id: String,
     representation_id: &'static str,
     runtime_type: &'static str,
-    instance_id: Option<u64>,
     lane: ExecutionLaneKey,
 }
 
@@ -531,34 +530,12 @@ impl AuxiliaryPinnedRuntimeCacheKey {
             pack_content_id: pack_content_id.into(),
             representation_id,
             runtime_type: std::any::type_name::<R>(),
-            instance_id: None,
             lane: current_execution_lane_key(backend),
         }
     }
 
-    pub(crate) fn for_current_session_lane<R: 'static>(
-        architecture_id: &'static str,
-        pack_content_id: impl Into<String>,
-        representation_id: &'static str,
-        instance_id: u64,
-        backend: GgmlCpuGraphBackend,
-    ) -> Self {
-        let mut key = Self::for_current_lane::<R>(
-            architecture_id,
-            pack_content_id,
-            representation_id,
-            backend,
-        );
-        key.instance_id = Some(instance_id);
-        key
-    }
-
     pub(crate) fn has_content_id(&self, pack_content_id: &str) -> bool {
         self.pack_content_id == pack_content_id
-    }
-
-    pub(crate) fn has_instance_id(&self, instance_id: u64) -> bool {
-        self.instance_id == Some(instance_id)
     }
 }
 

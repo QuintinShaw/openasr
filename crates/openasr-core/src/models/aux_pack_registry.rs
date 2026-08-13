@@ -104,8 +104,6 @@ pub(crate) enum AuxPackKind {
     /// Speaker embedder (ReDimNet2-B6) / speaker segmenter (pyannote) diarization
     /// support packs.
     Diarization,
-    /// Translation runtime packs (Hy-MT2).
-    Translation,
     /// Punctuation-restoration packs (FireRedPunc).
     Punctuation,
     /// Forced-alignment word-timestamp refiner packs (Qwen3-ForcedAligner).
@@ -142,7 +140,6 @@ impl AuxPackKind {
     pub(crate) fn validation_failure_label(self) -> &'static str {
         match self {
             AuxPackKind::Diarization => "diarization pack validation failed",
-            AuxPackKind::Translation => "translation pack validation failed",
             AuxPackKind::Punctuation => "punctuation pack validation failed",
             AuxPackKind::ForcedAlignment => "forced-alignment pack validation failed",
         }
@@ -184,16 +181,6 @@ fn validate_diarizen(
     tensor_index: &GgufTensorIndex,
 ) -> Result<(), String> {
     crate::diarize::segment::DiariZenSegmenter::probe_preflight_parts(metadata, tensor_index)
-        .map_err(|error| error.to_string())
-}
-
-fn validate_hymt2(
-    _path: &Path,
-    metadata: &GgufMetadata,
-    tensor_index: &GgufTensorIndex,
-) -> Result<(), String> {
-    crate::models::hymt2::Hymt2Runtime::probe_preflight_parts(metadata, tensor_index)
-        .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
@@ -293,26 +280,6 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
                 reason: "speaker segmentation has no audio-encoder quantization tier",
             },
         validate: validate_diarizen,
-    },
-    AuxPackDescriptor {
-        architecture_id: crate::models::hymt2::config::HUNYUAN_DENSE_ARCHITECTURE_VALUE,
-        catalog_family_id: "hymt2",
-        kind: AuxPackKind::Translation,
-        // Hy-MT2 selects one complete ggml backend; it has no implemented
-        // partial-offload topology, so advertising Hybrid here would create a
-        // semantically false candidate even though both rows currently map to
-        // the same coarse backend enum.
-        execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
-            capabilities: AUX_CPU_AND_FULL_DEVICE_EXECUTION,
-            auto_gpu_policy: AutoGpuPolicy::AllBackends,
-        },
-        ownership: AuxiliaryRuntimeOwnership::AdmittedPinnedActor,
-        quantization_classification:
-            crate::models::pack_quant::TensorQuantizationContract::NotApplicable {
-                model_architecture: crate::models::hymt2::config::HUNYUAN_DENSE_ARCHITECTURE_VALUE,
-                reason: "text translation has no acoustic encoder",
-            },
-        validate: validate_hymt2,
     },
     AuxPackDescriptor {
         architecture_id: crate::models::firered_punc::config::FIRERED_PUNC_ARCHITECTURE_VALUE,
@@ -684,7 +651,6 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         let runtime = AUX_PACK_DESCRIPTORS
             .iter()
-            .filter(|descriptor| descriptor.kind != AuxPackKind::Translation)
             .map(|descriptor| descriptor.catalog_family_id)
             .collect::<std::collections::BTreeSet<_>>();
 

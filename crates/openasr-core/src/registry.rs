@@ -1083,7 +1083,7 @@ pub fn default_catalog_url() -> &'static str {
 // PARITY: must match the desktop TypeScript client's `canonicalQuantTag` exactly.
 const QUANT_ALIAS_GROUPS: &[(&[&str], &str)] = &[
     (&["q8", "q8_0"], "q8_0"),
-    // "q4km" is the catalog product suffix for mixed Q4_K_M packs (Hy-MT2);
+    // "q4km" is the catalog product suffix for mixed Q4_K_M packs;
     // see tooling/publish-model/scripts/_catalog.py's QUANT_METADATA table.
     (&["q4", "q4_k", "q4_k_m", "q4km"], "q4_k"),
     (&["q3", "q3_k"], "q3_k"),

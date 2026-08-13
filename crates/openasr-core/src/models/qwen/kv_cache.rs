@@ -223,10 +223,6 @@ pub(crate) enum Qwen3AsrHostKvMode {
 pub(crate) struct Qwen3AsrHostKvCacheOwner(SystemMemoryOwner<Vec<Qwen3AsrLayerKvCacheState>>);
 
 impl Qwen3AsrHostKvCacheOwner {
-    pub(crate) const fn empty() -> Self {
-        Self(SystemMemoryOwner::without_allocation(Vec::new()))
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         resource_id: &'static str,
@@ -245,34 +241,6 @@ impl Qwen3AsrHostKvCacheOwner {
             head_dim,
             element_type,
             mode,
-            HostKvLeaseOwnership::Standalone,
-        )
-    }
-
-    /// Builds materialized host KV inside an already-provisional parent
-    /// [`SystemMemoryOwner`] transaction. The returned value owns the buffers
-    /// but deliberately has no nested lease; the parent outcome must measure
-    /// [`Self::retained_system_memory_bytes`] and bind the one candidate lease
-    /// to the aggregate runtime + every session arena.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn try_new_inside_parent_transaction(
-        resource_id: &'static str,
-        layer_count: usize,
-        capacity: Qwen3AsrKvCacheCapacity,
-        kv_heads: usize,
-        head_dim: usize,
-        element_type: GgmlKvElementType,
-        mode: Qwen3AsrHostKvMode,
-    ) -> Result<Self, String> {
-        Self::try_new_with_ownership(
-            resource_id,
-            layer_count,
-            capacity,
-            kv_heads,
-            head_dim,
-            element_type,
-            mode,
-            HostKvLeaseOwnership::ParentTransaction,
         )
     }
 
@@ -285,7 +253,6 @@ impl Qwen3AsrHostKvCacheOwner {
         head_dim: usize,
         element_type: GgmlKvElementType,
         mode: Qwen3AsrHostKvMode,
-        ownership: HostKvLeaseOwnership,
     ) -> Result<Self, String> {
         let logical_positions = capacity.logical_positions();
         match mode {
@@ -323,35 +290,24 @@ impl Qwen3AsrHostKvCacheOwner {
                             qwen_host_kv_actual_capacity_bytes(&layers, layers.capacity())?;
                         Ok((layers, actual_bytes))
                     };
-                match ownership {
-                    HostKvLeaseOwnership::Standalone => {
-                        let quote = SystemMemoryAllocationQuote::new(
-                            resource_id,
-                            quoted_bytes,
-                            quoted_bytes,
-                        )
+                let quote =
+                    SystemMemoryAllocationQuote::new(resource_id, quoted_bytes, quoted_bytes)
                         .map_err(|error| error.to_string())?;
-                        let owner = SystemMemoryOwner::try_allocate(quote, || {
-                            let (layers, actual_bytes) = allocate_layers()?;
-                            Ok(SystemMemoryAllocationOutcome::new(
-                                layers,
-                                actual_bytes,
-                                actual_bytes,
-                            ))
-                        })
-                        .map_err(|error| error.to_string())?;
-                        Ok(Self(owner))
-                    }
-                    HostKvLeaseOwnership::ParentTransaction => {
-                        let (layers, _actual_bytes) = allocate_layers()?;
-                        Ok(Self(SystemMemoryOwner::without_allocation(layers)))
-                    }
-                }
+                let owner = SystemMemoryOwner::try_allocate(quote, || {
+                    let (layers, actual_bytes) = allocate_layers()?;
+                    Ok(SystemMemoryAllocationOutcome::new(
+                        layers,
+                        actual_bytes,
+                        actual_bytes,
+                    ))
+                })
+                .map_err(|error| error.to_string())?;
+                Ok(Self(owner))
             }
         }
     }
 
-    #[allow(dead_code)] // Reconciled by aggregate owners such as Hy-MT2.
+    #[allow(dead_code)] // Reconciled by aggregate decoder owners.
     pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
         qwen_host_kv_actual_capacity_bytes(&self.0, self.0.capacity())
     }
@@ -413,6 +369,7 @@ impl Qwen3AsrHostKvCacheOwner {
     /// Copy a written prefix between two already-admitted, materialized owners
     /// without allocating. Long-lived session scratch can therefore reuse its
     /// stable envelope while a separate prefix-cache owner remains intact.
+    #[cfg(test)]
     pub(crate) fn replace_prefix_from(
         &mut self,
         source: &Self,
@@ -439,12 +396,6 @@ impl Qwen3AsrHostKvCacheOwner {
         self.iter()
             .all(Qwen3AsrLayerKvCacheState::has_materialized_storage)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HostKvLeaseOwnership {
-    Standalone,
-    ParentTransaction,
 }
 
 impl Deref for Qwen3AsrHostKvCacheOwner {
@@ -848,15 +799,12 @@ impl Qwen3AsrLayerKvCacheState {
         self.max_positions
     }
 
-    pub(crate) fn clear_written_positions(&mut self) {
-        self.written_positions = 0;
-    }
-
     #[cfg(test)]
     pub(crate) fn written_positions(&self) -> usize {
         self.written_positions
     }
 
+    #[cfg(test)]
     pub(crate) fn truncate_written_positions(
         &mut self,
         written_positions: usize,
@@ -1011,6 +959,7 @@ impl Qwen3AsrLayerKvCacheState {
         Ok(forked)
     }
 
+    #[cfg(test)]
     fn validate_prefix_copy_from(
         &self,
         source: &Self,
@@ -1059,6 +1008,7 @@ impl Qwen3AsrLayerKvCacheState {
         Ok(())
     }
 
+    #[cfg(test)]
     fn copy_prefix_from_for_owner(
         &mut self,
         source: &Self,
@@ -1133,6 +1083,7 @@ impl Qwen3AsrLayerKvCacheState {
         Ok(())
     }
 
+    #[cfg(test)]
     fn storage_len(&self) -> Result<usize, String> {
         match self.element_type {
             GgmlKvElementType::F32 => self
@@ -1486,6 +1437,7 @@ impl Qwen3AsrLayerKvCacheState {
         Ok(())
     }
 
+    #[cfg(test)]
     fn copy_history_prefix_to_span_f32(
         source: &[f32],
         target: &mut [f32],
@@ -1522,6 +1474,7 @@ impl Qwen3AsrLayerKvCacheState {
         Ok(())
     }
 
+    #[cfg(test)]
     fn copy_history_prefix_to_span_bytes(
         source: &[u8],
         target: &mut [u8],

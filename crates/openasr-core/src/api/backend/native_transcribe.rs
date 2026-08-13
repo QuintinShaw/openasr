@@ -1452,8 +1452,8 @@ fn optional_punctuation_failure_disables_stage(
         PolicyResolvedAuxRuntimeError::Operation(BackendError::TranscriptionCanceled) => false,
         PolicyResolvedAuxRuntimeError::Operation(_)
         | PolicyResolvedAuxRuntimeError::CandidatesExhausted { .. } => true,
-        PolicyResolvedAuxRuntimeError::CandidateFailed { .. }
-        | PolicyResolvedAuxRuntimeError::EmptyPlan { .. } => false,
+        PolicyResolvedAuxRuntimeError::CandidateFailed { .. } => false,
+        PolicyResolvedAuxRuntimeError::EmptyPlan { .. } => false,
     }
 }
 
@@ -7087,21 +7087,21 @@ mod tests {
         ));
     }
 
-    // The catalog's own product suffix for Hy-MT2's mixed Q4_K_M pack is
+    // The catalog product suffix for mixed Q4_K_M packs is
     // "q4km" (tooling/publish-model/scripts/_catalog.py QUANT_METADATA), which
     // is exactly what a user copies from `pull_recommended` /
-    // `openasr pull hymt2-1.8b:q4km`. `canonical_quant_tag` must recognize it
+    // `openasr pull translator-test:q4km`. `canonical_quant_tag` must recognize it
     // as an alias of q4_k so a request using it matches a runtime source
     // tagged with any other spelling of the same quant.
     #[test]
     fn native_runtime_model_refs_match_catalog_q4km_product_suffix_alias() {
         assert!(native_runtime_model_refs_match(
-            "hymt2-1.8b:q4km",
-            "hymt2-1.8b:q4_k"
+            "translator-test:q4km",
+            "translator-test:q4_k"
         ));
         assert!(native_runtime_model_refs_match(
-            "hymt2-1.8b:q4_k_m",
-            "hymt2-1.8b:q4km"
+            "translator-test:q4_k_m",
+            "translator-test:q4km"
         ));
     }
 

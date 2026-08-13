@@ -347,7 +347,6 @@ fn k4_persistent_auxiliary_families_reference_their_declared_owner_shape() {
             "diarize/segment/policy_runtime.rs",
             "AuxiliaryRuntimeCacheKey",
         ),
-        ("models/hymt2/policy_runtime.rs", "PinnedRuntimeActor"),
         (
             "models/firered_punc/policy_runtime.rs",
             "PinnedRuntimeActor",

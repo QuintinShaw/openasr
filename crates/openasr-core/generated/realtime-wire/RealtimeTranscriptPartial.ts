@@ -3,21 +3,21 @@ import type { RealtimeTranscriptWord } from "./RealtimeTranscriptWord";
 import type { TranscriptSegmentId } from "./TranscriptSegmentId";
 import type { TranscriptUtteranceId } from "./TranscriptUtteranceId";
 
-export type RealtimeTranscriptPartial = { utterance_id: TranscriptUtteranceId, segment_id: TranscriptSegmentId, revision: number, text: string, start_ms: number, end_ms: number, is_final: boolean, words: Array<RealtimeTranscriptWord>, language: string | null, 
+export type RealtimeTranscriptPartial = { utterance_id: TranscriptUtteranceId, segment_id: TranscriptSegmentId, revision: number, text: string, start_ms: number, end_ms: number, is_final: boolean, words: Array<RealtimeTranscriptWord>, language: string | null,
 /**
  * Speaker label (`SPEAKER_NN`/`SPEAKER_ME`) when diarization is on; omitted
  * otherwise, so the wire contract is identical with diarization off.
  */
-speaker: string | null, 
+speaker: string | null,
 /**
  * Stable anonymous session label (`SPEAKER_NN`) when `speaker` was replaced
  * by an enrolled voice-match display name.
  */
-speaker_label: string | null, 
+speaker_label: string | null,
 /**
  * Stable Voice ID person id when a v2 match was accepted.
  */
-speaker_person_id: string | null, 
+speaker_person_id: string | null,
 /**
  * Display name frozen at assignment time (survives later renames/deletes).
  */

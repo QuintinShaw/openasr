@@ -302,19 +302,6 @@ fn import_command(command: ImportCommand) -> Result<()> {
             &package_id,
             quantization,
         ),
-        ImportCommand::Hymt2Gguf {
-            source_gguf,
-            output_pack,
-            package_id,
-            license_file,
-            notice_file,
-        } => import_hymt2_gguf_local_command(
-            &source_gguf,
-            &output_pack,
-            &package_id,
-            &license_file,
-            &notice_file,
-        ),
         ImportCommand::Wav2Vec2Ctc {
             source_root,
             output_root,
@@ -780,43 +767,6 @@ fn import_xasr_zipformer_local_command(
         result.output_path.display(),
         result.tensor_count,
         result.blank_token_id
-    );
-    Ok(())
-}
-
-fn import_hymt2_gguf_local_command(
-    source_gguf: &Path,
-    output_pack: &Path,
-    package_id: &str,
-    license_file: &Path,
-    notice_file: &Path,
-) -> Result<()> {
-    ensure_ggml_package_output_suffix(output_pack)?;
-    let license_text = std::fs::read_to_string(license_file)
-        .with_context(|| format!("read license file {}", license_file.display()))?;
-    let notice_text = std::fs::read_to_string(notice_file)
-        .with_context(|| format!("read notice file {}", notice_file.display()))?;
-    let request = openasr_core::Hymt2ImportRequest {
-        source_gguf: source_gguf.to_path_buf(),
-        output_pack: output_pack.to_path_buf(),
-        model_id: package_id.to_string(),
-        quantization: "q4_k_m".to_string(),
-        license_text,
-        notice_text,
-        expected_source_sha256: openasr_core::HYMT2_PINNED_SOURCE_GGUF_SHA256.to_string(),
-    };
-
-    let result =
-        openasr_core::import_hymt2_gguf_to_runtime_pack(&request).map_err(anyhow::Error::new)?;
-    println!(
-        "Imported pinned Hy-MT2 GGUF into translation runtime pack:\n- source: {}\n- source_sha256: {}\n- output: {}\n- pack_sha256: {}\n- size_bytes: {}\n- tensor_count: {}\n- spliced_metadata_entries: {}",
-        source_gguf.display(),
-        result.source_sha256,
-        result.output_path.display(),
-        result.pack_sha256,
-        result.pack_size_bytes,
-        result.tensor_count,
-        result.appended_metadata_entries,
     );
     Ok(())
 }

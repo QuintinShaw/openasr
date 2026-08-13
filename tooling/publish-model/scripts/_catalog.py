@@ -545,7 +545,7 @@ QUANT_METADATA = {
     "fp16": QuantMetadata(cli_token="fp16", suffix="fp16", label="fp16"),
     "q8_0": QuantMetadata(cli_token="q8-0", suffix="q8", label="q8_0"),
     "q4_k": QuantMetadata(cli_token="q4-k", suffix="q4", label="q4_k"),
-    # Product quant name for mixed-tensor GGUF files such as Hy-MT2 Q4_K_M.
+    # Product quant name for mixed-tensor Q4_K_M GGUF files.
     # This is catalog/pack metadata only: the runtime still sees ordinary GGUF
     # tensor types (Q4_K, Q6_K, F32) and does not gain a new matmul type.
     "q4_k_m": QuantMetadata(cli_token="q4-k-m", suffix="q4km", label="Q4_K_M"),
@@ -1381,6 +1381,39 @@ def main(argv: list[str]) -> int:
         print(
             f"wrote word_timestamp_source for {updated} changed catalog model(s) to {path}"
         )
+    elif cmd == "prune-catalog-models":
+        from _file_loaders import atomic_write_json
+
+        path = Path(argv[1])
+        data = json.loads(path.read_text(encoding="utf-8"))
+        allowed_registry_ids = {
+            model_entry["registry_id"] for model_entry in load().values()
+        }
+        before = len(data.get("models", []))
+        data["models"] = [
+            model
+            for model in data.get("models", [])
+            if model.get("id") in allowed_registry_ids
+        ]
+        removed = before - len(data["models"])
+        atomic_write_json(path, data)
+        print(f"pruned {removed} stale catalog model(s) from {path}")
+    elif cmd == "write-public-projection":
+        from _file_loaders import atomic_write_json
+
+        source = Path(argv[1])
+        target = Path(argv[2])
+        data = json.loads(source.read_text(encoding="utf-8"))
+        projection = {
+            "schema_version": data["schema_version"],
+            "generated_at": data["generated_at"],
+            "catalog_url": data["catalog_url"],
+            "models": [model for model in data.get("models", []) if model.get("public") is True],
+        }
+        if data.get("language_labels"):
+            projection["language_labels"] = data["language_labels"]
+        atomic_write_json(target, projection)
+        print(f"wrote {len(projection['models'])}-model public projection to {target}")
     else:
         sys.exit(f"unknown command '{cmd}'")
     return 0

@@ -94,6 +94,12 @@ for model in "${MODELS[@]}"; do
   python3 "${manifest_args[@]}"
 done
 
+# Remove catalog rows whose authored model sources were deleted. Per-model
+# regeneration is intentionally upsert-only; the full regeneration path owns
+# retirement so stale signed-catalog inputs cannot survive a hard model cut.
+log "pruning retired catalog models"
+python3 "$CATALOG_PY" prune-catalog-models "$REPO_ROOT/model-registry/catalog.json"
+
 # Refresh the catalog's top-level language/dialect label map (generated data,
 # independent of any single model) so a full regenerate keeps it in lockstep
 # with _catalog.LANGUAGE_DISPLAY_LABELS. Idempotent; leaves models[] untouched.

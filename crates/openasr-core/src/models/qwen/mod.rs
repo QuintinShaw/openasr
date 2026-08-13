@@ -56,7 +56,7 @@ pub(crate) use ggml_executor::Qwen3AsrGgmlExecutor;
 pub(crate) use graph_config::qwen_decoder_graph_config;
 pub(crate) use kv_cache::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
-    Qwen3AsrKvCacheCapacityError, Qwen3AsrLayerKvCacheState, qwen_host_kv_quoted_bytes,
+    Qwen3AsrKvCacheCapacityError, Qwen3AsrLayerKvCacheState,
 };
 #[cfg(test)]
 pub(crate) use llm_transformer::compile_qwen_whole_decoder_graph_from_prepared_plan_with_config;
@@ -67,8 +67,7 @@ pub(crate) use llm_transformer::{
 };
 pub(crate) use llm_transformer::{
     Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrLlmWholeStepOutput,
-    Qwen3AsrLlmWholeStepTop1Output, QwenFamilyLlmLayerTensorNames,
-    QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
+    QwenFamilyLlmLayerTensorNames, QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
     add_qwen_decoder_prepared_runtime_quote, compile_qwen_whole_decoder_graph_from_prepared_plan,
     compile_qwen_whole_decoder_graph_from_prepared_plan_with_config_and_native_gqa,
     compile_qwen_whole_decoder_graph_from_prepared_plan_with_native_gqa, even_prefill_chunk_len,
@@ -78,9 +77,7 @@ pub(crate) use llm_transformer::{
 #[cfg(test)]
 pub(crate) use logits_head::load_qwen3_llm_logits_head_from_reader;
 pub(crate) use logits_head::{
-    DEFAULT_RMS_NORM_EPSILON, Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead,
-    Qwen3AsrLlmLogitsHeadRuntime, load_qwen3_llm_logits_head_from_reader_with_output_tensor,
-    logits_head_ggml_enabled,
+    DEFAULT_RMS_NORM_EPSILON, Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime,
 };
 pub(crate) use package_import::TENSOR_QUANTIZATION_CONTRACT;
 pub use package_import::{
@@ -95,6 +92,7 @@ pub(crate) use prompt_embedding::{
     Qwen3AsrPromptEmbeddings, Qwen3AsrPromptTokenInput,
     build_qwen3_prompt_embeddings_with_audio_positions,
 };
+#[cfg(test)]
 pub(crate) use token_embedding::load_qwen3_token_embedding_table_from_reader;
 pub(crate) use tokenizer::Qwen3AsrTokenizer;
 

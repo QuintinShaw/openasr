@@ -31,7 +31,7 @@ class MinBytesForTests(unittest.TestCase):
             "small.cn.pt",
             "b6-vb2+vox2+cnc2_v0-lm.pt",
             "model.onnx",
-            "Hy-MT2-1.8B-Q4_K_M.gguf",
+            "translator-test-Q4_K_M.gguf",
         ):
             self.assertEqual(min_bytes_for(name), WEIGHT_MIN_BYTES, name)
 

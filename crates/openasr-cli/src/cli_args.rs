@@ -1034,27 +1034,6 @@ pub(crate) enum ImportCommand {
         #[arg(long, value_enum, default_value_t = ImportXasrZipformerQuantization::Fp16)]
         quantization: ImportXasrZipformerQuantization,
     },
-    /// Repackage the pinned upstream Hy-MT2 Q4_K_M GGUF into one translation runtime pack file (`.oasr`).
-    ///
-    /// Tensor data is preserved byte-for-byte; only `openasr.*` provenance,
-    /// translation contract, and license/notice metadata are spliced into the
-    /// GGUF KV section. The source file must match the pinned upstream sha256.
-    #[command(name = "hymt2-gguf")]
-    Hymt2Gguf {
-        /// Pinned upstream Hy-MT2-1.8B-Q4_K_M.gguf source file.
-        source_gguf: PathBuf,
-        /// Output path for one runtime pack file (`.oasr`).
-        output_pack: PathBuf,
-        /// Model id written to pack metadata (openasr.model.id).
-        #[arg(long, default_value = "hymt2-1.8b")]
-        package_id: String,
-        /// Upstream LICENSE.txt file embedded into the pack.
-        #[arg(long)]
-        license_file: PathBuf,
-        /// OpenASR NOTICE.openasr.txt file embedded into the pack; must record the pinned upstream revisions.
-        #[arg(long)]
-        notice_file: PathBuf,
-    },
     /// Import one local wav2vec2-CTC (facebook/wav2vec2-*) HF-style source directory into one runtime pack file (`.oasr`).
     #[command(name = "wav2vec2-ctc")]
     Wav2Vec2Ctc {

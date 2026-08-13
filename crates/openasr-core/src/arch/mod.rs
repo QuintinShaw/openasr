@@ -320,15 +320,6 @@ pub(crate) const GRANITE_SPEECH_RUNTIME_TENSOR_CONTRACT_ID: &str =
     "granite-speech.runtime-tensors.v0";
 pub(crate) const GRANITE_SPEECH_EXECUTOR_COMPONENT_ID: &str = "granite-speech.ggml-executor.v0";
 
-// hymt2 (Tencent Hunyuan-MT2 subtitle translation, hunyuan-dense decoder-only
-// LLM). An auxiliary text-to-text family, NOT an ASR architecture: it is
-// dispatched through `models::aux_pack_registry` / the translation routes, so
-// it declares no architecture descriptor here. Its decode policy id still
-// lives in this file (the single home for policy ids) and resolves directly
-// through `models::decode_policy_component_registry`, keeping its greedy loop
-// on the one shared decode driver.
-pub(crate) const HYMT2_DECODE_POLICY_ID: &str = "hymt2.greedy.seq2seq.v0";
-
 /// Default chunk length long-form slicing aims for: how long a slice we
 /// *want*, as a transcription-quality choice.
 ///

@@ -163,49 +163,6 @@ class MaterializeResultSidecarsTest(unittest.TestCase):
         with self.assertRaisesRegex(ResultSidecarError, "legacy qwen"):
             build_sidecar(MODEL, "fp16", pack)
 
-    def test_hymt2_sidecar_requires_translation_pack_metadata(self) -> None:
-        model = "hymt2-1.8b"
-        packs = self.root / "tmp" / "publish" / model / "packs"
-        packs.mkdir(parents=True)
-        pack = packs / f"{model}-q4_k_m.oasr"
-        pack.write_bytes(
-            b"general.architecture\0hunyuan-dense\0"
-            b"openasr.model.kind\0translation-model\0"
-            b"openasr.translation.source_langs\0zh\0"
-            b"openasr.translation.target_langs\0en\0"
-            b"openasr.upstream.base_revision\0"
-            b"9a341cd1b679d3efd23b46e847b01745a71ed792\0"
-            b"openasr.upstream.gguf_revision\0"
-            b"1cd5208700acedef4ef93019b6cfc148b8522d45\0"
-            b"openasr.license.files\0LICENSE.txt\0NOTICE.openasr.txt\0"
-        )
-
-        sidecar = build_sidecar(model, "q4_k_m", pack)
-
-        self.assertEqual(sidecar["model"], model)
-        self.assertEqual(sidecar["quant"], "q4_k_m")
-        self.assertEqual(sidecar["cli_token"], "q4-k-m")
-
-    def test_hymt2_sidecar_rejects_missing_notice_marker(self) -> None:
-        model = "hymt2-1.8b"
-        packs = self.root / "tmp" / "publish" / model / "packs"
-        packs.mkdir(parents=True)
-        pack = packs / f"{model}-q4_k_m.oasr"
-        pack.write_bytes(
-            b"general.architecture\0hunyuan-dense\0"
-            b"openasr.model.kind\0translation-model\0"
-            b"openasr.translation.source_langs\0zh\0"
-            b"openasr.translation.target_langs\0en\0"
-            b"openasr.upstream.base_revision\0"
-            b"9a341cd1b679d3efd23b46e847b01745a71ed792\0"
-            b"openasr.upstream.gguf_revision\0"
-            b"1cd5208700acedef4ef93019b6cfc148b8522d45\0"
-            b"openasr.license.files\0LICENSE.txt\0"
-        )
-
-        with self.assertRaisesRegex(ResultSidecarError, "NOTICE.openasr.txt"):
-            build_sidecar(model, "q4_k_m", pack)
-
     def test_diarizen_sidecar_requires_pinned_license_provenance(self) -> None:
         model = "diarizen-large-s80-v2"
         packs = self.root / "tmp" / "publish" / model / "packs"

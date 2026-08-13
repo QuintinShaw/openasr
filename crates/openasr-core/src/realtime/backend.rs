@@ -37,7 +37,6 @@ pub struct RealtimeBackendCapabilities {
     pub phrase_bias: BackendFeatureCapability,
     pub word_timestamps: BackendFeatureCapability,
     pub diarization: BackendFeatureCapability,
-    pub translation: RealtimeTranslationCapability,
     pub requires_vad_utterance_boundaries: bool,
     pub is_file_per_utterance_fallback: bool,
     pub is_true_streaming: bool,
@@ -51,62 +50,6 @@ pub struct RealtimeBackendCapabilities {
 }
 
 pub const REALTIME_VOICE_ID_UNSUPPORTED_REASON: &str = "Voice ID is available only for file transcription; realtime sessions do not support diarize=true or --diarize.";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[cfg_attr(any(test, feature = "ts-export"), derive(ts_rs::TS))]
-#[cfg_attr(
-    any(test, feature = "ts-export"),
-    ts(export_to = "generated/realtime-wire/")
-)]
-pub struct RealtimeTranslationCapability {
-    pub supported: bool,
-    pub installed: bool,
-    pub experimental: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mode: Option<&'static str>,
-    pub source_langs: &'static [&'static str],
-    pub target_langs: &'static [&'static str],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_id: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub requires_pack: Option<&'static str>,
-    pub reason: Option<&'static str>,
-}
-
-impl RealtimeTranslationCapability {
-    pub const MODE_CLAUSE_RETRANSLATION: &'static str = "clause_retranslation";
-    pub const MODEL_ID_HYMT2_1_8B_Q4_K_M: &'static str = "hymt2-1.8b-q4_k_m";
-    pub const REASON_PACK_MISSING: &'static str = "translation_pack_missing";
-    pub const REASON_MODEL_UNSUPPORTED: &'static str = "translation_model_unsupported";
-
-    pub const fn unavailable(reason: &'static str) -> Self {
-        Self {
-            supported: false,
-            installed: false,
-            experimental: true,
-            mode: Some(Self::MODE_CLAUSE_RETRANSLATION),
-            source_langs: &["zh"],
-            target_langs: &["en"],
-            model_id: Some(Self::MODEL_ID_HYMT2_1_8B_Q4_K_M),
-            requires_pack: Some(Self::MODEL_ID_HYMT2_1_8B_Q4_K_M),
-            reason: Some(reason),
-        }
-    }
-
-    pub const fn installed_hymt2() -> Self {
-        Self {
-            supported: true,
-            installed: true,
-            experimental: true,
-            mode: Some(Self::MODE_CLAUSE_RETRANSLATION),
-            source_langs: &["zh"],
-            target_langs: &["en"],
-            model_id: Some(Self::MODEL_ID_HYMT2_1_8B_Q4_K_M),
-            requires_pack: Some(Self::MODEL_ID_HYMT2_1_8B_Q4_K_M),
-            reason: None,
-        }
-    }
-}
 
 impl RealtimeBackendCapabilities {
     const fn build(
@@ -125,9 +68,6 @@ impl RealtimeBackendCapabilities {
             phrase_bias,
             word_timestamps,
             diarization: realtime_diarization_unsupported(),
-            translation: RealtimeTranslationCapability::unavailable(
-                RealtimeTranslationCapability::REASON_PACK_MISSING,
-            ),
             requires_vad_utterance_boundaries,
             is_file_per_utterance_fallback: matches!(
                 mode,

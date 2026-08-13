@@ -436,36 +436,6 @@ min_cli_version = "0.1.28"
 feature = "speaker-diarization"
 role = "speaker-segmenter"
 
-# Simultaneous-translation MVP model. Published as an experimental
-# translation-model pack: the importer repackages the pinned upstream GGUF
-# byte-for-byte (no weight changes) and splices license/notice/provenance
-# metadata.
-
-["hymt2-1.8b"]
-kind = "translation-model"
-family = "hymt2"
-hf_repo = "OpenASR/hymt2-1.8b"
-release_public = true
-size = "1.8b"
-registry_id = "hymt2-1.8b"
-display_name = "Hy-MT2 1.8B"
-license_name = "Apache-2.0"
-license_source = "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/blob/1cd5208700acedef4ef93019b6cfc148b8522d45/LICENSE.txt"
-license_class = "permissive"
-languages = ["en", "zh"]
-source_langs = ["zh"]
-target_langs = ["en"]
-experimental = true
-quants = ["q4_k_m"]
-recommended_quant = "q4_k_m"
-upstream_release_date = "2026-05-11"
-upstream_base_repo = "tencent/Hy-MT2-1.8B"
-upstream_base_revision = "9a341cd1b679d3efd23b46e847b01745a71ed792"
-upstream_gguf_repo = "tencent/Hy-MT2-1.8B-GGUF"
-upstream_gguf_revision = "1cd5208700acedef4ef93019b6cfc148b8522d45"
-license_files = ["LICENSE.txt", "NOTICE.openasr.txt"]
-notice_file = "tooling/publish-model/notices/hymt2-1.8b/NOTICE.openasr.txt"
-
 ["whisper-tiny"]
 family = "whisper"
 hf_repo = "OpenASR/whisper-tiny"

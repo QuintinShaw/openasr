@@ -473,7 +473,7 @@ mod tests {
                     openasr_core::CatalogModelKind::CapabilityPack,
                 ),
                 catalog_model(
-                    "hymt2-1.8b",
+                    "translator-test",
                     openasr_core::CatalogModelKind::TranslationModel,
                 ),
             ],
@@ -484,7 +484,10 @@ mod tests {
             &catalog,
             "redimnet2-b6-cn"
         ));
-        assert!(!should_update_default_asr_model(&catalog, "hymt2-1.8b"));
+        assert!(!should_update_default_asr_model(
+            &catalog,
+            "translator-test"
+        ));
     }
 
     #[test]
@@ -501,7 +504,7 @@ mod tests {
                     openasr_core::CatalogModelKind::CapabilityPack,
                 ),
                 catalog_model(
-                    "hymt2-1.8b",
+                    "translator-test",
                     openasr_core::CatalogModelKind::TranslationModel,
                 ),
             ],
@@ -512,8 +515,8 @@ mod tests {
             "Installed capability pack redimnet2-b6-cn:fp16; default ASR model was not changed."
         );
         assert_eq!(
-            non_default_asr_install_status(&catalog, "hymt2-1.8b", "hymt2-1.8b:q4km"),
-            "Installed translation model hymt2-1.8b:q4km; default ASR model was not changed."
+            non_default_asr_install_status(&catalog, "translator-test", "translator-test:q4km"),
+            "Installed translation model translator-test:q4km; default ASR model was not changed."
         );
     }
 }

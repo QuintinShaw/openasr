@@ -395,7 +395,7 @@ pub(crate) fn select_seq2seq_greedy_step_token(
 ) -> Result<Seq2SeqGreedyStepSelection, Seq2SeqGreedyDecodeError> {
     if step_logits.logits.is_empty() {
         // Hint-only step: executors whose decode step ends in a fused
-        // device-side argmax (e.g. hymt2's fused top1 logits head) never
+        // device-side argmax never
         // materialize a host logit row, and forcing one per step would regress
         // the very kernel that fusion exists for. Honor the hint when nothing
         // about this step needs the row (no phrase bias, hint not suppressed);

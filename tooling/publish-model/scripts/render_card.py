@@ -31,7 +31,6 @@ REPO_ROOT = repo_root(SCRIPT_DIR)
 TOOLING_ROOT = REPO_ROOT / "tooling" / "publish-model"
 TEMPLATE = TOOLING_ROOT / "template" / "MODEL_CARD.md.tmpl"
 DIARIZE_TEMPLATE = TOOLING_ROOT / "template" / "DIARIZE_CARD.md.tmpl"
-TRANSLATION_TEMPLATE = TOOLING_ROOT / "template" / "TRANSLATION_CARD.md.tmpl"
 CAPABILITY_TEMPLATE = TOOLING_ROOT / "template" / "CAPABILITY_CARD.md.tmpl"
 # Capability semantics are part of the catalog contract. Keep the small
 # presentation mapping keyed by role rather than duplicating family ids here.
@@ -161,7 +160,10 @@ def card_type_for_catalog(catalog: dict) -> str:
     if kind == "translation-model":
         if catalog.get("capability") is not None:
             raise ValueError("render_card translation-model entry must not carry capability metadata")
-        return "translation"
+        raise ValueError(
+            "render_card cannot publish translation-model cards: the catalog kind is "
+            "reserved, but OpenASR currently has no text-to-text translation runtime"
+        )
 
     feature, role = _capability_semantics(catalog)
     if feature == "speaker-diarization" and role in {"speaker-embedder", "speaker-segmenter"}:
@@ -186,7 +188,10 @@ def pipeline_tag_for_catalog(catalog: dict, prose: dict) -> str:
     if kind == "asr-model":
         return "automatic-speech-recognition"
     if kind == "translation-model":
-        return "translation"
+        raise ValueError(
+            "render_card cannot publish translation-model cards: the catalog kind is "
+            "reserved, but OpenASR currently has no text-to-text translation runtime"
+        )
 
     try:
         assert role is not None
@@ -209,7 +214,6 @@ def main(argv: list[str]) -> int:
 
     card_type = card_type_for_catalog(catalog)
     diarize = card_type == "diarize"
-    translation = card_type == "translation"
     capability = card_type == "capability"
 
     # Perf table rows + pull lines, one per built quant (catalog order). The
@@ -220,7 +224,7 @@ def main(argv: list[str]) -> int:
     for q in catalog["quants"]:
         meta = QUANT_METADATA[q]
         m = qm.get(q, {})
-        if diarize or translation or capability:
+        if diarize or capability:
             rows.append(f"| {meta.label} | `{model}-{q}.oasr` | {human_bytes(m.get('size_bytes'))} |")
         else:
             rows.append(
@@ -243,8 +247,6 @@ def main(argv: list[str]) -> int:
 
     if card_type == "diarize":
         template = DIARIZE_TEMPLATE
-    elif card_type == "translation":
-        template = TRANSLATION_TEMPLATE
     elif card_type == "capability":
         template = CAPABILITY_TEMPLATE
     else:

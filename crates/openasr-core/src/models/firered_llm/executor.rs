@@ -963,7 +963,7 @@ impl FireRedLlmGgmlExecutor {
             }
         };
         // Opt-in perf diagnostic, same gate/shape as the decoder_backend line
-        // below (mirrors the qwen `OPENASR_HYMT2_PROFILE` precedent): the
+        // below (mirrors the qwen profiling precedent): the
         // adapter stage regressed to 2868ms/18.4% of `execute` on the naive
         // scalar-dequant host implementation this ggml graph replaced (see
         // this module's doc comment), so it earns the same always-available

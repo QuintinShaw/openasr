@@ -16,7 +16,7 @@ pub use audio::{
 };
 pub use backend::{
     REALTIME_VOICE_ID_UNSUPPORTED_REASON, RealtimeBackendCapabilities, RealtimeBackendMode,
-    RealtimeTranslationCapability, realtime_diarization_capability,
+    realtime_diarization_capability,
 };
 pub use buffer::{
     BufferedUtterance, RealtimeBuffer, RealtimeBufferConfig, RealtimeBufferError,
@@ -31,10 +31,8 @@ pub use events::{
     RealtimeEventEnvelope, RealtimeEventId, RealtimeEventSeq, RealtimeEventSequencer,
     RealtimeLifecycleEvent, RealtimeSessionId, RealtimeTranscriptEvent, RealtimeTranscriptFinal,
     RealtimeTranscriptPartial, RealtimeTranscriptRevision, RealtimeTranscriptWord,
-    RealtimeTranslationEvent, RealtimeTranslationFinal, RealtimeTranslationPartial,
-    RealtimeTranslationStatus, RealtimeTranslationTombstone, RealtimeVadEvent,
-    SessionCapabilitiesEvent, SessionTranslationSummary, TranscriptSegmentId,
-    TranscriptUtteranceId, VadSpeechStartedEvent, VadSpeechStoppedEvent,
+    RealtimeVadEvent, SessionCapabilitiesEvent, TranscriptSegmentId, TranscriptUtteranceId,
+    VadSpeechStartedEvent, VadSpeechStoppedEvent,
 };
 pub use history::{
     RealtimeExportFormat, RealtimeHistoryApplyResult, RealtimeHistoryEntry,

@@ -36,9 +36,7 @@ EXPECTED_CAPABILITY_FEATURES = {
     "qwen3-forced-aligner-0.6b": "word-timestamps",
     "redimnet2-b6-cn": "speaker-diarization",
 }
-EXPECTED_TRANSLATION_MODELS = {
-    "hymt2-1.8b": (["zh"], ["en"]),
-}
+EXPECTED_TRANSLATION_MODELS = {}
 
 
 class PublishHelpersTest(unittest.TestCase):

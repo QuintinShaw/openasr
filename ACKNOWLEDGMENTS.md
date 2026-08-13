@@ -97,7 +97,6 @@ credits the people who built the original.
 
 **Translation (experimental)**
 
-- Hy-MT2 — <https://huggingface.co/OpenASR/hymt2-1.8b>
 
 ## Design and implementation references
 

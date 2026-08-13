@@ -31,6 +31,7 @@ use crate::models::device_greedy_token::{
 use super::logits_head::{Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead};
 use super::lora::{QwenLayerLoraSlots, QwenLoraAdapter, new_qwen_lora_slot};
 use super::runtime_contract::{Qwen3AsrExecutionMetadata, qwen3_asr_decoder_contract};
+#[cfg(test)]
 use super::tensor_names::llm_layer_tensor_names;
 use crate::models::mapped_token_embedding::{
     MappedTokenEmbeddingDeviceSpec, MappedTokenEmbeddingTable,
@@ -1008,7 +1009,7 @@ fn qwen_llm_resolve_use_native_gqa(backend: GgmlCpuGraphBackend) -> bool {
 }
 
 /// Production KV-cache policy for every Qwen-shaped whole-decoder constructor
-/// (qwen / mimo / firered2 / moss / hymt2 / serve-batch).
+/// (qwen / mimo / firered2 / moss / serve-batch).
 ///
 /// Applies the shared phase-1 Q8 rules: CPU/Metal + native-GQA + flash geometry
 /// selects `Q8_0`; discrete GPU and incomplete geometry stay on Default.
@@ -1210,8 +1211,11 @@ pub(crate) struct Qwen3AsrLlmWholeStepOutput {
 
 pub(crate) struct Qwen3AsrLlmWholeStepTop1Output {
     pub token_id: u32,
+    #[cfg(test)]
     pub layer_kv: Vec<(Vec<f32>, Vec<f32>)>,
+    #[cfg(test)]
     pub build_micros: u128,
+    #[cfg(test)]
     pub compute_micros: u128,
 }
 
@@ -2997,7 +3001,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             materialization_peak_staging_bytes: 0,
         };
         // Shared production policy for every family that builds this executor
-        // (qwen/mimo/firered2/moss/hymt2/serve-batch). Discrete GPU and the
+        // (qwen/mimo/firered2/moss/serve-batch). Discrete GPU and the
         // OPENASR_QWEN_KV_CACHE_F32 opt-out stay on Default.
         let policy = resolve_qwen_family_production_kv_cache_policy(
             executor.runner.backend_kind(),
@@ -3122,6 +3126,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             .unwrap_or(false)
     }
 
+    #[cfg(test)]
     pub(crate) fn backend_is_metal(&self) -> bool {
         matches!(self.runner.backend_kind(), GgmlCpuGraphBackend::Metal)
     }
@@ -3669,6 +3674,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn run_step_top1(
         &mut self,
         hidden: &[f32],
@@ -4973,6 +4979,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn run_step_reused_batched_top1(
         &mut self,
         hidden: &[f32],
@@ -4989,6 +4996,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn run_step_reused_batched_seeded_top1(
         &mut self,
         hidden: &[f32],
@@ -5624,8 +5632,10 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         graph.set_i32_slice(row_indices_tensor, &row_indices, "qwen_llm_reuse_row_index")?;
         graph.set_i32_slice(positions, &rope_positions, "qwen_llm_reuse_position")?;
 
+        #[cfg(test)]
         let compute_started_at = std::time::Instant::now();
         let token_ids = graph.compute_output_i32(top1, 1)?;
+        #[cfg(test)]
         let compute_micros = compute_started_at.elapsed().as_micros();
         let token_id = token_ids
             .first()
@@ -5637,8 +5647,11 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             .and_then(|token_id| validate_fused_top1_token_id(token_id, vocab_size))?;
         Ok(Qwen3AsrLlmWholeStepTop1Output {
             token_id,
+            #[cfg(test)]
             layer_kv: Vec::new(),
+            #[cfg(test)]
             build_micros: 0,
+            #[cfg(test)]
             compute_micros,
         })
     }
@@ -6814,6 +6827,7 @@ pub(crate) fn add_qwen_decoder_prepared_runtime_quote(
 }
 
 impl QwenWholeDecoderPlan {
+    #[cfg(test)]
     pub(crate) fn quoted_retained_system_memory_bytes_for_qwen3_asr(
         layer_count: usize,
     ) -> Result<u64, String> {

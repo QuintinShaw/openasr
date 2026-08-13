@@ -11,9 +11,7 @@
 //! of these shapes as TypeScript types with no compiler link back to the Rust
 //! structs, so a field rename/add/remove on the Rust side was a silent
 //! drift risk caught only by manual review (or not at all -- see the PR
-//! description for the drift already found this way, e.g.
-//! `RealtimeTranslationTombstone` growing no `translation_version` field
-//! while the hand-written TS type carried one that could never be populated).
+//! description for examples of drift already found this way).
 //!
 //! ts-rs was chosen over schemars for this because the deliverable is
 //! TypeScript *types*, not a JSON Schema a separate tool would still have to
@@ -41,7 +39,7 @@
 //!
 //! `RealtimeEventEnvelope`, `RealtimeEvent`, and the per-family enums
 //! (`RealtimeLifecycleEvent`, `RealtimeAudioInputEvent`, `RealtimeVadEvent`,
-//! `RealtimeTranscriptEvent`, `RealtimeTranslationEvent`) are deliberately
+//! `RealtimeTranscriptEvent`) are deliberately
 //! **not** derived here. All of them are `#[serde(untagged)]`, and the
 //! envelope additionally `#[serde(flatten)]`s the chosen variant next to a
 //! `type` field that is a plain `&'static str` computed by the hand-written
@@ -72,7 +70,7 @@
 //! # A modeling nuance worth knowing: `Option<T>` renders as `T | null`, not `T?`
 //!
 //! Every `#[serde(skip_serializing_if = "Option::is_none")] pub field:
-//! Option<T>` here (e.g. `language`, `speaker`, `RealtimeTranslationCapability::mode`)
+//! Option<T>` here (e.g. `language` and `speaker`)
 //! generates `field: T | null` rather than an optional `field?: T`. ts-rs only
 //! widens a maybe-omitted field to an optional TS key when it is *also*
 //! `#[serde(default)]` (its serde-compat mirrors what makes an omitted key
@@ -93,17 +91,13 @@ use ts_rs::{Config, TS};
 
 use crate::api::backend::{BackendCapabilityBehavior, BackendFeatureCapability};
 use crate::realtime::audio::{RealtimeAudioEncoding, RealtimeAudioFormat};
-use crate::realtime::backend::{
-    RealtimeBackendCapabilities, RealtimeBackendMode, RealtimeTranslationCapability,
-};
+use crate::realtime::backend::{RealtimeBackendCapabilities, RealtimeBackendMode};
 use crate::realtime::events::{
     AudioInputStartedEvent, AudioInputStoppedEvent, RealtimeErrorCode, RealtimeErrorEvent,
     RealtimeEventId, RealtimeSessionId, RealtimeTranscriptFinal, RealtimeTranscriptPartial,
-    RealtimeTranscriptRevision, RealtimeTranscriptWord, RealtimeTranslationFinal,
-    RealtimeTranslationPartial, RealtimeTranslationStatus, RealtimeTranslationTombstone,
-    SessionCapabilitiesEvent, SessionClosedEvent, SessionConfiguredEvent, SessionCreatedEvent,
-    SessionTranslationSummary, SessionVadSummary, TranscriptSegmentId, TranscriptUtteranceId,
-    VadSpeechStartedEvent, VadSpeechStoppedEvent,
+    RealtimeTranscriptRevision, RealtimeTranscriptWord, SessionCapabilitiesEvent,
+    SessionClosedEvent, SessionConfiguredEvent, SessionCreatedEvent, SessionVadSummary,
+    TranscriptSegmentId, TranscriptUtteranceId, VadSpeechStartedEvent, VadSpeechStoppedEvent,
 };
 
 const COMMITTED_RELATIVE_DIR: &str = "generated/realtime-wire";
@@ -131,7 +125,6 @@ fn export_realtime_wire_bindings(cfg: &Config) {
         RealtimeAudioFormat,
         RealtimeBackendMode,
         RealtimeBackendCapabilities,
-        RealtimeTranslationCapability,
         RealtimeSessionId,
         RealtimeEventId,
         TranscriptUtteranceId,
@@ -139,7 +132,6 @@ fn export_realtime_wire_bindings(cfg: &Config) {
         SessionCreatedEvent,
         SessionCapabilitiesEvent,
         SessionConfiguredEvent,
-        SessionTranslationSummary,
         SessionVadSummary,
         SessionClosedEvent,
         AudioInputStartedEvent,
@@ -150,10 +142,6 @@ fn export_realtime_wire_bindings(cfg: &Config) {
         RealtimeTranscriptPartial,
         RealtimeTranscriptFinal,
         RealtimeTranscriptRevision,
-        RealtimeTranslationStatus,
-        RealtimeTranslationPartial,
-        RealtimeTranslationFinal,
-        RealtimeTranslationTombstone,
         RealtimeErrorEvent,
         RealtimeErrorCode,
     );
@@ -168,6 +156,7 @@ fn realtime_wire_bindings_regenerate_to_match_committed() {
             .with_out_dir(manifest_dir)
             .with_large_int("number");
         export_realtime_wire_bindings(&cfg);
+        normalize_generated_typescript(&manifest_dir.join(COMMITTED_RELATIVE_DIR));
         return;
     }
 
@@ -179,7 +168,35 @@ fn realtime_wire_bindings_regenerate_to_match_committed() {
     export_realtime_wire_bindings(&cfg);
 
     let regenerated_dir = scratch.path().join(COMMITTED_RELATIVE_DIR);
+    normalize_generated_typescript(&regenerated_dir);
     assert_directory_trees_match(&regenerated_dir, &committed_dir);
+}
+
+/// ts-rs leaves a space at the end of a field line when the next exported
+/// field has a Rust doc comment. Normalize that generator artifact in both
+/// regenerate and golden-check modes so committed output is reproducible and
+/// passes Git's whitespace checks without hand-editing generated files.
+fn normalize_generated_typescript(dir: &Path) {
+    for relative_path in list_files_relative(dir) {
+        let path = dir.join(&relative_path);
+        if path.extension().and_then(|extension| extension.to_str()) != Some("ts") {
+            continue;
+        }
+        let content = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {relative_path}: {error}"));
+        let mut normalized = content
+            .lines()
+            .map(|line| line.trim_end_matches([' ', '\t']))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if content.ends_with('\n') {
+            normalized.push('\n');
+        }
+        if normalized != content {
+            fs::write(&path, normalized)
+                .unwrap_or_else(|error| panic!("failed to normalize {relative_path}: {error}"));
+        }
+    }
 }
 
 /// Compares two directory trees of generated `.ts` files byte-for-byte,

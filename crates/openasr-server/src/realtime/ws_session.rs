@@ -2,7 +2,7 @@
 //!
 //! Pure code-motion from `realtime.rs`; no behavior changes.
 
-use crate::{ModelSessionPermit, NativeExecutionSupervisor};
+use crate::ModelSessionPermit;
 
 use super::*;
 
@@ -11,22 +11,19 @@ use super::*;
 ///
 /// Keep this list product-semantic rather than model-specific: family runtimes
 /// own how they prepare, while the session owns the single audio-admission
-/// boundary shared by native streaming, mock fallback, translation, and
-/// speaker features.
+/// boundary shared by native streaming, mock fallback, and speaker features.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RequiredStage {
     Asr,
-    Translation,
     SpeakerIdentity,
 }
 
 impl RequiredStage {
-    const ALL: [Self; 3] = [Self::Asr, Self::Translation, Self::SpeakerIdentity];
+    const ALL: [Self; 2] = [Self::Asr, Self::SpeakerIdentity];
 
     const fn as_str(self) -> &'static str {
         match self {
             Self::Asr => "asr",
-            Self::Translation => "translation",
             Self::SpeakerIdentity => "speaker_identity",
         }
     }
@@ -48,12 +45,9 @@ pub(crate) struct RequiredStageReadinessBarrier {
 }
 
 impl RequiredStageReadinessBarrier {
-    pub(crate) fn for_session(translation: bool, speaker_identity: bool) -> Self {
+    pub(crate) fn for_session(speaker_identity: bool) -> Self {
         let mut barrier = Self::default();
         barrier.require(RequiredStage::Asr);
-        if translation {
-            barrier.require(RequiredStage::Translation);
-        }
         if speaker_identity {
             barrier.require(RequiredStage::SpeakerIdentity);
         }
@@ -254,79 +248,17 @@ pub(crate) struct WsSession {
     /// revised once that label binds (`utterance_id` here is the OLD
     /// utterance the text was carved from).
     pub(crate) pending_split_tail_relabels: VecDeque<PendingSpeakerRevision>,
-    pub(crate) translation: Option<RealtimeTranslationLane>,
     /// Explicit test seam for protocol/lifecycle tests whose metadata-only
     /// packs intentionally contain no executable tensors. Production builds
     /// compile this field and its branch out entirely; runtime-readiness tests
     /// use tensor-ready fixtures instead of this seam.
     #[cfg(test)]
     pub(crate) test_native_streaming_session_factory: Option<NativeStreamingSessionFactory>,
-    #[cfg(test)]
-    pub(crate) test_translation_worker: Option<TranslationWorkerHook>,
-    /// When set together with `test_translation_worker`, the worker is built
-    /// through the asynchronous thread-local init path (mirroring the real
-    /// Hy-MT2 cold load); this hook runs as the worker initialization.
-    #[cfg(test)]
-    pub(crate) test_translation_worker_init: Option<TranslationWorkerInitHook>,
 }
-
-pub(crate) type TranslationWorkerHook = Arc<
-    dyn Fn(TranslationRequest) -> Result<TranslationWorkerOutput, TranslationQueueError>
-        + Send
-        + Sync,
->;
-
-pub(crate) type TranslationWorkerInitHook =
-    Arc<dyn Fn() -> Result<(), TranslationQueueError> + Send + Sync>;
 
 #[cfg(test)]
 pub(crate) type NativeStreamingSessionFactory =
     Arc<dyn Fn() -> Result<Box<dyn NativeAsrSession>, openasr_core::NativeAsrError> + Send + Sync>;
-
-pub(crate) struct RealtimeTranslationLane {
-    session: TranslationSession,
-    segmenter: ClauseSegmenter,
-    gates: HashMap<ClauseId, StabilityGate>,
-    clause_meta: HashMap<ClauseId, TranslationClauseMeta>,
-    retired_clause_ids: HashSet<ClauseId>,
-    retired_clause_order: VecDeque<ClauseId>,
-    source_segments: Vec<TranslationSourceSegmentState>,
-    model_id: String,
-    target_lang: TargetLang,
-    provisional: bool,
-    /// Whether the one-shot `translation.status` ready event was already
-    /// emitted (true at build time when the worker was ready at birth, e.g.
-    /// test workers).
-    ready_announced: bool,
-}
-
-#[derive(Debug, Clone)]
-struct TranslationSourceSegmentState {
-    source_segment_id: String,
-    text: String,
-    finalized: bool,
-    start_ms: u64,
-    end_ms: u64,
-}
-
-#[derive(Debug, Clone)]
-struct TranslationSourceEvent {
-    source_segment_id: String,
-    text: String,
-    finalized: bool,
-    start_ms: u64,
-    end_ms: u64,
-}
-
-#[derive(Debug, Clone)]
-struct TranslationClauseMeta {
-    source_segment_id: String,
-    source_version: u64,
-    replaces_clause_id: Option<ClauseId>,
-    start_ms: u64,
-    end_ms: u64,
-    stability: f32,
-}
 
 pub(crate) enum NativePendingSpeakerSlot {
     DeferredSamples(Vec<f32>),
@@ -382,10 +314,6 @@ const NATIVE_SPLIT_REATTRIBUTION_MAX_TAIL_MS: u64 = 3_000;
 /// Cap on tracked speaker-pending finals; an utterance produces at most a
 /// handful of sentence-cut segments before its terminal label binds.
 const MAX_PENDING_SPEAKER_REVISIONS: usize = 16;
-const MAX_TRANSLATION_SOURCE_SEGMENTS: usize = 128;
-const MAX_TRANSLATION_CLAUSE_META: usize = 256;
-const MAX_TRANSLATION_RETIRED_CLAUSES: usize = 256;
-const TRANSLATION_TOMBSTONE_REASON_SOURCE_RETIRED: &str = "source_clause_retired";
 
 /// The single SpeechBoundaryEvent -> client-event mapping. Both VAD paths
 /// (fallback controller-routed, native WS-edge) consume it; adding a boundary
@@ -554,214 +482,6 @@ fn realtime_phrase_bias_rejection_message(
         .to_string()
 }
 
-fn session_language_is_chinese(language: Option<&str>) -> bool {
-    let Some(language) = language else {
-        return false;
-    };
-    matches!(
-        language.trim().to_ascii_lowercase().as_str(),
-        "zh" | "zh-cn" | "zh-hans" | "cmn"
-    )
-}
-
-impl TranslationSourceEvent {
-    fn from_transcript(transcript: RealtimeTranscriptEvent) -> Option<Self> {
-        match transcript {
-            RealtimeTranscriptEvent::Partial(event) => Some(Self {
-                source_segment_id: event.segment_id.0,
-                text: event.text,
-                finalized: false,
-                start_ms: event.start_ms,
-                end_ms: event.end_ms,
-            }),
-            RealtimeTranscriptEvent::Final(event) => Some(Self {
-                source_segment_id: event.segment_id.0,
-                text: event.text,
-                finalized: true,
-                start_ms: event.start_ms,
-                end_ms: event.end_ms,
-            }),
-            RealtimeTranscriptEvent::Revision(event) => Some(Self {
-                source_segment_id: event.segment_id.0,
-                text: event.text,
-                finalized: event.is_final,
-                start_ms: event.start_ms,
-                end_ms: event.end_ms,
-            }),
-        }
-    }
-}
-
-impl RealtimeTranslationLane {
-    fn observe_source(
-        &mut self,
-        source: TranslationSourceEvent,
-    ) -> Result<Vec<RealtimeEvent>, String> {
-        if source.text.trim().is_empty() && self.source_segments.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.upsert_source_segment(&source);
-        let full_text = self
-            .source_segments
-            .iter()
-            .map(|segment| segment.text.as_str())
-            .collect::<String>();
-        let update = if source.finalized {
-            self.segmenter.push_final(&full_text)
-        } else {
-            self.segmenter.push_partial(&full_text)
-        };
-        let tombstones = self.apply_retired_clauses(&update)?;
-        for segment in update.segments {
-            self.enqueue_clause_segment(segment, &source)?;
-        }
-        self.prune_source_segments();
-        self.prune_clause_meta();
-        Ok(tombstones)
-    }
-
-    fn upsert_source_segment(&mut self, source: &TranslationSourceEvent) {
-        if let Some(existing) = self
-            .source_segments
-            .iter_mut()
-            .find(|segment| segment.source_segment_id == source.source_segment_id)
-        {
-            existing.text = source.text.clone();
-            existing.finalized = source.finalized;
-            existing.start_ms = source.start_ms;
-            existing.end_ms = source.end_ms;
-            return;
-        }
-        self.source_segments.push(TranslationSourceSegmentState {
-            source_segment_id: source.source_segment_id.clone(),
-            text: source.text.clone(),
-            finalized: source.finalized,
-            start_ms: source.start_ms,
-            end_ms: source.end_ms,
-        });
-    }
-
-    fn apply_retired_clauses(
-        &mut self,
-        update: &openasr_core::ClauseSegmentationUpdate,
-    ) -> Result<Vec<RealtimeEvent>, String> {
-        if update.retired_clause_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.session
-            .retire_clause_ids(update.retired_clause_ids.iter().copied())
-            .map_err(|error| format!("Realtime translation retire failed: {error}"))?;
-        self.remember_retired_clause_ids(update.retired_clause_ids.iter().copied());
-
-        let replaced_clause_ids = update
-            .segments
-            .iter()
-            .filter_map(|segment| segment.replaces_clause_id)
-            .collect::<HashSet<_>>();
-        let mut tombstones = Vec::new();
-        for clause_id in &update.retired_clause_ids {
-            self.gates.remove(clause_id);
-            let meta = self.clause_meta.remove(clause_id);
-            if replaced_clause_ids.contains(clause_id) {
-                continue;
-            }
-            if let Some(meta) = meta {
-                tombstones.push(RealtimeEvent::Translation(
-                    RealtimeTranslationEvent::Tombstone(RealtimeTranslationTombstone {
-                        clause_id: clause_id.to_string(),
-                        source_segment_id: meta.source_segment_id,
-                        source_version: meta.source_version,
-                        target_lang: self.target_lang.as_str().to_string(),
-                        reason: TRANSLATION_TOMBSTONE_REASON_SOURCE_RETIRED.to_string(),
-                        is_final: true,
-                        model: self.model_id.clone(),
-                    }),
-                ));
-            }
-        }
-        Ok(tombstones)
-    }
-
-    fn remember_retired_clause_ids(&mut self, clause_ids: impl IntoIterator<Item = ClauseId>) {
-        for clause_id in clause_ids {
-            if self.retired_clause_ids.insert(clause_id) {
-                self.retired_clause_order.push_back(clause_id);
-            }
-        }
-        while self.retired_clause_ids.len() > MAX_TRANSLATION_RETIRED_CLAUSES {
-            let Some(oldest) = self.retired_clause_order.pop_front() else {
-                return;
-            };
-            self.retired_clause_ids.remove(&oldest);
-        }
-    }
-
-    fn prune_source_segments(&mut self) {
-        while self.source_segments.len() > MAX_TRANSLATION_SOURCE_SEGMENTS {
-            self.source_segments.remove(0);
-        }
-    }
-
-    fn prune_clause_meta(&mut self) {
-        while self.clause_meta.len() > MAX_TRANSLATION_CLAUSE_META {
-            let Some(oldest) = self.clause_meta.keys().min().copied() else {
-                return;
-            };
-            self.clause_meta.remove(&oldest);
-        }
-    }
-
-    fn enqueue_clause_segment(
-        &mut self,
-        segment: ClauseSegment,
-        source: &TranslationSourceEvent,
-    ) -> Result<(), String> {
-        let finalized = segment.status == ClauseStatus::Finalized;
-        if !finalized && !self.provisional {
-            return Ok(());
-        }
-        // Punctuation-only clauses (e.g. a lone "。" left over after an ASR
-        // final consumed the words before it) carry nothing to translate;
-        // spending a worker decode on them just steals MT throughput.
-        if !segment.text.chars().any(char::is_alphanumeric) {
-            return Ok(());
-        }
-        let gate = self.gates.entry(segment.clause_id).or_default();
-        let decision = gate.observe(StabilityGateInput {
-            source_text: &segment.text,
-            observed_at_ms: source.end_ms,
-            finalized,
-        });
-        if !decision.should_enqueue {
-            return Ok(());
-        }
-        self.clause_meta.insert(
-            segment.clause_id,
-            TranslationClauseMeta {
-                source_segment_id: source.source_segment_id.clone(),
-                source_version: segment.source_version,
-                replaces_clause_id: segment.replaces_clause_id,
-                start_ms: source.start_ms,
-                end_ms: source.end_ms,
-                stability: if finalized { 1.0 } else { decision.stability },
-            },
-        );
-        self.session
-            .enqueue(TranslationRequest {
-                clause_id: segment.clause_id,
-                replaces_clause_id: segment.replaces_clause_id,
-                source_version: segment.source_version,
-                source_text: segment.text,
-                finalized,
-                revised: segment.revised,
-                target_lang: self.target_lang,
-                finalized_context: Vec::new(),
-            })
-            .map(|_| ())
-            .map_err(|error| format!("Realtime translation enqueue failed: {error}"))
-    }
-}
-
 impl WsSession {
     #[cfg(test)]
     pub(crate) fn new(
@@ -839,13 +559,8 @@ impl WsSession {
             pending_native_split_change_points: VecDeque::new(),
             native_speakerless_finals: Vec::new(),
             pending_split_tail_relabels: VecDeque::new(),
-            translation: None,
             #[cfg(test)]
             test_native_streaming_session_factory: None,
-            #[cfg(test)]
-            test_translation_worker: None,
-            #[cfg(test)]
-            test_translation_worker_init: None,
         }
     }
 
@@ -863,22 +578,7 @@ impl WsSession {
     }
 
     fn realtime_capabilities(&self) -> RealtimeBackendCapabilities {
-        #[cfg(test)]
-        {
-            let mut capabilities = realtime_capabilities_for_runtime_and_distribution(
-                &self.runtime,
-                &self.distribution,
-            );
-            if self.test_translation_worker.is_some() {
-                capabilities.translation =
-                    openasr_core::RealtimeTranslationCapability::installed_hymt2();
-            }
-            capabilities
-        }
-        #[cfg(not(test))]
-        {
-            realtime_capabilities_for_runtime_and_distribution(&self.runtime, &self.distribution)
-        }
+        realtime_capabilities_for_runtime_and_distribution(&self.runtime, &self.distribution)
     }
 
     /// Stamps a locally-produced event onto the connection sequence and sends.
@@ -909,21 +609,6 @@ impl WsSession {
         send_event(&self.event_sender, stamped).await
     }
 
-    pub(crate) async fn emit_envelope_with_translation(
-        &mut self,
-        envelope: RealtimeEventEnvelope,
-    ) -> Result<(), ()> {
-        let transcript = match &envelope.event {
-            RealtimeEvent::Transcript(event) => Some(event.clone()),
-            _ => None,
-        };
-        self.emit_envelope(envelope).await?;
-        if let Some(transcript) = transcript {
-            self.observe_translation_source(transcript).await?;
-        }
-        self.drain_translation_outputs().await
-    }
-
     pub(crate) fn remember_emitted_event_id(&mut self, producer_id: String, client_id: String) {
         const MAX_REMEMBERED_EVENT_IDS: usize = 1024;
         if self
@@ -946,10 +631,6 @@ impl WsSession {
 
     pub(crate) fn has_pending_backend_jobs(&self) -> bool {
         self.pending_backend_jobs > 0
-    }
-
-    pub(crate) fn has_active_translation(&self) -> bool {
-        self.translation.is_some()
     }
 
     pub(crate) async fn recv_backend_result(&mut self) -> Option<BackendResult> {
@@ -1132,62 +813,13 @@ impl WsSession {
             .await?;
             return Err(());
         }
-        let translation_required = session
-            .translation
-            .as_ref()
-            .is_some_and(|options| options.enabled.unwrap_or(false));
-        self.required_stage_readiness =
-            RequiredStageReadinessBarrier::for_session(translation_required, diarize);
+        self.required_stage_readiness = RequiredStageReadinessBarrier::for_session(diarize);
         let execution_target = session.execution_target.or_else(|| {
             self.distribution
                 .openasr_home()
                 .ok()
                 .and_then(|home| realtime_execution_target_preference(&home))
         });
-        #[cfg(test)]
-        let test_translation_worker = self
-            .test_translation_worker
-            .clone()
-            .map(|worker| (worker, self.test_translation_worker_init.clone()));
-        #[cfg(not(test))]
-        let test_translation_worker = None;
-        let (translation, translation_summary) = match Self::build_translation_lane(
-            &session,
-            capabilities,
-            self.distribution.clone(),
-            self.runtime.native_execution.clone(),
-            execution_target.unwrap_or_default(),
-            test_translation_worker,
-        )
-        .await
-        {
-            Ok(result) => {
-                if translation_required
-                    && let Err(message) = self
-                        .required_stage_readiness
-                        .mark_ready(RequiredStage::Translation)
-                {
-                    self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
-                        .await?;
-                    return Err(());
-                }
-                result
-            }
-            Err(error) => {
-                if translation_required {
-                    self.required_stage_readiness
-                        .mark_failed(RequiredStage::Translation, error.to_string());
-                }
-                let recoverable = matches!(error, ApiError::ModelSessionCapacity(_));
-                self.emit_error(
-                    realtime_error_code_for_api_error(&error),
-                    &error.to_string(),
-                    recoverable,
-                )
-                .await?;
-                return Err(());
-            }
-        };
         let phrase_bias = match build_realtime_phrase_bias_config(&session) {
             Ok(phrase_bias) => phrase_bias,
             Err(message) => {
@@ -1250,7 +882,6 @@ impl WsSession {
         );
         config.partial_results = effective_partial_results;
         config.word_timestamps = word_timestamps;
-        config.translation = translation_summary;
         config.vad = vad;
         config.buffer = buffer;
         let mut controller = match RealtimeSessionController::new_with_execution(
@@ -1291,7 +922,6 @@ impl WsSession {
         self.execution_target = execution_target;
         self.word_timestamps = word_timestamps;
         self.source_name = source_name;
-        self.translation = translation;
         if use_native_streaming {
             self.controller = Some(controller);
             let result = self
@@ -1310,7 +940,6 @@ impl WsSession {
                     worker.detach_cancel();
                 }
                 self.controller = None;
-                self.translation = None;
             }
             return result;
         }
@@ -1324,7 +953,6 @@ impl WsSession {
                 .mark_failed(RequiredStage::Asr, message);
             self.emit_error(RealtimeErrorCode::StartupConfigError, message, false)
                 .await?;
-            self.translation = None;
             return Err(());
         }
         // The mock backend owns no model weights, arenas, or graph workspace;
@@ -1338,7 +966,6 @@ impl WsSession {
         {
             self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
                 .await?;
-            self.translation = None;
             return Err(());
         }
 
@@ -1377,429 +1004,6 @@ impl WsSession {
             return Err(());
         }
         Ok(())
-    }
-
-    async fn build_translation_lane(
-        session: &StartSession,
-        capabilities: RealtimeBackendCapabilities,
-        distribution: DistributionContext,
-        native_execution: NativeExecutionSupervisor,
-        execution_target: openasr_core::ExecutionTarget,
-        test_worker: Option<(TranslationWorkerHook, Option<TranslationWorkerInitHook>)>,
-    ) -> Result<(Option<RealtimeTranslationLane>, SessionTranslationSummary), ApiError> {
-        let Some(options) = session.translation.as_ref() else {
-            return Ok((None, SessionTranslationSummary::disabled()));
-        };
-        if !options.enabled.unwrap_or(false) {
-            return Ok((None, SessionTranslationSummary::disabled()));
-        }
-
-        if !capabilities.translation.supported {
-            let reason = capabilities
-                .translation
-                .reason
-                .unwrap_or(openasr_core::RealtimeTranslationCapability::REASON_PACK_MISSING);
-            return Err(ApiError::BadRequest(format!(
-                "Realtime translation was requested but is unavailable: {reason}."
-            )));
-        }
-        let target_lang = options
-            .target_lang
-            .as_deref()
-            .unwrap_or("en")
-            .trim()
-            .to_string();
-        let Some(target_lang) = TargetLang::parse_mvp(&target_lang) else {
-            return Err(ApiError::BadRequest(
-                "Realtime translation MVP only supports translation.target_lang=\"en\"."
-                    .to_string(),
-            ));
-        };
-        let mode = options
-            .mode
-            .as_deref()
-            .unwrap_or(openasr_core::RealtimeTranslationCapability::MODE_CLAUSE_RETRANSLATION);
-        if mode != openasr_core::RealtimeTranslationCapability::MODE_CLAUSE_RETRANSLATION {
-            return Err(ApiError::BadRequest(
-                "Realtime translation MVP only supports translation.mode=\"clause_retranslation\"."
-                    .to_string(),
-            ));
-        }
-        if !session_language_is_chinese(session.language.as_deref()) {
-            return Err(ApiError::BadRequest(
-                "Realtime translation MVP requires session.language=\"zh\" so zh->en is explicit."
-                    .to_string(),
-            ));
-        }
-        if let Some(model) = options.model.as_deref()
-            && !translation_model_ref_supported(model)
-        {
-            return Err(ApiError::BadRequest(format!(
-                "Realtime translation MVP only supports translation.model=\"{}\" or \"hymt2-1.8b\".",
-                HYMT2_TRANSLATION_MODEL_ID
-            )));
-        }
-
-        let model_id = HYMT2_TRANSLATION_MODEL_ID.to_string();
-        let requested_model = options.model.clone();
-        // One product envelope owns both segmentation and decoder capacity.
-        // Never let these paths independently choose a clause bound: every
-        // segment emitted below must fit the arenas admitted before the
-        // translation worker publishes its first candidate.
-        let segmentation_config = ClauseSegmentationConfig::default();
-        let max_source_clause_chars = segmentation_config.max_emitted_clause_chars();
-        let translation_session = Self::build_translation_session(
-            distribution,
-            requested_model.as_deref(),
-            native_execution,
-            execution_target,
-            max_source_clause_chars,
-            test_worker,
-        )
-        .await?;
-        let ready_at_construction = matches!(
-            translation_session.worker_readiness(),
-            TranslationWorkerReadiness::Ready
-        );
-        let translation_session = Self::await_translation_worker_ready(translation_session).await?;
-        let summary = SessionTranslationSummary {
-            enabled: true,
-            target_lang: Some(target_lang.as_str().to_string()),
-            model: Some(model_id.clone()),
-            mode: Some(
-                openasr_core::RealtimeTranslationCapability::MODE_CLAUSE_RETRANSLATION.to_string(),
-            ),
-        };
-        Ok((
-            Some(RealtimeTranslationLane {
-                session: translation_session,
-                segmenter: ClauseSegmenter::new(segmentation_config),
-                gates: HashMap::new(),
-                clause_meta: HashMap::new(),
-                retired_clause_ids: HashSet::new(),
-                retired_clause_order: VecDeque::new(),
-                source_segments: Vec::new(),
-                model_id,
-                target_lang,
-                provisional: options.provisional.unwrap_or(true),
-                // A synchronously constructed test worker has never needed a
-                // status transition. A cold-loaded worker still announces one
-                // Ready transition after session lifecycle events, even though
-                // session.start now waits for that readiness before returning.
-                ready_announced: ready_at_construction,
-            }),
-            summary,
-        ))
-    }
-
-    async fn await_translation_worker_ready(
-        session: TranslationSession,
-    ) -> Result<TranslationSession, ApiError> {
-        let timeout = backend_result_timeout();
-        let (session, readiness) = tokio::task::spawn_blocking(move || {
-            let readiness = session.wait_for_worker_readiness(timeout);
-            (session, readiness)
-        })
-        .await
-        .map_err(ApiError::BackendJoin)?;
-        match readiness {
-            TranslationWorkerReadiness::Ready => Ok(session),
-            TranslationWorkerReadiness::Failed { reason } => Err(ApiError::Backend(
-                openasr_core::BackendError::NativeFailClosed {
-                    reason: format!(
-                        "Realtime translation required-stage initialization failed: {reason}"
-                    ),
-                },
-            )),
-            TranslationWorkerReadiness::Initializing => Err(ApiError::Backend(
-                openasr_core::BackendError::NativeFailClosed {
-                    reason: format!(
-                        "Realtime translation required-stage initialization did not finish within {} seconds",
-                        timeout.as_secs()
-                    ),
-                },
-            )),
-        }
-    }
-
-    async fn build_translation_session(
-        distribution: DistributionContext,
-        requested_model: Option<&str>,
-        native_execution: NativeExecutionSupervisor,
-        execution_target: openasr_core::ExecutionTarget,
-        max_source_clause_chars: usize,
-        test_worker: Option<(TranslationWorkerHook, Option<TranslationWorkerInitHook>)>,
-    ) -> Result<TranslationSession, ApiError> {
-        if let Some((worker, init)) = test_worker {
-            if let Some(init) = init {
-                return Ok(TranslationSession::spawn_thread_local(move || {
-                    init()?;
-                    Ok(move |request| worker(request))
-                }));
-            }
-            return Ok(TranslationSession::spawn(move |request| worker(request)));
-        }
-
-        let selection = resolve_translation_pack_selection(&distribution, requested_model)
-            .map_err(ApiError::BadRequest)?;
-        let execution_services = Arc::clone(native_execution.execution_services());
-        let model_session_permit = native_execution
-            .try_acquire(format!("hymt2:{HYMT2_TRANSLATION_MODEL_ID}"))
-            .map_err(ApiError::ModelSessionCapacity)?;
-        Ok(Self::load_hymt2_translation_session(
-            selection,
-            model_session_permit,
-            execution_services,
-            execution_target,
-            max_source_clause_chars,
-        ))
-    }
-
-    /// Spawns the Hy-MT2 translation worker with the (multi-second) model cold
-    /// load running on its dedicated thread. The async session-start task then
-    /// waits on the worker's readiness state without blocking the Tokio runtime;
-    /// no transcript/audio is accepted while initialization is pending.
-    fn load_hymt2_translation_session(
-        selection: TranslationPackSelection,
-        model_session_permit: ModelSessionPermit,
-        execution_services: Arc<openasr_core::NativeExecutionServices>,
-        execution_target: openasr_core::ExecutionTarget,
-        max_source_clause_chars: usize,
-    ) -> TranslationSession {
-        let path = selection.path;
-        Self::spawn_admitted_hymt2_translation_worker(model_session_permit, move || {
-            let mut runtime = PolicyResolvedHymt2TranslationRuntime::load(
-                execution_services,
-                path,
-                execution_target,
-                max_source_clause_chars,
-            )
-            .map_err(|error| TranslationQueueError::Worker {
-                reason: format!("Realtime translation Hy-MT2 runtime could not be loaded: {error}"),
-            })?;
-            Ok(move |request| {
-                runtime
-                    .translate_request(&request)
-                    .map_err(|error| TranslationQueueError::Worker {
-                        reason: error.to_string(),
-                    })
-            })
-        })
-    }
-
-    /// Owns a Hy-MT2 capacity permit on the dedicated translation worker until
-    /// that worker exits, including while its model initializer is running.
-    pub(in crate::realtime) fn spawn_admitted_hymt2_translation_worker<W>(
-        model_session_permit: ModelSessionPermit,
-        init_worker: impl FnOnce() -> Result<W, TranslationQueueError> + Send + 'static,
-    ) -> TranslationSession
-    where
-        W: FnMut(TranslationRequest) -> Result<TranslationWorkerOutput, TranslationQueueError>
-            + 'static,
-    {
-        TranslationSession::spawn_thread_local(move || {
-            let model_session_permit = model_session_permit;
-            let mut worker = init_worker()?;
-            Ok(move |request| {
-                let _permit = &model_session_permit;
-                worker(request)
-            })
-        })
-    }
-
-    async fn observe_translation_source(
-        &mut self,
-        transcript: RealtimeTranscriptEvent,
-    ) -> Result<(), ()> {
-        let Some(source) = TranslationSourceEvent::from_transcript(transcript) else {
-            return Ok(());
-        };
-        let Some(lane) = self.translation.as_mut() else {
-            return Ok(());
-        };
-        let tombstones = match lane.observe_source(source) {
-            Ok(tombstones) => tombstones,
-            Err(message) => {
-                self.emit_error(RealtimeErrorCode::BackendCrashed, &message, false)
-                    .await?;
-                return Err(());
-            }
-        };
-        for tombstone in tombstones {
-            self.emit_event(tombstone).await?;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn drain_translation_outputs(&mut self) -> Result<(), ()> {
-        self.announce_translation_ready().await?;
-        loop {
-            let next = {
-                let Some(lane) = self.translation.as_ref() else {
-                    return Ok(());
-                };
-                lane.session.try_recv()
-            };
-            let output = match next {
-                Ok(Some(output)) => output,
-                Ok(None) => return Ok(()),
-                Err(error) => {
-                    self.emit_error(
-                        RealtimeErrorCode::BackendCrashed,
-                        &format!("Realtime translation session failed: {error}"),
-                        false,
-                    )
-                    .await?;
-                    self.translation = None;
-                    return Err(());
-                }
-            };
-            if output.dropped_stale {
-                if let Some(lane) = self.translation.as_mut() {
-                    lane.retired_clause_ids.remove(&output.clause_id);
-                }
-                continue;
-            }
-            if self
-                .translation
-                .as_mut()
-                .is_some_and(|lane| lane.retired_clause_ids.remove(&output.clause_id))
-            {
-                continue;
-            }
-            let accepted_output = output.clone();
-            let Some(event) = self.translation_event_from_output(output) else {
-                continue;
-            };
-            let context_error = self
-                .translation
-                .as_ref()
-                .and_then(|lane| lane.session.record_output_context(&accepted_output).err());
-            if let Some(error) = context_error {
-                self.emit_error(
-                    RealtimeErrorCode::BackendCrashed,
-                    &format!("Realtime translation context update failed: {error}"),
-                    false,
-                )
-                .await?;
-                return Err(());
-            }
-            self.emit_event(event).await?;
-        }
-    }
-
-    /// Emits the one-shot `translation.status` transition after session
-    /// lifecycle publication for a worker that required asynchronous setup.
-    /// The required-stage barrier guarantees the worker is already ready here.
-    async fn announce_translation_ready(&mut self) -> Result<(), ()> {
-        let ready = match self.translation.as_ref() {
-            Some(lane) if !lane.ready_announced => lane.session.worker_ready(),
-            _ => return Ok(()),
-        };
-        if !ready {
-            return Ok(());
-        }
-        let Some(lane) = self.translation.as_mut() else {
-            return Ok(());
-        };
-        lane.ready_announced = true;
-        let event = RealtimeEvent::Translation(RealtimeTranslationEvent::Status(
-            RealtimeTranslationStatus {
-                state: RealtimeTranslationStatus::STATE_READY.to_string(),
-                model: lane.model_id.clone(),
-                target_lang: lane.target_lang.as_str().to_string(),
-            },
-        ));
-        self.emit_event(event).await
-    }
-
-    pub(crate) async fn drain_translation_until_idle(&mut self) -> Result<(), ()> {
-        let deadline = Instant::now() + backend_result_timeout();
-        loop {
-            self.drain_translation_outputs().await?;
-            let pending = self
-                .translation
-                .as_ref()
-                .is_some_and(|lane| lane.session.has_pending_or_running());
-            if !pending {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                self.emit_error(
-                    RealtimeErrorCode::BackendTimeout,
-                    "Realtime translation did not finish before the session close timeout.",
-                    false,
-                )
-                .await?;
-                return Err(());
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-
-    fn translation_event_from_output(
-        &mut self,
-        output: TranslationOutput,
-    ) -> Option<RealtimeEvent> {
-        let lane = self.translation.as_mut()?;
-        let meta = lane
-            .clause_meta
-            .get(&output.clause_id)
-            .cloned()
-            .unwrap_or_else(|| TranslationClauseMeta {
-                source_segment_id: String::new(),
-                source_version: output.source_version,
-                replaces_clause_id: output.replaces_clause_id,
-                start_ms: 0,
-                end_ms: 0,
-                stability: if output.finalized { 1.0 } else { 0.0 },
-            });
-        if output.finalized {
-            lane.gates.remove(&output.clause_id);
-        }
-        let target_lang = output.target_lang.as_str().to_string();
-        let model = lane.model_id.clone();
-        let replaces_clause_id = meta
-            .replaces_clause_id
-            .or(output.replaces_clause_id)
-            .map(|clause_id| clause_id.to_string());
-        let revises_clause_id = replaces_clause_id.clone();
-        Some(if output.finalized {
-            RealtimeEvent::Translation(RealtimeTranslationEvent::Final(RealtimeTranslationFinal {
-                clause_id: output.clause_id.to_string(),
-                replaces_clause_id,
-                revises_clause_id,
-                source_segment_id: meta.source_segment_id,
-                source_version: output.source_version,
-                translation_version: output.translation_version,
-                target_lang,
-                text: output.text,
-                source_text: output.source_text,
-                start_ms: meta.start_ms,
-                end_ms: meta.end_ms,
-                is_final: true,
-                model,
-            }))
-        } else {
-            RealtimeEvent::Translation(RealtimeTranslationEvent::Partial(
-                RealtimeTranslationPartial {
-                    clause_id: output.clause_id.to_string(),
-                    replaces_clause_id,
-                    revises_clause_id,
-                    source_segment_id: meta.source_segment_id,
-                    source_version: output.source_version,
-                    translation_version: output.translation_version,
-                    target_lang,
-                    text: output.text,
-                    source_text: output.source_text,
-                    start_ms: meta.start_ms,
-                    end_ms: meta.end_ms,
-                    stability: meta.stability,
-                    is_final: false,
-                    model,
-                },
-            ))
-        })
     }
 
     pub(crate) async fn start_native_streaming_session(
@@ -1889,21 +1093,8 @@ impl WsSession {
             }
         };
         let context = NativeAsrSessionContext::from_realtime_session_id(self.session_id.clone());
-        // With translation active, session.language is the validated zh->en
-        // translation source declaration consumed by the translation lane. Only
-        // families that actually honor a source-language decode hint (Whisper,
-        // Cohere) may also receive it as an ASR option; xasr/qwen fail closed on
-        // decode hints they ignore, which would otherwise break the translation
-        // contract that REQUIRES session.language="zh".
-        let asr_language = if self.translation.is_some()
-            && !openasr_core::native_adapter_supports_source_language_hint(adapter.adapter_id())
-        {
-            None
-        } else {
-            self.language.clone()
-        };
         let options = NativeAsrRequestOptions::new()
-            .with_language(asr_language)
+            .with_language(self.language.clone())
             .with_task(self.task)
             .with_prompt(self.prompt.clone())
             .with_phrase_bias(self.phrase_bias.clone())
@@ -2298,7 +1489,7 @@ impl WsSession {
                 .then(|| snapshot_final_transcript(&envelope))
                 .flatten();
             let producer_event_id = envelope.event_id.0.clone();
-            self.emit_envelope_with_translation(envelope).await?;
+            self.emit_envelope(envelope).await?;
             if let Some(snapshot) = final_snapshot {
                 let client_event_id = self.emitted_event_ids.get(&producer_event_id).cloned();
                 self.apply_retroactive_speaker_attribution(
@@ -2507,8 +1698,7 @@ impl WsSession {
 
     /// Re-sends a pending line as a `transcript.revision` with the bound
     /// speaker attached. Emitted directly on the connection sequencer:
-    /// history already recorded the original text and the text is unchanged,
-    /// so the history and translation observers must not see it again.
+    /// history already recorded the original text and the text is unchanged.
     async fn emit_speaker_attribution_revision(
         &mut self,
         record: PendingSpeakerRevision,
@@ -3380,7 +2570,7 @@ impl WsSession {
                             envelope.event_id.clone(),
                         );
                     }
-                    self.emit_envelope_with_translation(envelope).await?;
+                    self.emit_envelope(envelope).await?;
                     if !history_text.is_empty() {
                         self.history_text.push(history_text);
                         self.history_duration_ms = self.history_duration_ms.max(history_end_ms);
@@ -3474,10 +2664,6 @@ impl WsSession {
             }
         }
 
-        if !self.backend_failed && !transport_closed {
-            self.drain_translation_until_idle().await?;
-        }
-
         if !self.backend_failed && !transport_closed && self.record_history {
             self.record_history_entry().await?;
         }
@@ -3523,9 +2709,6 @@ impl WsSession {
             self.emit_envelope(closed).await?;
             self.closed = true;
         }
-        if transport_closed || self.backend_failed {
-            self.translation = None;
-        }
         if self.backend_failed { Err(()) } else { Ok(()) }
     }
 
@@ -3539,7 +2722,6 @@ impl WsSession {
             if let Some(worker) = self.native_streaming.take() {
                 worker.detach_cancel();
             }
-            self.translation = None;
             self.closed = true;
             return Ok(());
         } else if !self.carry.is_empty() {
@@ -3569,16 +2751,10 @@ impl WsSession {
         };
         let (kind, events) = self.native_streaming_command(command).await?;
         self.forward_native_streaming_events(kind, events).await?;
-        if !self.backend_failed && !transport_closed {
-            self.drain_translation_until_idle().await?;
-        }
         // The worker exited after the terminal command; join it so the session
         // (and its decoder cache) is dropped before we report the session closed.
         if let Some(worker) = self.native_streaming.take() {
             worker.join();
-        }
-        if transport_closed || self.backend_failed {
-            self.translation = None;
         }
         if !self.backend_failed && !transport_closed && self.record_history {
             self.record_history_entry().await?;
@@ -3592,7 +2768,6 @@ impl WsSession {
             if let Some(worker) = self.native_streaming.take() {
                 worker.detach_cancel();
             }
-            self.translation = None;
             self.emit_error(RealtimeErrorCode::Cancelled, reason, false)
                 .await?;
             if let Some(controller) = self.controller.as_mut() {
@@ -3635,7 +2810,6 @@ impl WsSession {
         self.pending_native_split_change_points.clear();
         self.native_speakerless_finals.clear();
         self.pending_split_tail_relabels.clear();
-        self.translation = None;
     }
 
     pub(crate) fn remember_captured_audio_frame(&mut self, frame: &RealtimeAudioFrame) {

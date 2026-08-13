@@ -24,21 +24,17 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use openasr_core::realtime::REALTIME_VOICE_ID_UNSUPPORTED_REASON;
 use openasr_core::{
-    BufferedUtterance, ClauseId, ClauseSegment, ClauseSegmentationConfig, ClauseSegmenter,
-    ClauseStatus, MAX_INFERENCE_THREADS, PhraseBiasConfig, RealtimeAudioEncoding,
+    BufferedUtterance, MAX_INFERENCE_THREADS, PhraseBiasConfig, RealtimeAudioEncoding,
     RealtimeAudioFormat, RealtimeAudioFrame, RealtimeBackendCapabilities, RealtimeBufferConfig,
     RealtimeErrorCode, RealtimeErrorEvent, RealtimeEvent, RealtimeEventEnvelope, RealtimeEventId,
     RealtimeEventSequencer, RealtimeLifecycleAction, RealtimeLifecycleEvent, RealtimeSessionConfig,
     RealtimeSessionController, RealtimeSessionId, RealtimeSessionState, RealtimeTranscriptEvent,
     RealtimeTranscriptFinal, RealtimeTranscriptRevision, RealtimeTranscriptWord,
-    RealtimeTranslationEvent, RealtimeTranslationFinal, RealtimeTranslationPartial,
-    RealtimeTranslationStatus, RealtimeTranslationTombstone, RealtimeUtteranceEndReason,
-    RealtimeVadEvent, ResponseFormat, SessionCapabilitiesEvent, SessionTranslationSummary,
-    SpeechBoundaryEvent, StabilityGate, StabilityGateInput, TargetLang, TranscriptLifecycleResult,
-    TranscriptSegmentId, TranscriptUpdate, TranscriptUtteranceId, Transcription, TranslationOutput,
-    TranslationQueueError, TranslationRequest, TranslationSession, TranslationWorkerOutput,
-    TranslationWorkerReadiness, VadConfig, VadMode, VadSpeechStartedEvent, VadSpeechStoppedEvent,
-    VadState, WordTimestamp, native_runtime_model_adapter_for_path, parse_model_ref,
+    RealtimeUtteranceEndReason, RealtimeVadEvent, ResponseFormat, SessionCapabilitiesEvent,
+    SpeechBoundaryEvent, TranscriptLifecycleResult, TranscriptSegmentId, TranscriptUpdate,
+    TranscriptUtteranceId, Transcription, VadConfig, VadMode, VadSpeechStartedEvent,
+    VadSpeechStoppedEvent, VadState, WordTimestamp, native_runtime_model_adapter_for_path,
+    parse_model_ref,
     realtime::history::{
         DaemonHistoryKind, DaemonHistoryProvenance, DaemonHistoryRecord, DaemonHistoryStore,
     },
@@ -47,7 +43,6 @@ use openasr_core::{
 use openasr_core::{
     NativeAsrExecutor, NativeAsrModelAdapter, NativeAsrRequestOptions, NativeAsrSession,
     NativeAsrSessionContext, NativeAsrStreamingSessionConfig, NativeBackendExecutor,
-    PolicyResolvedHymt2TranslationRuntime,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -55,11 +50,10 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
-    ApiError, DistributionContext, HYMT2_TRANSLATION_MODEL_ID, ServerAuth, ServerRuntime,
-    TranslationPackSelection, is_remote_compute_client_request,
+    ApiError, DistributionContext, ServerAuth, ServerRuntime, is_remote_compute_client_request,
     native_hardware_target_from_execution_target, parse_transcription_multipart,
     realtime_capabilities_for_runtime_and_distribution, record_file_transcription_history,
-    resolve_translation_pack_selection, transcribe_with_runtime, translation_model_ref_supported,
+    transcribe_with_runtime,
 };
 
 mod native_worker;
@@ -78,7 +72,6 @@ const AUDIO_FRAME_QUEUE_CAPACITY: usize = 64;
 const NATIVE_STREAMING_COMMAND_QUEUE_CAPACITY: usize = 1024;
 const NATIVE_STREAMING_OUTCOME_QUEUE_CAPACITY: usize = 1024;
 const NATIVE_STREAMING_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const TRANSLATION_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Poll is latest-only at the worker boundary: one heavy decode may be in
 /// flight, while newer audio keeps buffering cheaply. Extra queued Polls only
 /// re-decode stale checkpoints, waste compute, and can delay VAD-driven
@@ -417,14 +410,8 @@ async fn handle_websocket(
     let result_timeout = backend_result_timeout();
     let mut native_poll_interval = tokio::time::interval(NATIVE_STREAMING_POLL_INTERVAL);
     native_poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut translation_poll_interval = tokio::time::interval(TRANSLATION_POLL_INTERVAL);
-    translation_poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
     loop {
         if session.drain_native_streaming_outcomes().await.is_err() {
-            break;
-        }
-        if session.drain_translation_outputs().await.is_err() {
             break;
         }
         // Dispatch the next native partial Poll as soon as the previous decode's
@@ -452,11 +439,6 @@ async fn handle_websocket(
                         break;
                     }
                 }
-                _ = translation_poll_interval.tick(), if session.has_active_translation() => {
-                    if session.drain_translation_outputs().await.is_err() {
-                        break;
-                    }
-                }
                 _ = tokio::time::sleep(result_timeout), if has_pending => {
                     // A backend job is in flight but neither its result nor any
                     // socket activity arrived within the watchdog window: treat
@@ -479,11 +461,6 @@ async fn handle_websocket(
             tokio::select! {
                 _ = native_poll_interval.tick(), if session.is_native_streaming() => {
                     if session.poll_native_streaming().await.is_err() {
-                        break;
-                    }
-                }
-                _ = translation_poll_interval.tick(), if session.has_active_translation() => {
-                    if session.drain_translation_outputs().await.is_err() {
                         break;
                     }
                 }
@@ -518,6 +495,7 @@ enum ClientMessage {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StartSession {
     model: Option<String>,
     language: Option<String>,
@@ -533,16 +511,6 @@ pub(crate) struct StartSession {
     partial_results: Option<bool>,
     word_timestamps: Option<bool>,
     diarize: Option<bool>,
-    translation: Option<ClientTranslationOptions>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub(crate) struct ClientTranslationOptions {
-    enabled: Option<bool>,
-    target_lang: Option<String>,
-    model: Option<String>,
-    mode: Option<String>,
-    provisional: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]

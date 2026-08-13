@@ -24,7 +24,6 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CATALOG = CATALOG_CORE
 QWEN3_ASR_EXPECTED_GENERAL_ARCHITECTURE = b"qwen3-asr"
 QWEN3_ASR_LEGACY_GENERAL_ARCHITECTURE = b"qwen3asr"
-HYMT2_EXPECTED_GENERAL_ARCHITECTURE = b"hunyuan-dense"
 DIARIZEN_EXPECTED_GENERAL_ARCHITECTURE = b"diarizen-wavlm-conformer-segmentation"
 DIARIZEN_REQUIRED_HEADER_MARKERS = (
     b"openasr.source.name",
@@ -35,19 +34,6 @@ DIARIZEN_REQUIRED_HEADER_MARKERS = (
     b"CC BY-NC 4.0",
     b"openasr.license.source",
     b"https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md-v2/blob/f27b9ffbedcf422856d104ecee9b94be37ea578e/README.md",
-)
-HYMT2_REQUIRED_HEADER_MARKERS = (
-    b"openasr.model.kind",
-    b"translation-model",
-    b"openasr.translation.source_langs",
-    b"openasr.translation.target_langs",
-    b"openasr.upstream.base_revision",
-    b"9a341cd1b679d3efd23b46e847b01745a71ed792",
-    b"openasr.upstream.gguf_revision",
-    b"1cd5208700acedef4ef93019b6cfc148b8522d45",
-    b"openasr.license.files",
-    b"LICENSE.txt",
-    b"NOTICE.openasr.txt",
 )
 GGUF_GENERAL_ARCHITECTURE_KEY = b"general.architecture"
 
@@ -84,8 +70,6 @@ def sha256_file(path: Path) -> str:
 def expected_general_architecture(model: str) -> bytes | None:
     if model.startswith("qwen3-asr-"):
         return QWEN3_ASR_EXPECTED_GENERAL_ARCHITECTURE
-    if model == "hymt2-1.8b":
-        return HYMT2_EXPECTED_GENERAL_ARCHITECTURE
     if model == "diarizen-large-s80-v2":
         return DIARIZEN_EXPECTED_GENERAL_ARCHITECTURE
     return None
@@ -109,12 +93,6 @@ def validate_pack_runtime_metadata(model: str, pack: Path) -> None:
         raise ResultSidecarError(
             f"pack general.architecture mismatch for {model}: expected {expected.decode()}: {pack}"
         )
-    if model == "hymt2-1.8b":
-        for marker in HYMT2_REQUIRED_HEADER_MARKERS:
-            if marker not in header:
-                raise ResultSidecarError(
-                    f"pack missing Hy-MT2 required metadata marker {marker.decode(errors='replace')}: {pack}"
-                )
     if model == "diarizen-large-s80-v2":
         for marker in DIARIZEN_REQUIRED_HEADER_MARKERS:
             if marker not in header:

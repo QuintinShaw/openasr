@@ -6,30 +6,30 @@
  * controls a given model actually honors. Drift-free by construction: it is
  * produced from the same mode the fail-closed gate dispatches on.
  */
-export type LanguageCapability = { 
+export type LanguageCapability = {
 /**
  * Stable machine tag: detect_and_specify | detect_implicit | specify_only |
  * fixed_monolingual | fixed_multilingual.
  */
-mode: string, 
+mode: string,
 /**
  * Whether omitting the language (auto) is honored. Always true.
  */
-auto_supported: boolean, 
+auto_supported: boolean,
 /**
  * Whether an explicit per-request language selection is honored.
  */
-specify_supported: boolean, 
+specify_supported: boolean,
 /**
  * The language used when none is requested (the conditioned default, or the
  * intrinsically fixed single language).
  */
-default_language: string | null, 
+default_language: string | null,
 /**
  * Languages a fixed-multilingual model is built for (no per-request choice).
  * Empty for the other modes.
  */
-fixed_languages: Array<string>, 
+fixed_languages: Array<string>,
 /**
  * Why an explicit selection is rejected, when `specify_supported` is false
  * for a reason worth surfacing (e.g. not implemented yet).

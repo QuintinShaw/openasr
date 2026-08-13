@@ -126,13 +126,7 @@ pub(crate) struct InvocationShapeInput {
     sequences: NonZeroU32,
 }
 
-/// Modality-specific invocation coordinates consumed by the otherwise
-/// modality-neutral decoder-state planner.
-///
-/// Audio ASR families use sample counts. Text-only auxiliary decoders use
-/// already-tokenized prompt/prefix/generation axes. Keeping the contract as a
-/// type parameter avoids pretending that text tokens are audio samples while
-/// preserving one validation/aggregation implementation for every decoder.
+/// Invocation coordinates consumed by the decoder-state planner.
 pub(crate) trait DecoderInvocationContract {
     type Invocation: Copy;
     type Envelope: Copy;
@@ -151,181 +145,6 @@ impl DecoderInvocationContract for AudioInvocationContract {
         invocation.sample_rate_hz == envelope.sample_rate_hz
             && invocation.samples <= envelope.max_samples
             && invocation.sequences <= envelope.max_sequences
-    }
-}
-
-/// Exact token coordinates for one text-decoder invocation.
-///
-/// `prefix_positions` is the reusable source prefix. It may be smaller than
-/// `prompt_positions` because generation markers belong to the latter only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TokenInvocationShapeInput {
-    prompt_positions: usize,
-    prefix_positions: usize,
-    max_generated_positions: usize,
-    sequences: NonZeroU32,
-}
-
-impl TokenInvocationShapeInput {
-    pub(crate) fn new(
-        prompt_positions: usize,
-        prefix_positions: usize,
-        max_generated_positions: usize,
-    ) -> Result<Self, TopologyError> {
-        Self::new_with_sequences(
-            prompt_positions,
-            prefix_positions,
-            max_generated_positions,
-            NonZeroU32::MIN,
-        )
-    }
-
-    /// Exact invocation for an owner whose persistent state contains every
-    /// listed sequence concurrently.
-    pub(crate) fn new_with_sequences(
-        prompt_positions: usize,
-        prefix_positions: usize,
-        max_generated_positions: usize,
-        sequences: NonZeroU32,
-    ) -> Result<Self, TopologyError> {
-        if prompt_positions == 0 || prefix_positions == 0 || max_generated_positions == 0 {
-            return Err(TopologyError::EmptyTokenInvocation);
-        }
-        if prefix_positions > prompt_positions {
-            return Err(TopologyError::PrefixExceedsPrompt {
-                prefix_positions,
-                prompt_positions,
-            });
-        }
-        Ok(Self {
-            prompt_positions,
-            prefix_positions,
-            max_generated_positions,
-            sequences,
-        })
-    }
-
-    pub(crate) const fn prompt_positions(self) -> usize {
-        self.prompt_positions
-    }
-
-    pub(crate) const fn prefix_positions(self) -> usize {
-        self.prefix_positions
-    }
-
-    pub(crate) const fn max_generated_positions(self) -> usize {
-        self.max_generated_positions
-    }
-
-    pub(crate) const fn sequences(self) -> NonZeroU32 {
-        self.sequences
-    }
-}
-
-/// Stable token bounds known before a text-decoder session is published.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TokenInvocationEnvelope {
-    maximum: TokenInvocationShapeInput,
-    max_generated_positions: usize,
-    max_total_positions: usize,
-}
-
-impl TokenInvocationEnvelope {
-    pub(crate) fn new(
-        max_prompt_positions: usize,
-        max_prefix_positions: usize,
-        max_generated_positions: usize,
-    ) -> Result<Self, TopologyError> {
-        let max_total_positions = max_prompt_positions
-            .checked_add(max_generated_positions)
-            .ok_or(TopologyError::ArithmeticOverflow {
-                operation: "text decoder stable prompt plus generation positions",
-            })?;
-        Self::with_total_position_cap(
-            max_prompt_positions,
-            max_prefix_positions,
-            max_generated_positions,
-            max_total_positions,
-        )
-    }
-
-    /// Construct a correlated envelope where prompt and generation maxima do
-    /// not have to occur simultaneously. This preserves an existing full
-    /// context API without over-allocating `max_prompt + max_generation` past
-    /// the model ceiling.
-    pub(crate) fn with_total_position_cap(
-        max_prompt_positions: usize,
-        max_prefix_positions: usize,
-        max_generated_positions: usize,
-        max_total_positions: usize,
-    ) -> Result<Self, TopologyError> {
-        Self::with_total_position_cap_and_sequences(
-            max_prompt_positions,
-            max_prefix_positions,
-            max_generated_positions,
-            max_total_positions,
-            NonZeroU32::MIN,
-        )
-    }
-
-    /// Correlated stable bounds for one genuinely multi-sequence state owner.
-    pub(crate) fn with_total_position_cap_and_sequences(
-        max_prompt_positions: usize,
-        max_prefix_positions: usize,
-        max_generated_positions: usize,
-        max_total_positions: usize,
-        max_sequences: NonZeroU32,
-    ) -> Result<Self, TopologyError> {
-        if max_total_positions == 0
-            || max_prompt_positions >= max_total_positions
-            || max_generated_positions == 0
-        {
-            return Err(TopologyError::InvalidTokenEnvelope);
-        }
-        let generated_at_max_prompt =
-            max_generated_positions.min(max_total_positions.saturating_sub(max_prompt_positions));
-        Ok(Self {
-            maximum: TokenInvocationShapeInput::new_with_sequences(
-                max_prompt_positions,
-                max_prefix_positions,
-                generated_at_max_prompt,
-                max_sequences,
-            )?,
-            max_generated_positions,
-            max_total_positions,
-        })
-    }
-
-    pub(crate) const fn maximum_invocation(self) -> TokenInvocationShapeInput {
-        self.maximum
-    }
-
-    pub(crate) const fn max_prefix_positions(self) -> usize {
-        self.maximum.prefix_positions
-    }
-
-    pub(crate) const fn max_total_positions(self) -> usize {
-        self.max_total_positions
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TokenInvocationContract {}
-
-impl DecoderInvocationContract for TokenInvocationContract {
-    type Invocation = TokenInvocationShapeInput;
-    type Envelope = TokenInvocationEnvelope;
-
-    fn contains(envelope: Self::Envelope, invocation: Self::Invocation) -> bool {
-        let maximum = envelope.maximum;
-        invocation.prompt_positions <= maximum.prompt_positions
-            && invocation.prefix_positions <= maximum.prefix_positions
-            && invocation.max_generated_positions <= envelope.max_generated_positions
-            && invocation
-                .prompt_positions
-                .checked_add(invocation.max_generated_positions)
-                .is_some_and(|total| total <= envelope.max_total_positions)
-            && invocation.sequences <= maximum.sequences
     }
 }
 
@@ -873,17 +692,8 @@ pub(crate) enum TopologyError {
     EmptyInvocation,
     #[error("decoder invocation envelope must contain at least one sample")]
     EmptyInvocationEnvelope,
-    #[error("text decoder invocation positions must all be positive")]
-    EmptyTokenInvocation,
     #[error("causal decoder generation budget must contain at least one step")]
     EmptyGenerationBudget,
-    #[error("text decoder invocation envelope is invalid")]
-    InvalidTokenEnvelope,
-    #[error("text decoder prefix span {prefix_positions} exceeds prompt span {prompt_positions}")]
-    PrefixExceedsPrompt {
-        prefix_positions: usize,
-        prompt_positions: usize,
-    },
     #[error("decoder invocation lies outside its declared session envelope")]
     InvocationOutsideEnvelope,
     #[error(

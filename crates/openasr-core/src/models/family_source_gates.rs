@@ -428,22 +428,6 @@ fn public_runtime_pack_imports_carry_the_writer_proof() {
 }
 
 #[test]
-fn byte_preserving_hymt2_repack_stays_inside_the_oasr_transaction() {
-    let path = models_root().join("hymt2/package_import.rs");
-    let syntax = ProductionSyntax::collect(&path);
-    for required in ["begin_repack", "staging_path", "commit"] {
-        assert!(
-            syntax.calls.contains(required) || syntax.methods.contains(required),
-            "Hy-MT2's byte-preserving writer must retain transaction step {required}"
-        );
-    }
-    assert!(
-        !syntax.creates_request_output_pack,
-        "custom repackers must never write the final output path directly"
-    );
-}
-
-#[test]
 fn removed_family_architecture_apis_cannot_return() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
@@ -892,12 +876,10 @@ fn decode_drivers_forward_request_scoped_work_progress() {
 
     let root = models_root();
     for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
-        if descriptor.identity.module_slug == "hymt2"
-            || matches!(
-                descriptor.topology_contract.decode_driver,
-                OpenAsrDecodeDriverStrategy::Dedicated { .. }
-            )
-        {
+        if matches!(
+            descriptor.topology_contract.decode_driver,
+            OpenAsrDecodeDriverStrategy::Dedicated { .. }
+        ) {
             continue;
         }
 

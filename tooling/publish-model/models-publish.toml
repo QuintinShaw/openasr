@@ -230,20 +230,6 @@ required_download_files = ["config.toml", "pytorch_model.bin"]
 required_source_files = ["config.toml", "pytorch_model.bin"]
 external_converter = "python3 tooling/diarizen/convert_diarizen.py --checkpoint {src}/pytorch_model.bin --config {src}/config.toml --out {out} --model-id {registry_id} --quant {quant}"
 
-# Hy-MT2 repackaging: fixed-revision upstream GGUF -> .oasr, tensors preserved
-# byte-for-byte; only openasr.* metadata + license/notice are spliced in.
-# Fetch exactly the pinned Q4_K_M GGUF + LICENSE.txt (the repo also ships Q6_K
-# and Q8_0 variants the pipeline never uses).
-["hymt2-1.8b"]
-import_subcommand = "import hymt2-gguf"
-upstream_repo = "tencent/Hy-MT2-1.8B-GGUF"
-source_revision = "1cd5208700acedef4ef93019b6cfc148b8522d45"
-source_filename = "Hy-MT2-1.8B-Q4_K_M.gguf"
-needs_license_flags = true
-download_includes = ["Hy-MT2-1.8B-Q4_K_M.gguf", "LICENSE.txt"]
-required_download_files = ["Hy-MT2-1.8B-Q4_K_M.gguf", "LICENSE.txt"]
-import_command = "model-pack import hymt2-gguf {src}/Hy-MT2-1.8B-Q4_K_M.gguf {out} --package-id {registry_id} --license-file {src}/LICENSE.txt --notice-file tooling/publish-model/notices/hymt2-1.8b/NOTICE.openasr.txt"
-
 ["whisper-tiny"]
 import_subcommand = "import whisper"
 upstream_repo = "openai/whisper-tiny"

@@ -55,12 +55,14 @@ patching the generated file by hand.
 
 `model-registry/catalog.json` is the machine-readable pull catalog. It keeps
 `schema_version = 1` and a flat `models[]` array. Each entry carries an explicit
-`kind`: `asr-model` for transcription models, `translation-model` for standalone
-local translation packs, or `capability-pack` for auxiliary packs. Translation
-models carry explicit `source_langs` and `target_langs` metadata and are not
-modeled as capability packs: they have independent licenses, revisions,
-quantization choices, storage/memory budgets, and release gates. Capability packs
-also carry
+`kind`: `asr-model` for transcription models, `translation-model` as a reserved
+forward-compatible taxonomy for possible standalone translation packs, or
+`capability-pack` for auxiliary packs. The current authored registry and signed
+catalog contain no `translation-model` entries, and open core has no text-to-text
+or realtime translation runtime/API. If that kind is implemented in the future,
+entries carry explicit `source_langs` and `target_langs` metadata and remain
+separate from capability packs so their licenses, revisions, quantization choices,
+storage/memory budgets, and release gates are explicit. Capability packs also carry
 `capability = { feature = "speaker-diarization", role = "speaker-embedder" |
 "speaker-segmenter" }`. All entries still carry ids/aliases, license metadata,
 public visibility, recommended quant, and per-quant pack entries with pull
@@ -88,15 +90,16 @@ dependency by guessing.
 predicate. The Rust market-list helper is `CatalogModel::is_market_listed()`,
 defined as `public && kind in {asr-model, translation-model}`; capability packs
 may be `public:true` so they can be pulled/imported while staying out of ASR
-model listings. UI consumers should still partition the market by `kind` so
-translation models are visible installable items without appearing in the default
-ASR model selector.
+model listings. UI consumers must partition the market by `kind`; if translation
+packs are implemented and published in the future, they must not appear in the
+default ASR model selector. There are no such current installable items.
 
 The catalog is consumed by `openasr pull <id>:<quant>` and by bare
-`openasr pull <id>`, which resolves to the recommended quant. ASR models,
-translation models, and public capability packs are pullable by digest-verified
-catalog entries. Pulling a translation model installs a reusable text-to-text
-runtime pack; it does not change the default ASR model.
+`openasr pull <id>`, which resolves to the recommended quant. Current ASR models
+and public capability packs are pullable by digest-verified catalog entries.
+Although the signed schema can represent `translation-model`, publishing and
+runtime dispatch for that reserved kind are intentionally fail-closed until an
+open-core text-to-text implementation and its release gates exist.
 
 Local registry cards under `model-registry/models/*.toml` remain the local model
 metadata surface for list/config/API-id validation and native pack selection.
@@ -133,7 +136,7 @@ validation, API model-id validation, `openasr pull` catalog
 validation/resolution, and native model-id / family / variant selection for local
 `.oasr` packs. `variant.*` is local pack-selection metadata (`model[:tag]`), not
 remote artifact routing. The committed card set (one or more per bundled family
-plus capability/translation packs) is the source of truth — read
+plus capability packs) is the source of truth — read
 `model-registry/models/` rather than maintaining a duplicate list here.
 
 ## Pull and install mechanics
@@ -150,8 +153,9 @@ The same core pull engine backs three surfaces:
 - Desktop: the Models page installs through the local daemon, never from the
   webview.
 
-Pulling a published `capability-pack` (e.g. `redimnet2-b6-cn:fp16`) or a
-`translation-model` does not change the default ASR model. `openasr transcribe
+Pulling a published `capability-pack` (e.g. `redimnet2-b6-cn:fp16`) does not
+change the default ASR model. The reserved `translation-model` kind has no current
+published entries or runtime. `openasr transcribe
 --diarize` is explicit consent for the CLI to install a missing required
 `speaker-diarization` capability pack before the fail-closed capability check.
 Realtime `live --diarize` is a hidden compatibility flag that fails before

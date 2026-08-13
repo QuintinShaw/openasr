@@ -112,9 +112,6 @@ jobs:
           # longer exists in the catalog at all, so that pull failed closed.
           - { name: diarize, ref: "whisper-tiny:q4", mode: diarize, strategy: exact,
               args: "--extra-pull redimnet2-b6-cn:fp16" }
-          # hymt2 is a translation model with no batch transcribe CLI path;
-          # cover the real pull + pack integrity chain only.
-          - { name: hymt2, ref: "hymt2-1.8b:q4km", mode: verify, strategy: exact }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:

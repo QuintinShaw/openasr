@@ -62,7 +62,6 @@ pub enum RealtimeEvent {
     AudioInput(RealtimeAudioInputEvent),
     Vad(RealtimeVadEvent),
     Transcript(RealtimeTranscriptEvent),
-    Translation(RealtimeTranslationEvent),
     Error(RealtimeErrorEvent),
 }
 
@@ -73,7 +72,6 @@ impl RealtimeEvent {
             Self::AudioInput(event) => event.event_type(),
             Self::Vad(event) => event.event_type(),
             Self::Transcript(event) => event.event_type(),
-            Self::Translation(event) => event.event_type(),
             Self::Error(_) => "error",
         }
     }
@@ -125,32 +123,7 @@ pub struct SessionConfiguredEvent {
     pub partial_results: bool,
     pub word_timestamps: bool,
     pub diarize: bool,
-    pub translation: SessionTranslationSummary,
     pub vad: SessionVadSummary,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
-pub struct SessionTranslationSummary {
-    pub enabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_lang: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mode: Option<String>,
-}
-
-impl SessionTranslationSummary {
-    pub fn disabled() -> Self {
-        Self {
-            enabled: false,
-            target_lang: None,
-            model: None,
-            mode: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -349,102 +322,6 @@ pub struct RealtimeTranscriptRevision {
     pub speaker_person_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speaker_snapshot_label: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(untagged)]
-pub enum RealtimeTranslationEvent {
-    Status(RealtimeTranslationStatus),
-    Partial(RealtimeTranslationPartial),
-    Final(RealtimeTranslationFinal),
-    Tombstone(RealtimeTranslationTombstone),
-}
-
-impl RealtimeTranslationEvent {
-    fn event_type(&self) -> &'static str {
-        match self {
-            Self::Status(_) => "translation.status",
-            Self::Partial(_) => "translation.partial",
-            Self::Final(_) => "translation.final",
-            Self::Tombstone(_) => "translation.tombstone",
-        }
-    }
-}
-
-/// Lifecycle status of the per-session translation lane. The translation
-/// runtime cold-loads off the session-start critical path, so `session.
-/// configured` reporting `translation.enabled=true` means "accepted and
-/// loading"; this event reports when the runtime is actually ready. A load
-/// failure is reported through the regular `error` event instead, keeping the
-/// configured-truthfulness contract: enabled -> either `translation.status`
-/// ready or a session-fatal error.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
-pub struct RealtimeTranslationStatus {
-    pub state: String,
-    pub model: String,
-    pub target_lang: String,
-}
-
-impl RealtimeTranslationStatus {
-    pub const STATE_READY: &'static str = "ready";
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
-pub struct RealtimeTranslationPartial {
-    pub clause_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub replaces_clause_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub revises_clause_id: Option<String>,
-    pub source_segment_id: String,
-    pub source_version: u64,
-    pub translation_version: u64,
-    pub target_lang: String,
-    pub text: String,
-    pub source_text: String,
-    pub start_ms: u64,
-    pub end_ms: u64,
-    pub stability: f32,
-    pub is_final: bool,
-    pub model: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
-pub struct RealtimeTranslationFinal {
-    pub clause_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub replaces_clause_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub revises_clause_id: Option<String>,
-    pub source_segment_id: String,
-    pub source_version: u64,
-    pub translation_version: u64,
-    pub target_lang: String,
-    pub text: String,
-    pub source_text: String,
-    pub start_ms: u64,
-    pub end_ms: u64,
-    pub is_final: bool,
-    pub model: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
-pub struct RealtimeTranslationTombstone {
-    pub clause_id: String,
-    pub source_segment_id: String,
-    pub source_version: u64,
-    pub target_lang: String,
-    pub reason: String,
-    pub is_final: bool,
-    pub model: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -677,74 +554,6 @@ mod tests {
         assert_eq!(value["language"], "en");
         assert!(value.get("confidence").is_none());
         assert!(value.get("stability").is_none());
-    }
-
-    #[test]
-    fn serializes_translation_partial_contract_fields() {
-        let mut sequencer = RealtimeEventSequencer::new(RealtimeSessionId("rt_test".to_string()));
-        let envelope = sequencer.next(
-            RealtimeEvent::Translation(RealtimeTranslationEvent::Partial(
-                RealtimeTranslationPartial {
-                    clause_id: "c-12".to_string(),
-                    replaces_clause_id: Some("c-10".to_string()),
-                    revises_clause_id: Some("c-10".to_string()),
-                    source_segment_id: "s-34".to_string(),
-                    source_version: 18,
-                    translation_version: 7,
-                    target_lang: "en".to_string(),
-                    text: "We need to keep the streaming path fast".to_string(),
-                    source_text: "我们需要保持流式路径很快".to_string(),
-                    start_ms: 12_340,
-                    end_ms: 14_720,
-                    stability: 0.82,
-                    is_final: false,
-                    model: "hymt2-1.8b-q4_k_m".to_string(),
-                },
-            )),
-            "2026-05-09T00:00:02Z",
-        );
-
-        let value = serde_json::to_value(&envelope).unwrap();
-        assert_eq!(value["type"], "translation.partial");
-        assert_eq!(value["clause_id"], "c-12");
-        assert_eq!(value["replaces_clause_id"], "c-10");
-        assert_eq!(value["revises_clause_id"], "c-10");
-        assert_eq!(value["source_segment_id"], "s-34");
-        assert_eq!(value["source_version"], 18);
-        assert_eq!(value["translation_version"], 7);
-        assert_eq!(value["target_lang"], "en");
-        assert!((value["stability"].as_f64().unwrap() - 0.82).abs() < 0.000_001);
-        assert_eq!(value["is_final"], false);
-        assert_eq!(value["model"], "hymt2-1.8b-q4_k_m");
-    }
-
-    #[test]
-    fn serializes_translation_tombstone_contract_fields() {
-        let mut sequencer = RealtimeEventSequencer::new(RealtimeSessionId("rt_test".to_string()));
-        let envelope = sequencer.next(
-            RealtimeEvent::Translation(RealtimeTranslationEvent::Tombstone(
-                RealtimeTranslationTombstone {
-                    clause_id: "c-12".to_string(),
-                    source_segment_id: "s-34".to_string(),
-                    source_version: 19,
-                    target_lang: "en".to_string(),
-                    reason: "source_clause_retired".to_string(),
-                    is_final: true,
-                    model: "hymt2-1.8b-q4_k_m".to_string(),
-                },
-            )),
-            "2026-05-09T00:00:03Z",
-        );
-
-        let value = serde_json::to_value(&envelope).unwrap();
-        assert_eq!(value["type"], "translation.tombstone");
-        assert_eq!(value["clause_id"], "c-12");
-        assert_eq!(value["source_segment_id"], "s-34");
-        assert_eq!(value["source_version"], 19);
-        assert_eq!(value["target_lang"], "en");
-        assert_eq!(value["reason"], "source_clause_retired");
-        assert_eq!(value["is_final"], true);
-        assert_eq!(value["model"], "hymt2-1.8b-q4_k_m");
     }
 
     #[test]

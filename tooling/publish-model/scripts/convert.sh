@@ -20,7 +20,7 @@
 #   import_command         `model-pack ...` invocation template for families
 #                          whose CLI shape differs from the generic default
 #                          (dolphin's language scheme, firered's multi-input,
-#                          hymt2/pyannote file-shaped sources).
+#                          pyannote file-shaped sources).
 # With neither override, falls back to the generic `import <import_subcommand>`
 # shapes; a model with no usable recipe fails closed instead of guessing.
 source "$(dirname "$0")/lib.sh"

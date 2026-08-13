@@ -282,7 +282,15 @@ fn capability_pack_model_with_feature(
 
 fn translation_model(id: &str, public: bool) -> CatalogModel {
     let revision = "0123456789abcdef0123456789abcdef01234567";
-    let mut model = alias_contract_model(id, "Hy-MT2 1.8B", "hymt2", &[], None, "1.8b", public);
+    let mut model = alias_contract_model(
+        id,
+        "Translation Model Fixture",
+        "translator-test",
+        &[],
+        None,
+        "test",
+        public,
+    );
     model.kind = CatalogModelKind::TranslationModel;
     model.experimental = true;
     model.languages = vec!["en".to_string(), "zh".to_string()];
@@ -369,7 +377,9 @@ fn catalog_kind_matrix_controls_market_listing() {
         "redimnet2-b6-cn",
         CatalogCapabilityRole::SpeakerEmbedder,
     ));
-    catalog.models.push(translation_model("hymt2-1.8b", true));
+    catalog
+        .models
+        .push(translation_model("translator-test", true));
     catalog
         .models
         .push(translation_model("private-translator", false));
@@ -387,9 +397,9 @@ fn catalog_kind_matrix_controls_market_listing() {
     assert_eq!(
         market_ids,
         vec![
-            "hymt2-1.8b",
             "qwen3-asr-0.6b",
             "qwen3-asr-1.7b",
+            "translator-test",
             "whisper-small",
         ]
     );
@@ -565,7 +575,7 @@ fn catalog_parser_hides_backend_with_unrecognized_file_role_via_full_parse_pipel
 #[test]
 fn catalog_translation_model_requires_translation_metadata() {
     let mut catalog = alias_contract_catalog();
-    let mut model = translation_model("hymt2-1.8b", true);
+    let mut model = translation_model("translator-test", true);
     model.source_langs.clear();
     catalog.models.push(model);
 
@@ -580,7 +590,7 @@ fn catalog_translation_model_requires_translation_metadata() {
 #[test]
 fn catalog_translation_model_rejects_one_letter_language_code() {
     let mut catalog = alias_contract_catalog();
-    let mut model = translation_model("hymt2-1.8b", true);
+    let mut model = translation_model("translator-test", true);
     model.source_langs = vec!["z".to_string()];
     catalog.models.push(model);
 
@@ -1632,10 +1642,10 @@ fn embedded_catalog_language_mode_matches_core_language_mode_per_family() {
     );
     assert_eq!(whisper_en.language_default.as_deref(), Some("en"));
 
-    // hymt2 (translation-model) and the diarization capability packs are not
-    // GgmlFamilyAdapterDescriptor ASR families -- no source-language axis, so
-    // the field is omitted rather than guessed.
-    for id in ["hymt2-1.8b", "pyannote-segmentation-3.0", "redimnet2-b6-cn"] {
+    // Diarization capability packs are not GgmlFamilyAdapterDescriptor ASR
+    // families -- no source-language axis, so the field is omitted rather
+    // than guessed.
+    for id in ["pyannote-segmentation-3.0", "redimnet2-b6-cn"] {
         let model = find(id);
         assert_eq!(model.language_mode, None, "{id} should omit language_mode");
         assert_eq!(
@@ -1714,9 +1724,9 @@ fn embedded_catalog_emits_punctuation_matches_family() {
         );
     }
 
-    // hymt2 (translation-model) and the diarization capability packs have no
-    // ASR transcript-punctuation axis, so the field is omitted rather than guessed.
-    for id in ["hymt2-1.8b", "pyannote-segmentation-3.0", "redimnet2-b6-cn"] {
+    // Diarization capability packs have no ASR transcript-punctuation axis,
+    // so the field is omitted rather than guessed.
+    for id in ["pyannote-segmentation-3.0", "redimnet2-b6-cn"] {
         assert_eq!(
             find(id).emits_punctuation,
             None,

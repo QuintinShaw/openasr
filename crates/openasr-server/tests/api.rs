@@ -833,9 +833,6 @@ async fn preferences_only_put_merges_partial_preferences() {
 
 #[tokio::test]
 async fn capabilities_endpoint_exposes_transcription_capability_contract() {
-    // Hermetic: point the app at an empty TempDir so realtime.translation.installed
-    // is deterministically false on any machine, regardless of whether hymt2 (or
-    // any other translation pack) is installed in the real OpenASR home.
     let temp = tempfile::tempdir().unwrap();
     let response = openasr_server::app_with_runtime_and_distribution(
         openasr_server::ServerRuntime::default(),
@@ -891,12 +888,6 @@ async fn capabilities_endpoint_exposes_transcription_capability_contract() {
     assert_eq!(
         parsed["realtime"]["diarization"]["reason"],
         "Voice ID is available only for file transcription; realtime sessions do not support diarize=true or --diarize."
-    );
-    assert_eq!(parsed["realtime"]["translation"]["supported"], false);
-    assert_eq!(parsed["realtime"]["translation"]["installed"], false);
-    assert_eq!(
-        parsed["realtime"]["translation"]["reason"],
-        "translation_pack_missing"
     );
 }
 

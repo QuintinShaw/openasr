@@ -58,7 +58,6 @@ RELEASE_LANE_MODELS = (
     "redimnet2-b6-cn",
     "pyannote-segmentation-3.0",
     "diarizen-large-s80-v2",
-    "hymt2-1.8b",
     "dolphin-cn-dialect-base",
     "dolphin-small",
     "dolphin-base",

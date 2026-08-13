@@ -1182,11 +1182,6 @@ pub struct NativeExecutionServices {
     policy_resolver: Arc<dyn ExecutionPolicyResolver>,
     memory_broker: Arc<DeviceMemoryBrokerSet>,
     auxiliary_runtime_owners: super::policy_resolved_aux_runtime::AuxiliaryRuntimeOwnerCache,
-    hymt2_translation_actors:
-        super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorPool<
-            super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
-            super::hymt2::Hymt2TranslationCandidate,
-        >,
     firered_punc_actors: super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorPool<
         super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
         super::firered_punc::runtime::FireRedPuncRuntime,
@@ -1255,14 +1250,6 @@ impl NativeExecutionServices {
             memory_broker,
             auxiliary_runtime_owners:
                 super::policy_resolved_aux_runtime::AuxiliaryRuntimeOwnerCache::default(),
-            hymt2_translation_actors:
-                super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorPool::new(
-                    "openasr-hymt2-owner",
-                    super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorPoolLimits::new(
-                        4,
-                        crate::host::host_available_memory_bytes().unwrap_or(u64::MAX),
-                    ),
-                ),
             firered_punc_actors:
                 super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorPool::new(
                     "openasr-firered-punc-owner",
@@ -1327,15 +1314,6 @@ impl NativeExecutionServices {
         &self.auxiliary_runtime_owners
     }
 
-    pub(crate) fn hymt2_translation_actors(
-        &self,
-    ) -> &super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorPool<
-        super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
-        super::hymt2::Hymt2TranslationCandidate,
-    > {
-        &self.hymt2_translation_actors
-    }
-
     pub(crate) fn firered_punc_actors(
         &self,
     ) -> &super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorPool<
@@ -1395,7 +1373,6 @@ impl NativeExecutionServices {
         self.dispatches.offline.unload_all();
         self.dispatches.streaming.unload_all();
         self.auxiliary_runtime_owners.clear();
-        self.hymt2_translation_actors.clear();
         self.firered_punc_actors.clear();
         self.diarizen_segmenter_actors.clear();
         self.pyannote_segmenter_actors.clear();
@@ -1412,8 +1389,6 @@ impl NativeExecutionServices {
             .evict_prepared_runtime_content_id(pack_content_id);
         self.auxiliary_runtime_owners
             .evict_content_id(pack_content_id);
-        self.hymt2_translation_actors
-            .evict_where(|key| key.has_content_id(pack_content_id));
         self.firered_punc_actors
             .evict_where(|key| key.has_content_id(pack_content_id));
         self.diarizen_segmenter_actors

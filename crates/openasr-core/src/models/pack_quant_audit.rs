@@ -878,17 +878,6 @@ mod tests {
     }
 
     #[test]
-    fn translation_pack_decoder_quants_are_not_encoder_floor_violations() {
-        let view = view_with(
-            Some(crate::models::hymt2::config::HUNYUAN_DENSE_ARCHITECTURE_VALUE),
-            vec![tensor("blk.0.ffn_gate.weight", GGML_TYPE_Q4_K)],
-        );
-        let report = audit_quant_floor(&view, Some(PackQuant::Q4_K)).expect("auditable");
-        assert!(report.passed());
-        assert_eq!(report.q8_floor_block_quant_tensors, 0);
-    }
-
-    #[test]
     fn entire_pack_rule_floors_every_tensor() {
         // redimnet2 (speaker embedder): a single acoustic backbone with no
         // decoder side, so EVERY block-quant tensor is encoder regardless of

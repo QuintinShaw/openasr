@@ -16,6 +16,16 @@ fn test_distribution() -> DistributionContext {
     })
 }
 
+async fn collect_events(
+    receiver: &mut mpsc::Receiver<RealtimeEventEnvelope>,
+) -> Vec<RealtimeEventEnvelope> {
+    let mut events = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        events.push(event);
+    }
+    events
+}
+
 struct EnvVarGuard {
     key: &'static str,
     previous: Option<String>,
@@ -1112,7 +1122,7 @@ async fn fallback_first_frame_is_rejected_without_buffering_before_required_stag
         .await
         .expect("construct fallback fixture");
     let _ = collect_events(&mut event_receiver).await;
-    session.required_stage_readiness = RequiredStageReadinessBarrier::for_session(false, false);
+    session.required_stage_readiness = RequiredStageReadinessBarrier::for_session(false);
 
     let result = session.handle_binary(&vec![0; 640]).await;
 
@@ -1144,7 +1154,7 @@ async fn native_first_frame_is_rejected_without_buffering_before_required_stages
         )
         .await
         .expect("attach native fixture");
-    session.required_stage_readiness = RequiredStageReadinessBarrier::for_session(false, false);
+    session.required_stage_readiness = RequiredStageReadinessBarrier::for_session(false);
 
     let result = session.handle_native_streaming_binary(&vec![0; 640]).await;
 
@@ -2251,6 +2261,58 @@ async fn unsupported_legacy_stop_and_flush_controls_fail_closed() {
 }
 
 #[tokio::test]
+async fn session_start_rejects_removed_translation_and_unknown_configuration_fields() {
+    for unknown_field in [
+        r#""translation":{"target_language":"en"}"#,
+        r#""future_session_option":true"#,
+    ] {
+        let (event_sender, mut event_receiver) = mpsc::channel(2);
+        let mut session =
+            WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+        let message = format!(
+            r#"{{"type":"session.start","session":{{"model":"whisper-large-v3-turbo",{unknown_field}}}}}"#
+        );
+
+        assert!(session.handle_text(&message).await.is_err());
+        let event = event_receiver
+            .try_recv()
+            .expect("invalid session.start configuration emits an error");
+        assert_eq!(event.event_type, "error");
+        match event.event {
+            RealtimeEvent::Error(RealtimeErrorEvent {
+                code: RealtimeErrorCode::StartupConfigError,
+                message,
+                recoverable: false,
+            }) => {
+                assert!(message.contains("Unsupported realtime control message schema"));
+                let field_name = unknown_field
+                    .split_once(':')
+                    .expect("test field contains a colon")
+                    .0
+                    .trim_matches('"');
+                assert!(message.contains(&format!("unknown field `{field_name}`")));
+            }
+            other => panic!("expected startup_config_error event, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn session_start_keeps_unknown_envelope_fields_extensible() {
+    let message = serde_json::json!({
+        "type": "session.start",
+        "future_envelope_field": { "version": 2 },
+        "session": { "model": "whisper-large-v3-turbo" }
+    });
+
+    let parsed = serde_json::from_value::<ClientMessage>(message);
+    assert!(
+        parsed.is_ok(),
+        "only the nested session.start configuration is fail-closed: {parsed:?}"
+    );
+}
+
+#[tokio::test]
 async fn native_streaming_session_receives_binary_frames_without_file_fallback_worker() {
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
@@ -2329,7 +2391,7 @@ async fn native_streaming_warm_up_keeps_audio_admission_closed_until_ready() {
         )
         .await
         .unwrap();
-    session.required_stage_readiness = RequiredStageReadinessBarrier::for_session(false, false);
+    session.required_stage_readiness = RequiredStageReadinessBarrier::for_session(false);
 
     let started = Instant::now();
     session
@@ -2462,7 +2524,7 @@ async fn session_start_waits_for_native_warm_without_publishing_lifecycle() {
 async fn native_warm_failure_is_startup_fatal_and_publishes_no_lifecycle_or_audio() {
     let (event_sender, mut event_receiver) = mpsc::channel(16);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
-    session.required_stage_readiness = RequiredStageReadinessBarrier::for_session(false, false);
+    session.required_stage_readiness = RequiredStageReadinessBarrier::for_session(false);
     session
         .attach_native_streaming_session(
             test_native_streaming_worker_key("warm-failure-readiness"),
@@ -3653,15 +3715,9 @@ async fn websocket_session_emits_capabilities_before_start_with_monotonic_sequen
                 event.capabilities.diarization.reason,
                 Some(REALTIME_VOICE_ID_UNSUPPORTED_REASON)
             );
-            assert!(!event.capabilities.translation.supported);
-            assert!(!event.capabilities.translation.installed);
             // Default runtime (mock backend, no model pack) is
             // file-per-utterance fallback, never frame-sync.
             assert!(!event.capabilities.frame_sync_partials);
-            assert_eq!(
-                event.capabilities.translation.reason,
-                Some("translation_pack_missing")
-            );
             assert_eq!(event.frame_duration_ms, DEFAULT_FRAME_DURATION_MS);
             assert_eq!(event.frame_byte_len, 640);
             assert_eq!(event.max_message_bytes, MAX_WS_MESSAGE_BYTES);
@@ -4187,967 +4243,6 @@ async fn remote_compute_session_rejects_voice_id_before_embedder_resolution() {
         }
         other => panic!("expected startup config error, got {other:?}"),
     }
-}
-
-#[test]
-fn hymt2_translation_worker_permit_lives_until_worker_exits() {
-    let supervisor = NativeExecutionSupervisor::new(NonZeroUsize::new(1).unwrap());
-    let model_identity = format!("hymt2:{HYMT2_TRANSLATION_MODEL_ID}");
-    let permit = supervisor
-        .try_acquire(model_identity.clone())
-        .expect("translation worker must acquire its model slot");
-    let (initialized_sender, initialized_receiver) = std::sync::mpsc::channel();
-
-    let translation = WsSession::spawn_admitted_hymt2_translation_worker(permit, move || {
-        initialized_sender
-            .send(())
-            .expect("test must observe translation worker initialization");
-        Ok(move |_request: TranslationRequest| {
-            Ok(TranslationWorkerOutput {
-                text: "translated".to_string(),
-                timings: openasr_core::TranslationTimings::default(),
-            })
-        })
-    });
-
-    initialized_receiver
-        .recv_timeout(Duration::from_secs(1))
-        .expect("translation worker must initialize");
-    assert!(
-        supervisor.try_acquire(model_identity.clone()).is_err(),
-        "the worker must retain its Hy-MT2 permit while it remains alive"
-    );
-
-    drop(translation);
-
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        if let Ok(permit) = supervisor.try_acquire(model_identity.clone()) {
-            drop(permit);
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "worker exit must release the Hy-MT2 permit"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-fn translation_options_enabled() -> ClientTranslationOptions {
-    ClientTranslationOptions {
-        enabled: Some(true),
-        target_lang: Some("en".to_string()),
-        model: Some("hymt2-1.8b".to_string()),
-        mode: Some("clause_retranslation".to_string()),
-        provisional: Some(true),
-    }
-}
-
-fn fake_translation_worker(
-    f: impl Fn(TranslationRequest) -> Result<TranslationWorkerOutput, TranslationQueueError>
-    + Send
-    + Sync
-    + 'static,
-) -> TranslationWorkerHook {
-    Arc::new(f)
-}
-
-fn translation_transcript_envelope(event: RealtimeTranscriptEvent) -> RealtimeEventEnvelope {
-    TestServerNativeSession::new("translation_source")
-        .transcript(event)
-        .remove(0)
-}
-
-fn transcript_partial_text(text: &str, revision: u64, end_ms: u64) -> RealtimeTranscriptEvent {
-    RealtimeTranscriptEvent::Partial(openasr_core::RealtimeTranscriptPartial {
-        utterance_id: TranscriptUtteranceId("utt_translation_000001".to_string()),
-        segment_id: TranscriptSegmentId("seg_translation_000001".to_string()),
-        revision,
-        text: text.to_string(),
-        start_ms: 0,
-        end_ms,
-        is_final: false,
-        words: Vec::new(),
-        language: Some("zh".to_string()),
-        speaker: None,
-        speaker_label: None,
-        speaker_person_id: None,
-        speaker_snapshot_label: None,
-    })
-}
-
-fn transcript_final_text(text: &str, revision: u64, end_ms: u64) -> RealtimeTranscriptEvent {
-    RealtimeTranscriptEvent::Final(openasr_core::RealtimeTranscriptFinal {
-        utterance_id: TranscriptUtteranceId("utt_translation_000001".to_string()),
-        segment_id: TranscriptSegmentId("seg_translation_000001".to_string()),
-        revision,
-        text: text.to_string(),
-        start_ms: 0,
-        end_ms,
-        is_final: true,
-        words: Vec::new(),
-        language: Some("zh".to_string()),
-        speaker: None,
-        speaker_label: None,
-        speaker_person_id: None,
-        speaker_snapshot_label: None,
-    })
-}
-
-fn transcript_revision_text(text: &str, revision: u64, end_ms: u64) -> RealtimeTranscriptEvent {
-    RealtimeTranscriptEvent::Revision(openasr_core::RealtimeTranscriptRevision {
-        utterance_id: TranscriptUtteranceId("utt_translation_000001".to_string()),
-        segment_id: TranscriptSegmentId("seg_translation_000001".to_string()),
-        revises_event_id: None,
-        revision,
-        text: text.to_string(),
-        start_ms: 0,
-        end_ms,
-        is_final: true,
-        reason: openasr_core::TRANSCRIPT_REVISION_REASON_POST_FINAL_CORRECTION.to_string(),
-        words: Vec::new(),
-        language: Some("zh".to_string()),
-        speaker: None,
-        speaker_label: None,
-        speaker_person_id: None,
-        speaker_snapshot_label: None,
-    })
-}
-
-async fn collect_events(
-    receiver: &mut mpsc::Receiver<RealtimeEventEnvelope>,
-) -> Vec<RealtimeEventEnvelope> {
-    let mut events = Vec::new();
-    while let Ok(event) = receiver.try_recv() {
-        events.push(event);
-    }
-    events
-}
-
-/// Regression for the live zh-en stall (recording 1781267241): clause
-/// boundaries landing next to ASCII-run spaces made the segmenter misread
-/// every later partial as a revision, so translation output stopped after the
-/// first clauses while the worker kept burning CPU on doomed requests.
-#[tokio::test]
-async fn mixed_script_clause_boundaries_do_not_stall_translation() {
-    let (event_sender, mut event_receiver) = mpsc::channel(64);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
-    session.test_translation_worker = Some(fake_translation_worker(|request| {
-        Ok(TranslationWorkerOutput {
-            text: format!("en:{}", request.source_text),
-            timings: openasr_core::TranslationTimings::default(),
-        })
-    }));
-    session
-        .start_session(StartSession {
-            model: Some("whisper-large-v3-turbo".to_string()),
-            language: Some("zh".to_string()),
-            translation: Some(translation_options_enabled()),
-            ..StartSession::default()
-        })
-        .await
-        .expect("start with translation");
-
-    // The comma boundary leaves a remainder that starts with the space before
-    // "codex" — every later partial must still be read as a pure append.
-    let mut text = String::from("我们现在来看一下这个东西好吗， codex 是一个工具确实不错。");
-    let mut revision = 1;
-    for tail in [
-        "我们在 collect 里面怎么做一个项目的管理。",
-        "呃这期视频呢无论是对于这种开发者，",
-    ] {
-        text.push_str(tail);
-        revision += 1;
-        session
-            .emit_envelope_with_translation(translation_transcript_envelope(
-                transcript_partial_text(&text, revision, revision * 480),
-            ))
-            .await
-            .expect("emit growing partial");
-    }
-    session
-        .drain_translation_until_idle()
-        .await
-        .expect("drain translation");
-
-    let events = collect_events(&mut event_receiver).await;
-    let finals = events
-        .iter()
-        .filter_map(|event| match &event.event {
-            RealtimeEvent::Translation(RealtimeTranslationEvent::Final(event)) => {
-                Some(event.text.as_str())
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        finals
-            .iter()
-            .any(|text| text.contains("collect 里面怎么做一个项目的管理。")),
-        "clauses after the mixed-script boundary must keep translating; got {finals:?}"
-    );
-    assert!(
-        finals
-            .iter()
-            .any(|text| text.contains("呃这期视频呢无论是对于这种开发者，")),
-        "late clauses must keep translating; got {finals:?}"
-    );
-    assert!(
-        !events.iter().any(|event| matches!(
-            &event.event,
-            RealtimeEvent::Translation(RealtimeTranslationEvent::Tombstone(_))
-        )),
-        "pure appends must not retire clauses"
-    );
-}
-
-#[tokio::test]
-async fn punctuation_only_clause_is_not_sent_to_the_translator() {
-    let (event_sender, mut event_receiver) = mpsc::channel(64);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
-    session.test_translation_worker = Some(fake_translation_worker(|request| {
-        Ok(TranslationWorkerOutput {
-            text: format!("en:{}", request.source_text),
-            timings: openasr_core::TranslationTimings::default(),
-        })
-    }));
-    session
-        .start_session(StartSession {
-            model: Some("whisper-large-v3-turbo".to_string()),
-            language: Some("zh".to_string()),
-            translation: Some(translation_options_enabled()),
-            ..StartSession::default()
-        })
-        .await
-        .expect("start with translation");
-
-    // The ASR final consumes the words; the next partial leaves a lone "。"
-    // as its own finalized clause, which must not reach the worker.
-    session
-        .emit_envelope_with_translation(translation_transcript_envelope(transcript_final_text(
-            "这是没问题的",
-            1,
-            500,
-        )))
-        .await
-        .expect("emit final");
-    session
-        .emit_envelope_with_translation(translation_transcript_envelope(transcript_partial_text(
-            "这是没问题的。后面我们继续讲，",
-            2,
-            900,
-        )))
-        .await
-        .expect("emit partial with leftover punctuation");
-    session
-        .drain_translation_until_idle()
-        .await
-        .expect("drain translation");
-
-    let events = collect_events(&mut event_receiver).await;
-    let finals = events
-        .iter()
-        .filter_map(|event| match &event.event {
-            RealtimeEvent::Translation(RealtimeTranslationEvent::Final(event)) => {
-                Some(event.text.as_str())
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        !finals.contains(&"en:。"),
-        "punctuation-only clause must be skipped; got {finals:?}"
-    );
-    assert!(
-        finals.contains(&"en:后面我们继续讲，"),
-        "the real clause after the punctuation must still translate; got {finals:?}"
-    );
-}
-
-#[tokio::test]
-async fn session_start_rejects_translation_without_hymt2_pack() {
-    let (event_sender, mut event_receiver) = mpsc::channel(8);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
-
-    let result = session
-        .start_session(StartSession {
-            model: Some("whisper-large-v3-turbo".to_string()),
-            language: Some("zh".to_string()),
-            translation: Some(translation_options_enabled()),
-            ..StartSession::default()
-        })
-        .await;
-
-    assert!(result.is_err());
-    let events = collect_events(&mut event_receiver).await;
-    assert_eq!(
-        first_error_code(&events),
-        Some(RealtimeErrorCode::StartupConfigError)
-    );
-    let message = events
-        .iter()
-        .find_map(|event| match &event.event {
-            RealtimeEvent::Error(error) => Some(error.message.as_str()),
-            _ => None,
-        })
-        .expect("translation startup error");
-    assert!(message.contains("translation_pack_missing"));
-}
-
-#[tokio::test]
-async fn session_start_waits_for_required_translation_readiness_without_publishing_lifecycle() {
-    let (event_sender, mut event_receiver) = mpsc::channel(32);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
-    let (release_init_sender, release_init_receiver) = std::sync::mpsc::channel::<()>();
-    let release_init_receiver = Arc::new(Mutex::new(release_init_receiver));
-    session.test_translation_worker = Some(fake_translation_worker(|request| {
-        Ok(TranslationWorkerOutput {
-            text: format!("en:{}", request.source_text),
-            timings: openasr_core::TranslationTimings::default(),
-        })
-    }));
-    session.test_translation_worker_init = Some(Arc::new(move || {
-        release_init_receiver
-            .lock()
-            .expect("init release mutex")
-            .recv()
-            .map_err(|_| TranslationQueueError::Worker {
-                reason: "init release channel closed".to_string(),
-            })
-    }));
-
-    // Keep polling session.start while the worker initializes. The future is
-    // intentionally pending, and no lifecycle event may advertise an
-    // audio-ready session yet.
-    let mut start = Box::pin(session.start_session(StartSession {
-        model: Some("whisper-large-v3-turbo".to_string()),
-        language: Some("zh".to_string()),
-        translation: Some(translation_options_enabled()),
-        ..StartSession::default()
-    }));
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), start.as_mut())
-            .await
-            .is_err(),
-        "session.start must remain pending while a required translation stage initializes"
-    );
-    let pre_ready_events = collect_events(&mut event_receiver).await;
-    assert!(
-        !pre_ready_events.iter().any(|event| matches!(
-            event.event_type,
-            "session.created" | "session.configured" | "audio.input.started" | "translation.status"
-        )),
-        "no audio-ready lifecycle may escape before every required stage is ready: {pre_ready_events:?}"
-    );
-
-    release_init_sender.send(()).expect("release init");
-    start
-        .as_mut()
-        .await
-        .expect("session.start succeeds after translation readiness");
-    drop(start);
-    let startup_events = collect_events(&mut event_receiver).await;
-    assert!(
-        startup_events
-            .iter()
-            .any(|event| event.event_type == "session.created")
-    );
-    assert!(
-        startup_events
-            .iter()
-            .any(|event| event.event_type == "audio.input.started")
-    );
-
-    // Source reaches translation only after the shared readiness barrier has
-    // opened; there is no pre-ready transcript buffering/replay path.
-    session
-        .emit_envelope_with_translation(translation_transcript_envelope(transcript_final_text(
-            "我们需要保持流式路径很快。",
-            1,
-            500,
-        )))
-        .await
-        .expect("emit transcript final after readiness");
-    session
-        .drain_translation_until_idle()
-        .await
-        .expect("drain translation after init");
-
-    let events = collect_events(&mut event_receiver).await;
-    let status_events = events
-        .iter()
-        .filter_map(|event| match &event.event {
-            RealtimeEvent::Translation(RealtimeTranslationEvent::Status(status)) => Some(status),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(status_events.len(), 1, "exactly one ready announcement");
-    assert_eq!(status_events[0].state, "ready");
-    assert_eq!(status_events[0].model, HYMT2_TRANSLATION_MODEL_ID);
-    assert_eq!(status_events[0].target_lang, "en");
-    let translation_final = events
-        .iter()
-        .find_map(|event| match &event.event {
-            RealtimeEvent::Translation(RealtimeTranslationEvent::Final(event)) => Some(event),
-            _ => None,
-        })
-        .expect("post-ready source translated");
-    assert_eq!(translation_final.text, "en:我们需要保持流式路径很快。");
-
-    // The announcement is one-shot.
-    session
-        .drain_translation_outputs()
-        .await
-        .expect("idle drain");
-    let extra_events = collect_events(&mut event_receiver).await;
-    assert!(
-        !extra_events
-            .iter()
-            .any(|event| event.event_type == "translation.status")
-    );
-}
-
-#[tokio::test]
-async fn required_translation_init_failure_rejects_session_before_lifecycle_or_audio() {
-    let (event_sender, mut event_receiver) = mpsc::channel(32);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
-    session.test_translation_worker = Some(fake_translation_worker(|request| {
-        Ok(TranslationWorkerOutput {
-            text: request.source_text,
-            timings: openasr_core::TranslationTimings::default(),
-        })
-    }));
-    session.test_translation_worker_init = Some(Arc::new(|| {
-        Err(TranslationQueueError::Worker {
-            reason: "Realtime translation Hy-MT2 runtime could not be loaded: 模拟加载失败"
-                .to_string(),
-        })
-    }));
-
-    let result = session
-        .start_session(StartSession {
-            model: Some("whisper-large-v3-turbo".to_string()),
-            language: Some("zh".to_string()),
-            translation: Some(translation_options_enabled()),
-            ..StartSession::default()
-        })
-        .await;
-    assert!(result.is_err(), "required-stage failure must reject start");
-
-    let events = collect_events(&mut event_receiver).await;
-    assert_eq!(
-        first_error_code(&events),
-        Some(RealtimeErrorCode::BackendCrashed)
-    );
-    let message = events
-        .iter()
-        .find_map(|event| match &event.event {
-            RealtimeEvent::Error(error) => Some(error.message.as_str()),
-            _ => None,
-        })
-        .expect("translation load failure error");
-    assert!(message.contains("Hy-MT2 runtime could not be loaded"));
-    assert!(
-        !events.iter().any(|event| matches!(
-            event.event_type,
-            "session.created" | "session.configured" | "audio.input.started" | "translation.status"
-        )),
-        "a failed required stage must publish neither readiness nor session lifecycle"
-    );
-    assert!(session.carry.is_empty());
-    assert_eq!(session.next_frame_seq, 1);
-    assert_eq!(session.next_frame_start_ms, 0);
-    assert!(session.controller.is_none());
-}
-
-#[tokio::test]
-async fn session_configured_reports_translation_truthfully() {
-    let (event_sender, mut event_receiver) = mpsc::channel(8);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
-    session.test_translation_worker = Some(fake_translation_worker(|request| {
-        Ok(TranslationWorkerOutput {
-            text: request.source_text,
-            timings: openasr_core::TranslationTimings::default(),
-        })
-    }));
-
-    session
-        .start_session(StartSession {
-            model: Some("whisper-large-v3-turbo".to_string()),
-            language: Some("zh".to_string()),
-            translation: Some(translation_options_enabled()),
-            ..StartSession::default()
-        })
-        .await
-        .expect("start with fake translation");
-
-    assert!(session.translation.is_some());
-    let events = collect_events(&mut event_receiver).await;
-    let configured = events
-        .iter()
-        .find_map(|event| match &event.event {
-            RealtimeEvent::Lifecycle(RealtimeLifecycleEvent::SessionConfigured(configured)) => {
-                Some(configured)
-            }
-            _ => None,
-        })
-        .expect("session.configured");
-    assert!(configured.translation.enabled);
-    assert_eq!(configured.translation.target_lang.as_deref(), Some("en"));
-    assert_eq!(
-        configured.translation.model.as_deref(),
-        Some(HYMT2_TRANSLATION_MODEL_ID)
-    );
-}
-
-#[tokio::test]
-async fn translation_final_uses_session_sequencer_and_versions() {
-    let (event_sender, mut event_receiver) = mpsc::channel(16);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
-    session.test_translation_worker = Some(fake_translation_worker(|request| {
-        Ok(TranslationWorkerOutput {
-            text: format!("en:{}:{}", request.source_version, request.source_text),
-            timings: openasr_core::TranslationTimings::default(),
-        })
-    }));
-    session
-        .start_session(StartSession {
-            model: Some("whisper-large-v3-turbo".to_string()),
-            language: Some("zh".to_string()),
-            translation: Some(translation_options_enabled()),
-            ..StartSession::default()
-        })
-        .await
-        .expect("start with fake translation");
-    let _ = collect_events(&mut event_receiver).await;
-
-    session
-        .emit_envelope_with_translation(translation_transcript_envelope(transcript_final_text(
-            "我们需要保持流式路径很快。",
-            1,
-            500,
-        )))
-        .await
-        .expect("emit transcript final");
-    session
-        .drain_translation_until_idle()
-        .await
-        .expect("drain translation");
-
-    let events = collect_events(&mut event_receiver).await;
-    assert_eq!(
-        events
-            .iter()
-            .map(|event| event.event_type)
-            .collect::<Vec<_>>(),
-        vec!["transcript.final", "translation.final"]
-    );
-    assert_eq!(events[0].seq + 1, events[1].seq);
-    match &events[1].event {
-        RealtimeEvent::Translation(RealtimeTranslationEvent::Final(event)) => {
-            assert_eq!(event.clause_id, "c-1");
-            assert_eq!(event.source_segment_id, "seg_translation_000001");
-            assert_eq!(event.source_version, 1);
-            assert_eq!(event.translation_version, 1);
-            assert_eq!(event.target_lang, "en");
-            assert!(event.is_final);
-            assert_eq!(event.model, HYMT2_TRANSLATION_MODEL_ID);
-        }
-        other => panic!("expected translation.final, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn translation_latest_only_drops_stale_provisional_outputs() {
-    let (event_sender, mut event_receiver) = mpsc::channel(32);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
-    let (started_sender, started_receiver) = std::sync::mpsc::channel();
-    let (release_sender, release_receiver) = std::sync::mpsc::channel();
-    let release_receiver = Arc::new(Mutex::new(release_receiver));
-    session.test_translation_worker = Some(fake_translation_worker(move |request| {
-        started_sender
-            .send(request.source_version)
-            .expect("started send");
-        if request.source_version == 1 {
-            release_receiver
-                .lock()
-                .expect("release mutex")
-                .recv()
-                .expect("release first translation");
-        }
-        Ok(TranslationWorkerOutput {
-            text: format!("en-v{}", request.source_version),
-            timings: openasr_core::TranslationTimings::default(),
-        })
-    }));
-    session
-        .start_session(StartSession {
-            model: Some("whisper-large-v3-turbo".to_string()),
-            language: Some("zh".to_string()),
-            translation: Some(translation_options_enabled()),
-            ..StartSession::default()
-        })
-        .await
-        .expect("start with fake translation");
-    let _ = collect_events(&mut event_receiver).await;
-
-    for (revision, text, end_ms) in [(1, "我们需要", 0), (2, "我们需要", 200)] {
-        session
-            .emit_envelope_with_translation(translation_transcript_envelope(
-                transcript_partial_text(text, revision, end_ms),
-            ))
-            .await
-            .expect("emit partial");
-    }
-    // Wait until the worker has TAKEN v1 (and is blocked inside it) before
-    // growing the source: otherwise the v2 provisional can replace v1 in the
-    // pending slot and the worker would never see v1 at all.
-    assert_eq!(
-        started_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("first translation started"),
-        1
-    );
-    for (revision, text, end_ms) in [
-        (3, "我们需要保持流式路径", 300),
-        (4, "我们需要保持流式路径", 500),
-    ] {
-        session
-            .emit_envelope_with_translation(translation_transcript_envelope(
-                transcript_partial_text(text, revision, end_ms),
-            ))
-            .await
-            .expect("emit partial");
-    }
-    release_sender.send(()).expect("release stale worker");
-    session
-        .drain_translation_until_idle()
-        .await
-        .expect("drain translations");
-
-    let events = collect_events(&mut event_receiver).await;
-    let translations = events
-        .iter()
-        .filter_map(|event| match &event.event {
-            RealtimeEvent::Translation(RealtimeTranslationEvent::Partial(partial)) => Some(partial),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(translations.len(), 1);
-    assert_eq!(translations[0].source_version, 2);
-    assert_eq!(translations[0].translation_version, 2);
-    assert_eq!(translations[0].text, "en-v2");
-}
-
-#[tokio::test]
-async fn translation_reemits_revised_source_with_replacement_metadata() {
-    let (event_sender, mut event_receiver) = mpsc::channel(32);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
-    session.test_translation_worker = Some(fake_translation_worker(|request| {
-        Ok(TranslationWorkerOutput {
-            text: format!("en:{}", request.source_text),
-            timings: openasr_core::TranslationTimings::default(),
-        })
-    }));
-    session
-        .start_session(StartSession {
-            model: Some("whisper-large-v3-turbo".to_string()),
-            language: Some("zh".to_string()),
-            translation: Some(translation_options_enabled()),
-            ..StartSession::default()
-        })
-        .await
-        .expect("start with fake translation");
-    let _ = collect_events(&mut event_receiver).await;
-
-    session
-        .emit_envelope_with_translation(translation_transcript_envelope(transcript_final_text(
-            "我们需要保持流式路径很快。",
-            1,
-            500,
-        )))
-        .await
-        .expect("emit final");
-    session.drain_translation_until_idle().await.unwrap();
-    session
-        .emit_envelope_with_translation(translation_transcript_envelope(transcript_revision_text(
-            "我们必须保持流式路径很快。",
-            2,
-            700,
-        )))
-        .await
-        .expect("emit revision");
-    session.drain_translation_until_idle().await.unwrap();
-
-    let events = collect_events(&mut event_receiver).await;
-    let translations = events
-        .iter()
-        .filter_map(|event| match &event.event {
-            RealtimeEvent::Translation(RealtimeTranslationEvent::Final(final_event)) => {
-                Some(final_event)
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        translations
-            .iter()
-            .map(|event| event.clause_id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["c-1", "c-2"]
-    );
-    assert_eq!(translations[0].replaces_clause_id, None);
-    assert_eq!(translations[0].revises_clause_id, None);
-    assert_eq!(translations[1].replaces_clause_id.as_deref(), Some("c-1"));
-    assert_eq!(translations[1].revises_clause_id.as_deref(), Some("c-1"));
-}
-
-#[tokio::test]
-async fn translation_revision_drops_in_flight_retired_final() {
-    let (event_sender, mut event_receiver) = mpsc::channel(32);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
-    let (started_sender, started_receiver) = std::sync::mpsc::channel();
-    let (release_sender, release_receiver) = std::sync::mpsc::channel();
-    let release_receiver = Arc::new(Mutex::new(release_receiver));
-    session.test_translation_worker = Some(fake_translation_worker(move |request| {
-        started_sender
-            .send(request.clause_id)
-            .expect("started send");
-        if request.clause_id == ClauseId::new(1) {
-            release_receiver
-                .lock()
-                .expect("release mutex")
-                .recv()
-                .expect("release retired final");
-        }
-        Ok(TranslationWorkerOutput {
-            text: format!("en:{}", request.source_text),
-            timings: openasr_core::TranslationTimings::default(),
-        })
-    }));
-    session
-        .start_session(StartSession {
-            model: Some("whisper-large-v3-turbo".to_string()),
-            language: Some("zh".to_string()),
-            translation: Some(translation_options_enabled()),
-            ..StartSession::default()
-        })
-        .await
-        .expect("start with fake translation");
-    let _ = collect_events(&mut event_receiver).await;
-
-    session
-        .emit_envelope_with_translation(translation_transcript_envelope(transcript_final_text(
-            "我们需要保持流式路径很快。",
-            1,
-            500,
-        )))
-        .await
-        .expect("emit final");
-    assert_eq!(
-        started_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("first final started"),
-        ClauseId::new(1)
-    );
-    session
-        .emit_envelope_with_translation(translation_transcript_envelope(transcript_revision_text(
-            "我们必须保持流式路径很快。",
-            2,
-            700,
-        )))
-        .await
-        .expect("emit revision");
-    release_sender.send(()).expect("release retired final");
-    session.drain_translation_until_idle().await.unwrap();
-
-    let events = collect_events(&mut event_receiver).await;
-    let translations = events
-        .iter()
-        .filter_map(|event| match &event.event {
-            RealtimeEvent::Translation(RealtimeTranslationEvent::Final(final_event)) => {
-                Some(final_event)
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(translations.len(), 1);
-    assert_eq!(translations[0].clause_id, "c-2");
-    assert_eq!(translations[0].replaces_clause_id.as_deref(), Some("c-1"));
-    assert_eq!(translations[0].revises_clause_id.as_deref(), Some("c-1"));
-    assert!(
-        !translations.iter().any(|event| event.clause_id == "c-1"),
-        "retired c-1 final must not emit after the revision"
-    );
-}
-
-#[tokio::test]
-async fn translation_revision_tombstones_clause_removed_without_replacement() {
-    let (event_sender, mut event_receiver) = mpsc::channel(32);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
-    session.test_translation_worker = Some(fake_translation_worker(|request| {
-        Ok(TranslationWorkerOutput {
-            text: format!("en:{}", request.source_text),
-            timings: openasr_core::TranslationTimings::default(),
-        })
-    }));
-    session
-        .start_session(StartSession {
-            model: Some("whisper-large-v3-turbo".to_string()),
-            language: Some("zh".to_string()),
-            translation: Some(translation_options_enabled()),
-            ..StartSession::default()
-        })
-        .await
-        .expect("start with fake translation");
-    let _ = collect_events(&mut event_receiver).await;
-
-    session
-        .emit_envelope_with_translation(translation_transcript_envelope(transcript_final_text(
-            "我们需要保持流式路径很快。",
-            1,
-            500,
-        )))
-        .await
-        .expect("emit final");
-    session.drain_translation_until_idle().await.unwrap();
-    let _ = collect_events(&mut event_receiver).await;
-
-    session
-        .emit_envelope_with_translation(translation_transcript_envelope(transcript_revision_text(
-            "", 2, 700,
-        )))
-        .await
-        .expect("emit revision deleting text");
-
-    let events = collect_events(&mut event_receiver).await;
-    let tombstone = events
-        .iter()
-        .find_map(|event| match &event.event {
-            RealtimeEvent::Translation(RealtimeTranslationEvent::Tombstone(tombstone)) => {
-                Some(tombstone)
-            }
-            _ => None,
-        })
-        .expect("translation tombstone");
-    assert_eq!(tombstone.clause_id, "c-1");
-    assert_eq!(tombstone.source_segment_id, "seg_translation_000001");
-    assert_eq!(tombstone.reason, "source_clause_retired");
-    assert_eq!(tombstone.target_lang, "en");
-    assert_eq!(tombstone.model, HYMT2_TRANSLATION_MODEL_ID);
-}
-
-#[tokio::test]
-async fn slow_translation_does_not_block_asr_event_emission() {
-    let (event_sender, mut event_receiver) = mpsc::channel(32);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
-    let (release_sender, release_receiver) = std::sync::mpsc::channel();
-    let release_receiver = Arc::new(Mutex::new(release_receiver));
-    session.test_translation_worker = Some(fake_translation_worker(move |request| {
-        release_receiver
-            .lock()
-            .expect("release mutex")
-            .recv()
-            .expect("release slow translation");
-        Ok(TranslationWorkerOutput {
-            text: request.source_text,
-            timings: openasr_core::TranslationTimings::default(),
-        })
-    }));
-    session
-        .start_session(StartSession {
-            model: Some("whisper-large-v3-turbo".to_string()),
-            language: Some("zh".to_string()),
-            translation: Some(translation_options_enabled()),
-            ..StartSession::default()
-        })
-        .await
-        .expect("start with fake translation");
-    let _ = collect_events(&mut event_receiver).await;
-
-    session
-        .emit_envelope_with_translation(translation_transcript_envelope(transcript_final_text(
-            "我们需要保持流式路径很快。",
-            1,
-            500,
-        )))
-        .await
-        .expect("emit final while translation blocks");
-    let events = collect_events(&mut event_receiver).await;
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].event_type, "transcript.final");
-
-    release_sender.send(()).expect("release slow translation");
-    session.drain_translation_until_idle().await.unwrap();
-    let events = collect_events(&mut event_receiver).await;
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].event_type, "translation.final");
-    assert!(events[0].seq > 1);
-}
-
-#[tokio::test]
-async fn cancel_with_blocked_translation_worker_emits_closed_without_waiting() {
-    let (event_sender, mut event_receiver) = mpsc::channel(32);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
-    let (started_sender, started_receiver) = std::sync::mpsc::channel();
-    let (release_sender, release_receiver) = std::sync::mpsc::channel();
-    let release_receiver = Arc::new(Mutex::new(release_receiver));
-    session.test_translation_worker = Some(fake_translation_worker(move |request| {
-        started_sender
-            .send(request.clause_id)
-            .expect("started send");
-        release_receiver
-            .lock()
-            .expect("release mutex")
-            .recv()
-            .expect("release blocked translation");
-        Ok(TranslationWorkerOutput {
-            text: request.source_text,
-            timings: openasr_core::TranslationTimings::default(),
-        })
-    }));
-    session
-        .start_session(StartSession {
-            model: Some("whisper-large-v3-turbo".to_string()),
-            language: Some("zh".to_string()),
-            translation: Some(translation_options_enabled()),
-            ..StartSession::default()
-        })
-        .await
-        .expect("start with fake translation");
-    let _ = collect_events(&mut event_receiver).await;
-
-    session
-        .emit_envelope_with_translation(translation_transcript_envelope(transcript_final_text(
-            "我们需要保持流式路径很快。",
-            1,
-            500,
-        )))
-        .await
-        .expect("emit final while translation blocks");
-    started_receiver
-        .recv_timeout(Duration::from_secs(1))
-        .expect("translation started");
-
-    let started_at = Instant::now();
-    assert!(session.cancel("client_cancelled").await.is_err());
-    assert!(
-        started_at.elapsed() < Duration::from_millis(200),
-        "cancel waited for the blocked translation worker"
-    );
-    let events = collect_events(&mut event_receiver).await;
-    assert_eq!(
-        first_error_code(&events),
-        Some(RealtimeErrorCode::Cancelled)
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| event.event_type == "session.closed")
-    );
-
-    release_sender.send(()).expect("release translation");
 }
 
 #[tokio::test]

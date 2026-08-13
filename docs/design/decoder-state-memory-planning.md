@@ -146,7 +146,6 @@ topologies currently cover:
 | MiMo ASR | self KV | resampler/STFT/conv/RVQ grouping + fixed decode budget |
 | MOSS-TD | self KV | chunk/merge/marker topology + proportional decode budget |
 | Granite Speech | self KV | QFormer output + request prompt + fixed decode budget |
-| Hy-MT2 auxiliary | scratch self KV + reusable prefix KV | correlated total cap + independent prefix cap |
 
 `OpenAsrInvocationSpan` separately declares duration-only runtime limits.
 For example, Whisper is bounded at its exact 30-second frontend window and
@@ -322,38 +321,6 @@ accepted, automatic replay on another candidate is forbidden.
 
 Window reduction, model switching, and state quantization are separate product
 choices and are not hidden inside the planner or fallback resolver.
-
-## Text auxiliary decoders
-
-Realtime Hy-MT2 uses the same topology planner with a text invocation
-contract. The product clause segmenter and decoder capacity share one
-construction-time `max_emitted_clause_chars` value. Its default hard bound is
-40 Unicode scalars. Hy-MT2 uses byte-level BPE, whose successful output has at
-most one initial symbol per UTF-8 byte and whose merges only reduce token
-count, so source text has the proof-backed bound
-
-```text
-T_source <= 4 * max_clause_chars = 160
-```
-
-The fixed prompt content is also bounded by its UTF-8 bytes (rather than
-assuming separately tokenized prefix counts compose across a pre-tokenizer
-boundary), while role/generation markers are counted exactly. The tokenizer
-enforces `encoded_tokens <= UTF-8 bytes` at runtime and fails closed if a pack
-or future implementation violates the proof.
-
-One translation candidate declares two simultaneous stable state streams:
-
-```text
-R_decode_scratch = P_max + G_max - 1
-R_session_prefix = Prefix_max
-```
-
-Decode scratch owns host history plus the reusable resident graph. Each
-streaming translation session owns a separate host prefix arena. Clause
-switches, finalization, and failed prefix prefill clear written positions and
-metadata in place; they never free/reallocate the admitted arena. Candidate
-construction allocates and warms both streams before it may be published.
 
 ## Product envelope
 

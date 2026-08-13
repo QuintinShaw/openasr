@@ -277,7 +277,7 @@ mod tests {
 
     /// Real-weights parity: only runs when `OPENASR_FIRERED_PUNC_REAL_PACK`
     /// points at a converted FireRedPunc `.oasr` pack. Left env-gated (like the
-    /// hymt2 / qwen real-pack tests) so the default suite stays weight-free; the
+    /// qwen real-pack tests) so the default suite stays weight-free; the
     /// true upstream parity is exercised at publish time.
     #[test]
     #[ignore = "host-local: needs OPENASR_FIRERED_PUNC_REAL_PACK"]

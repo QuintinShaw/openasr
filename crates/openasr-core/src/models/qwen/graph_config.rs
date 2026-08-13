@@ -59,7 +59,7 @@ pub(crate) fn qwen_encoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpu
 /// deliberately requesting fewer threads than `Default` to cut thread-pool
 /// wake/join overhead on the dominant small-graph call instead of
 /// over-provisioning threads the per-token op mix cannot use. mimo-asr,
-/// firered2-llm, moss-transcribe-diarize, and hymt2 all construct their
+/// firered2-llm and moss-transcribe-diarize construct their
 /// whole-decoder executor through the shared prepared-plan compile seam, so
 /// they inherit this tier automatically without a family-local constructor.
 pub(crate) fn qwen_decoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {

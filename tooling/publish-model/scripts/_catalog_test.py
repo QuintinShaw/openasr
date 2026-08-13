@@ -653,7 +653,7 @@ class LanguageModeForModelTest(unittest.TestCase):
         )
 
     def test_translation_model_is_omitted(self) -> None:
-        entry = {"kind": "translation-model", "family": "hymt2"}
+        entry = {"kind": "translation-model", "family": "translator-test"}
         self.assertEqual(language_mode_for_model(entry, ["en", "zh"]), {})
 
 
@@ -679,7 +679,7 @@ class PunctuationForModelTest(unittest.TestCase):
                 )
 
     def test_translation_model_is_omitted(self) -> None:
-        entry = {"kind": "translation-model", "family": "hymt2"}
+        entry = {"kind": "translation-model", "family": "translator-test"}
         self.assertEqual(punctuation_for_model(entry), {})
 
     def test_capability_pack_is_omitted(self) -> None:

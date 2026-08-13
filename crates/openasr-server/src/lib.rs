@@ -12,7 +12,6 @@ pub(crate) use routes::models_api::*;
 pub(crate) use routes::pairing::*;
 pub(crate) use routes::pull_jobs::*;
 pub(crate) use routes::transcription::*;
-pub(crate) use routes::translation::*;
 pub(crate) use routes::voice_id::*;
 
 use std::{
@@ -2119,11 +2118,9 @@ pub(crate) fn realtime_capabilities_for_runtime(
 
 pub(crate) fn realtime_capabilities_for_runtime_and_distribution(
     runtime: &ServerRuntime,
-    distribution: &DistributionContext,
+    _distribution: &DistributionContext,
 ) -> RealtimeBackendCapabilities {
-    let mut capabilities = realtime_capabilities_for_runtime(runtime);
-    capabilities.translation = translation_capability_for_distribution(distribution);
-    capabilities
+    realtime_capabilities_for_runtime(runtime)
 }
 
 /// Deriving realtime capabilities reads GGUF metadata from disk; every session

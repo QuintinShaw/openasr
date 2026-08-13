@@ -9,6 +9,7 @@ use crate::ggml_runtime::{
     GgmlStaticTensor, GgmlStaticTensorArena, GgufOwnedWeightTensorPayload, GgufTensorDataReadError,
     GgufTensorDataReader, env_toggle_with_raw,
 };
+#[cfg(test)]
 use crate::models::device_greedy_token::{
     first_max_argmax_reverse_indices, first_max_token_id_from_reversed_argmax,
 };
@@ -114,6 +115,7 @@ pub(crate) enum Qwen3AsrLlmLogitsHeadError {
     RuntimeHeadMismatch,
     #[error("qwen3-asr llm logits head internal allocation overflowed")]
     AllocationOverflow,
+    #[cfg(test)]
     #[error(
         "qwen3-asr llm logits head top-1 token id {token_id} is outside vocab size {vocab_size}"
     )]
@@ -376,6 +378,7 @@ impl Qwen3AsrLlmLogitsHead {
         Ok(logits)
     }
 
+    #[cfg(test)]
     pub(crate) fn compute_top1_token_for_last_hidden(
         &self,
         hidden: &[f32],
@@ -472,6 +475,7 @@ impl Qwen3AsrLlmLogitsHeadRuntime {
         head.compute_logits_for_last_hidden(hidden)
     }
 
+    #[cfg(test)]
     pub(crate) fn compute_top1_token_for_last_hidden(
         &mut self,
         head: &Qwen3AsrLlmLogitsHead,
@@ -749,6 +753,7 @@ struct Qwen3AsrLlmLogitsHeadGraphExecutor {
     arena: GgmlStaticTensorArena,
     output_norm_weight: GgmlStaticTensor,
     output_weight: GgmlStaticTensor,
+    #[cfg(test)]
     argmax_reverse_indices: GgmlStaticTensor,
 }
 
@@ -804,6 +809,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
             output_weight.ggml_type,
             "qwen_llm_logits_output_weight",
         )?;
+        #[cfg(test)]
         let argmax_reverse_indices =
             arena.new_tensor_1d_i32(vocab_size, "qwen_llm_logits_argmax_reverse_indices")?;
         arena.set_f32_slice(
@@ -816,6 +822,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
             output_weight.payload.bytes(),
             "qwen_llm_logits_output_weight",
         )?;
+        #[cfg(test)]
         arena.set_i32_slice(
             argmax_reverse_indices,
             &first_max_argmax_reverse_indices(vocab_size)?,
@@ -829,6 +836,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
             arena,
             output_norm_weight: norm,
             output_weight: weight,
+            #[cfg(test)]
             argmax_reverse_indices,
         })
     }
@@ -872,6 +880,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
         graph.compute_output_f32(logits, output_len)
     }
 
+    #[cfg(test)]
     fn compute_top1(&mut self, hidden: &[f32]) -> Result<i32, GgmlCpuGraphError> {
         if hidden.len() != self.d_model {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
@@ -880,7 +889,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
         }
         // Deliberately per-call. A prepared standalone logits-head top-1 graph
         // can alias stale i32 output storage on GPU-class non-scheduler backends
-        // and has segfaulted under Hy-MT2 decode. The hot greedy path is fused
+        // and has segfaulted under scheduler-backed decode. The hot greedy path is fused
         // into the resident whole-decoder graph instead; keep this shared Qwen
         // helper as a simple fallback with no hidden persistent crash path.
         self.compute_top1_rows(hidden, 1)?.into_iter().next().ok_or(
@@ -891,6 +900,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
         )
     }
 
+    #[cfg(test)]
     fn compute_top1_rows(
         &mut self,
         hidden: &[f32],
@@ -931,6 +941,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
     }
 }
 
+#[cfg(test)]
 fn validate_top1_token_id(
     token_id: i32,
     vocab_size: usize,

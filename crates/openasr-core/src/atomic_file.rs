@@ -133,7 +133,34 @@ impl AtomicFileSystem for RealAtomicFileSystem {
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        fs::rename(from, to)
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+            };
+
+            let from_wide: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+            let to_wide: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+            // SAFETY: both buffers are live, NUL-terminated UTF-16 paths. The
+            // flags request the Windows equivalent of Unix rename-over-target
+            // and flush the rename before returning.
+            if unsafe {
+                MoveFileExW(
+                    from_wide.as_ptr(),
+                    to_wide.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            fs::rename(from, to)
+        }
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
