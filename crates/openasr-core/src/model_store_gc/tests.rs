@@ -17,6 +17,7 @@ fn models_dir_of(home: &Path) -> PathBuf {
     models_root(home).unwrap()
 }
 
+#[cfg_attr(not(unix), allow(clippy::permissions_set_readonly_false))]
 fn set_writable(path: &Path) {
     let mut permissions = fs::metadata(path).unwrap().permissions();
     #[cfg(unix)]

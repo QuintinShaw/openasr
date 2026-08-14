@@ -562,10 +562,10 @@ mod tests {
 
     use tempfile::NamedTempFile;
 
-    use super::{
-        GgufTensorIndexReadError, GgufTensorMetadata, read_gguf_tensor_index,
-        read_gguf_tensor_index_from_runtime_source,
-    };
+    #[cfg(unix)]
+    use super::read_gguf_tensor_index_from_runtime_source;
+    use super::{GgufTensorIndexReadError, GgufTensorMetadata, read_gguf_tensor_index};
+    #[cfg(unix)]
     use crate::validate_ggml_runtime_source_path;
 
     fn push_u32(bytes: &mut Vec<u8>, value: u32) {

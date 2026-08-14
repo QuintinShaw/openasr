@@ -225,7 +225,10 @@ impl XasrDeviceHead {
             Self::build_decoder_projection(&mut runner, &arena, &weights, metadata)?;
         let joint = Self::build_joint(&mut runner, &arena, &weights, metadata)?;
         let speculative_blank = if speculative_blank_batch {
-            if metadata.decode_chunk_len % XASR_OUTPUT_DOWNSAMPLING_FACTOR != 0 {
+            if !metadata
+                .decode_chunk_len
+                .is_multiple_of(XASR_OUTPUT_DOWNSAMPLING_FACTOR)
+            {
                 return Err(format!(
                     "xasr decode chunk length {} is not divisible by output downsampling factor {}",
                     metadata.decode_chunk_len, XASR_OUTPUT_DOWNSAMPLING_FACTOR
@@ -555,13 +558,13 @@ impl XasrGreedyDecodeBackend for XasrDeviceHead {
             .iter()
             .position(|&token| token < 0 || token as u32 != self.blank_id)
             .unwrap_or(tokens.len());
-        if let Some(&token) = tokens.get(first_non_blank) {
-            if token < 0 || token as usize >= self.vocab_size {
-                return Err(format!(
-                    "xasr speculative device head selected token {token} outside vocab {}",
-                    self.vocab_size
-                ));
-            }
+        if let Some(&token) = tokens.get(first_non_blank)
+            && (token < 0 || token as usize >= self.vocab_size)
+        {
+            return Err(format!(
+                "xasr speculative device head selected token {token} outside vocab {}",
+                self.vocab_size
+            ));
         }
         Ok(Some(first_non_blank))
     }

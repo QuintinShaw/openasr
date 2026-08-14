@@ -980,11 +980,8 @@ mod tests {
         }
 
         fn resolved_backend_name(self) -> String {
-            let name = crate::ggml_runtime::GgmlCpuGraphConfig::resolve_backend_name_for(
-                self.graph_backend(),
-            )
-            .expect("resolve benchmark backend name");
-            name
+            crate::ggml_runtime::GgmlCpuGraphConfig::resolve_backend_name_for(self.graph_backend())
+                .expect("resolve benchmark backend name")
         }
 
         fn load_session(

@@ -285,6 +285,7 @@ pub(crate) fn seal_object(path: &Path) -> Result<(), ContentStoreError> {
 
 /// Windows refuses to unlink a read-only file, so collection has to clear the
 /// bit first. On Unix this is a no-op: the seal never blocked unlink there.
+#[cfg_attr(not(unix), allow(clippy::permissions_set_readonly_false))]
 fn unseal_object_for_removal(path: &Path) {
     #[cfg(not(unix))]
     if let Ok(metadata) = fs::metadata(path) {
@@ -868,6 +869,7 @@ mod tests {
     /// Overwrite a sealed object the way a bug or a stray tool would have to:
     /// by defeating the seal first. Tests that simulate corruption must not
     /// silently depend on objects being writable.
+    #[cfg_attr(not(unix), allow(clippy::permissions_set_readonly_false))]
     fn force_overwrite_object(path: &Path, bytes: &[u8]) {
         let mut permissions = fs::metadata(path).unwrap().permissions();
         #[cfg(unix)]

@@ -108,7 +108,7 @@ mod tests {
         }
         let scheduled_gpu = GgmlCpuGraphConfig {
             use_scheduler: true,
-            ..direct_gpu.clone()
+            ..direct_gpu
         };
         let cuda = exactly_addressable_preference(ExecutionProvider::Cuda);
         assert!(!sensevoice_sanm_flash_attention_enabled(

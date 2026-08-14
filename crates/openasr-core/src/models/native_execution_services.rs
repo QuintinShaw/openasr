@@ -1147,10 +1147,8 @@ pub(crate) fn run_execution_candidate_attempt<T, E>(
         journal_scope.finish(committed);
         (result, candidate_failure, committed)
     };
-    if committed {
-        if let Some((parent, attempt)) = observation_transaction {
-            parent.append(attempt.observations());
-        }
+    if committed && let Some((parent, attempt)) = observation_transaction {
+        parent.append(attempt.observations());
     }
     ExecutionCandidateAttemptOutcome {
         result,
