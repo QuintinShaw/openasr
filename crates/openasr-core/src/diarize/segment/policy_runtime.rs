@@ -411,7 +411,14 @@ impl LocalActivitySegmenter for PolicyResolvedDiariZenSegmenterRuntime {
                     })?
                     .invoke_replay_safe(|actor| {
                         actor
-                            .call_mut_fallible({
+                            // DiariZen owns a persistent graph whose session is
+                            // poisoned on abort/compute failure and rebuilt by
+                            // `ensure_healthy_graph` on the next request. Keep
+                            // the owner alive so that recovery path remains
+                            // reachable. A typed candidate failure is still
+                            // observed by `invoke_replay_safe`, which drops the
+                            // entire runtime before changing lanes.
+                            .call_mut({
                                 let window = window.clone();
                                 move |runtime| runtime.infer(window.as_slice())
                             })
@@ -597,6 +604,43 @@ fn content_changed(label: &str, expected: &str, actual: &str) -> SegmentError {
 mod tests {
     use super::*;
 
+    fn diarizen_accelerated_provider() -> crate::device::execution_route::ExecutionProvider {
+        match std::env::var("OPENASR_DIARIZEN_BENCH_BACKEND")
+            .expect("OPENASR_DIARIZEN_BENCH_BACKEND must select cuda or vulkan")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "cuda" => crate::device::execution_route::ExecutionProvider::Cuda,
+            "vulkan" => crate::device::execution_route::ExecutionProvider::Vulkan,
+            backend => {
+                panic!("DiariZen accelerated stress accepts only cuda or vulkan, got {backend:?}")
+            }
+        }
+    }
+
+    fn diarizen_activity_sha256(activity: &LocalActivity) -> String {
+        crate::testing::benchmark_sha256_bytes(
+            activity
+                .windows
+                .iter()
+                .map(|window| window.frame_activity.as_slice())
+                .chain(std::iter::once(activity.speaker_count.as_slice())),
+        )
+    }
+
+    fn diarizen_stress_samples(sample_count: usize) -> crate::PcmBuffer {
+        crate::PcmBuffer::from_vec(
+            (0..sample_count)
+                .map(|index| {
+                    let time = index as f32 / diarizen::DIARIZEN_SAMPLE_RATE_HZ as f32;
+                    0.13 * (time * 173.0 * std::f32::consts::TAU).sin()
+                        + 0.05 * (time * 421.0 * std::f32::consts::TAU + 0.23).cos()
+                })
+                .collect(),
+        )
+    }
+
     #[test]
     fn diarizen_graph_cancellation_remains_typed_across_policy_boundary() {
         for source in [
@@ -609,6 +653,150 @@ mod tests {
             });
             assert!(matches!(mapped, SegmentError::Canceled));
         }
+    }
+
+    #[test]
+    #[ignore = "host-local stress: needs OPENASR_DIARIZEN_PACK, OPENASR_DIARIZEN_BENCH_BACKEND, and the requested CUDA/Vulkan device"]
+    fn diarizen_accelerated_concurrency_cancel_and_recover_when_pack_present() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier, mpsc};
+        use std::time::{Duration, Instant};
+
+        let requested_provider = diarizen_accelerated_provider();
+        let intent = ExecutionIntent::ConstrainedAcceleratedOnly(
+            crate::device::execution_policy::AcceleratedDeviceConstraint::Provider(
+                requested_provider,
+            ),
+        );
+        let services = Arc::new(
+            NativeExecutionServices::for_local_process().expect("native execution services"),
+        );
+        let prepared =
+            super::super::pack::prepare_segmenter(crate::config::VoiceIdSegmenterPreference::Auto)
+                .expect("prepare installed DiariZen pack");
+        assert_eq!(prepared.provider, SegmenterProvider::DiariZen);
+        let observations =
+            crate::models::native_execution_services::ExecutionObservationSink::new();
+        let runtime = {
+            let _observation_guard =
+                crate::models::native_execution_services::install_execution_observation_sink(
+                    observations.clone(),
+                );
+            Arc::new(
+                PolicyResolvedSegmenterRuntime::load_prepared(services, intent, prepared)
+                    .expect("load accelerated DiariZen runtime"),
+            )
+        };
+        let observations = observations.observations();
+        assert!(!observations.is_empty(), "DiariZen constructed no backend");
+        let requested_route = &observations[0].requested_route;
+        assert_eq!(requested_route.provider, requested_provider);
+        assert!(
+            observations.iter().all(|observation| {
+                observation.requested_route == *requested_route
+                    && observation.actual_provider == requested_provider
+                    && observation.actual_stable_id == requested_route.stable_id
+                    && observation.placement
+                        == crate::device::execution_policy::ExecutionPlacement::FullDevice
+                    && observation.backend_kind.is_gpu_class()
+                    && !observation.use_scheduler
+            }),
+            "DiariZen did not remain on one direct FullDevice route: {observations:?}"
+        );
+
+        let short_samples = Arc::new(diarizen_stress_samples(diarizen::DIARIZEN_WINDOW_SAMPLES));
+        let baseline = runtime
+            .adapter()
+            .segment_local_activity(short_samples.full_slice(), 16_000, &|| false, None)
+            .expect("baseline DiariZen activity");
+        let baseline_sha256 = diarizen_activity_sha256(&baseline);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let runtime = Arc::clone(&runtime);
+                let samples = Arc::clone(&short_samples);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    runtime
+                        .adapter()
+                        .segment_local_activity(samples.full_slice(), 16_000, &|| false, None)
+                        .map(|activity| diarizen_activity_sha256(&activity))
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for worker in workers {
+            let concurrent_sha256 = worker
+                .join()
+                .expect("concurrent DiariZen worker panicked")
+                .expect("concurrent DiariZen activity");
+            assert_eq!(concurrent_sha256, baseline_sha256);
+        }
+
+        let long_sample_count =
+            diarizen::DIARIZEN_WINDOW_SAMPLES + 63 * diarizen::DIARIZEN_WINDOW_STEP_SAMPLES;
+        let long_samples = Arc::new(diarizen_stress_samples(long_sample_count));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let telemetry = crate::GgmlExecutionTelemetryCollector::new();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let cancel_worker = {
+            let runtime = Arc::clone(&runtime);
+            let samples = Arc::clone(&long_samples);
+            let cancel = Arc::clone(&cancel);
+            let telemetry = telemetry.clone();
+            std::thread::spawn(move || {
+                let _telemetry_guard = telemetry.install();
+                let previous =
+                    crate::ggml_runtime::arm_thread_job_cancel_flag(Some(Arc::clone(&cancel)));
+                ready_tx.send(()).expect("cancel worker readiness");
+                let result = runtime.adapter().segment_local_activity(
+                    samples.full_slice(),
+                    16_000,
+                    &|| cancel.load(Ordering::Acquire),
+                    None,
+                );
+                assert!(
+                    crate::ggml_runtime::disarm_thread_job_cancel_flag_if_current(
+                        &cancel, previous
+                    )
+                );
+                result
+            })
+        };
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancel worker did not become ready");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while telemetry.snapshot().direct_graph_computes == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let observed_direct_graph_entries = telemetry.snapshot().direct_graph_computes;
+        cancel.store(true, Ordering::Release);
+        let canceled = cancel_worker
+            .join()
+            .expect("cancel DiariZen worker panicked");
+        assert!(
+            observed_direct_graph_entries > 0,
+            "DiariZen cancel gate did not enter direct GPU graph compute"
+        );
+        assert!(
+            matches!(canceled, Err(SegmentError::Canceled)),
+            "DiariZen cancellation must remain typed, got {canceled:?}"
+        );
+
+        let recovered = runtime
+            .adapter()
+            .segment_local_activity(short_samples.full_slice(), 16_000, &|| false, None)
+            .expect("DiariZen must recover after cancellation");
+        let recovered_sha256 = diarizen_activity_sha256(&recovered);
+        assert_eq!(recovered_sha256, baseline_sha256);
+        eprintln!(
+            "DIARIZEN_ACCELERATED_STRESS provider={} stable_id={} placement=FullDevice scheduler=false concurrent_requests=2 cancel_after_direct_graph_entries={observed_direct_graph_entries} recovery_sha256={recovered_sha256}",
+            requested_provider.as_str(),
+            observations[0].actual_stable_id,
+        );
     }
 
     #[test]
