@@ -27,7 +27,9 @@ use crate::nn::half::f32_to_f16_bits;
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 
 use super::encoder_weights::{NamedTensor, SenseVoiceEncoderWeights, SenseVoiceLayerWeights};
-use super::graph_config::sensevoice_encoder_graph_config;
+use super::graph_config::{
+    sensevoice_encoder_graph_config, sensevoice_sanm_flash_attention_for_current_request,
+};
 use super::runtime_contract::SenseVoiceExecutionMetadata;
 
 const SANM_ARENA_TENSORS_PER_LAYER: usize = 9;
@@ -70,6 +72,27 @@ pub(crate) struct SenseVoiceEncoderOutput {
     pub frame_count: usize,
     pub vocab_size: usize,
     pub logits: Vec<f32>,
+}
+
+/// Compact per-frame output used only by ordinary un-biased CTC decode on an
+/// explicitly pinned direct CUDA/Vulkan route. It preserves first-max argmax
+/// semantics while avoiding a `[vocab, frames]` host readback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SenseVoiceFrameTokenOutput {
+    pub frame_count: usize,
+    pub vocab_size: usize,
+    pub token_ids: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SenseVoiceEncoderReadbackMode {
+    FullLogits,
+    FrameTokenIds,
+}
+
+enum SenseVoiceEncoderReadback {
+    FullLogits(SenseVoiceEncoderOutput),
+    FrameTokenIds(SenseVoiceFrameTokenOutput),
 }
 
 // `WeightSlot` (imported above from `ggml_runtime`): arena tensor or
@@ -184,6 +207,7 @@ pub(crate) fn quoted_graph_retained_bytes(
 
 pub(crate) struct SenseVoiceEncoderGraph {
     metadata: SenseVoiceExecutionMetadata,
+    use_flash_attention: bool,
     runner: GgmlCpuGraphRunner,
     // `loaded_weights` owns the mmap-backed buffer the `Loaded` slots alias
     // (drop-order note mirrors parakeet/cohere/qwen).
@@ -221,6 +245,7 @@ impl SenseVoiceEncoderGraph {
     ) -> Result<Self, SenseVoiceEncoderError> {
         let total_layers = weights.enc_layers.len() + weights.tp_layers.len();
         let mut config = sensevoice_encoder_graph_config(backend);
+        let use_flash_attention = sensevoice_sanm_flash_attention_for_current_request(&config);
         let graph_capacity = sanm_fsmn_graph_node_capacity(
             total_layers,
             SENSEVOICE_FIXED_GRAPH_NODES,
@@ -348,6 +373,7 @@ impl SenseVoiceEncoderGraph {
 
         Ok(Self {
             metadata,
+            use_flash_attention,
             runner,
             loaded_weights,
             arena,
@@ -402,6 +428,7 @@ impl SenseVoiceEncoderGraph {
             self.tp_norm_bias,
             self.ctc_head_weight,
             self.ctc_head_bias,
+            self.use_flash_attention,
         )?;
         graph.set_output(logits).map_err(bf("set_output_logits"))?;
 
@@ -437,6 +464,39 @@ impl SenseVoiceEncoderGraph {
         lfr_features: &[f32],
         prompt_indices: &[usize],
     ) -> Result<SenseVoiceEncoderOutput, SenseVoiceEncoderError> {
+        match self.encode_lfr_with_prompt_readback(
+            lfr_features,
+            prompt_indices,
+            SenseVoiceEncoderReadbackMode::FullLogits,
+        )? {
+            SenseVoiceEncoderReadback::FullLogits(output) => Ok(output),
+            SenseVoiceEncoderReadback::FrameTokenIds(_) => unreachable!("requested full logits"),
+        }
+    }
+
+    pub(crate) fn encode_lfr_with_prompt_frame_token_ids(
+        &mut self,
+        lfr_features: &[f32],
+        prompt_indices: &[usize],
+    ) -> Result<SenseVoiceFrameTokenOutput, SenseVoiceEncoderError> {
+        match self.encode_lfr_with_prompt_readback(
+            lfr_features,
+            prompt_indices,
+            SenseVoiceEncoderReadbackMode::FrameTokenIds,
+        )? {
+            SenseVoiceEncoderReadback::FrameTokenIds(output) => Ok(output),
+            SenseVoiceEncoderReadback::FullLogits(_) => {
+                unreachable!("requested compact frame token ids")
+            }
+        }
+    }
+
+    fn encode_lfr_with_prompt_readback(
+        &mut self,
+        lfr_features: &[f32],
+        prompt_indices: &[usize],
+        readback_mode: SenseVoiceEncoderReadbackMode,
+    ) -> Result<SenseVoiceEncoderReadback, SenseVoiceEncoderError> {
         let metadata = self.metadata;
         if lfr_features.is_empty() || !lfr_features.len().is_multiple_of(metadata.feature_dim) {
             return Err(SenseVoiceEncoderError::Shape {
@@ -524,10 +584,33 @@ impl SenseVoiceEncoderGraph {
             self.tp_norm_bias,
             self.ctc_head_weight,
             self.ctc_head_bias,
+            self.use_flash_attention,
         )?;
-        graph.set_output(logits).map_err(bf("set_output_logits"))?;
+        let mut top1 = None;
+        let mut finite_checksum = None;
+        let output_root = match readback_mode {
+            SenseVoiceEncoderReadbackMode::FullLogits => logits,
+            SenseVoiceEncoderReadbackMode::FrameTokenIds => {
+                let token_ids = graph
+                    .top1_argmax_first_max(logits)
+                    .map_err(bf("frame_first_max_argmax"))?;
+                let checksum = graph
+                    .sum(graph.abs(logits).map_err(bf("frame_logits_abs"))?)
+                    .map_err(bf("frame_logits_finite_checksum"))?;
+                top1 = Some(token_ids);
+                finite_checksum = Some(checksum);
+                token_ids
+            }
+        };
         graph
-            .prepare_outputs_for_upload(&[logits])
+            .set_output(output_root)
+            .map_err(bf("set_encoder_output"))?;
+        let mut prepared_outputs = vec![output_root];
+        if let Some(checksum) = finite_checksum {
+            prepared_outputs.push(checksum);
+        }
+        graph
+            .prepare_outputs_for_upload(&prepared_outputs)
             .map_err(bf("prepare_outputs"))?;
         graph
             .set_f32_slice(lfr, lfr_features, "sensevoice_lfr")
@@ -538,21 +621,63 @@ impl SenseVoiceEncoderGraph {
         graph
             .set_f32_slice(position, &positions, "sensevoice_positions")
             .map_err(bf("upload_positions"))?;
-        let want = metadata.vocab_size.checked_mul(frames).ok_or_else(|| {
-            SenseVoiceEncoderError::Shape {
-                reason: "SenseVoice logits size overflowed".to_string(),
+        match readback_mode {
+            SenseVoiceEncoderReadbackMode::FullLogits => {
+                let want = metadata.vocab_size.checked_mul(frames).ok_or_else(|| {
+                    SenseVoiceEncoderError::Shape {
+                        reason: "SenseVoice logits size overflowed".to_string(),
+                    }
+                })?;
+                let logits = graph.compute_output_f32(logits, want).map_err(|error| {
+                    SenseVoiceEncoderError::GraphExecutionFailed {
+                        reason: error.to_string(),
+                    }
+                })?;
+                Ok(SenseVoiceEncoderReadback::FullLogits(
+                    SenseVoiceEncoderOutput {
+                        frame_count: frames,
+                        vocab_size: metadata.vocab_size,
+                        logits,
+                    },
+                ))
             }
-        })?;
-        let logits = graph.compute_output_f32(logits, want).map_err(|error| {
-            SenseVoiceEncoderError::GraphExecutionFailed {
-                reason: error.to_string(),
+            SenseVoiceEncoderReadbackMode::FrameTokenIds => {
+                let top1 = top1.expect("compact readback top1");
+                let checksum = finite_checksum.expect("compact readback checksum");
+                let (checksums, frame_ids) = graph
+                    .compute_outputs_f32_i32(&[(checksum, 1)], &[(top1, frames)])
+                    .map_err(|error| SenseVoiceEncoderError::GraphExecutionFailed {
+                        reason: error.to_string(),
+                    })?;
+                let checksum = checksums[0][0];
+                if !checksum.is_finite() {
+                    return Err(SenseVoiceEncoderError::GraphExecutionFailed {
+                        reason: "SenseVoice compact CTC output detected non-finite logits"
+                            .to_string(),
+                    });
+                }
+                let token_ids = frame_ids
+                    .into_iter()
+                    .next()
+                    .expect("compact readback token row")
+                    .into_iter()
+                    .map(|token| {
+                        u32::try_from(token)
+                            .map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+                                reason: "SenseVoice compact CTC token id is negative",
+                            })
+                            .map_err(bf("map_frame_token_id"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(SenseVoiceEncoderReadback::FrameTokenIds(
+                    SenseVoiceFrameTokenOutput {
+                        frame_count: frames,
+                        vocab_size: metadata.vocab_size,
+                        token_ids,
+                    },
+                ))
             }
-        })?;
-        Ok(SenseVoiceEncoderOutput {
-            frame_count: frames,
-            vocab_size: metadata.vocab_size,
-            logits,
-        })
+        }
     }
 }
 
@@ -571,6 +696,7 @@ fn compose_sensevoice_encoder_logits<'a>(
     tp_norm_bias: GgmlStaticTensor,
     ctc_head_weight: WeightSlot,
     ctc_head_bias: GgmlStaticTensor,
+    use_flash_attention: bool,
 ) -> Result<GgmlCpuTensor<'a>, SenseVoiceEncoderError> {
     let map = |step, source| SenseVoiceEncoderError::GraphBuildFailed { step, source };
     for handles in enc_layers {
@@ -585,6 +711,7 @@ fn compose_sensevoice_encoder_logits<'a>(
                 frame_count: frames,
                 fsmn_kernel: metadata.fsmn_kernel,
                 layer_norm_epsilon: ENCODER_LAYER_NORM_EPSILON,
+                use_flash_attention,
             },
             sanm_weights(arena, handles),
             map,
@@ -615,6 +742,7 @@ fn compose_sensevoice_encoder_logits<'a>(
                 frame_count: frames,
                 fsmn_kernel: metadata.fsmn_kernel,
                 layer_norm_epsilon: ENCODER_LAYER_NORM_EPSILON,
+                use_flash_attention,
             },
             sanm_weights(arena, handles),
             map,
@@ -872,5 +1000,23 @@ mod tests {
             out.frame_count
         );
         assert_eq!(mismatches, 0, "greedy argmax must match the reference");
+
+        let compact = graph
+            .encode_lfr_with_prompt_frame_token_ids(&lfr, &[3, 1, 2, 15])
+            .expect("compact CTC readback");
+        let full_argmax = out
+            .logits
+            .chunks_exact(vocab)
+            .map(|row| {
+                let mut best = 0usize;
+                for (index, &value) in row.iter().enumerate().skip(1) {
+                    if value > row[best] {
+                        best = index;
+                    }
+                }
+                best as u32
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(compact.token_ids, full_argmax);
     }
 }

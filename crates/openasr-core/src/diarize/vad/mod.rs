@@ -54,8 +54,8 @@ pub(crate) fn stream_vad_execution_capabilities()
     firered_stream::execution_capabilities()
 }
 
-pub(crate) const STREAM_VAD_AUTO_GPU_POLICY: crate::ggml_runtime::AutoGpuPolicy =
-    firered_stream::AUTO_GPU_POLICY;
+pub(crate) const STREAM_VAD_OFFLINE_AUTO_GPU_POLICY: crate::ggml_runtime::AutoGpuPolicy =
+    firered_stream::OFFLINE_AUTO_GPU_POLICY;
 
 /// Single source of truth for VAD-mode selection strings. `Some(true)` selects
 /// the neural detector (Stream-VAD), `Some(false)` the energy gate, `None` is

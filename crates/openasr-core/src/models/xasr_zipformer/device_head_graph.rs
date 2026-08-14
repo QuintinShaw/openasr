@@ -13,14 +13,11 @@ use super::graph_config::{DEVICE_HEAD_GRAPH_SIZE, xasr_zipformer_device_head_gra
 use super::greedy::XasrGreedyDecodeBackend;
 use super::package_import::compact_xasr_name;
 use super::runtime_contract::{
-    XASR_DECODER_CONV_GROUPS, XasrRuntimeTensorContract, XasrZipformerExecutionMetadata,
+    XASR_DECODER_CONV_GROUPS, XASR_OUTPUT_DOWNSAMPLING_FACTOR, XasrRuntimeTensorContract,
+    XasrZipformerExecutionMetadata,
 };
 
-const ENCODER_PROJECTION_GRAPH_SIZE: usize = 32;
-const DECODER_PROJECTION_GRAPH_SIZE: usize = DEVICE_HEAD_GRAPH_SIZE;
-const JOINT_GRAPH_SIZE: usize = 32;
-const STATIC_TENSOR_COUNT: usize = 10;
-
+const STATIC_TENSOR_COUNT: usize = 9;
 struct ProjectionGraph {
     session: GgmlPersistentGraphSession,
     input: GgmlCpuTensor<'static>,
@@ -28,8 +25,16 @@ struct ProjectionGraph {
 
 struct JointGraph {
     session: GgmlPersistentGraphSession,
+    encoder_frame: GgmlCpuTensor<'static>,
     selected_probability: GgmlCpuTensor<'static>,
     top1: GgmlCpuTensor<'static>,
+}
+
+struct SpeculativeBlankGraph {
+    session: GgmlPersistentGraphSession,
+    encoder_frames: GgmlCpuTensor<'static>,
+    top1: GgmlCpuTensor<'static>,
+    frames: usize,
 }
 
 struct HeadWeights {
@@ -41,16 +46,15 @@ struct HeadWeights {
     decoder_proj_bias: GgmlStaticTensor,
     output_weight: GgmlStaticTensor,
     output_bias: GgmlStaticTensor,
-    encoder_projection: GgmlStaticTensor,
     decoder_projection: GgmlStaticTensor,
 }
 
 /// Field order is intentional: the persistent sessions contain raw references
 /// into both the runner and arena, so all graphs must drop first.
 pub(crate) struct XasrDeviceHead {
-    encoder_projection: ProjectionGraph,
     decoder_projection: ProjectionGraph,
     joint: JointGraph,
+    speculative_blank: Option<SpeculativeBlankGraph>,
     runner: GgmlCpuGraphRunner,
     arena: GgmlStaticTensorArena,
     context_size: usize,
@@ -116,6 +120,7 @@ impl XasrDeviceHead {
         reader: &GgufTensorDataReader,
         metadata: &XasrZipformerExecutionMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        speculative_blank_batch: bool,
     ) -> Result<Self, String> {
         let contract = XasrRuntimeTensorContract::for_metadata(metadata);
         let decoder_embedding = checked_payload(reader, &contract, "decoder.embedding.weight")?;
@@ -163,9 +168,6 @@ impl XasrDeviceHead {
             output_bias: arena
                 .new_tensor_from_weight_payload(&output_bias)
                 .map_err(|error| error.to_string())?,
-            encoder_projection: arena
-                .new_tensor_1d_f32(metadata.joiner_dim, "xasr_head_encoder_projection")
-                .map_err(|error| error.to_string())?,
             decoder_projection: arena
                 .new_tensor_1d_f32(metadata.joiner_dim, "xasr_head_decoder_projection")
                 .map_err(|error| error.to_string())?,
@@ -211,32 +213,43 @@ impl XasrDeviceHead {
         ] {
             upload_weight(&mut arena, tensor, payload, name)?;
         }
-        let zeros = vec![0.0_f32; metadata.joiner_dim];
-        arena
-            .set_f32_slice(
-                weights.encoder_projection,
-                &zeros,
-                "xasr_head_encoder_projection",
-            )
-            .map_err(|error| error.to_string())?;
         arena
             .set_f32_slice(
                 weights.decoder_projection,
-                &zeros,
+                &vec![0.0_f32; metadata.joiner_dim],
                 "xasr_head_decoder_projection",
             )
             .map_err(|error| error.to_string())?;
 
-        let encoder_projection =
-            Self::build_encoder_projection(&mut runner, &arena, &weights, metadata)?;
         let decoder_projection =
             Self::build_decoder_projection(&mut runner, &arena, &weights, metadata)?;
-        let joint = Self::build_joint(&mut runner, &arena, &weights)?;
+        let joint = Self::build_joint(&mut runner, &arena, &weights, metadata)?;
+        let speculative_blank = if speculative_blank_batch {
+            if metadata.decode_chunk_len % XASR_OUTPUT_DOWNSAMPLING_FACTOR != 0 {
+                return Err(format!(
+                    "xasr decode chunk length {} is not divisible by output downsampling factor {}",
+                    metadata.decode_chunk_len, XASR_OUTPUT_DOWNSAMPLING_FACTOR
+                ));
+            }
+            let frames = metadata.decode_chunk_len / XASR_OUTPUT_DOWNSAMPLING_FACTOR;
+            if frames == 0 {
+                return Err("xasr speculative blank batch requires at least one frame".to_string());
+            }
+            Some(Self::build_speculative_blank(
+                &mut runner,
+                &arena,
+                &weights,
+                metadata,
+                frames,
+            )?)
+        } else {
+            None
+        };
 
         Ok(Self {
-            encoder_projection,
             decoder_projection,
             joint,
+            speculative_blank,
             runner,
             arena,
             context_size: metadata.decoder_context_size,
@@ -249,34 +262,6 @@ impl XasrDeviceHead {
         })
     }
 
-    fn build_encoder_projection(
-        runner: &mut GgmlCpuGraphRunner,
-        arena: &GgmlStaticTensorArena,
-        weights: &HeadWeights,
-        metadata: &XasrZipformerExecutionMetadata,
-    ) -> Result<ProjectionGraph, String> {
-        let mut session = runner
-            .start_persistent_graph_session_with_node_capacity(ENCODER_PROJECTION_GRAPH_SIZE)
-            .map_err(|error| error.to_string())?;
-        let graph = session.builder();
-        let input = graph
-            .new_tensor_1d_f32(metadata.encoder_output_dim(), "xasr_head_encoder_frame")
-            .map_err(|error| error.to_string())?;
-        graph.set_input(input).map_err(|error| error.to_string())?;
-        let projected = graph
-            .mul_mat(weights.encoder_proj_weight.as_graph_tensor(), input)
-            .and_then(|value| graph.add(value, weights.encoder_proj_bias.as_graph_tensor()))
-            .map_err(|error| error.to_string())?;
-        let write = graph
-            .cpy(projected, arena.graph_tensor(weights.encoder_projection))
-            .map_err(|error| error.to_string())?;
-        graph
-            .add_side_effect_root(write)
-            .and_then(|()| graph.prepare_side_effects_for_upload())
-            .map_err(|error| error.to_string())?;
-        Ok(ProjectionGraph { session, input })
-    }
-
     fn build_decoder_projection(
         runner: &mut GgmlCpuGraphRunner,
         arena: &GgmlStaticTensorArena,
@@ -284,17 +269,17 @@ impl XasrDeviceHead {
         metadata: &XasrZipformerExecutionMetadata,
     ) -> Result<ProjectionGraph, String> {
         let mut session = runner
-            .start_persistent_graph_session_with_node_capacity(DECODER_PROJECTION_GRAPH_SIZE)
+            .start_persistent_graph_session_with_node_capacity(DEVICE_HEAD_GRAPH_SIZE)
             .map_err(|error| error.to_string())?;
         let graph = session.builder();
-        let token_ids = graph
+        let decoder_context = graph
             .new_tensor_1d_i32(metadata.decoder_context_size, "xasr_head_context")
             .map_err(|error| error.to_string())?;
         graph
-            .set_input(token_ids)
+            .set_input(decoder_context)
             .map_err(|error| error.to_string())?;
         let embedded = graph
-            .get_rows(weights.decoder_embedding.as_graph_tensor(), token_ids)
+            .get_rows(weights.decoder_embedding.as_graph_tensor(), decoder_context)
             .and_then(|value| graph.transpose(value))
             .and_then(|value| graph.cont(value))
             .map_err(|error| error.to_string())?;
@@ -317,12 +302,15 @@ impl XasrDeviceHead {
             .and_then(|value| graph.reshape_1d(value, metadata.decoder_dim()))
             .and_then(|value| graph.relu(value))
             .map_err(|error| error.to_string())?;
-        let projected = graph
+        let decoder_projection = graph
             .mul_mat(weights.decoder_proj_weight.as_graph_tensor(), conv)
             .and_then(|value| graph.add(value, weights.decoder_proj_bias.as_graph_tensor()))
             .map_err(|error| error.to_string())?;
         let write = graph
-            .cpy(projected, arena.graph_tensor(weights.decoder_projection))
+            .cpy(
+                decoder_projection,
+                arena.graph_tensor(weights.decoder_projection),
+            )
             .map_err(|error| error.to_string())?;
         graph
             .add_side_effect_root(write)
@@ -330,7 +318,7 @@ impl XasrDeviceHead {
             .map_err(|error| error.to_string())?;
         Ok(ProjectionGraph {
             session,
-            input: token_ids,
+            input: decoder_context,
         })
     }
 
@@ -338,14 +326,25 @@ impl XasrDeviceHead {
         runner: &mut GgmlCpuGraphRunner,
         arena: &GgmlStaticTensorArena,
         weights: &HeadWeights,
+        metadata: &XasrZipformerExecutionMetadata,
     ) -> Result<JointGraph, String> {
         let mut session = runner
-            .start_persistent_graph_session_with_node_capacity(JOINT_GRAPH_SIZE)
+            .start_persistent_graph_session_with_node_capacity(DEVICE_HEAD_GRAPH_SIZE)
             .map_err(|error| error.to_string())?;
         let graph = session.builder();
+        let encoder_frame = graph
+            .new_tensor_1d_f32(metadata.encoder_output_dim(), "xasr_head_encoder_frame")
+            .map_err(|error| error.to_string())?;
+        graph
+            .set_input(encoder_frame)
+            .map_err(|error| error.to_string())?;
+        let encoder_projection = graph
+            .mul_mat(weights.encoder_proj_weight.as_graph_tensor(), encoder_frame)
+            .and_then(|value| graph.add(value, weights.encoder_proj_bias.as_graph_tensor()))
+            .map_err(|error| error.to_string())?;
         let joined = graph
             .add(
-                arena.graph_tensor(weights.encoder_projection),
+                encoder_projection,
                 arena.graph_tensor(weights.decoder_projection),
             )
             .and_then(|value| graph.tanh(value))
@@ -372,8 +371,63 @@ impl XasrDeviceHead {
             .map_err(|error| error.to_string())?;
         Ok(JointGraph {
             session,
+            encoder_frame,
             selected_probability,
             top1,
+        })
+    }
+
+    fn build_speculative_blank(
+        runner: &mut GgmlCpuGraphRunner,
+        arena: &GgmlStaticTensorArena,
+        weights: &HeadWeights,
+        metadata: &XasrZipformerExecutionMetadata,
+        frames: usize,
+    ) -> Result<SpeculativeBlankGraph, String> {
+        let mut session = runner
+            .start_persistent_graph_session_with_node_capacity(DEVICE_HEAD_GRAPH_SIZE)
+            .map_err(|error| error.to_string())?;
+        let graph = session.builder();
+        let encoder_frames = graph
+            .new_tensor_2d_f32(
+                metadata.encoder_output_dim(),
+                frames,
+                "xasr_head_speculative_encoder_frames",
+            )
+            .map_err(|error| error.to_string())?;
+        graph
+            .set_input(encoder_frames)
+            .map_err(|error| error.to_string())?;
+        let encoder_projection = graph
+            .mul_mat(
+                weights.encoder_proj_weight.as_graph_tensor(),
+                encoder_frames,
+            )
+            .and_then(|value| graph.add(value, weights.encoder_proj_bias.as_graph_tensor()))
+            .map_err(|error| error.to_string())?;
+        let joined = graph
+            .add(
+                encoder_projection,
+                arena.graph_tensor(weights.decoder_projection),
+            )
+            .and_then(|value| graph.tanh(value))
+            .map_err(|error| error.to_string())?;
+        let logits = graph
+            .mul_mat(weights.output_weight.as_graph_tensor(), joined)
+            .and_then(|value| graph.add(value, weights.output_bias.as_graph_tensor()))
+            .map_err(|error| error.to_string())?;
+        let top1 = graph
+            .top1_argmax(logits)
+            .map_err(|error| error.to_string())?;
+        graph.set_output(top1).map_err(|error| error.to_string())?;
+        graph
+            .prepare_outputs_for_upload(&[top1])
+            .map_err(|error| error.to_string())?;
+        Ok(SpeculativeBlankGraph {
+            session,
+            encoder_frames,
+            top1,
+            frames,
         })
     }
 }
@@ -387,14 +441,9 @@ impl XasrGreedyDecodeBackend for XasrDeviceHead {
                 self.encoder_dim
             ));
         }
-        let graph = self.encoder_projection.session.builder();
+        let graph = self.joint.session.builder();
         graph
-            .set_f32_slice(
-                self.encoder_projection.input,
-                frame,
-                "xasr_head_encoder_frame",
-            )
-            .and_then(|()| graph.compute_side_effects())
+            .set_f32_slice(self.joint.encoder_frame, frame, "xasr_head_encoder_frame")
             .map_err(|error| error.to_string())
     }
 
@@ -463,6 +512,59 @@ impl XasrGreedyDecodeBackend for XasrDeviceHead {
         }
         Ok(self.last_probability)
     }
+
+    fn speculative_blank_prefix_len(
+        &mut self,
+        context: Option<&[u32]>,
+        encoder_frames: &[f32],
+        frame_count: usize,
+        encoder_dim: usize,
+    ) -> Result<Option<usize>, String> {
+        let Some(speculative_frames) = self
+            .speculative_blank
+            .as_ref()
+            .map(|speculative| speculative.frames)
+        else {
+            return Ok(None);
+        };
+        if frame_count < speculative_frames || encoder_dim != self.encoder_dim {
+            return Ok(None);
+        }
+        if let Some(context) = context {
+            self.project_decoder_context(context)?;
+        }
+        let Some(speculative) = self.speculative_blank.as_mut() else {
+            return Err("xasr speculative graph disappeared during context projection".to_string());
+        };
+        let value_count = speculative
+            .frames
+            .checked_mul(encoder_dim)
+            .ok_or_else(|| "xasr speculative frame shape overflowed".to_string())?;
+        let graph = speculative.session.builder();
+        graph
+            .set_f32_slice(
+                speculative.encoder_frames,
+                &encoder_frames[..value_count],
+                "xasr_head_speculative_encoder_frames",
+            )
+            .map_err(|error| error.to_string())?;
+        let tokens = graph
+            .compute_output_i32(speculative.top1, speculative.frames)
+            .map_err(|error| error.to_string())?;
+        let first_non_blank = tokens
+            .iter()
+            .position(|&token| token < 0 || token as u32 != self.blank_id)
+            .unwrap_or(tokens.len());
+        if let Some(&token) = tokens.get(first_non_blank) {
+            if token < 0 || token as usize >= self.vocab_size {
+                return Err(format!(
+                    "xasr speculative device head selected token {token} outside vocab {}",
+                    self.vocab_size
+                ));
+            }
+        }
+        Ok(Some(first_non_blank))
+    }
 }
 
 impl XasrDeviceHead {
@@ -476,5 +578,19 @@ impl XasrDeviceHead {
         // the shared ggml layer and carry their own leases.
         let _keep_alive = (&self.runner, &self.arena, self.decoder_dim);
         0
+    }
+
+    #[cfg(test)]
+    pub(super) fn persistent_graph_node_counts_for_test(&self) -> Vec<Option<usize>> {
+        let mut counts = vec![
+            self.decoder_projection
+                .session
+                .prepared_native_node_count_for_test(),
+            self.joint.session.prepared_native_node_count_for_test(),
+        ];
+        if let Some(speculative) = &self.speculative_blank {
+            counts.push(speculative.session.prepared_native_node_count_for_test());
+        }
+        counts
     }
 }

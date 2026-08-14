@@ -18,7 +18,9 @@ use super::ggml_decoder_graph::{
     run_whisper_decoder_reused_incremental_step_ggml_v0,
 };
 use super::ggml_executor::{WhisperDecoderWeightSeam, WhisperExecutionOutput};
-use super::graph_config::whisper_decoder_graph_config;
+use super::graph_config::whisper_runtime_graph_config;
+#[cfg(test)]
+use super::graph_config::{WhisperDecoderPlacementPolicy, whisper_decoder_graph_config};
 use super::runtime_contract::WhisperGgmlExecutionMetadata;
 use super::tokenizer::WhisperTokenizer;
 use crate::PhraseBiasConfig;
@@ -141,6 +143,7 @@ pub(crate) struct WhisperServeBatchEngineKey {
     resident_self_positions: usize,
     resident_cross_positions: usize,
     hidden_size: usize,
+    uses_scheduler: bool,
     max_batch: usize,
 }
 
@@ -275,7 +278,12 @@ fn validate_whisper_serve_decoder_state(
 impl WhisperServeDecoderRuntime {
     fn new(job: &WhisperServeBatchJob, n_seq: usize) -> Result<Self, WhisperServeBatchError> {
         validate_whisper_serve_decoder_state(job)?;
-        let mut graph_config = whisper_decoder_graph_config(job.backend);
+        // This owner runs after the submitting request's Exact route TLS has
+        // ended. Keep its graph placement and scheduler as the submitting
+        // thread's resolved snapshot; re-running decoder policy here could
+        // otherwise change a small CUDA/Vulkan decoder back to a scheduler
+        // graph on the owner thread.
+        let mut graph_config = whisper_runtime_graph_config(job.backend);
         graph_config.use_scheduler = job.uses_scheduler;
         let plan = build_whisper_decoder_graph_plan(
             WhisperDecoderGraphMetadata {
@@ -509,6 +517,7 @@ impl Seq2SeqServeBatchFamily for WhisperFamily {
             resident_self_positions: job.decoder_state.self_attention.resident_positions,
             resident_cross_positions: job.decoder_state.cross_attention.resident_positions,
             hidden_size: job.encoder_hidden_size,
+            uses_scheduler: job.uses_scheduler,
             max_batch,
         }
     }
@@ -713,6 +722,8 @@ impl WhisperServeBatchJob {
     fn can_batch_with(&self, other: &Self) -> bool {
         self.build_identity == other.build_identity
             && self.runtime_cache_path == other.runtime_cache_path
+            && self.backend == other.backend
+            && self.uses_scheduler == other.uses_scheduler
             && whisper_serve_decode_configs_can_share_fixed_bucket(
                 &self.decode_config,
                 &other.decode_config,
@@ -986,6 +997,36 @@ mod tests {
             .unavailable_retryable(),
             None
         );
+    }
+
+    #[test]
+    fn serve_batch_engine_key_separates_scheduler_modes_on_the_same_backend() {
+        let lane = crate::models::native_execution_services::current_execution_lane_key(
+            GgmlCpuGraphBackend::Cpu,
+        );
+        let direct = WhisperServeBatchEngineKey {
+            build_identity: crate::RuntimeBuildIdentity::new(
+                "test-pack",
+                "whisper:test",
+                "adapter=none",
+            ),
+            lane: lane.clone(),
+            resident_self_positions: 448,
+            resident_cross_positions: 1500,
+            hidden_size: 512,
+            uses_scheduler: false,
+            max_batch: 2,
+        };
+        let scheduled = WhisperServeBatchEngineKey {
+            uses_scheduler: true,
+            ..direct.clone()
+        };
+
+        assert_eq!(
+            WhisperFamily::engine_key_backend(&direct),
+            WhisperFamily::engine_key_backend(&scheduled)
+        );
+        assert_ne!(direct, scheduled);
     }
     use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
     use crate::models::serve_batch_env::OPENASR_SERVE_BATCH_ENV;
@@ -1622,8 +1663,9 @@ mod tests {
             });
         let preflight = read_runtime_source_preflight(&runtime_path);
         let (execution, tokenizer, decoder_weights) = load_real_pack_decoder_components(&preflight);
-        let runtime_config = super::super::graph_config::whisper_decoder_graph_config(
+        let runtime_config = whisper_decoder_graph_config(
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            WhisperDecoderPlacementPolicy::resolve(),
         );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
@@ -1722,8 +1764,9 @@ mod tests {
             });
         let preflight = read_runtime_source_preflight(&runtime_path);
         let (execution, tokenizer, decoder_weights) = load_real_pack_decoder_components(&preflight);
-        let runtime_config = super::super::graph_config::whisper_decoder_graph_config(
+        let runtime_config = whisper_decoder_graph_config(
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            WhisperDecoderPlacementPolicy::resolve(),
         );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
@@ -1795,8 +1838,9 @@ mod tests {
             });
         let preflight = read_runtime_source_preflight(&runtime_path);
         let (execution, tokenizer, decoder_weights) = load_real_pack_decoder_components(&preflight);
-        let runtime_config = super::super::graph_config::whisper_decoder_graph_config(
+        let runtime_config = whisper_decoder_graph_config(
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            WhisperDecoderPlacementPolicy::resolve(),
         );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
@@ -1877,8 +1921,9 @@ mod tests {
             });
         let preflight = read_runtime_source_preflight(&runtime_path);
         let (execution, tokenizer, decoder_weights) = load_real_pack_decoder_components(&preflight);
-        let runtime_config = super::super::graph_config::whisper_decoder_graph_config(
+        let runtime_config = whisper_decoder_graph_config(
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            WhisperDecoderPlacementPolicy::resolve(),
         );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,

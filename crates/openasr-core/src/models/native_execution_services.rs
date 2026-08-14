@@ -27,6 +27,10 @@ use crate::device::{
     execution_route::{ExecutionProvider, ExecutionRouteCacheKey, ResolvedExecutionRoute},
 };
 use crate::ggml_runtime::{
+    BackendMemoryBytes, BackendMemoryLifecyclePoint, BackendMemoryStatsSnapshot,
+    BackendMemoryUnknownReason, SafeBackendMemoryReceipt,
+};
+use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector,
     GgmlExecutionTelemetryGuard, RequestBackendOverrideGuard, RequestBackendPreference,
     current_execution_telemetry_collector, install_execution_telemetry_collector,
@@ -78,6 +82,13 @@ thread_local! {
     static CURRENT_EXECUTION_PLACEMENT: Cell<Option<ExecutionPlacement>> = const {
         Cell::new(None)
     };
+    /// Optional request-scoped observation channel used by exact native
+    /// runtime audits. It is inert unless an explicit caller installs it, and
+    /// rides the same context propagation path as the route and placement so
+    /// worker-owned graphs cannot turn an Exact request into an unobservable
+    /// one.
+    static CURRENT_EXECUTION_OBSERVATION_SINK:
+        RefCell<Option<ExecutionObservationSink>> = const { RefCell::new(None) };
     /// Typed, attempt-local failure channel. Low-level allocators record only
     /// candidate-local resource/device failures here; business/decode/input
     /// failures never touch it and therefore can never trigger fallback.
@@ -96,6 +107,134 @@ thread_local! {
     static CURRENT_EXECUTION_CACHE_ATTEMPT_ID: Cell<Option<ExecutionCacheAttemptId>> = const {
         Cell::new(None)
     };
+}
+
+/// A backend that was actually constructed for one policy-scoped graph.
+///
+/// `requested_route` and `placement` are the policy facts in force while the
+/// runner was built; `backend_kind` and `backend_name` come from the live ggml
+/// backend handle after initialization. This is deliberately diagnostic data:
+/// graph policy continues to use typed capability data rather than parsing a
+/// provider label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExecutionBackendObservation {
+    pub(crate) requested_route: ResolvedExecutionRoute,
+    pub(crate) placement: ExecutionPlacement,
+    pub(crate) backend_kind: GgmlCpuGraphBackend,
+    pub(crate) backend_name: String,
+    pub(crate) actual_provider: ExecutionProvider,
+    pub(crate) actual_stable_id: String,
+    pub(crate) use_scheduler: bool,
+    /// In-process join key only. It is never emitted by the smoke receipt.
+    backend_identity: usize,
+    pub(crate) memory_receipts: Vec<SafeBackendMemoryReceipt>,
+}
+
+/// Explicitly installed sink for exact-route audit evidence. Normal production
+/// execution leaves this absent, so collecting observations never changes the
+/// default runtime path or retains per-request graph state.
+#[derive(Clone, Default)]
+pub(crate) struct ExecutionObservationSink {
+    observations: Arc<Mutex<Vec<ExecutionBackendObservation>>>,
+}
+
+#[allow(dead_code)] // Constructed by ignored host-local true-pack tests only.
+impl ExecutionObservationSink {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn observations(&self) -> Vec<ExecutionBackendObservation> {
+        self.observations
+            .lock()
+            .expect("execution observation sink lock must not be poisoned")
+            .clone()
+    }
+
+    fn record(&self, observation: ExecutionBackendObservation) {
+        self.observations
+            .lock()
+            .expect("execution observation sink lock must not be poisoned")
+            .push(observation);
+    }
+
+    fn append(&self, observations: impl IntoIterator<Item = ExecutionBackendObservation>) {
+        self.observations
+            .lock()
+            .expect("execution observation sink lock must not be poisoned")
+            .extend(observations);
+    }
+
+    fn record_memory(&self, backend_identity: usize, mut receipts: Vec<SafeBackendMemoryReceipt>) {
+        let mut observations = self
+            .observations
+            .lock()
+            .expect("execution observation sink lock must not be poisoned");
+        let Some(observation) = observations
+            .iter_mut()
+            .rev()
+            .find(|observation| observation.backend_identity == backend_identity)
+        else {
+            return;
+        };
+        for receipt in &mut receipts {
+            let prior = observation
+                .memory_receipts
+                .iter()
+                .filter(|prior| {
+                    prior.domain_kind == receipt.domain_kind
+                        && prior.heap_index == receipt.heap_index
+                })
+                .filter_map(
+                    |prior| match prior.backend_owned_observed_high_water_bytes {
+                        BackendMemoryBytes::Known(bytes) => Some(bytes),
+                        BackendMemoryBytes::Unknown(_) => None,
+                    },
+                )
+                .max();
+            if let (Some(prior), BackendMemoryBytes::Known(current)) =
+                (prior, receipt.backend_owned_observed_high_water_bytes)
+            {
+                receipt.backend_owned_observed_high_water_bytes =
+                    BackendMemoryBytes::Known(prior.max(current));
+            }
+        }
+        for receipt in receipts {
+            if let Some(existing) = observation.memory_receipts.iter_mut().find(|existing| {
+                existing.lifecycle == receipt.lifecycle
+                    && existing.domain_kind == receipt.domain_kind
+                    && existing.heap_index == receipt.heap_index
+            }) {
+                *existing = receipt;
+            } else {
+                observation.memory_receipts.push(receipt);
+            }
+        }
+    }
+}
+
+/// Installs an observation sink around one native request. Callers must retain
+/// the returned guard for the complete request so candidate attempts and any
+/// worker contexts inherit the same sink.
+#[allow(dead_code)] // Installed by ignored host-local true-pack tests only.
+pub(crate) fn install_execution_observation_sink(
+    sink: ExecutionObservationSink,
+) -> ExecutionObservationSinkGuard {
+    let previous = CURRENT_EXECUTION_OBSERVATION_SINK.with(|current| current.replace(Some(sink)));
+    ExecutionObservationSinkGuard { previous }
+}
+
+#[allow(dead_code)] // Returned by the ignored host-local true-pack test seam.
+pub(crate) struct ExecutionObservationSinkGuard {
+    previous: Option<ExecutionObservationSink>,
+}
+
+impl Drop for ExecutionObservationSinkGuard {
+    fn drop(&mut self) {
+        CURRENT_EXECUTION_OBSERVATION_SINK.with(|current| {
+            *current.borrow_mut() = self.previous.take();
+        });
+    }
 }
 
 type DeferredCacheCommit = Box<dyn FnOnce() + 'static>;
@@ -289,6 +428,7 @@ pub(crate) struct NativeExecutionContext {
     memory_broker: Arc<DeviceMemoryBrokerSet>,
     backend_preference: Option<RequestBackendPreference>,
     placement: Option<ExecutionPlacement>,
+    observation_sink: Option<ExecutionObservationSink>,
     failure_sink: Option<ExecutionCandidateFailureSink>,
     cache_attempt_id: Option<ExecutionCacheAttemptId>,
     execution_telemetry: Option<GgmlExecutionTelemetryCollector>,
@@ -298,12 +438,19 @@ impl NativeExecutionContext {
     /// Stable execution-lane equality for a shared worker/engine key. The
     /// request-local failure sink is intentionally excluded: two jobs may
     /// share an engine only when their scope, broker, backend and placement
-    /// agree, while each still retains its own sink for failure fan-out.
+    /// agree, while each still retains its own sink for failure fan-out. An
+    /// installed observation sink intentionally makes the lane request-local:
+    /// audit evidence must never be silently attributed to another request.
     pub(crate) fn shares_execution_lane_with(&self, other: &Self) -> bool {
         self.scope_id == other.scope_id
             && Arc::ptr_eq(&self.memory_broker, &other.memory_broker)
             && self.backend_preference == other.backend_preference
             && self.placement == other.placement
+            && match (&self.observation_sink, &other.observation_sink) {
+                (Some(left), Some(right)) => Arc::ptr_eq(&left.observations, &right.observations),
+                (None, None) => true,
+                _ => false,
+            }
     }
 
     /// Builds a temporary worker context for one shared graph operation.
@@ -346,6 +493,7 @@ impl NativeExecutionContext {
             memory_broker: Arc::clone(&first.memory_broker),
             backend_preference: first.backend_preference.clone(),
             placement: first.placement,
+            observation_sink: first.observation_sink.clone(),
             failure_sink,
             cache_attempt_id,
             execution_telemetry,
@@ -366,6 +514,7 @@ pub(crate) struct NativeExecutionContextGuard {
     scope: NativeExecutionScopeGuard,
     previous_memory_broker: Option<Arc<DeviceMemoryBrokerSet>>,
     previous_placement: Option<ExecutionPlacement>,
+    previous_observation_sink: Option<ExecutionObservationSink>,
     previous_failure_sink: Option<ExecutionCandidateFailureSink>,
     previous_cache_attempt_id: Option<ExecutionCacheAttemptId>,
     execution_telemetry: GgmlExecutionTelemetryGuard,
@@ -378,6 +527,9 @@ impl Drop for NativeExecutionContextGuard {
             *current.borrow_mut() = self.previous_memory_broker.take();
         });
         CURRENT_EXECUTION_PLACEMENT.with(|current| current.set(self.previous_placement));
+        CURRENT_EXECUTION_OBSERVATION_SINK.with(|current| {
+            *current.borrow_mut() = self.previous_observation_sink.take();
+        });
         CURRENT_EXECUTION_CANDIDATE_FAILURE_SINK.with(|current| {
             *current.borrow_mut() = self.previous_failure_sink.take();
         });
@@ -489,6 +641,7 @@ pub(crate) fn current_native_execution_context() -> Option<NativeExecutionContex
         memory_broker,
         backend_preference: request_backend_override(),
         placement: current_execution_placement(),
+        observation_sink: current_execution_observation_sink(),
         failure_sink: current_execution_candidate_failure_sink(),
         cache_attempt_id: current_execution_cache_attempt_id(),
         execution_telemetry: current_execution_telemetry_collector(),
@@ -504,6 +657,132 @@ pub(crate) fn current_native_execution_memory_broker() -> Option<Arc<DeviceMemor
 
 pub(crate) fn current_execution_placement() -> Option<ExecutionPlacement> {
     CURRENT_EXECUTION_PLACEMENT.with(Cell::get)
+}
+
+pub(crate) fn current_execution_observation_sink() -> Option<ExecutionObservationSink> {
+    CURRENT_EXECUTION_OBSERVATION_SINK.with(|current| current.borrow().clone())
+}
+
+/// Records a runner-backed observation only while an explicitly instrumented
+/// policy request is active. The route is recovered from the same Exact
+/// backend preference that the runner receives, never from an environment
+/// label.
+pub(crate) fn record_current_execution_backend_observation(
+    backend_identity: usize,
+    backend_kind: GgmlCpuGraphBackend,
+    backend_name: &str,
+    actual_provider: ExecutionProvider,
+    actual_stable_id: &str,
+    use_scheduler: bool,
+) {
+    let Some(sink) = current_execution_observation_sink() else {
+        return;
+    };
+    let Some(placement) = current_execution_placement() else {
+        return;
+    };
+    let route = match request_backend_override() {
+        Some(RequestBackendPreference::Exact(route)) => route,
+        Some(RequestBackendPreference::CpuOnly) => ResolvedExecutionRoute::cpu(),
+        Some(RequestBackendPreference::Accelerated) | None => return,
+    };
+    sink.record(ExecutionBackendObservation {
+        requested_route: route,
+        placement,
+        backend_kind,
+        backend_name: backend_name.to_string(),
+        actual_provider,
+        actual_stable_id: actual_stable_id.to_string(),
+        use_scheduler,
+        backend_identity,
+        memory_receipts: Vec::new(),
+    });
+}
+
+pub(crate) fn record_current_execution_backend_memory_stats(
+    backend_identity: usize,
+    lifecycle: BackendMemoryLifecyclePoint,
+    snapshot: &BackendMemoryStatsSnapshot,
+) {
+    let Some(sink) = current_execution_observation_sink() else {
+        return;
+    };
+    let provider = {
+        let observations = sink.observations();
+        observations
+            .iter()
+            .rev()
+            .find(|observation| observation.backend_identity == backend_identity)
+            .map(|observation| observation.actual_provider)
+    };
+    let Some(provider) = provider else {
+        return;
+    };
+    sink.record_memory(
+        backend_identity,
+        snapshot.safe_receipts(provider, lifecycle),
+    );
+}
+
+pub(crate) fn record_current_execution_backend_memory_unavailable(
+    backend_identity: usize,
+    lifecycle: BackendMemoryLifecyclePoint,
+    reason: BackendMemoryUnknownReason,
+) {
+    let Some(sink) = current_execution_observation_sink() else {
+        return;
+    };
+    sink.record_memory(
+        backend_identity,
+        vec![SafeBackendMemoryReceipt::unknown(lifecycle, reason)],
+    );
+}
+
+/// Fail closed when an Exact runner violates its selected placement or is not
+/// backed by that precise live ggml device. FullDevice is intentionally
+/// stronger than merely "some GPU observation": every constructed runner
+/// must be a direct GPU backend. Hybrid retains its explicit CPU helper path.
+/// Unscoped low-level Exact tests have no placement contract, but still prove
+/// the actual provider-local route identity.
+pub(crate) fn attest_current_exact_accelerated_backend(
+    backend_kind: GgmlCpuGraphBackend,
+    actual_provider: ExecutionProvider,
+    actual_stable_id: &str,
+    use_scheduler: bool,
+) -> Result<(), crate::device::execution_route::ExecutionRouteError> {
+    let Some(RequestBackendPreference::Exact(requested)) = request_backend_override() else {
+        return Ok(());
+    };
+    let placement = current_execution_placement();
+    if placement == Some(ExecutionPlacement::FullDevice) && !backend_kind.is_gpu_class() {
+        return Err(
+            crate::device::execution_route::ExecutionRouteError::init_failed(
+                "Exact FullDevice initialized a non-GPU runner",
+            ),
+        );
+    }
+    if placement == Some(ExecutionPlacement::FullDevice) && use_scheduler {
+        return Err(
+            crate::device::execution_route::ExecutionRouteError::init_failed(
+                "Exact FullDevice initialized a scheduler-backed runner",
+            ),
+        );
+    }
+    if !backend_kind.is_gpu_class() {
+        return Ok(());
+    }
+    if requested.provider == actual_provider && requested.stable_id == actual_stable_id {
+        return Ok(());
+    }
+    Err(
+        crate::device::execution_route::ExecutionRouteError::init_failed(format!(
+            "exact backend mismatch: requested provider={} stable_id={}, actual provider={} stable_id={}",
+            requested.provider.as_str(),
+            requested.stable_id,
+            actual_provider.as_str(),
+            actual_stable_id,
+        )),
+    )
 }
 
 pub(crate) fn current_execution_candidate_failure_sink() -> Option<ExecutionCandidateFailureSink> {
@@ -651,6 +930,8 @@ pub(crate) fn install_native_execution_context(
         .with(|current| current.replace(Some(context.memory_broker)));
     let previous_placement =
         CURRENT_EXECUTION_PLACEMENT.with(|current| current.replace(context.placement));
+    let previous_observation_sink = CURRENT_EXECUTION_OBSERVATION_SINK
+        .with(|current| current.replace(context.observation_sink));
     let previous_failure_sink = CURRENT_EXECUTION_CANDIDATE_FAILURE_SINK
         .with(|current| current.replace(context.failure_sink));
     let previous_cache_attempt_id = CURRENT_EXECUTION_CACHE_ATTEMPT_ID
@@ -661,6 +942,7 @@ pub(crate) fn install_native_execution_context(
         scope,
         previous_memory_broker,
         previous_placement,
+        previous_observation_sink,
         previous_failure_sink,
         previous_cache_attempt_id,
         execution_telemetry,
@@ -679,6 +961,7 @@ pub(crate) fn install_native_execution_services(
         // enclosing values and continue to install `None` for all three.
         backend_preference: request_backend_override(),
         placement: current_execution_placement(),
+        observation_sink: current_execution_observation_sink(),
         failure_sink: current_execution_candidate_failure_sink(),
         cache_attempt_id: current_execution_cache_attempt_id(),
         execution_telemetry: current_execution_telemetry_collector(),
@@ -706,6 +989,7 @@ pub(crate) fn install_execution_candidate_attempt(
         memory_broker: Arc::clone(&services.memory_broker),
         backend_preference,
         placement: Some(candidate.placement),
+        observation_sink: current_execution_observation_sink(),
         failure_sink: Some(failure_sink),
         cache_attempt_id: current_execution_cache_attempt_id(),
         execution_telemetry: current_execution_telemetry_collector(),
@@ -839,7 +1123,15 @@ pub(crate) fn run_execution_candidate_attempt<T, E>(
     let combined_collector = GgmlExecutionTelemetryCollector::fanout(
         outer_collector.iter().chain(placement_collector.iter()),
     );
-    let (result, candidate_failure) = {
+    // Audit observations follow the same candidate transaction as resident
+    // cache publication. A failed FullDevice attempt must not contaminate the
+    // evidence for a succeeding Hybrid attempt on the same Exact device.
+    let observation_transaction = current_execution_observation_sink()
+        .map(|parent| (parent, ExecutionObservationSink::new()));
+    let (result, candidate_failure, committed) = {
+        let _observation_guard = observation_transaction
+            .as_ref()
+            .map(|(_, attempt)| install_execution_observation_sink(attempt.clone()));
         let _telemetry = install_execution_telemetry_collector(combined_collector);
         let _attempt =
             install_execution_candidate_attempt(services, candidate, failure_sink.clone());
@@ -851,9 +1143,15 @@ pub(crate) fn run_execution_candidate_attempt<T, E>(
                 observed_placement_violation(candidate, &collector.snapshot())
             });
         }
-        journal_scope.finish(result.is_ok() && candidate_failure.is_none());
-        (result, candidate_failure)
+        let committed = result.is_ok() && candidate_failure.is_none();
+        journal_scope.finish(committed);
+        (result, candidate_failure, committed)
     };
+    if committed {
+        if let Some((parent, attempt)) = observation_transaction {
+            parent.append(attempt.observations());
+        }
+    }
     ExecutionCandidateAttemptOutcome {
         result,
         candidate_failure,
@@ -1378,6 +1676,222 @@ mod tests {
         assert_eq!(
             outcome.candidate_failure.unwrap().operation,
             "worker-allocation"
+        );
+    }
+
+    #[test]
+    fn candidate_context_propagates_observation_sink_to_worker() {
+        let services = test_native_execution_services();
+        let candidate = gpu_candidate(
+            ExecutionProvider::Cuda,
+            "CUDA0",
+            "0000:01:00.0",
+            ExecutionPlacement::FullDevice,
+        );
+        let observations = ExecutionObservationSink::new();
+        let _observation_guard = install_execution_observation_sink(observations.clone());
+        let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            let context = current_native_execution_context().expect("candidate context");
+            std::thread::spawn(move || {
+                let _guard = install_native_execution_context(context);
+                record_current_execution_backend_observation(
+                    1,
+                    GgmlCpuGraphBackend::Gpu,
+                    "CUDA0",
+                    ExecutionProvider::Cuda,
+                    "CUDA0",
+                    true,
+                );
+            })
+            .join()
+            .unwrap();
+            Ok::<_, ()>(())
+        });
+        assert!(outcome.result.is_ok());
+        assert_eq!(
+            observations.observations(),
+            vec![ExecutionBackendObservation {
+                requested_route: candidate.device.route,
+                placement: ExecutionPlacement::FullDevice,
+                backend_kind: GgmlCpuGraphBackend::Gpu,
+                backend_name: "CUDA0".to_string(),
+                actual_provider: ExecutionProvider::Cuda,
+                actual_stable_id: "CUDA0".to_string(),
+                use_scheduler: true,
+                backend_identity: 1,
+                memory_receipts: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn observation_sink_publishes_only_the_committed_candidate_attempt() {
+        let services = test_native_execution_services();
+        let full_device = gpu_candidate(
+            ExecutionProvider::Cuda,
+            "CUDA0",
+            "0000:01:00.0",
+            ExecutionPlacement::FullDevice,
+        );
+        let hybrid = gpu_candidate(
+            ExecutionProvider::Cuda,
+            "CUDA0",
+            "0000:01:00.0",
+            ExecutionPlacement::Hybrid,
+        );
+        let observations = ExecutionObservationSink::new();
+        let _observation_guard = install_execution_observation_sink(observations.clone());
+
+        let failed = run_execution_candidate_attempt(services.as_ref(), &full_device, || {
+            record_current_execution_backend_observation(
+                1,
+                GgmlCpuGraphBackend::Gpu,
+                "CUDA0",
+                ExecutionProvider::Cuda,
+                "CUDA0",
+                false,
+            );
+            record_current_execution_candidate_failure(ExecutionCandidateFailure::capacity(
+                "full-device-allocation",
+                "synthetic capacity rejection",
+            ));
+            Err::<(), _>("failed")
+        });
+        assert!(failed.result.is_err());
+        assert!(failed.candidate_failure.is_some());
+        assert!(observations.observations().is_empty());
+
+        let succeeded = run_execution_candidate_attempt(services.as_ref(), &hybrid, || {
+            record_current_execution_backend_observation(
+                2,
+                GgmlCpuGraphBackend::Gpu,
+                "CUDA0",
+                ExecutionProvider::Cuda,
+                "CUDA0",
+                false,
+            );
+            Ok::<_, &str>(())
+        });
+        assert!(succeeded.result.is_ok());
+        assert!(succeeded.candidate_failure.is_none());
+        assert_eq!(observations.observations().len(), 1);
+        assert_eq!(
+            observations.observations()[0].placement,
+            ExecutionPlacement::Hybrid
+        );
+    }
+
+    #[test]
+    fn exact_accelerated_backend_attestation_enforces_full_device_and_route_contracts() {
+        let services = test_native_execution_services();
+        let full_device = gpu_candidate(
+            ExecutionProvider::Cuda,
+            "CUDA0",
+            "0000:01:00.0",
+            ExecutionPlacement::FullDevice,
+        );
+        let hybrid = gpu_candidate(
+            ExecutionProvider::Cuda,
+            "CUDA0",
+            "0000:01:00.0",
+            ExecutionPlacement::Hybrid,
+        );
+        let attest =
+            |candidate: &ExecutionCandidate, backend_kind, provider, stable_id, use_scheduler| {
+                let sink = ExecutionCandidateFailureSink::new();
+                let _guard =
+                    install_execution_candidate_attempt(services.as_ref(), candidate, sink);
+                attest_current_exact_accelerated_backend(
+                    backend_kind,
+                    provider,
+                    stable_id,
+                    use_scheduler,
+                )
+            };
+
+        assert!(
+            attest(
+                &full_device,
+                GgmlCpuGraphBackend::Gpu,
+                ExecutionProvider::Cuda,
+                "CUDA0",
+                false,
+            )
+            .is_ok()
+        );
+        assert!(
+            attest(
+                &full_device,
+                GgmlCpuGraphBackend::Cpu,
+                ExecutionProvider::Cpu,
+                "CPU",
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            attest(
+                &full_device,
+                GgmlCpuGraphBackend::Gpu,
+                ExecutionProvider::Cuda,
+                "CUDA0",
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            attest(
+                &full_device,
+                GgmlCpuGraphBackend::Gpu,
+                ExecutionProvider::Vulkan,
+                "Vulkan0",
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            attest(
+                &full_device,
+                GgmlCpuGraphBackend::Gpu,
+                ExecutionProvider::Cuda,
+                "CUDA1",
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            attest(
+                &hybrid,
+                GgmlCpuGraphBackend::Cpu,
+                ExecutionProvider::Cpu,
+                "CPU",
+                false,
+            )
+            .is_ok()
+        );
+
+        let _backend_guard = install_request_backend_override(Some(
+            RequestBackendPreference::Exact(full_device.device.route.clone()),
+        ));
+        assert!(
+            attest_current_exact_accelerated_backend(
+                GgmlCpuGraphBackend::Gpu,
+                ExecutionProvider::Cuda,
+                "CUDA0",
+                false,
+            )
+            .is_ok(),
+            "unscoped Exact GPU runner must retain identity attestation"
+        );
+        assert!(
+            attest_current_exact_accelerated_backend(
+                GgmlCpuGraphBackend::Gpu,
+                ExecutionProvider::Cuda,
+                "CUDA1",
+                false,
+            )
+            .is_err(),
+            "unscoped Exact GPU runner must reject a route mismatch"
         );
     }
 

@@ -49,6 +49,12 @@ pub use backend::{
 pub(crate) use backend::{
     accelerated_device_rank, ensure_backends_loaded, preferred_accelerated_device,
 };
+pub(crate) use backend_memory::{
+    BackendMemoryBytes, BackendMemoryLifecyclePoint, BackendMemoryStatsSnapshot,
+    BackendMemoryUnknownReason, SafeBackendMemoryReceipt,
+};
+#[allow(unused_imports)]
+pub(crate) use cpu_graph::GgmlLstmGateOrder;
 pub use cpu_graph::{
     AutoGpuPolicy, GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError,
     GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, RequestBackendOverrideGuard,
@@ -57,7 +63,8 @@ pub use cpu_graph::{
 };
 pub(crate) use cpu_graph::{
     GgmlBackendCapabilities, GgmlCpuGraphBuilder, GgmlCpuTensor, GgmlFlashAttentionPrecision,
-    GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlPersistentGraphSession, GgmlRopeExtParams,
+    GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext,
+    GgmlMatmulPrecision, GgmlNativeGqaCapability, GgmlPersistentGraphSession, GgmlRopeExtParams,
     GgmlStaticTensor, GgmlStaticTensorArena,
 };
 pub(crate) use env_flags::{env_toggle_with_raw, env_var_truthy};
@@ -68,7 +75,7 @@ pub use execution_telemetry::{
 pub(crate) use execution_telemetry::{
     current_execution_telemetry_collector, install_execution_telemetry_collector,
 };
-pub(crate) use ffi::{GGML_TYPE_F16, GGML_TYPE_F32};
+pub(crate) use ffi::{GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0};
 pub(crate) use gguf_c_parser_sandbox::load_gguf_metadata_and_tensor_index_with_c_parser_sandbox;
 pub use gguf_c_parser_sandbox::{
     GGUF_C_PARSER_SANDBOX_HELPER_ARG, GgufCParserSandboxError,

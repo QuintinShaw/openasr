@@ -29,7 +29,12 @@ use crate::NativeAsrError;
 use crate::NativeAsrSession;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::FIRERED_LLM_DECODE_POLICY_ID;
-use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::device::execution_policy::ExecutionPlacement;
+use crate::device::execution_route::ExecutionProvider;
+use crate::ggml_runtime::{
+    GgmlCpuGraphBackend, GgmlNativeGqaCapability, RequestBackendPreference,
+    request_backend_override,
+};
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
     PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
@@ -40,6 +45,7 @@ use crate::models::decode_policy_component_registry::{
 };
 use crate::models::firered_aed::encoder_graph::FireRedEncoderGraphRuntime;
 use crate::models::firered_aed::frontend::{FireRedFbankFrontend, apply_cmvn};
+use crate::models::firered_aed::runtime_contract::FireRedAedExecutionMetadata;
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
     GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
@@ -47,20 +53,23 @@ use crate::models::ggml_asr_executor::{
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
 };
-use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
+use crate::models::native_execution_services::{
+    ExecutionLaneKey, current_execution_lane_key, current_execution_placement,
+};
 use crate::models::qwen::{
-    Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity, Qwen3AsrKvCacheCapacityError,
-    Qwen3AsrPromptTokenInput,
+    Qwen3AsrDecodePrompt, Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity,
+    Qwen3AsrKvCacheCapacityError, Qwen3AsrPromptTokenInput,
+    qwen_llm_effective_native_gqa_capability,
 };
 use crate::models::runtime_cache_coordinator::PackContentKey;
 use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
 use crate::models::seq2seq_greedy_decode::{
-    Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
-    Seq2SeqGreedyDecodeStepLogitsOutput,
+    Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeStepExecutor,
+    Seq2SeqGreedyDecodeStepInput, Seq2SeqGreedyDecodeStepLogitsOutput,
 };
 use crate::models::system_memory_owner::{
     SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
-    SystemMemoryAllocationTransactionError, SystemMemoryOwner,
+    SystemMemoryAllocationTransactionError, SystemMemoryCapacity, SystemMemoryOwner,
 };
 
 use super::adapter_graph::FireRedLlmAdapterGraphRuntime;
@@ -68,8 +77,8 @@ use super::decode_prompt::build_firered_llm_decode_prompt;
 use super::llm_transformer::FireRedLlmDecoderRuntime;
 use super::runtime_contract::{
     FIRERED_LLM_CMVN_INV_STDDEV_TENSOR, FIRERED_LLM_CMVN_NEG_MEAN_TENSOR,
-    parse_firered_llm_adapter_metadata, parse_firered_llm_decoder_metadata,
-    parse_firered_llm_encoder_metadata,
+    FireRedLlmDecoderMetadata, parse_firered_llm_adapter_metadata,
+    parse_firered_llm_decoder_metadata, parse_firered_llm_encoder_metadata,
 };
 use super::tokenizer::FireRedLlmTokenizer;
 
@@ -92,12 +101,121 @@ use super::tokenizer::FireRedLlmTokenizer;
 /// are thread-affine. The accompanying [`SystemMemoryOwner`] accounts for the
 /// host logits/embedding representation, while native graph construction
 /// accounts backend buffers in their physical memory domain.
-type FireRedLlmDecoderCacheKey = (PackContentKey, ExecutionLaneKey);
+type FireRedLlmDecoderCacheKey = (PackContentKey, ExecutionLaneKey, GgmlNativeGqaCapability);
 
 type FireRedLlmDecoderRuntimePool =
     AdmittedPinnedRuntimeActorCheckoutPool<FireRedLlmDecoderCacheKey, FireRedLlmDecoderRuntime>;
 type FireRedLlmDecoderRuntimeActor =
     PinnedRuntimeActorCheckout<FireRedLlmDecoderCacheKey, FireRedLlmDecoderRuntime>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FireRedLlmUnifiedRuntimeCacheKey {
+    content: PackContentKey,
+    lane: ExecutionLaneKey,
+    native_gqa: GgmlNativeGqaCapability,
+}
+
+struct FireRedLlmUnifiedRuntimeState {
+    encoder: FireRedEncoderGraphRuntime,
+    adapter: FireRedLlmAdapterGraphRuntime,
+    decoder: FireRedLlmDecoderRuntime,
+}
+
+fn firered_llm_unified_runtime_system_memory_shape(
+    encoder_retained: u64,
+    adapter_retained: u64,
+    decoder_peak: u64,
+    decoder_retained: u64,
+) -> Result<(u64, u64), String> {
+    let base_retained = encoder_retained
+        .checked_add(adapter_retained)
+        .ok_or_else(|| "firered-llm unified base retained bytes overflowed".to_string())?;
+    let retained = base_retained
+        .checked_add(decoder_retained)
+        .ok_or_else(|| "firered-llm unified retained bytes overflowed".to_string())?;
+    // Decoder construction starts only after the encoder and adapter are
+    // resident, so its transient peak overlaps their retention rather than
+    // either stage's construction peak.
+    let peak = base_retained
+        .checked_add(decoder_peak)
+        .ok_or_else(|| "firered-llm unified construction peak overflowed".to_string())?;
+    Ok((peak, retained))
+}
+
+type FireRedLlmUnifiedRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
+    FireRedLlmUnifiedRuntimeCacheKey,
+    FireRedLlmUnifiedRuntimeState,
+>;
+type FireRedLlmUnifiedRuntimeActor =
+    PinnedRuntimeActorCheckout<FireRedLlmUnifiedRuntimeCacheKey, FireRedLlmUnifiedRuntimeState>;
+
+impl FireRedLlmUnifiedRuntimeState {
+    fn system_memory_quote(
+        preflight: &crate::GgufRuntimeSourcePreflight,
+        encoder_metadata: FireRedAedExecutionMetadata,
+        decoder_metadata: FireRedLlmDecoderMetadata,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<SystemMemoryAllocationQuote, String> {
+        let content_id = preflight.runtime_source.content_id();
+        let encoder =
+            FireRedEncoderGraphRuntime::system_memory_quote(encoder_metadata, content_id)?;
+        let reader = build_runtime_tensor_reader_from_preflight(preflight)
+            .map_err(|error| format!("unified decoder quote tensor reader failed: {error}"))?;
+        let (decoder_peak, decoder_retained) =
+            super::llm_transformer::quoted_firered_llm_decoder_system_memory_bytes(
+                &reader,
+                &decoder_metadata,
+                backend,
+            )?;
+        let adapter_retained = 0_u64;
+        let (peak, retained) = firered_llm_unified_runtime_system_memory_shape(
+            encoder.retained_bytes,
+            adapter_retained,
+            decoder_peak,
+            decoder_retained,
+        )?;
+        SystemMemoryAllocationQuote::new(
+            format!("firered-llm-unified-runtime:{content_id}"),
+            peak,
+            retained,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = SystemMemoryCapacity::default();
+        bytes.add(
+            self.encoder.retained_system_memory_bytes()?,
+            "firered-llm unified encoder retained",
+        )?;
+        bytes.add(
+            self.adapter.retained_system_memory_bytes(),
+            "firered-llm unified adapter retained",
+        )?;
+        bytes.add(
+            self.decoder.retained_system_memory_bytes()?,
+            "firered-llm unified decoder retained",
+        )?;
+        Ok(bytes.finish())
+    }
+}
+
+fn firered_llm_unified_runtime_enabled(
+    allow_unified_runtime: bool,
+    backend: GgmlCpuGraphBackend,
+    backend_preference: Option<&RequestBackendPreference>,
+    placement: Option<ExecutionPlacement>,
+) -> bool {
+    allow_unified_runtime
+        && backend == GgmlCpuGraphBackend::Gpu
+        && placement == Some(ExecutionPlacement::FullDevice)
+        && matches!(
+            backend_preference,
+            Some(RequestBackendPreference::Exact(route))
+                if route.addressability.is_exactly_addressable()
+                    && matches!(route.provider, ExecutionProvider::Cuda | ExecutionProvider::Vulkan)
+        )
+}
 
 const FIRERED_LLM_EXECUTOR_ID: &str = crate::arch::FIRERED_LLM_EXECUTOR_COMPONENT_ID;
 const FIRERED_LLM_STREAMING_EXECUTOR_ID: &str = "firered-llm-ggml-snapshot-streaming-executor-v1";
@@ -154,10 +272,148 @@ enum FireRedLlmExecutorError {
 
 const FIRERED_LLM_RUNTIME_ACTOR_MAX_IDLE_ENTRIES: usize = 4;
 const FIRERED_LLM_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
+// One q4 pack binding plus the 7B decoder's transient prefill graph already
+// approaches the usable envelope of a 12 GiB discrete GPU. Long-form workers
+// must queue on the same exact lane rather than constructing a second 5.1 GB
+// unified owner concurrently.
+const FIRERED_LLM_UNIFIED_GPU_MAX_INSTANCES_PER_KEY: usize = 1;
+
+fn validate_firered_llm_unified_runtime(
+    state: &FireRedLlmUnifiedRuntimeState,
+) -> Result<(), FireRedLlmExecutorError> {
+    let direct_gpu_lane = (GgmlCpuGraphBackend::Gpu, false);
+    if state.encoder.graph_lane() != direct_gpu_lane
+        || state.adapter.graph_lane() != direct_gpu_lane
+        || state.decoder.graph_lane() != direct_gpu_lane
+    {
+        return Err(FireRedLlmExecutorError::RuntimeContractViolation {
+            reason: "unified FireRed-LLM runtime requires direct GPU encoder, adapter, and decoder lanes"
+                .to_string(),
+        });
+    }
+    let encoder_binding = state.encoder.loaded_weight_binding_identity();
+    let adapter_binding = state.adapter.loaded_weight_binding_identity();
+    let decoder_binding = state
+        .decoder
+        .loaded_weight_binding_identity()
+        .ok_or_else(|| FireRedLlmExecutorError::RuntimeContractViolation {
+            reason: "unified FireRed-LLM decoder did not retain a loaded weight binding"
+                .to_string(),
+        })?;
+    if encoder_binding != adapter_binding || encoder_binding != decoder_binding {
+        return Err(FireRedLlmExecutorError::RuntimeContractViolation {
+            reason: "unified FireRed-LLM runtime did not coalesce its pack-wide weight binding"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn firered_llm_native_gqa_capability(
+    backend: GgmlCpuGraphBackend,
+    preference: Option<&RequestBackendPreference>,
+    resolved: GgmlNativeGqaCapability,
+) -> GgmlNativeGqaCapability {
+    qwen_llm_effective_native_gqa_capability(firered_llm_native_gqa_candidate(
+        backend, preference, resolved,
+    ))
+}
+
+fn firered_llm_native_gqa_candidate(
+    backend: GgmlCpuGraphBackend,
+    preference: Option<&RequestBackendPreference>,
+    resolved: GgmlNativeGqaCapability,
+) -> GgmlNativeGqaCapability {
+    match backend {
+        GgmlCpuGraphBackend::Cpu | GgmlCpuGraphBackend::Metal => resolved,
+        GgmlCpuGraphBackend::Gpu => match preference {
+            Some(RequestBackendPreference::Exact(route))
+                if route.provider == ExecutionProvider::Vulkan =>
+            {
+                resolved
+            }
+            Some(RequestBackendPreference::CpuOnly)
+            | Some(RequestBackendPreference::Accelerated)
+            | Some(RequestBackendPreference::Exact(_))
+            | None => GgmlNativeGqaCapability::Unsupported,
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn allocate_firered_llm_unified_runtime(
+    preflight: crate::GgufRuntimeSourcePreflight,
+    encoder_metadata: FireRedAedExecutionMetadata,
+    decoder_metadata: FireRedLlmDecoderMetadata,
+    backend: GgmlCpuGraphBackend,
+    native_gqa: GgmlNativeGqaCapability,
+    quote: SystemMemoryAllocationQuote,
+) -> Result<SystemMemoryOwner<FireRedLlmUnifiedRuntimeState>, FireRedLlmExecutorError> {
+    let construction_transient = quote
+        .peak_bytes
+        .checked_sub(quote.retained_bytes)
+        .ok_or_else(|| FireRedLlmExecutorError::RuntimeOwnershipFailed {
+            stage: "unified-runtime",
+            reason: "unified SystemMemory quote retained bytes exceed peak".to_string(),
+        })?;
+    match SystemMemoryOwner::try_allocate_transaction(quote, || {
+        // Keep each earlier stage alive while constructing the next one. All
+        // three runners resolve the same owner-thread backend, so the weak
+        // pack-wide loaded-context cache upgrades one Rc binding instead of
+        // uploading the complete pack three times.
+        let encoder =
+            FireRedEncoderGraphRuntime::new_from_preflight(&preflight, encoder_metadata, backend)
+                .map_err(|error| FireRedLlmExecutorError::EncoderFailed {
+                reason: error.to_string(),
+            })?;
+        let adapter = FireRedLlmAdapterGraphRuntime::new_from_preflight(&preflight, backend)
+            .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
+                reason: error.to_string(),
+            })?;
+        let decoder = FireRedLlmDecoderRuntime::new_from_preflight_with_native_gqa(
+            &preflight,
+            decoder_metadata,
+            backend,
+            native_gqa,
+        )
+        .map_err(|error| FireRedLlmExecutorError::DecoderFailed {
+            reason: error.to_string(),
+        })?;
+        let state = FireRedLlmUnifiedRuntimeState {
+            encoder,
+            adapter,
+            decoder,
+        };
+        validate_firered_llm_unified_runtime(&state)?;
+        let retained = state.retained_system_memory_bytes().map_err(|reason| {
+            FireRedLlmExecutorError::RuntimeOwnershipFailed {
+                stage: "unified-runtime",
+                reason,
+            }
+        })?;
+        let peak = retained
+            .checked_add(construction_transient)
+            .ok_or_else(|| FireRedLlmExecutorError::RuntimeOwnershipFailed {
+                stage: "unified-runtime",
+                reason: "unified post-build SystemMemory peak overflowed".to_string(),
+            })?;
+        Ok(SystemMemoryAllocationOutcome::new(state, peak, retained))
+    }) {
+        Ok(owner) => Ok(owner),
+        Err(SystemMemoryAllocationTransactionError::Allocation(error)) => Err(error),
+        Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+            Err(FireRedLlmExecutorError::RuntimeOwnershipFailed {
+                stage: "unified-runtime",
+                reason: error.to_string(),
+            })
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct FireRedLlmGgmlExecutor {
     decoder_runtimes: Arc<FireRedLlmDecoderRuntimePool>,
+    unified_gpu_runtimes: Arc<FireRedLlmUnifiedRuntimePool>,
 }
 
 impl std::fmt::Debug for FireRedLlmGgmlExecutor {
@@ -172,15 +428,24 @@ impl Default for FireRedLlmGgmlExecutor {
     fn default() -> Self {
         let max_committed_requested_bytes =
             crate::host::host_available_memory_bytes().unwrap_or(u64::MAX);
-        let limits = AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+        let split_limits = AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
             FIRERED_LLM_RUNTIME_ACTOR_MAX_IDLE_ENTRIES,
             max_committed_requested_bytes,
             FIRERED_LLM_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY,
         );
+        let unified_limits = AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+            FIRERED_LLM_RUNTIME_ACTOR_MAX_IDLE_ENTRIES,
+            max_committed_requested_bytes,
+            FIRERED_LLM_UNIFIED_GPU_MAX_INSTANCES_PER_KEY,
+        );
         Self {
             decoder_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
                 "openasr-firered-llm-decoder-owner",
-                limits,
+                split_limits,
+            )),
+            unified_gpu_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+                "openasr-firered-llm-unified-gpu-owner",
+                unified_limits,
             )),
         }
     }
@@ -274,6 +539,72 @@ impl Seq2SeqGreedyDecodeStepExecutor for FireRedLlmGreedyStepExecutor<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_firered_llm_decode_with_runtime(
+    decoder: &mut FireRedLlmDecoderRuntime,
+    decode_prompt: Qwen3AsrDecodePrompt,
+    speech_rows: Vec<f32>,
+    kv_capacity: Qwen3AsrKvCacheCapacity,
+    config: BuiltinSeq2SeqDecodePolicyConfigInput,
+    tokenizer: FireRedLlmTokenizer,
+    control: Arc<crate::api::backend::TranscriptionControl>,
+    decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
+    profile_enabled: bool,
+) -> Result<Seq2SeqGreedyDecodeResult, FireRedLlmExecutorError> {
+    if profile_enabled {
+        eprintln!(
+            "OPENASR_FIRERED_LLM_PROFILE decoder_backend={} native_gqa={}",
+            decoder.backend_label(),
+            decoder.uses_native_gqa(),
+        );
+    }
+    let audio_pad_end = decode_prompt
+        .audio_pad_start_index
+        .checked_add(decode_prompt.audio_pad_count)
+        .ok_or_else(|| FireRedLlmExecutorError::PromptEmbeddingFailed {
+            reason: "audio pad position overflowed".to_string(),
+        })?;
+    let prompt_input = Qwen3AsrPromptTokenInput {
+        token_ids: decode_prompt.token_ids,
+        audio_rows: speech_rows,
+        audio_positions: (decode_prompt.audio_pad_start_index..audio_pad_end).collect(),
+    };
+    let layer_kv_caches = decoder
+        .new_kv_caches(kv_capacity)
+        .map_err(|reason| FireRedLlmExecutorError::DecoderFailed { reason })?;
+    let mut step_executor = FireRedLlmGreedyStepExecutor {
+        decoder,
+        layer_kv_caches,
+        kv_capacity,
+        prompt_input: Some(prompt_input),
+        cache_prompt_tokens: 0,
+        control: Arc::clone(&control),
+    };
+    let decode_result = run_builtin_seq2seq_decode_policy(
+        FIRERED_LLM_DECODE_POLICY_ID,
+        &config,
+        &(),
+        None,
+        &mut step_executor,
+        &|token_ids: &[u32]| {
+            tokenizer.decode_text_token_ids(token_ids).map_err(|error| {
+                Seq2SeqGreedyDecodeError::TokenizerDecodeFailed {
+                    reason: error.to_string(),
+                }
+            })
+        },
+        |error: Seq2SeqGreedyDecodeError| error,
+        |error: Seq2SeqGreedyDecodeError| error,
+        map_registry_error,
+        &control,
+        decode_work_progress.as_ref(),
+    );
+    decoder.release_session_scoped_buffers();
+    decode_result.map_err(|error| FireRedLlmExecutorError::GreedyDecodeFailed {
+        reason: error.to_string(),
+    })
+}
+
 impl FireRedLlmGgmlExecutor {
     fn map_actor_error(
         stage: &'static str,
@@ -289,10 +620,12 @@ impl FireRedLlmGgmlExecutor {
         preflight: &crate::GgufRuntimeSourcePreflight,
         metadata: super::runtime_contract::FireRedLlmDecoderMetadata,
         backend: GgmlCpuGraphBackend,
+        native_gqa: GgmlNativeGqaCapability,
     ) -> Result<FireRedLlmDecoderRuntimeActor, FireRedLlmExecutorError> {
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
+            native_gqa,
         );
         let quote_preflight = preflight.clone();
         let build_preflight = preflight.clone();
@@ -331,15 +664,21 @@ impl FireRedLlmGgmlExecutor {
                         reason: error.to_string(),
                     }
                 })?;
-                Ok((retained_bytes, (build_preflight, metadata, backend, quote)))
+                Ok((
+                    retained_bytes,
+                    (build_preflight, metadata, backend, native_gqa, quote),
+                ))
             },
-            move |(preflight, metadata, backend, quote)| {
+            move |(preflight, metadata, backend, native_gqa, quote)| {
                 match SystemMemoryOwner::try_allocate_transaction(quote, || {
-                    let runtime =
-                        FireRedLlmDecoderRuntime::new_from_preflight(&preflight, metadata, backend)
-                            .map_err(|error| FireRedLlmExecutorError::DecoderFailed {
-                                reason: error.to_string(),
-                            })?;
+                    let runtime = FireRedLlmDecoderRuntime::new_from_preflight_with_native_gqa(
+                        &preflight, metadata, backend, native_gqa,
+                    )
+                    .map_err(|error| {
+                        FireRedLlmExecutorError::DecoderFailed {
+                            reason: error.to_string(),
+                        }
+                    })?;
                     let retained = runtime.retained_system_memory_bytes().map_err(|reason| {
                         FireRedLlmExecutorError::RuntimeOwnershipFailed {
                             stage: "decoder",
@@ -364,18 +703,87 @@ impl FireRedLlmGgmlExecutor {
         )
     }
 
+    fn checkout_unified_gpu_runtime(
+        &self,
+        preflight: &crate::GgufRuntimeSourcePreflight,
+        encoder_metadata: FireRedAedExecutionMetadata,
+        decoder_metadata: FireRedLlmDecoderMetadata,
+        backend: GgmlCpuGraphBackend,
+        native_gqa: GgmlNativeGqaCapability,
+    ) -> Result<FireRedLlmUnifiedRuntimeActor, FireRedLlmExecutorError> {
+        let key = FireRedLlmUnifiedRuntimeCacheKey {
+            content: PackContentKey::for_runtime_source(&preflight.runtime_source),
+            lane: current_execution_lane_key(backend),
+            native_gqa,
+        };
+        let quote_preflight = preflight.clone();
+        let build_preflight = preflight.clone();
+        self.unified_gpu_runtimes.checkout_or_try_build_with(
+            key,
+            move || {
+                let quote = FireRedLlmUnifiedRuntimeState::system_memory_quote(
+                    &quote_preflight,
+                    encoder_metadata,
+                    decoder_metadata,
+                    backend,
+                )
+                .map_err(|reason| {
+                    FireRedLlmExecutorError::RuntimeOwnershipFailed {
+                        stage: "unified-runtime",
+                        reason,
+                    }
+                })?;
+                Ok((quote.retained_bytes, (build_preflight, quote)))
+            },
+            move |(preflight, quote)| {
+                allocate_firered_llm_unified_runtime(
+                    preflight,
+                    encoder_metadata,
+                    decoder_metadata,
+                    backend,
+                    native_gqa,
+                    quote,
+                )
+            },
+            |error| Self::map_actor_error("unified-runtime", error),
+        )
+    }
+
     pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
         self.decoder_runtimes
             .evict_where(|key| key.0.pack_content_id == pack_content_id);
+        self.unified_gpu_runtimes
+            .evict_where(|key| key.content.pack_content_id == pack_content_id);
     }
 
     fn clear_runtime_actors(&self) {
         self.decoder_runtimes.clear();
+        self.unified_gpu_runtimes.clear();
     }
 
     fn execute_inner(
         &self,
         request: &GgmlAsrExecutionViewRequest,
+    ) -> Result<GgmlAsrExecutionResult, FireRedLlmExecutorError> {
+        self.execute_inner_with_runtime_mode(request, true)
+    }
+
+    fn execute_streaming_view(
+        &self,
+        request: &GgmlAsrExecutionViewRequest,
+    ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+        self.execute_inner_with_runtime_mode(request, false)
+            .map_err(|error| GgmlAsrExecutionError::ExecutorFailed {
+                executor_id: FIRERED_LLM_STREAMING_EXECUTOR_ID,
+                adapter_id: request.selected_family.adapter_id,
+                reason: error.to_string(),
+            })
+    }
+
+    fn execute_inner_with_runtime_mode(
+        &self,
+        request: &GgmlAsrExecutionViewRequest,
+        allow_unified_runtime: bool,
     ) -> Result<GgmlAsrExecutionResult, FireRedLlmExecutorError> {
         let expected_adapter = crate::arch::FIRERED_LLM_GGML_ADAPTER_ID;
         if request.selected_family.adapter_id != expected_adapter {
@@ -450,41 +858,110 @@ impl FireRedLlmGgmlExecutor {
             },
         )?;
 
-        let mut encoder_runtime = FireRedEncoderGraphRuntime::new_from_preflight(
-            preflight,
-            encoder_metadata,
-            request.resolved_runtime.backend(),
-        )
-        .map_err(|error| FireRedLlmExecutorError::EncoderFailed {
-            reason: error.to_string(),
-        })?;
-        let encoder_output = encoder_runtime
-            .encode(&features.data, features.n_frames)
-            .map_err(|error| FireRedLlmExecutorError::EncoderFailed {
-                reason: error.to_string(),
-            })?;
-        drop(encoder_runtime);
+        let backend = request.resolved_runtime.backend();
+        let backend_preference = request_backend_override();
+        let native_gqa = firered_llm_native_gqa_capability(
+            backend,
+            backend_preference.as_ref(),
+            request.resolved_runtime.native_gqa_capability(),
+        );
+        let placement = current_execution_placement();
+        let unified_gpu_runtime = if firered_llm_unified_runtime_enabled(
+            allow_unified_runtime,
+            backend,
+            backend_preference.as_ref(),
+            placement,
+        ) {
+            Some(self.checkout_unified_gpu_runtime(
+                preflight,
+                encoder_metadata,
+                decoder_metadata,
+                backend,
+                native_gqa,
+            )?)
+        } else {
+            None
+        };
+
+        let feature_frames = features.n_frames;
+        let encoder_output = match unified_gpu_runtime.as_ref() {
+            Some(runtime) => runtime
+                .call_mut_fallible(move |state| {
+                    let encode_result = state.encoder.encode(&features.data, feature_frames);
+                    let release_result = state.encoder.release_transient_compute_memory();
+                    match (encode_result, release_result) {
+                        (Ok(output), Ok(())) => Ok(output),
+                        (Err(error), _) => Err(error),
+                        (Ok(_), Err(error)) => Err(error),
+                    }
+                })
+                .map_err(|error| Self::map_actor_error("unified-encoder", error))?
+                .map_err(|error| FireRedLlmExecutorError::EncoderFailed {
+                    reason: error.to_string(),
+                })?,
+            None => {
+                let mut encoder_runtime = FireRedEncoderGraphRuntime::new_from_preflight(
+                    preflight,
+                    encoder_metadata,
+                    backend,
+                )
+                .map_err(|error| FireRedLlmExecutorError::EncoderFailed {
+                    reason: error.to_string(),
+                })?;
+                let output = encoder_runtime
+                    .encode(&features.data, feature_frames)
+                    .map_err(|error| FireRedLlmExecutorError::EncoderFailed {
+                        reason: error.to_string(),
+                    })?;
+                drop(encoder_runtime);
+                output
+            }
+        };
 
         let adapter_profile_started_at = std::time::Instant::now();
-        let mut adapter_runtime = FireRedLlmAdapterGraphRuntime::new_from_preflight(
-            preflight,
-            request.resolved_runtime.backend(),
-        )
-        .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
-            reason: error.to_string(),
-        })?;
-        let (speech_rows, speech_frame_count) = adapter_runtime
-            .run(
-                &encoder_output.rows,
-                encoder_output.frame_count,
-                encoder_metadata.d_model,
-                adapter_metadata.downsample_rate,
-                adapter_metadata.llm_dim,
-            )
-            .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
-                reason: error.to_string(),
-            })?;
-        drop(adapter_runtime);
+        let (speech_rows, speech_frame_count) = match unified_gpu_runtime.as_ref() {
+            Some(runtime) => runtime
+                .call_mut_fallible(move |state| {
+                    let adapter_result = state.adapter.run(
+                        &encoder_output.rows,
+                        encoder_output.frame_count,
+                        encoder_metadata.d_model,
+                        adapter_metadata.downsample_rate,
+                        adapter_metadata.llm_dim,
+                    );
+                    let release_result = state.adapter.release_transient_compute_memory();
+                    match (adapter_result, release_result) {
+                        (Ok(output), Ok(())) => Ok(output),
+                        (Err(error), _) => Err(error),
+                        (Ok(_), Err(error)) => Err(error),
+                    }
+                })
+                .map_err(|error| Self::map_actor_error("unified-adapter", error))?
+                .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
+                    reason: error.to_string(),
+                })?,
+            None => {
+                let mut adapter_runtime = FireRedLlmAdapterGraphRuntime::new_from_preflight(
+                    preflight, backend,
+                )
+                .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
+                    reason: error.to_string(),
+                })?;
+                let output = adapter_runtime
+                    .run(
+                        &encoder_output.rows,
+                        encoder_output.frame_count,
+                        encoder_metadata.d_model,
+                        adapter_metadata.downsample_rate,
+                        adapter_metadata.llm_dim,
+                    )
+                    .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
+                        reason: error.to_string(),
+                    })?;
+                drop(adapter_runtime);
+                output
+            }
+        };
         // Opt-in perf diagnostic, same gate/shape as the decoder_backend line
         // below (mirrors the qwen `OPENASR_HYMT2_PROFILE` precedent): the
         // adapter stage regressed to 2868ms/18.4% of `execute` on the naive
@@ -507,7 +984,7 @@ impl FireRedLlmGgmlExecutor {
         // this candidate. Family executors must not invent a second heuristic
         // fallback: doing so would make allocation ownership and the reported
         // execution route disagree.
-        let decoder_backend = request.resolved_runtime.backend();
+        let decoder_backend = backend;
         let measured_positions =
             crate::capacity::topology::causal_prefix_positions_with_context_cap(
                 super::capacity::FIRERED_LLM_SELF_KV_STATE_ID,
@@ -524,8 +1001,6 @@ impl FireRedLlmGgmlExecutor {
         )
         .and_then(|capacity| capacity.validate_measured_logical_positions(measured_positions))
         .map_err(|source| FireRedLlmExecutorError::DecoderStateCapacity { source })?;
-        let decoder_actor =
-            self.checkout_decoder_runtime(preflight, decoder_metadata, decoder_backend)?;
         let config = BuiltinSeq2SeqDecodePolicyConfigInput {
             initial_prompt_tokens: decode_prompt.token_ids.clone(),
             eot_token_id: tokenizer.chatml_im_end_token_id,
@@ -539,63 +1014,56 @@ impl FireRedLlmGgmlExecutor {
             .decode_work_progress_observer()
             .cloned();
         let profile_enabled = std::env::var_os("OPENASR_FIRERED_LLM_PROFILE").is_some();
-        let result = decoder_actor
-            .call_mut(move |decoder| {
-                if profile_enabled {
-                    eprintln!(
-                        "OPENASR_FIRERED_LLM_PROFILE decoder_backend={}",
-                        decoder.backend_label()
-                    );
-                }
-                let audio_pad_end = decode_prompt
-                    .audio_pad_start_index
-                    .checked_add(decode_prompt.audio_pad_count)
-                    .ok_or_else(|| FireRedLlmExecutorError::PromptEmbeddingFailed {
-                        reason: "audio pad position overflowed".to_string(),
-                    })?;
-                let prompt_input = Qwen3AsrPromptTokenInput {
-                    token_ids: decode_prompt.token_ids.clone(),
-                    audio_rows: speech_rows,
-                    audio_positions: (decode_prompt.audio_pad_start_index..audio_pad_end).collect(),
+        let terminate_unified_after_decode = request
+            .request_options
+            .longform_chunk_count_hint
+            .is_some_and(|chunk_count| chunk_count > 1);
+        let result = match unified_gpu_runtime.as_ref() {
+            Some(runtime) => {
+                let decode = move |state: &mut FireRedLlmUnifiedRuntimeState| {
+                    run_firered_llm_decode_with_runtime(
+                        &mut state.decoder,
+                        decode_prompt,
+                        speech_rows,
+                        kv_capacity,
+                        config,
+                        decoder_tokenizer,
+                        decoder_control,
+                        decoder_decode_work_progress,
+                        profile_enabled,
+                    )
                 };
-                let layer_kv_caches = decoder
-                    .new_kv_caches(kv_capacity)
-                    .map_err(|reason| FireRedLlmExecutorError::DecoderFailed { reason })?;
-                let mut step_executor = FireRedLlmGreedyStepExecutor {
-                    decoder,
-                    layer_kv_caches,
-                    kv_capacity,
-                    prompt_input: Some(prompt_input),
-                    cache_prompt_tokens: 0,
-                    control: Arc::clone(&decoder_control),
+                let decoded = if terminate_unified_after_decode {
+                    runtime.call_mut_then_terminate(decode)
+                } else {
+                    runtime.call_mut_fallible(decode)
                 };
-                let decode_result = run_builtin_seq2seq_decode_policy(
-                    FIRERED_LLM_DECODE_POLICY_ID,
-                    &config,
-                    &(),
-                    None,
-                    &mut step_executor,
-                    &|token_ids: &[u32]| {
-                        decoder_tokenizer
-                            .decode_text_token_ids(token_ids)
-                            .map_err(|error| Seq2SeqGreedyDecodeError::TokenizerDecodeFailed {
-                                reason: error.to_string(),
-                            })
-                    },
-                    |error: Seq2SeqGreedyDecodeError| error,
-                    |error: Seq2SeqGreedyDecodeError| error,
-                    map_registry_error,
-                    &decoder_control,
-                    decoder_decode_work_progress.as_ref(),
-                );
-                // CPU step buffers are invocation-scoped. Native weights and
-                // the stable resident arena remain with this actor.
-                decoder.release_session_scoped_buffers();
-                decode_result.map_err(|error| FireRedLlmExecutorError::GreedyDecodeFailed {
-                    reason: error.to_string(),
-                })
-            })
-            .map_err(|error| Self::map_actor_error("decoder", error))??;
+                decoded.map_err(|error| Self::map_actor_error("unified-decoder", error))??
+            }
+            None => {
+                let decoder_actor = self.checkout_decoder_runtime(
+                    preflight,
+                    decoder_metadata,
+                    decoder_backend,
+                    native_gqa,
+                )?;
+                decoder_actor
+                    .call_mut(move |decoder| {
+                        run_firered_llm_decode_with_runtime(
+                            decoder,
+                            decode_prompt,
+                            speech_rows,
+                            kv_capacity,
+                            config,
+                            decoder_tokenizer,
+                            decoder_control,
+                            decoder_decode_work_progress,
+                            profile_enabled,
+                        )
+                    })
+                    .map_err(|error| Self::map_actor_error("decoder", error))??
+            }
+        };
 
         let text = result.text.trim().to_string();
         let transcription = Transcription {
@@ -694,7 +1162,7 @@ impl GgmlAsrStreamingExecutor for FireRedLlmGgmlExecutor {
             "firered-llm",
             request,
             STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT,
-            FireRedLlmGgmlExecutor::execute_view,
+            FireRedLlmGgmlExecutor::execute_streaming_view,
         )
     }
 
@@ -713,6 +1181,127 @@ mod tests {
     use crate::models::ggml_asr_executor::GgmlAsrPreparedAudioView;
 
     use super::*;
+
+    fn exactly_addressable_preference(provider: ExecutionProvider) -> RequestBackendPreference {
+        RequestBackendPreference::Exact(crate::device::execution_route::ResolvedExecutionRoute {
+            provider,
+            stable_id: format!("{}0", provider.as_str()),
+            registry_ordinal: 0,
+            kind: crate::device::execution_route::RouteDeviceKind::Accelerated,
+            addressability:
+                crate::device::execution_route::DeviceAddressability::ExactlyAddressable {
+                    physical_key: crate::device::execution_route::PhysicalResourceKey::new(
+                        "0000:01:00.0",
+                    )
+                    .expect("physical key"),
+                },
+        })
+    }
+
+    #[test]
+    fn unified_owner_is_limited_to_offline_exact_cuda_and_vulkan_full_device() {
+        for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
+            let preference = exactly_addressable_preference(provider);
+            assert!(firered_llm_unified_runtime_enabled(
+                true,
+                GgmlCpuGraphBackend::Gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+            ));
+            assert!(!firered_llm_unified_runtime_enabled(
+                false,
+                GgmlCpuGraphBackend::Gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+            ));
+            assert!(!firered_llm_unified_runtime_enabled(
+                true,
+                GgmlCpuGraphBackend::Gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::Hybrid),
+            ));
+        }
+
+        for provider in [
+            ExecutionProvider::Cpu,
+            ExecutionProvider::Metal,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Accelerator,
+            ExecutionProvider::Unknown,
+        ] {
+            let preference = exactly_addressable_preference(provider);
+            assert!(!firered_llm_unified_runtime_enabled(
+                true,
+                GgmlCpuGraphBackend::Gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+            ));
+        }
+        assert!(!firered_llm_unified_runtime_enabled(
+            true,
+            GgmlCpuGraphBackend::Cpu,
+            None,
+            Some(ExecutionPlacement::CpuOnly),
+        ));
+    }
+
+    #[test]
+    fn native_gqa_candidate_is_vulkan_only_on_discrete_gpu() {
+        let validated = GgmlNativeGqaCapability::Validated;
+        for (provider, expected) in [
+            (
+                ExecutionProvider::Cuda,
+                GgmlNativeGqaCapability::Unsupported,
+            ),
+            (ExecutionProvider::Vulkan, validated),
+            (ExecutionProvider::Hip, GgmlNativeGqaCapability::Unsupported),
+            (
+                ExecutionProvider::Accelerator,
+                GgmlNativeGqaCapability::Unsupported,
+            ),
+            (
+                ExecutionProvider::Unknown,
+                GgmlNativeGqaCapability::Unsupported,
+            ),
+        ] {
+            let preference = exactly_addressable_preference(provider);
+            assert_eq!(
+                firered_llm_native_gqa_candidate(
+                    GgmlCpuGraphBackend::Gpu,
+                    Some(&preference),
+                    validated,
+                ),
+                expected,
+            );
+        }
+        assert_eq!(
+            firered_llm_native_gqa_candidate(GgmlCpuGraphBackend::Cpu, None, validated),
+            validated,
+        );
+        assert_eq!(
+            firered_llm_native_gqa_candidate(GgmlCpuGraphBackend::Metal, None, validated),
+            validated,
+        );
+        assert_eq!(
+            firered_llm_native_gqa_candidate(
+                GgmlCpuGraphBackend::Gpu,
+                Some(&exactly_addressable_preference(ExecutionProvider::Vulkan)),
+                GgmlNativeGqaCapability::Unsupported,
+            ),
+            GgmlNativeGqaCapability::Unsupported,
+        );
+    }
+
+    #[test]
+    fn unified_owner_quote_overlaps_decoder_construction_with_prior_retention() {
+        assert_eq!(
+            firered_llm_unified_runtime_system_memory_shape(100, 10, 70, 40).expect("valid quote"),
+            (180, 150),
+        );
+        assert!(firered_llm_unified_runtime_system_memory_shape(u64::MAX, 1, 0, 0).is_err());
+        assert!(firered_llm_unified_runtime_system_memory_shape(1, 0, u64::MAX, 0).is_err());
+        assert!(firered_llm_unified_runtime_system_memory_shape(1, 0, 0, u64::MAX).is_err());
+    }
 
     /// Points at the real converted pack from T2
     /// (`scratchpad/fr2/T2-report.md`), an ~8.9GB q8_0 `.oasr` NOT committed

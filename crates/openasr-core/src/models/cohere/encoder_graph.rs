@@ -3,7 +3,7 @@ use std::time::Instant;
 use thiserror::Error;
 
 use crate::ggml_runtime::{
-    GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedTensor,
+    GGML_TYPE_F32, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedTensor,
     GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
 };
 use crate::nn::conv::{
@@ -27,7 +27,10 @@ const COHERE_DEBUG_ENCODER_ENV: &str = "OPENASR_COHERE_DEBUG_ENCODER";
 const COHERE_DEBUG_ENCODER_BUILD_ENV: &str = "OPENASR_COHERE_DEBUG_ENCODER_BUILD";
 
 enum RuntimeWeightSource<'a> {
-    Verified(&'a GgufRuntimeSourcePreflight),
+    Verified {
+        preflight: &'a GgufRuntimeSourcePreflight,
+        fully_loaded: bool,
+    },
     #[cfg(test)]
     Synthetic,
 }
@@ -63,89 +66,98 @@ pub(crate) enum CohereTranscribeEncoderError {
 }
 
 struct CohereEncoderPreludeRuntime {
-    pre_conv0_weight: GgmlStaticTensor,
-    pre_conv0_bias: GgmlStaticTensor,
+    pre_conv0_weight: CohereEncoderWeightTensor,
+    pre_conv0_bias: CohereEncoderWeightTensor,
     pre_conv0_bias_len: usize,
-    pre_conv2_weight: GgmlStaticTensor,
-    pre_conv2_bias: GgmlStaticTensor,
+    pre_conv2_weight: CohereEncoderWeightTensor,
+    pre_conv2_bias: CohereEncoderWeightTensor,
     pre_conv2_bias_len: usize,
-    pre_conv3_weight: GgmlStaticTensor,
-    pre_conv3_bias: GgmlStaticTensor,
+    pre_conv3_weight: CohereEncoderWeightTensor,
+    pre_conv3_bias: CohereEncoderWeightTensor,
     pre_conv3_bias_len: usize,
-    pre_conv5_weight: GgmlStaticTensor,
-    pre_conv5_bias: GgmlStaticTensor,
+    pre_conv5_weight: CohereEncoderWeightTensor,
+    pre_conv5_bias: CohereEncoderWeightTensor,
     pre_conv5_bias_len: usize,
-    pre_conv6_weight: GgmlStaticTensor,
-    pre_conv6_bias: GgmlStaticTensor,
+    pre_conv6_weight: CohereEncoderWeightTensor,
+    pre_conv6_bias: CohereEncoderWeightTensor,
     pre_conv6_bias_len: usize,
-    pre_out_weight: GgmlStaticTensor,
-    pre_out_bias: GgmlStaticTensor,
-    enc_proj_weight: GgmlStaticTensor,
-    enc_proj_bias: GgmlStaticTensor,
+    pre_out_weight: CohereEncoderWeightTensor,
+    pre_out_bias: CohereEncoderWeightTensor,
+    enc_proj_weight: CohereEncoderWeightTensor,
+    enc_proj_bias: CohereEncoderWeightTensor,
 }
 
 struct CohereEncoderLayerRuntime {
-    ff1_norm_weight: GgmlStaticTensor,
-    ff1_norm_bias: GgmlStaticTensor,
-    ff1_up_weight: GgmlStaticTensor,
-    ff1_up_bias: GgmlStaticTensor,
-    ff1_down_weight: GgmlStaticTensor,
-    ff1_down_bias: GgmlStaticTensor,
-    attn_norm_weight: GgmlStaticTensor,
-    attn_norm_bias: GgmlStaticTensor,
-    attn_q_weight: GgmlStaticTensor,
-    attn_q_bias: GgmlStaticTensor,
-    attn_k_weight: GgmlStaticTensor,
-    attn_k_bias: GgmlStaticTensor,
-    attn_v_weight: GgmlStaticTensor,
-    attn_v_bias: GgmlStaticTensor,
-    attn_out_weight: GgmlStaticTensor,
-    attn_out_bias: GgmlStaticTensor,
-    attn_pos_weight: GgmlStaticTensor,
-    attn_pos_bias_u: GgmlStaticTensor,
-    attn_pos_bias_v: GgmlStaticTensor,
-    conv_norm_weight: GgmlStaticTensor,
-    conv_norm_bias: GgmlStaticTensor,
-    conv_pw1_weight: GgmlStaticTensor,
-    conv_pw1_bias: GgmlStaticTensor,
-    conv_dw_weight: GgmlStaticTensor,
-    conv_dw_bias: GgmlStaticTensor,
-    conv_pw2_weight: GgmlStaticTensor,
-    conv_pw2_bias: GgmlStaticTensor,
-    ff2_norm_weight: GgmlStaticTensor,
-    ff2_norm_bias: GgmlStaticTensor,
-    ff2_up_weight: GgmlStaticTensor,
-    ff2_up_bias: GgmlStaticTensor,
-    ff2_down_weight: GgmlStaticTensor,
-    ff2_down_bias: GgmlStaticTensor,
-    out_norm_weight: GgmlStaticTensor,
-    out_norm_bias: GgmlStaticTensor,
+    ff1_norm_weight: CohereEncoderWeightTensor,
+    ff1_norm_bias: CohereEncoderWeightTensor,
+    ff1_up_weight: CohereEncoderWeightTensor,
+    ff1_up_bias: CohereEncoderWeightTensor,
+    ff1_down_weight: CohereEncoderWeightTensor,
+    ff1_down_bias: CohereEncoderWeightTensor,
+    attn_norm_weight: CohereEncoderWeightTensor,
+    attn_norm_bias: CohereEncoderWeightTensor,
+    attn_q_weight: CohereEncoderWeightTensor,
+    attn_q_bias: CohereEncoderWeightTensor,
+    attn_k_weight: CohereEncoderWeightTensor,
+    attn_k_bias: CohereEncoderWeightTensor,
+    attn_v_weight: CohereEncoderWeightTensor,
+    attn_v_bias: CohereEncoderWeightTensor,
+    attn_out_weight: CohereEncoderWeightTensor,
+    attn_out_bias: CohereEncoderWeightTensor,
+    attn_pos_weight: CohereEncoderWeightTensor,
+    attn_pos_bias_u: CohereEncoderWeightTensor,
+    attn_pos_bias_v: CohereEncoderWeightTensor,
+    conv_norm_weight: CohereEncoderWeightTensor,
+    conv_norm_bias: CohereEncoderWeightTensor,
+    conv_pw1_weight: CohereEncoderWeightTensor,
+    conv_pw1_bias: CohereEncoderWeightTensor,
+    conv_dw_weight: CohereEncoderWeightTensor,
+    conv_dw_bias: CohereEncoderWeightTensor,
+    conv_pw2_weight: CohereEncoderWeightTensor,
+    conv_pw2_bias: CohereEncoderWeightTensor,
+    ff2_norm_weight: CohereEncoderWeightTensor,
+    ff2_norm_bias: CohereEncoderWeightTensor,
+    ff2_up_weight: CohereEncoderWeightTensor,
+    ff2_up_bias: CohereEncoderWeightTensor,
+    ff2_down_weight: CohereEncoderWeightTensor,
+    ff2_down_bias: CohereEncoderWeightTensor,
+    out_norm_weight: CohereEncoderWeightTensor,
+    out_norm_bias: CohereEncoderWeightTensor,
+}
+
+#[derive(Clone, Copy)]
+enum CohereEncoderWeightTensor {
+    Loaded(GgmlLoadedTensor),
+    LoadedView(GgmlStaticTensor),
+    Static(GgmlStaticTensor),
+}
+
+impl CohereEncoderWeightTensor {
+    fn as_graph_tensor<'a>(self) -> crate::ggml_runtime::GgmlCpuTensor<'a> {
+        match self {
+            Self::Loaded(tensor) => tensor.as_graph_tensor(),
+            Self::LoadedView(tensor) | Self::Static(tensor) => tensor.as_graph_tensor(),
+        }
+    }
+
+    fn static_tensor(self) -> Option<GgmlStaticTensor> {
+        match self {
+            Self::Static(tensor) => Some(tensor),
+            Self::Loaded(_) | Self::LoadedView(_) => None,
+        }
+    }
 }
 
 pub(crate) struct CohereTranscribeEncoderGraphRuntime {
     metadata: CohereTranscribeExecutionMetadata,
-    runner: GgmlCpuGraphRunner,
-    loaded_weights: Option<GgmlLoadedWeightContext>,
-    arena: GgmlStaticTensorArena,
     relative_position_inverse_timescales: GgmlStaticTensor,
     prelude: CohereEncoderPreludeRuntime,
     layers: Vec<CohereEncoderLayerRuntime>,
-}
-
-fn has_loaded_tensor(loaded_weights: Option<&GgmlLoadedWeightContext>, name: &str) -> bool {
-    loaded_weights
-        .and_then(|loaded| loaded.tensor(name))
-        .is_some()
-}
-
-fn loaded_or_static_tensor<'a>(
-    loaded: Option<GgmlLoadedTensor>,
-    arena: &GgmlStaticTensorArena,
-    tensor: GgmlStaticTensor,
-) -> crate::ggml_runtime::GgmlCpuTensor<'a> {
-    loaded
-        .map(GgmlLoadedTensor::as_graph_tensor)
-        .unwrap_or_else(|| arena.graph_tensor(tensor))
+    // Graph-visible handles and views must drop before their backing arena,
+    // loaded roots, and backend runner, in that order.
+    arena: GgmlStaticTensorArena,
+    loaded_weights: Option<GgmlLoadedWeightContext>,
+    runner: GgmlCpuGraphRunner,
 }
 
 #[cfg(test)]
@@ -161,6 +173,38 @@ pub(crate) fn encode_cohere_transcribe_audio_embeddings_from_weights(
 }
 
 impl CohereTranscribeEncoderGraphRuntime {
+    pub(crate) fn quoted_retained_system_memory_bytes(
+        metadata: CohereTranscribeExecutionMetadata,
+    ) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_usize(
+            metadata
+                .encoder_layers
+                .checked_mul(std::mem::size_of::<CohereEncoderLayerRuntime>())
+                .ok_or_else(|| "cohere encoder runtime handle quote overflowed".to_string())?,
+            "cohere encoder runtime layer handles",
+        )?;
+        Ok(bytes.finish())
+    }
+
+    pub(crate) fn graph_lane(&self) -> (crate::ggml_runtime::GgmlCpuGraphBackend, bool) {
+        (self.runner.backend_kind(), self.runner.uses_scheduler())
+    }
+
+    pub(crate) fn loaded_weight_binding_identity(
+        &self,
+    ) -> Option<crate::ggml_runtime::GgmlLoadedWeightBindingIdentity> {
+        self.loaded_weights
+            .as_ref()
+            .map(|loaded| self.runner.loaded_weight_binding_identity(loaded))
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.layers, "cohere encoder runtime layer handles")?;
+        Ok(bytes.finish())
+    }
+
     pub(crate) fn new(
         weights: &CohereTranscribeEncoderWeights,
         metadata: CohereTranscribeExecutionMetadata,
@@ -170,7 +214,27 @@ impl CohereTranscribeEncoderGraphRuntime {
         Self::new_impl(
             weights,
             metadata,
-            RuntimeWeightSource::Verified(runtime_preflight),
+            RuntimeWeightSource::Verified {
+                preflight: runtime_preflight,
+                fully_loaded: false,
+            },
+            backend,
+        )
+    }
+
+    pub(crate) fn new_fully_loaded(
+        weights: &CohereTranscribeEncoderWeights,
+        metadata: CohereTranscribeExecutionMetadata,
+        runtime_preflight: &GgufRuntimeSourcePreflight,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    ) -> Result<Self, CohereTranscribeEncoderError> {
+        Self::new_impl(
+            weights,
+            metadata,
+            RuntimeWeightSource::Verified {
+                preflight: runtime_preflight,
+                fully_loaded: true,
+            },
             backend,
         )
     }
@@ -211,17 +275,23 @@ impl CohereTranscribeEncoderGraphRuntime {
             }
         })?;
         let runner_ms = runner_start.elapsed().as_secs_f64() * 1000.0;
-        let loaded_weights = match runtime_source {
-            RuntimeWeightSource::Verified(preflight) => Some(
-                runner
-                    .load_gguf_weight_context_from_preflight(preflight)
-                    .map_err(|source| CohereTranscribeEncoderError::GraphBuildFailed {
-                        step: "load_gguf_weight_context",
-                        source,
-                    })?,
+        let (loaded_weights, fully_loaded) = match runtime_source {
+            RuntimeWeightSource::Verified {
+                preflight,
+                fully_loaded,
+            } => (
+                Some(
+                    runner
+                        .load_gguf_weight_context_from_preflight(preflight)
+                        .map_err(|source| CohereTranscribeEncoderError::GraphBuildFailed {
+                            step: "load_gguf_weight_context",
+                            source,
+                        })?,
+                ),
+                fully_loaded,
             ),
             #[cfg(test)]
-            RuntimeWeightSource::Synthetic => None,
+            RuntimeWeightSource::Synthetic => (None, false),
         };
         let arena_start = Instant::now();
         let arena_tensor_count = weights
@@ -253,79 +323,124 @@ impl CohereTranscribeEncoderGraphRuntime {
 
         let prelude_decl_start = Instant::now();
         let prelude = CohereEncoderPreludeRuntime {
-            pre_conv0_weight: new_static_tensor_4d_from_dims(
+            pre_conv0_weight: new_encoder_tensor_weight(
                 &arena,
-                &weights.pre_conv0_weight.dims,
+                loaded_weights.as_ref(),
+                fully_loaded,
+                &weights.pre_conv0_weight,
+                false,
+                CohereEncoderStaticTensorKind::F32Rank4,
                 "enc_pre_conv0_weight",
             )?,
-            pre_conv0_bias: new_static_tensor_1d_from_len(
+            pre_conv0_bias: new_encoder_vector_weight(
                 &arena,
-                weights.pre_conv0_bias.values.len(),
+                loaded_weights.as_ref(),
+                fully_loaded,
+                &weights.pre_conv0_bias,
+                false,
                 "enc_pre_conv0_bias",
             )?,
             pre_conv0_bias_len: weights.pre_conv0_bias.values.len(),
-            pre_conv2_weight: new_static_tensor_4d_f16_from_dims(
+            pre_conv2_weight: new_encoder_tensor_weight(
                 &arena,
-                &weights.pre_conv2_weight.dims,
+                loaded_weights.as_ref(),
+                fully_loaded,
+                &weights.pre_conv2_weight,
+                false,
+                CohereEncoderStaticTensorKind::F16Rank4,
                 "enc_pre_conv2_weight",
             )?,
-            pre_conv2_bias: new_static_tensor_1d_from_len(
+            pre_conv2_bias: new_encoder_vector_weight(
                 &arena,
-                weights.pre_conv2_bias.values.len(),
+                loaded_weights.as_ref(),
+                fully_loaded,
+                &weights.pre_conv2_bias,
+                false,
                 "enc_pre_conv2_bias",
             )?,
             pre_conv2_bias_len: weights.pre_conv2_bias.values.len(),
-            pre_conv3_weight: new_static_tensor_4d_from_dims(
+            pre_conv3_weight: new_encoder_tensor_weight(
                 &arena,
-                &weights.pre_conv3_weight.dims,
+                loaded_weights.as_ref(),
+                fully_loaded,
+                &weights.pre_conv3_weight,
+                false,
+                CohereEncoderStaticTensorKind::F32Rank4,
                 "enc_pre_conv3_weight",
             )?,
-            pre_conv3_bias: new_static_tensor_1d_from_len(
+            pre_conv3_bias: new_encoder_vector_weight(
                 &arena,
-                weights.pre_conv3_bias.values.len(),
+                loaded_weights.as_ref(),
+                fully_loaded,
+                &weights.pre_conv3_bias,
+                false,
                 "enc_pre_conv3_bias",
             )?,
             pre_conv3_bias_len: weights.pre_conv3_bias.values.len(),
-            pre_conv5_weight: new_static_tensor_4d_f16_from_dims(
+            pre_conv5_weight: new_encoder_tensor_weight(
                 &arena,
-                &weights.pre_conv5_weight.dims,
+                loaded_weights.as_ref(),
+                fully_loaded,
+                &weights.pre_conv5_weight,
+                false,
+                CohereEncoderStaticTensorKind::F16Rank4,
                 "enc_pre_conv5_weight",
             )?,
-            pre_conv5_bias: new_static_tensor_1d_from_len(
+            pre_conv5_bias: new_encoder_vector_weight(
                 &arena,
-                weights.pre_conv5_bias.values.len(),
+                loaded_weights.as_ref(),
+                fully_loaded,
+                &weights.pre_conv5_bias,
+                false,
                 "enc_pre_conv5_bias",
             )?,
             pre_conv5_bias_len: weights.pre_conv5_bias.values.len(),
-            pre_conv6_weight: new_static_tensor_4d_from_dims(
+            pre_conv6_weight: new_encoder_tensor_weight(
                 &arena,
-                &weights.pre_conv6_weight.dims,
+                loaded_weights.as_ref(),
+                fully_loaded,
+                &weights.pre_conv6_weight,
+                false,
+                CohereEncoderStaticTensorKind::F32Rank4,
                 "enc_pre_conv6_weight",
             )?,
-            pre_conv6_bias: new_static_tensor_1d_from_len(
+            pre_conv6_bias: new_encoder_vector_weight(
                 &arena,
-                weights.pre_conv6_bias.values.len(),
+                loaded_weights.as_ref(),
+                fully_loaded,
+                &weights.pre_conv6_bias,
+                false,
                 "enc_pre_conv6_bias",
             )?,
             pre_conv6_bias_len: weights.pre_conv6_bias.values.len(),
-            pre_out_weight: new_static_projection_tensor(
+            pre_out_weight: new_encoder_projection_weight(
                 &arena,
+                loaded_weights.as_ref(),
+                fully_loaded,
                 &weights.pre_out_weight,
                 "enc_pre_out_weight",
             )?,
-            pre_out_bias: new_static_tensor_1d_from_len(
+            pre_out_bias: new_encoder_vector_weight(
                 &arena,
-                weights.pre_out_bias.values.len(),
+                loaded_weights.as_ref(),
+                fully_loaded,
+                &weights.pre_out_bias,
+                false,
                 "enc_pre_out_bias",
             )?,
-            enc_proj_weight: new_static_projection_tensor(
+            enc_proj_weight: new_encoder_projection_weight(
                 &arena,
+                loaded_weights.as_ref(),
+                fully_loaded,
                 &weights.encoder_projection_weight,
                 "enc_proj_weight",
             )?,
-            enc_proj_bias: new_static_tensor_1d_from_len(
+            enc_proj_bias: new_encoder_vector_weight(
                 &arena,
-                weights.encoder_projection_bias.values.len(),
+                loaded_weights.as_ref(),
+                fully_loaded,
+                &weights.encoder_projection_bias,
+                false,
                 "enc_proj_bias",
             )?,
         };
@@ -335,179 +450,280 @@ impl CohereTranscribeEncoderGraphRuntime {
         let mut layers = Vec::with_capacity(weights.layers.len());
         for layer in &weights.layers {
             let runtime = CohereEncoderLayerRuntime {
-                ff1_norm_weight: new_static_tensor_1d_from_len(
+                ff1_norm_weight: new_encoder_vector_weight(
                     &arena,
-                    layer.ff1_norm_weight.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.ff1_norm_weight,
+                    false,
                     "enc_ff1_norm_weight",
                 )?,
-                ff1_norm_bias: new_static_tensor_1d_from_len(
+                ff1_norm_bias: new_encoder_vector_weight(
                     &arena,
-                    layer.ff1_norm_bias.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.ff1_norm_bias,
+                    false,
                     "enc_ff1_norm_bias",
                 )?,
-                ff1_up_weight: new_static_projection_tensor(
+                ff1_up_weight: new_encoder_projection_weight(
                     &arena,
+                    loaded_weights.as_ref(),
+                    fully_loaded,
                     &layer.ff1_up_weight,
                     "enc_ff1_up_weight",
                 )?,
-                ff1_up_bias: new_static_tensor_1d_from_len(
+                ff1_up_bias: new_encoder_vector_weight(
                     &arena,
-                    layer.ff1_up_bias.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.ff1_up_bias,
+                    false,
                     "enc_ff1_up_bias",
                 )?,
-                ff1_down_weight: new_static_projection_tensor(
+                ff1_down_weight: new_encoder_projection_weight(
                     &arena,
+                    loaded_weights.as_ref(),
+                    fully_loaded,
                     &layer.ff1_down_weight,
                     "enc_ff1_down_weight",
                 )?,
-                ff1_down_bias: new_static_tensor_1d_from_len(
+                ff1_down_bias: new_encoder_vector_weight(
                     &arena,
-                    layer.ff1_down_bias.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.ff1_down_bias,
+                    false,
                     "enc_ff1_down_bias",
                 )?,
-                attn_norm_weight: new_static_tensor_1d_from_len(
+                attn_norm_weight: new_encoder_vector_weight(
                     &arena,
-                    layer.attn_norm_weight.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.attn_norm_weight,
+                    false,
                     "enc_attn_norm_weight",
                 )?,
-                attn_norm_bias: new_static_tensor_1d_from_len(
+                attn_norm_bias: new_encoder_vector_weight(
                     &arena,
-                    layer.attn_norm_bias.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.attn_norm_bias,
+                    false,
                     "enc_attn_norm_bias",
                 )?,
-                attn_q_weight: new_static_projection_tensor(
+                attn_q_weight: new_encoder_projection_weight(
                     &arena,
+                    loaded_weights.as_ref(),
+                    fully_loaded,
                     &layer.attn_q_weight,
                     "enc_attn_q_weight",
                 )?,
-                attn_q_bias: new_static_tensor_1d_from_len(
+                attn_q_bias: new_encoder_vector_weight(
                     &arena,
-                    layer.attn_q_bias.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.attn_q_bias,
+                    false,
                     "enc_attn_q_bias",
                 )?,
-                attn_k_weight: new_static_projection_tensor(
+                attn_k_weight: new_encoder_projection_weight(
                     &arena,
+                    loaded_weights.as_ref(),
+                    fully_loaded,
                     &layer.attn_k_weight,
                     "enc_attn_k_weight",
                 )?,
-                attn_k_bias: new_static_tensor_1d_from_len(
+                attn_k_bias: new_encoder_vector_weight(
                     &arena,
-                    layer.attn_k_bias.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.attn_k_bias,
+                    false,
                     "enc_attn_k_bias",
                 )?,
-                attn_v_weight: new_static_projection_tensor(
+                attn_v_weight: new_encoder_projection_weight(
                     &arena,
+                    loaded_weights.as_ref(),
+                    fully_loaded,
                     &layer.attn_v_weight,
                     "enc_attn_v_weight",
                 )?,
-                attn_v_bias: new_static_tensor_1d_from_len(
+                attn_v_bias: new_encoder_vector_weight(
                     &arena,
-                    layer.attn_v_bias.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.attn_v_bias,
+                    false,
                     "enc_attn_v_bias",
                 )?,
-                attn_out_weight: new_static_projection_tensor(
+                attn_out_weight: new_encoder_projection_weight(
                     &arena,
+                    loaded_weights.as_ref(),
+                    fully_loaded,
                     &layer.attn_out_weight,
                     "enc_attn_out_weight",
                 )?,
-                attn_out_bias: new_static_tensor_1d_from_len(
+                attn_out_bias: new_encoder_vector_weight(
                     &arena,
-                    layer.attn_out_bias.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.attn_out_bias,
+                    false,
                     "enc_attn_out_bias",
                 )?,
-                attn_pos_weight: new_static_projection_tensor(
+                attn_pos_weight: new_encoder_projection_weight(
                     &arena,
+                    loaded_weights.as_ref(),
+                    fully_loaded,
                     &layer.attn_pos_weight,
                     "enc_attn_pos_weight",
                 )?,
-                attn_pos_bias_u: new_static_tensor_1d_from_len(
+                attn_pos_bias_u: new_encoder_vector_weight(
                     &arena,
-                    layer.attn_pos_bias_u.len,
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.attn_pos_bias_u,
+                    false,
                     "enc_attn_pos_bias_u",
                 )?,
-                attn_pos_bias_v: new_static_tensor_1d_from_len(
+                attn_pos_bias_v: new_encoder_vector_weight(
                     &arena,
-                    layer.attn_pos_bias_v.len,
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.attn_pos_bias_v,
+                    false,
                     "enc_attn_pos_bias_v",
                 )?,
-                conv_norm_weight: new_static_tensor_1d_from_len(
+                conv_norm_weight: new_encoder_vector_weight(
                     &arena,
-                    layer.conv_norm_weight.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.conv_norm_weight,
+                    false,
                     "enc_conv_norm_weight",
                 )?,
-                conv_norm_bias: new_static_tensor_1d_from_len(
+                conv_norm_bias: new_encoder_vector_weight(
                     &arena,
-                    layer.conv_norm_bias.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.conv_norm_bias,
+                    false,
                     "enc_conv_norm_bias",
                 )?,
-                conv_pw1_weight: new_static_tensor_2d_or_3d_from_weight(
+                conv_pw1_weight: new_encoder_tensor_weight(
                     &arena,
+                    loaded_weights.as_ref(),
+                    fully_loaded,
                     &layer.conv_pw1_weight,
+                    false,
+                    CohereEncoderStaticTensorKind::F32Rank2Or3,
                     "enc_conv_pw1_weight",
                 )?,
-                conv_pw1_bias: new_static_tensor_1d_from_len(
+                conv_pw1_bias: new_encoder_vector_weight(
                     &arena,
-                    layer.conv_pw1_bias.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.conv_pw1_bias,
+                    false,
                     "enc_conv_pw1_bias",
                 )?,
-                conv_dw_weight: new_static_tensor_2d_or_3d_f16_from_dims(
+                // BatchNorm folding mutates these values after pack load, so
+                // the canonical pack root is no longer the execution tensor.
+                conv_dw_weight: new_encoder_tensor_weight(
                     &arena,
-                    &layer.conv_dw_weight.dims,
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.conv_dw_weight,
+                    true,
+                    CohereEncoderStaticTensorKind::F16Rank2Or3,
                     "enc_conv_dw_weight",
                 )?,
-                conv_dw_bias: new_static_tensor_1d_from_len(
+                conv_dw_bias: new_encoder_vector_weight(
                     &arena,
-                    layer.conv_dw_bias.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.conv_dw_bias,
+                    true,
                     "enc_conv_dw_bias",
                 )?,
-                conv_pw2_weight: new_static_tensor_2d_or_3d_from_weight(
+                conv_pw2_weight: new_encoder_tensor_weight(
                     &arena,
+                    loaded_weights.as_ref(),
+                    fully_loaded,
                     &layer.conv_pw2_weight,
+                    false,
+                    CohereEncoderStaticTensorKind::F32Rank2Or3,
                     "enc_conv_pw2_weight",
                 )?,
-                conv_pw2_bias: new_static_tensor_1d_from_len(
+                conv_pw2_bias: new_encoder_vector_weight(
                     &arena,
-                    layer.conv_pw2_bias.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.conv_pw2_bias,
+                    false,
                     "enc_conv_pw2_bias",
                 )?,
-                ff2_norm_weight: new_static_tensor_1d_from_len(
+                ff2_norm_weight: new_encoder_vector_weight(
                     &arena,
-                    layer.ff2_norm_weight.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.ff2_norm_weight,
+                    false,
                     "enc_ff2_norm_weight",
                 )?,
-                ff2_norm_bias: new_static_tensor_1d_from_len(
+                ff2_norm_bias: new_encoder_vector_weight(
                     &arena,
-                    layer.ff2_norm_bias.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.ff2_norm_bias,
+                    false,
                     "enc_ff2_norm_bias",
                 )?,
-                ff2_up_weight: new_static_projection_tensor(
+                ff2_up_weight: new_encoder_projection_weight(
                     &arena,
+                    loaded_weights.as_ref(),
+                    fully_loaded,
                     &layer.ff2_up_weight,
                     "enc_ff2_up_weight",
                 )?,
-                ff2_up_bias: new_static_tensor_1d_from_len(
+                ff2_up_bias: new_encoder_vector_weight(
                     &arena,
-                    layer.ff2_up_bias.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.ff2_up_bias,
+                    false,
                     "enc_ff2_up_bias",
                 )?,
-                ff2_down_weight: new_static_projection_tensor(
+                ff2_down_weight: new_encoder_projection_weight(
                     &arena,
+                    loaded_weights.as_ref(),
+                    fully_loaded,
                     &layer.ff2_down_weight,
                     "enc_ff2_down_weight",
                 )?,
-                ff2_down_bias: new_static_tensor_1d_from_len(
+                ff2_down_bias: new_encoder_vector_weight(
                     &arena,
-                    layer.ff2_down_bias.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.ff2_down_bias,
+                    false,
                     "enc_ff2_down_bias",
                 )?,
-                out_norm_weight: new_static_tensor_1d_from_len(
+                out_norm_weight: new_encoder_vector_weight(
                     &arena,
-                    layer.out_norm_weight.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.out_norm_weight,
+                    false,
                     "enc_out_norm_weight",
                 )?,
-                out_norm_bias: new_static_tensor_1d_from_len(
+                out_norm_bias: new_encoder_vector_weight(
                     &arena,
-                    layer.out_norm_bias.values.len(),
+                    loaded_weights.as_ref(),
+                    fully_loaded,
+                    &layer.out_norm_bias,
+                    false,
                     "enc_out_norm_bias",
                 )?,
             };
@@ -522,95 +738,102 @@ impl CohereTranscribeEncoderGraphRuntime {
             &relative_position_inverse_timescales(metadata.encoder_d_model),
             "cohere_relative_position_inverse_timescales",
         )?;
-        upload_static_tensor_weight_with_expected_type(
-            &mut arena,
-            prelude.pre_conv0_weight,
-            &weights.pre_conv0_weight,
-            crate::ggml_runtime::GGML_TYPE_F32,
-            "enc_pre_conv0_weight",
-        )?;
-        upload_static_f32(
+        if let Some(tensor) = prelude.pre_conv0_weight.static_tensor() {
+            upload_static_tensor_weight_with_expected_type(
+                &mut arena,
+                tensor,
+                &weights.pre_conv0_weight,
+                crate::ggml_runtime::GGML_TYPE_F32,
+                "enc_pre_conv0_weight",
+            )?;
+        }
+        upload_encoder_static_f32(
             &mut arena,
             prelude.pre_conv0_bias,
             &weights.pre_conv0_bias.values,
             "enc_pre_conv0_bias",
         )?;
-        upload_static_f16_from_weight(
-            &mut arena,
-            prelude.pre_conv2_weight,
-            &weights.pre_conv2_weight,
-            "enc_pre_conv2_weight",
-        )?;
-        upload_static_f32(
+        if let Some(tensor) = prelude.pre_conv2_weight.static_tensor() {
+            upload_static_f16_from_weight(
+                &mut arena,
+                tensor,
+                &weights.pre_conv2_weight,
+                "enc_pre_conv2_weight",
+            )?;
+        }
+        upload_encoder_static_f32(
             &mut arena,
             prelude.pre_conv2_bias,
             &weights.pre_conv2_bias.values,
             "enc_pre_conv2_bias",
         )?;
-        upload_static_tensor_weight_with_expected_type(
-            &mut arena,
-            prelude.pre_conv3_weight,
-            &weights.pre_conv3_weight,
-            crate::ggml_runtime::GGML_TYPE_F32,
-            "enc_pre_conv3_weight",
-        )?;
-        upload_static_f32(
+        if let Some(tensor) = prelude.pre_conv3_weight.static_tensor() {
+            upload_static_tensor_weight_with_expected_type(
+                &mut arena,
+                tensor,
+                &weights.pre_conv3_weight,
+                crate::ggml_runtime::GGML_TYPE_F32,
+                "enc_pre_conv3_weight",
+            )?;
+        }
+        upload_encoder_static_f32(
             &mut arena,
             prelude.pre_conv3_bias,
             &weights.pre_conv3_bias.values,
             "enc_pre_conv3_bias",
         )?;
-        upload_static_f16_from_weight(
-            &mut arena,
-            prelude.pre_conv5_weight,
-            &weights.pre_conv5_weight,
-            "enc_pre_conv5_weight",
-        )?;
-        upload_static_f32(
+        if let Some(tensor) = prelude.pre_conv5_weight.static_tensor() {
+            upload_static_f16_from_weight(
+                &mut arena,
+                tensor,
+                &weights.pre_conv5_weight,
+                "enc_pre_conv5_weight",
+            )?;
+        }
+        upload_encoder_static_f32(
             &mut arena,
             prelude.pre_conv5_bias,
             &weights.pre_conv5_bias.values,
             "enc_pre_conv5_bias",
         )?;
-        upload_static_tensor_weight_with_expected_type(
-            &mut arena,
-            prelude.pre_conv6_weight,
-            &weights.pre_conv6_weight,
-            crate::ggml_runtime::GGML_TYPE_F32,
-            "enc_pre_conv6_weight",
-        )?;
-        upload_static_f32(
+        if let Some(tensor) = prelude.pre_conv6_weight.static_tensor() {
+            upload_static_tensor_weight_with_expected_type(
+                &mut arena,
+                tensor,
+                &weights.pre_conv6_weight,
+                crate::ggml_runtime::GGML_TYPE_F32,
+                "enc_pre_conv6_weight",
+            )?;
+        }
+        upload_encoder_static_f32(
             &mut arena,
             prelude.pre_conv6_bias,
             &weights.pre_conv6_bias.values,
             "enc_pre_conv6_bias",
         )?;
-        if !has_loaded_tensor(loaded_weights.as_ref(), &weights.pre_out_weight.name) {
+        if let Some(tensor) = prelude.pre_out_weight.static_tensor() {
             upload_static_projection_f32(
                 &mut arena,
-                prelude.pre_out_weight,
+                tensor,
                 &weights.pre_out_weight,
                 "enc_pre_out_weight",
             )?;
         }
-        upload_static_f32(
+        upload_encoder_static_f32(
             &mut arena,
             prelude.pre_out_bias,
             &weights.pre_out_bias.values,
             "enc_pre_out_bias",
         )?;
-        if !has_loaded_tensor(
-            loaded_weights.as_ref(),
-            &weights.encoder_projection_weight.name,
-        ) {
+        if let Some(tensor) = prelude.enc_proj_weight.static_tensor() {
             upload_static_projection_f32(
                 &mut arena,
-                prelude.enc_proj_weight,
+                tensor,
                 &weights.encoder_projection_weight,
                 "enc_proj_weight",
             )?;
         }
-        upload_static_f32(
+        upload_encoder_static_f32(
             &mut arena,
             prelude.enc_proj_bias,
             &weights.encoder_projection_bias.values,
@@ -620,7 +843,7 @@ impl CohereTranscribeEncoderGraphRuntime {
 
         let layer_upload_start = Instant::now();
         for (layer, runtime) in weights.layers.iter().zip(layers.iter()) {
-            upload_static_encoder_layer(&mut arena, loaded_weights.as_ref(), layer, runtime)?;
+            upload_static_encoder_layer(&mut arena, layer, runtime)?;
         }
         let layer_upload_ms = layer_upload_start.elapsed().as_secs_f64() * 1000.0;
         if build_debug {
@@ -632,12 +855,12 @@ impl CohereTranscribeEncoderGraphRuntime {
 
         Ok(Self {
             metadata,
-            runner,
-            loaded_weights,
-            arena,
             relative_position_inverse_timescales: relative_position_inv,
             prelude,
             layers,
+            arena,
+            loaded_weights,
+            runner,
         })
     }
 
@@ -718,35 +941,35 @@ impl CohereTranscribeEncoderGraphRuntime {
         };
         let pre_conv0_bias_4d = nn_reshape_bias_4d(
             &graph,
-            self.arena.graph_tensor(self.prelude.pre_conv0_bias),
+            self.prelude.pre_conv0_bias.as_graph_tensor(),
             self.prelude.pre_conv0_bias_len,
             "ggml_reshape_4d(bias)",
             map_graph_error,
         )?;
         let pre_conv2_bias_4d = nn_reshape_bias_4d(
             &graph,
-            self.arena.graph_tensor(self.prelude.pre_conv2_bias),
+            self.prelude.pre_conv2_bias.as_graph_tensor(),
             self.prelude.pre_conv2_bias_len,
             "ggml_reshape_4d(bias)",
             map_graph_error,
         )?;
         let pre_conv3_bias_4d = nn_reshape_bias_4d(
             &graph,
-            self.arena.graph_tensor(self.prelude.pre_conv3_bias),
+            self.prelude.pre_conv3_bias.as_graph_tensor(),
             self.prelude.pre_conv3_bias_len,
             "ggml_reshape_4d(bias)",
             map_graph_error,
         )?;
         let pre_conv5_bias_4d = nn_reshape_bias_4d(
             &graph,
-            self.arena.graph_tensor(self.prelude.pre_conv5_bias),
+            self.prelude.pre_conv5_bias.as_graph_tensor(),
             self.prelude.pre_conv5_bias_len,
             "ggml_reshape_4d(bias)",
             map_graph_error,
         )?;
         let pre_conv6_bias_4d = nn_reshape_bias_4d(
             &graph,
-            self.arena.graph_tensor(self.prelude.pre_conv6_bias),
+            self.prelude.pre_conv6_bias.as_graph_tensor(),
             self.prelude.pre_conv6_bias_len,
             "ggml_reshape_4d(bias)",
             map_graph_error,
@@ -760,7 +983,7 @@ impl CohereTranscribeEncoderGraphRuntime {
             })?;
         state_4d = apply_conv_2d_bias_activation(
             &graph,
-            self.arena.graph_tensor(self.prelude.pre_conv0_weight),
+            self.prelude.pre_conv0_weight.as_graph_tensor(),
             state_4d,
             pre_conv0_bias_4d,
             prelude_stride2,
@@ -775,7 +998,7 @@ impl CohereTranscribeEncoderGraphRuntime {
 
         state_4d = apply_conv_2d_depthwise_bias_activation(
             &graph,
-            self.arena.graph_tensor(self.prelude.pre_conv2_weight),
+            self.prelude.pre_conv2_weight.as_graph_tensor(),
             state_4d,
             pre_conv2_bias_4d,
             prelude_stride2,
@@ -789,7 +1012,7 @@ impl CohereTranscribeEncoderGraphRuntime {
         )?;
         state_4d = apply_conv_2d_bias_activation(
             &graph,
-            self.arena.graph_tensor(self.prelude.pre_conv3_weight),
+            self.prelude.pre_conv3_weight.as_graph_tensor(),
             state_4d,
             pre_conv3_bias_4d,
             prelude_pointwise,
@@ -804,7 +1027,7 @@ impl CohereTranscribeEncoderGraphRuntime {
 
         state_4d = apply_conv_2d_depthwise_bias_activation(
             &graph,
-            self.arena.graph_tensor(self.prelude.pre_conv5_weight),
+            self.prelude.pre_conv5_weight.as_graph_tensor(),
             state_4d,
             pre_conv5_bias_4d,
             prelude_stride2,
@@ -818,7 +1041,7 @@ impl CohereTranscribeEncoderGraphRuntime {
         )?;
         state_4d = apply_conv_2d_bias_activation(
             &graph,
-            self.arena.graph_tensor(self.prelude.pre_conv6_weight),
+            self.prelude.pre_conv6_weight.as_graph_tensor(),
             state_4d,
             pre_conv6_bias_4d,
             prelude_pointwise,
@@ -856,22 +1079,13 @@ impl CohereTranscribeEncoderGraphRuntime {
                 source,
             })?;
         state = graph
-            .mul_mat(
-                loaded_or_static_tensor(
-                    self.loaded_weights
-                        .as_ref()
-                        .and_then(|loaded| loaded.tensor("enc.pre.out.weight")),
-                    &self.arena,
-                    self.prelude.pre_out_weight,
-                ),
-                state,
-            )
+            .mul_mat(self.prelude.pre_out_weight.as_graph_tensor(), state)
             .map_err(|source| CohereTranscribeEncoderError::GraphBuildFailed {
                 step: "ggml_mul_mat(pre_out)",
                 source,
             })?;
         state = graph
-            .add(state, self.arena.graph_tensor(self.prelude.pre_out_bias))
+            .add(state, self.prelude.pre_out_bias.as_graph_tensor())
             .map_err(|source| CohereTranscribeEncoderError::GraphBuildFailed {
                 step: "ggml_add(pre_out_bias)",
                 source,
@@ -883,8 +1097,6 @@ impl CohereTranscribeEncoderGraphRuntime {
             &mut graph,
             state,
             &self.layers,
-            &self.arena,
-            self.loaded_weights.as_ref(),
             pos_enc,
             metadata,
             subsampled_frames,
@@ -894,22 +1106,13 @@ impl CohereTranscribeEncoderGraphRuntime {
 
         let pre_projection_state = state;
         state = graph
-            .mul_mat(
-                loaded_or_static_tensor(
-                    self.loaded_weights
-                        .as_ref()
-                        .and_then(|loaded| loaded.tensor("enc.proj.weight")),
-                    &self.arena,
-                    self.prelude.enc_proj_weight,
-                ),
-                state,
-            )
+            .mul_mat(self.prelude.enc_proj_weight.as_graph_tensor(), state)
             .map_err(|source| CohereTranscribeEncoderError::GraphBuildFailed {
                 step: "ggml_mul_mat(enc_proj)",
                 source,
             })?;
         state = graph
-            .add(state, self.arena.graph_tensor(self.prelude.enc_proj_bias))
+            .add(state, self.prelude.enc_proj_bias.as_graph_tensor())
             .map_err(|source| CohereTranscribeEncoderError::GraphBuildFailed {
                 step: "ggml_add(enc_proj_bias)",
                 source,
@@ -1120,89 +1323,43 @@ struct EncoderLayerRunResult<'a> {
 }
 
 impl CohereEncoderLayerRuntime {
-    fn as_graph_tensors<'a>(
-        &self,
-        arena: &'a GgmlStaticTensorArena,
-        loaded_weights: Option<&GgmlLoadedWeightContext>,
-        layer_idx: usize,
-    ) -> EncoderLayerGraphTensors<'a> {
-        let prefix = format!("enc.blk.{layer_idx}.");
+    fn as_graph_tensors(&self) -> EncoderLayerGraphTensors<'_> {
         EncoderLayerGraphTensors {
-            ff1_norm_weight: arena.graph_tensor(self.ff1_norm_weight),
-            ff1_norm_bias: arena.graph_tensor(self.ff1_norm_bias),
-            ff1_up_weight: loaded_or_static_tensor(
-                loaded_weights.and_then(|loaded| loaded.tensor(&format!("{prefix}ff1.up.weight"))),
-                arena,
-                self.ff1_up_weight,
-            ),
-            ff1_up_bias: arena.graph_tensor(self.ff1_up_bias),
-            ff1_down_weight: loaded_or_static_tensor(
-                loaded_weights
-                    .and_then(|loaded| loaded.tensor(&format!("{prefix}ff1.down.weight"))),
-                arena,
-                self.ff1_down_weight,
-            ),
-            ff1_down_bias: arena.graph_tensor(self.ff1_down_bias),
-            attn_norm_weight: arena.graph_tensor(self.attn_norm_weight),
-            attn_norm_bias: arena.graph_tensor(self.attn_norm_bias),
-            attn_q_weight: loaded_or_static_tensor(
-                loaded_weights.and_then(|loaded| loaded.tensor(&format!("{prefix}attn.q.weight"))),
-                arena,
-                self.attn_q_weight,
-            ),
-            attn_q_bias: arena.graph_tensor(self.attn_q_bias),
-            attn_k_weight: loaded_or_static_tensor(
-                loaded_weights.and_then(|loaded| loaded.tensor(&format!("{prefix}attn.k.weight"))),
-                arena,
-                self.attn_k_weight,
-            ),
-            attn_k_bias: arena.graph_tensor(self.attn_k_bias),
-            attn_v_weight: loaded_or_static_tensor(
-                loaded_weights.and_then(|loaded| loaded.tensor(&format!("{prefix}attn.v.weight"))),
-                arena,
-                self.attn_v_weight,
-            ),
-            attn_v_bias: arena.graph_tensor(self.attn_v_bias),
-            attn_out_weight: loaded_or_static_tensor(
-                loaded_weights
-                    .and_then(|loaded| loaded.tensor(&format!("{prefix}attn.out.weight"))),
-                arena,
-                self.attn_out_weight,
-            ),
-            attn_out_bias: arena.graph_tensor(self.attn_out_bias),
-            attn_pos_weight: loaded_or_static_tensor(
-                loaded_weights
-                    .and_then(|loaded| loaded.tensor(&format!("{prefix}attn.pos.weight"))),
-                arena,
-                self.attn_pos_weight,
-            ),
-            attn_pos_bias_u: arena.graph_tensor(self.attn_pos_bias_u),
-            attn_pos_bias_v: arena.graph_tensor(self.attn_pos_bias_v),
-            conv_norm_weight: arena.graph_tensor(self.conv_norm_weight),
-            conv_norm_bias: arena.graph_tensor(self.conv_norm_bias),
-            conv_pw1_weight: arena.graph_tensor(self.conv_pw1_weight),
-            conv_pw1_bias: arena.graph_tensor(self.conv_pw1_bias),
-            conv_dw_weight: arena.graph_tensor(self.conv_dw_weight),
-            conv_dw_bias: arena.graph_tensor(self.conv_dw_bias),
-            conv_pw2_weight: arena.graph_tensor(self.conv_pw2_weight),
-            conv_pw2_bias: arena.graph_tensor(self.conv_pw2_bias),
-            ff2_norm_weight: arena.graph_tensor(self.ff2_norm_weight),
-            ff2_norm_bias: arena.graph_tensor(self.ff2_norm_bias),
-            ff2_up_weight: loaded_or_static_tensor(
-                loaded_weights.and_then(|loaded| loaded.tensor(&format!("{prefix}ff2.up.weight"))),
-                arena,
-                self.ff2_up_weight,
-            ),
-            ff2_up_bias: arena.graph_tensor(self.ff2_up_bias),
-            ff2_down_weight: loaded_or_static_tensor(
-                loaded_weights
-                    .and_then(|loaded| loaded.tensor(&format!("{prefix}ff2.down.weight"))),
-                arena,
-                self.ff2_down_weight,
-            ),
-            ff2_down_bias: arena.graph_tensor(self.ff2_down_bias),
-            out_norm_weight: arena.graph_tensor(self.out_norm_weight),
-            out_norm_bias: arena.graph_tensor(self.out_norm_bias),
+            ff1_norm_weight: self.ff1_norm_weight.as_graph_tensor(),
+            ff1_norm_bias: self.ff1_norm_bias.as_graph_tensor(),
+            ff1_up_weight: self.ff1_up_weight.as_graph_tensor(),
+            ff1_up_bias: self.ff1_up_bias.as_graph_tensor(),
+            ff1_down_weight: self.ff1_down_weight.as_graph_tensor(),
+            ff1_down_bias: self.ff1_down_bias.as_graph_tensor(),
+            attn_norm_weight: self.attn_norm_weight.as_graph_tensor(),
+            attn_norm_bias: self.attn_norm_bias.as_graph_tensor(),
+            attn_q_weight: self.attn_q_weight.as_graph_tensor(),
+            attn_q_bias: self.attn_q_bias.as_graph_tensor(),
+            attn_k_weight: self.attn_k_weight.as_graph_tensor(),
+            attn_k_bias: self.attn_k_bias.as_graph_tensor(),
+            attn_v_weight: self.attn_v_weight.as_graph_tensor(),
+            attn_v_bias: self.attn_v_bias.as_graph_tensor(),
+            attn_out_weight: self.attn_out_weight.as_graph_tensor(),
+            attn_out_bias: self.attn_out_bias.as_graph_tensor(),
+            attn_pos_weight: self.attn_pos_weight.as_graph_tensor(),
+            attn_pos_bias_u: self.attn_pos_bias_u.as_graph_tensor(),
+            attn_pos_bias_v: self.attn_pos_bias_v.as_graph_tensor(),
+            conv_norm_weight: self.conv_norm_weight.as_graph_tensor(),
+            conv_norm_bias: self.conv_norm_bias.as_graph_tensor(),
+            conv_pw1_weight: self.conv_pw1_weight.as_graph_tensor(),
+            conv_pw1_bias: self.conv_pw1_bias.as_graph_tensor(),
+            conv_dw_weight: self.conv_dw_weight.as_graph_tensor(),
+            conv_dw_bias: self.conv_dw_bias.as_graph_tensor(),
+            conv_pw2_weight: self.conv_pw2_weight.as_graph_tensor(),
+            conv_pw2_bias: self.conv_pw2_bias.as_graph_tensor(),
+            ff2_norm_weight: self.ff2_norm_weight.as_graph_tensor(),
+            ff2_norm_bias: self.ff2_norm_bias.as_graph_tensor(),
+            ff2_up_weight: self.ff2_up_weight.as_graph_tensor(),
+            ff2_up_bias: self.ff2_up_bias.as_graph_tensor(),
+            ff2_down_weight: self.ff2_down_weight.as_graph_tensor(),
+            ff2_down_bias: self.ff2_down_bias.as_graph_tensor(),
+            out_norm_weight: self.out_norm_weight.as_graph_tensor(),
+            out_norm_bias: self.out_norm_bias.as_graph_tensor(),
         }
     }
 }
@@ -1220,9 +1377,7 @@ impl CohereEncoderLayerRuntime {
 fn compose_conformer_encoder_layer_stack<'a>(
     graph: &mut crate::ggml_runtime::GgmlCpuGraphBuilder<'a>,
     mut state: crate::ggml_runtime::GgmlCpuTensor<'a>,
-    layers: &[CohereEncoderLayerRuntime],
-    arena: &'a GgmlStaticTensorArena,
-    loaded_weights: Option<&GgmlLoadedWeightContext>,
+    layers: &'a [CohereEncoderLayerRuntime],
     pos_enc: crate::ggml_runtime::GgmlCpuTensor<'a>,
     metadata: CohereTranscribeExecutionMetadata,
     frame_count: usize,
@@ -1236,7 +1391,7 @@ fn compose_conformer_encoder_layer_stack<'a>(
 > {
     let mut layer0_debug = None;
     for (layer_idx, layer) in layers.iter().enumerate() {
-        let graph_tensors = layer.as_graph_tensors(arena, loaded_weights, layer_idx);
+        let graph_tensors = layer.as_graph_tensors();
         let result = run_encoder_layer(
             graph,
             state,
@@ -1444,6 +1599,155 @@ fn new_static_tensor_1d_from_len(
         .map_err(|source| CohereTranscribeEncoderError::GraphBuildFailed { step, source })
 }
 
+fn required_loaded_encoder_tensor(
+    loaded: &GgmlLoadedWeightContext,
+    name: &str,
+) -> Result<GgmlLoadedTensor, CohereTranscribeEncoderError> {
+    loaded
+        .tensor(name)
+        .ok_or_else(|| CohereTranscribeEncoderError::InvalidTensorShape {
+            tensor_name: name.to_string(),
+            shape: "[]".to_string(),
+            reason: "verified fully-loaded encoder context is missing a required tensor"
+                .to_string(),
+        })
+}
+
+fn new_encoder_vector_weight(
+    arena: &GgmlStaticTensorArena,
+    loaded: Option<&GgmlLoadedWeightContext>,
+    fully_loaded: bool,
+    weight: &super::weights::CohereVectorWeight,
+    force_static: bool,
+    step: &'static str,
+) -> Result<CohereEncoderWeightTensor, CohereTranscribeEncoderError> {
+    // Encoder elementwise/norm consumers require F32 vectors. Keep F16 and
+    // transformed vectors as small static F32 exceptions instead of treating
+    // a storage-compatible loaded root as an execution-compatible operand.
+    let loaded_f32 = weight
+        .raw_ggml
+        .as_ref()
+        .is_some_and(|raw| raw.ggml_type == GGML_TYPE_F32);
+    if fully_loaded && !force_static && loaded_f32 {
+        let loaded = loaded.ok_or_else(|| CohereTranscribeEncoderError::InvalidTensorShape {
+            tensor_name: weight.name.clone(),
+            shape: "[]".to_string(),
+            reason: "fully-loaded encoder mode requires a loaded weight context".to_string(),
+        })?;
+        return required_loaded_encoder_tensor(loaded, &weight.name)
+            .map(CohereEncoderWeightTensor::Loaded);
+    }
+    new_static_tensor_1d_from_len(arena, weight.len, step).map(CohereEncoderWeightTensor::Static)
+}
+
+fn new_encoder_projection_weight(
+    arena: &GgmlStaticTensorArena,
+    loaded: Option<&GgmlLoadedWeightContext>,
+    fully_loaded: bool,
+    weight: &super::weights::CohereMatrixWeight,
+    step: &'static str,
+) -> Result<CohereEncoderWeightTensor, CohereTranscribeEncoderError> {
+    if let Some(loaded) = loaded {
+        if let Some(tensor) = loaded.tensor(&weight.name) {
+            if fully_loaded {
+                return arena
+                    .reshape_loaded_tensor(tensor, &[weight.cols, weight.rows], step)
+                    .map(CohereEncoderWeightTensor::LoadedView)
+                    .map_err(|source| CohereTranscribeEncoderError::GraphBuildFailed {
+                        step,
+                        source,
+                    });
+            }
+            return Ok(CohereEncoderWeightTensor::Loaded(tensor));
+        }
+        if fully_loaded {
+            return Err(CohereTranscribeEncoderError::InvalidTensorShape {
+                tensor_name: weight.name.clone(),
+                shape: "[]".to_string(),
+                reason: "verified fully-loaded encoder context is missing a projection tensor"
+                    .to_string(),
+            });
+        }
+    }
+    new_static_projection_tensor(arena, weight, step).map(CohereEncoderWeightTensor::Static)
+}
+
+#[derive(Clone, Copy)]
+enum CohereEncoderStaticTensorKind {
+    F32Rank2Or3,
+    F16Rank2Or3,
+    F32Rank4,
+    F16Rank4,
+}
+
+impl CohereEncoderStaticTensorKind {
+    fn execution_ggml_type(self) -> i32 {
+        match self {
+            Self::F32Rank2Or3 | Self::F32Rank4 => GGML_TYPE_F32,
+            Self::F16Rank2Or3 | Self::F16Rank4 => GGML_TYPE_F16,
+        }
+    }
+}
+
+fn encoder_loaded_tensor_execution_compatible(
+    kind: CohereEncoderStaticTensorKind,
+    raw_ggml_type: i32,
+    raw_dims: &[usize],
+    execution_dims: &[usize],
+) -> bool {
+    raw_ggml_type == kind.execution_ggml_type()
+        && raw_dims
+            .iter()
+            .try_fold(1usize, |elements, dim| elements.checked_mul(*dim))
+            == execution_dims
+                .iter()
+                .try_fold(1usize, |elements, dim| elements.checked_mul(*dim))
+}
+
+fn new_encoder_tensor_weight(
+    arena: &GgmlStaticTensorArena,
+    loaded: Option<&GgmlLoadedWeightContext>,
+    fully_loaded: bool,
+    weight: &super::weights::CohereTensorWeight,
+    force_static: bool,
+    kind: CohereEncoderStaticTensorKind,
+    step: &'static str,
+) -> Result<CohereEncoderWeightTensor, CohereTranscribeEncoderError> {
+    let loaded_execution_compatible = weight.raw_ggml.as_ref().is_some_and(|raw| {
+        encoder_loaded_tensor_execution_compatible(kind, raw.ggml_type, &raw.dims, &weight.dims)
+    });
+    if fully_loaded && !force_static && loaded_execution_compatible {
+        let loaded = loaded.ok_or_else(|| CohereTranscribeEncoderError::InvalidTensorShape {
+            tensor_name: weight.name.clone(),
+            shape: "[]".to_string(),
+            reason: "fully-loaded encoder mode requires a loaded weight context".to_string(),
+        })?;
+        return arena
+            .reshape_loaded_tensor(
+                required_loaded_encoder_tensor(loaded, &weight.name)?,
+                &weight.dims,
+                step,
+            )
+            .map(CohereEncoderWeightTensor::LoadedView)
+            .map_err(|source| CohereTranscribeEncoderError::GraphBuildFailed { step, source });
+    }
+    let tensor = match kind {
+        CohereEncoderStaticTensorKind::F32Rank2Or3 => {
+            new_static_tensor_2d_or_3d_from_weight(arena, weight, step)?
+        }
+        CohereEncoderStaticTensorKind::F16Rank2Or3 => {
+            new_static_tensor_2d_or_3d_f16_from_dims(arena, &weight.dims, step)?
+        }
+        CohereEncoderStaticTensorKind::F32Rank4 => {
+            new_static_tensor_4d_from_dims(arena, &weight.dims, step)?
+        }
+        CohereEncoderStaticTensorKind::F16Rank4 => {
+            new_static_tensor_4d_f16_from_dims(arena, &weight.dims, step)?
+        }
+    };
+    Ok(CohereEncoderWeightTensor::Static(tensor))
+}
+
 fn new_static_tensor_2d_or_3d_from_dims(
     arena: &GgmlStaticTensorArena,
     dims: &[usize],
@@ -1574,6 +1878,54 @@ fn upload_static_f32(
         .map_err(|source| CohereTranscribeEncoderError::GraphBuildFailed { step, source })
 }
 
+fn upload_encoder_static_f32(
+    arena: &mut GgmlStaticTensorArena,
+    tensor: CohereEncoderWeightTensor,
+    values: &[f32],
+    step: &'static str,
+) -> Result<(), CohereTranscribeEncoderError> {
+    match tensor.static_tensor() {
+        Some(tensor) => upload_static_f32(arena, tensor, values, step),
+        None => Ok(()),
+    }
+}
+
+fn upload_encoder_static_projection(
+    arena: &mut GgmlStaticTensorArena,
+    tensor: CohereEncoderWeightTensor,
+    weight: &super::weights::CohereMatrixWeight,
+    step: &'static str,
+) -> Result<(), CohereTranscribeEncoderError> {
+    match tensor.static_tensor() {
+        Some(tensor) => upload_static_projection_f32(arena, tensor, weight, step),
+        None => Ok(()),
+    }
+}
+
+fn upload_encoder_static_tensor_weight(
+    arena: &mut GgmlStaticTensorArena,
+    tensor: CohereEncoderWeightTensor,
+    weight: &super::weights::CohereTensorWeight,
+    step: &'static str,
+) -> Result<(), CohereTranscribeEncoderError> {
+    match tensor.static_tensor() {
+        Some(tensor) => upload_static_tensor_weight(arena, tensor, weight, step),
+        None => Ok(()),
+    }
+}
+
+fn upload_encoder_static_f16_from_weight(
+    arena: &mut GgmlStaticTensorArena,
+    tensor: CohereEncoderWeightTensor,
+    weight: &super::weights::CohereTensorWeight,
+    step: &'static str,
+) -> Result<(), CohereTranscribeEncoderError> {
+    match tensor.static_tensor() {
+        Some(tensor) => upload_static_f16_from_weight(arena, tensor, weight, step),
+        None => Ok(()),
+    }
+}
+
 fn upload_static_f16_from_f32(
     arena: &mut GgmlStaticTensorArena,
     tensor: GgmlStaticTensor,
@@ -1660,233 +2012,214 @@ fn upload_static_projection_f32(
 
 fn upload_static_encoder_layer(
     arena: &mut GgmlStaticTensorArena,
-    loaded_weights: Option<&GgmlLoadedWeightContext>,
     layer: &CohereEncoderLayerWeights,
     tensors: &CohereEncoderLayerRuntime,
 ) -> Result<(), CohereTranscribeEncoderError> {
-    upload_static_f32(
+    upload_encoder_static_f32(
         arena,
         tensors.ff1_norm_weight,
         &layer.ff1_norm_weight.values,
         "enc_ff1_norm_weight",
     )?;
-    upload_static_f32(
+    upload_encoder_static_f32(
         arena,
         tensors.ff1_norm_bias,
         &layer.ff1_norm_bias.values,
         "enc_ff1_norm_bias",
     )?;
-    if !has_loaded_tensor(loaded_weights, &layer.ff1_up_weight.name) {
-        upload_static_projection_f32(
-            arena,
-            tensors.ff1_up_weight,
-            &layer.ff1_up_weight,
-            "enc_ff1_up_weight",
-        )?;
-    }
-    upload_static_f32(
+    upload_encoder_static_projection(
+        arena,
+        tensors.ff1_up_weight,
+        &layer.ff1_up_weight,
+        "enc_ff1_up_weight",
+    )?;
+    upload_encoder_static_f32(
         arena,
         tensors.ff1_up_bias,
         &layer.ff1_up_bias.values,
         "enc_ff1_up_bias",
     )?;
-    if !has_loaded_tensor(loaded_weights, &layer.ff1_down_weight.name) {
-        upload_static_projection_f32(
-            arena,
-            tensors.ff1_down_weight,
-            &layer.ff1_down_weight,
-            "enc_ff1_down_weight",
-        )?;
-    }
-    upload_static_f32(
+    upload_encoder_static_projection(
+        arena,
+        tensors.ff1_down_weight,
+        &layer.ff1_down_weight,
+        "enc_ff1_down_weight",
+    )?;
+    upload_encoder_static_f32(
         arena,
         tensors.ff1_down_bias,
         &layer.ff1_down_bias.values,
         "enc_ff1_down_bias",
     )?;
-    upload_static_f32(
+    upload_encoder_static_f32(
         arena,
         tensors.attn_norm_weight,
         &layer.attn_norm_weight.values,
         "enc_attn_norm_weight",
     )?;
-    upload_static_f32(
+    upload_encoder_static_f32(
         arena,
         tensors.attn_norm_bias,
         &layer.attn_norm_bias.values,
         "enc_attn_norm_bias",
     )?;
-    if !has_loaded_tensor(loaded_weights, &layer.attn_q_weight.name) {
-        upload_static_projection_f32(
-            arena,
-            tensors.attn_q_weight,
-            &layer.attn_q_weight,
-            "enc_attn_q_weight",
-        )?;
-    }
-    upload_static_f32(
+    upload_encoder_static_projection(
+        arena,
+        tensors.attn_q_weight,
+        &layer.attn_q_weight,
+        "enc_attn_q_weight",
+    )?;
+    upload_encoder_static_f32(
         arena,
         tensors.attn_q_bias,
         &layer.attn_q_bias.values,
         "enc_attn_q_bias",
     )?;
-    if !has_loaded_tensor(loaded_weights, &layer.attn_k_weight.name) {
-        upload_static_projection_f32(
-            arena,
-            tensors.attn_k_weight,
-            &layer.attn_k_weight,
-            "enc_attn_k_weight",
-        )?;
-    }
-    upload_static_f32(
+    upload_encoder_static_projection(
+        arena,
+        tensors.attn_k_weight,
+        &layer.attn_k_weight,
+        "enc_attn_k_weight",
+    )?;
+    upload_encoder_static_f32(
         arena,
         tensors.attn_k_bias,
         &layer.attn_k_bias.values,
         "enc_attn_k_bias",
     )?;
-    if !has_loaded_tensor(loaded_weights, &layer.attn_v_weight.name) {
-        upload_static_projection_f32(
-            arena,
-            tensors.attn_v_weight,
-            &layer.attn_v_weight,
-            "enc_attn_v_weight",
-        )?;
-    }
-    upload_static_f32(
+    upload_encoder_static_projection(
+        arena,
+        tensors.attn_v_weight,
+        &layer.attn_v_weight,
+        "enc_attn_v_weight",
+    )?;
+    upload_encoder_static_f32(
         arena,
         tensors.attn_v_bias,
         &layer.attn_v_bias.values,
         "enc_attn_v_bias",
     )?;
-    if !has_loaded_tensor(loaded_weights, &layer.attn_out_weight.name) {
-        upload_static_projection_f32(
-            arena,
-            tensors.attn_out_weight,
-            &layer.attn_out_weight,
-            "enc_attn_out_weight",
-        )?;
-    }
-    upload_static_f32(
+    upload_encoder_static_projection(
+        arena,
+        tensors.attn_out_weight,
+        &layer.attn_out_weight,
+        "enc_attn_out_weight",
+    )?;
+    upload_encoder_static_f32(
         arena,
         tensors.attn_out_bias,
         &layer.attn_out_bias.values,
         "enc_attn_out_bias",
     )?;
-    if !has_loaded_tensor(loaded_weights, &layer.attn_pos_weight.name) {
-        upload_static_projection_f32(
-            arena,
-            tensors.attn_pos_weight,
-            &layer.attn_pos_weight,
-            "enc_attn_pos_weight",
-        )?;
-    }
-    upload_static_f32(
+    upload_encoder_static_projection(
+        arena,
+        tensors.attn_pos_weight,
+        &layer.attn_pos_weight,
+        "enc_attn_pos_weight",
+    )?;
+    upload_encoder_static_f32(
         arena,
         tensors.attn_pos_bias_u,
         &layer.attn_pos_bias_u.values,
         "enc_attn_pos_bias_u",
     )?;
-    upload_static_f32(
+    upload_encoder_static_f32(
         arena,
         tensors.attn_pos_bias_v,
         &layer.attn_pos_bias_v.values,
         "enc_attn_pos_bias_v",
     )?;
-    upload_static_f32(
+    upload_encoder_static_f32(
         arena,
         tensors.conv_norm_weight,
         &layer.conv_norm_weight.values,
         "enc_conv_norm_weight",
     )?;
-    upload_static_f32(
+    upload_encoder_static_f32(
         arena,
         tensors.conv_norm_bias,
         &layer.conv_norm_bias.values,
         "enc_conv_norm_bias",
     )?;
-    upload_static_tensor_weight(
+    upload_encoder_static_tensor_weight(
         arena,
         tensors.conv_pw1_weight,
         &layer.conv_pw1_weight,
         "enc_conv_pw1_weight",
     )?;
-    upload_static_f32(
+    upload_encoder_static_f32(
         arena,
         tensors.conv_pw1_bias,
         &layer.conv_pw1_bias.values,
         "enc_conv_pw1_bias",
     )?;
-    upload_static_f16_from_weight(
+    upload_encoder_static_f16_from_weight(
         arena,
         tensors.conv_dw_weight,
         &layer.conv_dw_weight,
         "enc_conv_dw_weight",
     )?;
-    upload_static_f32(
+    upload_encoder_static_f32(
         arena,
         tensors.conv_dw_bias,
         &layer.conv_dw_bias.values,
         "enc_conv_dw_bias",
     )?;
-    upload_static_tensor_weight(
+    upload_encoder_static_tensor_weight(
         arena,
         tensors.conv_pw2_weight,
         &layer.conv_pw2_weight,
         "enc_conv_pw2_weight",
     )?;
-    upload_static_f32(
+    upload_encoder_static_f32(
         arena,
         tensors.conv_pw2_bias,
         &layer.conv_pw2_bias.values,
         "enc_conv_pw2_bias",
     )?;
-    upload_static_f32(
+    upload_encoder_static_f32(
         arena,
         tensors.ff2_norm_weight,
         &layer.ff2_norm_weight.values,
         "enc_ff2_norm_weight",
     )?;
-    upload_static_f32(
+    upload_encoder_static_f32(
         arena,
         tensors.ff2_norm_bias,
         &layer.ff2_norm_bias.values,
         "enc_ff2_norm_bias",
     )?;
-    if !has_loaded_tensor(loaded_weights, &layer.ff2_up_weight.name) {
-        upload_static_projection_f32(
-            arena,
-            tensors.ff2_up_weight,
-            &layer.ff2_up_weight,
-            "enc_ff2_up_weight",
-        )?;
-    }
-    upload_static_f32(
+    upload_encoder_static_projection(
+        arena,
+        tensors.ff2_up_weight,
+        &layer.ff2_up_weight,
+        "enc_ff2_up_weight",
+    )?;
+    upload_encoder_static_f32(
         arena,
         tensors.ff2_up_bias,
         &layer.ff2_up_bias.values,
         "enc_ff2_up_bias",
     )?;
-    if !has_loaded_tensor(loaded_weights, &layer.ff2_down_weight.name) {
-        upload_static_projection_f32(
-            arena,
-            tensors.ff2_down_weight,
-            &layer.ff2_down_weight,
-            "enc_ff2_down_weight",
-        )?;
-    }
-    upload_static_f32(
+    upload_encoder_static_projection(
+        arena,
+        tensors.ff2_down_weight,
+        &layer.ff2_down_weight,
+        "enc_ff2_down_weight",
+    )?;
+    upload_encoder_static_f32(
         arena,
         tensors.ff2_down_bias,
         &layer.ff2_down_bias.values,
         "enc_ff2_down_bias",
     )?;
-    upload_static_f32(
+    upload_encoder_static_f32(
         arena,
         tensors.out_norm_weight,
         &layer.out_norm_weight.values,
         "enc_out_norm_weight",
     )?;
-    upload_static_f32(
+    upload_encoder_static_f32(
         arena,
         tensors.out_norm_bias,
         &layer.out_norm_bias.values,
@@ -1967,6 +2300,34 @@ mod tests {
                 tensor_index: Arc::new(tensor_index),
             },
         )
+    }
+
+    #[test]
+    fn fully_loaded_encoder_tensor_requires_the_execution_storage_type() {
+        assert!(encoder_loaded_tensor_execution_compatible(
+            CohereEncoderStaticTensorKind::F32Rank4,
+            GGML_TYPE_F32,
+            &[3, 3, 1, 64],
+            &[3, 3, 1, 64],
+        ));
+        assert!(!encoder_loaded_tensor_execution_compatible(
+            CohereEncoderStaticTensorKind::F32Rank4,
+            GGML_TYPE_F16,
+            &[3, 3, 1, 64],
+            &[3, 3, 1, 64],
+        ));
+        assert!(!encoder_loaded_tensor_execution_compatible(
+            CohereEncoderStaticTensorKind::F16Rank2Or3,
+            GGML_TYPE_F32,
+            &[3, 64, 1],
+            &[3, 64, 1],
+        ));
+        assert!(!encoder_loaded_tensor_execution_compatible(
+            CohereEncoderStaticTensorKind::F16Rank4,
+            GGML_TYPE_F16,
+            &[3, 3, 1, 63],
+            &[3, 3, 1, 64],
+        ));
     }
 
     fn sample_features(metadata: CohereTranscribeExecutionMetadata) -> CohereTranscribeMelFeatures {

@@ -208,7 +208,7 @@ impl PolicyResolvedFireRedStreamVadProvider {
             .policy_resolver()
             .resolve(
                 intent,
-                super::AUTO_GPU_POLICY,
+                super::OFFLINE_AUTO_GPU_POLICY,
                 super::execution_capabilities(),
                 &inventory,
             )

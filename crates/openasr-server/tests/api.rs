@@ -4765,6 +4765,32 @@ async fn transcriptions_with_native_backend_accepts_quant_alias_against_legacy_h
 }
 
 #[tokio::test]
+async fn transcriptions_with_native_backend_matches_normalized_path_stem_after_retired_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack_root = temp.path().join("native-pack.oasr");
+    write_whisper_oasr_v1_fixture(&pack_root, "whisper-tiny:q4_0");
+    let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_root),
+    });
+    let wav_bytes = sample_wav_bytes();
+    let request = multipart_request("native-pack", "sample.wav", &wav_bytes);
+    let response = app.oneshot(request).await.unwrap();
+
+    // The fixture is intentionally not executable as the requested family;
+    // this gate only proves that the already-normalized path-stem identity is
+    // not reopened and compared against the retired metadata spelling.
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(response.into_body(), 1024 * 256).await.unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(!body.contains("does not match server native local runtime source id"));
+    assert!(!body.contains("retired legacy metadata id"));
+}
+
+#[tokio::test]
 async fn transcriptions_with_native_backend_and_diarize_returns_bad_request() {
     let temp = tempfile::tempdir().unwrap();
     // Hermetic: diarization availability probes the installed ReDimNet2-B6 pack,

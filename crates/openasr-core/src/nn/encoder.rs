@@ -938,6 +938,9 @@ pub(crate) struct SanMFsmnBlockConfig {
     pub frame_count: usize,
     pub fsmn_kernel: usize,
     pub layer_norm_epsilon: f32,
+    /// Use fused scaled-dot attention when the selected backend validates the
+    /// requested head width. The DFSMN branch remains unchanged.
+    pub use_flash_attention: bool,
 }
 
 /// Weight handles for one SAN-M block. `attn_qkv_weight` is the fused
@@ -1060,12 +1063,15 @@ where
         attention_heads: config.attention_heads,
         sequence_len: frame_count,
     };
+    let use_flash_attention =
+        config.use_flash_attention && graph.supports_flash_attn_ext_head_dim(config.head_dim);
+    let use_strided_flash_views = use_flash_attention && graph.backend_kind().is_gpu_class();
     let q_heads = reshape_projection_to_attention_heads(
         graph,
         q,
         layout,
         STANDARD_HEAD_PERMUTE_AXES,
-        false,
+        use_flash_attention && !use_strided_flash_views,
         AttentionReshapeSteps {
             reshape: "ggml_reshape_3d(sanm_q)",
             permute: "ggml_permute(sanm_q)",
@@ -1078,7 +1084,7 @@ where
         k,
         layout,
         STANDARD_HEAD_PERMUTE_AXES,
-        false,
+        use_flash_attention && !use_strided_flash_views,
         AttentionReshapeSteps {
             reshape: "ggml_reshape_3d(sanm_k)",
             permute: "ggml_permute(sanm_k)",
@@ -1086,24 +1092,12 @@ where
         },
         map_err,
     )?;
-    let k_heads = graph
-        .cont(k_heads)
-        .map_err(|source| map_err("ggml_cont(sanm_k)", source))?;
-    let mut scores = graph
-        .mul_mat(k_heads, q_heads)
-        .map_err(|source| map_err("ggml_mul_mat(sanm_scores)", source))?;
-    scores = graph
-        .scale(scores, 1.0 / (config.head_dim as f32).sqrt())
-        .map_err(|source| map_err("ggml_scale(sanm_scores)", source))?;
-    let probs = graph
-        .soft_max(scores)
-        .map_err(|source| map_err("ggml_soft_max(sanm_scores)", source))?;
     let v_heads = reshape_projection_to_attention_heads(
         graph,
         v,
         layout,
         STANDARD_HEAD_PERMUTE_AXES,
-        true,
+        !use_strided_flash_views,
         AttentionReshapeSteps {
             reshape: "ggml_reshape_3d(sanm_v)",
             permute: "ggml_permute(sanm_v)",
@@ -1111,21 +1105,43 @@ where
         },
         map_err,
     )?;
-    let context = attention_context_from_probs(
-        graph,
-        v_heads,
-        probs,
-        layout,
-        AttentionValueMergeSteps {
-            value_permute: "ggml_permute(sanm_v_t)",
-            value_cont: "ggml_cont(sanm_v_t)",
-            context_mul: "ggml_mul_mat(sanm_ctx)",
-            context_merge_permute: "ggml_permute(sanm_ctx_merge)",
-            context_merge_cont: "ggml_cont(sanm_ctx_merge)",
-            context_merge_reshape: "ggml_reshape_2d(sanm_ctx_merge)",
-        },
-        map_err,
-    )?;
+    let scale = 1.0 / (config.head_dim as f32).sqrt();
+    let context = if use_flash_attention {
+        let flash = graph
+            .flash_attn_ext(q_heads, k_heads, v_heads, None, scale, 0.0, 0.0)
+            .map_err(|source| map_err("ggml_flash_attn_ext(sanm_attn)", source))?;
+        graph
+            .reshape_2d(flash, d_model, frame_count)
+            .map_err(|source| map_err("ggml_reshape_2d(sanm_flash_merge)", source))?
+    } else {
+        let k_heads = graph
+            .cont(k_heads)
+            .map_err(|source| map_err("ggml_cont(sanm_k)", source))?;
+        let mut scores = graph
+            .mul_mat(k_heads, q_heads)
+            .map_err(|source| map_err("ggml_mul_mat(sanm_scores)", source))?;
+        scores = graph
+            .scale(scores, scale)
+            .map_err(|source| map_err("ggml_scale(sanm_scores)", source))?;
+        let probs = graph
+            .soft_max(scores)
+            .map_err(|source| map_err("ggml_soft_max(sanm_scores)", source))?;
+        attention_context_from_probs(
+            graph,
+            v_heads,
+            probs,
+            layout,
+            AttentionValueMergeSteps {
+                value_permute: "ggml_permute(sanm_v_t)",
+                value_cont: "ggml_cont(sanm_v_t)",
+                context_mul: "ggml_mul_mat(sanm_ctx)",
+                context_merge_permute: "ggml_permute(sanm_ctx_merge)",
+                context_merge_cont: "ggml_cont(sanm_ctx_merge)",
+                context_merge_reshape: "ggml_reshape_2d(sanm_ctx_merge)",
+            },
+            map_err,
+        )?
+    };
     let mut attn_out = graph
         .mul_mat(weights.attn_out_weight, context)
         .map_err(|source| map_err("ggml_mul_mat(sanm_attn_out)", source))?;
@@ -1682,6 +1698,7 @@ mod tests {
                 frame_count: TOKENS,
                 fsmn_kernel: SANM_FSMN_KERNEL,
                 layer_norm_epsilon: 1.0e-5,
+                use_flash_attention: false,
             },
             SanMFsmnBlockWeights {
                 attn_norm_weight,

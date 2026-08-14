@@ -16,7 +16,10 @@ pub fn load_wav_16khz_mono_f32_v0(
     parse_wav_16khz_mono_f32(&bytes, input_label)
 }
 
-fn parse_wav_16khz_mono_f32(bytes: &[u8], input_label: &str) -> Result<Vec<f32>, NativeAsrError> {
+pub(crate) fn parse_wav_16khz_mono_f32(
+    bytes: &[u8],
+    input_label: &str,
+) -> Result<Vec<f32>, NativeAsrError> {
     if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err(wav_error("input is not a RIFF/WAVE file"));
     }

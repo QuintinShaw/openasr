@@ -220,7 +220,7 @@
             {
               "provider": "vulkan",
               "full_device": true,
-              "hybrid": false
+              "hybrid": true
             }
           ]
         },
@@ -984,8 +984,8 @@
             },
             {
               "provider": "vulkan",
-              "full_device": true,
-              "hybrid": false
+              "full_device": false,
+              "hybrid": true
             }
           ]
         },

@@ -42,6 +42,11 @@ pub(crate) const XASR_DECODER_CONV_GROUPS: usize = 128;
 /// tensor contract instead of duplicated loader literals.
 pub(crate) const XASR_ENCODER_EMBED_INPUT_DIM: usize = 2432;
 
+/// The exported X-ASR Zipformer encoder emits one transducer frame for every
+/// four feature-hop frames. This is an architecture contract (the final
+/// `downsample_output` width is four), not a tuning knob.
+pub(crate) const XASR_OUTPUT_DOWNSAMPLING_FACTOR: usize = 4;
+
 /// Architecture ceilings for pack-supplied geometry, with generous headroom
 /// over the published checkpoint (6 stacks, 19 encoder layers, dims up to
 /// 768, joiner 512, vocab 5000). They bound every contract-derived

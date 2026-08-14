@@ -22,11 +22,15 @@ use super::prepared_runtime::{
 };
 use crate::MOONSHINE_GGML_ADAPTER_ID;
 use crate::NativeAsrSession;
-use crate::ggml_runtime::GgmlCpuGraphBackend;
-use crate::ggml_runtime::GgufRuntimeSourcePreflight;
+use crate::ggml_runtime::{
+    GgmlCpuGraphBackend, GgufRuntimeSourcePreflight, request_backend_override,
+};
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
     PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
+};
+use crate::models::device_greedy_token::{
+    DeviceGreedyStepOutputMode, device_greedy_step_output_mode,
 };
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
@@ -39,7 +43,9 @@ use crate::models::incremental_streaming_driver::{
 use crate::models::lora_adapter::{
     ResolvedLoraAdapterCache, ResolvedLoraAdapterHandle, resolved_lora_adapter,
 };
-use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
+use crate::models::native_execution_services::{
+    ExecutionLaneKey, current_execution_lane_key, current_execution_placement,
+};
 use crate::models::prepared_runtime_cache::{
     HostNeutralPreparedRuntime, PreparedRuntimeCache, PreparedRuntimeHandle,
     PreparedRuntimeQuoteContext, SystemMemoryMaterialization,
@@ -53,7 +59,8 @@ const MOONSHINE_STREAMING_EXECUTOR_ID: &str = "moonshine-ggml-snapshot-streaming
 const MOONSHINE_RUNTIME_ACTOR_MAX_IDLE_ENTRIES: usize = 4;
 const MOONSHINE_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
 
-/// (pack content id, execution lane, adapter fingerprint). The content id
+/// (pack content id, execution lane, decoder capacity, adapter fingerprint,
+/// greedy-step output mode). The content id
 /// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
 /// replacement at the same path from reusing a runtime built from the old
 /// bytes. The adapter fingerprint MUST stay in this key -- prepared encoder
@@ -65,6 +72,7 @@ type MoonshineDecoderRuntimeCacheKey = (
     ExecutionLaneKey,
     crate::models::seq2seq_decoder_state::Seq2SeqResidentCapacity,
     String,
+    DeviceGreedyStepOutputMode,
 );
 
 struct MoonshineEncoderActorState {
@@ -234,6 +242,18 @@ impl MoonshineGgmlExecutor {
             super::batched_decode::MoonshineFamily,
         >(request.request_options.serve_batch);
         let decoder_config = moonshine_decoder_graph_config(backend);
+        let greedy_step_output_mode = moonshine_greedy_step_output_mode(
+            device_greedy_step_output_mode(
+                decoder_config.backend,
+                decoder_config.use_scheduler,
+                request_backend_override().as_ref(),
+                current_execution_placement(),
+            ),
+            skip_serve_batch,
+            adapter.is_some(),
+            request.request_options.phrase_bias.is_some(),
+            request.request_options.word_timestamps,
+        );
         let can_use_serve_batch = can_use_moonshine_serve_batch(
             skip_serve_batch,
             adapter.is_some(),
@@ -300,6 +320,7 @@ impl MoonshineGgmlExecutor {
                     audio_duration,
                     adapter.clone(),
                     decoder_state,
+                    greedy_step_output_mode,
                     Arc::clone(&request.execution_context.control),
                     request
                         .execution_context
@@ -420,6 +441,7 @@ impl MoonshineGgmlExecutor {
         adapter: Option<ResolvedLoraAdapterHandle>,
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
         backend: GgmlCpuGraphBackend,
+        greedy_step_output_mode: DeviceGreedyStepOutputMode,
     ) -> Result<MoonshineDecoderRuntimeActor, MoonshineGgmlExecutorError> {
         let decoder_backend = moonshine_decoder_graph_config(backend).backend;
         let key = (
@@ -427,13 +449,14 @@ impl MoonshineGgmlExecutor {
             current_execution_lane_key(decoder_backend),
             decoder_state.resident_capacity(),
             moonshine_adapter_cache_fingerprint(adapter.as_ref().map(resolved_lora_adapter)),
+            greedy_step_output_mode,
         );
         let preflight = preflight.clone();
         self.decoder_runtimes.checkout_or_try_build_with(
             key,
             move || Ok((0, (preflight, prepared, adapter))),
             move |(preflight, prepared, adapter)| {
-                let runtime = MoonshineDecoderGraphRuntime::new(
+                let runtime = MoonshineDecoderGraphRuntime::new_with_greedy_step_output_mode(
                     MoonshineDecoderRuntimeInput {
                         decoder_weights: &prepared.decoder_weights,
                         metadata: prepared.metadata,
@@ -442,6 +465,7 @@ impl MoonshineGgmlExecutor {
                     },
                     &preflight,
                     adapter.as_ref().map(resolved_lora_adapter),
+                    greedy_step_output_mode,
                 )
                 .map_err(|error| MoonshineGgmlExecutorError::DecoderFailed {
                     reason: error.to_string(),
@@ -494,13 +518,20 @@ impl MoonshineGgmlExecutor {
         audio_duration_seconds: f32,
         adapter: Option<ResolvedLoraAdapterHandle>,
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
+        greedy_step_output_mode: DeviceGreedyStepOutputMode,
         control: Arc<crate::api::backend::TranscriptionControl>,
         decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
     ) -> Result<super::decoder_graph::MoonshineDecodeOutput, MoonshineGgmlExecutorError> {
         let tokenizer = prepared.tokenizer.clone();
         let metadata = prepared.metadata;
-        let runtime =
-            self.checkout_decoder_runtime(preflight, prepared, adapter, decoder_state, backend)?;
+        let runtime = self.checkout_decoder_runtime(
+            preflight,
+            prepared,
+            adapter,
+            decoder_state,
+            backend,
+            greedy_step_output_mode,
+        )?;
         runtime
             .call_mut(move |state| {
                 state.runtime.activate_decoder_state(decoder_state)?;
@@ -532,6 +563,23 @@ fn can_use_moonshine_serve_batch(
     decoder_uses_scheduler: bool,
 ) -> bool {
     !skip_serve_batch && !adapter_active && decoder_backend_is_gpu_class && !decoder_uses_scheduler
+}
+
+/// Narrow the shared device top-1 capability to Moonshine consumers that do
+/// not need logits or probabilities. The mode is frozen on the request thread
+/// and carried through the actor key; owner threads never re-read route TLS.
+fn moonshine_greedy_step_output_mode(
+    base_mode: DeviceGreedyStepOutputMode,
+    force_full_logits: bool,
+    adapter_active: bool,
+    phrase_bias_active: bool,
+    word_timestamps: bool,
+) -> DeviceGreedyStepOutputMode {
+    if force_full_logits || adapter_active || phrase_bias_active || word_timestamps {
+        DeviceGreedyStepOutputMode::FullLogits
+    } else {
+        base_mode
+    }
 }
 
 fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudioView) -> f32 {
@@ -672,7 +720,8 @@ fn map_decoder_error(error: MoonshineDecoderGraphError) -> MoonshineGgmlExecutor
 
 #[cfg(test)]
 mod tests {
-    use super::can_use_moonshine_serve_batch;
+    use super::{can_use_moonshine_serve_batch, moonshine_greedy_step_output_mode};
+    use crate::models::device_greedy_token::DeviceGreedyStepOutputMode;
 
     #[test]
     fn serve_batch_is_allowed_only_on_direct_gpu_path_without_adapter() {
@@ -696,5 +745,46 @@ mod tests {
         assert!(!can_use_moonshine_serve_batch(true, false, true, false));
         assert!(!can_use_moonshine_serve_batch(false, false, false, false));
         assert!(!can_use_moonshine_serve_batch(false, false, true, true));
+    }
+
+    #[test]
+    fn device_top1_requires_an_ordinary_logit_free_consumer() {
+        assert_eq!(
+            moonshine_greedy_step_output_mode(
+                DeviceGreedyStepOutputMode::DeviceTop1,
+                false,
+                false,
+                false,
+                false,
+            ),
+            DeviceGreedyStepOutputMode::DeviceTop1
+        );
+        for (force_full_logits, adapter, phrase_bias, word_timestamps) in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ] {
+            assert_eq!(
+                moonshine_greedy_step_output_mode(
+                    DeviceGreedyStepOutputMode::DeviceTop1,
+                    force_full_logits,
+                    adapter,
+                    phrase_bias,
+                    word_timestamps,
+                ),
+                DeviceGreedyStepOutputMode::FullLogits
+            );
+        }
+        assert_eq!(
+            moonshine_greedy_step_output_mode(
+                DeviceGreedyStepOutputMode::FullLogits,
+                false,
+                false,
+                false,
+                false,
+            ),
+            DeviceGreedyStepOutputMode::FullLogits
+        );
     }
 }

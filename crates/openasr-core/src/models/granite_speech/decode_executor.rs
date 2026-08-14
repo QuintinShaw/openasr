@@ -288,15 +288,12 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechResidentAudioDecodeStepExe
         // Steps after the first advance the resident session by one token.
         if self.prefilled {
             let new_token = incremental_new_token(self.session, self.prompt_len, &input)?;
-            if let Some(logits) = self
+            if let Some(output) = self
                 .session
                 .decode_step_from_token_id(new_token)
                 .map_err(map_step_error(input.step_index, "audio"))?
             {
-                return Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-                    logits,
-                    greedy_token_hint: None,
-                });
+                return Ok(output);
             }
             let embedding = self
                 .embedding_table
@@ -328,7 +325,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechResidentAudioDecodeStepExe
                 (token_id == GRANITE_SPEECH_AUDIO_TOKEN_ID).then_some(position)
             })
             .collect::<Vec<_>>();
-        let logits = match self
+        let output = match self
             .session
             .prefill_token_ids_with_audio(
                 &self.initial_prompt_token_ids,
@@ -338,7 +335,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechResidentAudioDecodeStepExe
             )
             .map_err(map_step_error(input.step_index, "audio"))?
         {
-            Some(logits) => logits,
+            Some(output) => output,
             None => {
                 let prompt_embeddings = materialize_audio_prompt_embeddings_from_mapped_table(
                     self.session.config(),
@@ -352,21 +349,23 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechResidentAudioDecodeStepExe
                         input.step_index
                     ),
                 })?;
-                self.session
+                let logits = self
+                    .session
                     .prefill(
                         &prompt_embeddings,
                         self.initial_prompt_token_ids.len(),
                         self.capacity,
                     )
-                    .map_err(map_step_error(input.step_index, "audio"))?
+                    .map_err(map_step_error(input.step_index, "audio"))?;
+                Seq2SeqGreedyDecodeStepLogitsOutput {
+                    logits,
+                    greedy_token_hint: None,
+                }
             }
         };
         self.prompt_len = self.initial_prompt_token_ids.len();
         self.prefilled = true;
-        Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-            logits,
-            greedy_token_hint: None,
-        })
+        Ok(output)
     }
 }
 

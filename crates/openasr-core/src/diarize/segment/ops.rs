@@ -92,17 +92,46 @@ pub(crate) fn linear(
 
 /// Row-wise log-softmax over `[rows, cols]`.
 pub(crate) fn log_softmax(x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; rows * cols];
+    let mut out = x.to_vec();
+    log_softmax_checked_inplace(&mut out, rows, cols)
+        .expect("log_softmax caller must provide a finite, exact-shape tensor");
+    out
+}
+
+/// Stable row-wise log-softmax with an explicit malformed-payload boundary.
+/// The hybrid GPU runtime uses this after device readback, so non-finite logits
+/// or an inconsistent shape cannot be converted into an apparently valid
+/// diarization result.
+pub(crate) fn log_softmax_checked_inplace(
+    x: &mut [f32],
+    rows: usize,
+    cols: usize,
+) -> Result<(), &'static str> {
+    if cols == 0 {
+        return Err("log-softmax requires a positive class dimension");
+    }
+    let elements = rows
+        .checked_mul(cols)
+        .ok_or("log-softmax shape overflows usize")?;
+    if x.len() != elements {
+        return Err("log-softmax input shape mismatch");
+    }
+    if x.iter().any(|value| !value.is_finite()) {
+        return Err("log-softmax input contains a non-finite value");
+    }
     for r in 0..rows {
-        let row = &x[r * cols..(r + 1) * cols];
+        let row = &mut x[r * cols..(r + 1) * cols];
         let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let sum: f32 = row.iter().map(|v| (v - max).exp()).sum();
         let log_sum = max + sum.ln();
-        for c in 0..cols {
-            out[r * cols + c] = row[c] - log_sum;
+        for value in row.iter_mut() {
+            *value -= log_sum;
         }
     }
-    out
+    if x.iter().any(|value| !value.is_finite()) {
+        return Err("log-softmax output contains a non-finite value");
+    }
+    Ok(())
 }
 
 use crate::diarize::embed::ops::sigmoid;
@@ -207,5 +236,15 @@ mod tests {
         let out = log_softmax(&[1.0, 2.0, 3.0], 1, 3);
         let p: f32 = out.iter().map(|v| v.exp()).sum();
         assert!((p - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn checked_log_softmax_keeps_extreme_logits_finite() {
+        let mut logits = vec![-1000.0, 0.0, 1000.0];
+        log_softmax_checked_inplace(&mut logits, 1, 3)
+            .expect("stable log-softmax must not underflow through probabilities");
+        assert!(logits.iter().all(|value| value.is_finite()));
+        assert_eq!(logits[2], 0.0);
+        assert!(logits[0] < -1_900.0 && logits[1] < -900.0);
     }
 }

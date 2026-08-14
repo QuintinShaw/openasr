@@ -10,6 +10,7 @@ pub(crate) mod ctc_prefix_beam;
 pub(crate) mod ctc_streaming_driver;
 pub(crate) mod decode_policy_component_registry;
 pub(crate) mod decode_token_history;
+pub(crate) mod device_greedy_token;
 pub(crate) mod diarize_pack_import;
 pub(crate) mod dolphin;
 pub(crate) mod executor_component_registry;

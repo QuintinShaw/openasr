@@ -48,7 +48,7 @@ use super::runtime_contract::{
 };
 use super::tokenizer::ParakeetTdtTokenizer;
 
-type ParakeetTdtRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
+type ParakeetTdtRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, bool);
 type ParakeetTdtRuntimePool =
     AdmittedPinnedRuntimeActorCheckoutPool<ParakeetTdtRuntimeCacheKey, ParakeetTdtPreparedRuntime>;
 type ParakeetTdtRuntimeActor =
@@ -98,13 +98,16 @@ fn checkout_parakeet_tdt_prepared_runtime(
     preflight: &crate::GgufRuntimeSourcePreflight,
     resolved_backend: GgmlCpuGraphBackend,
 ) -> Result<ParakeetTdtRuntimeActor, String> {
-    let backend = crate::models::parakeet_tdt::graph_config::parakeet_tdt_encoder_graph_config(
+    let config = crate::models::parakeet_tdt::graph_config::parakeet_tdt_encoder_graph_config(
         resolved_backend,
-    )
-    .backend;
+    );
+    let backend = config.backend;
+    let resident_predictor_state =
+        crate::models::parakeet_tdt::graph_config::parakeet_tdt_resident_predictor_state(config);
     let key = (
         PackContentKey::for_runtime_source(&preflight.runtime_source),
         current_execution_lane_key(backend),
+        resident_predictor_state,
     );
     let preflight = preflight.clone();
     let pack_content_id = preflight.runtime_source.content_id().to_string();
@@ -121,14 +124,23 @@ fn checkout_parakeet_tdt_prepared_runtime(
                 metadata,
                 &pack_content_id,
                 backend,
+                resident_predictor_state,
             )
             .map_err(|error| error.to_string())?;
             Ok((
                 quote.retained_bytes,
-                (preflight, reader, metadata, quote, plan, backend),
+                (
+                    preflight,
+                    reader,
+                    metadata,
+                    quote,
+                    plan,
+                    backend,
+                    resident_predictor_state,
+                ),
             ))
         },
-        |(preflight, reader, metadata, quote, plan, backend)| {
+        |(preflight, reader, metadata, quote, plan, backend, resident_predictor_state)| {
             match SystemMemoryOwner::try_allocate_transaction(quote, || {
                 let tokenizer = ParakeetTdtTokenizer::from_metadata(&preflight.metadata)?;
                 let tokenizer_bytes = tokenizer.retained_system_memory_bytes()?;
@@ -136,9 +148,14 @@ fn checkout_parakeet_tdt_prepared_runtime(
                 let encoder_weights = load_parakeet_tdt_encoder_weights(&reader, &metadata)
                     .map_err(|error| error.to_string())?;
                 let encoder_weights_bytes = encoder_weights.retained_system_memory_bytes()?;
-                let mut graph =
-                    ParakeetTdtEncoderGraph::new(&encoder_weights, metadata, &preflight, backend)
-                        .map_err(|error| error.to_string())?;
+                let mut graph = ParakeetTdtEncoderGraph::new(
+                    &encoder_weights,
+                    metadata,
+                    &preflight,
+                    backend,
+                    resident_predictor_state,
+                )
+                .map_err(|error| error.to_string())?;
                 let graph_bytes = graph.retained_system_memory_bytes()?;
                 drop(encoder_weights);
 
@@ -218,6 +235,7 @@ fn parakeet_tdt_runtime_system_memory_quote(
     metadata: ParakeetTdtExecutionMetadata,
     pack_content_id: &str,
     backend: GgmlCpuGraphBackend,
+    resident_predictor_state: bool,
 ) -> Result<(SystemMemoryAllocationQuote, FastConformerSystemMemoryPlan), SystemMemoryOwnerError> {
     let tokenizer_bytes = tokenizer_quote_bytes(gguf_metadata, "parakeet-tdt")?;
     let plan = plan_fastconformer_system_memory(
@@ -246,9 +264,13 @@ fn parakeet_tdt_runtime_system_memory_quote(
         )?;
         (predictor, joint, 0)
     } else {
-        let device = device_decoder_quote_bytes(metadata).map_err(|reason| {
-            SystemMemoryOwnerError::capacity_failure("parakeet_tdt_device_decoder_quote", reason)
-        })?;
+        let device =
+            device_decoder_quote_bytes(metadata, resident_predictor_state).map_err(|reason| {
+                SystemMemoryOwnerError::capacity_failure(
+                    "parakeet_tdt_device_decoder_quote",
+                    reason,
+                )
+            })?;
         (0, 0, device)
     };
     let retained_bytes = checked_sum(
@@ -385,7 +407,7 @@ fn transcribe_parakeet_tdt_pcm_cached(
     let actor = checkout_parakeet_tdt_prepared_runtime(runtime_pool, preflight, backend)?;
     let samples = samples.to_vec();
     actor
-        .call_mut(move |runtime| {
+        .call_mut_fallible(move |runtime| {
             runtime.transcribe(
                 &samples,
                 word_timestamps,
@@ -421,7 +443,9 @@ impl Default for ParakeetTdtGgmlExecutor {
 impl ParakeetTdtGgmlExecutor {
     pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
         self.runtime_pool
-            .evict_where(|(key, _lane)| key.pack_content_id == pack_content_id);
+            .evict_where(|(key, _lane, _resident_predictor_state)| {
+                key.pack_content_id == pack_content_id
+            });
     }
 }
 

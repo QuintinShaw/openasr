@@ -15,6 +15,10 @@ use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, BuiltinSeq2SeqDecodePolicyConfigInput,
     BuiltinSeq2SeqDecodePolicyTokenSource, run_builtin_seq2seq_decode_policy,
 };
+use crate::models::device_greedy_token::{
+    DeviceGreedyStepOutputMode, first_max_argmax_reverse_indices,
+    first_max_token_id_from_reversed_argmax,
+};
 use crate::models::seq2seq_decoder_state::Seq2SeqDecoderState;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeStepExecutor,
@@ -364,6 +368,7 @@ pub(crate) struct MoonshineDecoderGraphRuntime {
     loaded_weights: Option<GgmlLoadedWeightContext>,
     runner: GgmlCpuGraphRunner,
     arena: GgmlStaticTensorArena,
+    argmax_reverse_indices: Option<GgmlStaticTensor>,
     embedding: GgmlStaticTensor,
     out_norm: GgmlStaticTensor,
     layers: Vec<MoonshineDecoderLayerRuntime>,
@@ -371,6 +376,7 @@ pub(crate) struct MoonshineDecoderGraphRuntime {
     decoder_state: Seq2SeqDecoderState,
     cross_frame_count: usize,
     n_seq: usize,
+    greedy_step_output_mode: DeviceGreedyStepOutputMode,
 }
 
 /// The resolved-input identity a decoder runtime is built from: the weights
@@ -394,7 +400,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for MoonshineDecoderStepExecutor<'_> {
         &mut self,
         input: Seq2SeqGreedyDecodeStepInput<'_>,
     ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeError> {
-        let logits = if input.initial_prompt_tokens.len() == 1
+        let output = if input.initial_prompt_tokens.len() == 1
             && self.runtime.supports_reusable_decode_graph()
         {
             let current_token = input
@@ -404,7 +410,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for MoonshineDecoderStepExecutor<'_> {
                 .unwrap_or(input.initial_prompt_tokens[0]);
             let position = input.generated_tokens.len();
             self.runtime
-                .compute_incremental_step_logits(current_token, position)
+                .compute_incremental_step_output(current_token, position)
         } else {
             let prefix = input
                 .initial_prompt_tokens
@@ -412,15 +418,12 @@ impl Seq2SeqGreedyDecodeStepExecutor for MoonshineDecoderStepExecutor<'_> {
                 .copied()
                 .chain(input.generated_tokens.iter().copied())
                 .collect::<Vec<_>>();
-            self.runtime.compute_full_prefix_step_logits(&prefix)
+            self.runtime.compute_full_prefix_step_output(&prefix)
         }
         .map_err(|error| Seq2SeqGreedyDecodeError::DecoderStepFailed {
             reason: error.to_string(),
         })?;
-        Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-            logits,
-            greedy_token_hint: None,
-        })
+        Ok(output)
     }
 }
 
@@ -454,6 +457,20 @@ impl MoonshineDecoderGraphRuntime {
         runtime_preflight: &GgufRuntimeSourcePreflight,
         adapter: Option<&MoonshineLoraAdapter>,
     ) -> Result<Self, MoonshineDecoderGraphError> {
+        Self::new_with_greedy_step_output_mode(
+            input,
+            runtime_preflight,
+            adapter,
+            DeviceGreedyStepOutputMode::FullLogits,
+        )
+    }
+
+    pub(crate) fn new_with_greedy_step_output_mode(
+        input: MoonshineDecoderRuntimeInput<'_>,
+        runtime_preflight: &GgufRuntimeSourcePreflight,
+        adapter: Option<&MoonshineLoraAdapter>,
+        greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    ) -> Result<Self, MoonshineDecoderGraphError> {
         Self::new_with_n_seq(
             input.decoder_weights,
             input.metadata,
@@ -462,6 +479,7 @@ impl MoonshineDecoderGraphRuntime {
             runtime_preflight,
             1,
             adapter,
+            greedy_step_output_mode,
         )
     }
 
@@ -479,6 +497,7 @@ impl MoonshineDecoderGraphRuntime {
             RuntimeWeightSource::Synthetic,
             1,
             adapter,
+            DeviceGreedyStepOutputMode::FullLogits,
         )
     }
 
@@ -491,6 +510,7 @@ impl MoonshineDecoderGraphRuntime {
         runtime_preflight: &GgufRuntimeSourcePreflight,
         n_seq: usize,
         adapter: Option<&MoonshineLoraAdapter>,
+        greedy_step_output_mode: DeviceGreedyStepOutputMode,
     ) -> Result<Self, MoonshineDecoderGraphError> {
         Self::new_with_n_seq_impl(
             decoder_weights,
@@ -500,6 +520,7 @@ impl MoonshineDecoderGraphRuntime {
             RuntimeWeightSource::Verified(runtime_preflight),
             n_seq,
             adapter,
+            greedy_step_output_mode,
         )
     }
 
@@ -521,6 +542,7 @@ impl MoonshineDecoderGraphRuntime {
             RuntimeWeightSource::Synthetic,
             n_seq,
             adapter,
+            DeviceGreedyStepOutputMode::FullLogits,
         )
     }
 
@@ -533,6 +555,7 @@ impl MoonshineDecoderGraphRuntime {
         runtime_source: RuntimeWeightSource<'_>,
         n_seq: usize,
         adapter: Option<&MoonshineLoraAdapter>,
+        greedy_step_output_mode: DeviceGreedyStepOutputMode,
     ) -> Result<Self, MoonshineDecoderGraphError> {
         decoder_state
             .validate()
@@ -560,6 +583,11 @@ impl MoonshineDecoderGraphRuntime {
         if n_seq == 0 {
             return Err(MoonshineDecoderGraphError::InvalidInput {
                 reason: "moonshine decoder n_seq must be positive".to_string(),
+            });
+        }
+        if n_seq != 1 && greedy_step_output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
+            return Err(MoonshineDecoderGraphError::InvalidInput {
+                reason: "moonshine device top-1 requires a single decode sequence".to_string(),
             });
         }
 
@@ -619,6 +647,11 @@ impl MoonshineDecoderGraphRuntime {
                     .checked_mul(2)
                     .and_then(|lora| count.checked_add(lora))
             })
+            .and_then(|count| {
+                count.checked_add(usize::from(
+                    greedy_step_output_mode == DeviceGreedyStepOutputMode::DeviceTop1,
+                ))
+            })
             .ok_or(MoonshineDecoderGraphError::ShapeOverflow)?;
         let mut arena = runner
             .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
@@ -628,6 +661,17 @@ impl MoonshineDecoderGraphRuntime {
 
         let embedding = new_matrix(&arena, &decoder_weights.embedding, "dec_emb")?;
         let out_norm = new_vector(&arena, decoder_weights.out_norm.len(), "dec_out_norm")?;
+        let argmax_reverse_indices = if greedy_step_output_mode
+            == DeviceGreedyStepOutputMode::DeviceTop1
+        {
+            Some(
+                arena
+                    .new_tensor_1d_i32(metadata.vocab_size, "moonshine_dec_argmax_reverse_indices")
+                    .map_err(build_err("argmax_reverse_indices"))?,
+            )
+        } else {
+            None
+        };
         let d_model = metadata.d_model;
 
         let mut layers = Vec::with_capacity(decoder_weights.layers.len());
@@ -751,6 +795,16 @@ impl MoonshineDecoderGraphRuntime {
                     source,
                 })?;
         }
+        if let Some(reverse_indices) = argmax_reverse_indices {
+            arena
+                .set_i32_slice(
+                    reverse_indices,
+                    &first_max_argmax_reverse_indices(metadata.vocab_size)
+                        .map_err(build_err("argmax_reverse_indices"))?,
+                    "moonshine_dec_argmax_reverse_indices",
+                )
+                .map_err(build_err("argmax_reverse_indices"))?;
+        }
 
         Ok(Self {
             metadata,
@@ -759,6 +813,7 @@ impl MoonshineDecoderGraphRuntime {
             loaded_weights,
             runner,
             arena,
+            argmax_reverse_indices,
             embedding,
             out_norm,
             layers,
@@ -766,6 +821,7 @@ impl MoonshineDecoderGraphRuntime {
             decoder_state,
             cross_frame_count: decoder_state.cross_attention.logical_positions,
             n_seq,
+            greedy_step_output_mode,
         })
     }
 
@@ -976,6 +1032,33 @@ impl MoonshineDecoderGraphRuntime {
         token_id: u32,
         position: usize,
     ) -> Result<Vec<f32>, MoonshineDecoderGraphError> {
+        Ok(self
+            .compute_incremental_step_output_with_mode(
+                token_id,
+                position,
+                DeviceGreedyStepOutputMode::FullLogits,
+            )?
+            .logits)
+    }
+
+    fn compute_incremental_step_output(
+        &mut self,
+        token_id: u32,
+        position: usize,
+    ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, MoonshineDecoderGraphError> {
+        self.compute_incremental_step_output_with_mode(
+            token_id,
+            position,
+            self.greedy_step_output_mode,
+        )
+    }
+
+    fn compute_incremental_step_output_with_mode(
+        &mut self,
+        token_id: u32,
+        position: usize,
+        output_mode: DeviceGreedyStepOutputMode,
+    ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, MoonshineDecoderGraphError> {
         if self.n_seq != 1 {
             return Err(MoonshineDecoderGraphError::InvalidInput {
                 reason: "single moonshine decode step requires n_seq=1".to_string(),
@@ -1009,10 +1092,12 @@ impl MoonshineDecoderGraphRuntime {
                 reuse.is_poisoned()
                     || reuse.max_positions != logical_max_positions
                     || reuse.n_seq != 1
+                    || reuse.top1.is_some()
+                        != (output_mode == DeviceGreedyStepOutputMode::DeviceTop1)
             })
             .unwrap_or(true);
         if needs_build {
-            self.build_reusable_decode_graph()?;
+            self.build_reusable_decode_graph(output_mode)?;
         }
 
         let reuse = self
@@ -1024,6 +1109,7 @@ impl MoonshineDecoderGraphRuntime {
         let position_tensor = reuse.position;
         let attention_mask = reuse.attention_mask;
         let logits = reuse.logits;
+        let top1 = reuse.top1;
         let max_positions = reuse.max_positions;
         let graph = reuse.builder();
 
@@ -1042,11 +1128,35 @@ impl MoonshineDecoderGraphRuntime {
             .set_f16_bits_slice(attention_mask, &mask_bits, "moonshine_reuse_self_mask")
             .map_err(build_err("ggml_set_f16_bits_slice(reuse_mask)"))?;
 
-        graph
-            .compute_output_f32(logits, self.metadata.vocab_size)
-            .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
-                reason: error.to_string(),
-            })
+        match top1 {
+            Some(top1) => {
+                let reversed_token_id = graph
+                    .compute_output_i32(top1, 1)
+                    .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
+                        reason: error.to_string(),
+                    })?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| MoonshineDecoderGraphError::GraphExecutionFailed {
+                        reason: "moonshine device top-1 returned no token id".to_string(),
+                    })?;
+                Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                    logits: Vec::new(),
+                    greedy_token_hint: Some(map_reversed_top1_token(
+                        reversed_token_id,
+                        self.metadata.vocab_size,
+                    )?),
+                })
+            }
+            None => Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits: graph
+                    .compute_output_f32(logits, self.metadata.vocab_size)
+                    .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
+                        reason: error.to_string(),
+                    })?,
+                greedy_token_hint: None,
+            }),
+        }
     }
 
     // Wired by the moonshine serve-batch owner thread in the follow-up step.
@@ -1124,7 +1234,7 @@ impl MoonshineDecoderGraphRuntime {
             })
             .unwrap_or(true);
         if needs_build {
-            self.build_reusable_decode_graph()?;
+            self.build_reusable_decode_graph(DeviceGreedyStepOutputMode::FullLogits)?;
         }
 
         let reuse = self
@@ -1335,7 +1445,10 @@ impl MoonshineDecoderGraphRuntime {
             })
     }
 
-    fn build_reusable_decode_graph(&mut self) -> Result<(), MoonshineDecoderGraphError> {
+    fn build_reusable_decode_graph(
+        &mut self,
+        output_mode: DeviceGreedyStepOutputMode,
+    ) -> Result<(), MoonshineDecoderGraphError> {
         let d_model = self.metadata.d_model;
         let heads = self.metadata.n_heads;
         let head_dim = self.metadata.head_dim;
@@ -1433,30 +1546,72 @@ impl MoonshineDecoderGraphRuntime {
         let logits = graph
             .mul_mat(self.arena.graph_tensor(self.embedding), state)
             .map_err(build_err("ggml_mul_mat(reuse_logits)"))?;
+        let top1 = if output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
+            let reverse_indices = self.argmax_reverse_indices.ok_or_else(|| {
+                MoonshineDecoderGraphError::InvalidInput {
+                    reason: "moonshine device top-1 reverse indices are unavailable".to_string(),
+                }
+            })?;
+            Some(
+                graph
+                    .top1_argmax_first_max_reversed(
+                        logits,
+                        self.arena.graph_tensor(reverse_indices),
+                    )
+                    .map_err(build_err("ggml_argmax(reuse_top1)"))?,
+            )
+        } else {
+            None
+        };
+        let output_root = top1.unwrap_or(logits);
         graph
-            .set_output(logits)
+            .set_output(output_root)
             .map_err(build_err("ggml_set_output(reuse_logits)"))?;
         graph
-            .prepare_outputs_for_upload(&[logits])
+            .prepare_outputs_for_upload(&[output_root])
             .map_err(build_err("ggml_prepare_outputs(reuse_logits)"))?;
 
-        self.reuse = Some(Seq2SeqReusableDecodeGraph::new_with_borrowed_kv_arena(
-            session,
-            max_context,
-            n_seq,
-            token_id,
-            row_index,
-            position,
-            attention_mask,
-            logits,
-        ));
+        self.reuse = Some(
+            Seq2SeqReusableDecodeGraph::new_with_borrowed_kv_arena_and_optional_top1(
+                session,
+                max_context,
+                n_seq,
+                token_id,
+                row_index,
+                position,
+                attention_mask,
+                logits,
+                top1,
+            ),
+        );
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn compute_full_prefix_step_logits(
         &mut self,
         tokens: &[u32],
     ) -> Result<Vec<f32>, MoonshineDecoderGraphError> {
+        Ok(self
+            .compute_full_prefix_step_output_with_mode(
+                tokens,
+                DeviceGreedyStepOutputMode::FullLogits,
+            )?
+            .logits)
+    }
+
+    fn compute_full_prefix_step_output(
+        &mut self,
+        tokens: &[u32],
+    ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, MoonshineDecoderGraphError> {
+        self.compute_full_prefix_step_output_with_mode(tokens, self.greedy_step_output_mode)
+    }
+
+    fn compute_full_prefix_step_output_with_mode(
+        &mut self,
+        tokens: &[u32],
+        output_mode: DeviceGreedyStepOutputMode,
+    ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, MoonshineDecoderGraphError> {
         let token_count = tokens.len();
         if token_count == 0 {
             return Err(MoonshineDecoderGraphError::InvalidInput {
@@ -1543,14 +1698,32 @@ impl MoonshineDecoderGraphRuntime {
         let logits = graph
             .mul_mat(self.arena.graph_tensor(self.embedding), last)
             .map_err(build_err("ggml_mul_mat(logits)"))?;
+        let top1 = if output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
+            let reverse_indices = self.argmax_reverse_indices.ok_or_else(|| {
+                MoonshineDecoderGraphError::InvalidInput {
+                    reason: "moonshine device top-1 reverse indices are unavailable".to_string(),
+                }
+            })?;
+            Some(
+                graph
+                    .top1_argmax_first_max_reversed(
+                        logits,
+                        self.arena.graph_tensor(reverse_indices),
+                    )
+                    .map_err(build_err("ggml_argmax(top1)"))?,
+            )
+        } else {
+            None
+        };
+        let output_root = top1.unwrap_or(logits);
         graph
-            .set_output(logits)
+            .set_output(output_root)
             .map_err(build_err("ggml_set_output(logits)"))?;
         // Allocate the full-prefix step graph through the scheduler's gallocr
         // before uploading inputs, mirroring the single-step reuse graph and
         // batched prefill above.
         graph
-            .prepare_outputs_for_upload(&[logits])
+            .prepare_outputs_for_upload(&[output_root])
             .map_err(build_err("ggml_prepare_outputs(logits)"))?;
 
         let token_values = tokens_as_i32(tokens)?;
@@ -1568,12 +1741,50 @@ impl MoonshineDecoderGraphRuntime {
                 .map_err(build_err("ggml_set_f16_bits_slice(self_mask)"))?;
         }
 
-        graph
-            .compute_output_f32(logits, self.metadata.vocab_size)
-            .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
-                reason: error.to_string(),
-            })
+        match top1 {
+            Some(top1) => {
+                let reversed_token_id = graph
+                    .compute_output_i32(top1, 1)
+                    .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
+                        reason: error.to_string(),
+                    })?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| MoonshineDecoderGraphError::GraphExecutionFailed {
+                        reason: "moonshine device top-1 returned no token id".to_string(),
+                    })?;
+                Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                    logits: Vec::new(),
+                    greedy_token_hint: Some(map_reversed_top1_token(
+                        reversed_token_id,
+                        self.metadata.vocab_size,
+                    )?),
+                })
+            }
+            None => Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits: graph
+                    .compute_output_f32(logits, self.metadata.vocab_size)
+                    .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
+                        reason: error.to_string(),
+                    })?,
+                greedy_token_hint: None,
+            }),
+        }
     }
+}
+
+fn map_reversed_top1_token(
+    reversed_token_id: i32,
+    vocab_size: usize,
+) -> Result<u32, MoonshineDecoderGraphError> {
+    let token_id = first_max_token_id_from_reversed_argmax(reversed_token_id, vocab_size).map_err(
+        |error| MoonshineDecoderGraphError::GraphExecutionFailed {
+            reason: error.to_string(),
+        },
+    )?;
+    u32::try_from(token_id).map_err(|_| MoonshineDecoderGraphError::GraphExecutionFailed {
+        reason: format!("moonshine device top-1 token id {token_id} does not fit u32"),
+    })
 }
 
 fn reusable_decode_graph_supported_for_runner(runner: &GgmlCpuGraphRunner) -> bool {
@@ -3003,6 +3214,7 @@ mod tests {
             &preflight,
             2,
             None,
+            DeviceGreedyStepOutputMode::FullLogits,
         )
         .expect("batched runtime");
         batched_runtime
@@ -3095,6 +3307,7 @@ mod tests {
             &preflight,
             2,
             None,
+            DeviceGreedyStepOutputMode::FullLogits,
         )
         .expect("batched runtime");
         batched_runtime

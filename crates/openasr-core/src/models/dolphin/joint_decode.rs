@@ -205,7 +205,7 @@ pub(crate) fn joint_decode_with_progress(
 const DOLPHIN_CTC_HEAD_GRAPH_SIZE: usize = 2048;
 
 fn dolphin_ctc_head_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
-    GgmlCpuGraphConfig {
+    crate::models::graph_runtime_config::apply_request_execution_placement(GgmlCpuGraphConfig {
         context_bytes: GgmlCpuGraphConfig::metadata_context_bytes(DOLPHIN_CTC_HEAD_GRAPH_SIZE),
         graph_size: DOLPHIN_CTC_HEAD_GRAPH_SIZE,
         n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
@@ -213,11 +213,10 @@ fn dolphin_ctc_head_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphCo
             crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::Default,
         ),
         backend,
-        // See the matching comment in encoder_graph.rs: unconditionally
-        // enabling the gallocr scheduler only bounds memory footprint, never
-        // the CTC head's computed output.
+        // CPU/unscoped callers retain the bounded gallocr scheduler. The
+        // active candidate placement is applied last.
         use_scheduler: true,
-    }
+    })
 }
 
 /// Build-once/run-many CTC head runtime: `ctc.ctc_lo` weight + bias resident

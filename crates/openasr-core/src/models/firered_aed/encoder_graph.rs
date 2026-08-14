@@ -29,8 +29,8 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::ggml_runtime::{
-    GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightContext,
-    GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
+    GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightBindingIdentity,
+    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
 };
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, AttentionValueMergeSteps,
@@ -137,6 +137,14 @@ impl FireRedEncoderGraphRuntime {
 
     pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
         self.weights.retained_system_memory_bytes()
+    }
+
+    pub(crate) fn graph_lane(&self) -> (crate::ggml_runtime::GgmlCpuGraphBackend, bool) {
+        (self.runner.backend_kind(), self.runner.uses_scheduler())
+    }
+
+    pub(crate) fn loaded_weight_binding_identity(&self) -> GgmlLoadedWeightBindingIdentity {
+        self.runner.loaded_weight_binding_identity(&self._loaded)
     }
 
     pub(crate) fn new(

@@ -280,12 +280,15 @@ mod tests {
     /// hymt2 / qwen real-pack tests) so the default suite stays weight-free; the
     /// true upstream parity is exercised at publish time.
     #[test]
+    #[ignore = "host-local: needs OPENASR_FIRERED_PUNC_REAL_PACK"]
     fn real_pack_punctuates_readme_example() {
-        let Some(path) = std::env::var_os("OPENASR_FIRERED_PUNC_REAL_PACK") else {
-            return;
-        };
+        let pack = crate::testing::external_test_fixture_path(
+            "OPENASR_FIRERED_PUNC_REAL_PACK",
+            "FireRedPunc runtime pack",
+        )
+        .expect("OPENASR_FIRERED_PUNC_REAL_PACK");
         let runtime = FireRedPuncRuntime::from_pack(
-            Path::new(&path),
+            &pack,
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("load real pack");
@@ -377,19 +380,23 @@ mod tests {
     /// ids are fed to both sides so this isolates the numeric forward from
     /// tokenization.
     #[test]
+    #[ignore = "host-local: needs OPENASR_FIRERED_PUNC_REAL_PACK and OPENASR_FIRERED_PUNC_GOLDEN_JSON"]
     fn real_pack_labels_match_pytorch_reference_golden() {
-        let (Some(pack), Some(json)) = (
-            std::env::var_os("OPENASR_FIRERED_PUNC_REAL_PACK"),
-            std::env::var_os("OPENASR_FIRERED_PUNC_GOLDEN_JSON"),
-        ) else {
-            return;
-        };
+        let pack = crate::testing::external_test_fixture_path(
+            "OPENASR_FIRERED_PUNC_REAL_PACK",
+            "FireRedPunc runtime pack",
+        )
+        .expect("OPENASR_FIRERED_PUNC_REAL_PACK");
+        let json = crate::testing::external_test_fixture_path(
+            "OPENASR_FIRERED_PUNC_GOLDEN_JSON",
+            "FireRedPunc PyTorch reference labels",
+        )
+        .expect("OPENASR_FIRERED_PUNC_GOLDEN_JSON");
         let backend = crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend;
         let execution_placement = crate::GgmlExecutionTelemetryCollector::new();
         let _execution_placement_guard = execution_placement.install();
-        let runtime =
-            FireRedPuncRuntime::from_pack(Path::new(&pack), backend).expect("load real pack");
-        let text = std::fs::read_to_string(Path::new(&json)).expect("read golden json");
+        let runtime = FireRedPuncRuntime::from_pack(&pack, backend).expect("load real pack");
+        let text = std::fs::read_to_string(&json).expect("read golden json");
         let entries: serde_json::Value = serde_json::from_str(&text).expect("parse golden json");
         let entries = entries.as_array().expect("golden json is a list");
         let mut checked = 0usize;

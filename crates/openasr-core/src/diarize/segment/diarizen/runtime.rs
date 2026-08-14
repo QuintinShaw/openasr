@@ -92,6 +92,11 @@ struct DiariZenPersistentGraph {
 }
 
 impl DiariZenRuntime {
+    #[cfg(test)]
+    pub(super) fn backend_label(&self) -> String {
+        self._runner.backend_label()
+    }
+
     pub(crate) fn quote_candidate_system_memory(
         preflight: &GgufRuntimeSourcePreflight,
     ) -> Result<

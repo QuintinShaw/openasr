@@ -290,6 +290,18 @@ pub(crate) struct FunasrNanoEncoderGraph {
 }
 
 impl FunasrNanoEncoderGraph {
+    pub(crate) fn graph_lane(&self) -> (crate::ggml_runtime::GgmlCpuGraphBackend, bool) {
+        (self.runner.backend_kind(), self.runner.uses_scheduler())
+    }
+
+    pub(crate) fn loaded_weight_binding_identity(
+        &self,
+    ) -> Option<crate::ggml_runtime::GgmlLoadedWeightBindingIdentity> {
+        self.loaded_weights
+            .as_ref()
+            .map(|loaded| self.runner.loaded_weight_binding_identity(loaded))
+    }
+
     pub(crate) fn new_from_preflight(
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         metadata: FunasrNanoEncoderMetadata,
@@ -438,6 +450,7 @@ impl FunasrNanoEncoderGraph {
                     frame_count: n_frames,
                     fsmn_kernel: metadata.fsmn_kernel,
                     layer_norm_epsilon: eps,
+                    use_flash_attention: false,
                 },
                 sanm_weights(&self.arena, handles),
                 map,
@@ -468,6 +481,7 @@ impl FunasrNanoEncoderGraph {
                     frame_count: n_frames,
                     fsmn_kernel: metadata.fsmn_kernel,
                     layer_norm_epsilon: eps,
+                    use_flash_attention: false,
                 },
                 sanm_weights(&self.arena, handles),
                 map,

@@ -358,7 +358,15 @@ impl OasrPackTransaction {
     pub(crate) fn commit(
         mut self,
     ) -> Result<super::pack_verifier::VerifiedPack, OasrPackWriteError> {
-        fs::File::open(&self.staging_path)
+        // `File::open` creates a read-only handle. Windows requires write
+        // access for `FlushFileBuffers`, which backs `sync_all`, so reopening
+        // the completed staging file read-only makes every pack commit fail
+        // with `ERROR_ACCESS_DENIED`. Keep the handle private and request the
+        // minimum additional access needed for the durability barrier.
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.staging_path)
             .and_then(|file| file.sync_all())
             .map_err(|source| OasrPackWriteError::Durability {
                 path: self.staging_path.clone(),

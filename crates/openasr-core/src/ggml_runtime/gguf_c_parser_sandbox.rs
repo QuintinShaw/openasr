@@ -386,7 +386,14 @@ fn sandbox_child_windows_path_entries(helper: &Path) -> Vec<PathBuf> {
         push_unique_existing_dir(&mut entries, parent.to_path_buf());
     }
 
-    for key in ["HIP_PATH", "ROCM_PATH", "ROCM_HOME"] {
+    for key in [
+        "HIP_PATH",
+        "ROCM_PATH",
+        "ROCM_HOME",
+        "CUDA_PATH",
+        "CUDA_HOME",
+        "CudaToolkitDir",
+    ] {
         if let Some(root) = env::var_os(key) {
             push_unique_existing_dir(&mut entries, PathBuf::from(root).join("bin"));
         }
@@ -417,6 +424,20 @@ fn windows_dir_contains_accelerated_runtime_dll(path: &Path) -> bool {
         || path.join("libhipblas.dll").is_file()
         || path.join("amdhip64_7.dll").is_file()
         || path.join("amdhip64.dll").is_file()
+        || windows_dir_contains_versioned_dll(path, "cudart64_")
+        || windows_dir_contains_versioned_dll(path, "cublas64_")
+}
+
+#[cfg(windows)]
+fn windows_dir_contains_versioned_dll(path: &Path, prefix: &str) -> bool {
+    std::fs::read_dir(path).is_ok_and(|entries| {
+        entries.filter_map(Result::ok).any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(prefix) && name.ends_with(".dll"))
+        })
+    })
 }
 
 fn read_to_end_limited(mut reader: impl Read, limit: usize) -> Result<Vec<u8>, io::Error> {
@@ -602,5 +623,31 @@ mod tests {
                 if operation == "gguf-base-preflight-parse"
                     && detail == "fixture allocation failed"
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sandbox_path_retains_cuda_runtime_directory_but_excludes_ordinary_path_entries() {
+        let helper = tempfile::tempdir().expect("helper tempdir");
+        let ordinary = tempfile::tempdir().expect("ordinary tempdir");
+        let cuda = tempfile::tempdir().expect("CUDA tempdir");
+        std::fs::write(cuda.path().join("cudart64_99.dll"), []).expect("write CUDA marker");
+        let parent_path = std::env::join_paths([ordinary.path(), cuda.path()])
+            .expect("join synthetic parent PATH");
+        let overrides = [
+            ("HIP_PATH", None),
+            ("ROCM_PATH", None),
+            ("ROCM_HOME", None),
+            ("CUDA_PATH", None),
+            ("CUDA_HOME", None),
+            ("CudaToolkitDir", None),
+            ("PATH", Some(parent_path)),
+        ];
+        crate::test_process_env::with_test_process_env(overrides, || {
+            let entries = sandbox_child_windows_path_entries(&helper.path().join("openasr.exe"));
+            assert!(entries.iter().any(|entry| entry == cuda.path()));
+            assert!(!entries.iter().any(|entry| entry == ordinary.path()));
+            assert!(entries.iter().any(|entry| entry == helper.path()));
+        });
     }
 }

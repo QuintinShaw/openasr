@@ -198,6 +198,12 @@ fn main() {
         .arg(cmake_flag("GGML_NATIVE", ggml_native))
         .arg(cmake_flag("GGML_OPENMP", effective_openmp))
         .arg(cmake_flag("GGML_CUDA", feat_cuda))
+        // Keep CUDA Graph capture fail-closed and deterministic. A host-local
+        // X-ASR experiment showed that cached graph executables can outlive
+        // the CUDA primary context during Windows TLS teardown; explicitly
+        // pinning this OFF also prevents a stale CMake cache from silently
+        // carrying that rejected experiment into later production builds.
+        .arg("-DGGML_CUDA_GRAPHS=OFF")
         .arg(cmake_flag("GGML_VULKAN", feat_vulkan))
         .arg(cmake_flag("GGML_HIP", feat_hip))
         .arg(cmake_flag("GGML_SYCL", feat_sycl))
@@ -1320,7 +1326,12 @@ fn run(command: &mut Command) {
 
 fn cmake_path(path: &Path) -> String {
     path.to_string_lossy()
-        .replace('\\', "\\\\")
+        // CMake accepts forward slashes on Windows. Backslashes passed through
+        // `-D` are serialized into generated CMake compiler files and parsed a
+        // second time, where paths such as `D:\workspace` contain invalid
+        // escapes (`\o`). Normalizing once keeps command-line and generated-file
+        // parsing identical.
+        .replace('\\', "/")
         .replace('"', "\\\"")
 }
 

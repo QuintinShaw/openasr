@@ -35,6 +35,185 @@ const GOLDEN_DIFF_TINY_WHISPER_ENCODER_PRELUDE_SHA256: &str =
 const GOLDEN_DIFF_TINY_WHISPER_DECODER_STEP_LOGITS_SHA256: &str =
     "562f79a316fb538274ec4eb03a8ee28407dd5a8f258029d44fe6c1fba5882561";
 
+fn exactly_addressable_preference(provider: ExecutionProvider) -> RequestBackendPreference {
+    RequestBackendPreference::Exact(crate::device::execution_route::ResolvedExecutionRoute {
+        provider,
+        stable_id: format!("{}0", provider.as_str()),
+        registry_ordinal: 0,
+        kind: crate::device::execution_route::RouteDeviceKind::Accelerated,
+        addressability: crate::device::execution_route::DeviceAddressability::ExactlyAddressable {
+            physical_key: crate::device::execution_route::PhysicalResourceKey::new("0000:01:00.0")
+                .expect("physical key"),
+        },
+    })
+}
+
+#[test]
+fn unified_owner_is_limited_to_exact_direct_cuda_vulkan_full_device() {
+    let direct_gpu = GgmlCpuGraphConfig {
+        backend: GgmlCpuGraphBackend::Gpu,
+        use_scheduler: false,
+        ..GgmlCpuGraphConfig::conservative_default()
+    };
+    let medium_geometry = WhisperUnifiedRuntimeGeometry {
+        decoder_layers: 24,
+        decoder_hidden_size: 1024,
+        tensor_storage_bytes: Some(2 * 1024 * 1024 * 1024),
+    };
+    let large_geometry = WhisperUnifiedRuntimeGeometry {
+        decoder_layers: 32,
+        decoder_hidden_size: 1280,
+        tensor_storage_bytes: Some(2 * 1024 * 1024 * 1024),
+    };
+    let vulkan = exactly_addressable_preference(ExecutionProvider::Vulkan);
+    assert!(whisper_unified_runtime_enabled_with_override(
+        GgmlCpuGraphBackend::Gpu,
+        Some(&vulkan),
+        Some(ExecutionPlacement::FullDevice),
+        direct_gpu,
+        direct_gpu,
+        medium_geometry,
+        false,
+        None,
+        None,
+    ));
+    let cuda = exactly_addressable_preference(ExecutionProvider::Cuda);
+    assert!(!whisper_unified_runtime_enabled_with_override(
+        GgmlCpuGraphBackend::Gpu,
+        Some(&cuda),
+        Some(ExecutionPlacement::FullDevice),
+        direct_gpu,
+        direct_gpu,
+        medium_geometry,
+        false,
+        None,
+        None,
+    ));
+    assert!(whisper_unified_runtime_enabled_with_override(
+        GgmlCpuGraphBackend::Gpu,
+        Some(&cuda),
+        Some(ExecutionPlacement::FullDevice),
+        direct_gpu,
+        direct_gpu,
+        medium_geometry,
+        true,
+        None,
+        None,
+    ));
+    assert!(whisper_unified_runtime_enabled_with_override(
+        GgmlCpuGraphBackend::Gpu,
+        Some(&cuda),
+        Some(ExecutionPlacement::FullDevice),
+        direct_gpu,
+        direct_gpu,
+        large_geometry,
+        false,
+        None,
+        None,
+    ));
+    assert!(whisper_unified_runtime_enabled_with_override(
+        GgmlCpuGraphBackend::Gpu,
+        Some(&cuda),
+        Some(ExecutionPlacement::FullDevice),
+        direct_gpu,
+        direct_gpu,
+        medium_geometry,
+        false,
+        None,
+        Some("1"),
+    ));
+    assert!(!whisper_unified_runtime_enabled_with_override(
+        GgmlCpuGraphBackend::Gpu,
+        Some(&vulkan),
+        Some(ExecutionPlacement::FullDevice),
+        direct_gpu,
+        direct_gpu,
+        medium_geometry,
+        false,
+        Some("1"),
+        None,
+    ));
+    for provider in [
+        ExecutionProvider::Cpu,
+        ExecutionProvider::Metal,
+        ExecutionProvider::Hip,
+        ExecutionProvider::Accelerator,
+        ExecutionProvider::Unknown,
+    ] {
+        let preference = exactly_addressable_preference(provider);
+        assert!(!whisper_unified_runtime_enabled_with_override(
+            GgmlCpuGraphBackend::Gpu,
+            Some(&preference),
+            Some(ExecutionPlacement::FullDevice),
+            direct_gpu,
+            direct_gpu,
+            large_geometry,
+            true,
+            None,
+            None,
+        ));
+    }
+    let scheduled_gpu = GgmlCpuGraphConfig {
+        use_scheduler: true,
+        ..direct_gpu
+    };
+    assert!(!whisper_unified_runtime_enabled_with_override(
+        GgmlCpuGraphBackend::Gpu,
+        Some(&exactly_addressable_preference(ExecutionProvider::Cuda)),
+        Some(ExecutionPlacement::FullDevice),
+        direct_gpu,
+        scheduled_gpu,
+        large_geometry,
+        true,
+        None,
+        None,
+    ));
+}
+
+#[test]
+fn cuda_unified_owner_geometry_requires_large_depth_and_width() {
+    assert!(
+        WhisperUnifiedRuntimeGeometry {
+            decoder_layers: 32,
+            decoder_hidden_size: 1280,
+            tensor_storage_bytes: Some(WHISPER_CUDA_UNIFIED_MIN_TENSOR_STORAGE_BYTES),
+        }
+        .favors_cuda_unified_runtime()
+    );
+    assert!(
+        !WhisperUnifiedRuntimeGeometry {
+            decoder_layers: 31,
+            decoder_hidden_size: 1280,
+            tensor_storage_bytes: Some(WHISPER_CUDA_UNIFIED_MIN_TENSOR_STORAGE_BYTES),
+        }
+        .favors_cuda_unified_runtime()
+    );
+    assert!(
+        !WhisperUnifiedRuntimeGeometry {
+            decoder_layers: 32,
+            decoder_hidden_size: 1279,
+            tensor_storage_bytes: Some(WHISPER_CUDA_UNIFIED_MIN_TENSOR_STORAGE_BYTES),
+        }
+        .favors_cuda_unified_runtime()
+    );
+    assert!(
+        !WhisperUnifiedRuntimeGeometry {
+            decoder_layers: 32,
+            decoder_hidden_size: 1280,
+            tensor_storage_bytes: Some(WHISPER_CUDA_UNIFIED_MIN_TENSOR_STORAGE_BYTES - 1),
+        }
+        .favors_cuda_unified_runtime()
+    );
+    assert!(
+        !WhisperUnifiedRuntimeGeometry {
+            decoder_layers: 32,
+            decoder_hidden_size: 1280,
+            tensor_storage_bytes: None,
+        }
+        .favors_cuda_unified_runtime()
+    );
+}
+
 fn sha256_f32_le(values: &[f32]) -> String {
     let mut hasher = Sha256::new();
     for value in values {

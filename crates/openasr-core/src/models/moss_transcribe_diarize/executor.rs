@@ -24,6 +24,12 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::api::backend::Transcription;
+use crate::device::execution_policy::ExecutionPlacement;
+use crate::device::execution_route::ExecutionProvider;
+use crate::ggml_runtime::{
+    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlNativeGqaCapability, RequestBackendPreference,
+    request_backend_override,
+};
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
     PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
@@ -39,13 +45,14 @@ use crate::models::ggml_asr_executor::{
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
 };
+use crate::models::native_execution_services::current_execution_placement;
 use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
 use crate::models::prepared_runtime_cache::{
     PreparedRuntimeCache, PreparedRuntimeHandle, PreparedRuntimeQuoteContext,
 };
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity, Qwen3AsrKvCacheCapacityError,
-    Qwen3AsrPromptTokenInput,
+    Qwen3AsrPromptTokenInput, qwen_llm_effective_native_gqa_capability,
 };
 use crate::models::runtime_cache_coordinator::PackContentKey;
 use crate::models::seq2seq_greedy_decode::{
@@ -55,7 +62,7 @@ use crate::models::seq2seq_greedy_decode::{
 };
 use crate::models::system_memory_owner::{
     SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
-    SystemMemoryAllocationTransactionError, SystemMemoryOwner,
+    SystemMemoryAllocationTransactionError, SystemMemoryCapacity, SystemMemoryOwner,
 };
 use crate::models::whisper::whisper_log_mel_spectrogram_16khz_mono_v0;
 
@@ -157,8 +164,47 @@ enum MossTdExecutorError {
 const MOSS_TD_RUNTIME_ACTOR_MAX_IDLE_ENTRIES: usize = 4;
 const MOSS_TD_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
 
-type MossTdEncoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
-type MossTdDecoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct MossTdGraphRuntimeCacheProfile {
+    context_bytes: usize,
+    graph_size: usize,
+    n_threads: Option<usize>,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    use_scheduler: bool,
+}
+
+impl From<crate::ggml_runtime::GgmlCpuGraphConfig> for MossTdGraphRuntimeCacheProfile {
+    fn from(config: crate::ggml_runtime::GgmlCpuGraphConfig) -> Self {
+        Self {
+            context_bytes: config.context_bytes,
+            graph_size: config.graph_size,
+            n_threads: config.n_threads,
+            backend: config.backend,
+            use_scheduler: config.use_scheduler,
+        }
+    }
+}
+
+type MossTdEncoderRuntimeCacheKey = (
+    PackContentKey,
+    ExecutionLaneKey,
+    MossTdGraphRuntimeCacheProfile,
+);
+type MossTdDecoderRuntimeCacheKey = (
+    PackContentKey,
+    ExecutionLaneKey,
+    MossTdGraphRuntimeCacheProfile,
+    GgmlNativeGqaCapability,
+);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct MossTdUnifiedRuntimeCacheKey {
+    content: PackContentKey,
+    lane: ExecutionLaneKey,
+    encoder_profile: MossTdGraphRuntimeCacheProfile,
+    decoder_profile: MossTdGraphRuntimeCacheProfile,
+    native_gqa: GgmlNativeGqaCapability,
+}
 
 struct MossTdEncoderActorState {
     runtime: MossEncoderRuntime,
@@ -170,20 +216,148 @@ struct MossTdDecoderActorState {
     _prepared_owner: PreparedRuntimeHandle<MossTdPreparedRuntime>,
 }
 
+struct MossTdUnifiedActorState {
+    encoder: MossEncoderRuntime,
+    decoder: MossTdDecoderRuntime,
+    _prepared_owner: PreparedRuntimeHandle<MossTdPreparedRuntime>,
+}
+
 type MossTdEncoderRuntimePool =
     AdmittedPinnedRuntimeActorCheckoutPool<MossTdEncoderRuntimeCacheKey, MossTdEncoderActorState>;
 type MossTdDecoderRuntimePool =
     AdmittedPinnedRuntimeActorCheckoutPool<MossTdDecoderRuntimeCacheKey, MossTdDecoderActorState>;
+type MossTdUnifiedRuntimePool =
+    AdmittedPinnedRuntimeActorCheckoutPool<MossTdUnifiedRuntimeCacheKey, MossTdUnifiedActorState>;
 type MossTdEncoderRuntimeActor =
     PinnedRuntimeActorCheckout<MossTdEncoderRuntimeCacheKey, MossTdEncoderActorState>;
 type MossTdDecoderRuntimeActor =
     PinnedRuntimeActorCheckout<MossTdDecoderRuntimeCacheKey, MossTdDecoderActorState>;
+type MossTdUnifiedRuntimeActor =
+    PinnedRuntimeActorCheckout<MossTdUnifiedRuntimeCacheKey, MossTdUnifiedActorState>;
+
+fn moss_td_unified_system_memory_shape(
+    encoder_retained: u64,
+    decoder_retained: u64,
+) -> Result<(u64, u64), String> {
+    let retained = encoder_retained
+        .checked_add(decoder_retained)
+        .ok_or_else(|| "MOSS unified runtime retained bytes overflowed".to_string())?;
+    Ok((retained, retained))
+}
+
+impl MossTdUnifiedActorState {
+    fn system_memory_quote(
+        prepared: &MossTdPreparedRuntime,
+        content_id: &str,
+        encoder_config: GgmlCpuGraphConfig,
+        decoder_config: GgmlCpuGraphConfig,
+    ) -> Result<SystemMemoryAllocationQuote, String> {
+        if encoder_config.backend != GgmlCpuGraphBackend::Gpu
+            || encoder_config.use_scheduler
+            || decoder_config.backend != GgmlCpuGraphBackend::Gpu
+            || decoder_config.use_scheduler
+        {
+            return Err("MOSS unified runtime quote requires direct GPU stages".to_string());
+        }
+        // The accelerated encoder owns only typed handles into the prepared
+        // runtime and the shared loaded context. Its CPU adaptor Vecs do not
+        // exist on this lane, so its actor-local SystemMemory retention is 0.
+        let encoder_retained = 0;
+        let decoder_retained =
+            MossTdDecoderRuntime::quoted_resident_system_memory_bytes(&prepared.decoder_plan)?;
+        let (peak, retained) =
+            moss_td_unified_system_memory_shape(encoder_retained, decoder_retained)?;
+        SystemMemoryAllocationQuote::new(
+            format!("moss-td-unified-runtime:{content_id}"),
+            peak,
+            retained,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = SystemMemoryCapacity::default();
+        bytes.add(
+            self.encoder.retained_host_system_memory_bytes()?,
+            "MOSS unified encoder runtime",
+        )?;
+        bytes.add(
+            self.decoder.resident_system_memory_bytes()?,
+            "MOSS unified decoder runtime",
+        )?;
+        Ok(bytes.finish())
+    }
+}
+
+fn moss_td_unified_runtime_configs(
+    allow_unified_runtime: bool,
+    backend: GgmlCpuGraphBackend,
+    backend_preference: Option<&RequestBackendPreference>,
+    placement: Option<ExecutionPlacement>,
+) -> Option<(GgmlCpuGraphConfig, GgmlCpuGraphConfig)> {
+    let encoder = moss_td_encoder_graph_config(backend);
+    let decoder = moss_td_runtime_graph_config(backend);
+    moss_td_unified_runtime_enabled(
+        allow_unified_runtime,
+        backend,
+        backend_preference,
+        placement,
+        encoder,
+        decoder,
+    )
+    .then_some((encoder, decoder))
+}
+
+fn moss_td_unified_runtime_enabled(
+    allow_unified_runtime: bool,
+    backend: GgmlCpuGraphBackend,
+    backend_preference: Option<&RequestBackendPreference>,
+    placement: Option<ExecutionPlacement>,
+    encoder: GgmlCpuGraphConfig,
+    decoder: GgmlCpuGraphConfig,
+) -> bool {
+    allow_unified_runtime
+        && backend == GgmlCpuGraphBackend::Gpu
+        && placement == Some(ExecutionPlacement::FullDevice)
+        && matches!(
+            backend_preference,
+            Some(RequestBackendPreference::Exact(route))
+                if route.addressability.is_exactly_addressable()
+                    && matches!(route.provider, ExecutionProvider::Cuda | ExecutionProvider::Vulkan)
+        )
+        && encoder.backend == GgmlCpuGraphBackend::Gpu
+        && !encoder.use_scheduler
+        && decoder.backend == GgmlCpuGraphBackend::Gpu
+        && !decoder.use_scheduler
+}
+
+fn moss_td_native_gqa_candidate(
+    backend: GgmlCpuGraphBackend,
+    preference: Option<&RequestBackendPreference>,
+    resolved: GgmlNativeGqaCapability,
+) -> GgmlNativeGqaCapability {
+    match backend {
+        GgmlCpuGraphBackend::Cpu | GgmlCpuGraphBackend::Metal => resolved,
+        GgmlCpuGraphBackend::Gpu => match preference {
+            Some(RequestBackendPreference::Exact(route))
+                if route.provider == ExecutionProvider::Vulkan =>
+            {
+                resolved
+            }
+            Some(RequestBackendPreference::CpuOnly)
+            | Some(RequestBackendPreference::Accelerated)
+            | Some(RequestBackendPreference::Exact(_))
+            | None => GgmlNativeGqaCapability::Unsupported,
+        },
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct MossTdGgmlExecutor {
     prepared_runtimes: Arc<PreparedRuntimeCache<MossTdPreparedRuntime>>,
     encoder_runtimes: Arc<MossTdEncoderRuntimePool>,
     decoder_runtimes: Arc<MossTdDecoderRuntimePool>,
+    unified_runtimes: Arc<MossTdUnifiedRuntimePool>,
 }
 
 impl std::fmt::Debug for MossTdGgmlExecutor {
@@ -209,6 +383,10 @@ impl Default for MossTdGgmlExecutor {
             )),
             decoder_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
                 "openasr-moss-td-decoder-owner",
+                limits,
+            )),
+            unified_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+                "openasr-moss-td-unified-owner",
                 limits,
             )),
         }
@@ -547,8 +725,8 @@ mod moss_td_chunk_frame_math_tests {
 /// resident encoder runtime for this pack+backend. Each chunk's valid encoder
 /// prefix is time-merged inside the same ggml graph, so only final adaptor rows
 /// cross back to the host.
-fn encode_moss_td_chunks_with_cached_runtime(
-    actor: &MossTdEncoderRuntimeActor,
+fn encode_moss_td_chunks_with_runtime(
+    runtime: &mut MossEncoderRuntime,
     encoder_config: MossEncoderConfig,
     merge_size: usize,
     adaptor_input_dim: usize,
@@ -558,64 +736,79 @@ fn encode_moss_td_chunks_with_cached_runtime(
     // Upstream `_compute_audio_token_length`'s stride: hop_length * the
     // Whisper conv stem's 2x stride * audio_merge_size.
     let token_stride = HOP_LENGTH * WHISPER_ENCODER_CONV_STRIDE * merge_size;
+    let mut concatenated_rows: Vec<f32> = Vec::new();
+    let mut total_tokens = 0usize;
+    for chunk in samples.chunks(CHUNK_SAMPLES) {
+        let mel = whisper_log_mel_spectrogram_16khz_mono_v0(
+            chunk,
+            encoder_config.n_mels,
+            MEL_TARGET_FRAMES,
+        )
+        .map_err(|error| MossTdExecutorError::FrontendFailed {
+            reason: error.to_string(),
+        })?;
+        let token_length = moss_td_chunk_token_length(chunk.len(), token_stride);
+        let keep_frames = moss_td_chunk_keep_frames(
+            token_length,
+            merge_size,
+            encoder_config.max_source_positions,
+        );
+        let adaptor_rows = runtime
+            .encode_and_adapt(
+                encoder_config,
+                mel.data(),
+                MEL_TARGET_FRAMES,
+                keep_frames,
+                merge_size,
+                adaptor_input_dim,
+                llm_dim,
+                MOSS_TD_ADAPTOR_NORM_EPSILON,
+            )
+            .map_err(|error| MossTdExecutorError::EncoderFailed {
+                reason: error.to_string(),
+            })?;
+        let expected_values = token_length.checked_mul(llm_dim).ok_or_else(|| {
+            MossTdExecutorError::EncoderFailed {
+                reason: "adaptor output length overflowed".to_string(),
+            }
+        })?;
+        if adaptor_rows.len() != expected_values {
+            return Err(MossTdExecutorError::EncoderFailed {
+                reason: format!(
+                    "adaptor output length {} != expected {expected_values}",
+                    adaptor_rows.len()
+                ),
+            });
+        }
+        concatenated_rows.extend_from_slice(&adaptor_rows);
+        total_tokens = total_tokens.checked_add(token_length).ok_or_else(|| {
+            MossTdExecutorError::EncoderFailed {
+                reason: "adaptor token count overflowed".to_string(),
+            }
+        })?;
+    }
+    Ok((concatenated_rows, total_tokens))
+}
+
+fn encode_moss_td_chunks_with_cached_runtime(
+    actor: &MossTdEncoderRuntimeActor,
+    encoder_config: MossEncoderConfig,
+    merge_size: usize,
+    adaptor_input_dim: usize,
+    llm_dim: usize,
+    samples: &[f32],
+) -> Result<(Vec<f32>, usize), MossTdExecutorError> {
     let samples = samples.to_vec();
     actor
-        .call_mut(move |state| {
-            let encode_result = (|| {
-                let mut concatenated_rows: Vec<f32> = Vec::new();
-                let mut total_tokens = 0usize;
-                for chunk in samples.chunks(CHUNK_SAMPLES) {
-                    let mel = whisper_log_mel_spectrogram_16khz_mono_v0(
-                        chunk,
-                        encoder_config.n_mels,
-                        MEL_TARGET_FRAMES,
-                    )
-                    .map_err(|error| MossTdExecutorError::FrontendFailed {
-                        reason: error.to_string(),
-                    })?;
-                    let token_length = moss_td_chunk_token_length(chunk.len(), token_stride);
-                    let keep_frames = moss_td_chunk_keep_frames(
-                        token_length,
-                        merge_size,
-                        encoder_config.max_source_positions,
-                    );
-                    let adaptor_rows = state
-                        .runtime
-                        .encode_and_adapt(
-                            encoder_config,
-                            mel.data(),
-                            MEL_TARGET_FRAMES,
-                            keep_frames,
-                            merge_size,
-                            adaptor_input_dim,
-                            llm_dim,
-                            MOSS_TD_ADAPTOR_NORM_EPSILON,
-                        )
-                        .map_err(|error| MossTdExecutorError::EncoderFailed {
-                            reason: error.to_string(),
-                        })?;
-                    let expected_values = token_length.checked_mul(llm_dim).ok_or_else(|| {
-                        MossTdExecutorError::EncoderFailed {
-                            reason: "adaptor output length overflowed".to_string(),
-                        }
-                    })?;
-                    if adaptor_rows.len() != expected_values {
-                        return Err(MossTdExecutorError::EncoderFailed {
-                            reason: format!(
-                                "adaptor output length {} != expected {expected_values}",
-                                adaptor_rows.len()
-                            ),
-                        });
-                    }
-                    concatenated_rows.extend_from_slice(&adaptor_rows);
-                    total_tokens = total_tokens.checked_add(token_length).ok_or_else(|| {
-                        MossTdExecutorError::EncoderFailed {
-                            reason: "adaptor token count overflowed".to_string(),
-                        }
-                    })?;
-                }
-                Ok((concatenated_rows, total_tokens))
-            })();
+        .call_mut_fallible(move |state| {
+            let encode_result = encode_moss_td_chunks_with_runtime(
+                &mut state.runtime,
+                encoder_config,
+                merge_size,
+                adaptor_input_dim,
+                llm_dim,
+                &samples,
+            );
             let release_result =
                 state
                     .runtime
@@ -655,6 +848,108 @@ struct MossTdDecodeOutput {
 /// is logically reset by the next prefill. `release_session_scoped_buffers`
 /// below drops poisoned resident state and CPU-only scratch before reuse.
 #[allow(clippy::too_many_arguments)]
+fn run_moss_td_decoder_with_runtime(
+    decoder: &mut MossTdDecoderRuntime,
+    decoder_metadata: MossTdDecoderMetadata,
+    kv_capacity: Qwen3AsrKvCacheCapacity,
+    max_generated_tokens: usize,
+    decode_prompt_token_ids: &[u32],
+    audio_pad_positions: &[usize],
+    audio_rows: &[f32],
+    tokenizer: MossTdTokenizer,
+    control: Arc<crate::api::backend::TranscriptionControl>,
+    decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
+) -> Result<MossTdDecodeOutput, MossTdExecutorError> {
+    if std::env::var_os("OPENASR_MOSS_TD_PROFILE").is_some() {
+        eprintln!(
+            "OPENASR_MOSS_TD_PROFILE decoder_backend={} decoder_reuse_supported={} native_gqa={}",
+            decoder.backend_label(),
+            decoder.supports_graph_reuse(),
+            decoder.uses_native_gqa()
+        );
+    }
+
+    let prompt_input = Qwen3AsrPromptTokenInput {
+        token_ids: decode_prompt_token_ids.to_vec(),
+        audio_rows: audio_rows.to_vec(),
+        audio_positions: audio_pad_positions.to_vec(),
+    };
+
+    let layer_kv_caches = decoder
+        .new_kv_caches(kv_capacity)
+        .map_err(|reason| MossTdExecutorError::DecoderFailed { reason })?;
+    let mut step_executor = MossTdGreedyStepExecutor {
+        decoder,
+        layer_kv_caches,
+        kv_capacity,
+        prompt_input: Some(prompt_input),
+        cache_prompt_tokens: 0,
+        control: Arc::clone(&control),
+    };
+    let config = BuiltinSeq2SeqDecodePolicyConfigInput {
+        initial_prompt_tokens: decode_prompt_token_ids.to_vec(),
+        eot_token_id: tokenizer.im_end_token_id,
+        vocab_size: decoder_metadata.vocab_size,
+        max_generated_tokens,
+    };
+    let result = run_builtin_seq2seq_decode_policy(
+        crate::arch::MOSS_TD_DECODE_POLICY_ID,
+        &config,
+        &tokenizer,
+        None,
+        &mut step_executor,
+        &|token_ids: &[u32]| {
+            tokenizer.decode_text_token_ids(token_ids).map_err(|error| {
+                Seq2SeqGreedyDecodeError::TokenizerDecodeFailed {
+                    reason: error.to_string(),
+                }
+            })
+        },
+        |error: Seq2SeqGreedyDecodeError| error,
+        |error: Seq2SeqGreedyDecodeError| error,
+        map_registry_error,
+        &control,
+        decode_work_progress.as_ref(),
+    );
+    // Release this request's per-token grow-to-fit host buffer before the
+    // runtime goes back into the cache -- unconditionally, on both success
+    // and failure, so a failed decode never leaves session-scoped memory in
+    // the cached runtime.
+    step_executor.decoder.release_session_scoped_buffers();
+    let result = match result {
+        Ok(result) => result,
+        // Budget exhausted before `<|im_end|>`: preserve the generated prefix
+        // and mark it truncated instead of discarding useful transcription.
+        Err(Seq2SeqGreedyDecodeError::EotNotReachedBeforeMaxTokens {
+            generated_tokens, ..
+        }) => {
+            let text = tokenizer
+                .decode_text_token_ids(&generated_tokens)
+                .map_err(|error| MossTdExecutorError::GreedyDecodeFailed {
+                    reason: format!(
+                        "tokenizer decode of the budget-exhausted prefix failed: {error}"
+                    ),
+                })?;
+            Seq2SeqGreedyDecodeResult {
+                text,
+                generated_tokens,
+                generated_probabilities: Vec::new(),
+                stop_reason: Seq2SeqGreedyDecodeStopReason::BudgetExhausted,
+            }
+        }
+        Err(error) => {
+            return Err(MossTdExecutorError::GreedyDecodeFailed {
+                reason: error.to_string(),
+            });
+        }
+    };
+    Ok(MossTdDecodeOutput {
+        text: result.text.trim().to_string(),
+        stop_reason: result.stop_reason,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_moss_td_decoder_with_cached_runtime(
     actor: &MossTdDecoderRuntimeActor,
     decoder_metadata: MossTdDecoderMetadata,
@@ -671,104 +966,19 @@ fn run_moss_td_decoder_with_cached_runtime(
     let audio_pad_positions = audio_pad_positions.to_vec();
     let audio_rows = audio_rows.to_vec();
     actor
-        .call_mut(move |state| {
-            let decoder = &mut state.runtime;
-            if std::env::var_os("OPENASR_MOSS_TD_PROFILE").is_some() {
-                eprintln!(
-                    "OPENASR_MOSS_TD_PROFILE decoder_backend={}",
-                    decoder.backend_label()
-                );
-            }
-
-            let prompt_input = Qwen3AsrPromptTokenInput {
-                token_ids: decode_prompt_token_ids.clone(),
-                audio_rows,
-                audio_positions: audio_pad_positions,
-            };
-
-            let layer_kv_caches = decoder
-                .new_kv_caches(kv_capacity)
-                .map_err(|reason| MossTdExecutorError::DecoderFailed { reason })?;
-            let mut step_executor = MossTdGreedyStepExecutor {
-                decoder,
-                layer_kv_caches,
+        .call_mut_fallible(move |state| {
+            run_moss_td_decoder_with_runtime(
+                &mut state.runtime,
+                decoder_metadata,
                 kv_capacity,
-                prompt_input: Some(prompt_input),
-                cache_prompt_tokens: 0,
-                control: Arc::clone(&control),
-            };
-            let config = BuiltinSeq2SeqDecodePolicyConfigInput {
-                initial_prompt_tokens: decode_prompt_token_ids.to_vec(),
-                eot_token_id: tokenizer.im_end_token_id,
-                vocab_size: decoder_metadata.vocab_size,
                 max_generated_tokens,
-            };
-            let result = run_builtin_seq2seq_decode_policy(
-                crate::arch::MOSS_TD_DECODE_POLICY_ID,
-                &config,
-                &tokenizer,
-                None,
-                &mut step_executor,
-                &|token_ids: &[u32]| {
-                    tokenizer.decode_text_token_ids(token_ids).map_err(|error| {
-                        Seq2SeqGreedyDecodeError::TokenizerDecodeFailed {
-                            reason: error.to_string(),
-                        }
-                    })
-                },
-                |error: Seq2SeqGreedyDecodeError| error,
-                |error: Seq2SeqGreedyDecodeError| error,
-                map_registry_error,
-                &control,
-                decode_work_progress.as_ref(),
-            );
-            // Release this request's per-token grow-to-fit host buffer before
-            // the runtime goes back into the cache (mirrors qwen3-asr's
-            // `ggml_executor`'s `release_session_scoped_buffers` call around
-            // its own resident whole-decoder cache) -- unconditionally, on
-            // both the success and failure paths, so a failed decode never
-            // leaves a session-scoped allocation riding along on the cached
-            // runtime.
-            step_executor.decoder.release_session_scoped_buffers();
-            let result = match result {
-                Ok(result) => result,
-                // Budget exhausted before `<|im_end|>`: keep the generated
-                // prefix instead of failing the whole request closed, matching
-                // firered-aed's handling of the same driver error. A partial
-                // transcript is a real answer for the audio it covers, and
-                // `truncated` below keeps it labelled as one -- the segment
-                // assembler will not stretch the last segment over the audio
-                // the decode never reached. Discarding it instead returns
-                // nothing at all for a recording the model largely transcribed,
-                // which is strictly worse for the same underlying shortfall.
-                Err(Seq2SeqGreedyDecodeError::EotNotReachedBeforeMaxTokens {
-                    generated_tokens,
-                    ..
-                }) => {
-                    let text = tokenizer.decode_text_token_ids(&generated_tokens).map_err(
-                        |error| MossTdExecutorError::GreedyDecodeFailed {
-                            reason: format!(
-                                "tokenizer decode of the budget-exhausted prefix failed: {error}"
-                            ),
-                        },
-                    )?;
-                    Seq2SeqGreedyDecodeResult {
-                        text,
-                        generated_tokens,
-                        generated_probabilities: Vec::new(),
-                        stop_reason: Seq2SeqGreedyDecodeStopReason::BudgetExhausted,
-                    }
-                }
-                Err(error) => {
-                    return Err(MossTdExecutorError::GreedyDecodeFailed {
-                        reason: error.to_string(),
-                    });
-                }
-            };
-            Ok(MossTdDecodeOutput {
-                text: result.text.trim().to_string(),
-                stop_reason: result.stop_reason,
-            })
+                &decode_prompt_token_ids,
+                &audio_pad_positions,
+                &audio_rows,
+                tokenizer,
+                control,
+                decode_work_progress,
+            )
         })
         .map_err(|error| MossTdExecutorError::RuntimeOwnershipFailed {
             stage: "decoder",
@@ -822,10 +1032,12 @@ impl MossTdGgmlExecutor {
         prepared: PreparedRuntimeHandle<MossTdPreparedRuntime>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<MossTdEncoderRuntimeActor, MossTdExecutorError> {
-        let encoder_backend = moss_td_encoder_graph_config(backend).backend;
+        let graph_config = moss_td_encoder_graph_config(backend);
+        let encoder_backend = graph_config.backend;
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(encoder_backend),
+            graph_config.into(),
         );
         let preflight = preflight.clone();
         let content_id = preflight.runtime_source.content_id().to_string();
@@ -871,7 +1083,7 @@ impl MossTdGgmlExecutor {
                         prepared.adaptor_metadata.merge_size,
                         prepared.decoder_metadata.d_model,
                         MOSS_TD_ADAPTOR_NORM_EPSILON,
-                        backend,
+                        graph_config,
                     )
                     .map_err(|error| MossTdExecutorError::EncoderFailed {
                         reason: format!("could not initialize encoder runtime: {error}"),
@@ -918,10 +1130,15 @@ impl MossTdGgmlExecutor {
         preflight: &crate::GgufRuntimeSourcePreflight,
         prepared: PreparedRuntimeHandle<MossTdPreparedRuntime>,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        native_gqa: GgmlNativeGqaCapability,
     ) -> Result<MossTdDecoderRuntimeActor, MossTdExecutorError> {
+        let graph_config = moss_td_runtime_graph_config(backend);
+        let effective_backend = graph_config.backend;
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
-            current_execution_lane_key(moss_td_runtime_graph_config(backend).backend),
+            current_execution_lane_key(effective_backend),
+            graph_config.into(),
+            native_gqa,
         );
         let preflight = preflight.clone();
         let content_id = preflight.runtime_source.content_id().to_string();
@@ -955,7 +1172,8 @@ impl MossTdGgmlExecutor {
                         Arc::clone(&prepared.decoder_plan),
                         Arc::clone(&prepared.logits_head),
                         Arc::clone(&prepared.token_embedding),
-                        backend,
+                        graph_config,
+                        native_gqa,
                     )
                     .map_err(|error| MossTdExecutorError::DecoderFailed {
                         reason: error.to_string(),
@@ -989,9 +1207,122 @@ impl MossTdGgmlExecutor {
         )
     }
 
+    fn checkout_unified_runtime(
+        &self,
+        preflight: &crate::GgufRuntimeSourcePreflight,
+        prepared: PreparedRuntimeHandle<MossTdPreparedRuntime>,
+        backend: GgmlCpuGraphBackend,
+        encoder_config: GgmlCpuGraphConfig,
+        decoder_config: GgmlCpuGraphConfig,
+        native_gqa: GgmlNativeGqaCapability,
+    ) -> Result<MossTdUnifiedRuntimeActor, MossTdExecutorError> {
+        let key = MossTdUnifiedRuntimeCacheKey {
+            content: PackContentKey::for_runtime_source(&preflight.runtime_source),
+            lane: current_execution_lane_key(backend),
+            encoder_profile: encoder_config.into(),
+            decoder_profile: decoder_config.into(),
+            native_gqa,
+        };
+        let preflight = preflight.clone();
+        let content_id = preflight.runtime_source.content_id().to_string();
+        self.unified_runtimes.checkout_or_try_build_with(
+            key,
+            move || {
+                let quote = MossTdUnifiedActorState::system_memory_quote(
+                    &prepared,
+                    &content_id,
+                    encoder_config,
+                    decoder_config,
+                )
+                .map_err(|reason| MossTdExecutorError::RuntimeOwnershipFailed {
+                    stage: "unified-runtime",
+                    reason,
+                })?;
+                Ok((quote.retained_bytes, (preflight, prepared, quote)))
+            },
+            move |(preflight, prepared, quote)| {
+                match SystemMemoryOwner::try_allocate_transaction(quote, || {
+                    // Build both graph stages on this owner thread while the
+                    // encoder's pack binding is live. The shared loaded-weight
+                    // cache can then upgrade the same Rc for the decoder rather
+                    // than upload the complete pack a second time.
+                    let encoder = MossEncoderRuntime::new_with_prepared_weights_from_preflight(
+                        &preflight,
+                        Arc::clone(&prepared.encoder_weights),
+                        None,
+                        prepared.encoder_metadata.d_model,
+                        prepared.adaptor_metadata.merge_size,
+                        prepared.decoder_metadata.d_model,
+                        MOSS_TD_ADAPTOR_NORM_EPSILON,
+                        encoder_config,
+                    )
+                    .map_err(|error| MossTdExecutorError::EncoderFailed {
+                        reason: format!("could not initialize unified encoder runtime: {error}"),
+                    })?;
+                    let decoder = MossTdDecoderRuntime::new_with_prepared_state_from_preflight(
+                        &preflight,
+                        prepared.decoder_metadata,
+                        Arc::clone(&prepared.decoder_plan),
+                        Arc::clone(&prepared.logits_head),
+                        Arc::clone(&prepared.token_embedding),
+                        decoder_config,
+                        native_gqa,
+                    )
+                    .map_err(|error| MossTdExecutorError::DecoderFailed {
+                        reason: error.to_string(),
+                    })?;
+                    let expected_lane = (GgmlCpuGraphBackend::Gpu, false);
+                    let decoder_lanes = decoder.graph_lanes();
+                    if encoder.graph_lane() != expected_lane
+                        || decoder_lanes.0 != expected_lane
+                        || decoder_lanes.1 != Some(expected_lane)
+                    {
+                        return Err(MossTdExecutorError::RuntimeContractViolation {
+                            reason: "unified MOSS runtime requires direct GPU encoder, decoder, and logits lanes"
+                                .to_string(),
+                        });
+                    }
+                    if decoder.loaded_weight_binding_identity()
+                        != Some(encoder.loaded_weight_binding_identity())
+                    {
+                        return Err(MossTdExecutorError::RuntimeContractViolation {
+                            reason: "unified MOSS runtime did not coalesce its pack-wide weight binding"
+                                .to_string(),
+                        });
+                    }
+                    let state = MossTdUnifiedActorState {
+                        encoder,
+                        decoder,
+                        _prepared_owner: prepared,
+                    };
+                    let retained = state.retained_system_memory_bytes().map_err(|reason| {
+                        MossTdExecutorError::RuntimeOwnershipFailed {
+                            stage: "unified-runtime",
+                            reason,
+                        }
+                    })?;
+                    Ok(SystemMemoryAllocationOutcome::new(
+                        state, retained, retained,
+                    ))
+                }) {
+                    Ok(owner) => Ok(owner),
+                    Err(SystemMemoryAllocationTransactionError::Allocation(error)) => Err(error),
+                    Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+                        Err(MossTdExecutorError::RuntimeOwnershipFailed {
+                            stage: "unified-runtime",
+                            reason: error.to_string(),
+                        })
+                    }
+                }
+            },
+            |error| Self::map_actor_error("unified-runtime", error),
+        )
+    }
+
     fn clear_runtime_owners(&self) {
         self.encoder_runtimes.clear();
         self.decoder_runtimes.clear();
+        self.unified_runtimes.clear();
         self.prepared_runtimes.clear();
     }
 
@@ -1000,12 +1331,22 @@ impl MossTdGgmlExecutor {
             .evict_where(|key| key.0.pack_content_id == pack_content_id);
         self.decoder_runtimes
             .evict_where(|key| key.0.pack_content_id == pack_content_id);
+        self.unified_runtimes
+            .evict_where(|key| key.content.pack_content_id == pack_content_id);
         self.prepared_runtimes.evict_content_id(pack_content_id);
     }
 
     fn execute_inner(
         &self,
         request: &GgmlAsrExecutionViewRequest,
+    ) -> Result<GgmlAsrExecutionResult, MossTdExecutorError> {
+        self.execute_inner_with_runtime_mode(request, true)
+    }
+
+    fn execute_inner_with_runtime_mode(
+        &self,
+        request: &GgmlAsrExecutionViewRequest,
+        allow_unified_runtime: bool,
     ) -> Result<GgmlAsrExecutionResult, MossTdExecutorError> {
         let expected_adapter = crate::arch::MOSS_TD_GGML_ADAPTER_ID;
         if request.selected_family.adapter_id != expected_adapter {
@@ -1022,6 +1363,30 @@ impl MossTdGgmlExecutor {
         let adaptor_metadata = prepared.adaptor_metadata;
         let decoder_metadata = prepared.decoder_metadata;
         let tokenizer = prepared.tokenizer.clone();
+        let backend_preference = request_backend_override();
+        let native_gqa = qwen_llm_effective_native_gqa_capability(moss_td_native_gqa_candidate(
+            backend,
+            backend_preference.as_ref(),
+            request.resolved_runtime.native_gqa_capability(),
+        ));
+        let unified_configs = moss_td_unified_runtime_configs(
+            allow_unified_runtime,
+            backend,
+            backend_preference.as_ref(),
+            current_execution_placement(),
+        );
+        let unified_runtime = unified_configs
+            .map(|(encoder_config, decoder_config)| {
+                self.checkout_unified_runtime(
+                    preflight,
+                    Arc::clone(&prepared),
+                    backend,
+                    encoder_config,
+                    decoder_config,
+                    native_gqa,
+                )
+            })
+            .transpose()?;
 
         let samples = &request.prepared_audio.samples_f32;
         if samples.is_empty() {
@@ -1052,16 +1417,49 @@ impl MossTdGgmlExecutor {
             n_mels: encoder_metadata.n_mels,
             max_source_positions: encoder_metadata.max_source_positions,
         };
-        let encoder_actor =
-            self.checkout_encoder_runtime(preflight, Arc::clone(&prepared), backend)?;
-        let (audio_rows, audio_token_count) = encode_moss_td_chunks_with_cached_runtime(
-            &encoder_actor,
-            encoder_config,
-            adaptor_metadata.merge_size,
-            adaptor_metadata.input_dim,
-            decoder_metadata.d_model,
-            samples,
-        )?;
+        let (audio_rows, audio_token_count) = match unified_runtime.as_ref() {
+            Some(actor) => {
+                let samples = samples.to_vec();
+                actor
+                    .call_mut_fallible(move |state| {
+                        let encode_result = encode_moss_td_chunks_with_runtime(
+                            &mut state.encoder,
+                            encoder_config,
+                            adaptor_metadata.merge_size,
+                            adaptor_metadata.input_dim,
+                            decoder_metadata.d_model,
+                            &samples,
+                        );
+                        let release_result = state
+                            .encoder
+                            .release_transient_compute_memory()
+                            .map_err(|error| MossTdExecutorError::EncoderFailed {
+                                reason: error.to_string(),
+                            });
+                        match (encode_result, release_result) {
+                            (Ok(output), Ok(())) => Ok(output),
+                            (Err(error), _) => Err(error),
+                            (Ok(_), Err(error)) => Err(error),
+                        }
+                    })
+                    .map_err(|error| MossTdExecutorError::RuntimeOwnershipFailed {
+                        stage: "unified-encoder",
+                        reason: error.to_string(),
+                    })??
+            }
+            None => {
+                let encoder_actor =
+                    self.checkout_encoder_runtime(preflight, Arc::clone(&prepared), backend)?;
+                encode_moss_td_chunks_with_cached_runtime(
+                    &encoder_actor,
+                    encoder_config,
+                    adaptor_metadata.merge_size,
+                    adaptor_metadata.input_dim,
+                    decoder_metadata.d_model,
+                    samples,
+                )?
+            }
+        };
 
         let decode_prompt =
             build_moss_td_decode_prompt(&tokenizer, audio_token_count).map_err(|error| {
@@ -1125,22 +1523,52 @@ impl MossTdGgmlExecutor {
             });
         }
 
-        let decoder_actor = self.checkout_decoder_runtime(preflight, prepared, backend)?;
-        let decoded = run_moss_td_decoder_with_cached_runtime(
-            &decoder_actor,
-            decoder_metadata,
-            kv_capacity_plan,
-            max_generated_tokens,
-            &decode_prompt.token_ids,
-            &decode_prompt.audio_pad_positions,
-            &audio_rows,
-            tokenizer,
-            Arc::clone(&request.execution_context.control),
-            request
-                .execution_context
-                .decode_work_progress_observer()
-                .cloned(),
-        )?;
+        let control = Arc::clone(&request.execution_context.control);
+        let decode_work_progress = request
+            .execution_context
+            .decode_work_progress_observer()
+            .cloned();
+        let decoded = match unified_runtime.as_ref() {
+            Some(actor) => {
+                let token_ids = decode_prompt.token_ids;
+                let audio_positions = decode_prompt.audio_pad_positions;
+                actor
+                    .call_mut_fallible(move |state| {
+                        run_moss_td_decoder_with_runtime(
+                            &mut state.decoder,
+                            decoder_metadata,
+                            kv_capacity_plan,
+                            max_generated_tokens,
+                            &token_ids,
+                            &audio_positions,
+                            &audio_rows,
+                            tokenizer,
+                            control,
+                            decode_work_progress,
+                        )
+                    })
+                    .map_err(|error| MossTdExecutorError::RuntimeOwnershipFailed {
+                        stage: "unified-decoder",
+                        reason: error.to_string(),
+                    })??
+            }
+            None => {
+                let decoder_actor =
+                    self.checkout_decoder_runtime(preflight, prepared, backend, native_gqa)?;
+                run_moss_td_decoder_with_cached_runtime(
+                    &decoder_actor,
+                    decoder_metadata,
+                    kv_capacity_plan,
+                    max_generated_tokens,
+                    &decode_prompt.token_ids,
+                    &decode_prompt.audio_pad_positions,
+                    &audio_rows,
+                    tokenizer,
+                    control,
+                    decode_work_progress,
+                )?
+            }
+        };
         // Normalize the model's own inline `[start][end][SNN]` markup into the
         // engine's shared segment representation. The decode prompt is fixed,
         // so the markers are written whether or not the request asked for
@@ -1230,6 +1658,20 @@ impl GgmlAsrViewExecutor for MossTdGgmlExecutor {
     }
 }
 
+impl MossTdGgmlExecutor {
+    fn execute_streaming_view(
+        &self,
+        request: &GgmlAsrExecutionViewRequest,
+    ) -> Result<GgmlAsrExecutionResult, GgmlAsrExecutionError> {
+        self.execute_inner_with_runtime_mode(request, false)
+            .map_err(|error| GgmlAsrExecutionError::ExecutorFailed {
+                executor_id: MOSS_TD_STREAMING_EXECUTOR_ID,
+                adapter_id: request.selected_family.adapter_id,
+                reason: error.to_string(),
+            })
+    }
+}
+
 /// Not a true incremental streaming session -- this family's architecture
 /// needs the full audio up front to place its numeric time-anchor markers
 /// (see `decode_prompt`'s module doc), so there is no meaningful "partial"
@@ -1256,7 +1698,7 @@ impl GgmlAsrStreamingExecutor for MossTdGgmlExecutor {
             "moss-transcribe-diarize",
             request,
             STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT,
-            MossTdGgmlExecutor::execute_view,
+            MossTdGgmlExecutor::execute_streaming_view,
         )
     }
 
@@ -1271,6 +1713,9 @@ mod tests {
     use std::time::Instant;
 
     use crate::arch::builtin_adapter_descriptor;
+    use crate::device::execution_route::{
+        DeviceAddressability, PhysicalResourceKey, ResolvedExecutionRoute, RouteDeviceKind,
+    };
     use crate::ggml_runtime::install_request_backend_override;
     use crate::models::ggml_asr_executor::{GgmlAsrBackendPreference, GgmlAsrPreparedAudioView};
 
@@ -1278,6 +1723,168 @@ mod tests {
 
     use super::super::speaker_segments::parse_moss_td_speaker_segments;
     use super::*;
+
+    #[test]
+    fn graph_runtime_cache_profile_separates_scheduler_and_threading() {
+        let base = crate::ggml_runtime::GgmlCpuGraphConfig {
+            backend: crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+            use_scheduler: false,
+            n_threads: Some(2),
+            ..crate::ggml_runtime::GgmlCpuGraphConfig::conservative_default()
+        };
+        let direct: MossTdGraphRuntimeCacheProfile = base.into();
+        let scheduled: MossTdGraphRuntimeCacheProfile = crate::ggml_runtime::GgmlCpuGraphConfig {
+            use_scheduler: true,
+            ..base
+        }
+        .into();
+        let more_threads: MossTdGraphRuntimeCacheProfile =
+            crate::ggml_runtime::GgmlCpuGraphConfig {
+                n_threads: Some(4),
+                ..base
+            }
+            .into();
+
+        assert_ne!(direct, scheduled);
+        assert_ne!(direct, more_threads);
+    }
+
+    fn exactly_addressable_preference(provider: ExecutionProvider) -> RequestBackendPreference {
+        RequestBackendPreference::Exact(ResolvedExecutionRoute {
+            provider,
+            stable_id: format!("{}0", provider.as_str()),
+            registry_ordinal: 0,
+            kind: RouteDeviceKind::Accelerated,
+            addressability: DeviceAddressability::ExactlyAddressable {
+                physical_key: PhysicalResourceKey::new("0000:01:00.0")
+                    .expect("synthetic physical key"),
+            },
+        })
+    }
+
+    fn direct_gpu_config() -> GgmlCpuGraphConfig {
+        GgmlCpuGraphConfig {
+            backend: GgmlCpuGraphBackend::Gpu,
+            use_scheduler: false,
+            ..GgmlCpuGraphConfig::conservative_default()
+        }
+    }
+
+    #[test]
+    fn native_gqa_candidate_is_vulkan_only_on_discrete_gpu() {
+        let validated = GgmlNativeGqaCapability::Validated;
+        for (provider, expected) in [
+            (
+                ExecutionProvider::Cuda,
+                GgmlNativeGqaCapability::Unsupported,
+            ),
+            (ExecutionProvider::Vulkan, validated),
+            (ExecutionProvider::Hip, GgmlNativeGqaCapability::Unsupported),
+            (
+                ExecutionProvider::Accelerator,
+                GgmlNativeGqaCapability::Unsupported,
+            ),
+            (
+                ExecutionProvider::Unknown,
+                GgmlNativeGqaCapability::Unsupported,
+            ),
+        ] {
+            let preference = exactly_addressable_preference(provider);
+            assert_eq!(
+                moss_td_native_gqa_candidate(
+                    GgmlCpuGraphBackend::Gpu,
+                    Some(&preference),
+                    validated,
+                ),
+                expected,
+            );
+        }
+        assert_eq!(
+            moss_td_native_gqa_candidate(GgmlCpuGraphBackend::Cpu, None, validated),
+            validated,
+        );
+        assert_eq!(
+            moss_td_native_gqa_candidate(GgmlCpuGraphBackend::Metal, None, validated),
+            validated,
+        );
+    }
+
+    #[test]
+    fn unified_runtime_is_ordinary_exact_direct_cuda_or_vulkan_full_device_only() {
+        for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
+            let preference = exactly_addressable_preference(provider);
+            assert!(moss_td_unified_runtime_enabled(
+                true,
+                GgmlCpuGraphBackend::Gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+                direct_gpu_config(),
+                direct_gpu_config(),
+            ));
+            assert!(!moss_td_unified_runtime_enabled(
+                false,
+                GgmlCpuGraphBackend::Gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+                direct_gpu_config(),
+                direct_gpu_config(),
+            ));
+            assert!(!moss_td_unified_runtime_enabled(
+                true,
+                GgmlCpuGraphBackend::Gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::Hybrid),
+                direct_gpu_config(),
+                direct_gpu_config(),
+            ));
+            assert!(!moss_td_unified_runtime_enabled(
+                true,
+                GgmlCpuGraphBackend::Gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+                GgmlCpuGraphConfig {
+                    use_scheduler: true,
+                    ..direct_gpu_config()
+                },
+                direct_gpu_config(),
+            ));
+            assert!(!moss_td_unified_runtime_enabled(
+                true,
+                GgmlCpuGraphBackend::Gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+                direct_gpu_config(),
+                GgmlCpuGraphConfig {
+                    backend: GgmlCpuGraphBackend::Cpu,
+                    ..direct_gpu_config()
+                },
+            ));
+        }
+
+        for provider in [
+            ExecutionProvider::Cpu,
+            ExecutionProvider::Metal,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Accelerator,
+            ExecutionProvider::Unknown,
+        ] {
+            let preference = exactly_addressable_preference(provider);
+            assert!(!moss_td_unified_runtime_enabled(
+                true,
+                GgmlCpuGraphBackend::Gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+                direct_gpu_config(),
+                direct_gpu_config(),
+            ));
+        }
+    }
+
+    #[test]
+    fn unified_system_memory_shape_is_checked_and_phase_exact() {
+        assert_eq!(moss_td_unified_system_memory_shape(17, 29), Ok((46, 46)));
+        assert!(moss_td_unified_system_memory_shape(u64::MAX, 1).is_err());
+    }
 
     /// Real converted local pack (fp16), not committed. It is a weight-bearing
     /// fixture supplied for opt-in tests, which remain outside weight-free CI.

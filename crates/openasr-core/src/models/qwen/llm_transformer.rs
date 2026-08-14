@@ -16,18 +16,19 @@ use thiserror::Error;
 use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlFlashAttentionPrecision, GgmlKvElementType, GgmlLoadedTensor, GgmlRopeExtParams,
-    GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReadError, GgufTensorDataReader,
-    env_toggle_with_raw, env_var_truthy,
+    GgmlFlashAttentionPrecision, GgmlKvElementType, GgmlLoadedTensor, GgmlNativeGqaCapability,
+    GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReadError,
+    GgufTensorDataReader, env_toggle_with_raw, env_var_truthy,
 };
 
 use super::decoder_contract::{QwenDecoderContract, QwenDecoderContractGeometry};
 use super::graph_config::qwen_decoder_graph_config;
 use super::kv_cache::{Qwen3AsrKvCacheCapacity, Qwen3AsrLayerKvCacheState};
-use super::logits_head::{
-    Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead, first_max_argmax_reverse_indices,
-    first_max_token_id_from_reversed_argmax,
+use crate::models::device_greedy_token::{
+    first_max_argmax_reverse_indices, first_max_token_id_from_reversed_argmax,
 };
+
+use super::logits_head::{Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead};
 use super::lora::{QwenLayerLoraSlots, QwenLoraAdapter, new_qwen_lora_slot};
 use super::runtime_contract::{Qwen3AsrExecutionMetadata, qwen3_asr_decoder_contract};
 use super::tensor_names::llm_layer_tensor_names;
@@ -964,26 +965,46 @@ impl FusedQkvProjectionWeight {
 /// on the discrete-GPU lane (attention falls back to the unfused head-expansion
 /// path, the CPU/Metal-reference-correct attention) and ON for CPU and Metal.
 ///
-/// A discrete GPU is re-enabled only after `tooling/qwen-gpu-parity` proves its
-/// GPU transcript matches the CPU reference (a synthetic runtime self-check was
-/// tried and rejected: it can false-pass when its probe shape does not hit the
-/// exact op the real decoder mis-computes). `OPENASR_QWEN_LLM_NATIVE_GQA`
-/// overrides the default either way.
+/// A discrete GPU is re-enabled only by a typed, validated Exact CUDA/Vulkan
+/// route. A synthetic runtime self-check was rejected because a probe shape can
+/// miss the real decoder op that diverges. `OPENASR_QWEN_LLM_NATIVE_GQA` is an
+/// emergency opt-out only; it cannot promote an unsupported provider.
 fn qwen_llm_native_gqa_default_for_backend(backend: GgmlCpuGraphBackend) -> bool {
     !matches!(backend, GgmlCpuGraphBackend::Gpu)
 }
 
-fn qwen_llm_native_gqa_enabled(raw: Option<&str>, default_enabled: bool) -> bool {
-    env_toggle_with_raw(None, raw, default_enabled)
+fn qwen_llm_native_gqa_enabled(raw: Option<&str>, capability: GgmlNativeGqaCapability) -> bool {
+    capability.is_validated() && env_toggle_with_raw(None, raw, true)
 }
 
-/// Resolve whether to use native GQA on `backend`: `OPENASR_QWEN_LLM_NATIVE_GQA`
-/// wins in either direction; otherwise the per-backend default applies.
-fn qwen_llm_resolve_use_native_gqa(backend: GgmlCpuGraphBackend) -> bool {
+fn qwen_llm_resolve_use_native_gqa_for_capability(capability: GgmlNativeGqaCapability) -> bool {
     qwen_llm_native_gqa_enabled(
         std::env::var(QWEN3_LLM_NATIVE_GQA_ENV).ok().as_deref(),
-        qwen_llm_native_gqa_default_for_backend(backend),
+        capability,
     )
+}
+
+pub(crate) fn qwen_llm_effective_native_gqa_capability(
+    capability: GgmlNativeGqaCapability,
+) -> GgmlNativeGqaCapability {
+    if qwen_llm_resolve_use_native_gqa_for_capability(capability) {
+        GgmlNativeGqaCapability::Validated
+    } else {
+        GgmlNativeGqaCapability::Unsupported
+    }
+}
+
+/// Conservative resolver for shared Qwen-shaped constructors. Only Qwen3-ASR
+/// production requests pass the request's typed capability explicitly; other
+/// families and the forced aligner retain the established CPU/Metal-on,
+/// discrete-GPU-off behavior.
+fn qwen_llm_resolve_use_native_gqa(backend: GgmlCpuGraphBackend) -> bool {
+    let capability = if qwen_llm_native_gqa_default_for_backend(backend) {
+        GgmlNativeGqaCapability::Validated
+    } else {
+        GgmlNativeGqaCapability::Unsupported
+    };
+    qwen_llm_resolve_use_native_gqa_for_capability(capability)
 }
 
 /// Production KV-cache policy for every Qwen-shaped whole-decoder constructor
@@ -1103,13 +1124,10 @@ fn qwen_llm_stack_config(
         n_seq,
         rms_norm_epsilon,
         rope,
-        // Batched (n_seq > 1) decode requires the native-GQA layout. NOTE: on the
-        // discrete-GPU lane native GQA mis-computes on RDNA4 (see
-        // `qwen_llm_native_gqa_default_for_backend`), so multi-sequence serve
-        // batching on such GPUs can still garble; single-stream (n_seq == 1)
-        // honours the backend-aware default and is correct. Fixing batched GPU
-        // serve needs n_seq > 1 support in the unfused head-expansion path.
-        use_native_gqa: use_native_gqa || n_seq > 1,
+        // Multi-sequence callers are validated before graph composition. Never
+        // turn native GQA on here: doing so bypasses the typed provider gate and
+        // corrupts output on HIP/RDNA4.
+        use_native_gqa,
         use_flash_attention,
         flash_attention_precision,
         kv_cache_spec,
@@ -2170,14 +2188,76 @@ pub(crate) struct QwenPreparedDecoderGraphCompileRequest<'a> {
 pub(crate) fn compile_qwen_whole_decoder_graph_from_prepared_plan(
     request: QwenPreparedDecoderGraphCompileRequest<'_>,
 ) -> Result<Qwen3AsrLlmWholeDecoderGraphExecutor, GgmlCpuGraphError> {
-    Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_adapter(
+    let graph_config = qwen_decoder_graph_config(request.backend);
+    compile_qwen_whole_decoder_graph_from_prepared_plan_with_config(request, graph_config)
+}
+
+/// Typed Exact-provider variant for Qwen-shaped families that have completed
+/// their own CUDA/Vulkan native-GQA parity gate. The capability is resolved on
+/// the submitting thread and carried into the owner; worker threads never
+/// infer a provider from a coarse `Gpu` backend or a backend name.
+pub(crate) fn compile_qwen_whole_decoder_graph_from_prepared_plan_with_native_gqa(
+    request: QwenPreparedDecoderGraphCompileRequest<'_>,
+    native_gqa: GgmlNativeGqaCapability,
+) -> Result<Qwen3AsrLlmWholeDecoderGraphExecutor, GgmlCpuGraphError> {
+    let graph_config = qwen_decoder_graph_config(request.backend);
+    compile_qwen_whole_decoder_graph_from_prepared_plan_with_config_and_native_gqa(
+        request,
+        graph_config,
+        native_gqa,
+    )
+}
+
+/// Compile a prepared Qwen-shaped decoder with a family-owned, already
+/// resolved graph configuration. This is intentionally narrower than a
+/// second materializer: tensor assembly remains centralized here, while a
+/// Hybrid family such as MOSS may freeze its per-stage scheduler decision
+/// without the generic Qwen policy re-applying placement defaults.
+pub(crate) fn compile_qwen_whole_decoder_graph_from_prepared_plan_with_config(
+    request: QwenPreparedDecoderGraphCompileRequest<'_>,
+    graph_config: GgmlCpuGraphConfig,
+) -> Result<Qwen3AsrLlmWholeDecoderGraphExecutor, GgmlCpuGraphError> {
+    compile_qwen_whole_decoder_graph_from_prepared_plan_with_config_and_native_gqa_impl(
+        request,
+        graph_config,
+        None,
+    )
+}
+
+/// Family-owned graph-config variant for a typed native-GQA capability that
+/// was frozen on the submitting thread. This keeps placement/thread policy in
+/// the family while centralizing Qwen tensor assembly and provider gating.
+pub(crate) fn compile_qwen_whole_decoder_graph_from_prepared_plan_with_config_and_native_gqa(
+    request: QwenPreparedDecoderGraphCompileRequest<'_>,
+    graph_config: GgmlCpuGraphConfig,
+    native_gqa: GgmlNativeGqaCapability,
+) -> Result<Qwen3AsrLlmWholeDecoderGraphExecutor, GgmlCpuGraphError> {
+    compile_qwen_whole_decoder_graph_from_prepared_plan_with_config_and_native_gqa_impl(
+        request,
+        graph_config,
+        Some(native_gqa),
+    )
+}
+
+fn compile_qwen_whole_decoder_graph_from_prepared_plan_with_config_and_native_gqa_impl(
+    request: QwenPreparedDecoderGraphCompileRequest<'_>,
+    graph_config: GgmlCpuGraphConfig,
+    native_gqa: Option<GgmlNativeGqaCapability>,
+) -> Result<Qwen3AsrLlmWholeDecoderGraphExecutor, GgmlCpuGraphError> {
+    if graph_config.backend != request.backend {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "prepared decoder graph config backend does not match compile request",
+        });
+    }
+    Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_adapter_and_native_gqa(
         request.plan,
         request.rms_norm_epsilon,
         request.fused_logits_head,
         request.token_embedding,
         None,
         request.preflight,
-        request.backend,
+        graph_config,
+        native_gqa,
     )
 }
 
@@ -2278,6 +2358,32 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         Ok(bytes.finish())
     }
 
+    pub(crate) fn graph_lane(&self) -> (GgmlCpuGraphBackend, bool) {
+        (self.runner.backend_kind(), self.runner.uses_scheduler())
+    }
+
+    fn require_native_gqa_for_multi_sequence(&self, n_seq: usize) -> Result<(), GgmlCpuGraphError> {
+        if n_seq > 1 && !self.use_native_gqa {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "whole-decoder multi-sequence execution requires a validated native GQA lane",
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn loaded_weight_binding_identity(
+        &self,
+    ) -> Option<crate::ggml_runtime::GgmlLoadedWeightBindingIdentity> {
+        self.loaded
+            .as_ref()
+            .map(|loaded| self.runner.loaded_weight_binding_identity(loaded))
+    }
+
+    pub(crate) fn uses_native_gqa(&self) -> bool {
+        self.use_native_gqa
+    }
+
+    #[allow(dead_code)] // Conservative shared-family entry point; Qwen uses the typed variant.
     pub(crate) fn new_from_plan_with_preflight_and_lora(
         plan: &QwenWholeDecoderPlan,
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
@@ -2293,7 +2399,29 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             token_embedding,
             adapter,
             preflight,
-            backend,
+            qwen_decoder_graph_config(backend),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_from_plan_with_preflight_and_lora_for_qwen(
+        plan: &QwenWholeDecoderPlan,
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
+        fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
+        token_embedding: Option<MappedTokenEmbeddingDeviceSpec<'_>>,
+        adapter: Option<&QwenLoraAdapter>,
+        backend: GgmlCpuGraphBackend,
+        native_gqa: GgmlNativeGqaCapability,
+    ) -> Result<Self, GgmlCpuGraphError> {
+        Self::new_from_plan_with_adapter_and_native_gqa(
+            plan,
+            DEFAULT_RMS_NORM_EPSILON,
+            fused_logits_head,
+            token_embedding,
+            adapter,
+            preflight,
+            qwen_decoder_graph_config(backend),
+            Some(native_gqa),
         )
     }
 
@@ -2343,7 +2471,49 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         token_embedding: Option<MappedTokenEmbeddingDeviceSpec<'_>>,
         adapter: Option<&QwenLoraAdapter>,
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
+        graph_config: GgmlCpuGraphConfig,
+    ) -> Result<Self, GgmlCpuGraphError> {
+        Self::new_from_plan_with_adapter_and_native_gqa(
+            plan,
+            rms_norm_epsilon,
+            fused_logits_head,
+            token_embedding,
+            adapter,
+            preflight,
+            graph_config,
+            None,
+        )
+    }
+
+    pub(crate) fn new_from_plan_with_preflight_and_token_embedding_for_qwen(
+        plan: &QwenWholeDecoderPlan,
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
+        token_embedding: MappedTokenEmbeddingDeviceSpec<'_>,
         backend: GgmlCpuGraphBackend,
+        native_gqa: GgmlNativeGqaCapability,
+    ) -> Result<Self, GgmlCpuGraphError> {
+        Self::new_from_plan_with_adapter_and_native_gqa(
+            plan,
+            DEFAULT_RMS_NORM_EPSILON,
+            None,
+            Some(token_embedding),
+            None,
+            preflight,
+            qwen_decoder_graph_config(backend),
+            Some(native_gqa),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_from_plan_with_adapter_and_native_gqa(
+        plan: &QwenWholeDecoderPlan,
+        rms_norm_epsilon: f32,
+        fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
+        token_embedding: Option<MappedTokenEmbeddingDeviceSpec<'_>>,
+        adapter: Option<&QwenLoraAdapter>,
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
+        graph_config: GgmlCpuGraphConfig,
+        native_gqa: Option<GgmlNativeGqaCapability>,
     ) -> Result<Self, GgmlCpuGraphError> {
         if plan.layers.is_empty() {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
@@ -2360,10 +2530,13 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 reason: error.to_string(),
             })?;
         plan.validate_materialization_reader(&reader)?;
-        let mut config = qwen_decoder_graph_config(backend);
+        let mut config = graph_config;
         config.graph_size = QWEN3_LLM_WHOLE_DECODE_GRAPH_SIZE;
         config.context_bytes = qwen_llm_graph_context_bytes();
-        let use_native_gqa = qwen_llm_resolve_use_native_gqa(config.backend);
+        let use_native_gqa = native_gqa.map_or_else(
+            || qwen_llm_resolve_use_native_gqa(config.backend),
+            qwen_llm_resolve_use_native_gqa_for_capability,
+        );
         let runner = GgmlCpuGraphRunner::new(config)?;
         let loaded = Some(runner.load_gguf_weight_context_from_preflight(preflight)?);
         let mut arena = runner
@@ -3814,6 +3987,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         rope_theta: f32,
         materialize_last_hidden: bool,
     ) -> Result<Qwen3AsrLlmWholeStepOutput, GgmlCpuGraphError> {
+        self.require_native_gqa_for_multi_sequence(n_seq)?;
         let dims = self.dims;
         if token_count == 0 {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
@@ -4181,6 +4355,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         rope_theta: f32,
         materialize_layer_kv: bool,
     ) -> Result<Qwen3AsrLlmWholeStepOutput, GgmlCpuGraphError> {
+        self.require_native_gqa_for_multi_sequence(n_seq)?;
         let dims = self.dims;
         let kv_cache_spec = self.kv_cache_spec;
         if token_count == 0 {
@@ -4909,6 +5084,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         seed: Option<(&[usize], &[&[Qwen3AsrLayerKvCacheState]])>,
         input_kind: QwenReusableDecodeInputKind,
     ) -> Result<(), GgmlCpuGraphError> {
+        self.require_native_gqa_for_multi_sequence(n_seq)?;
         if n_seq == 0 {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
                 reason: "whole-decoder n_seq must be positive",
@@ -5063,6 +5239,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
     ) -> Result<Qwen3AsrLlmWholeStepOutput, GgmlCpuGraphError> {
         let dims = self.dims;
         let n_seq = cache_positions.len();
+        self.require_native_gqa_for_multi_sequence(n_seq)?;
         if n_seq == 0 {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
                 reason: "whole-decoder n_seq must be positive",
@@ -8161,13 +8338,22 @@ mod tests {
 
     #[test]
     fn qwen_llm_native_gqa_uses_backend_default_when_env_unset() {
-        // No / unrecognized env value falls back to the supplied per-backend
-        // default (true for CPU/Metal, false for the GPU lane).
-        assert!(qwen_llm_native_gqa_enabled(None, true));
-        assert!(qwen_llm_native_gqa_enabled(Some(""), true));
-        assert!(qwen_llm_native_gqa_enabled(Some("native"), true));
-        assert!(!qwen_llm_native_gqa_enabled(None, false));
-        assert!(!qwen_llm_native_gqa_enabled(Some("maybe"), false));
+        assert!(qwen_llm_native_gqa_enabled(
+            None,
+            GgmlNativeGqaCapability::Validated
+        ));
+        assert!(qwen_llm_native_gqa_enabled(
+            Some("native"),
+            GgmlNativeGqaCapability::Validated
+        ));
+        assert!(!qwen_llm_native_gqa_enabled(
+            None,
+            GgmlNativeGqaCapability::Unsupported
+        ));
+        assert!(!qwen_llm_native_gqa_enabled(
+            Some("maybe"),
+            GgmlNativeGqaCapability::Unsupported
+        ));
     }
 
     #[test]
@@ -8274,12 +8460,60 @@ mod tests {
     }
 
     #[test]
-    fn qwen_llm_native_gqa_env_can_disable_or_enable() {
-        // An explicit env value overrides the per-backend default both ways.
-        assert!(!qwen_llm_native_gqa_enabled(Some("0"), true));
-        assert!(!qwen_llm_native_gqa_enabled(Some("false"), true));
-        assert!(qwen_llm_native_gqa_enabled(Some("1"), false));
-        assert!(qwen_llm_native_gqa_enabled(Some("true"), false));
+    fn qwen_llm_native_gqa_env_can_disable_but_not_promote() {
+        assert!(!qwen_llm_native_gqa_enabled(
+            Some("0"),
+            GgmlNativeGqaCapability::Validated
+        ));
+        assert!(!qwen_llm_native_gqa_enabled(
+            Some("false"),
+            GgmlNativeGqaCapability::Validated
+        ));
+        for raw in [Some("1"), Some("true"), None] {
+            assert!(!qwen_llm_native_gqa_enabled(
+                raw,
+                GgmlNativeGqaCapability::Unsupported
+            ));
+        }
+        crate::test_process_env::with_test_process_env(
+            [(
+                QWEN3_LLM_NATIVE_GQA_ENV,
+                Some(std::ffi::OsString::from("0")),
+            )],
+            || {
+                assert_eq!(
+                    qwen_llm_effective_native_gqa_capability(GgmlNativeGqaCapability::Validated),
+                    GgmlNativeGqaCapability::Unsupported
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn qwen_llm_stack_config_never_promotes_multi_sequence_native_gqa() {
+        let dims = Qwen3AsrLlmDecodeDims {
+            d_model: 8,
+            q_width: 8,
+            k_width: 4,
+            v_width: 4,
+            head_dim: 4,
+            q_heads: 2,
+            kv_heads: 1,
+        };
+        let rope = GgmlRopeExtParams::qwen_neox(4, 8, 1_000_000.0).expect("rope");
+        let config = qwen_llm_stack_config(
+            dims,
+            rope,
+            false,
+            DEFAULT_RMS_NORM_EPSILON,
+            1,
+            2,
+            true,
+            GgmlFlashAttentionPrecision::Default,
+            LlmKvCacheSpec::DEFAULT,
+            false,
+        );
+        assert!(!config.use_native_gqa);
     }
 
     #[test]
@@ -8901,6 +9135,72 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual real-pack cross-backend diagnostic: set OPENASR_QWEN_PREFILL_REAL_PACK and OPENASR_GGML_BACKEND=hip/vulkan/cuda/metal"]
+    fn qwen_llm_prefill_real_pack_selected_backend_matches_cpu() {
+        let runtime_path = qwen_prefill_real_pack_path();
+        let runtime_source =
+            validate_ggml_runtime_source_path(&runtime_path).expect("valid qwen runtime source");
+        let metadata = read_gguf_metadata_from_runtime_source(&runtime_source)
+            .expect("read qwen runtime metadata");
+        let metadata = qwen_prefill_execution_metadata(&metadata);
+        let token_count = qwen_prefill_token_count(metadata);
+        let hidden = deterministic_prefill_hidden(metadata.llm_d_model, token_count);
+        let reader =
+            GgufTensorDataReader::from_path(runtime_source.path()).expect("qwen tensor reader");
+        let projections = load_qwen3_llm_attention_projections_from_reader(&reader, metadata)
+            .expect("llm layers");
+        let selected_backend = GgmlCpuGraphConfig::runtime_default().backend;
+        assert_ne!(
+            selected_backend,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            "cross-backend diagnostic requires an accelerated backend"
+        );
+        let cpu = run_qwen_whole_prefill_on_backend(
+            &projections,
+            &runtime_source,
+            token_count,
+            &hidden,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        );
+        let selected = run_qwen_whole_prefill_on_backend(
+            &projections,
+            &runtime_source,
+            token_count,
+            &hidden,
+            selected_backend,
+        );
+
+        let mut hidden_stats = VectorDiffStats::default();
+        hidden_stats.extend_pairs(&selected.hidden, &cpu.hidden);
+        eprintln!(
+            "qwen cross-backend prefill backend={selected_backend:?} token_count={token_count} hidden_max_abs={:.6} hidden_cosine={:.9}",
+            hidden_stats.max_abs,
+            hidden_stats.cosine(),
+        );
+        assert!(hidden_stats.is_finite(), "hidden diff stats must be finite");
+        assert_eq!(selected.layer_kv.len(), cpu.layer_kv.len());
+        for (layer, ((selected_k, selected_v), (cpu_k, cpu_v))) in
+            selected.layer_kv.iter().zip(&cpu.layer_kv).enumerate()
+        {
+            let mut key_stats = VectorDiffStats::default();
+            key_stats.extend_pairs(selected_k, cpu_k);
+            let mut value_stats = VectorDiffStats::default();
+            value_stats.extend_pairs(selected_v, cpu_v);
+            eprintln!(
+                "qwen cross-backend layer={layer} key_max_abs={:.6} key_cosine={:.9} value_max_abs={:.6} value_cosine={:.9}",
+                key_stats.max_abs,
+                key_stats.cosine(),
+                value_stats.max_abs,
+                value_stats.cosine(),
+            );
+            assert!(
+                key_stats.is_finite() && value_stats.is_finite(),
+                "layer {layer} KV diff stats must be finite"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "manual real-pack GPU harness: set OPENASR_QWEN_PREFILL_REAL_PACK and OPENASR_GGML_BACKEND=hip/vulkan/cuda/metal"]
     fn qwen_llm_chunked_prefill_real_pack_selected_backend_matches_serial() {
         let report = run_qwen_real_pack_prefill_parity(Qwen3AsrPrefillParityMode::Chunked {
@@ -8924,7 +9224,7 @@ mod tests {
             validate_ggml_runtime_source_path(&runtime_path).expect("valid qwen runtime source");
         let metadata = read_gguf_metadata_from_runtime_source(&runtime_source)
             .expect("read qwen runtime metadata");
-        let metadata = parse_qwen3_execution_metadata(&metadata).expect("parse qwen metadata");
+        let metadata = qwen_prefill_execution_metadata(&metadata);
         let token_count = qwen_prefill_token_count(metadata).min(8);
         let hidden = deterministic_prefill_hidden(metadata.llm_d_model, token_count);
         let reader =
@@ -9061,7 +9361,7 @@ mod tests {
             validate_ggml_runtime_source_path(&runtime_path).expect("valid qwen runtime source");
         let metadata = read_gguf_metadata_from_runtime_source(&runtime_source)
             .expect("read qwen runtime metadata");
-        let metadata = parse_qwen3_execution_metadata(&metadata).expect("parse qwen metadata");
+        let metadata = qwen_prefill_execution_metadata(&metadata);
         let token_count = qwen_prefill_token_count(metadata);
         let hidden = deterministic_prefill_hidden(metadata.llm_d_model, token_count);
         let reader =
@@ -9233,18 +9533,53 @@ mod tests {
         token_count: usize,
         hidden: &[f32],
     ) -> Qwen3AsrLlmWholeStepOutput {
-        let mut decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new(
+        run_qwen_whole_prefill_on_backend(
             projections,
-            Some(runtime_source),
+            runtime_source,
+            token_count,
+            hidden,
             GgmlCpuGraphConfig::runtime_default().backend,
         )
-        .expect("prefill qwen decoder");
+    }
+
+    fn run_qwen_whole_prefill_on_backend(
+        projections: &[Qwen3AsrLlmLayerAttentionProjection],
+        runtime_source: &crate::GgmlRuntimeSource,
+        token_count: usize,
+        hidden: &[f32],
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    ) -> Qwen3AsrLlmWholeStepOutput {
+        let mut decoder =
+            Qwen3AsrLlmWholeDecoderGraphExecutor::new(projections, Some(runtime_source), backend)
+                .expect("prefill qwen decoder");
         decoder
             .set_kv_cache_policy(LlmKvCachePolicy::Default)
             .expect("pin f32 KV for prefill parity");
         decoder
             .run_prefill(hidden, token_count, 1_000_000.0)
             .expect("qwen whole-prompt prefill")
+    }
+
+    fn qwen_prefill_execution_metadata(
+        metadata: &crate::ggml_runtime::GgufMetadata,
+    ) -> Qwen3AsrExecutionMetadata {
+        match metadata
+            .get_string(crate::arch::GENERAL_ARCHITECTURE_KEY)
+            .expect("qwen architecture metadata")
+            .trim()
+        {
+            crate::QWEN3_ASR_GGML_ARCHITECTURE_ID => {
+                parse_qwen3_execution_metadata(metadata).expect("parse qwen metadata")
+            }
+            crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID => {
+                crate::models::qwen::forced_aligner_runtime::parse_forced_aligner_runtime_metadata(
+                    metadata,
+                )
+                .expect("parse forced-aligner metadata")
+                .as_embedding_execution_metadata()
+            }
+            architecture => panic!("unsupported qwen prefill architecture '{architecture}'"),
+        }
     }
 
     fn run_qwen_chunked_prefill(

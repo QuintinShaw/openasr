@@ -57,6 +57,49 @@ const CPU_AND_FULL_DEVICE_EXECUTION: ExecutionCapabilities = ExecutionCapabiliti
         AcceleratedPlacementCapabilities::FULL_DEVICE,
     );
 
+const MOONSHINE_EXECUTION_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities::new(true)
+    .with_provider(
+        ExecutionProvider::Metal,
+        AcceleratedPlacementCapabilities::FULL_DEVICE,
+    )
+    .with_provider(
+        ExecutionProvider::Cuda,
+        AcceleratedPlacementCapabilities::FULL_DEVICE,
+    )
+    .with_provider(
+        ExecutionProvider::Hip,
+        AcceleratedPlacementCapabilities::FULL_DEVICE,
+    )
+    .with_provider(
+        ExecutionProvider::Vulkan,
+        AcceleratedPlacementCapabilities::HYBRID,
+    );
+
+// Dolphin's Vulkan rescore is validated as a direct graph for every published
+// quantization. Range-sensitive F16/Q4_K projections request the shared F32
+// accumulation contract; Q8_0 keeps the faster backend default. Retain Hybrid
+// as a same-device capacity fallback without weakening the preferred
+// FullDevice candidate. Other providers expose only the all-device placement.
+const DOLPHIN_EXECUTION_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilities::new(true)
+    .with_provider(
+        ExecutionProvider::Metal,
+        AcceleratedPlacementCapabilities::FULL_DEVICE,
+    )
+    .with_provider(
+        ExecutionProvider::Cuda,
+        AcceleratedPlacementCapabilities::FULL_DEVICE,
+    )
+    .with_provider(
+        ExecutionProvider::Hip,
+        AcceleratedPlacementCapabilities::FULL_DEVICE,
+    )
+    .with_provider(
+        ExecutionProvider::Vulkan,
+        AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
+    );
+
+const FIRERED_LLM_EXECUTION_CAPABILITIES: ExecutionCapabilities = CPU_AND_FULL_DEVICE_EXECUTION;
+
 pub const COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID: &str = "cohere-transcribe-conformer-transformer";
 pub const COHERE_TRANSCRIBE_GGML_ADAPTER_ID: &str = "ggml-family-cohere-transcribe-runtime-v1";
 pub const COHERE_TRANSCRIBE_AUDIO_FRONTEND_ID: &str =
@@ -2206,7 +2249,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                     crate::models::moonshine::MoonshineGgmlExecutor,
                 >,
             execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
-            execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
+            execution_capabilities: MOONSHINE_EXECUTION_CAPABILITIES,
             phrase_bias: OpenAsrPhraseBiasStrategy::Always,
             supports_translation_task: false,
             supports_source_language_hint: false,
@@ -2239,11 +2282,11 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         optimization_contract: OpenAsrOptimizationContract {
             prefer_cpu_decoder_for_multichunk_metal: false,
             // Host waveform/token preparation sits outside Moonshine's neural
-            // graphs; the encoder and decoder themselves are complete device
-            // graphs. Their exact device placement substantially narrows Metal's dispatch gap and
-            // lowers physical memory, but M1 q8 remains slightly slower than
-            // CPU. Keep explicit Metal available while Auto stays on CPU for
-            // Apple Silicon until the speed crossover is stable.
+            // graphs. Metal/CUDA/HIP run the complete encoder and decoder on
+            // device; Vulkan uses the measured Hybrid split (device encoder,
+            // CPU decoder). Exact Metal placement substantially narrows its
+            // dispatch gap and lowers physical memory, but M1 q8 remains
+            // slightly slower than CPU, so Metal stays explicit-only.
             auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
             encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
                 max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
@@ -2305,7 +2348,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                     crate::models::dolphin::executor::DolphinGgmlExecutor,
                 >,
             execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
-            execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
+            execution_capabilities: DOLPHIN_EXECUTION_CAPABILITIES,
             phrase_bias: OpenAsrPhraseBiasStrategy::RequiresTensor {
                 tensor_name: crate::models::dolphin::hotword_context::CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME,
             },
@@ -2595,7 +2638,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                     crate::models::firered_llm::executor::FireRedLlmGgmlExecutor,
                 >,
             execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
-            execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
+            execution_capabilities: FIRERED_LLM_EXECUTION_CAPABILITIES,
             phrase_bias: OpenAsrPhraseBiasStrategy::Unsupported,
             supports_translation_task: false,
             supports_source_language_hint: false,
@@ -3121,7 +3164,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_accelerated_routes_are_full_device_only() {
+    fn builtin_accelerated_routes_match_declared_neural_topologies() {
         for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
             let capabilities = descriptor.execution_contract.execution_capabilities;
             assert!(capabilities.supports_cpu());
@@ -3131,23 +3174,80 @@ mod tests {
                 ExecutionProvider::Hip,
                 ExecutionProvider::Vulkan,
             ] {
+                let hybrid_only = descriptor.identity.model_architecture
+                    == MOONSHINE_GGML_ARCHITECTURE_ID
+                    && provider == ExecutionProvider::Vulkan;
+                let qualified_fallback = descriptor.identity.model_architecture
+                    == DOLPHIN_GGML_ARCHITECTURE_ID
+                    && provider == ExecutionProvider::Vulkan;
                 assert!(
                     capabilities.supports(
                         provider,
-                        crate::device::execution_policy::ExecutionPlacement::FullDevice,
+                        if hybrid_only {
+                            crate::device::execution_policy::ExecutionPlacement::Hybrid
+                        } else {
+                            crate::device::execution_policy::ExecutionPlacement::FullDevice
+                        },
                     ),
-                    "architecture '{}' lost its full-device {provider} route",
+                    "architecture '{}' lost its declared {provider} route",
                     descriptor.identity.model_architecture,
                 );
                 assert!(
-                    !capabilities.supports(
-                        provider,
-                        crate::device::execution_policy::ExecutionPlacement::Hybrid,
-                    ),
-                    "architecture '{}' must not accept CPU neural compute under {provider}",
+                    qualified_fallback
+                        || !capabilities.supports(
+                            provider,
+                            if hybrid_only {
+                                crate::device::execution_policy::ExecutionPlacement::FullDevice
+                            } else {
+                                crate::device::execution_policy::ExecutionPlacement::Hybrid
+                            },
+                        ),
+                    "architecture '{}' admits two unqualified topologies under {provider}",
                     descriptor.identity.model_architecture,
                 );
             }
+        }
+    }
+
+    #[test]
+    fn firered_aed_windows_direct_routes_preserve_upstream_provider_boundaries() {
+        use crate::device::execution_policy::ExecutionPlacement;
+
+        let capabilities = OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_model_architecture(FIRERED_AED_GGML_ARCHITECTURE_ID)
+            .expect("FireRed AED descriptor")
+            .execution_contract
+            .execution_capabilities;
+        assert!(capabilities.supports_cpu());
+        for provider in [
+            ExecutionProvider::Metal,
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Vulkan,
+        ] {
+            assert!(capabilities.supports(provider, ExecutionPlacement::FullDevice));
+            assert!(!capabilities.supports(provider, ExecutionPlacement::Hybrid));
+        }
+    }
+
+    #[test]
+    fn firered_llm_all_gpu_providers_use_full_device() {
+        use crate::device::execution_policy::ExecutionPlacement;
+
+        let capabilities = OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_model_architecture(FIRERED_LLM_GGML_ARCHITECTURE_ID)
+            .expect("FireRed LLM descriptor")
+            .execution_contract
+            .execution_capabilities;
+        assert!(capabilities.supports_cpu());
+        for provider in [
+            ExecutionProvider::Metal,
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Vulkan,
+        ] {
+            assert!(capabilities.supports(provider, ExecutionPlacement::FullDevice));
+            assert!(!capabilities.supports(provider, ExecutionPlacement::Hybrid));
         }
     }
 
@@ -3617,6 +3717,50 @@ mod tests {
             registry.descriptors().len(),
             "expectation table must cover every builtin architecture, no more, no less"
         );
+    }
+
+    #[test]
+    fn moonshine_declares_vulkan_hybrid_without_weakening_other_accelerators() {
+        use crate::device::execution_policy::ExecutionPlacement;
+
+        let capabilities = OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_model_architecture(MOONSHINE_GGML_ARCHITECTURE_ID)
+            .expect("Moonshine descriptor")
+            .execution_contract
+            .execution_capabilities;
+        assert!(capabilities.supports_cpu());
+        for provider in [
+            ExecutionProvider::Metal,
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Hip,
+        ] {
+            assert!(capabilities.supports(provider, ExecutionPlacement::FullDevice));
+            assert!(!capabilities.supports(provider, ExecutionPlacement::Hybrid));
+        }
+        assert!(capabilities.supports(ExecutionProvider::Vulkan, ExecutionPlacement::Hybrid));
+        assert!(!capabilities.supports(ExecutionProvider::Vulkan, ExecutionPlacement::FullDevice,));
+    }
+
+    #[test]
+    fn dolphin_declares_vulkan_full_device_and_hybrid_without_weakening_other_accelerators() {
+        use crate::device::execution_policy::ExecutionPlacement;
+
+        let capabilities = OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_model_architecture(DOLPHIN_GGML_ARCHITECTURE_ID)
+            .expect("Dolphin descriptor")
+            .execution_contract
+            .execution_capabilities;
+        assert!(capabilities.supports_cpu());
+        for provider in [
+            ExecutionProvider::Metal,
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Hip,
+        ] {
+            assert!(capabilities.supports(provider, ExecutionPlacement::FullDevice));
+            assert!(!capabilities.supports(provider, ExecutionPlacement::Hybrid));
+        }
+        assert!(capabilities.supports(ExecutionProvider::Vulkan, ExecutionPlacement::FullDevice));
+        assert!(capabilities.supports(ExecutionProvider::Vulkan, ExecutionPlacement::Hybrid));
     }
 
     /// Regression for the platform-scoping guarantee itself: `ExceptMetal`

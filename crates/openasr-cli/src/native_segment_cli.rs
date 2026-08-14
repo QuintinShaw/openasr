@@ -558,16 +558,27 @@ pub(super) async fn serve(
     if backend == BackendKind::Native
         && let Some(model_pack_path) = model_source.model_pack_path.as_deref()
     {
-        let local_model_id = resolve_native_runtime_model_id_from_source(model_pack_path)?;
+        let adapter = openasr_core::native_runtime_model_adapter_for_path(model_pack_path)
+            .ok_or_else(|| {
+                anyhow!(
+                    "could not verify and select a native model adapter from local source '{}'",
+                    model_pack_path.display()
+                )
+            })?;
+        let local_model_id = adapter
+            .verified_runtime_model_identity(None)
+            .map_err(|error| anyhow!("could not resolve native runtime model identity: {error}"))?
+            .model_id;
         // Tolerant matching, not string equality: `model_source.model_id` is the
         // catalog-resolved ref (e.g. `whisper-tiny:q8_0`) while the pack's
         // runtime id is bare (`whisper-tiny`), so equality would reject every
         // catalog-installed pack the daemon is about to serve.
         if let Some(model_ref) = model
-            && !openasr_core::native_runtime_model_refs_match(
-                &model_source.model_id,
-                &local_model_id,
-            )
+            && !adapter
+                .verified_pack_matches_model_ref(&model_source.model_id)
+                .map_err(|error| {
+                    anyhow!("could not match model against verified runtime pack: {error}")
+                })?
         {
             bail!(
                 "Native GGUF local-source serve mode requires --model to match local source id '{}', got '{}' (resolved '{}').\nUse --model {} or omit --model.",
@@ -720,14 +731,6 @@ fn default_tls_subject_alt_names(addr: SocketAddr, configured: &[String]) -> Vec
         names.push("localhost".to_string());
     }
     names
-}
-
-pub(super) fn resolve_native_runtime_model_id_from_source(
-    model_pack_root: &Path,
-) -> Result<String> {
-    let identity = openasr_core::resolve_local_native_runtime_model_identity(model_pack_root, None)
-        .map_err(|error| anyhow!("{error}"))?;
-    Ok(identity.model_id)
 }
 
 pub(crate) fn transcribe_with_backend(

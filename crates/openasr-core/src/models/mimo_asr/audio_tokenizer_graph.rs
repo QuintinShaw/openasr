@@ -223,7 +223,9 @@ impl MimoAudiotokEncoderRuntime {
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
         enable_rvq_fusion: bool,
     ) -> Result<Self, MimoAudiotokEncoderError> {
-        let mut config = GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend);
+        let mut config = crate::models::graph_runtime_config::apply_request_execution_placement(
+            GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend),
+        );
         config.set_graph_node_capacity(config.graph_size);
         let device_rvq_enabled = enable_rvq_fusion && config.backend.is_gpu_class();
         let runner =

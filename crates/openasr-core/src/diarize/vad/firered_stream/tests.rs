@@ -48,14 +48,79 @@ fn max_abs_diff_with_location(got: &[f32], want: &[f32]) -> (f32, usize) {
     (worst, worst_idx)
 }
 
-fn benchmark_backend() -> crate::ggml_runtime::GgmlCpuGraphBackend {
-    match std::env::var("OPENASR_FIRERED_STREAM_VAD_BENCH_BACKEND")
+fn mean_abs_diff(got: &[f32], want: &[f32]) -> f64 {
+    assert_eq!(got.len(), want.len(), "frame count mismatch");
+    got.iter()
+        .zip(want)
+        .map(|(actual, expected)| f64::from((actual - expected).abs()))
+        .sum::<f64>()
+        / got.len().max(1) as f64
+}
+
+struct BenchmarkBackend {
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    requested_provider: &'static str,
+    exact_route_identity: Option<String>,
+    _route_guard: Option<crate::ggml_runtime::RequestBackendOverrideGuard>,
+}
+
+fn benchmark_backend() -> BenchmarkBackend {
+    let requested = std::env::var("OPENASR_FIRERED_STREAM_VAD_BENCH_BACKEND")
         .unwrap_or_else(|_| "cpu".to_string())
-        .as_str()
-    {
-        "cpu" => crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
-        "metal" => crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
-        backend => panic!("unsupported FireRedVAD benchmark backend '{backend}'"),
+        .trim()
+        .to_ascii_lowercase();
+    let (backend, provider, requested_provider) = match requested.as_str() {
+        "cpu" => (
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            crate::device::execution_route::ExecutionProvider::Cpu,
+            "cpu",
+        ),
+        "metal" => (
+            crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
+            crate::device::execution_route::ExecutionProvider::Metal,
+            "metal",
+        ),
+        "cuda" => (
+            crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+            crate::device::execution_route::ExecutionProvider::Cuda,
+            "cuda",
+        ),
+        "vulkan" => (
+            crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+            crate::device::execution_route::ExecutionProvider::Vulkan,
+            "vulkan",
+        ),
+        backend => panic!(
+            "OPENASR_FIRERED_STREAM_VAD_BENCH_BACKEND must be cpu, metal, cuda, or vulkan; got '{backend}'"
+        ),
+    };
+    let mut exact_route_identity = None;
+    let route_guard = if matches!(
+        provider,
+        crate::device::execution_route::ExecutionProvider::Cuda
+            | crate::device::execution_route::ExecutionProvider::Vulkan
+    ) {
+        let route = crate::device::execution_route::enumerate_compute_devices_from_ggml(
+            &crate::ggml_runtime::ggml_available_devices(),
+        )
+        .into_iter()
+        .find(|device| device.provider == provider)
+        .unwrap_or_else(|| {
+            panic!("requested FireRedVAD provider '{requested_provider}' is unavailable")
+        })
+        .to_resolved_route();
+        exact_route_identity = Some(route.isolation_key());
+        Some(crate::ggml_runtime::install_request_backend_override(Some(
+            crate::ggml_runtime::RequestBackendPreference::Exact(route),
+        )))
+    } else {
+        None
+    };
+    BenchmarkBackend {
+        backend,
+        requested_provider,
+        exact_route_identity,
+        _route_guard: route_guard,
     }
 }
 
@@ -190,6 +255,61 @@ fn metal_graph_matches_cpu_probabilities_and_product_spans_on_macos() {
 }
 
 #[test]
+#[ignore = "host-local: set OPENASR_FIRERED_STREAM_VAD_BENCH_BACKEND=cuda or vulkan"]
+fn exact_gpu_graph_matches_cpu_probabilities_and_product_spans() {
+    let benchmark_backend = benchmark_backend();
+    assert_eq!(
+        benchmark_backend.backend,
+        crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+        "this parity gate requires OPENASR_FIRERED_STREAM_VAD_BENCH_BACKEND=cuda or vulkan"
+    );
+    let (samples, _) = golden();
+    let model = super::shared_model().expect("vendored FireRedVAD weights");
+    let cpu = streaming_probabilities_for_backend(
+        model,
+        &samples,
+        crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+    )
+    .expect("run FireRedVAD CPU reference");
+    let accelerated =
+        streaming_probabilities_for_backend(model, &samples, benchmark_backend.backend)
+            .expect("run FireRedVAD exact GPU route");
+    let (max_abs, worst_frame) = max_abs_diff_with_location(&accelerated, &cpu);
+    let mean_abs = mean_abs_diff(&accelerated, &cpu);
+    eprintln!(
+        "FIRERED_VAD_EXACT_GPU_PARITY provider={} placement=full-device exact_route={} frames={} max_abs={max_abs:.9} mean_abs={mean_abs:.9} worst_frame={worst_frame}",
+        benchmark_backend.requested_provider,
+        benchmark_backend
+            .exact_route_identity
+            .as_deref()
+            .expect("exact GPU route identity"),
+        accelerated.len(),
+    );
+    assert!(
+        accelerated
+            .iter()
+            .all(|probability| probability.is_finite() && (0.0..=1.0).contains(probability)),
+        "exact GPU probabilities must be finite and in [0, 1]"
+    );
+    assert!(
+        max_abs < 5e-3,
+        "CPU/{} max abs probability difference {max_abs} at frame {worst_frame} exceeds tolerance",
+        benchmark_backend.requested_provider,
+    );
+    assert!(
+        mean_abs < 1e-4,
+        "CPU/{} mean abs probability difference {mean_abs} exceeds tolerance",
+        benchmark_backend.requested_provider,
+    );
+    let options = crate::LongFormOptions::default();
+    assert_eq!(
+        super::provider::spans_from_probs(&accelerated, samples.len(), &options),
+        super::provider::spans_from_probs(&cpu, samples.len(), &options),
+        "CPU and exact GPU probabilities must yield identical speech spans"
+    );
+}
+
+#[test]
 #[ignore = "host-local: needs OPENASR_FIRERED_STREAM_VAD_REFERENCE_AUDIO and OPENASR_FIRERED_STREAM_VAD_REFERENCE_NPY"]
 fn firered_stream_vad_matches_official_reference_on_aux_audio() {
     let audio = match crate::testing::external_test_fixture_path(
@@ -220,7 +340,8 @@ fn firered_stream_vad_matches_official_reference_on_aux_audio() {
     .expect("load official parity audio");
     let reference_probs = read_reference_probabilities(&reference);
     let model = super::shared_model().expect("vendored FireRedVAD weights");
-    let backend = benchmark_backend();
+    let benchmark_backend = benchmark_backend();
+    let backend = benchmark_backend.backend;
     let execution_placement = crate::GgmlExecutionTelemetryCollector::new();
     let _execution_placement_guard = execution_placement.install();
     let probabilities = streaming_probabilities_for_backend(model, &samples, backend)
@@ -250,7 +371,17 @@ fn firered_stream_vad_matches_official_reference_on_aux_audio() {
         super::provider::spans_from_probs(&reference_probs, samples.len(), &options);
     let memory = crate::metrics::process_memory_snapshot();
     eprintln!(
-        "FIRERED_VAD_OFFICIAL_PARITY backend={backend:?} frames={} max_abs={max_abs:.9} p99_abs={p99_abs:.9} mean_abs={mean_abs:.9} worst_frame={worst_frame} actual_at_worst={:.9} reference_at_worst={:.9} threshold_disagreements={threshold_disagreements} speech_spans={} observed_compute_nodes={:?} current_rss_bytes={:?} peak_rss_bytes={:?} current_phys_footprint_bytes={:?} peak_phys_footprint_bytes={:?}",
+        "FIRERED_VAD_OFFICIAL_PARITY provider={} placement={} exact_route={} backend={backend:?} frames={} max_abs={max_abs:.9} p99_abs={p99_abs:.9} mean_abs={mean_abs:.9} worst_frame={worst_frame} actual_at_worst={:.9} reference_at_worst={:.9} threshold_disagreements={threshold_disagreements} speech_spans={} observed_compute_nodes={:?} current_rss_bytes={:?} peak_rss_bytes={:?} current_phys_footprint_bytes={:?} peak_phys_footprint_bytes={:?}",
+        benchmark_backend.requested_provider,
+        if backend == crate::ggml_runtime::GgmlCpuGraphBackend::Cpu {
+            "cpu-only"
+        } else {
+            "full-device"
+        },
+        benchmark_backend
+            .exact_route_identity
+            .as_deref()
+            .unwrap_or("coarse"),
         probabilities.len(),
         probabilities[worst_frame],
         reference_probs[worst_frame],
@@ -515,7 +646,8 @@ fn firered_stream_vad_fifteen_minute_endurance() {
     );
 
     let model = super::shared_model().expect("vendored Stream-VAD weights");
-    let backend = benchmark_backend();
+    let benchmark_backend = benchmark_backend();
+    let backend = benchmark_backend.backend;
     // Warm up (page-in, allocator warm) before timing.
     let _ =
         streaming_probabilities_for_backend(model, &samples[..samples.len().min(16_000)], backend)
@@ -541,7 +673,17 @@ fn firered_stream_vad_fifteen_minute_endurance() {
     let chunk_seconds = std::env::var("OPENASR_FIRERED_STREAM_VAD_BENCH_CHUNK_SECONDS")
         .unwrap_or_else(|_| "1".to_string());
     println!(
-        "AUX_MODEL_ENDURANCE model=fireredvad backend={backend:?} chunk_seconds={chunk_seconds} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={rtf:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} phys_footprint_bytes={phys_footprint_bytes} peak_phys_footprint_bytes={peak_phys_footprint_bytes} frames={} probability_sha256={probability_sha256} runs={seconds:?}",
+        "AUX_MODEL_ENDURANCE model=fireredvad provider={} placement={} exact_route={} backend={backend:?} chunk_seconds={chunk_seconds} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={rtf:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} phys_footprint_bytes={phys_footprint_bytes} peak_phys_footprint_bytes={peak_phys_footprint_bytes} frames={} probability_sha256={probability_sha256} runs={seconds:?}",
+        benchmark_backend.requested_provider,
+        if backend == crate::ggml_runtime::GgmlCpuGraphBackend::Cpu {
+            "cpu-only"
+        } else {
+            "full-device"
+        },
+        benchmark_backend
+            .exact_route_identity
+            .as_deref()
+            .unwrap_or("coarse"),
         probs.len(),
     );
     assert!(!probs.is_empty());

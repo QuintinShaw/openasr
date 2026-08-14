@@ -11,6 +11,16 @@ pub(crate) trait XasrGreedyDecodeBackend {
     fn project_decoder_context(&mut self, context: &[u32]) -> Result<(), String>;
     fn next_token(&mut self) -> Result<u32, String>;
     fn token_probability(&self, token: u32) -> Result<f32, String>;
+
+    fn speculative_blank_prefix_len(
+        &mut self,
+        _context: Option<&[u32]>,
+        _encoder_frames: &[f32],
+        _frame_count: usize,
+        _encoder_dim: usize,
+    ) -> Result<Option<usize>, String> {
+        Ok(None)
+    }
 }
 
 struct HostXasrGreedyDecodeBackend<'a> {
@@ -197,7 +207,8 @@ pub(crate) fn greedy_decode_frames_incremental_with_backend<B: XasrGreedyDecodeB
     }
     let start_len = emitted.len();
     let mut decoder_projection_valid = false;
-    for frame_idx in 0..frame_count {
+    let mut frame_idx = 0usize;
+    while frame_idx < frame_count {
         // The token-control loop remains host-side on every backend, so poll at
         // each encoder-frame boundary in addition to the shared graph-abort
         // callback used by device graph execution.
@@ -205,6 +216,26 @@ pub(crate) fn greedy_decode_frames_incremental_with_backend<B: XasrGreedyDecodeB
             return Err(format!(
                 "xasr-zipformer decode canceled at encoder frame {frame_idx}"
             ));
+        }
+        let remaining_frames = frame_count - frame_idx;
+        let remaining_values = &encoder_frames[frame_idx * encoder_dim..];
+        let speculative_context = (!decoder_projection_valid).then_some(context.as_slice());
+        if let Some(blank_prefix_len) = backend.speculative_blank_prefix_len(
+            speculative_context,
+            remaining_values,
+            remaining_frames,
+            encoder_dim,
+        )? {
+            if blank_prefix_len > remaining_frames {
+                return Err("xasr speculative blank prefix exceeds remaining frames".to_string());
+            }
+            if speculative_context.is_some() {
+                decoder_projection_valid = true;
+            }
+            frame_idx += blank_prefix_len;
+            if frame_idx == frame_count {
+                break;
+            }
         }
         let frame = &encoder_frames[frame_idx * encoder_dim..(frame_idx + 1) * encoder_dim];
         backend.project_encoder_frame(frame)?;
@@ -224,6 +255,7 @@ pub(crate) fn greedy_decode_frames_incremental_with_backend<B: XasrGreedyDecodeB
             context.push(token_id);
             decoder_projection_valid = false;
         }
+        frame_idx += 1;
     }
     Ok(emitted.len() - start_len)
 }
@@ -347,6 +379,119 @@ mod tests {
             emitted.is_empty(),
             "cancel polling must remain frame-local and emit nothing"
         );
+    }
+
+    struct SpeculativeTestBackend {
+        blank_prefix: usize,
+        projected_frames: Vec<Vec<f32>>,
+        projected_contexts: usize,
+        tokens: std::collections::VecDeque<u32>,
+    }
+
+    impl XasrGreedyDecodeBackend for SpeculativeTestBackend {
+        fn project_encoder_frame(&mut self, frame: &[f32]) -> Result<(), String> {
+            self.projected_frames.push(frame.to_vec());
+            Ok(())
+        }
+
+        fn project_decoder_context(&mut self, _context: &[u32]) -> Result<(), String> {
+            self.projected_contexts += 1;
+            Ok(())
+        }
+
+        fn next_token(&mut self) -> Result<u32, String> {
+            self.tokens
+                .pop_front()
+                .ok_or_else(|| "speculative test backend ran out of tokens".to_string())
+        }
+
+        fn token_probability(&self, _token: u32) -> Result<f32, String> {
+            Ok(0.75)
+        }
+
+        fn speculative_blank_prefix_len(
+            &mut self,
+            context: Option<&[u32]>,
+            _encoder_frames: &[f32],
+            _frame_count: usize,
+            _encoder_dim: usize,
+        ) -> Result<Option<usize>, String> {
+            if context.is_some() {
+                self.projected_contexts += 1;
+            }
+            Ok(Some(self.blank_prefix))
+        }
+    }
+
+    #[test]
+    fn speculative_blank_prefix_skips_only_confirmed_frames_then_uses_scalar_path() {
+        let mut backend = SpeculativeTestBackend {
+            blank_prefix: 2,
+            projected_frames: Vec::new(),
+            projected_contexts: 0,
+            tokens: [1, 0].into_iter().collect(),
+        };
+        let mut context = vec![0, 0];
+        let mut emitted = Vec::new();
+        let mut frames = Vec::new();
+        let mut probabilities = Vec::new();
+
+        let count = greedy_decode_frames_incremental_with_backend(
+            &[10.0, 11.0, 20.0, 21.0, 30.0, 31.0],
+            3,
+            2,
+            &mut backend,
+            0,
+            2,
+            &mut context,
+            &mut emitted,
+            &mut frames,
+            &mut probabilities,
+            7,
+            &|| false,
+        )
+        .expect("speculative blank prefix decode");
+
+        assert_eq!(count, 1);
+        assert_eq!(emitted, vec![1]);
+        assert_eq!(frames, vec![9]);
+        assert_eq!(probabilities, vec![0.75]);
+        assert_eq!(context, vec![0, 1]);
+        assert_eq!(backend.projected_frames, vec![vec![30.0, 31.0]]);
+        assert_eq!(backend.projected_contexts, 2);
+    }
+
+    #[test]
+    fn speculative_blank_prefix_rejects_backend_overrun() {
+        let mut backend = SpeculativeTestBackend {
+            blank_prefix: 3,
+            projected_frames: Vec::new(),
+            projected_contexts: 0,
+            tokens: std::collections::VecDeque::new(),
+        };
+        let mut context = vec![0, 0];
+        let mut emitted = Vec::new();
+        let mut frames = Vec::new();
+        let mut probabilities = Vec::new();
+
+        let error = greedy_decode_frames_incremental_with_backend(
+            &[1.0, 2.0, 3.0, 4.0],
+            2,
+            2,
+            &mut backend,
+            0,
+            1,
+            &mut context,
+            &mut emitted,
+            &mut frames,
+            &mut probabilities,
+            0,
+            &|| false,
+        )
+        .expect_err("speculative prefix beyond remaining frames must fail closed");
+
+        assert!(error.contains("exceeds remaining frames"), "{error}");
+        assert!(emitted.is_empty());
     }
 
     fn decoder_weights() -> XasrDecoderWeights {

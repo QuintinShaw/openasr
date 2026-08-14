@@ -11,7 +11,7 @@
 
 use thiserror::Error;
 
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReader};
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlNativeGqaCapability, GgufTensorDataReader};
 
 use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
 use crate::models::qwen::{
@@ -20,8 +20,8 @@ use crate::models::qwen::{
     Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, QwenDecoderTail,
     QwenDecoderTailLoadError, QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
     build_qwen3_prompt_embeddings_with_audio_positions,
-    compile_qwen_whole_decoder_graph_from_prepared_plan, load_qwen_decoder_tail_from_contract,
-    quoted_qwen_decoder_system_memory_bytes,
+    compile_qwen_whole_decoder_graph_from_prepared_plan_with_native_gqa,
+    load_qwen_decoder_tail_from_contract, quoted_qwen_decoder_system_memory_bytes,
 };
 
 use super::runtime_contract::{MimoLlmMetadata, mimo_asr_qwen_decoder_contract};
@@ -88,6 +88,7 @@ impl MimoLlmDecoderRuntime {
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         metadata: MimoLlmMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        native_gqa: GgmlNativeGqaCapability,
     ) -> Result<Self, MimoLlmDecoderError> {
         let reader =
             crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(preflight)
@@ -123,7 +124,7 @@ impl MimoLlmDecoderRuntime {
         // `moss_transcribe_diarize::llm_decoder`'s identical wiring (mimo's
         // registered policy has no suppression or phrase bias, so the shared
         // driver can always honor the hint).
-        let whole_decoder = compile_qwen_whole_decoder_graph_from_prepared_plan(
+        let whole_decoder = compile_qwen_whole_decoder_graph_from_prepared_plan_with_native_gqa(
             QwenPreparedDecoderGraphCompileRequest {
                 plan: &decoder_plan,
                 preflight,
@@ -132,6 +133,7 @@ impl MimoLlmDecoderRuntime {
                 token_embedding: token_embedding.device_graph_spec(),
                 backend,
             },
+            native_gqa,
         )
         .map_err(|error| MimoLlmDecoderError::GraphFailed {
             reason: error.to_string(),

@@ -40,7 +40,8 @@
 use thiserror::Error;
 
 use crate::ggml_runtime::{
-    GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedTensor, GgmlLoadedWeightContext,
+    GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity,
+    GgmlLoadedWeightContext,
 };
 use crate::models::firered_aed::graph_config::firered_encoder_graph_config;
 
@@ -110,6 +111,28 @@ pub(crate) struct FireRedLlmAdapterGraphRuntime {
 }
 
 impl FireRedLlmAdapterGraphRuntime {
+    pub(crate) const fn retained_system_memory_bytes(&self) -> u64 {
+        // Native runner/context allocations are admitted by the backend. The
+        // Rust owner retains only four Copy tensor descriptors.
+        0
+    }
+
+    pub(crate) fn graph_lane(&self) -> (crate::ggml_runtime::GgmlCpuGraphBackend, bool) {
+        (self.runner.backend_kind(), self.runner.uses_scheduler())
+    }
+
+    pub(crate) fn loaded_weight_binding_identity(&self) -> GgmlLoadedWeightBindingIdentity {
+        self.runner.loaded_weight_binding_identity(&self._loaded)
+    }
+
+    pub(crate) fn release_transient_compute_memory(
+        &mut self,
+    ) -> Result<(), FireRedLlmAdapterError> {
+        self.runner
+            .release_transient_scheduler_working_set()
+            .map_err(|source| map_err("release_transient_scheduler_working_set", source))
+    }
+
     pub(crate) fn new_from_preflight(
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,

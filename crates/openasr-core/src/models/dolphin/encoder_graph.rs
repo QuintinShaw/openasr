@@ -1311,24 +1311,23 @@ impl DolphinEncoderRuntime {
         backend: GgmlCpuGraphBackend,
         pos_capacity_frames: usize,
     ) -> Result<Self, DolphinEncoderError> {
-        let graph_config = GgmlCpuGraphConfig {
-            context_bytes: GgmlCpuGraphConfig::metadata_context_bytes(
-                DOLPHIN_ENCODER_GRAPH_NODE_CAPACITY,
-            ),
-            graph_size: DOLPHIN_ENCODER_GRAPH_NODE_CAPACITY,
-            n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
+        let graph_config = crate::models::graph_runtime_config::apply_request_execution_placement(
+            GgmlCpuGraphConfig {
+                context_bytes: GgmlCpuGraphConfig::metadata_context_bytes(
+                    DOLPHIN_ENCODER_GRAPH_NODE_CAPACITY,
+                ),
+                graph_size: DOLPHIN_ENCODER_GRAPH_NODE_CAPACITY,
+                n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
+                    backend,
+                    crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,
+                ),
                 backend,
-                crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::EncoderPrelude,
-            ),
-            backend,
-            // Ggml's gallocr scheduler reuses buffer space across tensors whose
-            // lifetimes don't overlap instead of giving every non-view tensor its
-            // own allocation; on the CPU backend both allocators produce
-            // identical results, so unconditionally enabling it (like the
-            // sibling cohere/moonshine encoders) only bounds memory footprint on
-            // long audio, never the encoder's output.
-            use_scheduler: true,
-        };
+                // CPU/unscoped callers retain the bounded gallocr scheduler. The
+                // active policy placement is applied last: FullDevice must be direct,
+                // while Dolphin's qualified Vulkan split uses Hybrid.
+                use_scheduler: true,
+            },
+        );
         let runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
         // Persistent weight arena (a WEIGHTS-usage backend buffer). Placing every
         // encoder weight here -- instead of the per-call transient graph leaves the

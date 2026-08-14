@@ -422,6 +422,13 @@ impl PyannoteSegmenter {
         self.model.persistent_host_commitment_bytes()
     }
 
+    pub(super) fn prepare_accelerated_features(
+        &self,
+        samples: &[f32],
+    ) -> Result<(Vec<f32>, usize), WeightsError> {
+        self.model.frontend_features(samples)
+    }
+
     /// Compatibility helper for diagnostics. Production external diarization
     /// consumes [`LocalActivity`] and performs local-to-global reconstruction;
     /// this helper only renders each window-local slot independently.
@@ -489,8 +496,8 @@ impl LocalActivitySegmenter for PyannoteSegmenter {
 }
 
 /// Serial sliding-window protocol for a thread-pinned accelerated PyanNet
-/// runtime. The CPU owner keeps its bounded Rayon implementation above; a
-/// single Metal actor deliberately submits windows in order so one persistent
+/// runtime. The CPU owner keeps its bounded Rayon implementation above; an
+/// accelerated actor deliberately submits windows in order so one persistent
 /// graph is never driven concurrently from multiple request threads.
 pub(super) fn segment_pyannote_local_activity_serial(
     samples: crate::PcmSlice,

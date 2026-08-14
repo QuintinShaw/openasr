@@ -30,7 +30,8 @@ use crate::device::execution_memory::{
 
 use super::{
     backend_memory::{
-        BackendMemoryAbi, BackendMemoryAbiError, BackendMemoryQuote, BackendMemoryStatsSnapshot,
+        BackendMemoryAbi, BackendMemoryAbiError, BackendMemoryLifecyclePoint, BackendMemoryQuote,
+        BackendMemoryStatsSnapshot,
     },
     ffi,
 };
@@ -75,7 +76,7 @@ impl NativeQuotedBackendGroup {
             return Err(NativeMemoryAdmissionError::EmptyGroupId);
         }
         let quote = abi.quote(&requests)?;
-        let fresh_stats = abi.stats()?;
+        let fresh_stats = abi.stats_at(BackendMemoryLifecyclePoint::AdmissionQuote)?;
         Ok(Self {
             group_id,
             backend_device_identity,
@@ -707,7 +708,9 @@ fn fetch_live_observations(
 ) -> Result<BTreeMap<MemoryDomainKey, DomainObservation>, NativeMemoryAdmissionError> {
     let mut observations = BTreeMap::new();
     for group in groups {
-        let stats = group.abi.stats()?;
+        let stats = group
+            .abi
+            .stats_at(BackendMemoryLifecyclePoint::PostAllocationReconciliation)?;
         let mapped = map_group_stats(
             &group.group_id,
             &group.backend_device_identity,

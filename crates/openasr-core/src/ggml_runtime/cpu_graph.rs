@@ -53,6 +53,7 @@ const I32_WIDTH_BYTES: usize = std::mem::size_of::<i32>();
 const DEFAULT_CONTEXT_BYTES: usize = 1024 * 1024;
 const DEFAULT_GRAPH_SIZE: usize = 4096;
 static NEXT_EXECUTION_GRAPH_ID: AtomicU64 = AtomicU64::new(1);
+const GGML_LSTM_SEQ_MAX_HIDDEN: usize = 256;
 
 unsafe extern "C" {
     #[link_name = "ggml_backend_buft_get_max_size"]
@@ -131,11 +132,53 @@ pub(crate) enum GgmlFlashAttentionPrecision {
     F32,
 }
 
+/// Accumulation contract for `ggml_mul_mat`.
+///
+/// `Default` preserves the backend's fastest validated implementation. `F32`
+/// requests ggml's explicit full-precision accumulation contract for
+/// numerically sensitive weighted projections. Families must select this from
+/// typed execution policy; the shared graph layer never guesses from model ids.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) enum GgmlMatmulPrecision {
+    #[default]
+    Default,
+    F32,
+}
+
 impl GgmlFlashAttentionPrecision {
     const fn ffi_value(self) -> c_int {
         match self {
             Self::Default => ffi::GGML_PREC_DEFAULT,
             Self::F32 => ffi::GGML_PREC_F32,
+        }
+    }
+}
+
+fn mul_mat_requires_f32_precision_to_preserve_rhs_range(
+    capabilities: GgmlBackendCapabilities,
+    lhs_type: i32,
+    rhs_type: i32,
+) -> bool {
+    capabilities.f16_lhs_f32_rhs_mul_mat_requires_f32_precision()
+        && lhs_type == ffi::GGML_TYPE_F16
+        && rhs_type == ffi::GGML_TYPE_F32
+}
+
+/// Gate layout used by a fused LSTM sequence. This domain type deliberately
+/// hides ggml's C enum from model graph code; the FFI conversion is explicit at
+/// the checked boundary below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum GgmlLstmGateOrder {
+    Iofc,
+    Ifgo,
+}
+
+impl GgmlLstmGateOrder {
+    const fn as_ffi(self) -> c_int {
+        match self {
+            Self::Iofc => ffi::GGML_LSTM_GATE_ORDER_IOFC,
+            Self::Ifgo => ffi::GGML_LSTM_GATE_ORDER_IFGO,
         }
     }
 }
@@ -151,6 +194,7 @@ impl GgmlFlashAttentionPrecision {
 pub(crate) struct GgmlBackendCapabilities {
     known_discrete_gpu: bool,
     vulkan: bool,
+    f16_lhs_f32_rhs_mul_mat_requires_f32_precision: bool,
     multi_query_prefill_width_multiple: usize,
 }
 
@@ -160,6 +204,7 @@ impl GgmlBackendCapabilities {
             return Self {
                 known_discrete_gpu: false,
                 vulkan: false,
+                f16_lhs_f32_rhs_mul_mat_requires_f32_precision: false,
                 multi_query_prefill_width_multiple: 1,
             };
         }
@@ -171,6 +216,13 @@ impl GgmlBackendCapabilities {
         Self {
             known_discrete_gpu,
             vulkan,
+            // CUDA/HIP-style F16 matmul pipelines may down-convert an F32 RHS
+            // before accumulation, so values above F16's finite range require
+            // ggml's explicit F32 precision contract. Vulkan's default mixed
+            // pipeline preserves the range already and is materially faster;
+            // keep its validated default rather than forcing the slower path.
+            // Unknown generic-GPU providers stay on the correctness-first side.
+            f16_lhs_f32_rhs_mul_mat_requires_f32_precision: !vulkan,
             // Measured ggml HIP/ROCm kernels require even multi-token query
             // widths; all other known providers accept unit alignment. An
             // unknown provider remains conservative through
@@ -185,6 +237,10 @@ impl GgmlBackendCapabilities {
 
     pub(crate) const fn is_vulkan(self) -> bool {
         self.vulkan
+    }
+
+    pub(crate) const fn f16_lhs_f32_rhs_mul_mat_requires_f32_precision(self) -> bool {
+        self.f16_lhs_f32_rhs_mul_mat_requires_f32_precision
     }
 
     pub(crate) const fn multi_query_prefill_width_multiple(self) -> usize {
@@ -628,9 +684,22 @@ impl GgmlCpuGraphConfig {
 /// to grow a resolved content identity / already-open runtime source
 /// alongside the backend, which only requires adding a field here -- not
 /// another signature change at every call site already carrying this type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum GgmlNativeGqaCapability {
+    Validated,
+    Unsupported,
+}
+
+impl GgmlNativeGqaCapability {
+    pub(crate) const fn is_validated(self) -> bool {
+        matches!(self, Self::Validated)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolvedFamilyRuntimeInput {
     backend: GgmlCpuGraphBackend,
+    native_gqa: GgmlNativeGqaCapability,
 }
 
 impl ResolvedFamilyRuntimeInput {
@@ -641,8 +710,11 @@ impl ResolvedFamilyRuntimeInput {
     /// straight in; this never installs anything, so there is no global
     /// state for a thread boundary to lose.
     pub fn resolve(preference: Option<RequestBackendPreference>, policy: AutoGpuPolicy) -> Self {
+        let backend =
+            GgmlCpuGraphConfig::resolve_family_backend_for_preference(preference.clone(), policy);
         Self {
-            backend: GgmlCpuGraphConfig::resolve_family_backend_for_preference(preference, policy),
+            backend,
+            native_gqa: resolve_native_gqa_capability(preference.as_ref(), backend),
         }
     }
 
@@ -650,6 +722,37 @@ impl ResolvedFamilyRuntimeInput {
     /// family's own [`AutoGpuPolicy`] gate.
     pub fn backend(self) -> GgmlCpuGraphBackend {
         self.backend
+    }
+
+    /// Typed proof that the resolved execution lane is allowed to use ggml's
+    /// native grouped-query attention broadcast. A coarse generic GPU choice
+    /// is deliberately insufficient: discrete GPU enablement requires an
+    /// Exact CUDA/Vulkan route, while HIP and unknown providers fail closed.
+    pub(crate) fn native_gqa_capability(self) -> GgmlNativeGqaCapability {
+        self.native_gqa
+    }
+}
+
+fn resolve_native_gqa_capability(
+    preference: Option<&RequestBackendPreference>,
+    backend: GgmlCpuGraphBackend,
+) -> GgmlNativeGqaCapability {
+    match backend {
+        GgmlCpuGraphBackend::Cpu | GgmlCpuGraphBackend::Metal => GgmlNativeGqaCapability::Validated,
+        GgmlCpuGraphBackend::Gpu => match preference {
+            Some(RequestBackendPreference::Exact(route))
+                if matches!(
+                    route.provider,
+                    ExecutionProvider::Cuda | ExecutionProvider::Vulkan
+                ) =>
+            {
+                GgmlNativeGqaCapability::Validated
+            }
+            Some(RequestBackendPreference::CpuOnly)
+            | Some(RequestBackendPreference::Accelerated)
+            | Some(RequestBackendPreference::Exact(_))
+            | None => GgmlNativeGqaCapability::Unsupported,
+        },
     }
 }
 
@@ -1325,6 +1428,24 @@ pub(crate) struct GgmlStaticTensorArena {
     backend: NonNull<c_void>,
     buffer: Option<GgmlBackendBufferGuard>,
     require_direct_matmul_weight_support: bool,
+    usage: GgmlStaticTensorArenaUsage,
+}
+
+/// Typed purpose for a persistent tensor arena. This prevents mutable model
+/// state from being mislabeled as immutable weights at the backend boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GgmlStaticTensorArenaUsage {
+    Weights,
+    State,
+}
+
+impl GgmlStaticTensorArenaUsage {
+    const fn backend_buffer_usage(self) -> c_int {
+        match self {
+            Self::Weights => ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS,
+            Self::State => ffi::GGML_BACKEND_BUFFER_USAGE_COMPUTE,
+        }
+    }
 }
 
 struct GgmlLoadedWeightContextInner {
@@ -1345,6 +1466,16 @@ struct GgmlLoadedWeightContextInner {
 #[derive(Clone)]
 pub(crate) struct GgmlLoadedWeightContext {
     inner: Rc<GgmlLoadedWeightContextInner>,
+}
+
+/// Opaque diagnostic identity for one pack-wide native weight binding.
+/// Keeping this typed prevents family code from sharing or dereferencing raw
+/// backend pointers while still allowing it to prove that co-located stages
+/// resolved the same backend and the same cached `Rc` owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GgmlLoadedWeightBindingIdentity {
+    backend_address: usize,
+    context_address: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1400,6 +1531,7 @@ pub(crate) struct GgmlCpuGraphBuilder<'a> {
     context: NonNull<c_void>,
     backend: NonNull<c_void>,
     backend_kind: GgmlCpuGraphBackend,
+    backend_capabilities: GgmlBackendCapabilities,
     scheduler: Option<NonNull<c_void>>,
     scheduler_memory_owner: Option<GgmlSchedulerMemoryOwner>,
     scheduler_graph_lifetime: Option<GgmlSchedulerGraphLifetime>,
@@ -1473,6 +1605,13 @@ impl GgmlPersistentGraphSession {
 
     pub(crate) fn mark_poisoned_after_failed_compute(&mut self) {
         self.builder.mark_poisoned_after_failed_compute();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepared_native_node_count_for_test(&self) -> Option<usize> {
+        let graph = self.builder.prepared_graph?;
+        let count = unsafe { ffi::ggml_graph_n_nodes(graph.as_ptr()) };
+        usize::try_from(count).ok()
     }
 
     #[cfg(test)]
@@ -1580,6 +1719,38 @@ impl GgmlCpuGraphRunner {
         };
 
         let backend_name = backend.name();
+        let exact_request = matches!(
+            request_backend_override(),
+            Some(RequestBackendPreference::Exact(_))
+        );
+        if exact_request
+            || crate::models::native_execution_services::current_execution_observation_sink()
+                .is_some()
+        {
+            let (actual_provider, actual_stable_id) = backend_provider_and_stable_id(backend.raw)?;
+            crate::models::native_execution_services::attest_current_exact_accelerated_backend(
+                config.backend,
+                actual_provider,
+                &actual_stable_id,
+                config.use_scheduler,
+            )?;
+            crate::models::native_execution_services::record_current_execution_backend_observation(
+                backend.raw.as_ptr() as usize,
+                config.backend,
+                &backend_name,
+                actual_provider,
+                &actual_stable_id,
+                config.use_scheduler,
+            );
+            if crate::models::native_execution_services::current_execution_observation_sink()
+                .is_some()
+            {
+                super::backend_memory::record_backend_memory_probe(
+                    backend.raw.as_ptr(),
+                    super::backend_memory::BackendMemoryLifecyclePoint::BackendInitialized,
+                );
+            }
+        }
         let backend_capabilities = GgmlBackendCapabilities::resolve(config.backend, &backend_name);
         Ok(Self {
             context,
@@ -1667,6 +1838,16 @@ impl GgmlCpuGraphRunner {
 
     pub(crate) fn uses_scheduler(&self) -> bool {
         self.scheduler.is_some()
+    }
+
+    pub(crate) fn loaded_weight_binding_identity(
+        &self,
+        loaded: &GgmlLoadedWeightContext,
+    ) -> GgmlLoadedWeightBindingIdentity {
+        GgmlLoadedWeightBindingIdentity {
+            backend_address: self.backend.raw.as_ptr() as usize,
+            context_address: Rc::as_ptr(&loaded.inner) as usize,
+        }
     }
 
     /// Loads GGUF weights from `source`'s own already-open mapping -- never a
@@ -1780,6 +1961,7 @@ impl GgmlCpuGraphRunner {
             context: self.context.raw,
             backend: self.backend.raw,
             backend_kind: self.backend_kind,
+            backend_capabilities: self.backend_capabilities,
             scheduler,
             scheduler_memory_owner,
             scheduler_graph_lifetime,
@@ -1902,10 +2084,32 @@ impl GgmlCpuGraphRunner {
         &self,
         context_bytes: usize,
     ) -> Result<GgmlStaticTensorArena, GgmlCpuGraphError> {
+        self.start_static_tensor_arena_with_usage(
+            context_bytes,
+            GgmlStaticTensorArenaUsage::Weights,
+        )
+    }
+
+    /// Starts a persistent mutable-state arena. Unlike the legacy static arena
+    /// wrapper above, its backend buffer is classified as COMPUTE memory while
+    /// retaining the same session-resident admission lifetime.
+    pub(crate) fn start_state_tensor_arena(
+        &self,
+        context_bytes: usize,
+    ) -> Result<GgmlStaticTensorArena, GgmlCpuGraphError> {
+        self.start_static_tensor_arena_with_usage(context_bytes, GgmlStaticTensorArenaUsage::State)
+    }
+
+    fn start_static_tensor_arena_with_usage(
+        &self,
+        context_bytes: usize,
+        usage: GgmlStaticTensorArenaUsage,
+    ) -> Result<GgmlStaticTensorArena, GgmlCpuGraphError> {
         GgmlStaticTensorArena::new(
             context_bytes,
             self.backend.raw,
             self.backend_kind.is_gpu_class() && self.scheduler.is_none(),
+            usage,
         )
     }
 
@@ -1942,6 +2146,7 @@ impl GgmlCpuGraphRunner {
             context: context.raw,
             backend: self.backend.raw,
             backend_kind: self.backend_kind,
+            backend_capabilities: self.backend_capabilities,
             scheduler: self.scheduler.as_ref().map(|scheduler| scheduler.raw),
             scheduler_memory_owner: self
                 .scheduler
@@ -2164,6 +2369,7 @@ impl GgmlStaticTensorArena {
         context_bytes: usize,
         backend: NonNull<c_void>,
         require_direct_matmul_weight_support: bool,
+        usage: GgmlStaticTensorArenaUsage,
     ) -> Result<Self, GgmlCpuGraphError> {
         if context_bytes == 0 {
             return Err(GgmlCpuGraphError::InvalidContextBytes);
@@ -2173,6 +2379,14 @@ impl GgmlStaticTensorArena {
             backend,
             buffer: None,
             require_direct_matmul_weight_support,
+            usage,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backend_buffer_capacity_bytes(&self) -> Option<u64> {
+        self.buffer.as_ref().and_then(|buffer| {
+            u64::try_from(unsafe { ffi::ggml_backend_buffer_get_size(buffer.raw().as_ptr()) }).ok()
         })
     }
 
@@ -2427,6 +2641,110 @@ impl GgmlStaticTensorArena {
             raw: tensor.raw,
             _marker: PhantomData,
         }
+    }
+
+    /// Reinterprets one already-bound pack weight in this arena's metadata
+    /// context without allocating or copying its payload. Some GGUF families
+    /// describe a logical `[rows, columns]` matrix with that dimension order,
+    /// while ggml matmul consumes the same contiguous bytes as
+    /// `[columns, rows]`. The returned descriptor is only an external view;
+    /// its `GgmlLoadedWeightContext` owner must outlive this arena and every
+    /// graph that references the view.
+    pub(crate) fn reshape_loaded_tensor_2d(
+        &self,
+        input: GgmlLoadedTensor,
+        ne0: usize,
+        ne1: usize,
+        tensor_name: &'static str,
+    ) -> Result<GgmlStaticTensor, GgmlCpuGraphError> {
+        self.reshape_loaded_tensor(input, &[ne0, ne1], tensor_name)
+    }
+
+    pub(crate) fn reshape_loaded_tensor(
+        &self,
+        input: GgmlLoadedTensor,
+        dims: &[usize],
+        tensor_name: &'static str,
+    ) -> Result<GgmlStaticTensor, GgmlCpuGraphError> {
+        self.ensure_can_extend("ggml_reshape_2d(loaded)")?;
+        if dims.is_empty() || dims.len() > ffi::GGML_MAX_DIMS {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "loaded tensor reshape supports rank 1 through 4",
+            });
+        }
+        let layout = unsafe { *(input.raw.as_ptr() as *const ffi::GgmlTensorAllocPrefix) };
+        if layout.buffer.is_null() || layout.data.is_null() {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "loaded tensor must have a live backend binding before reshape",
+            });
+        }
+        if !unsafe { ffi::ggml_is_contiguous(input.raw.as_ptr()) } {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "loaded tensor reshape requires contiguous storage",
+            });
+        }
+        let expected = dims.iter().try_fold(1_usize, |total, dim| {
+            total
+                .checked_mul(*dim)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "loaded tensor reshape target overflows usize",
+                })
+        })?;
+        let actual =
+            usize::try_from(unsafe { ffi::ggml_nelements(input.raw.as_ptr()) }).map_err(|_| {
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "loaded tensor element count exceeds usize boundary",
+                }
+            })?;
+        if actual != expected {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "loaded tensor reshape target must preserve element count",
+            });
+        }
+        let block_size =
+            usize::try_from(unsafe { ffi::ggml_blck_size(layout.type_) }).map_err(|_| {
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "loaded tensor block size exceeds usize boundary",
+                }
+            })?;
+        if block_size == 0 || !dims[0].is_multiple_of(block_size) {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "loaded tensor reshape row width must align to its quantization block",
+            });
+        }
+        let dims = dims
+            .iter()
+            .map(|dim| checked_dim_to_i64(*dim))
+            .collect::<Result<Vec<_>, _>>()?;
+        let raw = unsafe {
+            match dims.as_slice() {
+                [ne0] => ffi::ggml_reshape_1d(self.context.raw.as_ptr(), input.raw.as_ptr(), *ne0),
+                [ne0, ne1] => {
+                    ffi::ggml_reshape_2d(self.context.raw.as_ptr(), input.raw.as_ptr(), *ne0, *ne1)
+                }
+                [ne0, ne1, ne2] => ffi::ggml_reshape_3d(
+                    self.context.raw.as_ptr(),
+                    input.raw.as_ptr(),
+                    *ne0,
+                    *ne1,
+                    *ne2,
+                ),
+                [ne0, ne1, ne2, ne3] => ffi::ggml_reshape_4d(
+                    self.context.raw.as_ptr(),
+                    input.raw.as_ptr(),
+                    *ne0,
+                    *ne1,
+                    *ne2,
+                    *ne3,
+                ),
+                _ => unreachable!("rank was validated above"),
+            }
+        };
+        NonNull::new(raw).map(|raw| GgmlStaticTensor { raw }).ok_or(
+            GgmlCpuGraphError::TensorAllocationFailed {
+                tensor: tensor_name,
+            },
+        )
     }
 
     pub(crate) fn view_2d(
@@ -2711,7 +3029,7 @@ impl GgmlStaticTensorArena {
             self.buffer = Some(GgmlBackendBufferGuard::allocate_with_usage(
                 self.context.raw,
                 self.backend,
-                ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS,
+                self.usage.backend_buffer_usage(),
             )?);
         }
         Ok(())
@@ -3197,6 +3515,42 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         lhs: GgmlCpuTensor<'a>,
         rhs: GgmlCpuTensor<'a>,
     ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.mul_mat_impl(lhs, rhs, false)
+    }
+
+    pub(crate) fn mul_mat_with_precision(
+        &self,
+        lhs: GgmlCpuTensor<'a>,
+        rhs: GgmlCpuTensor<'a>,
+        precision: GgmlMatmulPrecision,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.mul_mat_impl(lhs, rhs, precision == GgmlMatmulPrecision::F32)
+    }
+
+    /// Preserve the dynamic range of an F32 RHS when a generic GPU consumes
+    /// an F16 matrix. CUDA's default F16 cuBLAS path converts the RHS to F16
+    /// and may overflow otherwise-finite activations before the dot product;
+    /// Vulkan likewise has an explicit F32-precision matmul pipeline. Other
+    /// weight types and CPU/Metal retain their established default path.
+    pub(crate) fn mul_mat_preserving_f32_rhs_range(
+        &self,
+        lhs: GgmlCpuTensor<'a>,
+        rhs: GgmlCpuTensor<'a>,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        let force_f32 = mul_mat_requires_f32_precision_to_preserve_rhs_range(
+            self.backend_capabilities,
+            self.tensor_type(lhs),
+            self.tensor_type(rhs),
+        );
+        self.mul_mat_impl(lhs, rhs, force_f32)
+    }
+
+    fn mul_mat_impl(
+        &self,
+        lhs: GgmlCpuTensor<'a>,
+        rhs: GgmlCpuTensor<'a>,
+        force_f32: bool,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
         self.ensure_can_extend_graph("ggml_mul_mat")?;
         self.ensure_tensor_type_in(
             lhs,
@@ -3221,7 +3575,11 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.ensure_can_mul_mat(lhs, rhs)?;
         let raw =
             unsafe { ffi::ggml_mul_mat(self.context.as_ptr(), lhs.raw.as_ptr(), rhs.raw.as_ptr()) };
-        self.new_tensor_checked(raw, "ggml_mul_mat")
+        let output = self.new_tensor_checked(raw, "ggml_mul_mat")?;
+        if force_f32 {
+            unsafe { ffi::ggml_mul_mat_set_prec(output.raw.as_ptr(), ffi::GGML_PREC_F32) };
+        }
+        Ok(output)
     }
 
     pub(crate) fn get_rows(
@@ -3284,6 +3642,25 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.ensure_tensor_type(input, ffi::GGML_TYPE_F32, "ggml_argmax input")?;
         let raw = unsafe { ffi::ggml_argmax(self.context.as_ptr(), input.raw.as_ptr()) };
         self.new_tensor_checked(raw, "ggml_argmax")
+    }
+
+    /// Returns the lowest column index whose finite value is maximal in each
+    /// row. This is the exact tie policy used by OpenASR greedy decoding.
+    pub(crate) fn top1_argmax_first_max(
+        &self,
+        input: GgmlCpuTensor<'a>,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        let shape = self.tensor_shape_4d(input)?;
+        if shape[2] != 1 || shape[3] != 1 {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_argmax_first input must be a rank-2 row matrix",
+            });
+        }
+        self.ensure_can_extend_graph("ggml_argmax_first")?;
+        self.ensure_tensor_type(input, ffi::GGML_TYPE_F32, "ggml_argmax_first input")?;
+        self.ensure_tensor_contiguous(input, "ggml_argmax_first input")?;
+        let raw = unsafe { ffi::ggml_argmax_first(self.context.as_ptr(), input.raw.as_ptr()) };
+        self.new_tensor_checked(raw, "ggml_argmax_first")
     }
 
     /// OpenASR greedy top-1 uses first-max tie semantics. Native ggml argmax
@@ -3893,6 +4270,33 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.new_tensor_checked(raw, "ggml_softplus")
     }
 
+    pub(crate) fn swoosh(
+        &self,
+        input: GgmlCpuTensor<'a>,
+        offset: f32,
+        shift: f32,
+        linear_scale: f32,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.ensure_can_extend_graph("ggml_swoosh")?;
+        self.ensure_tensor_type(input, ffi::GGML_TYPE_F32, "ggml_swoosh input")?;
+        self.ensure_tensor_contiguous(input, "ggml_swoosh input")?;
+        if !offset.is_finite() || !shift.is_finite() || !linear_scale.is_finite() {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_swoosh parameters must be finite",
+            });
+        }
+        let raw = unsafe {
+            ffi::ggml_swoosh(
+                self.context.as_ptr(),
+                input.raw.as_ptr(),
+                offset,
+                shift,
+                linear_scale,
+            )
+        };
+        self.new_tensor_checked(raw, "ggml_swoosh")
+    }
+
     #[allow(dead_code)]
     pub(crate) fn exp(
         &self,
@@ -4410,6 +4814,20 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         Ok(())
     }
 
+    /// Reserves the complete side-effect root set before a persistent graph is
+    /// assembled. Model runtimes use the matching capacity in their retained
+    /// host-memory quote, avoiding allocator-growth capacity that appears only
+    /// after the actor has already passed admission.
+    pub(crate) fn reserve_side_effect_roots(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), GgmlCpuGraphError> {
+        self.ensure_can_extend_graph("reserve side-effect roots")?;
+        self.side_effect_roots
+            .try_reserve_exact(additional)
+            .map_err(|_| GgmlCpuGraphError::AllocationFailed)
+    }
+
     pub(crate) fn transpose(
         &self,
         input: GgmlCpuTensor<'a>,
@@ -4579,6 +4997,92 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             )
         };
         self.new_tensor_checked(raw, "ggml_pool_1d")
+    }
+
+    /// Builds ggml's depthwise state-space convolution. `state_and_input` is
+    /// `[d_conv - 1 + n_t, d_inner, n_s]` and `kernel` is
+    /// `[d_conv, d_inner]`; the result is `[d_inner, n_t, n_s]`.
+    ///
+    /// ggml validates this contract with native assertions. Keep those
+    /// assertions behind this checked boundary so malformed model graphs fail
+    /// closed instead of terminating the process.
+    #[allow(dead_code)]
+    pub(crate) fn ssm_conv(
+        &self,
+        state_and_input: GgmlCpuTensor<'a>,
+        kernel: GgmlCpuTensor<'a>,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.ensure_can_extend_graph("ggml_ssm_conv")?;
+        self.ensure_tensor_type(
+            state_and_input,
+            ffi::GGML_TYPE_F32,
+            "ggml_ssm_conv state_and_input",
+        )?;
+        self.ensure_tensor_type(kernel, ffi::GGML_TYPE_F32, "ggml_ssm_conv kernel")?;
+        self.ensure_tensor_contiguous(state_and_input, "ggml_ssm_conv state_and_input")?;
+        self.ensure_tensor_contiguous(kernel, "ggml_ssm_conv kernel")?;
+        self.ensure_ssm_conv_compatible(state_and_input, kernel)?;
+
+        let raw = unsafe {
+            ffi::ggml_ssm_conv(
+                self.context.as_ptr(),
+                state_and_input.raw.as_ptr(),
+                kernel.raw.as_ptr(),
+            )
+        };
+        self.new_tensor_checked(raw, "ggml_ssm_conv")
+    }
+
+    /// Builds ggml's fused LSTM sequence op. The native constructor creates
+    /// its graph-owned gate/cell workspace; callers only provide model inputs.
+    ///
+    /// Keep ggml's assertion-heavy contract behind this checked boundary so
+    /// malformed model graphs fail closed rather than terminating the process.
+    #[allow(dead_code)]
+    pub(crate) fn lstm_seq(
+        &self,
+        x: GgmlCpuTensor<'a>,
+        w: GgmlCpuTensor<'a>,
+        r: GgmlCpuTensor<'a>,
+        b: GgmlCpuTensor<'a>,
+        gate_order: GgmlLstmGateOrder,
+        reverse: bool,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.ensure_can_extend_graph("ggml_lstm_seq")?;
+        self.ensure_tensor_type(x, ffi::GGML_TYPE_F32, "ggml_lstm_seq x")?;
+        self.ensure_tensor_type(w, ffi::GGML_TYPE_F32, "ggml_lstm_seq w")?;
+        self.ensure_tensor_type(r, ffi::GGML_TYPE_F32, "ggml_lstm_seq r")?;
+        self.ensure_tensor_type(b, ffi::GGML_TYPE_F32, "ggml_lstm_seq b")?;
+        self.ensure_tensor_contiguous(x, "ggml_lstm_seq x")?;
+        self.ensure_tensor_contiguous(w, "ggml_lstm_seq w")?;
+        self.ensure_tensor_contiguous(r, "ggml_lstm_seq r")?;
+        self.ensure_tensor_contiguous(b, "ggml_lstm_seq b")?;
+        for tensor in [x, w, r, b] {
+            let layout = unsafe { *(tensor.raw.as_ptr() as *const ffi::GgmlTensorAllocPrefix) };
+            if layout.view_offs % std::mem::size_of::<f32>() != 0 {
+                return Err(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "ggml_lstm_seq inputs must be f32 element aligned",
+                });
+            }
+        }
+        self.ensure_lstm_seq_compatible(x, w, r, b)?;
+        self.ensure_context_tensor_metadata_capacity(
+            2,
+            "ggml_lstm_seq context lacks metadata for result and workspace",
+        )?;
+
+        let raw = unsafe {
+            ffi::ggml_lstm_seq(
+                self.context.as_ptr(),
+                x.raw.as_ptr(),
+                w.raw.as_ptr(),
+                r.raw.as_ptr(),
+                b.raw.as_ptr(),
+                gate_order.as_ffi(),
+                reverse,
+            )
+        };
+        self.new_tensor_checked(raw, "ggml_lstm_seq")
     }
 
     pub(crate) fn conv_2d(
@@ -5457,7 +5961,17 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.prepare_direct_graph_private_gate(graph)?;
         self.record_execution_placement(graph);
         let compute = compute_graph_with_current_job_cancel(self.backend, self.scheduler, graph);
-        self.finish_compute_result(compute)
+        let result = self.finish_compute_result(compute);
+        if result.is_ok()
+            && crate::models::native_execution_services::current_execution_observation_sink()
+                .is_some()
+        {
+            super::backend_memory::record_backend_memory_probe(
+                self.backend.as_ptr(),
+                super::backend_memory::BackendMemoryLifecyclePoint::AfterGraphCompute,
+            );
+        }
+        result
     }
 
     fn record_execution_placement(&mut self, graph: NonNull<c_void>) {
@@ -6098,6 +6612,25 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         Ok(())
     }
 
+    fn ensure_context_tensor_metadata_capacity(
+        &self,
+        additional_tensors: usize,
+        reason: &'static str,
+    ) -> Result<(), GgmlCpuGraphError> {
+        let required = unsafe { ffi::ggml_tensor_overhead() }
+            .checked_mul(additional_tensors)
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs { reason })?;
+        let used = unsafe { ffi::ggml_used_mem(self.context.as_ptr()) };
+        let capacity = unsafe { ffi::ggml_get_mem_size(self.context.as_ptr()) };
+        let available = capacity
+            .checked_sub(used)
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs { reason })?;
+        if available < required {
+            return Err(GgmlCpuGraphError::UnsupportedInputs { reason });
+        }
+        Ok(())
+    }
+
     fn new_tensor_checked(
         &self,
         raw: *mut c_void,
@@ -6188,6 +6721,10 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     "ggml_flash_attn_ext mask" => {
                         "ggml_flash_attn_ext mask requires contiguous input tensor"
                     }
+                    "ggml_lstm_seq x" => "ggml_lstm_seq x requires contiguous input tensor",
+                    "ggml_lstm_seq w" => "ggml_lstm_seq w requires contiguous input tensor",
+                    "ggml_lstm_seq r" => "ggml_lstm_seq r requires contiguous input tensor",
+                    "ggml_lstm_seq b" => "ggml_lstm_seq b requires contiguous input tensor",
                     "ggml_cpy src" => "ggml_cpy src requires contiguous tensor",
                     "ggml_cpy dst" => "ggml_cpy dst requires contiguous tensor",
                     _ => "operation requires contiguous input tensor",
@@ -6334,6 +6871,12 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     "ggml_repeat_4d input" => "ggml_repeat_4d input must be f32",
                     "ggml_soft_max input" => "ggml_soft_max input must be f32",
                     "ggml_soft_max_ext input" => "ggml_soft_max_ext input must be f32",
+                    "ggml_ssm_conv state_and_input" => "ggml_ssm_conv state_and_input must be f32",
+                    "ggml_ssm_conv kernel" => "ggml_ssm_conv kernel must be f32",
+                    "ggml_lstm_seq x" => "ggml_lstm_seq x must be f32",
+                    "ggml_lstm_seq w" => "ggml_lstm_seq w must be f32",
+                    "ggml_lstm_seq r" => "ggml_lstm_seq r must be f32",
+                    "ggml_lstm_seq b" => "ggml_lstm_seq b must be f32",
                     "ggml_argmax input" => "ggml_argmax input must be f32",
                     "ggml_top_k input" => "ggml_top_k input must be f32",
                     "ggml_get_rows indices" => "ggml_get_rows indices must be i32",
@@ -6675,6 +7218,158 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    fn ensure_ssm_conv_compatible(
+        &self,
+        state_and_input: GgmlCpuTensor<'a>,
+        kernel: GgmlCpuTensor<'a>,
+    ) -> Result<(), GgmlCpuGraphError> {
+        let state_shape = self.tensor_shape_4d(state_and_input)?;
+        let kernel_shape = self.tensor_shape_4d(kernel)?;
+        if state_shape[3] != 1 {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_ssm_conv state_and_input must be a 3d tensor",
+            });
+        }
+        if kernel_shape[2] != 1 || kernel_shape[3] != 1 {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_ssm_conv kernel must be a 2d tensor",
+            });
+        }
+        if state_shape[1] != kernel_shape[1] {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_ssm_conv state_and_input.ne1 must equal kernel.ne1",
+            });
+        }
+
+        let history =
+            kernel_shape[0]
+                .checked_sub(1)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "ggml_ssm_conv kernel.ne0 must be positive",
+                })?;
+        let n_tokens =
+            state_shape[0]
+                .checked_sub(history)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "ggml_ssm_conv state_and_input.ne0 is shorter than kernel history",
+                })?;
+        if n_tokens == 0 {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_ssm_conv requires at least one output token",
+            });
+        }
+        let expected_state_time =
+            history
+                .checked_add(n_tokens)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "ggml_ssm_conv state_and_input time dimension overflows usize",
+                })?;
+        if state_shape[0] != expected_state_time {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_ssm_conv state_and_input.ne0 must equal kernel.ne0 - 1 + n_tokens",
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_lstm_seq_compatible(
+        &self,
+        x: GgmlCpuTensor<'a>,
+        w: GgmlCpuTensor<'a>,
+        r: GgmlCpuTensor<'a>,
+        b: GgmlCpuTensor<'a>,
+    ) -> Result<(), GgmlCpuGraphError> {
+        let x_shape = self.tensor_shape_4d(x)?;
+        let w_shape = self.tensor_shape_4d(w)?;
+        let r_shape = self.tensor_shape_4d(r)?;
+        let b_shape = self.tensor_shape_4d(b)?;
+
+        if x_shape[0] == 0 || x_shape[1] == 0 || x_shape[2] == 0 {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_lstm_seq x dimensions must be nonzero",
+            });
+        }
+        if x_shape[3] != 1 {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_lstm_seq x must be a 3d tensor",
+            });
+        }
+        if w_shape[2] != 1 || w_shape[3] != 1 {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_lstm_seq w must be a 2d tensor",
+            });
+        }
+        if r_shape[2] != 1 || r_shape[3] != 1 {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_lstm_seq r must be a 2d tensor",
+            });
+        }
+        if b_shape[1] != 1 || b_shape[2] != 1 || b_shape[3] != 1 {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_lstm_seq b must be a 1d tensor",
+            });
+        }
+        if x_shape[0] > i32::MAX as usize {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_lstm_seq x.ne0 exceeds ggml int boundary",
+            });
+        }
+        if w_shape[0] != x_shape[0] {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_lstm_seq w.ne0 must equal x.ne0",
+            });
+        }
+        if w_shape[1] % 4 != 0 {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_lstm_seq w.ne1 must be divisible by 4",
+            });
+        }
+
+        let hidden = w_shape[1] / 4;
+        if !(1..=GGML_LSTM_SEQ_MAX_HIDDEN).contains(&hidden) {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_lstm_seq hidden size must be in 1..=256",
+            });
+        }
+        let gate_width = hidden
+            .checked_mul(4)
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_lstm_seq gate width overflows usize",
+            })?;
+        let recurrent_bias_width =
+            gate_width
+                .checked_mul(2)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "ggml_lstm_seq recurrent bias width overflows usize",
+                })?;
+        let workspace_width =
+            hidden
+                .checked_mul(5)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "ggml_lstm_seq workspace width overflows usize",
+                })?;
+
+        if r_shape != [hidden, gate_width, 1, 1] {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_lstm_seq r must have shape [hidden, 4 * hidden]",
+            });
+        }
+        if b_shape[0] != gate_width && b_shape[0] != recurrent_bias_width {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_lstm_seq b must have shape [4 * hidden] or [8 * hidden]",
+            });
+        }
+        for dimensions in [
+            [x_shape[0], x_shape[1], x_shape[2]],
+            [hidden, x_shape[1], x_shape[2]],
+            [workspace_width, x_shape[2], 1],
+        ] {
+            ensure_lstm_f32_extent(dimensions)?;
+        }
+        Ok(())
+    }
+
     fn ensure_flash_attn_ext_compatible(
         &self,
         q: GgmlCpuTensor<'a>,
@@ -6874,6 +7569,24 @@ fn checked_dim_to_i64(value: usize) -> Result<i64, GgmlCpuGraphError> {
     i64::try_from(value).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
         reason: "tensor length exceeds ggml int64 shape boundary",
     })
+}
+
+fn ensure_lstm_f32_extent(dimensions: [usize; 3]) -> Result<(), GgmlCpuGraphError> {
+    let elements = dimensions
+        .into_iter()
+        .try_fold(1usize, |product, dimension| {
+            product
+                .checked_mul(dimension)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "ggml_lstm_seq tensor extent exceeds ggml allocation boundary",
+                })
+        })?;
+    if elements > i64::MAX as usize || elements.checked_mul(F32_WIDTH_BYTES).is_none() {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "ggml_lstm_seq tensor extent exceeds ggml allocation boundary",
+        });
+    }
+    Ok(())
 }
 
 struct GgmlContextGuard {
@@ -7899,6 +8612,30 @@ fn quote_scheduler_groups(
         .collect()
 }
 
+/// Provider-local route identity read from the initialized backend's own ggml
+/// device handle. `props.name` is the same provider-local stable-id namespace
+/// used by execution-route inventory (`CUDA0`, `Vulkan0`, ...); `device_id`
+/// is reserved there for physical addressability and must not replace it.
+fn backend_provider_and_stable_id(
+    backend: NonNull<c_void>,
+) -> Result<(ExecutionProvider, String), GgmlCpuGraphError> {
+    ensure_backend_device_present(backend)?;
+    let device = NonNull::new(unsafe { ffi::ggml_backend_get_device(backend.as_ptr()) })
+        .expect("device presence was checked immediately above");
+    let mut props = ffi::GgmlBackendDevProps {
+        name: ptr::null(),
+        description: ptr::null(),
+        memory_free: 0,
+        memory_total: 0,
+        type_: 0,
+        device_id: ptr::null(),
+        caps: ffi::GgmlBackendDevCaps::default(),
+    };
+    unsafe { ffi::ggml_backend_dev_get_props(device.as_ptr(), &mut props) };
+    let name = cstr_lossy(props.name);
+    Ok((ExecutionProvider::from_backend_name(&name), name))
+}
+
 /// Stable backend identity retained in native quote evidence and diagnostics.
 /// Device-local admission itself never falls back to this provider-local key:
 /// its native domain must expose a canonical physical token or fail closed, so
@@ -8897,12 +9634,14 @@ mod tests {
     use super::{
         AutoGpuPolicy, GPU_PROBE_NEGATIVE_TTL, GgmlBackendCapabilities, GgmlContextGuard,
         GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphCpuAcceleratorPolicy,
-        GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlRopeExtParams,
-        GpuProbeCache, GpuProbeOutcome, GpuProbeState, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS,
-        backend_satisfies_execution_placement, flash_attn_ext_head_dim_supported_on_backend,
-        gpu_probe_failed_log_message, gpu_probe_log_message, memory_admission_failure,
-        runtime_gpu_is_available, scheduler_allows_cpu_participants,
-        validate_graph_cancel_capability,
+        GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlCpuTensor,
+        GgmlLstmGateOrder, GgmlMatmulPrecision, GgmlPersistentGraphSession, GgmlRopeExtParams,
+        GgmlStaticTensor, GpuProbeCache, GpuProbeOutcome, GpuProbeState,
+        METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS, backend_satisfies_execution_placement,
+        flash_attn_ext_head_dim_supported_on_backend, gpu_probe_failed_log_message,
+        gpu_probe_log_message, memory_admission_failure,
+        mul_mat_requires_f32_precision_to_preserve_rhs_range, runtime_gpu_is_available,
+        scheduler_allows_cpu_participants, validate_graph_cancel_capability,
     };
 
     #[test]
@@ -8980,23 +9719,32 @@ mod tests {
             let capabilities =
                 GgmlBackendCapabilities::from_backend_for_test(GgmlCpuGraphBackend::Gpu, name);
             assert!(capabilities.is_known_discrete_gpu());
+            assert!(capabilities.f16_lhs_f32_rhs_mul_mat_requires_f32_precision());
             assert_eq!(capabilities.multi_query_prefill_width_multiple(), 2);
         }
-        for name in ["CUDA0", "NVIDIA", "Vulkan0"] {
+        for name in ["CUDA0", "NVIDIA"] {
             let capabilities =
                 GgmlBackendCapabilities::from_backend_for_test(GgmlCpuGraphBackend::Gpu, name);
             assert!(capabilities.is_known_discrete_gpu());
+            assert!(capabilities.f16_lhs_f32_rhs_mul_mat_requires_f32_precision());
             assert_eq!(capabilities.multi_query_prefill_width_multiple(), 1);
         }
+        let vulkan =
+            GgmlBackendCapabilities::from_backend_for_test(GgmlCpuGraphBackend::Gpu, "Vulkan0");
+        assert!(vulkan.is_known_discrete_gpu());
+        assert!(!vulkan.f16_lhs_f32_rhs_mul_mat_requires_f32_precision());
+        assert_eq!(vulkan.multi_query_prefill_width_multiple(), 1);
         let unknown = GgmlBackendCapabilities::from_backend_for_test(
             GgmlCpuGraphBackend::Gpu,
             "future-provider",
         );
         assert!(!unknown.is_known_discrete_gpu());
+        assert!(unknown.f16_lhs_f32_rhs_mul_mat_requires_f32_precision());
         assert_eq!(unknown.multi_query_prefill_width_multiple(), 1);
         for backend in [GgmlCpuGraphBackend::Cpu, GgmlCpuGraphBackend::Metal] {
             let capabilities = GgmlBackendCapabilities::from_backend_for_test(backend, "HIP0");
             assert!(!capabilities.is_known_discrete_gpu());
+            assert!(!capabilities.f16_lhs_f32_rhs_mul_mat_requires_f32_precision());
             assert_eq!(capabilities.multi_query_prefill_width_multiple(), 1);
         }
     }
@@ -10336,6 +11084,72 @@ mod tests {
     }
 
     #[test]
+    fn resolved_family_runtime_native_gqa_capability_is_typed_and_fail_closed() {
+        use super::{
+            GgmlNativeGqaCapability, RequestBackendPreference, ResolvedFamilyRuntimeInput,
+            resolve_native_gqa_capability,
+        };
+        use crate::device::execution_route::{
+            DeviceAddressability, ExecutionProvider, ResolvedExecutionRoute, RouteDeviceKind,
+        };
+
+        let exact = |provider| {
+            RequestBackendPreference::Exact(ResolvedExecutionRoute {
+                provider,
+                stable_id: format!("{}0", provider.as_str()),
+                registry_ordinal: 0,
+                kind: RouteDeviceKind::Accelerated,
+                addressability: DeviceAddressability::NotExactlyAddressable {
+                    reason: "typed capability fixture",
+                },
+            })
+        };
+        for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
+            let resolved = ResolvedFamilyRuntimeInput::resolve(
+                Some(exact(provider)),
+                AutoGpuPolicy::AllBackends,
+            );
+            assert_eq!(resolved.backend(), GgmlCpuGraphBackend::Gpu);
+            assert_eq!(
+                resolved.native_gqa_capability(),
+                GgmlNativeGqaCapability::Validated
+            );
+        }
+        for provider in [
+            ExecutionProvider::Hip,
+            ExecutionProvider::Accelerator,
+            ExecutionProvider::Unknown,
+        ] {
+            let resolved = ResolvedFamilyRuntimeInput::resolve(
+                Some(exact(provider)),
+                AutoGpuPolicy::AllBackends,
+            );
+            assert_eq!(resolved.backend(), GgmlCpuGraphBackend::Gpu);
+            assert_eq!(
+                resolved.native_gqa_capability(),
+                GgmlNativeGqaCapability::Unsupported
+            );
+        }
+        assert_eq!(
+            resolve_native_gqa_capability(
+                Some(&RequestBackendPreference::Accelerated),
+                GgmlCpuGraphBackend::Gpu,
+            ),
+            GgmlNativeGqaCapability::Unsupported
+        );
+        assert_eq!(
+            resolve_native_gqa_capability(None, GgmlCpuGraphBackend::Gpu),
+            GgmlNativeGqaCapability::Unsupported
+        );
+        for backend in [GgmlCpuGraphBackend::Cpu, GgmlCpuGraphBackend::Metal] {
+            assert_eq!(
+                resolve_native_gqa_capability(None, backend),
+                GgmlNativeGqaCapability::Validated
+            );
+        }
+    }
+
+    #[test]
     fn resolve_family_runtime_backend_except_metal_gates_only_metal() {
         use super::{RequestBackendPreference, install_request_backend_override};
 
@@ -10418,6 +11232,53 @@ mod tests {
         assert_f32_close(&outputs[2], &values.map(f32::ln), 1.0e-6);
         assert_f32_close(&outputs[3], &values.map(f32::exp), 1.0e-5);
         assert_f32_close(&outputs[4], &values.map(softplus_reference), 1.0e-6);
+    }
+
+    #[test]
+    fn parameterized_swoosh_computes_expected_values_and_rejects_non_finite_parameters() {
+        const OFFSET: f32 = 1.0;
+        const SHIFT: f32 = -0.08;
+        const LINEAR_SCALE: f32 = 0.08;
+
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner should initialize");
+        let mut graph = runner.start_graph();
+        let input = graph
+            .new_tensor_1d_f32(7, "swoosh_input")
+            .expect("input allocation should succeed");
+        graph
+            .set_input(input)
+            .expect("input set_input should succeed");
+        let output = graph
+            .swoosh(input, OFFSET, SHIFT, LINEAR_SCALE)
+            .expect("swoosh should build");
+        graph
+            .set_output(output)
+            .expect("set_output should succeed before allocation");
+
+        let values = [-40.0_f32, -8.0, -1.0, 0.0, 1.0, 8.0, 40.0];
+        graph
+            .set_f32_slice(input, &values, "swoosh_input")
+            .expect("input upload should succeed");
+        let actual = graph
+            .compute_output_f32(output, values.len())
+            .expect("swoosh graph should compute");
+        let expected =
+            values.map(|value| softplus_reference(value - OFFSET) - LINEAR_SCALE * value - SHIFT);
+        assert_f32_close(&actual, &expected, 1.0e-6);
+
+        drop(graph);
+        let graph = runner.start_graph();
+        let invalid = graph
+            .new_tensor_1d_f32(1, "invalid_swoosh_input")
+            .expect("input allocation should succeed");
+        let invalid = graph.swoosh(invalid, f32::NAN, SHIFT, LINEAR_SCALE);
+        assert!(matches!(
+            invalid,
+            Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_swoosh parameters must be finite"
+            })
+        ));
     }
 
     #[test]
@@ -10924,12 +11785,24 @@ mod tests {
         // contiguous). mul_mat(W, x) with x=[1,1,1] -> [1+2+3, 4+5+6] = [6, 15].
         let w: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let data: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let tensors = vec![GgufWriteTensor {
-            name: "loaded.weight".to_string(),
-            dims: vec![3, 2],
-            tensor_type: GgufWriteTensorType::F32,
-            data,
-        }];
+        let tensors = vec![
+            GgufWriteTensor {
+                name: "loaded.weight".to_string(),
+                dims: vec![3, 2],
+                tensor_type: GgufWriteTensorType::F32,
+                data: data.clone(),
+            },
+            // Same bytes, but a family metadata contract may describe the
+            // logical matrix as [rows, columns]. The static external view
+            // must reinterpret that storage as ggml [columns, rows] without
+            // allocating or copying a second weight payload.
+            GgufWriteTensor {
+                name: "loaded.rows_by_columns".to_string(),
+                dims: vec![2, 3],
+                tensor_type: GgufWriteTensorType::F32,
+                data,
+            },
+        ];
         write_gguf_file_v0(&pack, &BTreeMap::new(), &tensors).expect("write tiny gguf");
 
         let runtime_source =
@@ -10946,6 +11819,48 @@ mod tests {
             loaded.shares_storage_with(&shared_loaded),
             "same pack and cached backend must share one live native binding"
         );
+        assert_eq!(
+            runner.loaded_weight_binding_identity(&loaded),
+            runner.loaded_weight_binding_identity(&shared_loaded),
+            "one owner/backend must expose exactly one loaded-weight binding identity"
+        );
+        let mut external_view_arena = runner
+            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(2))
+            .expect("external view arena should initialize");
+        let reoriented = external_view_arena
+            .reshape_loaded_tensor_2d(
+                loaded
+                    .tensor("loaded.rows_by_columns")
+                    .expect("reoriented loaded tensor present"),
+                3,
+                2,
+                "loaded_rows_by_columns_view",
+            )
+            .expect("loaded tensor should reshape without a payload copy");
+        let arena_sentinel = external_view_arena
+            .new_tensor_1d_f32(1, "external_view_arena_sentinel")
+            .expect("arena sentinel should allocate");
+        external_view_arena
+            .set_f32_slice(arena_sentinel, &[0.0], "external_view_arena_sentinel")
+            .expect("arena allocation should initialize the external view");
+        {
+            let mut graph = runner.start_graph();
+            let input = graph
+                .new_tensor_2d_f32(3, 1, "reoriented_input")
+                .expect("reoriented input tensor");
+            let out = graph
+                .mul_mat(external_view_arena.graph_tensor(reoriented), input)
+                .expect("mul_mat reoriented loaded leaf");
+            graph
+                .set_f32_slice(input, &[1.0, 1.0, 1.0], "reoriented_input")
+                .expect("upload reoriented input");
+            assert_eq!(
+                graph
+                    .compute_output_f32(out, 2)
+                    .expect("compute reoriented loaded leaf"),
+                vec![6.0, 15.0]
+            );
+        }
         let weight = loaded
             .tensor("loaded.weight")
             .expect("loaded tensor present")
@@ -11243,6 +12158,141 @@ mod tests {
                 .committed_bytes,
             0
         );
+    }
+
+    #[test]
+    fn weight_and_state_tensor_arenas_coexist_and_remain_readable() {
+        assert_eq!(
+            super::GgmlStaticTensorArenaUsage::Weights.backend_buffer_usage(),
+            ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS
+        );
+        assert_eq!(
+            super::GgmlStaticTensorArenaUsage::State.backend_buffer_usage(),
+            ffi::GGML_BACKEND_BUFFER_USAGE_COMPUTE
+        );
+
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner should initialize");
+        let mut weights = runner
+            .start_static_tensor_arena(1024 * 1024)
+            .expect("weight arena should initialize");
+        let weight = weights
+            .new_tensor_1d_f32(2, "resident_weight")
+            .expect("weight tensor should allocate");
+        weights
+            .set_f32_slice(weight, &[2.0, 3.0], "resident_weight")
+            .expect("weight tensor should upload");
+
+        let mut state = runner
+            .start_state_tensor_arena(1024 * 1024)
+            .expect("state arena should initialize");
+        let cache = state
+            .new_tensor_1d_f32(2, "resident_state")
+            .expect("state tensor should allocate");
+        state
+            .set_f32_slice(cache, &[5.0, 7.0], "resident_state")
+            .expect("state tensor should upload");
+
+        let mut graph = runner.start_graph();
+        let weight_output = graph
+            .new_tensor_1d_f32(2, "weight_output")
+            .expect("weight output should allocate");
+        let state_output = graph
+            .new_tensor_1d_f32(2, "state_output")
+            .expect("state output should allocate");
+        let weight_read = graph
+            .cpy(weights.graph_tensor(weight), weight_output)
+            .expect("weight read should build");
+        let state_read = graph
+            .cpy(state.graph_tensor(cache), state_output)
+            .expect("state read should build");
+        graph
+            .set_output(weight_read)
+            .expect("weight read should be an output");
+        graph
+            .set_output(state_read)
+            .expect("state read should be an output");
+
+        let outputs = graph
+            .compute_outputs_f32(&[(weight_read, 2), (state_read, 2)])
+            .expect("both persistent arenas should be readable");
+        assert_eq!(outputs, vec![vec![2.0, 3.0], vec![5.0, 7.0]]);
+    }
+
+    #[test]
+    fn persistent_sessions_ping_pong_external_state_and_reset_cleanly() {
+        let config = GgmlCpuGraphConfig::conservative_default();
+        let mut runner = GgmlCpuGraphRunner::new(config).expect("CPU graph runner");
+        let mut state = runner
+            .start_state_tensor_arena(1024 * 1024)
+            .expect("state arena");
+        let bank0 = state
+            .new_tensor_1d_f32(1, "ping_pong_bank0")
+            .expect("bank0");
+        let bank1 = state
+            .new_tensor_1d_f32(1, "ping_pong_bank1")
+            .expect("bank1");
+        state
+            .set_f32_slice(bank0, &[0.0], "ping_pong_bank0")
+            .expect("initialize bank0");
+        state
+            .set_f32_slice(bank1, &[0.0], "ping_pong_bank1")
+            .expect("initialize bank1");
+
+        let build_session = |runner: &mut GgmlCpuGraphRunner,
+                             source: GgmlStaticTensor,
+                             destination: GgmlStaticTensor,
+                             input_name: &'static str| {
+            let mut session = runner
+                .start_persistent_graph_session(config.context_bytes)
+                .expect("persistent session");
+            let graph = session.builder();
+            let input = graph.new_tensor_1d_f32(1, input_name).expect("step input");
+            graph.set_input(input).expect("step input marker");
+            let output = graph
+                .add(state.graph_tensor(source), input)
+                .expect("state increment");
+            let write = graph
+                .cpy(output, state.graph_tensor(destination))
+                .expect("state copy");
+            graph
+                .add_side_effect_root(write)
+                .expect("state side-effect root");
+            graph
+                .prepare_outputs_for_upload(&[output])
+                .expect("prepare persistent graph");
+            (session, input, output)
+        };
+        let (mut zero_to_one, input0, output0) =
+            build_session(&mut runner, bank0, bank1, "ping_pong_input0");
+        let (mut one_to_zero, input1, output1) =
+            build_session(&mut runner, bank1, bank0, "ping_pong_input1");
+
+        let step = |session: &mut GgmlPersistentGraphSession,
+                    input: GgmlCpuTensor<'static>,
+                    output: GgmlCpuTensor<'static>| {
+            let graph = session.builder();
+            graph
+                .set_f32_slice(input, &[1.0], "ping_pong_increment")
+                .expect("upload increment");
+            graph
+                .compute_output_f32(output, 1)
+                .expect("compute ping-pong step")[0]
+        };
+
+        assert_eq!(step(&mut zero_to_one, input0, output0), 1.0);
+        assert_eq!(step(&mut one_to_zero, input1, output1), 2.0);
+        assert_eq!(step(&mut zero_to_one, input0, output0), 3.0);
+        assert_eq!(step(&mut one_to_zero, input1, output1), 4.0);
+
+        // A new logical generation only needs to clear its source bank. The
+        // first A->B graph overwrites the destination in full before it can
+        // become authoritative.
+        state
+            .set_f32_slice(bank0, &[0.0], "ping_pong_bank0")
+            .expect("reset source bank");
+        assert_eq!(step(&mut zero_to_one, input0, output0), 1.0);
+        assert_eq!(step(&mut one_to_zero, input1, output1), 2.0);
     }
 
     fn assert_transient_scheduler_release_drops_owner_and_rebuilds_runner(
@@ -11766,6 +12816,67 @@ mod tests {
             .compute_output_f32(output_f32, 2)
             .expect("graph should compute with f16 rhs input");
         assert_eq!(output, vec![2.0, 3.0]);
+    }
+
+    #[test]
+    fn f32_rhs_range_precision_policy_is_cuda_like_f16_gpu_only() {
+        let cuda =
+            GgmlBackendCapabilities::from_backend_for_test(GgmlCpuGraphBackend::Gpu, "CUDA0");
+        assert!(mul_mat_requires_f32_precision_to_preserve_rhs_range(
+            cuda,
+            ffi::GGML_TYPE_F16,
+            ffi::GGML_TYPE_F32,
+        ));
+        let vulkan =
+            GgmlBackendCapabilities::from_backend_for_test(GgmlCpuGraphBackend::Gpu, "Vulkan0");
+        let cpu = GgmlBackendCapabilities::from_backend_for_test(GgmlCpuGraphBackend::Cpu, "CPU");
+        let metal =
+            GgmlBackendCapabilities::from_backend_for_test(GgmlCpuGraphBackend::Metal, "Metal");
+        for (capabilities, lhs, rhs) in [
+            (vulkan, ffi::GGML_TYPE_F16, ffi::GGML_TYPE_F32),
+            (cpu, ffi::GGML_TYPE_F16, ffi::GGML_TYPE_F32),
+            (metal, ffi::GGML_TYPE_F16, ffi::GGML_TYPE_F32),
+            (cuda, ffi::GGML_TYPE_F32, ffi::GGML_TYPE_F32),
+            (cuda, ffi::GGML_TYPE_F16, ffi::GGML_TYPE_F16),
+        ] {
+            assert!(!mul_mat_requires_f32_precision_to_preserve_rhs_range(
+                capabilities,
+                lhs,
+                rhs,
+            ));
+        }
+    }
+
+    #[test]
+    fn explicit_mul_mat_precision_reaches_native_op_params() {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let arena = runner
+            .start_static_tensor_arena(GgmlCpuGraphConfig::default().context_bytes)
+            .expect("static tensor arena should initialize");
+        let weight = arena
+            .new_tensor_2d_f16(2, 2, "static_weight")
+            .expect("static f16 tensor should allocate");
+        let graph = runner.start_graph();
+        let input = graph
+            .new_tensor_2d_f32(2, 1, "input")
+            .expect("input should allocate");
+        let precise = graph
+            .mul_mat_with_precision(arena.graph_tensor(weight), input, GgmlMatmulPrecision::F32)
+            .expect("precision-tagged matmul should build");
+        let default = graph
+            .mul_mat_with_precision(
+                arena.graph_tensor(weight),
+                input,
+                GgmlMatmulPrecision::Default,
+            )
+            .expect("default-precision matmul should build");
+        let precise_layout =
+            unsafe { *(precise.raw.as_ptr() as *const ffi::GgmlTensorAllocPrefix) };
+        let default_layout =
+            unsafe { *(default.raw.as_ptr() as *const ffi::GgmlTensorAllocPrefix) };
+        assert_eq!(precise_layout.op_params[0], ffi::GGML_PREC_F32);
+        assert_eq!(default_layout.op_params[0], ffi::GGML_PREC_DEFAULT);
     }
 
     #[test]
@@ -13027,6 +14138,43 @@ mod tests {
     }
 
     #[test]
+    fn native_rowwise_first_max_argmax_preserves_tie_order() {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let mut graph = runner.start_graph();
+        let logits = graph
+            .new_tensor_2d_f32(4, 3, "native_rowwise_logits")
+            .expect("logits allocation should succeed");
+        graph
+            .set_input(logits)
+            .expect("logits set_input should succeed");
+        let top1 = graph
+            .top1_argmax_first_max(logits)
+            .expect("native rowwise first-max argmax should build");
+        graph
+            .set_output(top1)
+            .expect("set_output should succeed before allocation");
+        graph
+            .set_f32_slice(
+                logits,
+                &[
+                    1.0, 5.0, 5.0, 2.0, // first maximum is index 1
+                    9.0, 3.0, 2.0, 1.0, // maximum is index 0
+                    7.0, 7.0, 7.0, 7.0, // first maximum is index 0
+                ],
+                "native_rowwise_logits",
+            )
+            .expect("logits upload should succeed");
+
+        assert_eq!(
+            graph
+                .compute_output_i32(top1, 3)
+                .expect("native rowwise argmax should compute"),
+            vec![1, 0, 0]
+        );
+    }
+
+    #[test]
     fn decoder_attention_like_smoke_with_embedding_and_top1() {
         let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
             .expect("cpu graph runner should initialize");
@@ -13185,6 +14333,261 @@ mod tests {
                 }
             ),
         }
+    }
+
+    #[test]
+    fn ssm_conv_builds_20_tap_graph_with_expected_shape() {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let graph = runner.start_graph();
+        let state_and_input = graph
+            .new_tensor_3d_f32(27, 3, 2, "ssm_state_and_input")
+            .expect("state and input allocation should succeed");
+        let kernel = graph
+            .new_tensor_2d_f32(20, 3, "ssm_kernel")
+            .expect("kernel allocation should succeed");
+
+        let output = graph
+            .ssm_conv(state_and_input, kernel)
+            .expect("20-tap ssm convolution should build");
+        assert_eq!(
+            graph.tensor_shape_4d(output).expect("output shape"),
+            [3, 8, 2, 1]
+        );
+    }
+
+    #[test]
+    fn ssm_conv_rejects_invalid_type_and_shape_before_native_assertions() {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let graph = runner.start_graph();
+        let f16_state_and_input = graph
+            .new_tensor_3d_f16(27, 3, 2, "ssm_f16_state_and_input")
+            .expect("f16 state and input allocation should succeed");
+        let kernel = graph
+            .new_tensor_2d_f32(20, 3, "ssm_kernel")
+            .expect("kernel allocation should succeed");
+        assert_eq!(
+            graph
+                .ssm_conv(f16_state_and_input, kernel)
+                .expect_err("non-f32 state and input must fail closed"),
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_ssm_conv state_and_input must be f32",
+            }
+        );
+
+        let short_state_and_input = graph
+            .new_tensor_3d_f32(18, 3, 2, "ssm_short_state_and_input")
+            .expect("short state and input allocation should succeed");
+        assert_eq!(
+            graph
+                .ssm_conv(short_state_and_input, kernel)
+                .expect_err("state shorter than kernel history must fail closed"),
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_ssm_conv state_and_input.ne0 is shorter than kernel history",
+            }
+        );
+    }
+
+    #[test]
+    fn lstm_seq_builds_real_seg3_layer_shapes_for_both_gate_orders_and_directions() {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let graph = runner.start_graph();
+        let x = graph
+            .new_tensor_3d_f32(60, 8, 1, "lstm_x")
+            .expect("input allocation should succeed");
+        let w = graph
+            .new_tensor_2d_f32(60, 512, "lstm_w")
+            .expect("input weights allocation should succeed");
+        let r = graph
+            .new_tensor_2d_f32(128, 512, "lstm_r")
+            .expect("recurrent weights allocation should succeed");
+        let input_bias = graph
+            .new_tensor_1d_f32(512, "lstm_input_bias")
+            .expect("input bias allocation should succeed");
+        let recurrent_bias = graph
+            .new_tensor_1d_f32(1024, "lstm_recurrent_bias")
+            .expect("recurrent bias allocation should succeed");
+
+        let forward = graph
+            .lstm_seq(x, w, r, input_bias, GgmlLstmGateOrder::Iofc, false)
+            .expect("IOFC forward LSTM graph should build");
+        let reverse = graph
+            .lstm_seq(x, w, r, recurrent_bias, GgmlLstmGateOrder::Ifgo, true)
+            .expect("IFGO reverse LSTM graph should build");
+        assert_eq!(
+            graph
+                .tensor_shape_4d(forward)
+                .expect("forward output shape"),
+            [128, 8, 1, 1]
+        );
+        assert_eq!(
+            graph
+                .tensor_shape_4d(reverse)
+                .expect("reverse output shape"),
+            [128, 8, 1, 1]
+        );
+
+        let upper_x = graph
+            .new_tensor_3d_f32(256, 8, 1, "lstm_upper_x")
+            .expect("upper-layer input allocation should succeed");
+        let upper_w = graph
+            .new_tensor_2d_f32(256, 512, "lstm_upper_w")
+            .expect("upper-layer input weights allocation should succeed");
+        let upper = graph
+            .lstm_seq(
+                upper_x,
+                upper_w,
+                r,
+                recurrent_bias,
+                GgmlLstmGateOrder::Iofc,
+                false,
+            )
+            .expect("upper Seg3 LSTM graph should build");
+        assert_eq!(
+            graph.tensor_shape_4d(upper).expect("upper output shape"),
+            [128, 8, 1, 1]
+        );
+    }
+
+    #[test]
+    fn lstm_seq_rust_ffi_executes_ifgo_reverse_with_recurrent_bias() {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let mut graph = runner.start_graph();
+        let x = graph
+            .new_tensor_3d_f32(1, 2, 1, "lstm_e2e_x")
+            .expect("input allocation should succeed");
+        let w = graph
+            .new_tensor_2d_f32(1, 4, "lstm_e2e_w")
+            .expect("input weights allocation should succeed");
+        let r = graph
+            .new_tensor_2d_f32(1, 4, "lstm_e2e_r")
+            .expect("recurrent weights allocation should succeed");
+        let b = graph
+            .new_tensor_1d_f32(8, "lstm_e2e_b")
+            .expect("recurrent bias allocation should succeed");
+        let output = graph
+            .lstm_seq(x, w, r, b, GgmlLstmGateOrder::Ifgo, true)
+            .expect("reverse IFGO graph should build");
+        graph.set_input(x).expect("mark x as input");
+        graph.set_input(w).expect("mark w as input");
+        graph.set_input(r).expect("mark r as input");
+        graph.set_input(b).expect("mark b as input");
+        graph.set_output(output).expect("mark output");
+
+        // IFGO weights: only the candidate gate reads x. Both halves of the
+        // 8H bias are non-zero so this also verifies Wb + Rb semantics.
+        graph
+            .set_f32_slice(x, &[1.0, 2.0], "lstm_e2e_x")
+            .expect("upload input");
+        graph
+            .set_f32_slice(w, &[0.0, 0.0, 1.0, 0.0], "lstm_e2e_w")
+            .expect("upload input weights");
+        graph
+            .set_f32_slice(r, &[0.0; 4], "lstm_e2e_r")
+            .expect("upload recurrent weights");
+        graph
+            .set_f32_slice(
+                b,
+                &[0.1, -0.1, 0.2, -0.2, 0.1, -0.2, 0.2, 0.3],
+                "lstm_e2e_b",
+            )
+            .expect("upload recurrent bias");
+        let actual = graph
+            .compute_output_f32(output, 2)
+            .expect("execute LSTM through the Rust FFI seam");
+
+        let sigmoid = |value: f32| 1.0 / (1.0 + (-value).exp());
+        let input_gate = sigmoid(0.2);
+        let forget_gate = sigmoid(-0.3);
+        let output_gate = sigmoid(0.1);
+        // Reverse traversal visits x[1] first, but result rows retain their
+        // original time indices.
+        let cell_t1 = input_gate * 2.4_f32.tanh();
+        let expected_t1 = output_gate * cell_t1.tanh();
+        let cell_t0 = forget_gate * cell_t1 + input_gate * 1.4_f32.tanh();
+        let expected_t0 = output_gate * cell_t0.tanh();
+        let expected = [expected_t0, expected_t1];
+        for (index, (observed, reference)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (observed - reference).abs() <= 1.0e-6,
+                "LSTM FFI output {index} drifted: observed={observed} reference={reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn lstm_seq_rejects_invalid_type_shape_bias_and_hidden_before_native_assertions() {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let graph = runner.start_graph();
+        let f16_x = graph
+            .new_tensor_3d_f16(240, 8, 2, "lstm_f16_x")
+            .expect("f16 input allocation should succeed");
+        let x = graph
+            .new_tensor_3d_f32(240, 8, 2, "lstm_x")
+            .expect("input allocation should succeed");
+        let w = graph
+            .new_tensor_2d_f32(240, 512, "lstm_w")
+            .expect("input weights allocation should succeed");
+        let bad_w = graph
+            .new_tensor_2d_f32(239, 512, "lstm_bad_w")
+            .expect("invalid input weights allocation should succeed");
+        let r = graph
+            .new_tensor_2d_f32(128, 512, "lstm_r")
+            .expect("recurrent weights allocation should succeed");
+        let b = graph
+            .new_tensor_1d_f32(512, "lstm_b")
+            .expect("bias allocation should succeed");
+
+        assert_eq!(
+            graph
+                .lstm_seq(f16_x, w, r, b, GgmlLstmGateOrder::Iofc, false)
+                .expect_err("non-f32 input must fail closed"),
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_lstm_seq x must be f32",
+            }
+        );
+        assert_eq!(
+            graph
+                .lstm_seq(x, bad_w, r, b, GgmlLstmGateOrder::Iofc, false)
+                .expect_err("input/weight shape mismatch must fail closed"),
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_lstm_seq w.ne0 must equal x.ne0",
+            }
+        );
+
+        let bad_bias = graph
+            .new_tensor_1d_f32(513, "lstm_bad_bias")
+            .expect("invalid bias allocation should succeed");
+        assert_eq!(
+            graph
+                .lstm_seq(x, w, r, bad_bias, GgmlLstmGateOrder::Iofc, false)
+                .expect_err("invalid bias shape must fail closed"),
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_lstm_seq b must have shape [4 * hidden] or [8 * hidden]",
+            }
+        );
+
+        let large_w = graph
+            .new_tensor_2d_f32(240, 1028, "lstm_large_w")
+            .expect("large input weights allocation should succeed");
+        let large_r = graph
+            .new_tensor_2d_f32(257, 1028, "lstm_large_r")
+            .expect("large recurrent weights allocation should succeed");
+        let large_b = graph
+            .new_tensor_1d_f32(1028, "lstm_large_b")
+            .expect("large bias allocation should succeed");
+        assert_eq!(
+            graph
+                .lstm_seq(x, large_w, large_r, large_b, GgmlLstmGateOrder::Iofc, false,)
+                .expect_err("hidden sizes greater than 256 must fail closed"),
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_lstm_seq hidden size must be in 1..=256",
+            }
+        );
     }
 
     #[test]

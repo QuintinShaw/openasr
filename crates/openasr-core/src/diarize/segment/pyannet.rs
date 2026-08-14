@@ -157,10 +157,19 @@ impl PyannetModel {
     /// Run the network on `samples` (16 kHz mono) and return the per-frame
     /// log-probabilities (`[frames, 7]` row-major) plus the frame count.
     pub(crate) fn forward(&self, samples: &[f32]) -> Result<(Vec<f32>, usize), WeightsError> {
-        let (h, frames) = self.sincnet(samples)?;
-        // transpose [60, frames] -> [frames, 60] for the recurrent stack.
-        let feat = transpose(&h, 60, frames);
+        let (feat, frames) = self.frontend_features(samples)?;
         Ok((self.recurrent_classifier(&feat, frames)?, frames))
+    }
+
+    /// SincNet features in the row-major `[frames, 60]` layout consumed by
+    /// the recurrent graph. CUDA and Vulkan use this verified host frontend
+    /// while Metal retains its full-device frontend.
+    pub(super) fn frontend_features(
+        &self,
+        samples: &[f32],
+    ) -> Result<(Vec<f32>, usize), WeightsError> {
+        let (features, frames) = self.sincnet(samples)?;
+        Ok((transpose(&features, 60, frames), frames))
     }
 
     /// Recurrent stack plus classifier on row-major `[frames, 60]` features.

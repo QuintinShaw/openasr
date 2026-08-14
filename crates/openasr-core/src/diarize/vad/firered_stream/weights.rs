@@ -37,6 +37,18 @@ pub enum FireRedStreamVadWeightsError {
         got: usize,
         want: usize,
     },
+    #[error("firered Stream-VAD tensor '{name}' has shape {got:?}, expected {want:?}")]
+    Shape {
+        name: String,
+        got: Vec<usize>,
+        want: Vec<usize>,
+    },
+    #[error("firered Stream-VAD tensor '{name}' has {got} data bytes, expected {want}")]
+    ByteLen {
+        name: String,
+        got: usize,
+        want: usize,
+    },
     #[error("firered Stream-VAD tensor '{name}' data range {range:?} is out of bounds")]
     Bounds { name: String, range: [usize; 2] },
     #[error(
@@ -99,44 +111,66 @@ impl FireRedStreamVadWeights {
             .filter(|end| *end <= bytes.len())
             .ok_or(FireRedStreamVadWeightsError::Truncated {
                 len: bytes.len(),
-                need: 8 + header_len,
+                need: 8usize.saturating_add(header_len),
             })?;
         let header: BTreeMap<String, serde_json::Value> =
             serde_json::from_slice(&bytes[8..header_end])
                 .map_err(|error| FireRedStreamVadWeightsError::Header(error.to_string()))?;
         let data = &bytes[header_end..];
 
-        let load_named =
-            |name: String, want_len: usize| -> Result<Vec<f32>, FireRedStreamVadWeightsError> {
-                let value = header
-                    .get(&name)
-                    .ok_or_else(|| FireRedStreamVadWeightsError::MissingTensor(name.clone()))?;
-                let info: TensorInfo = TensorInfo::deserialize(value)
-                    .map_err(|error| FireRedStreamVadWeightsError::Header(error.to_string()))?;
-                if info.dtype != "F32" {
-                    return Err(FireRedStreamVadWeightsError::Dtype {
-                        name,
-                        dtype: info.dtype,
-                    });
-                }
-                let got_len: usize = info.shape.iter().product();
-                if got_len != want_len {
-                    return Err(FireRedStreamVadWeightsError::Len {
-                        name,
-                        got: got_len,
-                        want: want_len,
-                    });
-                }
-                let [start, end] = info.data_offsets;
-                if end < start || end > data.len() {
-                    return Err(FireRedStreamVadWeightsError::Bounds {
-                        name,
-                        range: [start, end],
-                    });
-                }
-                Ok(read_f32_le(&data[start..end]))
-            };
-        let load = |name: &str, want_len: usize| load_named(name.to_string(), want_len);
+        let load_named = |name: String,
+                          want_shape: &[usize]|
+         -> Result<Vec<f32>, FireRedStreamVadWeightsError> {
+            let value = header
+                .get(&name)
+                .ok_or_else(|| FireRedStreamVadWeightsError::MissingTensor(name.clone()))?;
+            let info: TensorInfo = TensorInfo::deserialize(value)
+                .map_err(|error| FireRedStreamVadWeightsError::Header(error.to_string()))?;
+            if info.dtype != "F32" {
+                return Err(FireRedStreamVadWeightsError::Dtype {
+                    name,
+                    dtype: info.dtype,
+                });
+            }
+            if info.shape != want_shape {
+                return Err(FireRedStreamVadWeightsError::Shape {
+                    name,
+                    got: info.shape,
+                    want: want_shape.to_vec(),
+                });
+            }
+            let want_len = want_shape
+                .iter()
+                .try_fold(1usize, |product, dim| product.checked_mul(*dim))
+                .ok_or_else(|| FireRedStreamVadWeightsError::Len {
+                    name: name.clone(),
+                    got: usize::MAX,
+                    want: usize::MAX,
+                })?;
+            let [start, end] = info.data_offsets;
+            if end < start || end > data.len() {
+                return Err(FireRedStreamVadWeightsError::Bounds {
+                    name,
+                    range: [start, end],
+                });
+            }
+            let want_bytes = want_len
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| FireRedStreamVadWeightsError::ByteLen {
+                    name: name.clone(),
+                    got: end - start,
+                    want: usize::MAX,
+                })?;
+            if end - start != want_bytes {
+                return Err(FireRedStreamVadWeightsError::ByteLen {
+                    name,
+                    got: end - start,
+                    want: want_bytes,
+                });
+            }
+            Ok(read_f32_le(&data[start..end]))
+        };
+        let load = |name: &str, want_shape: &[usize]| load_named(name.to_string(), want_shape);
 
         // Hyperparameter guard: N2 = 0 is the load-bearing invariant that
         // makes the hand-written forward pass causal-only.
@@ -152,11 +186,25 @@ impl FireRedStreamVadWeights {
                     dtype: info.dtype,
                 });
             }
+            if info.shape != [10] {
+                return Err(FireRedStreamVadWeightsError::Shape {
+                    name: "hparams".to_string(),
+                    got: info.shape,
+                    want: vec![10],
+                });
+            }
             let [start, end] = info.data_offsets;
             if end < start || end > data.len() {
                 return Err(FireRedStreamVadWeightsError::Bounds {
                     name: "hparams".to_string(),
                     range: [start, end],
+                });
+            }
+            if end - start != 10 * std::mem::size_of::<i32>() {
+                return Err(FireRedStreamVadWeightsError::ByteLen {
+                    name: "hparams".to_string(),
+                    got: end - start,
+                    want: 10 * std::mem::size_of::<i32>(),
                 });
             }
             let got: Vec<i32> = data[start..end]
@@ -183,31 +231,31 @@ impl FireRedStreamVadWeights {
         let mut blocks = Vec::with_capacity(NUM_BLOCKS);
         for i in 0..NUM_BLOCKS {
             blocks.push(BlockWeights {
-                fc1_w: load(&format!("dfsmn.block{i}.fc1.weight"), HIDDEN * PROJ)?,
-                fc1_b: load(&format!("dfsmn.block{i}.fc1.bias"), HIDDEN)?,
-                fc2_w: load(&format!("dfsmn.block{i}.fc2.weight"), PROJ * HIDDEN)?,
-                lookback: load(&format!("dfsmn.block{i}.lookback"), PROJ * LOOKBACK_ORDER)?,
+                fc1_w: load(&format!("dfsmn.block{i}.fc1.weight"), &[HIDDEN, PROJ])?,
+                fc1_b: load(&format!("dfsmn.block{i}.fc1.bias"), &[HIDDEN])?,
+                fc2_w: load(&format!("dfsmn.block{i}.fc2.weight"), &[PROJ, HIDDEN])?,
+                lookback: load(&format!("dfsmn.block{i}.lookback"), &[PROJ, LOOKBACK_ORDER])?,
             });
         }
 
-        let out_w = load("out.weight", HIDDEN)?;
-        let out_b = load("out.bias", 1)?[0];
-        let cmvn_mean_vec = load("frontend.cmvn.mean", NUM_MEL_BINS)?;
-        let cmvn_istd_vec = load("frontend.cmvn.inv_stddev", NUM_MEL_BINS)?;
+        let out_w = load("out.weight", &[1, HIDDEN])?;
+        let out_b = load("out.bias", &[1])?[0];
+        let cmvn_mean_vec = load("frontend.cmvn.mean", &[NUM_MEL_BINS])?;
+        let cmvn_istd_vec = load("frontend.cmvn.inv_stddev", &[NUM_MEL_BINS])?;
         let mut cmvn_mean = [0.0f32; NUM_MEL_BINS];
         let mut cmvn_inv_stddev = [0.0f32; NUM_MEL_BINS];
         cmvn_mean.copy_from_slice(&cmvn_mean_vec);
         cmvn_inv_stddev.copy_from_slice(&cmvn_istd_vec);
 
         Ok(Self {
-            fc1_w: load("dfsmn.fc1.weight", HIDDEN * NUM_MEL_BINS)?,
-            fc1_b: load("dfsmn.fc1.bias", HIDDEN)?,
-            fc2_w: load("dfsmn.fc2.weight", PROJ * HIDDEN)?,
-            fc2_b: load("dfsmn.fc2.bias", PROJ)?,
-            fsmn1_lookback: load("dfsmn.fsmn1.lookback", PROJ * LOOKBACK_ORDER)?,
+            fc1_w: load("dfsmn.fc1.weight", &[HIDDEN, NUM_MEL_BINS])?,
+            fc1_b: load("dfsmn.fc1.bias", &[HIDDEN])?,
+            fc2_w: load("dfsmn.fc2.weight", &[PROJ, HIDDEN])?,
+            fc2_b: load("dfsmn.fc2.bias", &[PROJ])?,
+            fsmn1_lookback: load("dfsmn.fsmn1.lookback", &[PROJ, LOOKBACK_ORDER])?,
             blocks,
-            dnn_w: load("dfsmn.dnn.weight", HIDDEN * PROJ)?,
-            dnn_b: load("dfsmn.dnn.bias", HIDDEN)?,
+            dnn_w: load("dfsmn.dnn.weight", &[HIDDEN, PROJ])?,
+            dnn_b: load("dfsmn.dnn.bias", &[HIDDEN])?,
             out_w,
             out_b,
             cmvn_mean,

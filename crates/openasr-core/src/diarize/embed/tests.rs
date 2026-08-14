@@ -5,6 +5,10 @@ use super::{
     RedimNetResidentRuntime, SpeakerEmbedder, SpeakerEmbeddingExecutionPlan,
     abort_successful_results_after_terminal_failure, embed_batch_worker_range,
 };
+use crate::device::{
+    execution_policy::{AcceleratedDeviceConstraint, ExecutionIntent},
+    execution_route::ExecutionProvider,
+};
 use crate::diarize::contract::SpeakerEmbedding;
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -12,6 +16,39 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
     dot / (na * nb)
+}
+
+fn auxiliary_bench_execution_intent() -> (ExecutionIntent, &'static str) {
+    match std::env::var("OPENASR_AUX_BENCH_PROVIDER")
+        .unwrap_or_else(|_| "auto".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "auto" => (ExecutionIntent::Auto, "auto"),
+        "cpu" => (ExecutionIntent::CpuOnly, "cpu"),
+        "metal" => (
+            ExecutionIntent::ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint::Provider(
+                ExecutionProvider::Metal,
+            )),
+            "metal",
+        ),
+        "cuda" => (
+            ExecutionIntent::ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint::Provider(
+                ExecutionProvider::Cuda,
+            )),
+            "cuda",
+        ),
+        "vulkan" => (
+            ExecutionIntent::ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint::Provider(
+                ExecutionProvider::Vulkan,
+            )),
+            "vulkan",
+        ),
+        value => panic!(
+            "OPENASR_AUX_BENCH_PROVIDER must be auto, cpu, metal, cuda, or vulkan; got {value:?}"
+        ),
+    }
 }
 
 fn redimnet_bench_backend() -> crate::ggml_runtime::GgmlCpuGraphBackend {
@@ -89,8 +126,10 @@ fn embedder_rtf_bench_when_pack_present() {
     let services = std::sync::Arc::new(
         crate::NativeExecutionServices::for_local_process().expect("execution services"),
     );
+    let (execution_intent, requested_provider) = auxiliary_bench_execution_intent();
     let Some(runtime) =
-        super::PolicyResolvedSpeakerRuntime::load(services).expect("load policy-owned embedder")
+        super::PolicyResolvedSpeakerRuntime::load_with_intent(services, execution_intent)
+            .expect("load policy-owned embedder")
     else {
         eprintln!("skipping: redimnet2-b6 pack absent");
         return;
@@ -119,9 +158,9 @@ fn embedder_rtf_bench_when_pack_present() {
         .collect();
     let embedding_sha256 = crate::testing::benchmark_sha256_f32(&last_embedding.0);
     let (median_seconds, runs) = crate::testing::benchmark_median_seconds(runs);
-    let rtf_cpu = median_seconds / audio_seconds;
+    let rtf = median_seconds / audio_seconds;
     println!(
-        "AUX_MODEL_BENCH model=redimnet2 backend=cpu audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={rtf_cpu:.6} embedding_sha256={embedding_sha256} runs={runs:?}"
+        "AUX_MODEL_BENCH model=redimnet2 requested_provider={requested_provider} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={rtf:.6} embedding_sha256={embedding_sha256} runs={runs:?}"
     );
 
     let crop_len = samples.len() / 4;
@@ -164,6 +203,70 @@ fn embedder_rtf_bench_when_pack_present() {
         batch_runs[1],
         batch_runs[3],
         sequential / batch
+    );
+}
+
+#[ignore = "host-local parity: needs OPENASR_REDIMNET_PACK, OPENASR_AUX_BENCH_PROVIDER, and the requested device"]
+#[test]
+fn redimnet_policy_cpu_accelerated_parity_when_pack_present() {
+    let services = std::sync::Arc::new(
+        crate::NativeExecutionServices::for_local_process().expect("execution services"),
+    );
+    let (execution_intent, requested_provider) = auxiliary_bench_execution_intent();
+    assert!(
+        matches!(requested_provider, "cuda" | "vulkan"),
+        "accelerated parity requires OPENASR_AUX_BENCH_PROVIDER=cuda or vulkan"
+    );
+    let cpu = super::PolicyResolvedSpeakerRuntime::load_with_intent(
+        std::sync::Arc::clone(&services),
+        ExecutionIntent::CpuOnly,
+    )
+    .expect("load CPU policy-owned embedder")
+    .expect("redimnet2-b6 pack is present");
+    let accelerated =
+        super::PolicyResolvedSpeakerRuntime::load_with_intent(services, execution_intent)
+            .expect("load accelerated policy-owned embedder")
+            .expect("redimnet2-b6 pack is present");
+    let wav = std::env::var_os("OPENASR_AUX_BENCH_AUDIO")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav")
+        });
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+        wav,
+        "redimnet CPU/accelerated parity",
+        "redimnet CPU/accelerated parity",
+    )
+    .expect("parity wav loads");
+    let cpu_embedding = cpu
+        .embedder()
+        .embed(&samples, 16_000)
+        .expect("CPU embedding");
+    let accelerated_embedding = accelerated
+        .embedder()
+        .embed(&samples, 16_000)
+        .expect("accelerated embedding");
+    assert_eq!(cpu_embedding.dim(), 192, "CPU embedding dimension");
+    assert_eq!(
+        accelerated_embedding.dim(),
+        192,
+        "accelerated embedding dimension"
+    );
+    let cosine = cosine(&cpu_embedding.0, &accelerated_embedding.0);
+    let max_abs = cpu_embedding
+        .0
+        .iter()
+        .zip(&accelerated_embedding.0)
+        .map(|(cpu, accelerated)| (cpu - accelerated).abs())
+        .fold(0.0f32, f32::max);
+    let cpu_sha256 = crate::testing::benchmark_sha256_f32(&cpu_embedding.0);
+    let accelerated_sha256 = crate::testing::benchmark_sha256_f32(&accelerated_embedding.0);
+    eprintln!(
+        "REDIMNET_CPU_ACCELERATED_PARITY provider={requested_provider} cosine={cosine:.8} max_abs={max_abs:.9} dim=192 cpu_sha256={cpu_sha256} accelerated_sha256={accelerated_sha256}"
+    );
+    assert!(
+        cosine >= 0.9999,
+        "ReDimNet CPU/{requested_provider} cosine {cosine}"
     );
 }
 
@@ -621,6 +724,54 @@ fn redimnet_backend_benchmark() {
         memory.current_phys_footprint_bytes,
         memory.peak_phys_footprint_bytes,
         clips.len(),
+    );
+}
+
+#[test]
+#[ignore = "host-local: needs OPENASR_REDIMNET_PACK, private audio, official embedding, and OPENASR_AUX_BENCH_PROVIDER"]
+fn redimnet_policy_matches_official_reference_on_aux_audio() {
+    let audio = crate::testing::external_test_fixture_path(
+        "OPENASR_AUX_BENCH_AUDIO",
+        "private auxiliary-model parity audio",
+    )
+    .expect("OPENASR_AUX_BENCH_AUDIO");
+    let reference = crate::testing::external_test_fixture_path(
+        "OPENASR_REDIMNET_REFERENCE_NPY",
+        "official ReDimNet2 embedding",
+    )
+    .expect("OPENASR_REDIMNET_REFERENCE_NPY");
+    let (execution_intent, requested_provider) = auxiliary_bench_execution_intent();
+    assert_ne!(
+        requested_provider, "auto",
+        "official placement evidence requires an explicit provider"
+    );
+    let services = std::sync::Arc::new(
+        crate::NativeExecutionServices::for_local_process().expect("execution services"),
+    );
+    let runtime = super::PolicyResolvedSpeakerRuntime::load_with_intent(services, execution_intent)
+        .expect("load policy-owned ReDimNet runtime")
+        .expect("redimnet2-b6 pack is present");
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+        &audio,
+        "redimnet policy official parity",
+        "redimnet policy official parity",
+    )
+    .expect("load parity audio");
+    let actual = runtime
+        .embedder()
+        .embed(&samples, 16_000)
+        .expect("run policy-owned ReDimNet embedding");
+    let expected = read_redimnet_golden_embedding(&reference);
+    assert_eq!(actual.dim(), expected.len(), "embedding dimension");
+    let cosine = cosine(&actual.0, &expected);
+    let actual_sha256 = crate::testing::benchmark_sha256_f32(&actual.0);
+    eprintln!(
+        "REDIMNET_POLICY_OFFICIAL_PARITY requested_provider={requested_provider} cosine={cosine:.8} dim={} actual_sha256={actual_sha256}",
+        actual.dim()
+    );
+    assert!(
+        cosine >= 0.9999,
+        "ReDimNet {requested_provider} official cosine {cosine}"
     );
 }
 

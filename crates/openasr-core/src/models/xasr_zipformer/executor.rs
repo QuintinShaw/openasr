@@ -149,7 +149,7 @@ impl Default for XasrZipformerGgmlExecutor {
 impl XasrZipformerGgmlExecutor {
     pub(crate) fn evict_prepared_runtime_content_id(&self, pack_content_id: &str) {
         self.runtime_pool
-            .evict_where(|(key, _lane)| key.pack_content_id == pack_content_id);
+            .evict_where(|(key, _lane, _speculation)| key.pack_content_id == pack_content_id);
     }
 }
 

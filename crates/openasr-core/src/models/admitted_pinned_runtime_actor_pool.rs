@@ -353,6 +353,28 @@ impl<R: 'static> PinnedRuntimeActor<R> {
         self.call_mut_fallible_async(operation)?.join()
     }
 
+    /// Runs one final operation and then terminates the owner thread even when
+    /// the operation succeeds. This is for native runtimes whose backend pool
+    /// intentionally retains address-stable private high-water that must not
+    /// cross an invocation boundary. The operation result is preserved while
+    /// the dead actor is excluded from subsequent cache reuse.
+    pub(crate) fn call_mut_then_terminate<O, F>(
+        &self,
+        operation: F,
+    ) -> Result<O, PinnedRuntimeActorError>
+    where
+        O: Send + 'static,
+        F: FnOnce(&mut R) -> O + Send + 'static,
+    {
+        let outcome = self.call_mut_fallible(move |runtime| {
+            Err::<std::convert::Infallible, O>(operation(runtime))
+        })?;
+        match outcome {
+            Err(output) => Ok(output),
+            Ok(never) => match never {},
+        }
+    }
+
     fn call_mut_fallible_async<O, E, F>(
         &self,
         operation: F,
@@ -1244,6 +1266,49 @@ mod tests {
             )
             .expect("a terminated cached actor must be evicted and rebuilt");
         assert_eq!(rebuilt.call_mut(|runtime| runtime.value.get()).unwrap(), 2);
+    }
+
+    #[test]
+    fn final_operation_returns_output_and_excludes_actor_from_reuse() {
+        let pool = AdmittedPinnedRuntimeActorPool::new(
+            "pinned-final-operation-test",
+            AdmittedPinnedRuntimeActorPoolLimits::new(1, 64),
+        );
+        let drops = Arc::new(AtomicUsize::new(0));
+        let actor = pool
+            .get_or_try_insert_with(
+                "final",
+                || Ok::<_, String>((16, ())),
+                {
+                    let drops = Arc::clone(&drops);
+                    move |()| Ok(owner(7, 16, drops))
+                },
+                |error| error.to_string(),
+            )
+            .expect("actor");
+        assert_eq!(
+            actor
+                .call_mut_then_terminate(|runtime| runtime.value.get())
+                .expect("final operation result"),
+            7
+        );
+        assert!(matches!(
+            actor.call_mut(|_| ()),
+            Err(PinnedRuntimeActorError::WorkerTerminated)
+        ));
+
+        let rebuilt = pool
+            .get_or_try_insert_with(
+                "final",
+                || Ok::<_, String>((16, ())),
+                {
+                    let drops = Arc::clone(&drops);
+                    move |()| Ok(owner(8, 16, drops))
+                },
+                |error| error.to_string(),
+            )
+            .expect("terminated actor must rebuild");
+        assert_eq!(rebuilt.call_mut(|runtime| runtime.value.get()).unwrap(), 8);
     }
 
     #[test]

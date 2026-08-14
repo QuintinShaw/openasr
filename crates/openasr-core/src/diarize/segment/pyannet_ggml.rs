@@ -589,7 +589,7 @@ impl PyannetGgmlRuntime {
         Ok(graph.compute_output_f32(output, len)?)
     }
 
-    fn forward_features(
+    pub(crate) fn forward_features(
         &mut self,
         features: &[f32],
         frames: usize,
@@ -907,9 +907,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_hybrid_input_is_normalized_to_the_complete_device_graph() {
+    fn gpu_subgraph_is_direct_even_when_the_family_stage_is_hybrid() {
         assert_eq!(
             device_graph_placement(GgmlCpuGraphBackend::Metal, ExecutionPlacement::Hybrid,),
+            ExecutionPlacement::FullDevice,
+        );
+        assert_eq!(
+            device_graph_placement(GgmlCpuGraphBackend::Gpu, ExecutionPlacement::Hybrid,),
             ExecutionPlacement::FullDevice,
         );
         assert_eq!(

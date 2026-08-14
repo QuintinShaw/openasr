@@ -19,14 +19,19 @@ use super::frontend::{
     Qwen3AsrMelFeatures, Qwen3AsrMelFrontendError, Qwen3AsrMelFrontendPlan,
     qwen3_mel_features_from_prepared_audio,
 };
-use super::graph_config::{qwen_encoder_graph_config, qwen_runtime_graph_config};
+use super::graph_config::{
+    qwen_decoder_graph_config, qwen_encoder_graph_config, qwen_runtime_graph_config,
+};
 use super::greedy_decode::{Qwen3AsrGreedyDecodeError, run_qwen3_greedy_decode_loop};
 use super::kv_cache::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
     Qwen3AsrKvCacheCapacityError,
 };
 use super::llm_prefill::build_qwen3_llm_prefill_input;
-use super::llm_transformer::{Qwen3AsrLlmWholeDecoderGraphExecutor, QwenWholeDecoderPlan};
+use super::llm_transformer::{
+    Qwen3AsrLlmWholeDecoderGraphExecutor, QwenWholeDecoderPlan,
+    qwen_llm_effective_native_gqa_capability,
+};
 use super::logits_head::{Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime};
 use super::lora::{qwen_adapter_cache_fingerprint, resolve_qwen_lora_adapter};
 #[cfg(test)]
@@ -44,7 +49,10 @@ use crate::arch::shape_orchestrator::{
 use crate::arch::{
     OpenAsrArchitectureRegistry, OpenAsrBlockStackStrategy, QWEN3_ASR_GGML_ARCHITECTURE_ID,
 };
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphError, env_var_truthy};
+use crate::ggml_runtime::{
+    GgmlCpuGraphBackend, GgmlCpuGraphError, GgmlNativeGqaCapability, ResolvedFamilyRuntimeInput,
+    env_var_truthy,
+};
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
     PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
@@ -71,7 +79,10 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeStopReason,
 };
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
-use crate::models::system_memory_owner::SystemMemoryOwner;
+use crate::models::system_memory_owner::{
+    SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
+    SystemMemoryAllocationTransactionError, SystemMemoryCapacity, SystemMemoryOwner,
+};
 use crate::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
     GgmlAsrPreparedAudioView, GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest,
@@ -91,11 +102,22 @@ const QWEN3_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
 const QWEN3_DECODE_PROFILE_ENV: &str = "OPENASR_QWEN_DECODE_PROFILE";
 
 type Qwen3AsrAudioEncoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
-/// Decoder identity consists only of immutable pack, lane, and adapter facts.
-/// The reusable graph owns the request's resident KV envelope and rebuilds
-/// itself when that envelope changes; putting the envelope in this key would
-/// retain duplicate copies of identical decoder weights across audio lengths.
-type Qwen3AsrDecoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, String);
+type Qwen3AsrDecoderRuntimeCacheKey = (
+    PackContentKey,
+    ExecutionLaneKey,
+    String,
+    GgmlNativeGqaCapability,
+);
+
+/// Immutable identity of one ordinary Qwen model owner. Request-sized KV is
+/// deliberately absent: it is created inside one actor call and dropped before
+/// checkout return, while the pack, physical lane and adapter stay resident.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Qwen3AsrRuntimeOwnerCacheKey {
+    content: PackContentKey,
+    lane: ExecutionLaneKey,
+    native_gqa: GgmlNativeGqaCapability,
+}
 
 struct Qwen3AsrAudioEncoderRuntimeActorState {
     runtime: Qwen3AsrAudioEncoderRuntime,
@@ -123,6 +145,46 @@ impl std::fmt::Debug for Qwen3AsrDecoderRuntimeActorState {
     }
 }
 
+/// All ordinary Qwen native stages live and die on this one owner thread.
+/// GPU-class runners therefore resolve one thread-local raw backend and their
+/// pack-wide weight loads coalesce into one Rc binding. Mutable KV/session
+/// state remains request-owned and never enters this object.
+struct Qwen3AsrRuntimeOwnerState {
+    audio_encoder: Qwen3AsrAudioEncoderRuntime,
+    whole_decoder: Qwen3AsrLlmWholeDecoderGraphExecutor,
+    logits_head: Arc<Qwen3AsrLlmLogitsHead>,
+    logits_head_runtime: Qwen3AsrLlmLogitsHeadRuntime,
+    _prepared_runtime_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
+}
+
+impl std::fmt::Debug for Qwen3AsrRuntimeOwnerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Qwen3AsrRuntimeOwnerState")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Qwen3AsrRuntimeOwnerState {
+    fn quoted_retained_system_memory_bytes(layer_count: usize) -> Result<u64, String> {
+        Qwen3AsrLlmWholeDecoderGraphExecutor::quoted_retained_system_memory_bytes(layer_count)
+    }
+
+    fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        // The decoder layer-handle Vec is the only uniquely owned Rust heap in
+        // this actor. Encoder/decoder native contexts and arenas admit their
+        // own allocations at construction; the loaded pack binding is one Rc
+        // owner; prepared/logits assets are Arc clones already charged by the
+        // prepared-runtime owner. Keep quote and outcome on this same exact
+        // actor-owned boundary rather than double-charging shared/native data.
+        let mut bytes = SystemMemoryCapacity::default();
+        bytes.add(
+            self.whole_decoder.retained_system_memory_bytes()?,
+            "qwen unified runtime decoder handles",
+        )?;
+        Ok(bytes.finish())
+    }
+}
+
 type Qwen3AsrAudioEncoderRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
     Qwen3AsrAudioEncoderRuntimeCacheKey,
     Qwen3AsrAudioEncoderRuntimeActorState,
@@ -131,12 +193,104 @@ type Qwen3AsrDecoderRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
     Qwen3AsrDecoderRuntimeCacheKey,
     Qwen3AsrDecoderRuntimeActorState,
 >;
+type Qwen3AsrRuntimeOwnerPool =
+    AdmittedPinnedRuntimeActorCheckoutPool<Qwen3AsrRuntimeOwnerCacheKey, Qwen3AsrRuntimeOwnerState>;
 type Qwen3AsrAudioEncoderRuntimeActor = PinnedRuntimeActorCheckout<
     Qwen3AsrAudioEncoderRuntimeCacheKey,
     Qwen3AsrAudioEncoderRuntimeActorState,
 >;
 type Qwen3AsrDecoderRuntimeActor =
     PinnedRuntimeActorCheckout<Qwen3AsrDecoderRuntimeCacheKey, Qwen3AsrDecoderRuntimeActorState>;
+type Qwen3AsrRuntimeOwnerActor =
+    PinnedRuntimeActorCheckout<Qwen3AsrRuntimeOwnerCacheKey, Qwen3AsrRuntimeOwnerState>;
+
+struct Qwen3AsrDecoderRuntimeView<'a> {
+    whole_decoder: &'a mut Qwen3AsrLlmWholeDecoderGraphExecutor,
+    logits_head: &'a Arc<Qwen3AsrLlmLogitsHead>,
+    logits_head_runtime: &'a mut Qwen3AsrLlmLogitsHeadRuntime,
+}
+
+enum Qwen3AsrDecoderActorCheckout {
+    UnifiedGpu(Qwen3AsrRuntimeOwnerActor),
+    Split(Qwen3AsrDecoderRuntimeActor),
+}
+
+impl Qwen3AsrDecoderActorCheckout {
+    fn call_mut_fallible<O, E, F>(
+        &self,
+        operation: F,
+    ) -> Result<Result<O, E>, PinnedRuntimeActorError>
+    where
+        O: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce(&mut Qwen3AsrDecoderRuntimeView<'_>) -> Result<O, E> + Send + 'static,
+    {
+        match self {
+            Self::UnifiedGpu(actor) => actor.call_mut_fallible(move |state| {
+                operation(&mut Qwen3AsrDecoderRuntimeView {
+                    whole_decoder: &mut state.whole_decoder,
+                    logits_head: &state.logits_head,
+                    logits_head_runtime: &mut state.logits_head_runtime,
+                })
+            }),
+            Self::Split(actor) => actor.call_mut(move |state| {
+                operation(&mut Qwen3AsrDecoderRuntimeView {
+                    whole_decoder: &mut state.whole_decoder,
+                    logits_head: &state.logits_head,
+                    logits_head_runtime: &mut state.logits_head_runtime,
+                })
+            }),
+        }
+    }
+}
+
+fn qwen_unified_runtime_owner_enabled(
+    resolved_runtime: ResolvedFamilyRuntimeInput,
+    native_gqa: GgmlNativeGqaCapability,
+    native_logits_runtime: bool,
+) -> bool {
+    let backend = resolved_runtime.backend();
+    if backend != GgmlCpuGraphBackend::Gpu || !native_gqa.is_validated() || !native_logits_runtime {
+        return false;
+    }
+    let encoder = qwen_encoder_graph_config(backend);
+    let decoder = qwen_decoder_graph_config(backend);
+    let logits = qwen_decoder_graph_config(backend);
+    [encoder, decoder, logits].into_iter().all(|config| {
+        config.backend == backend && config.backend.is_gpu_class() && !config.use_scheduler
+    })
+}
+
+fn validate_unified_runtime_owner_state(
+    state: &Qwen3AsrRuntimeOwnerState,
+    expected_backend: GgmlCpuGraphBackend,
+) -> Result<(), Qwen3AsrGgmlExecutorError> {
+    let expected_lane = (expected_backend, false);
+    let encoder_lane = state.audio_encoder.graph_lane();
+    let decoder_lane = state.whole_decoder.graph_lane();
+    let logits_lane = state.logits_head_runtime.graph_lane();
+    if !expected_backend.is_gpu_class()
+        || encoder_lane != expected_lane
+        || decoder_lane != expected_lane
+        || logits_lane != Some(expected_lane)
+    {
+        return Err(Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
+            reason: format!(
+                "unified runtime requires one direct GPU lane: expected={expected_lane:?}, encoder={encoder_lane:?}, decoder={decoder_lane:?}, logits={logits_lane:?}"
+            ),
+        });
+    }
+    let encoder_binding = state.audio_encoder.loaded_weight_binding_identity();
+    let decoder_binding = state.whole_decoder.loaded_weight_binding_identity();
+    if encoder_binding.is_none() || encoder_binding != decoder_binding {
+        return Err(Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
+            reason: format!(
+                "unified runtime failed to coalesce its pack-wide loaded-weight binding: encoder={encoder_binding:?}, decoder={decoder_binding:?}"
+            ),
+        });
+    }
+    Ok(())
+}
 
 fn qwen_decode_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -232,6 +386,7 @@ pub(crate) struct Qwen3AsrGgmlExecutor {
     runtime_cache_by_path: BuiltinPreparedRuntimeCache,
     audio_encoder_runtimes: Arc<Qwen3AsrAudioEncoderRuntimePool>,
     decoder_runtimes: Arc<Qwen3AsrDecoderRuntimePool>,
+    unified_gpu_runtimes: Arc<Qwen3AsrRuntimeOwnerPool>,
     serve_batch_engines: Qwen3AsrServeBatchEngineRegistry,
     lora_adapters: ResolvedLoraAdapterCache,
 }
@@ -253,6 +408,10 @@ impl Default for Qwen3AsrGgmlExecutor {
             )),
             decoder_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
                 "openasr-qwen3-decoder-owner",
+                limits,
+            )),
+            unified_gpu_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+                "openasr-qwen3-unified-gpu-owner",
                 limits,
             )),
             serve_batch_engines: Qwen3AsrServeBatchEngineRegistry::default(),
@@ -337,18 +496,51 @@ impl Qwen3AsrGgmlExecutor {
             .map_err(map_audio_encoder_error)
     }
 
+    fn encode_with_unified_gpu_runtime(
+        &self,
+        actor: &Qwen3AsrRuntimeOwnerActor,
+        mel_features: Qwen3AsrMelFeatures,
+    ) -> Result<super::audio_encoder::Qwen3AsrAudioEncoderOutput, Qwen3AsrGgmlExecutorError> {
+        actor
+            .call_mut_fallible(move |state| {
+                let prepared_runtime = state
+                    ._prepared_runtime_owner
+                    .as_ref()
+                    .as_qwen3_asr()
+                    .ok_or_else(|| Qwen3AsrAudioEncoderError::GraphExecutionFailed {
+                        reason: "unified actor received a non-qwen prepared runtime".to_string(),
+                    })?;
+                let encode_result = state.audio_encoder.encode(
+                    &prepared_runtime.audio_encoder_weights,
+                    prepared_runtime.metadata,
+                    &mel_features,
+                );
+                let release_result = state.audio_encoder.release_transient_compute_memory();
+                match (encode_result, release_result) {
+                    (Ok(output), Ok(())) => Ok(output),
+                    (Err(error), _) => Err(error),
+                    (Ok(_), Err(error)) => Err(error),
+                }
+            })
+            .map_err(|error| Self::map_actor_error("unified-audio-encoder", error))?
+            .map_err(map_audio_encoder_error)
+    }
+
     fn checkout_decoder_runtime(
         &self,
         preflight: &GgufRuntimeSourcePreflight,
         prepared_runtime_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
         adapter: Option<ResolvedLoraAdapterHandle>,
-        backend: GgmlCpuGraphBackend,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
+        native_gqa: GgmlNativeGqaCapability,
     ) -> Result<Qwen3AsrDecoderRuntimeActor, Qwen3AsrGgmlExecutorError> {
+        let backend = resolved_runtime.backend();
         let decoder_backend = qwen_runtime_graph_config(backend).backend;
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(decoder_backend),
             qwen_adapter_cache_fingerprint(adapter.as_ref().map(resolved_lora_adapter)),
+            native_gqa,
         );
         let preflight = preflight.clone();
         self.decoder_runtimes.checkout_or_try_build_with(
@@ -364,13 +556,14 @@ impl Qwen3AsrGgmlExecutor {
                                 .to_string(),
                         })?;
                 let whole_decoder =
-                    Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_and_lora(
+                    Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_and_lora_for_qwen(
                         &prepared_runtime.decoder_plan,
                         &preflight,
                         prepared_runtime.logits_head.fused_top1_spec(),
                         prepared_runtime.token_embedding_table.device_graph_spec(),
                         adapter.as_ref().map(resolved_lora_adapter),
                         backend,
+                        native_gqa,
                     )
                     .map_err(|error| {
                         Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
@@ -393,6 +586,121 @@ impl Qwen3AsrGgmlExecutor {
                 ))
             },
             |error| Self::map_actor_error("decoder", error),
+        )
+    }
+
+    fn checkout_unified_gpu_runtime(
+        &self,
+        preflight: &GgufRuntimeSourcePreflight,
+        prepared_runtime_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
+        native_gqa: GgmlNativeGqaCapability,
+    ) -> Result<Qwen3AsrRuntimeOwnerActor, Qwen3AsrGgmlExecutorError> {
+        let backend = resolved_runtime.backend();
+        let decoder_backend = qwen_runtime_graph_config(backend).backend;
+        let key = Qwen3AsrRuntimeOwnerCacheKey {
+            content: PackContentKey::for_runtime_source(&preflight.runtime_source),
+            lane: current_execution_lane_key(decoder_backend),
+            native_gqa,
+        };
+        let preflight = preflight.clone();
+        let content_id = preflight.runtime_source.content_id().to_string();
+        self.unified_gpu_runtimes.checkout_or_try_build_with(
+            key,
+            move || {
+                let prepared_runtime = prepared_runtime_owner
+                    .as_ref()
+                    .as_qwen3_asr()
+                    .ok_or_else(|| Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
+                        reason: "unified actor received a non-qwen prepared runtime".to_string(),
+                    })?;
+                let retained = Qwen3AsrRuntimeOwnerState::quoted_retained_system_memory_bytes(
+                    prepared_runtime.decoder_plan.layer_count(),
+                )
+                .map_err(|reason| Qwen3AsrGgmlExecutorError::RuntimeOwnershipFailed {
+                    stage: "unified-runtime",
+                    reason,
+                })?;
+                let quote = SystemMemoryAllocationQuote::new(
+                    format!("qwen-unified-gpu-runtime:{content_id}"),
+                    retained,
+                    retained,
+                )
+                .map_err(|error| Qwen3AsrGgmlExecutorError::RuntimeOwnershipFailed {
+                    stage: "unified-runtime",
+                    reason: error.to_string(),
+                })?;
+                Ok((
+                    retained,
+                    (preflight, prepared_runtime_owner, quote),
+                ))
+            },
+            move |(preflight, prepared_runtime_owner, quote)| {
+                match SystemMemoryOwner::try_allocate_transaction(quote, || {
+                    let prepared_runtime = prepared_runtime_owner
+                        .as_ref()
+                        .as_qwen3_asr()
+                        .ok_or_else(|| Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
+                            reason: "unified actor received a non-qwen prepared runtime"
+                                .to_string(),
+                        })?;
+                    // Keep the encoder's loaded context alive while constructing
+                    // the decoder and logits runners. On CUDA/Vulkan these three
+                    // runners resolve one cached raw backend on this owner thread,
+                    // so the decoder load upgrades the encoder's weak Rc entry.
+                    let audio_encoder = Qwen3AsrAudioEncoderRuntime::new_from_preflight(
+                        &preflight, backend,
+                    )
+                    .map_err(|error| Qwen3AsrGgmlExecutorError::AudioEncoderFailed {
+                        reason: error.to_string(),
+                    })?;
+                    let whole_decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_and_lora_for_qwen(
+                        &prepared_runtime.decoder_plan,
+                        &preflight,
+                        prepared_runtime.logits_head.fused_top1_spec(),
+                        prepared_runtime.token_embedding_table.device_graph_spec(),
+                        None,
+                        backend,
+                        native_gqa,
+                    )
+                    .map_err(|error| Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
+                        reason: format!("qwen3-asr whole-decoder graph init failed: {error}"),
+                    })?;
+                    let logits_head_runtime = prepared_runtime
+                        .logits_head
+                        .new_runtime(decoder_backend)
+                        .map_err(|error| Qwen3AsrGgmlExecutorError::LlmLogitsHeadFailed {
+                            reason: error.to_string(),
+                        })?;
+                    let state = Qwen3AsrRuntimeOwnerState {
+                        audio_encoder,
+                        whole_decoder,
+                        logits_head: Arc::clone(&prepared_runtime.logits_head),
+                        logits_head_runtime,
+                        _prepared_runtime_owner: prepared_runtime_owner,
+                    };
+                    validate_unified_runtime_owner_state(&state, decoder_backend)?;
+                    let retained = state.retained_system_memory_bytes().map_err(|reason| {
+                        Qwen3AsrGgmlExecutorError::RuntimeOwnershipFailed {
+                            stage: "unified-runtime",
+                            reason,
+                        }
+                    })?;
+                    Ok(SystemMemoryAllocationOutcome::new(
+                        state, retained, retained,
+                    ))
+                }) {
+                    Ok(owner) => Ok(owner),
+                    Err(SystemMemoryAllocationTransactionError::Allocation(error)) => Err(error),
+                    Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+                        Err(Qwen3AsrGgmlExecutorError::RuntimeOwnershipFailed {
+                            stage: "unified-runtime",
+                            reason: error.to_string(),
+                        })
+                    }
+                }
+            },
+            |error| Self::map_actor_error("unified-runtime", error),
         )
     }
 
@@ -545,16 +853,60 @@ impl Qwen3AsrGgmlExecutor {
         // local instead of each independently re-deriving it from a
         // thread-local override + env.
         let backend = request.resolved_runtime.backend();
+        let native_gqa = qwen_llm_effective_native_gqa_capability(
+            request.resolved_runtime.native_gqa_capability(),
+        );
         // The serve-batch owner loads the pack itself; it needs the path, not
         // the content id.
         let runtime_cache_path = canonical_runtime_cache_path(runtime_source.path());
+        let serve_batch_graph_config = super::graph_config::qwen_runtime_graph_config(backend);
+        // Serve-batch remains an independent owner topology in this change.
+        // In particular, do not build and retain an otherwise-idle unified
+        // decoder merely to run its encoder before handing decode to the batch
+        // engine. Adapter-bearing, streaming, CPU and scheduler-backed requests
+        // retain their established split-owner path as well.
+        let adapter_active = adapter.is_some();
+        let serve_batch_config = Qwen3AsrServeBatchConfig::from_policy(
+            request.request_options.serve_batch,
+        )
+        .filter(|_| {
+            !skip_serve_batch
+                && !adapter_active
+                && serve_batch_graph_config.backend.is_gpu_class()
+                && !serve_batch_graph_config.use_scheduler
+                && native_gqa.is_validated()
+        });
+        let native_logits_runtime = prepared_runtime_owner
+            .as_ref()
+            .as_qwen3_asr()
+            .is_some_and(|prepared| prepared.logits_head.supports_native_runtime());
+        let unified_gpu_runtime = if qwen_unified_runtime_owner_enabled(
+            request.resolved_runtime,
+            native_gqa,
+            native_logits_runtime,
+        ) && !adapter_active
+            && !skip_serve_batch
+            && serve_batch_config.is_none()
+        {
+            Some(self.checkout_unified_gpu_runtime(
+                preflight,
+                Arc::clone(&prepared_runtime_owner),
+                request.resolved_runtime,
+                native_gqa,
+            )?)
+        } else {
+            None
+        };
         let audio_encoder_started_at = qwen_decode_profile_start();
-        let audio_embeddings = self.encode_with_owned_audio_encoder_runtime(
-            preflight,
-            Arc::clone(&prepared_runtime_owner),
-            mel_features.clone(),
-            backend,
-        )?;
+        let audio_embeddings = match unified_gpu_runtime.as_ref() {
+            Some(actor) => self.encode_with_unified_gpu_runtime(actor, mel_features.clone())?,
+            None => self.encode_with_owned_audio_encoder_runtime(
+                preflight,
+                Arc::clone(&prepared_runtime_owner),
+                mel_features.clone(),
+                backend,
+            )?,
+        };
         qwen_decode_profile_log_opt("audio_encoder_actor", audio_encoder_started_at);
         let decode_prompt_started_at = qwen_decode_profile_start();
         let decode_prompt = build_qwen3_decode_prompt(
@@ -629,31 +981,7 @@ impl Qwen3AsrGgmlExecutor {
             "validate_materialized_block_stacks",
             validate_stacks_started_at,
         );
-        let serve_batch_graph_config = super::graph_config::qwen_runtime_graph_config(backend);
-        // An active LoRA adapter (request --adapter or the OPENASR_ADAPTER env
-        // fallback) must never take the serve-batch lane: the batch worker resolves
-        // weights before this point and has no adapter plumbing, so it would
-        // silently run on base weights. Resolve the active source up front and fail
-        // closed onto the serial lane below, matching moonshine's adapter bypass.
-        let adapter_active = adapter.is_some();
-        if let Some(serve_batch_config) =
-            Qwen3AsrServeBatchConfig::from_policy(request.request_options.serve_batch)
-                // Serve-batch needs the unified GPU lane on the direct reusable graph.
-                // Fall through to direct decode on CPU / scheduler-backed nodes instead
-                // of hard-failing with UnsupportedBackend, so ineligible lanes
-                // stay serial without claiming batch width.
-                .filter(|_| {
-                    // Streaming bypasses the batch worker so live sessions stay on the
-                    // direct greedy loop below; an active adapter bypasses it too
-                    // (see adapter_active above).
-                    // TODO(serve-batch): plumb LoRA adapters through the batch worker
-                    // so adapter-bearing requests can share the batched GPU lane.
-                    !skip_serve_batch
-                        && !adapter_active
-                        && serve_batch_graph_config.backend.is_gpu_class()
-                        && !serve_batch_graph_config.use_scheduler
-                })
-        {
+        if let Some(serve_batch_config) = serve_batch_config {
             let serve_batch_started_at = qwen_decode_profile_start();
             let decode_policy = resolve_builtin_decode_policy(crate::QWEN3_ASR_DECODE_POLICY_ID)
                 .map_err(|error| Qwen3AsrGgmlExecutorError::GreedyDecodeFailed {
@@ -681,7 +1009,8 @@ impl Qwen3AsrGgmlExecutor {
                             backend,
                             runtime_source,
                         ),
-                    backend,
+                    resolved_runtime: request.resolved_runtime,
+                    native_gqa,
                     metadata,
                     prepared_assets:
                         super::batched_decode::Qwen3AsrServeBatchPreparedAssets::Admitted(
@@ -713,12 +1042,16 @@ impl Qwen3AsrGgmlExecutor {
         }
         let decoder_backend = qwen_runtime_graph_config(backend).backend;
         let whole_decoder_started_at = qwen_decode_profile_start();
-        let decoder_actor = self.checkout_decoder_runtime(
-            preflight,
-            Arc::clone(&prepared_runtime_owner),
-            adapter,
-            backend,
-        )?;
+        let decoder_actor = match unified_gpu_runtime {
+            Some(actor) => Qwen3AsrDecoderActorCheckout::UnifiedGpu(actor),
+            None => Qwen3AsrDecoderActorCheckout::Split(self.checkout_decoder_runtime(
+                preflight,
+                Arc::clone(&prepared_runtime_owner),
+                adapter,
+                request.resolved_runtime,
+                native_gqa,
+            )?),
+        };
         qwen_decode_profile_log_opt("decoder_actor_checkout", whole_decoder_started_at);
 
         // The host KV owner is request-scoped, while the whole decoder and its
@@ -766,7 +1099,7 @@ impl Qwen3AsrGgmlExecutor {
         );
         let greedy_decode_started_at = qwen_decode_profile_start();
         let decode_result = decoder_actor
-            .call_mut(move |state| {
+            .call_mut_fallible(move |state| {
                 let token_source_for_actor: &dyn crate::models::decode_policy_component_registry::BuiltinSeq2SeqDecodePolicyTokenSource = tokenizer_for_actor
                     .as_ref()
                     .map(|tokenizer| tokenizer as _)
@@ -785,16 +1118,16 @@ impl Qwen3AsrGgmlExecutor {
                         .collect::<Vec<_>>()
                         .join(" "))
                 };
-                let logits_head = Arc::clone(&state.logits_head);
+                let logits_head = Arc::clone(state.logits_head);
                 let mut step_executor = Qwen3AsrPrefillOnlyGreedyStepExecutor {
                     metadata,
                     prompt_input: Qwen3AsrRuntimePromptInput::TokenIds(prompt_token_input),
                     logits_head: logits_head.as_ref(),
-                    logits_head_runtime: &mut state.logits_head_runtime,
+                    logits_head_runtime: state.logits_head_runtime,
                     token_embedding_table,
                     layer_kv_caches,
                     kv_capacity,
-                    whole_decoder: &mut state.whole_decoder,
+                    whole_decoder: state.whole_decoder,
                     cache_prompt_tokens: 1,
                     consumed_prefill_step: false,
                     fused_top1_hint_allowed,
@@ -1014,6 +1347,8 @@ impl Qwen3AsrGgmlExecutor {
             .evict_where(|key| key.0.pack_content_id == pack_content_id);
         self.decoder_runtimes
             .evict_where(|key| key.0.pack_content_id == pack_content_id);
+        self.unified_gpu_runtimes
+            .evict_where(|key| key.content.pack_content_id == pack_content_id);
         self.lora_adapters.evict_base_content_id(pack_content_id);
         self.runtime_cache_by_path.evict_content_id(pack_content_id);
         shutdown_qwen_serve_batch_engines(&self.serve_batch_engines);
@@ -1954,6 +2289,7 @@ impl GgmlAsrViewExecutor for Qwen3AsrGgmlExecutor {
         shutdown_qwen_serve_batch_engines(&self.serve_batch_engines);
         self.audio_encoder_runtimes.clear();
         self.decoder_runtimes.clear();
+        self.unified_gpu_runtimes.clear();
         self.lora_adapters.clear();
         self.runtime_cache_by_path.clear();
     }
@@ -2017,6 +2353,7 @@ impl GgmlAsrStreamingExecutor for Qwen3AsrGgmlExecutor {
         shutdown_qwen_serve_batch_engines(&self.serve_batch_engines);
         self.audio_encoder_runtimes.clear();
         self.decoder_runtimes.clear();
+        self.unified_gpu_runtimes.clear();
         self.lora_adapters.clear();
         self.runtime_cache_by_path.clear();
     }

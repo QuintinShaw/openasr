@@ -16,7 +16,9 @@ use crate::api::native::{
     NativeAsrStreamingSessionConfig, NativeAsrTensorLayoutRef,
 };
 use crate::arch::{
-    OpenAsrArchitectureRegistry, OpenAsrPhraseBiasStrategy, StreamingPartialGranularity,
+    GRANITE_SPEECH_GGML_ADAPTER_ID, GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+    GRANITE_SPEECH_MODEL_FAMILY, OpenAsrArchitectureRegistry, OpenAsrPhraseBiasStrategy,
+    StreamingPartialGranularity,
 };
 use crate::device::{
     execution_policy::{
@@ -221,6 +223,23 @@ impl NativeRuntimeModelAdapter {
         })
     }
 
+    /// Match a caller's model ref against this exact verified pack generation.
+    ///
+    /// The ordinary matcher intentionally remains limited to stable spelling
+    /// differences (bare ids and quant aliases). Published compatibility for a
+    /// pack whose metadata uses an upstream runtime id is evaluated here, where
+    /// the verified content, route, and selected adapter are all available.
+    pub fn verified_pack_matches_model_ref(&self, requested: &str) -> Result<bool, NativeAsrError> {
+        let identity = self.verified_runtime_model_identity(None)?;
+        let verified_pack = self.verified_pack()?;
+        Ok(native_runtime_model_ref_matches_verified_pack(
+            requested,
+            &identity.model_id,
+            verified_pack,
+            &self.descriptor,
+        ))
+    }
+
     /// Bind a caller-visible model id to the exact verified source generation
     /// that produced this adapter. Product offline and streaming execution use
     /// this constructor so the proof crosses the executor seam with the pack
@@ -257,6 +276,82 @@ impl NativeRuntimeModelAdapter {
             && self.descriptor.word_timestamp_source
                 == crate::arch::WordTimestampSource::ForcedAligner
     }
+}
+
+const GRANITE_SPEECH_PUBLISHED_CATALOG_MODEL_ID: &str = "granite-speech-4.1-2b";
+const GRANITE_SPEECH_PUBLISHED_RUNTIME_MODEL_ID: &str = "ibm-granite/granite-speech-4.1-2b";
+const GRANITE_SPEECH_PUBLISHED_FP16_CONTENT_ID: &str =
+    "sha256:56ff48fd309c7219c416492ef71ff56bbf6cc836a5c6e0176f0800b3062080e0";
+const GRANITE_SPEECH_PUBLISHED_Q8_CONTENT_ID: &str =
+    "sha256:7368242e65f8f907bae8002a609f966a25fcb32af6575b1baae6057c48e6566c";
+const GRANITE_SPEECH_PUBLISHED_Q4_CONTENT_ID: &str =
+    "sha256:8092fb3209781dfee9ebd4ee2c203ab10d75597470c33d728bf3802d26289758";
+#[cfg(test)]
+const GRANITE_SPEECH_PUBLISHED_CONTENT_ID: &str = GRANITE_SPEECH_PUBLISHED_Q8_CONTENT_ID;
+
+fn granite_speech_published_content_id_for_quant(quant: &str) -> Option<&'static str> {
+    match crate::canonical_quant_tag(quant) {
+        "fp16" => Some(GRANITE_SPEECH_PUBLISHED_FP16_CONTENT_ID),
+        "q8_0" => Some(GRANITE_SPEECH_PUBLISHED_Q8_CONTENT_ID),
+        "q4_k" => Some(GRANITE_SPEECH_PUBLISHED_Q4_CONTENT_ID),
+        _ => None,
+    }
+}
+
+/// Content-bound compatibility for the already-published Granite Speech packs.
+///
+/// This is deliberately separate from `native_runtime_model_refs_match`: that
+/// matcher remains a generic id/quant spelling check and must not learn an
+/// upstream alias. This compatibility exists only while every immutable fact
+/// below still identifies one exact quant/content pair from the reviewed pack
+/// generation.
+pub(super) fn native_runtime_model_ref_matches_verified_pack(
+    requested: &str,
+    runtime_source_id: &str,
+    verified_pack: &crate::models::pack_verifier::VerifiedPack,
+    selected_adapter: &GgmlFamilyAdapterDescriptor,
+) -> bool {
+    if native_transcribe::native_runtime_model_refs_match(requested, runtime_source_id) {
+        return true;
+    }
+
+    granite_speech_published_identity_compatibility_matches(
+        requested,
+        runtime_source_id,
+        verified_pack.content_id(),
+        verified_pack.proves_asr_family(
+            GRANITE_SPEECH_MODEL_FAMILY,
+            GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+        ),
+        selected_adapter.adapter_id,
+        selected_adapter.model_family,
+        selected_adapter.model_architecture,
+    )
+}
+
+fn granite_speech_published_identity_compatibility_matches(
+    requested: &str,
+    runtime_source_id: &str,
+    content_id: &str,
+    proven_granite_route: bool,
+    adapter_id: &str,
+    model_family: &str,
+    model_architecture: &str,
+) -> bool {
+    let Ok(requested) = crate::parse_model_ref(requested.trim()) else {
+        return false;
+    };
+    let expected_content_id = requested
+        .tag
+        .as_deref()
+        .and_then(granite_speech_published_content_id_for_quant);
+    requested.family == GRANITE_SPEECH_PUBLISHED_CATALOG_MODEL_ID
+        && expected_content_id.is_some_and(|expected| content_id == expected)
+        && runtime_source_id.trim() == GRANITE_SPEECH_PUBLISHED_RUNTIME_MODEL_ID
+        && proven_granite_route
+        && adapter_id == GRANITE_SPEECH_GGML_ADAPTER_ID
+        && model_family == GRANITE_SPEECH_MODEL_FAMILY
+        && model_architecture == GRANITE_SPEECH_GGML_ARCHITECTURE_ID
 }
 
 impl NativeRuntimeModelProjection {
@@ -1594,6 +1689,173 @@ mod tests {
                 message: "first causal failure".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn published_granite_identity_compatibility_is_content_bound() {
+        for (requested, content_id) in [
+            (
+                "granite-speech-4.1-2b:fp16",
+                GRANITE_SPEECH_PUBLISHED_FP16_CONTENT_ID,
+            ),
+            (
+                "granite-speech-4.1-2b:q8",
+                GRANITE_SPEECH_PUBLISHED_Q8_CONTENT_ID,
+            ),
+            (
+                "granite-speech-4.1-2b:q8_0",
+                GRANITE_SPEECH_PUBLISHED_Q8_CONTENT_ID,
+            ),
+            (
+                "granite-speech-4.1-2b:q4",
+                GRANITE_SPEECH_PUBLISHED_Q4_CONTENT_ID,
+            ),
+            (
+                "granite-speech-4.1-2b:q4_k_m",
+                GRANITE_SPEECH_PUBLISHED_Q4_CONTENT_ID,
+            ),
+        ] {
+            assert!(!native_transcribe::native_runtime_model_refs_match(
+                requested,
+                GRANITE_SPEECH_PUBLISHED_RUNTIME_MODEL_ID,
+            ));
+            assert!(granite_speech_published_identity_compatibility_matches(
+                requested,
+                GRANITE_SPEECH_PUBLISHED_RUNTIME_MODEL_ID,
+                content_id,
+                true,
+                GRANITE_SPEECH_GGML_ADAPTER_ID,
+                GRANITE_SPEECH_MODEL_FAMILY,
+                GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+            ));
+        }
+
+        let requested = "granite-speech-4.1-2b:q8";
+
+        for (
+            label,
+            requested,
+            runtime_id,
+            content_id,
+            route,
+            adapter_id,
+            model_family,
+            model_architecture,
+        ) in [
+            (
+                "wrong SHA",
+                requested,
+                GRANITE_SPEECH_PUBLISHED_RUNTIME_MODEL_ID,
+                "not-the-published-content",
+                true,
+                GRANITE_SPEECH_GGML_ADAPTER_ID,
+                GRANITE_SPEECH_MODEL_FAMILY,
+                GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+            ),
+            (
+                "bare SHA must not match the content id",
+                requested,
+                GRANITE_SPEECH_PUBLISHED_RUNTIME_MODEL_ID,
+                "7368242e65f8f907bae8002a609f966a25fcb32af6575b1baae6057c48e6566c",
+                true,
+                GRANITE_SPEECH_GGML_ADAPTER_ID,
+                GRANITE_SPEECH_MODEL_FAMILY,
+                GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+            ),
+            (
+                "wrong runtime id",
+                requested,
+                "ibm-granite/other",
+                GRANITE_SPEECH_PUBLISHED_CONTENT_ID,
+                true,
+                GRANITE_SPEECH_GGML_ADAPTER_ID,
+                GRANITE_SPEECH_MODEL_FAMILY,
+                GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+            ),
+            (
+                "wrong route",
+                requested,
+                GRANITE_SPEECH_PUBLISHED_RUNTIME_MODEL_ID,
+                GRANITE_SPEECH_PUBLISHED_CONTENT_ID,
+                false,
+                GRANITE_SPEECH_GGML_ADAPTER_ID,
+                GRANITE_SPEECH_MODEL_FAMILY,
+                GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+            ),
+            (
+                "wrong adapter",
+                requested,
+                GRANITE_SPEECH_PUBLISHED_RUNTIME_MODEL_ID,
+                GRANITE_SPEECH_PUBLISHED_CONTENT_ID,
+                true,
+                "other-adapter",
+                GRANITE_SPEECH_MODEL_FAMILY,
+                GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+            ),
+            (
+                "wrong adapter family",
+                requested,
+                GRANITE_SPEECH_PUBLISHED_RUNTIME_MODEL_ID,
+                GRANITE_SPEECH_PUBLISHED_CONTENT_ID,
+                true,
+                GRANITE_SPEECH_GGML_ADAPTER_ID,
+                "other-family",
+                GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+            ),
+            (
+                "wrong adapter architecture",
+                requested,
+                GRANITE_SPEECH_PUBLISHED_RUNTIME_MODEL_ID,
+                GRANITE_SPEECH_PUBLISHED_CONTENT_ID,
+                true,
+                GRANITE_SPEECH_GGML_ADAPTER_ID,
+                GRANITE_SPEECH_MODEL_FAMILY,
+                "other-architecture",
+            ),
+            (
+                "wrong catalog family",
+                "other-granite:q8",
+                GRANITE_SPEECH_PUBLISHED_RUNTIME_MODEL_ID,
+                GRANITE_SPEECH_PUBLISHED_CONTENT_ID,
+                true,
+                GRANITE_SPEECH_GGML_ADAPTER_ID,
+                GRANITE_SPEECH_MODEL_FAMILY,
+                GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+            ),
+            (
+                "q4 must not inherit q8 compatibility",
+                "granite-speech-4.1-2b:q4_k_m",
+                GRANITE_SPEECH_PUBLISHED_RUNTIME_MODEL_ID,
+                GRANITE_SPEECH_PUBLISHED_CONTENT_ID,
+                true,
+                GRANITE_SPEECH_GGML_ADAPTER_ID,
+                GRANITE_SPEECH_MODEL_FAMILY,
+                GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+            ),
+            (
+                "fp16 must not inherit q8 compatibility",
+                "granite-speech-4.1-2b:f16",
+                GRANITE_SPEECH_PUBLISHED_RUNTIME_MODEL_ID,
+                GRANITE_SPEECH_PUBLISHED_CONTENT_ID,
+                true,
+                GRANITE_SPEECH_GGML_ADAPTER_ID,
+                GRANITE_SPEECH_MODEL_FAMILY,
+                GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+            ),
+        ] {
+            assert!(
+                !granite_speech_published_identity_compatibility_matches(
+                    requested,
+                    runtime_id,
+                    content_id,
+                    route,
+                    adapter_id,
+                    model_family,
+                    model_architecture,
+                ),
+                "{label} must reject"
+            );
+        }
     }
 
     #[test]

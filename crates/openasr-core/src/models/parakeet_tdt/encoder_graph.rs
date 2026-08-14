@@ -89,6 +89,7 @@ impl ParakeetTdtEncoderGraph {
         metadata: ParakeetTdtExecutionMetadata,
         runtime_preflight: &GgufRuntimeSourcePreflight,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        resident_predictor_state: bool,
     ) -> Result<Self, ParakeetTdtEncoderError> {
         let config = parakeet_tdt_encoder_graph_config(backend);
         let (mut core, (enc_proj_weight, enc_proj_bias)) = FastConformerEncoderCore::build(
@@ -109,26 +110,32 @@ impl ParakeetTdtEncoderGraph {
             },
         )?;
 
-        let device_decoder =
-            if backend == crate::ggml_runtime::GgmlCpuGraphBackend::Cpu {
-                None
-            } else {
-                let loaded = core.loaded_weights.as_ref().ok_or_else(|| {
-                    ParakeetTdtEncoderError::Shape {
+        let device_decoder = if backend == crate::ggml_runtime::GgmlCpuGraphBackend::Cpu {
+            None
+        } else {
+            let loaded =
+                core.loaded_weights
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ParakeetTdtEncoderError::Shape {
                     reason:
                         "accelerated predictor/joint requires the verified loaded-weight context"
                             .to_string(),
                 }
-                })?;
-                Some(
-                    ParakeetTdtDeviceDecoder::new(&mut core.runner, loaded, metadata).map_err(
-                        |source| ParakeetTdtEncoderError::GraphBuildFailed {
-                            step: "device_predictor_joint",
-                            source,
-                        },
-                    )?,
+                    })?;
+            Some(
+                ParakeetTdtDeviceDecoder::new(
+                    &mut core.runner,
+                    loaded,
+                    metadata,
+                    resident_predictor_state,
                 )
-            };
+                .map_err(|source| ParakeetTdtEncoderError::GraphBuildFailed {
+                    step: "device_predictor_joint",
+                    source,
+                })?,
+            )
+        };
 
         Ok(Self {
             metadata,
@@ -274,6 +281,7 @@ mod tests {
             metadata,
             &preflight,
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            false,
         )
         .expect("graph");
         let n_frames = 128usize;
@@ -316,6 +324,7 @@ mod tests {
             metadata,
             &preflight,
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            false,
         )
         .expect("graph");
         let n_frames = 128usize;

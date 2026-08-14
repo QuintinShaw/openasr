@@ -33,14 +33,37 @@ pub(crate) use realtime_runtime::{FireRedRealtimeVadRuntime, FireRedRealtimeVadS
 pub use streaming::FireRedStreamingVad;
 
 pub(crate) fn execution_capabilities() -> crate::device::execution_policy::ExecutionCapabilities {
-    crate::device::execution_policy::ExecutionCapabilities::new(true).with_provider(
-        crate::device::execution_route::ExecutionProvider::Metal,
-        crate::device::execution_policy::AcceleratedPlacementCapabilities::FULL_DEVICE,
-    )
+    use crate::device::{
+        execution_policy::{AcceleratedPlacementCapabilities, ExecutionCapabilities},
+        execution_route::ExecutionProvider,
+    };
+
+    // Feature extraction remains host-side preprocessing on every backend;
+    // the complete neural DFSMN graph executes on the selected device.
+    ExecutionCapabilities::new(true)
+        .with_provider(
+            ExecutionProvider::Metal,
+            AcceleratedPlacementCapabilities::FULL_DEVICE,
+        )
+        .with_provider(
+            ExecutionProvider::Cuda,
+            AcceleratedPlacementCapabilities::FULL_DEVICE,
+        )
+        .with_provider(
+            ExecutionProvider::Vulkan,
+            AcceleratedPlacementCapabilities::FULL_DEVICE,
+        )
 }
 
+/// Realtime sessions keep automatic selection on CPU. Explicit accelerated
+/// requests still use the unified stateful runtime and its replay contract.
 pub(crate) const AUTO_GPU_POLICY: crate::ggml_runtime::AutoGpuPolicy =
     crate::ggml_runtime::AutoGpuPolicy::Never;
+
+/// Offline slicing uses CUDA/Vulkan automatically while Metal remains an
+/// explicit opt-in until its product-level latency evidence is promoted.
+pub(crate) const OFFLINE_AUTO_GPU_POLICY: crate::ggml_runtime::AutoGpuPolicy =
+    crate::ggml_runtime::AutoGpuPolicy::ExceptMetal;
 
 static SHARED_MODEL: OnceLock<Option<FireRedStreamVadModel>> = OnceLock::new();
 

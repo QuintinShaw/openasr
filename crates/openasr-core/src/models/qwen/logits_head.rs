@@ -9,6 +9,9 @@ use crate::ggml_runtime::{
     GgmlStaticTensor, GgmlStaticTensorArena, GgufOwnedWeightTensorPayload, GgufTensorDataReadError,
     GgufTensorDataReader, env_toggle_with_raw,
 };
+use crate::models::device_greedy_token::{
+    first_max_argmax_reverse_indices, first_max_token_id_from_reversed_argmax,
+};
 
 use super::graph_config::{qwen_decoder_graph_config, qwen_runtime_graph_config};
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
@@ -222,6 +225,17 @@ impl Qwen3AsrLlmLogitsHead {
         &self,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Qwen3AsrLlmLogitsHeadRuntime, Qwen3AsrLlmLogitsHeadError> {
+        self.new_runtime_with_graph_config(qwen_decoder_graph_config(backend))
+    }
+
+    pub(crate) fn supports_native_runtime(&self) -> bool {
+        self.ggml_output_weight.is_some()
+    }
+
+    pub(crate) fn new_runtime_with_graph_config(
+        &self,
+        graph_config: GgmlCpuGraphConfig,
+    ) -> Result<Qwen3AsrLlmLogitsHeadRuntime, Qwen3AsrLlmLogitsHeadError> {
         let executor = self
             .ggml_output_weight
             .as_ref()
@@ -232,7 +246,7 @@ impl Qwen3AsrLlmLogitsHead {
                     self.rms_norm_epsilon,
                     &self.output_norm_weight,
                     output_weight,
-                    backend,
+                    graph_config,
                 )
             })
             .transpose()
@@ -390,6 +404,15 @@ impl Qwen3AsrLlmLogitsHead {
 }
 
 impl Qwen3AsrLlmLogitsHeadRuntime {
+    pub(crate) fn graph_lane(&self) -> Option<(GgmlCpuGraphBackend, bool)> {
+        self.executor.as_ref().map(|executor| {
+            (
+                executor.runner.backend_kind(),
+                executor.runner.uses_scheduler(),
+            )
+        })
+    }
+
     pub(crate) fn compute_logits_for_hidden_rows(
         &mut self,
         head: &Qwen3AsrLlmLogitsHead,
@@ -475,7 +498,6 @@ impl Qwen3AsrLlmLogitsHeadRuntime {
         head.compute_top1_token_for_last_hidden(hidden)
     }
 
-    #[cfg(test)]
     pub(crate) fn compute_top1_tokens_for_hidden_rows(
         &mut self,
         head: &Qwen3AsrLlmLogitsHead,
@@ -745,7 +767,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
         rms_norm_epsilon: f32,
         output_norm_weight: &[f32],
         output_weight: &OwnedGgmlLogitsWeight,
-        backend: GgmlCpuGraphBackend,
+        graph_config: GgmlCpuGraphConfig,
     ) -> Result<Self, GgmlCpuGraphError> {
         if !rms_norm_epsilon.is_finite() || rms_norm_epsilon <= 0.0 {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
@@ -768,7 +790,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
         // use the decoder execution tier because they share the same output
         // matrix and execution lane; the batched form amortizes graph setup
         // and GPU submission without introducing a second runtime owner.
-        let mut config = qwen_decoder_graph_config(backend);
+        let mut config = graph_config;
         config.set_graph_node_capacity(QWEN3_LLM_LOGITS_GRAPH_NODE_CAPACITY);
         let runner = GgmlCpuGraphRunner::new(config)?;
         let mut arena = runner.start_static_tensor_arena(
@@ -906,38 +928,6 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
             })
             .collect()
     }
-}
-
-pub(crate) fn first_max_argmax_reverse_indices(
-    vocab_size: usize,
-) -> Result<Vec<i32>, GgmlCpuGraphError> {
-    (0..vocab_size)
-        .rev()
-        .map(|index| {
-            i32::try_from(index).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
-                reason: "first-max argmax vocab index exceeds ggml int boundary",
-            })
-        })
-        .collect()
-}
-
-pub(crate) fn first_max_token_id_from_reversed_argmax(
-    reversed_token_id: i32,
-    vocab_size: usize,
-) -> Result<i32, GgmlCpuGraphError> {
-    let reversed_index =
-        usize::try_from(reversed_token_id).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
-            reason: "first-max argmax reversed token id is negative",
-        })?;
-    if reversed_index >= vocab_size {
-        return Err(GgmlCpuGraphError::UnsupportedInputs {
-            reason: "first-max argmax reversed token id is outside vocab size",
-        });
-    }
-    let original_index = vocab_size - 1 - reversed_index;
-    i32::try_from(original_index).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
-        reason: "first-max argmax token id exceeds ggml int boundary",
-    })
 }
 
 fn validate_top1_token_id(

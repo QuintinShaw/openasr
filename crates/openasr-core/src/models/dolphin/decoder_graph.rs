@@ -34,7 +34,8 @@
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlMatmulPrecision, GgmlStaticTensor,
+    GgmlStaticTensorArena,
 };
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, AttentionValueMergeSteps,
@@ -476,10 +477,11 @@ fn linear<'a>(
     graph: &GgmlCpuGraphBuilder<'a>,
     weights: &LinearWeights<'a>,
     input: GgmlCpuTensor<'a>,
+    precision: GgmlMatmulPrecision,
     stage: &'static str,
 ) -> Result<GgmlCpuTensor<'a>, DolphinDecoderError> {
     let projected = graph
-        .mul_mat(weights.weight, input)
+        .mul_mat_with_precision(weights.weight, input, precision)
         .map_err(ggml_err(stage))?;
     graph.add(projected, weights.bias).map_err(ggml_err(stage))
 }
@@ -588,12 +590,25 @@ fn build_cross_attention_heads<'a>(
     encoder_out: GgmlCpuTensor<'a>,
     weights: &DecoderLayerWeights<'a>,
     config: &DolphinDecoderConfig,
+    precision: GgmlMatmulPrecision,
     frames: usize,
 ) -> Result<CrossAttentionHeads<'a>, DolphinDecoderError> {
     let hd = config.head_dim;
     let heads = config.attention_heads;
-    let k = linear(graph, &weights.src_k, encoder_out, "cross_attn_k")?;
-    let v = linear(graph, &weights.src_v, encoder_out, "cross_attn_v")?;
+    let k = linear(
+        graph,
+        &weights.src_k,
+        encoder_out,
+        precision,
+        "cross_attn_k",
+    )?;
+    let v = linear(
+        graph,
+        &weights.src_v,
+        encoder_out,
+        precision,
+        "cross_attn_v",
+    )?;
     Ok(CrossAttentionHeads {
         k_heads: reshape_heads(graph, k, hd, heads, frames)?,
         v_heads: reshape_heads(graph, v, hd, heads, frames)?,
@@ -608,6 +623,7 @@ fn decoder_layer<'a>(
     causal_mask: GgmlCpuTensor<'a>,
     weights: &DecoderLayerWeights<'a>,
     config: &DolphinDecoderConfig,
+    precision: GgmlMatmulPrecision,
     tokens: usize,
 ) -> Result<GgmlCpuTensor<'a>, DolphinDecoderError> {
     let eps = config.layer_norm_epsilon;
@@ -617,23 +633,23 @@ fn decoder_layer<'a>(
 
     // Self-attention (causal) sub-block: residual + self_attn(norm1(x)).
     let self_norm = affine_ln(graph, input, eps, &weights.norm1, "self_attn_norm")?;
-    let q = linear(graph, &weights.self_q, self_norm, "self_attn_q")?;
-    let k = linear(graph, &weights.self_k, self_norm, "self_attn_k")?;
-    let v = linear(graph, &weights.self_v, self_norm, "self_attn_v")?;
+    let q = linear(graph, &weights.self_q, self_norm, precision, "self_attn_q")?;
+    let k = linear(graph, &weights.self_k, self_norm, precision, "self_attn_k")?;
+    let v = linear(graph, &weights.self_v, self_norm, precision, "self_attn_v")?;
     let q = reshape_heads(graph, q, hd, heads, tokens)?;
     let k = reshape_heads(graph, k, hd, heads, tokens)?;
     let v = reshape_heads(graph, v, hd, heads, tokens)?;
     let context = attention(graph, q, k, v, Some(causal_mask), config, tokens)?;
-    let self_out = linear(graph, &weights.self_o, context, "self_attn_out")?;
+    let self_out = linear(graph, &weights.self_o, context, precision, "self_attn_out")?;
     let x = graph.add(input, self_out).map_err(map)?;
 
     // Cross-attention sub-block: residual + src_attn(norm2(x)) over the
     // shared, per-utterance K/V heads (see [`CrossAttentionHeads`]).
     let cross_norm = affine_ln(graph, x, eps, &weights.norm2, "cross_attn_norm")?;
-    let q = linear(graph, &weights.src_q, cross_norm, "cross_attn_q")?;
+    let q = linear(graph, &weights.src_q, cross_norm, precision, "cross_attn_q")?;
     let q = reshape_heads(graph, q, hd, heads, tokens)?;
     let context = attention(graph, q, cross.k_heads, cross.v_heads, None, config, tokens)?;
-    let cross_out = linear(graph, &weights.src_o, context, "cross_attn_out")?;
+    let cross_out = linear(graph, &weights.src_o, context, precision, "cross_attn_out")?;
     let x = graph.add(x, cross_out).map_err(map)?;
 
     // Feed-forward sub-block: residual + w_2(relu(w_1(norm3(x)))).
@@ -649,8 +665,8 @@ fn decoder_layer<'a>(
             scale: None,
             residual: "ffn_residual",
         },
-        |graph, value| linear(graph, &weights.ff_w1, value, "ffn_up"),
-        |graph, value| linear(graph, &weights.ff_w2, value, "ffn_down"),
+        |graph, value| linear(graph, &weights.ff_w1, value, precision, "ffn_up"),
+        |graph, value| linear(graph, &weights.ff_w2, value, precision, "ffn_down"),
         |s, source| DolphinDecoderError::Ggml { stage: s, source },
     )
 }
@@ -671,7 +687,7 @@ fn build_causal_mask(tokens: usize) -> Vec<f32> {
 }
 
 fn dolphin_decoder_runner_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
-    GgmlCpuGraphConfig {
+    crate::models::graph_runtime_config::apply_request_execution_placement(GgmlCpuGraphConfig {
         context_bytes: GgmlCpuGraphConfig::metadata_context_bytes(
             DOLPHIN_DECODER_GRAPH_NODE_CAPACITY,
         ),
@@ -681,12 +697,11 @@ fn dolphin_decoder_runner_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphCo
             crate::ggml_runtime::GgmlCpuGraphThreadingWorkload::Decoder,
         ),
         backend,
-        // See the matching comment in encoder_graph.rs: unconditionally
-        // enabling the gallocr scheduler (like the sibling cohere/moonshine
-        // decoders) only bounds memory footprint, never the decoder's
-        // computed output.
+        // CPU/unscoped callers retain the bounded gallocr scheduler. The
+        // active policy placement wins last so FullDevice is direct and the
+        // qualified Vulkan split remains scheduler-backed Hybrid.
         use_scheduler: true,
-    }
+    })
 }
 
 /// Build-once/run-many Dolphin decoder runtime for attention rescoring.
@@ -703,6 +718,7 @@ pub(crate) struct DolphinDecoderRescoreRuntime {
     arena: GgmlStaticTensorArena,
     config: DolphinDecoderConfig,
     weights: DecoderStaticWeights,
+    matmul_precision: GgmlMatmulPrecision,
 }
 
 impl DolphinDecoderRescoreRuntime {
@@ -741,6 +757,15 @@ impl DolphinDecoderRescoreRuntime {
         config: &DolphinDecoderConfig,
         provider: &dyn DolphinWeightProvider,
         backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, DolphinDecoderError> {
+        Self::new_with_matmul_precision(config, provider, backend, GgmlMatmulPrecision::Default)
+    }
+
+    pub(crate) fn new_with_matmul_precision(
+        config: &DolphinDecoderConfig,
+        provider: &dyn DolphinWeightProvider,
+        backend: GgmlCpuGraphBackend,
+        matmul_precision: GgmlMatmulPrecision,
     ) -> Result<Self, DolphinDecoderError> {
         let d = config.d_model;
         let runner = GgmlCpuGraphRunner::new(dolphin_decoder_runner_config(backend))
@@ -798,6 +823,7 @@ impl DolphinDecoderRescoreRuntime {
                 output_weight,
                 output_bias,
             },
+            matmul_precision,
         })
     }
 
@@ -828,6 +854,7 @@ impl DolphinDecoderRescoreRuntime {
         prompts: &[Vec<u32>],
     ) -> Result<Vec<DolphinDecoderOutput>, DolphinDecoderError> {
         let config = &self.config;
+        let matmul_precision = self.matmul_precision;
         let d = config.d_model;
         if frames == 0 || encoder_out.len() != frames * d {
             return Err(DolphinDecoderError::Shape {
@@ -894,6 +921,7 @@ impl DolphinDecoderRescoreRuntime {
                 encoder_mem,
                 layer,
                 config,
+                matmul_precision,
                 frames,
             )?);
         }
@@ -938,6 +966,7 @@ impl DolphinDecoderRescoreRuntime {
                     causal_mask,
                     layer,
                     config,
+                    matmul_precision,
                     tokens,
                 )?;
             }
@@ -949,7 +978,11 @@ impl DolphinDecoderRescoreRuntime {
                 "after_norm",
             )?;
             let logits = graph
-                .mul_mat(arena.graph_tensor(self.weights.output_weight), normed)
+                .mul_mat_with_precision(
+                    arena.graph_tensor(self.weights.output_weight),
+                    normed,
+                    matmul_precision,
+                )
                 .map_err(ggml_err("output_layer"))?;
             let logits = graph
                 .add(logits, arena.graph_tensor(self.weights.output_bias))

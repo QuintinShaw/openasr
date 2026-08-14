@@ -40,8 +40,9 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::ggml_runtime::{
-    GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightContext,
-    GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReadError, GgufTensorDataReader,
+    GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightBindingIdentity,
+    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReadError,
+    GgufTensorDataReader,
 };
 use crate::nn::conv::{
     Conv1dParams, ConvActivation, ConvBlockSteps, apply_conv_1d_bias_activation,
@@ -388,6 +389,14 @@ pub(crate) struct MossEncoderRuntime {
 }
 
 impl MossEncoderRuntime {
+    pub(crate) fn graph_lane(&self) -> (crate::ggml_runtime::GgmlCpuGraphBackend, bool) {
+        (self.runner.backend_kind(), self.runner.uses_scheduler())
+    }
+
+    pub(crate) fn loaded_weight_binding_identity(&self) -> GgmlLoadedWeightBindingIdentity {
+        self.runner.loaded_weight_binding_identity(&self.loaded)
+    }
+
     pub(crate) fn new_with_prepared_weights_from_preflight(
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         weights: Arc<MossEncoderWeights>,
@@ -396,9 +405,8 @@ impl MossEncoderRuntime {
         adaptor_merge_size: usize,
         llm_dim: usize,
         adaptor_norm_epsilon: f32,
-        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        graph_config: crate::ggml_runtime::GgmlCpuGraphConfig,
     ) -> Result<Self, MossEncoderError> {
-        let graph_config = super::graph_config::moss_td_encoder_graph_config(backend);
         let runner = GgmlCpuGraphRunner::new(graph_config)
             .map_err(|source| map_graph_error("runner_init", source))?;
         let loaded = runner

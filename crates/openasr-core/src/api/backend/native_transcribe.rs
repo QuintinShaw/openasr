@@ -746,10 +746,33 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
         let decode_positions_ref = &decode_positions;
         let cursor_ref = &cursor;
         let stop_ref = &stop;
+        // `thread::scope` does not inherit TLS. Capture the complete request
+        // execution context once so every slice worker keeps the same broker,
+        // Exact route namespace, telemetry, and transactional observation
+        // parent as the request thread. Candidate attempts installed below the
+        // worker then publish into that parent instead of silently losing the
+        // evidence stream on concurrent long audio.
+        let native_execution_context =
+            crate::models::native_execution_services::current_native_execution_context();
+        // The orchestration thread can sit above the per-candidate service
+        // scope, so `current_native_execution_context()` is legitimately None
+        // while an audit sink is still installed around the whole request.
+        // Carry that parent independently; the worker's candidate transaction
+        // will derive its attempt-local sink from it.
+        let execution_observation_sink =
+            crate::models::native_execution_services::current_execution_observation_sink();
         std::thread::scope(|scope| {
             for _ in 0..worker_count {
                 let result_tx = result_tx.clone();
+                let native_execution_context = native_execution_context.clone();
+                let execution_observation_sink = execution_observation_sink.clone();
                 scope.spawn(move || {
+                    let _native_execution_context = native_execution_context.map(
+                        crate::models::native_execution_services::install_native_execution_context,
+                    );
+                    let _execution_observation_sink = execution_observation_sink.map(
+                        crate::models::native_execution_services::install_execution_observation_sink,
+                    );
                     // Arm this worker thread's ggml abort callback when the
                     // request has a cancel source, so a mid-graph cancel aborts
                     // this worker too. Between-step cancel is already covered
@@ -1615,6 +1638,29 @@ pub fn refine_existing_transcription_timeline(
     ))
 }
 
+/// Maps a resolved provider/placement pair to one measured aligner topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForcedAlignerSessionPlan {
+    Uniform,
+}
+
+fn forced_aligner_session_plan(
+    placement: ExecutionPlacement,
+    provider: ExecutionProvider,
+) -> Result<ForcedAlignerSessionPlan, &'static str> {
+    match (placement, provider) {
+        (ExecutionPlacement::CpuOnly, ExecutionProvider::Cpu) => {
+            Ok(ForcedAlignerSessionPlan::Uniform)
+        }
+        (ExecutionPlacement::FullDevice, ExecutionProvider::Metal)
+        | (ExecutionPlacement::FullDevice, ExecutionProvider::Cuda)
+        | (ExecutionPlacement::FullDevice, ExecutionProvider::Vulkan) => {
+            Ok(ForcedAlignerSessionPlan::Uniform)
+        }
+        _ => Err("forced-aligner execution topology is not validated for this provider"),
+    }
+}
+
 /// Reuses the exact normalized PCM backing decoded by the main request and
 /// loads the installed Qwen3-ForcedAligner pack once. Each already-bounded ASR
 /// segment is aligned independently, then its local spans are mapped back to
@@ -1673,11 +1719,23 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
             }
             let backend = crate::models::policy_resolved_aux_runtime::resolved_runtime_for_auxiliary_candidate(candidate).backend();
             let session_load_started = Instant::now();
-            let session =
-                Qwen3ForcedAlignerSession::load_verified(verified_forced_aligner.clone(), backend)
-                    .map_err(|error| {
-                        forced_alignment_error_to_backend(execution_context, error.to_string())
-                    })?;
+            let session_plan =
+                forced_aligner_session_plan(candidate.placement, candidate.device.route.provider)
+                    .map_err(|reason| BackendError::NativeFailClosed {
+                    reason: format!(
+                        "{reason}: provider={:?} placement={:?}",
+                        candidate.device.route.provider, candidate.placement,
+                    ),
+                })?;
+            let session = match session_plan {
+                ForcedAlignerSessionPlan::Uniform => Qwen3ForcedAlignerSession::load_verified(
+                    verified_forced_aligner.clone(),
+                    backend,
+                ),
+            }
+            .map_err(|error| {
+                forced_alignment_error_to_backend(execution_context, error.to_string())
+            })?;
             crate::stage_timing::log_detail_stage(
                 "forced_aligner",
                 "session_load",
@@ -2022,7 +2080,7 @@ fn run_native_transcription_impl(
     let selection_metadata = selection_metadata_from_gguf(&runtime_preflight.metadata);
     let selected_family = validate_runtime_source_and_select_adapter(
         requested_model_id,
-        runtime_preflight.runtime_source.path(),
+        &verified_pack,
         &selection_metadata,
     )?;
     let emits_punctuation =
@@ -2387,7 +2445,7 @@ fn run_native_transcription_impl(
                         &longform_options,
                         resolved_runtime_for_candidate(
                             candidate,
-                            crate::diarize::vad::STREAM_VAD_AUTO_GPU_POLICY,
+                            crate::diarize::vad::STREAM_VAD_OFFLINE_AUTO_GPU_POLICY,
                         )
                         .backend(),
                         candidate.placement,
@@ -3801,32 +3859,36 @@ fn normalize_and_validate_model_id(request: &TranscriptionRequest) -> Result<&st
 
 fn validate_runtime_source_and_select_adapter(
     requested_model_id: &str,
-    runtime_source_path: &Path,
+    verified_pack: &VerifiedPack,
     metadata: &BTreeMap<String, String>,
 ) -> Result<GgmlFamilyAdapterDescriptor, BackendError> {
     let normalized_model_id =
         super::native_model_id::resolve_native_runtime_model_identity_from_string_metadata(
             metadata,
-            runtime_source_path,
+            verified_pack.preflight().runtime_source().path(),
             None,
         )
         .map_err(|error| BackendError::NativeFailClosed {
             reason: error.to_string(),
         })?
         .model_id;
+    let selected = OpenAsrArchitectureRegistry::with_builtins()
+        .select_ggml_adapter_from_gguf_metadata_v1(metadata)
+        .map(|descriptor| descriptor.ggml_family_adapter_descriptor())
+        .map_err(map_family_selection_error)?;
     if requested_model_id != NATIVE_RUNTIME_MODEL_ID_AUTO
-        && !native_runtime_model_refs_match(requested_model_id, &normalized_model_id)
+        && !super::native_runtime_model_ref_matches_verified_pack(
+            requested_model_id,
+            &normalized_model_id,
+            verified_pack,
+            &selected,
+        )
     {
         return Err(BackendError::NativeModelSelectionMismatch {
             requested: requested_model_id.to_string(),
             local: normalized_model_id,
         });
     }
-
-    let selected = OpenAsrArchitectureRegistry::with_builtins()
-        .select_ggml_adapter_from_gguf_metadata_v1(metadata)
-        .map(|descriptor| descriptor.ggml_family_adapter_descriptor())
-        .map_err(map_family_selection_error)?;
     Ok(selected)
 }
 
@@ -3836,9 +3898,8 @@ fn validate_runtime_source_and_select_adapter(
 /// (`family:quant`) matches a bare runtime id (`family`) -- the
 /// `(Some(_), None) => true` arm below is load-bearing. Quant tags on both
 /// sides compare through `canonical_quant_tag` so catalog aliases (`q8` vs
-/// `q8_0`) match. Every requested-vs-loaded-pack gate (core dispatch, server
-/// request validation, CLI serve startup) must use this instead of comparing
-/// strings, or catalog-resolved refs spuriously mismatch the loaded pack.
+/// `q8_0`) match. Verified-pack gates use this as their ordinary spelling
+/// check before considering a narrowly content-bound published compatibility.
 pub fn native_runtime_model_refs_match(requested: &str, runtime_source_id: &str) -> bool {
     let requested = requested.trim();
     let runtime_source_id = runtime_source_id.trim();
@@ -4106,7 +4167,7 @@ fn resolve_longform_vad_execution_plan(
         .policy_resolver()
         .resolve(
             request_intent.clone(),
-            crate::diarize::vad::STREAM_VAD_AUTO_GPU_POLICY,
+            crate::diarize::vad::STREAM_VAD_OFFLINE_AUTO_GPU_POLICY,
             crate::diarize::vad::stream_vad_execution_capabilities(),
             &inventory,
         )
@@ -4523,6 +4584,149 @@ mod tests {
     use super::*;
 
     #[test]
+    fn forced_aligner_session_plan_matches_validated_provider_topologies() {
+        assert_eq!(
+            forced_aligner_session_plan(ExecutionPlacement::CpuOnly, ExecutionProvider::Cpu),
+            Ok(ForcedAlignerSessionPlan::Uniform),
+        );
+        assert_eq!(
+            forced_aligner_session_plan(ExecutionPlacement::FullDevice, ExecutionProvider::Metal),
+            Ok(ForcedAlignerSessionPlan::Uniform),
+        );
+        assert_eq!(
+            forced_aligner_session_plan(ExecutionPlacement::FullDevice, ExecutionProvider::Cuda),
+            Ok(ForcedAlignerSessionPlan::Uniform),
+        );
+        assert_eq!(
+            forced_aligner_session_plan(ExecutionPlacement::FullDevice, ExecutionProvider::Vulkan,),
+            Ok(ForcedAlignerSessionPlan::Uniform),
+        );
+        for (placement, provider) in [
+            (ExecutionPlacement::Hybrid, ExecutionProvider::Metal),
+            (ExecutionPlacement::Hybrid, ExecutionProvider::Cuda),
+            (ExecutionPlacement::Hybrid, ExecutionProvider::Vulkan),
+            (ExecutionPlacement::Hybrid, ExecutionProvider::Hip),
+            (ExecutionPlacement::FullDevice, ExecutionProvider::Hip),
+        ] {
+            assert!(
+                forced_aligner_session_plan(placement, provider).is_err(),
+                "provider {provider:?} must fail closed for {placement:?}",
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "host-local: needs the installed Qwen3-ForcedAligner q8 pack and an exact CUDA or Vulkan device"]
+    fn forced_aligner_exact_full_device_q8_matches_cpu_on_jfk() {
+        let provider = asr_exact_smoke_provider(
+            &std::env::var("OPENASR_FORCED_ALIGNER_SMOKE_PROVIDER")
+                .expect("OPENASR_FORCED_ALIGNER_SMOKE_PROVIDER must be cuda or vulkan"),
+        );
+        let exact_intent = asr_exact_smoke_intent(provider, None);
+        let wav = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav");
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            wav,
+            "forced-aligner Exact FullDevice smoke",
+            "forced-aligner Exact FullDevice smoke",
+        )
+        .expect("JFK fixture loads");
+        let pcm = crate::PcmBuffer::from_vec(samples);
+        let audio_seconds = pcm.len() as f32 / 16_000.0;
+        let text = "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.";
+        let input = Transcription {
+            text: text.to_string(),
+            language: Some("English".to_string()),
+            segments: vec![segment(0.0, audio_seconds, text)],
+            ..Transcription::default()
+        };
+        let services = native_execution_services_for_test();
+        let execution_context = crate::RequestExecutionContext::uncancellable(
+            "forced-aligner Exact FullDevice q8 smoke",
+        );
+        let cpu = refine_transcription_word_timestamps_with_forced_aligner_policy(
+            input.clone(),
+            pcm.full_slice(),
+            Some("English"),
+            services.as_ref(),
+            &ExecutionIntent::CpuOnly,
+            &execution_context,
+            None,
+        )
+        .expect("CPU forced alignment");
+
+        let telemetry = crate::GgmlExecutionTelemetryCollector::new();
+        let _telemetry_guard = telemetry.install();
+        let accelerated = refine_transcription_word_timestamps_with_forced_aligner_policy(
+            input,
+            pcm.full_slice(),
+            Some("English"),
+            services.as_ref(),
+            &exact_intent,
+            &execution_context,
+            None,
+        )
+        .expect("Exact FullDevice forced alignment");
+        let observed = telemetry.snapshot();
+        assert!(
+            !observed.observed_compute_nodes_by_backend.is_empty(),
+            "Exact FullDevice aligner must execute backend graph nodes"
+        );
+        let expected_backend_fragment = match provider {
+            ExecutionProvider::Cuda => "cuda",
+            ExecutionProvider::Vulkan => "vulkan",
+            _ => unreachable!("provider parser accepts only CUDA/Vulkan"),
+        };
+        assert!(
+            observed
+                .observed_compute_nodes_by_backend
+                .keys()
+                .all(|backend| backend
+                    .to_ascii_lowercase()
+                    .contains(expected_backend_fragment)),
+            "Exact {provider:?} aligner observed a different backend: {:?}",
+            observed.observed_compute_nodes_by_backend,
+        );
+
+        assert_eq!(cpu.segments.len(), accelerated.segments.len());
+        let mut drift_ms = Vec::new();
+        let mut output_bytes = Vec::new();
+        for (cpu_segment, accelerated_segment) in cpu.segments.iter().zip(&accelerated.segments) {
+            assert_eq!(cpu_segment.text, accelerated_segment.text);
+            assert_eq!(cpu_segment.words.len(), accelerated_segment.words.len());
+            for (cpu_word, accelerated_word) in
+                cpu_segment.words.iter().zip(&accelerated_segment.words)
+            {
+                assert_eq!(cpu_word.word, accelerated_word.word);
+                drift_ms.push(
+                    (f64::from(cpu_word.start) - f64::from(accelerated_word.start)).abs() * 1000.0,
+                );
+                drift_ms.push(
+                    (f64::from(cpu_word.end) - f64::from(accelerated_word.end)).abs() * 1000.0,
+                );
+                output_bytes.extend_from_slice(accelerated_word.word.as_bytes());
+                output_bytes.push(0);
+                output_bytes.extend_from_slice(&accelerated_word.start.to_le_bytes());
+                output_bytes.extend_from_slice(&accelerated_word.end.to_le_bytes());
+            }
+        }
+        assert!(!drift_ms.is_empty(), "forced aligner must emit word spans");
+        drift_ms.sort_by(f64::total_cmp);
+        let median_ms = drift_ms[drift_ms.len() / 2];
+        let p95_ms = drift_ms[(drift_ms.len() - 1) * 95 / 100];
+        let max_ms = drift_ms[drift_ms.len() - 1];
+        let output_sha256 = crate::testing::benchmark_sha256_bytes([output_bytes]);
+        eprintln!(
+            "FORCED_ALIGNER_EXACT_FULL_DEVICE_Q8 provider={provider:?} words={} endpoints={} median_ms={median_ms:.3} p95_ms={p95_ms:.3} max_ms={max_ms:.3} output_sha256={output_sha256} observed_compute_nodes={:?}",
+            drift_ms.len() / 2,
+            drift_ms.len(),
+            observed.observed_compute_nodes_by_backend,
+        );
+        assert!(median_ms < 80.0, "median drift {median_ms:.3}ms");
+        assert!(p95_ms <= 160.0, "p95 drift {p95_ms:.3}ms");
+        assert!(max_ms <= 320.0, "maximum drift {max_ms:.3}ms");
+    }
+
+    #[test]
     fn multichunk_cpu_decoder_hint_is_auto_only() {
         let architecture = crate::arch::COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID;
         assert!(should_prefer_cpu_decoder_for_multichunk_metal(
@@ -4744,6 +4948,1212 @@ mod tests {
 
     fn native_execution_services_for_test() -> Arc<NativeExecutionServices> {
         crate::models::native_execution_services::test_native_execution_services()
+    }
+
+    const ASR_EXACT_SMOKE_PACK_ENV: &str = "OPENASR_ASR_SMOKE_PACK";
+    const ASR_EXACT_SMOKE_MODEL_ENV: &str = "OPENASR_ASR_SMOKE_MODEL";
+    const ASR_EXACT_SMOKE_PROVIDER_ENV: &str = "OPENASR_ASR_SMOKE_PROVIDER";
+    const ASR_EXACT_SMOKE_STABLE_ID_ENV: &str = "OPENASR_ASR_SMOKE_STABLE_ID";
+    const ASR_EXACT_SMOKE_FIXTURE_ENV: &str = "OPENASR_ASR_SMOKE_FIXTURE";
+    const ASR_EXACT_SMOKE_PRIVATE_ENV: &str = "OPENASR_ASR_SMOKE_PRIVATE";
+    const ASR_EXACT_SMOKE_AUDIO_PATH_ENV: &str = "OPENASR_ASR_SMOKE_AUDIO_PATH";
+    const ASR_EXACT_SMOKE_AUDIO_LABEL_ENV: &str = "OPENASR_ASR_SMOKE_AUDIO_LABEL";
+    const ASR_EXACT_SMOKE_AUDIO_SHA256_ENV: &str = "OPENASR_ASR_SMOKE_AUDIO_SHA256";
+    const ASR_EXACT_SMOKE_FRESH_MODE_ENV: &str = "OPENASR_ASR_SMOKE_FRESH_MODE";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum AsrExactSmokeFreshMode {
+        CpuOnly,
+        ExactAccelerated,
+    }
+
+    fn asr_exact_smoke_fresh_mode(raw: &str) -> AsrExactSmokeFreshMode {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "cpu" => AsrExactSmokeFreshMode::CpuOnly,
+            "accelerated" => AsrExactSmokeFreshMode::ExactAccelerated,
+            _ => panic!("OPENASR_ASR_SMOKE_FRESH_MODE must be cpu or accelerated"),
+        }
+    }
+
+    fn render_safe_memory_bytes(value: crate::ggml_runtime::BackendMemoryBytes) -> String {
+        match value {
+            crate::ggml_runtime::BackendMemoryBytes::Known(bytes) => format!("known:{bytes}"),
+            crate::ggml_runtime::BackendMemoryBytes::Unknown(reason) => {
+                format!("unknown:{reason:?}")
+            }
+        }
+    }
+
+    fn emit_exact_smoke_safe_memory_receipts(
+        observations: &[crate::models::native_execution_services::ExecutionBackendObservation],
+    ) {
+        for observation in observations {
+            for receipt in &observation.memory_receipts {
+                eprintln!(
+                    "ASR_EXACT_MEMORY_RECEIPT provider={} placement={:?} backend_kind={:?} lifecycle={:?} domain_kind={:?} heap_index={:?} device_used_bytes={} device_free_bytes={} backend_owned_live_bytes={} backend_owned_cached_bytes={} backend_owned_workspace_bytes={} backend_owned_observed_high_water_bytes={}",
+                    observation.actual_provider.as_str(),
+                    observation.placement,
+                    observation.backend_kind,
+                    receipt.lifecycle,
+                    receipt.domain_kind,
+                    receipt.heap_index,
+                    render_safe_memory_bytes(receipt.device_used_bytes),
+                    render_safe_memory_bytes(receipt.device_free_bytes),
+                    render_safe_memory_bytes(receipt.backend_owned_live_bytes),
+                    render_safe_memory_bytes(receipt.backend_owned_cached_bytes),
+                    render_safe_memory_bytes(receipt.backend_owned_workspace_bytes),
+                    render_safe_memory_bytes(receipt.backend_owned_observed_high_water_bytes),
+                );
+            }
+        }
+    }
+
+    struct AsrExactSmokeAudio {
+        label: &'static str,
+        basename: &'static str,
+        oracle_tier: &'static str,
+        path: std::path::PathBuf,
+        sha256: String,
+        samples: Arc<Vec<f32>>,
+        allow_matching_truncation: bool,
+        longform_mode: LongFormMode,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct AsrExactSmokeTextDriftBudget {
+        max_segment_mismatches: usize,
+        max_word_edits: usize,
+    }
+
+    fn required_asr_exact_smoke_env(name: &str) -> String {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| {
+                panic!("missing required host-local smoke environment variable {name}")
+            })
+    }
+
+    fn asr_exact_smoke_fixture(raw: &str) -> (&'static str, std::path::PathBuf) {
+        let fixture = raw.trim().to_ascii_lowercase();
+        let (label, file) = match fixture.as_str() {
+            "jfk" => ("jfk", "jfk.wav"),
+            "jfk_repeated_15m" => ("jfk_repeated_15m", "jfk.wav"),
+            "zh_sample" => ("zh_sample", "zh_sample.wav"),
+            "en_zh_mixed" => ("en_zh_mixed", "en_zh_mixed.wav"),
+            _ => panic!(
+                "OPENASR_ASR_SMOKE_FIXTURE must be one of jfk, jfk_repeated_15m, zh_sample, en_zh_mixed"
+            ),
+        };
+        (
+            label,
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join("fixtures")
+                .join(file),
+        )
+    }
+
+    fn private_asr_exact_smoke_audio_spec(
+        raw: &str,
+    ) -> (&'static str, &'static str, &'static str, bool) {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "sichuan_dialect_30s" => (
+                "sichuan_dialect_30s",
+                "sichuan_dialect_30s.wav",
+                "stress_parity_only",
+                false,
+            ),
+            "dolphin_sichuan_clip" => (
+                "dolphin_sichuan_clip",
+                "clip_sichuan.wav",
+                "human_ground_truth_2_38s_only",
+                false,
+            ),
+            "private_family_59s_normalized" => (
+                "private_family_59s_normalized",
+                "private_family_59s_16k_mono_f32.wav",
+                "pinned_reference",
+                false,
+            ),
+            "arabic_synthetic" => (
+                "arabic_synthetic",
+                "arabic_synthetic_16k_mono.wav",
+                "routing_crash_parity_only",
+                true,
+            ),
+            _ => panic!("OPENASR_ASR_SMOKE_AUDIO_LABEL is not an approved private-audio label"),
+        }
+    }
+
+    fn parse_asr_exact_smoke_sha256(raw: &str) -> String {
+        let normalized = raw.trim().to_ascii_lowercase();
+        assert!(
+            normalized.len() == 64 && normalized.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "OPENASR_ASR_SMOKE_AUDIO_SHA256 must be exactly 64 hexadecimal characters"
+        );
+        normalized
+    }
+
+    fn asr_exact_smoke_audio() -> AsrExactSmokeAudio {
+        let private_path = std::env::var(ASR_EXACT_SMOKE_AUDIO_PATH_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        let (label, basename, oracle_tier, path, expected_sha256, allow_matching_truncation) =
+            if let Some(private_path) = private_path {
+                assert_eq!(
+                    std::env::var(ASR_EXACT_SMOKE_PRIVATE_ENV).ok().as_deref(),
+                    Some("1"),
+                    "private ASR smoke audio requires OPENASR_ASR_SMOKE_PRIVATE=1"
+                );
+                assert!(
+                    std::env::var(ASR_EXACT_SMOKE_FIXTURE_ENV)
+                        .ok()
+                        .is_none_or(|value| value.trim().is_empty()),
+                    "private ASR smoke audio cannot be combined with a public fixture"
+                );
+                let raw_label = required_asr_exact_smoke_env(ASR_EXACT_SMOKE_AUDIO_LABEL_ENV);
+                let (label, basename, oracle_tier, allow_matching_truncation) =
+                    private_asr_exact_smoke_audio_spec(&raw_label);
+                let path = std::path::PathBuf::from(private_path);
+                assert!(
+                    path.is_absolute(),
+                    "private ASR smoke audio path must be absolute"
+                );
+                assert!(
+                    path.file_name()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| value.eq_ignore_ascii_case(basename)),
+                    "private ASR smoke audio basename does not match its approved label"
+                );
+                assert!(path.is_file(), "private ASR smoke audio is missing");
+                let expected_sha256 = parse_asr_exact_smoke_sha256(&required_asr_exact_smoke_env(
+                    ASR_EXACT_SMOKE_AUDIO_SHA256_ENV,
+                ));
+                (
+                    label,
+                    basename,
+                    oracle_tier,
+                    path,
+                    Some(expected_sha256),
+                    allow_matching_truncation,
+                )
+            } else {
+                assert!(
+                    std::env::var(ASR_EXACT_SMOKE_PRIVATE_ENV)
+                        .ok()
+                        .is_none_or(|value| value.trim().is_empty()),
+                    "OPENASR_ASR_SMOKE_PRIVATE requires a private audio path"
+                );
+                let (label, path) = asr_exact_smoke_fixture(&required_asr_exact_smoke_env(
+                    ASR_EXACT_SMOKE_FIXTURE_ENV,
+                ));
+                let basename = match label {
+                    "jfk" => "jfk.wav",
+                    "jfk_repeated_15m" => "jfk_repeated_15m.wav",
+                    "zh_sample" => "zh_sample.wav",
+                    "en_zh_mixed" => "en_zh_mixed.wav",
+                    _ => unreachable!("public fixture parser returned an unknown label"),
+                };
+                let oracle_tier = if label == "jfk_repeated_15m" {
+                    "public_fixture_longform_quality"
+                } else {
+                    "public_fixture_parity"
+                };
+                (label, basename, oracle_tier, path, None, false)
+            };
+
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|_| panic!("ASR smoke audio could not be read after identity checks"));
+        let source_sha256 = crate::testing::benchmark_sha256_bytes([bytes.as_slice()]);
+        if let Some(expected_sha256) = expected_sha256 {
+            assert_eq!(
+                source_sha256, expected_sha256,
+                "private ASR smoke audio SHA-256 does not match its declared identity"
+            );
+        }
+        let mut samples =
+            crate::api::audio_io::parse_wav_16khz_mono_f32(&bytes, "ASR Exact smoke audio")
+                .unwrap_or_else(|_| panic!("ASR smoke audio is not a supported 16 kHz mono WAV"));
+        let sha256 = if label == "jfk_repeated_15m" {
+            samples = repeat_f32_samples_to_exact_len(&samples, 15 * 60 * 16_000);
+            crate::testing::benchmark_sha256_f32(&samples)
+        } else {
+            source_sha256
+        };
+        AsrExactSmokeAudio {
+            label,
+            basename,
+            oracle_tier,
+            path,
+            sha256,
+            samples: Arc::new(samples),
+            allow_matching_truncation,
+            longform_mode: asr_exact_smoke_longform_mode(label),
+        }
+    }
+
+    fn asr_exact_smoke_longform_mode(label: &str) -> LongFormMode {
+        match label {
+            // Keep the ASR Exact seam scoped to the main model. Stream-VAD has
+            // its own CUDA/Vulkan 15-minute endurance gate and publishes a
+            // separate placement contract; Fixed still exercises the complete
+            // 30-second window/assembler/state lifecycle without conflating
+            // auxiliary observations with this ASR-only evidence stream.
+            "jfk_repeated_15m" => LongFormMode::Fixed,
+            _ => LongFormMode::Off,
+        }
+    }
+
+    fn asr_exact_smoke_text_drift_budget(label: &str) -> AsrExactSmokeTextDriftBudget {
+        if label == "jfk_repeated_15m" {
+            // Floating-point reductions may change a few greedy choices across 30
+            // independently decoded windows. Keep this long-audio quality gate
+            // much tighter than a conventional WER threshold while the short
+            // fixtures continue to require byte-identical normalized text.
+            AsrExactSmokeTextDriftBudget {
+                max_segment_mismatches: 2,
+                max_word_edits: 2,
+            }
+        } else {
+            AsrExactSmokeTextDriftBudget {
+                max_segment_mismatches: 0,
+                max_word_edits: 0,
+            }
+        }
+    }
+
+    fn repeat_f32_samples_to_exact_len(source: &[f32], target_len: usize) -> Vec<f32> {
+        assert!(!source.is_empty(), "repeat source must not be empty");
+        let mut output = Vec::with_capacity(target_len);
+        while output.len() < target_len {
+            let remaining = target_len - output.len();
+            output.extend_from_slice(&source[..source.len().min(remaining)]);
+        }
+        output
+    }
+
+    #[test]
+    fn repeated_public_smoke_audio_has_exact_target_length_and_prefix() {
+        let repeated = repeat_f32_samples_to_exact_len(&[1.0, 2.0, 3.0], 8);
+        assert_eq!(repeated, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0]);
+        assert_eq!(
+            asr_exact_smoke_longform_mode("jfk_repeated_15m"),
+            LongFormMode::Fixed
+        );
+        assert_eq!(asr_exact_smoke_longform_mode("jfk"), LongFormMode::Off);
+        assert_eq!(
+            asr_exact_smoke_text_drift_budget("jfk_repeated_15m"),
+            AsrExactSmokeTextDriftBudget {
+                max_segment_mismatches: 2,
+                max_word_edits: 2,
+            }
+        );
+        assert_eq!(
+            asr_exact_smoke_text_drift_budget("jfk"),
+            AsrExactSmokeTextDriftBudget {
+                max_segment_mismatches: 0,
+                max_word_edits: 0,
+            }
+        );
+    }
+
+    fn asr_exact_smoke_provider(raw: &str) -> ExecutionProvider {
+        if raw.eq_ignore_ascii_case("cuda") {
+            ExecutionProvider::Cuda
+        } else if raw.eq_ignore_ascii_case("vulkan") {
+            ExecutionProvider::Vulkan
+        } else {
+            panic!("OPENASR_ASR_SMOKE_PROVIDER must be cuda or vulkan")
+        }
+    }
+
+    fn asr_exact_smoke_route(
+        provider: ExecutionProvider,
+        configured_stable_id: Option<String>,
+    ) -> crate::ResolvedExecutionRoute {
+        let inventory = enumerate_compute_devices_from_ggml(&crate::ggml_available_devices());
+        let matching = inventory
+            .iter()
+            .filter(|device| device.provider == provider)
+            .collect::<Vec<_>>();
+        let stable_id = match configured_stable_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            Some(stable_id) => stable_id,
+            None if matching.len() == 1 => matching[0].stable_id.clone(),
+            None => panic!(
+                "OPENASR_ASR_SMOKE_STABLE_ID is required unless exactly one requested provider device is visible"
+            ),
+        };
+        matching
+            .into_iter()
+            .find(|device| device.stable_id == stable_id)
+            .unwrap_or_else(|| panic!("configured Exact ASR smoke device is not visible"))
+            .to_resolved_route()
+    }
+
+    fn asr_exact_smoke_intent(
+        provider: ExecutionProvider,
+        configured_stable_id: Option<String>,
+    ) -> ExecutionIntent {
+        let route = asr_exact_smoke_route(provider, configured_stable_id);
+        ExecutionIntent::Exact(crate::ExactDeviceSelector::StableId {
+            provider: Some(provider),
+            stable_id: route.stable_id,
+        })
+    }
+
+    fn assert_exact_stress_observations(
+        observations: &[crate::models::native_execution_services::ExecutionBackendObservation],
+        expected_route: &crate::ResolvedExecutionRoute,
+    ) {
+        assert!(
+            !observations.is_empty(),
+            "Exact stress request constructed no observed backend"
+        );
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.requested_route == *expected_route),
+            "Exact stress request changed its requested route"
+        );
+        let placements = observations
+            .iter()
+            .map(|observation| observation.placement)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            placements.len(),
+            1,
+            "Exact stress request published more than one committed placement"
+        );
+        assert!(
+            observations.iter().any(|observation| {
+                observation.backend_kind.is_gpu_class()
+                    && observation.actual_provider == expected_route.provider
+                    && observation.actual_stable_id == expected_route.stable_id
+            }),
+            "Exact stress request did not construct the requested accelerated device"
+        );
+        assert!(observations.iter().all(|observation| {
+            if observation.backend_kind.is_gpu_class() {
+                observation.actual_provider == expected_route.provider
+                    && observation.actual_stable_id == expected_route.stable_id
+                    && matches!(
+                        observation.placement,
+                        ExecutionPlacement::FullDevice | ExecutionPlacement::Hybrid
+                    )
+                    && (observation.placement != ExecutionPlacement::FullDevice
+                        || !observation.use_scheduler)
+            } else {
+                observation.actual_provider == ExecutionProvider::Cpu
+                    && observation.placement == ExecutionPlacement::Hybrid
+            }
+        }));
+    }
+
+    fn asr_exact_stress_decode_is_in_progress(
+        stage: TranscriptionStage,
+        stage_fraction: Option<f32>,
+    ) -> bool {
+        stage == TranscriptionStage::Decode
+            && stage_fraction.is_some_and(|fraction| fraction > 0.0 && fraction < 1.0)
+    }
+
+    fn asr_exact_smoke_request(
+        fixture: &std::path::Path,
+        model_ref: &str,
+        pack: &std::path::Path,
+        prepared_samples: Arc<Vec<f32>>,
+        longform_mode: LongFormMode,
+    ) -> TranscriptionRequest {
+        TranscriptionRequest::new(fixture, model_ref)
+            .with_model_pack_path(Some(pack.to_path_buf()))
+            .with_prepared_samples(Some(prepared_samples))
+            .with_punctuation(false)
+            .with_word_timestamps(false)
+            .with_word_timestamps_refine(false)
+            .with_voice_id(false)
+            .with_longform(Some(crate::LongFormOptions {
+                mode: longform_mode,
+                ..crate::LongFormOptions::default()
+            }))
+    }
+
+    fn normalized_transcription_hash(transcription: &Transcription) -> String {
+        crate::testing::benchmark_sha256_bytes([
+            crate::normalize_text(&transcription.text).as_bytes()
+        ])
+    }
+
+    fn normalized_segment_hash(segment: &Segment) -> String {
+        crate::testing::benchmark_sha256_bytes([crate::normalize_text(&segment.text).as_bytes()])
+    }
+
+    fn assert_exact_smoke_timestamps_are_valid(transcription: &Transcription, label: &str) {
+        let mut previous_segment_start = 0.0_f32;
+        let mut previous_segment_end = 0.0_f32;
+        for (segment_index, segment) in transcription.segments.iter().enumerate() {
+            assert!(
+                segment.start.is_finite()
+                    && segment.end.is_finite()
+                    && segment.start >= 0.0
+                    && segment.end >= segment.start,
+                "{label} segment {segment_index} has invalid timestamps"
+            );
+            assert!(
+                segment.start >= previous_segment_start && segment.end >= previous_segment_end,
+                "{label} segment {segment_index} timestamps are not monotonic"
+            );
+            previous_segment_start = segment.start;
+            previous_segment_end = segment.end;
+
+            let mut previous_word_start = segment.start;
+            let mut previous_word_end = segment.start;
+            for (word_index, word) in segment.words.iter().enumerate() {
+                assert!(
+                    word.start.is_finite()
+                        && word.end.is_finite()
+                        && word.start >= 0.0
+                        && word.end >= word.start,
+                    "{label} segment {segment_index} word {word_index} has invalid timestamps"
+                );
+                assert!(
+                    word.start >= previous_word_start && word.end >= previous_word_end,
+                    "{label} segment {segment_index} word {word_index} timestamps are not monotonic"
+                );
+                previous_word_start = word.start;
+                previous_word_end = word.end;
+            }
+        }
+    }
+
+    fn assert_exact_smoke_structure_parity(
+        cpu: &Transcription,
+        accelerated: &Transcription,
+        allow_matching_truncation: bool,
+        timestamp_tolerance_seconds: f32,
+    ) -> (usize, Option<usize>) {
+        assert_eq!(
+            cpu.segments.len(),
+            accelerated.segments.len(),
+            "CPU/accelerated segment count mismatch"
+        );
+        let mut segment_text_mismatches = 0usize;
+        let mut first_segment_text_mismatch = None;
+        for (segment_index, (cpu_segment, accelerated_segment)) in
+            cpu.segments.iter().zip(&accelerated.segments).enumerate()
+        {
+            if normalized_segment_hash(cpu_segment) != normalized_segment_hash(accelerated_segment)
+            {
+                segment_text_mismatches += 1;
+                first_segment_text_mismatch.get_or_insert(segment_index);
+            }
+            let start_delta = (cpu_segment.start - accelerated_segment.start).abs();
+            let end_delta = (cpu_segment.end - accelerated_segment.end).abs();
+            assert!(
+                start_delta <= timestamp_tolerance_seconds
+                    && end_delta <= timestamp_tolerance_seconds,
+                "CPU/accelerated segment timestamp mismatch at segment {segment_index}: \
+                 cpu_start={:.6} accelerated_start={:.6} start_delta={start_delta:.6} \
+                 cpu_end={:.6} accelerated_end={:.6} end_delta={end_delta:.6} tolerance={timestamp_tolerance_seconds:.6}",
+                cpu_segment.start,
+                accelerated_segment.start,
+                cpu_segment.end,
+                accelerated_segment.end,
+            );
+        }
+        if allow_matching_truncation {
+            assert_eq!(
+                cpu.truncated_decodes.len(),
+                accelerated.truncated_decodes.len(),
+                "CPU/accelerated truncation count mismatch"
+            );
+            for (index, (cpu_truncation, accelerated_truncation)) in cpu
+                .truncated_decodes
+                .iter()
+                .zip(&accelerated.truncated_decodes)
+                .enumerate()
+            {
+                assert_eq!(
+                    cpu_truncation.slice_index, accelerated_truncation.slice_index,
+                    "CPU/accelerated truncation slice mismatch at index {index}"
+                );
+                assert_eq!(
+                    cpu_truncation.truncation.reason, accelerated_truncation.truncation.reason,
+                    "CPU/accelerated truncation reason mismatch at index {index}"
+                );
+                match (
+                    cpu_truncation.truncation.transcript_covers_up_to_seconds,
+                    accelerated_truncation
+                        .truncation
+                        .transcript_covers_up_to_seconds,
+                ) {
+                    (None, None) => {}
+                    (Some(cpu_coverage), Some(accelerated_coverage)) => assert!(
+                        cpu_coverage.is_finite()
+                            && accelerated_coverage.is_finite()
+                            && (cpu_coverage - accelerated_coverage).abs()
+                                <= timestamp_tolerance_seconds,
+                        "CPU/accelerated truncation coverage mismatch at index {index}"
+                    ),
+                    _ => panic!(
+                        "CPU/accelerated truncation coverage presence mismatch at index {index}"
+                    ),
+                }
+            }
+        } else {
+            assert!(
+                cpu.truncated_decodes.is_empty() && accelerated.truncated_decodes.is_empty(),
+                "ASR Exact smoke must not produce truncated decodes for this audio tier"
+            );
+        }
+        (segment_text_mismatches, first_segment_text_mismatch)
+    }
+
+    fn exact_smoke_timestamp_tolerance_seconds(model_architecture: &str) -> f32 {
+        if model_architecture == crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID {
+            // MOSS emits centisecond timestamps as autoregressive text tokens.
+            // Keep text and segment structure exact while allowing at most ten
+            // centiseconds of backend-dependent anchor drift.
+            0.100
+        } else {
+            0.050
+        }
+    }
+
+    #[test]
+    fn exact_smoke_timestamp_tolerance_is_narrowly_moss_specific() {
+        assert_eq!(
+            exact_smoke_timestamp_tolerance_seconds(crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID),
+            0.100
+        );
+        for architecture in [
+            crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID,
+            crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+            "future-asr-family",
+        ] {
+            assert_eq!(exact_smoke_timestamp_tolerance_seconds(architecture), 0.050);
+        }
+    }
+
+    /// Opt-in true-pack parity seam for every native ASR family. This test
+    /// accepts only a verified local pack plus either a committed public
+    /// fixture enum or a strictly allowlisted private WAV whose basename and
+    /// exact file SHA-256 are supplied separately. It never downloads or
+    /// serializes source text or absolute paths into test output.
+    /// Long-form and auxiliary-model placement belong to their own matrix so
+    /// this ASR-only seam never conflates their observations with a main
+    /// model's FullDevice contract.
+    #[test]
+    #[ignore = "host-local true-pack CPU/CUDA-or-Vulkan Exact smoke; requires explicit environment"]
+    fn asr_exact_pack_cpu_accelerated_smoke_and_parity() {
+        let pack_path =
+            std::path::PathBuf::from(required_asr_exact_smoke_env(ASR_EXACT_SMOKE_PACK_ENV));
+        let model_ref = required_asr_exact_smoke_env(ASR_EXACT_SMOKE_MODEL_ENV);
+        parse_model_ref(&model_ref).unwrap_or_else(|_| {
+            panic!("OPENASR_ASR_SMOKE_MODEL must be a valid catalog model reference")
+        });
+        let provider =
+            asr_exact_smoke_provider(&required_asr_exact_smoke_env(ASR_EXACT_SMOKE_PROVIDER_ENV));
+        let configured_stable_id = std::env::var(ASR_EXACT_SMOKE_STABLE_ID_ENV).ok();
+        let audio = asr_exact_smoke_audio();
+
+        let verified_pack = Arc::new(
+            PackVerifier
+                .verify_candidate(PackCandidate::new(&pack_path))
+                .unwrap_or_else(|_| panic!("OPENASR_ASR_SMOKE_PACK did not verify as an ASR pack")),
+        );
+        assert!(
+            matches!(verified_pack.route(), PackRoute::Asr { .. }),
+            "OPENASR_ASR_SMOKE_PACK must be an ASR pack"
+        );
+        let audio_seconds = audio.samples.len() as f64 / 16_000.0;
+
+        let services = native_execution_services_for_test();
+        let exact_intent = asr_exact_smoke_intent(provider, configured_stable_id);
+        let selection_metadata = selection_metadata_from_gguf(&verified_pack.preflight().metadata);
+        let selected_family = validate_runtime_source_and_select_adapter(
+            &model_ref,
+            &verified_pack,
+            &selection_metadata,
+        )
+        .unwrap_or_else(|_| panic!("catalog model reference does not match the verified ASR pack"));
+        let exact_plan = resolve_native_execution_plan(
+            services.as_ref(),
+            &selected_family,
+            exact_intent.clone(),
+        )
+        .unwrap_or_else(|_| panic!("Exact accelerated plan could not be resolved"));
+        let exact_candidates = exact_plan.candidates();
+        assert!(
+            !exact_candidates.is_empty(),
+            "Exact execution must contain an accelerated candidate"
+        );
+        let expected_route = exact_candidates[0].device.route.clone();
+        let declared_placements = exact_candidates
+            .iter()
+            .map(|candidate| candidate.placement)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(expected_route.provider, provider);
+        assert!(
+            exact_candidates.iter().all(|candidate| {
+                candidate.device.route == expected_route
+                    && matches!(
+                        candidate.placement,
+                        ExecutionPlacement::FullDevice | ExecutionPlacement::Hybrid
+                    )
+            }),
+            "Exact execution may try multiple placements, but must never change device or append CPU fallback"
+        );
+
+        let cpu_started = Instant::now();
+        let cpu = run_native_transcription_with_verified_pack(
+            asr_exact_smoke_request(
+                &audio.path,
+                &model_ref,
+                &pack_path,
+                Arc::clone(&audio.samples),
+                audio.longform_mode,
+            ),
+            Arc::clone(&services),
+            Some(ExecutionIntent::CpuOnly),
+            Arc::clone(&verified_pack),
+        )
+        .unwrap_or_else(|_| panic!("CPU baseline failed"));
+        let cpu_seconds = cpu_started.elapsed().as_secs_f64();
+
+        let observations =
+            crate::models::native_execution_services::ExecutionObservationSink::new();
+        let accelerated_started = Instant::now();
+        let accelerated = {
+            let _observation_guard =
+                crate::models::native_execution_services::install_execution_observation_sink(
+                    observations.clone(),
+                );
+            run_native_transcription_with_verified_pack(
+                asr_exact_smoke_request(
+                    &audio.path,
+                    &model_ref,
+                    &pack_path,
+                    Arc::clone(&audio.samples),
+                    audio.longform_mode,
+                ),
+                Arc::clone(&services),
+                Some(exact_intent),
+                Arc::clone(&verified_pack),
+            )
+            .unwrap_or_else(|_| panic!("Exact accelerated transcription failed"))
+        };
+        let accelerated_seconds = accelerated_started.elapsed().as_secs_f64();
+
+        assert!(
+            !crate::normalize_text(&cpu.text).is_empty(),
+            "CPU baseline produced an empty normalized transcript"
+        );
+        assert!(
+            !crate::normalize_text(&accelerated.text).is_empty(),
+            "Exact accelerated run produced an empty normalized transcript"
+        );
+        assert_exact_smoke_timestamps_are_valid(&cpu, "CPU baseline");
+        assert_exact_smoke_timestamps_are_valid(&accelerated, "Exact accelerated");
+        let (segment_text_mismatches, first_segment_text_mismatch) =
+            assert_exact_smoke_structure_parity(
+                &cpu,
+                &accelerated,
+                audio.allow_matching_truncation,
+                exact_smoke_timestamp_tolerance_seconds(selected_family.model_architecture),
+            );
+        let cpu_hash = normalized_transcription_hash(&cpu);
+        let accelerated_hash = normalized_transcription_hash(&accelerated);
+        let text_drift_budget = asr_exact_smoke_text_drift_budget(audio.label);
+        let normalized_word_edits = crate::metrics::wer_counts(&accelerated.text, &cpu.text).errors;
+        assert!(
+            segment_text_mismatches <= text_drift_budget.max_segment_mismatches
+                && normalized_word_edits <= text_drift_budget.max_word_edits,
+            "CPU/accelerated normalized text drift exceeded the fixture budget: \
+             segment_mismatches={segment_text_mismatches} segment_budget={} \
+             word_edits={normalized_word_edits} word_budget={} \
+             first_segment_mismatch={first_segment_text_mismatch:?}",
+            text_drift_budget.max_segment_mismatches,
+            text_drift_budget.max_word_edits,
+        );
+        if text_drift_budget.max_word_edits == 0 {
+            assert_eq!(
+                cpu_hash, accelerated_hash,
+                "CPU/accelerated normalized text hash mismatch"
+            );
+        }
+        let observations = observations.observations();
+        assert!(
+            !observations.is_empty(),
+            "Exact accelerated execution must construct an observed backend"
+        );
+        assert!(observations.iter().all(|observation| {
+            observation.requested_route == expected_route
+                && declared_placements.contains(&observation.placement)
+        }));
+        let observed_placements = observations
+            .iter()
+            .map(|observation| observation.placement)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            observed_placements.len(),
+            1,
+            "only the committed Exact candidate placement may publish observations"
+        );
+        let selected_placement = *observed_placements
+            .iter()
+            .next()
+            .expect("non-empty observations yield one selected placement");
+        let gpu_observations = observations
+            .iter()
+            .filter(|observation| observation.backend_kind.is_gpu_class())
+            .collect::<Vec<_>>();
+        assert!(
+            !gpu_observations.is_empty(),
+            "Exact FullDevice/Hybrid execution must construct at least one observed GPU backend"
+        );
+        assert!(gpu_observations.iter().all(|observation| {
+            observation.actual_provider == expected_route.provider
+                && observation.actual_stable_id == expected_route.stable_id
+        }));
+        if selected_placement == ExecutionPlacement::FullDevice {
+            assert!(
+                observations
+                    .iter()
+                    .all(|observation| observation.backend_kind.is_gpu_class()
+                        && !observation.use_scheduler),
+                "Exact FullDevice execution must construct only direct GPU runners"
+            );
+        }
+        let peak_rss_bytes = crate::metrics::peak_rss_bytes().unwrap_or(0);
+        eprintln!(
+            "ASR_EXACT_SMOKE model={model_ref} audio_label={} audio_basename={} oracle_tier={} pack_content_id={} audio_sha256={} requested_provider={} requested_stable_id={} placement={:?} cpu_seconds={cpu_seconds:.6} cpu_rtf={:.6} accelerated_seconds={accelerated_seconds:.6} accelerated_rtf={:.6} peak_rss_bytes={peak_rss_bytes} cpu_segments={} accelerated_segments={} segment_text_mismatches={segment_text_mismatches} normalized_word_edits={normalized_word_edits} truncated_decodes={} normalized_text_sha256={accelerated_hash} observed_gpu_backends={}",
+            audio.label,
+            audio.basename,
+            audio.oracle_tier,
+            verified_pack.content_id(),
+            audio.sha256,
+            expected_route.provider.as_str(),
+            expected_route.stable_id,
+            selected_placement,
+            cpu_seconds / audio_seconds.max(f64::MIN_POSITIVE),
+            accelerated_seconds / audio_seconds.max(f64::MIN_POSITIVE),
+            cpu.segments.len(),
+            accelerated.segments.len(),
+            accelerated.truncated_decodes.len(),
+            gpu_observations.len(),
+        );
+    }
+
+    /// Single-route memory receipt seam. Run this ignored test by exact name
+    /// in a newly spawned test process for each mode; unlike the parity seam
+    /// above it never initializes both CPU and an accelerator in one process.
+    /// Lines prefixed with `ASR_EXACT_MEMORY_RECEIPT` contain only typed
+    /// backend/device memory receipts and route-class facts. A private runner
+    /// must parse those lines in memory and persist only that allowlisted
+    /// projection; ordinary test/runtime diagnostics are not evidence-safe.
+    #[test]
+    #[ignore = "host-local fresh-process CPU-only or Exact accelerated ASR smoke"]
+    fn asr_exact_pack_fresh_single_route_memory_receipt() {
+        let mode = asr_exact_smoke_fresh_mode(&required_asr_exact_smoke_env(
+            ASR_EXACT_SMOKE_FRESH_MODE_ENV,
+        ));
+        let pack_path =
+            std::path::PathBuf::from(required_asr_exact_smoke_env(ASR_EXACT_SMOKE_PACK_ENV));
+        let model_ref = required_asr_exact_smoke_env(ASR_EXACT_SMOKE_MODEL_ENV);
+        parse_model_ref(&model_ref).unwrap_or_else(|_| {
+            panic!("OPENASR_ASR_SMOKE_MODEL must be a valid catalog model reference")
+        });
+        let audio = asr_exact_smoke_audio();
+        let verified_pack = Arc::new(
+            PackVerifier
+                .verify_candidate(PackCandidate::new(&pack_path))
+                .unwrap_or_else(|_| panic!("OPENASR_ASR_SMOKE_PACK did not verify as an ASR pack")),
+        );
+        assert!(matches!(verified_pack.route(), PackRoute::Asr { .. }));
+        let intent = match mode {
+            AsrExactSmokeFreshMode::CpuOnly => ExecutionIntent::CpuOnly,
+            AsrExactSmokeFreshMode::ExactAccelerated => {
+                let provider = asr_exact_smoke_provider(&required_asr_exact_smoke_env(
+                    ASR_EXACT_SMOKE_PROVIDER_ENV,
+                ));
+                asr_exact_smoke_intent(provider, std::env::var(ASR_EXACT_SMOKE_STABLE_ID_ENV).ok())
+            }
+        };
+        let services = native_execution_services_for_test();
+        let observations =
+            crate::models::native_execution_services::ExecutionObservationSink::new();
+        let transcription = {
+            let _observation_guard =
+                crate::models::native_execution_services::install_execution_observation_sink(
+                    observations.clone(),
+                );
+            run_native_transcription_with_verified_pack(
+                asr_exact_smoke_request(
+                    &audio.path,
+                    &model_ref,
+                    &pack_path,
+                    Arc::clone(&audio.samples),
+                    audio.longform_mode,
+                ),
+                services,
+                Some(intent),
+                verified_pack,
+            )
+            .unwrap_or_else(|_| panic!("fresh single-route ASR transcription failed"))
+        };
+        assert!(
+            !crate::normalize_text(&transcription.text).is_empty(),
+            "fresh single-route ASR smoke produced an empty transcript"
+        );
+        let observations = observations.observations();
+        assert!(
+            !observations.is_empty(),
+            "fresh single-route ASR smoke did not construct an observed backend"
+        );
+        assert!(
+            observations
+                .iter()
+                .any(|observation| !observation.memory_receipts.is_empty()),
+            "fresh single-route ASR smoke produced no typed memory receipt"
+        );
+        match mode {
+            AsrExactSmokeFreshMode::CpuOnly => assert!(
+                observations
+                    .iter()
+                    .all(|observation| observation.actual_provider == ExecutionProvider::Cpu)
+            ),
+            AsrExactSmokeFreshMode::ExactAccelerated => {
+                let first = observations
+                    .first()
+                    .expect("accelerated memory receipt requires an observation");
+                assert_eq!(
+                    first.placement,
+                    ExecutionPlacement::FullDevice,
+                    "accelerated memory receipt requires committed FullDevice placement"
+                );
+                assert!(matches!(
+                    first.actual_provider,
+                    ExecutionProvider::Cuda | ExecutionProvider::Vulkan
+                ));
+                assert!(
+                    observations.iter().all(|observation| {
+                        observation.placement == ExecutionPlacement::FullDevice
+                            && observation.backend_kind.is_gpu_class()
+                            && !observation.use_scheduler
+                            && observation.actual_provider == first.actual_provider
+                            && observation.requested_route == first.requested_route
+                    }),
+                    "accelerated memory receipt must contain only one exact direct-GPU route"
+                );
+            }
+        }
+        emit_exact_smoke_safe_memory_receipts(&observations);
+    }
+
+    /// Fresh-process concurrency gate for one exact provider. Both requests
+    /// share the production execution services and verified pack, enter the
+    /// dispatcher together, and must retain independent output/telemetry.
+    #[test]
+    #[ignore = "host-local fresh-process two-request Exact accelerated ASR gate"]
+    fn asr_exact_pack_two_concurrent_requests_match() {
+        let pack_path =
+            std::path::PathBuf::from(required_asr_exact_smoke_env(ASR_EXACT_SMOKE_PACK_ENV));
+        let model_ref = required_asr_exact_smoke_env(ASR_EXACT_SMOKE_MODEL_ENV);
+        parse_model_ref(&model_ref)
+            .unwrap_or_else(|_| panic!("OPENASR_ASR_SMOKE_MODEL must be a valid model reference"));
+        let provider =
+            asr_exact_smoke_provider(&required_asr_exact_smoke_env(ASR_EXACT_SMOKE_PROVIDER_ENV));
+        let expected_route =
+            asr_exact_smoke_route(provider, std::env::var(ASR_EXACT_SMOKE_STABLE_ID_ENV).ok());
+        let intent = ExecutionIntent::Exact(crate::ExactDeviceSelector::StableId {
+            provider: Some(provider),
+            stable_id: expected_route.stable_id.clone(),
+        });
+        let audio = asr_exact_smoke_audio();
+        let verified_pack = Arc::new(
+            PackVerifier
+                .verify_candidate(PackCandidate::new(&pack_path))
+                .unwrap_or_else(|_| panic!("OPENASR_ASR_SMOKE_PACK did not verify as an ASR pack")),
+        );
+        let services = native_execution_services_for_test();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel(2);
+        let mut workers = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let barrier = Arc::clone(&barrier);
+            let outcome_tx = outcome_tx.clone();
+            let services = Arc::clone(&services);
+            let verified_pack = Arc::clone(&verified_pack);
+            let intent = intent.clone();
+            let pack_path = pack_path.clone();
+            let model_ref = model_ref.clone();
+            let audio_path = audio.path.clone();
+            let samples = Arc::clone(&audio.samples);
+            let longform_mode = audio.longform_mode;
+            workers.push(std::thread::spawn(move || {
+                let observations =
+                    crate::models::native_execution_services::ExecutionObservationSink::new();
+                barrier.wait();
+                let transcription = {
+                    let _observation_guard = crate::models::native_execution_services::
+                        install_execution_observation_sink(observations.clone());
+                    run_native_transcription_with_verified_pack(
+                        asr_exact_smoke_request(
+                            &audio_path,
+                            &model_ref,
+                            &pack_path,
+                            samples,
+                            longform_mode,
+                        ),
+                        services,
+                        Some(intent),
+                        verified_pack,
+                    )
+                };
+                let _ = outcome_tx.send((transcription, observations.observations()));
+            }));
+        }
+        drop(outcome_tx);
+        barrier.wait();
+        let mut outcomes = (0..2)
+            .map(|_| {
+                let (result, observations) = outcome_rx
+                    .recv_timeout(std::time::Duration::from_secs(60))
+                    .expect("concurrent Exact ASR request must not hang");
+                result
+                    .map(|transcription| (transcription, observations))
+                    .unwrap_or_else(|_| panic!("concurrent Exact ASR request failed"))
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker
+                .join()
+                .unwrap_or_else(|_| panic!("concurrent Exact ASR worker panicked"));
+        }
+        let (first, first_observations) = outcomes.remove(0);
+        let (second, second_observations) = outcomes.remove(0);
+        assert_eq!(
+            normalized_transcription_hash(&first),
+            normalized_transcription_hash(&second),
+            "concurrent Exact requests produced different normalized text"
+        );
+        assert_exact_smoke_structure_parity(&first, &second, false, 0.05);
+        for observations in [&first_observations, &second_observations] {
+            assert_exact_stress_observations(observations, &expected_route);
+        }
+        eprintln!(
+            "ASR_EXACT_STRESS mode=concurrent model={model_ref} provider={} status=pass requests=2 normalized_text_sha256={}",
+            provider.as_str(),
+            normalized_transcription_hash(&first),
+        );
+    }
+
+    /// Mid-decode cancellation and same-services recovery gate. A canceled
+    /// request must return the typed terminal error promptly; the next exact
+    /// request must rebuild/reuse only healthy state and complete normally.
+    #[test]
+    #[ignore = "host-local fresh-process mid-decode cancel/recovery Exact accelerated ASR gate"]
+    fn asr_exact_pack_mid_decode_cancel_then_recovers() {
+        let pack_path =
+            std::path::PathBuf::from(required_asr_exact_smoke_env(ASR_EXACT_SMOKE_PACK_ENV));
+        let model_ref = required_asr_exact_smoke_env(ASR_EXACT_SMOKE_MODEL_ENV);
+        parse_model_ref(&model_ref)
+            .unwrap_or_else(|_| panic!("OPENASR_ASR_SMOKE_MODEL must be a valid model reference"));
+        let provider =
+            asr_exact_smoke_provider(&required_asr_exact_smoke_env(ASR_EXACT_SMOKE_PROVIDER_ENV));
+        let expected_route =
+            asr_exact_smoke_route(provider, std::env::var(ASR_EXACT_SMOKE_STABLE_ID_ENV).ok());
+        let intent = ExecutionIntent::Exact(crate::ExactDeviceSelector::StableId {
+            provider: Some(provider),
+            stable_id: expected_route.stable_id.clone(),
+        });
+        let audio = asr_exact_smoke_audio();
+        let verified_pack = Arc::new(
+            PackVerifier
+                .verify_candidate(PackCandidate::new(&pack_path))
+                .unwrap_or_else(|_| panic!("OPENASR_ASR_SMOKE_PACK did not verify as an ASR pack")),
+        );
+        let services = native_execution_services_for_test();
+        let control = Arc::new(crate::api::backend::TranscriptionControl::new());
+        let request_id = "exact-stress-cancel";
+        let execution_context = Arc::new(crate::RequestExecutionContext::new(
+            Some(request_id.to_string()),
+            Arc::clone(&control),
+        ));
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = {
+            let services = Arc::clone(&services);
+            let verified_pack = Arc::clone(&verified_pack);
+            let intent = intent.clone();
+            let request = asr_exact_smoke_request(
+                &audio.path,
+                &model_ref,
+                &pack_path,
+                Arc::clone(&audio.samples),
+                audio.longform_mode,
+            )
+            .with_execution_context(execution_context);
+            std::thread::spawn(move || {
+                let observations =
+                    crate::models::native_execution_services::ExecutionObservationSink::new();
+                let result = {
+                    let _observation_guard = crate::models::native_execution_services::
+                        install_execution_observation_sink(observations.clone());
+                    run_native_transcription_with_verified_pack(
+                        request,
+                        services,
+                        Some(intent),
+                        verified_pack,
+                    )
+                };
+                let _ = result_tx.send((result, observations.observations()));
+            })
+        };
+        let decode_ready_deadline = Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if native_transcription_progress_for_id(request_id).is_some_and(|progress| {
+                asr_exact_stress_decode_is_in_progress(progress.stage, progress.stage_fraction)
+            }) {
+                break;
+            }
+            match result_rx.try_recv() {
+                Ok(_) => {
+                    worker
+                        .join()
+                        .unwrap_or_else(|_| panic!("mid-decode Exact worker panicked"));
+                    panic!("Exact request completed before publishing real decode work");
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    worker
+                        .join()
+                        .unwrap_or_else(|_| panic!("mid-decode Exact worker panicked"));
+                    panic!("mid-decode Exact worker disconnected before publishing progress");
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            assert!(
+                Instant::now() < decode_ready_deadline,
+                "Exact request did not publish real decode work before cancellation timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        control.request_cancel();
+        let (canceled, canceled_observations) = result_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("mid-decode Exact cancellation must not hang");
+        worker
+            .join()
+            .unwrap_or_else(|_| panic!("mid-decode Exact worker panicked"));
+        let canceled = canceled.expect_err("mid-decode Exact cancellation must fail closed");
+        assert!(
+            matches!(canceled, BackendError::TranscriptionCanceled),
+            "mid-decode Exact cancellation must remain typed"
+        );
+        // A canceled execution candidate intentionally does not commit its
+        // observation journal. If an earlier stage did commit observations,
+        // they must still prove the exact route; an empty journal is the
+        // expected fail-closed outcome for a cancellation inside the main
+        // candidate.
+        if !canceled_observations.is_empty() {
+            assert_exact_stress_observations(&canceled_observations, &expected_route);
+        }
+
+        let recovered_observations =
+            crate::models::native_execution_services::ExecutionObservationSink::new();
+        let recovered = {
+            let _observation_guard =
+                crate::models::native_execution_services::install_execution_observation_sink(
+                    recovered_observations.clone(),
+                );
+            run_native_transcription_with_verified_pack(
+                asr_exact_smoke_request(
+                    &audio.path,
+                    &model_ref,
+                    &pack_path,
+                    Arc::clone(&audio.samples),
+                    audio.longform_mode,
+                ),
+                services,
+                Some(intent),
+                verified_pack,
+            )
+            .unwrap_or_else(|_| panic!("Exact ASR request did not recover after cancellation"))
+        };
+        assert!(
+            !crate::normalize_text(&recovered.text).is_empty(),
+            "recovered Exact ASR request produced empty text"
+        );
+        assert_exact_stress_observations(&recovered_observations.observations(), &expected_route);
+        eprintln!(
+            "ASR_EXACT_STRESS mode=cancel-recover model={model_ref} provider={} status=pass normalized_text_sha256={}",
+            provider.as_str(),
+            normalized_transcription_hash(&recovered),
+        );
+    }
+
+    #[test]
+    fn exact_stress_decode_readiness_requires_strictly_in_progress_fraction() {
+        assert!(!asr_exact_stress_decode_is_in_progress(
+            TranscriptionStage::Decode,
+            None,
+        ));
+        assert!(!asr_exact_stress_decode_is_in_progress(
+            TranscriptionStage::Decode,
+            Some(0.0),
+        ));
+        assert!(asr_exact_stress_decode_is_in_progress(
+            TranscriptionStage::Decode,
+            Some(0.5),
+        ));
+        assert!(!asr_exact_stress_decode_is_in_progress(
+            TranscriptionStage::Decode,
+            Some(1.0),
+        ));
+        assert!(!asr_exact_stress_decode_is_in_progress(
+            TranscriptionStage::Decode,
+            Some(f32::NAN),
+        ));
+        assert!(!asr_exact_stress_decode_is_in_progress(
+            TranscriptionStage::Project,
+            Some(0.5),
+        ));
+    }
+
+    #[test]
+    fn private_asr_exact_smoke_audio_specs_are_safe_and_unique() {
+        let labels = [
+            "sichuan_dialect_30s",
+            "dolphin_sichuan_clip",
+            "private_family_59s_normalized",
+            "arabic_synthetic",
+        ];
+        let mut basenames = std::collections::HashSet::new();
+        for label in labels {
+            let (canonical_label, basename, oracle_tier, _) =
+                private_asr_exact_smoke_audio_spec(label);
+            assert_eq!(canonical_label, label);
+            assert!(!basename.is_empty());
+            assert!(!basename.contains(['/', '\\']));
+            assert!(!oracle_tier.is_empty());
+            assert!(basenames.insert(basename));
+        }
+    }
+
+    #[test]
+    fn private_asr_exact_smoke_sha256_parser_is_canonical() {
+        assert_eq!(
+            parse_asr_exact_smoke_sha256(
+                "ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+            ),
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        );
     }
 
     /// The full user-intent x family-capability matrix, pinned because every

@@ -207,6 +207,7 @@ impl Seq2SeqServeRuntime for MoonshineDecoderGraphRuntime {
             &job.runtime_preflight,
             n_seq,
             None,
+            crate::models::device_greedy_token::DeviceGreedyStepOutputMode::FullLogits,
         )
         .map_err(map_decoder_error)
     }

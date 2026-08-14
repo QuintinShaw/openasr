@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::ggml_runtime::GgmlNativeGqaCapability;
 use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
@@ -22,7 +23,7 @@ use crate::models::qwen::{
     Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings,
     QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
     build_qwen3_prompt_embeddings_with_audio_positions,
-    compile_qwen_whole_decoder_graph_from_prepared_plan,
+    compile_qwen_whole_decoder_graph_from_prepared_plan_with_config_and_native_gqa,
 };
 
 use super::runtime_contract::{
@@ -73,6 +74,24 @@ pub(crate) struct MossTdPrefillOutput {
 }
 
 impl MossTdDecoderRuntime {
+    pub(crate) fn graph_lanes(
+        &self,
+    ) -> (
+        (crate::ggml_runtime::GgmlCpuGraphBackend, bool),
+        Option<(crate::ggml_runtime::GgmlCpuGraphBackend, bool)>,
+    ) {
+        (
+            self.whole_decoder.graph_lane(),
+            self.logits_runtime.graph_lane(),
+        )
+    }
+
+    pub(crate) fn loaded_weight_binding_identity(
+        &self,
+    ) -> Option<crate::ggml_runtime::GgmlLoadedWeightBindingIdentity> {
+        self.whole_decoder.loaded_weight_binding_identity()
+    }
+
     /// Quote the actor-local graph handles from the already-prepared plan.
     ///
     /// Accepting the plan instead of a raw layer count keeps runtime admission
@@ -95,29 +114,33 @@ impl MossTdDecoderRuntime {
         decoder_plan: Arc<QwenWholeDecoderPlan>,
         logits_head: Arc<Qwen3AsrLlmLogitsHead>,
         token_embedding: Arc<MappedTokenEmbeddingTable>,
-        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        graph_config: crate::ggml_runtime::GgmlCpuGraphConfig,
+        native_gqa: GgmlNativeGqaCapability,
     ) -> Result<Self, MossTdDecoderError> {
         // Structural Prepared Graph Plan adoption: host prepare already owns
         // the typed plan and compiles through the shared seam (same entry
         // FunASR-Nano uses). Performance remains an evidence-only claim.
-        let whole_decoder = compile_qwen_whole_decoder_graph_from_prepared_plan(
-            QwenPreparedDecoderGraphCompileRequest {
-                plan: &decoder_plan,
-                preflight,
-                rms_norm_epsilon: MOSS_TD_RMS_NORM_EPSILON,
-                fused_logits_head: logits_head.fused_top1_spec(),
-                token_embedding: token_embedding.device_graph_spec(),
-                backend,
-            },
-        )
-        .map_err(|error| MossTdDecoderError::GraphFailed {
-            reason: error.to_string(),
-        })?;
-        let logits_runtime = logits_head.new_runtime(backend).map_err(|error| {
-            MossTdDecoderError::LogitsHeadFailed {
+        let whole_decoder =
+            compile_qwen_whole_decoder_graph_from_prepared_plan_with_config_and_native_gqa(
+                QwenPreparedDecoderGraphCompileRequest {
+                    plan: &decoder_plan,
+                    preflight,
+                    rms_norm_epsilon: MOSS_TD_RMS_NORM_EPSILON,
+                    fused_logits_head: logits_head.fused_top1_spec(),
+                    token_embedding: token_embedding.device_graph_spec(),
+                    backend: graph_config.backend,
+                },
+                graph_config,
+                native_gqa,
+            )
+            .map_err(|error| MossTdDecoderError::GraphFailed {
                 reason: error.to_string(),
-            }
-        })?;
+            })?;
+        let logits_runtime = logits_head
+            .new_runtime_with_graph_config(graph_config)
+            .map_err(|error| MossTdDecoderError::LogitsHeadFailed {
+                reason: error.to_string(),
+            })?;
         Ok(Self {
             whole_decoder,
             logits_head,
@@ -129,6 +152,14 @@ impl MossTdDecoderRuntime {
 
     pub(crate) fn backend_label(&self) -> String {
         self.whole_decoder.backend_label()
+    }
+
+    pub(crate) fn uses_native_gqa(&self) -> bool {
+        self.whole_decoder.uses_native_gqa()
+    }
+
+    pub(crate) fn supports_graph_reuse(&self) -> bool {
+        self.whole_decoder.supports_graph_reuse()
     }
 
     /// Frees this decoder's per-token grow-to-fit host step buffer. Call

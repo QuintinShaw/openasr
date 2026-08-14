@@ -31,7 +31,7 @@
 
 use thiserror::Error;
 
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReader};
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlNativeGqaCapability, GgufTensorDataReader};
 use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
@@ -39,12 +39,15 @@ use crate::models::qwen::{
     Qwen3AsrLlmWholeDecoderGraphExecutor, Qwen3AsrPromptEmbeddings, QwenDecoderTail,
     QwenDecoderTailLoadError, QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
     build_qwen3_prompt_embeddings_with_audio_positions,
-    compile_qwen_whole_decoder_graph_from_prepared_plan, load_qwen_decoder_tail_from_contract,
-    quoted_qwen_decoder_system_memory_bytes,
+    compile_qwen_whole_decoder_graph_from_prepared_plan,
+    compile_qwen_whole_decoder_graph_from_prepared_plan_with_native_gqa,
+    load_qwen_decoder_tail_from_contract, quoted_qwen_decoder_system_memory_bytes,
 };
 #[cfg(test)]
 use crate::models::qwen::{
-    Qwen3AsrLlmLayerAttentionProjection, load_qwen_family_llm_layer_attention_projection_generic,
+    Qwen3AsrLlmLayerAttentionProjection,
+    compile_qwen_whole_decoder_graph_from_prepared_plan_with_config,
+    load_qwen_family_llm_layer_attention_projection_generic, qwen_decoder_graph_config,
 };
 
 #[cfg(test)]
@@ -131,10 +134,29 @@ pub(crate) struct FireRedLlmPrefillOutput {
 }
 
 impl FireRedLlmDecoderRuntime {
+    #[cfg(test)]
     pub(crate) fn new_from_preflight(
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         metadata: FireRedLlmDecoderMetadata,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    ) -> Result<Self, FireRedLlmDecoderError> {
+        Self::new_from_preflight_impl(preflight, metadata, backend, None)
+    }
+
+    pub(crate) fn new_from_preflight_with_native_gqa(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
+        metadata: FireRedLlmDecoderMetadata,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        native_gqa: GgmlNativeGqaCapability,
+    ) -> Result<Self, FireRedLlmDecoderError> {
+        Self::new_from_preflight_impl(preflight, metadata, backend, Some(native_gqa))
+    }
+
+    fn new_from_preflight_impl(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
+        metadata: FireRedLlmDecoderMetadata,
+        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        native_gqa: Option<GgmlNativeGqaCapability>,
     ) -> Result<Self, FireRedLlmDecoderError> {
         let reader =
             crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(preflight)
@@ -163,16 +185,23 @@ impl FireRedLlmDecoderRuntime {
             backend,
         )
         .map_err(map_tail_load_error)?;
-        let whole_decoder = compile_qwen_whole_decoder_graph_from_prepared_plan(
-            QwenPreparedDecoderGraphCompileRequest {
-                plan: &decoder_plan,
-                preflight,
-                rms_norm_epsilon: FIRERED_LLM_RMS_NORM_EPSILON,
-                fused_logits_head: logits_head.fused_top1_spec(),
-                token_embedding: token_embedding.device_graph_spec(),
-                backend,
-            },
-        )
+        let compile_request = QwenPreparedDecoderGraphCompileRequest {
+            plan: &decoder_plan,
+            preflight,
+            rms_norm_epsilon: FIRERED_LLM_RMS_NORM_EPSILON,
+            fused_logits_head: logits_head.fused_top1_spec(),
+            token_embedding: token_embedding.device_graph_spec(),
+            backend,
+        };
+        let whole_decoder = match native_gqa {
+            Some(capability) => {
+                compile_qwen_whole_decoder_graph_from_prepared_plan_with_native_gqa(
+                    compile_request,
+                    capability,
+                )
+            }
+            None => compile_qwen_whole_decoder_graph_from_prepared_plan(compile_request),
+        }
         .map_err(|error| FireRedLlmDecoderError::GraphFailed {
             reason: error.to_string(),
         })?;
@@ -196,6 +225,20 @@ impl FireRedLlmDecoderRuntime {
     /// maintainer can confirm which backend the 7B decoder actually ran on.
     pub(crate) fn backend_label(&self) -> String {
         self.whole_decoder.backend_label()
+    }
+
+    pub(crate) fn graph_lane(&self) -> (GgmlCpuGraphBackend, bool) {
+        self.whole_decoder.graph_lane()
+    }
+
+    pub(crate) fn uses_native_gqa(&self) -> bool {
+        self.whole_decoder.uses_native_gqa()
+    }
+
+    pub(crate) fn loaded_weight_binding_identity(
+        &self,
+    ) -> Option<crate::ggml_runtime::GgmlLoadedWeightBindingIdentity> {
+        self.whole_decoder.loaded_weight_binding_identity()
     }
 
     /// Exact post-build Rust container capacity retained by the resident
@@ -872,5 +915,67 @@ mod parity_tests {
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
         )
         .expect("decoder runtime constructs against the real pack");
+    }
+
+    #[test]
+    #[ignore = "manual direct-GPU numeric regression: set OPENASR_FIRERED_LLM_PACK and \
+                OPENASR_GGML_BACKEND=cuda|vulkan"]
+    fn direct_gpu_resident_prefill_128_tokens_remains_finite() {
+        let Some(pack_path) = dev_pack_path() else {
+            return;
+        };
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack_path).expect("runtime source");
+        let preflight = crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index_from_source(
+            &runtime_source,
+        )
+        .expect("runtime preflight");
+        let decoder_metadata =
+            super::super::runtime_contract::parse_firered_llm_decoder_metadata(&preflight.metadata)
+                .expect("parse decoder metadata");
+        let reader = crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(
+            &preflight,
+        )
+        .expect("runtime tensor reader");
+        let contract =
+            firered_llm_qwen_decoder_contract(&decoder_metadata).expect("decoder contract");
+        let plan = QwenWholeDecoderPlan::for_qwen_family(&reader, &contract)
+            .expect("decoder materialization plan");
+        let backend = crate::ggml_runtime::GgmlCpuGraphBackend::Gpu;
+        let mut graph_config = qwen_decoder_graph_config(backend);
+        graph_config.backend = backend;
+        graph_config.use_scheduler = false;
+        let mut decoder = compile_qwen_whole_decoder_graph_from_prepared_plan_with_config(
+            QwenPreparedDecoderGraphCompileRequest {
+                plan: &plan,
+                preflight: &preflight,
+                rms_norm_epsilon: FIRERED_LLM_RMS_NORM_EPSILON,
+                fused_logits_head: None,
+                token_embedding: None,
+                backend,
+            },
+            graph_config,
+        )
+        .expect("direct GPU decoder");
+        assert_eq!(decoder.graph_lane(), (backend, false));
+        let token_count = 128_usize;
+        let hidden = deterministic_f32_vec(
+            0xD1A6_0000,
+            token_count
+                .checked_mul(decoder_metadata.d_model)
+                .expect("diagnostic hidden size"),
+        );
+        let control = std::sync::Arc::new(crate::api::backend::TranscriptionControl::new());
+        let output = decoder
+            .run_prefill_into_reused_batched(
+                &hidden,
+                token_count,
+                1,
+                token_count,
+                FIRERED_LLM_ROPE_THETA,
+                &control,
+            )
+            .expect("direct GPU resident prefill");
+        assert!(output.hidden.iter().all(|value| value.is_finite()));
     }
 }

@@ -29,7 +29,7 @@ use crate::arch::shape_orchestrator::{
 use crate::arch::{
     OpenAsrArchitectureRegistry, OpenAsrBlockStackStrategy, SENSEVOICE_GGML_ARCHITECTURE_ID,
 };
-use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::ggml_runtime::{GgmlCpuGraphBackend, request_backend_override};
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
     PinnedRuntimeActorCheckout,
@@ -39,12 +39,16 @@ use crate::models::ctc_streaming_driver::build_ctc_streaming_driver;
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, run_builtin_ctc_decode_policy,
 };
+use crate::models::device_greedy_token::{
+    DeviceGreedyStepOutputMode, device_greedy_step_output_mode,
+};
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionViewRequest, GgmlAsrStreamingExecutor,
     GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
 };
 use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptSession;
 use crate::models::incremental_streaming_driver::STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT;
+use crate::models::native_execution_services::current_execution_placement;
 use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
 use crate::models::runtime_cache_coordinator::PackContentKey;
 use crate::models::runtime_memory::checked_sum;
@@ -240,14 +244,74 @@ impl SenseVoicePreparedRuntime {
         language: Option<&str>,
         phrase_bias: Option<&PhraseBiasConfig>,
         decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
+        output_mode: DeviceGreedyStepOutputMode,
     ) -> Result<SenseVoiceTranscription, String> {
-        let result = self.decode_result(samples, language, phrase_bias, decode_work_progress)?;
         let requested = build_sensevoice_prompt(language, true).map_err(|e| e.to_string())?;
+        let raw_text =
+            if output_mode == DeviceGreedyStepOutputMode::DeviceTop1 && phrase_bias.is_none() {
+                let fbank = SenseVoiceFbankFrontend::new()
+                    .compute(samples)
+                    .map_err(|e| e.to_string())?;
+                let mut lfr = apply_lfr(&fbank.data, fbank.n_mels).map_err(|e| e.to_string())?;
+                apply_cmvn(
+                    &mut lfr.data,
+                    lfr.feature_dim,
+                    &self.cmvn_neg_mean,
+                    &self.cmvn_inv_stddev,
+                )
+                .map_err(|e| e.to_string())?;
+                let output = self
+                    .graph
+                    .encode_lfr_with_prompt_frame_token_ids(&lfr.data, &requested.embed_indices)
+                    .map_err(|e| e.to_string())?;
+                if output.token_ids.len() != output.frame_count {
+                    return Err("SenseVoice compact CTC frame/token count mismatch".to_string());
+                }
+                let collapsed = collapse_sensevoice_frame_token_ids(
+                    &output.token_ids,
+                    output.vocab_size,
+                    self.metadata.blank_token_id,
+                    decode_work_progress,
+                )?;
+                self.tokenizer.decode(&collapsed)?
+            } else {
+                self.decode_result(samples, language, phrase_bias, decode_work_progress)?
+                    .text
+            };
         Ok(sensevoice_result_to_transcription(
-            &result.text,
+            &raw_text,
             &requested.resolved_language,
         ))
     }
+}
+
+fn collapse_sensevoice_frame_token_ids(
+    frame_token_ids: &[u32],
+    vocab_size: usize,
+    blank_token_id: u32,
+    decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
+) -> Result<Vec<u32>, String> {
+    if frame_token_ids.is_empty() {
+        return Err("SenseVoice compact CTC decode has no frames".to_string());
+    }
+    if blank_token_id as usize >= vocab_size {
+        return Err("SenseVoice compact CTC blank token is outside vocabulary".to_string());
+    }
+    let mut collapsed = Vec::new();
+    let mut previous = None;
+    for (frame_index, &token_id) in frame_token_ids.iter().enumerate() {
+        if token_id as usize >= vocab_size {
+            return Err("SenseVoice compact CTC frame token is outside vocabulary".to_string());
+        }
+        if previous != Some(token_id) && token_id != blank_token_id {
+            collapsed.push(token_id);
+        }
+        previous = Some(token_id);
+        if let Some(observer) = decode_work_progress {
+            observer.report(frame_index + 1, frame_token_ids.len());
+        }
+    }
+    Ok(collapsed)
 }
 
 /// Strip the tag prefix and derive the honest language read-back. Emotion/event
@@ -309,6 +373,28 @@ fn transcribe_sensevoice_pcm_cached(
     backend: GgmlCpuGraphBackend,
     decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
 ) -> Result<SenseVoiceTranscription, String> {
+    transcribe_sensevoice_pcm_cached_with_output_mode(
+        runtime_pool,
+        samples,
+        preflight,
+        language,
+        phrase_bias,
+        backend,
+        decode_work_progress,
+        DeviceGreedyStepOutputMode::FullLogits,
+    )
+}
+
+fn transcribe_sensevoice_pcm_cached_with_output_mode(
+    runtime_pool: &SenseVoiceRuntimePool,
+    samples: &[f32],
+    preflight: &crate::GgufRuntimeSourcePreflight,
+    language: Option<&str>,
+    phrase_bias: Option<&PhraseBiasConfig>,
+    backend: GgmlCpuGraphBackend,
+    decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
+    output_mode: DeviceGreedyStepOutputMode,
+) -> Result<SenseVoiceTranscription, String> {
     let actor = checkout_sensevoice_prepared_runtime(runtime_pool, preflight, backend)?;
     let samples = samples.to_vec();
     let language = language.map(str::to_owned);
@@ -320,6 +406,7 @@ fn transcribe_sensevoice_pcm_cached(
                 language.as_deref(),
                 phrase_bias.as_ref(),
                 decode_work_progress.as_ref(),
+                output_mode,
             )
         })
         .map_err(|error| error.to_string())?
@@ -535,17 +622,33 @@ impl GgmlAsrViewExecutor for SenseVoiceGgmlExecutor {
             reason,
         };
         let preflight = request.runtime_source_preflight();
-        let output = transcribe_sensevoice_pcm_cached(
+        let backend = request.resolved_runtime.backend();
+        let graph_config = sensevoice_encoder_graph_config(backend);
+        let output_mode = device_greedy_step_output_mode(
+            graph_config.backend,
+            graph_config.use_scheduler,
+            request_backend_override().as_ref(),
+            current_execution_placement(),
+        );
+        #[cfg(test)]
+        let output_mode = if std::env::var_os("OPENASR_SENSEVOICE_TEST_FORCE_FULL_LOGITS").is_some()
+        {
+            DeviceGreedyStepOutputMode::FullLogits
+        } else {
+            output_mode
+        };
+        let output = transcribe_sensevoice_pcm_cached_with_output_mode(
             &self.runtime_pool,
             &request.prepared_audio.samples_f32,
             preflight,
             request.request_options.language.as_deref(),
             request.request_options.phrase_bias.as_ref(),
-            request.resolved_runtime.backend(),
+            backend,
             request
                 .execution_context
                 .decode_work_progress_observer()
                 .cloned(),
+            output_mode,
         )
         .map_err(fail)?;
         let duration = request.prepared_audio.samples_f32.len() as f32 / 16_000.0_f32;
@@ -651,6 +754,18 @@ mod tests {
             "auto",
         );
         assert_eq!(unknown.language, None);
+    }
+
+    #[test]
+    fn compact_ctc_collapse_matches_transition_then_blank_semantics() {
+        assert_eq!(
+            collapse_sensevoice_frame_token_ids(&[0, 1, 1, 0, 1, 2, 2, 0], 3, 0, None)
+                .expect("compact collapse"),
+            vec![1, 1, 2]
+        );
+        assert!(collapse_sensevoice_frame_token_ids(&[], 3, 0, None).is_err());
+        assert!(collapse_sensevoice_frame_token_ids(&[3], 3, 0, None).is_err());
+        assert!(collapse_sensevoice_frame_token_ids(&[1], 3, 3, None).is_err());
     }
 
     /// End-to-end transcription gate on the real packs + real clips (zh + en).

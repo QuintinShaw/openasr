@@ -53,10 +53,13 @@ pub(crate) use forced_aligner_runtime::{
 };
 pub(crate) use frontend::{Qwen3AsrMelFrontendPlan, load_qwen3_mel_frontend_plan_from_reader};
 pub(crate) use ggml_executor::Qwen3AsrGgmlExecutor;
+pub(crate) use graph_config::qwen_decoder_graph_config;
 pub(crate) use kv_cache::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
     Qwen3AsrKvCacheCapacityError, Qwen3AsrLayerKvCacheState, qwen_host_kv_quoted_bytes,
 };
+#[cfg(test)]
+pub(crate) use llm_transformer::compile_qwen_whole_decoder_graph_from_prepared_plan_with_config;
 #[cfg(test)]
 pub(crate) use llm_transformer::{
     Qwen3AsrLlmLayerAttentionProjection, load_qwen_family_llm_layer_attention_projection_generic,
@@ -67,7 +70,9 @@ pub(crate) use llm_transformer::{
     Qwen3AsrLlmWholeStepTop1Output, QwenFamilyLlmLayerTensorNames,
     QwenPreparedDecoderGraphCompileRequest, QwenWholeDecoderPlan,
     add_qwen_decoder_prepared_runtime_quote, compile_qwen_whole_decoder_graph_from_prepared_plan,
-    even_prefill_chunk_len, quoted_qwen_decoder_system_memory_bytes,
+    compile_qwen_whole_decoder_graph_from_prepared_plan_with_config_and_native_gqa,
+    compile_qwen_whole_decoder_graph_from_prepared_plan_with_native_gqa, even_prefill_chunk_len,
+    quoted_qwen_decoder_system_memory_bytes, qwen_llm_effective_native_gqa_capability,
     resolve_qwen_family_production_kv_cache_policy,
 };
 #[cfg(test)]

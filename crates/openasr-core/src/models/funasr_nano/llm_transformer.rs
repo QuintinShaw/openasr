@@ -90,6 +90,16 @@ pub(crate) struct FunasrNanoPrefillOutput {
 }
 
 impl FunasrNanoDecoderRuntime {
+    pub(crate) fn graph_lane(&self) -> (crate::ggml_runtime::GgmlCpuGraphBackend, bool) {
+        self.whole_decoder.graph_lane()
+    }
+
+    pub(crate) fn loaded_weight_binding_identity(
+        &self,
+    ) -> Option<crate::ggml_runtime::GgmlLoadedWeightBindingIdentity> {
+        self.whole_decoder.loaded_weight_binding_identity()
+    }
+
     pub(crate) fn new_from_preflight(
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         metadata: FunasrNanoDecoderMetadata,
@@ -506,7 +516,11 @@ fn write_layer_kv(
             })?;
             layer_kv_caches[layer_index]
                 .write(absolute_position, key_row, value_row)
-                .map_err(|reason| FunasrNanoDecoderError::KvCacheFailed { reason })?;
+                .map_err(|reason| FunasrNanoDecoderError::KvCacheFailed {
+                    reason: format!(
+                        "layer {layer_index} token {absolute_position} write failed: {reason}"
+                    ),
+                })?;
         }
     }
     Ok(())

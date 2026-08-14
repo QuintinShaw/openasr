@@ -1475,7 +1475,18 @@ pub(crate) fn validate_native_request_model(
         NativeRuntimeModelIdSource::ExplicitModelIdFallback => Ok(()),
         NativeRuntimeModelIdSource::MetadataGgufKey { .. }
         | NativeRuntimeModelIdSource::RuntimeSourcePathStemFallback => {
-            if !native_model_refs_match(model, &identity.model_id) {
+            // Compare against the already-normalized identity first. Retired
+            // metadata ids may have been replaced with the verified pack's
+            // safe path-stem fallback above; reopening the pack identity here
+            // would compare against the retired spelling again and reject a
+            // request that just matched. Only consult the content-bound
+            // published-pack compatibility when ordinary normalized matching
+            // did not succeed.
+            if !openasr_core::native_runtime_model_refs_match(model, &identity.model_id)
+                && !adapter
+                    .verified_pack_matches_model_ref(model)
+                    .map_err(|error| error.to_string())?
+            {
                 return Err(format!(
                     "Model '{}' does not match server native local runtime source id '{}' ({}).",
                     model,
@@ -1488,6 +1499,7 @@ pub(crate) fn validate_native_request_model(
     }
 }
 
+#[cfg(test)]
 fn native_model_refs_match(requested: &str, runtime_source_id: &str) -> bool {
     // Single source of truth for the bare-id / quant-alias matching contract;
     // the local tests below stay as a regression net over the same semantics.

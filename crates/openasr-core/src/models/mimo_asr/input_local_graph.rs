@@ -58,7 +58,7 @@ fn mimo_input_local_graph_config(
         .max(GgmlCpuGraphConfig::metadata_context_bytes(
             config.graph_size,
         ));
-    config
+    crate::models::graph_runtime_config::apply_request_execution_placement(config)
 }
 
 #[derive(Debug, Error)]

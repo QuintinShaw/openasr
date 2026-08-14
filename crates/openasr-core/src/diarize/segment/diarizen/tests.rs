@@ -10,15 +10,38 @@ fn external_path(env: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("{env} must point at the external DiariZen parity fixture"))
 }
 
-fn benchmark_backend() -> crate::ggml_runtime::GgmlCpuGraphBackend {
-    match std::env::var("OPENASR_DIARIZEN_BENCH_BACKEND")
-        .unwrap_or_else(|_| "cpu".to_string())
-        .as_str()
-    {
-        "cpu" => crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
-        "metal" => crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
-        "gpu" => crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
-        backend => panic!("unsupported OPENASR_DIARIZEN_BENCH_BACKEND '{backend}'"),
+struct BenchmarkBackend {
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    requested_provider: &'static str,
+    accelerated_fp16_tolerances: bool,
+    expected_backend_name: Option<String>,
+    exact_route_identity: Option<String>,
+    _route_guard: Option<crate::ggml_runtime::RequestBackendOverrideGuard>,
+}
+
+impl BenchmarkBackend {
+    fn assert_runtime(&self, runtime: &DiariZenRuntime) {
+        let backend = runtime.backend_label();
+        if let Some(expected_backend_name) = &self.expected_backend_name {
+            assert_eq!(
+                backend,
+                format!("Gpu:{expected_backend_name}"),
+                "the exact DiariZen route must initialize the requested ggml device"
+            );
+        } else {
+            assert!(
+                backend
+                    .to_ascii_lowercase()
+                    .contains(self.requested_provider),
+                "requested DiariZen provider '{}' but constructed backend '{backend}'",
+                self.requested_provider
+            );
+        }
+        eprintln!(
+            "DIARIZEN_BACKEND_RECEIPT requested_provider={} placement=full_device exact_route={} backend={backend}",
+            self.requested_provider,
+            self.exact_route_identity.as_deref().unwrap_or("coarse")
+        );
     }
 }
 
@@ -42,6 +65,101 @@ fn assert_selected_backend_compute(
         "{operation} explicit Metal route observed non-Metal compute: {:?}",
         observed.observed_compute_nodes_by_backend,
     );
+}
+
+fn benchmark_backend() -> BenchmarkBackend {
+    let requested = std::env::var("OPENASR_DIARIZEN_BENCH_BACKEND")
+        .unwrap_or_else(|_| "cpu".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    let (backend, provider) = match requested.as_str() {
+        "cpu" => (
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            crate::device::execution_route::ExecutionProvider::Cpu,
+        ),
+        "metal" => (
+            crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
+            crate::device::execution_route::ExecutionProvider::Metal,
+        ),
+        "cuda" => (
+            crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+            crate::device::execution_route::ExecutionProvider::Cuda,
+        ),
+        "vulkan" => (
+            crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+            crate::device::execution_route::ExecutionProvider::Vulkan,
+        ),
+        backend => panic!(
+            "OPENASR_DIARIZEN_BENCH_BACKEND must be cpu, metal, cuda, or vulkan; got '{backend}'"
+        ),
+    };
+    let mut expected_backend_name = None;
+    let mut exact_route_identity = None;
+    let route_guard = if matches!(
+        provider,
+        crate::device::execution_route::ExecutionProvider::Cuda
+            | crate::device::execution_route::ExecutionProvider::Vulkan
+    ) {
+        let route = crate::device::execution_route::enumerate_compute_devices_from_ggml(
+            &crate::ggml_runtime::ggml_available_devices(),
+        )
+        .into_iter()
+        .find(|device| device.provider == provider)
+        .unwrap_or_else(|| panic!("requested DiariZen provider '{requested}' is unavailable"))
+        .to_resolved_route();
+        expected_backend_name = Some(route.stable_id.clone());
+        exact_route_identity = Some(route.isolation_key());
+        Some(crate::ggml_runtime::install_request_backend_override(Some(
+            crate::ggml_runtime::RequestBackendPreference::Exact(route),
+        )))
+    } else {
+        None
+    };
+    BenchmarkBackend {
+        backend,
+        requested_provider: match provider {
+            crate::device::execution_route::ExecutionProvider::Cpu => "cpu",
+            crate::device::execution_route::ExecutionProvider::Metal => "metal",
+            crate::device::execution_route::ExecutionProvider::Cuda => "cuda",
+            crate::device::execution_route::ExecutionProvider::Vulkan => "vulkan",
+            _ => unreachable!("DiariZen benchmark parser admits only concrete providers"),
+        },
+        accelerated_fp16_tolerances: matches!(
+            provider,
+            crate::device::execution_route::ExecutionProvider::Cuda
+                | crate::device::execution_route::ExecutionProvider::Vulkan
+        ),
+        expected_backend_name,
+        exact_route_identity,
+        _route_guard: route_guard,
+    }
+}
+
+fn golden_limits(name: &str, accelerated_fp16: bool) -> (f32, f32) {
+    let (max_limit, mean_limit) = match name {
+        "wavlm_layer_23" => (3.0, 0.14),
+        name if name.starts_with("wavlm_layer_") => (0.55, 0.035),
+        "weighted_layer_sum_raw" => (1.0, 0.05),
+        "projection_raw" => (1.5, 0.18),
+        "projection_norm" | "conformer_layer_00" | "conformer_layer_01" | "conformer_layer_02"
+        | "conformer_layer_03" => (0.08, 0.008),
+        "logits" => (0.04, 0.015),
+        _ => (0.05, 0.005),
+    };
+    if !accelerated_fp16 {
+        return (max_limit, mean_limit);
+    }
+    // On the frozen FP16 pack, exact CUDA and Vulkan kernels have a wider
+    // audited accumulation envelope through 24 WavLM layers than the CPU
+    // reference path. Keep the CPU/PyTorch envelope above unchanged and use
+    // fixed, evidence-backed multipliers for those two routes. Every stage's
+    // observed max/mean remains in the host-local evidence log, while the
+    // downstream powerset/activity/segment gates remain exact.
+    let multiplier = match name {
+        "wavlm_layer_23" | "weighted_layer_sum_raw" | "projection_raw" => 2.5,
+        _ => 2.0,
+    };
+    (max_limit * multiplier, mean_limit * multiplier)
 }
 
 fn npy_bytes(npz: &std::path::Path, name: &str) -> Vec<u8> {
@@ -239,21 +357,30 @@ fn legacy_long_name_pack_is_rejected_by_the_compact_schema_runtime() {
 fn native_graph_matches_external_pytorch_golden() {
     let pack = external_path("OPENASR_DIARIZEN_PACK");
     let golden = external_path("OPENASR_DIARIZEN_GOLDEN");
+    let benchmark_backend = benchmark_backend();
     DiariZenSegmenter::probe_oasr(&pack).expect("strict pack probe");
     let waveform = npy_f32(&golden, "waveform");
-    let backend = benchmark_backend();
-    let mut runtime = DiariZenRuntime::new(&pack, 16_000, true, Some(backend))
+    let mut runtime = DiariZenRuntime::new(&pack, 16_000, true, Some(benchmark_backend.backend))
         .expect("construct test-geometry runtime");
+    benchmark_backend.assert_runtime(&runtime);
     let execution_placement = crate::GgmlExecutionTelemetryCollector::new();
     let _execution_placement_guard = execution_placement.install();
     let trace = runtime.infer_trace(&waveform).expect("native trace");
     let observed = execution_placement.snapshot();
     eprintln!(
-        "DIARIZEN_OFFICIAL_PLACEMENT backend={backend:?} observed_compute_nodes={:?} observed_nodes={:?}",
-        observed.observed_compute_nodes_by_backend, observed.observed_nodes_by_backend,
+        "DIARIZEN_OFFICIAL_PLACEMENT provider={} backend={} observed_compute_nodes={:?} observed_nodes={:?}",
+        benchmark_backend.requested_provider,
+        runtime.backend_label(),
+        observed.observed_compute_nodes_by_backend,
+        observed.observed_nodes_by_backend,
     );
-    assert_selected_backend_compute(backend, &observed, "DiariZen official parity");
+    assert_selected_backend_compute(
+        benchmark_backend.backend,
+        &observed,
+        "DiariZen official parity",
+    );
 
+    let mut numeric_violations = Vec::new();
     for (name, actual) in &trace {
         if name == "weighted_layer_sum_raw" {
             // The golden carries a trailing singleton dimension; flat order is
@@ -266,20 +393,13 @@ fn native_graph_matches_external_pytorch_golden() {
         // visibly in its final layer. The learned layer mixture, projection,
         // and LayerNorm contract that drift again, so keep those downstream
         // limits tight and require exact powerset argmax below.
-        let (max_limit, mean_limit) = match name.as_str() {
-            "wavlm_layer_23" => (3.0, 0.14),
-            name if name.starts_with("wavlm_layer_") => (0.55, 0.035),
-            "weighted_layer_sum_raw" => (1.0, 0.05),
-            "projection_raw" => (1.5, 0.18),
-            "projection_norm" | "conformer_layer_00" | "conformer_layer_01"
-            | "conformer_layer_02" | "conformer_layer_03" => (0.08, 0.008),
-            "logits" => (0.04, 0.015),
-            _ => (0.05, 0.005),
-        };
-        assert!(
-            max_abs <= max_limit && mean_abs <= mean_limit,
-            "{name} drift: max_abs={max_abs} (limit {max_limit}), mean_abs={mean_abs} (limit {mean_limit})"
-        );
+        let (max_limit, mean_limit) =
+            golden_limits(name, benchmark_backend.accelerated_fp16_tolerances);
+        if max_abs > max_limit || mean_abs > mean_limit {
+            numeric_violations.push(format!(
+                "{name} drift: max_abs={max_abs} (limit {max_limit}), mean_abs={mean_abs} (limit {mean_limit})"
+            ));
+        }
     }
 
     let logits = trace
@@ -309,6 +429,11 @@ fn native_graph_matches_external_pytorch_golden() {
         decode_segments(&expected_activity, frames),
         "segment-boundary parity"
     );
+    assert!(
+        numeric_violations.is_empty(),
+        "numeric golden violations:\n{}",
+        numeric_violations.join("\n")
+    );
 }
 
 #[test]
@@ -316,8 +441,11 @@ fn native_graph_matches_external_pytorch_golden() {
 fn native_fp16_exact_window_benchmark() {
     let pack = external_path("OPENASR_DIARIZEN_PACK");
     let samples = synthetic_exact_window();
-    let mut runtime = DiariZenRuntime::new(&pack, samples.len(), false, Some(benchmark_backend()))
-        .expect("construct production runtime");
+    let benchmark_backend = benchmark_backend();
+    let mut runtime =
+        DiariZenRuntime::new(&pack, samples.len(), false, Some(benchmark_backend.backend))
+            .expect("construct production runtime");
+    benchmark_backend.assert_runtime(&runtime);
     let allocation_bytes = runtime
         .prepared_graph_allocation_bytes()
         .expect("direct benchmark backend uses the liveness-aware graph allocator");
@@ -353,8 +481,11 @@ fn native_fp16_exact_window_benchmark() {
 fn native_fp16_sixty_second_window_throughput_benchmark() {
     let pack = external_path("OPENASR_DIARIZEN_PACK");
     let samples = synthetic_exact_window();
-    let mut runtime = DiariZenRuntime::new(&pack, samples.len(), false, Some(benchmark_backend()))
-        .expect("construct production runtime");
+    let benchmark_backend = benchmark_backend();
+    let mut runtime =
+        DiariZenRuntime::new(&pack, samples.len(), false, Some(benchmark_backend.backend))
+            .expect("construct production runtime");
+    benchmark_backend.assert_runtime(&runtime);
     runtime.infer(&samples).expect("warmup inference");
 
     // Match pyannote Inference.slide: all complete 16 s windows at the pinned
@@ -407,13 +538,15 @@ fn diarizen_aux_audio_sliding_benchmark() {
     .expect("load benchmark audio");
     let pcm = crate::PcmBuffer::from_vec(samples);
     let audio_seconds = pcm.len() as f64 / super::config::SAMPLE_RATE_HZ as f64;
+    let benchmark_backend = benchmark_backend();
     let mut runtime = DiariZenRuntime::new(
         &pack,
         super::config::WINDOW_SAMPLES,
         false,
-        Some(benchmark_backend()),
+        Some(benchmark_backend.backend),
     )
     .expect("construct production runtime");
+    benchmark_backend.assert_runtime(&runtime);
     let mut run = || {
         super::super::segment_diarizen_local_activity(
             pcm.full_slice(),
@@ -446,8 +579,9 @@ fn diarizen_aux_audio_sliding_benchmark() {
     );
     let (median_seconds, seconds) = crate::testing::benchmark_median_seconds(seconds);
     eprintln!(
-        "AUX_MODEL_BENCH model=diarizen backend={:?} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} windows={} activity_sha256={activity_sha256} runs={seconds:?}",
-        benchmark_backend(),
+        "AUX_MODEL_BENCH model=diarizen provider={} placement=full_device backend={} audio_seconds={audio_seconds:.6} median_seconds={median_seconds:.6} rtf={:.6} windows={} activity_sha256={activity_sha256} runs={seconds:?}",
+        benchmark_backend.requested_provider,
+        runtime.backend_label(),
         median_seconds / audio_seconds,
         last.windows.len(),
     );
@@ -470,12 +604,17 @@ fn diarizen_fifteen_minute_endurance() {
     .expect("load endurance audio");
     let audio_seconds = samples.len() as f64 / super::config::SAMPLE_RATE_HZ as f64;
     assert!(audio_seconds >= 15.0 * 60.0, "endurance audio is too short");
-    let backend = benchmark_backend();
+    let benchmark_backend = benchmark_backend();
+    let mut runtime = DiariZenRuntime::new(
+        &pack,
+        super::config::WINDOW_SAMPLES,
+        false,
+        Some(benchmark_backend.backend),
+    )
+    .expect("construct production runtime");
+    benchmark_backend.assert_runtime(&runtime);
     let execution_placement = crate::GgmlExecutionTelemetryCollector::new();
     let _execution_placement_guard = execution_placement.install();
-    let mut runtime =
-        DiariZenRuntime::new(&pack, super::config::WINDOW_SAMPLES, false, Some(backend))
-            .expect("construct production runtime");
     runtime
         .infer(&samples[..super::config::WINDOW_SAMPLES])
         .expect("warm DiariZen runtime");
@@ -509,13 +648,15 @@ fn diarizen_fifteen_minute_endurance() {
     let peak_phys_footprint_bytes = memory.peak_phys_footprint_bytes.unwrap_or(0);
     let observed = execution_placement.snapshot();
     eprintln!(
-        "AUX_MODEL_ENDURANCE model=diarizen backend={backend:?} audio_seconds={audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} phys_footprint_bytes={phys_footprint_bytes} peak_phys_footprint_bytes={peak_phys_footprint_bytes} windows={} activity_sha256={activity_sha256} observed_compute_nodes={:?} observed_nodes={:?}",
+        "AUX_MODEL_ENDURANCE model=diarizen provider={} placement=full_device backend={} audio_seconds={audio_seconds:.6} elapsed_seconds={elapsed_seconds:.6} rtf={:.6} peak_rss_bytes={peak_rss_bytes} current_rss_bytes={current_rss_bytes} phys_footprint_bytes={phys_footprint_bytes} peak_phys_footprint_bytes={peak_phys_footprint_bytes} windows={} activity_sha256={activity_sha256} observed_compute_nodes={:?} observed_nodes={:?}",
+        benchmark_backend.requested_provider,
+        runtime.backend_label(),
         elapsed_seconds / audio_seconds,
         activity.windows.len(),
         observed.observed_compute_nodes_by_backend,
         observed.observed_nodes_by_backend,
     );
-    assert_selected_backend_compute(backend, &observed, "DiariZen endurance");
+    assert_selected_backend_compute(benchmark_backend.backend, &observed, "DiariZen endurance");
 }
 
 #[test]
@@ -600,6 +741,105 @@ fn diarizen_cpu_and_metal_activity_stays_semantically_close() {
     assert!(
         aggregate_rate <= 0.01,
         "CPU/Metal aggregated speaker counts diverged for {:.3}% of recording frames",
+        aggregate_rate * 100.0
+    );
+}
+
+#[test]
+#[ignore = "host-local: needs OPENASR_DIARIZEN_PACK, OPENASR_AUX_BENCH_AUDIO, and exact cuda or vulkan backend"]
+fn diarizen_cpu_and_exact_gpu_activity_stays_semantically_close() {
+    let pack = external_path("OPENASR_DIARIZEN_PACK");
+    let audio = crate::testing::external_test_fixture_path(
+        "OPENASR_AUX_BENCH_AUDIO",
+        "private auxiliary-model benchmark audio",
+    )
+    .expect("OPENASR_AUX_BENCH_AUDIO");
+    let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+        &audio,
+        "DiariZen exact GPU parity",
+        "DiariZen exact GPU parity",
+    )
+    .expect("load parity audio");
+    let pcm = crate::PcmBuffer::from_vec(samples);
+    let benchmark_backend = benchmark_backend();
+    assert!(
+        benchmark_backend.accelerated_fp16_tolerances,
+        "this parity gate requires OPENASR_DIARIZEN_BENCH_BACKEND=cuda or vulkan"
+    );
+
+    let run = |backend| {
+        let mut runtime =
+            DiariZenRuntime::new(&pack, super::config::WINDOW_SAMPLES, false, Some(backend))
+                .expect("construct parity runtime");
+        if backend == benchmark_backend.backend {
+            benchmark_backend.assert_runtime(&runtime);
+        }
+        super::super::segment_diarizen_local_activity(
+            pcm.full_slice(),
+            super::config::SAMPLE_RATE_HZ,
+            &|| false,
+            None,
+            |window| {
+                runtime
+                    .infer(&window)
+                    .map_err(|error| super::super::SegmentError::Inference(error.to_string()))
+            },
+        )
+        .expect("segment parity audio")
+    };
+
+    let cpu = run(crate::ggml_runtime::GgmlCpuGraphBackend::Cpu);
+    let accelerated = run(benchmark_backend.backend);
+    assert_eq!(cpu.frame_clock, accelerated.frame_clock);
+    assert_eq!(cpu.local_speaker_slots, accelerated.local_speaker_slots);
+    assert_eq!(cpu.windows.len(), accelerated.windows.len());
+    assert_eq!(cpu.speaker_count.len(), accelerated.speaker_count.len());
+
+    let mut frame_count = 0usize;
+    let mut exact_mask_mismatches = 0usize;
+    let mut active_count_mismatches = 0usize;
+    for (cpu_window, accelerated_window) in cpu.windows.iter().zip(&accelerated.windows) {
+        assert_eq!(cpu_window.start_sample, accelerated_window.start_sample);
+        assert_eq!(
+            cpu_window.frame_activity.len(),
+            accelerated_window.frame_activity.len()
+        );
+        for (&cpu_mask, &accelerated_mask) in cpu_window
+            .frame_activity
+            .iter()
+            .zip(&accelerated_window.frame_activity)
+        {
+            frame_count += 1;
+            exact_mask_mismatches += usize::from(cpu_mask != accelerated_mask);
+            active_count_mismatches +=
+                usize::from(cpu_mask.count_ones() != accelerated_mask.count_ones());
+        }
+    }
+    assert!(frame_count > 0, "parity audio produced no activity frames");
+    let aggregate_mismatches = cpu
+        .speaker_count
+        .iter()
+        .zip(&accelerated.speaker_count)
+        .filter(|(cpu_count, accelerated_count)| cpu_count != accelerated_count)
+        .count();
+    let exact_mask_rate = exact_mask_mismatches as f64 / frame_count as f64;
+    let active_count_rate = active_count_mismatches as f64 / frame_count as f64;
+    let aggregate_rate = aggregate_mismatches as f64 / cpu.speaker_count.len() as f64;
+    eprintln!(
+        "DIARIZEN_EXACT_GPU_PARITY provider={} placement=full_device frames={frame_count} exact_mask_mismatches={exact_mask_mismatches} exact_mask_rate={exact_mask_rate:.8} active_count_mismatches={active_count_mismatches} active_count_rate={active_count_rate:.8} aggregate_mismatches={aggregate_mismatches} aggregate_rate={aggregate_rate:.8}",
+        benchmark_backend.requested_provider,
+    );
+
+    assert!(
+        active_count_rate <= 0.01,
+        "CPU/{} active-speaker counts diverged for {:.3}% of window frames",
+        benchmark_backend.requested_provider,
+        active_count_rate * 100.0
+    );
+    assert!(
+        aggregate_rate <= 0.01,
+        "CPU/{} aggregated speaker counts diverged for {:.3}% of recording frames",
+        benchmark_backend.requested_provider,
         aggregate_rate * 100.0
     );
 }

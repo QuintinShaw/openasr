@@ -240,7 +240,10 @@ impl<R, E> PolicyResolvedAuxRuntime<R, E> {
                 builder(candidate)
             });
             match (attempt.result, attempt.candidate_failure) {
-                (Ok(runtime), None) => return Ok((candidate_index, runtime)),
+                (Ok(runtime), None) => {
+                    log_auxiliary_candidate_selected(stage, candidate);
+                    return Ok((candidate_index, runtime));
+                }
                 (Err(error), None) => {
                     return Err(PolicyResolvedAuxRuntimeError::Operation(error));
                 }
@@ -446,6 +449,19 @@ impl<R, E> PolicyResolvedStatefulAuxRuntime<R, E> {
     }
 }
 
+fn log_auxiliary_candidate_selected(stage: &'static str, candidate: &ExecutionCandidate) {
+    crate::stage_timing::log_detail_event(
+        "native_auxiliary_runtime",
+        format_args!(
+            "stage=execution_candidate event=selected auxiliary_stage={stage} provider={} placement={:?} stable_id={} backend_kind={:?}",
+            candidate.device.route.provider,
+            candidate.placement,
+            candidate.device.route.stable_id,
+            candidate.device.ggml_kind,
+        ),
+    );
+}
+
 fn log_auxiliary_candidate_retry(
     stage: &'static str,
     operation: &'static str,
@@ -564,6 +580,7 @@ impl AuxiliaryRuntimeCacheKey {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn for_current_lane<T: Send + Sync + 'static>(
         architecture_id: &'static str,
         pack_content_id: impl Into<String>,

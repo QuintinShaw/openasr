@@ -20,7 +20,11 @@ use crate::NativeAsrError;
 use crate::NativeAsrSession;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::MIMO_ASR_DECODE_POLICY_ID;
-use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::device::execution_route::ExecutionProvider;
+use crate::ggml_runtime::{
+    GgmlCpuGraphBackend, GgmlNativeGqaCapability, RequestBackendPreference,
+    request_backend_override,
+};
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
     PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
@@ -39,7 +43,7 @@ use crate::models::incremental_streaming_driver::{
 use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity, Qwen3AsrKvCacheCapacityError,
-    Qwen3AsrPromptTokenInput,
+    Qwen3AsrPromptTokenInput, qwen_llm_effective_native_gqa_capability,
 };
 use crate::models::runtime_cache_coordinator::PackContentKey;
 use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
@@ -159,7 +163,7 @@ struct MimoAsrPreparedRuntime {
 /// bytes. Entries are tagged with the idle-unload generation they were built
 /// service root can clear or target-evict every actor directly; each runtime is
 /// destroyed on the same owner thread that constructed its native contexts.
-type MimoAsrPreparedRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
+type MimoAsrPreparedRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, GgmlNativeGqaCapability);
 
 type MimoAsrPreparedRuntimePool =
     AdmittedPinnedRuntimeActorCheckoutPool<MimoAsrPreparedRuntimeCacheKey, MimoAsrPreparedRuntime>;
@@ -410,6 +414,7 @@ impl MimoAsrPreparedRuntime {
     fn build(
         preflight: &crate::GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
+        native_gqa: GgmlNativeGqaCapability,
     ) -> Result<Self, MimoAsrExecutorError> {
         let llm_metadata = parse_mimo_llm_metadata(&preflight.metadata).map_err(|error| {
             MimoAsrExecutorError::RuntimeContractViolation {
@@ -519,10 +524,11 @@ impl MimoAsrPreparedRuntime {
             reason: error.to_string(),
         })?;
 
-        let decoder = MimoLlmDecoderRuntime::new_from_preflight(preflight, llm_metadata, backend)
-            .map_err(|error| MimoAsrExecutorError::DecoderFailed {
-            reason: error.to_string(),
-        })?;
+        let decoder =
+            MimoLlmDecoderRuntime::new_from_preflight(preflight, llm_metadata, backend, native_gqa)
+                .map_err(|error| MimoAsrExecutorError::DecoderFailed {
+                    reason: error.to_string(),
+                })?;
 
         Ok(Self {
             encoder_runtime,
@@ -583,6 +589,27 @@ fn phase_aware_quote<const N: usize>(
     Ok((peak, retained))
 }
 
+fn mimo_native_gqa_candidate(
+    backend: GgmlCpuGraphBackend,
+    preference: Option<&RequestBackendPreference>,
+    resolved: GgmlNativeGqaCapability,
+) -> GgmlNativeGqaCapability {
+    match backend {
+        GgmlCpuGraphBackend::Cpu | GgmlCpuGraphBackend::Metal => resolved,
+        GgmlCpuGraphBackend::Gpu => match preference {
+            Some(RequestBackendPreference::Exact(route))
+                if route.provider == ExecutionProvider::Vulkan =>
+            {
+                resolved
+            }
+            Some(RequestBackendPreference::CpuOnly)
+            | Some(RequestBackendPreference::Accelerated)
+            | Some(RequestBackendPreference::Exact(_))
+            | None => GgmlNativeGqaCapability::Unsupported,
+        },
+    }
+}
+
 impl MimoAsrGgmlExecutor {
     fn map_actor_error(error: PinnedRuntimeActorError) -> MimoAsrExecutorError {
         MimoAsrExecutorError::RuntimeOwnershipFailed {
@@ -595,10 +622,12 @@ impl MimoAsrGgmlExecutor {
         &self,
         preflight: &crate::GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
+        native_gqa: GgmlNativeGqaCapability,
     ) -> Result<MimoAsrPreparedRuntimeActor, MimoAsrExecutorError> {
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
+            native_gqa,
         );
         let quote_preflight = preflight.clone();
         let build_preflight = preflight.clone();
@@ -617,7 +646,7 @@ impl MimoAsrGgmlExecutor {
                 Ok((retained_bytes, quote))
             },
             move |quote| match SystemMemoryOwner::try_allocate_transaction(quote, || {
-                let runtime = MimoAsrPreparedRuntime::build(&build_preflight, backend)?;
+                let runtime = MimoAsrPreparedRuntime::build(&build_preflight, backend, native_gqa)?;
                 let retained = runtime.retained_system_memory_bytes()?;
                 Ok(SystemMemoryAllocationOutcome::new(
                     runtime, retained, retained,
@@ -666,12 +695,17 @@ impl MimoAsrGgmlExecutor {
         }
 
         let backend = request.resolved_runtime.backend();
+        let native_gqa = qwen_llm_effective_native_gqa_capability(mimo_native_gqa_candidate(
+            backend,
+            request_backend_override().as_ref(),
+            request.resolved_runtime.native_gqa_capability(),
+        ));
         let kv_capacity = Qwen3AsrKvCacheCapacity::from_decoder_state(
             &request.decoder_state,
             super::capacity::MIMO_ASR_SELF_KV_STATE_ID,
         )
         .map_err(|source| MimoAsrExecutorError::DecoderStateCapacity { source })?;
-        let actor = self.checkout_prepared_runtime(preflight, backend)?;
+        let actor = self.checkout_prepared_runtime(preflight, backend, native_gqa)?;
         let samples = samples.to_vec();
         let input_rate = request.prepared_audio.sample_rate_hz;
         let control = Arc::clone(&request.execution_context.control);
@@ -1021,6 +1055,53 @@ mod tests {
     use crate::models::ggml_asr_executor::{GgmlAsrBackendPreference, GgmlAsrPreparedAudioView};
 
     use super::*;
+
+    fn exactly_addressable_preference(provider: ExecutionProvider) -> RequestBackendPreference {
+        RequestBackendPreference::Exact(crate::device::execution_route::ResolvedExecutionRoute {
+            provider,
+            stable_id: format!("{}0", provider.as_str()),
+            registry_ordinal: 0,
+            kind: crate::device::execution_route::RouteDeviceKind::Accelerated,
+            addressability:
+                crate::device::execution_route::DeviceAddressability::ExactlyAddressable {
+                    physical_key: crate::device::execution_route::PhysicalResourceKey::new(
+                        "0000:01:00.0",
+                    )
+                    .expect("physical key"),
+                },
+        })
+    }
+
+    #[test]
+    fn native_gqa_candidate_is_vulkan_only_on_discrete_gpu() {
+        let validated = GgmlNativeGqaCapability::Validated;
+        for (provider, expected) in [
+            (
+                ExecutionProvider::Cuda,
+                GgmlNativeGqaCapability::Unsupported,
+            ),
+            (ExecutionProvider::Vulkan, validated),
+            (ExecutionProvider::Hip, GgmlNativeGqaCapability::Unsupported),
+            (
+                ExecutionProvider::Unknown,
+                GgmlNativeGqaCapability::Unsupported,
+            ),
+        ] {
+            let preference = exactly_addressable_preference(provider);
+            assert_eq!(
+                mimo_native_gqa_candidate(GgmlCpuGraphBackend::Gpu, Some(&preference), validated,),
+                expected,
+            );
+        }
+        assert_eq!(
+            mimo_native_gqa_candidate(GgmlCpuGraphBackend::Cpu, None, validated),
+            validated,
+        );
+        assert_eq!(
+            mimo_native_gqa_candidate(GgmlCpuGraphBackend::Metal, None, validated),
+            validated,
+        );
+    }
 
     #[test]
     fn strip_mimo_language_tags_matches_reference_asr_sft_postprocess() {

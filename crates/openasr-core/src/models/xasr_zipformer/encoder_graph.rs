@@ -28,8 +28,9 @@ use super::encoder_weights::{
 use super::runtime_contract::XasrZipformerExecutionMetadata;
 use super::weights::StoredLinear;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlPersistentGraphSession, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlPersistentGraphSession, GgmlStaticTensor,
+    GgmlStaticTensorArena,
 };
 use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
@@ -139,6 +140,8 @@ pub(crate) struct XasrEncoderLayerCache {
 pub(crate) struct XasrEncoderChunkState {
     pub embed_states: Vec<f32>,
     pub layer_caches: Vec<XasrEncoderLayerCache>,
+    resident_generation: Option<u64>,
+    resident_hop: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -162,25 +165,34 @@ pub(crate) struct XasrZipformerEncoderGraph {
     ggml_config: Option<GgmlCpuGraphConfig>,
     // Drop order is load-bearing: reusable sessions hold raw backend pointers
     // into `ggml_runner`, so this field must be declared before `ggml_runner`.
+    // Direct CUDA/Vulkan execution keeps its recurrent layer caches in a
+    // device-resident ping-pong arena. The two frozen sessions inside this
+    // owner must drop before the arena, and this owner must drop before the
+    // runner whose backend it borrows.
+    device_encoder_reuse: RefCell<Option<XasrDeviceFullEncoderReusableGraph>>,
     full_encoder_reuse: RefCell<Option<XasrFullEncoderReusableGraph>>,
-    ggml_runner: RefCell<Option<GgmlCpuGraphRunner>>,
-    // The encoder-embed graph rebuilds its forward graph every chunk; it must run
-    // on a SEPARATE backend from `ggml_runner` so it does not stomp the
-    // full-encoder persistent session's prepared (frozen) graph buffer between
-    // chunk computes.
-    embed_ggml_runner: RefCell<Option<GgmlCpuGraphRunner>>,
-    // Model-lifetime residency for the stack/layer 2-D matmul weights (see
-    // `XasrEncoderWeightArena`). Built once from `ggml_runner`, independent of
-    // `full_encoder_reuse` rebuilds.
+    // Weight arenas expose tensors captured by both persistent graph owners,
+    // and borrow the runner backend. They must therefore drop after the graph
+    // owners but before their runner.
     weight_arena: RefCell<Option<XasrEncoderWeightArena>>,
+    ggml_runner: RefCell<Option<GgmlCpuGraphRunner>>,
+    // The fixed-geometry encoder-embed graph owns a persistent session on a
+    // SEPARATE backend from `ggml_runner`, so neither prepared graph can stomp
+    // the other's frozen graph buffer between chunk computes. Declaration order
+    // is load-bearing: the session must drop before its weight arena and runner.
+    embed_graph_reuse: RefCell<Option<XasrEncoderEmbedPersistentGraph>>,
     // Model-lifetime residency for the encoder-embed `out` weight (see
     // `XasrEncoderEmbedWeightArena`). Built once from `embed_ggml_runner`.
     embed_weight_arena: RefCell<Option<XasrEncoderEmbedWeightArena>>,
+    embed_ggml_runner: RefCell<Option<GgmlCpuGraphRunner>>,
     // The OS thread the ggml runners above were last built on. Their GPU-class
     // backend guards are non-owning views into that thread's thread-local
     // backend cache, so when a pooled runtime migrates to another decode worker
     // thread the runners must be rebuilt before use. See `thread_moved_since_bind`.
     bound_thread: Cell<Option<ThreadId>>,
+    next_resident_generation: Cell<u64>,
+    #[cfg(test)]
+    embed_graph_builds: Cell<u64>,
 }
 
 impl std::fmt::Debug for XasrZipformerEncoderGraph {
@@ -203,6 +215,55 @@ impl XasrZipformerEncoderGraph {
         self.ggml_runner.borrow().is_some()
     }
 
+    #[cfg(test)]
+    pub(super) fn resident_state_for_test(&self) -> Option<(u64, u64, usize)> {
+        self.device_encoder_reuse
+            .borrow()
+            .as_ref()
+            .and_then(|reuse| {
+                reuse
+                    .active_generation
+                    .map(|generation| (generation, reuse.expected_hop, reuse.active_bank))
+            })
+    }
+
+    #[cfg(test)]
+    pub(super) fn resident_allocation_for_test(&self) -> Option<(u64, u64, u64)> {
+        let reuse = self.device_encoder_reuse.borrow();
+        let reuse = reuse.as_ref()?;
+        Some((
+            reuse.sessions[0].session.prepared_allocation_bytes()?,
+            reuse.sessions[1].session.prepared_allocation_bytes()?,
+            reuse.cache_arena._arena.backend_buffer_capacity_bytes()?,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(super) fn resident_native_node_counts_for_test(&self) -> Option<(usize, usize)> {
+        let reuse = self.device_encoder_reuse.borrow();
+        let reuse = reuse.as_ref()?;
+        Some((
+            reuse.sessions[0]
+                .session
+                .prepared_native_node_count_for_test()?,
+            reuse.sessions[1]
+                .session
+                .prepared_native_node_count_for_test()?,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(super) fn embed_persistent_graph_for_test(&self) -> Option<(u64, usize)> {
+        let reuse = self.embed_graph_reuse.borrow();
+        Some((
+            self.embed_graph_builds.get(),
+            reuse
+                .as_ref()?
+                .session
+                .prepared_native_node_count_for_test()?,
+        ))
+    }
+
     pub(crate) fn new_reference(
         metadata: XasrZipformerExecutionMetadata,
         weights: XasrEncoderWeights,
@@ -213,12 +274,17 @@ impl XasrZipformerEncoderGraph {
             weights,
             backend: XasrEncoderGraphBackend::Reference,
             ggml_config: None,
+            device_encoder_reuse: RefCell::new(None),
             full_encoder_reuse: RefCell::new(None),
-            ggml_runner: RefCell::new(None),
-            embed_ggml_runner: RefCell::new(None),
             weight_arena: RefCell::new(None),
+            ggml_runner: RefCell::new(None),
+            embed_graph_reuse: RefCell::new(None),
             embed_weight_arena: RefCell::new(None),
+            embed_ggml_runner: RefCell::new(None),
             bound_thread: Cell::new(None),
+            next_resident_generation: Cell::new(1),
+            #[cfg(test)]
+            embed_graph_builds: Cell::new(0),
         })
     }
 
@@ -233,12 +299,17 @@ impl XasrZipformerEncoderGraph {
             weights,
             backend: XasrEncoderGraphBackend::GgmlCpuStack0,
             ggml_config: Some(config),
+            device_encoder_reuse: RefCell::new(None),
             full_encoder_reuse: RefCell::new(None),
-            ggml_runner: RefCell::new(None),
-            embed_ggml_runner: RefCell::new(None),
             weight_arena: RefCell::new(None),
+            ggml_runner: RefCell::new(None),
+            embed_graph_reuse: RefCell::new(None),
             embed_weight_arena: RefCell::new(None),
+            embed_ggml_runner: RefCell::new(None),
             bound_thread: Cell::new(None),
+            next_resident_generation: Cell::new(1),
+            #[cfg(test)]
+            embed_graph_builds: Cell::new(0),
         })
     }
 
@@ -253,12 +324,17 @@ impl XasrZipformerEncoderGraph {
             weights,
             backend: XasrEncoderGraphBackend::GgmlCpuFullEncoder,
             ggml_config: Some(config),
+            device_encoder_reuse: RefCell::new(None),
             full_encoder_reuse: RefCell::new(None),
-            ggml_runner: RefCell::new(None),
-            embed_ggml_runner: RefCell::new(None),
             weight_arena: RefCell::new(None),
+            ggml_runner: RefCell::new(None),
+            embed_graph_reuse: RefCell::new(None),
             embed_weight_arena: RefCell::new(None),
+            embed_ggml_runner: RefCell::new(None),
             bound_thread: Cell::new(None),
+            next_resident_generation: Cell::new(1),
+            #[cfg(test)]
+            embed_graph_builds: Cell::new(0),
         })
     }
 
@@ -332,23 +408,44 @@ impl XasrZipformerEncoderGraph {
     /// thread's (possibly already-freed) GPU-class backend. See
     /// [`thread_moved_since_bind`] for the pooled-runtime migration this guards.
     ///
-    /// Clears in field-declaration order: `full_encoder_reuse` holds raw backend
-    /// pointers into `ggml_runner`, so it is dropped first. `weight_arena` and
-    /// `embed_weight_arena` are cleared alongside their owning runners for the
-    /// same reason -- each arena's backend buffer is a non-owning view into the
-    /// runner's backend, so it cannot outlive the runner it was built from. The
-    /// runners are pure graph builders -- per-utterance encoder cache state
-    /// lives in the caller's `XasrEncoderChunkState`, not here -- so a rebuild
-    /// only re-pays the graph warm-up (and the arena's one-time weight upload),
-    /// never loses decode state.
-    fn rebind_ggml_runners_to_current_thread(&self) {
+    /// Clears in field-declaration order: reusable graphs first, then each
+    /// arena, then the runner whose backend it borrows. Host execution keeps
+    /// recurrent caches in `XasrEncoderChunkState` and may rebuild safely;
+    /// direct GPU execution keeps recurrent caches in `device_encoder_reuse`,
+    /// so a live resident generation must fail closed instead of migrating.
+    fn rebind_ggml_runners_to_current_thread(&self) -> bool {
         if thread_moved_since_bind(&self.bound_thread, std::thread::current().id()) {
+            *self.device_encoder_reuse.borrow_mut() = None;
             *self.full_encoder_reuse.borrow_mut() = None;
-            *self.ggml_runner.borrow_mut() = None;
             *self.weight_arena.borrow_mut() = None;
-            *self.embed_ggml_runner.borrow_mut() = None;
+            *self.ggml_runner.borrow_mut() = None;
+            *self.embed_graph_reuse.borrow_mut() = None;
             *self.embed_weight_arena.borrow_mut() = None;
+            *self.embed_ggml_runner.borrow_mut() = None;
+            true
+        } else {
+            false
         }
+    }
+
+    fn uses_device_resident_layer_caches(&self) -> bool {
+        self.ggml_config.is_some_and(|config| {
+            matches!(
+                config.backend,
+                crate::ggml_runtime::GgmlCpuGraphBackend::Gpu
+            ) && !config.use_scheduler
+        })
+    }
+
+    fn next_device_generation(&self) -> Result<u64, XasrEncoderGraphError> {
+        let generation = self.next_resident_generation.get();
+        let next = generation
+            .checked_add(1)
+            .ok_or_else(|| XasrEncoderGraphError::Shape {
+                reason: "xasr resident encoder generation overflowed".to_string(),
+            })?;
+        self.next_resident_generation.set(next);
+        Ok(generation)
     }
 
     pub(crate) fn encode_streaming_chunk_from_features(
@@ -356,7 +453,7 @@ impl XasrZipformerEncoderGraph {
         input: &XasrEncoderFeatureInput,
         state: Option<&XasrEncoderChunkState>,
     ) -> Result<XasrEncoderChunkOutput, XasrEncoderGraphError> {
-        self.rebind_ggml_runners_to_current_thread();
+        let moved_threads = self.rebind_ggml_runners_to_current_thread();
         if self.backend != XasrEncoderGraphBackend::GgmlCpuFullEncoder {
             return Err(XasrEncoderGraphError::Shape {
                 reason: "streaming chunk execution requires GgmlCpuFullEncoder backend".to_string(),
@@ -370,22 +467,70 @@ impl XasrZipformerEncoderGraph {
                 ),
             });
         }
+        let resident_generation = if self.uses_device_resident_layer_caches() {
+            let existing = state.and_then(|state| state.resident_generation);
+            if moved_threads && existing.is_some() {
+                return Err(XasrEncoderGraphError::Shape {
+                    reason: "xasr device-resident encoder state cannot migrate between threads"
+                        .to_string(),
+                });
+            }
+            Some(match existing {
+                Some(generation) => {
+                    let hop = state.and_then(|state| state.resident_hop).ok_or_else(|| {
+                        XasrEncoderGraphError::Shape {
+                            reason: "xasr resident encoder state is missing its hop token"
+                                .to_string(),
+                        }
+                    })?;
+                    (generation, hop, false)
+                }
+                None => (self.next_device_generation()?, 0, true),
+            })
+        } else {
+            None
+        };
         let embed = self.encode_embed_from_features_ggml(
             input,
             state.map(|state| state.embed_states.as_slice()),
         )?;
-        let chunk = self.encode_from_embed_rows_ggml_full_with_cache_capture(
-            &embed.rows,
-            embed.frames,
-            embed.dim,
-            input.frames,
-            state.map(|state| state.layer_caches.as_slice()),
-        )?;
+        let chunk = match resident_generation {
+            Some((generation, hop, new_generation)) => self
+                .encode_from_embed_rows_ggml_full_device_resident(
+                    &embed.rows,
+                    embed.frames,
+                    embed.dim,
+                    input.frames,
+                    generation,
+                    hop,
+                    new_generation,
+                )?,
+            None => self.encode_from_embed_rows_ggml_full_with_cache_capture(
+                &embed.rows,
+                embed.frames,
+                embed.dim,
+                input.frames,
+                state.map(|state| state.layer_caches.as_slice()),
+            )?,
+        };
         Ok(XasrEncoderChunkOutput {
             output: chunk.output,
             state: XasrEncoderChunkState {
                 embed_states: embed.new_embed_states,
                 layer_caches: chunk.layer_caches,
+                resident_generation: resident_generation.map(|(generation, _, _)| generation),
+                resident_hop: match resident_generation {
+                    Some((_, hop, _)) => {
+                        Some(
+                            hop.checked_add(1)
+                                .ok_or_else(|| XasrEncoderGraphError::Shape {
+                                    reason: "xasr resident encoder hop token overflowed"
+                                        .to_string(),
+                                })?,
+                        )
+                    }
+                    None => None,
+                },
             },
         })
     }
@@ -400,6 +545,7 @@ impl XasrZipformerEncoderGraph {
             .ok_or_else(|| XasrEncoderGraphError::Shape {
                 reason: "GGML encoder embed backend requires a graph config".to_string(),
             })?;
+        let embed_config = super::graph_config::xasr_zipformer_encoder_embed_graph_config(config);
         validate_rows_len(
             &input.rows,
             input.frames,
@@ -408,18 +554,20 @@ impl XasrZipformerEncoderGraph {
         )?;
         let total_profile = xasr_encoder_profile_start();
         let runner_profile = xasr_encoder_profile_start();
-        // Dedicated embed backend: keep this rebuild-every-chunk graph off the
-        // full-encoder persistent session's runner so it cannot invalidate the
-        // prepared graph's frozen buffers.
+        // Dedicated embed backend: keep this fixed-geometry persistent graph
+        // off the full-encoder sessions' runner so neither prepared graph can
+        // invalidate the other's frozen buffers.
         let mut runner_slot = self.embed_ggml_runner.borrow_mut();
         let mut arena_slot = self.embed_weight_arena.borrow_mut();
         if runner_slot.is_none() {
-            let runner =
-                map_ggml_stage("encoder_embed_runner_init", GgmlCpuGraphRunner::new(config))?;
+            let runner = map_ggml_stage(
+                "encoder_embed_runner_init",
+                GgmlCpuGraphRunner::new(embed_config),
+            )?;
             // Built once, alongside the runner: residency for `out`'s 2-D
             // matmul weight so it lands in a WEIGHTS-usage buffer instead of
-            // being re-uploaded into the rebuild-every-chunk graph's compute
-            // buffer (see `XasrEncoderEmbedWeightArena`).
+            // the persistent graph's reusable compute allocation (see
+            // `XasrEncoderEmbedWeightArena`).
             *arena_slot = Some(map_ggml_stage(
                 "encoder_embed_weight_arena_init",
                 build_xasr_embed_weight_arena(&runner, &self.weights.embed),
@@ -454,88 +602,154 @@ impl XasrZipformerEncoderGraph {
                 .ok_or_else(|| XasrEncoderGraphError::Shape {
                     reason: "GGML encoder embed weight arena was not initialized".to_string(),
                 })?;
-        let build_profile = xasr_encoder_profile_start();
-        let mut graph = runner.start_graph();
-        let binding = map_ggml_stage(
-            "encoder_embed_alloc",
-            XasrEncoderEmbedGraphBinding::new(
-                &mut graph,
-                &self.weights.embed,
-                input.frames,
-                input.feature_dim,
-                embed_weight_arena,
-            ),
-        )?;
-        binding.set_inputs(&mut graph)?;
-        let features = binding.tensors.features;
-        let output = map_ggml_stage(
-            "encoder_embed_graph",
-            apply_encoder_embed_graph(&graph, features, binding.tensors.embed, binding.shape),
-        )?;
-        map_ggml_stage("encoder_embed_set_output", graph.set_output(output.rows))?;
-        map_ggml_stage(
-            "encoder_embed_set_cache_output",
-            graph.set_output(output.new_embed_states),
-        )?;
-        map_ggml_stage(
-            "encoder_embed_upload_features",
-            graph.set_f32_slice(features, &input.rows, "xasr_encoder_embed_features"),
-        )?;
-        binding.upload(&mut graph, &self.weights.embed, embed_states)?;
-        let expected_rows = binding
-            .shape
-            .embed_frames
-            .checked_mul(binding.shape.output_dim)
-            .ok_or_else(|| XasrEncoderGraphError::Shape {
-                reason: "xasr encoder embed output length overflows".to_string(),
-            })?;
-        let expected_cache = binding
-            .shape
-            .channels
-            .checked_mul(binding.shape.cache_frames)
-            .and_then(|value| value.checked_mul(binding.shape.embed_width))
-            .ok_or_else(|| XasrEncoderGraphError::Shape {
-                reason: "xasr encoder embed cache length overflows".to_string(),
-            })?;
-        xasr_encoder_profile_log(
-            "encoder_embed_graph_build",
-            build_profile,
-            format_args!(
-                "input_frames={} embed_frames={} output_dim={}",
-                input.frames, binding.shape.embed_frames, binding.shape.output_dim
-            ),
-        );
-        let compute_profile = xasr_encoder_profile_start();
-        let mut outputs = map_ggml_stage(
-            "encoder_embed_compute",
-            graph.compute_outputs_f32(&[
-                (output.rows, expected_rows),
-                (output.new_embed_states, expected_cache),
-            ]),
-        )?;
-        xasr_encoder_profile_log(
-            "encoder_embed_graph_compute",
-            compute_profile,
-            format_args!(
-                "input_frames={} embed_frames={} output_dim={}",
-                input.frames, binding.shape.embed_frames, binding.shape.output_dim
-            ),
-        );
-        let rows = outputs.remove(0);
-        let new_embed_states = outputs.remove(0);
+        let mut reuse_slot = self.embed_graph_reuse.borrow_mut();
+        let must_rebuild = reuse_slot
+            .as_ref()
+            .is_none_or(|reuse| !reuse.matches(input.frames, input.feature_dim));
+        if must_rebuild {
+            // Drop the old metadata context before allocating its replacement;
+            // the actor's SystemMemory lease prices one embed session, not an
+            // overlapping old/new geometry pair.
+            *reuse_slot = None;
+            let build_profile = xasr_encoder_profile_start();
+            let mut session = map_ggml_stage(
+                "encoder_embed_persistent_session",
+                runner.start_persistent_graph_session(embed_config.context_bytes),
+            )?;
+            let graph = session.builder();
+            let binding = map_ggml_stage(
+                "encoder_embed_alloc",
+                XasrEncoderEmbedGraphBinding::new(
+                    graph,
+                    &self.weights.embed,
+                    input.frames,
+                    input.feature_dim,
+                    embed_weight_arena,
+                ),
+            )?;
+            binding.set_inputs(graph)?;
+            let output = map_ggml_stage(
+                "encoder_embed_graph",
+                apply_encoder_embed_graph(
+                    graph,
+                    binding.tensors.features,
+                    binding.tensors.embed,
+                    binding.shape,
+                ),
+            )?;
+            map_ggml_stage("encoder_embed_set_output", graph.set_output(output.rows))?;
+            map_ggml_stage(
+                "encoder_embed_set_cache_output",
+                graph.set_output(output.new_embed_states),
+            )?;
+            map_ggml_stage(
+                "encoder_embed_prepare",
+                graph.prepare_outputs_for_upload(&[output.rows, output.new_embed_states]),
+            )?;
+            let expected_rows = binding
+                .shape
+                .embed_frames
+                .checked_mul(binding.shape.output_dim)
+                .ok_or_else(|| XasrEncoderGraphError::Shape {
+                    reason: "xasr encoder embed output length overflows".to_string(),
+                })?;
+            let expected_cache = binding
+                .shape
+                .channels
+                .checked_mul(binding.shape.cache_frames)
+                .and_then(|value| value.checked_mul(binding.shape.embed_width))
+                .ok_or_else(|| XasrEncoderGraphError::Shape {
+                    reason: "xasr encoder embed cache length overflows".to_string(),
+                })?;
+            xasr_encoder_profile_log(
+                "encoder_embed_graph_build",
+                build_profile,
+                format_args!(
+                    "input_frames={} embed_frames={} output_dim={}",
+                    input.frames, binding.shape.embed_frames, binding.shape.output_dim
+                ),
+            );
+            *reuse_slot = Some(XasrEncoderEmbedPersistentGraph {
+                session,
+                binding,
+                output,
+                expected_rows,
+                expected_cache,
+            });
+            #[cfg(test)]
+            self.embed_graph_builds.set(
+                self.embed_graph_builds
+                    .get()
+                    .checked_add(1)
+                    .expect("xasr embed graph test build count must not overflow"),
+            );
+        }
+        let compute_result = (|| {
+            let reuse = reuse_slot
+                .as_mut()
+                .ok_or_else(|| XasrEncoderGraphError::Shape {
+                    reason: "GGML encoder embed persistent graph was not initialized".to_string(),
+                })?;
+            let graph = reuse.session.builder();
+            map_ggml_stage(
+                "encoder_embed_upload_features",
+                graph.set_f32_slice(
+                    reuse.binding.tensors.features,
+                    &input.rows,
+                    "xasr_encoder_embed_features",
+                ),
+            )?;
+            // Inputs allocated inside a direct persistent graph remain part of
+            // its reusable compute allocation; unlike the external `out`
+            // weight arena, their bytes are not a model-resident ownership
+            // boundary and may be reused after a compute. Refresh them before
+            // every run exactly as the former one-shot graph did.
+            reuse
+                .binding
+                .upload_parameters(graph, &self.weights.embed)?;
+            reuse
+                .binding
+                .upload_cache(graph, reuse.expected_cache, embed_states)?;
+            let compute_profile = xasr_encoder_profile_start();
+            let outputs = map_ggml_stage(
+                "encoder_embed_compute",
+                graph.compute_outputs_f32(&[
+                    (reuse.output.rows, reuse.expected_rows),
+                    (reuse.output.new_embed_states, reuse.expected_cache),
+                ]),
+            )?;
+            xasr_encoder_profile_log(
+                "encoder_embed_graph_compute",
+                compute_profile,
+                format_args!(
+                    "input_frames={} embed_frames={} output_dim={}",
+                    input.frames, reuse.binding.shape.embed_frames, reuse.binding.shape.output_dim
+                ),
+            );
+            Ok::<_, XasrEncoderGraphError>((outputs, reuse.binding.shape))
+        })();
+        let (mut outputs, shape) = match compute_result {
+            Ok(output) => output,
+            Err(error) => {
+                // A failed prepared compute may have mutated native buffers.
+                // Drop the whole session so the next request cannot reuse it.
+                *reuse_slot = None;
+                return Err(error);
+            }
+        };
         xasr_encoder_profile_log(
             "encoder_embed_graph_total",
             total_profile,
             format_args!(
                 "input_frames={} embed_frames={} output_dim={}",
-                input.frames, binding.shape.embed_frames, binding.shape.output_dim
+                input.frames, shape.embed_frames, shape.output_dim
             ),
         );
         Ok(XasrEncoderEmbedOwnedOutput {
-            frames: binding.shape.embed_frames,
-            dim: binding.shape.output_dim,
-            rows,
-            new_embed_states,
+            frames: shape.embed_frames,
+            dim: shape.output_dim,
+            rows: outputs.remove(0),
+            new_embed_states: outputs.remove(0),
         })
     }
 
@@ -891,9 +1105,10 @@ impl XasrZipformerEncoderGraph {
         let mut trunk_dim = dim;
         let mut stack3_tail = None;
         let mut stack4_tail = None;
-        let mut layer_uploads = Vec::new();
-        let mut downsample_uploads = Vec::new();
-        let mut out_combiner_uploads = Vec::new();
+        let layer_count = self.metadata.total_encoder_layers();
+        let mut layer_uploads = Vec::with_capacity(layer_count);
+        let mut downsample_uploads = Vec::with_capacity(self.metadata.num_stacks);
+        let mut out_combiner_uploads = Vec::with_capacity(self.metadata.num_stacks);
         let mut cache_index = 0usize;
 
         for stack_index in 0..self.metadata.num_stacks {
@@ -1201,6 +1416,302 @@ impl XasrZipformerEncoderGraph {
         })
     }
 
+    fn build_device_encoder_session(
+        &self,
+        runner: &mut GgmlCpuGraphRunner,
+        weight_arena: &XasrEncoderWeightArena,
+        cache_arena: &XasrDeviceEncoderCacheArena,
+        read_bank: usize,
+        write_bank: usize,
+        frames: usize,
+        dim: usize,
+        valid_left_context: usize,
+    ) -> Result<XasrDeviceFullEncoderSession, XasrEncoderGraphError> {
+        let config = self
+            .ggml_config
+            .ok_or_else(|| XasrEncoderGraphError::Shape {
+                reason: "GGML device encoder backend requires a graph config".to_string(),
+            })?;
+        if config.use_scheduler || !matches!(config.backend, GgmlCpuGraphBackend::Gpu) {
+            return Err(XasrEncoderGraphError::Shape {
+                reason: "xasr resident encoder caches require a direct GPU backend".to_string(),
+            });
+        }
+        let read =
+            cache_arena
+                .banks
+                .get(read_bank)
+                .ok_or_else(|| XasrEncoderGraphError::Shape {
+                    reason: "xasr resident encoder read bank is invalid".to_string(),
+                })?;
+        let write =
+            cache_arena
+                .banks
+                .get(write_bank)
+                .ok_or_else(|| XasrEncoderGraphError::Shape {
+                    reason: "xasr resident encoder write bank is invalid".to_string(),
+                })?;
+        let mut session = map_ggml_stage(
+            "resident_encoder_persistent_session",
+            runner.start_persistent_graph_session(config.context_bytes),
+        )?;
+        let graph = session.builder();
+        let input = map_ggml_stage(
+            "resident_encoder_input_alloc",
+            graph.new_tensor_2d_f32(dim, frames, "xasr_resident_full_input"),
+        )?;
+        map_ggml_stage("resident_encoder_set_input", graph.set_input(input))?;
+        let plan = self.build_full_encoder_graph_plan(
+            graph,
+            input,
+            frames,
+            dim,
+            valid_left_context,
+            weight_arena,
+            Some((read.as_slice(), write.as_slice())),
+        )?;
+        let output = plan.output.rows;
+        map_ggml_stage(
+            "resident_encoder_prepare_output",
+            graph.prepare_outputs_for_upload(&[output]),
+        )?;
+        Ok(XasrDeviceFullEncoderSession {
+            session,
+            input,
+            output,
+            output_frames: plan.output.frames,
+            output_dim: plan.output.dim,
+            static_uploaded: false,
+            read_bank,
+            write_bank,
+            layer_uploads: plan.layer_uploads,
+            downsample_uploads: plan.downsample_uploads,
+            out_combiner_uploads: plan.out_combiner_uploads,
+        })
+    }
+
+    fn encode_from_embed_rows_ggml_full_device_resident(
+        &self,
+        rows: &[f32],
+        frames: usize,
+        dim: usize,
+        valid_left_context: usize,
+        generation: u64,
+        hop: u64,
+        new_generation: bool,
+    ) -> Result<XasrEncoderChunkGraphOutput, XasrEncoderGraphError> {
+        let config = self
+            .ggml_config
+            .ok_or_else(|| XasrEncoderGraphError::Shape {
+                reason: "GGML device encoder backend requires a graph config".to_string(),
+            })?;
+        if config.use_scheduler || !matches!(config.backend, GgmlCpuGraphBackend::Gpu) {
+            return Err(XasrEncoderGraphError::Shape {
+                reason: "xasr resident encoder caches require a direct GPU backend".to_string(),
+            });
+        }
+        validate_rows_len(rows, frames, dim, "resident full encoder input")?;
+
+        {
+            let mut reuse_slot = self.device_encoder_reuse.borrow_mut();
+            let needs_rebuild = !reuse_slot
+                .as_ref()
+                .is_some_and(|reuse| reuse.matches(frames, dim, valid_left_context));
+            if needs_rebuild {
+                if reuse_slot
+                    .as_ref()
+                    .is_some_and(|reuse| reuse.active_generation.is_some() && !new_generation)
+                {
+                    return Err(XasrEncoderGraphError::Shape {
+                        reason: "xasr resident encoder geometry changed within one generation"
+                            .to_string(),
+                    });
+                }
+                // The actor lease prices one resident geometry. Release the
+                // previous owner before constructing its replacement.
+                reuse_slot.take();
+                let mut runner_slot = self.ggml_runner.borrow_mut();
+                let mut weight_slot = self.weight_arena.borrow_mut();
+                if runner_slot.is_none() {
+                    let runner = map_ggml_stage(
+                        "resident_encoder_runner_init",
+                        GgmlCpuGraphRunner::new(config),
+                    )?;
+                    *weight_slot = Some(map_ggml_stage(
+                        "resident_encoder_weight_arena_init",
+                        build_xasr_weight_arena(&runner, &self.weights),
+                    )?);
+                    *runner_slot = Some(runner);
+                }
+                let runner = runner_slot
+                    .as_mut()
+                    .ok_or_else(|| XasrEncoderGraphError::Shape {
+                        reason: "resident encoder runner was not initialized".to_string(),
+                    })?;
+                let weight_arena =
+                    weight_slot
+                        .as_ref()
+                        .ok_or_else(|| XasrEncoderGraphError::Shape {
+                            reason: "resident encoder weight arena was not initialized".to_string(),
+                        })?;
+                let cache_arena = map_ggml_stage(
+                    "resident_encoder_cache_arena_init",
+                    build_xasr_device_cache_arena(runner, &self.metadata, &self.weights),
+                )?;
+                let session0 = self.build_device_encoder_session(
+                    runner,
+                    weight_arena,
+                    &cache_arena,
+                    0,
+                    1,
+                    frames,
+                    dim,
+                    valid_left_context,
+                )?;
+                let session1 = self.build_device_encoder_session(
+                    runner,
+                    weight_arena,
+                    &cache_arena,
+                    1,
+                    0,
+                    frames,
+                    dim,
+                    valid_left_context,
+                )?;
+                *reuse_slot = Some(XasrDeviceFullEncoderReusableGraph {
+                    sessions: [session0, session1],
+                    cache_arena,
+                    frames,
+                    dim,
+                    valid_left_context,
+                    active_bank: 0,
+                    active_generation: None,
+                    expected_hop: 0,
+                });
+            }
+        }
+
+        let mut reuse_slot = self.device_encoder_reuse.borrow_mut();
+        let result = (|| {
+            let reuse = reuse_slot
+                .as_mut()
+                .ok_or_else(|| XasrEncoderGraphError::Shape {
+                    reason: "resident encoder reusable graph was not initialized".to_string(),
+                })?;
+            let transition = resident_state_transition(
+                reuse.active_generation,
+                reuse.expected_hop,
+                generation,
+                hop,
+                new_generation,
+            )
+            .map_err(|reason| XasrEncoderGraphError::Shape {
+                reason: reason.to_string(),
+            })?;
+            let next_hop = match transition {
+                XasrResidentStateTransition::Reset { next_hop } => {
+                    map_ggml_stage(
+                        "resident_encoder_cache_reset",
+                        reuse.cache_arena.reset_source_bank(),
+                    )?;
+                    reuse.active_bank = 0;
+                    reuse.active_generation = Some(generation);
+                    reuse.expected_hop = 0;
+                    next_hop
+                }
+                XasrResidentStateTransition::Continue { next_hop } => next_hop,
+            };
+
+            let session_index = reuse.active_bank;
+            let session = reuse.sessions.get_mut(session_index).ok_or_else(|| {
+                XasrEncoderGraphError::Shape {
+                    reason: "xasr resident encoder active bank is invalid".to_string(),
+                }
+            })?;
+            if session.read_bank != session_index {
+                return Err(XasrEncoderGraphError::Shape {
+                    reason: "xasr resident encoder session bank contract drifted".to_string(),
+                });
+            }
+            let XasrDeviceFullEncoderSession {
+                session,
+                input,
+                output,
+                output_frames,
+                output_dim,
+                static_uploaded,
+                read_bank: _,
+                write_bank,
+                layer_uploads,
+                downsample_uploads,
+                out_combiner_uploads,
+            } = session;
+            let needs_static_upload = !*static_uploaded;
+            let graph = session.builder();
+            map_ggml_stage(
+                "resident_encoder_upload_input",
+                graph.set_f32_slice(*input, rows, "xasr_resident_full_input"),
+            )?;
+            if needs_static_upload {
+                for upload in downsample_uploads.iter() {
+                    upload.upload(graph)?;
+                }
+                for upload in layer_uploads.iter() {
+                    let layer = &self.weights.stacks[upload.stack_index].layers[upload.layer_index];
+                    upload
+                        .binding
+                        .upload(graph, layer, upload.valid_left_context, None)?;
+                }
+                for upload in out_combiner_uploads.iter() {
+                    let scale = self.weights.stacks[upload.stack_index]
+                        .out_combiner_bypass_scale
+                        .as_ref()
+                        .ok_or_else(|| XasrEncoderGraphError::Shape {
+                            reason: format!(
+                                "stack{} missing out_combiner bypass scale",
+                                upload.stack_index
+                            ),
+                        })?;
+                    upload_f32(graph, upload.scale, scale, "xasr_out_combiner_scale")?;
+                }
+            }
+            let computed = graph.compute_output_f32(
+                *output,
+                output_frames.checked_mul(*output_dim).ok_or_else(|| {
+                    XasrEncoderGraphError::Shape {
+                        reason: "xasr resident encoder output shape overflows".to_string(),
+                    }
+                })?,
+            );
+            match computed {
+                Ok(output_rows) => {
+                    *static_uploaded = true;
+                    reuse.active_bank = *write_bank;
+                    reuse.expected_hop = next_hop;
+                    Ok(XasrEncoderChunkGraphOutput {
+                        output: XasrEncoderGraphOutput {
+                            frames: *output_frames,
+                            dim: *output_dim,
+                            rows: output_rows,
+                        },
+                        layer_caches: Vec::new(),
+                    })
+                }
+                Err(source) => Err(XasrEncoderGraphError::Ggml {
+                    stage: "resident_encoder_compute",
+                    source,
+                }),
+            }
+        })();
+        if result.is_err() {
+            // The destination bank may have been partially written. Drop both
+            // directions and the arena together; no same-utterance retry can
+            // safely reconstruct device-only state from a host checkpoint.
+            *reuse_slot = None;
+        }
+        result
+    }
+
     fn encode_from_embed_rows_ggml_full_reused(
         &self,
         rows: &[f32],
@@ -1221,6 +1732,10 @@ impl XasrZipformerEncoderGraph {
                 .as_ref()
                 .is_some_and(|reuse| reuse.matches(frames, dim, valid_left_context));
             if needs_rebuild {
+                // Host caches make geometry reconstruction safe, but the
+                // actor lease prices only one persistent session. Drop the
+                // old owner before allocating its replacement.
+                reuse_slot.take();
                 let runner_profile = xasr_encoder_profile_start();
                 let mut runner_slot = self.ggml_runner.borrow_mut();
                 let mut arena_slot = self.weight_arena.borrow_mut();
@@ -1285,6 +1800,7 @@ impl XasrZipformerEncoderGraph {
                     dim,
                     valid_left_context,
                     weight_arena,
+                    None,
                 )?;
                 let output_specs = full_encoder_output_specs(&plan, true)?;
                 // Build the forward cgraph and allocate the backend buffer ONCE here.
@@ -1436,14 +1952,31 @@ impl XasrZipformerEncoderGraph {
         dim: usize,
         valid_left_context: usize,
         weight_arena: &XasrEncoderWeightArena,
+        resident_cache_banks: Option<(
+            &[XasrDeviceLayerCacheTensors],
+            &[XasrDeviceLayerCacheTensors],
+        )>,
     ) -> Result<XasrFullEncoderGraphPlan<'a>, XasrEncoderGraphError> {
         let mut trunk_frames = frames;
         let mut trunk_dim = dim;
         let mut stack3_tail = None;
         let mut stack4_tail = None;
-        let mut layer_uploads = Vec::new();
-        let mut downsample_uploads = Vec::new();
-        let mut out_combiner_uploads = Vec::new();
+        let layer_count = self.metadata.total_encoder_layers();
+        let mut layer_uploads = Vec::with_capacity(layer_count);
+        let mut downsample_uploads = Vec::with_capacity(self.metadata.num_stacks);
+        let mut out_combiner_uploads = Vec::with_capacity(self.metadata.num_stacks);
+        if resident_cache_banks.is_some() {
+            let side_effect_count =
+                layer_count
+                    .checked_mul(6)
+                    .ok_or_else(|| XasrEncoderGraphError::Shape {
+                        reason: "xasr resident side-effect root count overflowed".to_string(),
+                    })?;
+            map_ggml_stage(
+                "resident_encoder_side_effect_reserve",
+                graph.reserve_side_effect_roots(side_effect_count),
+            )?;
+        }
         let mut cache_index = 0usize;
 
         for stack_index in 0..self.metadata.num_stacks {
@@ -1512,9 +2045,13 @@ impl XasrZipformerEncoderGraph {
                             "weight arena missing stack{stack_index} layer{layer_index}"
                         ),
                     })?;
+                let resident_input = resident_cache_banks
+                    .and_then(|(read, _)| read.get(cache_index))
+                    .copied()
+                    .map(XasrDeviceLayerCacheTensors::as_graph_tensors);
                 let binding = map_ggml_stage(
                     "full_encoder_layer_alloc",
-                    XasrZipformerLayerGraphBinding::new(
+                    XasrZipformerLayerGraphBinding::new_with_resident_cache(
                         graph,
                         layer,
                         stack.dim,
@@ -1523,6 +2060,7 @@ impl XasrZipformerEncoderGraph {
                         self.metadata.num_heads[stack_index],
                         self.metadata.query_head_dims[stack_index],
                         layer_arena,
+                        resident_input,
                     ),
                 )?;
                 binding.set_persistent_inputs(graph)?;
@@ -1535,6 +2073,14 @@ impl XasrZipformerEncoderGraph {
                         binding.shape(),
                     ),
                 )?;
+                if let Some((_, write)) = resident_cache_banks {
+                    let destination = write.get(cache_index).copied().ok_or_else(|| {
+                        XasrEncoderGraphError::Shape {
+                            reason: "xasr resident cache write bank is missing a layer".to_string(),
+                        }
+                    })?;
+                    register_resident_cache_writes(graph, output, destination)?;
+                }
                 branch_rows = output.rows;
                 layer_uploads.push(XasrZipformerLayerGraphUpload {
                     cache_index,
@@ -2011,7 +2557,19 @@ fn full_encoder_output_specs<'a>(
         .ok_or_else(|| XasrEncoderGraphError::Shape {
             reason: "full encoder output shape overflows".to_string(),
         })?;
-    let mut output_specs = vec![(plan.output.rows, expected)];
+    let capacity = if capture_caches {
+        plan.layer_uploads
+            .len()
+            .checked_mul(6)
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| XasrEncoderGraphError::Shape {
+                reason: "full encoder output-spec count overflowed".to_string(),
+            })?
+    } else {
+        1
+    };
+    let mut output_specs = Vec::with_capacity(capacity);
+    output_specs.push((plan.output.rows, expected));
     if capture_caches {
         for upload in &plan.layer_uploads {
             let lengths = layer_cache_lengths(upload.binding.shape())?;
@@ -2087,6 +2645,22 @@ struct XasrFullEncoderGraphPlan<'a> {
     out_combiner_uploads: Vec<XasrOutCombinerGraphUpload<'a>>,
 }
 
+struct XasrEncoderEmbedPersistentGraph {
+    session: GgmlPersistentGraphSession,
+    binding: XasrEncoderEmbedGraphBinding<'static>,
+    output: XasrEncoderEmbedGraphOutput<'static>,
+    expected_rows: usize,
+    expected_cache: usize,
+}
+
+impl XasrEncoderEmbedPersistentGraph {
+    fn matches(&self, input_frames: usize, feature_dim: usize) -> bool {
+        !self.session.is_poisoned()
+            && self.binding.shape.input_frames == input_frames
+            && self.binding.shape.feature_dim == feature_dim
+    }
+}
+
 struct XasrFullEncoderReusableGraph {
     session: GgmlPersistentGraphSession,
     frames: usize,
@@ -2116,6 +2690,160 @@ impl XasrFullEncoderReusableGraph {
     fn builder(&mut self) -> &mut GgmlCpuGraphBuilder<'static> {
         self.session.builder()
     }
+}
+
+struct XasrDeviceFullEncoderReusableGraph {
+    // Drop order is load-bearing: both sessions hold graph tensors backed by
+    // `cache_arena`, so sessions must be destroyed first.
+    sessions: [XasrDeviceFullEncoderSession; 2],
+    cache_arena: XasrDeviceEncoderCacheArena,
+    frames: usize,
+    dim: usize,
+    valid_left_context: usize,
+    active_bank: usize,
+    active_generation: Option<u64>,
+    expected_hop: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XasrResidentStateTransition {
+    Reset { next_hop: u64 },
+    Continue { next_hop: u64 },
+}
+
+fn resident_state_transition(
+    active_generation: Option<u64>,
+    expected_hop: u64,
+    generation: u64,
+    hop: u64,
+    new_generation: bool,
+) -> Result<XasrResidentStateTransition, &'static str> {
+    let next_hop = hop
+        .checked_add(1)
+        .ok_or("xasr resident encoder hop token overflowed")?;
+    if new_generation {
+        if hop != 0 {
+            return Err("xasr new resident encoder generation must start at hop zero");
+        }
+        return Ok(XasrResidentStateTransition::Reset { next_hop });
+    }
+    match active_generation {
+        Some(active) if active == generation => {}
+        Some(_) => return Err("xasr resident encoder generations cannot interleave on one actor"),
+        None => return Err("xasr resident encoder generation lost its device state"),
+    }
+    if expected_hop != hop {
+        return Err("xasr resident encoder hop token is stale or out of order");
+    }
+    Ok(XasrResidentStateTransition::Continue { next_hop })
+}
+
+impl XasrDeviceFullEncoderReusableGraph {
+    fn matches(&self, frames: usize, dim: usize, valid_left_context: usize) -> bool {
+        self.sessions
+            .iter()
+            .all(|session| !session.session.is_poisoned())
+            && self.frames == frames
+            && self.dim == dim
+            && self.valid_left_context == valid_left_context
+    }
+}
+
+struct XasrDeviceFullEncoderSession {
+    session: GgmlPersistentGraphSession,
+    input: GgmlCpuTensor<'static>,
+    output: GgmlCpuTensor<'static>,
+    output_frames: usize,
+    output_dim: usize,
+    static_uploaded: bool,
+    read_bank: usize,
+    write_bank: usize,
+    layer_uploads: Vec<XasrZipformerLayerGraphUpload<'static>>,
+    downsample_uploads: Vec<XasrDownsampleGraphBinding<'static>>,
+    out_combiner_uploads: Vec<XasrOutCombinerGraphUpload<'static>>,
+}
+
+impl XasrDeviceFullEncoderSession {
+    fn builder(&mut self) -> &mut GgmlCpuGraphBuilder<'static> {
+        self.session.builder()
+    }
+}
+
+struct XasrDeviceEncoderCacheArena {
+    banks: [Vec<XasrDeviceLayerCacheTensors>; 2],
+    layouts: Vec<XasrDeviceLayerCacheLayout>,
+    _arena: GgmlStaticTensorArena,
+}
+
+impl XasrDeviceEncoderCacheArena {
+    fn reset_source_bank(&mut self) -> Result<(), GgmlCpuGraphError> {
+        let max_elements = self
+            .layouts
+            .iter()
+            .flat_map(|layout| {
+                [
+                    layout.cached_key,
+                    layout.cached_nonlin_attention,
+                    layout.cached_val1,
+                    layout.cached_val2,
+                    layout.cached_conv1,
+                    layout.cached_conv2,
+                ]
+            })
+            .try_fold(0_usize, |max_elements, shape| {
+                shape
+                    .0
+                    .checked_mul(shape.1)
+                    .map(|elements| max_elements.max(elements))
+                    .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "xasr resident cache zero length overflows",
+                    })
+            })?;
+        let zeros = vec![0.0_f32; max_elements];
+        let source = self
+            .banks
+            .first()
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "xasr resident cache source bank is missing",
+            })?;
+        for (tensors, layout) in source.iter().copied().zip(self.layouts.iter().copied()) {
+            zero_device_layer_cache_tensors(&mut self._arena, tensors, layout, &zeros)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct XasrDeviceLayerCacheTensors {
+    cached_key: GgmlStaticTensor,
+    cached_nonlin_attention: GgmlStaticTensor,
+    cached_val1: GgmlStaticTensor,
+    cached_val2: GgmlStaticTensor,
+    cached_conv1: GgmlStaticTensor,
+    cached_conv2: GgmlStaticTensor,
+}
+
+impl XasrDeviceLayerCacheTensors {
+    fn as_graph_tensors<'a>(self) -> XasrLayerCacheGraphTensors<'a> {
+        XasrLayerCacheGraphTensors {
+            cached_key: self.cached_key.as_graph_tensor(),
+            cached_nonlin_attention: self.cached_nonlin_attention.as_graph_tensor(),
+            cached_val1: self.cached_val1.as_graph_tensor(),
+            cached_val2: self.cached_val2.as_graph_tensor(),
+            cached_conv1: self.cached_conv1.as_graph_tensor(),
+            cached_conv2: self.cached_conv2.as_graph_tensor(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct XasrLayerCacheGraphTensors<'a> {
+    cached_key: GgmlCpuTensor<'a>,
+    cached_nonlin_attention: GgmlCpuTensor<'a>,
+    cached_val1: GgmlCpuTensor<'a>,
+    cached_val2: GgmlCpuTensor<'a>,
+    cached_conv1: GgmlCpuTensor<'a>,
+    cached_conv2: GgmlCpuTensor<'a>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2202,10 +2930,6 @@ impl<'a> XasrEncoderEmbedGraphBinding<'a> {
             out_bias: graph.new_tensor_1d_f32(weights.out.bias.len(), "xasr_embed_out_b")?,
             out_norm_bias: graph
                 .new_tensor_1d_f32(weights.out_norm_bias.len(), "xasr_embed_out_norm_b")?,
-            swoosh_r_offset: graph.new_tensor_1d_f32(1, "xasr_embed_swoosh_r_offset")?,
-            swoosh_r_shift: graph.new_tensor_1d_f32(1, "xasr_embed_swoosh_r_shift")?,
-            swoosh_l_offset: graph.new_tensor_1d_f32(1, "xasr_embed_swoosh_l_offset")?,
-            swoosh_l_shift: graph.new_tensor_1d_f32(1, "xasr_embed_swoosh_l_shift")?,
         };
         Ok(Self {
             tensors: XasrEncoderEmbedGraphBindingTensors {
@@ -2239,21 +2963,16 @@ impl<'a> XasrEncoderEmbedGraphBinding<'a> {
             // per-chunk graph input.
             embed.out_bias,
             embed.out_norm_bias,
-            embed.swoosh_r_offset,
-            embed.swoosh_r_shift,
-            embed.swoosh_l_offset,
-            embed.swoosh_l_shift,
         ] {
             map_ggml_stage("encoder_embed_set_input", graph.set_input(tensor))?;
         }
         Ok(())
     }
 
-    fn upload(
+    fn upload_parameters(
         &self,
         graph: &mut GgmlCpuGraphBuilder<'a>,
         weights: &XasrEncoderEmbedWeights,
-        embed_states: Option<&[f32]>,
     ) -> Result<(), XasrEncoderGraphError> {
         let tensors = self.tensors.embed;
         upload_conv2d_tensors(
@@ -2273,21 +2992,6 @@ impl<'a> XasrEncoderEmbedGraphBinding<'a> {
             tensors.conv7_weight,
             tensors.conv7_bias,
             &weights.conv7,
-        )?;
-        let expected_cache = self
-            .shape
-            .channels
-            .checked_mul(self.shape.cache_frames)
-            .and_then(|value| value.checked_mul(self.shape.embed_width))
-            .ok_or_else(|| XasrEncoderGraphError::Shape {
-                reason: "xasr encoder embed cache length overflows".to_string(),
-            })?;
-        upload_cache_or_zero(
-            graph,
-            tensors.embed_cache,
-            expected_cache,
-            embed_states,
-            "xasr_embed_cache",
         )?;
         upload_conv2d_tensors(
             graph,
@@ -2321,30 +3025,21 @@ impl<'a> XasrEncoderEmbedGraphBinding<'a> {
             tensors.out_norm_bias,
             &weights.out_norm_bias,
             "xasr_embed_out_norm_b",
-        )?;
-        upload_f32(
+        )
+    }
+
+    fn upload_cache(
+        &self,
+        graph: &mut GgmlCpuGraphBuilder<'a>,
+        expected_cache: usize,
+        embed_states: Option<&[f32]>,
+    ) -> Result<(), XasrEncoderGraphError> {
+        upload_cache_or_zero(
             graph,
-            tensors.swoosh_r_offset,
-            &[SWOOSH_R_OFFSET],
-            "xasr_embed_swoosh_r_offset",
-        )?;
-        upload_f32(
-            graph,
-            tensors.swoosh_r_shift,
-            &[SWOOSH_R_SHIFT],
-            "xasr_embed_swoosh_r_shift",
-        )?;
-        upload_f32(
-            graph,
-            tensors.swoosh_l_offset,
-            &[SWOOSH_L_OFFSET],
-            "xasr_embed_swoosh_l_offset",
-        )?;
-        upload_f32(
-            graph,
-            tensors.swoosh_l_shift,
-            &[SWOOSH_L_SHIFT],
-            "xasr_embed_swoosh_l_shift",
+            self.tensors.embed.embed_cache,
+            expected_cache,
+            embed_states,
+            "xasr_embed_cache",
         )
     }
 }
@@ -2830,13 +3525,10 @@ fn build_xasr_weight_arena(
 
 /// Residency for the encoder-embed's single 2-D matmul weight (`out`, the
 /// projection from the stacked conv-subsampling features into the first
-/// Zipformer stack's model dimension). The embed graph rebuilds its forward
-/// graph every chunk (see `embed_ggml_runner`'s doc comment), so without
-/// this arena `out`'s weight would be re-uploaded into a non-WEIGHTS
-/// compute buffer every chunk, same defect as the per-layer weights above.
-/// The embed's conv front-end stays on the existing per-chunk upload path:
-/// small parameter count, and conv ops offload to GPU poorly regardless of
-/// buffer placement.
+/// Zipformer stack's model dimension). Direct graph liveness allocation may
+/// reuse internal input storage after each compute, so this model-lifetime
+/// weight must remain in a separate WEIGHTS-usage arena. The smaller conv
+/// front-end parameters are explicitly refreshed before every prepared run.
 struct XasrEncoderEmbedWeightArena {
     _arena: GgmlStaticTensorArena,
     out_weight: GgmlStaticTensor,
@@ -2867,6 +3559,212 @@ fn build_xasr_embed_weight_arena(
 struct XasrZipformerLayerGraphBinding<'a> {
     tensors: XasrZipformerLayerGraphTensors<'a>,
     shape: XasrZipformerLayerGraphShape,
+    resident_cache: bool,
+}
+
+fn build_xasr_device_cache_arena(
+    runner: &GgmlCpuGraphRunner,
+    metadata: &XasrZipformerExecutionMetadata,
+    weights: &XasrEncoderWeights,
+) -> Result<XasrDeviceEncoderCacheArena, GgmlCpuGraphError> {
+    let context_bytes = device_resident_cache_context_bytes(metadata).map_err(|_| {
+        GgmlCpuGraphError::UnsupportedInputs {
+            reason: "xasr resident cache metadata context size overflows",
+        }
+    })?;
+    let mut arena = runner.start_state_tensor_arena(context_bytes)?;
+    let mut layouts = Vec::with_capacity(metadata.total_encoder_layers());
+    for (stack_index, stack) in weights.stacks.iter().enumerate() {
+        let left_context_len = *metadata.left_context_len.get(stack_index).ok_or(
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "xasr resident cache metadata is missing left context",
+            },
+        )?;
+        let num_heads =
+            *metadata
+                .num_heads
+                .get(stack_index)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "xasr resident cache metadata is missing head count",
+                })?;
+        let query_head_dim = *metadata.query_head_dims.get(stack_index).ok_or(
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "xasr resident cache metadata is missing query head dimension",
+            },
+        )?;
+        for layer in &stack.layers {
+            layouts.push(device_layer_cache_layout(
+                layer,
+                stack.dim,
+                left_context_len,
+                num_heads,
+                query_head_dim,
+            )?);
+        }
+    }
+    if layouts.len() != metadata.total_encoder_layers() {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "xasr resident cache layer count does not match metadata",
+        });
+    }
+
+    let mut banks = [
+        Vec::with_capacity(layouts.len()),
+        Vec::with_capacity(layouts.len()),
+    ];
+    for bank in &mut banks {
+        for layout in &layouts {
+            bank.push(allocate_device_layer_cache_tensors(&arena, *layout)?);
+        }
+    }
+    arena.allocate_backend_buffer()?;
+    Ok(XasrDeviceEncoderCacheArena {
+        banks,
+        layouts,
+        _arena: arena,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct XasrDeviceLayerCacheLayout {
+    cached_key: (usize, usize),
+    cached_nonlin_attention: (usize, usize),
+    cached_val1: (usize, usize),
+    cached_val2: (usize, usize),
+    cached_conv1: (usize, usize),
+    cached_conv2: (usize, usize),
+}
+
+pub(super) fn device_resident_cache_context_bytes(
+    metadata: &XasrZipformerExecutionMetadata,
+) -> Result<usize, String> {
+    let tensors = metadata
+        .total_encoder_layers()
+        .checked_mul(2)
+        .and_then(|value| value.checked_mul(6))
+        .and_then(|value| value.checked_add(32))
+        .ok_or_else(|| "xasr resident cache tensor count overflowed".to_string())?;
+    Ok(GgmlCpuGraphConfig::metadata_context_bytes(tensors))
+}
+
+fn device_layer_cache_layout(
+    layer: &XasrEncoderLayerWeights,
+    dim: usize,
+    left_context_len: usize,
+    num_heads: usize,
+    query_head_dim: usize,
+) -> Result<XasrDeviceLayerCacheLayout, GgmlCpuGraphError> {
+    let query_dim =
+        num_heads
+            .checked_mul(query_head_dim)
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "xasr resident cache query dimension overflows",
+            })?;
+    let nonlin_hidden_dim = layer.nonlin_attention.out_proj.weight.input_dim;
+    let self1_value_dim = layer.self_attn1.in_proj.weight.output_dim;
+    let self2_value_dim = layer.self_attn2.in_proj.weight.output_dim;
+    let conv1_cache_len = chunk_conv1d_kernel_len(&layer.conv_module1)? / 2;
+    let conv2_cache_len = chunk_conv1d_kernel_len(&layer.conv_module2)? / 2;
+    Ok(XasrDeviceLayerCacheLayout {
+        cached_key: (query_dim, left_context_len),
+        cached_nonlin_attention: (nonlin_hidden_dim, left_context_len),
+        cached_val1: (self1_value_dim, left_context_len),
+        cached_val2: (self2_value_dim, left_context_len),
+        cached_conv1: (conv1_cache_len, dim),
+        cached_conv2: (conv2_cache_len, dim),
+    })
+}
+
+fn allocate_device_layer_cache_tensors(
+    arena: &GgmlStaticTensorArena,
+    layout: XasrDeviceLayerCacheLayout,
+) -> Result<XasrDeviceLayerCacheTensors, GgmlCpuGraphError> {
+    Ok(XasrDeviceLayerCacheTensors {
+        cached_key: arena.new_tensor_2d_f32(
+            layout.cached_key.0,
+            layout.cached_key.1,
+            "xasr_resident_cached_key",
+        )?,
+        cached_nonlin_attention: arena.new_tensor_2d_f32(
+            layout.cached_nonlin_attention.0,
+            layout.cached_nonlin_attention.1,
+            "xasr_resident_cached_nonlin",
+        )?,
+        cached_val1: arena.new_tensor_2d_f32(
+            layout.cached_val1.0,
+            layout.cached_val1.1,
+            "xasr_resident_cached_val1",
+        )?,
+        cached_val2: arena.new_tensor_2d_f32(
+            layout.cached_val2.0,
+            layout.cached_val2.1,
+            "xasr_resident_cached_val2",
+        )?,
+        cached_conv1: arena.new_tensor_2d_f32(
+            layout.cached_conv1.0,
+            layout.cached_conv1.1,
+            "xasr_resident_cached_conv1",
+        )?,
+        cached_conv2: arena.new_tensor_2d_f32(
+            layout.cached_conv2.0,
+            layout.cached_conv2.1,
+            "xasr_resident_cached_conv2",
+        )?,
+    })
+}
+
+fn zero_device_layer_cache_tensors(
+    arena: &mut GgmlStaticTensorArena,
+    tensors: XasrDeviceLayerCacheTensors,
+    layout: XasrDeviceLayerCacheLayout,
+    zeros: &[f32],
+) -> Result<(), GgmlCpuGraphError> {
+    for (tensor, shape, name) in [
+        (
+            tensors.cached_key,
+            layout.cached_key,
+            "xasr_resident_cached_key",
+        ),
+        (
+            tensors.cached_nonlin_attention,
+            layout.cached_nonlin_attention,
+            "xasr_resident_cached_nonlin",
+        ),
+        (
+            tensors.cached_val1,
+            layout.cached_val1,
+            "xasr_resident_cached_val1",
+        ),
+        (
+            tensors.cached_val2,
+            layout.cached_val2,
+            "xasr_resident_cached_val2",
+        ),
+        (
+            tensors.cached_conv1,
+            layout.cached_conv1,
+            "xasr_resident_cached_conv1",
+        ),
+        (
+            tensors.cached_conv2,
+            layout.cached_conv2,
+            "xasr_resident_cached_conv2",
+        ),
+    ] {
+        let len = shape
+            .0
+            .checked_mul(shape.1)
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "xasr resident cache zero length overflows",
+            })?;
+        let values = zeros
+            .get(..len)
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "xasr resident cache zero scratch is too small",
+            })?;
+        arena.set_f32_slice(tensor, values, name)?;
+    }
+    Ok(())
 }
 
 impl<'a> XasrZipformerLayerGraphBinding<'a> {
@@ -2879,6 +3777,31 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
         num_heads: usize,
         query_head_dim: usize,
         weight_arena: &XasrLayerWeightArenaTensors,
+    ) -> Result<Self, GgmlCpuGraphError> {
+        Self::new_with_resident_cache(
+            graph,
+            layer,
+            dim,
+            frames,
+            left_context_len,
+            num_heads,
+            query_head_dim,
+            weight_arena,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_resident_cache(
+        graph: &mut GgmlCpuGraphBuilder<'a>,
+        layer: &XasrEncoderLayerWeights,
+        dim: usize,
+        frames: usize,
+        left_context_len: usize,
+        num_heads: usize,
+        query_head_dim: usize,
+        weight_arena: &XasrLayerWeightArenaTensors,
+        resident_cache: Option<XasrLayerCacheGraphTensors<'a>>,
     ) -> Result<Self, GgmlCpuGraphError> {
         let query_dim =
             num_heads
@@ -2926,11 +3849,14 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
                     weight_arena.feed_forward1_out_weight,
                 )?,
                 attention_weights: XasrSelfAttentionWeightsGraphTensors {
-                    cache: graph.new_tensor_2d_f32(
-                        query_dim,
-                        left_context_len,
-                        "xasr_stack0_attn_cache",
-                    )?,
+                    cache: match resident_cache {
+                        Some(cache) => cache.cached_key,
+                        None => graph.new_tensor_2d_f32(
+                            query_dim,
+                            left_context_len,
+                            "xasr_stack0_attn_cache",
+                        )?,
+                    },
                     mask: graph.new_tensor_2d_f32(k_len, frames, "xasr_stack0_attn_mask")?,
                     pos_embedding: graph.new_tensor_2d_f32(
                         pos_dim,
@@ -2948,11 +3874,14 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
                     )?,
                     linear_pos_weight: weight_arena.attn_pos_weight.as_graph_tensor(),
                 },
-                nonlin_cache: graph.new_tensor_2d_f32(
-                    nonlin_hidden_dim,
-                    left_context_len,
-                    "xasr_stack0_nonlin_cache",
-                )?,
+                nonlin_cache: match resident_cache {
+                    Some(cache) => cache.cached_nonlin_attention,
+                    None => graph.new_tensor_2d_f32(
+                        nonlin_hidden_dim,
+                        left_context_len,
+                        "xasr_stack0_nonlin_cache",
+                    )?,
+                },
                 // in_proj/out_proj weights come from the model-lifetime weight
                 // arena (WEIGHTS-usage buffer); see `XasrLayerWeightArenaTensors`.
                 nonlin_in_proj_weight: weight_arena.nonlin_in_weight.as_graph_tensor(),
@@ -2967,11 +3896,14 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
                     &layer.nonlin_attention.out_proj,
                     "xasr_stack0_nonlin_out_b",
                 )?,
-                self1_cache: graph.new_tensor_2d_f32(
-                    self1_value_dim,
-                    left_context_len,
-                    "xasr_stack0_self1_cache",
-                )?,
+                self1_cache: match resident_cache {
+                    Some(cache) => cache.cached_val1,
+                    None => graph.new_tensor_2d_f32(
+                        self1_value_dim,
+                        left_context_len,
+                        "xasr_stack0_self1_cache",
+                    )?,
+                },
                 self1_in_proj_weight: weight_arena.self1_in_weight.as_graph_tensor(),
                 self1_in_proj_bias: allocate_linear_bias_tensor(
                     graph,
@@ -2984,7 +3916,7 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
                     &layer.self_attn1.out_proj,
                     "xasr_stack0_self1_out_b",
                 )?,
-                conv_module1: allocate_convolution_module_tensors(
+                conv_module1: allocate_convolution_module_tensors_with_cache(
                     graph,
                     &layer.conv_module1,
                     dim,
@@ -2992,6 +3924,7 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
                     conv1_cache_len,
                     weight_arena.conv1_in_weight,
                     weight_arena.conv1_out_weight,
+                    resident_cache.map(|cache| cache.cached_conv1),
                 )?,
                 feed_forward2: allocate_feed_forward_tensors(
                     graph,
@@ -3001,11 +3934,14 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
                 )?,
                 bypass_mid_scale: graph.new_tensor_1d_f32(dim, "xasr_stack0_bypass_mid_scale")?,
             },
-            self2_cache: graph.new_tensor_2d_f32(
-                self2_value_dim,
-                left_context_len,
-                "xasr_stack0_self2_cache",
-            )?,
+            self2_cache: match resident_cache {
+                Some(cache) => cache.cached_val2,
+                None => graph.new_tensor_2d_f32(
+                    self2_value_dim,
+                    left_context_len,
+                    "xasr_stack0_self2_cache",
+                )?,
+            },
             // in_proj/out_proj weights come from the model-lifetime weight
             // arena (WEIGHTS-usage buffer); see `XasrLayerWeightArenaTensors`.
             self2_in_proj_weight: weight_arena.self2_in_weight.as_graph_tensor(),
@@ -3021,7 +3957,7 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
                 "xasr_stack0_self2_out_b",
             )?,
             layer_tail: XasrLayerTailGraphTensors {
-                conv_module2: allocate_convolution_module_tensors(
+                conv_module2: allocate_convolution_module_tensors_with_cache(
                     graph,
                     &layer.conv_module2,
                     dim,
@@ -3029,6 +3965,7 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
                     conv2_cache_len,
                     weight_arena.conv2_in_weight,
                     weight_arena.conv2_out_weight,
+                    resident_cache.map(|cache| cache.cached_conv2),
                 )?,
                 feed_forward3: allocate_feed_forward_tensors(
                     graph,
@@ -3065,7 +4002,11 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
                 norm_log_scale: layer.norm_log_scale[0],
             },
         };
-        Ok(Self { tensors, shape })
+        Ok(Self {
+            tensors,
+            shape,
+            resident_cache: resident_cache.is_some(),
+        })
     }
 
     fn tensors(&self) -> XasrZipformerLayerGraphTensors<'a> {
@@ -3102,6 +4043,18 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
         let conv1 = head.conv_module1;
         let tail = tensors.layer_tail;
         let conv2 = tail.conv_module2;
+        if !self.resident_cache {
+            for tensor in [
+                attn.cache,
+                head.nonlin_cache,
+                head.self1_cache,
+                conv1.cache,
+                tensors.self2_cache,
+                conv2.cache,
+            ] {
+                f(tensor)?;
+            }
+        }
         // The 2-D matmul weight tensors (in_proj/out_proj/linear_pos) are
         // intentionally excluded here: they resolve to tensors owned by the
         // model-lifetime `XasrEncoderWeightArena`, not this graph, so they
@@ -3110,19 +4063,13 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
         for tensor in [
             head.feed_forward1.in_proj_bias,
             head.feed_forward1.out_proj_bias,
-            head.feed_forward1.swoosh_l_offset,
-            head.feed_forward1.swoosh_l_shift,
-            attn.cache,
             attn.mask,
             attn.pos_embedding,
             attn.in_proj_bias,
-            head.nonlin_cache,
             head.nonlin_in_proj_bias,
             head.nonlin_out_proj_bias,
-            head.self1_cache,
             head.self1_in_proj_bias,
             head.self1_out_proj_bias,
-            conv1.cache,
             conv1.in_proj_bias,
             conv1.causal_kernel,
             conv1.causal_bias,
@@ -3130,17 +4077,11 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
             conv1.chunk_bias,
             conv1.chunk_scale,
             conv1.out_proj_bias,
-            conv1.swoosh_r_offset,
-            conv1.swoosh_r_shift,
             head.feed_forward2.in_proj_bias,
             head.feed_forward2.out_proj_bias,
-            head.feed_forward2.swoosh_l_offset,
-            head.feed_forward2.swoosh_l_shift,
             head.bypass_mid_scale,
-            tensors.self2_cache,
             tensors.self2_in_proj_bias,
             tensors.self2_out_proj_bias,
-            conv2.cache,
             conv2.in_proj_bias,
             conv2.causal_kernel,
             conv2.causal_bias,
@@ -3148,12 +4089,8 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
             conv2.chunk_bias,
             conv2.chunk_scale,
             conv2.out_proj_bias,
-            conv2.swoosh_r_offset,
-            conv2.swoosh_r_shift,
             tail.feed_forward3.in_proj_bias,
             tail.feed_forward3.out_proj_bias,
-            tail.feed_forward3.swoosh_l_offset,
-            tail.feed_forward3.swoosh_l_shift,
             tail.norm_bias,
             tail.bypass_scale,
         ] {
@@ -3178,8 +4115,6 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
         for tensor in [
             head.feed_forward1.in_proj_bias,
             head.feed_forward1.out_proj_bias,
-            head.feed_forward1.swoosh_l_offset,
-            head.feed_forward1.swoosh_l_shift,
             attn.mask,
             attn.pos_embedding,
             attn.in_proj_bias,
@@ -3194,12 +4129,8 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
             conv1.chunk_bias,
             conv1.chunk_scale,
             conv1.out_proj_bias,
-            conv1.swoosh_r_offset,
-            conv1.swoosh_r_shift,
             head.feed_forward2.in_proj_bias,
             head.feed_forward2.out_proj_bias,
-            head.feed_forward2.swoosh_l_offset,
-            head.feed_forward2.swoosh_l_shift,
             head.bypass_mid_scale,
             tensors.self2_in_proj_bias,
             tensors.self2_out_proj_bias,
@@ -3210,12 +4141,8 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
             conv2.chunk_bias,
             conv2.chunk_scale,
             conv2.out_proj_bias,
-            conv2.swoosh_r_offset,
-            conv2.swoosh_r_shift,
             tail.feed_forward3.in_proj_bias,
             tail.feed_forward3.out_proj_bias,
-            tail.feed_forward3.swoosh_l_offset,
-            tail.feed_forward3.swoosh_l_shift,
             tail.norm_bias,
             tail.bypass_scale,
         ] {
@@ -3243,14 +4170,17 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
             shape.layer_head,
             valid_left_context,
             cache.map(|cache| cache.cached_key.as_slice()),
+            !self.resident_cache,
         )?;
-        upload_cache_or_zero(
-            graph,
-            head.nonlin_cache,
-            lengths.cached_nonlin_attention,
-            cache.map(|cache| cache.cached_nonlin_attention.as_slice()),
-            "xasr_stack0_nonlin_cache",
-        )?;
+        if !self.resident_cache {
+            upload_cache_or_zero(
+                graph,
+                head.nonlin_cache,
+                lengths.cached_nonlin_attention,
+                cache.map(|cache| cache.cached_nonlin_attention.as_slice()),
+                "xasr_stack0_nonlin_cache",
+            )?;
+        }
         // in_proj/out_proj weights are arena-resident (uploaded once at
         // construction); only their biases need a per-session upload here.
         upload_f32(
@@ -3265,13 +4195,15 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
             &layer.nonlin_attention.out_proj.bias,
             "xasr_stack0_nonlin_out_b",
         )?;
-        upload_cache_or_zero(
-            graph,
-            head.self1_cache,
-            lengths.cached_val1,
-            cache.map(|cache| cache.cached_val1.as_slice()),
-            "xasr_stack0_self1_cache",
-        )?;
+        if !self.resident_cache {
+            upload_cache_or_zero(
+                graph,
+                head.self1_cache,
+                lengths.cached_val1,
+                cache.map(|cache| cache.cached_val1.as_slice()),
+                "xasr_stack0_self1_cache",
+            )?;
+        }
         // in_proj/out_proj weights are arena-resident (uploaded once at
         // construction); only their biases need a per-session upload here.
         upload_f32(
@@ -3294,6 +4226,7 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
             shape.layer_head.frames,
             shape.layer_head.conv1_cache_len,
             cache.map(|cache| cache.cached_conv1.as_slice()),
+            !self.resident_cache,
         )?;
         upload_feed_forward_tensors(graph, head.feed_forward2, &layer.feed_forward2)?;
         upload_f32(
@@ -3302,13 +4235,15 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
             &layer.bypass_mid_scale,
             "xasr_stack0_bypass_mid_scale",
         )?;
-        upload_cache_or_zero(
-            graph,
-            tensors.self2_cache,
-            lengths.cached_val2,
-            cache.map(|cache| cache.cached_val2.as_slice()),
-            "xasr_stack0_self2_cache",
-        )?;
+        if !self.resident_cache {
+            upload_cache_or_zero(
+                graph,
+                tensors.self2_cache,
+                lengths.cached_val2,
+                cache.map(|cache| cache.cached_val2.as_slice()),
+                "xasr_stack0_self2_cache",
+            )?;
+        }
         // in_proj/out_proj weights are arena-resident (uploaded once at
         // construction); only their biases need a per-session upload here.
         upload_f32(
@@ -3331,6 +4266,7 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
             shape.layer_tail.frames,
             shape.layer_tail.conv_cache_len,
             cache.map(|cache| cache.cached_conv2.as_slice()),
+            !self.resident_cache,
         )?;
         upload_feed_forward_tensors(
             graph,
@@ -3357,6 +4293,9 @@ impl<'a> XasrZipformerLayerGraphBinding<'a> {
         graph: &mut GgmlCpuGraphBuilder<'a>,
         cache: Option<&XasrEncoderLayerCache>,
     ) -> Result<(), XasrEncoderGraphError> {
+        if self.resident_cache {
+            return Ok(());
+        }
         let tensors = self.tensors;
         let head = tensors.layer_head;
         let lengths = layer_cache_lengths(self.shape)?;
@@ -3418,12 +4357,10 @@ fn allocate_feed_forward_tensors<'a>(
         in_proj_bias: allocate_linear_bias_tensor(graph, &weights.in_proj, "xasr_ff_in_b")?,
         out_proj_weight: out_proj_weight.as_graph_tensor(),
         out_proj_bias: allocate_linear_bias_tensor(graph, &weights.out_proj, "xasr_ff_out_b")?,
-        swoosh_l_offset: graph.new_tensor_1d_f32(1, "xasr_ff_swoosh_l_offset")?,
-        swoosh_l_shift: graph.new_tensor_1d_f32(1, "xasr_ff_swoosh_l_shift")?,
     })
 }
 
-fn allocate_convolution_module_tensors<'a>(
+fn allocate_convolution_module_tensors_with_cache<'a>(
     graph: &mut GgmlCpuGraphBuilder<'a>,
     weights: &XasrConvolutionModuleWeights,
     dim: usize,
@@ -3431,9 +4368,13 @@ fn allocate_convolution_module_tensors<'a>(
     cache_len: usize,
     in_proj_weight: GgmlStaticTensor,
     out_proj_weight: GgmlStaticTensor,
+    resident_cache: Option<GgmlCpuTensor<'a>>,
 ) -> Result<XasrConvolutionModuleGraphTensors<'a>, GgmlCpuGraphError> {
     Ok(XasrConvolutionModuleGraphTensors {
-        cache: graph.new_tensor_2d_f32(cache_len, dim, "xasr_conv_cache")?,
+        cache: match resident_cache {
+            Some(cache) => cache,
+            None => graph.new_tensor_2d_f32(cache_len, dim, "xasr_conv_cache")?,
+        },
         // in_proj/out_proj weights come from the model-lifetime weight arena
         // (WEIGHTS-usage buffer); see `XasrLayerWeightArenaTensors`.
         in_proj_weight: in_proj_weight.as_graph_tensor(),
@@ -3455,8 +4396,6 @@ fn allocate_convolution_module_tensors<'a>(
         chunk_scale: graph.new_tensor_2d_f32(frames, dim, "xasr_conv_chunk_scale")?,
         out_proj_weight: out_proj_weight.as_graph_tensor(),
         out_proj_bias: allocate_linear_bias_tensor(graph, &weights.out_proj, "xasr_conv_out_b")?,
-        swoosh_r_offset: graph.new_tensor_1d_f32(1, "xasr_conv_swoosh_r_offset")?,
-        swoosh_r_shift: graph.new_tensor_1d_f32(1, "xasr_conv_swoosh_r_shift")?,
     })
 }
 
@@ -3591,6 +4530,7 @@ fn upload_attention_weights_tensors<'a>(
     shape: XasrLayerHeadGraphShape,
     valid_left_context: usize,
     cached_key: Option<&[f32]>,
+    upload_cache: bool,
 ) -> Result<(), XasrEncoderGraphError> {
     let query_dim = shape
         .num_heads
@@ -3598,18 +4538,20 @@ fn upload_attention_weights_tensors<'a>(
         .ok_or_else(|| XasrEncoderGraphError::Shape {
             reason: "xasr stack0 query dimension overflows".to_string(),
         })?;
-    upload_cache_or_zero(
-        graph,
-        tensors.cache,
-        shape
-            .left_context_len
-            .checked_mul(query_dim)
-            .ok_or_else(|| XasrEncoderGraphError::Shape {
-                reason: "xasr attention key cache length overflows".to_string(),
-            })?,
-        cached_key,
-        "xasr_stack0_attn_cache",
-    )?;
+    if upload_cache {
+        upload_cache_or_zero(
+            graph,
+            tensors.cache,
+            shape
+                .left_context_len
+                .checked_mul(query_dim)
+                .ok_or_else(|| XasrEncoderGraphError::Shape {
+                    reason: "xasr attention key cache length overflows".to_string(),
+                })?,
+            cached_key,
+            "xasr_stack0_attn_cache",
+        )?;
+    }
     let mask_values =
         attention_mask_values_for_graph(shape.left_context_len, shape.frames, valid_left_context)?;
     upload_f32(graph, tensors.mask, &mask_values, "xasr_stack0_attn_mask")?;
@@ -3642,19 +4584,22 @@ fn upload_convolution_module_tensors<'a>(
     frames: usize,
     cache_len: usize,
     cache: Option<&[f32]>,
+    upload_cache: bool,
 ) -> Result<(), XasrEncoderGraphError> {
     let expected_cache =
         dim.checked_mul(cache_len)
             .ok_or_else(|| XasrEncoderGraphError::Shape {
                 reason: "xasr convolution cache length overflows".to_string(),
             })?;
-    upload_cache_or_zero(
-        graph,
-        tensors.cache,
-        expected_cache,
-        cache,
-        "xasr_conv_cache",
-    )?;
+    if upload_cache {
+        upload_cache_or_zero(
+            graph,
+            tensors.cache,
+            expected_cache,
+            cache,
+            "xasr_conv_cache",
+        )?;
+    }
     // in_proj/out_proj weights are arena-resident (uploaded once at
     // construction); only their biases need a per-session upload here.
     upload_f32(
@@ -3699,18 +4644,6 @@ fn upload_convolution_module_tensors<'a>(
         tensors.out_proj_bias,
         &weights.out_proj.bias,
         "xasr_conv_out_b",
-    )?;
-    upload_f32(
-        graph,
-        tensors.swoosh_r_offset,
-        &[SWOOSH_R_OFFSET],
-        "xasr_conv_swoosh_r_offset",
-    )?;
-    upload_f32(
-        graph,
-        tensors.swoosh_r_shift,
-        &[SWOOSH_R_SHIFT],
-        "xasr_conv_swoosh_r_shift",
     )
 }
 
@@ -3732,18 +4665,6 @@ fn upload_feed_forward_tensors<'a>(
         tensors.out_proj_bias,
         &weights.out_proj.bias,
         "xasr_ff_out_b",
-    )?;
-    upload_f32(
-        graph,
-        tensors.swoosh_l_offset,
-        &[SWOOSH_L_OFFSET],
-        "xasr_ff_swoosh_l_offset",
-    )?;
-    upload_f32(
-        graph,
-        tensors.swoosh_l_shift,
-        &[SWOOSH_L_SHIFT],
-        "xasr_ff_swoosh_l_shift",
     )
 }
 
@@ -4018,32 +4939,15 @@ fn chunkwise_conv_scale_for_graph(
 fn apply_swoosh_r_graph<'a>(
     graph: &GgmlCpuGraphBuilder<'a>,
     input: GgmlCpuTensor<'a>,
-    offset: GgmlCpuTensor<'a>,
-    shift: GgmlCpuTensor<'a>,
 ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
-    apply_swoosh_graph(graph, input, offset, shift)
+    graph.swoosh(input, SWOOSH_R_OFFSET, SWOOSH_R_SHIFT, SWOOSH_LINEAR_SCALE)
 }
 
 fn apply_swoosh_l_graph<'a>(
     graph: &GgmlCpuGraphBuilder<'a>,
     input: GgmlCpuTensor<'a>,
-    offset: GgmlCpuTensor<'a>,
-    shift: GgmlCpuTensor<'a>,
 ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
-    apply_swoosh_graph(graph, input, offset, shift)
-}
-
-fn apply_swoosh_graph<'a>(
-    graph: &GgmlCpuGraphBuilder<'a>,
-    input: GgmlCpuTensor<'a>,
-    offset: GgmlCpuTensor<'a>,
-    shift: GgmlCpuTensor<'a>,
-) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
-    let shifted = graph.sub(input, offset)?;
-    let softplus = graph.softplus(shifted)?;
-    let linear = graph.scale(input, SWOOSH_LINEAR_SCALE)?;
-    let without_linear = graph.sub(softplus, linear)?;
-    graph.sub(without_linear, shift)
+    graph.swoosh(input, SWOOSH_L_OFFSET, SWOOSH_L_SHIFT, SWOOSH_LINEAR_SCALE)
 }
 
 fn apply_bias_norm_graph<'a>(
@@ -4082,10 +4986,6 @@ struct XasrEncoderEmbedGraphTensors<'a> {
     out_weight: GgmlCpuTensor<'a>,
     out_bias: GgmlCpuTensor<'a>,
     out_norm_bias: GgmlCpuTensor<'a>,
-    swoosh_r_offset: GgmlCpuTensor<'a>,
-    swoosh_r_shift: GgmlCpuTensor<'a>,
-    swoosh_l_offset: GgmlCpuTensor<'a>,
-    swoosh_l_shift: GgmlCpuTensor<'a>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4340,12 +5240,7 @@ fn apply_encoder_embed_graph<'a>(
             pad_h: 0,
         },
     )?;
-    state = apply_swoosh_r_graph(
-        graph,
-        state,
-        tensors.swoosh_r_offset,
-        tensors.swoosh_r_shift,
-    )?;
+    state = apply_swoosh_r_graph(graph, state)?;
     state = apply_conv2d_with_bias_graph(
         graph,
         tensors.conv4_weight,
@@ -4359,12 +5254,7 @@ fn apply_encoder_embed_graph<'a>(
             pad_h: 0,
         },
     )?;
-    state = apply_swoosh_r_graph(
-        graph,
-        state,
-        tensors.swoosh_r_offset,
-        tensors.swoosh_r_shift,
-    )?;
+    state = apply_swoosh_r_graph(graph, state)?;
     state = apply_conv2d_with_bias_graph(
         graph,
         tensors.conv7_weight,
@@ -4378,12 +5268,7 @@ fn apply_encoder_embed_graph<'a>(
             pad_h: 0,
         },
     )?;
-    state = apply_swoosh_r_graph(
-        graph,
-        state,
-        tensors.swoosh_r_offset,
-        tensors.swoosh_r_shift,
-    )?;
+    state = apply_swoosh_r_graph(graph, state)?;
     let state = graph.cont(state)?;
 
     let element_size = std::mem::size_of::<f32>();
@@ -4482,12 +5367,7 @@ fn apply_encoder_embed_graph<'a>(
             pad_h: 0,
         },
     )?;
-    convnext = apply_swoosh_l_graph(
-        graph,
-        convnext,
-        tensors.swoosh_l_offset,
-        tensors.swoosh_l_shift,
-    )?;
+    convnext = apply_swoosh_l_graph(graph, convnext)?;
     convnext = apply_conv2d_with_bias_graph(
         graph,
         tensors.convnext_pointwise2_weight,
@@ -4580,8 +5460,6 @@ struct XasrFeedForwardGraphTensors<'a> {
     in_proj_bias: GgmlCpuTensor<'a>,
     out_proj_weight: GgmlCpuTensor<'a>,
     out_proj_bias: GgmlCpuTensor<'a>,
-    swoosh_l_offset: GgmlCpuTensor<'a>,
-    swoosh_l_shift: GgmlCpuTensor<'a>,
 }
 
 fn apply_feed_forward_graph<'a>(
@@ -4590,12 +5468,7 @@ fn apply_feed_forward_graph<'a>(
     weights: XasrFeedForwardGraphTensors<'a>,
 ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
     let hidden = apply_linear_graph(graph, weights.in_proj_weight, input, weights.in_proj_bias)?;
-    let hidden = apply_swoosh_l_graph(
-        graph,
-        hidden,
-        weights.swoosh_l_offset,
-        weights.swoosh_l_shift,
-    )?;
+    let hidden = apply_swoosh_l_graph(graph, hidden)?;
     apply_linear_graph(
         graph,
         weights.out_proj_weight,
@@ -4721,8 +5594,6 @@ struct XasrConvolutionModuleGraphTensors<'a> {
     chunk_scale: GgmlCpuTensor<'a>,
     out_proj_weight: GgmlCpuTensor<'a>,
     out_proj_bias: GgmlCpuTensor<'a>,
-    swoosh_r_offset: GgmlCpuTensor<'a>,
-    swoosh_r_shift: GgmlCpuTensor<'a>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4823,12 +5694,7 @@ fn apply_convolution_module_graph<'a>(
     let depthwise = graph.reshape_2d(depthwise, shape.frames, shape.dim)?;
     let frame_major = graph.transpose(depthwise)?;
     let frame_major = graph.cont(frame_major)?;
-    let activated = apply_swoosh_r_graph(
-        graph,
-        frame_major,
-        tensors.swoosh_r_offset,
-        tensors.swoosh_r_shift,
-    )?;
+    let activated = apply_swoosh_r_graph(graph, frame_major)?;
     let rows = apply_linear_graph(
         graph,
         tensors.out_proj_weight,
@@ -4921,7 +5787,8 @@ struct XasrSelfAttentionGraphOutput<'a> {
 struct XasrAttentionWeightedValuesGraphShape {
     frames: usize,
     left_context_len: usize,
-    num_heads: usize,
+    value_heads: usize,
+    attention_weight_heads: usize,
     value_dim: usize,
 }
 
@@ -4933,14 +5800,20 @@ fn apply_attention_weighted_values_graph<'a>(
 ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
     if shape.frames == 0
         || shape.left_context_len == 0
-        || shape.num_heads == 0
+        || shape.value_heads == 0
+        || shape.attention_weight_heads == 0
         || shape.value_dim == 0
     {
         return Err(GgmlCpuGraphError::UnsupportedInputs {
             reason: "xasr attention weighted values dimensions must be positive",
         });
     }
-    if !shape.value_dim.is_multiple_of(shape.num_heads) {
+    if shape.value_heads > shape.attention_weight_heads {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "xasr attention weighted values require more heads than the weights provide",
+        });
+    }
+    if !shape.value_dim.is_multiple_of(shape.value_heads) {
         return Err(GgmlCpuGraphError::UnsupportedInputs {
             reason: "xasr attention weighted values value_dim must be divisible by num_heads",
         });
@@ -4950,73 +5823,41 @@ fn apply_attention_weighted_values_graph<'a>(
             reason: "xasr attention weighted values key length overflows",
         },
     )?;
-    let value_head_dim = shape.value_dim / shape.num_heads;
-    let element_size = std::mem::size_of::<f32>();
-    let value_row_stride =
-        shape
-            .value_dim
-            .checked_mul(element_size)
-            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "xasr attention weighted values row stride overflows",
-            })?;
-    let attn_head_stride =
-        k_len
-            .checked_mul(element_size)
-            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "xasr attention weighted values weight row stride overflows",
-            })?;
-    let attn_head_bytes = shape
-        .frames
-        .checked_mul(k_len)
-        .and_then(|value| value.checked_mul(element_size))
-        .ok_or(GgmlCpuGraphError::UnsupportedInputs {
-            reason: "xasr attention weighted values weight head span overflows",
-        })?;
-    let mut head_outputs = Vec::with_capacity(shape.num_heads);
-    for head in 0..shape.num_heads {
-        let value_offset = head
-            .checked_mul(value_head_dim)
-            .and_then(|value| value.checked_mul(element_size))
-            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "xasr attention weighted values value head offset overflows",
-            })?;
-        let values_head = graph.view_2d(
-            values,
-            value_head_dim,
-            k_len,
-            value_row_stride,
-            value_offset,
-        )?;
-        let values_head = graph.cont(values_head)?;
-        let values_head = graph.transpose(values_head)?;
-        let values_head = graph.cont(values_head)?;
-        let attn_offset =
-            head.checked_mul(attn_head_bytes)
-                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
-                    reason: "xasr attention weighted values weight head offset overflows",
-                })?;
-        let attn_head = graph.view_2d(
-            attention_weights,
-            k_len,
-            shape.frames,
-            attn_head_stride,
-            attn_offset,
-        )?;
-        // Per-head slice of the attention weights sits at a data-dependent byte
-        // offset (head * frames * k_len * elt), which is generally not a multiple
-        // of a storage-buffer offset alignment. The Vulkan matmul path requires
-        // aligned source offsets, so materialize a contiguous copy before mul_mat
-        // to keep this graph backend-agnostic.
-        let attn_head = graph.cont(attn_head)?;
-        let attended = graph.mul_mat(values_head, attn_head)?;
-        head_outputs.push(graph.cont(attended)?);
-    }
+    let value_head_dim = shape.value_dim / shape.value_heads;
 
-    let mut combined = head_outputs[0];
-    for &next in &head_outputs[1..] {
-        combined = graph.concat(combined, next, 0)?;
-    }
-    Ok(combined)
+    // `values` is physically `[value_head_dim, heads, key]`. Reorder it to
+    // `[key, value_head_dim, heads]` so ggml's batched mul_mat can evaluate all
+    // heads in one graph op against `[key, frames, heads]` attention weights.
+    // The result `[value_head_dim, frames, heads]` is then reordered to
+    // `[value_head_dim, heads, frames]` and flattened back to the public
+    // `[value_dim, frames]` layout. This preserves the old head-major channel
+    // order while avoiding one tiny matmul and several copies per head.
+    let values = graph.reshape_3d(values, value_head_dim, shape.value_heads, k_len)?;
+    let values = graph.permute(values, 1, 2, 0, 3)?;
+    let values = graph.cont(values)?;
+
+    let attention_weights = graph.reshape_3d(
+        attention_weights,
+        k_len,
+        shape.frames,
+        shape.attention_weight_heads,
+    )?;
+    let attention_weights = if shape.value_heads == shape.attention_weight_heads {
+        attention_weights
+    } else {
+        let selected_elements = k_len
+            .checked_mul(shape.frames)
+            .and_then(|value| value.checked_mul(shape.value_heads))
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "xasr attention weighted values selected head span overflows",
+            })?;
+        let selected = graph.view_1d(attention_weights, selected_elements, 0)?;
+        graph.reshape_3d(selected, k_len, shape.frames, shape.value_heads)?
+    };
+    let attended = graph.mul_mat(values, attention_weights)?;
+    let attended = graph.permute(attended, 0, 2, 1, 3)?;
+    let attended = graph.cont(attended)?;
+    graph.reshape_2d(attended, shape.value_dim, shape.frames)
 }
 
 fn apply_self_attention_value_graph<'a>(
@@ -5074,7 +5915,8 @@ fn apply_self_attention_value_graph<'a>(
         XasrAttentionWeightedValuesGraphShape {
             frames: shape.frames,
             left_context_len: shape.left_context_len,
-            num_heads: shape.num_heads,
+            value_heads: shape.num_heads,
+            attention_weight_heads: shape.num_heads,
             value_dim: shape.value_dim,
         },
     )?;
@@ -5103,6 +5945,7 @@ struct XasrNonlinAttentionGraphShape {
     frames: usize,
     left_context_len: usize,
     num_heads: usize,
+    attention_weight_heads: usize,
     hidden_dim: usize,
 }
 
@@ -5218,7 +6061,8 @@ fn apply_nonlin_attention_value_graph<'a>(
         XasrAttentionWeightedValuesGraphShape {
             frames: shape.frames,
             left_context_len: shape.left_context_len,
-            num_heads: shape.num_heads,
+            value_heads: shape.num_heads,
+            attention_weight_heads: shape.attention_weight_heads,
             value_dim: shape.hidden_dim,
         },
     )?;
@@ -5324,12 +6168,6 @@ fn apply_self_attention_weights_graph<'a>(
             .ok_or(GgmlCpuGraphError::UnsupportedInputs {
                 reason: "xasr self attention query row stride overflows",
             })?;
-    let pos_row_stride = shape.pos_output_dim.checked_mul(element_size).ok_or(
-        GgmlCpuGraphError::UnsupportedInputs {
-            reason: "xasr self attention pos row stride overflows",
-        },
-    )?;
-
     let projected = apply_linear_graph(graph, tensors.in_proj_weight, input, tensors.in_proj_bias)?;
     let q = graph.view_2d(projected, query_dim, shape.frames, projected_row_stride, 0)?;
     let q = graph.cont(q)?;
@@ -5380,109 +6218,107 @@ fn apply_self_attention_weights_graph<'a>(
 
     let projected_pos = graph.mul_mat(tensors.linear_pos_weight, tensors.pos_embedding)?;
     let projected_pos = graph.cont(projected_pos)?;
-    let pos_head_span_bytes =
-        pos_head_dim
+    // Materialize the head axis as the GGML batch dimension. This replaces
+    // one QK GEMM and one relative-position GEMM per head with one batched
+    // GEMM of each kind, while preserving the canonical [key, frame, head]
+    // output layout consumed by the weighted-values helper.
+    let q_heads = graph.reshape_3d(q, shape.query_head_dim, shape.num_heads, shape.frames)?;
+    let q_heads = graph.permute(q_heads, 0, 2, 1, 3)?;
+    let q_heads = graph.cont(q_heads)?;
+    let key_heads = graph.reshape_3d(all_keys, shape.query_head_dim, shape.num_heads, k_len)?;
+    let key_heads = graph.permute(key_heads, 0, 2, 1, 3)?;
+    let key_heads = graph.cont(key_heads)?;
+    let qk_scores = graph.mul_mat(key_heads, q_heads)?;
+
+    let p_heads = graph.reshape_3d(p, pos_head_dim, shape.num_heads, shape.frames)?;
+    let p_heads = graph.permute(p_heads, 0, 2, 1, 3)?;
+    let p_heads = graph.cont(p_heads)?;
+    let projected_pos_heads =
+        graph.reshape_3d(projected_pos, pos_head_dim, shape.num_heads, rel_len)?;
+    let projected_pos_heads = graph.permute(projected_pos_heads, 0, 2, 1, 3)?;
+    let projected_pos_heads = graph.cont(projected_pos_heads)?;
+    let pos_scores = apply_relative_position_scores_graph(
+        graph,
+        projected_pos_heads,
+        p_heads,
+        shape.frames,
+        k_len,
+        rel_len,
+        shape.num_heads,
+    )?;
+
+    let scores = graph.add(qk_scores, pos_scores)?;
+    let scores = graph.cont(scores)?;
+    let weights = graph.soft_max_ext(scores, Some(tensors.mask), 1.0, 0.0)?;
+    let weights = graph.cont(weights)?;
+    Ok(XasrSelfAttentionWeightsGraphOutput { weights, new_cache })
+}
+
+fn apply_relative_position_scores_graph<'a>(
+    graph: &GgmlCpuGraphBuilder<'a>,
+    projected_pos_head: GgmlCpuTensor<'a>,
+    p_head: GgmlCpuTensor<'a>,
+    frames: usize,
+    k_len: usize,
+    rel_len: usize,
+    num_heads: usize,
+) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+    if frames == 0 || k_len == 0 || rel_len == 0 || num_heads == 0 {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "xasr relative position score dimensions must be positive",
+        });
+    }
+    let expected_rel_len =
+        k_len
+            .checked_add(frames - 1)
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "xasr relative position score length overflows",
+            })?;
+    if rel_len != expected_rel_len {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "xasr relative position score length does not match key and frame geometry",
+        });
+    }
+
+    // Compute every target column in one GEMM. The desired relative slice for
+    // target t begins at row `frames - 1 - t` in that target's full column.
+    // Across the contiguous `[rel_len, frames]` result, those starts form a 2-D
+    // strided view whose column stride is `(rel_len - 1) * sizeof(f32)`.
+    let full = graph.mul_mat(projected_pos_head, p_head)?;
+    let full = graph.cont(full)?;
+    if frames == 1 {
+        return Ok(full);
+    }
+
+    let element_size = std::mem::size_of::<f32>();
+    let column_stride =
+        (rel_len - 1)
             .checked_mul(element_size)
             .ok_or(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "xasr self attention pos head span overflows",
+                reason: "xasr relative position score stride overflows",
             })?;
-
-    let mut head_outputs = Vec::with_capacity(shape.num_heads);
-    for head in 0..shape.num_heads {
-        let query_head_offset = head
-            .checked_mul(shape.query_head_dim)
-            .and_then(|value| value.checked_mul(element_size))
+    let offset =
+        (frames - 1)
+            .checked_mul(element_size)
             .ok_or(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "xasr self attention query head offset overflows",
+                reason: "xasr relative position score offset overflows",
             })?;
-        let q_head = graph.view_2d(
-            q,
-            shape.query_head_dim,
-            shape.frames,
-            query_row_stride,
-            query_head_offset,
-        )?;
-        let q_head = graph.cont(q_head)?;
-        let k_head = graph.view_2d(
-            all_keys,
-            shape.query_head_dim,
-            k_len,
-            query_row_stride,
-            query_head_offset,
-        )?;
-        let k_head = graph.cont(k_head)?;
-        let qk_scores = graph.mul_mat(k_head, q_head)?;
-
-        let pos_head_offset = head
-            .checked_mul(pos_head_dim)
-            .and_then(|value| value.checked_mul(element_size))
-            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "xasr self attention pos head offset overflows",
-            })?;
-        let p_head = graph.view_2d(
-            p,
-            pos_head_dim,
-            shape.frames,
-            pos_row_stride,
-            pos_head_offset,
-        )?;
-        let p_head = graph.cont(p_head)?;
-
-        let mut pos_columns = Vec::with_capacity(shape.frames);
-        for target in 0..shape.frames {
-            let relative_start = shape.frames - 1 - target;
-            if relative_start + k_len > rel_len {
-                return Err(GgmlCpuGraphError::UnsupportedInputs {
-                    reason: "xasr self attention relative position view exceeds embedding length",
-                });
-            }
-            let pos_offset = relative_start
-                .checked_mul(shape.pos_output_dim)
-                .and_then(|value| value.checked_add(head * pos_head_dim))
-                .and_then(|value| value.checked_mul(element_size))
-                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
-                    reason: "xasr self attention relative position offset overflows",
-                })?;
-            let pos_segment = graph.view_2d(
-                projected_pos,
-                pos_head_dim,
-                k_len,
-                pos_row_stride,
-                pos_offset,
-            )?;
-            let pos_segment = graph.cont(pos_segment)?;
-            let p_target_offset = target.checked_mul(pos_head_span_bytes).ok_or(
-                GgmlCpuGraphError::UnsupportedInputs {
-                    reason: "xasr self attention p target offset overflows",
-                },
-            )?;
-            let p_target = graph.view_2d(
-                p_head,
-                pos_head_dim,
-                1,
-                pos_head_span_bytes,
-                p_target_offset,
-            )?;
-            let p_target = graph.cont(p_target)?;
-            let pos_score = graph.mul_mat(pos_segment, p_target)?;
-            pos_columns.push(graph.cont(pos_score)?);
-        }
-        let mut pos_scores = pos_columns[0];
-        for &next in &pos_columns[1..] {
-            pos_scores = graph.concat(pos_scores, next, 1)?;
-        }
-
-        let scores = graph.add(qk_scores, pos_scores)?;
-        let scores = graph.cont(scores)?;
-        let probs = graph.soft_max_ext(scores, Some(tensors.mask), 1.0, 0.0)?;
-        head_outputs.push(graph.cont(probs)?);
-    }
-
-    let mut weights = head_outputs[0];
-    for &next in &head_outputs[1..] {
-        weights = graph.concat(weights, next, 2)?;
-    }
-    Ok(XasrSelfAttentionWeightsGraphOutput { weights, new_cache })
+    let plane_stride = rel_len
+        .checked_mul(frames)
+        .and_then(|value| value.checked_mul(element_size))
+        .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "xasr relative position score plane stride overflows",
+        })?;
+    let shifted = graph.view_3d(
+        full,
+        k_len,
+        frames,
+        num_heads,
+        column_stride,
+        plane_stride,
+        offset,
+    )?;
+    graph.cont(shifted)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5568,6 +6404,7 @@ fn apply_layer_head_graph<'a>(
             frames: shape.frames,
             left_context_len: shape.left_context_len,
             num_heads: 1,
+            attention_weight_heads: shape.num_heads,
             hidden_dim: shape.nonlin_hidden_dim,
         },
     )?;
@@ -5686,6 +6523,32 @@ fn apply_zipformer_layer_graph<'a>(
     })
 }
 
+fn register_resident_cache_writes<'a>(
+    graph: &mut GgmlCpuGraphBuilder<'a>,
+    output: XasrZipformerLayerGraphOutput<'a>,
+    destination: XasrDeviceLayerCacheTensors,
+) -> Result<(), XasrEncoderGraphError> {
+    let destination = destination.as_graph_tensors();
+    for (source, target) in [
+        (output.new_cached_key, destination.cached_key),
+        (
+            output.new_cached_nonlin_attention,
+            destination.cached_nonlin_attention,
+        ),
+        (output.new_cached_val1, destination.cached_val1),
+        (output.new_cached_val2, destination.cached_val2),
+        (output.new_cached_conv1, destination.cached_conv1),
+        (output.new_cached_conv2, destination.cached_conv2),
+    ] {
+        let write = map_ggml_stage("resident_cache_copy", graph.cpy(source, target))?;
+        map_ggml_stage(
+            "resident_cache_side_effect",
+            graph.add_side_effect_root(write),
+        )?;
+    }
+    Ok(())
+}
+
 fn apply_bypass_graph<'a>(
     graph: &GgmlCpuGraphBuilder<'a>,
     original: GgmlCpuTensor<'a>,
@@ -5714,10 +6577,7 @@ mod tests {
         GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphRunner, GgufTensorDataReader,
         read_gguf_metadata,
     };
-    use crate::models::xasr_zipformer::encoder_ops::{
-        SWOOSH_L_OFFSET, SWOOSH_L_SHIFT, SWOOSH_R_OFFSET, SWOOSH_R_SHIFT, bias_norm_last_dim,
-        swoosh_l, swoosh_r,
-    };
+    use crate::models::xasr_zipformer::encoder_ops::{bias_norm_last_dim, swoosh_l, swoosh_r};
     use crate::models::xasr_zipformer::encoder_reference::{
         XasrZipformerLayerReferenceCaches, bypass_reference,
         convolution_module_streaming_reference, downsample_streaming_reference,
@@ -5728,7 +6588,8 @@ mod tests {
     };
     use crate::models::xasr_zipformer::encoder_weights::{
         XasrConv2dWeights, XasrConvolutionModuleWeights, XasrEncoderEmbedWeights,
-        XasrEncoderWeights, XasrLinearPairWeights, XasrLinearWithBias, load_xasr_encoder_weights,
+        XasrEncoderWeights, XasrLinearPairWeights, XasrLinearWithBias,
+        XasrSelfAttentionWeightsWeights, load_xasr_encoder_weights,
     };
     use crate::models::xasr_zipformer::runtime_contract::parse_xasr_zipformer_execution_metadata;
     use crate::models::xasr_zipformer::weights::{NamedTensor, StoredLinear};
@@ -5754,6 +6615,23 @@ mod tests {
         // Once rebound it stays put until the thread changes again.
         assert!(!thread_moved_since_bind(&bound, b));
         assert!(thread_moved_since_bind(&bound, a));
+    }
+
+    #[test]
+    fn resident_generation_and_hop_transitions_fail_closed() {
+        assert_eq!(
+            resident_state_transition(Some(7), 9, 11, 0, true),
+            Ok(XasrResidentStateTransition::Reset { next_hop: 1 })
+        );
+        assert_eq!(
+            resident_state_transition(Some(11), 1, 11, 1, false),
+            Ok(XasrResidentStateTransition::Continue { next_hop: 2 })
+        );
+        assert!(resident_state_transition(Some(11), 2, 11, 1, false).is_err());
+        assert!(resident_state_transition(Some(12), 1, 11, 1, false).is_err());
+        assert!(resident_state_transition(None, 1, 11, 1, false).is_err());
+        assert!(resident_state_transition(Some(11), 0, 11, 1, true).is_err());
+        assert!(resident_state_transition(Some(11), u64::MAX, 11, u64::MAX, false).is_err());
     }
 
     fn metadata() -> XasrZipformerExecutionMetadata {
@@ -5838,43 +6716,122 @@ mod tests {
         assert!(error.to_string().contains("expected 2x80=160"));
     }
 
-    /// Vulkan lavapipe smoke test for issues #153/#154/#155: the per-head
-    /// slice of `attention_weights` in `apply_attention_weighted_values_graph`
-    /// sits at a data-dependent byte offset
-    /// `head * frames * k_len * size_of::<f32>()`, which is not generally a
-    /// multiple of the Vulkan backend's `minStorageBufferOffsetAlignment`.
-    /// `ggml_vk_tensor_subbuffer` (ggml-vulkan.cpp) hard-`GGML_ASSERT`s that
-    /// offset is aligned unless the caller opts into `allow_misalign`, so an
-    /// unaligned view fed straight into `mul_mat` aborts the whole process on
-    /// real hardware (Intel Arc/iGPU, 64B alignment) -- and is reproducible on
-    /// Mesa's software `lavapipe` ICD too, whose reported alignment is 16B.
-    ///
-    /// Shape: 2 heads, `frames=3`, `left_context_len=2` => `k_len=5`, so
-    /// `frames*k_len=15` is odd. Head 1's byte offset into the base
-    /// `attention_weights` tensor is `15 * size_of::<f32>() = 60` bytes.
-    /// `60 % 16 == 12`, `60 % 32 == 28`, and `60 % 64 == 60` -- all nonzero,
-    /// so this offset is misaligned under every alignment granularity ggml-
-    /// vulkan is known to report (16B lavapipe, 32B/64B real GPUs), without
-    /// relying on the exact value of any single device's
-    /// `minStorageBufferOffsetAlignment`.
-    ///
-    /// This is a process-abort bug: before the `graph.cont(attn_head)` fix,
-    /// the GGML_ASSERT above kills the test process outright (not a
-    /// catchable Rust panic), so this step shows up as a hard CI failure
-    /// rather than a normal `assert_eq!` failure. Requires an accelerated
-    /// (Vulkan) ggml backend to actually exercise the Vulkan matmul path, so
-    /// it is `#[ignore]`d by default and run explicitly by the lavapipe
-    /// smoke CI job on a build with `--features vulkan`.
+    #[test]
+    fn attention_weighted_values_batched_heads_match_scalar_reference() {
+        const LEFT_CONTEXT: usize = 7;
+        const VALUE_HEAD_DIM: usize = 3;
+
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("CPU graph runner should initialize");
+        for (value_heads, attention_weight_heads) in [(1usize, 4usize), (2, 2), (4, 4), (8, 8)] {
+            for frames in [1usize, 3, 6, 12, 24] {
+                let shape = XasrAttentionWeightedValuesGraphShape {
+                    frames,
+                    left_context_len: LEFT_CONTEXT,
+                    value_heads,
+                    attention_weight_heads,
+                    value_dim: value_heads * VALUE_HEAD_DIM,
+                };
+                let k_len = LEFT_CONTEXT + frames;
+                let values_data: Vec<f32> = (0..shape.value_dim * k_len)
+                    .map(|index| ((index % 23) as f32 - 11.0) * 0.03125)
+                    .collect();
+                let attention_data: Vec<f32> = (0..k_len * frames * attention_weight_heads)
+                    .map(|index| ((index % 17) as f32 - 8.0) * 0.015625)
+                    .collect();
+                let mut expected = Vec::with_capacity(shape.value_dim * frames);
+                for frame in 0..frames {
+                    for head in 0..value_heads {
+                        for channel in 0..VALUE_HEAD_DIM {
+                            let mut sum = 0.0_f32;
+                            for source in 0..k_len {
+                                let value = values_data
+                                    [source * shape.value_dim + head * VALUE_HEAD_DIM + channel];
+                                let weight =
+                                    attention_data[head * frames * k_len + frame * k_len + source];
+                                sum += value * weight;
+                            }
+                            expected.push(sum);
+                        }
+                    }
+                }
+
+                let mut graph = runner.start_graph();
+                let values = graph
+                    .new_tensor_2d_f32(shape.value_dim, k_len, "batched_attn_values")
+                    .expect("values tensor should allocate");
+                let attention_weights = graph
+                    .new_tensor_3d_f32(
+                        k_len,
+                        frames,
+                        attention_weight_heads,
+                        "batched_attn_weights",
+                    )
+                    .expect("attention weights tensor should allocate");
+                graph
+                    .set_input(values)
+                    .expect("values tensor should become input");
+                graph
+                    .set_input(attention_weights)
+                    .expect("attention weights tensor should become input");
+                let output =
+                    apply_attention_weighted_values_graph(&graph, values, attention_weights, shape)
+                        .expect("batched weighted-values graph should build");
+                graph
+                    .set_output(output)
+                    .expect("weighted-values output should set");
+                graph
+                    .set_f32_slice(values, &values_data, "batched_attn_values")
+                    .expect("values should upload");
+                graph
+                    .set_f32_slice(attention_weights, &attention_data, "batched_attn_weights")
+                    .expect("attention weights should upload");
+                let actual = graph
+                    .compute_output_f32(output, expected.len())
+                    .expect("weighted-values graph should compute");
+                assert_max_abs_diff(
+                    &format!(
+                        "weighted values frames={frames} value_heads={value_heads} attention_heads={attention_weight_heads}"
+                    ),
+                    &actual,
+                    &expected,
+                    1.0e-6,
+                );
+            }
+        }
+    }
+
+    /// Vulkan smoke test for the batched-head weighted-values path. The shape
+    /// deliberately keeps the historical odd `frames * k_len = 15` geometry
+    /// that made per-head views land at a 60-byte offset and abort Vulkan
+    /// backends with 16/32/64-byte storage-buffer alignment. The production
+    /// implementation now reshapes the contiguous tensor and performs one
+    /// batched matmul, so this remains a regression gate for both the original
+    /// alignment failure and the replacement multi-head topology.
     #[test]
     #[ignore = "requires an accelerated Vulkan ggml backend; run explicitly via the lavapipe smoke CI job"]
     fn xasr_attention_weighted_values_vulkan_head_offset_smoke() {
+        use crate::device::execution_route::{
+            ExecutionProvider, enumerate_compute_devices_from_ggml,
+        };
+        use crate::ggml_runtime::{
+            RequestBackendPreference, ggml_available_devices, install_request_backend_override,
+        };
+
         let shape = XasrAttentionWeightedValuesGraphShape {
             frames: 3,
             left_context_len: 2,
-            num_heads: 2,
+            value_heads: 2,
+            attention_weight_heads: 2,
             value_dim: 4,
         };
         let k_len = shape.left_context_len + shape.frames;
+        let route = enumerate_compute_devices_from_ggml(&ggml_available_devices())
+            .into_iter()
+            .find(|device| device.provider == ExecutionProvider::Vulkan)
+            .expect("a Vulkan device must be available for this ignored smoke test")
+            .to_resolved_route();
+        let _route = install_request_backend_override(Some(RequestBackendPreference::Exact(route)));
 
         let mut config = GgmlCpuGraphConfig::conservative_default();
         config.backend = GgmlCpuGraphBackend::Gpu;
@@ -5882,13 +6839,22 @@ mod tests {
         config.graph_size = 2_048;
         let mut runner = GgmlCpuGraphRunner::new(config)
             .expect("accelerated (Vulkan) ggml backend should initialize on the smoke runner");
+        assert_eq!(
+            ExecutionProvider::from_backend_name(&runner.backend_label()),
+            ExecutionProvider::Vulkan,
+            "smoke test must execute on the exact Vulkan route"
+        );
 
         let mut graph = runner.start_graph();
         let values = graph
             .new_tensor_2d_f32(shape.value_dim, k_len, "attn_smoke_values")
             .expect("values tensor allocation should succeed");
         let attention_weights = graph
-            .new_tensor_2d_f32(k_len, shape.frames * shape.num_heads, "attn_smoke_weights")
+            .new_tensor_2d_f32(
+                k_len,
+                shape.frames * shape.attention_weight_heads,
+                "attn_smoke_weights",
+            )
             .expect("attention weights tensor allocation should succeed");
         graph
             .set_input(values)
@@ -5903,7 +6869,7 @@ mod tests {
         graph.set_output(output).expect("set_output should succeed");
 
         let values_data = vec![0.5_f32; shape.value_dim * k_len];
-        let attn_data = vec![0.1_f32; k_len * shape.frames * shape.num_heads];
+        let attn_data = vec![0.1_f32; k_len * shape.frames * shape.attention_weight_heads];
         graph
             .set_f32_slice(values, &values_data, "attn_smoke_values")
             .expect("values upload should succeed");
@@ -5913,20 +6879,21 @@ mod tests {
 
         // Before the fix, this call aborts the process inside ggml-vulkan's
         // GGML_ASSERT when it schedules head 1's misaligned view onto the
-        // Vulkan matmul path. Returning normally (with finite output values)
-        // is the smoke assertion -- the CI job's pass/fail signal is this
-        // test step's own exit code, since a GGML_ASSERT abort never reaches
-        // a catchable Result/panic.
+        // Vulkan matmul path. Returning normally with the exact expected
+        // batched-head values is the smoke assertion -- the CI job's pass/fail
+        // signal is this test step's own exit code, since a GGML_ASSERT abort
+        // never reaches a catchable Result/panic.
         let actual = graph
             .compute_outputs_f32(&[(output, shape.value_dim * shape.frames)])
             .expect("attention weighted values graph should compute on the Vulkan backend");
 
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0].len(), shape.value_dim * shape.frames);
-        assert!(
-            actual[0].iter().all(|value| value.is_finite()),
-            "attention weighted values output must be finite: {:?}",
-            actual[0]
+        assert_max_abs_diff(
+            "Vulkan batched weighted values",
+            &actual[0],
+            &vec![0.25; shape.value_dim * shape.frames],
+            1.0e-4,
         );
     }
 
@@ -6020,18 +6987,6 @@ mod tests {
         let out_norm_b = graph
             .new_tensor_1d_f32(output_dim, "embed_out_norm_b")
             .expect("out norm bias allocation should succeed");
-        let swoosh_r_offset = graph
-            .new_tensor_1d_f32(1, "embed_swoosh_r_offset")
-            .expect("swoosh r offset allocation should succeed");
-        let swoosh_r_shift = graph
-            .new_tensor_1d_f32(1, "embed_swoosh_r_shift")
-            .expect("swoosh r shift allocation should succeed");
-        let swoosh_l_offset = graph
-            .new_tensor_1d_f32(1, "embed_swoosh_l_offset")
-            .expect("swoosh l offset allocation should succeed");
-        let swoosh_l_shift = graph
-            .new_tensor_1d_f32(1, "embed_swoosh_l_shift")
-            .expect("swoosh l shift allocation should succeed");
         for tensor in [
             input,
             conv0_w,
@@ -6050,10 +7005,6 @@ mod tests {
             out_w,
             out_b,
             out_norm_b,
-            swoosh_r_offset,
-            swoosh_r_shift,
-            swoosh_l_offset,
-            swoosh_l_shift,
         ] {
             graph
                 .set_input(tensor)
@@ -6080,10 +7031,6 @@ mod tests {
                 out_weight: out_w,
                 out_bias: out_b,
                 out_norm_bias: out_norm_b,
-                swoosh_r_offset,
-                swoosh_r_shift,
-                swoosh_l_offset,
-                swoosh_l_shift,
             },
             XasrEncoderEmbedGraphShape {
                 input_frames,
@@ -6180,19 +7127,6 @@ mod tests {
         graph
             .set_f32_slice(out_norm_b, &embed.out_norm_bias, "embed_out_norm_b")
             .expect("out norm bias upload should succeed");
-        graph
-            .set_f32_slice(swoosh_r_offset, &[SWOOSH_R_OFFSET], "embed_swoosh_r_offset")
-            .expect("swoosh r offset upload should succeed");
-        graph
-            .set_f32_slice(swoosh_r_shift, &[SWOOSH_R_SHIFT], "embed_swoosh_r_shift")
-            .expect("swoosh r shift upload should succeed");
-        graph
-            .set_f32_slice(swoosh_l_offset, &[SWOOSH_L_OFFSET], "embed_swoosh_l_offset")
-            .expect("swoosh l offset upload should succeed");
-        graph
-            .set_f32_slice(swoosh_l_shift, &[SWOOSH_L_SHIFT], "embed_swoosh_l_shift")
-            .expect("swoosh l shift upload should succeed");
-
         let actual = graph
             .compute_outputs_f32(&[
                 (output.rows, embed_frames * output_dim),
@@ -6496,28 +7430,12 @@ mod tests {
         let input = graph
             .new_tensor_2d_f32(3, 2, "swoosh_input")
             .expect("input allocation should succeed");
-        let r_offset = graph
-            .new_tensor_1d_f32(1, "swoosh_r_offset")
-            .expect("r offset allocation should succeed");
-        let r_shift = graph
-            .new_tensor_1d_f32(1, "swoosh_r_shift")
-            .expect("r shift allocation should succeed");
-        let l_offset = graph
-            .new_tensor_1d_f32(1, "swoosh_l_offset")
-            .expect("l offset allocation should succeed");
-        let l_shift = graph
-            .new_tensor_1d_f32(1, "swoosh_l_shift")
-            .expect("l shift allocation should succeed");
-        for tensor in [input, r_offset, r_shift, l_offset, l_shift] {
-            graph
-                .set_input(tensor)
-                .expect("set_input should succeed before allocation");
-        }
+        graph
+            .set_input(input)
+            .expect("set_input should succeed before allocation");
 
-        let swoosh_r_output =
-            apply_swoosh_r_graph(&graph, input, r_offset, r_shift).expect("swoosh r graph");
-        let swoosh_l_output =
-            apply_swoosh_l_graph(&graph, input, l_offset, l_shift).expect("swoosh l graph");
+        let swoosh_r_output = apply_swoosh_r_graph(&graph, input).expect("swoosh r graph");
+        let swoosh_l_output = apply_swoosh_l_graph(&graph, input).expect("swoosh l graph");
         graph
             .set_output(swoosh_r_output)
             .expect("swoosh r output should set");
@@ -6529,19 +7447,6 @@ mod tests {
         graph
             .set_f32_slice(input, &values, "swoosh_input")
             .expect("input upload should succeed");
-        graph
-            .set_f32_slice(r_offset, &[SWOOSH_R_OFFSET], "swoosh_r_offset")
-            .expect("r offset upload should succeed");
-        graph
-            .set_f32_slice(r_shift, &[SWOOSH_R_SHIFT], "swoosh_r_shift")
-            .expect("r shift upload should succeed");
-        graph
-            .set_f32_slice(l_offset, &[SWOOSH_L_OFFSET], "swoosh_l_offset")
-            .expect("l offset upload should succeed");
-        graph
-            .set_f32_slice(l_shift, &[SWOOSH_L_SHIFT], "swoosh_l_shift")
-            .expect("l shift upload should succeed");
-
         let outputs = graph
             .compute_outputs_f32(&[
                 (swoosh_r_output, values.len()),
@@ -6619,21 +7524,7 @@ mod tests {
         let out_bias = graph
             .new_tensor_1d_f32(DIM, "ff_out_bias")
             .expect("out bias allocation should succeed");
-        let swoosh_l_offset = graph
-            .new_tensor_1d_f32(1, "ff_swoosh_l_offset")
-            .expect("swoosh offset allocation should succeed");
-        let swoosh_l_shift = graph
-            .new_tensor_1d_f32(1, "ff_swoosh_l_shift")
-            .expect("swoosh shift allocation should succeed");
-        for tensor in [
-            input,
-            in_weight,
-            in_bias,
-            out_weight,
-            out_bias,
-            swoosh_l_offset,
-            swoosh_l_shift,
-        ] {
+        for tensor in [input, in_weight, in_bias, out_weight, out_bias] {
             graph
                 .set_input(tensor)
                 .expect("set_input should succeed before allocation");
@@ -6647,8 +7538,6 @@ mod tests {
                 in_proj_bias: in_bias,
                 out_proj_weight: out_weight,
                 out_proj_bias: out_bias,
-                swoosh_l_offset,
-                swoosh_l_shift,
             },
         )
         .expect("feed-forward graph");
@@ -6685,12 +7574,6 @@ mod tests {
         graph
             .set_f32_slice(out_bias, &out_bias_values, "ff_out_bias")
             .expect("out bias upload should succeed");
-        graph
-            .set_f32_slice(swoosh_l_offset, &[SWOOSH_L_OFFSET], "ff_swoosh_l_offset")
-            .expect("swoosh offset upload should succeed");
-        graph
-            .set_f32_slice(swoosh_l_shift, &[SWOOSH_L_SHIFT], "ff_swoosh_l_shift")
-            .expect("swoosh shift upload should succeed");
         let actual = graph
             .compute_output_f32(output, DIM * FRAMES)
             .expect("feed-forward graph should compute");
@@ -7295,12 +8178,6 @@ mod tests {
         let out_bias = graph
             .new_tensor_1d_f32(DIM, "conv_out_bias")
             .expect("out bias allocation should succeed");
-        let swoosh_r_offset = graph
-            .new_tensor_1d_f32(1, "conv_swoosh_r_offset")
-            .expect("swoosh offset allocation should succeed");
-        let swoosh_r_shift = graph
-            .new_tensor_1d_f32(1, "conv_swoosh_r_shift")
-            .expect("swoosh shift allocation should succeed");
         for tensor in [
             input,
             cache,
@@ -7313,8 +8190,6 @@ mod tests {
             chunk_scale,
             out_weight,
             out_bias,
-            swoosh_r_offset,
-            swoosh_r_shift,
         ] {
             graph
                 .set_input(tensor)
@@ -7334,8 +8209,6 @@ mod tests {
                 chunk_scale,
                 out_proj_weight: out_weight,
                 out_proj_bias: out_bias,
-                swoosh_r_offset,
-                swoosh_r_shift,
             },
             XasrConvolutionModuleGraphShape {
                 dim: DIM,
@@ -7386,13 +8259,6 @@ mod tests {
         graph
             .set_f32_slice(out_bias, &out_bias_values, "conv_out_bias")
             .expect("out bias upload should succeed");
-        graph
-            .set_f32_slice(swoosh_r_offset, &[SWOOSH_R_OFFSET], "conv_swoosh_r_offset")
-            .expect("swoosh offset upload should succeed");
-        graph
-            .set_f32_slice(swoosh_r_shift, &[SWOOSH_R_SHIFT], "conv_swoosh_r_shift")
-            .expect("swoosh shift upload should succeed");
-
         let actual = graph
             .compute_outputs_f32(&[
                 (output.rows, DIM * FRAMES),
@@ -7419,6 +8285,263 @@ mod tests {
             &actual[1],
             &expected.new_cache,
             1.0e-5,
+        );
+    }
+
+    #[test]
+    fn relative_position_scores_graph_matches_scalar_reference() {
+        const HEAD_DIM: usize = 5;
+        const LEFT_CONTEXT: usize = 7;
+
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("CPU graph runner should initialize");
+        for num_heads in [1usize, 4, 8] {
+            for frames in [1usize, 3, 6, 12, 24] {
+                let k_len = LEFT_CONTEXT + frames;
+                let rel_len = k_len + frames - 1;
+                let projected: Vec<f32> = (0..HEAD_DIM * rel_len * num_heads)
+                    .map(|index| ((index % 19) as f32 - 9.0) * 0.03125)
+                    .collect();
+                let p: Vec<f32> = (0..HEAD_DIM * frames * num_heads)
+                    .map(|index| ((index % 13) as f32 - 6.0) * 0.046875)
+                    .collect();
+                let mut expected = Vec::with_capacity(k_len * frames * num_heads);
+                for head in 0..num_heads {
+                    for target in 0..frames {
+                        let relative_start = frames - 1 - target;
+                        for source in 0..k_len {
+                            let relative = relative_start + source;
+                            let mut sum = 0.0_f32;
+                            for dim in 0..HEAD_DIM {
+                                sum += projected
+                                    [head * rel_len * HEAD_DIM + relative * HEAD_DIM + dim]
+                                    * p[head * frames * HEAD_DIM + target * HEAD_DIM + dim];
+                            }
+                            expected.push(sum);
+                        }
+                    }
+                }
+
+                let mut graph = runner.start_graph();
+                let projected_tensor = graph
+                    .new_tensor_3d_f32(HEAD_DIM, rel_len, num_heads, "relative_projected")
+                    .expect("projected tensor should allocate");
+                let p_tensor = graph
+                    .new_tensor_3d_f32(HEAD_DIM, frames, num_heads, "relative_p")
+                    .expect("p tensor should allocate");
+                graph
+                    .set_input(projected_tensor)
+                    .expect("projected tensor should become input");
+                graph
+                    .set_input(p_tensor)
+                    .expect("p tensor should become input");
+                let output = apply_relative_position_scores_graph(
+                    &graph,
+                    projected_tensor,
+                    p_tensor,
+                    frames,
+                    k_len,
+                    rel_len,
+                    num_heads,
+                )
+                .expect("relative position graph should build");
+                graph
+                    .set_output(output)
+                    .expect("relative position output should set");
+                graph
+                    .set_f32_slice(projected_tensor, &projected, "relative_projected")
+                    .expect("projected values should upload");
+                graph
+                    .set_f32_slice(p_tensor, &p, "relative_p")
+                    .expect("p values should upload");
+                let actual = graph
+                    .compute_output_f32(output, expected.len())
+                    .expect("relative position graph should compute");
+                assert_max_abs_diff(
+                    &format!("relative position scores frames={frames} num_heads={num_heads}"),
+                    &actual,
+                    &expected,
+                    1.0e-6,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn self_attention_weights_batched_heads_match_scalar_reference() {
+        const DIM: usize = 5;
+        const FRAMES: usize = 3;
+        const LEFT_CONTEXT: usize = 4;
+        const NUM_HEADS: usize = 2;
+        const QUERY_HEAD_DIM: usize = 3;
+        const POS_DIM: usize = 4;
+        const POS_OUTPUT_DIM: usize = 6;
+        const QUERY_DIM: usize = NUM_HEADS * QUERY_HEAD_DIM;
+        const PROJECTED_DIM: usize = 2 * QUERY_DIM + POS_OUTPUT_DIM;
+
+        let patterned = |len: usize, period: usize, scale: f32| {
+            (0..len)
+                .map(|index| ((index % period) as f32 - (period / 2) as f32) * scale)
+                .collect::<Vec<_>>()
+        };
+        let weights = XasrSelfAttentionWeightsWeights {
+            in_proj: XasrLinearWithBias {
+                weight: StoredLinear {
+                    name: "test.attn.in_proj.weight".to_string(),
+                    input_dim: DIM,
+                    output_dim: PROJECTED_DIM,
+                    values: patterned(DIM * PROJECTED_DIM, 17, 0.015625),
+                    native: None,
+                },
+                bias: patterned(PROJECTED_DIM, 11, 0.0078125),
+            },
+            linear_pos: StoredLinear {
+                name: "test.attn.linear_pos.weight".to_string(),
+                input_dim: POS_DIM,
+                output_dim: POS_OUTPUT_DIM,
+                values: patterned(POS_DIM * POS_OUTPUT_DIM, 13, 0.0234375),
+                native: None,
+            },
+        };
+        let input_values = patterned(DIM * FRAMES, 19, 0.03125);
+        let cache_values = patterned(LEFT_CONTEXT * QUERY_DIM, 23, 0.01953125);
+        let key_padding_mask = vec![true, false, false, false, false, false, false];
+        let expected = self_attention_weights_streaming_reference(
+            &weights,
+            &input_values,
+            FRAMES,
+            DIM,
+            NUM_HEADS,
+            QUERY_HEAD_DIM,
+            LEFT_CONTEXT,
+            Some(&cache_values),
+            Some(&key_padding_mask),
+        )
+        .expect("scalar attention-weights reference should compute");
+        let k_len = LEFT_CONTEXT + FRAMES;
+        let rel_len = LEFT_CONTEXT + 2 * FRAMES - 1;
+        let pos_embedding_values =
+            compact_relative_positional_encoding_for_test(FRAMES, LEFT_CONTEXT, POS_DIM);
+        let mut mask_values = vec![0.0_f32; FRAMES * k_len];
+        for target in 0..FRAMES {
+            for source in 0..k_len {
+                if key_padding_mask[source] {
+                    mask_values[target * k_len + source] = -1000.0;
+                }
+            }
+        }
+
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("CPU graph runner should initialize");
+        let mut graph = runner.start_graph();
+        let input = graph
+            .new_tensor_2d_f32(DIM, FRAMES, "batched_attn_input")
+            .expect("input allocation should succeed");
+        let cache = graph
+            .new_tensor_2d_f32(QUERY_DIM, LEFT_CONTEXT, "batched_attn_cache")
+            .expect("cache allocation should succeed");
+        let mask = graph
+            .new_tensor_2d_f32(k_len, FRAMES, "batched_attn_mask")
+            .expect("mask allocation should succeed");
+        let pos_embedding = graph
+            .new_tensor_2d_f32(POS_DIM, rel_len, "batched_attn_pos_embedding")
+            .expect("positional embedding allocation should succeed");
+        let in_weight = graph
+            .new_tensor_2d_f32(DIM, PROJECTED_DIM, "batched_attn_in_weight")
+            .expect("input projection allocation should succeed");
+        let in_bias = graph
+            .new_tensor_1d_f32(PROJECTED_DIM, "batched_attn_in_bias")
+            .expect("input projection bias allocation should succeed");
+        let linear_pos_weight = graph
+            .new_tensor_2d_f32(POS_DIM, POS_OUTPUT_DIM, "batched_attn_pos_weight")
+            .expect("position projection allocation should succeed");
+        for tensor in [
+            input,
+            cache,
+            mask,
+            pos_embedding,
+            in_weight,
+            in_bias,
+            linear_pos_weight,
+        ] {
+            graph
+                .set_input(tensor)
+                .expect("attention tensor should become an input");
+        }
+        let output = apply_self_attention_weights_graph(
+            &graph,
+            input,
+            XasrSelfAttentionWeightsGraphTensors {
+                cache,
+                mask,
+                pos_embedding,
+                in_proj_weight: in_weight,
+                in_proj_bias: in_bias,
+                linear_pos_weight,
+            },
+            XasrSelfAttentionWeightsGraphShape {
+                dim: DIM,
+                frames: FRAMES,
+                left_context_len: LEFT_CONTEXT,
+                num_heads: NUM_HEADS,
+                query_head_dim: QUERY_HEAD_DIM,
+                pos_dim: POS_DIM,
+                pos_output_dim: POS_OUTPUT_DIM,
+            },
+        )
+        .expect("batched attention-weights graph should build");
+        graph
+            .set_output(output.weights)
+            .expect("attention weights should become an output");
+        graph
+            .set_output(output.new_cache)
+            .expect("attention cache should become an output");
+        for (tensor, values, label) in [
+            (input, input_values.as_slice(), "batched_attn_input"),
+            (cache, cache_values.as_slice(), "batched_attn_cache"),
+            (mask, mask_values.as_slice(), "batched_attn_mask"),
+            (
+                pos_embedding,
+                pos_embedding_values.as_slice(),
+                "batched_attn_pos_embedding",
+            ),
+            (
+                in_weight,
+                weights.in_proj.weight.values.as_slice(),
+                "batched_attn_in_weight",
+            ),
+            (
+                in_bias,
+                weights.in_proj.bias.as_slice(),
+                "batched_attn_in_bias",
+            ),
+            (
+                linear_pos_weight,
+                weights.linear_pos.values.as_slice(),
+                "batched_attn_pos_weight",
+            ),
+        ] {
+            graph
+                .set_f32_slice(tensor, values, label)
+                .expect("attention input should upload");
+        }
+        let actual = graph
+            .compute_outputs_f32(&[
+                (output.weights, expected.weights.len()),
+                (output.new_cache, expected.new_cached_key.len()),
+            ])
+            .expect("batched attention-weights graph should compute");
+        assert_max_abs_diff(
+            "batched attention weights vs scalar reference",
+            &actual[0],
+            &expected.weights,
+            1.0e-6,
+        );
+        assert_max_abs_diff(
+            "batched attention cache vs scalar reference",
+            &actual[1],
+            &expected.new_cached_key,
+            1.0e-6,
         );
     }
 
@@ -7733,12 +8856,6 @@ mod tests {
         let ff1_out_b = graph
             .new_tensor_1d_f32(layer.feed_forward1.out_proj.bias.len(), "layer_ff1_out_b")
             .expect("ff1 out bias allocation should succeed");
-        let ff1_swoosh_l_offset = graph
-            .new_tensor_1d_f32(1, "layer_ff1_swoosh_l_offset")
-            .expect("ff1 swoosh offset allocation should succeed");
-        let ff1_swoosh_l_shift = graph
-            .new_tensor_1d_f32(1, "layer_ff1_swoosh_l_shift")
-            .expect("ff1 swoosh shift allocation should succeed");
         let attn_cache = graph
             .new_tensor_2d_f32(query_dim, left_context_len, "layer_attn_cache")
             .expect("attention cache allocation should succeed");
@@ -7849,12 +8966,6 @@ mod tests {
         let conv1_out_b = graph
             .new_tensor_1d_f32(conv1.out_proj.bias.len(), "layer_conv1_out_b")
             .expect("conv1 out bias allocation should succeed");
-        let conv1_swoosh_r_offset = graph
-            .new_tensor_1d_f32(1, "layer_conv1_swoosh_r_offset")
-            .expect("conv1 swoosh offset allocation should succeed");
-        let conv1_swoosh_r_shift = graph
-            .new_tensor_1d_f32(1, "layer_conv1_swoosh_r_shift")
-            .expect("conv1 swoosh shift allocation should succeed");
         let ff2_in_w = graph
             .new_tensor_2d_f32(
                 layer.feed_forward2.in_proj.weight.input_dim,
@@ -7875,12 +8986,6 @@ mod tests {
         let ff2_out_b = graph
             .new_tensor_1d_f32(layer.feed_forward2.out_proj.bias.len(), "layer_ff2_out_b")
             .expect("ff2 out bias allocation should succeed");
-        let ff2_swoosh_l_offset = graph
-            .new_tensor_1d_f32(1, "layer_ff2_swoosh_l_offset")
-            .expect("ff2 swoosh offset allocation should succeed");
-        let ff2_swoosh_l_shift = graph
-            .new_tensor_1d_f32(1, "layer_ff2_swoosh_l_shift")
-            .expect("ff2 swoosh shift allocation should succeed");
         let bypass_mid_scale = graph
             .new_tensor_1d_f32(dim, "layer_bypass_mid_scale")
             .expect("bypass mid scale allocation should succeed");
@@ -7945,12 +9050,6 @@ mod tests {
         let conv2_out_b = graph
             .new_tensor_1d_f32(conv2.out_proj.bias.len(), "layer_conv2_out_b")
             .expect("conv2 out bias allocation should succeed");
-        let conv2_swoosh_r_offset = graph
-            .new_tensor_1d_f32(1, "layer_conv2_swoosh_r_offset")
-            .expect("conv2 swoosh offset allocation should succeed");
-        let conv2_swoosh_r_shift = graph
-            .new_tensor_1d_f32(1, "layer_conv2_swoosh_r_shift")
-            .expect("conv2 swoosh shift allocation should succeed");
         let ff3_in_w = graph
             .new_tensor_2d_f32(
                 layer.feed_forward3.in_proj.weight.input_dim,
@@ -7971,12 +9070,6 @@ mod tests {
         let ff3_out_b = graph
             .new_tensor_1d_f32(layer.feed_forward3.out_proj.bias.len(), "layer_ff3_out_b")
             .expect("ff3 out bias allocation should succeed");
-        let ff3_swoosh_l_offset = graph
-            .new_tensor_1d_f32(1, "layer_ff3_swoosh_l_offset")
-            .expect("ff3 swoosh offset allocation should succeed");
-        let ff3_swoosh_l_shift = graph
-            .new_tensor_1d_f32(1, "layer_ff3_swoosh_l_shift")
-            .expect("ff3 swoosh shift allocation should succeed");
         let norm_bias = graph
             .new_tensor_1d_f32(dim, "layer_norm_bias")
             .expect("norm bias allocation should succeed");
@@ -7990,8 +9083,6 @@ mod tests {
             ff1_in_b,
             ff1_out_w,
             ff1_out_b,
-            ff1_swoosh_l_offset,
-            ff1_swoosh_l_shift,
             attn_cache,
             attn_mask,
             attn_pos,
@@ -8018,14 +9109,10 @@ mod tests {
             conv1_chunk_scale,
             conv1_out_w,
             conv1_out_b,
-            conv1_swoosh_r_offset,
-            conv1_swoosh_r_shift,
             ff2_in_w,
             ff2_in_b,
             ff2_out_w,
             ff2_out_b,
-            ff2_swoosh_l_offset,
-            ff2_swoosh_l_shift,
             bypass_mid_scale,
             self2_cache,
             self2_in_w,
@@ -8042,14 +9129,10 @@ mod tests {
             conv2_chunk_scale,
             conv2_out_w,
             conv2_out_b,
-            conv2_swoosh_r_offset,
-            conv2_swoosh_r_shift,
             ff3_in_w,
             ff3_in_b,
             ff3_out_w,
             ff3_out_b,
-            ff3_swoosh_l_offset,
-            ff3_swoosh_l_shift,
             norm_bias,
             bypass_scale,
         ] {
@@ -8068,8 +9151,6 @@ mod tests {
                         in_proj_bias: ff1_in_b,
                         out_proj_weight: ff1_out_w,
                         out_proj_bias: ff1_out_b,
-                        swoosh_l_offset: ff1_swoosh_l_offset,
-                        swoosh_l_shift: ff1_swoosh_l_shift,
                     },
                     attention_weights: XasrSelfAttentionWeightsGraphTensors {
                         cache: attn_cache,
@@ -8100,16 +9181,12 @@ mod tests {
                         chunk_scale: conv1_chunk_scale,
                         out_proj_weight: conv1_out_w,
                         out_proj_bias: conv1_out_b,
-                        swoosh_r_offset: conv1_swoosh_r_offset,
-                        swoosh_r_shift: conv1_swoosh_r_shift,
                     },
                     feed_forward2: XasrFeedForwardGraphTensors {
                         in_proj_weight: ff2_in_w,
                         in_proj_bias: ff2_in_b,
                         out_proj_weight: ff2_out_w,
                         out_proj_bias: ff2_out_b,
-                        swoosh_l_offset: ff2_swoosh_l_offset,
-                        swoosh_l_shift: ff2_swoosh_l_shift,
                     },
                     bypass_mid_scale,
                 },
@@ -8130,16 +9207,12 @@ mod tests {
                         chunk_scale: conv2_chunk_scale,
                         out_proj_weight: conv2_out_w,
                         out_proj_bias: conv2_out_b,
-                        swoosh_r_offset: conv2_swoosh_r_offset,
-                        swoosh_r_shift: conv2_swoosh_r_shift,
                     },
                     feed_forward3: XasrFeedForwardGraphTensors {
                         in_proj_weight: ff3_in_w,
                         in_proj_bias: ff3_in_b,
                         out_proj_weight: ff3_out_w,
                         out_proj_bias: ff3_out_b,
-                        swoosh_l_offset: ff3_swoosh_l_offset,
-                        swoosh_l_shift: ff3_swoosh_l_shift,
                     },
                     norm_bias,
                     bypass_scale,
@@ -8225,20 +9298,6 @@ mod tests {
                 "layer_ff1_out_b",
             )
             .expect("ff1 out bias upload should succeed");
-        graph
-            .set_f32_slice(
-                ff1_swoosh_l_offset,
-                &[SWOOSH_L_OFFSET],
-                "layer_ff1_swoosh_l_offset",
-            )
-            .expect("ff1 swoosh offset upload should succeed");
-        graph
-            .set_f32_slice(
-                ff1_swoosh_l_shift,
-                &[SWOOSH_L_SHIFT],
-                "layer_ff1_swoosh_l_shift",
-            )
-            .expect("ff1 swoosh shift upload should succeed");
         graph
             .set_f32_slice(attn_cache, &attn_cache_values, "layer_attn_cache")
             .expect("attn cache upload should succeed");
@@ -8355,20 +9414,6 @@ mod tests {
             .expect("conv1 out bias upload should succeed");
         graph
             .set_f32_slice(
-                conv1_swoosh_r_offset,
-                &[SWOOSH_R_OFFSET],
-                "layer_conv1_swoosh_r_offset",
-            )
-            .expect("conv1 swoosh offset upload should succeed");
-        graph
-            .set_f32_slice(
-                conv1_swoosh_r_shift,
-                &[SWOOSH_R_SHIFT],
-                "layer_conv1_swoosh_r_shift",
-            )
-            .expect("conv1 swoosh shift upload should succeed");
-        graph
-            .set_f32_slice(
                 ff2_in_w,
                 &layer.feed_forward2.in_proj.weight.values,
                 "layer_ff2_in_w",
@@ -8395,20 +9440,6 @@ mod tests {
                 "layer_ff2_out_b",
             )
             .expect("ff2 out bias upload should succeed");
-        graph
-            .set_f32_slice(
-                ff2_swoosh_l_offset,
-                &[SWOOSH_L_OFFSET],
-                "layer_ff2_swoosh_l_offset",
-            )
-            .expect("ff2 swoosh offset upload should succeed");
-        graph
-            .set_f32_slice(
-                ff2_swoosh_l_shift,
-                &[SWOOSH_L_SHIFT],
-                "layer_ff2_swoosh_l_shift",
-            )
-            .expect("ff2 swoosh shift upload should succeed");
         graph
             .set_f32_slice(
                 bypass_mid_scale,
@@ -8491,20 +9522,6 @@ mod tests {
             .expect("conv2 out bias upload should succeed");
         graph
             .set_f32_slice(
-                conv2_swoosh_r_offset,
-                &[SWOOSH_R_OFFSET],
-                "layer_conv2_swoosh_r_offset",
-            )
-            .expect("conv2 swoosh offset upload should succeed");
-        graph
-            .set_f32_slice(
-                conv2_swoosh_r_shift,
-                &[SWOOSH_R_SHIFT],
-                "layer_conv2_swoosh_r_shift",
-            )
-            .expect("conv2 swoosh shift upload should succeed");
-        graph
-            .set_f32_slice(
                 ff3_in_w,
                 &layer.feed_forward3.in_proj.weight.values,
                 "layer_ff3_in_w",
@@ -8531,20 +9548,6 @@ mod tests {
                 "layer_ff3_out_b",
             )
             .expect("ff3 out bias upload should succeed");
-        graph
-            .set_f32_slice(
-                ff3_swoosh_l_offset,
-                &[SWOOSH_L_OFFSET],
-                "layer_ff3_swoosh_l_offset",
-            )
-            .expect("ff3 swoosh offset upload should succeed");
-        graph
-            .set_f32_slice(
-                ff3_swoosh_l_shift,
-                &[SWOOSH_L_SHIFT],
-                "layer_ff3_swoosh_l_shift",
-            )
-            .expect("ff3 swoosh shift upload should succeed");
         graph
             .set_f32_slice(norm_bias, &layer.norm_bias, "layer_norm_bias")
             .expect("norm bias upload should succeed");
@@ -8864,6 +9867,7 @@ mod tests {
                 frames,
                 left_context_len,
                 num_heads,
+                attention_weight_heads: num_heads,
                 hidden_dim,
             },
         )

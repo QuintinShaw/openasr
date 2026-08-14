@@ -37,7 +37,7 @@ use super::execution_policy::{
     whisper_decoder_persistent_cross_cache_default_f32_rhs_on_cpu_enabled_with_env as decoder_persistent_cross_cache_default_f32_rhs_on_cpu_enabled_with_env,
     whisper_decoder_persistent_cross_cache_f16_upload_enabled_with_env as decoder_persistent_cross_cache_f16_upload_enabled_with_env,
 };
-use super::graph_config::whisper_decoder_graph_config;
+use super::graph_config::whisper_runtime_graph_config;
 
 const GGML_TYPE_F16: i32 = 1;
 
@@ -1011,7 +1011,8 @@ struct PersistentCrossAttentionProjectionTask {
 
 /// The encoder-side graph input a decoder's cross-attention cache is built
 /// from: the encoder hidden state, its shape, and the resolved backend to
-/// build the one-shot K/V projection graphs with. Grouped because they
+/// build the one-shot K/V projection graphs with, plus the parent decoder
+/// runner's scheduler state. Grouped because they
 /// always travel together into [`WhisperDecoderExecutionTensorCache::materialize_cross_attention_cache`]
 /// from a single call site.
 struct WhisperCrossAttentionCacheInput {
@@ -1019,6 +1020,7 @@ struct WhisperCrossAttentionCacheInput {
     hidden: usize,
     encoder_frames: usize,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    uses_scheduler: bool,
 }
 
 /// One linear-projection call's input: the values to project (a slice of the
@@ -1030,6 +1032,7 @@ struct WhisperCrossProjectionInput {
     values: Arc<[f32]>,
     columns: usize,
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    uses_scheduler: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1350,6 +1353,7 @@ impl WhisperDecoderExecutionTensorCache {
                 values: Arc::clone(&input.encoder_hidden),
                 columns: input.encoder_frames,
                 backend: input.backend,
+                uses_scheduler: input.uses_scheduler,
             },
             &layer.cross_attn_k,
             None,
@@ -1362,6 +1366,7 @@ impl WhisperDecoderExecutionTensorCache {
                 values: input.encoder_hidden,
                 columns: input.encoder_frames,
                 backend: input.backend,
+                uses_scheduler: input.uses_scheduler,
             },
             &layer.cross_attn_v.projection,
             Some(&layer.cross_attn_v.bias),
@@ -1409,6 +1414,15 @@ impl WhisperDecoderExecutionTensorCache {
 }
 
 impl WhisperDecoderPersistentWeightCache {
+    pub(crate) fn loaded_weight_binding_identity(
+        &self,
+        runner: &GgmlCpuGraphRunner,
+    ) -> Option<crate::ggml_runtime::GgmlLoadedWeightBindingIdentity> {
+        self._loaded_weights
+            .as_ref()
+            .map(|loaded| runner.loaded_weight_binding_identity(loaded))
+    }
+
     fn validate_cross_attention_stage_plan(
         &self,
         plan: &WhisperDecoderGraphPlan,
@@ -2496,7 +2510,7 @@ pub(crate) fn run_whisper_decoder_greedy_step_with_cache_ggml_v0(
     config: WhisperDecoderGraphExecutionConfig,
     tensor_cache: &mut WhisperDecoderExecutionTensorCache,
 ) -> Result<WhisperDecoderGraphExecutionOutput, WhisperDecoderGraphExecutionError> {
-    let mut runner = GgmlCpuGraphRunner::new(whisper_decoder_graph_config(
+    let mut runner = GgmlCpuGraphRunner::new(whisper_runtime_graph_config(
         crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
     ))
     .map_err(
@@ -2567,6 +2581,7 @@ fn execute_whisper_decoder_with_position_offset_ggml_v0(
     // read it back here rather than re-deriving it, so the one-shot cross-
     // attention cache graph this function builds below always matches.
     let backend = runner.backend_kind();
+    let uses_scheduler = runner.uses_scheduler();
     let prefix_len = decoder_tokens.len();
     let hidden = plan.input_shape.hidden_size;
     let encoder_frames = plan.input_shape.encoder_frames;
@@ -2808,6 +2823,7 @@ fn execute_whisper_decoder_with_position_offset_ggml_v0(
                         hidden,
                         encoder_frames,
                         backend,
+                        uses_scheduler,
                     },
                     &mut cross_cache_misses,
                 )?)
@@ -5371,14 +5387,18 @@ fn materialize_linear_projection_output_ggml(
     bias: Option<&WhisperDecoderGraphTensorRef>,
     label_prefix: &'static str,
 ) -> Result<Arc<[f32]>, WhisperDecoderGraphExecutionError> {
-    let mut runner =
-        GgmlCpuGraphRunner::new(whisper_decoder_graph_config(input.backend)).map_err(|error| {
-            WhisperDecoderGraphExecutionError::GraphExecutionFailed {
-                reason: format!(
-                    "could not initialize ggml cpu graph runner for {label_prefix}: {error}"
-                ),
-            }
-        })?;
+    let mut graph_config = whisper_runtime_graph_config(input.backend);
+    // The one-shot cross-cache runner must retain the parent decoder's
+    // scheduler decision. In particular, a direct Exact CUDA/Vulkan decoder
+    // must never allocate a scheduler just to materialize cross-cache K/V.
+    graph_config.use_scheduler = input.uses_scheduler;
+    let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(|error| {
+        WhisperDecoderGraphExecutionError::GraphExecutionFailed {
+            reason: format!(
+                "could not initialize ggml cpu graph runner for {label_prefix}: {error}"
+            ),
+        }
+    })?;
     materialize_linear_projection_output_with_runner_ggml(
         &mut runner,
         tensor_cache,

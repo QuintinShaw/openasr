@@ -1294,6 +1294,30 @@ mod tests {
     }
 
     #[test]
+    fn runner_config_keeps_gpu_direct_and_cpu_scheduler_policy() {
+        let cpu = runner_config_with_threads(
+            Some(3),
+            GgmlCpuGraphBackend::Cpu,
+            crate::device::execution_policy::ExecutionPlacement::CpuOnly,
+        );
+        assert_eq!(cpu.backend, GgmlCpuGraphBackend::Cpu);
+        assert_eq!(cpu.n_threads, Some(3));
+        assert_eq!(
+            cpu.use_scheduler,
+            GgmlCpuGraphConfig::resolve_runtime_scheduler_usage()
+        );
+
+        let gpu = runner_config_with_threads(
+            Some(3),
+            GgmlCpuGraphBackend::Gpu,
+            crate::device::execution_policy::ExecutionPlacement::FullDevice,
+        );
+        assert_eq!(gpu.backend, GgmlCpuGraphBackend::Gpu);
+        assert_eq!(gpu.n_threads, Some(3));
+        assert!(!gpu.use_scheduler);
+    }
+
+    #[test]
     fn borrowed_pending_upload_propagates_length_errors_without_copying() {
         let values = [3.0_f32];
         let weights = one_tensor_weights("test.weight", &[values.len()], &values);

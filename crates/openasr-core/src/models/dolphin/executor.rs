@@ -20,10 +20,12 @@ use crate::NativeAsrSession;
 use crate::PhraseBiasConfig;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::DOLPHIN_GGML_ADAPTER_ID;
+use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
-    GGML_TYPE_F32, GgmlCpuGraphBackend, GgufMetadata, GgufOwnedWeightTensorPayload,
-    GgufTensorDataReadError, GgufTensorDataReader, GgufWeightTensorElementType,
-    build_runtime_tensor_reader_from_preflight,
+    GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GgmlCpuGraphBackend, GgmlMatmulPrecision,
+    GgufMetadata, GgufOwnedWeightTensorPayload, GgufTensorDataReadError, GgufTensorDataReader,
+    GgufWeightTensorElementType, RequestBackendPreference,
+    build_runtime_tensor_reader_from_preflight, request_backend_override,
 };
 use crate::models::admitted_host_object_cache::{
     AdmittedHostObjectCache, AdmittedHostObjectCacheLimits,
@@ -412,6 +414,43 @@ type DolphinPreparedRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
 type DolphinPreparedRuntimeActor =
     PinnedRuntimeActorCheckout<DolphinPreparedRuntimeCacheKey, DolphinPreparedRuntimeActorState>;
 
+fn current_exact_provider() -> Option<ExecutionProvider> {
+    match request_backend_override() {
+        Some(RequestBackendPreference::Exact(route)) => Some(route.provider),
+        _ => None,
+    }
+}
+
+fn dolphin_rescore_matmul_precision(
+    provider: Option<ExecutionProvider>,
+    output_weight_type: Option<GgufWeightTensorElementType>,
+) -> GgmlMatmulPrecision {
+    // Dolphin selects the final transcript by attention-only rescoring over a
+    // CTC n-best. On the qualified Vulkan route, F16 and Q4_K rescore logits
+    // can reorder a near-tied pair under the backend-default accumulation
+    // contract even though the encoder and CTC outputs are otherwise valid.
+    // Request explicit F32 accumulation for their weighted projections. Q8_0
+    // already preserves parity with the default pipeline. CUDA, Metal, HIP,
+    // CPU, and unscoped low-level runs retain their established defaults.
+    let vulkan_range_sensitive_weight = match output_weight_type {
+        Some(GgufWeightTensorElementType::F16)
+        | Some(GgufWeightTensorElementType::RawGgml {
+            ggml_type: GGML_TYPE_Q4_K,
+        }) => true,
+        Some(GgufWeightTensorElementType::RawGgml {
+            ggml_type: GGML_TYPE_Q8_0,
+        })
+        | Some(GgufWeightTensorElementType::F32)
+        | Some(GgufWeightTensorElementType::RawGgml { .. })
+        | None => false,
+    };
+    if provider == Some(ExecutionProvider::Vulkan) && vulkan_range_sensitive_weight {
+        GgmlMatmulPrecision::F32
+    } else {
+        GgmlMatmulPrecision::Default
+    }
+}
+
 /// Build the three prepared graph runtimes for one pack + backend. The
 /// encoder's resident position-table capacity is sized to the pack's own
 /// `encoder.max_ctx`; a longer utterance (multilingual scheme only, whose
@@ -442,8 +481,19 @@ pub(crate) fn build_dolphin_prepared_runtime(
         backend,
     )
     .map_err(|error| format!("dolphin ctc head runtime build failed: {error}"))?;
-    let rescore = DolphinDecoderRescoreRuntime::new(&decoder_config, weights, backend)
-        .map_err(|error| format!("dolphin rescore runtime build failed: {error}"))?;
+    let rescore_weight_type = weights
+        .native_weights
+        .get("decoder.output_layer.weight")
+        .map(|weight| weight.element_type);
+    let rescore_precision =
+        dolphin_rescore_matmul_precision(current_exact_provider(), rescore_weight_type);
+    let rescore = DolphinDecoderRescoreRuntime::new_with_matmul_precision(
+        &decoder_config,
+        weights,
+        backend,
+        rescore_precision,
+    )
+    .map_err(|error| format!("dolphin rescore runtime build failed: {error}"))?;
     Ok(DolphinPreparedRuntime {
         backend,
         encoder,
@@ -1059,6 +1109,56 @@ mod tests {
     use crate::models::runtime_cache_coordinator::PackContentKey;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn vulkan_rescore_precision_is_weight_type_specific() {
+        assert_eq!(
+            dolphin_rescore_matmul_precision(
+                Some(ExecutionProvider::Vulkan),
+                Some(GgufWeightTensorElementType::F16),
+            ),
+            GgmlMatmulPrecision::F32
+        );
+        assert_eq!(
+            dolphin_rescore_matmul_precision(
+                Some(ExecutionProvider::Vulkan),
+                Some(GgufWeightTensorElementType::RawGgml {
+                    ggml_type: GGML_TYPE_Q4_K,
+                }),
+            ),
+            GgmlMatmulPrecision::F32
+        );
+        assert_eq!(
+            dolphin_rescore_matmul_precision(
+                Some(ExecutionProvider::Vulkan),
+                Some(GgufWeightTensorElementType::RawGgml {
+                    ggml_type: GGML_TYPE_Q8_0,
+                }),
+            ),
+            GgmlMatmulPrecision::Default
+        );
+    }
+
+    #[test]
+    fn dolphin_rescore_policy_does_not_change_other_routes() {
+        for (provider, weight_type) in [
+            (
+                Some(ExecutionProvider::Cuda),
+                Some(GgufWeightTensorElementType::F16),
+            ),
+            (None, Some(GgufWeightTensorElementType::F16)),
+            (
+                Some(ExecutionProvider::Metal),
+                Some(GgufWeightTensorElementType::F16),
+            ),
+            (Some(ExecutionProvider::Vulkan), None),
+        ] {
+            assert_eq!(
+                dolphin_rescore_matmul_precision(provider, weight_type),
+                GgmlMatmulPrecision::Default
+            );
+        }
+    }
 
     fn cached_placeholder(
         executor: &DolphinGgmlExecutor,

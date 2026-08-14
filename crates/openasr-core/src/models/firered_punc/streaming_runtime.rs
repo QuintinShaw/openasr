@@ -216,7 +216,59 @@ fn streaming_punctuation_stage_applies(model_architecture: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::execution_policy::ExecutionCandidateFailure;
+    use crate::device::{
+        execution_policy::{
+            AcceleratedDeviceConstraint, ExecutionCandidateFailure, ExecutionIntent,
+        },
+        execution_route::ExecutionProvider,
+    };
+
+    fn auxiliary_bench_execution_intent() -> (ExecutionIntent, &'static str) {
+        match std::env::var("OPENASR_AUX_BENCH_PROVIDER")
+            .expect("OPENASR_AUX_BENCH_PROVIDER must be cuda or vulkan")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "cuda" => (
+                ExecutionIntent::ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint::Provider(
+                    ExecutionProvider::Cuda,
+                )),
+                "cuda",
+            ),
+            "vulkan" => (
+                ExecutionIntent::ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint::Provider(
+                    ExecutionProvider::Vulkan,
+                )),
+                "vulkan",
+            ),
+            value => {
+                panic!("OPENASR_AUX_BENCH_PROVIDER must be cuda or vulkan; got {value:?}")
+            }
+        }
+    }
+
+    fn punctuate_with_policy(
+        execution_services: Arc<crate::NativeExecutionServices>,
+        execution_intent: ExecutionIntent,
+        text: &str,
+    ) -> String {
+        let punctuator = PolicyResolvedStreamingPunctuator::prepare(
+            execution_services,
+            crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
+            "firered-punc-policy-parity",
+            &execution_intent,
+        )
+        .expect("prepare policy-owned punctuation stage")
+        .expect("FireRedPunc pack is present and routed as punctuation");
+        punctuator
+            .initialize()
+            .expect("initialize policy-owned punctuation stage");
+        punctuator
+            .slot()
+            .process(text)
+            .expect("punctuate through the production streaming slot")
+    }
 
     #[test]
     fn stage_applies_only_to_unpunctuated_architectures() {
@@ -253,5 +305,44 @@ mod tests {
         assert!(optional_punctuation_failure_disables_stage(&exhausted));
         assert!(!optional_punctuation_failure_disables_stage(&empty));
         assert!(!optional_punctuation_failure_disables_stage(&pinned));
+    }
+
+    #[test]
+    #[ignore = "host-local parity: needs OPENASR_FIRERED_PUNC_PACK, OPENASR_AUX_BENCH_TEXT, OPENASR_AUX_BENCH_PROVIDER, and the requested device"]
+    fn production_policy_cpu_accelerated_parity_when_pack_present() {
+        let text_path = crate::testing::external_test_fixture_path(
+            "OPENASR_AUX_BENCH_TEXT",
+            "private FireRedPunc parity transcript",
+        )
+        .expect("OPENASR_AUX_BENCH_TEXT");
+        let text = std::fs::read_to_string(text_path).expect("read parity transcript");
+        let text = text.trim();
+        assert!(!text.is_empty(), "parity transcript must not be empty");
+
+        let (accelerated_intent, requested_provider) = auxiliary_bench_execution_intent();
+        let execution_services = Arc::new(
+            crate::NativeExecutionServices::for_local_process().expect("execution services"),
+        );
+        let cpu = punctuate_with_policy(
+            Arc::clone(&execution_services),
+            ExecutionIntent::CpuOnly,
+            text,
+        );
+        let accelerated = punctuate_with_policy(execution_services, accelerated_intent, text);
+
+        assert_ne!(
+            cpu, text,
+            "CPU punctuation must transform the unpunctuated parity transcript"
+        );
+        assert_eq!(
+            accelerated, cpu,
+            "FireRedPunc CPU/{requested_provider} output mismatch"
+        );
+        let input_sha256 = crate::testing::benchmark_sha256_bytes([text.as_bytes()]);
+        let output_sha256 = crate::testing::benchmark_sha256_bytes([cpu.as_bytes()]);
+        eprintln!(
+            "FIRERED_PUNC_CPU_ACCELERATED_PARITY provider={requested_provider} chars={} input_sha256={input_sha256} output_sha256={output_sha256}",
+            text.chars().count()
+        );
     }
 }

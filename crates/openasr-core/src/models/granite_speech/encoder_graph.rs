@@ -129,7 +129,7 @@ impl GraniteSpeechEncoderConfig {
 
 fn encoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
     const GRAPH_SIZE: usize = 16_384;
-    GgmlCpuGraphConfig {
+    crate::models::graph_runtime_config::apply_request_execution_placement(GgmlCpuGraphConfig {
         context_bytes: GgmlCpuGraphConfig::metadata_context_bytes(GRAPH_SIZE),
         graph_size: GRAPH_SIZE,
         n_threads: GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
@@ -138,7 +138,7 @@ fn encoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
         ),
         backend,
         use_scheduler: true,
-    }
+    })
 }
 
 /// Request-invariant Granite encoder state. Large matrix weights stay in their

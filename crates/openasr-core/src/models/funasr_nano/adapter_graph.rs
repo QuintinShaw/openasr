@@ -179,6 +179,16 @@ pub(crate) struct FunasrNanoAdapterGraph {
 }
 
 impl FunasrNanoAdapterGraph {
+    pub(crate) fn graph_lane(&self) -> (crate::ggml_runtime::GgmlCpuGraphBackend, bool) {
+        (self.runner.backend_kind(), self.runner.uses_scheduler())
+    }
+
+    pub(crate) fn loaded_weight_binding_identity(
+        &self,
+    ) -> crate::ggml_runtime::GgmlLoadedWeightBindingIdentity {
+        self.runner.loaded_weight_binding_identity(&self._loaded)
+    }
+
     pub(crate) fn new_from_preflight(
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         metadata: FunasrNanoAdapterMetadata,

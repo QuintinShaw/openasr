@@ -345,6 +345,9 @@ pub(crate) const GGML_TYPE_Q5_K: c_int = 13;
 pub(crate) const GGML_TYPE_Q6_K: c_int = 14;
 pub(crate) const GGML_TYPE_I32: c_int = 26;
 
+pub(crate) const GGML_LSTM_GATE_ORDER_IOFC: c_int = 0;
+pub(crate) const GGML_LSTM_GATE_ORDER_IFGO: c_int = 1;
+
 #[allow(dead_code)]
 pub(crate) const GGML_ROPE_TYPE_NEOX: c_int = 2;
 
@@ -666,12 +669,14 @@ unsafe extern "C" {
         a: GgmlTensorRaw,
         b: GgmlTensorRaw,
     ) -> GgmlTensorRaw;
+    pub(crate) fn ggml_mul_mat_set_prec(a: GgmlTensorRaw, prec: c_int);
     pub(crate) fn ggml_get_rows(
         ctx: GgmlContextRaw,
         a: GgmlTensorRaw,
         b: GgmlTensorRaw,
     ) -> GgmlTensorRaw;
     pub(crate) fn ggml_argmax(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
+    pub(crate) fn ggml_argmax_first(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
     #[cfg(test)]
     pub(crate) fn ggml_top_k(ctx: GgmlContextRaw, a: GgmlTensorRaw, k: c_int) -> GgmlTensorRaw;
     pub(crate) fn ggml_scale(ctx: GgmlContextRaw, a: GgmlTensorRaw, s: f32) -> GgmlTensorRaw;
@@ -743,6 +748,22 @@ unsafe extern "C" {
         mask: GgmlTensorRaw,
         scale: f32,
     ) -> GgmlTensorRaw;
+    #[allow(dead_code)]
+    pub(crate) fn ggml_ssm_conv(
+        ctx: GgmlContextRaw,
+        sx: GgmlTensorRaw,
+        c: GgmlTensorRaw,
+    ) -> GgmlTensorRaw;
+    #[allow(dead_code)]
+    pub(crate) fn ggml_lstm_seq(
+        ctx: GgmlContextRaw,
+        x: GgmlTensorRaw,
+        w: GgmlTensorRaw,
+        r: GgmlTensorRaw,
+        b: GgmlTensorRaw,
+        gate_order: c_int,
+        reverse: bool,
+    ) -> GgmlTensorRaw;
     pub(crate) fn ggml_can_repeat(a: GgmlTensorRaw, b: GgmlTensorRaw) -> bool;
     pub(crate) fn ggml_gelu(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
     pub(crate) fn ggml_gelu_erf(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
@@ -750,6 +771,13 @@ unsafe extern "C" {
     pub(crate) fn ggml_relu(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
     pub(crate) fn ggml_sigmoid(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
     pub(crate) fn ggml_softplus(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
+    pub(crate) fn ggml_swoosh(
+        ctx: GgmlContextRaw,
+        a: GgmlTensorRaw,
+        offset: f32,
+        shift: f32,
+        linear_scale: f32,
+    ) -> GgmlTensorRaw;
     pub(crate) fn ggml_exp(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
     #[allow(dead_code)]
     pub(crate) fn ggml_silu(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
@@ -923,6 +951,8 @@ unsafe extern "C" {
     // context needs, mirroring llama.cpp's compute-meta buffer sizing.
     pub(crate) fn ggml_tensor_overhead() -> usize;
     pub(crate) fn ggml_graph_overhead_custom(size: usize, grads: bool) -> usize;
+    pub(crate) fn ggml_used_mem(ctx: GgmlContextRaw) -> usize;
+    pub(crate) fn ggml_get_mem_size(ctx: GgmlContextRaw) -> usize;
     // ggml_cpu_has_* / ggml_cpu_get_* are not declared here: under
     // GGML_BACKEND_DL they live in the loaded ggml-cpu plugin, not the linked
     // core. GgmlCpuFeatures::detect() reads CPU features via the Rust stdlib

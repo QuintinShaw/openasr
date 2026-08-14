@@ -4,7 +4,8 @@ use thiserror::Error;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext, GgmlStaticTensor,
+    GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
 };
 use crate::{Segment, Transcription};
 
@@ -21,6 +22,10 @@ use super::weights::{CohereMatrixLayout, CohereMatrixWeight, CohereVectorWeight}
 use crate::PhraseBiasConfig;
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, BuiltinSeq2SeqDecodePolicyConfigInput,
+};
+use crate::models::device_greedy_token::{
+    DeviceGreedyStepOutputMode, first_max_argmax_reverse_indices,
+    first_max_token_id_from_reversed_argmax,
 };
 use crate::models::seq2seq_decoder_state::Seq2SeqDecoderState;
 use crate::models::seq2seq_greedy_decode::{
@@ -470,17 +475,17 @@ pub(crate) struct CohereDecoderGraphRuntime {
     // `reuse` holds raw pointers into `runner`, `arena`, and resident KV/cross
     // tensors, so it must be declared first and dropped first.
     reuse: Option<Seq2SeqReusableDecodeGraph>,
+    argmax_reverse_indices: Option<GgmlStaticTensor>,
+    greedy_step_output_mode: DeviceGreedyStepOutputMode,
     metadata: CohereTranscribeExecutionMetadata,
-    runner: GgmlCpuGraphRunner,
-    arena: GgmlStaticTensorArena,
-    token_embedding: GgmlStaticTensor,
-    positional_embedding: GgmlStaticTensor,
-    emb_ln_weight: GgmlStaticTensor,
-    emb_ln_bias: GgmlStaticTensor,
-    out_ln_weight: GgmlStaticTensor,
-    out_ln_bias: GgmlStaticTensor,
-    output_head_weight: GgmlStaticTensor,
-    output_head_bias: GgmlStaticTensor,
+    token_embedding: CohereDecoderWeightTensor,
+    positional_embedding: CohereDecoderWeightTensor,
+    emb_ln_weight: CohereDecoderWeightTensor,
+    emb_ln_bias: CohereDecoderWeightTensor,
+    out_ln_weight: CohereDecoderWeightTensor,
+    out_ln_bias: CohereDecoderWeightTensor,
+    output_head_weight: CohereDecoderWeightTensor,
+    output_head_bias: CohereDecoderWeightTensor,
     layers: Vec<CohereDecoderLayerRuntime>,
     cross_layers: Vec<CohereDecoderCrossCacheLayerRuntime>,
     self_kv_layers: Vec<CohereDecoderSelfKvLayerRuntime>,
@@ -490,7 +495,7 @@ pub(crate) struct CohereDecoderGraphRuntime {
     /// utterance shape.
     cross_capacity_frames: usize,
     /// The active cross-frame-count [`Self::reuse`]'s persistent graph was
-    /// last built for (0 if never built). `compute_reused_incremental_step_logits`
+    /// last built for (0 if never built). `compute_reused_incremental_step_output`
     /// compares this against the current `cross_layers[0].frame_count` and
     /// rebuilds the (cheap, metadata-only) reusable graph whenever a
     /// differently-sized chunk swaps in, since `build_reusable_decode_graph`
@@ -499,6 +504,38 @@ pub(crate) struct CohereDecoderGraphRuntime {
     reuse_cross_frame_count: usize,
     cached_positions: usize,
     n_seq: usize,
+    // Every graph-visible handle and persistent session above must drop before
+    // its metadata/state arena, loaded roots, and backend runner.
+    arena: GgmlStaticTensorArena,
+    // Load-bearing for every `Loaded` weight handle above. In the unified
+    // owner this upgrades the encoder's same-thread pack binding instead of
+    // allocating a second decoder weight arena.
+    loaded_weights: Option<GgmlLoadedWeightContext>,
+    runner: GgmlCpuGraphRunner,
+}
+
+#[derive(Clone, Copy)]
+enum CohereDecoderWeightTensor {
+    Loaded(GgmlLoadedTensor),
+    LoadedMatrixView(GgmlStaticTensor),
+    Static(GgmlStaticTensor),
+}
+
+impl CohereDecoderWeightTensor {
+    fn as_graph_tensor<'a>(self) -> GgmlCpuTensor<'a> {
+        match self {
+            Self::Loaded(tensor) => tensor.as_graph_tensor(),
+            Self::LoadedMatrixView(tensor) => tensor.as_graph_tensor(),
+            Self::Static(tensor) => tensor.as_graph_tensor(),
+        }
+    }
+
+    fn static_tensor(self) -> Option<GgmlStaticTensor> {
+        match self {
+            Self::Loaded(_) | Self::LoadedMatrixView(_) => None,
+            Self::Static(tensor) => Some(tensor),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -518,32 +555,32 @@ struct CoherePromptDebugTensors<'a> {
 
 #[derive(Clone, Copy)]
 struct CohereDecoderLayerRuntime {
-    attn_ln_weight: GgmlStaticTensor,
-    attn_ln_bias: GgmlStaticTensor,
-    attn_q_weight: GgmlStaticTensor,
-    attn_q_bias: GgmlStaticTensor,
-    attn_k_weight: GgmlStaticTensor,
-    attn_k_bias: GgmlStaticTensor,
-    attn_v_weight: GgmlStaticTensor,
-    attn_v_bias: GgmlStaticTensor,
-    attn_o_weight: GgmlStaticTensor,
-    attn_o_bias: GgmlStaticTensor,
-    cross_ln_weight: GgmlStaticTensor,
-    cross_ln_bias: GgmlStaticTensor,
-    cross_k_weight: GgmlStaticTensor,
-    cross_k_bias: GgmlStaticTensor,
-    cross_v_weight: GgmlStaticTensor,
-    cross_v_bias: GgmlStaticTensor,
-    cross_q_weight: GgmlStaticTensor,
-    cross_q_bias: GgmlStaticTensor,
-    cross_o_weight: GgmlStaticTensor,
-    cross_o_bias: GgmlStaticTensor,
-    ffn_ln_weight: GgmlStaticTensor,
-    ffn_ln_bias: GgmlStaticTensor,
-    ffn_up_weight: GgmlStaticTensor,
-    ffn_up_bias: GgmlStaticTensor,
-    ffn_down_weight: GgmlStaticTensor,
-    ffn_down_bias: GgmlStaticTensor,
+    attn_ln_weight: CohereDecoderWeightTensor,
+    attn_ln_bias: CohereDecoderWeightTensor,
+    attn_q_weight: CohereDecoderWeightTensor,
+    attn_q_bias: CohereDecoderWeightTensor,
+    attn_k_weight: CohereDecoderWeightTensor,
+    attn_k_bias: CohereDecoderWeightTensor,
+    attn_v_weight: CohereDecoderWeightTensor,
+    attn_v_bias: CohereDecoderWeightTensor,
+    attn_o_weight: CohereDecoderWeightTensor,
+    attn_o_bias: CohereDecoderWeightTensor,
+    cross_ln_weight: CohereDecoderWeightTensor,
+    cross_ln_bias: CohereDecoderWeightTensor,
+    cross_k_weight: CohereDecoderWeightTensor,
+    cross_k_bias: CohereDecoderWeightTensor,
+    cross_v_weight: CohereDecoderWeightTensor,
+    cross_v_bias: CohereDecoderWeightTensor,
+    cross_q_weight: CohereDecoderWeightTensor,
+    cross_q_bias: CohereDecoderWeightTensor,
+    cross_o_weight: CohereDecoderWeightTensor,
+    cross_o_bias: CohereDecoderWeightTensor,
+    ffn_ln_weight: CohereDecoderWeightTensor,
+    ffn_ln_bias: CohereDecoderWeightTensor,
+    ffn_up_weight: CohereDecoderWeightTensor,
+    ffn_up_bias: CohereDecoderWeightTensor,
+    ffn_down_weight: CohereDecoderWeightTensor,
+    ffn_down_bias: CohereDecoderWeightTensor,
 }
 
 #[derive(Clone, Copy)]
@@ -590,19 +627,80 @@ impl Seq2SeqGreedyDecodeStepExecutor for CohereDecoderGraphStepExecutor<'_> {
             .copied()
             .chain(input.generated_tokens.iter().copied())
             .collect::<Vec<_>>();
-        let logits = self.runtime.compute_step_logits(&prefix).map_err(|error| {
+        self.runtime.compute_step_output(&prefix).map_err(|error| {
             Seq2SeqGreedyDecodeError::DecoderStepFailed {
                 reason: error.to_string(),
             }
-        })?;
-        Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-            logits,
-            greedy_token_hint: None,
         })
     }
 }
 
 impl CohereDecoderGraphRuntime {
+    pub(crate) fn quoted_retained_system_memory_bytes(
+        metadata: CohereTranscribeExecutionMetadata,
+    ) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        for (size, label) in [
+            (
+                std::mem::size_of::<CohereDecoderLayerRuntime>(),
+                "cohere decoder runtime layer handles",
+            ),
+            (
+                std::mem::size_of::<CohereDecoderCrossCacheLayerRuntime>(),
+                "cohere decoder cross-cache handles",
+            ),
+            (
+                std::mem::size_of::<CohereDecoderSelfKvLayerRuntime>(),
+                "cohere decoder self-KV handles",
+            ),
+        ] {
+            bytes.add_usize(
+                metadata
+                    .decoder_layers
+                    .checked_mul(size)
+                    .ok_or_else(|| format!("{label} quote overflowed"))?,
+                label,
+            )?;
+        }
+        Ok(bytes.finish())
+    }
+
+    pub(crate) fn quoted_construction_peak_system_memory_bytes(
+        metadata: CohereTranscribeExecutionMetadata,
+        output_mode: DeviceGreedyStepOutputMode,
+    ) -> Result<u64, String> {
+        let retained = Self::quoted_retained_system_memory_bytes(metadata)?;
+        retained
+            .checked_add(device_top1_construction_transient_bytes(
+                metadata.vocab_size,
+                output_mode,
+            )?)
+            .ok_or_else(|| "cohere decoder construction peak overflowed".to_string())
+    }
+
+    pub(crate) fn new_from_preflight(
+        decoder_weights: &CohereTranscribeDecoderWeights,
+        metadata: CohereTranscribeExecutionMetadata,
+        decoder_state: Seq2SeqDecoderState,
+        cross_hidden_size: usize,
+        backend: GgmlCpuGraphBackend,
+        prefer_cpu_backend: bool,
+        preflight: &GgufRuntimeSourcePreflight,
+        greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    ) -> Result<Self, CohereDecoderGraphError> {
+        Self::new_with_n_seq_impl(
+            decoder_weights,
+            metadata,
+            decoder_state,
+            cross_hidden_size,
+            backend,
+            prefer_cpu_backend,
+            1,
+            Some(preflight),
+            greedy_step_output_mode,
+        )
+    }
+
     pub(crate) fn new(
         decoder_weights: &CohereTranscribeDecoderWeights,
         metadata: CohereTranscribeExecutionMetadata,
@@ -631,6 +729,31 @@ impl CohereDecoderGraphRuntime {
         prefer_cpu_backend: bool,
         n_seq: usize,
     ) -> Result<Self, CohereDecoderGraphError> {
+        Self::new_with_n_seq_impl(
+            decoder_weights,
+            metadata,
+            decoder_state,
+            cross_hidden_size,
+            backend,
+            prefer_cpu_backend,
+            n_seq,
+            None,
+            DeviceGreedyStepOutputMode::FullLogits,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_n_seq_impl(
+        decoder_weights: &CohereTranscribeDecoderWeights,
+        metadata: CohereTranscribeExecutionMetadata,
+        decoder_state: Seq2SeqDecoderState,
+        cross_hidden_size: usize,
+        backend: GgmlCpuGraphBackend,
+        prefer_cpu_backend: bool,
+        n_seq: usize,
+        runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
+        greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    ) -> Result<Self, CohereDecoderGraphError> {
         decoder_state
             .validate()
             .map_err(|error| CohereDecoderGraphError::InvalidInput {
@@ -639,6 +762,11 @@ impl CohereDecoderGraphRuntime {
         if n_seq == 0 {
             return Err(CohereDecoderGraphError::InvalidInput {
                 reason: "cohere decoder n_seq must be positive".to_string(),
+            });
+        }
+        if n_seq != 1 && greedy_step_output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
+            return Err(CohereDecoderGraphError::InvalidInput {
+                reason: "cohere device top-1 requires n_seq=1".to_string(),
             });
         }
         validate_decoder_runtime_shapes(decoder_weights, metadata)?;
@@ -673,18 +801,33 @@ impl CohereDecoderGraphRuntime {
                 source,
             }
         })?;
+        let loaded_weights = runtime_preflight
+            .map(|preflight| {
+                runner
+                    .load_gguf_weight_context_from_preflight(preflight)
+                    .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
+                        step: "load_gguf_weight_context",
+                        source,
+                    })
+            })
+            .transpose()?;
         let arena_state = build_cohere_decoder_arena_state(
             &runner,
+            loaded_weights.as_ref(),
             decoder_weights,
             metadata,
             cross_hidden_size,
             decoder_state.self_attention.resident_positions,
             cross_alloc_frames,
             n_seq,
+            greedy_step_output_mode,
         )?;
 
         Ok(Self {
             reuse: None,
+            argmax_reverse_indices: arena_state.argmax_reverse_indices,
+            greedy_step_output_mode,
+            loaded_weights,
             metadata,
             runner,
             arena: arena_state.arena,
@@ -705,6 +848,33 @@ impl CohereDecoderGraphRuntime {
             cached_positions: 0,
             n_seq,
         })
+    }
+
+    pub(crate) fn graph_lane(&self) -> (GgmlCpuGraphBackend, bool) {
+        (self.runner.backend_kind(), self.runner.uses_scheduler())
+    }
+
+    pub(crate) fn loaded_weight_binding_identity(&self) -> Option<GgmlLoadedWeightBindingIdentity> {
+        self.loaded_weights
+            .as_ref()
+            .map(|loaded| self.runner.loaded_weight_binding_identity(loaded))
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.layers, "cohere decoder runtime layer handles")?;
+        bytes.add_vec(&self.cross_layers, "cohere decoder cross-cache handles")?;
+        bytes.add_vec(&self.self_kv_layers, "cohere decoder self-KV handles")?;
+        Ok(bytes.finish())
+    }
+
+    pub(crate) fn construction_peak_system_memory_bytes(&self) -> Result<u64, String> {
+        self.retained_system_memory_bytes()?
+            .checked_add(device_top1_construction_transient_bytes(
+                self.metadata.vocab_size,
+                self.greedy_step_output_mode,
+            )?)
+            .ok_or_else(|| "cohere decoder construction peak overflowed".to_string())
     }
 
     pub(crate) fn activate_decoder_state(
@@ -759,14 +929,15 @@ impl CohereDecoderGraphRuntime {
 /// tensor declaration and upload transaction cohesive.
 struct CohereDecoderArenaState {
     arena: GgmlStaticTensorArena,
-    token_embedding: GgmlStaticTensor,
-    positional_embedding: GgmlStaticTensor,
-    emb_ln_weight: GgmlStaticTensor,
-    emb_ln_bias: GgmlStaticTensor,
-    out_ln_weight: GgmlStaticTensor,
-    out_ln_bias: GgmlStaticTensor,
-    output_head_weight: GgmlStaticTensor,
-    output_head_bias: GgmlStaticTensor,
+    argmax_reverse_indices: Option<GgmlStaticTensor>,
+    token_embedding: CohereDecoderWeightTensor,
+    positional_embedding: CohereDecoderWeightTensor,
+    emb_ln_weight: CohereDecoderWeightTensor,
+    emb_ln_bias: CohereDecoderWeightTensor,
+    out_ln_weight: CohereDecoderWeightTensor,
+    out_ln_bias: CohereDecoderWeightTensor,
+    output_head_weight: CohereDecoderWeightTensor,
+    output_head_bias: CohereDecoderWeightTensor,
     layers: Vec<CohereDecoderLayerRuntime>,
     cross_layers: Vec<CohereDecoderCrossCacheLayerRuntime>,
     self_kv_layers: Vec<CohereDecoderSelfKvLayerRuntime>,
@@ -775,21 +946,29 @@ struct CohereDecoderArenaState {
 #[allow(clippy::too_many_arguments)]
 fn build_cohere_decoder_arena_state(
     runner: &GgmlCpuGraphRunner,
+    loaded_weights: Option<&GgmlLoadedWeightContext>,
     decoder_weights: &CohereTranscribeDecoderWeights,
     metadata: CohereTranscribeExecutionMetadata,
     cross_hidden_size: usize,
     self_kv_alloc_positions: usize,
     cross_alloc_frames: usize,
     n_seq: usize,
+    greedy_step_output_mode: DeviceGreedyStepOutputMode,
 ) -> Result<CohereDecoderArenaState, CohereDecoderGraphError> {
     let arena_tensor_count = decoder_weights
         .layers
         .len()
         .checked_mul(30)
         .and_then(|count| count.checked_add(8))
+        .and_then(|count| {
+            count.checked_add(
+                (greedy_step_output_mode == DeviceGreedyStepOutputMode::DeviceTop1) as usize,
+            )
+        })
         .ok_or_else(|| CohereDecoderGraphError::InvalidInput {
             reason: "cohere decoder static tensor count overflows usize".to_string(),
         })?;
+
     let mut arena = runner
         .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(
             arena_tensor_count,
@@ -798,133 +977,228 @@ fn build_cohere_decoder_arena_state(
             step: "static_tensor_arena",
             source,
         })?;
+    let argmax_reverse_indices =
+        if greedy_step_output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
+            Some(
+                arena
+                    .new_tensor_1d_i32(metadata.vocab_size, "cohere_dec_argmax_reverse_indices")
+                    .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
+                        step: "argmax_reverse_indices",
+                        source,
+                    })?,
+            )
+        } else {
+            None
+        };
 
-    let token_embedding =
-        new_embedding_tensor_in_arena(&arena, &decoder_weights.token_embedding, "dec_emb")?;
-    let positional_embedding =
-        new_embedding_tensor_in_arena(&arena, &decoder_weights.positional_embedding, "dec_pos")?;
-    let emb_ln_weight =
-        new_vector_tensor_in_arena(&arena, decoder_weights.emb_ln_weight.len, "dec_emb_ln_w")?;
-    let emb_ln_bias =
-        new_vector_tensor_in_arena(&arena, decoder_weights.emb_ln_bias.len, "dec_emb_ln_b")?;
-    let out_ln_weight =
-        new_vector_tensor_in_arena(&arena, decoder_weights.out_ln_weight.len, "dec_out_ln_w")?;
-    let out_ln_bias =
-        new_vector_tensor_in_arena(&arena, decoder_weights.out_ln_bias.len, "dec_out_ln_b")?;
-    let output_head_weight =
-        new_projection_tensor_in_arena(&arena, &decoder_weights.output_head_weight, "dec_head")?;
-    let output_head_bias =
-        new_vector_tensor_in_arena(&arena, decoder_weights.output_head_bias.len, "dec_head_b")?;
+    let token_embedding = decoder_embedding_tensor(
+        loaded_weights,
+        &arena,
+        &decoder_weights.token_embedding,
+        "dec_emb",
+    )?;
+    let positional_embedding = decoder_embedding_tensor(
+        loaded_weights,
+        &arena,
+        &decoder_weights.positional_embedding,
+        "dec_pos",
+    )?;
+    let emb_ln_weight = decoder_vector_tensor(
+        loaded_weights,
+        &arena,
+        &decoder_weights.emb_ln_weight,
+        "dec_emb_ln_w",
+    )?;
+    let emb_ln_bias = decoder_vector_tensor(
+        loaded_weights,
+        &arena,
+        &decoder_weights.emb_ln_bias,
+        "dec_emb_ln_b",
+    )?;
+    let out_ln_weight = decoder_vector_tensor(
+        loaded_weights,
+        &arena,
+        &decoder_weights.out_ln_weight,
+        "dec_out_ln_w",
+    )?;
+    let out_ln_bias = decoder_vector_tensor(
+        loaded_weights,
+        &arena,
+        &decoder_weights.out_ln_bias,
+        "dec_out_ln_b",
+    )?;
+    let output_head_weight = decoder_projection_tensor(
+        loaded_weights,
+        &arena,
+        &decoder_weights.output_head_weight,
+        "dec_head",
+    )?;
+    let output_head_bias = decoder_vector_tensor(
+        loaded_weights,
+        &arena,
+        &decoder_weights.output_head_bias,
+        "dec_head_b",
+    )?;
 
     let mut layers = Vec::with_capacity(decoder_weights.layers.len());
     let mut cross_layers = Vec::with_capacity(decoder_weights.layers.len());
     let mut self_kv_layers = Vec::with_capacity(decoder_weights.layers.len());
     for layer in &decoder_weights.layers {
         let runtime = CohereDecoderLayerRuntime {
-            attn_ln_weight: new_vector_tensor_in_arena(
+            attn_ln_weight: decoder_vector_tensor(
+                loaded_weights,
                 &arena,
-                layer.attn_ln_weight.len,
+                &layer.attn_ln_weight,
                 "dec_attn_ln_w",
             )?,
-            attn_ln_bias: new_vector_tensor_in_arena(
+            attn_ln_bias: decoder_vector_tensor(
+                loaded_weights,
                 &arena,
-                layer.attn_ln_bias.len,
+                &layer.attn_ln_bias,
                 "dec_attn_ln_b",
             )?,
-            attn_q_weight: new_projection_tensor_in_arena(
+            attn_q_weight: decoder_projection_tensor(
+                loaded_weights,
                 &arena,
                 &layer.attn_q_weight,
                 "dec_attn_q_w",
             )?,
-            attn_q_bias: new_vector_tensor_in_arena(&arena, layer.attn_q_bias.len, "dec_attn_q_b")?,
-            attn_k_weight: new_projection_tensor_in_arena(
+            attn_q_bias: decoder_vector_tensor(
+                loaded_weights,
+                &arena,
+                &layer.attn_q_bias,
+                "dec_attn_q_b",
+            )?,
+            attn_k_weight: decoder_projection_tensor(
+                loaded_weights,
                 &arena,
                 &layer.attn_k_weight,
                 "dec_attn_k_w",
             )?,
-            attn_k_bias: new_vector_tensor_in_arena(&arena, layer.attn_k_bias.len, "dec_attn_k_b")?,
-            attn_v_weight: new_projection_tensor_in_arena(
+            attn_k_bias: decoder_vector_tensor(
+                loaded_weights,
+                &arena,
+                &layer.attn_k_bias,
+                "dec_attn_k_b",
+            )?,
+            attn_v_weight: decoder_projection_tensor(
+                loaded_weights,
                 &arena,
                 &layer.attn_v_weight,
                 "dec_attn_v_w",
             )?,
-            attn_v_bias: new_vector_tensor_in_arena(&arena, layer.attn_v_bias.len, "dec_attn_v_b")?,
-            attn_o_weight: new_projection_tensor_in_arena(
+            attn_v_bias: decoder_vector_tensor(
+                loaded_weights,
+                &arena,
+                &layer.attn_v_bias,
+                "dec_attn_v_b",
+            )?,
+            attn_o_weight: decoder_projection_tensor(
+                loaded_weights,
                 &arena,
                 &layer.attn_o_weight,
                 "dec_attn_o_w",
             )?,
-            attn_o_bias: new_vector_tensor_in_arena(&arena, layer.attn_o_bias.len, "dec_attn_o_b")?,
-            cross_ln_weight: new_vector_tensor_in_arena(
+            attn_o_bias: decoder_vector_tensor(
+                loaded_weights,
                 &arena,
-                layer.cross_ln_weight.len,
+                &layer.attn_o_bias,
+                "dec_attn_o_b",
+            )?,
+            cross_ln_weight: decoder_vector_tensor(
+                loaded_weights,
+                &arena,
+                &layer.cross_ln_weight,
                 "dec_cross_ln_w",
             )?,
-            cross_ln_bias: new_vector_tensor_in_arena(
+            cross_ln_bias: decoder_vector_tensor(
+                loaded_weights,
                 &arena,
-                layer.cross_ln_bias.len,
+                &layer.cross_ln_bias,
                 "dec_cross_ln_b",
             )?,
-            cross_k_weight: new_projection_tensor_in_arena(
+            cross_k_weight: decoder_projection_tensor(
+                loaded_weights,
                 &arena,
                 &layer.cross_k_weight,
                 "dec_cross_k_w",
             )?,
-            cross_k_bias: new_vector_tensor_in_arena(
+            cross_k_bias: decoder_vector_tensor(
+                loaded_weights,
                 &arena,
-                layer.cross_k_bias.len,
+                &layer.cross_k_bias,
                 "dec_cross_k_b",
             )?,
-            cross_v_weight: new_projection_tensor_in_arena(
+            cross_v_weight: decoder_projection_tensor(
+                loaded_weights,
                 &arena,
                 &layer.cross_v_weight,
                 "dec_cross_v_w",
             )?,
-            cross_v_bias: new_vector_tensor_in_arena(
+            cross_v_bias: decoder_vector_tensor(
+                loaded_weights,
                 &arena,
-                layer.cross_v_bias.len,
+                &layer.cross_v_bias,
                 "dec_cross_v_b",
             )?,
-            cross_q_weight: new_projection_tensor_in_arena(
+            cross_q_weight: decoder_projection_tensor(
+                loaded_weights,
                 &arena,
                 &layer.cross_q_weight,
                 "dec_cross_q_w",
             )?,
-            cross_q_bias: new_vector_tensor_in_arena(
+            cross_q_bias: decoder_vector_tensor(
+                loaded_weights,
                 &arena,
-                layer.cross_q_bias.len,
+                &layer.cross_q_bias,
                 "dec_cross_q_b",
             )?,
-            cross_o_weight: new_projection_tensor_in_arena(
+            cross_o_weight: decoder_projection_tensor(
+                loaded_weights,
                 &arena,
                 &layer.cross_o_weight,
                 "dec_cross_o_w",
             )?,
-            cross_o_bias: new_vector_tensor_in_arena(
+            cross_o_bias: decoder_vector_tensor(
+                loaded_weights,
                 &arena,
-                layer.cross_o_bias.len,
+                &layer.cross_o_bias,
                 "dec_cross_o_b",
             )?,
-            ffn_ln_weight: new_vector_tensor_in_arena(
+            ffn_ln_weight: decoder_vector_tensor(
+                loaded_weights,
                 &arena,
-                layer.ffn_ln_weight.len,
+                &layer.ffn_ln_weight,
                 "dec_ffn_ln_w",
             )?,
-            ffn_ln_bias: new_vector_tensor_in_arena(&arena, layer.ffn_ln_bias.len, "dec_ffn_ln_b")?,
-            ffn_up_weight: new_projection_tensor_in_arena(
+            ffn_ln_bias: decoder_vector_tensor(
+                loaded_weights,
+                &arena,
+                &layer.ffn_ln_bias,
+                "dec_ffn_ln_b",
+            )?,
+            ffn_up_weight: decoder_projection_tensor(
+                loaded_weights,
                 &arena,
                 &layer.ffn_up_weight,
                 "dec_ffn_up_w",
             )?,
-            ffn_up_bias: new_vector_tensor_in_arena(&arena, layer.ffn_up_bias.len, "dec_ffn_up_b")?,
-            ffn_down_weight: new_projection_tensor_in_arena(
+            ffn_up_bias: decoder_vector_tensor(
+                loaded_weights,
+                &arena,
+                &layer.ffn_up_bias,
+                "dec_ffn_up_b",
+            )?,
+            ffn_down_weight: decoder_projection_tensor(
+                loaded_weights,
                 &arena,
                 &layer.ffn_down_weight,
                 "dec_ffn_down_w",
             )?,
-            ffn_down_bias: new_vector_tensor_in_arena(
+            ffn_down_bias: decoder_vector_tensor(
+                loaded_weights,
                 &arena,
-                layer.ffn_down_bias.len,
+                &layer.ffn_down_bias,
                 "dec_ffn_down_b",
             )?,
         };
@@ -972,6 +1246,19 @@ fn build_cohere_decoder_arena_state(
             )?,
             max_positions: self_kv_alloc_positions,
         });
+    }
+
+    // The legacy Static path allocates this arena as a side effect of the
+    // first weight upload below. A loaded-weight runtime skips every such
+    // upload, but its persistent cross/self-KV roots still live in this
+    // arena and must be bound before graph code creates views of them.
+    if loaded_weights.is_some() {
+        arena.allocate_backend_buffer().map_err(|source| {
+            CohereDecoderGraphError::GraphBuildFailed {
+                step: "allocate_decoder_state_arena",
+                source,
+            }
+        })?;
     }
 
     upload_embedding_to_arena(
@@ -1025,9 +1312,27 @@ fn build_cohere_decoder_arena_state(
     for (layer_idx, (runtime, layer)) in layers.iter().zip(&decoder_weights.layers).enumerate() {
         upload_decoder_layer_to_arena(&mut arena, runtime, layer, layer_idx)?;
     }
+    if let Some(reverse_indices) = argmax_reverse_indices {
+        arena
+            .set_i32_slice(
+                reverse_indices,
+                &first_max_argmax_reverse_indices(metadata.vocab_size).map_err(|source| {
+                    CohereDecoderGraphError::GraphBuildFailed {
+                        step: "argmax_reverse_indices",
+                        source,
+                    }
+                })?,
+                "cohere_dec_argmax_reverse_indices",
+            )
+            .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
+                step: "argmax_reverse_indices",
+                source,
+            })?;
+    }
 
     Ok(CohereDecoderArenaState {
         arena,
+        argmax_reverse_indices,
         token_embedding,
         positional_embedding,
         emb_ln_weight,
@@ -1129,8 +1434,8 @@ impl CohereDecoderGraphRuntime {
             let key_rows = apply_linear_with_bias(
                 &graph,
                 encoder_rows,
-                self.arena.graph_tensor(layer.cross_k_weight),
-                self.arena.graph_tensor(layer.cross_k_bias),
+                layer.cross_k_weight.as_graph_tensor(),
+                layer.cross_k_bias.as_graph_tensor(),
                 "decoder_cross_cache_k",
             )?;
             let key_target = cross_cache_slot_target(
@@ -1158,8 +1463,8 @@ impl CohereDecoderGraphRuntime {
             let value_rows = apply_linear_with_bias(
                 &graph,
                 encoder_rows,
-                self.arena.graph_tensor(layer.cross_v_weight),
-                self.arena.graph_tensor(layer.cross_v_bias),
+                layer.cross_v_weight.as_graph_tensor(),
+                layer.cross_v_bias.as_graph_tensor(),
                 "decoder_cross_cache_v",
             )?;
             let value_target = cross_cache_slot_target(
@@ -1223,6 +1528,23 @@ impl CohereDecoderGraphRuntime {
         &mut self,
         decoder_tokens: &[u32],
     ) -> Result<Vec<f32>, CohereDecoderGraphError> {
+        Ok(self
+            .compute_step_output_with_mode(decoder_tokens, DeviceGreedyStepOutputMode::FullLogits)?
+            .logits)
+    }
+
+    fn compute_step_output(
+        &mut self,
+        decoder_tokens: &[u32],
+    ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, CohereDecoderGraphError> {
+        self.compute_step_output_with_mode(decoder_tokens, self.greedy_step_output_mode)
+    }
+
+    fn compute_step_output_with_mode(
+        &mut self,
+        decoder_tokens: &[u32],
+        output_mode: DeviceGreedyStepOutputMode,
+    ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, CohereDecoderGraphError> {
         if self.n_seq != 1 {
             return Err(CohereDecoderGraphError::InvalidInput {
                 reason: "single cohere decode step requires n_seq=1".to_string(),
@@ -1275,7 +1597,11 @@ impl CohereDecoderGraphRuntime {
             .checked_add(token_count)
             .ok_or(CohereDecoderGraphError::ShapeOverflow)?;
         if position_offset > 0 && token_count == 1 && self.supports_reusable_decode_graph() {
-            return self.compute_reused_incremental_step_logits(decode_tokens[0], position_offset);
+            return self.compute_reused_incremental_step_output(
+                decode_tokens[0],
+                position_offset,
+                output_mode,
+            );
         }
         let mut graph = self.runner.start_graph();
         let hidden = self.metadata.decoder_d_model;
@@ -1377,17 +1703,14 @@ impl CohereDecoderGraphRuntime {
         }
 
         let token_state = graph
-            .get_rows(
-                self.arena.graph_tensor(self.token_embedding),
-                token_ids_tensor,
-            )
+            .get_rows(self.token_embedding.as_graph_tensor(), token_ids_tensor)
             .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
                 step: "ggml_get_rows(token)",
                 source,
             })?;
         let position_state = graph
             .get_rows(
-                self.arena.graph_tensor(self.positional_embedding),
+                self.positional_embedding.as_graph_tensor(),
                 position_ids_tensor,
             )
             .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
@@ -1403,8 +1726,8 @@ impl CohereDecoderGraphRuntime {
         state = apply_affine_norm(
             &graph,
             state,
-            self.arena.graph_tensor(self.emb_ln_weight),
-            self.arena.graph_tensor(self.emb_ln_bias),
+            self.emb_ln_weight.as_graph_tensor(),
+            self.emb_ln_bias.as_graph_tensor(),
             "decoder_emb_norm",
         )?;
         let mut prompt_debug_tensors = Some(CoherePromptDebugTensors {
@@ -1442,8 +1765,8 @@ impl CohereDecoderGraphRuntime {
         state = apply_affine_norm(
             &graph,
             state,
-            self.arena.graph_tensor(self.out_ln_weight),
-            self.arena.graph_tensor(self.out_ln_bias),
+            self.out_ln_weight.as_graph_tensor(),
+            self.out_ln_bias.as_graph_tensor(),
             "decoder_out_norm",
         )?;
         if position_offset == 0
@@ -1453,23 +1776,44 @@ impl CohereDecoderGraphRuntime {
         }
         let last_state = view_last_token_state(&graph, state, hidden, token_count)?;
         let logits = graph
-            .mul_mat(self.arena.graph_tensor(self.output_head_weight), last_state)
+            .mul_mat(self.output_head_weight.as_graph_tensor(), last_state)
             .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
                 step: "ggml_mul_mat(output_head)",
                 source,
             })?;
         let logits = graph
-            .add(logits, self.arena.graph_tensor(self.output_head_bias))
+            .add(logits, self.output_head_bias.as_graph_tensor())
             .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
                 step: "ggml_add(output_head_bias)",
                 source,
             })?;
-        graph
-            .set_output(logits)
-            .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
+        let top1 = if output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
+            let reverse_indices = self.argmax_reverse_indices.ok_or_else(|| {
+                CohereDecoderGraphError::InvalidInput {
+                    reason: "cohere device top-1 reverse indices are unavailable".to_string(),
+                }
+            })?;
+            Some(
+                graph
+                    .top1_argmax_first_max_reversed(
+                        logits,
+                        self.arena.graph_tensor(reverse_indices),
+                    )
+                    .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
+                        step: "ggml_argmax(top1)",
+                        source,
+                    })?,
+            )
+        } else {
+            None
+        };
+        let output_root = top1.unwrap_or(logits);
+        graph.set_output(output_root).map_err(|source| {
+            CohereDecoderGraphError::GraphBuildFailed {
                 step: "ggml_set_output(logits)",
                 source,
-            })?;
+            }
+        })?;
         let debug_prompt_step =
             std::env::var_os("OPENASR_COHERE_DEBUG_TOKENS").is_some() && position_offset == 0;
         // When the debug-token dump is enabled, the intermediate taps below must
@@ -1508,7 +1852,7 @@ impl CohereDecoderGraphRuntime {
         // liveness-based buffer reuse before uploading inputs, same ordering as
         // the sibling firered/moonshine decoders.
         graph
-            .prepare_outputs_for_upload(&[logits])
+            .prepare_outputs_for_upload(&[output_root])
             .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
                 step: "ggml_prepare_outputs(logits)",
                 source,
@@ -1517,6 +1861,11 @@ impl CohereDecoderGraphRuntime {
             upload.apply(&mut graph)?;
         }
         let output = if debug_prompt_step {
+            if top1.is_some() {
+                return Err(CohereDecoderGraphError::InvalidInput {
+                    reason: "cohere debug-token output requires full logits".to_string(),
+                });
+            }
             let debug = prompt_debug_tensors.ok_or(CohereDecoderGraphError::InvalidInput {
                 reason: "missing prompt debug tensors for first decoder layer".to_string(),
             })?;
@@ -1539,24 +1888,27 @@ impl CohereDecoderGraphRuntime {
                     reason: error.to_string(),
                 })?;
             emit_cohere_debug_prompt_intermediates_if_enabled(&outputs);
-            outputs
-                .into_iter()
-                .next()
-                .ok_or(CohereDecoderGraphError::InvalidInput {
-                    reason: "missing logits output".to_string(),
-                })?
+            Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits: outputs.into_iter().next().ok_or(
+                    CohereDecoderGraphError::InvalidInput {
+                        reason: "missing logits output".to_string(),
+                    },
+                )?,
+                greedy_token_hint: None,
+            }
         } else {
-            graph
-                .compute_output_f32(logits, self.metadata.vocab_size)
-                .map_err(|error| CohereDecoderGraphError::GraphExecutionFailed {
-                    reason: error.to_string(),
-                })?
+            compute_greedy_step_output_for_graph(
+                &mut graph,
+                logits,
+                top1,
+                self.metadata.vocab_size,
+            )?
         };
         emit_cohere_debug_step_logits_if_enabled(
             decode_tokens,
             position_offset,
             total_token_count,
-            &output,
+            &output.logits,
         );
         self.cached_positions = if use_incremental_self_kv {
             total_token_count
@@ -1570,11 +1922,12 @@ impl CohereDecoderGraphRuntime {
         reusable_decode_graph_supported_for_runner(&self.runner)
     }
 
-    fn compute_reused_incremental_step_logits(
+    fn compute_reused_incremental_step_output(
         &mut self,
         token_id: u32,
         position: usize,
-    ) -> Result<Vec<f32>, CohereDecoderGraphError> {
+        output_mode: DeviceGreedyStepOutputMode,
+    ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, CohereDecoderGraphError> {
         let logical_max_positions = self.decoder_state.self_attention.logical_positions;
         if position >= logical_max_positions {
             return Err(CohereDecoderGraphError::InvalidInput {
@@ -1613,10 +1966,12 @@ impl CohereDecoderGraphRuntime {
                     || reuse.max_positions != logical_max_positions
                     || reuse.n_seq != 1
                     || self.reuse_cross_frame_count != active_cross_frame_count
+                    || reuse.top1.is_some()
+                        != (output_mode == DeviceGreedyStepOutputMode::DeviceTop1)
             })
             .unwrap_or(true);
         if needs_build {
-            self.build_reusable_decode_graph()?;
+            self.build_reusable_decode_graph(output_mode)?;
         }
 
         let reuse = self
@@ -1628,6 +1983,7 @@ impl CohereDecoderGraphRuntime {
         let position_tensor = reuse.position;
         let attention_mask = reuse.attention_mask;
         let logits = reuse.logits;
+        let top1 = reuse.top1;
         let max_positions = reuse.max_positions;
         let graph = reuse.builder();
 
@@ -1663,11 +2019,8 @@ impl CohereDecoderGraphRuntime {
                 source,
             })?;
 
-        let output = graph
-            .compute_output_f32(logits, self.metadata.vocab_size)
-            .map_err(|error| CohereDecoderGraphError::GraphExecutionFailed {
-                reason: error.to_string(),
-            })?;
+        let output =
+            compute_greedy_step_output_for_graph(graph, logits, top1, self.metadata.vocab_size)?;
         self.cached_positions = total_tokens;
         Ok(output)
     }
@@ -1750,7 +2103,7 @@ impl CohereDecoderGraphRuntime {
             })
             .unwrap_or(true);
         if needs_build {
-            self.build_reusable_decode_graph()?;
+            self.build_reusable_decode_graph(DeviceGreedyStepOutputMode::FullLogits)?;
         }
 
         let reuse = self
@@ -1901,19 +2254,13 @@ impl CohereDecoderGraphRuntime {
         })?;
 
         let token_state = graph
-            .get_rows(
-                self.arena.graph_tensor(self.token_embedding),
-                token_ids_tensor,
-            )
+            .get_rows(self.token_embedding.as_graph_tensor(), token_ids_tensor)
             .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
                 step: "ggml_get_rows(prefill_token)",
                 source,
             })?;
         let position_state = graph
-            .get_rows(
-                self.arena.graph_tensor(self.positional_embedding),
-                position_tensor,
-            )
+            .get_rows(self.positional_embedding.as_graph_tensor(), position_tensor)
             .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
                 step: "ggml_get_rows(prefill_position)",
                 source,
@@ -1927,8 +2274,8 @@ impl CohereDecoderGraphRuntime {
         state = apply_affine_norm(
             &graph,
             state,
-            self.arena.graph_tensor(self.emb_ln_weight),
-            self.arena.graph_tensor(self.emb_ln_bias),
+            self.emb_ln_weight.as_graph_tensor(),
+            self.emb_ln_bias.as_graph_tensor(),
             "prefill_decoder_emb_norm",
         )?;
         let mut uploads = Vec::new();
@@ -1955,20 +2302,20 @@ impl CohereDecoderGraphRuntime {
         state = apply_affine_norm(
             &graph,
             state,
-            self.arena.graph_tensor(self.out_ln_weight),
-            self.arena.graph_tensor(self.out_ln_bias),
+            self.out_ln_weight.as_graph_tensor(),
+            self.out_ln_bias.as_graph_tensor(),
             "prefill_decoder_out_norm",
         )?;
         let last_state =
             view_batched_last_token_state(&graph, state, hidden, token_count, self.n_seq)?;
         let logits = graph
-            .mul_mat(self.arena.graph_tensor(self.output_head_weight), last_state)
+            .mul_mat(self.output_head_weight.as_graph_tensor(), last_state)
             .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
                 step: "ggml_mul_mat(prefill_output_head)",
                 source,
             })?;
         let bias = graph
-            .repeat(self.arena.graph_tensor(self.output_head_bias), logits)
+            .repeat(self.output_head_bias.as_graph_tensor(), logits)
             .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
                 step: "ggml_repeat(prefill_output_head_bias)",
                 source,
@@ -2035,7 +2382,15 @@ impl CohereDecoderGraphRuntime {
         Ok(output)
     }
 
-    fn build_reusable_decode_graph(&mut self) -> Result<(), CohereDecoderGraphError> {
+    fn build_reusable_decode_graph(
+        &mut self,
+        output_mode: DeviceGreedyStepOutputMode,
+    ) -> Result<(), CohereDecoderGraphError> {
+        if self.n_seq != 1 && output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
+            return Err(CohereDecoderGraphError::InvalidInput {
+                reason: "cohere device top-1 requires n_seq=1".to_string(),
+            });
+        }
         let hidden = self.metadata.decoder_d_model;
         let max_context = self.decoder_state.self_attention.logical_positions;
         let n_seq = self.n_seq;
@@ -2120,13 +2475,13 @@ impl CohereDecoderGraphRuntime {
         })?;
 
         let token_state = graph
-            .get_rows(self.arena.graph_tensor(self.token_embedding), token_id)
+            .get_rows(self.token_embedding.as_graph_tensor(), token_id)
             .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
                 step: "ggml_get_rows(reuse_token)",
                 source,
             })?;
         let position_state = graph
-            .get_rows(self.arena.graph_tensor(self.positional_embedding), position)
+            .get_rows(self.positional_embedding.as_graph_tensor(), position)
             .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
                 step: "ggml_get_rows(reuse_position)",
                 source,
@@ -2140,8 +2495,8 @@ impl CohereDecoderGraphRuntime {
         state = apply_affine_norm(
             graph,
             state,
-            self.arena.graph_tensor(self.emb_ln_weight),
-            self.arena.graph_tensor(self.emb_ln_bias),
+            self.emb_ln_weight.as_graph_tensor(),
+            self.emb_ln_bias.as_graph_tensor(),
             "reuse_decoder_emb_norm",
         )?;
         let mut uploads = Vec::new();
@@ -2168,8 +2523,8 @@ impl CohereDecoderGraphRuntime {
         state = apply_affine_norm(
             graph,
             state,
-            self.arena.graph_tensor(self.out_ln_weight),
-            self.arena.graph_tensor(self.out_ln_bias),
+            self.out_ln_weight.as_graph_tensor(),
+            self.out_ln_bias.as_graph_tensor(),
             "reuse_decoder_out_norm",
         )?;
         let last_state = if n_seq == 1 {
@@ -2178,12 +2533,12 @@ impl CohereDecoderGraphRuntime {
             state
         };
         let logits = graph
-            .mul_mat(self.arena.graph_tensor(self.output_head_weight), last_state)
+            .mul_mat(self.output_head_weight.as_graph_tensor(), last_state)
             .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
                 step: "ggml_mul_mat(reuse_output_head)",
                 source,
             })?;
-        let output_head_bias = self.arena.graph_tensor(self.output_head_bias);
+        let output_head_bias = self.output_head_bias.as_graph_tensor();
         let logits = if n_seq == 1 {
             graph.add(logits, output_head_bias).map_err(|source| {
                 CohereDecoderGraphError::GraphBuildFailed {
@@ -2205,31 +2560,117 @@ impl CohereDecoderGraphRuntime {
                     source,
                 })?
         };
-        graph
-            .set_output(logits)
-            .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
+        let top1 = if output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
+            let reverse_indices = self.argmax_reverse_indices.ok_or_else(|| {
+                CohereDecoderGraphError::InvalidInput {
+                    reason: "cohere device top-1 reverse indices are unavailable".to_string(),
+                }
+            })?;
+            Some(
+                graph
+                    .top1_argmax_first_max_reversed(
+                        logits,
+                        self.arena.graph_tensor(reverse_indices),
+                    )
+                    .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
+                        step: "ggml_argmax(reuse_top1)",
+                        source,
+                    })?,
+            )
+        } else {
+            None
+        };
+        let output_root = top1.unwrap_or(logits);
+        graph.set_output(output_root).map_err(|source| {
+            CohereDecoderGraphError::GraphBuildFailed {
                 step: "ggml_set_output(reuse_logits)",
                 source,
-            })?;
+            }
+        })?;
         graph
-            .prepare_outputs_for_upload(&[logits])
+            .prepare_outputs_for_upload(&[output_root])
             .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
                 step: "ggml_prepare_outputs(reuse_logits)",
                 source,
             })?;
 
-        self.reuse = Some(Seq2SeqReusableDecodeGraph::new_with_borrowed_kv_arena(
-            session,
-            max_context,
-            n_seq,
-            token_id,
-            row_index,
-            position,
-            attention_mask,
-            logits,
-        ));
+        self.reuse = Some(
+            Seq2SeqReusableDecodeGraph::new_with_borrowed_kv_arena_and_optional_top1(
+                session,
+                max_context,
+                n_seq,
+                token_id,
+                row_index,
+                position,
+                attention_mask,
+                logits,
+                top1,
+            ),
+        );
         self.reuse_cross_frame_count = active_cross_frame_count;
         Ok(())
+    }
+}
+
+fn device_top1_construction_transient_bytes(
+    vocab_size: usize,
+    output_mode: DeviceGreedyStepOutputMode,
+) -> Result<u64, String> {
+    if output_mode == DeviceGreedyStepOutputMode::FullLogits {
+        return Ok(0);
+    }
+    let bytes = vocab_size
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or_else(|| "cohere device top-1 construction bytes overflowed".to_string())?;
+    u64::try_from(bytes)
+        .map_err(|_| "cohere device top-1 construction bytes exceed u64".to_string())
+}
+
+fn map_reversed_top1_token(
+    reversed_token_id: i32,
+    vocab_size: usize,
+) -> Result<u32, CohereDecoderGraphError> {
+    let token_id = first_max_token_id_from_reversed_argmax(reversed_token_id, vocab_size).map_err(
+        |error| CohereDecoderGraphError::GraphExecutionFailed {
+            reason: error.to_string(),
+        },
+    )?;
+    u32::try_from(token_id).map_err(|_| CohereDecoderGraphError::GraphExecutionFailed {
+        reason: "cohere device top-1 token id does not fit u32".to_string(),
+    })
+}
+
+fn compute_greedy_step_output_for_graph<'a>(
+    graph: &mut crate::ggml_runtime::GgmlCpuGraphBuilder<'a>,
+    logits: GgmlCpuTensor<'a>,
+    top1: Option<GgmlCpuTensor<'a>>,
+    vocab_size: usize,
+) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, CohereDecoderGraphError> {
+    match top1 {
+        Some(top1) => {
+            let reversed_token_id = graph
+                .compute_output_i32(top1, 1)
+                .map_err(|error| CohereDecoderGraphError::GraphExecutionFailed {
+                    reason: error.to_string(),
+                })?
+                .into_iter()
+                .next()
+                .ok_or_else(|| CohereDecoderGraphError::GraphExecutionFailed {
+                    reason: "cohere device top-1 returned no token id".to_string(),
+                })?;
+            Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits: Vec::new(),
+                greedy_token_hint: Some(map_reversed_top1_token(reversed_token_id, vocab_size)?),
+            })
+        }
+        None => Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+            logits: graph
+                .compute_output_f32(logits, vocab_size)
+                .map_err(|error| CohereDecoderGraphError::GraphExecutionFailed {
+                    reason: error.to_string(),
+                })?,
+            greedy_token_hint: None,
+        }),
     }
 }
 
@@ -2666,6 +3107,82 @@ fn new_vector_tensor_in_arena(
     })
 }
 
+fn loaded_decoder_tensor(
+    loaded: &GgmlLoadedWeightContext,
+    tensor_name: &str,
+) -> Result<GgmlLoadedTensor, CohereDecoderGraphError> {
+    loaded
+        .tensor(tensor_name)
+        .ok_or_else(|| CohereDecoderGraphError::InvalidInput {
+            reason: format!(
+                "cohere decoder verified loaded-weight context is missing tensor '{tensor_name}'"
+            ),
+        })
+}
+
+fn decoder_vector_tensor(
+    loaded: Option<&GgmlLoadedWeightContext>,
+    arena: &GgmlStaticTensorArena,
+    weight: &CohereVectorWeight,
+    tensor_name: &'static str,
+) -> Result<CohereDecoderWeightTensor, CohereDecoderGraphError> {
+    match loaded {
+        Some(loaded) => {
+            loaded_decoder_tensor(loaded, &weight.name).map(CohereDecoderWeightTensor::Loaded)
+        }
+        None => new_vector_tensor_in_arena(arena, weight.len, tensor_name)
+            .map(CohereDecoderWeightTensor::Static),
+    }
+}
+
+fn decoder_projection_tensor(
+    loaded: Option<&GgmlLoadedWeightContext>,
+    arena: &GgmlStaticTensorArena,
+    weight: &CohereMatrixWeight,
+    tensor_name: &'static str,
+) -> Result<CohereDecoderWeightTensor, CohereDecoderGraphError> {
+    match loaded {
+        Some(loaded) => arena
+            .reshape_loaded_tensor_2d(
+                loaded_decoder_tensor(loaded, &weight.name)?,
+                weight.cols,
+                weight.rows,
+                tensor_name,
+            )
+            .map(CohereDecoderWeightTensor::LoadedMatrixView)
+            .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
+                step: tensor_name,
+                source,
+            }),
+        None => new_projection_tensor_in_arena(arena, weight, tensor_name)
+            .map(CohereDecoderWeightTensor::Static),
+    }
+}
+
+fn decoder_embedding_tensor(
+    loaded: Option<&GgmlLoadedWeightContext>,
+    arena: &GgmlStaticTensorArena,
+    weight: &CohereMatrixWeight,
+    tensor_name: &'static str,
+) -> Result<CohereDecoderWeightTensor, CohereDecoderGraphError> {
+    match loaded {
+        Some(loaded) => arena
+            .reshape_loaded_tensor_2d(
+                loaded_decoder_tensor(loaded, &weight.name)?,
+                weight.cols,
+                weight.rows,
+                tensor_name,
+            )
+            .map(CohereDecoderWeightTensor::LoadedMatrixView)
+            .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
+                step: tensor_name,
+                source,
+            }),
+        None => new_embedding_tensor_in_arena(arena, weight, tensor_name)
+            .map(CohereDecoderWeightTensor::Static),
+    }
+}
+
 fn new_projection_tensor_in_arena(
     arena: &GgmlStaticTensorArena,
     weight: &CohereMatrixWeight,
@@ -2751,10 +3268,13 @@ fn new_persistent_self_kv_tensor_in_arena(
 
 fn upload_vector_to_arena(
     arena: &mut GgmlStaticTensorArena,
-    tensor: GgmlStaticTensor,
+    tensor: CohereDecoderWeightTensor,
     weight: &CohereVectorWeight,
     tensor_name: &'static str,
 ) -> Result<(), CohereDecoderGraphError> {
+    let Some(tensor) = tensor.static_tensor() else {
+        return Ok(());
+    };
     if let Some(raw) = &weight.raw_ggml
         && raw.dims.as_slice() == [weight.len]
         && arena
@@ -2821,10 +3341,13 @@ fn vector_values_for_cpu(
 
 fn upload_projection_to_arena(
     arena: &mut GgmlStaticTensorArena,
-    tensor: GgmlStaticTensor,
+    tensor: CohereDecoderWeightTensor,
     weight: &CohereMatrixWeight,
     tensor_name: &'static str,
 ) -> Result<(), CohereDecoderGraphError> {
+    let Some(tensor) = tensor.static_tensor() else {
+        return Ok(());
+    };
     if let Some(raw) = &weight.raw_ggml
         && raw.dims.as_slice() == [weight.cols, weight.rows]
         && arena
@@ -2844,10 +3367,13 @@ fn upload_projection_to_arena(
 
 fn upload_embedding_to_arena(
     arena: &mut GgmlStaticTensorArena,
-    tensor: GgmlStaticTensor,
+    tensor: CohereDecoderWeightTensor,
     weight: &CohereMatrixWeight,
     tensor_name: &'static str,
 ) -> Result<(), CohereDecoderGraphError> {
+    let Some(tensor) = tensor.static_tensor() else {
+        return Ok(());
+    };
     if let Some(raw) = &weight.raw_ggml
         && raw.dims.as_slice() == [weight.rows, weight.cols]
     {
@@ -3576,6 +4102,110 @@ mod tests {
         });
     }
 
+    #[test]
+    fn device_top1_matches_full_logits_and_builds_reusable_output_root() {
+        with_forced_cpu_backend_for_test(|| {
+            let (_runtime_path, preflight) = write_runtime_ready_preflight();
+            let metadata =
+                super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
+                    &preflight.metadata,
+                )
+                .expect("parse metadata");
+            let reader = build_runtime_tensor_reader_from_preflight(&preflight).expect("reader");
+            let decoder_weights =
+                super::super::decoder_weights::load_cohere_transcribe_decoder_weights_from_reader(
+                    &reader, metadata,
+                )
+                .expect("decoder weights");
+            let tokenizer = super::super::tokenizer::CohereTranscribeTokenizer::from_gguf_metadata(
+                &preflight.metadata,
+            )
+            .expect("tokenizer");
+            let prompt = super::super::prompt::build_cohere_transcribe_decode_prompt(
+                &tokenizer,
+                metadata.decoder_start_token_id,
+                Some("en"),
+                &GgmlAsrExecutionOptions::default(),
+            )
+            .expect("prompt");
+            let encoder_output = sample_encoder_output(metadata);
+            let state = decoder_state(
+                metadata,
+                encoder_output.frame_count,
+                encoder_output.frame_count,
+            );
+            let mut full = CohereDecoderGraphRuntime::new(
+                &decoder_weights,
+                metadata,
+                state,
+                encoder_output.hidden_size,
+                GgmlCpuGraphBackend::Cpu,
+                false,
+            )
+            .expect("full-logits runtime");
+            let mut top1 = CohereDecoderGraphRuntime::new_with_n_seq_impl(
+                &decoder_weights,
+                metadata,
+                state,
+                encoder_output.hidden_size,
+                GgmlCpuGraphBackend::Cpu,
+                false,
+                1,
+                None,
+                DeviceGreedyStepOutputMode::DeviceTop1,
+            )
+            .expect("device-top1 runtime");
+            full.populate_cross_attention_cache(&encoder_output)
+                .expect("populate full cross cache");
+            top1.populate_cross_attention_cache(&encoder_output)
+                .expect("populate top1 cross cache");
+
+            let first_logits = full
+                .compute_step_logits(&prompt.token_ids)
+                .expect("fresh full logits");
+            let first_expected = first_logits
+                .iter()
+                .enumerate()
+                .fold(0, |best, (index, value)| {
+                    if *value > first_logits[best] {
+                        index
+                    } else {
+                        best
+                    }
+                }) as u32;
+            let first_top1 = top1
+                .compute_step_output(&prompt.token_ids)
+                .expect("fresh device top1");
+            assert!(first_top1.logits.is_empty());
+            assert_eq!(first_top1.greedy_token_hint, Some(first_expected));
+
+            let mut next_prefix = prompt.token_ids.clone();
+            next_prefix.push(first_expected);
+            let next_logits = full
+                .compute_step_logits(&next_prefix)
+                .expect("reused full logits");
+            let next_expected = next_logits
+                .iter()
+                .enumerate()
+                .fold(0, |best, (index, value)| {
+                    if *value > next_logits[best] {
+                        index
+                    } else {
+                        best
+                    }
+                }) as u32;
+            let next_top1 = top1
+                .compute_step_output(&next_prefix)
+                .expect("second fresh device top1");
+            assert!(next_top1.logits.is_empty());
+            assert_eq!(next_top1.greedy_token_hint, Some(next_expected));
+
+            top1.build_reusable_decode_graph(DeviceGreedyStepOutputMode::DeviceTop1)
+                .expect("device top1 reusable graph");
+            assert!(top1.reuse.as_ref().and_then(|reuse| reuse.top1).is_some());
+        });
+    }
+
     /// One resident arena serves multiple logical chunk shapes from the same
     /// envelope. Shape changes are explicit and never trigger arena growth.
     #[test]
@@ -3716,7 +4346,7 @@ mod tests {
             ));
 
             runtime
-                .build_reusable_decode_graph()
+                .build_reusable_decode_graph(DeviceGreedyStepOutputMode::FullLogits)
                 .expect("batched reusable graph should build");
 
             let reuse = runtime.reuse.as_ref().expect("reuse graph");

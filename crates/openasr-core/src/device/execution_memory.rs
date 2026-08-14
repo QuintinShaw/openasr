@@ -1062,12 +1062,19 @@ impl DeviceMemoryReservationBatch {
             // `snapshot_after.free_bytes` already reflects this candidate's
             // live allocation. Only *other* pending transactions still need
             // to be held back from the observed headroom.
-            let observed_safe = snapshot.free_bytes
-                >= self
-                    .broker
-                    .policy
-                    .minimum_headroom_bytes
-                    .saturating_add(other_pending);
+            // A zero-byte residual marker proves that this candidate did not
+            // grow the domain. Its exclusive gate still protected the
+            // observation window, but an already-small heap must not fail the
+            // transaction solely because its baseline capacity is below the
+            // global headroom policy. Non-zero growth keeps the full live
+            // headroom check.
+            let observed_safe = reconciliation.actual_peak_bytes == 0
+                || snapshot.free_bytes
+                    >= self
+                        .broker
+                        .policy
+                        .minimum_headroom_bytes
+                        .saturating_add(other_pending);
             if reconciliation.actual_peak_bytes > available_owned || !observed_safe {
                 return Err(MemoryPlanningError::PostAllocationBudgetExceeded {
                     domain: entry.domain.clone(),
@@ -1721,6 +1728,88 @@ mod tests {
             .unwrap();
         assert_eq!(lease.committed_bytes(&domain()), Some(3 * GIB / 4));
         assert_eq!(broker.usage(&domain()).committed_bytes, 3 * GIB / 4);
+    }
+
+    #[test]
+    fn zero_growth_residual_marker_does_not_require_new_domain_headroom() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: GIB,
+        }));
+        let mut residual = request(domain(), GIB / 4, 0, 0, "vulkan-unused-small-heap");
+        residual.requires_reconciliation = true;
+        let mut lease = broker.try_reserve_batch(vec![residual]).unwrap();
+
+        lease
+            .reconcile_and_commit(&[DomainMemoryReconciliation {
+                domain: domain(),
+                actual_peak_bytes: 0,
+                actual_retained_bytes: 0,
+                snapshot_after: snapshot(GIB / 4),
+            }])
+            .unwrap();
+
+        assert_eq!(lease.committed_bytes(&domain()), Some(0));
+        assert_eq!(broker.usage(&domain()).pending_bytes, 0);
+        assert_eq!(broker.usage(&domain()).committed_bytes, 0);
+        assert!(!broker.usage(&domain()).exclusive_pending);
+    }
+
+    #[test]
+    fn nonzero_growth_on_small_domain_still_requires_headroom() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: GIB,
+        }));
+        let mut residual = request(domain(), GIB / 4, 0, 0, "vulkan-small-heap-growth");
+        residual.requires_reconciliation = true;
+        let mut lease = broker.try_reserve_batch(vec![residual]).unwrap();
+
+        let error = lease
+            .reconcile_and_commit(&[DomainMemoryReconciliation {
+                domain: domain(),
+                actual_peak_bytes: 1,
+                actual_retained_bytes: 1,
+                snapshot_after: snapshot(GIB / 4),
+            }])
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MemoryPlanningError::PostAllocationBudgetExceeded { .. }
+        ));
+        assert!(lease.is_pending());
+        assert!(broker.usage(&domain()).exclusive_pending);
+    }
+
+    #[test]
+    fn zero_growth_still_rejects_unknown_post_allocation_observation() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: GIB,
+        }));
+        let mut residual = request(domain(), GIB / 4, 0, 0, "vulkan-unknown-small-heap");
+        residual.requires_reconciliation = true;
+        let mut lease = broker.try_reserve_batch(vec![residual]).unwrap();
+
+        let error = lease
+            .reconcile_and_commit(&[DomainMemoryReconciliation {
+                domain: domain(),
+                actual_peak_bytes: 0,
+                actual_retained_bytes: 0,
+                snapshot_after: DeviceMemorySnapshot {
+                    confidence: MemoryObservationConfidence::Unknown,
+                    ..snapshot(GIB / 4)
+                },
+            }])
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MemoryPlanningError::MemoryObservationUnavailable { .. }
+        ));
+        assert!(lease.is_pending());
+        assert!(broker.usage(&domain()).exclusive_pending);
     }
 
     #[test]

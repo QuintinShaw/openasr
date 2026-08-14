@@ -684,13 +684,19 @@ fn qwen_shaped_family_constructors_keep_the_bound_plan_tail_compile_chain() {
             binder,
             "for_qwen_family",
             "load_qwen_decoder_tail_from_contract",
-            "compile_qwen_whole_decoder_graph_from_prepared_plan",
         ] {
             assert!(
                 syntax.calls_or_invokes_method(required),
                 "{relative} must keep its production decoder on the bound contract chain; missing {required}"
             );
         }
+        assert!(
+            syntax.calls_or_invokes_method("compile_qwen_whole_decoder_graph_from_prepared_plan")
+                || syntax.calls_or_invokes_method(
+                    "compile_qwen_whole_decoder_graph_from_prepared_plan_with_native_gqa"
+                ),
+            "{relative} must materialize the prepared decoder through a shared compile seam"
+        );
     }
 
     let moss_prepare = "moss_transcribe_diarize/prepared_runtime.rs";
@@ -709,7 +715,10 @@ fn qwen_shaped_family_constructors_keep_the_bound_plan_tail_compile_chain() {
     let moss_compile_syntax = ProductionSyntax::collect(&root.join(moss_compile));
     assert!(
         moss_compile_syntax
-            .calls_or_invokes_method("compile_qwen_whole_decoder_graph_from_prepared_plan"),
+            .calls_or_invokes_method("compile_qwen_whole_decoder_graph_from_prepared_plan")
+            || moss_compile_syntax.calls_or_invokes_method(
+                "compile_qwen_whole_decoder_graph_from_prepared_plan_with_config_and_native_gqa"
+            ),
         "{moss_compile} must materialize the prepared decoder through the shared compile seam"
     );
     assert!(
@@ -741,27 +750,49 @@ fn resident_model_actor_keys_exclude_request_capacity() {
         (
             "mimo_asr/executor.rs",
             "MimoAsrPreparedRuntimeCacheKey",
-            &["PackContentKey", "ExecutionLaneKey"][..],
+            &[
+                "PackContentKey",
+                "ExecutionLaneKey",
+                "GgmlNativeGqaCapability",
+            ][..],
         ),
         (
             "firered_llm/executor.rs",
             "FireRedLlmDecoderCacheKey",
-            &["PackContentKey", "ExecutionLaneKey"][..],
+            &[
+                "PackContentKey",
+                "ExecutionLaneKey",
+                "GgmlNativeGqaCapability",
+            ][..],
         ),
         (
             "moss_transcribe_diarize/executor.rs",
             "MossTdDecoderRuntimeCacheKey",
-            &["PackContentKey", "ExecutionLaneKey"][..],
+            &[
+                "PackContentKey",
+                "ExecutionLaneKey",
+                "MossTdGraphRuntimeCacheProfile",
+                "GgmlNativeGqaCapability",
+            ][..],
         ),
         (
             "granite_speech/executor.rs",
             "GraniteSpeechPreparedRuntimeCacheKey",
-            &["PackContentKey", "ExecutionLaneKey"][..],
+            &[
+                "PackContentKey",
+                "ExecutionLaneKey",
+                "DeviceGreedyStepOutputMode",
+            ][..],
         ),
         (
             "qwen/ggml_executor.rs",
             "Qwen3AsrDecoderRuntimeCacheKey",
-            &["PackContentKey", "ExecutionLaneKey", "String"][..],
+            &[
+                "PackContentKey",
+                "ExecutionLaneKey",
+                "String",
+                "GgmlNativeGqaCapability",
+            ][..],
         ),
     ] {
         assert_tuple_alias_components(&root.join(relative), alias, expected);

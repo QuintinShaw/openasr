@@ -21,7 +21,9 @@ use super::logits_head::{Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime};
 use super::prompt_embedding::Qwen3AsrPromptTokenInput;
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 use super::tokenizer::Qwen3AsrTokenizer;
-use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::ggml_runtime::{
+    GgmlCpuGraphBackend, GgmlNativeGqaCapability, ResolvedFamilyRuntimeInput,
+};
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, apply_seq2seq_text_postprocess,
 };
@@ -97,7 +99,13 @@ pub(super) struct Qwen3AsrServeBatchJob {
     /// The owner thread must use this instead of reparsing a path.
     pub runtime_source_preflight: crate::GgufRuntimeSourcePreflight,
     pub build_identity: crate::RuntimeBuildIdentity,
-    pub backend: GgmlCpuGraphBackend,
+    /// Backend plus typed native-GQA proof resolved on the submitting thread.
+    /// The batch owner must never re-derive provider capability from its own
+    /// thread-local state or a backend label.
+    pub resolved_runtime: ResolvedFamilyRuntimeInput,
+    /// Effective native-GQA capability frozen on the submitting thread after
+    /// applying the process opt-out. Owner threads must not reread the env.
+    pub native_gqa: GgmlNativeGqaCapability,
     pub metadata: Qwen3AsrExecutionMetadata,
     /// Owner-bound prepared assets. The job crosses to the batch owner thread,
     /// so it carries the admission lease itself rather than cloning large
@@ -146,6 +154,10 @@ struct Qwen3AsrServeBatchPreparedRef<'a> {
 }
 
 impl Qwen3AsrServeBatchJob {
+    fn backend(&self) -> GgmlCpuGraphBackend {
+        self.resolved_runtime.backend()
+    }
+
     fn prepared_runtime(
         &self,
     ) -> Result<Qwen3AsrServeBatchPreparedRef<'_>, Qwen3AsrServeBatchError> {
@@ -261,6 +273,7 @@ struct Qwen3AsrServeBatchEngineKey {
     lane: crate::models::native_execution_services::ExecutionLaneKey,
     resident_positions: usize,
     max_batch: usize,
+    native_gqa: GgmlNativeGqaCapability,
 }
 
 /// Executor-owned qwen serve-batch owners. Clones of one executor share the
@@ -381,7 +394,10 @@ impl Qwen3AsrServeBatchConfig {
                 max_batch: self.max_batch,
             });
         }
-        let backend = job.backend;
+        let backend = job.backend();
+        if !job.native_gqa.is_validated() {
+            return Err(Qwen3AsrServeBatchError::UnsupportedBackend { backend });
+        }
         if !reusable_decode_graph_supported(
             backend,
             qwen_runtime_graph_config(backend).use_scheduler,
@@ -411,9 +427,10 @@ pub(super) fn submit_qwen_serve_batch_job(
     let config = config.validate_for_job(&job)?;
     let key = Qwen3AsrServeBatchEngineKey {
         build_identity: job.build_identity.clone(),
-        lane: crate::models::native_execution_services::current_execution_lane_key(job.backend),
+        lane: crate::models::native_execution_services::current_execution_lane_key(job.backend()),
         resident_positions: job.kv_capacity.resident_positions(),
         max_batch: config.max_batch,
+        native_gqa: job.native_gqa,
     };
     let engine = qwen_serve_batch_engine_for_key(registry, key.clone(), config)?;
     let result = engine.submit(job);
@@ -1011,7 +1028,7 @@ impl Qwen3AsrOwnerThreadState {
             .iter()
             .find_map(|slot| {
                 slot.as_ref()
-                    .map(|active| (active.slot.job.metadata, active.slot.job.backend))
+                    .map(|active| (active.slot.job.metadata, active.slot.job.backend()))
             })
             .ok_or_else(|| Qwen3AsrServeBatchError::OwnerFailed {
                 reason: "qwen serve batch cannot build dummy seed without an active slot"
@@ -1711,18 +1728,19 @@ impl Qwen3AsrOwnerThreadState {
                     reason: "qwen serve batch requires canonical device token embedding"
                         .to_string(),
                 })?;
-            let decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_and_token_embedding(
+            let decoder = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_and_token_embedding_for_qwen(
                 prepared_runtime.decoder_plan.as_ref(),
                 &slot.job.runtime_source_preflight,
                 token_embedding,
-                slot.job.backend,
+                slot.job.backend(),
+                slot.job.native_gqa,
             )
             .map_err(|error| Qwen3AsrServeBatchError::OwnerFailed {
                 reason: format!("qwen whole-decoder init failed: {error}"),
             })?;
             let logits_runtime = prepared_runtime
                 .logits_head
-                .new_runtime(slot.job.backend)
+                .new_runtime(slot.job.backend())
                 .map_err(|error| Qwen3AsrServeBatchError::OwnerFailed {
                     reason: format!("qwen logits-head runtime init failed: {error}"),
                 })?;
@@ -1798,15 +1816,17 @@ impl Qwen3AsrBatchSlot {
                     .to_string(),
             });
         }
-        // `job.backend` was materialized on the submitting thread (see
-        // `Qwen3AsrServeBatchJob::backend`'s doc comment); this constructor
+        // `job.resolved_runtime` was materialized on the submitting thread;
+        // this constructor
         // may run on a different worker thread with no request-backend
         // override installed, so re-resolving here would silently diverge
         // from the backend the submitter actually decided on.
-        let host =
-            resolve_qwen_family_production_kv_cache_policy(job.backend, job.metadata.llm_head_dim)
-                .to_spec()
-                .host;
+        let host = resolve_qwen_family_production_kv_cache_policy(
+            job.backend(),
+            job.metadata.llm_head_dim,
+        )
+        .to_spec()
+        .host;
         let layer_kv_caches = Qwen3AsrHostKvCacheOwner::try_new(
             "qwen3-asr.serve-batch.slot.self-kv.host",
             job.metadata.llm_layers,
@@ -1830,7 +1850,7 @@ impl Qwen3AsrBatchSlot {
         })
     }
 
-    /// `backend` must come from an active slot's own `job.backend` (already
+    /// `backend` must come from an active slot's own resolved runtime (already
     /// materialized on that job's submitting thread) -- this constructor may
     /// run on a worker thread with no request-backend override installed, so
     /// re-resolving here would silently diverge from what the batch is
@@ -2896,7 +2916,11 @@ mod tests {
                 runtime_source.content_id(),
             ),
             runtime_source_preflight: fixture.runtime_source_preflight.clone(),
-            backend: GgmlCpuGraphConfig::runtime_default().backend,
+            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                None,
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
+            native_gqa: GgmlNativeGqaCapability::Validated,
             metadata: fixture.metadata,
             prepared_assets: Qwen3AsrServeBatchPreparedAssets::Fixture {
                 tokenizer: None,

@@ -25,7 +25,9 @@ use super::encoder_graph::{
 };
 use super::encoder_weights::load_xasr_encoder_weights;
 use super::frontend::{XASR_FINAL_FLUSH_TAIL_PAD_SAMPLES, XasrFbankFeatures, XasrFbankFrontend};
-use super::graph_config::xasr_zipformer_encoder_graph_config;
+use super::graph_config::{
+    xasr_zipformer_encoder_graph_config, xasr_zipformer_speculative_blank_batch,
+};
 use super::greedy::{
     DEFAULT_MAX_SYMBOLS_PER_FRAME, XasrGreedyDecodeResult, greedy_decode_frames_incremental,
     greedy_decode_frames_incremental_with_backend,
@@ -42,13 +44,12 @@ const XASR_PROFILE_ENV: &str = "OPENASR_XASR_PROFILE";
 const XASR_RUNTIME_ACTOR_CACHE_MAX_IDLE_ENTRIES: usize = 4;
 const XASR_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 4;
 
-/// Pool key: pack content id + the backend the runtime's prepared encoder
-/// graph was built for. CPU and Metal runtimes must never conflate -- a
-/// checkout for an accelerated session must not receive a CPU-frozen runtime
-/// (or vice versa). The content id ([`PackContentKey::for_runtime_source`])
+/// Pool key: pack content id, the execution lane, and the frozen blank-batch
+/// mode. CPU and GPU or scalar and batched runtimes must never conflate. The
+/// content id ([`PackContentKey::for_runtime_source`])
 /// keeps an in-place pack replacement at the same path from checking out a
 /// runtime built from the old bytes.
-pub(super) type XasrRuntimeActorKey = (PackContentKey, ExecutionLaneKey);
+pub(super) type XasrRuntimeActorKey = (PackContentKey, ExecutionLaneKey, bool);
 pub(super) type XasrRuntimeActorPool =
     AdmittedPinnedRuntimeActorCheckoutPool<XasrRuntimeActorKey, XasrZipformerPreparedRuntime>;
 pub(super) type XasrRuntimeActor =
@@ -216,9 +217,11 @@ pub(super) fn checkout_prepared_runtime(
     resolved_backend: GgmlCpuGraphBackend,
 ) -> Result<XasrRuntimeActor, String> {
     let backend = xasr_zipformer_encoder_graph_config(resolved_backend).backend;
+    let speculative_blank_batch = xasr_zipformer_speculative_blank_batch(backend);
     let key = (
         PackContentKey::for_runtime_source(&preflight.runtime_source),
         current_execution_lane_key(backend),
+        speculative_blank_batch,
     );
     let preflight = preflight.clone();
     let pack_content_id = preflight.runtime_source.content_id().to_string();
@@ -234,25 +237,30 @@ pub(super) fn checkout_prepared_runtime(
                 backend,
             )
             .map_err(|error| error.to_string())?;
-            Ok((quote.retained_bytes, (preflight, reader, quote, backend)))
+            Ok((
+                quote.retained_bytes,
+                (preflight, reader, quote, backend, speculative_blank_batch),
+            ))
         },
-        |(preflight, reader, quote, backend)| match SystemMemoryOwner::try_allocate_transaction(
-            quote,
-            || {
-                let runtime = XasrZipformerPreparedRuntime::from_reader_metadata(
+        |(preflight, reader, quote, backend, speculative_blank_batch)| {
+            match SystemMemoryOwner::try_allocate_transaction(quote, || {
+                let runtime = XasrZipformerPreparedRuntime::from_reader_metadata_with_speculation(
                     &reader,
                     &preflight.metadata,
                     backend,
+                    speculative_blank_batch,
                 )?;
                 let retained = runtime.retained_system_memory_bytes;
                 Ok(SystemMemoryAllocationOutcome::new(
                     runtime, retained, retained,
                 ))
-            },
-        ) {
-            Ok(owner) => Ok(owner),
-            Err(SystemMemoryAllocationTransactionError::Allocation(reason)) => Err(reason),
-            Err(SystemMemoryAllocationTransactionError::Capacity(error)) => Err(error.to_string()),
+            }) {
+                Ok(owner) => Ok(owner),
+                Err(SystemMemoryAllocationTransactionError::Allocation(reason)) => Err(reason),
+                Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+                    Err(error.to_string())
+                }
+            }
         },
         |error| error.to_string(),
     )
@@ -271,7 +279,6 @@ fn xasr_runtime_system_memory_quote(
     })?;
     let mut quote =
         PreparedRuntimeQuoteBuilder::new::<XasrZipformerPreparedRuntime>(pack_content_id);
-
     // Runtime + encoder graph each retain one metadata clone.
     for values in [
         &metadata.num_encoder_layers,
@@ -447,12 +454,28 @@ impl XasrZipformerPreparedRuntime {
         gguf_metadata: &GgufMetadata,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, String> {
+        let speculative_blank_batch = xasr_zipformer_speculative_blank_batch(backend);
+        Self::from_reader_metadata_with_speculation(
+            reader,
+            gguf_metadata,
+            backend,
+            speculative_blank_batch,
+        )
+    }
+
+    fn from_reader_metadata_with_speculation(
+        reader: &GgufTensorDataReader,
+        gguf_metadata: &GgufMetadata,
+        backend: GgmlCpuGraphBackend,
+        speculative_blank_batch: bool,
+    ) -> Result<Self, String> {
         let metadata =
             parse_xasr_zipformer_execution_metadata(gguf_metadata).map_err(|e| e.to_string())?;
         let tokenizer = XasrZipformerTokenizer::from_metadata(gguf_metadata, metadata.blank_id)?;
         let backend = xasr_zipformer_encoder_graph_config(backend).backend;
         let encoder_weights =
             load_xasr_encoder_weights(reader, &metadata).map_err(|e| e.to_string())?;
+        let graph_config = xasr_zipformer_encoder_graph_config(backend);
         let mut retained = crate::models::system_memory_owner::SystemMemoryCapacity::default();
         retained.add(
             metadata
@@ -469,7 +492,7 @@ impl XasrZipformerPreparedRuntime {
         let encoder = XasrZipformerEncoderGraph::new_ggml_cpu_full_encoder(
             metadata.clone(),
             encoder_weights,
-            xasr_zipformer_encoder_graph_config(backend),
+            graph_config,
         )
         .map_err(|e| e.to_string())?;
         let decode_backend = if backend == GgmlCpuGraphBackend::Cpu {
@@ -494,7 +517,7 @@ impl XasrZipformerPreparedRuntime {
                 joiner: XasrJoiner::new(joiner_weights),
             }))
         } else {
-            let device = XasrDeviceHead::new(reader, &metadata, backend)?;
+            let device = XasrDeviceHead::new(reader, &metadata, backend, speculative_blank_batch)?;
             retained.add(
                 device.retained_system_memory_bytes(),
                 "xasr device predictor and joiner",
@@ -936,6 +959,180 @@ mod tests {
         let rows = feature_chunk_rows(&features, 1, 2, 4).expect("chunk rows");
 
         assert_eq!(rows, vec![3.0, 4.0, 5.0, 6.0, 5.0, 6.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    #[ignore = "host-local: requires OPENASR_XASR_RESIDENT_PACK and OPENASR_XASR_RESIDENT_PROVIDER=cuda|vulkan"]
+    fn exact_device_resident_state_resets_between_reused_runtime_requests() {
+        use crate::device::execution_route::ExecutionProvider;
+        use crate::ggml_runtime::{
+            RequestBackendPreference, install_request_backend_override,
+            load_runtime_source_metadata_and_tensor_index,
+        };
+
+        let pack = std::env::var_os("OPENASR_XASR_RESIDENT_PACK")
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .expect("OPENASR_XASR_RESIDENT_PACK must identify a verified local pack");
+        let provider_label = std::env::var("OPENASR_XASR_RESIDENT_PROVIDER")
+            .expect("OPENASR_XASR_RESIDENT_PROVIDER must be cuda or vulkan")
+            .trim()
+            .to_ascii_lowercase();
+        let provider = match provider_label.as_str() {
+            "cuda" => ExecutionProvider::Cuda,
+            "vulkan" => ExecutionProvider::Vulkan,
+            _ => panic!("OPENASR_XASR_RESIDENT_PROVIDER must be cuda or vulkan"),
+        };
+        let route = crate::device::execution_route::enumerate_compute_devices_from_ggml(
+            &crate::ggml_runtime::ggml_available_devices(),
+        )
+        .into_iter()
+        .find(|device| device.provider == provider)
+        .unwrap_or_else(|| panic!("requested X-ASR provider is unavailable"))
+        .to_resolved_route();
+        let stable_id = route.stable_id.clone();
+        let _route = install_request_backend_override(Some(RequestBackendPreference::Exact(route)));
+
+        let preflight = load_runtime_source_metadata_and_tensor_index(&pack)
+            .expect("X-ASR resident pack preflight");
+        let reader = build_runtime_tensor_reader_from_preflight(&preflight)
+            .expect("X-ASR resident pack reader");
+        let mut runtime = XasrZipformerPreparedRuntime::from_reader_metadata_with_speculation(
+            &reader,
+            &preflight.metadata,
+            GgmlCpuGraphBackend::Gpu,
+            true,
+        )
+        .expect("X-ASR exact resident runtime");
+        let wav = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav");
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            wav,
+            "xasr resident-state parity fixture",
+            "xasr resident-state parity fixture",
+        )
+        .expect("JFK fixture should load");
+
+        let first = runtime
+            .transcribe(&samples, &|| false, None)
+            .expect("first X-ASR resident request");
+        let first_state = runtime
+            .encoder
+            .resident_state_for_test()
+            .expect("first request must leave resident state");
+        let resident_bytes = runtime
+            .encoder
+            .resident_allocation_for_test()
+            .expect("resident graph allocations must be observable");
+        let resident_node_counts = runtime
+            .encoder
+            .resident_native_node_counts_for_test()
+            .expect("resident prepared graph node counts must be observable");
+        let first_embed_graph = runtime
+            .encoder
+            .embed_persistent_graph_for_test()
+            .expect("encoder-embed persistent graph must be observable");
+        let second = runtime
+            .transcribe(&samples, &|| false, None)
+            .expect("second X-ASR resident request");
+        let second_state = runtime
+            .encoder
+            .resident_state_for_test()
+            .expect("second request must leave resident state");
+        let second_embed_graph = runtime
+            .encoder
+            .embed_persistent_graph_for_test()
+            .expect("encoder-embed persistent graph must remain observable");
+        let device_head_node_counts = match &runtime.decode_backend {
+            XasrPreparedDecodeBackend::Device(device) => device
+                .persistent_graph_node_counts_for_test()
+                .into_iter()
+                .map(|count| count.expect("device-head graph must be prepared"))
+                .collect::<Vec<_>>(),
+            XasrPreparedDecodeBackend::Host(_) => {
+                panic!("exact accelerated X-ASR runtime must use the device head")
+            }
+        };
+
+        assert_eq!(first.text, second.text);
+        assert_eq!(first.token_ids, second.token_ids);
+        assert_eq!(first.emit_frames, second.emit_frames);
+        assert_eq!(first.encoder_frames, second.encoder_frames);
+        assert!(
+            first_state.1 > 0,
+            "first request must advance resident hops"
+        );
+        assert!(
+            resident_bytes.0 > 0 && resident_bytes.1 > 0 && resident_bytes.2 > 0,
+            "resident graph and cache allocations must be non-zero"
+        );
+        assert_eq!(
+            resident_node_counts.0, resident_node_counts.1,
+            "both resident bank directions must use the same prepared topology"
+        );
+        assert!(
+            resident_node_counts.0 > 0,
+            "resident prepared graph must contain native nodes"
+        );
+        // Fused Swoosh leaves 4,214 nodes on both prepared bank directions.
+        // Keep bounded maintenance headroom while ensuring that the former
+        // 4,594-node composed-Swoosh topology cannot return unnoticed.
+        assert!(
+            resident_node_counts.0 <= 4_450,
+            "resident prepared graph exceeded the X-ASR native-node budget: {}",
+            resident_node_counts.0
+        );
+        assert_eq!(first_state.1, second_state.1);
+        assert_eq!(
+            second_state.2,
+            usize::try_from(second_state.1 % 2).expect("resident bank parity fits usize"),
+            "active bank must alternate once per successful hop"
+        );
+        assert!(
+            second_state.0 > first_state.0,
+            "second request must claim a fresh resident generation"
+        );
+        assert_eq!(
+            first_embed_graph, second_embed_graph,
+            "fixed encoder-embed geometry must reuse one prepared graph across requests"
+        );
+        assert_eq!(
+            second_embed_graph.0, 1,
+            "fixed encoder-embed geometry must be built exactly once"
+        );
+        assert!(
+            second_embed_graph.1 > 0,
+            "encoder-embed prepared graph must contain native nodes"
+        );
+        assert!(
+            second_embed_graph.1 <= 256,
+            "encoder-embed prepared graph exceeded its native-node budget: {}",
+            second_embed_graph.1
+        );
+        assert_eq!(
+            device_head_node_counts.len(),
+            3,
+            "Exact CUDA/Vulkan X-ASR must keep projection, joint, and speculative-blank graphs"
+        );
+        assert!(
+            device_head_node_counts.iter().all(|&count| count > 0),
+            "all X-ASR device-head graphs must contain native nodes: {device_head_node_counts:?}"
+        );
+        assert!(
+            device_head_node_counts.iter().all(|&count| count <= 16),
+            "X-ASR device-head graph exceeded its native-node budget: {device_head_node_counts:?}"
+        );
+        eprintln!(
+            "XASR_RESIDENT_RESET provider={provider_label} stable_id={stable_id} requests=2 hops={} final_bank={} native_nodes_per_session={} embed_graph_builds={} embed_native_nodes={} device_head_native_nodes={device_head_node_counts:?} session0_bytes={} session1_bytes={} cache_bytes={} text_sha256={}",
+            second_state.1,
+            second_state.2,
+            resident_node_counts.0,
+            second_embed_graph.0,
+            second_embed_graph.1,
+            resident_bytes.0,
+            resident_bytes.1,
+            resident_bytes.2,
+            crate::testing::benchmark_sha256_bytes([second.text.as_bytes()]),
+        );
     }
 
     #[test]

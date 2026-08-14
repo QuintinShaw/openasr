@@ -1395,6 +1395,7 @@ pub(crate) struct Seq2SeqReusableDecodeGraph {
     pub position: GgmlCpuTensor<'static>,
     pub attention_mask: GgmlCpuTensor<'static>,
     pub logits: GgmlCpuTensor<'static>,
+    pub top1: Option<GgmlCpuTensor<'static>>,
 }
 
 impl Seq2SeqReusableDecodeGraph {
@@ -1420,6 +1421,7 @@ impl Seq2SeqReusableDecodeGraph {
             position,
             attention_mask,
             logits,
+            top1: None,
         }
     }
 
@@ -1444,6 +1446,33 @@ impl Seq2SeqReusableDecodeGraph {
             position,
             attention_mask,
             logits,
+            top1: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_borrowed_kv_arena_and_optional_top1(
+        session: GgmlPersistentGraphSession,
+        max_positions: usize,
+        n_seq: usize,
+        token_id: GgmlCpuTensor<'static>,
+        row_index: GgmlCpuTensor<'static>,
+        position: GgmlCpuTensor<'static>,
+        attention_mask: GgmlCpuTensor<'static>,
+        logits: GgmlCpuTensor<'static>,
+        top1: Option<GgmlCpuTensor<'static>>,
+    ) -> Self {
+        Self {
+            session,
+            kv_arena: None,
+            max_positions,
+            n_seq,
+            token_id,
+            row_index,
+            position,
+            attention_mask,
+            logits,
+            top1,
         }
     }
 
@@ -1552,9 +1581,42 @@ fn llm_lora_matmul<'a, E, F>(
 where
     F: Fn(&'static str, GgmlCpuGraphError) -> E + Copy,
 {
-    let base = graph
-        .mul_mat(weight, input)
-        .map_err(|source| map_err(step, source))?;
+    llm_lora_matmul_impl(graph, weight, lora, input, step, false, map_err)
+}
+
+fn llm_lora_matmul_preserving_f32_rhs_range<'a, E, F>(
+    graph: &mut GgmlCpuGraphBuilder<'a>,
+    weight: GgmlCpuTensor<'a>,
+    lora: Option<LlmLoraSlot<'a>>,
+    input: GgmlCpuTensor<'a>,
+    step: &'static str,
+    map_err: F,
+) -> Result<GgmlCpuTensor<'a>, E>
+where
+    F: Fn(&'static str, GgmlCpuGraphError) -> E + Copy,
+{
+    llm_lora_matmul_impl(graph, weight, lora, input, step, true, map_err)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn llm_lora_matmul_impl<'a, E, F>(
+    graph: &mut GgmlCpuGraphBuilder<'a>,
+    weight: GgmlCpuTensor<'a>,
+    lora: Option<LlmLoraSlot<'a>>,
+    input: GgmlCpuTensor<'a>,
+    step: &'static str,
+    preserve_f32_rhs_range: bool,
+    map_err: F,
+) -> Result<GgmlCpuTensor<'a>, E>
+where
+    F: Fn(&'static str, GgmlCpuGraphError) -> E + Copy,
+{
+    let base = if preserve_f32_rhs_range {
+        graph.mul_mat_preserving_f32_rhs_range(weight, input)
+    } else {
+        graph.mul_mat(weight, input)
+    }
+    .map_err(|source| map_err(step, source))?;
     let Some(lora) = lora else {
         return Ok(base);
     };
@@ -2012,7 +2074,7 @@ where
             )
         },
         |graph, x| {
-            llm_lora_matmul(
+            llm_lora_matmul_preserving_f32_rhs_range(
                 graph,
                 weights.ffn_down_weight,
                 weights.ffn_down_lora,
@@ -2059,7 +2121,7 @@ where
         ));
     };
     let scores = graph
-        .mul_mat(k_full, q)
+        .mul_mat_preserving_f32_rhs_range(k_full, q)
         .map_err(|source| map_err("llm_naive_attn_scores", source))?;
     let probabilities = graph
         .soft_max_ext(scores, Some(mask), scale, 0.0)
@@ -2074,7 +2136,7 @@ where
         .cont(v_t)
         .map_err(|source| map_err("llm_naive_attn_v_cont", source))?;
     let attended = graph
-        .mul_mat(v_t, probabilities)
+        .mul_mat_preserving_f32_rhs_range(v_t, probabilities)
         .map_err(|source| map_err("llm_naive_attn_context", source))?;
     let attended = graph
         .permute(attended, 0, 2, 1, 3)

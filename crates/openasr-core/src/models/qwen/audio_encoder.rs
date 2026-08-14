@@ -289,6 +289,18 @@ impl Qwen3AsrAudioEncoderRuntime {
         Ok(Self { runner, loaded })
     }
 
+    pub(crate) fn graph_lane(&self) -> (GgmlCpuGraphBackend, bool) {
+        (self.runner.backend_kind(), self.runner.uses_scheduler())
+    }
+
+    pub(crate) fn loaded_weight_binding_identity(
+        &self,
+    ) -> Option<crate::ggml_runtime::GgmlLoadedWeightBindingIdentity> {
+        self.loaded
+            .as_ref()
+            .map(|loaded| self.runner.loaded_weight_binding_identity(loaded))
+    }
+
     pub(crate) fn encode(
         &mut self,
         weights: &Qwen3AsrAudioEncoderWeights,

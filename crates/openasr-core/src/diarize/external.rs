@@ -1667,7 +1667,21 @@ mod tests {
                     ),
                 )
             }
-            other => panic!("OPENASR_REDIMNET_BENCH_BACKEND must be cpu or metal, got {other}"),
+            "cuda" => crate::device::execution_policy::ExecutionIntent::ConstrainedAcceleratedOnly(
+                crate::device::execution_policy::AcceleratedDeviceConstraint::Provider(
+                    crate::device::execution_route::ExecutionProvider::Cuda,
+                ),
+            ),
+            "vulkan" => {
+                crate::device::execution_policy::ExecutionIntent::ConstrainedAcceleratedOnly(
+                    crate::device::execution_policy::AcceleratedDeviceConstraint::Provider(
+                        crate::device::execution_route::ExecutionProvider::Vulkan,
+                    ),
+                )
+            }
+            other => panic!(
+                "OPENASR_REDIMNET_BENCH_BACKEND must be cpu, metal, cuda, or vulkan, got {other}"
+            ),
         };
         let runtime = super::super::embed::PolicyResolvedSpeakerRuntime::load_with_intent(
             services,

@@ -101,14 +101,21 @@ struct PolicySpeakerCandidate {
     placement: crate::device::execution_policy::ExecutionPlacement,
 }
 
+fn redimnet_actor_key(
+    content_id: impl Into<String>,
+    backend: GgmlCpuGraphBackend,
+) -> AuxiliaryPinnedRuntimeCacheKey {
+    AuxiliaryPinnedRuntimeCacheKey::for_current_lane::<RedimNetResidentRuntime>(
+        REDIMNET2_GGML_ARCHITECTURE_ID,
+        content_id,
+        REDIMNET_RESIDENT_REPRESENTATION,
+        backend,
+    )
+}
+
 impl PolicySpeakerCandidate {
     fn actor_key(&self) -> AuxiliaryPinnedRuntimeCacheKey {
-        AuxiliaryPinnedRuntimeCacheKey::for_current_lane::<RedimNetResidentRuntime>(
-            REDIMNET2_GGML_ARCHITECTURE_ID,
-            self.content_id.clone(),
-            REDIMNET_RESIDENT_REPRESENTATION,
-            self.backend,
-        )
+        redimnet_actor_key(self.content_id.clone(), self.backend)
     }
 
     fn checkout_actor(
@@ -581,4 +588,16 @@ fn deterministic_warmup_audio() -> Vec<f32> {
 
 fn policy_runtime_error(error: PolicyResolvedAuxRuntimeError<EmbedError>) -> EmbedError {
     EmbedError::Unavailable(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redimnet_actor_key_separates_cpu_and_gpu_residents() {
+        let cpu = redimnet_actor_key("same-pack", GgmlCpuGraphBackend::Cpu);
+        let gpu = redimnet_actor_key("same-pack", GgmlCpuGraphBackend::Gpu);
+        assert_ne!(cpu, gpu);
+    }
 }

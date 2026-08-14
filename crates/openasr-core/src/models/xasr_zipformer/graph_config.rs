@@ -4,6 +4,8 @@ use crate::models::graph_runtime_config::{
     has_explicit_thread_override,
 };
 
+const OPENASR_XASR_SPECULATIVE_BLANK_BATCH: &str = "OPENASR_XASR_SPECULATIVE_BLANK_BATCH";
+
 /// Right-sized from the measured full-encoder forward graph (~11.1k nodes /
 /// ~12.4k tensors for the streaming chunk window). The graph topology is
 /// architecture-bound (layers x ops-per-layer), not sequence-length-bound —
@@ -14,10 +16,25 @@ use crate::models::graph_runtime_config::{
 /// [`GgmlCpuGraphConfig::metadata_context_bytes`]), OOM'd CPU transcription.
 pub(super) const FULL_ENCODER_GRAPH_SIZE: usize = 65_536;
 
-/// The stateless predictor and joiner use three tiny persistent graphs. Keep
-/// their runner independent from the 65k-node streaming encoder so the head
-/// does not inherit another full-encoder metadata context.
+/// The stateless predictor and fused encoder-projection/joiner use two tiny
+/// persistent graphs, plus one optional blank-prefix batch graph on validated
+/// discrete GPUs. Keep their runner independent from the 65k-node streaming
+/// encoder so the head does not inherit another full-encoder metadata context.
 pub(super) const DEVICE_HEAD_GRAPH_SIZE: usize = 64;
+
+/// The encoder-embed prepared graph is intentionally isolated from the much
+/// larger Zipformer layer graph. Its frozen topology currently has 87 native
+/// nodes; 2,048 leaves over 20x headroom while avoiding a second pair of
+/// 65,536-node metadata contexts for the dedicated runner and session.
+pub(super) const ENCODER_EMBED_GRAPH_SIZE: usize = 2_048;
+
+pub(super) fn xasr_zipformer_encoder_embed_graph_config(
+    mut config: GgmlCpuGraphConfig,
+) -> GgmlCpuGraphConfig {
+    config.graph_size = ENCODER_EMBED_GRAPH_SIZE;
+    config.context_bytes = GgmlCpuGraphConfig::metadata_context_bytes(config.graph_size);
+    config
+}
 
 /// Auto prefers the accelerator on the generic GPU lane (HIP/CUDA/Vulkan),
 /// and only falls back to CPU when no accelerator is present or the request
@@ -81,6 +98,38 @@ pub(crate) fn xasr_zipformer_device_head_graph_config(
     config
 }
 
+pub(crate) fn xasr_zipformer_speculative_blank_batch(backend: GgmlCpuGraphBackend) -> bool {
+    let raw = std::env::var(OPENASR_XASR_SPECULATIVE_BLANK_BATCH).ok();
+    let preference = crate::ggml_runtime::request_backend_override();
+    xasr_zipformer_speculative_blank_batch_with_inputs(
+        backend,
+        preference.as_ref(),
+        crate::models::native_execution_services::current_execution_placement(),
+        raw.as_deref(),
+    )
+}
+
+fn xasr_zipformer_speculative_blank_batch_with_inputs(
+    backend: GgmlCpuGraphBackend,
+    preference: Option<&crate::ggml_runtime::RequestBackendPreference>,
+    placement: Option<crate::device::execution_policy::ExecutionPlacement>,
+    raw: Option<&str>,
+) -> bool {
+    let validated_discrete_gpu = matches!(
+        (backend, preference, placement),
+        (
+            GgmlCpuGraphBackend::Gpu,
+            Some(crate::ggml_runtime::RequestBackendPreference::Exact(route)),
+            Some(crate::device::execution_policy::ExecutionPlacement::FullDevice),
+        ) if matches!(
+            route.provider,
+            crate::device::execution_route::ExecutionProvider::Cuda
+                | crate::device::execution_route::ExecutionProvider::Vulkan
+        )
+    );
+    validated_discrete_gpu && crate::ggml_runtime::env_toggle_with_raw(None, raw, true)
+}
+
 /// Pure encoder-graph policy: env-derived inputs are dependency-injected so this
 /// can be unit-tested without mutating process-global env (which races across
 /// the parallel test runner). Mirrors the cohere `*_with_overrides` idiom.
@@ -122,6 +171,11 @@ fn xasr_zipformer_encoder_graph_config_with_overrides(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::execution_policy::ExecutionPlacement;
+    use crate::device::execution_route::{
+        DeviceAddressability, ExecutionProvider, ResolvedExecutionRoute, RouteDeviceKind,
+    };
+    use crate::ggml_runtime::RequestBackendPreference;
 
     fn base_with(backend: GgmlCpuGraphBackend, n_threads: Option<usize>) -> GgmlCpuGraphConfig {
         GgmlCpuGraphConfig {
@@ -130,6 +184,65 @@ mod tests {
             use_scheduler: backend.is_gpu_class(),
             ..GgmlCpuGraphConfig::conservative_default()
         }
+    }
+
+    fn exact_route(provider: ExecutionProvider) -> RequestBackendPreference {
+        RequestBackendPreference::Exact(ResolvedExecutionRoute {
+            provider,
+            stable_id: format!("{}0", provider.as_str()),
+            registry_ordinal: 0,
+            kind: RouteDeviceKind::Accelerated,
+            addressability: DeviceAddressability::NotExactlyAddressable {
+                reason: "xasr speculative blank policy fixture",
+            },
+        })
+    }
+
+    #[test]
+    fn speculative_blank_batch_is_default_on_only_for_exact_full_device_cuda_and_vulkan() {
+        for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
+            let preference = exact_route(provider);
+            assert!(xasr_zipformer_speculative_blank_batch_with_inputs(
+                GgmlCpuGraphBackend::Gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+                None,
+            ));
+            assert!(!xasr_zipformer_speculative_blank_batch_with_inputs(
+                GgmlCpuGraphBackend::Gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+                Some("0"),
+            ));
+        }
+
+        for provider in [
+            ExecutionProvider::Hip,
+            ExecutionProvider::Metal,
+            ExecutionProvider::Accelerator,
+            ExecutionProvider::Unknown,
+        ] {
+            let preference = exact_route(provider);
+            assert!(!xasr_zipformer_speculative_blank_batch_with_inputs(
+                GgmlCpuGraphBackend::Gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+                Some("1"),
+            ));
+        }
+        let cuda = exact_route(ExecutionProvider::Cuda);
+        assert!(!xasr_zipformer_speculative_blank_batch_with_inputs(
+            GgmlCpuGraphBackend::Gpu,
+            Some(&cuda),
+            Some(ExecutionPlacement::Hybrid),
+            Some("1"),
+        ));
+        assert!(!xasr_zipformer_speculative_blank_batch_with_inputs(
+            GgmlCpuGraphBackend::Cpu,
+            Some(&cuda),
+            Some(ExecutionPlacement::FullDevice),
+            Some("1"),
+        ));
     }
 
     #[test]
@@ -148,17 +261,23 @@ mod tests {
     #[test]
     fn full_encoder_contexts_stay_within_cpu_commit_budget() {
         // Regression guard for the CPU-transcription OOM: the embed runner, the
-        // full-encoder runner, and the persistent graph session each allocate one
-        // no_alloc metadata context at the same time. `ggml_init` always mallocs
-        // the full `mem_size` even with `no_alloc=true`, so the pre-fix 2 GiB x3 =
-        // 6 GiB tripped `_aligned_malloc` -> NULL -> GGML_ASSERT. Sizing each
-        // context from `graph_size` keeps all three comfortably resident.
+        // full-encoder runner, and both persistent graph sessions each allocate
+        // one no_alloc metadata context at the same time. `ggml_init` always
+        // mallocs the full `mem_size` even with `no_alloc=true`, so the pre-fix
+        // 2 GiB contexts tripped `_aligned_malloc` -> NULL -> GGML_ASSERT. The
+        // embed pair is right-sized independently from the full graph pair.
         let config = xasr_zipformer_encoder_graph_config_with_overrides(
             base_with(GgmlCpuGraphBackend::Cpu, None),
             false,
         );
-        // Three coexisting contexts must stay well under a CPU commit budget...
-        assert!(config.context_bytes * 3 < 256 * 1024 * 1024);
+        let embed = xasr_zipformer_encoder_embed_graph_config(config);
+        assert_eq!(embed.graph_size, ENCODER_EMBED_GRAPH_SIZE);
+        assert_eq!(
+            embed.context_bytes,
+            GgmlCpuGraphConfig::metadata_context_bytes(ENCODER_EMBED_GRAPH_SIZE)
+        );
+        // Four coexisting contexts must stay well under a CPU commit budget...
+        assert!(config.context_bytes * 2 + embed.context_bytes * 2 < 256 * 1024 * 1024);
         // ...while still exceeding the ~7 MB the measured 11.1k-node graph uses.
         assert!(config.context_bytes > 7 * 1024 * 1024);
     }
