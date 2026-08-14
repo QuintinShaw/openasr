@@ -5859,7 +5859,9 @@ mod tests {
 
     /// Fresh-process concurrency gate for one exact provider. Both requests
     /// share the production execution services and verified pack, enter the
-    /// dispatcher together, and must retain independent output/telemetry.
+    /// dispatcher together, and must retain independent outputs plus exact
+    /// aggregate route telemetry. A warmed actor may legitimately emit no new
+    /// backend-construction observation for one request.
     #[test]
     #[ignore = "host-local fresh-process two-request Exact accelerated ASR gate"]
     fn asr_exact_pack_two_concurrent_requests_match() {
@@ -5945,9 +5947,12 @@ mod tests {
             "concurrent Exact requests produced different normalized text"
         );
         assert_exact_smoke_structure_parity(&first, &second, false, 0.05);
-        for observations in [&first_observations, &second_observations] {
-            assert_exact_stress_observations(observations, &expected_route);
-        }
+        let combined_observations = first_observations
+            .iter()
+            .chain(&second_observations)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_exact_stress_observations(&combined_observations, &expected_route);
         eprintln!(
             "ASR_EXACT_STRESS mode=concurrent model={model_ref} provider={} status=pass requests=2 normalized_text_sha256={}",
             provider.as_str(),
