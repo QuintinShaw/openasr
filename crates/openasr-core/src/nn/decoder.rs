@@ -1223,6 +1223,10 @@ pub(crate) struct LlmLoraSlot<'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum LlmQkvWeights<'a> {
     Fused(GgmlCpuTensor<'a>),
+    FusedQvSplitK {
+        qv: GgmlCpuTensor<'a>,
+        k: GgmlCpuTensor<'a>,
+    },
     Split {
         q: GgmlCpuTensor<'a>,
         k: GgmlCpuTensor<'a>,
@@ -1658,13 +1662,60 @@ where
 {
     let element = std::mem::size_of::<f32>();
     let any_qkv_lora = q_lora.is_some() || k_lora.is_some() || v_lora.is_some();
-    if any_qkv_lora && matches!(qkv, LlmQkvWeights::Fused(_)) {
+    if any_qkv_lora && !matches!(qkv, LlmQkvWeights::Split { .. }) {
         return Err(map_err(
             "llm_qkv_storage",
             GgmlCpuGraphError::UnsupportedInputs {
                 reason: "per-projection QKV LoRA requires split resident weights",
             },
         ));
+    }
+    if let LlmQkvWeights::FusedQvSplitK { qv, k } = qkv {
+        let qv_width = q_width.checked_add(v_width).ok_or_else(|| {
+            map_err(
+                "llm_qv_fused_width",
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "llm fused qv width overflow",
+                },
+            )
+        })?;
+        let column_stride = qv_width.checked_mul(element).ok_or_else(|| {
+            map_err(
+                "llm_qv_fused_stride",
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "llm fused qv stride overflow",
+                },
+            )
+        })?;
+        let v_offset = q_width.checked_mul(element).ok_or_else(|| {
+            map_err(
+                "llm_qv_v_offset",
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "llm fused qv value offset overflow",
+                },
+            )
+        })?;
+        let qv = graph
+            .mul_mat(qv, normed)
+            .map_err(|source| map_err("llm_qv_fused", source))?;
+        let mut q = graph
+            .view_2d(qv, q_width, output_tokens, column_stride, 0)
+            .map_err(|source| map_err("llm_qv_q_view", source))?;
+        let mut v = graph
+            .view_2d(qv, v_width, output_tokens, column_stride, v_offset)
+            .map_err(|source| map_err("llm_qv_v_view", source))?;
+        if output_tokens > 1 {
+            q = graph
+                .cont(q)
+                .map_err(|source| map_err("llm_qv_q_cont", source))?;
+            v = graph
+                .cont(v)
+                .map_err(|source| map_err("llm_qv_v_cont", source))?;
+        }
+        let k = graph
+            .mul_mat(k, normed)
+            .map_err(|source| map_err("llm_k_proj", source))?;
+        return Ok((q, k, v));
     }
     if let LlmQkvWeights::Fused(qkv_weight) = qkv {
         let qkv_width = q_width

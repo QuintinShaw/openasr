@@ -1050,13 +1050,24 @@ impl LlmWeightHandle {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum QwenQkvExecutionMode {
+    FusedArena,
+    SplitLoaded,
+}
+
 /// Resident weight handles for one decode layer, allocated into a shared arena.
+#[derive(Clone, Copy)]
 enum QwenQkvWeightHandles {
     Fused(GgmlStaticTensor),
+    FusedQvSplitK {
+        qv: GgmlStaticTensor,
+        k: LlmWeightHandle,
+    },
     Split {
-        q: GgmlStaticTensor,
-        k: GgmlStaticTensor,
-        v: GgmlStaticTensor,
+        q: LlmWeightHandle,
+        k: LlmWeightHandle,
+        v: LlmWeightHandle,
     },
 }
 
@@ -1158,10 +1169,14 @@ fn qwen_llm_layer_weights_with_lora<'a>(
         attn_norm_weight: arena.graph_tensor(layer.attn_norm_weight),
         qkv: match layer.qkv {
             QwenQkvWeightHandles::Fused(weight) => LlmQkvWeights::Fused(weight.as_graph_tensor()),
+            QwenQkvWeightHandles::FusedQvSplitK { qv, k } => LlmQkvWeights::FusedQvSplitK {
+                qv: qv.as_graph_tensor(),
+                k: k.as_graph_tensor(arena),
+            },
             QwenQkvWeightHandles::Split { q, k, v } => LlmQkvWeights::Split {
-                q: q.as_graph_tensor(),
-                k: k.as_graph_tensor(),
-                v: v.as_graph_tensor(),
+                q: q.as_graph_tensor(arena),
+                k: k.as_graph_tensor(arena),
+                v: v.as_graph_tensor(arena),
             },
         },
         q_bias: layer.q_bias.map(|t| arena.graph_tensor(t)),
@@ -1296,6 +1311,7 @@ fn allocate_decode_layer_from_plan(
     loaded: Option<&crate::ggml_runtime::GgmlLoadedWeightContext>,
     plan: &QwenWholeDecoderLayerPlan,
     force_split_qkv: bool,
+    qkv_execution_mode: QwenQkvExecutionMode,
 ) -> Result<(Qwen3AsrLlmLayerWeightHandles, Qwen3AsrLlmDecodeDims), GgmlCpuGraphError> {
     let dims = plan.dims()?;
     let has_qk_norm = plan.q_norm.is_some();
@@ -1327,7 +1343,11 @@ fn allocate_decode_layer_from_plan(
         .then(|| arena.new_tensor_2d_f32(plan.v.output_width, 1, "qwen_llm_decode_v_bias"))
         .transpose()?;
     let ffn_norm = arena.new_tensor_2d_f32(plan.d_model, 1, "qwen_llm_decode_ffn_norm_weight")?;
-    let qkv = match plan.qkv_storage_mode(force_split_qkv) {
+    let qkv_storage_mode = match qkv_execution_mode {
+        QwenQkvExecutionMode::FusedArena => plan.qkv_storage_mode(force_split_qkv),
+        QwenQkvExecutionMode::SplitLoaded => QkvStorageMode::Split,
+    };
+    let qkv = match qkv_storage_mode {
         QkvStorageMode::Fused { ggml_type } => {
             let output_width = plan
                 .q
@@ -1344,11 +1364,33 @@ fn allocate_decode_layer_from_plan(
                 "qwen_llm_decode_qkv_weight",
             )?)
         }
-        QkvStorageMode::Split => QwenQkvWeightHandles::Split {
-            q: new_projection_tensor_from_plan(arena, &plan.q, "qwen_llm_decode_q_weight")?,
-            k: new_projection_tensor_from_plan(arena, &plan.k, "qwen_llm_decode_k_weight")?,
-            v: new_projection_tensor_from_plan(arena, &plan.v, "qwen_llm_decode_v_weight")?,
-        },
+        QkvStorageMode::Split => {
+            let bind = |arena: &GgmlStaticTensorArena,
+                        plan: &ProjectionWeightPlan,
+                        tensor_name: &'static str|
+             -> Result<LlmWeightHandle, GgmlCpuGraphError> {
+                match qkv_execution_mode {
+                    QwenQkvExecutionMode::FusedArena => Ok(LlmWeightHandle::Arena(
+                        new_projection_tensor_from_plan(arena, plan, tensor_name)?,
+                    )),
+                    QwenQkvExecutionMode::SplitLoaded => {
+                        bind_or_arena_llm_plan(arena, loaded, plan, tensor_name)
+                    }
+                }
+            };
+            let q = bind(arena, &plan.q, "qwen_llm_decode_q_weight")?;
+            let k = bind(arena, &plan.k, "qwen_llm_decode_k_weight")?;
+            let v = bind(arena, &plan.v, "qwen_llm_decode_v_weight")?;
+            if qkv_execution_mode == QwenQkvExecutionMode::SplitLoaded
+                && let (LlmWeightHandle::Loaded(q), LlmWeightHandle::Loaded(v)) = (q, v)
+                && let Some(qv) =
+                    arena.try_fuse_adjacent_loaded_tensors_2d(q, v, "qwen_llm_decode_qv_weight")?
+            {
+                QwenQkvWeightHandles::FusedQvSplitK { qv, k }
+            } else {
+                QwenQkvWeightHandles::Split { q, k, v }
+            }
+        }
     };
     Ok((
         Qwen3AsrLlmLayerWeightHandles {
@@ -1562,15 +1604,28 @@ fn upload_decode_layer_from_plan(
         QwenQkvWeightHandles::Fused(handle) => {
             upload_fused_qkv_from_plan(reader, arena, handle, plan)?;
         }
+        QwenQkvWeightHandles::FusedQvSplitK { k, .. } => {
+            if let Some(handle) = k.arena_handle() {
+                peak_staging_bytes = peak_staging_bytes.max(upload_projection_from_plan(
+                    reader,
+                    arena,
+                    handle,
+                    &plan.k,
+                    "qwen_llm_decode_k_weight",
+                )?);
+            }
+        }
         QwenQkvWeightHandles::Split { q, k, v } => {
             for (handle, projection, name) in [
-                (q, &plan.q, "qwen_llm_decode_q_weight"),
-                (k, &plan.k, "qwen_llm_decode_k_weight"),
-                (v, &plan.v, "qwen_llm_decode_v_weight"),
+                (q.arena_handle(), &plan.q, "qwen_llm_decode_q_weight"),
+                (k.arena_handle(), &plan.k, "qwen_llm_decode_k_weight"),
+                (v.arena_handle(), &plan.v, "qwen_llm_decode_v_weight"),
             ] {
-                peak_staging_bytes = peak_staging_bytes.max(upload_projection_from_plan(
-                    reader, arena, handle, projection, name,
-                )?);
+                if let Some(handle) = handle {
+                    peak_staging_bytes = peak_staging_bytes.max(upload_projection_from_plan(
+                        reader, arena, handle, projection, name,
+                    )?);
+                }
             }
         }
     }
@@ -1761,9 +1816,21 @@ fn allocate_decode_layer_tensors(
             "qwen_llm_decode_qkv_weight",
         )?),
         None => QwenQkvWeightHandles::Split {
-            q: new_projection_tensor_in_arena(arena, q_weight, "qwen_llm_decode_q_weight")?,
-            k: new_projection_tensor_in_arena(arena, k_weight, "qwen_llm_decode_k_weight")?,
-            v: new_projection_tensor_in_arena(arena, v_weight, "qwen_llm_decode_v_weight")?,
+            q: LlmWeightHandle::Arena(new_projection_tensor_in_arena(
+                arena,
+                q_weight,
+                "qwen_llm_decode_q_weight",
+            )?),
+            k: LlmWeightHandle::Arena(new_projection_tensor_in_arena(
+                arena,
+                k_weight,
+                "qwen_llm_decode_k_weight",
+            )?),
+            v: LlmWeightHandle::Arena(new_projection_tensor_in_arena(
+                arena,
+                v_weight,
+                "qwen_llm_decode_v_weight",
+            )?),
         },
     };
     // Bind output/gate/up/down zero-copy from the mmap'd pack when present
@@ -2112,9 +2179,16 @@ fn upload_decode_layer_weights(
             upload_fused_qkv_weight_to_arena(arena, *tensor, weight, "qwen_llm_decode_qkv_weight")?;
         }
         (QwenQkvWeightHandles::Split { q, k, v }, None) => {
-            upload_projection_weight_to_arena(arena, *q, q_weight, "qwen_llm_decode_q_weight")?;
-            upload_projection_weight_to_arena(arena, *k, k_weight, "qwen_llm_decode_k_weight")?;
-            upload_projection_weight_to_arena(arena, *v, v_weight, "qwen_llm_decode_v_weight")?;
+            for (handle, weight, name) in [
+                (q.arena_handle(), q_weight, "qwen_llm_decode_q_weight"),
+                (k.arena_handle(), k_weight, "qwen_llm_decode_k_weight"),
+                (v.arena_handle(), v_weight, "qwen_llm_decode_v_weight"),
+            ] {
+                let handle = handle.ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "fixture split QKV handle must be arena-backed",
+                })?;
+                upload_projection_weight_to_arena(arena, handle, weight, name)?;
+            }
         }
         _ => {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
@@ -2258,6 +2332,7 @@ fn compile_qwen_whole_decoder_graph_from_prepared_plan_with_config_and_native_gq
         request.preflight,
         graph_config,
         native_gqa,
+        QwenQkvExecutionMode::FusedArena,
     )
 }
 
@@ -2412,6 +2487,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         adapter: Option<&QwenLoraAdapter>,
         backend: GgmlCpuGraphBackend,
         native_gqa: GgmlNativeGqaCapability,
+        qkv_execution_mode: QwenQkvExecutionMode,
     ) -> Result<Self, GgmlCpuGraphError> {
         Self::new_from_plan_with_adapter_and_native_gqa(
             plan,
@@ -2422,6 +2498,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             preflight,
             qwen_decoder_graph_config(backend),
             Some(native_gqa),
+            qkv_execution_mode,
         )
     }
 
@@ -2482,6 +2559,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             preflight,
             graph_config,
             None,
+            QwenQkvExecutionMode::FusedArena,
         )
     }
 
@@ -2491,6 +2569,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         token_embedding: MappedTokenEmbeddingDeviceSpec<'_>,
         backend: GgmlCpuGraphBackend,
         native_gqa: GgmlNativeGqaCapability,
+        qkv_execution_mode: QwenQkvExecutionMode,
     ) -> Result<Self, GgmlCpuGraphError> {
         Self::new_from_plan_with_adapter_and_native_gqa(
             plan,
@@ -2501,6 +2580,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             preflight,
             qwen_decoder_graph_config(backend),
             Some(native_gqa),
+            qkv_execution_mode,
         )
     }
 
@@ -2514,6 +2594,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         graph_config: GgmlCpuGraphConfig,
         native_gqa: Option<GgmlNativeGqaCapability>,
+        qkv_execution_mode: QwenQkvExecutionMode,
     ) -> Result<Self, GgmlCpuGraphError> {
         if plan.layers.is_empty() {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
@@ -2566,6 +2647,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 loaded.as_ref(),
                 layer_plan,
                 force_split_qkv,
+                qkv_execution_mode,
             )?;
             handles.lora = layer_lora;
             match dims {
@@ -8139,6 +8221,86 @@ mod tests {
             "peak staging {} must fit within one layer payload {one_layer_payload}",
             executor.materialization_peak_staging_bytes
         );
+    }
+
+    #[test]
+    fn split_loaded_qkv_binds_pack_roots_and_matches_fused_prefill() {
+        let (_temp, source, metadata) = metadata_only_decoder_fixture(false);
+        let reader = GgufTensorDataReader::from_runtime_source(&source).expect("reader");
+        let plan = QwenWholeDecoderPlan::for_qwen3_asr(&reader, metadata).expect("decoder plan");
+        let preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index_from_source(
+                &source,
+            )
+            .expect("decoder fixture preflight");
+
+        let mut fused =
+            Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_and_lora_for_qwen(
+                &plan,
+                &preflight,
+                None,
+                None,
+                None,
+                GgmlCpuGraphBackend::Cpu,
+                GgmlNativeGqaCapability::Validated,
+                QwenQkvExecutionMode::FusedArena,
+            )
+            .expect("fused decoder");
+        let mut split =
+            Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_and_lora_for_qwen(
+                &plan,
+                &preflight,
+                None,
+                None,
+                None,
+                GgmlCpuGraphBackend::Cpu,
+                GgmlNativeGqaCapability::Validated,
+                QwenQkvExecutionMode::SplitLoaded,
+            )
+            .expect("split-loaded decoder");
+
+        assert!(
+            fused
+                .layers
+                .iter()
+                .all(|layer| matches!(layer.qkv, QwenQkvWeightHandles::Fused(_)))
+        );
+        assert!(split.layers.iter().all(|layer| matches!(
+            layer.qkv,
+            QwenQkvWeightHandles::Split {
+                q: LlmWeightHandle::Loaded(_),
+                k: LlmWeightHandle::Loaded(_),
+                v: LlmWeightHandle::Loaded(_),
+            } | QwenQkvWeightHandles::FusedQvSplitK {
+                k: LlmWeightHandle::Loaded(_),
+                ..
+            }
+        )));
+
+        let token_count = 7;
+        let hidden = deterministic_prefill_hidden(metadata.llm_d_model, token_count);
+        let fused = fused
+            .run_prefill(&hidden, token_count, 1_000_000.0)
+            .expect("fused prefill");
+        let split = split
+            .run_prefill(&hidden, token_count, 1_000_000.0)
+            .expect("split-loaded prefill");
+        assert_qwen2_scheduler_vectors_close("split-loaded hidden", &split.hidden, &fused.hidden);
+        assert_eq!(split.layer_kv.len(), fused.layer_kv.len());
+        for (layer_index, ((split_k, split_v), (fused_k, fused_v))) in
+            split.layer_kv.iter().zip(&fused.layer_kv).enumerate()
+        {
+            assert_qwen2_scheduler_vectors_close(
+                &format!("split-loaded layer {layer_index} key"),
+                split_k,
+                fused_k,
+            );
+            assert_qwen2_scheduler_vectors_close(
+                &format!("split-loaded layer {layer_index} value"),
+                split_v,
+                fused_v,
+            );
+        }
     }
 
     #[test]

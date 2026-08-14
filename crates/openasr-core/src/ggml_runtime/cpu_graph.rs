@@ -2747,6 +2747,109 @@ impl GgmlStaticTensorArena {
         )
     }
 
+    /// Creates one read-only 2D descriptor over two adjacent loaded weight
+    /// tensors without copying either payload. This is intentionally narrow:
+    /// both tensors must already be live, contiguous rank-2 leaves in the same
+    /// backend buffer, share the same type and row width, and the second byte
+    /// range must start exactly where the first ends. `Ok(None)` means that the
+    /// pack/backend layout cannot be fused and the caller should use its split
+    /// graph; malformed live bindings fail closed.
+    ///
+    /// The returned descriptor aliases the loaded buffer, so both loaded
+    /// tensors' `GgmlLoadedWeightContext` owner must outlive this arena and all
+    /// graphs that reference it.
+    pub(crate) fn try_fuse_adjacent_loaded_tensors_2d(
+        &self,
+        first: GgmlLoadedTensor,
+        second: GgmlLoadedTensor,
+        tensor_name: &'static str,
+    ) -> Result<Option<GgmlStaticTensor>, GgmlCpuGraphError> {
+        self.ensure_can_extend("fuse adjacent loaded tensors")?;
+        let first_layout = unsafe { *(first.raw.as_ptr() as *const ffi::GgmlTensorAllocPrefix) };
+        let second_layout = unsafe { *(second.raw.as_ptr() as *const ffi::GgmlTensorAllocPrefix) };
+        if first_layout.buffer.is_null()
+            || second_layout.buffer.is_null()
+            || first_layout.data.is_null()
+            || second_layout.data.is_null()
+        {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "adjacent loaded tensor fusion requires live backend bindings",
+            });
+        }
+        if !unsafe { ffi::ggml_is_contiguous(first.raw.as_ptr()) }
+            || !unsafe { ffi::ggml_is_contiguous(second.raw.as_ptr()) }
+        {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "adjacent loaded tensor fusion requires contiguous inputs",
+            });
+        }
+        if first_layout.buffer != second_layout.buffer
+            || first_layout.type_ != second_layout.type_
+            || first_layout.ne[0] != second_layout.ne[0]
+            || first_layout.ne[2..] != [1, 1]
+            || second_layout.ne[2..] != [1, 1]
+        {
+            return Ok(None);
+        }
+        let first_bytes = unsafe { ffi::ggml_nbytes(first.raw.as_ptr()) };
+        let second_bytes = unsafe { ffi::ggml_nbytes(second.raw.as_ptr()) };
+        let first_start = first_layout.data as usize;
+        let Some(first_end) = first_start.checked_add(first_bytes) else {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "adjacent loaded tensor fusion byte range overflowed",
+            });
+        };
+        if first_end != second_layout.data as usize {
+            return Ok(None);
+        }
+        let ne0 = usize::try_from(first_layout.ne[0]).map_err(|_| {
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "adjacent loaded tensor fusion row width exceeds usize",
+            }
+        })?;
+        let first_ne1 = usize::try_from(first_layout.ne[1]).map_err(|_| {
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "adjacent loaded tensor fusion first row count exceeds usize",
+            }
+        })?;
+        let second_ne1 = usize::try_from(second_layout.ne[1]).map_err(|_| {
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "adjacent loaded tensor fusion second row count exceeds usize",
+            }
+        })?;
+        let ne1 =
+            first_ne1
+                .checked_add(second_ne1)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "adjacent loaded tensor fusion row count overflowed",
+                })?;
+        if self.require_direct_matmul_weight_support {
+            validate_direct_matmul_weight_type(self.backend, first_layout.type_, tensor_name)?;
+        }
+        let raw = self.new_tensor_2d_typed(ne0, ne1, first_layout.type_, tensor_name)?;
+        let combined_bytes = unsafe { ffi::ggml_nbytes(raw.raw.as_ptr()) };
+        if combined_bytes
+            != first_bytes.checked_add(second_bytes).ok_or(
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "adjacent loaded tensor fusion combined size overflowed",
+                },
+            )?
+        {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "adjacent loaded tensor fusion changed the payload byte size",
+            });
+        }
+        let status = unsafe {
+            ffi::ggml_backend_tensor_alloc(first_layout.buffer, raw.raw.as_ptr(), first_layout.data)
+        };
+        if status != ffi::GGML_STATUS_SUCCESS {
+            return Err(GgmlCpuGraphError::TensorAllocationFailed {
+                tensor: tensor_name,
+            });
+        }
+        Ok(Some(raw))
+    }
+
     pub(crate) fn view_2d(
         &self,
         input: GgmlStaticTensor,
@@ -11802,6 +11905,24 @@ mod tests {
                 tensor_type: GgufWriteTensorType::F32,
                 data,
             },
+            GgufWriteTensor {
+                name: "loaded.q".to_string(),
+                dims: vec![8, 2],
+                tensor_type: GgufWriteTensorType::F32,
+                data: (1..=16)
+                    .map(|value| value as f32)
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            },
+            GgufWriteTensor {
+                name: "loaded.v".to_string(),
+                dims: vec![8, 1],
+                tensor_type: GgufWriteTensorType::F32,
+                data: (17..=24)
+                    .map(|value| value as f32)
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            },
         ];
         write_gguf_file_v0(&pack, &BTreeMap::new(), &tensors).expect("write tiny gguf");
 
@@ -11825,7 +11946,7 @@ mod tests {
             "one owner/backend must expose exactly one loaded-weight binding identity"
         );
         let mut external_view_arena = runner
-            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(2))
+            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(4))
             .expect("external view arena should initialize");
         let reoriented = external_view_arena
             .reshape_loaded_tensor_2d(
@@ -11837,12 +11958,38 @@ mod tests {
                 "loaded_rows_by_columns_view",
             )
             .expect("loaded tensor should reshape without a payload copy");
+        let fused_qv = external_view_arena
+            .try_fuse_adjacent_loaded_tensors_2d(
+                loaded.tensor("loaded.q").expect("loaded q tensor"),
+                loaded.tensor("loaded.v").expect("loaded v tensor"),
+                "loaded_qv_fused_view",
+            )
+            .expect("adjacent loaded tensor fusion should validate")
+            .expect("writer preserves adjacent q/v payloads");
         let arena_sentinel = external_view_arena
             .new_tensor_1d_f32(1, "external_view_arena_sentinel")
             .expect("arena sentinel should allocate");
         external_view_arena
             .set_f32_slice(arena_sentinel, &[0.0], "external_view_arena_sentinel")
             .expect("arena allocation should initialize the external view");
+        {
+            let mut graph = runner.start_graph();
+            let input = graph
+                .new_tensor_2d_f32(8, 1, "fused_qv_input")
+                .expect("fused qv input tensor");
+            let out = graph
+                .mul_mat(external_view_arena.graph_tensor(fused_qv), input)
+                .expect("mul_mat fused loaded q/v leaf");
+            graph
+                .set_f32_slice(input, &[1.0; 8], "fused_qv_input")
+                .expect("upload fused qv input");
+            assert_eq!(
+                graph
+                    .compute_output_f32(out, 3)
+                    .expect("compute fused loaded q/v leaf"),
+                vec![36.0, 100.0, 164.0]
+            );
+        }
         {
             let mut graph = runner.start_graph();
             let input = graph

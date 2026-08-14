@@ -14,7 +14,7 @@ use super::llm_prefill::Qwen3AsrLlmPrefillInput;
 #[cfg(test)]
 use super::llm_transformer::Qwen3AsrLlmLayerAttentionProjection;
 use super::llm_transformer::{
-    Qwen3AsrLlmWholeDecoderGraphExecutor, QwenWholeDecoderPlan,
+    Qwen3AsrLlmWholeDecoderGraphExecutor, QwenQkvExecutionMode, QwenWholeDecoderPlan,
     resolve_qwen_family_production_kv_cache_policy,
 };
 use super::logits_head::{Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime};
@@ -1734,6 +1734,7 @@ impl Qwen3AsrOwnerThreadState {
                 token_embedding,
                 slot.job.backend(),
                 slot.job.native_gqa,
+                QwenQkvExecutionMode::FusedArena,
             )
             .map_err(|error| Qwen3AsrServeBatchError::OwnerFailed {
                 reason: format!("qwen whole-decoder init failed: {error}"),
