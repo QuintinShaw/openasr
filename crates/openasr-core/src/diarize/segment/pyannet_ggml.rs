@@ -1206,7 +1206,9 @@ mod tests {
             PyannetGgmlRuntime::quoted_persistent_host_commitment_bytes(ExecutionPlacement::Hybrid,),
             ACCELERATED_HOST_COMMITMENT_BYTES,
         );
-        assert!(ACCELERATED_HOST_COMMITMENT_BYTES > ACCELERATED_BASE_HOST_COMMITMENT_BYTES);
+        const {
+            assert!(ACCELERATED_HOST_COMMITMENT_BYTES > ACCELERATED_BASE_HOST_COMMITMENT_BYTES);
+        }
     }
 
     #[test]
