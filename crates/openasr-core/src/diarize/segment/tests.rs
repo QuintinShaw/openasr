@@ -65,6 +65,35 @@ fn bounded_pyannote_window_pool_checks_cancellation_between_batches() {
 }
 
 #[test]
+fn accelerated_pyannote_protocol_submits_b4_plus_ordered_tail() {
+    let sample_count = 14 * super::SAMPLE_RATE_HZ as usize;
+    let pcm = crate::PcmBuffer::from_vec(vec![0.0; sample_count]);
+    let frames = super::pyannet::output_frame_count(10 * super::SAMPLE_RATE_HZ as usize);
+    let mut submitted = Vec::new();
+    let activity = super::segment_pyannote_local_activity_batched(
+        pcm.full_slice(),
+        super::SAMPLE_RATE_HZ,
+        &|| false,
+        None,
+        4,
+        |windows| {
+            submitted.push(windows.len());
+            Ok(vec![vec![0; frames]; windows.len()])
+        },
+    )
+    .expect("batched sliding-window protocol");
+    assert_eq!(submitted, [4, 1]);
+    assert_eq!(activity.windows.len(), 5);
+    assert!(
+        activity
+            .windows
+            .iter()
+            .map(|window| window.start_sample)
+            .eq((0..5).map(|index| index * super::SAMPLE_RATE_HZ as usize))
+    );
+}
+
+#[test]
 #[ignore = "needs OPENASR_PYANNOTE_F32_PACK"]
 fn parallel_pyannote_windows_match_serial_reference() {
     let pack = std::env::var_os("OPENASR_PYANNOTE_F32_PACK")
@@ -515,9 +544,28 @@ fn pyannet_exact_gpu_matches_cpu_and_onnx_reference() {
         crate::device::execution_policy::ExecutionPlacement::Hybrid,
     )
     .expect("exact GPU runtime");
-    let actual = runtime
-        .forward_features(&features, feature_frames)
-        .expect("exact GPU recurrent/classifier forward");
+    let feature_batch = [
+        features.as_slice(),
+        features.as_slice(),
+        features.as_slice(),
+        features.as_slice(),
+    ];
+    let mut actual_batch = runtime
+        .forward_features_batch(&feature_batch, feature_frames)
+        .expect("exact GPU batched recurrent/classifier forward");
+    assert_eq!(actual_batch.len(), feature_batch.len());
+    let actual = actual_batch.remove(0);
+    for duplicate in actual_batch {
+        let duplicate_max_abs = duplicate
+            .iter()
+            .zip(&actual)
+            .map(|(duplicate, actual)| (duplicate - actual).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            duplicate_max_abs < 1e-6,
+            "GPU batch lanes diverged by {duplicate_max_abs}"
+        );
+    }
     let frames = feature_frames;
     assert_eq!(frames, cpu_frames, "CPU/GPU frame count");
     assert_eq!(frames, y_dims[1], "GPU/oracle frame count");

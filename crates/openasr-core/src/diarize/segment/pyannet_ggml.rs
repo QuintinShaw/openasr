@@ -8,14 +8,15 @@
 
 use thiserror::Error;
 
+use super::ops::log_softmax_checked_inplace;
 use super::pyannet::{ALPHA, HIDDEN, LSTM_WEIGHTS, NUM_CLASSES, PyannetModel, output_frame_count};
 use crate::{
     device::execution_policy::ExecutionPlacement,
     diarize::embed::weights::{Weights, WeightsError},
     ggml_runtime::{
         GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-        GgmlCpuGraphRunner, GgmlCpuTensor, GgmlPersistentGraphSession, GgmlStaticTensor,
-        GgmlStaticTensorArena,
+        GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLstmGateOrder, GgmlPersistentGraphSession,
+        GgmlStaticTensor, GgmlStaticTensorArena,
     },
 };
 
@@ -29,9 +30,15 @@ const SINC_GRAPH_SIZE: usize = 1 << 9;
 // monolithic four-layer bidirectional graph.
 const DIRECTION_GRAPH_SIZE: usize = 1 << 14;
 const MAX_DIRECTION_FRAMES: usize = 800;
+const HYBRID_BATCH_FRAMES: usize = 589;
+const HYBRID_BATCH_WIDTH: usize = 4;
+const HYBRID_BATCH_INPUT_ELEMENTS: usize =
+    INPUT_FEATURES * HYBRID_BATCH_FRAMES * HYBRID_BATCH_WIDTH;
 // 13 SincNet handles + 6 stacked LSTM handles + 6 classifier handles + zero.
 const ARENA_TENSORS: usize = 26;
-const ACCELERATED_HOST_COMMITMENT_BYTES: u64 = 64 * 1024;
+const ACCELERATED_BASE_HOST_COMMITMENT_BYTES: u64 = 64 * 1024;
+const ACCELERATED_HOST_COMMITMENT_BYTES: u64 = ACCELERATED_BASE_HOST_COMMITMENT_BYTES
+    + (HYBRID_BATCH_INPUT_ELEMENTS * std::mem::size_of::<f32>()) as u64;
 const F32_BYTES: usize = std::mem::size_of::<f32>();
 const LSTM_GROUP_SPECS: [(usize, usize); 2] = [(INPUT_FEATURES, 2), (2 * HIDDEN, 6)];
 
@@ -45,6 +52,12 @@ pub(crate) enum PyannetGgmlError {
     InvalidFeaturePayload { got: usize, expected: usize },
     #[error("PyanNet recurrent input has {frames} frames, maximum supported is {maximum}")]
     TooManyFrames { frames: usize, maximum: usize },
+    #[error("PyanNet recurrent batch accepts one to {HYBRID_BATCH_WIDTH} windows, got {got}")]
+    InvalidFeatureBatch { got: usize },
+    #[error("PyanNet recurrent batch requires {HYBRID_BATCH_FRAMES} frames per window, got {got}")]
+    InvalidFeatureBatchFrames { got: usize },
+    #[error("PyanNet recurrent batch produced invalid logits: {0}")]
+    InvalidFeatureBatchOutput(&'static str),
     #[error("PyanNet SincNet output has {got} values, expected {expected}")]
     InvalidSincOutput { got: usize, expected: usize },
 }
@@ -329,6 +342,12 @@ struct PersistentDirectionGraph {
     frames: usize,
 }
 
+struct PersistentBatchedRecurrentGraph {
+    session: GgmlPersistentGraphSession,
+    input: GgmlCpuTensor<'static>,
+    output: GgmlCpuTensor<'static>,
+}
+
 /// Thread-confined full-device PyanNet runtime.
 ///
 /// Field order is load-bearing: graph tensors drop before their static arena,
@@ -336,8 +355,10 @@ struct PersistentDirectionGraph {
 pub(crate) struct PyannetGgmlRuntime {
     sinc_graph: Option<PersistentSincGraph>,
     direction_graphs: [Option<PersistentDirectionGraph>; 2],
+    batched_recurrent_graph: Option<PersistentBatchedRecurrentGraph>,
     resident: ResidentWeights,
     runner: GgmlCpuGraphRunner,
+    hybrid_batch_input: Option<Vec<f32>>,
 }
 
 impl PyannetGgmlRuntime {
@@ -364,27 +385,59 @@ impl PyannetGgmlRuntime {
         let graph_placement = device_graph_placement(backend, placement);
         let config =
             crate::models::graph_runtime_config::apply_execution_placement(config, graph_placement);
-        let runner = GgmlCpuGraphRunner::new(config)?;
+        let mut runner = GgmlCpuGraphRunner::new(config)?;
         let arena = runner
             .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(ARENA_TENSORS))?;
         let handles = WeightHandles::allocate(&arena)?;
         let mut arena = arena;
         handles.upload(&mut arena, model.weights())?;
         drop(model);
+        let resident = ResidentWeights { handles, arena };
+        let use_hybrid_batch = backend.is_gpu_class() && placement == ExecutionPlacement::Hybrid;
+        let batched_recurrent_graph = use_hybrid_batch
+            .then(|| build_batched_recurrent_graph(&mut runner, &resident))
+            .transpose()?;
         Ok(Self {
             sinc_graph: None,
             direction_graphs: std::array::from_fn(|_| None),
-            resident: ResidentWeights { handles, arena },
+            batched_recurrent_graph,
+            resident,
             runner,
+            hybrid_batch_input: use_hybrid_batch.then(|| vec![0.0; HYBRID_BATCH_INPUT_ELEMENTS]),
         })
     }
 
     pub(crate) fn persistent_host_commitment_bytes(&self) -> Result<u64, PyannetGgmlError> {
-        Ok(ACCELERATED_HOST_COMMITMENT_BYTES)
+        let staging_bytes = self
+            .hybrid_batch_input
+            .as_ref()
+            .map_or(0, |input| input.capacity() * std::mem::size_of::<f32>());
+        ACCELERATED_BASE_HOST_COMMITMENT_BYTES
+            .checked_add(u64::try_from(staging_bytes).map_err(|_| {
+                PyannetGgmlError::Graph(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "PyanNet hybrid staging bytes do not fit u64",
+                })
+            })?)
+            .ok_or({
+                PyannetGgmlError::Graph(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "PyanNet hybrid retained host byte sum overflowed",
+                })
+            })
     }
 
-    pub(crate) const fn quoted_persistent_host_commitment_bytes() -> u64 {
-        ACCELERATED_HOST_COMMITMENT_BYTES
+    pub(crate) const fn quoted_persistent_host_commitment_bytes(
+        placement: ExecutionPlacement,
+    ) -> u64 {
+        match placement {
+            ExecutionPlacement::Hybrid => ACCELERATED_HOST_COMMITMENT_BYTES,
+            ExecutionPlacement::CpuOnly | ExecutionPlacement::FullDevice => {
+                ACCELERATED_BASE_HOST_COMMITMENT_BYTES
+            }
+        }
+    }
+
+    pub(crate) const fn hybrid_batch_width() -> usize {
+        HYBRID_BATCH_WIDTH
     }
 
     #[cfg(test)]
@@ -621,6 +674,94 @@ impl PyannetGgmlRuntime {
         self.run_classifier(&states, frames)
     }
 
+    /// Execute one to four independent host-SincNet windows in one persistent
+    /// recurrent/classifier graph. Inactive B4 lanes stay zero-filled and are
+    /// never returned to the caller.
+    pub(crate) fn forward_features_batch(
+        &mut self,
+        inputs: &[&[f32]],
+        frames: usize,
+    ) -> Result<Vec<Vec<f32>>, PyannetGgmlError> {
+        if inputs.is_empty() || inputs.len() > HYBRID_BATCH_WIDTH {
+            return Err(PyannetGgmlError::InvalidFeatureBatch { got: inputs.len() });
+        }
+        if frames != HYBRID_BATCH_FRAMES {
+            return Err(PyannetGgmlError::InvalidFeatureBatchFrames { got: frames });
+        }
+        let values_per_window =
+            frames
+                .checked_mul(INPUT_FEATURES)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "PyanNet recurrent batch input size overflowed",
+                })?;
+        for input in inputs {
+            if input.len() != values_per_window {
+                return Err(PyannetGgmlError::InvalidFeaturePayload {
+                    got: input.len(),
+                    expected: values_per_window,
+                });
+            }
+        }
+
+        if self.batched_recurrent_graph.is_none() {
+            self.batched_recurrent_graph = Some(build_batched_recurrent_graph(
+                &mut self.runner,
+                &self.resident,
+            )?);
+        }
+        if self.hybrid_batch_input.is_none() {
+            self.hybrid_batch_input = Some(vec![0.0; HYBRID_BATCH_INPUT_ELEMENTS]);
+        }
+        let staging = self
+            .hybrid_batch_input
+            .as_mut()
+            .expect("PyanNet hybrid staging allocated");
+        staging.fill(0.0);
+        for (batch, input) in inputs.iter().enumerate() {
+            let start = batch.checked_mul(values_per_window).ok_or(
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "PyanNet recurrent batch offset overflowed",
+                },
+            )?;
+            let end = start.checked_add(values_per_window).ok_or(
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "PyanNet recurrent batch range overflowed",
+                },
+            )?;
+            staging[start..end].copy_from_slice(input);
+        }
+
+        let persistent = self
+            .batched_recurrent_graph
+            .as_mut()
+            .expect("PyanNet hybrid graph built");
+        let graph = persistent.session.builder();
+        graph.set_f32_slice(persistent.input, staging, "pyannet_recurrent_batch_input")?;
+        let output_elements = HYBRID_BATCH_WIDTH
+            .checked_mul(frames)
+            .and_then(|values| values.checked_mul(NUM_CLASSES))
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "PyanNet recurrent batch output size overflowed",
+            })?;
+        let raw = graph.compute_output_f32(persistent.output, output_elements)?;
+        let values_per_output =
+            frames
+                .checked_mul(NUM_CLASSES)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "PyanNet recurrent batch output row size overflowed",
+                })?;
+        let mut outputs = raw
+            .chunks_exact(values_per_output)
+            .take(inputs.len())
+            .map(<[f32]>::to_vec)
+            .collect::<Vec<_>>();
+        for output in &mut outputs {
+            log_softmax_checked_inplace(output, frames, NUM_CLASSES)
+                .map_err(PyannetGgmlError::InvalidFeatureBatchOutput)?;
+        }
+        Ok(outputs)
+    }
+
     fn run_lstm_direction(
         &mut self,
         states: &[f32],
@@ -745,6 +886,137 @@ impl PyannetGgmlRuntime {
         graph.set_f32_slice(input, states, "pyannet_classifier_input")?;
         Ok(graph.compute_output_f32(output, frames * NUM_CLASSES)?)
     }
+}
+
+fn build_batched_recurrent_graph(
+    runner: &mut GgmlCpuGraphRunner,
+    resident: &ResidentWeights,
+) -> Result<PersistentBatchedRecurrentGraph, GgmlCpuGraphError> {
+    let mut session =
+        runner.start_persistent_graph_session_with_node_capacity(DIRECTION_GRAPH_SIZE)?;
+    let graph = session.builder();
+    let input = graph.new_tensor_3d_f32(
+        INPUT_FEATURES,
+        HYBRID_BATCH_FRAMES,
+        HYBRID_BATCH_WIDTH,
+        "pyannet_recurrent_batch_input",
+    )?;
+    let mut state = input;
+    for layer in 0..LSTM_WEIGHTS.len() {
+        let group = usize::from(layer != 0);
+        let slot_base = if layer == 0 { 0 } else { (layer - 1) * 2 };
+        let (forward_w, forward_r, forward_b) =
+            batched_lstm_weight_views(graph, resident, group, slot_base)?;
+        let (backward_w, backward_r, backward_b) =
+            batched_lstm_weight_views(graph, resident, group, slot_base + 1)?;
+        let forward = graph.lstm_seq(
+            state,
+            forward_w,
+            forward_r,
+            forward_b,
+            GgmlLstmGateOrder::Iofc,
+            false,
+        )?;
+        let backward = graph.lstm_seq(
+            state,
+            backward_w,
+            backward_r,
+            backward_b,
+            GgmlLstmGateOrder::Iofc,
+            true,
+        )?;
+        state = graph.cont(graph.concat(forward, backward, 0)?)?;
+    }
+    for (index, handles) in resident.handles.classifier.iter().copied().enumerate() {
+        state = linear(graph, &resident.arena, handles, state)?;
+        if index + 1 != resident.handles.classifier.len() {
+            state = graph.leaky_relu(state, ALPHA)?;
+        }
+    }
+    // Read raw logits once. The checked CPU postlude applies stable row-wise
+    // log-softmax without another device synchronization or the underflow risk
+    // of evaluating log(softmax(x)) directly.
+    let output = state;
+    graph.set_input(input)?;
+    graph.set_output(output)?;
+    graph.prepare_outputs_for_upload(&[output])?;
+    Ok(PersistentBatchedRecurrentGraph {
+        session,
+        input,
+        output,
+    })
+}
+
+fn batched_lstm_weight_views<'a>(
+    graph: &GgmlCpuGraphBuilder<'a>,
+    resident: &ResidentWeights,
+    group: usize,
+    slot: usize,
+) -> Result<(GgmlCpuTensor<'a>, GgmlCpuTensor<'a>, GgmlCpuTensor<'a>), GgmlCpuGraphError> {
+    let handles = resident.handles.lstm_groups[group];
+    if slot >= handles.slots {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "PyanNet recurrent batch weight slot is out of range",
+        });
+    }
+    let gate = GATE_COUNT
+        .checked_mul(HIDDEN)
+        .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "PyanNet recurrent batch gate width overflowed",
+        })?;
+    let input_offset = checked_f32_offset(slot, gate, handles.input_features)?;
+    let recurrent_offset = checked_f32_offset(slot, gate, HIDDEN)?;
+    let bias_offset = slot
+        .checked_mul(gate)
+        .and_then(|elements| elements.checked_mul(F32_BYTES))
+        .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "PyanNet recurrent batch bias offset overflowed",
+        })?;
+    let input_stride = handles.input_features.checked_mul(F32_BYTES).ok_or(
+        GgmlCpuGraphError::UnsupportedInputs {
+            reason: "PyanNet recurrent batch input stride overflowed",
+        },
+    )?;
+    let recurrent_stride =
+        HIDDEN
+            .checked_mul(F32_BYTES)
+            .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "PyanNet recurrent batch recurrent stride overflowed",
+            })?;
+    Ok((
+        graph.view_2d(
+            resident.arena.graph_tensor(handles.input_weights),
+            handles.input_features,
+            gate,
+            input_stride,
+            input_offset,
+        )?,
+        graph.view_2d(
+            resident.arena.graph_tensor(handles.recurrent_weights),
+            HIDDEN,
+            gate,
+            recurrent_stride,
+            recurrent_offset,
+        )?,
+        graph.view_1d(
+            resident.arena.graph_tensor(handles.combined_biases),
+            gate,
+            bias_offset,
+        )?,
+    ))
+}
+
+fn checked_f32_offset(
+    slot: usize,
+    rows: usize,
+    row_width: usize,
+) -> Result<usize, GgmlCpuGraphError> {
+    slot.checked_mul(rows)
+        .and_then(|elements| elements.checked_mul(row_width))
+        .and_then(|elements| elements.checked_mul(F32_BYTES))
+        .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "PyanNet recurrent batch tensor offset overflowed",
+        })
 }
 
 const fn valid_output_count(input: usize, kernel: usize, stride: usize) -> usize {
@@ -920,6 +1192,21 @@ mod tests {
             device_graph_placement(GgmlCpuGraphBackend::Cpu, ExecutionPlacement::CpuOnly,),
             ExecutionPlacement::CpuOnly,
         );
+    }
+
+    #[test]
+    fn hybrid_batch_staging_does_not_change_full_device_host_quote() {
+        assert_eq!(
+            PyannetGgmlRuntime::quoted_persistent_host_commitment_bytes(
+                ExecutionPlacement::FullDevice,
+            ),
+            ACCELERATED_BASE_HOST_COMMITMENT_BYTES,
+        );
+        assert_eq!(
+            PyannetGgmlRuntime::quoted_persistent_host_commitment_bytes(ExecutionPlacement::Hybrid,),
+            ACCELERATED_HOST_COMMITMENT_BYTES,
+        );
+        assert!(ACCELERATED_HOST_COMMITMENT_BYTES > ACCELERATED_BASE_HOST_COMMITMENT_BYTES);
     }
 
     #[test]

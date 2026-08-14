@@ -548,6 +548,84 @@ pub(super) fn segment_pyannote_local_activity_serial(
     Ok(finalize_pyannote_activity(&samples, windows))
 }
 
+/// Ordered sliding-window protocol for an accelerated PyanNet runtime that
+/// executes a bounded batch inside one persistent graph. The host frontend
+/// remains sequential and request cancellation is checked before each window
+/// is prepared and before each device submission.
+pub(super) fn segment_pyannote_local_activity_batched(
+    samples: crate::PcmSlice,
+    sample_rate_hz: u32,
+    canceled: &dyn Fn() -> bool,
+    progress: Option<&crate::api::backend::WorkProgressObserver>,
+    batch_width: usize,
+    mut infer_windows: impl FnMut(&[crate::PcmSlice]) -> Result<Vec<Vec<u8>>, SegmentError>,
+) -> Result<LocalActivity, SegmentError> {
+    if sample_rate_hz != SAMPLE_RATE_HZ {
+        return Err(SegmentError::UnsupportedSampleRate(sample_rate_hz));
+    }
+    if batch_width == 0 {
+        return Err(SegmentError::Inference(
+            "pyannote accelerated batch width must be nonzero".to_string(),
+        ));
+    }
+    if samples.is_empty() {
+        return Ok(LocalActivity {
+            frame_clock: activity_frame_clock(),
+            windows: Vec::new(),
+            local_speaker_slots: MAX_LOCAL_SPEAKERS as u8,
+            speaker_count: Vec::new(),
+        });
+    }
+    let window_samples = (DEFAULT_WINDOW_S * sample_rate_hz as f64) as usize;
+    let step_samples = (DEFAULT_STEP_S * sample_rate_hz as f64).round() as usize;
+    let starts = sliding_window_starts(samples.len(), window_samples, step_samples);
+    let total_windows = starts.len();
+    let mut windows = Vec::with_capacity(total_windows);
+    if let Some(progress) = progress {
+        progress.report(0, total_windows.max(1));
+    }
+    for start_batch in starts.chunks(batch_width) {
+        if canceled() {
+            return Err(SegmentError::Canceled);
+        }
+        let mut input_batch = Vec::with_capacity(start_batch.len());
+        for start in start_batch.iter().copied() {
+            if canceled() {
+                return Err(SegmentError::Canceled);
+            }
+            let end = (start + window_samples).min(samples.len());
+            if end - start == window_samples {
+                input_batch.push(samples.slice(start..end));
+            } else {
+                let mut padded = vec![0.0f32; window_samples];
+                padded[..end - start].copy_from_slice(&samples[start..end]);
+                input_batch.push(padded.into());
+            }
+        }
+        if canceled() {
+            return Err(SegmentError::Canceled);
+        }
+        let activities = infer_windows(&input_batch)?;
+        if activities.len() != start_batch.len() {
+            return Err(SegmentError::Inference(format!(
+                "pyannote accelerated batch returned {} windows, expected {}",
+                activities.len(),
+                start_batch.len(),
+            )));
+        }
+        for (start, activity) in start_batch.iter().copied().zip(activities) {
+            windows.push(LocalActivityWindow {
+                start_sample: start,
+                frame_activity: activity,
+            });
+            if let Some(progress) = progress {
+                progress.report(windows.len(), total_windows.max(1));
+            }
+        }
+    }
+    Ok(finalize_pyannote_activity(&samples, windows))
+}
+
 fn finalize_pyannote_activity(
     samples: &crate::PcmSlice,
     mut windows: Vec<LocalActivityWindow>,

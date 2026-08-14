@@ -31,7 +31,7 @@ use super::{
     DIARIZEN_GGML_ARCHITECTURE_ID, LocalActivity, LocalActivitySegmenter, PyannetGgmlRuntime,
     PyannoteSegmenter, SegmentError, SegmenterProvider, decode_activity, diarizen,
     pack::{PreparedSegmenterSource, PreparedSelectedSegmenter},
-    segment_pyannote_local_activity_serial,
+    segment_pyannote_local_activity_batched, segment_pyannote_local_activity_serial,
 };
 use crate::diarize::embed::weights::WeightsError;
 use crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID;
@@ -91,9 +91,6 @@ impl PolicyResolvedPyannoteSegmenterRuntime {
         let source = prepared.source;
         let content_id = source.content_id().to_string();
         let (retained_quote, peak_quote) = pyannote_source_quote(&source)?;
-        let accelerated_retained_quote =
-            PyannetGgmlRuntime::quoted_persistent_host_commitment_bytes();
-
         let execution_plan = resolve_auxiliary_execution_plan(
             execution_services.as_ref(),
             PYANNOTE_GGML_ARCHITECTURE_ID,
@@ -120,7 +117,6 @@ impl PolicyResolvedPyannoteSegmenterRuntime {
                         backend,
                         candidate.placement,
                         peak_quote,
-                        accelerated_retained_quote,
                     )
                     .map(PyannoteRuntimeOwner::FullDevice)
                 }
@@ -139,7 +135,6 @@ impl PolicyResolvedPyannoteSegmenterRuntime {
                         backend,
                         candidate.placement,
                         peak_quote,
-                        accelerated_retained_quote,
                     )?;
                     Ok(PyannoteRuntimeOwner::Hybrid {
                         frontend,
@@ -201,20 +196,47 @@ impl LocalActivitySegmenter for PolicyResolvedPyannoteSegmenterRuntime {
                 PyannoteRuntimeOwner::Hybrid {
                     frontend,
                     recurrent,
-                } => segment_pyannote_local_activity_serial(
+                } => segment_pyannote_local_activity_batched(
                     samples.clone(),
                     sample_rate_hz,
                     canceled,
                     progress,
-                    |window| {
-                        let (features, frames) = frontend
-                            .prepare_accelerated_features(window.as_slice())
-                            .map_err(|error| SegmentError::Inference(error.to_string()))?;
+                    PyannetGgmlRuntime::hybrid_batch_width(),
+                    |windows| {
+                        let prepared = windows
+                            .iter()
+                            .map(|window| {
+                                if canceled() {
+                                    return Err(SegmentError::Canceled);
+                                }
+                                frontend
+                                    .prepare_accelerated_features(window.as_slice())
+                                    .map_err(|error| SegmentError::Inference(error.to_string()))
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let frames = prepared.first().map_or(0, |(_, frames)| *frames);
+                        if prepared.iter().any(|(_, actual)| *actual != frames) {
+                            return Err(SegmentError::Inference(
+                                "pyannote accelerated batch frame counts differ".to_string(),
+                            ));
+                        }
+                        if canceled() {
+                            return Err(SegmentError::Canceled);
+                        }
                         recurrent
                             .call_mut_fallible(move |runtime| {
+                                let features = prepared
+                                    .iter()
+                                    .map(|(features, _)| features.as_slice())
+                                    .collect::<Vec<_>>();
                                 runtime
-                                    .forward_features(&features, frames)
-                                    .map(|logp| decode_activity(&logp, frames))
+                                    .forward_features_batch(&features, frames)
+                                    .map(|batch| {
+                                        batch
+                                            .into_iter()
+                                            .map(|logp| decode_activity(&logp, frames))
+                                            .collect::<Vec<_>>()
+                                    })
                             })
                             .map_err(|error| SegmentError::Inference(error.to_string()))?
                             .map_err(|error| SegmentError::Inference(error.to_string()))
@@ -254,7 +276,6 @@ fn load_pyannote_actor(
     backend: GgmlCpuGraphBackend,
     placement: crate::device::execution_policy::ExecutionPlacement,
     peak_quote: u64,
-    retained_quote: u64,
 ) -> Result<PyannoteActor, SegmentError> {
     if source.preflight().runtime_source.content_id() != expected_content_id {
         return Err(content_changed(
@@ -268,7 +289,7 @@ fn load_pyannote_actor(
             "pyannote-segmentation.full-device-ggml.v2"
         }
         crate::device::execution_policy::ExecutionPlacement::Hybrid => {
-            "pyannote-segmentation.hybrid-recurrent-ggml.v1"
+            "pyannote-segmentation.hybrid-recurrent-ggml.v2"
         }
         crate::device::execution_policy::ExecutionPlacement::CpuOnly => {
             return Err(SegmentError::LoadFailed(
@@ -276,6 +297,7 @@ fn load_pyannote_actor(
             ));
         }
     };
+    let retained_quote = PyannetGgmlRuntime::quoted_persistent_host_commitment_bytes(placement);
     let key = AuxiliaryPinnedRuntimeCacheKey::for_current_lane::<PyannetGgmlRuntime>(
         PYANNOTE_GGML_ARCHITECTURE_ID,
         expected_content_id,
