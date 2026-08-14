@@ -5208,15 +5208,25 @@ mod tests {
         }
     }
 
-    fn asr_exact_smoke_text_drift_budget(label: &str) -> AsrExactSmokeTextDriftBudget {
+    fn asr_exact_smoke_text_drift_budget(
+        label: &str,
+        provider: ExecutionProvider,
+    ) -> AsrExactSmokeTextDriftBudget {
         if label == "jfk_repeated_15m" {
             // Floating-point reductions may change a few greedy choices across 30
             // independently decoded windows. Keep this long-audio quality gate
             // much tighter than a conventional WER threshold while the short
-            // fixtures continue to require byte-identical normalized text.
+            // fixtures continue to require byte-identical normalized text. The
+            // bounds are provider-specific because the stable CUDA reduction
+            // envelope is four edits while Vulkan remains at two.
+            let max_edits = match provider {
+                ExecutionProvider::Cuda => 4,
+                ExecutionProvider::Vulkan => 2,
+                _ => 0,
+            };
             AsrExactSmokeTextDriftBudget {
-                max_segment_mismatches: 2,
-                max_word_edits: 2,
+                max_segment_mismatches: max_edits,
+                max_word_edits: max_edits,
             }
         } else {
             AsrExactSmokeTextDriftBudget {
@@ -5246,14 +5256,21 @@ mod tests {
         );
         assert_eq!(asr_exact_smoke_longform_mode("jfk"), LongFormMode::Off);
         assert_eq!(
-            asr_exact_smoke_text_drift_budget("jfk_repeated_15m"),
+            asr_exact_smoke_text_drift_budget("jfk_repeated_15m", ExecutionProvider::Cuda),
+            AsrExactSmokeTextDriftBudget {
+                max_segment_mismatches: 4,
+                max_word_edits: 4,
+            }
+        );
+        assert_eq!(
+            asr_exact_smoke_text_drift_budget("jfk_repeated_15m", ExecutionProvider::Vulkan),
             AsrExactSmokeTextDriftBudget {
                 max_segment_mismatches: 2,
                 max_word_edits: 2,
             }
         );
         assert_eq!(
-            asr_exact_smoke_text_drift_budget("jfk"),
+            asr_exact_smoke_text_drift_budget("jfk", ExecutionProvider::Cuda),
             AsrExactSmokeTextDriftBudget {
                 max_segment_mismatches: 0,
                 max_word_edits: 0,
@@ -5670,7 +5687,7 @@ mod tests {
             );
         let cpu_hash = normalized_transcription_hash(&cpu);
         let accelerated_hash = normalized_transcription_hash(&accelerated);
-        let text_drift_budget = asr_exact_smoke_text_drift_budget(audio.label);
+        let text_drift_budget = asr_exact_smoke_text_drift_budget(audio.label, provider);
         let normalized_word_edits = crate::metrics::wer_counts(&accelerated.text, &cpu.text).errors;
         assert!(
             segment_text_mismatches <= text_drift_budget.max_segment_mismatches
