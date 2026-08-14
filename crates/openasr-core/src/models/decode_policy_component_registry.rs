@@ -38,6 +38,7 @@ pub(crate) enum BuiltinDecodePolicyExecutionKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BuiltinDecodePolicySeq2SeqTextPostprocessKind {
     Identity,
+    FunAsrNanoStripControlMarkersV0,
     Qwen3AsrStripControlPrefixV0,
 }
 
@@ -223,11 +224,14 @@ pub(crate) const FUNASR_NANO_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyCompone
         // token (ChatML `<|im_end|>`) is supplied per-request via
         // `BuiltinSeq2SeqDecodePolicyConfigInput.eot_token_id`; the audio
         // placeholder tokens only ever appear in the PROMPT (spliced in by the
-        // executor), never emitted by the LLM, so there is nothing else to
-        // strip -- Identity postprocess, same shape as firered-llm/moss.
+        // executor). The model can still decode textual control markers used
+        // by the upstream runtime for silence and stream boundaries, so strip
+        // those in the shared seq2seq output path before any product consumes
+        // the transcript.
         decode_policy_id: crate::arch::FUNASR_NANO_DECODE_POLICY_ID,
         execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
-        seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+        seq2seq_text_postprocess_kind:
+            BuiltinDecodePolicySeq2SeqTextPostprocessKind::FunAsrNanoStripControlMarkersV0,
         seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
         seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
         seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
@@ -693,6 +697,8 @@ fn push_unique_token_id(target: &mut Vec<u32>, token_id: Option<u32>) {
 }
 
 const QWEN3_ASR_TEXT_MARKER: &str = "<asr_text>";
+const FUNASR_NANO_CONTROL_MARKERS: [&str; 3] = ["/sil", "endofbreak", "FFFF"];
+const FUNASR_NANO_ARTIFACT_CHARS: [char; 7] = ['Ｏ', '[', ']', '&', '＆', '|', '｜'];
 
 pub(crate) fn apply_seq2seq_text_postprocess(
     kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind,
@@ -700,11 +706,40 @@ pub(crate) fn apply_seq2seq_text_postprocess(
 ) -> String {
     match kind {
         BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity => decoded.to_string(),
+        BuiltinDecodePolicySeq2SeqTextPostprocessKind::FunAsrNanoStripControlMarkersV0 => {
+            // Mirror the model runtime's output contract at the model boundary:
+            // timestamp/control spans and vLLM artifacts are not speech. Keep
+            // this family-scoped so ordinary brackets and slash text from
+            // other architectures are never removed globally.
+            let mut text = strip_closed_spans(decoded, '<', '>');
+            text = strip_closed_spans(&text, '[', ']');
+            text.retain(|character| !FUNASR_NANO_ARTIFACT_CHARS.contains(&character));
+            for marker in FUNASR_NANO_CONTROL_MARKERS {
+                text = text.replace(marker, " ");
+            }
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
         BuiltinDecodePolicySeq2SeqTextPostprocessKind::Qwen3AsrStripControlPrefixV0 => decoded
             [seq2seq_transcript_byte_start(kind, decoded)..]
             .trim()
             .to_string(),
     }
+}
+
+fn strip_closed_spans(input: &str, open: char, close: char) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+    while let Some(start) = remaining.find(open) {
+        output.push_str(&remaining[..start]);
+        let after_open = &remaining[start + open.len_utf8()..];
+        let Some(end) = after_open.find(close) else {
+            output.push_str(&remaining[start..]);
+            return output;
+        };
+        remaining = &after_open[end + close.len_utf8()..];
+    }
+    output.push_str(remaining);
+    output
 }
 
 /// Byte offset where the spoken transcript starts inside the raw decoded
@@ -716,7 +751,8 @@ pub(crate) fn seq2seq_transcript_byte_start(
     decoded: &str,
 ) -> usize {
     match kind {
-        BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity => 0,
+        BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity
+        | BuiltinDecodePolicySeq2SeqTextPostprocessKind::FunAsrNanoStripControlMarkersV0 => 0,
         BuiltinDecodePolicySeq2SeqTextPostprocessKind::Qwen3AsrStripControlPrefixV0 => decoded
             .find(QWEN3_ASR_TEXT_MARKER)
             .map(|index| index + QWEN3_ASR_TEXT_MARKER.len())
@@ -799,6 +835,10 @@ mod tests {
         let qwen =
             resolve_builtin_decode_policy_for_architecture(crate::QWEN3_ASR_GGML_ARCHITECTURE_ID)
                 .expect("qwen decode policy");
+        let funasr = resolve_builtin_decode_policy_for_architecture(
+            crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID,
+        )
+        .expect("funasr-nano decode policy");
 
         assert_eq!(
             whisper.longform_prompt_carry_mode,
@@ -819,6 +859,10 @@ mod tests {
         assert_eq!(
             qwen.seq2seq_text_postprocess_kind,
             BuiltinDecodePolicySeq2SeqTextPostprocessKind::Qwen3AsrStripControlPrefixV0
+        );
+        assert_eq!(
+            funasr.seq2seq_text_postprocess_kind,
+            BuiltinDecodePolicySeq2SeqTextPostprocessKind::FunAsrNanoStripControlMarkersV0
         );
     }
 
@@ -1176,6 +1220,32 @@ mod tests {
         .expect("decode policy dispatch");
 
         assert_eq!(output.text, "transcript");
+    }
+
+    #[test]
+    fn funasr_nano_text_postprocess_removes_model_control_markers() {
+        let kind = BuiltinDecodePolicySeq2SeqTextPostprocessKind::FunAsrNanoStripControlMarkersV0;
+
+        assert_eq!(
+            apply_seq2seq_text_postprocess(kind, "这还行哈，这塞的挺满的。/sil"),
+            "这还行哈，这塞的挺满的。"
+        );
+        assert_eq!(
+            apply_seq2seq_text_postprocess(kind, "/sil hello endofbreak world FFFF next /sil"),
+            "hello world next"
+        );
+        assert_eq!(apply_seq2seq_text_postprocess(kind, "/sil"), "");
+        assert_eq!(
+            apply_seq2seq_text_postprocess(
+                kind,
+                "<|0.00|>你好[00:00-00:01] Ｏ＆｜ /sil <noise>world"
+            ),
+            "你好 world"
+        );
+        assert_eq!(
+            apply_seq2seq_text_postprocess(kind, "保留未闭合<标签和未闭合[内容"),
+            "保留未闭合<标签和未闭合内容"
+        );
     }
 
     #[test]
