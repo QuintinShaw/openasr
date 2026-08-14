@@ -17,8 +17,8 @@ use thiserror::Error;
 #[cfg(test)]
 use crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlFlashAttentionPrecision, GgufMetadata, GgufRuntimeSourcePreflight,
-    GgufTensorDataReadError, build_runtime_tensor_reader_from_preflight,
+    GgmlFlashAttentionPrecision, GgufMetadata, GgufRuntimeSourcePreflight, GgufTensorDataReadError,
+    build_runtime_tensor_reader_from_preflight,
 };
 use crate::models::gpt2_bpe::{build_merge_rank, build_token_to_id, encode_prompt_text};
 use crate::models::{
@@ -143,8 +143,6 @@ pub(crate) enum Qwen3ForcedAlignerRuntimeError {
     },
     #[error("qwen3-forced-aligner timestamp hidden batch allocation overflowed")]
     TimestampHiddenBatchOverflow,
-    #[error("qwen3-forced-aligner timestamp logits returned {found} bins for {expected} positions")]
-    TimestampBinCountMismatch { expected: usize, found: usize },
     #[error("qwen3-forced-aligner GGUF tensor read failed: {0}")]
     TensorRead(#[from] GgufTensorDataReadError),
     #[error("qwen3-forced-aligner llm layer projection load failed: {0}")]
@@ -341,6 +339,14 @@ impl ForcedAlignerStageBackends {
             audio: backend,
             decoder: backend,
             logits: backend,
+        }
+    }
+
+    const fn gpu_audio_hybrid() -> Self {
+        Self {
+            audio: crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+            decoder: crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            logits: crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         }
     }
 }
@@ -541,12 +547,22 @@ fn align_forced_with_stage_backends(
     report(ForcedAlignerProgressEvent::MelReady);
 
     report(ForcedAlignerProgressEvent::AudioEncodingStarted);
+    let audio_runtime_result = if matches!(
+        backends.audio,
+        crate::ggml_runtime::GgmlCpuGraphBackend::Gpu
+    ) {
+        Qwen3AsrAudioEncoderRuntime::new_from_preflight_with_flash_attention(
+            preflight,
+            backends.audio,
+            false,
+        )
+    } else {
+        Qwen3AsrAudioEncoderRuntime::new_from_preflight(preflight, backends.audio)
+    };
     let mut audio_runtime =
-        Qwen3AsrAudioEncoderRuntime::new_from_preflight(preflight, backends.audio).map_err(
-            |error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
-                reason: format!("audio encoder runtime init failed: {error}"),
-            },
-        )?;
+        audio_runtime_result.map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
+            reason: format!("audio encoder runtime init failed: {error}"),
+        })?;
     let audio_embeddings = audio_runtime
         .encode(
             &assets.audio_encoder_weights,
@@ -597,11 +613,11 @@ fn align_forced_with_stage_backends(
     .map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
         reason: error.to_string(),
     })?;
-    if backends.decoder == GgmlCpuGraphBackend::Metal {
+    if backends.decoder.is_gpu_class() {
         // Forced alignment turns a single near-tie attention argmax into an
         // absolute timestamp choice. Request ggml's precise attention contract
-        // for this transient decoder only; ordinary Qwen-family decode keeps
-        // the faster backend default.
+        // for this transient decoder on every GPU; ordinary Qwen-family decode
+        // keeps the faster backend default.
         whole_decoder.set_flash_attention_precision(GgmlFlashAttentionPrecision::F32);
     }
     let hidden_size = assets.token_embedding_table.d_model();
@@ -674,9 +690,11 @@ fn align_forced_with_stage_backends(
     }
 
     // Process bounded row batches instead of materializing a transcript-sized
-    // [vocab, timestamp_count] logits graph. GPU logits use the fused first-max
-    // argmax validated by the CUDA hybrid route; CPU and Metal retain complete
-    // logits so the stable near-tie rule remains available.
+    // [vocab, timestamp_count] logits graph. Every backend returns the bounded
+    // logits rows so the same ordered near-tie rule is applied everywhere.
+    // A device first-max is not sufficient here: a numerically insignificant
+    // reduction-order difference can otherwise move a word boundary by many
+    // timestamp bins.
     report(ForcedAlignerProgressEvent::TimestampLogitsStarted {
         total: timestamp_positions.len(),
     });
@@ -705,41 +723,19 @@ fn align_forced_with_stage_backends(
             )?;
             timestamp_hidden.extend_from_slice(row);
         }
-        if matches!(
-            backends.logits,
-            crate::ggml_runtime::GgmlCpuGraphBackend::Gpu
-        ) {
-            let bins = logits_runtime.compute_top1_tokens_for_hidden_rows(
-                &assets.logits_head,
-                &timestamp_hidden,
-                positions.len(),
-            )?;
-            if bins.len() != positions.len() {
-                return Err(Qwen3ForcedAlignerRuntimeError::TimestampBinCountMismatch {
-                    expected: positions.len(),
-                    found: bins.len(),
-                });
-            }
-            raw_timestamps_ms.extend(
-                bins.into_iter().map(|bin| {
-                    i64::from(bin) * i64::from(assets.metadata.timestamp_segment_time_ms)
-                }),
-            );
-        } else {
-            let logits = logits_runtime.compute_logits_for_hidden_rows(
-                &assets.logits_head,
-                &timestamp_hidden,
-                positions.len(),
-            )?;
-            for row in logits.chunks_exact(assets.metadata.classify_num) {
-                let bin = stable_timestamp_bin(row).ok_or_else(|| {
-                    Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
-                        reason: "timestamp classification produced an empty logits row".to_string(),
-                    }
-                })?;
-                raw_timestamps_ms
-                    .push(i64::from(bin) * i64::from(assets.metadata.timestamp_segment_time_ms));
-            }
+        let logits = logits_runtime.compute_logits_for_hidden_rows(
+            &assets.logits_head,
+            &timestamp_hidden,
+            positions.len(),
+        )?;
+        for row in logits.chunks_exact(assets.metadata.classify_num) {
+            let bin = stable_timestamp_bin(row).ok_or_else(|| {
+                Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
+                    reason: "timestamp classification produced an empty logits row".to_string(),
+                }
+            })?;
+            raw_timestamps_ms
+                .push(i64::from(bin) * i64::from(assets.metadata.timestamp_segment_time_ms));
         }
         report(ForcedAlignerProgressEvent::TimestampLogits {
             completed: raw_timestamps_ms.len(),
@@ -857,6 +853,15 @@ impl Qwen3ForcedAlignerSession {
         )
     }
 
+    pub(crate) fn load_verified_gpu_audio_hybrid(
+        verified: VerifiedPack,
+    ) -> Result<Self, Qwen3ForcedAlignerRuntimeError> {
+        Self::load_verified_with_stage_backends(
+            verified,
+            ForcedAlignerStageBackends::gpu_audio_hybrid(),
+        )
+    }
+
     fn load_verified_with_stage_backends(
         verified: VerifiedPack,
         backends: ForcedAlignerStageBackends,
@@ -955,7 +960,9 @@ mod tests {
 
         const fn stage_topology(self) -> &'static str {
             match self {
-                Self::Cpu | Self::Metal | Self::GenericGpu | Self::Cuda | Self::Vulkan => "uniform",
+                Self::Cpu | Self::Metal | Self::GenericGpu => "uniform",
+                Self::Cuda => "cuda-audio-cpu-decoder-cpu-logits",
+                Self::Vulkan => "vulkan-audio-cpu-decoder-cpu-logits",
             }
         }
 
@@ -988,7 +995,15 @@ mod tests {
             self,
             pack: &std::path::Path,
         ) -> Result<Qwen3ForcedAlignerSession, Qwen3ForcedAlignerRuntimeError> {
-            Qwen3ForcedAlignerSession::load(pack, self.graph_backend())
+            let verified = verify_forced_aligner_pack(pack)?;
+            match self {
+                Self::Cuda | Self::Vulkan => {
+                    Qwen3ForcedAlignerSession::load_verified_gpu_audio_hybrid(verified)
+                }
+                Self::Cpu | Self::Metal | Self::GenericGpu => {
+                    Qwen3ForcedAlignerSession::load_verified(verified, self.graph_backend())
+                }
+            }
         }
     }
 
@@ -1000,6 +1015,23 @@ mod tests {
         assert_eq!(stable_timestamp_bin(&[1.0, 1.01, 1.01]), Some(2));
         assert_eq!(stable_timestamp_bin(&[1.0, f32::NAN, 1.0]), None);
         assert_eq!(stable_timestamp_bin(&[1.0, f32::INFINITY]), None);
+    }
+
+    #[test]
+    fn discrete_gpu_hybrid_accelerates_only_the_audio_encoder() {
+        let backends = ForcedAlignerStageBackends::gpu_audio_hybrid();
+        assert_eq!(
+            backends.audio,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
+        );
+        assert_eq!(
+            backends.decoder,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        );
+        assert_eq!(
+            backends.logits,
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+        );
     }
 
     fn quant_floor_index(
@@ -1429,19 +1461,39 @@ mod tests {
         assert!(median_ms < 80.0, "median drift {median_ms:.3}ms");
         assert!(p95_ms <= 160.0, "p95 drift {p95_ms:.3}ms");
         assert!(max_ms <= 320.0, "maximum drift {max_ms:.3}ms");
-        if matches!(test_backend, ForcedAlignerTestBackend::Metal) {
-            assert!(
-                !observed.observed_compute_nodes_by_backend.is_empty()
-                    && observed
-                        .observed_compute_nodes_by_backend
-                        .keys()
-                        .all(|backend| {
-                            let backend = backend.to_ascii_lowercase();
-                            backend.starts_with("mtl") || backend.contains("metal")
-                        }),
-                "explicit Metal forced-aligner route observed non-Metal compute: {:?}",
-                observed.observed_compute_nodes_by_backend
-            );
+        let compute_nodes = &observed.observed_compute_nodes_by_backend;
+        match test_backend {
+            ForcedAlignerTestBackend::Metal => assert!(
+                !compute_nodes.is_empty()
+                    && compute_nodes.keys().all(|backend| {
+                        let backend = backend.to_ascii_lowercase();
+                        backend.starts_with("mtl") || backend.contains("metal")
+                    }),
+                "explicit Metal forced-aligner route observed non-Metal compute: {compute_nodes:?}",
+            ),
+            ForcedAlignerTestBackend::Cuda | ForcedAlignerTestBackend::Vulkan => {
+                let provider = test_backend.provider_label();
+                assert!(
+                    compute_nodes.iter().any(|(backend, nodes)| {
+                        backend.to_ascii_lowercase().contains(provider) && *nodes > 0
+                    }),
+                    "explicit {provider} Hybrid forced-aligner route did not execute its GPU stage: {compute_nodes:?}",
+                );
+                assert!(
+                    compute_nodes.iter().any(|(backend, nodes)| {
+                        backend.to_ascii_lowercase().contains("cpu") && *nodes > 0
+                    }),
+                    "explicit {provider} Hybrid forced-aligner route did not execute its CPU stages: {compute_nodes:?}",
+                );
+                assert!(
+                    compute_nodes.keys().all(|backend| {
+                        let backend = backend.to_ascii_lowercase();
+                        backend.contains(provider) || backend.contains("cpu")
+                    }),
+                    "explicit {provider} Hybrid forced-aligner route observed an unrelated backend: {compute_nodes:?}",
+                );
+            }
+            ForcedAlignerTestBackend::Cpu | ForcedAlignerTestBackend::GenericGpu => {}
         }
     }
 

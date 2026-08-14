@@ -335,14 +335,14 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
         architecture_id: crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
         catalog_family_id: "qwen3-forced-aligner",
         kind: AuxPackKind::ForcedAlignment,
-        // Every published pack satisfies the runtime's semantic Q8 floor, so
-        // Metal/CUDA/Vulkan can share the same uniform FullDevice graph. On
-        // Metal hosts Auto stays on CPU because the current Metal path is
-        // faster but still crosses the official maximum timestamp-drift
-        // envelope on near-tie boundaries. HIP remains fail-closed until the
-        // same timestamp and performance gates have passed there.
+        // Every published pack satisfies the runtime's semantic Q8 floor.
+        // Metal retains its validated precise FullDevice graph. CUDA and
+        // Vulkan share a Hybrid topology that runs the audio encoder without
+        // flash attention on the selected GPU while retaining numerically
+        // sensitive decoder/logits state on CPU. HIP remains fail-closed until
+        // the same timestamp and performance gates have passed there.
         execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
-            capabilities: AUX_CPU_METAL_CUDA_VULKAN_FULL_DEVICE_EXECUTION,
+            capabilities: AUX_CPU_METAL_FULL_DEVICE_CUDA_VULKAN_HYBRID_EXECUTION,
             auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
         },
         ownership: AuxiliaryRuntimeOwnership::InvocationTransient,
@@ -486,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_aligner_uses_validated_full_device_providers_while_auto_avoids_metal() {
+    fn forced_aligner_uses_validated_provider_topologies_while_auto_avoids_metal() {
         let policy = auxiliary_execution_policy(
             crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
         );
@@ -499,18 +499,22 @@ mod tests {
         };
         assert_eq!(auto_gpu_policy, AutoGpuPolicy::ExceptMetal);
         assert!(capabilities.supports_cpu());
-        for provider in [
+        assert!(capabilities.supports(
             ExecutionProvider::Metal,
-            ExecutionProvider::Cuda,
-            ExecutionProvider::Vulkan,
-        ] {
+            crate::device::execution_policy::ExecutionPlacement::FullDevice,
+        ));
+        assert!(!capabilities.supports(
+            ExecutionProvider::Metal,
+            crate::device::execution_policy::ExecutionPlacement::Hybrid,
+        ));
+        for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
             assert!(capabilities.supports(
                 provider,
-                crate::device::execution_policy::ExecutionPlacement::FullDevice,
+                crate::device::execution_policy::ExecutionPlacement::Hybrid,
             ));
             assert!(!capabilities.supports(
                 provider,
-                crate::device::execution_policy::ExecutionPlacement::Hybrid,
+                crate::device::execution_policy::ExecutionPlacement::FullDevice,
             ));
         }
         assert!(!capabilities.supports(
@@ -593,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn only_pyannote_cuda_vulkan_accept_verified_hybrid_compute() {
+    fn only_validated_auxiliary_topologies_accept_cuda_vulkan_hybrid_compute() {
         for descriptor in AUX_PACK_DESCRIPTORS {
             let AuxiliaryExecutionPolicy::RequestScoped { capabilities, .. } =
                 descriptor.execution_policy;
@@ -603,12 +607,14 @@ mod tests {
                 ExecutionProvider::Hip,
                 ExecutionProvider::Vulkan,
             ] {
-                let expected = descriptor.architecture_id
-                    == crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID
-                    && matches!(
-                        provider,
-                        ExecutionProvider::Cuda | ExecutionProvider::Vulkan
-                    );
+                let expected = matches!(
+                    descriptor.architecture_id,
+                    crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID
+                        | crate::models::qwen::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID
+                ) && matches!(
+                    provider,
+                    ExecutionProvider::Cuda | ExecutionProvider::Vulkan
+                );
                 assert_eq!(
                     capabilities.supports(
                         provider,

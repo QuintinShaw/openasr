@@ -237,6 +237,7 @@ impl Qwen3AsrAudioEncoderWeights {
 pub(crate) struct Qwen3AsrAudioEncoderRuntime {
     runner: GgmlCpuGraphRunner,
     loaded: Option<GgmlLoadedWeightContext>,
+    use_flash_attention: bool,
 }
 
 /// The audio-encoder runner's graph config: the family `EncoderPrelude` tier (see
@@ -264,6 +265,21 @@ impl Qwen3AsrAudioEncoderRuntime {
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
     ) -> Result<Self, Qwen3AsrAudioEncoderError> {
+        Self::new_from_preflight_with_flash_attention(
+            preflight,
+            backend,
+            qwen_audio_encoder_flash_attention_enabled(),
+        )
+    }
+
+    pub(crate) fn new_from_preflight_with_flash_attention(
+        preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
+        backend: GgmlCpuGraphBackend,
+        use_flash_attention: bool,
+    ) -> Result<Self, Qwen3AsrAudioEncoderError> {
+        // Family policy may need a stricter numerical contract than the
+        // process-wide default. Freeze that choice in the runtime so graph
+        // construction cannot observe a later environment change.
         // See `qwen_audio_encoder_runtime_graph_config` for the `EncoderPrelude`
         // threading tier and the right-sized metadata-context rationale.
         let config = qwen_audio_encoder_runtime_graph_config(backend);
@@ -286,7 +302,11 @@ impl Qwen3AsrAudioEncoderRuntime {
                     source,
                 })?,
         );
-        Ok(Self { runner, loaded })
+        Ok(Self {
+            runner,
+            loaded,
+            use_flash_attention,
+        })
     }
 
     pub(crate) fn graph_lane(&self) -> (GgmlCpuGraphBackend, bool) {
@@ -360,6 +380,7 @@ impl Qwen3AsrAudioEncoderRuntime {
             &chunked_mel,
             &positions,
             &mask,
+            self.use_flash_attention,
             profile_started,
         )
     }
@@ -384,6 +405,7 @@ fn encode_qwen3_audio_embeddings_with_graph<'a>(
     chunked_mel: &ChunkedMelInput,
     positions: &[f32],
     mask: &[f32],
+    use_flash_attention: bool,
     profile_started: Option<Instant>,
 ) -> Result<Qwen3AsrAudioEncoderOutput, Qwen3AsrAudioEncoderError> {
     // Per-call graph inputs: the mel features plus the per-chunk-derived
@@ -590,7 +612,7 @@ fn encode_qwen3_audio_embeddings_with_graph<'a>(
         metadata.audio_heads,
         chunked_mel.row_count,
         mask_tensor,
-        qwen_audio_encoder_flash_attention_enabled(),
+        use_flash_attention,
     )?;
 
     state = graph

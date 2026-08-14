@@ -498,6 +498,7 @@ impl Qwen3AsrLlmLogitsHeadRuntime {
         head.compute_top1_token_for_last_hidden(hidden)
     }
 
+    #[cfg(test)]
     pub(crate) fn compute_top1_tokens_for_hidden_rows(
         &mut self,
         head: &Qwen3AsrLlmLogitsHead,

@@ -1642,6 +1642,7 @@ pub fn refine_existing_transcription_timeline(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForcedAlignerSessionPlan {
     Uniform,
+    GpuAudioHybrid,
 }
 
 fn forced_aligner_session_plan(
@@ -1652,10 +1653,11 @@ fn forced_aligner_session_plan(
         (ExecutionPlacement::CpuOnly, ExecutionProvider::Cpu) => {
             Ok(ForcedAlignerSessionPlan::Uniform)
         }
-        (ExecutionPlacement::FullDevice, ExecutionProvider::Metal)
-        | (ExecutionPlacement::FullDevice, ExecutionProvider::Cuda)
-        | (ExecutionPlacement::FullDevice, ExecutionProvider::Vulkan) => {
+        (ExecutionPlacement::FullDevice, ExecutionProvider::Metal) => {
             Ok(ForcedAlignerSessionPlan::Uniform)
+        }
+        (ExecutionPlacement::Hybrid, ExecutionProvider::Cuda | ExecutionProvider::Vulkan) => {
+            Ok(ForcedAlignerSessionPlan::GpuAudioHybrid)
         }
         _ => Err("forced-aligner execution topology is not validated for this provider"),
     }
@@ -1732,6 +1734,11 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
                     verified_forced_aligner.clone(),
                     backend,
                 ),
+                ForcedAlignerSessionPlan::GpuAudioHybrid => {
+                    Qwen3ForcedAlignerSession::load_verified_gpu_audio_hybrid(
+                        verified_forced_aligner.clone(),
+                    )
+                }
             }
             .map_err(|error| {
                 forced_alignment_error_to_backend(execution_context, error.to_string())
@@ -4594,17 +4601,17 @@ mod tests {
             Ok(ForcedAlignerSessionPlan::Uniform),
         );
         assert_eq!(
-            forced_aligner_session_plan(ExecutionPlacement::FullDevice, ExecutionProvider::Cuda),
-            Ok(ForcedAlignerSessionPlan::Uniform),
+            forced_aligner_session_plan(ExecutionPlacement::Hybrid, ExecutionProvider::Cuda),
+            Ok(ForcedAlignerSessionPlan::GpuAudioHybrid),
         );
         assert_eq!(
-            forced_aligner_session_plan(ExecutionPlacement::FullDevice, ExecutionProvider::Vulkan,),
-            Ok(ForcedAlignerSessionPlan::Uniform),
+            forced_aligner_session_plan(ExecutionPlacement::Hybrid, ExecutionProvider::Vulkan),
+            Ok(ForcedAlignerSessionPlan::GpuAudioHybrid),
         );
         for (placement, provider) in [
             (ExecutionPlacement::Hybrid, ExecutionProvider::Metal),
-            (ExecutionPlacement::Hybrid, ExecutionProvider::Cuda),
-            (ExecutionPlacement::Hybrid, ExecutionProvider::Vulkan),
+            (ExecutionPlacement::FullDevice, ExecutionProvider::Cuda),
+            (ExecutionPlacement::FullDevice, ExecutionProvider::Vulkan),
             (ExecutionPlacement::Hybrid, ExecutionProvider::Hip),
             (ExecutionPlacement::FullDevice, ExecutionProvider::Hip),
         ] {
@@ -4617,7 +4624,7 @@ mod tests {
 
     #[test]
     #[ignore = "host-local: needs the installed Qwen3-ForcedAligner q8 pack and an exact CUDA or Vulkan device"]
-    fn forced_aligner_exact_full_device_q8_matches_cpu_on_jfk() {
+    fn forced_aligner_exact_hybrid_q8_matches_cpu_on_jfk() {
         let provider = asr_exact_smoke_provider(
             &std::env::var("OPENASR_FORCED_ALIGNER_SMOKE_PROVIDER")
                 .expect("OPENASR_FORCED_ALIGNER_SMOKE_PROVIDER must be cuda or vulkan"),
@@ -4626,8 +4633,8 @@ mod tests {
         let wav = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav");
         let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
             wav,
-            "forced-aligner Exact FullDevice smoke",
-            "forced-aligner Exact FullDevice smoke",
+            "forced-aligner Exact Hybrid smoke",
+            "forced-aligner Exact Hybrid smoke",
         )
         .expect("JFK fixture loads");
         let pcm = crate::PcmBuffer::from_vec(samples);
@@ -4640,9 +4647,8 @@ mod tests {
             ..Transcription::default()
         };
         let services = native_execution_services_for_test();
-        let execution_context = crate::RequestExecutionContext::uncancellable(
-            "forced-aligner Exact FullDevice q8 smoke",
-        );
+        let execution_context =
+            crate::RequestExecutionContext::uncancellable("forced-aligner Exact Hybrid q8 smoke");
         let cpu = refine_transcription_word_timestamps_with_forced_aligner_policy(
             input.clone(),
             pcm.full_slice(),
@@ -4665,25 +4671,47 @@ mod tests {
             &execution_context,
             None,
         )
-        .expect("Exact FullDevice forced alignment");
+        .expect("Exact Hybrid forced alignment");
         let observed = telemetry.snapshot();
         assert!(
             !observed.observed_compute_nodes_by_backend.is_empty(),
-            "Exact FullDevice aligner must execute backend graph nodes"
+            "Exact Hybrid aligner must execute backend graph nodes"
         );
         let expected_backend_fragment = match provider {
             ExecutionProvider::Cuda => "cuda",
             ExecutionProvider::Vulkan => "vulkan",
             _ => unreachable!("provider parser accepts only CUDA/Vulkan"),
         };
+        let observed_target_gpu = observed
+            .observed_compute_nodes_by_backend
+            .iter()
+            .filter(|(backend, _)| {
+                backend
+                    .to_ascii_lowercase()
+                    .contains(expected_backend_fragment)
+            })
+            .map(|(_, nodes)| nodes)
+            .sum::<u64>();
+        let observed_cpu = observed
+            .observed_compute_nodes_by_backend
+            .iter()
+            .filter(|(backend, _)| backend.to_ascii_lowercase().contains("cpu"))
+            .map(|(_, nodes)| nodes)
+            .sum::<u64>();
+        assert!(
+            observed_target_gpu > 0 && observed_cpu > 0,
+            "Exact {provider:?} Hybrid aligner must execute both its target GPU stage and CPU stages: {:?}",
+            observed.observed_compute_nodes_by_backend,
+        );
         assert!(
             observed
                 .observed_compute_nodes_by_backend
                 .keys()
-                .all(|backend| backend
-                    .to_ascii_lowercase()
-                    .contains(expected_backend_fragment)),
-            "Exact {provider:?} aligner observed a different backend: {:?}",
+                .all(|backend| {
+                    let backend = backend.to_ascii_lowercase();
+                    backend.contains(expected_backend_fragment) || backend.contains("cpu")
+                }),
+            "Exact {provider:?} Hybrid aligner observed an unrelated backend: {:?}",
             observed.observed_compute_nodes_by_backend,
         );
 
@@ -4716,7 +4744,7 @@ mod tests {
         let max_ms = drift_ms[drift_ms.len() - 1];
         let output_sha256 = crate::testing::benchmark_sha256_bytes([output_bytes]);
         eprintln!(
-            "FORCED_ALIGNER_EXACT_FULL_DEVICE_Q8 provider={provider:?} words={} endpoints={} median_ms={median_ms:.3} p95_ms={p95_ms:.3} max_ms={max_ms:.3} output_sha256={output_sha256} observed_compute_nodes={:?}",
+            "FORCED_ALIGNER_EXACT_HYBRID_Q8 provider={provider:?} words={} endpoints={} median_ms={median_ms:.3} p95_ms={p95_ms:.3} max_ms={max_ms:.3} output_sha256={output_sha256} observed_compute_nodes={:?}",
             drift_ms.len() / 2,
             drift_ms.len(),
             observed.observed_compute_nodes_by_backend,
