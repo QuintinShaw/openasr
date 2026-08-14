@@ -12,6 +12,8 @@ mod catalog_series;
 #[cfg(test)]
 mod cuda_targets;
 mod http;
+#[cfg(test)]
+mod windows_cmake_cache;
 
 // Module visibility is scoped to the actual external API surface. Modules that
 // external crates (openasr-cli, openasr-server, desktop src-tauri) reach into by

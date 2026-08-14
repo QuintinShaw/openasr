@@ -4,6 +4,9 @@ use std::{
     process::Command,
 };
 
+#[path = "src/windows_cmake_cache.rs"]
+mod windows_cmake_cache;
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let source_dir = manifest_dir.join("third_party/openasr-ggml");
@@ -134,6 +137,10 @@ fn main() {
     fs::create_dir_all(&build_dir).expect("create openasr-ggml build dir");
     fs::create_dir_all(&lib_dir).expect("create openasr-ggml lib dir");
 
+    let hip_path = feat_hip.then(hip_toolkit_path).flatten();
+    let cuda_path = feat_cuda.then(cuda_toolkit_path).flatten();
+    let vulkan_sdk = feat_vulkan.then(vulkan_sdk_path).flatten();
+
     // On Windows, cmake's Ninja generator picks the first C compiler on PATH. The
     // AMD ROCm SDK puts its clang.exe ahead of MSVC, so a non-HIP build would
     // accidentally use ROCm clang — the wrong ABI provider for the msvc Rust
@@ -144,25 +151,67 @@ fn main() {
     let msvc_tool = (is_windows && !feat_hip)
         .then(|| cc::windows_registry::find_tool(&target, "cl.exe"))
         .flatten();
-    if msvc_tool.is_some() {
-        // A cmake cache configured with a different compiler (e.g. ROCm clang that
-        // Ninja picked off PATH) cannot be reconfigured to cl; wipe it so the
-        // pinned MSVC compiler takes effect on the next configure.
+    if is_windows {
+        // CMake deletes and internally re-runs its cache when a configured
+        // compiler changes. That internal re-run loses this invocation's `-D`
+        // contract, which can leave a Debug shared-library build behind while
+        // rustc expects fresh Release static archives. Validate every
+        // topology-driving cache entry up front and rebuild only this crate's
+        // private CMake directory when the contract has drifted.
+        let expected_compiler = if is_windows_arm64 {
+            Some("clang-cl".to_owned())
+        } else if feat_hip {
+            hip_path
+                .as_deref()
+                .and_then(hip_sdk_clang_path)
+                .map(|path| cmake_path(&path))
+        } else {
+            msvc_tool.as_ref().map(|tool| cmake_path(tool.path()))
+        };
+        let mut tool_expectations = Vec::new();
+        if let Some(compiler) = expected_compiler {
+            tool_expectations.push(("CMAKE_C_COMPILER", compiler.clone()));
+            tool_expectations.push(("CMAKE_CXX_COMPILER", compiler));
+        }
+        if feat_cuda
+            && let Some(path) = cuda_path.as_deref()
+            && path.join("bin/nvcc.exe").is_file()
+        {
+            tool_expectations.push((
+                "CMAKE_CUDA_COMPILER",
+                cmake_path(&path.join("bin/nvcc.exe")),
+            ));
+        }
+        if feat_cuda && let Some(tool) = msvc_tool.as_ref() {
+            tool_expectations.push(("CMAKE_CUDA_HOST_COMPILER", cmake_path(tool.path())));
+        }
+        let on_off = |enabled| if enabled { "ON" } else { "OFF" }.to_owned();
+        let scalar_expectations = vec![
+            ("CMAKE_BUILD_TYPE", "Release".to_owned()),
+            ("BUILD_SHARED_LIBS", on_off(use_backend_dl)),
+            ("GGML_BACKEND_DL", on_off(use_backend_dl)),
+            ("GGML_CPU_ALL_VARIANTS", on_off(ggml_cpu_all_variants)),
+            ("GGML_BUILD_TESTS", "OFF".to_owned()),
+            ("GGML_BUILD_EXAMPLES", "OFF".to_owned()),
+            ("GGML_NATIVE", on_off(ggml_native)),
+            ("GGML_OPENMP", on_off(effective_openmp)),
+            ("GGML_CUDA", on_off(feat_cuda)),
+            ("GGML_VULKAN", on_off(feat_vulkan)),
+            ("GGML_HIP", on_off(feat_hip)),
+            ("GGML_SYCL", on_off(feat_sycl)),
+        ];
         let cache = build_dir.join("CMakeCache.txt");
-        if let Ok(text) = fs::read_to_string(&cache) {
-            let uses_cl = text.lines().any(|line| {
-                line.starts_with("CMAKE_C_COMPILER:") && line.to_lowercase().contains("cl.exe")
-            });
-            if !uses_cl {
-                let _ = fs::remove_dir_all(&build_dir);
-                fs::create_dir_all(&lib_dir).expect("recreate openasr-ggml lib dir");
-            }
+        if let Ok(text) = fs::read_to_string(&cache)
+            && !windows_cmake_cache::cache_matches_contract(
+                &text,
+                &tool_expectations,
+                &scalar_expectations,
+            )
+        {
+            fs::remove_dir_all(&build_dir).expect("reset incompatible openasr-ggml build dir");
+            fs::create_dir_all(&lib_dir).expect("recreate openasr-ggml lib dir");
         }
     }
-
-    let hip_path = feat_hip.then(hip_toolkit_path).flatten();
-    let cuda_path = feat_cuda.then(cuda_toolkit_path).flatten();
-    let vulkan_sdk = feat_vulkan.then(vulkan_sdk_path).flatten();
     let windows_hip_shim = if feat_hip && is_windows {
         Some(prepare_windows_hip_sdk_shim(
             &target,
