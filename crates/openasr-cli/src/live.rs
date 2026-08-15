@@ -385,13 +385,22 @@ fn run_live_from_input_file(
         input_file.display(),
         options.frame_duration_ms
     );
-    let mut transcription_worker =
-        LiveTranscriptionWorker::spawn(native_execution_services, backend, model_pack_path);
+    // A stored file can safely slow its producer while the bounded worker queue
+    // drains (including a cold model load). Capture sources cannot: they keep
+    // the fail-fast policy in `LiveTranscriptionWorker::spawn`.
+    let mut transcription_worker = LiveTranscriptionWorker::spawn_with_queue_policy(
+        native_execution_services,
+        backend,
+        model_pack_path,
+        LiveTranscriptionQueuePolicy::WaitForCapacity,
+    );
     let samples = prepare_input_file_samples_pcm16_mono_16khz(input_file, options)?;
     let frame_sample_count = RealtimeAudioFormat::pcm16_mono_16khz()
         .sample_count_for_duration_ms(options.frame_duration_ms)?;
+    let replay_started_at = Instant::now();
     let mut start_ms = 0_u64;
     for (frame_seq, chunk) in samples.chunks(frame_sample_count).enumerate() {
+        pace_live_input_file_frame(replay_started_at, start_ms);
         let frame = RealtimeAudioFrame::new(
             frame_seq as u64,
             start_ms,
@@ -409,6 +418,17 @@ fn run_live_from_input_file(
         }
     }
     pipeline.shutdown(start_ms, &mut transcription_worker, true)
+}
+
+fn pace_live_input_file_frame(replay_started_at: Instant, frame_start_ms: u64) {
+    let delay = live_input_file_replay_delay(replay_started_at.elapsed(), frame_start_ms);
+    if !delay.is_zero() {
+        thread::sleep(delay);
+    }
+}
+
+fn live_input_file_replay_delay(elapsed: Duration, frame_start_ms: u64) -> Duration {
+    Duration::from_millis(frame_start_ms).saturating_sub(elapsed)
 }
 
 fn prepare_input_file_samples_pcm16_mono_16khz(
@@ -1134,11 +1154,45 @@ enum LiveTranscriptionResult {
     Error(anyhow::Error),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveTranscriptionQueuePolicy {
+    FailFast,
+    WaitForCapacity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveTranscriptionQueueSendError {
+    Full,
+    Disconnected,
+}
+
+impl LiveTranscriptionQueuePolicy {
+    fn send<T>(
+        self,
+        sender: &SyncSender<T>,
+        value: T,
+    ) -> std::result::Result<(), LiveTranscriptionQueueSendError> {
+        match self {
+            Self::FailFast => match sender.try_send(value) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(_)) => Err(LiveTranscriptionQueueSendError::Full),
+                Err(TrySendError::Disconnected(_)) => {
+                    Err(LiveTranscriptionQueueSendError::Disconnected)
+                }
+            },
+            Self::WaitForCapacity => sender
+                .send(value)
+                .map_err(|_| LiveTranscriptionQueueSendError::Disconnected),
+        }
+    }
+}
+
 struct LiveTranscriptionWorker {
     jobs: Option<SyncSender<LiveTranscriptionJob>>,
     results: Receiver<LiveTranscriptionResult>,
     handle: Option<JoinHandle<()>>,
     pending_jobs: usize,
+    queue_policy: LiveTranscriptionQueuePolicy,
 }
 
 impl LiveTranscriptionWorker {
@@ -1146,6 +1200,20 @@ impl LiveTranscriptionWorker {
         native_execution_services: Arc<openasr_core::NativeExecutionServices>,
         backend: BackendKind,
         model_pack_path: Option<PathBuf>,
+    ) -> Self {
+        Self::spawn_with_queue_policy(
+            native_execution_services,
+            backend,
+            model_pack_path,
+            LiveTranscriptionQueuePolicy::FailFast,
+        )
+    }
+
+    fn spawn_with_queue_policy(
+        native_execution_services: Arc<openasr_core::NativeExecutionServices>,
+        backend: BackendKind,
+        model_pack_path: Option<PathBuf>,
+        queue_policy: LiveTranscriptionQueuePolicy,
     ) -> Self {
         let (job_sender, job_receiver) =
             mpsc::sync_channel::<LiveTranscriptionJob>(LIVE_TRANSCRIPTION_QUEUE_CAPACITY);
@@ -1198,6 +1266,7 @@ impl LiveTranscriptionWorker {
             results: result_receiver,
             handle: Some(handle),
             pending_jobs: 0,
+            queue_policy,
         }
     }
 
@@ -1206,17 +1275,17 @@ impl LiveTranscriptionWorker {
             .jobs
             .as_ref()
             .context("Live transcription worker is not running")?;
-        match sender.try_send(job) {
+        match self.queue_policy.send(sender, job) {
             Ok(()) => {
                 self.pending_jobs += 1;
                 Ok(())
             }
-            Err(TrySendError::Full(_)) => {
+            Err(LiveTranscriptionQueueSendError::Full) => {
                 bail!(
                     "Live transcription worker queue is full; stopped instead of buffering unbounded utterances."
                 )
             }
-            Err(TrySendError::Disconnected(_)) => {
+            Err(LiveTranscriptionQueueSendError::Disconnected) => {
                 bail!("Live transcription worker stopped before accepting the utterance.")
             }
         }
@@ -2741,6 +2810,54 @@ mod tests {
                 .to_string()
                 .contains("--max-utterances")
         );
+    }
+
+    #[test]
+    fn input_file_replay_delay_never_runs_ahead_of_audio_time() {
+        assert_eq!(
+            live_input_file_replay_delay(Duration::from_millis(125), 200),
+            Duration::from_millis(75)
+        );
+        assert_eq!(
+            live_input_file_replay_delay(Duration::from_millis(225), 200),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn input_file_queue_waits_for_bounded_capacity_while_capture_fails_fast() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.send(1).unwrap();
+        assert_eq!(
+            LiveTranscriptionQueuePolicy::FailFast.send(&sender, 2),
+            Err(LiveTranscriptionQueueSendError::Full)
+        );
+
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let waiting_sender = sender.clone();
+        let handle = thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            let result = LiveTranscriptionQueuePolicy::WaitForCapacity.send(&waiting_sender, 3);
+            result_sender.send(result).unwrap();
+        });
+        started_receiver.recv().unwrap();
+        assert!(
+            result_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "file replay must wait instead of rejecting work from a full bounded queue"
+        );
+
+        assert_eq!(receiver.recv().unwrap(), 1);
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(receiver.recv().unwrap(), 3);
+        handle.join().unwrap();
     }
 
     #[test]
