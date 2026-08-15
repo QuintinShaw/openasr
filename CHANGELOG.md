@@ -44,11 +44,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Qwen3 Forced Aligner import and runtime validation now accept the reserved
-  policy-guarded `q4_k` tier. Boundary-sensitive audio, token-embedding, and
+- Qwen3 Forced Aligner now publishes the policy-guarded `q4_k` tier as its
+  recommended default. Boundary-sensitive audio, token-embedding, and
   timestamp-head matrices remain Q8_0; legacy all-Q4, Q3, and mislabeled mixed
-  packs fail closed. The downloadable catalog continues to recommend Q8_0 until
-  a separately authorized catalog release enables the new tier.
+  packs fail closed.
 - Core: built-in model families now share the runtime admission, resource
   ownership, request-progress, and importer/tokenizer building blocks while
   retaining their family-specific graph and decode behavior.

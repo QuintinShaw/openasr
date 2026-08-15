@@ -692,7 +692,7 @@ min_cli_version = "0.1.17"
 # qwen3-asr autoregressive runtime -- see
 # crates/openasr-core/src/models/qwen/forced_aligner_import.rs.
 # release_public=true allows the public projection only after public_gate.py
-# verifies the same anonymous HF repository and pinned Q8_0 artifact that end
+# verifies the same anonymous HF repository and pinned artifacts that end
 # users download. Repository visibility alone never bypasses that gate.
 ["qwen3-forced-aligner-0.6b"]
 kind = "capability-pack"
@@ -712,18 +712,20 @@ license_class = "permissive"
 # far (see the align-text word-splitting support for en/zh).
 languages = ["en", "zh"]
 #
-# Forced alignment makes discrete decisions over 80 ms timestamp bins. Real
-# oracle runs showed that Q4_K perturbations can move a boundary by many bins,
-# even when the audio tower and the two boundary projections remain at Q8_0.
-# The production contract therefore requires Q8_0 or higher for every
-# quantizable matrix. Q8_0 is the recommended production tier and fp16 remains
-# available as the full-precision reference tier; older Q4_K artifacts are not
-# catalog targets and are rejected by pack verification.
-quants = ["fp16", "q8_0"]
-recommended_quant = "q8_0"
+# Forced alignment makes discrete decisions over 80 ms timestamp bins. The
+# public q4_k name follows the catalog-wide tier vocabulary; it does not mean
+# that every matrix is physically Q4_K. The audio encoder, token embedding,
+# and timestamp head remain Q8_0, while only policy-eligible text-decoder
+# matrices use Q4_K. Pack verification replays that exact per-tensor policy so
+# older all-Q4 artifacts and mislabeled mixed packs fail closed.
+quants = ["fp16", "q8_0", "q4_k"]
+recommended_quant = "q4_k"
 upstream_release_date = "2026-01-28"
-min_core_version = "0.1.9"
-min_cli_version = "0.1.9"
+# q4_k support and its per-tensor trust-boundary validation land after 0.1.31.
+# The whole capability-pack entry is version-gated because the signed catalog
+# has one compatibility floor per model, not per quant variant.
+min_core_version = "0.1.32"
+min_cli_version = "0.1.32"
 
 ["qwen3-forced-aligner-0.6b".capability]
 feature = "word-timestamps"

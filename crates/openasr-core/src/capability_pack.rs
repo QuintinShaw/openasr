@@ -427,25 +427,25 @@ mod tests {
             "fp16",
             b"GGUFstale-fp16",
         );
-        let production_q8 = install_content_addressed(
+        let production_q4 = install_content_addressed(
             home.path(),
             "qwen3-forced-aligner-0.6b",
-            "q8_0",
-            b"GGUFproduction-q8",
+            "q4_k",
+            b"GGUFproduction-q4",
         );
-        let older_family_q8 = install_content_addressed(
+        let older_family_q4 = install_content_addressed(
             home.path(),
             "qwen3-forced-aligner-0.5b",
-            "q8_0",
-            b"GGUFolder-family-q8",
+            "q4_k",
+            b"GGUFolder-family-q4",
         );
         let preference =
-            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q8_0");
+            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q4_k");
 
         let resolved = resolve_installed_capability_pack_in(home.path(), preference).unwrap();
-        assert_eq!(resolved, production_q8);
+        assert_eq!(resolved, production_q4);
         assert_ne!(resolved, stale_fp16);
-        assert_ne!(resolved, older_family_q8);
+        assert_ne!(resolved, older_family_q4);
     }
 
     #[test]
@@ -457,17 +457,17 @@ mod tests {
             "fp16",
             b"GGUFstale-fp16",
         );
-        let production_q8 = install_content_addressed(
+        let production_q4 = install_content_addressed(
             home.path(),
             "qwen3-forced-aligner-0.6b",
-            "q8",
-            b"GGUFproduction-q8-suffix",
+            "q4",
+            b"GGUFproduction-q4-suffix",
         );
         let preference =
-            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q8_0");
+            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q4_k");
 
         let resolved = resolve_installed_capability_pack_in(home.path(), preference).unwrap();
-        assert_eq!(resolved, production_q8);
+        assert_eq!(resolved, production_q4);
         assert_ne!(resolved, stale_fp16);
     }
 
@@ -480,17 +480,17 @@ mod tests {
             "fp16",
             b"GGUFolder-stale-fp16",
         );
-        let compatible_q8 = install_content_addressed(
+        let compatible_q4 = install_content_addressed(
             home.path(),
             "qwen3-forced-aligner-0.5b",
-            "q8_0",
-            b"GGUFolder-compatible-q8",
+            "q4_k",
+            b"GGUFolder-compatible-q4",
         );
         let preference =
-            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q8_0");
+            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q4_k");
 
         let resolved = resolve_installed_capability_pack_in(home.path(), preference).unwrap();
-        assert_eq!(resolved, compatible_q8);
+        assert_eq!(resolved, compatible_q4);
         assert_ne!(resolved, stale_fp16);
     }
 
@@ -503,17 +503,17 @@ mod tests {
             "fp16",
             b"GGUFstale-fp16",
         );
-        let production_q8 = install_legacy(
+        let production_q4 = install_legacy(
             home.path(),
             "qwen3-forced-aligner-0.6b",
-            "q8_0",
-            b"GGUFproduction-q8",
+            "q4_k",
+            b"GGUFproduction-q4",
         );
         let preference =
-            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q8_0");
+            CapabilityPackPreference::new("qwen3-forced-aligner-0.6b", "forced-aligner", "q4_k");
 
         let resolved = resolve_installed_capability_pack_in(home.path(), preference).unwrap();
-        assert_eq!(resolved, production_q8);
+        assert_eq!(resolved, production_q4);
         assert_ne!(resolved, stale_fp16);
     }
 

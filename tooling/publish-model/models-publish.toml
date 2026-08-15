@@ -393,8 +393,10 @@ requant_source_quant = "fp16"
 # qwen-forced-aligner` subcommand (same request shape as qwen). The CLI
 # defaults for source-name/license-name are stated explicitly anyway: the
 # pipeline never relies on argument defaults.
-# Forced-aligner imports intentionally expose only fp16 and q8_0. Publishing
-# builds both supported tiers; models-core.toml keeps q8_0 recommended.
+# Forced-aligner imports expose fp16, q8_0, and the policy-guarded q4_k tier.
+# q4_k is the unified public tier name; the importer still keeps the audio
+# encoder, token embedding, and timestamp head at Q8_0. models-core.toml makes
+# q4_k the recommended download.
 ["qwen3-forced-aligner-0.6b"]
 import_subcommand = "import qwen-forced-aligner"
 upstream_repo = "Qwen/Qwen3-ForcedAligner-0.6B"

@@ -461,7 +461,7 @@ fn bundled_catalog_public_models_are_release_public_in_source_metadata() {
 }
 
 #[test]
-fn bundled_catalog_public_models_resolve_recommended_default_quant() {
+fn bundled_catalog_public_models_have_coherent_recommended_default_quant() {
     let catalog = bundled_catalog();
     let public_models: Vec<_> = catalog.models.iter().filter(|model| model.public).collect();
 
@@ -486,6 +486,18 @@ fn bundled_catalog_public_models_resolve_recommended_default_quant() {
             "public model '{}' pull_recommended must point at the recommended quant",
             model.id
         );
+
+        // A signed catalog may intentionally advertise a model before the
+        // matching CLI release exists. Older clients must still load and list
+        // that entry, but resolve_catalog_pull correctly refuses to install it.
+        // The metadata checks above remain mandatory for every public model;
+        // exercise pull resolution only for entries this build can use.
+        if matches!(
+            model.availability(),
+            ModelAvailability::RequiresUpdate { .. }
+        ) {
+            continue;
+        }
 
         let default_pull = resolve_catalog_pull(
             &catalog,

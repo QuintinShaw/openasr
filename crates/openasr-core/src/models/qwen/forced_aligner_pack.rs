@@ -11,7 +11,11 @@ use std::path::PathBuf;
 const FORCED_ALIGNER_PACK_ENV: &str = "OPENASR_FORCED_ALIGNER_PACK";
 const FORCED_ALIGNER_INSTALLED_MODEL_ID_HINT: &str = "forced-aligner";
 const FORCED_ALIGNER_MODEL_ID: &str = "qwen3-forced-aligner-0.6b";
-const FORCED_ALIGNER_PREFERRED_QUANT: &str = "q8_0";
+// The catalog-wide public tier is `q4_k`, while the forced-aligner contract
+// keeps boundary-sensitive audio, embedding, and timestamp-head matrices at
+// Q8_0. This preference must match the signed catalog default so an
+// installation containing multiple valid tiers resolves deterministically.
+const FORCED_ALIGNER_PREFERRED_QUANT: &str = "q4_k";
 pub(crate) const FORCED_ALIGNER_PACK_PREFERENCE: crate::capability_pack::CapabilityPackPreference =
     crate::capability_pack::CapabilityPackPreference::new(
         FORCED_ALIGNER_MODEL_ID,
@@ -26,4 +30,14 @@ pub(crate) fn resolve_forced_aligner_pack_path() -> Option<PathBuf> {
         FORCED_ALIGNER_PACK_ENV,
         FORCED_ALIGNER_PACK_PREFERENCE,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preferred_quant_matches_the_policy_guarded_public_q4_k_tier() {
+        assert_eq!(FORCED_ALIGNER_PACK_PREFERENCE.preferred_quant, "q4_k");
+    }
 }

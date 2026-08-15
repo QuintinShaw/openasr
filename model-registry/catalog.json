@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-08-12T10:42:05+00:00",
+  "generated_at": "2026-08-15T14:45:03+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -1803,22 +1803,22 @@
       "license_url": "https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B/blob/c7cbfc2048c462b0d63a45797104fc9db3ad62b7/LICENSE",
       "license_class": "permissive",
       "hf_repo": "OpenASR/qwen3-forced-aligner-0.6b",
-      "hf_revision": "88cefff0030590029035f8139a649404a980bf3f",
+      "hf_revision": "3a82628cf7036c2ad0128f2d35bd1cced09b3100",
       "public": true,
-      "min_cli_version": "0.1.9",
-      "recommended_quant": "q8_0",
-      "pull_recommended": "qwen3-forced-aligner-0.6b:q8",
+      "min_cli_version": "0.1.32",
+      "recommended_quant": "q4_k",
+      "pull_recommended": "qwen3-forced-aligner-0.6b:q4",
       "prose": {
         "tagline": "Word-level forced alignment for OpenASR transcripts -- a non-autoregressive Qwen3 audio+text model that refines per-word timestamps",
         "overview": [
-          "Qwen3-ForcedAligner-0.6B is a **word-level forced-alignment** model from **Qwen**, sharing its\naudio-encoder + LM `thinker` tensor layout byte-for-byte with **Qwen3-ASR** (same\n`Qwen3ASRForConditionalGeneration` architecture). The only structural difference is the final\nhead: instead of a tied vocabulary `lm_head`, it uses an independent `Linear(hidden_size,\n5000)` classification head over 80ms-wide timestamp bins. Given a transcript's text and its\nsource audio, it runs a single non-autoregressive forward pass and reads off word-boundary\ntimestamps at argmax `<timestamp>` positions -- refining a model family's own (typically\ndecode-time-approximate) per-word timestamps. This OpenASR repo repackages the weights as\n`.oasr` packs that run natively in the OpenASR runtime -- no Python at inference, all decoding\nlocal. OpenASR recommends **q8_0** for production and also ships an **fp16** full-precision\nreference tier. Lower-precision Q3/Q4 packs are rejected because small logit perturbations can\nmove a word boundary across multiple 80ms bins.\n\n**Not a standalone transcription model.** This pack cannot transcribe audio by itself; it is an\nalignment dependency consumed explicitly via `openasr transcribe <audio> --model <asr-model>\n--word-timestamps=aligned`. It is also invoked internally when external speaker diarization\nmust split a coarse ASR segment at speaker changes; internally requested word anchors are\nremoved again unless the caller asked to receive them.\n\n**Verification:** local verification covers a tensor-parity check against the real upstream\ncheckpoint -- every source safetensors tensor maps 1:1 to a destination tensor, plus the two\nsynthesized frontend tensors. Both published tiers pass the all-matrix quantization-floor audit;\nthe recommended q8_0 pack additionally passes real Chinese meeting-audio attribution verification."
+          "Qwen3-ForcedAligner-0.6B is a **word-level forced-alignment** model from **Qwen**, sharing its\naudio-encoder + LM `thinker` tensor layout byte-for-byte with **Qwen3-ASR** (same\n`Qwen3ASRForConditionalGeneration` architecture). The only structural difference is the final\nhead: instead of a tied vocabulary `lm_head`, it uses an independent `Linear(hidden_size,\n5000)` classification head over 80ms-wide timestamp bins. Given a transcript's text and its\nsource audio, it runs a single non-autoregressive forward pass and reads off word-boundary\ntimestamps at argmax `<timestamp>` positions -- refining a model family's own (typically\ndecode-time-approximate) per-word timestamps. This OpenASR repo repackages the weights as\n`.oasr` packs that run natively in the OpenASR runtime -- no Python at inference, all decoding\nlocal. OpenASR recommends the validated **q4_k** tier and also ships **q8_0** and an **fp16**\nfull-precision reference tier. The q4_k label is the catalog's unified product name, not a claim\nthat every matrix uses Q4_K: the audio encoder, token embedding, and timestamp head remain Q8_0,\nand pack verification replays the exact per-tensor policy. Q3 and legacy all-Q4 packs are rejected\nbecause small logit perturbations can move a word boundary across multiple 80ms bins.\n\n**Not a standalone transcription model.** This pack cannot transcribe audio by itself; it is an\nalignment dependency consumed explicitly via `openasr transcribe <audio> --model <asr-model>\n--word-timestamps=aligned`. It is also invoked internally when external speaker diarization\nmust split a coarse ASR segment at speaker changes; internally requested word anchors are\nremoved again unless the caller asked to receive them.\n\n**Verification:** local verification covers a tensor-parity check against the real upstream\ncheckpoint -- every source safetensors tensor maps 1:1 to a destination tensor, plus the two\nsynthesized frontend tensors. On the fixed 205-item Chinese alignment set, the recommended q4_k\npack's CPU and Apple M1 Metal outputs each stayed within 320ms of the official reference and within\none 80ms model bin of q8_0. All published tiers pass their declared per-tensor quantization policy."
         ],
         "highlights": [
           "\ud83c\udfaf **Refined word timestamps** \u2014 consumes a finished transcript's text plus the source audio and replaces a model family's own approximate per-word timestamps with aligner-refined spans (`--word-timestamps=aligned`)",
           "\u26a1 **Non-autoregressive** \u2014 a single forward pass over interleaved audio/text with argmax at `<timestamp>` positions (5000 80ms-wide bins), not incremental greedy decoding, so it is not dispatched through the qwen3-asr runtime",
           "\ud83e\udde9 **Shares its backbone with Qwen3-ASR** \u2014 the same audio-encoder + LM `thinker` tensor layout, byte-for-byte; only the final head differs (an independent 5000-way classification head instead of the tied vocabulary head)",
           "\ud83d\udd0c **Shared attribution dependency** \u2014 used explicitly by `--word-timestamps=aligned` and internally when external diarization must split a coarse ASR segment at speaker changes",
-          "\ud83e\udd80 **Native Q8_0 + FP16 runtimes** \u2014 Q8_0 is recommended for production, while FP16 remains available as the full-precision reference tier; both run locally with no Python"
+          "\ud83e\udd80 **Validated native Q4_K default** \u2014 the public q4_k name follows OpenASR's unified tier naming, while boundary-sensitive audio, token-embedding, and timestamp-head matrices stay Q8_0; Q8_0 and FP16 remain available"
         ]
       },
       "quants": [
@@ -1827,7 +1827,7 @@
           "suffix": "fp16",
           "pull": "qwen3-forced-aligner-0.6b:fp16",
           "filename": "qwen3-forced-aligner-0.6b-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/qwen3-forced-aligner-0.6b/resolve/88cefff0030590029035f8139a649404a980bf3f/qwen3-forced-aligner-0.6b-fp16.oasr",
+          "url": "https://huggingface.co/OpenASR/qwen3-forced-aligner-0.6b/resolve/3a82628cf7036c2ad0128f2d35bd1cced09b3100/qwen3-forced-aligner-0.6b-fp16.oasr",
           "sha256": "6a66901681415f360e1bc61cc62ae4702ac53795910e99aed6913172c36dbafe",
           "size_bytes": 1841709344,
           "recommended": false,
@@ -1843,14 +1843,30 @@
           "suffix": "q8",
           "pull": "qwen3-forced-aligner-0.6b:q8",
           "filename": "qwen3-forced-aligner-0.6b-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/qwen3-forced-aligner-0.6b/resolve/88cefff0030590029035f8139a649404a980bf3f/qwen3-forced-aligner-0.6b-q8_0.oasr",
+          "url": "https://huggingface.co/OpenASR/qwen3-forced-aligner-0.6b/resolve/3a82628cf7036c2ad0128f2d35bd1cced09b3100/qwen3-forced-aligner-0.6b-q8_0.oasr",
           "sha256": "68af47f60b2809a942b1f6e7a43c6a5189e74bbf3f7ae15b4b3bdfe07e48c5c7",
           "size_bytes": 985596704,
-          "recommended": true,
+          "recommended": false,
           "perf": {
             "rtf_cpu": 0.153963,
             "rtf_metal": 0.050837,
             "peak_rss_bytes": 3000303616,
+            "jfk_wer_vs_fp16": null
+          }
+        },
+        {
+          "quant": "q4_k",
+          "suffix": "q4",
+          "pull": "qwen3-forced-aligner-0.6b:q4",
+          "filename": "qwen3-forced-aligner-0.6b-q4_k.oasr",
+          "url": "https://huggingface.co/OpenASR/qwen3-forced-aligner-0.6b/resolve/3a82628cf7036c2ad0128f2d35bd1cced09b3100/qwen3-forced-aligner-0.6b-q4_k.oasr",
+          "sha256": "5b36662d373cbee279f168c2f88700a59a93246584bf3a5ade9e800e41c7807b",
+          "size_bytes": 765395744,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.244569,
+            "rtf_metal": 0.051021,
+            "peak_rss_bytes": 2778791936,
             "jfk_wer_vs_fp16": null
           }
         }
@@ -1863,12 +1879,12 @@
             "\u26a1 **\u975e\u81ea\u56de\u5f52** \u2014 \u5bf9\u4ea4\u9519\u7684\u97f3\u9891/\u6587\u672c\u505a\u5355\u6b21\u524d\u5411\u8ba1\u7b97\uff0c\u5728 `<timestamp>` \u4f4d\u7f6e\u53d6 argmax\uff085000 \u4e2a 80ms \u5bbd\u7684\u5206\u7bb1\uff09\uff0c\u4e0d\u662f\u9010\u6b65\u8d2a\u5fc3\u89e3\u7801\uff0c\u56e0\u6b64\u4e0d\u901a\u8fc7 qwen3-asr \u8fd0\u884c\u65f6\u6d3e\u53d1",
             "\ud83e\udde9 **\u4e0e Qwen3-ASR \u5171\u4eab\u9aa8\u5e72** \u2014 \u97f3\u9891\u7f16\u7801\u5668 + LM \u7684 `thinker` \u5f20\u91cf\u5e03\u5c40\u9010\u4f4d\u76f8\u540c\uff0c\u4ec5\u672b\u7aef\u8f93\u51fa\u5934\u4e0d\u540c\uff08\u72ec\u7acb\u7684 5000 \u5206\u7c7b\u5934\uff0c\u800c\u975e\u5171\u4eab\u8bcd\u8868\u7684\u7ed1\u5b9a\u5934\uff09",
             "\ud83d\udd0c **\u7edf\u4e00\u5f52\u5c5e\u4f9d\u8d56** \u2014 \u65e2\u652f\u6301\u663e\u5f0f `--word-timestamps=aligned`\uff0c\u4e5f\u4f1a\u5728\u5916\u7f6e\u8bf4\u8bdd\u4eba\u5206\u79bb\u9700\u8981\u628a\u7c97\u7c92\u5ea6 ASR \u6bb5\u5207\u5230\u6362\u4eba\u8fb9\u754c\u65f6\u7531\u5185\u90e8\u8c03\u7528",
-            "\ud83e\udd80 **\u539f\u751f Q8_0 + FP16 \u8fd0\u884c\u65f6** \u2014 \u63a8\u8350\u751f\u4ea7\u4f7f\u7528 Q8_0\uff0c\u540c\u65f6\u4fdd\u7559 FP16 \u4f5c\u4e3a\u5168\u7cbe\u5ea6\u53c2\u8003\u6863\uff1b\u4e24\u8005\u5747\u5b8c\u5168\u672c\u5730\u8fd0\u884c\u4e14\u65e0\u9700 Python"
+            "\ud83e\udd80 **\u7ecf\u9a8c\u8bc1\u7684\u539f\u751f Q4_K \u9ed8\u8ba4\u6863** \u2014 q4_k \u6cbf\u7528 OpenASR \u7edf\u4e00\u6863\u4f4d\u547d\u540d\uff0c\u4f46\u5bf9\u8fb9\u754c\u654f\u611f\u7684\u97f3\u9891\u3001\u8bcd\u5d4c\u5165\u548c\u65f6\u95f4\u6233\u8f93\u51fa\u5934\u4ecd\u4fdd\u6301 Q8_0\uff1b\u53e6\u63d0\u4f9b Q8_0 \u4e0e FP16"
           ]
         }
       },
       "upstream_release_date": "2026-01-28",
-      "min_core_version": "0.1.9"
+      "min_core_version": "0.1.32"
     },
     {
       "id": "funasr-nano",
