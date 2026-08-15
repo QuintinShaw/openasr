@@ -1216,6 +1216,14 @@ fn serve_native_accepts_quant_pinned_model_ref_for_bare_local_runtime_source() {
 // that boundary.
 #[allow(clippy::zombie_processes)]
 fn spawn_serve_and_wait_until_listening(home: &Path) -> (std::process::Child, String) {
+    spawn_serve_with_extra_args_and_wait_until_listening(home, &[])
+}
+
+#[allow(clippy::zombie_processes)]
+fn spawn_serve_with_extra_args_and_wait_until_listening(
+    home: &Path,
+    extra_args: &[&str],
+) -> (std::process::Child, String) {
     // `--addr 127.0.0.1:0` asks the OS for an ephemeral port; `serve` reports
     // back the listener's actual bound address (not the `:0` it was given
     // verbatim), so the real port is parsed straight from that banner line
@@ -1229,6 +1237,7 @@ fn spawn_serve_and_wait_until_listening(home: &Path) -> (std::process::Child, St
         .env_remove("OPENASR_ASSUME_YES")
         .env_remove("OPENASR_OFFLINE")
         .args(["serve", "--backend", "native", "--addr", "127.0.0.1:0"])
+        .args(extra_args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut child = command.spawn().expect("spawn openasr serve");
@@ -1269,6 +1278,52 @@ fn spawn_serve_and_wait_until_listening(home: &Path) -> (std::process::Child, St
     }
 }
 
+fn install_default_moonshine_pack(home: &Path) {
+    let source = home.join("fixture-source.oasr");
+    write_moonshine_oasr_v1_fixture(&source, "moonshine-tiny");
+    let bytes = std::fs::read(&source).expect("read installed-pack fixture");
+    std::fs::remove_file(&source).expect("remove source after populating object store");
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let object = home
+        .join("models/objects/sha256")
+        .join(&sha256)
+        .join("content");
+    std::fs::create_dir_all(object.parent().expect("object parent")).expect("create object store");
+    std::fs::write(&object, &bytes).expect("write installed-pack object");
+
+    let reference = home.join("models/refs/moonshine-tiny/q8_0.json");
+    std::fs::create_dir_all(reference.parent().expect("reference parent"))
+        .expect("create model reference directory");
+    let pack = openasr_core::InstalledPack {
+        model_id: "moonshine-tiny".to_string(),
+        display_name: "Moonshine Tiny".to_string(),
+        quant: "q8_0".to_string(),
+        suffix: "q8".to_string(),
+        pull: "moonshine-tiny:q8".to_string(),
+        filename: "moonshine-tiny-q8_0.oasr".to_string(),
+        path: object,
+        url: "https://example.invalid/moonshine-tiny-q8_0.oasr".to_string(),
+        hf_revision: "test".to_string(),
+        sha256,
+        size_bytes: bytes.len() as u64,
+        installed_at_unix_seconds: 1,
+        source: None,
+    };
+    std::fs::write(
+        reference,
+        serde_json::to_vec(&pack).expect("serialize installed pack"),
+    )
+    .expect("write model reference");
+    openasr_core::save_config(
+        home,
+        &openasr_core::OpenAsrConfig {
+            default_model: Some("moonshine-tiny".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("persist installed default model");
+}
+
 fn raw_http_request(addr: &str, request: &[u8]) -> String {
     use std::io::{Read, Write};
     let stream = std::net::TcpStream::connect(addr).expect("connect to daemon");
@@ -1303,6 +1358,45 @@ fn serve_native_without_installed_model_starts_and_answers_health() {
     assert!(
         response.contains("\"model_installed\":false"),
         "expected /health to honestly report no model installed, got: {response}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn serve_no_model_keeps_an_installed_default_unbound_in_health() {
+    let temp = tempfile::tempdir().unwrap();
+    install_default_moonshine_pack(temp.path());
+    let installed = openasr_core::list_installed_packs(temp.path())
+        .expect("the fixture must be recognized as installed before the daemon starts");
+    assert_eq!(installed.len(), 1);
+    assert_eq!(installed[0].pull, "moonshine-tiny:q8");
+    assert_eq!(
+        openasr_core::load_config(temp.path())
+            .expect("load fixture config")
+            .default_model
+            .as_deref(),
+        Some("moonshine-tiny")
+    );
+    let (mut child, addr) =
+        spawn_serve_with_extra_args_and_wait_until_listening(temp.path(), &["--no-model"]);
+
+    let response = raw_http_request(
+        &addr,
+        format!("GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "expected a healthy 200 response, got: {response}"
+    );
+    assert!(
+        response.contains("\"model_installed\":false"),
+        "--no-model must hide even an installed default from the serving runtime: {response}"
+    );
+    assert!(
+        response.contains("\"model_resident\":false"),
+        "--no-model must not make an installed default resident: {response}"
     );
 
     let _ = child.kill();

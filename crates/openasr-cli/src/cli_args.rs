@@ -584,6 +584,9 @@ pub(crate) enum Command {
         /// Local `.oasr` runtime pack file for native backend transcription.
         #[arg(long)]
         model_pack: Option<PathBuf>,
+        /// Start without binding a model, even if a configured default is installed.
+        #[arg(long, conflicts_with_all = ["model", "model_pack"])]
+        no_model: bool,
         /// Maximum admitted native sessions for one resolved model. `1` keeps
         /// offline decoding serial; eligible direct-GPU families batch admitted
         /// jobs internally up to width 8, while larger values continue in

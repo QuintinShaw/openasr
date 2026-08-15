@@ -479,6 +479,7 @@ async fn run() -> Result<()> {
             backend,
             ffmpeg_bin,
             model_pack,
+            no_model,
             max_native_sessions_per_model,
             parent_pid,
         } => {
@@ -492,6 +493,7 @@ async fn run() -> Result<()> {
                 backend,
                 RuntimePathOverrides { ffmpeg_bin },
                 model_pack.as_deref(),
+                no_model,
                 max_native_sessions_per_model,
                 ServeSecurityOptions {
                     tls_self_signed,
@@ -1654,6 +1656,7 @@ mod tests {
             Some("qwen3-asr-0.6b"),
             BackendKind::Native,
             None,
+            false,
             &OpenAsrConfig::default(),
         )
         .expect("serve must resolve a model source even with zero packs installed");
@@ -1675,6 +1678,7 @@ mod tests {
             None,
             BackendKind::Native,
             Some(&missing_pack),
+            false,
             &OpenAsrConfig::default(),
         )
         .unwrap_err()
@@ -1933,15 +1937,11 @@ mod tests {
 
     /// Desktop-sidecar contract: the desktop sidecar spawns
     /// this binary as `openasr serve --backend native --parent-pid <pid> ...`.
-    /// Both
-    /// flags are `hide = true` in `cli_args.rs` because they are launch-detail
-    /// only, never meant for interactive use -- but "hidden from `--help`" must
-    /// never come to mean "safe to rename or remove". This test locks the two
-    /// flags' presence and shape (long names, hyphenated `--parent-pid`, an
-    /// accepted `native`/`mock` value for `--backend`, a `u32` for
-    /// `--parent-pid`) so a future "clean up hidden flags" pass fails CI here
-    /// instead of silently breaking every desktop build's ability to launch and
-    /// supervise its sidecar.
+    /// `--backend` and `--parent-pid` are hidden launch details, while
+    /// `--no-model` is the explicit fail-closed recovery mode used when the
+    /// desktop cannot launch its configured pack. This test locks all three
+    /// flags' presence and shape so a future CLI cleanup fails CI here instead
+    /// of silently breaking the desktop sidecar contract.
     #[test]
     fn serve_accepts_desktop_sidecar_contract_flags() {
         let cli = Cli::try_parse_from([
@@ -1951,11 +1951,15 @@ mod tests {
             "native",
             "--parent-pid",
             "4321",
+            "--no-model",
         ])
-        .expect("serve must keep accepting --backend and --parent-pid for the desktop sidecar");
+        .expect(
+            "serve must keep accepting --backend, --parent-pid, and --no-model for the desktop sidecar",
+        );
 
         let Command::Serve {
             backend,
+            no_model,
             max_native_sessions_per_model,
             parent_pid,
             ..
@@ -1965,8 +1969,33 @@ mod tests {
         };
 
         assert_eq!(backend, Some(BackendKind::Native));
+        assert!(no_model);
         assert_eq!(max_native_sessions_per_model.get(), 1);
         assert_eq!(parent_pid, Some(4321));
+    }
+
+    #[test]
+    fn serve_no_model_conflicts_with_explicit_model_sources() {
+        assert!(
+            Cli::try_parse_from([
+                "openasr",
+                "serve",
+                "--no-model",
+                "--model",
+                "moonshine-tiny",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "openasr",
+                "serve",
+                "--no-model",
+                "--model-pack",
+                "moonshine.oasr",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -1988,6 +2017,7 @@ mod tests {
 
         let Command::Serve {
             backend,
+            no_model,
             max_native_sessions_per_model,
             parent_pid,
             ..
@@ -1997,6 +2027,7 @@ mod tests {
         };
 
         assert_eq!(backend, None);
+        assert!(!no_model);
         assert_eq!(max_native_sessions_per_model.get(), 1);
         assert_eq!(parent_pid, None);
     }

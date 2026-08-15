@@ -483,13 +483,28 @@ pub(super) fn prepare_backend_run(
 /// `--model-pack` escape hatch still fails closed if the path does not
 /// validate; only the "nothing installed yet" case degrades to no model bound,
 /// which `openasr-server` reports via `/health` and fails closed on a
-/// transcription request instead.
+/// transcription request instead. Explicit `--no-model` skips persisted
+/// default resolution entirely so a supervisor can preserve that unbound
+/// recovery state even when the rejected pack is still installed on disk.
 pub(super) fn resolve_serve_model_source(
     model: Option<&str>,
     backend_kind: BackendKind,
     model_pack: Option<&Path>,
+    no_model: bool,
     config: &OpenAsrConfig,
 ) -> Result<ResolvedModelSource> {
+    if no_model {
+        if model.is_some() || model_pack.is_some() {
+            bail!("--no-model cannot be combined with --model or --model-pack");
+        }
+        if backend_kind != BackendKind::Native {
+            bail!("--no-model is only supported with the native backend");
+        }
+        return Ok(ResolvedModelSource {
+            model_id: NATIVE_RUNTIME_MODEL_ID_AUTO.to_string(),
+            model_pack_path: None,
+        });
+    }
     if backend_kind != BackendKind::Native {
         return resolve_model_source_for_backend("serve", model, backend_kind, model_pack, config);
     }
@@ -543,6 +558,7 @@ pub(super) async fn serve(
     backend_kind: Option<BackendKind>,
     runtime_paths: RuntimePathOverrides,
     model_pack: Option<&Path>,
+    no_model: bool,
     max_native_sessions_per_model: std::num::NonZeroUsize,
     security: ServeSecurityOptions,
 ) -> Result<()> {
@@ -554,7 +570,7 @@ pub(super) async fn serve(
     let config_document = openasr_core::load_config_document(&home)?;
     let config = &config_document.config;
     let backend = resolve_backend(backend_kind, config)?;
-    let model_source = resolve_serve_model_source(model, backend, model_pack, config)?;
+    let model_source = resolve_serve_model_source(model, backend, model_pack, no_model, config)?;
     if backend == BackendKind::Native
         && let Some(model_pack_path) = model_source.model_pack_path.as_deref()
     {
@@ -588,6 +604,10 @@ pub(super) async fn serve(
                 local_model_id
             );
         }
+    } else if backend == BackendKind::Native && no_model {
+        eprintln!(
+            "openasr-server: --no-model requested; starting with no model bound. Transcription requests will fail closed until the server is restarted with a model."
+        );
     } else if backend == BackendKind::Native {
         eprintln!(
             "openasr-server: no installed native model pack found; starting with no model bound. Install one (openasr pull <model-id>) or install via the desktop model market; transcription requests will fail closed until then."
@@ -1562,7 +1582,7 @@ mod tests {
     }
 
     #[test]
-    fn serve_auto_binds_default_from_content_addressed_ref() {
+    fn serve_auto_binds_default_from_content_addressed_ref_unless_no_model_is_explicit() {
         use sha2::Digest as _;
 
         with_env_lock(|| {
@@ -1610,8 +1630,14 @@ mod tests {
             std::fs::write(reference, serde_json::to_vec(&pack).unwrap()).unwrap();
 
             let resolved =
-                resolve_serve_model_source(None, BackendKind::Native, None, &config).unwrap();
+                resolve_serve_model_source(None, BackendKind::Native, None, false, &config)
+                    .unwrap();
             assert_eq!(resolved.model_pack_path, Some(object));
+
+            let explicitly_unbound =
+                resolve_serve_model_source(None, BackendKind::Native, None, true, &config).unwrap();
+            assert_eq!(explicitly_unbound.model_pack_path, None);
+            assert_eq!(explicitly_unbound.model_id, NATIVE_RUNTIME_MODEL_ID_AUTO);
         });
     }
 
