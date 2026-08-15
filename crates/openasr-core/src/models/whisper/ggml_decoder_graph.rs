@@ -70,6 +70,7 @@ pub(crate) struct WhisperDecoderGraphMetadata {
 pub(crate) struct WhisperDecoderGraphTensorRef {
     pub tensor_name: String,
     pub tensor_num_elements: usize,
+    pub source_ggml_type: i32,
     pub dims: Vec<u64>,
 }
 
@@ -961,15 +962,10 @@ struct LocalVectorCacheKey {
 
 pub(crate) struct WhisperDecoderPersistentWeightCache {
     arena: GgmlStaticTensorArena,
-    linear_weights: HashMap<LocalLinearWeightCacheKey, GgmlStaticTensor>,
-    // Zero-copy linear weights bound directly to the mmap'd runtime pack (no host
-    // copy, no arena upload). Only quantized input-output linear weights consumed
-    // verbatim via `linear_weight()` are bound here; the cross-attention K/V
-    // projections (referenced by the precompute task as arena tensors) and every
-    // f32/f16 weight stay on the arena path. `_loaded_weights` owns the mmap + ggml
-    // context the bound tensors point into and must outlive the graph.
+    linear_weights: HashMap<LocalLinearWeightCacheKey, WhisperDecoderPersistentWeight>,
+    // `_loaded_weights` owns the mmap + ggml context used by every Loaded or
+    // LoadedView handle and must outlive the arena and all persistent graphs.
     _loaded_weights: Option<GgmlLoadedWeightContext>,
-    loaded_linear_weights: HashMap<LocalLinearWeightCacheKey, GgmlLoadedTensor>,
     vectors: HashMap<LocalVectorCacheKey, GgmlStaticTensor>,
     embeddings: WhisperDecoderPersistentEmbeddingCache,
     _cross_attention_storage: WhisperDecoderPersistentCrossAttentionStorage,
@@ -1000,9 +996,9 @@ struct PersistentCrossAttentionProjectionTask {
     layer_idx: usize,
     input_dim: usize,
     output_dim: usize,
-    key_weight: GgmlStaticTensor,
+    key_weight: WhisperDecoderPersistentWeight,
     key_weight_accepts_f16_rhs: bool,
-    value_weight: GgmlStaticTensor,
+    value_weight: WhisperDecoderPersistentWeight,
     value_weight_accepts_f16_rhs: bool,
     value_bias: GgmlStaticTensor,
     key_target: GgmlStaticTensor,
@@ -1069,8 +1065,115 @@ struct WhisperDecoderPersistentSelfAttentionCache {
 
 #[derive(Debug, Clone, Copy)]
 struct WhisperDecoderPersistentEmbeddingCache {
-    token: GgmlStaticTensor,
+    token: WhisperDecoderPersistentWeight,
     position: GgmlStaticTensor,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WhisperDecoderPersistentWeight {
+    Static(GgmlStaticTensor),
+    Loaded(GgmlLoadedTensor),
+    LoadedView(GgmlStaticTensor),
+}
+
+impl WhisperDecoderPersistentWeight {
+    fn as_graph_tensor<'a>(self, arena: &GgmlStaticTensorArena) -> GgmlCpuTensor<'a> {
+        match self {
+            Self::Static(tensor) | Self::LoadedView(tensor) => arena.graph_tensor(tensor),
+            Self::Loaded(tensor) => tensor.as_graph_tensor(),
+        }
+    }
+}
+
+fn source_dims_match_2d(tensor: &WhisperDecoderGraphTensorRef, ne0: usize, ne1: usize) -> bool {
+    let Ok(ne0) = u64::try_from(ne0) else {
+        return false;
+    };
+    let Ok(ne1) = u64::try_from(ne1) else {
+        return false;
+    };
+    tensor.dims.as_slice() == [ne0, ne1]
+}
+
+fn try_loaded_f16_embedding(
+    loaded_weights: Option<&GgmlLoadedWeightContext>,
+    embedding: &WhisperDecoderEmbeddingPlan,
+    allow_loaded_f16_views: bool,
+) -> Option<WhisperDecoderPersistentWeight> {
+    loaded_f16_embedding_source_matches(embedding, allow_loaded_f16_views)
+        .then(|| {
+            loaded_weights
+                .and_then(|weights| weights.tensor(&embedding.weight.tensor_name))
+                .map(WhisperDecoderPersistentWeight::Loaded)
+        })
+        .flatten()
+}
+
+fn loaded_f16_embedding_source_matches(
+    embedding: &WhisperDecoderEmbeddingPlan,
+    allow_loaded_f16_views: bool,
+) -> bool {
+    allow_loaded_f16_views
+        && embedding.weight.source_ggml_type == GGML_TYPE_F16
+        && embedding.layout == WhisperDecoderEmbeddingLayout::HiddenVocab
+        && source_dims_match_2d(
+            &embedding.weight,
+            embedding.hidden_size,
+            embedding.vocab_size,
+        )
+}
+
+fn loaded_f16_linear_source_matches(
+    projection: &WhisperDecoderLinearProjectionPlan,
+    allow_loaded_f16_views: bool,
+) -> bool {
+    allow_loaded_f16_views
+        && projection.weight.source_ggml_type == GGML_TYPE_F16
+        && match projection.weight_layout {
+            WhisperDecoderLinearWeightLayout::InputOutput => source_dims_match_2d(
+                &projection.weight,
+                projection.input_dim,
+                projection.output_dim,
+            ),
+            WhisperDecoderLinearWeightLayout::OutputInput => source_dims_match_2d(
+                &projection.weight,
+                projection.output_dim,
+                projection.input_dim,
+            ),
+        }
+}
+
+fn try_loaded_f16_linear_weight(
+    arena: &GgmlStaticTensorArena,
+    loaded_weights: Option<&GgmlLoadedWeightContext>,
+    projection: &WhisperDecoderLinearProjectionPlan,
+    allow_loaded_f16_views: bool,
+) -> Result<Option<WhisperDecoderPersistentWeight>, WhisperDecoderGraphExecutionError> {
+    if !loaded_f16_linear_source_matches(projection, allow_loaded_f16_views) {
+        return Ok(None);
+    }
+    let Some(loaded) =
+        loaded_weights.and_then(|weights| weights.tensor(&projection.weight.tensor_name))
+    else {
+        return Ok(None);
+    };
+    match projection.weight_layout {
+        WhisperDecoderLinearWeightLayout::InputOutput => {
+            Ok(Some(WhisperDecoderPersistentWeight::Loaded(loaded)))
+        }
+        WhisperDecoderLinearWeightLayout::OutputInput => arena
+            .reshape_loaded_tensor_2d(
+                loaded,
+                projection.input_dim,
+                projection.output_dim,
+                "decoder_persistent_loaded_f16_linear_view",
+            )
+            .map(WhisperDecoderPersistentWeight::LoadedView)
+            .map(Some)
+            .map_err(|error| {
+                map_decoder_execute_graph_error("ggml_reshape_2d(loaded_f16_linear)", error)
+            }),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1511,6 +1614,26 @@ impl WhisperDecoderPersistentWeightCache {
         )
     }
 
+    pub(crate) fn build_static_stage_with_loaded_f16_views(
+        runner: &mut GgmlCpuGraphRunner,
+        plan: &WhisperDecoderGraphPlan,
+        source: &dyn WhisperDecoderTensorSource,
+        tensor_cache: &mut WhisperDecoderExecutionTensorCache,
+        self_kv_max_positions: usize,
+        runtime_preflight: &GgufRuntimeSourcePreflight,
+    ) -> Result<Self, WhisperDecoderGraphExecutionError> {
+        Self::build_static_stage_with_n_seq_impl(
+            runner,
+            plan,
+            source,
+            tensor_cache,
+            self_kv_max_positions,
+            RuntimeWeightSource::Verified(runtime_preflight),
+            1,
+            true,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn build_static_stage_synthetic(
         runner: &mut GgmlCpuGraphRunner,
@@ -1527,6 +1650,7 @@ impl WhisperDecoderPersistentWeightCache {
             self_kv_max_positions,
             RuntimeWeightSource::Synthetic,
             1,
+            false,
         )
     }
 
@@ -1547,6 +1671,7 @@ impl WhisperDecoderPersistentWeightCache {
             self_kv_max_positions,
             RuntimeWeightSource::Verified(runtime_preflight),
             n_seq,
+            false,
         )
     }
 
@@ -1567,6 +1692,7 @@ impl WhisperDecoderPersistentWeightCache {
             self_kv_max_positions,
             RuntimeWeightSource::Synthetic,
             n_seq,
+            false,
         )
     }
 
@@ -1578,6 +1704,7 @@ impl WhisperDecoderPersistentWeightCache {
         self_kv_max_positions: usize,
         runtime_source: RuntimeWeightSource<'_>,
         n_seq: usize,
+        allow_loaded_f16_views: bool,
     ) -> Result<Self, WhisperDecoderGraphExecutionError> {
         if n_seq == 0 {
             return Err(WhisperDecoderGraphExecutionError::InvalidInput {
@@ -1616,10 +1743,9 @@ impl WhisperDecoderPersistentWeightCache {
                 },
             )?;
         let arena_init_ms = persistent_build_start.elapsed().as_millis();
-        // Bind eligible quantized linear weights zero-copy to the mmap'd pack. The
-        // cross-attention K/V projections are EXCLUDED: their static arena tensors
-        // are referenced directly by the cross-attention precompute task, so they
-        // must remain arena-resident.
+        // Bind eligible immutable weights zero-copy to the mmap'd pack. Verified
+        // direct GPU sessions may additionally reinterpret source-F16 matrices as
+        // execution-layout views; all other paths retain the arena-copy contract.
         let loaded_weights = match runtime_source {
             RuntimeWeightSource::Verified(preflight) => Some(
                 runner
@@ -1644,32 +1770,39 @@ impl WhisperDecoderPersistentWeightCache {
             })
             .collect();
         let mut linear_weights = HashMap::new();
-        let mut loaded_linear_weights: HashMap<LocalLinearWeightCacheKey, GgmlLoadedTensor> =
-            HashMap::new();
         let mut linear_weight_types = HashMap::new();
         let mut vectors = HashMap::new();
         let mut uploads = Vec::new();
         let embeddings_start = Instant::now();
         let token_embedding_name = "decoder_persistent_token_embedding";
-        let token_embedding_values = tensor_cache
-            .materialize_embedding_hidden_vocab_f16_bits(source, &plan.token_embedding)?;
-        let token_embedding = arena
-            .new_tensor_2d_f16(
-                plan.token_embedding.hidden_size,
-                plan.token_embedding.vocab_size,
-                token_embedding_name,
-            )
-            .map_err(|error| {
-                map_decoder_execute_graph_error(
-                    "ggml_new_tensor_2d_f16(persistent_token_embedding)",
-                    error,
+        let token_embedding = if let Some(loaded) = try_loaded_f16_embedding(
+            loaded_weights.as_ref(),
+            &plan.token_embedding,
+            allow_loaded_f16_views,
+        ) {
+            loaded
+        } else {
+            let token_embedding_values = tensor_cache
+                .materialize_embedding_hidden_vocab_f16_bits(source, &plan.token_embedding)?;
+            let token_embedding = arena
+                .new_tensor_2d_f16(
+                    plan.token_embedding.hidden_size,
+                    plan.token_embedding.vocab_size,
+                    token_embedding_name,
                 )
-            })?;
-        uploads.push(PersistentTensorUpload::F16(
-            token_embedding,
-            token_embedding_values,
-            token_embedding_name,
-        ));
+                .map_err(|error| {
+                    map_decoder_execute_graph_error(
+                        "ggml_new_tensor_2d_f16(persistent_token_embedding)",
+                        error,
+                    )
+                })?;
+            uploads.push(PersistentTensorUpload::F16(
+                token_embedding,
+                token_embedding_values,
+                token_embedding_name,
+            ));
+            WhisperDecoderPersistentWeight::Static(token_embedding)
+        };
         let position_embedding_name = "decoder_persistent_position_embedding";
         let position_embedding_values =
             tensor_cache.materialize_embedding_hidden_vocab(source, &plan.position_embedding)?;
@@ -1751,15 +1884,23 @@ impl WhisperDecoderPersistentWeightCache {
                 output_dim: projection.output_dim,
                 source_layout: projection.weight_layout,
             };
-            if linear_weights.contains_key(&key) || loaded_linear_weights.contains_key(&key) {
+            if linear_weights.contains_key(&key) {
                 continue;
             }
-            // Zero-copy bind: a quantized input-output linear weight that is NOT a
-            // cross-attention K/V projection is consumed verbatim via mul_mat, so
-            // the mmap'd pack bytes are bit-identical to the arena copy. Bind it
-            // directly and skip the arena allocation + upload.
+            if let Some(loaded) = try_loaded_f16_linear_weight(
+                &arena,
+                loaded_weights.as_ref(),
+                projection,
+                allow_loaded_f16_views,
+            )? {
+                linear_weight_types.insert(key.clone(), GGML_TYPE_F16);
+                linear_weights.insert(key, loaded);
+                continue;
+            }
+            // Quantized input-output matrices are already stored in execution
+            // layout and can always bind zero-copy from a verified runtime pack.
             if projection.weight_layout == WhisperDecoderLinearWeightLayout::InputOutput
-                && !cross_kv_excluded_keys.contains(&key)
+                && (allow_loaded_f16_views || !cross_kv_excluded_keys.contains(&key))
                 && let Some((ggml_type, _bytes)) =
                     source.materialize_tensor_quantized_arc(&projection.weight)?
                 && let Some(loaded) = loaded_weights
@@ -1767,7 +1908,7 @@ impl WhisperDecoderPersistentWeightCache {
                     .and_then(|ctx| ctx.tensor(&projection.weight.tensor_name))
             {
                 linear_weight_types.insert(key.clone(), ggml_type);
-                loaded_linear_weights.insert(key, loaded);
+                linear_weights.insert(key, WhisperDecoderPersistentWeight::Loaded(loaded));
                 continue;
             }
             let weights =
@@ -1792,12 +1933,12 @@ impl WhisperDecoderPersistentWeightCache {
             match weights {
                 LocalLinearWeightPayload::F16Bits(values) => {
                     linear_weight_types.insert(key.clone(), GGML_TYPE_F16);
-                    linear_weights.insert(key, tensor);
+                    linear_weights.insert(key, WhisperDecoderPersistentWeight::Static(tensor));
                     uploads.push(PersistentTensorUpload::F16(tensor, values, tensor_name))
                 }
                 LocalLinearWeightPayload::Quantized { ggml_type, bytes } => {
                     linear_weight_types.insert(key.clone(), ggml_type);
-                    linear_weights.insert(key, tensor);
+                    linear_weights.insert(key, WhisperDecoderPersistentWeight::Static(tensor));
                     uploads.push(PersistentTensorUpload::Bytes(tensor, bytes, tensor_name))
                 }
             }
@@ -2087,7 +2228,6 @@ impl WhisperDecoderPersistentWeightCache {
             arena,
             linear_weights,
             _loaded_weights: loaded_weights,
-            loaded_linear_weights,
             vectors,
             embeddings: WhisperDecoderPersistentEmbeddingCache {
                 token: token_embedding,
@@ -2235,12 +2375,9 @@ impl WhisperDecoderPersistentWeightCache {
             output_dim: projection.output_dim,
             source_layout: projection.weight_layout,
         };
-        if let Some(loaded) = self.loaded_linear_weights.get(&key) {
-            return Some(loaded.as_graph_tensor());
-        }
         self.linear_weights
             .get(&key)
-            .map(|tensor| self.arena.graph_tensor(*tensor))
+            .map(|tensor| tensor.as_graph_tensor(&self.arena))
     }
 
     fn vector<'a>(
@@ -2258,7 +2395,7 @@ impl WhisperDecoderPersistentWeightCache {
     }
 
     fn token_embedding<'a>(&self) -> GgmlCpuTensor<'a> {
-        self.arena.graph_tensor(self.embeddings.token)
+        self.embeddings.token.as_graph_tensor(&self.arena)
     }
 
     fn position_embedding<'a>(&self) -> GgmlCpuTensor<'a> {
@@ -5642,12 +5779,12 @@ fn prepare_cross_attention_projection_pairs_with_persistent_weights_runner_ggml<
             value_input
         };
         let key_output = graph
-            .mul_mat(arena.graph_tensor(task.key_weight), key_mat_input)
+            .mul_mat(task.key_weight.as_graph_tensor(arena), key_mat_input)
             .map_err(|error| {
                 map_decoder_execute_graph_error("ggml_mul_mat(cross_k_linear)", error)
             })?;
         let value_linear = graph
-            .mul_mat(arena.graph_tensor(task.value_weight), value_mat_input)
+            .mul_mat(task.value_weight.as_graph_tensor(arena), value_mat_input)
             .map_err(|error| {
                 map_decoder_execute_graph_error("ggml_mul_mat(cross_v_linear)", error)
             })?;
@@ -5683,10 +5820,10 @@ fn prepare_cross_attention_projection_pairs_with_persistent_weights_runner_ggml<
 }
 
 fn persistent_linear_weight_handle(
-    linear_weights: &HashMap<LocalLinearWeightCacheKey, GgmlStaticTensor>,
+    linear_weights: &HashMap<LocalLinearWeightCacheKey, WhisperDecoderPersistentWeight>,
     projection: &WhisperDecoderLinearProjectionPlan,
     label_prefix: &'static str,
-) -> Result<GgmlStaticTensor, WhisperDecoderGraphExecutionError> {
+) -> Result<WhisperDecoderPersistentWeight, WhisperDecoderGraphExecutionError> {
     let key = LocalLinearWeightCacheKey {
         tensor_name: projection.weight.tensor_name.clone(),
         input_dim: projection.input_dim,
@@ -6128,6 +6265,52 @@ mod tests {
     use crate::ggml_runtime::{GgmlCpuGraphConfig, GgmlCpuGraphRunner};
 
     use super::*;
+
+    #[test]
+    fn decoder_loaded_f16_source_proof_accepts_only_exact_execution_layouts() {
+        let tensor = |ggml_type, dims: &[u64]| WhisperDecoderGraphTensorRef {
+            tensor_name: "decoder.weight".to_string(),
+            tensor_num_elements: dims.iter().copied().product::<u64>() as usize,
+            source_ggml_type: ggml_type,
+            dims: dims.to_vec(),
+        };
+        let output_input = WhisperDecoderLinearProjectionPlan {
+            weight: tensor(GGML_TYPE_F16, &[6, 4]),
+            weight_layout: WhisperDecoderLinearWeightLayout::OutputInput,
+            input_dim: 4,
+            output_dim: 6,
+        };
+        let input_output = WhisperDecoderLinearProjectionPlan {
+            weight: tensor(GGML_TYPE_F16, &[4, 6]),
+            weight_layout: WhisperDecoderLinearWeightLayout::InputOutput,
+            input_dim: 4,
+            output_dim: 6,
+        };
+        assert!(loaded_f16_linear_source_matches(&output_input, true));
+        assert!(loaded_f16_linear_source_matches(&input_output, true));
+        assert!(!loaded_f16_linear_source_matches(&output_input, false));
+
+        let mut converted = output_input.clone();
+        converted.weight.source_ggml_type = 0;
+        assert!(!loaded_f16_linear_source_matches(&converted, true));
+        let mut wrong_shape = output_input.clone();
+        wrong_shape.weight.dims = vec![4, 6];
+        assert!(!loaded_f16_linear_source_matches(&wrong_shape, true));
+
+        let embedding = WhisperDecoderEmbeddingPlan {
+            weight: tensor(GGML_TYPE_F16, &[4, 10]),
+            layout: WhisperDecoderEmbeddingLayout::HiddenVocab,
+            vocab_size: 10,
+            hidden_size: 4,
+        };
+        assert!(loaded_f16_embedding_source_matches(&embedding, true));
+        let transposed = WhisperDecoderEmbeddingPlan {
+            weight: tensor(GGML_TYPE_F16, &[10, 4]),
+            layout: WhisperDecoderEmbeddingLayout::VocabHidden,
+            ..embedding
+        };
+        assert!(!loaded_f16_embedding_source_matches(&transposed, true));
+    }
 
     #[test]
     fn default_cpu_f32_rhs_policy_enables_for_auto_and_blas() {
@@ -6867,6 +7050,7 @@ mod tests {
         WhisperDecoderGraphTensorRef {
             tensor_name: name.to_string(),
             tensor_num_elements: dims.iter().copied().product::<u64>() as usize,
+            source_ggml_type: 0,
             dims: dims.to_vec(),
         }
     }

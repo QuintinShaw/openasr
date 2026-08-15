@@ -171,7 +171,7 @@ fn unified_owner_is_limited_to_exact_direct_cuda_vulkan_full_device() {
 }
 
 #[test]
-fn encoder_loaded_f16_views_require_exact_direct_cuda_vulkan_full_device() {
+fn gpu_loaded_f16_views_require_exact_direct_cuda_vulkan_full_device() {
     let direct_gpu = GgmlCpuGraphConfig {
         backend: GgmlCpuGraphBackend::Gpu,
         use_scheduler: false,
@@ -180,24 +180,24 @@ fn encoder_loaded_f16_views_require_exact_direct_cuda_vulkan_full_device() {
     for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
         let preference = exactly_addressable_preference(provider);
         assert_eq!(
-            whisper_encoder_loaded_f16_weight_mode_with_override(
+            whisper_gpu_loaded_f16_weight_mode_with_override(
                 GgmlCpuGraphBackend::Gpu,
                 Some(&preference),
                 Some(ExecutionPlacement::FullDevice),
                 direct_gpu,
                 None,
             ),
-            WhisperEncoderLoadedF16WeightMode::LoadedView
+            WhisperGpuLoadedF16WeightMode::LoadedView
         );
         assert_eq!(
-            whisper_encoder_loaded_f16_weight_mode_with_override(
+            whisper_gpu_loaded_f16_weight_mode_with_override(
                 GgmlCpuGraphBackend::Gpu,
                 Some(&preference),
                 Some(ExecutionPlacement::FullDevice),
                 direct_gpu,
                 Some("1"),
             ),
-            WhisperEncoderLoadedF16WeightMode::ArenaCopy
+            WhisperGpuLoadedF16WeightMode::ArenaCopy
         );
     }
     for provider in [
@@ -209,14 +209,14 @@ fn encoder_loaded_f16_views_require_exact_direct_cuda_vulkan_full_device() {
     ] {
         let preference = exactly_addressable_preference(provider);
         assert_eq!(
-            whisper_encoder_loaded_f16_weight_mode_with_override(
+            whisper_gpu_loaded_f16_weight_mode_with_override(
                 GgmlCpuGraphBackend::Gpu,
                 Some(&preference),
                 Some(ExecutionPlacement::FullDevice),
                 direct_gpu,
                 None,
             ),
-            WhisperEncoderLoadedF16WeightMode::ArenaCopy
+            WhisperGpuLoadedF16WeightMode::ArenaCopy
         );
     }
     let scheduled_gpu = GgmlCpuGraphConfig {
@@ -224,24 +224,24 @@ fn encoder_loaded_f16_views_require_exact_direct_cuda_vulkan_full_device() {
         ..direct_gpu
     };
     assert_eq!(
-        whisper_encoder_loaded_f16_weight_mode_with_override(
+        whisper_gpu_loaded_f16_weight_mode_with_override(
             GgmlCpuGraphBackend::Gpu,
             Some(&exactly_addressable_preference(ExecutionProvider::Cuda)),
             Some(ExecutionPlacement::FullDevice),
             scheduled_gpu,
             None,
         ),
-        WhisperEncoderLoadedF16WeightMode::ArenaCopy
+        WhisperGpuLoadedF16WeightMode::ArenaCopy
     );
     assert_eq!(
-        whisper_encoder_loaded_f16_weight_mode_with_override(
+        whisper_gpu_loaded_f16_weight_mode_with_override(
             GgmlCpuGraphBackend::Gpu,
             Some(&exactly_addressable_preference(ExecutionProvider::Vulkan)),
             Some(ExecutionPlacement::Hybrid),
             direct_gpu,
             None,
         ),
-        WhisperEncoderLoadedF16WeightMode::ArenaCopy
+        WhisperGpuLoadedF16WeightMode::ArenaCopy
     );
 }
 
@@ -1041,7 +1041,7 @@ fn golden_diff_prepared_audio_real_mel_and_real_encoder_compute_reach_decoder_fa
         Arc::clone(&prepared_owner),
         Arc::new(WhisperCpuEncoderGraphComputeRunnerV0),
         GgmlCpuGraphBackend::Cpu,
-        WhisperEncoderLoadedF16WeightMode::ArenaCopy,
+        WhisperGpuLoadedF16WeightMode::ArenaCopy,
     )
     .expect("checkout first encoder actor");
     let first_actor_output = run_whisper_encoder_prelude_actor(
@@ -1071,7 +1071,7 @@ fn golden_diff_prepared_audio_real_mel_and_real_encoder_compute_reach_decoder_fa
         Arc::clone(&prepared_owner),
         Arc::new(WhisperCpuEncoderGraphComputeRunnerV0),
         GgmlCpuGraphBackend::Cpu,
-        WhisperEncoderLoadedF16WeightMode::ArenaCopy,
+        WhisperGpuLoadedF16WeightMode::ArenaCopy,
     )
     .expect("checkout returned encoder actor");
     let second_actor_output = run_whisper_encoder_prelude_actor(
