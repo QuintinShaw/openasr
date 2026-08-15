@@ -134,8 +134,24 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let build_dir = out_dir.join("openasr-ggml-build");
     let lib_dir = build_dir.join("lib");
-    fs::create_dir_all(&build_dir).expect("create openasr-ggml build dir");
-    fs::create_dir_all(&lib_dir).expect("create openasr-ggml lib dir");
+    let source_fingerprint = windows_cmake_cache::build_relevant_fingerprint(&source_dir)
+        .unwrap_or_else(|error| {
+            panic!(
+                "fingerprint build-relevant openasr-ggml inputs under {}: {error}",
+                source_dir.display()
+            )
+        });
+    let source_fingerprint_stamp = build_dir.join(windows_cmake_cache::SOURCE_FINGERPRINT_STAMP);
+    let stored_source_fingerprint = fs::read_to_string(&source_fingerprint_stamp).ok();
+    // A restored Cargo target directory can contain CMake objects newer than a
+    // freshly checked-out native source tree. In that state CMake's timestamp-
+    // based incremental build can accept old objects even though Cargo reran this
+    // build script. Treat source contents as part of the cache contract and force
+    // a fresh private CMake tree whenever that identity changes or is absent.
+    let mut reset_native_build_dir = windows_cmake_cache::source_fingerprint_requires_reset(
+        stored_source_fingerprint.as_deref(),
+        &source_fingerprint,
+    );
 
     let hip_path = feat_hip.then(hip_toolkit_path).flatten();
     let cuda_path = feat_cuda.then(cuda_toolkit_path).flatten();
@@ -200,18 +216,21 @@ fn main() {
             ("GGML_HIP", on_off(feat_hip)),
             ("GGML_SYCL", on_off(feat_sycl)),
         ];
-        let cache = build_dir.join("CMakeCache.txt");
-        if let Ok(text) = fs::read_to_string(&cache)
-            && !windows_cmake_cache::cache_matches_contract(
-                &text,
-                &tool_expectations,
-                &scalar_expectations,
-            )
-        {
-            fs::remove_dir_all(&build_dir).expect("reset incompatible openasr-ggml build dir");
-            fs::create_dir_all(&lib_dir).expect("recreate openasr-ggml lib dir");
+        if !reset_native_build_dir {
+            let cache = build_dir.join("CMakeCache.txt");
+            reset_native_build_dir = fs::read_to_string(&cache).map_or(true, |text| {
+                !windows_cmake_cache::cache_matches_contract(
+                    &text,
+                    &tool_expectations,
+                    &scalar_expectations,
+                )
+            });
         }
     }
+    if reset_native_build_dir && build_dir.exists() {
+        fs::remove_dir_all(&build_dir).expect("reset incompatible openasr-ggml build dir");
+    }
+    fs::create_dir_all(&lib_dir).expect("create openasr-ggml lib dir");
     let windows_hip_shim = if feat_hip && is_windows {
         Some(prepare_windows_hip_sdk_shim(
             &target,
@@ -636,6 +655,14 @@ fn main() {
         }
     }
     run(&mut build);
+    fs::write(&source_fingerprint_stamp, format!("{source_fingerprint}\n")).unwrap_or_else(
+        |error| {
+            panic!(
+                "write openasr-ggml source fingerprint stamp {}: {error}",
+                source_fingerprint_stamp.display()
+            )
+        },
+    );
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     if is_windows {
@@ -808,82 +835,17 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
     println!("cargo:rerun-if-env-changed=OPENASR_GGML_BUILD_JOBS");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_dir.join("CMakeLists.txt").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_dir.join("src/CMakeLists.txt").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_dir.join("include/ggml.h").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_dir.join("include/ggml-backend.h").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_dir.join("include/ggml-cpu.h").display()
-    );
-    // These sources define the backend-wide submission/completion and native
-    // cancellation contract. Missing them from Cargo's dependency set can
-    // silently reuse a stale native archive after an incremental edit, making
-    // backend tests exercise different code from the worktree. BLAS is watched
-    // as a directory because CMake may enable it from platform defaults rather
-    // than a Cargo feature.
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_dir.join("src/ggml-backend.cpp").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_dir.join("src/ggml-backend-impl.h").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_dir.join("src/ggml-blas").display()
-    );
-    // The GGML_BACKEND_DL loader shim is OpenASR-authored and decides how plugin
-    // DLLs (and their co-located satellite runtime DLLs) are opened on each OS, so
-    // edits to it must trigger a ggml rebuild. It was previously untracked, so
-    // changing the loader silently kept the stale compiled shim.
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_dir.join("src/ggml-backend-dl.cpp").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_dir.join("src/ggml-backend-dl.h").display()
-    );
-    // Watch the linked GPU backend's source tree so editing a backend kernel
-    // actually triggers a rebuild. HIP is built from the ggml-cuda sources
-    // (hipified), so it watches both. Gated by feature to avoid spurious
-    // rebuilds on the CPU/Metal-only build.
-    if feat_hip || feat_cuda {
+    // Cargo recursively watches directory inputs. Use the same complete roots
+    // as the source fingerprint above instead of a hand-maintained list of
+    // selected native files; adding an operation to a previously unlisted .c,
+    // header, shader, or CMake module must always rerun this build script.
+    for relative in windows_cmake_cache::BUILD_RELEVANT_DIRECTORIES
+        .iter()
+        .chain(windows_cmake_cache::BUILD_RELEVANT_FILES)
+    {
         println!(
             "cargo:rerun-if-changed={}",
-            source_dir.join("src/ggml-cuda").display()
-        );
-    }
-    if feat_hip {
-        println!(
-            "cargo:rerun-if-changed={}",
-            source_dir.join("src/ggml-hip").display()
-        );
-    }
-    if feat_vulkan {
-        println!(
-            "cargo:rerun-if-changed={}",
-            source_dir.join("src/ggml-vulkan").display()
-        );
-    }
-    if feat_sycl {
-        println!(
-            "cargo:rerun-if-changed={}",
-            source_dir.join("src/ggml-sycl").display()
+            source_dir.join(relative).display()
         );
     }
     println!("cargo:rerun-if-env-changed=OPENASR_HIP_GPU_TARGETS");
@@ -939,60 +901,6 @@ fn main() {
             "disabled".to_string()
         }
     );
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_dir.join("include/gguf.h").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_dir.join("src/gguf.cpp").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_dir
-            .join("src/ggml-metal/ggml-metal-device.cpp")
-            .display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_dir
-            .join("src/ggml-metal/ggml-metal-device.m")
-            .display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_dir
-            .join("src/ggml-metal/ggml-metal-device.h")
-            .display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_dir
-            .join("src/ggml-metal/ggml-metal-context.m")
-            .display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_dir
-            .join("src/ggml-metal/ggml-metal-ops.cpp")
-            .display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_dir
-            .join("src/ggml-metal/ggml-metal-impl.h")
-            .display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_dir.join("src/ggml-metal/ggml-metal.metal").display()
-    );
-    if is_macos {
-        println!(
-            "cargo:rerun-if-changed={}",
-            source_dir.join("include/ggml-metal.h").display()
-        );
-    }
 }
 
 fn cmake_flag(name: &str, enabled: bool) -> String {

@@ -83,6 +83,10 @@ ts-rs = { version = "12.0.1", features = ["no-serde-warnings"], optional = true 
 # Locate the MSVC `cl` toolchain (path + vcvars env) so build.rs can pin it for
 # non-HIP Windows ggml builds instead of the ROCm clang that Ninja picks off PATH.
 cc = "1"
+# Fingerprint every build-relevant vendored ggml input before reusing the private
+# CMake tree. This is also a normal dependency above, so it adds no new package to
+# the workspace lockfile.
+sha2.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal.workspace = true
