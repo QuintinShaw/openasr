@@ -792,6 +792,7 @@ fn resident_model_actor_keys_exclude_request_capacity() {
                 "ExecutionLaneKey",
                 "String",
                 "GgmlNativeGqaCapability",
+                "QwenQkvExecutionMode",
             ][..],
         ),
     ] {
