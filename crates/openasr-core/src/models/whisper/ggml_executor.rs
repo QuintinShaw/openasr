@@ -182,6 +182,8 @@ const OPENASR_WHISPER_DISABLE_UNIFIED_GPU_RUNTIME: &str =
     "OPENASR_WHISPER_DISABLE_UNIFIED_GPU_RUNTIME";
 const OPENASR_WHISPER_ENABLE_UNIFIED_GPU_RUNTIME: &str =
     "OPENASR_WHISPER_ENABLE_UNIFIED_GPU_RUNTIME";
+const OPENASR_WHISPER_DISABLE_GPU_LOADED_F16_WEIGHTS: &str =
+    "OPENASR_WHISPER_DISABLE_GPU_LOADED_F16_WEIGHTS";
 const WHISPER_ENCODER_LAYER_NORM_EPSILON: f32 = 1.0e-5;
 
 fn whisper_can_use_serve_batch(
@@ -394,6 +396,7 @@ struct WhisperEncoderPersistentStaticSession {
     runner: GgmlCpuGraphRunner,
     resident_weights: Option<WhisperEncoderResidentWeightCache>,
     graph_config: GgmlCpuGraphConfig,
+    loaded_f16_weight_mode: WhisperEncoderLoadedF16WeightMode,
     encoder_layers: usize,
     encoder_hidden_size: usize,
 }
@@ -428,14 +431,29 @@ struct WhisperDecoderPersistentStaticSession {
     decoder_state: Seq2SeqDecoderState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum WhisperEncoderLoadedF16WeightMode {
+    ArenaCopy,
+    LoadedView,
+}
+
 /// (pack content id, backend). The content id
 /// ([`PackContentKey::for_runtime_source`]) keeps an in-place pack
 /// replacement at the same path from reusing a persistent session whose
 /// resident weights came from the old bytes.
-type WhisperEncoderPersistentSessionKey = (PackContentKey, ExecutionLaneKey);
+type WhisperEncoderPersistentSessionKey = (
+    PackContentKey,
+    ExecutionLaneKey,
+    WhisperEncoderLoadedF16WeightMode,
+);
 type WhisperDecoderPersistentSessionKey =
     (PackContentKey, ExecutionLaneKey, Seq2SeqResidentCapacity);
-type WhisperUnifiedPersistentSessionKey = WhisperDecoderPersistentSessionKey;
+type WhisperUnifiedPersistentSessionKey = (
+    PackContentKey,
+    ExecutionLaneKey,
+    Seq2SeqResidentCapacity,
+    WhisperEncoderLoadedF16WeightMode,
+);
 
 type WhisperEncoderRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
     WhisperEncoderPersistentSessionKey,
@@ -1955,10 +1973,11 @@ struct WhisperEncoderResidentWeightCache {
     arena: GgmlStaticTensorArena,
     tensors_by_name: HashMap<String, GgmlStaticTensor>,
     // Zero-copy weights bound directly to the mmap'd runtime pack (no host copy,
-    // no arena upload). Only the large quantized linear weights that are consumed
-    // byte-for-byte as-is (input-output layout) are bound here; everything else
-    // stays on the resident arena upload path. `_loaded` owns the mmap + ggml
-    // context that `loaded_tensors_by_name` points into and must outlive the graph.
+    // no arena upload). Eligible quantized linears always use this path. Exact
+    // CUDA/Vulkan direct runners may also bind source-F16 input-output linears;
+    // converted F32 or transposed source layouts stay on the arena path.
+    // `_loaded` owns the mmap + ggml context that `loaded_tensors_by_name` points
+    // into and must outlive the graph.
     _loaded: Option<GgmlLoadedWeightContext>,
     loaded_tensors_by_name: HashMap<String, GgmlLoadedTensor>,
     upload_stats: WhisperEncoderGraphUploadStats,
@@ -2662,6 +2681,7 @@ fn build_encoder_resident_weight_cache<'weights>(
     encoder_weights: &'weights WhisperEncoderWeightBundle,
     plan: &WhisperEncoderGraphPlan,
     runtime_preflight: &GgufRuntimeSourcePreflight,
+    loaded_f16_weight_mode: WhisperEncoderLoadedF16WeightMode,
 ) -> Result<WhisperEncoderResidentWeightCache, WhisperGgmlExecutorError> {
     // Worst case: 15 resident handles per layer plus final norm weight/bias.
     // Eligible quantized linears bind zero-copy and use fewer handles, but the
@@ -2715,6 +2735,7 @@ fn build_encoder_resident_weight_cache<'weights>(
         add_resident_encoder_linear(
             &arena,
             loaded_weights.as_ref(),
+            loaded_f16_weight_mode,
             &mut loaded_tensors_by_name,
             source_tensors,
             &mut tensors_by_name,
@@ -2733,6 +2754,7 @@ fn build_encoder_resident_weight_cache<'weights>(
         add_resident_encoder_linear(
             &arena,
             loaded_weights.as_ref(),
+            loaded_f16_weight_mode,
             &mut loaded_tensors_by_name,
             source_tensors,
             &mut tensors_by_name,
@@ -2743,6 +2765,7 @@ fn build_encoder_resident_weight_cache<'weights>(
         add_resident_encoder_linear(
             &arena,
             loaded_weights.as_ref(),
+            loaded_f16_weight_mode,
             &mut loaded_tensors_by_name,
             source_tensors,
             &mut tensors_by_name,
@@ -2761,6 +2784,7 @@ fn build_encoder_resident_weight_cache<'weights>(
         add_resident_encoder_linear(
             &arena,
             loaded_weights.as_ref(),
+            loaded_f16_weight_mode,
             &mut loaded_tensors_by_name,
             source_tensors,
             &mut tensors_by_name,
@@ -2787,6 +2811,7 @@ fn build_encoder_resident_weight_cache<'weights>(
         add_resident_encoder_linear(
             &arena,
             loaded_weights.as_ref(),
+            loaded_f16_weight_mode,
             &mut loaded_tensors_by_name,
             source_tensors,
             &mut tensors_by_name,
@@ -2805,6 +2830,7 @@ fn build_encoder_resident_weight_cache<'weights>(
         add_resident_encoder_linear(
             &arena,
             loaded_weights.as_ref(),
+            loaded_f16_weight_mode,
             &mut loaded_tensors_by_name,
             source_tensors,
             &mut tensors_by_name,
@@ -2984,6 +3010,7 @@ fn add_resident_encoder_materialized_f32_vector<'weights>(
 fn add_resident_encoder_linear<'weights>(
     arena: &GgmlStaticTensorArena,
     loaded_weights: Option<&GgmlLoadedWeightContext>,
+    loaded_f16_weight_mode: WhisperEncoderLoadedF16WeightMode,
     loaded_tensors_by_name: &mut HashMap<String, GgmlLoadedTensor>,
     source_tensors: &HashMap<&str, &'weights WhisperMaterializedTensor>,
     tensors_by_name: &mut HashMap<String, GgmlStaticTensor>,
@@ -3015,12 +3042,19 @@ fn add_resident_encoder_linear<'weights>(
             ),
         });
     }
-    // Zero-copy bind: a quantized input-output linear weight is uploaded to the
-    // arena verbatim (no transpose/dequant), so the mmap'd pack bytes are
-    // bit-identical to what the arena would hold. Bind it directly when the
-    // loaded context exposes a tensor of the same on-disk name.
-    if let WhisperMaterializedTensorPayload::Quantized { .. } = &tensor.payload
-        && projection.weight_layout == WhisperEncoderLinearWeightLayout::InputOutput
+    // Zero-copy bind only when the pack bytes are exactly the execution bytes.
+    // Quantized input-output linears already satisfy this contract. F16 is
+    // additionally allowed on qualified direct GPU lanes when the immutable
+    // source metadata proves that runtime preparation neither converted F32 nor
+    // transposed an output-input tensor.
+    let is_input_output = projection.weight_layout == WhisperEncoderLinearWeightLayout::InputOutput;
+    let loaded_bytes_are_execution_bytes = is_input_output
+        && (matches!(
+            &tensor.payload,
+            WhisperMaterializedTensorPayload::Quantized { .. }
+        ) || loaded_f16_weight_mode == WhisperEncoderLoadedF16WeightMode::LoadedView
+            && tensor.source_is_f16_input_output(projection.input_dim, projection.output_dim));
+    if loaded_bytes_are_execution_bytes
         && let Some(loaded) =
             loaded_weights.and_then(|ctx| ctx.tensor(&projection.weight.tensor_name))
     {
@@ -3684,6 +3718,46 @@ impl WhisperUnifiedRuntimeGeometry {
     }
 }
 
+fn whisper_encoder_loaded_f16_weight_mode_with_override(
+    backend: GgmlCpuGraphBackend,
+    backend_preference: Option<&RequestBackendPreference>,
+    placement: Option<ExecutionPlacement>,
+    encoder_config: GgmlCpuGraphConfig,
+    disable_raw: Option<&str>,
+) -> WhisperEncoderLoadedF16WeightMode {
+    let enabled = crate::ggml_runtime::env_toggle_with_raw(disable_raw, None, true);
+    if enabled
+        && backend == GgmlCpuGraphBackend::Gpu
+        && encoder_config.backend == GgmlCpuGraphBackend::Gpu
+        && !encoder_config.use_scheduler
+        && placement == Some(ExecutionPlacement::FullDevice)
+        && matches!(
+            backend_preference,
+            Some(RequestBackendPreference::Exact(route))
+                if route.addressability.is_exactly_addressable()
+                    && matches!(route.provider, ExecutionProvider::Cuda | ExecutionProvider::Vulkan)
+        )
+    {
+        WhisperEncoderLoadedF16WeightMode::LoadedView
+    } else {
+        WhisperEncoderLoadedF16WeightMode::ArenaCopy
+    }
+}
+
+fn whisper_encoder_loaded_f16_weight_mode(
+    backend: GgmlCpuGraphBackend,
+) -> WhisperEncoderLoadedF16WeightMode {
+    whisper_encoder_loaded_f16_weight_mode_with_override(
+        backend,
+        request_backend_override().as_ref(),
+        current_execution_placement(),
+        whisper_encoder_graph_config(backend),
+        std::env::var(OPENASR_WHISPER_DISABLE_GPU_LOADED_F16_WEIGHTS)
+            .ok()
+            .as_deref(),
+    )
+}
+
 fn whisper_unified_runtime_enabled_with_override(
     backend: GgmlCpuGraphBackend,
     backend_preference: Option<&RequestBackendPreference>,
@@ -3762,10 +3836,12 @@ fn checkout_whisper_encoder_runtime(
     prepared: PreparedRuntimeHandle<WhisperPreparedRuntime>,
     runner: Arc<dyn WhisperEncoderGraphRunner>,
     backend: GgmlCpuGraphBackend,
+    loaded_f16_weight_mode: WhisperEncoderLoadedF16WeightMode,
 ) -> Result<WhisperEncoderRuntimeActor, WhisperGgmlExecutorError> {
     let key = (
         PackContentKey::for_runtime_source(runtime_source),
         current_execution_lane_key(whisper_encoder_graph_config(backend).backend),
+        loaded_f16_weight_mode,
     );
     pool.checkout_or_try_build_with(
         key,
@@ -3826,6 +3902,7 @@ fn checkout_whisper_unified_runtime(
     decoder_state: Seq2SeqDecoderState,
     backend: GgmlCpuGraphBackend,
     decoder_placement_policy: WhisperDecoderPlacementPolicy,
+    loaded_f16_weight_mode: WhisperEncoderLoadedF16WeightMode,
 ) -> Result<WhisperUnifiedRuntimeActor, WhisperGgmlExecutorError> {
     let key = (
         PackContentKey::for_runtime_source(runtime_source),
@@ -3833,6 +3910,7 @@ fn checkout_whisper_unified_runtime(
             whisper_decoder_graph_config(backend, decoder_placement_policy).backend,
         ),
         decoder_state.resident_capacity(),
+        loaded_f16_weight_mode,
     );
     pool.checkout_or_try_build_with(
         key,
@@ -3900,6 +3978,7 @@ fn run_whisper_encoder_actor(
     encoder_hidden_input: Vec<f32>,
     allow_persistent_session_reuse: bool,
     backend: GgmlCpuGraphBackend,
+    loaded_f16_weight_mode: WhisperEncoderLoadedF16WeightMode,
     trace: WhisperGgmlTrace,
 ) -> Result<WhisperEncoderGraphSeamResult, WhisperGgmlExecutorError> {
     actor
@@ -3914,6 +3993,7 @@ fn run_whisper_encoder_actor(
                 allow_persistent_session_reuse,
                 !allow_persistent_session_reuse,
                 backend,
+                loaded_f16_weight_mode,
                 trace,
             )
         })
@@ -3931,12 +4011,19 @@ fn run_whisper_encoder_state(
     allow_persistent_session_reuse: bool,
     drop_session_after_run: bool,
     backend: GgmlCpuGraphBackend,
+    loaded_f16_weight_mode: WhisperEncoderLoadedF16WeightMode,
     trace: WhisperGgmlTrace,
 ) -> Result<WhisperEncoderGraphSeamResult, WhisperGgmlExecutorError> {
     let graph_config = whisper_encoder_graph_config(backend);
     let can_reuse = allow_persistent_session_reuse
         && state.session.as_ref().is_some_and(|session| {
-            encoder_persistent_session_matches_runtime(session, &execution, &plan, graph_config)
+            encoder_persistent_session_matches_runtime(
+                session,
+                &execution,
+                &plan,
+                graph_config,
+                loaded_f16_weight_mode,
+            )
         });
     if !can_reuse {
         state.session = Some(build_whisper_encoder_persistent_static_session(
@@ -3945,6 +4032,7 @@ fn run_whisper_encoder_state(
             &prepared.encoder_weights,
             &plan,
             graph_config,
+            loaded_f16_weight_mode,
         )?);
     } else {
         emit_encoder_resident_weight_cache_reuse_trace();
@@ -4342,8 +4430,10 @@ fn encoder_persistent_session_matches_runtime(
     execution: &WhisperGgmlExecutionMetadata,
     plan: &WhisperEncoderGraphPlan,
     graph_config: GgmlCpuGraphConfig,
+    loaded_f16_weight_mode: WhisperEncoderLoadedF16WeightMode,
 ) -> bool {
     session.graph_config == graph_config
+        && session.loaded_f16_weight_mode == loaded_f16_weight_mode
         && session.encoder_layers == plan.layers.len()
         && session.encoder_hidden_size == execution.encoder_hidden_size
         && plan.output_hidden_size == execution.encoder_hidden_size
@@ -4356,6 +4446,7 @@ fn build_whisper_encoder_persistent_static_session(
     encoder_weights: &WhisperEncoderWeightBundle,
     plan: &WhisperEncoderGraphPlan,
     graph_config: GgmlCpuGraphConfig,
+    loaded_f16_weight_mode: WhisperEncoderLoadedF16WeightMode,
 ) -> Result<WhisperEncoderPersistentStaticSession, WhisperGgmlExecutorError> {
     let runner = GgmlCpuGraphRunner::new(graph_config).map_err(|error| {
         WhisperGgmlExecutorError::EncoderGraphExecutionFailed {
@@ -4371,6 +4462,7 @@ fn build_whisper_encoder_persistent_static_session(
             encoder_weights,
             plan,
             runtime_preflight,
+            loaded_f16_weight_mode,
         )?;
         emit_encoder_resident_weight_trace(
             cache.upload_stats.count,
@@ -4385,6 +4477,7 @@ fn build_whisper_encoder_persistent_static_session(
         runner,
         resident_weights,
         graph_config,
+        loaded_f16_weight_mode,
         encoder_layers: plan.layers.len(),
         encoder_hidden_size: execution.encoder_hidden_size,
     })
@@ -4553,6 +4646,10 @@ fn execute_whisper_with_prepared_runtime(
     let runtime_source = &preflight.runtime_source;
     let runtime = prepared_owner.as_ref();
     let trace = WhisperGgmlTrace::from_env();
+    // Freeze the typed route decision on the request thread. Pinned owner
+    // threads do not inherit the placement/preference TLS and must never infer
+    // CUDA/Vulkan from the generic Gpu backend label.
+    let encoder_loaded_f16_weight_mode = whisper_encoder_loaded_f16_weight_mode(resolved_backend);
     if adapter.adapter_id != WHISPER_GGML_ADAPTER_ID {
         return Err(WhisperGgmlExecutorError::AdapterMismatch {
             expected: WHISPER_GGML_ADAPTER_ID,
@@ -4605,6 +4702,7 @@ fn execute_whisper_with_prepared_runtime(
         Arc::clone(&prepared_owner),
         Arc::clone(&encoder_graph_runner),
         resolved_backend,
+        encoder_loaded_f16_weight_mode,
     )?;
     let prelude_result = trace.run_stage("prelude_run", || {
         if prelude_runner.supports_owner_thread_cached_runtime() {
@@ -4687,6 +4785,7 @@ fn execute_whisper_with_prepared_runtime(
             prelude_hidden_output.clone(),
             allow_persistent_session_reuse,
             resolved_backend,
+            encoder_loaded_f16_weight_mode,
             trace.clone(),
         )?;
         let WhisperEncoderGraphSeamResult::GraphExecuted {
@@ -4784,6 +4883,7 @@ fn execute_whisper_with_prepared_runtime(
             decoder_state,
             resolved_backend,
             decoder_placement_policy,
+            encoder_loaded_f16_weight_mode,
         )?;
         let unified_execution = runtime.execution.clone();
         let unified_preflight: GgufRuntimeSourcePreflight = (*preflight).clone();
@@ -4816,6 +4916,7 @@ fn execute_whisper_with_prepared_runtime(
                     allow_persistent_session_reuse,
                     false,
                     resolved_backend,
+                    encoder_loaded_f16_weight_mode,
                     trace,
                 )?;
                 let binding = state
@@ -4877,6 +4978,7 @@ fn execute_whisper_with_prepared_runtime(
             prelude_hidden_output,
             allow_persistent_session_reuse,
             resolved_backend,
+            encoder_loaded_f16_weight_mode,
             trace,
         )
     };

@@ -273,6 +273,8 @@ fn materialize_binding(
     Ok(WhisperMaterializedTensor {
         slot: binding.slot.clone(),
         tensor_name: binding.resolved_name.clone(),
+        source_ggml_type: binding.metadata.ggml_type,
+        source_dims: binding.metadata.dims.clone(),
         dims: binding.metadata.dims.clone(),
         num_elements,
         payload,

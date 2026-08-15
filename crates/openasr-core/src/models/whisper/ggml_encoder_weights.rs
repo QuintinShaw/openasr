@@ -23,18 +23,30 @@ pub(crate) enum WhisperMaterializedTensorPayload {
 pub(crate) struct WhisperMaterializedTensor {
     pub slot: WhisperGgufTensorSlot,
     pub tensor_name: String,
+    pub source_ggml_type: i32,
+    pub source_dims: Vec<u64>,
     pub dims: Vec<u64>,
     pub num_elements: usize,
     pub payload: WhisperMaterializedTensorPayload,
 }
 
 impl WhisperMaterializedTensor {
+    pub(crate) fn source_is_f16_input_output(&self, input_dim: usize, output_dim: usize) -> bool {
+        let (Ok(input_dim), Ok(output_dim)) = (u64::try_from(input_dim), u64::try_from(output_dim))
+        else {
+            return false;
+        };
+        self.source_ggml_type == GGML_TYPE_F16
+            && self.source_dims.as_slice() == [input_dim, output_dim]
+    }
+
     pub(crate) fn add_retained_system_memory(
         &self,
         bytes: &mut crate::models::system_memory_owner::SystemMemoryCapacity,
         label: &str,
     ) -> Result<(), String> {
         bytes.add_string(&self.tensor_name, label)?;
+        bytes.add_vec(&self.source_dims, label)?;
         bytes.add_vec(&self.dims, label)?;
         match &self.payload {
             WhisperMaterializedTensorPayload::F32(values) => bytes.add_vec(values, label),
@@ -332,6 +344,8 @@ fn materialize_binding(
     Ok(WhisperMaterializedTensor {
         slot: binding.slot.clone(),
         tensor_name: binding.resolved_name.clone(),
+        source_ggml_type: binding.metadata.ggml_type,
+        source_dims: binding.metadata.dims.clone(),
         dims: binding.metadata.dims.clone(),
         num_elements,
         payload,

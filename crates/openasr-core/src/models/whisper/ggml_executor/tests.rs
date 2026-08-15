@@ -171,6 +171,123 @@ fn unified_owner_is_limited_to_exact_direct_cuda_vulkan_full_device() {
 }
 
 #[test]
+fn encoder_loaded_f16_views_require_exact_direct_cuda_vulkan_full_device() {
+    let direct_gpu = GgmlCpuGraphConfig {
+        backend: GgmlCpuGraphBackend::Gpu,
+        use_scheduler: false,
+        ..GgmlCpuGraphConfig::conservative_default()
+    };
+    for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
+        let preference = exactly_addressable_preference(provider);
+        assert_eq!(
+            whisper_encoder_loaded_f16_weight_mode_with_override(
+                GgmlCpuGraphBackend::Gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+                direct_gpu,
+                None,
+            ),
+            WhisperEncoderLoadedF16WeightMode::LoadedView
+        );
+        assert_eq!(
+            whisper_encoder_loaded_f16_weight_mode_with_override(
+                GgmlCpuGraphBackend::Gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+                direct_gpu,
+                Some("1"),
+            ),
+            WhisperEncoderLoadedF16WeightMode::ArenaCopy
+        );
+    }
+    for provider in [
+        ExecutionProvider::Cpu,
+        ExecutionProvider::Metal,
+        ExecutionProvider::Hip,
+        ExecutionProvider::Accelerator,
+        ExecutionProvider::Unknown,
+    ] {
+        let preference = exactly_addressable_preference(provider);
+        assert_eq!(
+            whisper_encoder_loaded_f16_weight_mode_with_override(
+                GgmlCpuGraphBackend::Gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+                direct_gpu,
+                None,
+            ),
+            WhisperEncoderLoadedF16WeightMode::ArenaCopy
+        );
+    }
+    let scheduled_gpu = GgmlCpuGraphConfig {
+        use_scheduler: true,
+        ..direct_gpu
+    };
+    assert_eq!(
+        whisper_encoder_loaded_f16_weight_mode_with_override(
+            GgmlCpuGraphBackend::Gpu,
+            Some(&exactly_addressable_preference(ExecutionProvider::Cuda)),
+            Some(ExecutionPlacement::FullDevice),
+            scheduled_gpu,
+            None,
+        ),
+        WhisperEncoderLoadedF16WeightMode::ArenaCopy
+    );
+    assert_eq!(
+        whisper_encoder_loaded_f16_weight_mode_with_override(
+            GgmlCpuGraphBackend::Gpu,
+            Some(&exactly_addressable_preference(ExecutionProvider::Vulkan)),
+            Some(ExecutionPlacement::Hybrid),
+            direct_gpu,
+            None,
+        ),
+        WhisperEncoderLoadedF16WeightMode::ArenaCopy
+    );
+}
+
+#[test]
+fn encoder_loaded_f16_view_proof_rejects_converted_and_transposed_sources() {
+    let make_tensor =
+        |source_ggml_type, source_dims: Vec<u64>, payload| WhisperMaterializedTensor {
+            slot: WhisperGgufTensorSlot::EncoderLayerSelfAttnQWeight { layer_idx: 0 },
+            tensor_name: "model.encoder.layers.0.self_attn.q_proj.weight".to_string(),
+            source_ggml_type,
+            dims: source_dims.clone(),
+            source_dims,
+            num_elements: 6,
+            payload,
+        };
+
+    let mut source_f16 = make_tensor(
+        1,
+        vec![2, 3],
+        WhisperMaterializedTensorPayload::F16Bits(vec![0; 6]),
+    );
+    prepare_encoder_linear_weight_tensor_input_output_f16(&mut source_f16, 2, 3)
+        .expect("prepare source f16 input-output");
+    assert!(source_f16.source_is_f16_input_output(2, 3));
+
+    let mut converted_f32 = make_tensor(
+        0,
+        vec![2, 3],
+        WhisperMaterializedTensorPayload::F32(vec![0.0; 6]),
+    );
+    prepare_encoder_linear_weight_tensor_input_output_f16(&mut converted_f32, 2, 3)
+        .expect("prepare converted f32");
+    assert!(!converted_f32.source_is_f16_input_output(2, 3));
+
+    let mut transposed_f16 = make_tensor(
+        1,
+        vec![3, 2],
+        WhisperMaterializedTensorPayload::F16Bits(vec![0; 6]),
+    );
+    prepare_encoder_linear_weight_tensor_input_output_f16(&mut transposed_f16, 2, 3)
+        .expect("prepare transposed source f16");
+    assert_eq!(transposed_f16.dims, vec![2, 3]);
+    assert!(!transposed_f16.source_is_f16_input_output(2, 3));
+}
+
+#[test]
 fn cuda_unified_owner_geometry_requires_large_depth_and_width() {
     assert!(
         WhisperUnifiedRuntimeGeometry {
@@ -924,6 +1041,7 @@ fn golden_diff_prepared_audio_real_mel_and_real_encoder_compute_reach_decoder_fa
         Arc::clone(&prepared_owner),
         Arc::new(WhisperCpuEncoderGraphComputeRunnerV0),
         GgmlCpuGraphBackend::Cpu,
+        WhisperEncoderLoadedF16WeightMode::ArenaCopy,
     )
     .expect("checkout first encoder actor");
     let first_actor_output = run_whisper_encoder_prelude_actor(
@@ -953,6 +1071,7 @@ fn golden_diff_prepared_audio_real_mel_and_real_encoder_compute_reach_decoder_fa
         Arc::clone(&prepared_owner),
         Arc::new(WhisperCpuEncoderGraphComputeRunnerV0),
         GgmlCpuGraphBackend::Cpu,
+        WhisperEncoderLoadedF16WeightMode::ArenaCopy,
     )
     .expect("checkout returned encoder actor");
     let second_actor_output = run_whisper_encoder_prelude_actor(
@@ -1633,6 +1752,8 @@ fn decoder_quantized_tensor_is_indexed_in_quantized_source_map() {
         WhisperMaterializedTensor {
             slot: WhisperGgufTensorSlot::DecoderLayerSelfAttnQWeight { layer_idx: 0 },
             tensor_name: "model.decoder.layers.0.self_attn.q_proj.weight".to_string(),
+            source_ggml_type: 8,
+            source_dims: vec![2, 2],
             dims: vec![2, 2],
             num_elements: 4,
             payload: WhisperMaterializedTensorPayload::Quantized {
@@ -1663,6 +1784,8 @@ fn decoder_quantized_tensor_with_empty_bytes_fails_closed() {
         WhisperMaterializedTensor {
             slot: WhisperGgufTensorSlot::DecoderLayerSelfAttnQWeight { layer_idx: 0 },
             tensor_name: "model.decoder.layers.0.self_attn.q_proj.weight".to_string(),
+            source_ggml_type: 8,
+            source_dims: vec![2, 2],
             dims: vec![2, 2],
             num_elements: 4,
             payload: WhisperMaterializedTensorPayload::Quantized {
