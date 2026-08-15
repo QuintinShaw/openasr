@@ -184,7 +184,10 @@ fn main() {
         } else {
             msvc_tool.as_ref().map(|tool| cmake_path(tool.path()))
         };
-        let mut tool_expectations = Vec::new();
+        // CMake embeds the absolute source directory in its cache and refuses to
+        // reuse that tree from a new immutable staging path, even when the native
+        // contents have the same fingerprint.
+        let mut tool_expectations = vec![("CMAKE_HOME_DIRECTORY", cmake_path(&source_dir))];
         if let Some(compiler) = expected_compiler {
             tool_expectations.push(("CMAKE_C_COMPILER", compiler.clone()));
             tool_expectations.push(("CMAKE_CXX_COMPILER", compiler));

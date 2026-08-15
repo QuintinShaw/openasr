@@ -262,6 +262,14 @@ mod tests {
         )
     }
 
+    fn cache_with_source(source_dir: &Path, compiler: &str, shared: &str, cuda: &str) -> String {
+        format!(
+            "CMAKE_HOME_DIRECTORY:INTERNAL={}\n{}",
+            source_dir.display(),
+            cache(compiler, shared, cuda)
+        )
+    }
+
     #[test]
     fn equivalent_windows_compiler_spelling_matches() {
         let actual = cache(
@@ -331,6 +339,47 @@ mod tests {
             ("CMAKE_C_COMPILER", "clang-cl".to_owned()),
             ("CMAKE_CXX_COMPILER", "clang-cl.exe".to_owned()),
         ];
+
+        assert!(cache_matches_contract(&actual, &tools, &scalar_contract()));
+    }
+
+    #[test]
+    fn identical_native_contents_at_different_source_path_require_fresh_configure() {
+        let first = tempdir().expect("create first source fixture");
+        let second = tempdir().expect("create second source fixture");
+        native_fixture(first.path(), false);
+        native_fixture(second.path(), false);
+        assert_eq!(
+            build_relevant_fingerprint(first.path()).expect("fingerprint first source"),
+            build_relevant_fingerprint(second.path()).expect("fingerprint second source")
+        );
+
+        let compiler = "D:/Toolchain/VS/VC/Tools/MSVC/14.44/bin/HostX64/x64/cl.exe";
+        let tools = vec![
+            ("CMAKE_HOME_DIRECTORY", second.path().display().to_string()),
+            ("CMAKE_C_COMPILER", compiler.to_owned()),
+            ("CMAKE_CXX_COMPILER", compiler.to_owned()),
+        ];
+        let actual = cache_with_source(first.path(), compiler, "OFF", "ON");
+
+        assert!(!cache_matches_contract(&actual, &tools, &scalar_contract()));
+    }
+
+    #[test]
+    fn same_source_path_keeps_compatible_cache() {
+        let source_dir = Path::new(r"D:\Staging\openasr-ggml");
+        let compiler = "D:/Toolchain/VS/VC/Tools/MSVC/14.44/bin/HostX64/x64/cl.exe";
+        let tools = vec![
+            ("CMAKE_HOME_DIRECTORY", source_dir.display().to_string()),
+            ("CMAKE_C_COMPILER", compiler.to_owned()),
+            ("CMAKE_CXX_COMPILER", compiler.to_owned()),
+        ];
+        let actual = cache_with_source(
+            Path::new(r"\\?\d:\STAGING\openasr-ggml\"),
+            compiler,
+            "OFF",
+            "ON",
+        );
 
         assert!(cache_matches_contract(&actual, &tools, &scalar_contract()));
     }
