@@ -22,6 +22,10 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 output_dir="$repo_root/target/xcframework"
 configuration="release"
+# Keep every iOS object (Rust, C/C++, Metal, and linked SDK inputs) at the
+# deployment target required by the embedding app. This is the sole iOS target
+# contract; build_slice exports it through every build-system environment.
+readonly ios_deployment_target="26.0"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -90,6 +94,73 @@ fi
 
 # --- helpers -------------------------------------------------------------
 
+# Rust ships a small set of precompiled compiler_builtins objects with the
+# legacy LC_VERSION_MIN_IPHONEOS command. Its fixed-size command can be updated
+# in place, whereas vtool cannot grow it without load-command padding. Normalize
+# that legacy command inside the archive so every explicitly platform-tagged
+# object observes the same iOS contract; platform-neutral Rust objects are left
+# unchanged.
+normalize_ios_archive() {
+  local archive="$1"
+  local platform="$2"
+  python3 - "$archive" "$platform" "$ios_deployment_target" <<'PY'
+import struct
+import sys
+from pathlib import Path
+
+archive = Path(sys.argv[1])
+expected_platform = int(sys.argv[2])
+target_major, target_minor = (int(part) for part in sys.argv[3].split('.', 1))
+target_version = (target_major << 16) | (target_minor << 8)
+data = bytearray(archive.read_bytes())
+if data[:8] != b'!<arch>\n':
+    raise SystemExit(f"{archive}: not a BSD archive")
+
+offset = 8
+while offset < len(data):
+    header = data[offset:offset + 60]
+    if len(header) != 60 or header[58:60] != b'`\n':
+        raise SystemExit(f"{archive}: malformed archive header at offset {offset}")
+    size = int(header[48:58].decode('ascii').strip())
+    member_start = offset + 60
+    member_end = member_start + size
+    if member_end > len(data):
+        raise SystemExit(f"{archive}: truncated member at offset {offset}")
+    raw_name = header[:16].decode('ascii', errors='replace').rstrip()
+    payload_start = member_start
+    if raw_name.startswith('#1/'):
+        name_size = int(raw_name[3:])
+        payload_start += name_size
+    payload_size = member_end - payload_start
+    if payload_size >= 32 and data[payload_start:payload_start + 4] == b'\xcf\xfa\xed\xfe':
+        ncmds = struct.unpack_from('<I', data, payload_start + 16)[0]
+        command_offset = payload_start + 32
+        payload_limit = payload_start + payload_size
+        for _ in range(ncmds):
+            if command_offset + 8 > payload_limit:
+                raise SystemExit(f"{archive}: truncated Mach-O load command")
+            command, command_size = struct.unpack_from('<II', data, command_offset)
+            if command_size < 8 or command_offset + command_size > payload_limit:
+                raise SystemExit(f"{archive}: malformed Mach-O load command")
+            if command == (0x25 if expected_platform == 2 else 0x26):  # LC_VERSION_MIN_IPHONEOS(_SIMULATOR)
+                version = struct.unpack_from('<I', data, command_offset + 8)[0]
+                if version < target_version:
+                    struct.pack_into('<I', data, command_offset + 8, target_version)
+            elif command == 0x32:  # LC_BUILD_VERSION
+                platform_id, version = struct.unpack_from('<II', data, command_offset + 8)
+                if platform_id != expected_platform:
+                    raise SystemExit(
+                        f"{archive}: object has platform {platform_id}, expected {expected_platform}"
+                    )
+                if version < target_version:
+                    struct.pack_into('<I', data, command_offset + 12, target_version)
+            command_offset += command_size
+    offset = member_end + (size & 1)
+
+archive.write_bytes(data)
+PY
+}
+
 # Builds `openasr-ffi` for one Rust target and stages `<slice_dir>/lib/` +
 # `<slice_dir>/include/` for `xcodebuild -create-xcframework`.
 build_slice() {
@@ -102,31 +173,44 @@ build_slice() {
     rustup target add "$rust_target"
   fi
 
-  # openasr-core's build.rs floors IPHONEOS_DEPLOYMENT_TARGET at 15.0 for the
-  # CMake-built ggml C/C++ objects (see ios_deployment_target_from in
-  # crates/openasr-core/build.rs), and ring's build script picks up the
-  # host's SDK version (26.5 on this runner) for its precompiled asm objects.
-  # But rustc's own final link of openasr-ffi's cdylib/staticlib hardcodes
-  # `-target arm64-apple-ios10.0.0` regardless of IPHONEOS_DEPLOYMENT_TARGET
-  # (that env var is not honored for the plain, non-simulator aarch64-apple-ios
-  # target as of rustc 1.95.0). Linking against that old a minimum makes the
-  # linker treat `___chkstk_darwin` (a stack-probe helper gated to iOS 11+ in
-  # the SDK's libSystem.tbd) as unavailable, so ggml's/ring's newer-floor
-  # object code fails with an undefined-symbol error. Force the real minimum
-  # via an explicit `-target` link-arg pair, which clang resolves last-wins
-  # over the one rustc already inserted, so the whole slice (C++ and Rust)
-  # links against one consistent, high-enough minimum.
+  # All iOS producers must receive the same deployment target. In particular,
+  # do not let the active Xcode SDK version (for example 26.5) become the object
+  # minimum when the embedding app contract is 26.0.
   local rustflags=""
+  local -a build_env=()
   case "$rust_target" in
-    aarch64-apple-ios) rustflags="-C link-arg=-target -C link-arg=arm64-apple-ios15.0" ;;
-    aarch64-apple-ios-sim) rustflags="-C link-arg=-target -C link-arg=arm64-apple-ios15.0-simulator" ;;
+    aarch64-apple-ios)
+      rustflags="-C link-arg=-target -C link-arg=arm64-apple-ios${ios_deployment_target}"
+      build_env=(
+        "OPENASR_IOS_DEPLOYMENT_TARGET=$ios_deployment_target"
+        "IPHONEOS_DEPLOYMENT_TARGET=$ios_deployment_target"
+        "CMAKE_OSX_DEPLOYMENT_TARGET=$ios_deployment_target"
+      )
+      ;;
+    aarch64-apple-ios-sim)
+      rustflags="-C link-arg=-target -C link-arg=arm64-apple-ios${ios_deployment_target}-simulator"
+      build_env=(
+        "OPENASR_IOS_DEPLOYMENT_TARGET=$ios_deployment_target"
+        "IPHONEOS_DEPLOYMENT_TARGET=$ios_deployment_target"
+        "CMAKE_OSX_DEPLOYMENT_TARGET=$ios_deployment_target"
+      )
+      ;;
   esac
 
   if [[ -n "$rustflags" ]]; then
-    (cd "$repo_root" && RUSTFLAGS="$rustflags" cargo build -p openasr-ffi $cargo_flag --target "$rust_target")
+    (cd "$repo_root" && env "${build_env[@]}" RUSTFLAGS="$rustflags" cargo build -p openasr-ffi $cargo_flag --target "$rust_target")
   else
     (cd "$repo_root" && cargo build -p openasr-ffi $cargo_flag --target "$rust_target")
   fi
+
+  case "$rust_target" in
+    aarch64-apple-ios)
+      normalize_ios_archive "$repo_root/target/$rust_target/$cargo_profile_dir/$lib_name" 2
+      ;;
+    aarch64-apple-ios-sim)
+      normalize_ios_archive "$repo_root/target/$rust_target/$cargo_profile_dir/$lib_name" 7
+      ;;
+  esac
 
   mkdir -p "$slice_dir/lib" "$slice_dir/include"
   cp "$repo_root/target/$rust_target/$cargo_profile_dir/$lib_name" "$slice_dir/lib/$lib_name"
