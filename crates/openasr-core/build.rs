@@ -41,8 +41,8 @@ fn main() {
     // iOS device or simulator target (aarch64-apple-ios /
     // aarch64-apple-ios-sim). Deliberately distinct from `is_macos` (which only
     // matches "apple-darwin"): iOS builds have no bundled libomp (same as
-    // macOS) and, in this phase, no Metal/Accelerate/BLAS -- those already
-    // stay off because their gates key off `is_macos`.
+    // macOS). They reuse the macOS embedded Metal backend; Accelerate and BLAS
+    // stay macOS-only below.
     let is_ios = target.contains("apple-ios");
     // Rust's simulator targets are suffixed `-sim` (e.g. aarch64-apple-ios-sim);
     // the device target (aarch64-apple-ios) has no such suffix. Only this
@@ -52,6 +52,7 @@ fn main() {
     // against the other slices' objects ("building for 'iOS-simulator', but
     // linking in object file ... built for 'iOS'").
     let is_ios_simulator = is_ios && target.ends_with("-sim");
+    let use_apple_metal = (is_macos || is_ios) && !feat_cuda && !feat_vulkan;
     let host = env::var("HOST").unwrap_or_default();
     // Backend-DL plugin build for the CPU-only (no GPU feature) WINDOWS base:
     // ship ggml-base.dll + ggml.dll + ggml-cpu-<variant>.dll loaded via the ggml
@@ -268,14 +269,8 @@ fn main() {
             "-DGGML_BLAS_VENDOR={}",
             if is_macos { "Apple" } else { "Generic" }
         ))
-        .arg(cmake_flag(
-            "GGML_METAL",
-            is_macos && !feat_cuda && !feat_vulkan,
-        ))
-        .arg(cmake_flag(
-            "GGML_METAL_EMBED_LIBRARY",
-            is_macos && !feat_cuda && !feat_vulkan,
-        ))
+        .arg(cmake_flag("GGML_METAL", use_apple_metal))
+        .arg(cmake_flag("GGML_METAL_EMBED_LIBRARY", use_apple_metal))
         .arg(format!(
             "-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY={}",
             cmake_path(&lib_dir)
@@ -391,10 +386,9 @@ fn main() {
         // built-in Apple platform support drives Clang cross-compilation
         // straight from CMAKE_OSX_SYSROOT (the SDK Clang targets) +
         // CMAKE_OSX_ARCHITECTURES (only arm64 is wired up -- no armv7/i386
-        // device, no x86_64 simulator). Phase 1 is a CPU-only compile gate:
-        // Metal/Accelerate/BLAS already stay off here because their
-        // cmake_flag(...) calls above key off `is_macos`, which is `false` for
-        // the "apple-ios" target triple.
+        // device, no x86_64 simulator). Metal reuses the embedded Apple backend;
+        // Accelerate and BLAS remain disabled because their flags key only off
+        // `is_macos` above.
         let sysroot = if is_ios_simulator {
             "iphonesimulator"
         } else {
@@ -662,10 +656,14 @@ fn main() {
         println!("cargo:rustc-link-lib=static=ggml-base");
     }
 
-    if is_macos && !feat_cuda && !feat_vulkan {
+    if use_apple_metal {
         println!("cargo:rustc-link-lib=static=ggml-metal");
+    }
+    if is_macos && !feat_cuda && !feat_vulkan {
         println!("cargo:rustc-link-lib=static=ggml-blas");
         println!("cargo:rustc-link-lib=framework=Accelerate");
+    }
+    if use_apple_metal {
         println!("cargo:rustc-link-lib=framework=Foundation");
         println!("cargo:rustc-link-lib=framework=Metal");
         println!("cargo:rustc-link-lib=framework=MetalKit");
@@ -806,6 +804,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+    println!("cargo:rerun-if-env-changed=OPENASR_IOS_DEPLOYMENT_TARGET");
+    println!("cargo:rerun-if-env-changed=IPHONEOS_DEPLOYMENT_TARGET");
+    println!("cargo:rerun-if-env-changed=CMAKE_OSX_DEPLOYMENT_TARGET");
     println!("cargo:rerun-if-env-changed=OPENASR_GGML_BUILD_JOBS");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!(
@@ -1748,7 +1749,9 @@ fn macos_deployment_target() -> String {
 }
 
 fn ios_deployment_target() -> String {
-    let configured = env::var("IPHONEOS_DEPLOYMENT_TARGET").ok();
+    let configured = env::var("OPENASR_IOS_DEPLOYMENT_TARGET")
+        .ok()
+        .or_else(|| env::var("IPHONEOS_DEPLOYMENT_TARGET").ok());
     ios_deployment_target_from(configured.as_deref())
 }
 

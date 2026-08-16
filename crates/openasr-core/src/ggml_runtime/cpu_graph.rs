@@ -795,14 +795,15 @@ impl GgmlCpuGraphConfig {
         Self::default_gpu_backend_for_target()
     }
 
-    #[cfg(target_os = "macos")]
     fn default_gpu_backend_for_target() -> GgmlCpuGraphBackend {
-        GgmlCpuGraphBackend::Metal
+        Self::default_gpu_backend_for_target_os(std::env::consts::OS)
     }
 
-    #[cfg(not(target_os = "macos"))]
-    fn default_gpu_backend_for_target() -> GgmlCpuGraphBackend {
-        GgmlCpuGraphBackend::Gpu
+    fn default_gpu_backend_for_target_os(target_os: &str) -> GgmlCpuGraphBackend {
+        match target_os {
+            "macos" | "ios" => GgmlCpuGraphBackend::Metal,
+            _ => GgmlCpuGraphBackend::Gpu,
+        }
     }
 
     pub fn resolve_runtime_scheduler_usage() -> bool {
@@ -15225,6 +15226,22 @@ mod tests {
                 GgmlCpuGraphBackend::Cpu
             ),
             GgmlCpuGraphBackend::Metal
+        );
+    }
+
+    #[test]
+    fn ios_default_gpu_backend_is_metal() {
+        assert_eq!(
+            GgmlCpuGraphConfig::default_gpu_backend_for_target_os("ios"),
+            GgmlCpuGraphBackend::Metal
+        );
+        assert_eq!(
+            GgmlCpuGraphConfig::default_gpu_backend_for_target_os("macos"),
+            GgmlCpuGraphBackend::Metal
+        );
+        assert_eq!(
+            GgmlCpuGraphConfig::default_gpu_backend_for_target_os("linux"),
+            GgmlCpuGraphBackend::Gpu
         );
     }
 
