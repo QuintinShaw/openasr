@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from _test_support import posix_script_command
+
 
 SCRIPT = Path(__file__).with_name("publish.sh")
 
@@ -58,7 +60,7 @@ class PublishFlowTest(unittest.TestCase):
 
     def run_publish(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [str(SCRIPT), *args],
+            posix_script_command(SCRIPT, *args),
             env=self.env,
             text=True,
             capture_output=True,

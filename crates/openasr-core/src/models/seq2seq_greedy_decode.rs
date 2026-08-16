@@ -1681,7 +1681,7 @@ mod tests {
     #[test]
     fn seq2seq_greedy_decode_cancels_at_token_boundary_when_control_requests_cancel() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
         use std::thread;
         use std::time::Duration;
 
@@ -1689,11 +1689,11 @@ mod tests {
 
         let max_generated_tokens = 64usize;
         let cancel_after_steps = 3usize;
-        let steps_seen = Arc::new(AtomicUsize::new(0));
         let control = Arc::new(TranscriptionControl::new());
+        let (step_sender, step_receiver) = sync_channel::<usize>(0);
+        let (continue_sender, continue_receiver) = sync_channel::<()>(0);
 
         let worker_control = Arc::clone(&control);
-        let worker_steps = Arc::clone(&steps_seen);
         let worker = thread::spawn(move || {
             let mut step_executor = CountingNonStopStepExecutor {
                 vocab_size: 16,
@@ -1705,7 +1705,8 @@ mod tests {
             // waits on that signal).
             struct PublishingExecutor<'a> {
                 inner: &'a mut CountingNonStopStepExecutor,
-                steps_seen: &'a AtomicUsize,
+                step_sender: &'a SyncSender<usize>,
+                continue_receiver: &'a Receiver<()>,
             }
             impl Seq2SeqGreedyDecodeStepExecutor for PublishingExecutor<'_> {
                 fn decode_step_logits(
@@ -1714,17 +1715,19 @@ mod tests {
                 ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeError>
                 {
                     let out = self.inner.decode_step_logits(input)?;
-                    self.steps_seen
-                        .store(self.inner.logits_calls, Ordering::SeqCst);
-                    // Give the canceler a window to observe progress without
-                    // racing past the whole token budget on a fast host.
-                    thread::sleep(Duration::from_millis(5));
+                    self.step_sender
+                        .send(self.inner.logits_calls)
+                        .expect("test coordinator receives every completed step");
+                    self.continue_receiver
+                        .recv()
+                        .expect("test coordinator releases every completed step");
                     Ok(out)
                 }
             }
             let mut publisher = PublishingExecutor {
                 inner: &mut step_executor,
-                steps_seen: worker_steps.as_ref(),
+                step_sender: &step_sender,
+                continue_receiver: &continue_receiver,
             };
             let token_decoder = SyntheticTokenDecoder {
                 table: BTreeMap::from([(1, "a")]),
@@ -1753,16 +1756,22 @@ mod tests {
             (result, step_executor.logits_calls)
         });
 
-        // Wait until the decode has entered a few steps, then cancel.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while steps_seen.load(Ordering::SeqCst) < cancel_after_steps {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "decode never reached {cancel_after_steps} steps before cancel"
+        // Coordinate exact token boundaries rather than depending on host
+        // scheduling speed under the full parallel workspace suite.
+        for expected_step in 1..=cancel_after_steps {
+            assert_eq!(
+                step_receiver
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("decode must reach the coordinated token boundary"),
+                expected_step
             );
-            thread::sleep(Duration::from_millis(1));
+            if expected_step == cancel_after_steps {
+                control.request_cancel();
+            }
+            continue_sender
+                .send(())
+                .expect("decode worker must still be waiting at the boundary");
         }
-        control.request_cancel();
 
         let (result, logits_calls) = worker.join().expect("decode worker");
         assert_eq!(
@@ -1778,8 +1787,8 @@ mod tests {
         // returns without another decode_step_logits. Bound is loose so a slow
         // scheduler that lets a few extra steps slip through still passes.
         assert!(
-            logits_calls < max_generated_tokens / 2,
-            "expected early abort, got logits_calls={logits_calls}"
+            logits_calls == cancel_after_steps,
+            "cancel at a coordinated token boundary must not execute another step: logits_calls={logits_calls}"
         );
     }
 

@@ -543,12 +543,31 @@ fn resolve_preferred_accelerated_route(
 pub fn ranked_preferred_accelerated_devices(
     inventory: &[EnumeratedComputeDevice],
 ) -> Vec<&EnumeratedComputeDevice> {
+    ranked_preferred_accelerated_devices_for_provider(
+        inventory,
+        crate::ggml_runtime::activated_backend_execution_provider(),
+    )
+}
+
+pub(crate) fn ranked_preferred_accelerated_devices_for_provider(
+    inventory: &[EnumeratedComputeDevice],
+    preferred_provider: Option<ExecutionProvider>,
+) -> Vec<&EnumeratedComputeDevice> {
+    let has_preferred_provider = preferred_provider.is_some_and(|provider| {
+        inventory.iter().any(|device| {
+            device.kind == RouteDeviceKind::Accelerated && device.provider == provider
+        })
+    });
     let mut devices: Vec<&EnumeratedComputeDevice> = inventory
         .iter()
         .filter(|device| device.kind == RouteDeviceKind::Accelerated)
         .collect();
     devices.sort_by_key(|device| {
         (
+            u8::from(
+                has_preferred_provider
+                    && preferred_provider.is_some_and(|provider| device.provider != provider),
+            ),
             crate::ggml_runtime::accelerated_device_rank(device.ggml_kind),
             device.registry_ordinal,
         )
@@ -880,6 +899,38 @@ mod tests {
             ranked[0].to_resolved_route().cache_key(),
             ranked[1].to_resolved_route().cache_key()
         );
+    }
+
+    #[test]
+    fn preferred_accelerated_rank_puts_activated_provider_before_registry_order() {
+        let inventory = vec![
+            fake_device(0, "Vulkan0", GgmlBackendKind::Gpu, Some("0000:01:00.0")),
+            fake_device(1, "CUDA0", GgmlBackendKind::Gpu, Some("0000:01:00.0")),
+        ];
+        let ranked = ranked_preferred_accelerated_devices_for_provider(
+            &inventory,
+            Some(ExecutionProvider::Cuda),
+        );
+        assert_eq!(ranked[0].provider, ExecutionProvider::Cuda);
+        assert_eq!(ranked[1].provider, ExecutionProvider::Vulkan);
+    }
+
+    #[test]
+    fn preferred_accelerated_rank_ignores_absent_activated_provider() {
+        let inventory = vec![
+            fake_device(
+                0,
+                "Vulkan0",
+                GgmlBackendKind::IntegratedGpu,
+                Some("0000:00:02.0"),
+            ),
+            fake_device(1, "Vulkan1", GgmlBackendKind::Gpu, Some("0000:01:00.0")),
+        ];
+        let ranked = ranked_preferred_accelerated_devices_for_provider(
+            &inventory,
+            Some(ExecutionProvider::Cuda),
+        );
+        assert_eq!(ranked[0].stable_id, "Vulkan1");
     }
 
     #[test]

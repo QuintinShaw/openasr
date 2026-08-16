@@ -6,4 +6,11 @@
  * (`auto`/`cpu`/`accelerated`) the desktop `ExecutionTarget` mirrors;
  * `effective_target` is what `auto` actually resolves to on this machine.
  */
-export type ComputeDevice = { id: string, name: string, meta: string, kind: string, target: string, effective_target: string, memory: string | null, };
+export type ComputeDevice = { id: string, name: string, meta: string, kind: string, target: string, effective_target: string,
+/**
+ * Typed provider identity of the concrete device behind this row. This
+ * is independent from the coarse `accelerated` target and lets a shell
+ * attest that a requested CUDA/HIP plugin actually loaded instead of
+ * mistaking the bundled Vulkan rescue device for success.
+ */
+provider: string, memory: string | null, };

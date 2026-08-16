@@ -373,6 +373,13 @@ def check_public_projection(*, registry_dir: Path) -> None:
             "public projection language_labels drifted from the full catalog; "
             "rerun publish_catalog.sh"
         )
+    if canonical_json_bytes(full.get("backends", [])) != canonical_json_bytes(
+        public.get("backends", [])
+    ):
+        raise GateFailure(
+            "public projection backends drifted from the full catalog; "
+            "rerun publish_catalog.sh"
+        )
 
     full_public_models = models_by_id(full, "catalog.json", require_public=True)
     projected_models = models_by_id(

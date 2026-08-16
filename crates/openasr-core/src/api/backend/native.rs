@@ -3059,7 +3059,9 @@ mod tests {
                 .with_added_tensor(
                 crate::models::dolphin::hotword_context::CONTEXT_MODULE_WORD_EMBEDDING_TENSOR_NAME,
             );
-        write_tiny_gguf_runtime_source(&runtime_path, &hotword_spec).unwrap();
+        let replacement_path = temp.path().join("dolphin-replacement-new.oasr");
+        write_tiny_gguf_runtime_source(&replacement_path, &hotword_spec).unwrap();
+        std::fs::rename(&replacement_path, &runtime_path).unwrap();
         let hotword_adapter = native_runtime_model_adapter_for_path(&runtime_path)
             .expect("same-path Dolphin replacement must resolve");
         assert!(

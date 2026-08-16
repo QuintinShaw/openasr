@@ -407,12 +407,39 @@ unsafe extern "C" {
     // GGML_BACKEND_DL: register backend plugin DLLs (ggml-<name>-*.dll / .so).
     // Must run before any registry query under DL, where the static GGML_USE_*
     // backend registration is compiled out (empty registry, init_best returns
-    // null, otherwise). `load_all` scans next to the executable + GGML_BACKEND_PATH
-    // (the base installer's CPU variants); `load_all_from_path` scans an explicit
-    // directory — used to register the downloaded GPU packs under
-    // OPENASR_HOME/backends/<vendor>/<version>/.
-    pub(crate) fn ggml_backend_load_all();
-    pub(crate) fn ggml_backend_load_all_from_path(dir_path: *const c_char);
+    // null, otherwise). The verified bundled loader scans only the explicit
+    // application directory and rejects modules before init when the OpenASR
+    // ABI attestation does not match. Optional packs use the exact verified
+    // path loader below; scanning every installed version is not a safe
+    // activation policy.
+    pub(crate) fn ggml_backend_load_verified_v3_utf8(
+        path_utf8: *const c_char,
+        dependency_dirs_utf8: *const *const c_char,
+        dependency_dir_count: usize,
+        expected_openasr_abi_v1: *const c_char,
+        expected_provider_v1: *const c_char,
+        expected_device_target: *const c_char,
+        minimum_driver_version: *const c_char,
+    ) -> GgmlBackendRegRaw;
+    pub(crate) fn ggml_backend_probe_verified_v3_utf8(
+        path_utf8: *const c_char,
+        dependency_dirs_utf8: *const *const c_char,
+        dependency_dir_count: usize,
+        expected_openasr_abi_v1: *const c_char,
+        expected_provider_v1: *const c_char,
+        expected_device_target: *const c_char,
+        minimum_driver_version: *const c_char,
+        driver_out: *mut c_char,
+        driver_out_capacity: usize,
+    ) -> bool;
+    pub(crate) fn ggml_backend_load_best_verified_utf8(
+        paths_utf8: *const *const c_char,
+        path_count: usize,
+        expected_openasr_abi_v1: *const c_char,
+        expected_provider_v1: *const c_char,
+    ) -> GgmlBackendRegRaw;
+    pub(crate) fn ggml_backend_unload(reg: GgmlBackendRegRaw);
+    pub(crate) fn ggml_backend_reg_name(reg: GgmlBackendRegRaw) -> *const c_char;
     pub(crate) fn ggml_backend_buffer_free(buffer: GgmlBackendBufferRaw);
     pub(crate) fn ggml_backend_buffer_is_host(buffer: GgmlBackendBufferRaw) -> bool;
     pub(crate) fn ggml_backend_buffer_set_usage(buffer: GgmlBackendBufferRaw, usage: c_int);

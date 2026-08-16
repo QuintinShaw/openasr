@@ -1,21 +1,23 @@
-# Desktop inference kernel manifest (`backends-manifest.json`)
+# Legacy Desktop kernel manifest (`backends-manifest.json`)
 
-This document is the contract for the **desktop app's Windows "inference
-kernel" switch** (Vulkan / CUDA / HIP): a signed manifest that tells the
-desktop app which prebuilt `openasr-cli` release archive to download for each
-backend, and how to verify it before ever launching it as the sidecar
-process.
+This document records the one-release **whole-sidecar migration rail**. It is
+retained so an upgraded Desktop can roll back to a previously released
+statically linked Vulkan/CUDA/HIP `openasr.exe` while the terminal plugin
+topology gains release-cycle evidence. It is not the authority for a normal
+new installation.
 
-This is a **different mechanism** from the `GGML_BACKEND_DL` dynamic
-plugin-loading path described in [`GPU_PLUGIN_BUILD.md`](GPU_PLUGIN_BUILD.md)
-and implemented by `install_backend_pack`/`ensure_backends_loaded`. That path
-loads a GPU backend as a runtime plugin DLL *into one running process*. The
-mechanism here instead swaps the **entire sidecar binary**: the Windows
-release channel ships three separately, statically-linked `openasr.exe`
-builds (one per backend), each a complete, independent CLI. Desktop picks
-which whole binary to launch, not which plugin to load into one. Do not
-conflate the two -- a future consumer wanting the DL-plugin path should extend
-that mechanism, not this manifest.
+The terminal contract is the signed open-core backend catalog described in
+[`GPU_PLUGIN_BUILD.md`](GPU_PLUGIN_BUILD.md): one neutral
+`GGML_BACKEND_DL` host, installer-owned CPU/Vulkan rescue modules, and at most
+one selected compatible CUDA/HIP plugin. The open-core installer verifies and
+activates that pack; Desktop consumes the open-core transaction rather than
+reimplementing plugin trust or compatibility.
+
+The schema and state machine below apply only to the legacy rail. They must
+not be used to load a static sidecar into the neutral process, and a static
+GPU host must never load a dynamic ggml plugin. Removal of this rail requires
+the clean-install, upgrade, rollback, and recovery evidence defined by the
+Windows GPU lifecycle release gate.
 
 ## Files
 
@@ -51,7 +53,7 @@ for a different release's manifest" replay case.
 
 `schema_version: 2` (produced by core `>= 0.1.20`) adds an optional top-level
 `vendor_layers` map and an optional per-backend `vendor_layer` key, so a large,
-core-version-independent GPU vendor runtime can be split out of the small,
+core-version-independent GPU vendor runtime can be split out of the
 per-release sidecar archive. This build's reader accepts BOTH `1` and `2` --
 see [`BACKENDS_MANIFEST_SCHEMA_VERSIONS`] in `backend_manifest.rs` -- since the
 manifest is generated per-release: an already-shipped v1 manifest must keep
@@ -132,7 +134,7 @@ Consequently the SAME vendor archive can be (and, released against a
 compatible toolchain, IS) referenced by more than one `core_version`'s
 manifest without re-downloading or re-verifying it: an already-installed
 vendor layer with a matching sha256 is reused as-is by a later
-`switchKernel` upgrade, and only the small sidecar archive is re-fetched. A
+`switchKernel` upgrade, and only the per-core sidecar archive is re-fetched. A
 backend entry with no `vendor_layer` (`vulkan`, and every backend under a v1
 manifest) is self-contained: nothing else to fetch or verify before it can
 launch.
@@ -231,14 +233,14 @@ not what the manifest describes.
 
 ```text
 sidecars/vendor/<sha256>/...              # content-addressed, shared across core versions
-sidecars/cuda/<core_version>/openasr.exe  # small per-release sidecar
+sidecars/cuda/<core_version>/openasr.exe  # per-release whole executable
 sidecars/hip/<core_version>/openasr.exe
 ```
 
 A vendor layer lives under its own content address, independent of any
 `core_version` directory -- an upgrade that keeps the same GPU backend and a
 still-matching vendor layer sha256 reuses the on-disk vendor directory as-is
-and only re-downloads/re-verifies the small sidecar archive into a new
+and only re-downloads/re-verifies the per-core sidecar archive into a new
 `<core_version>` directory next to it.
 
 **Install order is load-bearing, not incidental**: the vendor layer must be

@@ -42,12 +42,15 @@ pub(crate) use arena_weight_pipeline::{
     upload_static_f16, upload_static_f32,
 };
 pub use backend::{
-    GgmlBackend, GgmlBackendDevice, GgmlBackendKind, GgmlCpuFeatures, GgmlDeviceMemory,
-    GgmlRuntimeError, GgmlRuntimeInfo, ggml_available_devices, ggml_hip_tuning_summary,
+    BackendPluginActivationError, GgmlBackend, GgmlBackendDevice, GgmlBackendKind, GgmlCpuFeatures,
+    GgmlDeviceMemory, GgmlRuntimeError, GgmlRuntimeInfo, OPTIONAL_BACKEND_PACK_ENV,
+    backend_plugin_activation_status, backend_plugin_host_available,
+    bundled_backend_activation_status, ggml_available_devices, ggml_hip_tuning_summary,
     ggml_native_build_enabled, ggml_runtime_boot_summary, ggml_runtime_info,
 };
 pub(crate) use backend::{
-    accelerated_device_rank, ensure_backends_loaded, preferred_accelerated_device,
+    accelerated_device_rank, activated_backend_execution_provider, ensure_backends_loaded,
+    preferred_accelerated_device, probe_exact_backend_plugin_candidate,
 };
 pub(crate) use backend_memory::{
     BackendMemoryBytes, BackendMemoryLifecyclePoint, BackendMemoryStatsSnapshot,

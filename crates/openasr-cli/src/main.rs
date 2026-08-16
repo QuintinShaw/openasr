@@ -30,6 +30,7 @@ use openasr_core::{
     verify_catalog_signature_manifest, verify_local_catalog_signature_manifest,
 };
 
+mod backend_plugin_cli;
 mod bench_receipt_cli;
 mod bench_suite_cli;
 mod catalog_cli;
@@ -199,7 +200,25 @@ fn migrate_model_store_once() {
 }
 
 async fn run() -> Result<()> {
-    let command = Cli::parse().command;
+    let command = match Cli::parse().command {
+        Command::BackendPlugin { command } => {
+            // Backend-pack installation uses the blocking catalog/download
+            // client by design: the same implementation is shared with the
+            // synchronous Desktop machine protocol and owns its short-lived
+            // reqwest runtime. Dropping that client while this function is
+            // inside Tokio's async worker panics (`Cannot drop a runtime in a
+            // context where blocking is not allowed`) after a real install.
+            // Keep the whole trust transaction on a blocking worker, just as
+            // `pull` and native transcription do below. This also keeps live
+            // plugin probing off Tokio's cooperative executor.
+            return tokio::task::spawn_blocking(move || {
+                backend_plugin_cli::backend_plugin_command(command)
+            })
+            .await
+            .context("backend plugin worker task failed")?;
+        }
+        command => command,
+    };
     let native_execution_services = Arc::new(
         NativeExecutionServices::for_local_process()
             .context("Could not initialize native execution services")?,
@@ -250,6 +269,7 @@ async fn run() -> Result<()> {
         Command::Verify { path } => model_pack_cli::validate_model_pack_path_command(&path),
         Command::Show { target } => show_model(&target),
         Command::ModelPack { command } => model_pack_command(command),
+        Command::BackendPlugin { .. } => unreachable!("handled before runtime initialization"),
         Command::GgufCParserProbe { path } => {
             let output = openasr_core::render_gguf_c_parser_sandbox_child_output(&path)?;
             println!("{output}");

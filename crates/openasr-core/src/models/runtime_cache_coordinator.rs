@@ -236,9 +236,8 @@ mod tests {
     /// [`PackContentKey::for_runtime_source`] instead of the removed
     /// path-plus-fingerprint identity type this superseded. This is the
     /// infallible constructor's own narrow contract -- same bytes at
-    /// the same path resolve to an equal key; an in-place replacement (a
-    /// rewrite, which changes the file's identity even when content length
-    /// matches) resolves to a different one, because a *fresh* validation
+    /// the same path resolve to an equal key; an atomic path replacement
+    /// resolves to a different one, because a *fresh* validation
     /// re-opens and re-hashes the replaced file rather than reusing a stale
     /// key built from an old open. The family-level regression tests (one
     /// hit/miss test per family in each family's own module) exercise this
@@ -259,20 +258,23 @@ mod tests {
     }
 
     #[test]
-    fn pack_content_key_for_runtime_source_misses_in_place_byte_replacement() {
+    fn pack_content_key_for_runtime_source_misses_atomic_path_replacement() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("same-path.gguf");
         std::fs::write(&path, b"GGUFcontent-a-bytes").expect("write a");
         let before = crate::validate_ggml_runtime_source_path(&path).expect("validate a");
         let before_key = PackContentKey::for_runtime_source(&before);
 
-        std::fs::write(&path, b"GGUFcontent-b-bytes-different").expect("write b");
+        let replacement = dir.path().join("same-path-replacement.gguf");
+        std::fs::write(&replacement, b"GGUFcontent-b-bytes-different")
+            .expect("write replacement b");
+        std::fs::rename(&replacement, &path).expect("atomically replace b");
         let after = crate::validate_ggml_runtime_source_path(&path).expect("validate b");
         let after_key = PackContentKey::for_runtime_source(&after);
 
         assert_ne!(
             before_key, after_key,
-            "an in-place replacement at the same path must not key equal"
+            "an atomic replacement at the same path must not key equal"
         );
     }
 

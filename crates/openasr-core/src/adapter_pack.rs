@@ -44,7 +44,7 @@
 //! dynamic adapters; every other family fails closed when one is active.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -739,7 +739,10 @@ pub fn write_lora_adapter_pack(
     let mut staging = AdapterPackStaging::new(staging_path);
     write_gguf_file_v0(staging.path(), &metadata, &tensors)
         .map_err(|error| write_failed(error.to_string()))?;
-    File::open(staging.path())
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(staging.path())
         .and_then(|file| file.sync_all())
         .map_err(|error| AdapterPackError::Durability {
             path: staging.path().to_path_buf(),

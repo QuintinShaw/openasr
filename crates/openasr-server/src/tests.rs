@@ -2899,7 +2899,7 @@ async fn native_transcribe_accepts_a_real_uploaded_aac_file_past_audio_preparati
     let multipart = <Multipart as axum::extract::FromRequest<()>>::from_request(http_request, &())
         .await
         .expect("a well-formed multipart body must extract");
-    let parsed = parse_transcription_multipart(Ok(multipart), BackendKind::Native, None)
+    let mut parsed = parse_transcription_multipart(Ok(multipart), BackendKind::Native, None)
         .await
         .expect("a multipart body with a real .aac file + valid model field must parse");
     assert_eq!(
@@ -2911,6 +2911,13 @@ async fn native_transcribe_accepts_a_real_uploaded_aac_file_past_audio_preparati
         Some("aac"),
         "the server's own upload temp file must keep the real .aac extension"
     );
+    // This fixture intentionally carries the tiny CPU-only Whisper tensor
+    // geometry. A neutral Windows host now exposes its bundled Vulkan module
+    // to Auto, so leaving the request unconstrained would turn this audio
+    // upload regression into an accidental GPU graph test. Keep the test on
+    // its documented fixture backend; real Vulkan placement/correctness has a
+    // separate exact-provider gate with production packs.
+    parsed.request.execution_target = Some(ExecutionTarget::Cpu);
 
     let runtime = ServerRuntime {
         backend: BackendKind::Native,

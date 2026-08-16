@@ -2418,9 +2418,22 @@ fn valid_hip_backend_json() -> String {
       "display_name": "AMD ROCm (HIP)",
       "targets": ["gfx1100", "gfx1200"],
       "min_cli_version": "0.1.0",
+      "host_abi": {{
+        "schema_version": 2,
+        "fingerprint": "{BACKEND_SHA_A}",
+        "target": "x86_64-pc-windows-msvc",
+        "crt": "msvc-md",
+        "toolchain": "msvc-v143",
+        "compile_flags_sha256": "{BACKEND_SHA_A}",
+        "ggml_backend_api_version": 3,
+        "ggml_revision": "cccccccccccccccccccccccccccccccccccccccc",
+        "ggml_headers_sha256": "{BACKEND_SHA_B}",
+        "openasr_ffi_sha256": "{BACKEND_SHA_A}",
+        "openasr_extension_sha256": "{BACKEND_SHA_B}"
+      }},
       "files": [
         {{"filename": "ggml-hip.dll", "role": "plugin", "url": "https://example.test/ggml-hip.dll", "sha256": "{BACKEND_SHA_A}", "size_bytes": 1048576}},
-        {{"filename": "rocblas-library.zip", "role": "archive", "extract_subdir": "rocblas/library", "url": "https://example.test/rocblas-library.zip", "sha256": "{BACKEND_SHA_B}", "size_bytes": 157286400}}
+        {{"filename": "rocblas-library.zip", "role": "archive", "extract_subdir": "rocblas/library", "extracted_tree_sha256": "{BACKEND_SHA_A}", "url": "https://example.test/rocblas-library.zip", "sha256": "{BACKEND_SHA_B}", "size_bytes": 157286400}}
       ]
     }}"#
     )
@@ -2437,6 +2450,7 @@ fn catalog_parser_accepts_backend_entries() {
     let backend = &catalog.backends[0];
     assert_eq!(backend.id, "hip-radeon");
     assert_eq!(backend.vendor, CatalogBackendVendor::Hip);
+    assert_eq!(backend.host_abi.fingerprint, BACKEND_SHA_A);
     assert_eq!(
         backend.targets,
         vec!["gfx1100".to_string(), "gfx1200".to_string()]
@@ -2474,7 +2488,14 @@ fn catalog_parser_rejects_backend_without_plugin() {
 
 #[test]
 fn catalog_parser_rejects_backend_with_bad_sha256() {
-    let bad = valid_hip_backend_json().replace(BACKEND_SHA_A, "tooshort");
+    // Corrupt only the plugin payload digest. Replacing every occurrence of
+    // BACKEND_SHA_A also invalidates the host ABI fields and makes this test
+    // depend on validator ordering rather than the file-hash contract it is
+    // meant to lock down.
+    let bad = valid_hip_backend_json().replace(
+        &format!("\"sha256\": \"{BACKEND_SHA_A}\", \"size_bytes\": 1048576"),
+        "\"sha256\": \"tooshort\", \"size_bytes\": 1048576",
+    );
     let error = parse_model_catalog(&catalog_json_with_backends(&bad), "fixture")
         .unwrap_err()
         .to_string();
@@ -2498,6 +2519,32 @@ fn catalog_parser_rejects_archive_without_extract_subdir() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("must declare extract_subdir"));
+}
+
+#[test]
+fn catalog_parser_rejects_archive_without_signed_extracted_tree() {
+    let no_tree = valid_hip_backend_json().replace(
+        &format!(", \"extracted_tree_sha256\": \"{BACKEND_SHA_A}\""),
+        "",
+    );
+    let error = parse_model_catalog(&catalog_json_with_backends(&no_tree), "fixture")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("extracted_tree_sha256"));
+}
+
+#[test]
+fn catalog_parser_rejects_extracted_tree_on_non_archive() {
+    let bad = valid_hip_backend_json().replace(
+        "\"filename\": \"ggml-hip.dll\", \"role\": \"plugin\"",
+        &format!(
+            "\"filename\": \"ggml-hip.dll\", \"role\": \"plugin\", \"extracted_tree_sha256\": \"{BACKEND_SHA_A}\""
+        ),
+    );
+    let error = parse_model_catalog(&catalog_json_with_backends(&bad), "fixture")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not an archive"));
 }
 
 #[test]
@@ -2542,6 +2589,7 @@ fn resolve_catalog_backend_pull_returns_the_matching_pack() {
     assert_eq!(resolved.backend_id, "hip-radeon");
     assert_eq!(resolved.vendor, CatalogBackendVendor::Hip);
     assert_eq!(resolved.version, "0.13.1+643b5659");
+    assert_eq!(resolved.host_abi.fingerprint, BACKEND_SHA_A);
     assert_eq!(resolved.files.len(), 2);
     assert!(
         resolved
@@ -2578,4 +2626,106 @@ fn resolve_catalog_backend_pull_errors_when_no_backends() {
         resolve_catalog_backend_pull(&catalog, "hip-radeon").unwrap_err(),
         BackendResolutionError::NoBackends
     );
+}
+
+#[test]
+fn compatible_backend_resolution_requires_exact_host_abi() {
+    let catalog = parse_model_catalog(
+        &catalog_json_with_backends(&valid_hip_backend_json()),
+        "fixture",
+    )
+    .unwrap();
+    let host = catalog.backends[0].host_abi.clone();
+    let resolved = resolve_compatible_catalog_backend_pull(
+        &catalog,
+        CatalogBackendVendor::Hip,
+        &host,
+        Some("gfx1200"),
+    )
+    .unwrap();
+    assert_eq!(resolved.backend_id, "hip-radeon");
+
+    let mut incompatible = host;
+    incompatible.fingerprint = BACKEND_SHA_B.to_string();
+    assert!(matches!(
+        resolve_compatible_catalog_backend_pull(
+            &catalog,
+            CatalogBackendVendor::Hip,
+            &incompatible,
+            Some("gfx1200"),
+        ),
+        Err(BackendResolutionError::NoCompatibleBackend { .. })
+    ));
+}
+
+#[test]
+fn compatible_backend_resolution_rejects_target_mismatch_and_ambiguity() {
+    let mut catalog = parse_model_catalog(
+        &catalog_json_with_backends(&valid_hip_backend_json()),
+        "fixture",
+    )
+    .unwrap();
+    let host = catalog.backends[0].host_abi.clone();
+    catalog.backends[0].targets = vec!["gfx1100".to_string()];
+    assert!(matches!(
+        resolve_compatible_catalog_backend_pull(
+            &catalog,
+            CatalogBackendVendor::Hip,
+            &host,
+            Some("gfx1200"),
+        ),
+        Err(BackendResolutionError::NoCompatibleBackend { .. })
+    ));
+
+    let mut duplicate = catalog.backends[0].clone();
+    duplicate.id = "hip-radeon-second".to_string();
+    catalog.backends.push(duplicate);
+    assert!(matches!(
+        resolve_compatible_catalog_backend_pull(
+            &catalog,
+            CatalogBackendVendor::Hip,
+            &host,
+            Some("gfx1100"),
+        ),
+        Err(BackendResolutionError::AmbiguousCompatibleBackend { .. })
+    ));
+}
+
+#[test]
+fn compatible_backend_resolution_requires_a_parseable_driver_at_or_above_the_floor() {
+    let mut catalog = parse_model_catalog(
+        &catalog_json_with_backends(&valid_hip_backend_json()),
+        "fixture",
+    )
+    .unwrap();
+    catalog.backends[0].min_driver_api = Some("24.10.1".to_string());
+    let host = catalog.backends[0].host_abi.clone();
+
+    for driver in [None, Some(""), Some("unknown"), Some("24.10.0")] {
+        assert!(matches!(
+            resolve_compatible_catalog_backend_pull_for_driver(
+                &catalog,
+                CatalogBackendVendor::Hip,
+                &host,
+                Some("gfx1200"),
+                driver,
+            ),
+            Err(BackendResolutionError::NoCompatibleBackend { .. })
+        ));
+    }
+
+    for driver in [Some("24.10.1"), Some("24.10.1.0"), Some("25.1")] {
+        assert_eq!(
+            resolve_compatible_catalog_backend_pull_for_driver(
+                &catalog,
+                CatalogBackendVendor::Hip,
+                &host,
+                Some("gfx1200"),
+                driver,
+            )
+            .unwrap()
+            .backend_id,
+            "hip-radeon"
+        );
+    }
 }

@@ -1311,6 +1311,11 @@ def entry(model: str) -> dict:
 
 
 def main(argv: list[str]) -> int:
+    # Bash consumes several commands line-by-line. Windows' default text
+    # translation would otherwise append CRLF and leak a trailing `\r` into
+    # model ids and quant tags under Git-for-Windows/MSYS.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", newline="\n")
     if not argv:
         sys.exit(__doc__)
     cmd = argv[0]

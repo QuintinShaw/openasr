@@ -9,17 +9,19 @@ import unittest
 from pathlib import Path
 
 from _catalog import CATALOG_URL
+from _test_support import posix_script_command
 
 
 SCRIPT = Path(__file__).with_name("publish_catalog.sh")
 
 
-def catalog_with(models: list[dict]) -> dict:
+def catalog_with(models: list[dict], backends: list[dict] | None = None) -> dict:
     return {
         "schema_version": 1,
         "generated_at": "2026-05-31T00:00:00Z",
         "catalog_url": CATALOG_URL,
         "models": models,
+        "backends": backends or [],
     }
 
 
@@ -69,7 +71,7 @@ class PublishCatalogTest(unittest.TestCase):
 
     def run_publish_catalog(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [str(SCRIPT), "--dry-run", *args],
+            posix_script_command(SCRIPT, "--dry-run", *args),
             env=self.env,
             text=True,
             capture_output=True,
@@ -96,6 +98,7 @@ class PublishCatalogTest(unittest.TestCase):
         self.assertIn("committed artifacts not touched", result.stderr)
         projection = json.loads((self.public_dir / "catalog.json").read_text())
         self.assertEqual([model["id"] for model in projection["models"]], ["public-model"])
+        self.assertEqual(projection["backends"], [])
         manifest = json.loads((self.public_dir / "catalog.signature.json").read_text())
         self.assertEqual(manifest["catalog_epoch"], 2026060101)
         self.assertEqual(manifest["signature"]["algorithm"], "ed25519")
@@ -110,8 +113,31 @@ class PublishCatalogTest(unittest.TestCase):
                 "bundled_catalog_json_parses_and_matches_registry_cards",
             ],
         )
+
+    def test_public_projection_preserves_backend_distribution_entries(self) -> None:
+        backend = {
+            "id": "cuda-win-sm86",
+            "vendor": "cuda",
+            "version": "v1",
+            "display_name": "CUDA sm_86",
+            "targets": ["sm_86"],
+            "min_cli_version": "0.1.0",
+            "host_abi": {"schema_version": 1, "fingerprint": "a" * 64},
+            "files": [],
+        }
+        self.catalog.write_text(
+            json.dumps(catalog_with([{"id": "public-model", "public": True}], [backend]))
+        )
+
+        result = self.run_publish_catalog()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        projection = json.loads((self.public_dir / "catalog.json").read_text())
+        self.assertEqual(projection["backends"], [backend])
+        commands = self.cargo_log.read_text().split("COMMAND\n")
+        sign_args = commands[2].splitlines()
         self.assertEqual(
-            commands[2].splitlines()[:7],
+            sign_args[:6],
             [
                 "run",
                 "--quiet",
@@ -119,9 +145,9 @@ class PublishCatalogTest(unittest.TestCase):
                 "openasr-cli",
                 "--",
                 "__openasr-sign-catalog-manifest",
-                str(self.public_dir / "catalog.json"),
             ],
         )
+        self.assertEqual(Path(sign_args[6]), self.public_dir / "catalog.json")
 
     def test_dry_run_can_write_redacted_summary_artifacts(self) -> None:
         self.catalog.write_text(
@@ -147,7 +173,7 @@ class PublishCatalogTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         summary = json.loads(summary_json.read_text())
         rendered_summary = json.dumps(summary, sort_keys=True)
-        markdown = summary_md.read_text()
+        markdown = summary_md.read_text(encoding="utf-8")
         self.assertEqual(summary["probe"], "catalog_publish")
         self.assertEqual(summary["target"], "catalog.openasr.org")
         self.assertTrue(summary["dry_run"])
@@ -191,12 +217,12 @@ class PublishCatalogTest(unittest.TestCase):
         )
 
         result = subprocess.run(
-            [
-                str(SCRIPT),
+            posix_script_command(
+                SCRIPT,
                 "--strict-evidence",
                 "--summary-md",
                 str(self.root / "summary.md"),
-            ],
+            ),
             env={**self.env, "HF_TOKEN": "redacted"},
             text=True,
             capture_output=True,
@@ -215,12 +241,12 @@ class PublishCatalogTest(unittest.TestCase):
         )
 
         result = subprocess.run(
-            [
-                str(SCRIPT),
+            posix_script_command(
+                SCRIPT,
                 "--strict-evidence",
                 "--summary-json",
                 str(self.root / "summary" / "publish-summary.json"),
-            ],
+            ),
             env={**self.env, "HF_TOKEN": "redacted"},
             text=True,
             capture_output=True,

@@ -8321,6 +8321,15 @@ impl GgmlBackendGuard {
                     )));
                 Err(error)
             }
+            Err(GgmlRuntimeError::BackendPluginActivation(error)) => {
+                let error =
+                    GgmlCpuGraphError::ExecutionRoute(ExecutionRouteError::init_failed(format!(
+                        "provider={} stable_id={} plugin_activation={error}",
+                        route.provider.as_str(),
+                        route.stable_id
+                    )));
+                Err(error)
+            }
         }
     }
 

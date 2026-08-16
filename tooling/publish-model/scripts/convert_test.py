@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from _test_support import native_path, posix_path, posix_script_command
+
 
 SCRIPT = Path(__file__).with_name("convert.sh")
 REAL_PYTHON = shutil.which("python3") or "/usr/bin/python3"
@@ -126,14 +128,14 @@ class ConvertTest(unittest.TestCase):
         env = os.environ.copy()
         env.update(
             {
-                "OPENASR_REPO_ROOT": str(root),
-                "OPENASR_FAKE_CONVERT_LOG": str(self.log),
+                "OPENASR_REPO_ROOT": posix_path(root),
+                "OPENASR_FAKE_CONVERT_LOG": posix_path(self.log),
                 "PATH": f"{self.bin_dir}{os.pathsep}{env['PATH']}",
                 **extra_env,
             }
         )
         return subprocess.run(
-            [str(SCRIPT), "mimo-v2.5-asr", quant],
+            posix_script_command(SCRIPT, "mimo-v2.5-asr", quant),
             env=env,
             text=True,
             capture_output=True,
@@ -161,17 +163,23 @@ class ConvertTest(unittest.TestCase):
         external = next(call for call in calls if call[0] == "EXTERNAL")
         self.assertIn("--quant", external)
         self.assertEqual(external[external.index("--quant") + 1], "fp16")
-        staging = Path(external[external.index("--out") + 1])
+        staging_arg = external[external.index("--out") + 1]
+        staging = native_path(staging_arg)
         self.assertEqual(staging.parent.parent, root / "tmp" / "publish" / "mimo-v2.5-asr")
         self.assertEqual(staging.name, "source.oasr")
         self.assertFalse(staging.exists(), "successful requant must remove the derived staging pack")
         self.assertFalse(staging.parent.exists(), "successful requant must remove the staging directory")
         requant = next(call for call in calls if call[:2] == ["BIN", "model-pack"])
         self.assertEqual(requant[2], "requant")
-        self.assertEqual(requant[3], str(staging))
-        self.assertEqual(requant[4], str(output))
+        self.assertEqual(native_path(requant[3]), staging)
+        self.assertEqual(native_path(requant[4]), output)
         self.assertEqual(requant[6], "q4-k")
-        self.assertTrue(any(call[:2] == ["BIN", "verify"] and call[2] == str(output) for call in calls))
+        self.assertTrue(
+            any(
+                call[:2] == ["BIN", "verify"] and native_path(call[2]) == output
+                for call in calls
+            )
+        )
         self.assertTrue((output.parent / "mimo-v2.5-asr.q4_k.result.json").is_file())
 
     def test_q4_k_fails_closed_when_converter_does_not_write_staging(self) -> None:
@@ -196,7 +204,7 @@ class ConvertTest(unittest.TestCase):
         self.assertTrue(output.is_file())
         calls = self._calls()
         external = next(call for call in calls if call[0] == "EXTERNAL")
-        self.assertEqual(external[external.index("--out") + 1], str(output))
+        self.assertEqual(native_path(external[external.index("--out") + 1]), output)
         self.assertEqual(external[external.index("--quant") + 1], "q8-0")
         self.assertFalse(any(call[:3] == ["BIN", "model-pack", "requant"] for call in calls))
 

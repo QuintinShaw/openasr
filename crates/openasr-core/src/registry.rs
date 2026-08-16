@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    atomic_file, catalog_security,
+    atomic_file,
+    backend_distribution::{BACKEND_HOST_ABI_SCHEMA_VERSION, BackendHostAbi},
+    catalog_security,
     catalog_series::{CatalogSeriesSpec, catalog_series_spec},
     config::DEFAULT_MODEL_ID,
     http,
@@ -720,14 +722,22 @@ pub struct CatalogBackend {
     pub display_name: String,
     #[serde(default)]
     pub description: Option<String>,
-    /// Device arch hints this pack targets (HIP `gfx` ids, CUDA SM numbers).
-    /// Empty for cross-vendor (Vulkan) or CPU. Drives UI device-match, not the
-    /// load decision (the ggml registry score-ranks what actually runs).
+    /// Exact device architectures this pack can execute (HIP `gfx` ids,
+    /// canonical CUDA `sm_XX` ids). Empty only for cross-vendor Vulkan or CPU.
+    /// Production activation uses this field as a signed compatibility gate;
+    /// catalog order and ggml score never choose an optional native module.
     #[serde(default)]
     pub targets: Vec<String>,
-    #[serde(default)]
-    pub min_driver: Option<String>,
+    /// Minimum provider driver-API compatibility level reported by the
+    /// module's side-effect-free probe (for CUDA, `cudaDriverGetVersion`,
+    /// e.g. `13.0.0`). This is deliberately not a Windows display-driver
+    /// package version such as `580.xx`.
+    #[serde(default, alias = "min_driver")]
+    pub min_driver_api: Option<String>,
     pub min_cli_version: String,
+    /// Exact neutral-host ABI this plugin was built against. Backend packs are
+    /// never selected by a loose core-version range.
+    pub host_abi: BackendHostAbi,
     pub files: Vec<CatalogBackendFile>,
 }
 
@@ -748,6 +758,12 @@ pub struct CatalogBackendFile {
     /// plugin/runtime files, which stage at the pack root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extract_subdir: Option<String>,
+    /// Canonical digest of the extracted payload tree for an archive. The
+    /// digest binds sorted relative paths, byte sizes, and file sha256 values,
+    /// so a locally modified extraction cannot be accepted by editing the
+    /// unsigned install marker. Required for archives and forbidden otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extracted_tree_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -862,6 +878,9 @@ pub struct ResolvedCatalogBackendPull {
     pub vendor: CatalogBackendVendor,
     pub version: String,
     pub display_name: String,
+    pub host_abi: BackendHostAbi,
+    pub targets: Vec<String>,
+    pub min_driver_api: Option<String>,
     pub files: Vec<CatalogBackendFile>,
 }
 
@@ -873,6 +892,23 @@ pub enum BackendResolutionError {
     UnknownBackend {
         reference: String,
         available: String,
+    },
+    #[error(
+        "No {vendor} backend pack matches host ABI '{host_fingerprint}' and device target '{device_target}'."
+    )]
+    NoCompatibleBackend {
+        vendor: String,
+        host_fingerprint: String,
+        device_target: String,
+    },
+    #[error(
+        "More than one {vendor} backend pack matches host ABI '{host_fingerprint}' and device target '{device_target}': {matches}."
+    )]
+    AmbiguousCompatibleBackend {
+        vendor: String,
+        host_fingerprint: String,
+        device_target: String,
+        matches: String,
     },
 }
 
@@ -1676,6 +1712,15 @@ fn filter_forward_compatible_catalog(catalog: &mut ModelCatalog) -> Vec<String> 
             ));
             return false;
         }
+        if backend.host_abi.schema_version != BACKEND_HOST_ABI_SCHEMA_VERSION {
+            notes.push(format!(
+                "catalog: hiding backend '{}': unsupported host ABI schema {} (this build supports {})",
+                backend.id,
+                backend.host_abi.schema_version,
+                BACKEND_HOST_ABI_SCHEMA_VERSION
+            ));
+            return false;
+        }
         if backend
             .files
             .iter()
@@ -1723,13 +1768,166 @@ pub fn resolve_catalog_backend_pull(
                 .collect::<Vec<_>>()
                 .join(", "),
         })?;
-    Ok(ResolvedCatalogBackendPull {
+    Ok(resolved_catalog_backend_pull(backend))
+}
+
+/// Resolve the one fat pack authored for a provider and neutral-host ABI,
+/// before downloading it. Target and driver-API proof deliberately happen
+/// after installation through the module's side-effect-free live probe.
+pub fn resolve_catalog_backend_pull_for_host(
+    catalog: &ModelCatalog,
+    vendor: CatalogBackendVendor,
+    host_abi: &BackendHostAbi,
+) -> Result<ResolvedCatalogBackendPull, BackendResolutionError> {
+    let mut matches = catalog
+        .backends
+        .iter()
+        .filter(|backend| backend.vendor == vendor)
+        .filter(|backend| host_abi.is_compatible_with(&backend.host_abi))
+        .collect::<Vec<_>>();
+    let vendor_label = backend_vendor_label(vendor).to_string();
+    if matches.is_empty() {
+        return Err(BackendResolutionError::NoCompatibleBackend {
+            vendor: vendor_label,
+            host_fingerprint: host_abi.fingerprint.clone(),
+            device_target: "post-install-live-probe".to_string(),
+        });
+    }
+    if matches.len() > 1 {
+        matches.sort_by(|left, right| left.id.cmp(&right.id));
+        return Err(BackendResolutionError::AmbiguousCompatibleBackend {
+            vendor: vendor_label,
+            host_fingerprint: host_abi.fingerprint.clone(),
+            device_target: "post-install-live-probe".to_string(),
+            matches: matches
+                .iter()
+                .map(|backend| backend.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        });
+    }
+    Ok(resolved_catalog_backend_pull(matches[0]))
+}
+
+/// Resolve exactly one backend pack compatible with the current neutral host
+/// and, when present, the current GPU architecture. Ambiguity fails closed;
+/// catalog order must never silently decide which native DLL enters a process.
+pub fn resolve_compatible_catalog_backend_pull(
+    catalog: &ModelCatalog,
+    vendor: CatalogBackendVendor,
+    host_abi: &BackendHostAbi,
+    device_target: Option<&str>,
+) -> Result<ResolvedCatalogBackendPull, BackendResolutionError> {
+    resolve_compatible_catalog_backend_pull_for_driver(
+        catalog,
+        vendor,
+        host_abi,
+        device_target,
+        None,
+    )
+}
+
+/// Resolve one exact backend pack using the signed host ABI, device target,
+/// and driver-API floor. A pack that declares `min_driver_api` is never selected when
+/// the caller cannot provide a parseable current driver version.
+pub fn resolve_compatible_catalog_backend_pull_for_driver(
+    catalog: &ModelCatalog,
+    vendor: CatalogBackendVendor,
+    host_abi: &BackendHostAbi,
+    device_target: Option<&str>,
+    current_driver: Option<&str>,
+) -> Result<ResolvedCatalogBackendPull, BackendResolutionError> {
+    let mut matches = catalog
+        .backends
+        .iter()
+        .filter(|backend| backend.vendor == vendor)
+        .filter(|backend| host_abi.is_compatible_with(&backend.host_abi))
+        .filter(|backend| {
+            backend.targets.is_empty()
+                || device_target.is_some_and(|target| {
+                    backend
+                        .targets
+                        .iter()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(target))
+                })
+        })
+        .filter(|backend| {
+            backend.min_driver_api.as_deref().is_none_or(|minimum| {
+                current_driver.is_some_and(|current| driver_version_at_least(current, minimum))
+            })
+        })
+        .collect::<Vec<_>>();
+    let vendor = backend_vendor_label(vendor).to_string();
+    let device_target = device_target.unwrap_or("any").to_string();
+    if matches.is_empty() {
+        return Err(BackendResolutionError::NoCompatibleBackend {
+            vendor,
+            host_fingerprint: host_abi.fingerprint.clone(),
+            device_target,
+        });
+    }
+    if matches.len() > 1 {
+        matches.sort_by(|left, right| left.id.cmp(&right.id));
+        return Err(BackendResolutionError::AmbiguousCompatibleBackend {
+            vendor,
+            host_fingerprint: host_abi.fingerprint.clone(),
+            device_target,
+            matches: matches
+                .iter()
+                .map(|backend| backend.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        });
+    }
+    Ok(resolved_catalog_backend_pull(matches[0]))
+}
+
+fn driver_version_at_least(current: &str, minimum: &str) -> bool {
+    fn parse(value: &str) -> Option<Vec<u64>> {
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        value
+            .split('.')
+            .map(|part| {
+                (!part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+                    .then(|| part.parse::<u64>().ok())
+                    .flatten()
+            })
+            .collect()
+    }
+
+    let (Some(mut current), Some(mut minimum)) = (parse(current), parse(minimum)) else {
+        return false;
+    };
+    let width = current.len().max(minimum.len());
+    current.resize(width, 0);
+    minimum.resize(width, 0);
+    current >= minimum
+}
+
+fn backend_vendor_label(vendor: CatalogBackendVendor) -> &'static str {
+    match vendor {
+        CatalogBackendVendor::Cpu => "cpu",
+        CatalogBackendVendor::Vulkan => "vulkan",
+        CatalogBackendVendor::Hip => "hip",
+        CatalogBackendVendor::Cuda => "cuda",
+        CatalogBackendVendor::Unknown => "unknown",
+    }
+}
+
+fn resolved_catalog_backend_pull(backend: &CatalogBackend) -> ResolvedCatalogBackendPull {
+    ResolvedCatalogBackendPull {
         backend_id: backend.id.clone(),
         vendor: backend.vendor,
         version: backend.version.clone(),
         display_name: backend.display_name.clone(),
+        host_abi: backend.host_abi.clone(),
+        targets: backend.targets.clone(),
+        min_driver_api: backend.min_driver_api.clone(),
         files: backend.files.clone(),
-    })
+    }
 }
 
 /// Like [`resolve_catalog_pull`], but when the request carries no explicit quant
@@ -2446,6 +2644,44 @@ fn validate_catalog_backend(backend: &CatalogBackend) -> Result<(), CatalogError
             backend.id
         )));
     }
+    let host_abi = &backend.host_abi;
+    if host_abi.schema_version != BACKEND_HOST_ABI_SCHEMA_VERSION {
+        return Err(CatalogError::InvalidCatalog(format!(
+            "backend '{}' host_abi schema {} is not supported by this build",
+            backend.id, host_abi.schema_version
+        )));
+    }
+    for (field, value) in [
+        ("fingerprint", host_abi.fingerprint.as_str()),
+        ("ggml_headers_sha256", host_abi.ggml_headers_sha256.as_str()),
+        ("openasr_ffi_sha256", host_abi.openasr_ffi_sha256.as_str()),
+        (
+            "openasr_extension_sha256",
+            host_abi.openasr_extension_sha256.as_str(),
+        ),
+        (
+            "compile_flags_sha256",
+            host_abi.compile_flags_sha256.as_str(),
+        ),
+    ] {
+        if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "backend '{}' host_abi.{field} must be 64 hex characters",
+                backend.id
+            )));
+        }
+    }
+    if host_abi.target.trim().is_empty()
+        || host_abi.crt.trim().is_empty()
+        || host_abi.toolchain.trim().is_empty()
+        || host_abi.ggml_revision.trim().is_empty()
+        || host_abi.ggml_backend_api_version == 0
+    {
+        return Err(CatalogError::InvalidCatalog(format!(
+            "backend '{}' host_abi identity is incomplete",
+            backend.id
+        )));
+    }
     if backend.files.is_empty() {
         return Err(CatalogError::InvalidCatalog(format!(
             "backend '{}' must contain at least one file",
@@ -2519,11 +2755,24 @@ fn validate_catalog_backend(backend: &CatalogBackend) -> Result<(), CatalogError
                         backend.id, file.filename
                     )));
                 }
+                let tree_sha = file.extracted_tree_sha256.as_deref().unwrap_or("");
+                if tree_sha.len() != 64 || !tree_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(CatalogError::InvalidCatalog(format!(
+                        "backend '{}' archive '{}' extracted_tree_sha256 must be 64 hex characters",
+                        backend.id, file.filename
+                    )));
+                }
             }
             CatalogBackendFileRole::Plugin | CatalogBackendFileRole::Runtime => {
                 if file.extract_subdir.is_some() {
                     return Err(CatalogError::InvalidCatalog(format!(
                         "backend '{}' file '{}' has extract_subdir but is not an archive",
+                        backend.id, file.filename
+                    )));
+                }
+                if file.extracted_tree_sha256.is_some() {
+                    return Err(CatalogError::InvalidCatalog(format!(
+                        "backend '{}' file '{}' has extracted_tree_sha256 but is not an archive",
                         backend.id, file.filename
                     )));
                 }

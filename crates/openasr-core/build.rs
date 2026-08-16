@@ -1,9 +1,14 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
     process::Command,
 };
 
+use sha2::{Digest, Sha256};
+
+#[path = "src/pe_authenticode.rs"]
+mod pe_authenticode;
 #[path = "src/windows_cmake_cache.rs"]
 mod windows_cmake_cache;
 
@@ -53,11 +58,10 @@ fn main() {
     // linking in object file ... built for 'iOS'").
     let is_ios_simulator = is_ios && target.ends_with("-sim");
     let host = env::var("HOST").unwrap_or_default();
-    // Backend-DL plugin build for the CPU-only (no GPU feature) WINDOWS base:
+    // Backend-DL plugin build for the neutral Windows host:
     // ship ggml-base.dll + ggml.dll + ggml-cpu-<variant>.dll loaded via the ggml
-    // registry, so GPU acceleration can be dropped in later as a downloadable
-    // plugin DLL with automatic CPU fallback. This is the v1 product surface — a
-    // Windows NSIS installer whose GPU packs are pulled on demand.
+    // registry. The installer owns this neutral host plus CPU/Vulkan rescue;
+    // signed CUDA/HIP packs are installed and selected independently.
     //
     // Scoped to Windows on purpose. macOS ships a self-contained static binary
     // with Metal/Accelerate (no plugin story). Linux is the CI/CLI platform: a
@@ -66,18 +70,41 @@ fn main() {
     // ggml-cpu-<variant>.so set, which `copy_runtime_dlls` does not stage). The
     // host-side registry refactor (init_by_type / ensure_backends_loaded) still
     // runs on the macOS+Linux+GPU-feature static builds, but
-    // `ensure_backends_loaded` (ggml_runtime/backend.rs) now skips the
-    // `ggml_backend_load_all` directory scan there and relies on the
-    // statically-registered backend instead: that scan is NOT a harmless no-op
+    // `ensure_backends_loaded` (ggml_runtime/backend.rs) skips the directory
+    // scan there and relies on the statically registered backend instead. That
+    // scan is NOT a harmless no-op
     // when it finds `ggml-*.dll` plugins sitting next to the exe (e.g. a desktop
     // bundle that ships the CPU BACKEND_DL variant alongside a statically-linked
     // GPU exe) — it dlopens a second copy of ggml core into the process and
     // `ggml.cpp:22 GGML_ASSERT(prev != ggml_uncaught_exception)` fastfails
-    // (0xc0000409). GPU-feature builds keep the static link regardless of OS
-    // (migrated to plugins in a later phase).
+    // (0xc0000409). Non-Windows GPU-feature builds remain platform-static;
+    // Windows GPU features stage optional modules unless the explicit legacy
+    // sidecar feature is selected.
     // GGML_CPU_ALL_VARIANTS requires GGML_NATIVE=OFF (CMake FATAL_ERROR otherwise),
     // and a portable base must not bake the build host's ISA anyway.
-    let use_backend_dl = is_windows && !feat_cuda && !feat_vulkan && !feat_hip;
+    // Windows defaults to one neutral ggml host. During the single published
+    // migration cycle only, a dedicated release leg may compile the old
+    // whole-sidecar topology through an auditable Cargo feature. An ambient
+    // environment variable can never change a production host's topology.
+    let legacy_static_windows =
+        is_windows && env::var_os("CARGO_FEATURE_LEGACY_WINDOWS_STATIC_SIDECAR").is_some();
+    let use_backend_dl = is_windows && !legacy_static_windows;
+    // The neutral Windows host always carries a Vulkan rescue module. CUDA/HIP
+    // are optional packs; CPU+Vulkan are the installer-owned LKG and must not
+    // depend on a consumer remembering to enable a feature.
+    let build_vulkan = feat_vulkan || use_backend_dl;
+    println!(
+        "cargo:rustc-env=OPENASR_WINDOWS_GGML_TOPOLOGY={}",
+        if legacy_static_windows {
+            "legacy-static-sidecar"
+        } else if is_windows {
+            "neutral-backend-dl"
+        } else {
+            "platform-static"
+        }
+    );
+    let (backend_host_abi_fingerprint, backend_host_abi_json) =
+        emit_backend_host_abi(&manifest_dir, &source_dir, &target, use_backend_dl);
     // GGML_CPU_ALL_VARIANTS compiles the multi-ISA CPU dispatch set (sse42/avx/
     // avx2/... on x86). ggml has NO Windows ARM entry in that variant table
     // (src/CMakeLists.txt only wires ARM ALL_VARIANTS for Linux/Android/Apple),
@@ -155,7 +182,7 @@ fn main() {
 
     let hip_path = feat_hip.then(hip_toolkit_path).flatten();
     let cuda_path = feat_cuda.then(cuda_toolkit_path).flatten();
-    let vulkan_sdk = feat_vulkan.then(vulkan_sdk_path).flatten();
+    let vulkan_sdk = build_vulkan.then(vulkan_sdk_path).flatten();
 
     // On Windows, cmake's Ninja generator picks the first C compiler on PATH. The
     // AMD ROCm SDK puts its clang.exe ahead of MSVC, so a non-HIP build would
@@ -209,15 +236,23 @@ fn main() {
             ("CMAKE_BUILD_TYPE", "Release".to_owned()),
             ("BUILD_SHARED_LIBS", on_off(use_backend_dl)),
             ("GGML_BACKEND_DL", on_off(use_backend_dl)),
+            (
+                "OPENASR_VERIFIED_BACKEND_LOADING_ONLY",
+                on_off(use_backend_dl),
+            ),
             ("GGML_CPU_ALL_VARIANTS", on_off(ggml_cpu_all_variants)),
             ("GGML_BUILD_TESTS", "OFF".to_owned()),
             ("GGML_BUILD_EXAMPLES", "OFF".to_owned()),
             ("GGML_NATIVE", on_off(ggml_native)),
             ("GGML_OPENMP", on_off(effective_openmp)),
             ("GGML_CUDA", on_off(feat_cuda)),
-            ("GGML_VULKAN", on_off(feat_vulkan)),
+            ("GGML_VULKAN", on_off(build_vulkan)),
             ("GGML_HIP", on_off(feat_hip)),
             ("GGML_SYCL", on_off(feat_sycl)),
+            (
+                "OPENASR_BACKEND_ABI_V1",
+                backend_host_abi_fingerprint.clone(),
+            ),
         ];
         if !reset_native_build_dir {
             let cache = build_dir.join("CMakeCache.txt");
@@ -263,6 +298,10 @@ fn main() {
         .arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON")
         .arg(cmake_flag("BUILD_SHARED_LIBS", use_backend_dl))
         .arg(cmake_flag("GGML_BACKEND_DL", use_backend_dl))
+        .arg(cmake_flag(
+            "OPENASR_VERIFIED_BACKEND_LOADING_ONLY",
+            use_backend_dl,
+        ))
         .arg(cmake_flag("GGML_CPU_ALL_VARIANTS", ggml_cpu_all_variants))
         .arg("-DGGML_BUILD_TESTS=OFF")
         .arg("-DGGML_BUILD_EXAMPLES=OFF")
@@ -275,9 +314,12 @@ fn main() {
         // pinning this OFF also prevents a stale CMake cache from silently
         // carrying that rejected experiment into later production builds.
         .arg("-DGGML_CUDA_GRAPHS=OFF")
-        .arg(cmake_flag("GGML_VULKAN", feat_vulkan))
+        .arg(cmake_flag("GGML_VULKAN", build_vulkan))
         .arg(cmake_flag("GGML_HIP", feat_hip))
         .arg(cmake_flag("GGML_SYCL", feat_sycl))
+        .arg(format!(
+            "-DOPENASR_BACKEND_ABI_V1={backend_host_abi_fingerprint}"
+        ))
         .arg(cmake_flag(
             "GGML_ACCELERATE",
             is_macos && !feat_cuda && !feat_vulkan,
@@ -310,7 +352,7 @@ fn main() {
             "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY={}",
             cmake_path(&build_dir.join("bin"))
         ));
-    if feat_vulkan
+    if build_vulkan
         && !is_android
         && let Some(path) = vulkan_sdk.as_deref()
     {
@@ -369,7 +411,7 @@ fn main() {
     // than the default Visual Studio generator's multi-arch project shape, which
     // configures for the HOST platform (x64) and would fight the arm64 cross
     // toolchain. See that block for the ARM-arch and clang-cl requirements.
-    if (feat_hip || feat_vulkan || feat_cuda || is_windows_arm64) && is_windows {
+    if (feat_hip || build_vulkan || feat_cuda || is_windows_arm64) && is_windows {
         configure.arg("-G").arg("Ninja");
     }
     if is_windows_arm64 {
@@ -567,6 +609,11 @@ fn main() {
                 hip_tuning.export_metrics,
             ));
     }
+    // CUDA is still compiled when the Windows host uses BACKEND_DL; only the
+    // final Rust link step is suppressed in that topology. CMake needs the
+    // toolkit, nvcc host compiler, target SM list and tuning flags in both the
+    // static and module builds or the optional ggml-cuda DLL is either
+    // unbuildable or silently built with a different contract.
     if feat_cuda {
         if let Some(path) = cuda_path.as_deref() {
             let cuda_root = cmake_path(path);
@@ -685,7 +732,22 @@ fn main() {
         // to the rerun-if-changed directives.
         println!("cargo:rustc-link-lib=dylib=ggml-base");
         println!("cargo:rustc-link-lib=dylib=ggml");
-        copy_runtime_dlls(&build_dir.join("bin"), &out_dir);
+        stage_windows_backend_dl_artifacts(
+            &build_dir.join("bin"),
+            &out_dir,
+            &backend_host_abi_fingerprint,
+            &backend_host_abi_json,
+            &target,
+            build_vulkan,
+            feat_cuda,
+            feat_hip,
+            feat_sycl,
+            ggml_cpu_all_variants,
+            ggml_native,
+            effective_openmp,
+            &cuda_tuning.summary(),
+            &hip_tuning.summary(),
+        );
     } else {
         println!("cargo:rustc-link-lib=static=ggml");
         println!("cargo:rustc-link-lib=static=ggml-cpu");
@@ -701,7 +763,7 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=MetalKit");
     }
 
-    if feat_cuda {
+    if feat_cuda && !use_backend_dl {
         println!("cargo:rustc-link-lib=static=ggml-cuda");
         println!("cargo:rustc-link-lib=dylib=cuda");
         println!("cargo:rustc-link-lib=dylib=cudart");
@@ -736,7 +798,7 @@ fn main() {
         }
     }
 
-    if feat_vulkan {
+    if feat_vulkan && !use_backend_dl {
         println!("cargo:rustc-link-lib=static=ggml-vulkan");
         if is_windows {
             println!("cargo:rustc-link-lib=dylib=vulkan-1");
@@ -757,7 +819,7 @@ fn main() {
         }
     }
 
-    if feat_hip {
+    if feat_hip && !use_backend_dl {
         println!("cargo:rustc-link-lib=static=ggml-hip");
         println!("cargo:rustc-link-lib=dylib=amdhip64");
         if is_windows {
@@ -784,7 +846,7 @@ fn main() {
         }
     }
 
-    if feat_sycl {
+    if feat_sycl && !use_backend_dl {
         println!("cargo:rustc-link-lib=static=ggml-sycl");
     }
 
@@ -1064,19 +1126,214 @@ fn materialize_musl_libcxx_archives(target: &str, lib_dir: &Path) {
     let _ = fs::remove_file(&stub_binary);
 }
 
-/// Copy the backend-DL runtime DLLs (ggml-base / ggml / ggml-cpu-<variant>) next
-/// to where cargo runs binaries and tests, so they resolve at load time without
-/// a PATH dance. Windows searches the executable's own directory first; cargo
+/// Copy the backend-DL host and every feature-selected backend module next to
+/// where cargo runs binaries and tests, so they resolve at load time without a
+/// PATH dance. Windows searches the executable's own directory first; cargo
 /// emits final bins to `target/<profile>/` and test bins to
 /// `target/<profile>/deps/`, so seed both. Windows-only by construction: under
 /// BUILD_SHARED_LIBS the Windows runtime DLLs land in the cmake RUNTIME dir
 /// (`bin`), while ELF/Mach-O shared objects go to the LIBRARY dir and resolve via
 /// rpath instead — Linux DL packaging is handled separately.
-fn copy_runtime_dlls(bin_dir: &Path, out_dir: &Path) {
+fn emit_backend_host_abi(
+    manifest_dir: &Path,
+    source_dir: &Path,
+    target: &str,
+    backend_dl: bool,
+) -> (String, serde_json::Value) {
+    let backend_impl = source_dir.join("src/ggml-backend-impl.h");
+    let header_paths = [
+        source_dir.join("include/ggml.h"),
+        source_dir.join("include/ggml-backend.h"),
+        source_dir.join("include/ggml-alloc.h"),
+        backend_impl.clone(),
+    ];
+    let headers_sha256 = hash_named_files(&header_paths);
+    let openasr_ffi = manifest_dir.join("src/ggml_runtime/ffi.rs");
+    let openasr_ffi_sha256 = hash_named_files(std::slice::from_ref(&openasr_ffi));
+    let openasr_extension_sha256 = hash_named_files(&[
+        openasr_ffi.clone(),
+        source_dir.join("include/ggml.h"),
+        backend_impl.clone(),
+    ]);
+    let backend_api_version = parse_backend_api_version(&backend_impl);
+    let ggml_revision =
+        read_git_revision(source_dir).unwrap_or_else(|| format!("source-{headers_sha256}"));
+    let crt = if target.ends_with("windows-msvc") {
+        "msvc-md"
+    } else if target.ends_with("windows-gnu") {
+        "gnu"
+    } else {
+        "platform-default"
+    };
+    let default_toolchain = if target.ends_with("windows-msvc") {
+        "msvc-v143"
+    } else if target.ends_with("windows-gnu") {
+        "gnu-w64"
+    } else {
+        "platform-default"
+    };
+    let toolchain = env::var("OPENASR_BACKEND_TOOLCHAIN_CONTRACT")
+        .unwrap_or_else(|_| default_toolchain.to_string());
+    assert!(
+        !toolchain.is_empty()
+            && toolchain.len() <= 128
+            && toolchain
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
+        "OPENASR_BACKEND_TOOLCHAIN_CONTRACT must be a short ASCII contract token"
+    );
+    let compile_flags_contract = format!(
+        "build_shared_libs={}\nggml_backend_dl={}\nverified_backend_loading_only={}\nposition_independent_code=1\nopenasr_backend_abi_export=1\n",
+        u8::from(backend_dl),
+        u8::from(backend_dl),
+        u8::from(backend_dl),
+    );
+    let compile_flags_sha256 = sha256_hex(compile_flags_contract.as_bytes());
+    let build_contract = format!(
+        "schema=2\ntarget={target}\ncrt={crt}\ntoolchain={toolchain}\ncompile_flags_sha256={compile_flags_sha256}\nbackend_dl={}\nshared={}\nbackend_api_version={backend_api_version}\nggml_revision={ggml_revision}\nggml_headers_sha256={headers_sha256}\nopenasr_ffi_sha256={openasr_ffi_sha256}\nopenasr_extension_sha256={openasr_extension_sha256}\n",
+        u8::from(backend_dl),
+        u8::from(backend_dl),
+    );
+    let fingerprint = sha256_hex(build_contract.as_bytes());
+
+    println!("cargo:rustc-env=OPENASR_BACKEND_ABI_SCHEMA_VERSION=2");
+    println!("cargo:rustc-env=OPENASR_BACKEND_HOST_ABI_FINGERPRINT={fingerprint}");
+    println!("cargo:rustc-env=OPENASR_BACKEND_TARGET={target}");
+    println!("cargo:rustc-env=OPENASR_BACKEND_CRT={crt}");
+    println!("cargo:rustc-env=OPENASR_BACKEND_TOOLCHAIN={toolchain}");
+    println!("cargo:rustc-env=OPENASR_BACKEND_COMPILE_FLAGS_SHA256={compile_flags_sha256}");
+    println!("cargo:rustc-env=OPENASR_GGML_BACKEND_API_VERSION={backend_api_version}");
+    println!("cargo:rustc-env=OPENASR_GGML_REVISION={ggml_revision}");
+    println!("cargo:rustc-env=OPENASR_GGML_HEADERS_SHA256={headers_sha256}");
+    println!("cargo:rustc-env=OPENASR_GGML_FFI_SHA256={openasr_ffi_sha256}");
+    println!("cargo:rustc-env=OPENASR_GGML_EXTENSION_SHA256={openasr_extension_sha256}");
+    println!("cargo:rerun-if-env-changed=OPENASR_BACKEND_TOOLCHAIN_CONTRACT");
+    println!("cargo:rerun-if-changed={}", openasr_ffi.display());
+    let json = serde_json::json!({
+        "schema_version": 2,
+        "fingerprint": fingerprint,
+        "target": target,
+        "crt": crt,
+        "toolchain": toolchain,
+        "compile_flags_sha256": compile_flags_sha256,
+        "ggml_backend_api_version": backend_api_version,
+        "ggml_revision": ggml_revision,
+        "ggml_headers_sha256": headers_sha256,
+        "openasr_ffi_sha256": openasr_ffi_sha256,
+        "openasr_extension_sha256": openasr_extension_sha256,
+    });
+    (
+        json["fingerprint"]
+            .as_str()
+            .expect("host ABI fingerprint is a string")
+            .to_string(),
+        json,
+    )
+}
+
+fn hash_named_files(paths: &[PathBuf]) -> String {
+    let mut hasher = Sha256::new();
+    for path in paths {
+        let name = path
+            .file_name()
+            .expect("ABI input must have a file name")
+            .to_string_lossy();
+        let bytes = fs::read(path)
+            .unwrap_or_else(|error| panic!("failed to read ABI input {}: {error}", path.display()));
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn parse_backend_api_version(path: &Path) -> u32 {
+    let text = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    text.lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("#define GGML_BACKEND_API_VERSION ")
+                .and_then(|value| value.trim().parse().ok())
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "GGML_BACKEND_API_VERSION is missing from {}",
+                path.display()
+            )
+        })
+}
+
+fn read_git_revision(source_dir: &Path) -> Option<String> {
+    let dot_git = source_dir.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let text = fs::read_to_string(&dot_git).ok()?;
+        let relative = text.trim().strip_prefix("gitdir:")?.trim();
+        source_dir.join(relative)
+    };
+    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    if is_git_object_id(head) {
+        return Some(head.to_ascii_lowercase());
+    }
+    let reference = head.strip_prefix("ref:")?.trim();
+    let direct = git_dir.join(reference);
+    if let Ok(value) = fs::read_to_string(direct) {
+        let value = value.trim();
+        if is_git_object_id(value) {
+            return Some(value.to_ascii_lowercase());
+        }
+    }
+    let common = fs::read_to_string(git_dir.join("commondir")).ok()?;
+    let common_dir = git_dir.join(common.trim());
+    let value = fs::read_to_string(common_dir.join(reference)).ok()?;
+    let value = value.trim();
+    is_git_object_id(value).then(|| value.to_ascii_lowercase())
+}
+
+fn is_git_object_id(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn stage_windows_backend_dl_artifacts(
+    bin_dir: &Path,
+    out_dir: &Path,
+    backend_host_abi_fingerprint: &str,
+    backend_host_abi_json: &serde_json::Value,
+    target: &str,
+    feat_vulkan: bool,
+    feat_cuda: bool,
+    feat_hip: bool,
+    feat_sycl: bool,
+    ggml_cpu_all_variants: bool,
+    ggml_native: bool,
+    effective_openmp: bool,
+    cuda_tuning: &str,
+    hip_tuning: &str,
+) {
     // out_dir = target/<profile>/build/<pkg>-<hash>/out -> nth(3) = target/<profile>
     let Some(profile_dir) = out_dir.ancestors().nth(3) else {
         return;
     };
+    let cmake_contract = windows_cmake_build_contract(
+        &bin_dir
+            .parent()
+            .expect("CMake runtime directory has a build parent")
+            .join("CMakeCache.txt"),
+        feat_cuda,
+    );
+    let cmake_contract_sha256 = sha256_hex(
+        &serde_json::to_vec(&cmake_contract).expect("serialize Windows CMake build contract"),
+    );
     // Single-config (Ninja) emits the runtime DLLs into bin/; a multi-config
     // generator nests them under bin/Release/. Gather from both.
     let mut dlls: Vec<PathBuf> = Vec::new();
@@ -1089,14 +1346,319 @@ fn copy_runtime_dlls(bin_dir: &Path, out_dir: &Path) {
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("dll"))
         }));
     }
+    let by_name = |wanted: &str| {
+        dlls.iter().find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(wanted))
+        })
+    };
+    let mut bundled = dlls
+        .iter()
+        .filter(|path| {
+            path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy().to_ascii_lowercase();
+                name == "ggml.dll"
+                    || name == "ggml-base.dll"
+                    || name.starts_with("ggml-cpu")
+                    || (feat_vulkan && name == "ggml-vulkan.dll")
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    bundled.sort();
+
+    let manifest_files = bundled
+        .iter()
+        .map(|path| {
+            let filename = path
+                .file_name()
+                .expect("bundled backend DLL has a filename")
+                .to_string_lossy()
+                .to_string();
+            let lower = filename.to_ascii_lowercase();
+            let provider = if lower.starts_with("ggml-cpu") {
+                "cpu"
+            } else if lower == "ggml-vulkan.dll" {
+                "vulkan"
+            } else {
+                "host"
+            };
+            let bytes = fs::read(path)
+                .unwrap_or_else(|error| panic!("hash bundled backend {}: {error}", path.display()));
+            let image = pe_authenticode::pe_image_identity(&bytes).unwrap_or_else(|error| {
+                panic!("derive stable PE identity for {}: {error}", path.display())
+            });
+            (
+                serde_json::json!({
+                    "filename": filename.clone(),
+                    "provider": provider,
+                    "sha256": sha256_hex(&bytes),
+                    "size_bytes": bytes.len(),
+                    "image_sha256": image.sha256.clone(),
+                    "image_size_bytes": image.size_bytes,
+                }),
+                pe_authenticode::BackendBundleContractEntry {
+                    filename,
+                    provider: provider.to_string(),
+                    image_sha256: image.sha256,
+                    image_size_bytes: image.size_bytes,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let bundled_contract_sha256 = pe_authenticode::backend_bundle_contract_sha256(
+        backend_host_abi_fingerprint,
+        &manifest_files
+            .iter()
+            .map(|(_, contract)| contract.clone())
+            .collect::<Vec<_>>(),
+    );
+    println!("cargo:rustc-env=OPENASR_BUNDLED_BACKEND_CONTRACT_SHA256={bundled_contract_sha256}");
+    let mut bundled_manifest = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 2,
+        "host_abi_fingerprint": backend_host_abi_fingerprint,
+        "bundle_contract_sha256": bundled_contract_sha256,
+        "files": manifest_files
+            .iter()
+            .map(|(file, _)| file)
+            .collect::<Vec<_>>(),
+    }))
+    .expect("serialize bundled backend manifest");
+    bundled_manifest.push(b'\n');
+    let cuda_targets = feat_cuda.then(cuda_gpu_targets).unwrap_or_default();
+    let hip_targets = feat_hip.then(hip_gpu_targets).unwrap_or_default();
+    let build_manifest = serde_json::json!({
+        "schema_version": 1,
+        "host_abi": backend_host_abi_json,
+        "target": target,
+        "topology": "neutral-backend-dl",
+        "providers": {
+            "cpu": true,
+            "vulkan": feat_vulkan,
+            "cuda": feat_cuda,
+            "hip": feat_hip,
+            "sycl": feat_sycl,
+        },
+        "backend_targets": {
+            "cuda": cuda_targets
+                .split(';')
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("sm_{value}"))
+                .collect::<Vec<_>>(),
+            "hip": hip_targets
+                .split(';')
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>(),
+        },
+        "build_flags": {
+            "backend_dl": true,
+            "shared": true,
+            "verified_backend_loading_only": true,
+            "cpu_all_variants": ggml_cpu_all_variants,
+            "native": ggml_native,
+            "openmp": effective_openmp,
+            "cuda_tuning": cuda_tuning,
+            "hip_tuning": hip_tuning,
+        },
+        "cmake_contract": cmake_contract,
+        "cmake_contract_sha256": cmake_contract_sha256,
+        "bundled_backend_contract_sha256": bundled_contract_sha256,
+    });
+    let mut host_abi_bytes =
+        serde_json::to_vec_pretty(backend_host_abi_json).expect("serialize host ABI manifest");
+    host_abi_bytes.push(b'\n');
+    let mut build_manifest_bytes =
+        serde_json::to_vec_pretty(&build_manifest).expect("serialize backend build manifest");
+    build_manifest_bytes.push(b'\n');
+
+    for required in ["ggml.dll", "ggml-base.dll"] {
+        assert!(
+            by_name(required).is_some(),
+            "missing required BACKEND_DL host DLL {required}"
+        );
+    }
+    assert!(
+        bundled.iter().any(|path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .to_ascii_lowercase()
+                    .starts_with("ggml-cpu")
+            })
+        }),
+        "missing required BACKEND_DL CPU plugin"
+    );
+    if feat_vulkan {
+        assert!(
+            by_name("ggml-vulkan.dll").is_some(),
+            "missing bundled Vulkan rescue plugin"
+        );
+    }
+
     for dest in [profile_dir.to_path_buf(), profile_dir.join("deps")] {
-        let _ = fs::create_dir_all(&dest);
-        for dll in &dlls {
-            if let Some(name) = dll.file_name() {
-                let _ = fs::copy(dll, dest.join(name));
+        fs::create_dir_all(&dest).expect("create BACKEND_DL runtime directory");
+        // Optional accelerators are never application-directory plugins. Clear
+        // stale copies left by a previous build topology before staging the
+        // neutral host and bundled rescue set.
+        for optional in ["ggml-cuda.dll", "ggml-hip.dll"] {
+            match fs::remove_file(dest.join(optional)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("remove stale optional backend {optional}: {error}"),
             }
         }
+        for dll in &bundled {
+            let name = dll.file_name().expect("runtime DLL has a filename");
+            fs::copy(dll, dest.join(name)).unwrap_or_else(|error| {
+                panic!("stage bundled backend DLL {}: {error}", dll.display())
+            });
+        }
+        fs::write(
+            dest.join("openasr-backend-bundle-v1.json"),
+            &bundled_manifest,
+        )
+        .expect("write bundled backend manifest");
+        fs::write(
+            dest.join("openasr-backend-host-abi-v1.json"),
+            &host_abi_bytes,
+        )
+        .expect("write backend host ABI manifest");
+        fs::write(
+            dest.join("openasr-backend-build-v1.json"),
+            &build_manifest_bytes,
+        )
+        .expect("write backend build manifest");
     }
+
+    for (enabled, provider, filename) in [
+        (feat_cuda, "cuda", "ggml-cuda.dll"),
+        (feat_hip, "hip", "ggml-hip.dll"),
+    ] {
+        if !enabled {
+            continue;
+        }
+        let source = by_name(filename)
+            .unwrap_or_else(|| panic!("missing optional backend module {filename}"));
+        let dest = profile_dir.join("openasr-backend-packs").join(provider);
+        fs::create_dir_all(&dest).expect("create optional backend pack staging directory");
+        fs::copy(source, dest.join(filename)).unwrap_or_else(|error| {
+            panic!(
+                "stage optional backend module {}: {error}",
+                source.display()
+            )
+        });
+        fs::write(
+            dest.join("openasr-backend-host-abi-v1.json"),
+            &host_abi_bytes,
+        )
+        .expect("write optional backend host ABI manifest");
+        fs::write(
+            dest.join("openasr-backend-build-v1.json"),
+            &build_manifest_bytes,
+        )
+        .expect("write optional backend build manifest");
+    }
+}
+
+fn windows_cmake_build_contract(
+    cache_path: &Path,
+    require_cuda_compiler: bool,
+) -> serde_json::Value {
+    let cache = fs::read_to_string(cache_path).unwrap_or_else(|error| {
+        panic!(
+            "read configured Windows CMake cache {}: {error}",
+            cache_path.display()
+        )
+    });
+    let mut entries = BTreeMap::new();
+    for name in [
+        "CMAKE_BUILD_TYPE",
+        "CMAKE_GENERATOR",
+        "CMAKE_GENERATOR_PLATFORM",
+        "CMAKE_GENERATOR_TOOLSET",
+        "CMAKE_MSVC_RUNTIME_LIBRARY",
+        "BUILD_SHARED_LIBS",
+        "GGML_BACKEND_DL",
+        "OPENASR_VERIFIED_BACKEND_LOADING_ONLY",
+        "GGML_CPU_ALL_VARIANTS",
+        "GGML_NATIVE",
+        "GGML_OPENMP",
+        "GGML_CUDA",
+        "GGML_CUDA_GRAPHS",
+        "GGML_VULKAN",
+        "GGML_HIP",
+        "GGML_SYCL",
+        "CMAKE_CUDA_ARCHITECTURES",
+        "AMDGPU_TARGETS",
+    ] {
+        if let Some(value) = windows_cmake_cache::cache_value(&cache, name) {
+            entries.insert(name.to_string(), value.to_string());
+        }
+    }
+    for required in [
+        "CMAKE_BUILD_TYPE",
+        "CMAKE_GENERATOR",
+        "BUILD_SHARED_LIBS",
+        "GGML_BACKEND_DL",
+        "OPENASR_VERIFIED_BACKEND_LOADING_ONLY",
+        "GGML_CPU_ALL_VARIANTS",
+        "GGML_NATIVE",
+        "GGML_OPENMP",
+        "GGML_CUDA",
+        "GGML_CUDA_GRAPHS",
+        "GGML_VULKAN",
+        "GGML_HIP",
+        "GGML_SYCL",
+    ] {
+        assert!(
+            entries.contains_key(required),
+            "configured Windows CMake cache is missing release contract field {required}"
+        );
+    }
+
+    let mut compilers = BTreeMap::new();
+    for (role, key, required) in [
+        ("c", "CMAKE_C_COMPILER", true),
+        ("cxx", "CMAKE_CXX_COMPILER", true),
+        ("cuda", "CMAKE_CUDA_COMPILER", require_cuda_compiler),
+    ] {
+        match windows_cmake_cache::cache_value(&cache, key) {
+            Some(path) => {
+                compilers.insert(role.to_string(), windows_tool_identity(Path::new(path)));
+            }
+            None if required => panic!("configured Windows CMake cache is missing {key}"),
+            None => {}
+        }
+    }
+    let cmake_version = Command::new("cmake")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| text.lines().next().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    serde_json::json!({
+        "schema_version": 1,
+        "cmake_version": cmake_version,
+        "entries": entries,
+        "compilers": compilers,
+    })
+}
+
+fn windows_tool_identity(path: &Path) -> serde_json::Value {
+    let bytes = fs::read(path)
+        .unwrap_or_else(|error| panic!("read configured compiler {}: {error}", path.display()));
+    let filename = path
+        .file_name()
+        .expect("configured compiler has a filename")
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    serde_json::json!({
+        "filename": filename,
+        "sha256": sha256_hex(&bytes),
+        "size_bytes": bytes.len(),
+    })
 }
 
 /// Decide whether to pass `-DGGML_NATIVE=ON` (`-march=native`-style host CPU

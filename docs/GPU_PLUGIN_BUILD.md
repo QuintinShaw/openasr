@@ -1,11 +1,22 @@
 # Building the GPU backend plugins (Vulkan / HIP / CUDA)
 
-OpenASR's Windows engine is a `GGML_BACKEND_DL` build: a CPU core
-(`ggml-base.dll` + `ggml.dll` + `ggml-cpu-*.dll`) that loads GPU backends as
-runtime plugin DLLs from `OPENASR_HOME/backends/<vendor>/<version>/`, with
-automatic CPU fallback. The GPU plugins are built **separately** from the same
-vendored ggml commit as the core (so the `ggml-base` C ABI matches across the
-DLL boundary) and distributed as downloads.
+OpenASR's terminal Windows topology is one neutral `GGML_BACKEND_DL` host:
+`ggml-base.dll`, `ggml.dll`, the CPU variants, and Vulkan are installer-owned;
+CUDA and HIP are optional signed backend packs. The host loads the bundled
+CPU/Vulkan rescue set from its verified application directory and at most one
+selected optional pack from its verified, content-addressed directory under
+`OPENASR_HOME/backends/`. It never scans every installed pack or accepts a
+plugin merely because its filename looks compatible.
+
+Every module is built from the same vendored ggml revision and generated host
+ABI contract. Activation also binds provider, SM/gfx targets, minimum driver,
+plugin bytes, and vendor-tree bytes. A matching ABI string is necessary but is
+not sufficient: installation rehashes every declared file and activation
+probes the real exported backend API before committing the selected pointer.
+
+The one-release migration rail still produces whole, statically linked
+CUDA/HIP sidecars. Those sidecars are rollback artifacts only and must never be
+mixed into the neutral host process.
 
 This document records the **verified** standalone build recipes and the
 local validation results on an RX 9060 XT (gfx1200, RDNA4) device.
@@ -85,20 +96,37 @@ bump the vendored ggml without re-validating the workaround.
 
 ### Satellite DLLs (clean-machine distribution)
 
-`ggml-hip.dll` imports `amdhip64_7.dll`, `libhipblas.dll`, `rocblas.dll`. On a
-dev box with ROCm on `PATH` these resolve automatically. The shipped pack must
-bundle them next to `ggml-hip.dll` (the `_7` suffix is tied to ROCm 7.1) plus
-the whole `bin\rocblas\library\` Tensile directory (~150 MB), and load via
-`LoadLibraryEx(LOAD_WITH_ALTERED_SEARCH_PATH)` after stripping the
-`Zone.Identifier` MOTW. That packaging step is tracked for the distribution
-phase.
+`ggml-hip.dll` imports the versioned HIP runtime, hipBLAS, and rocBLAS DLLs.
+The shipped pack declares those files plus the complete rocBLAS Tensile
+library tree in the signed catalog. The installer stores the vendor tree by
+content hash and the loader uses an absolute plugin path with restricted DLL
+search rooted at that verified tree. It does not depend on the process `PATH`.
 
-## CUDA (baked-in via `--features cuda`, all platforms)
+Application downloads normally do not create a `Zone.Identifier` stream.
+Installation may detect and report one; it may remove it only from an
+individually verified file when a Windows loading test proves it is necessary.
+Recursive, unconditional MOTW removal is not part of the trust model.
 
-Unlike Vulkan and HIP above, CUDA is not a `GGML_BACKEND_DL` runtime plugin on
-any platform: enabling the `cuda` Cargo feature bakes `ggml-cuda` directly into
-`openasr-cli`/`openasr-core` at compile time, and `crates/openasr-core/build.rs`
-(`cuda_gpu_targets_from_raw`) sets `-DCMAKE_CUDA_ARCHITECTURES` for that build.
+## CUDA plugin (`ggml-cuda.dll`, NVIDIA)
+
+On Windows, enabling the `cuda` Cargo feature without the explicit
+`legacy-windows-static-sidecar` feature builds a neutral host and stages
+`ggml-cuda.dll` as a separate optional backend pack. The release workflow
+extracts that DLL, stages the CUDA runtime/cuBLAS vendor tree separately,
+compiles one signed catalog entry, and publishes both byte identities. Other
+platforms retain their platform-specific static distribution topology.
+
+For a local Windows build, use the normal release command and select the GPU
+targets explicitly when validating one machine:
+
+```text
+set OPENASR_CUDA_GPU_TARGETS=86
+cargo build -p openasr-cli --release --features cuda
+```
+
+The resulting optional module is staged under
+`target\release\openasr-backend-packs\cuda\ggml-cuda.dll`; the application
+directory contains only the neutral host and bundled rescue modules.
 
 The default arch list is `75;80;86;89;90` -- sm_75 (Turing: RTX 20xx, GTX 16xx,
 T4, 2080 Ti) through sm_90 (Hopper). That is also this build's **hardware
@@ -114,7 +142,19 @@ able to use the Vulkan plugin instead, same as any other vendor -- this is the
 expected behavior of the cross-vendor Vulkan path above, not something
 separately verified against that specific old hardware.
 
-## Local validation (RX 9060 XT / gfx1200)
+## Validation boundary
+
+The current Windows release gate builds and packages both optional providers,
+but hardware claims remain provider-specific. CUDA and Vulkan have current
+neutral-host installation, activation, enumeration, exact-placement, and real
+transcription evidence on an RTX 3060 (sm_86). A machine without supported AMD
+hardware may prove only the HIP build/package/catalog/loader contract; it must
+not report HIP inference as passed.
+
+### Historical RX 9060 XT / gfx1200 measurement
+
+The following measurement predates the current release identity. It guards the
+HIP tuning choices, but it does not replace a current release-SHA hardware run.
 
 Both plugins were staged into `OPENASR_HOME/backends/<vendor>/<ver>/` and loaded
 by the engine (`openasr doctor`): the Vulkan and ROCm devices enumerate and

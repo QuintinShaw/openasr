@@ -251,7 +251,7 @@ def main(argv: list[str]) -> int:
         template = CAPABILITY_TEMPLATE
     else:
         template = TEMPLATE
-    text = template.read_text()
+    text = template.read_text(encoding="utf-8")
     repl = {
         "pipeline_tag": pipeline_tag_for_catalog(catalog, prose),
         "upstream_license_id": catalog["license_name"],
@@ -299,6 +299,8 @@ def main(argv: list[str]) -> int:
     }
     for k, v in repl.items():
         text = text.replace("{{" + k + "}}", str(v))
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     sys.stdout.write(text)
     return 0
 

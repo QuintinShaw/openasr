@@ -18,6 +18,7 @@ class RenderCardTest(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, str(SCRIPT), "moonshine-tiny"],
             text=True,
+            encoding="utf-8",
             capture_output=True,
             check=False,
         )
@@ -105,6 +106,7 @@ class RenderCardTest(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, str(SCRIPT), "diarizen-large-s80-v2"],
             text=True,
+            encoding="utf-8",
             capture_output=True,
             check=False,
         )
@@ -134,6 +136,7 @@ class RenderCardTest(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, str(SCRIPT), "qwen3-forced-aligner-0.6b"],
             text=True,
+            encoding="utf-8",
             capture_output=True,
             check=False,
         )

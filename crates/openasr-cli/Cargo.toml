@@ -22,6 +22,9 @@ hip = ["openasr-core/hip"]
 sycl = ["openasr-core/sycl"]
 openmp = ["openasr-core/openmp"]
 native = ["openasr-core/native"]
+# One-release compatibility rail for the independently packaged static
+# Windows sidecars. The normal Windows build is the neutral BACKEND_DL host.
+legacy-windows-static-sidecar = ["openasr-core/legacy-windows-static-sidecar"]
 
 [dependencies]
 anyhow.workspace = true

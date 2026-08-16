@@ -12,6 +12,7 @@ mod catalog_series;
 #[cfg(test)]
 mod cuda_targets;
 mod http;
+mod pe_authenticode;
 #[cfg(test)]
 mod windows_cmake_cache;
 
@@ -47,6 +48,14 @@ pub use arch::{
     XASR_ZIPFORMER_DECODE_POLICY_ID, XASR_ZIPFORMER_GGML_ADAPTER_ID,
     XASR_ZIPFORMER_GGML_ARCHITECTURE_ID, XASR_ZIPFORMER_TOKENIZER_ID,
 };
+pub use backend_distribution::{
+    ACTIVATED_BACKEND_SCHEMA_VERSION, ActivatedBackendPack, BACKEND_HOST_ABI_SCHEMA_VERSION,
+    BackendActivationError, BackendHostAbi, BackendPluginStatus, activate_installed_backend_pack,
+    activate_installed_backend_pack_auto, activated_backend_path, backend_plugin_status,
+    deactivate_backend_pack, install_and_activate_backend_pack,
+    install_and_activate_backend_provider, install_backend_pack_from_catalog,
+    read_activated_backend,
+};
 pub(crate) mod audio;
 pub mod family_inventory;
 pub use family_inventory::{
@@ -56,6 +65,7 @@ pub use family_inventory::{
 // `pub` (not `pub(crate)`): the desktop app reaches this by path
 // (`openasr_core::backend_manifest::verify_and_parse`) to verify the
 // downloaded inference-kernel manifest -- see the module doc comment.
+pub mod backend_distribution;
 pub mod backend_manifest;
 pub(crate) mod batch;
 pub(crate) mod benchmark;
@@ -211,18 +221,19 @@ pub use device::types::{CapabilityClass, DeviceCapabilities};
 pub use download_source::{DownloadSource, DownloadSourcePref, resolve_chain};
 pub use format::{ResponseFormat, render_transcription};
 pub use ggml_runtime::{
-    GGUF_C_PARSER_SANDBOX_HELPER_ARG, GgmlBackend, GgmlBackendDevice, GgmlBackendKind,
-    GgmlCpuBinaryOp, GgmlCpuFeatures, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
-    GgmlPackageExtensionHint, GgmlPackageFormat, GgmlPackageModelIdentityProbe, GgmlPackageProbe,
-    GgmlPackageProbeError, GgmlRuntimeError, GgmlRuntimeInfo, GgmlRuntimeSource,
+    BackendPluginActivationError, GGUF_C_PARSER_SANDBOX_HELPER_ARG, GgmlBackend, GgmlBackendDevice,
+    GgmlBackendKind, GgmlCpuBinaryOp, GgmlCpuFeatures, GgmlCpuGraphConfig, GgmlCpuGraphError,
+    GgmlCpuGraphRunner, GgmlPackageExtensionHint, GgmlPackageFormat, GgmlPackageModelIdentityProbe,
+    GgmlPackageProbe, GgmlPackageProbeError, GgmlRuntimeError, GgmlRuntimeInfo, GgmlRuntimeSource,
     GgmlRuntimeSourcePathError, GgufCParserSandboxError, GgufHostTensorPayload, GgufMetadata,
     GgufMetadataReadError, GgufMetadataValue, GgufRuntimeSourcePreflight, GgufTensorDataReadError,
     GgufTensorDataReader, GgufTensorIndex, GgufTensorIndexReadError, GgufTensorMetadata,
-    OPENASR_RUNTIME_PACK_EXTENSION, RuntimeSourceMetadataAndTensorIndexPreflightError,
-    ggml_available_devices, ggml_hip_tuning_summary, ggml_native_build_enabled,
-    ggml_runtime_boot_summary, ggml_runtime_info, has_openasr_runtime_pack_extension,
-    probe_ggml_package_model_identity, probe_ggml_package_path, read_gguf_metadata,
-    read_gguf_metadata_from_runtime_source, read_gguf_tensor_index,
+    OPENASR_RUNTIME_PACK_EXTENSION, OPTIONAL_BACKEND_PACK_ENV,
+    RuntimeSourceMetadataAndTensorIndexPreflightError, backend_plugin_activation_status,
+    bundled_backend_activation_status, ggml_available_devices, ggml_hip_tuning_summary,
+    ggml_native_build_enabled, ggml_runtime_boot_summary, ggml_runtime_info,
+    has_openasr_runtime_pack_extension, probe_ggml_package_model_identity, probe_ggml_package_path,
+    read_gguf_metadata, read_gguf_metadata_from_runtime_source, read_gguf_tensor_index,
     read_gguf_tensor_index_from_runtime_source, render_gguf_c_parser_sandbox_child_output,
     resolve_request_execution_route, validate_ggml_runtime_source_path,
 };
@@ -345,9 +356,11 @@ pub use models::{
 };
 pub use output::{OutputWriteError, atomic_write_text};
 pub use pull::{
-    BackendFileFormat, DefaultPackPointer, InstalledBackend, InstalledPack, LegacyMigrationFailure,
-    LegacyMigrationReport, ModelPackPreflightReceipt, PullError, PullModelPackRequest,
-    PullProgress, available_disk_space_bytes, default_pack_pointer_path, install_backend_pack,
+    BackendFileFormat, BackendPackDownloadPlan, BackendStoreGcReport, DefaultPackPointer,
+    InstalledBackend, InstalledPack, LegacyMigrationFailure, LegacyMigrationReport,
+    ModelPackPreflightReceipt, PullError, PullModelPackRequest, PullProgress,
+    available_disk_space_bytes, backend_artifact_fingerprint, backend_pack_download_plan,
+    default_pack_pointer_path, gc_backend_store, install_backend_pack,
     install_catalog_model_pack_from_path,
     install_catalog_model_pack_from_path_with_execution_services, install_model_pack_from_path,
     install_model_pack_from_path_with_execution_services, list_installed_packs,
@@ -395,10 +408,11 @@ pub use registry::{
     load_registry, model_cards_from_catalog, model_install_license_decision,
     model_reference_matches_resolved_source, model_refs_match_with_optional_tag_alias,
     parse_model_catalog, parse_model_ref, preview_local_catalog_file_with_identity,
-    recommend_catalog_quant, resolve_catalog_backend_pull, resolve_catalog_pull,
-    resolve_catalog_pull_with_profile, resolve_local_catalog_env_override,
-    resolve_registry_model_ref, resolve_runtime_catalog, resolve_runtime_model_ref,
-    runtime_registry,
+    recommend_catalog_quant, resolve_catalog_backend_pull, resolve_catalog_backend_pull_for_host,
+    resolve_catalog_pull, resolve_catalog_pull_with_profile,
+    resolve_compatible_catalog_backend_pull, resolve_compatible_catalog_backend_pull_for_driver,
+    resolve_local_catalog_env_override, resolve_registry_model_ref, resolve_runtime_catalog,
+    resolve_runtime_model_ref, runtime_registry,
 };
 pub use remote_compute::{
     certificate_fingerprint_sha256, pairing_safety_code_for_certificate_fingerprint,

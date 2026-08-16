@@ -86,7 +86,9 @@ fn write_content_addressed_moonshine_ref(home: &std::path::Path) -> std::path::P
     std::fs::remove_file(&staging).unwrap();
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
     let object = home
-        .join("models/objects/sha256")
+        .join("models")
+        .join("objects")
+        .join("sha256")
         .join(&sha256)
         .join("content");
     std::fs::create_dir_all(object.parent().unwrap()).unwrap();
@@ -3639,8 +3641,8 @@ fn oversized_streaming_multipart_request(total_file_bytes: u64) -> Request<Body>
 /// This drives the *actual* running process (via `oneshot`, same process as
 /// the test) with a body streamed from cheap `Bytes` clones -- so the input
 /// construction itself doesn't add O(file) memory that would muddy the
-/// measurement -- and samples RSS with `ps`, which is available in this
-/// project's macOS and Linux CI targets.
+/// measurement -- and samples RSS through open-core's cross-platform process
+/// probe (procfs/Mach/Win32), avoiding shell-tool availability differences.
 #[tokio::test]
 async fn transcriptions_large_upload_memory_stays_bounded() {
     let temp = tempfile::tempdir().unwrap();
@@ -3699,15 +3701,8 @@ async fn transcriptions_large_upload_memory_stays_bounded() {
 }
 
 fn process_rss_kb() -> u64 {
-    let pid = std::process::id().to_string();
-    let output = std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid])
-        .output()
-        .expect("`ps` should be available to sample this test process's RSS");
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .unwrap_or_else(|error| panic!("could not parse `ps -o rss=` output: {error}"))
+    openasr_core::current_rss_bytes().expect("this test platform must expose current process RSS")
+        / 1024
 }
 
 /// Builds a request that streams `total_file_bytes` of zeroed content as a

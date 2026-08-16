@@ -17,6 +17,16 @@ pub(crate) fn write_file_atomically(path: &Path, contents: &[u8]) -> io::Result<
     )
 }
 
+/// Atomically promotes an already-written same-directory file over `path`.
+/// The caller is responsible for syncing the source contents before calling;
+/// this helper provides replace-existing semantics on Windows and performs the
+/// best-effort parent-directory sync used by the ordinary atomic writer.
+pub(crate) fn replace_file_atomically(from: &Path, path: &Path) -> io::Result<()> {
+    RealAtomicFileSystem.rename(from, path)?;
+    RealAtomicFileSystem.sync_parent_dir_best_effort(path);
+    Ok(())
+}
+
 /// Atomically writes `contents` to `path`, creating the temporary file with
 /// owner-only (0600) permissions from the moment it is created (not
 /// after-the-fact via a post-rename `chmod`), then re-asserting 0600 on the

@@ -146,7 +146,7 @@ pub(crate) fn cache_matches_contract(
     })
 }
 
-fn cache_value<'a>(cache: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn cache_value<'a>(cache: &'a str, name: &str) -> Option<&'a str> {
     cache.lines().find_map(|line| {
         let (key_and_type, value) = line.split_once('=')?;
         let (key, _) = key_and_type.split_once(':')?;

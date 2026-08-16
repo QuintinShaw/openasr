@@ -1,11 +1,70 @@
 use std::{
-    ffi::{CStr, c_char, c_int, c_void},
+    collections::HashSet,
+    ffi::{CStr, CString, c_char, c_int, c_void},
+    path::{Component, Path, PathBuf},
     ptr::{self, NonNull},
 };
 
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::ffi;
+use crate::{
+    CatalogBackendVendor, ExecutionProvider,
+    backend_distribution::{ActivatedBackendPack, BackendHostAbi, read_activated_backend},
+    load_local_catalog_file_with_identity, load_model_catalog,
+    pe_authenticode::{
+        BackendBundleContractEntry, backend_bundle_contract_sha256, pe_image_identity,
+    },
+    pull::{
+        backend_artifact_fingerprint, backend_pack_install_dir, read_and_verify_installed_backend,
+    },
+    resolve_catalog_backend_pull, resolve_compatible_catalog_backend_pull_for_driver,
+    resolve_local_catalog_env_override,
+};
+
+pub const OPTIONAL_BACKEND_PACK_ENV: &str = "OPENASR_BACKEND_PLUGIN_ID";
+#[cfg(all(feature = "backend-plugin-development", debug_assertions))]
+const OPTIONAL_BACKEND_TARGET_ENV: &str = "OPENASR_BACKEND_PLUGIN_TARGET";
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum BackendPluginActivationError {
+    #[error("an optional backend plugin was selected in a host without GGML_BACKEND_DL")]
+    DynamicLoadingUnavailable,
+    #[error("OpenASR home could not be resolved: {0}")]
+    Home(String),
+    #[error("the signed backend catalog could not be loaded: {0}")]
+    Catalog(String),
+    #[error("backend activation state is invalid: {0}")]
+    ActivationState(String),
+    #[error("backend plugin environment overrides are available only in debug builds")]
+    DevelopmentOverrideUnavailable,
+    #[error("the bundled backend directory could not be resolved safely: {0}")]
+    BundledDirectory(String),
+    #[error("backend pack '{backend_id}' could not be resolved: {reason}")]
+    Resolution { backend_id: String, reason: String },
+    #[error("backend pack '{backend_id}' is not compatible with this host ABI")]
+    HostAbiMismatch { backend_id: String },
+    #[error(
+        "backend pack '{backend_id}' is not installed or failed integrity verification: {reason}"
+    )]
+    InstalledPackInvalid { backend_id: String, reason: String },
+    #[error("backend pack '{backend_id}' resolved outside its verified install directory")]
+    EscapedInstallDirectory { backend_id: String },
+    #[error("backend pack '{backend_id}' has a path that cannot be represented as UTF-8")]
+    NonUtf8Path { backend_id: String },
+    #[error("backend pack '{backend_id}' could not be loaded by ggml")]
+    LoadFailed { backend_id: String },
+    #[error("backend pack '{backend_id}' failed live device/driver attestation")]
+    LiveProbeFailed { backend_id: String },
+    #[error("backend pack '{backend_id}' registered '{actual}', expected provider '{expected}'")]
+    ProviderMismatch {
+        backend_id: String,
+        expected: &'static str,
+        actual: String,
+    },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GgmlRuntimeInfo {
@@ -97,6 +156,8 @@ pub struct GgmlCpuFeatures {
 pub enum GgmlRuntimeError {
     #[error("ggml backend is unavailable: {0}")]
     BackendUnavailable(&'static str),
+    #[error(transparent)]
+    BackendPluginActivation(#[from] BackendPluginActivationError),
 }
 
 pub struct GgmlBackend {
@@ -322,6 +383,12 @@ enum AcceleratedDeviceSelectionRule {
     LowVramFallback,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActivatedBackendRuntime {
+    backend_id: String,
+    provider: ExecutionProvider,
+}
+
 impl AcceleratedDeviceSelectionRule {
     /// The `rule=` value used in the boot summary's `gpu_selection` field.
     fn boot_log_label(self) -> &'static str {
@@ -349,16 +416,50 @@ fn select_accelerated_device(
     devices: &[GgmlBackendDevice],
     is_accelerated: impl Fn(GgmlBackendKind) -> bool,
 ) -> Option<(&GgmlBackendDevice, AcceleratedDeviceSelectionRule)> {
+    select_accelerated_device_for_provider(
+        devices,
+        is_accelerated,
+        activated_backend_execution_provider(),
+    )
+}
+
+fn select_accelerated_device_for_provider(
+    devices: &[GgmlBackendDevice],
+    is_accelerated: impl Fn(GgmlBackendKind) -> bool,
+    preferred_provider: Option<ExecutionProvider>,
+) -> Option<(&GgmlBackendDevice, AcceleratedDeviceSelectionRule)> {
+    // An activated optional pack is an explicit process-wide provider choice,
+    // not merely another device appended to the registry.  Bundled Vulkan is
+    // registered first as the rescue rail, so registry ordinal alone would
+    // otherwise make a successfully activated CUDA/HIP pack look selected
+    // while Auto inference still ran on Vulkan.  Constrain ranking to the
+    // activated provider when it has a live accelerated device; if inventory
+    // ever drifts, fall back to the ordinary rescue ranking rather than
+    // manufacturing a device.
+    let has_preferred_provider = preferred_provider.is_some_and(|provider| {
+        devices.iter().any(|device| {
+            is_accelerated(device.kind)
+                && ExecutionProvider::from_backend_name(&device.name) == provider
+        })
+    });
+    let eligible = |device: &&GgmlBackendDevice| {
+        is_accelerated(device.kind)
+            && (!has_preferred_provider
+                || preferred_provider.is_some_and(|provider| {
+                    ExecutionProvider::from_backend_name(&device.name) == provider
+                }))
+    };
     let kind_pick = devices
         .iter()
-        .filter(|device| is_accelerated(device.kind))
+        .filter(eligible)
         .min_by_key(|device| accelerated_device_rank(device.kind))?;
     if device_reports_viable_free_vram(kind_pick) {
         return Some((kind_pick, AcceleratedDeviceSelectionRule::KindRanking));
     }
     match devices
         .iter()
-        .filter(|device| is_accelerated(device.kind) && device_reports_viable_free_vram(device))
+        .filter(eligible)
+        .filter(|device| device_reports_viable_free_vram(device))
         .min_by_key(|device| accelerated_device_rank(device.kind))
     {
         Some(viable_pick) => Some((viable_pick, AcceleratedDeviceSelectionRule::LowVramSkipped)),
@@ -380,93 +481,725 @@ pub(crate) fn preferred_accelerated_device(
     select_accelerated_device(devices, is_accelerated).map(|(device, _rule)| device)
 }
 
-/// Register backend plugin DLLs once per process before the first registry
-/// query. Under `GGML_BACKEND_DL` the static `GGML_USE_*` backend registration
-/// is compiled out, so without this the registry is empty and every
-/// init/enumeration call returns nothing.
-///
-/// In a statically-linked build (macOS, Linux, GPU-feature Windows builds —
-/// `ggml_backend_dl_build_enabled() == false`) the compute backend is already
-/// registered at static-init time, so the directory scan is NOT run: it is not
-/// a harmless no-op. `ggml_backend_load_all` dlopens every `ggml-*.dll`/`.so`
-/// sitting next to the exe, and a desktop bundle can legitimately ship the CPU
-/// `BACKEND_DL` plugin DLLs next to a statically-linked GPU exe (the shell app
-/// needs them for other components). Loading that plugin pulls a second copy
-/// of ggml core into the process, and the two copies' global state collide at
-/// `ggml.cpp:22 GGML_ASSERT(prev != ggml_uncaught_exception)`, which fastfails
-/// the whole process (0xc0000409) rather than returning an error. Skipping the
-/// scan for static builds avoids that mixed-build crash while keeping the
-/// scan for genuine `BACKEND_DL` builds, which have no static backend and
-/// would otherwise register nothing at all.
-/// Idempotent and process-wide.
+/// Register backend modules once per process before the first registry query.
+/// A dynamic host loads only the bundled CPU/Vulkan rescue modules and at most
+/// one exact, signed, integrity-verified optional pack. Static hosts never load
+/// modules, avoiding the double-ggml global-state collision seen when a static
+/// GPU host loads a dynamic module.
 pub(crate) fn ensure_backends_loaded() {
-    use std::sync::OnceLock;
-    static LOADED: OnceLock<()> = OnceLock::new();
-    LOADED.get_or_init(|| {
-        if ggml_backend_dl_build_enabled() {
-            // Base-installer plugins next to the exe + GGML_BACKEND_PATH (the
-            // CPU variants on Windows). Only safe/needed under GGML_BACKEND_DL,
-            // where no backend is statically registered — see the doc comment.
-            unsafe { ffi::ggml_backend_load_all() };
-        }
-        // Downloaded GPU packs under OPENASR_HOME/backends/<vendor>/<version>/.
-        load_installed_backend_plugins();
+    let _ = bundled_backend_activation_cell().get_or_init(load_bundled_backend_modules);
+    backend_plugin_activation_cell().get_or_init(|| {
+        bundled_backend_activation_cell()
+            .get()
+            .expect("bundled backend activation cell initialized")
+            .clone()?;
+        activate_selected_backend_plugin()
     });
 }
 
-/// Register every downloaded GPU backend pack under
-/// `OPENASR_HOME/backends/<vendor>/<version>/` with the ggml registry. The base
-/// installer's CPU variants load from next to the executable (handled by
-/// `ggml_backend_load_all`); this adds the packs a user pulled on demand
-/// (HIP/Vulkan/CUDA). Best-effort and fail-open: a missing tree, an unreadable
-/// entry, or a plugin that fails to load is skipped — the engine always keeps
-/// the CPU backend, so a broken pack degrades to CPU rather than failing.
-fn load_installed_backend_plugins() {
-    let Ok(home) = crate::home::openasr_home() else {
-        return;
-    };
-    for dir in installed_backend_plugin_dirs(&home) {
-        let Ok(dir) = std::ffi::CString::new(dir.to_string_lossy().as_bytes()) else {
-            continue;
-        };
-        // On Windows each plugin's satellite runtime DLLs (amdhip64/rocblas/
-        // vulkan-1/cudart/...) are staged in this same pack dir, which is not on
-        // the default DLL search path. They resolve because the loader
-        // (`dl_load_library`) opens each absolute-path plugin with
-        // LOAD_WITH_ALTERED_SEARCH_PATH, so the plugin's own directory is searched
-        // for its dependencies — see third_party/openasr-ggml/src/ggml-backend-dl.cpp.
-        unsafe { ffi::ggml_backend_load_all_from_path(dir.as_ptr()) };
-    }
+fn bundled_backend_activation_cell()
+-> &'static std::sync::OnceLock<Result<(), BackendPluginActivationError>> {
+    static ACTIVATION: std::sync::OnceLock<Result<(), BackendPluginActivationError>> =
+        std::sync::OnceLock::new();
+    &ACTIVATION
 }
 
-/// The `OPENASR_HOME/backends/<vendor>/<version>/` directories that hold
-/// downloaded backend packs, sorted for a deterministic registration order.
-/// Pure (no FFI, no process-global state) so the discovery is unit-testable;
-/// [`load_installed_backend_plugins`] feeds each directory to the registry. A
-/// missing or unreadable tree yields an empty list (a CPU-only install).
-fn installed_backend_plugin_dirs(home: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut dirs = Vec::new();
-    let Ok(vendors) = std::fs::read_dir(home.join("backends")) else {
-        return dirs;
-    };
-    for vendor in vendors.flatten() {
-        let Ok(versions) = std::fs::read_dir(vendor.path()) else {
-            continue;
-        };
-        for version in versions.flatten() {
-            let path = version.path();
-            if path.is_dir() {
-                dirs.push(path);
+fn load_bundled_backend_modules() -> Result<(), BackendPluginActivationError> {
+    if !ggml_backend_dl_build_enabled() {
+        return Ok(());
+    }
+    let executable = std::env::current_exe()
+        .map_err(|error| BackendPluginActivationError::BundledDirectory(error.to_string()))?;
+    let directory = executable.parent().ok_or_else(|| {
+        BackendPluginActivationError::BundledDirectory(
+            "current executable has no parent directory".to_string(),
+        )
+    })?;
+    let directory = std::fs::canonicalize(directory)
+        .map_err(|error| BackendPluginActivationError::BundledDirectory(error.to_string()))?;
+    if !directory.is_absolute() {
+        return Err(BackendPluginActivationError::BundledDirectory(
+            "resolved directory is not absolute".to_string(),
+        ));
+    }
+    let manifest_path = directory.join("openasr-backend-bundle-v1.json");
+    let manifest_bytes = std::fs::read(&manifest_path)
+        .map_err(|error| BackendPluginActivationError::BundledDirectory(error.to_string()))?;
+    let manifest: BundledBackendManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| BackendPluginActivationError::BundledDirectory(error.to_string()))?;
+    let current_abi = BackendHostAbi::current();
+    validate_bundled_backend_manifest(&manifest)
+        .map_err(BackendPluginActivationError::BundledDirectory)?;
+    if manifest.host_abi_fingerprint != current_abi.fingerprint {
+        return Err(BackendPluginActivationError::BundledDirectory(
+            "bundled backend manifest does not match this neutral host ABI".to_string(),
+        ));
+    }
+    let expected_bundle_contract = option_env!("OPENASR_BUNDLED_BACKEND_CONTRACT_SHA256")
+        .ok_or_else(|| {
+            BackendPluginActivationError::BundledDirectory(
+                "neutral host has no embedded bundled-backend contract".to_string(),
+            )
+        })?;
+    let mut contract_entries = Vec::new();
+    let mut cpu_paths = Vec::new();
+    let mut vulkan_paths = Vec::new();
+    for file in &manifest.files {
+        let relative = Path::new(&file.filename);
+        if relative.components().count() != 1
+            || !matches!(relative.components().next(), Some(Component::Normal(_)))
+        {
+            return Err(BackendPluginActivationError::BundledDirectory(
+                "bundled backend manifest contains an unsafe filename".to_string(),
+            ));
+        }
+        let path = std::fs::canonicalize(directory.join(relative))
+            .map_err(|error| BackendPluginActivationError::BundledDirectory(error.to_string()))?;
+        if !path.starts_with(&directory) {
+            return Err(BackendPluginActivationError::BundledDirectory(
+                "bundled backend file escaped the application directory".to_string(),
+            ));
+        }
+        let bytes = std::fs::read(&path)
+            .map_err(|error| BackendPluginActivationError::BundledDirectory(error.to_string()))?;
+        if bytes.len() as u64 != file.size_bytes
+            || format!("{:x}", Sha256::digest(&bytes)) != file.sha256
+        {
+            return Err(BackendPluginActivationError::BundledDirectory(format!(
+                "bundled backend file '{}' failed integrity verification",
+                file.filename
+            )));
+        }
+        let image = pe_image_identity(&bytes).map_err(|error| {
+            BackendPluginActivationError::BundledDirectory(format!(
+                "bundled backend file '{}' is not a valid PE image: {error}",
+                file.filename
+            ))
+        })?;
+        if image.sha256 != file.image_sha256 || image.size_bytes != file.image_size_bytes {
+            return Err(BackendPluginActivationError::BundledDirectory(format!(
+                "bundled backend file '{}' failed stable PE identity verification",
+                file.filename
+            )));
+        }
+        if file.provider != "dependency" {
+            contract_entries.push(BackendBundleContractEntry {
+                filename: file.filename.clone(),
+                provider: file.provider.clone(),
+                image_sha256: image.sha256,
+                image_size_bytes: image.size_bytes,
+            });
+        }
+        match file.provider.as_str() {
+            "cpu" => cpu_paths.push(path_to_utf8_cstring("bundled-cpu", &path)?),
+            "vulkan" => vulkan_paths.push(path_to_utf8_cstring("bundled-vulkan", &path)?),
+            "host" | "dependency" => {}
+            _ => {
+                return Err(BackendPluginActivationError::BundledDirectory(
+                    "bundled backend manifest contains an unknown provider".to_string(),
+                ));
             }
         }
     }
-    dirs.sort();
-    dirs
+    let actual_bundle_contract =
+        backend_bundle_contract_sha256(&manifest.host_abi_fingerprint, &contract_entries);
+    if actual_bundle_contract != manifest.bundle_contract_sha256
+        || actual_bundle_contract != expected_bundle_contract
+    {
+        return Err(BackendPluginActivationError::BundledDirectory(format!(
+            "bundled CPU/Vulkan modules do not match the contract embedded in this neutral host \
+             (actual={actual_bundle_contract}, manifest={}, host={expected_bundle_contract})",
+            manifest.bundle_contract_sha256
+        )));
+    }
+    if cpu_paths.is_empty() || vulkan_paths.len() != 1 {
+        return Err(BackendPluginActivationError::BundledDirectory(
+            "neutral Windows bundle must contain CPU candidates and exactly one Vulkan rescue module"
+                .to_string(),
+        ));
+    }
+    load_best_bundled_backend(&cpu_paths, "cpu", &current_abi.fingerprint)?;
+    load_best_bundled_backend(&vulkan_paths, "vulkan", &current_abi.fingerprint)?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BundledBackendManifest {
+    schema_version: u32,
+    host_abi_fingerprint: String,
+    bundle_contract_sha256: String,
+    files: Vec<BundledBackendManifestFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BundledBackendManifestFile {
+    filename: String,
+    provider: String,
+    sha256: String,
+    size_bytes: u64,
+    image_sha256: String,
+    image_size_bytes: u64,
+}
+
+fn validate_bundled_backend_manifest(manifest: &BundledBackendManifest) -> Result<(), String> {
+    if manifest.schema_version != 2 {
+        return Err("bundled backend manifest has an unsupported schema".to_string());
+    }
+    if manifest.host_abi_fingerprint.len() != 64
+        || !manifest
+            .host_abi_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("bundled backend manifest has an invalid host ABI fingerprint".to_string());
+    }
+    if manifest.bundle_contract_sha256.len() != 64
+        || !manifest
+            .bundle_contract_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("bundled backend manifest has an invalid bundle contract".to_string());
+    }
+    if !(4..=64).contains(&manifest.files.len()) {
+        return Err("bundled backend manifest has an invalid file count".to_string());
+    }
+
+    let mut filenames = HashSet::new();
+    let mut host = HashSet::new();
+    let mut cpu_count = 0_usize;
+    let mut vulkan_count = 0_usize;
+    let mut dependency_count = 0_usize;
+    for file in &manifest.files {
+        let name = file.filename.to_ascii_lowercase();
+        if !filenames.insert(name.clone()) {
+            return Err("bundled backend manifest contains duplicate filenames".to_string());
+        }
+        if file.size_bytes == 0
+            || file.sha256.len() != 64
+            || !file
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || file.image_size_bytes == 0
+            || file.image_sha256.len() != 64
+            || !file
+                .image_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(format!(
+                "bundled backend file '{}' has an invalid byte identity",
+                file.filename
+            ));
+        }
+        match file.provider.as_str() {
+            "host" if matches!(name.as_str(), "ggml.dll" | "ggml-base.dll") => {
+                host.insert(name);
+            }
+            "cpu" if name.starts_with("ggml-cpu") && name.ends_with(".dll") => {
+                cpu_count += 1;
+            }
+            "vulkan" if name == "ggml-vulkan.dll" => vulkan_count += 1,
+            "dependency" if name == "vulkan-1.dll" => dependency_count += 1,
+            _ => {
+                return Err(format!(
+                    "bundled backend file '{}' has an invalid provider role",
+                    file.filename
+                ));
+            }
+        }
+    }
+    if host != HashSet::from(["ggml.dll".to_string(), "ggml-base.dll".to_string()])
+        || cpu_count == 0
+        || vulkan_count != 1
+        || dependency_count > 1
+    {
+        return Err(
+            "neutral bundle must contain exactly one host pair, CPU candidates, and one Vulkan rescue module"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn load_best_bundled_backend(
+    paths: &[CString],
+    provider: &'static str,
+    host_abi_fingerprint: &str,
+) -> Result<(), BackendPluginActivationError> {
+    let path_ptrs = paths.iter().map(|path| path.as_ptr()).collect::<Vec<_>>();
+    let abi = CString::new(host_abi_fingerprint).expect("backend ABI fingerprint is hexadecimal");
+    let provider_c = CString::new(provider).expect("provider is static ASCII");
+    let reg = unsafe {
+        ffi::ggml_backend_load_best_verified_utf8(
+            path_ptrs.as_ptr(),
+            path_ptrs.len(),
+            abi.as_ptr(),
+            provider_c.as_ptr(),
+        )
+    };
+    NonNull::new(reg)
+        .map(|_| ())
+        .ok_or_else(|| BackendPluginActivationError::LoadFailed {
+            backend_id: format!("bundled-{provider}"),
+        })
+}
+
+fn path_to_utf8_cstring(
+    backend_id: &str,
+    path: &Path,
+) -> Result<CString, BackendPluginActivationError> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| BackendPluginActivationError::NonUtf8Path {
+            backend_id: backend_id.to_string(),
+        })?;
+    CString::new(path).map_err(|_| BackendPluginActivationError::NonUtf8Path {
+        backend_id: backend_id.to_string(),
+    })
+}
+
+/// Process-global result of the optional backend candidate transaction. Rescue
+/// modules stay usable after an optional failure, while attestation can inspect
+/// this result and refuse to claim CUDA/HIP activation.
+fn backend_plugin_activation_cell() -> &'static std::sync::OnceLock<
+    Result<Option<ActivatedBackendRuntime>, BackendPluginActivationError>,
+> {
+    static ACTIVATION: std::sync::OnceLock<
+        Result<Option<ActivatedBackendRuntime>, BackendPluginActivationError>,
+    > = std::sync::OnceLock::new();
+    &ACTIVATION
+}
+
+pub fn backend_plugin_activation_status() -> Result<Option<String>, BackendPluginActivationError> {
+    ensure_backends_loaded();
+    bundled_backend_activation_cell()
+        .get()
+        .expect("bundled backend activation cell initialized")
+        .clone()?;
+    backend_plugin_activation_cell()
+        .get()
+        .expect("backend activation cell initialized")
+        .clone()
+        .map(|activated| activated.map(|activated| activated.backend_id))
+}
+
+/// Provider selected by the successfully completed optional-pack transaction.
+///
+/// This intentionally does not initialize the activation cell: callers use it
+/// only after backend enumeration has completed.  During the live probe inside
+/// activation the cell is still being initialized, and recursively waiting on
+/// it would deadlock.
+pub(crate) fn activated_backend_execution_provider() -> Option<ExecutionProvider> {
+    backend_plugin_activation_cell()
+        .get()
+        .and_then(|result| result.as_ref().ok())
+        .and_then(Option::as_ref)
+        .map(|activated| activated.provider)
+}
+
+/// Whether this binary is the neutral dynamic-backend host used by the
+/// plugin distribution. Static CUDA/HIP/Vulkan sidecars deliberately report
+/// false even though they expose the same CLI surface during the one-release
+/// migration window.
+pub fn backend_plugin_host_available() -> bool {
+    ggml_backend_dl_build_enabled()
+}
+
+/// Verifies and loads only the bundled CPU/Vulkan rescue modules. Optional
+/// activation is intentionally excluded so a broken selected plugin cannot
+/// make host-topology discovery unavailable to the Desktop recovery path.
+pub fn bundled_backend_activation_status() -> Result<(), BackendPluginActivationError> {
+    bundled_backend_activation_cell()
+        .get_or_init(load_bundled_backend_modules)
+        .clone()
+}
+
+fn activate_selected_backend_plugin()
+-> Result<Option<ActivatedBackendRuntime>, BackendPluginActivationError> {
+    if !ggml_backend_dl_build_enabled() {
+        return Err(BackendPluginActivationError::DynamicLoadingUnavailable);
+    }
+
+    let home = crate::home::openasr_home()
+        .map_err(|error| BackendPluginActivationError::Home(error.to_string()))?;
+    let activated = read_activated_backend(&home)
+        .map_err(|error| BackendPluginActivationError::ActivationState(error.to_string()))?;
+    let development = development_backend_override()?;
+    let (backend_id, device_target, activated_record) =
+        if let Some((backend_id, target)) = development {
+            (backend_id, target, None)
+        } else if let Some(record) = activated {
+            (
+                record.backend_id.clone(),
+                record.device_target.clone(),
+                Some(record),
+            )
+        } else {
+            return Ok(None);
+        };
+    // Loading the signed catalog may create a blocking HTTP client. Do not do
+    // that on every first runtime query when no optional plugin is selected:
+    // runtime discovery is commonly called from an async server handler, and
+    // reqwest's blocking client cannot be constructed and dropped inside a
+    // Tokio runtime. More importantly, the bundled CPU/Vulkan rescue path has
+    // no catalog dependency at all. Only a real activation pointer (or the
+    // explicit development override) authorizes catalog resolution here.
+    let catalog = load_backend_activation_catalog(&home)?;
+    let requested = resolve_catalog_backend_pull(&catalog, &backend_id).map_err(|error| {
+        BackendPluginActivationError::Resolution {
+            backend_id: backend_id.clone(),
+            reason: error.to_string(),
+        }
+    })?;
+    if !BackendHostAbi::current().is_compatible_with(&requested.host_abi) {
+        return Err(BackendPluginActivationError::HostAbiMismatch { backend_id });
+    }
+    if let Some(record) = activated_record.as_ref() {
+        verify_activated_backend_record(record, &requested)?;
+    }
+
+    let install_dir = backend_pack_install_dir(&home, &requested).map_err(|error| {
+        BackendPluginActivationError::Resolution {
+            backend_id: backend_id.clone(),
+            reason: error.to_string(),
+        }
+    })?;
+    let installed =
+        read_and_verify_installed_backend(&install_dir, &requested).map_err(|error| {
+            BackendPluginActivationError::InstalledPackInvalid {
+                backend_id: backend_id.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+    let canonical_dir = std::fs::canonicalize(&install_dir).map_err(|error| {
+        BackendPluginActivationError::InstalledPackInvalid {
+            backend_id: backend_id.clone(),
+            reason: error.to_string(),
+        }
+    })?;
+    let plugin_path =
+        std::fs::canonicalize(install_dir.join(&installed.plugin_filename)).map_err(|error| {
+            BackendPluginActivationError::InstalledPackInvalid {
+                backend_id: backend_id.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+    if !plugin_path.starts_with(&canonical_dir) {
+        return Err(BackendPluginActivationError::EscapedInstallDirectory { backend_id });
+    }
+    let dependency_dirs = crate::backend_distribution::verified_backend_dependency_dirs(
+        &backend_id,
+        &canonical_dir,
+        &installed,
+    )
+    .map_err(|error| BackendPluginActivationError::InstalledPackInvalid {
+        backend_id: backend_id.clone(),
+        reason: error.to_string(),
+    })?;
+    let live_driver = probe_exact_backend_plugin_candidate(
+        &backend_id,
+        requested.vendor,
+        &plugin_path,
+        &dependency_dirs,
+        &device_target,
+        requested.min_driver_api.as_deref(),
+    )?;
+    let resolved = resolve_compatible_catalog_backend_pull_for_driver(
+        &catalog,
+        requested.vendor,
+        &BackendHostAbi::current(),
+        Some(&device_target),
+        Some(&live_driver),
+    )
+    .map_err(|error| BackendPluginActivationError::Resolution {
+        backend_id: backend_id.clone(),
+        reason: error.to_string(),
+    })?;
+    if resolved.backend_id != backend_id {
+        return Err(BackendPluginActivationError::Resolution {
+            backend_id,
+            reason: format!(
+                "live device/driver proof resolves to '{}' instead of the selected pack",
+                resolved.backend_id
+            ),
+        });
+    }
+    load_exact_backend_plugin(
+        &backend_id,
+        resolved.vendor,
+        &plugin_path,
+        &dependency_dirs,
+        &device_target,
+        resolved.min_driver_api.as_deref(),
+    )?;
+    Ok(Some(ActivatedBackendRuntime {
+        backend_id,
+        provider: execution_provider_for_catalog_vendor(resolved.vendor),
+    }))
+}
+
+const fn execution_provider_for_catalog_vendor(vendor: CatalogBackendVendor) -> ExecutionProvider {
+    match vendor {
+        CatalogBackendVendor::Cpu => ExecutionProvider::Cpu,
+        CatalogBackendVendor::Cuda => ExecutionProvider::Cuda,
+        CatalogBackendVendor::Hip => ExecutionProvider::Hip,
+        CatalogBackendVendor::Vulkan => ExecutionProvider::Vulkan,
+        CatalogBackendVendor::Unknown => ExecutionProvider::Unknown,
+    }
+}
+
+/// Resolves the exact same explicitly configured catalog identity used by the
+/// CLI/server before falling back to the production catalog.  The optional
+/// backend activation pointer names an entry in that catalog, so resolving a
+/// different source here can otherwise make a correctly installed plugin
+/// disappear (or validate it against the wrong release) in the first runtime
+/// process after installation.
+///
+/// A half-configured local file/identity pair is fail-closed for optional GPU
+/// activation.  Bundled CPU/Vulkan rescue modules were already loaded before
+/// this function runs, so recovery remains available without guessing which
+/// trust identity the local bytes were meant to use.
+fn load_backend_activation_catalog(
+    home: &Path,
+) -> Result<crate::ModelCatalog, BackendPluginActivationError> {
+    let (local, warning) = resolve_local_catalog_env_override();
+    if let Some(warning) = warning {
+        return Err(BackendPluginActivationError::Catalog(warning));
+    }
+    if let Some(local) = local {
+        return load_local_catalog_file_with_identity(&local.path, &local.identity, home)
+            .map_err(|error| BackendPluginActivationError::Catalog(error.to_string()));
+    }
+
+    let catalog_url = std::env::var("OPENASR_CATALOG_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    load_model_catalog(catalog_url.as_deref(), home)
+        .map_err(|error| BackendPluginActivationError::Catalog(error.to_string()))
+}
+
+#[cfg(all(feature = "backend-plugin-development", debug_assertions))]
+fn development_backend_override() -> Result<Option<(String, String)>, BackendPluginActivationError>
+{
+    let Some(backend_id) = std::env::var_os(OPTIONAL_BACKEND_PACK_ENV)
+        .map(|value| value.to_string_lossy().trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let target = std::env::var(OPTIONAL_BACKEND_TARGET_ENV).map_err(|_| {
+        BackendPluginActivationError::ActivationState(format!(
+            "{OPTIONAL_BACKEND_TARGET_ENV} is required with {OPTIONAL_BACKEND_PACK_ENV}"
+        ))
+    })?;
+    Ok(Some((backend_id, target)))
+}
+
+#[cfg(not(all(feature = "backend-plugin-development", debug_assertions)))]
+fn development_backend_override() -> Result<Option<(String, String)>, BackendPluginActivationError>
+{
+    Ok(None)
+}
+
+fn verify_activated_backend_record(
+    record: &ActivatedBackendPack,
+    resolved: &crate::ResolvedCatalogBackendPull,
+) -> Result<(), BackendPluginActivationError> {
+    let valid = record.vendor == resolved.vendor
+        && record.version == resolved.version
+        && record.host_abi_fingerprint == resolved.host_abi.fingerprint
+        && record.artifact_fingerprint == backend_artifact_fingerprint(resolved);
+    if valid {
+        Ok(())
+    } else {
+        Err(BackendPluginActivationError::ActivationState(format!(
+            "activated backend '{}' no longer matches the signed catalog identity",
+            record.backend_id
+        )))
+    }
+}
+
+fn load_exact_backend_plugin(
+    backend_id: &str,
+    vendor: CatalogBackendVendor,
+    plugin_path: &Path,
+    dependency_dirs: &[PathBuf],
+    device_target: &str,
+    minimum_driver: Option<&str>,
+) -> Result<(), BackendPluginActivationError> {
+    let path = path_to_utf8_cstring(backend_id, plugin_path)?;
+    let abi = CString::new(BackendHostAbi::current().fingerprint)
+        .expect("backend ABI fingerprint is hexadecimal");
+    let provider_c = CString::new(backend_provider_label(vendor, backend_id)?)
+        .expect("provider is static ASCII");
+    let target_c = CString::new(device_target).map_err(|_| {
+        BackendPluginActivationError::ActivationState(
+            "backend device target contains an interior NUL".to_string(),
+        )
+    })?;
+    let minimum_driver_c = CString::new(minimum_driver.unwrap_or("")).map_err(|_| {
+        BackendPluginActivationError::ActivationState(
+            "backend minimum driver contains an interior NUL".to_string(),
+        )
+    })?;
+    let (dependency_dir_cstrings, dependency_dir_ptrs) =
+        dependency_dirs_to_ffi(backend_id, dependency_dirs)?;
+    let dependency_dir_ptr = if dependency_dir_ptrs.is_empty() {
+        std::ptr::null()
+    } else {
+        dependency_dir_ptrs.as_ptr()
+    };
+    let reg = unsafe {
+        ffi::ggml_backend_load_verified_v3_utf8(
+            path.as_ptr(),
+            dependency_dir_ptr,
+            dependency_dir_cstrings.len(),
+            abi.as_ptr(),
+            provider_c.as_ptr(),
+            target_c.as_ptr(),
+            minimum_driver_c.as_ptr(),
+        )
+    };
+    let Some(reg) = NonNull::new(reg) else {
+        return Err(BackendPluginActivationError::LoadFailed {
+            backend_id: backend_id.to_string(),
+        });
+    };
+    let name = unsafe { ffi::ggml_backend_reg_name(reg.as_ptr()) };
+    let actual = unsafe { cstr_lossy(name) };
+    let actual = if actual.is_empty() {
+        "<unknown>".to_string()
+    } else {
+        actual
+    };
+    let (expected, matches) = match vendor {
+        CatalogBackendVendor::Cpu => ("cpu", actual.to_ascii_lowercase().contains("cpu")),
+        CatalogBackendVendor::Cuda => ("cuda", actual.to_ascii_lowercase().contains("cuda")),
+        CatalogBackendVendor::Hip => {
+            let lower = actual.to_ascii_lowercase();
+            ("hip", lower.contains("hip") || lower.contains("rocm"))
+        }
+        CatalogBackendVendor::Vulkan => ("vulkan", actual.to_ascii_lowercase().contains("vulkan")),
+        CatalogBackendVendor::Unknown => ("known backend", false),
+    };
+    if !matches {
+        unsafe { ffi::ggml_backend_unload(reg.as_ptr()) };
+        return Err(BackendPluginActivationError::ProviderMismatch {
+            backend_id: backend_id.to_string(),
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn backend_provider_label(
+    vendor: CatalogBackendVendor,
+    backend_id: &str,
+) -> Result<&'static str, BackendPluginActivationError> {
+    match vendor {
+        CatalogBackendVendor::Cpu => Ok("cpu"),
+        CatalogBackendVendor::Cuda => Ok("cuda"),
+        CatalogBackendVendor::Hip => Ok("hip"),
+        CatalogBackendVendor::Vulkan => Ok("vulkan"),
+        CatalogBackendVendor::Unknown => Err(BackendPluginActivationError::ProviderMismatch {
+            backend_id: backend_id.to_string(),
+            expected: "known backend",
+            actual: "unknown catalog vendor".to_string(),
+        }),
+    }
+}
+
+pub(crate) fn probe_exact_backend_plugin_candidate(
+    backend_id: &str,
+    vendor: CatalogBackendVendor,
+    plugin_path: &Path,
+    dependency_dirs: &[PathBuf],
+    device_target: &str,
+    minimum_driver: Option<&str>,
+) -> Result<String, BackendPluginActivationError> {
+    let path = path_to_utf8_cstring(backend_id, plugin_path)?;
+    let abi = CString::new(BackendHostAbi::current().fingerprint)
+        .expect("backend ABI fingerprint is hexadecimal");
+    let provider = CString::new(backend_provider_label(vendor, backend_id)?)
+        .expect("provider is static ASCII");
+    let target = CString::new(device_target).map_err(|_| {
+        BackendPluginActivationError::ActivationState(
+            "backend device target contains an interior NUL".to_string(),
+        )
+    })?;
+    let minimum_driver = CString::new(minimum_driver.unwrap_or("")).map_err(|_| {
+        BackendPluginActivationError::ActivationState(
+            "backend minimum driver contains an interior NUL".to_string(),
+        )
+    })?;
+    let (dependency_dir_cstrings, dependency_dir_ptrs) =
+        dependency_dirs_to_ffi(backend_id, dependency_dirs)?;
+    let dependency_dir_ptr = if dependency_dir_ptrs.is_empty() {
+        std::ptr::null()
+    } else {
+        dependency_dir_ptrs.as_ptr()
+    };
+    let mut driver = [0_i8; 64];
+    let ok = unsafe {
+        ffi::ggml_backend_probe_verified_v3_utf8(
+            path.as_ptr(),
+            dependency_dir_ptr,
+            dependency_dir_cstrings.len(),
+            abi.as_ptr(),
+            provider.as_ptr(),
+            target.as_ptr(),
+            minimum_driver.as_ptr(),
+            driver.as_mut_ptr(),
+            driver.len(),
+        )
+    };
+    if !ok {
+        return Err(BackendPluginActivationError::LiveProbeFailed {
+            backend_id: backend_id.to_string(),
+        });
+    }
+    let driver = unsafe { CStr::from_ptr(driver.as_ptr()) }
+        .to_str()
+        .map_err(|_| BackendPluginActivationError::LiveProbeFailed {
+            backend_id: backend_id.to_string(),
+        })?
+        .to_string();
+    if driver.is_empty() {
+        return Err(BackendPluginActivationError::LiveProbeFailed {
+            backend_id: backend_id.to_string(),
+        });
+    }
+    Ok(driver)
+}
+
+fn dependency_dirs_to_ffi(
+    backend_id: &str,
+    dependency_dirs: &[PathBuf],
+) -> Result<(Vec<CString>, Vec<*const std::ffi::c_char>), BackendPluginActivationError> {
+    let mut cstrings = Vec::with_capacity(dependency_dirs.len());
+    for dependency_dir in dependency_dirs {
+        if !dependency_dir.is_absolute() {
+            return Err(BackendPluginActivationError::InstalledPackInvalid {
+                backend_id: backend_id.to_string(),
+                reason: "backend dependency directory is not absolute".to_string(),
+            });
+        }
+        cstrings.push(path_to_utf8_cstring(backend_id, dependency_dir)?);
+    }
+    let pointers = cstrings.iter().map(|value| value.as_ptr()).collect();
+    Ok((cstrings, pointers))
 }
 
 impl GgmlBackend {
     pub fn cpu() -> Result<Self, GgmlRuntimeError> {
-        ensure_backends_loaded();
+        bundled_backend_activation_cell()
+            .get_or_init(load_bundled_backend_modules)
+            .clone()?;
         // Go through the registry (not ggml_backend_cpu_init): under
         // GGML_BACKEND_DL that symbol lives in the loaded ggml-cpu plugin and is
         // not linked into the host. init_by_type works for static builds too.
@@ -483,9 +1216,16 @@ impl GgmlBackend {
     }
 
     pub fn best() -> Result<Self, GgmlRuntimeError> {
-        ensure_backends_loaded();
-        let raw = unsafe { ffi::ggml_backend_init_best() };
-        Self::from_raw(raw, "best")
+        backend_plugin_activation_status()?;
+        let devices = ggml_available_devices();
+        preferred_accelerated_device(&devices, GgmlBackendKind::is_gpu)
+            .or_else(|| {
+                devices
+                    .iter()
+                    .find(|device| device.kind == GgmlBackendKind::Cpu)
+            })
+            .ok_or(GgmlRuntimeError::BackendUnavailable("best"))?
+            .initialize()
     }
 
     pub fn name(&self) -> String {
@@ -592,10 +1332,13 @@ pub fn ggml_runtime_boot_summary(info: &GgmlRuntimeInfo) -> String {
             select_accelerated_device(&info.devices, GgmlBackendKind::is_gpu)
     {
         summary.push_str(&format!(
-            " gpu_selection={{picked={:?} kind={:?} rule={}}}",
+            " gpu_selection={{picked={:?} kind={:?} rule={} activated_provider={}}}",
             preferred.name,
             preferred.kind,
-            rule.boot_log_label()
+            rule.boot_log_label(),
+            activated_backend_execution_provider()
+                .map(ExecutionProvider::as_str)
+                .unwrap_or("none")
         ));
     }
     summary
@@ -791,6 +1534,50 @@ unsafe fn cstr_lossy(value: *const c_char) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bundled_file(filename: &str, provider: &str) -> BundledBackendManifestFile {
+        BundledBackendManifestFile {
+            filename: filename.to_string(),
+            provider: provider.to_string(),
+            sha256: "a".repeat(64),
+            size_bytes: 1,
+            image_sha256: "c".repeat(64),
+            image_size_bytes: 1,
+        }
+    }
+
+    fn valid_bundled_manifest() -> BundledBackendManifest {
+        BundledBackendManifest {
+            schema_version: 2,
+            host_abi_fingerprint: "b".repeat(64),
+            bundle_contract_sha256: "d".repeat(64),
+            files: vec![
+                bundled_file("ggml.dll", "host"),
+                bundled_file("ggml-base.dll", "host"),
+                bundled_file("ggml-cpu-avx2.dll", "cpu"),
+                bundled_file("ggml-vulkan.dll", "vulkan"),
+                bundled_file("vulkan-1.dll", "dependency"),
+            ],
+        }
+    }
+
+    #[test]
+    fn bundled_manifest_contract_is_strict_and_case_insensitive() {
+        let valid = valid_bundled_manifest();
+        assert_eq!(validate_bundled_backend_manifest(&valid), Ok(()));
+
+        let mut duplicate = valid_bundled_manifest();
+        duplicate.files.push(bundled_file("GGML.DLL", "host"));
+        assert!(validate_bundled_backend_manifest(&duplicate).is_err());
+
+        let mut wrong_role = valid_bundled_manifest();
+        wrong_role.files[3].provider = "host".to_string();
+        assert!(validate_bundled_backend_manifest(&wrong_role).is_err());
+
+        let mut malformed_hash = valid_bundled_manifest();
+        malformed_hash.files[0].sha256 = "A".repeat(64);
+        assert!(validate_bundled_backend_manifest(&malformed_hash).is_err());
+    }
 
     #[test]
     fn cpu_backend_initializes() {
@@ -1060,6 +1847,59 @@ mod tests {
     }
 
     #[test]
+    fn activated_provider_precedes_earlier_bundled_vulkan_device() {
+        let devices = vec![
+            test_device("Vulkan0", GgmlBackendKind::Gpu),
+            test_device("CUDA0", GgmlBackendKind::Gpu),
+        ];
+        let picked = select_accelerated_device_for_provider(
+            &devices,
+            GgmlBackendKind::is_gpu,
+            Some(ExecutionProvider::Cuda),
+        )
+        .expect("activated CUDA device is picked")
+        .0;
+        assert_eq!(picked.name, "CUDA0");
+    }
+
+    #[test]
+    fn activated_provider_choice_is_not_overridden_by_other_provider_free_vram() {
+        let devices = vec![
+            test_device_with_memory(
+                "Vulkan0",
+                GgmlBackendKind::Gpu,
+                Some(memory_mib(8 * 1024, 12 * 1024)),
+            ),
+            test_device_with_memory(
+                "ROCm0",
+                GgmlBackendKind::Gpu,
+                Some(memory_mib(128, 12 * 1024)),
+            ),
+        ];
+        let picked = select_accelerated_device_for_provider(
+            &devices,
+            GgmlBackendKind::is_gpu,
+            Some(ExecutionProvider::Hip),
+        )
+        .expect("activated HIP device is picked")
+        .0;
+        assert_eq!(picked.name, "ROCm0");
+    }
+
+    #[test]
+    fn missing_activated_provider_falls_back_to_rescue_ranking() {
+        let devices = vec![test_device("Vulkan0", GgmlBackendKind::Gpu)];
+        let picked = select_accelerated_device_for_provider(
+            &devices,
+            GgmlBackendKind::is_gpu,
+            Some(ExecutionProvider::Cuda),
+        )
+        .expect("bundled Vulkan rescue device is picked")
+        .0;
+        assert_eq!(picked.name, "Vulkan0");
+    }
+
+    #[test]
     fn preferred_accelerated_device_none_when_no_accelerated_device_present() {
         let devices = vec![test_device("CPU", GgmlBackendKind::Cpu)];
         assert!(preferred_accelerated_device(&devices, GgmlBackendKind::is_gpu).is_none());
@@ -1123,32 +1963,6 @@ mod tests {
         let summary = ggml_runtime_boot_summary(&hybrid);
         assert!(summary.contains("gpu_selection={picked=\"Vulkan0\" kind=IntegratedGpu"));
         assert!(summary.contains("rule=discrete_low_vram_skipped"));
-    }
-
-    #[test]
-    fn installed_backend_plugin_dirs_finds_vendor_version_dirs_sorted() {
-        let home = tempfile::tempdir().unwrap();
-        let backends = home.path().join("backends");
-        std::fs::create_dir_all(backends.join("vulkan").join("0.13.1")).unwrap();
-        std::fs::create_dir_all(backends.join("hip").join("0.13.1")).unwrap();
-        // A stray file under a vendor dir must be ignored (only version DIRS load).
-        std::fs::write(backends.join("hip").join("README.txt"), b"x").unwrap();
-
-        let dirs = installed_backend_plugin_dirs(home.path());
-
-        assert_eq!(
-            dirs,
-            vec![
-                backends.join("hip").join("0.13.1"),
-                backends.join("vulkan").join("0.13.1"),
-            ]
-        );
-    }
-
-    #[test]
-    fn installed_backend_plugin_dirs_empty_without_backends_tree() {
-        let home = tempfile::tempdir().unwrap();
-        assert!(installed_backend_plugin_dirs(home.path()).is_empty());
     }
 
     #[test]

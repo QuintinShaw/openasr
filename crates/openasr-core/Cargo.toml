@@ -28,6 +28,12 @@ native  = []   # GGML_NATIVE  — tune for the current host CPU; off for distrib
 ## enable it through dev-dependencies. The module is also available under
 ## `cfg(test)` for this crate's own unit tests.
 testing = []
+## Local-only backend-pack override. Production artifacts never enable this;
+## release CI rejects it and runtime otherwise does not read override env vars.
+backend-plugin-development = []
+## One-cycle R1 rollback artifact only. Neutral Desktop/CLI release jobs must
+## reject this feature; it exists solely in the dedicated legacy sidecar leg.
+legacy-windows-static-sidecar = []
 ## Cross-crate ts-rs TS-binding codegen switch for the HTTP capability/device
 ## types this crate shares with openasr-server's `/v1/capabilities` and
 ## `/v1/devices` responses (`BackendKind`, `LanguageCapability`,
@@ -86,6 +92,7 @@ cc = "1"
 # Fingerprint every build-relevant vendored ggml input before reusing the private
 # CMake tree. This is also a normal dependency above, so it adds no new package to
 # the workspace lockfile.
+serde_json.workspace = true
 sha2.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]

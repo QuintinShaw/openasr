@@ -3,3 +3,5 @@ model-registry/catalog.signature.json text eol=lf
 model-registry/catalog.epoch text eol=lf
 model-registry/catalog.public.json           text eol=lf
 model-registry/catalog.public.signature.json text eol=lf
+crates/openasr-core/tests/fixtures/catalog_incident/*.json text eol=lf
+crates/*/generated/**/*.ts text eol=lf

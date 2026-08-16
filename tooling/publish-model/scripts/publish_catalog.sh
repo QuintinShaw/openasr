@@ -108,6 +108,10 @@ projection = {
     "generated_at": catalog["generated_at"],
     "catalog_url": catalog["catalog_url"],
     "models": public_models,
+    # Backend packs are public runtime distribution metadata, not private
+    # model entries. Carry the signed list verbatim so the production catalog
+    # used by the neutral Windows host can resolve optional CUDA/HIP modules.
+    "backends": catalog.get("backends", []),
 }
 # The curated language/dialect label map is display DATA the served/embedded
 # public catalog needs too (app surfaces read it to name advertised codes), so

@@ -2463,13 +2463,27 @@ async fn session_start_waits_for_native_warm_without_publishing_lifecycle() {
         }) as Box<dyn NativeAsrSession>)
     }));
 
+    // Keep neutral-host DLL/driver cold initialization outside the assertion
+    // clock. The contract below is the session lifecycle barrier, not a debug
+    // build startup-performance budget; under the full parallel workspace
+    // suite the first CPU/Vulkan module load can legitimately exceed it.
+    tokio::task::spawn_blocking(|| drop(openasr_core::ggml_available_devices()))
+        .await
+        .expect("neutral backend initialization worker");
+
     let mut start = Box::pin(session.start_session(StartSession {
         model: Some(model_id.to_string()),
         source_name: Some("Live".to_string()),
         partial_results: Some(true),
         ..StartSession::default()
     }));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // A neutral Windows host verifies and loads its bundled CPU/Vulkan
+    // modules on the first runtime query. Debug builds can spend several
+    // seconds in that one-time DLL/driver initialization before the native
+    // session reaches its deliberately gated warm-up. Keep the assertion
+    // bounded, but do not make the lifecycle contract depend on a 5-second
+    // cold-loader budget that production release builds do not promise.
+    tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             match warm_started_rx.try_recv() {
                 Ok(()) => break,

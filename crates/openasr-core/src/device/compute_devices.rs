@@ -39,6 +39,11 @@ pub struct ComputeDevice {
     pub kind: String,
     pub target: String,
     pub effective_target: String,
+    /// Typed provider identity of the concrete device behind this row. This
+    /// is independent from the coarse `accelerated` target and lets a shell
+    /// attest that a requested CUDA/HIP plugin actually loaded instead of
+    /// mistaking the bundled Vulkan rescue device for success.
+    pub provider: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<String>,
 }
@@ -63,6 +68,9 @@ pub fn compute_devices_from_runtime(runtime: &GgmlRuntimeInfo) -> Vec<ComputeDev
                 kind: "accelerated".to_string(),
                 target: "accelerated".to_string(),
                 effective_target: "accelerated".to_string(),
+                provider: crate::ExecutionProvider::from_backend_name(&device.name)
+                    .as_str()
+                    .to_string(),
                 memory: device.memory.map(|memory| format_gib(memory.total_bytes)),
             }
         });
@@ -85,6 +93,10 @@ pub fn compute_devices_from_runtime(runtime: &GgmlRuntimeInfo) -> Vec<ComputeDev
             kind: "auto".to_string(),
             target: "auto".to_string(),
             effective_target: auto_effective_target,
+            provider: accelerated
+                .as_ref()
+                .map(|device| device.provider.clone())
+                .unwrap_or_else(|| "cpu".to_string()),
             memory: None,
         },
         ComputeDevice {
@@ -94,6 +106,7 @@ pub fn compute_devices_from_runtime(runtime: &GgmlRuntimeInfo) -> Vec<ComputeDev
             kind: "cpu".to_string(),
             target: "cpu".to_string(),
             effective_target: "cpu".to_string(),
+            provider: "cpu".to_string(),
             memory: None,
         },
     ];

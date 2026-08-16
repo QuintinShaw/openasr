@@ -11,6 +11,15 @@ pub(super) fn print_runtime_doctor() {
 }
 
 fn print_ggml_runtime_doctor() {
+    match openasr_core::bundled_backend_activation_status() {
+        Ok(()) => println!("  - bundled CPU/Vulkan modules: verified"),
+        Err(error) => println!("  - bundled CPU/Vulkan modules: unavailable ({error})"),
+    }
+    match openasr_core::backend_plugin_activation_status() {
+        Ok(Some(backend_id)) => println!("  - optional backend plugin: active ({backend_id})"),
+        Ok(None) => println!("  - optional backend plugin: not selected"),
+        Err(error) => println!("  - optional backend plugin: unavailable ({error})"),
+    }
     let info = openasr_core::ggml_runtime_info();
     let best_backend = info.best_backend_name.as_deref().unwrap_or("unavailable");
     println!(

@@ -1120,13 +1120,24 @@ mod tests {
         let immutable = source
             .immutable_snapshot_matching_content_id(&expected)
             .expect("make immutable snapshot");
-        write_magic_file(&path, replacement);
+        let rewrite = fs::write(&path, replacement);
+        #[cfg(windows)]
+        assert_eq!(
+            rewrite
+                .expect_err("Windows must protect a live mapped generation")
+                .raw_os_error(),
+            Some(1224),
+            "a live file mapping must reject in-place truncation/rewrite"
+        );
+        #[cfg(not(windows))]
+        rewrite.expect("rewrite source generation in place");
 
         assert_eq!(&immutable.backing_mmap()[..], original);
         assert_eq!(immutable.content_id(), expected);
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn immutable_snapshot_fails_closed_when_source_changed_after_preflight() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("auxiliary-pack.gguf");
@@ -1145,6 +1156,30 @@ mod tests {
             error,
             super::GgmlRuntimeSourcePathError::SnapshotContentChanged { .. }
         ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn immutable_snapshot_preflight_mapping_blocks_in_place_source_rewrite() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("auxiliary-pack.gguf");
+        let original = b"GGUFauxiliary-content-a";
+        let replacement = b"GGUFauxiliary-content-b";
+        assert_eq!(original.len(), replacement.len());
+        write_magic_file(&path, original);
+
+        let source = validate_ggml_runtime_source_path(&path).expect("validate source");
+        let expected = source.content_id().to_string();
+        assert_eq!(
+            fs::write(&path, replacement)
+                .expect_err("Windows must protect a live mapped generation")
+                .raw_os_error(),
+            Some(1224)
+        );
+        let immutable = source
+            .immutable_snapshot_matching_content_id(&expected)
+            .expect("unchanged protected generation must still snapshot");
+        assert_eq!(&immutable.backing_mmap()[..], original);
     }
 
     #[test]
@@ -1368,6 +1403,8 @@ mod tests {
 
         // Defeat the seal and rewrite the bytes in place: the next open is no
         // longer sealed, so trust is withdrawn and the hash speaks.
+        drop(source);
+        drop(admitted);
         set_mode(&object, false);
         write_magic_file(&object, b"GGUFadmitted-identity-XXXXXXX");
         let tampered = validate_ggml_runtime_source_path(&object).expect("validate tampered");

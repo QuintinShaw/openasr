@@ -495,6 +495,7 @@ fn atomic_replace(path: &Path, contents: &[u8]) -> io::Result<()> {
             .open(&temporary_path)?;
         file.write_all(contents)?;
         file.sync_all()?;
+        drop(file);
         replace_existing_file(&temporary_path, path)?;
         sync_parent_directory(path)
     })();

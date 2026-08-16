@@ -4,7 +4,7 @@ use std::{
     fs,
     io::{self, Cursor, Read, Write},
     net::TcpListener,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Barrier, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -2039,7 +2039,7 @@ fn pull_lock_blocks_second_writer() {
     let temp = tempfile::tempdir().unwrap();
     let paths = paths_for(temp.path(), &resolved);
     fs::create_dir_all(&paths.dir).unwrap();
-    fs::write(&paths.lock_path, "pid=1\n").unwrap();
+    fs::write(&paths.lock_path, format!("pid={}\n", std::process::id())).unwrap();
     let mut client = FakeClient::default();
 
     let error = pull_model_pack_with_client(
@@ -2950,11 +2950,19 @@ fn tensile_zip_bytes() -> Vec<u8> {
 }
 
 fn hip_pack_resolved(plugin: &[u8], archive: &[u8]) -> ResolvedCatalogBackendPull {
+    let extracted_tree_sha256 = materialized_tree_sha256(&[InstalledBackendMaterializedFile {
+        relative_path: "rocblas/library/Kernels.so-000-gfx1200.hsaco".to_string(),
+        sha256: sha256_hex(b"fake tensile kernel object"),
+        size_bytes: b"fake tensile kernel object".len() as u64,
+    }]);
     ResolvedCatalogBackendPull {
         backend_id: "hip-radeon".to_string(),
         vendor: CatalogBackendVendor::Hip,
         version: "0.13.1".to_string(),
         display_name: "AMD ROCm".to_string(),
+        host_abi: crate::backend_distribution::BackendHostAbi::current(),
+        targets: vec!["gfx1200".to_string()],
+        min_driver_api: Some("7.1.0".to_string()),
         files: vec![
             CatalogBackendFile {
                 filename: "ggml-hip.dll".to_string(),
@@ -2964,6 +2972,7 @@ fn hip_pack_resolved(plugin: &[u8], archive: &[u8]) -> ResolvedCatalogBackendPul
                 size_bytes: plugin.len() as u64,
                 role: CatalogBackendFileRole::Plugin,
                 extract_subdir: None,
+                extracted_tree_sha256: None,
             },
             CatalogBackendFile {
                 filename: "rocblas-library.zip".to_string(),
@@ -2973,6 +2982,7 @@ fn hip_pack_resolved(plugin: &[u8], archive: &[u8]) -> ResolvedCatalogBackendPul
                 size_bytes: archive.len() as u64,
                 role: CatalogBackendFileRole::Archive,
                 extract_subdir: Some("rocblas/library".to_string()),
+                extracted_tree_sha256: Some(extracted_tree_sha256),
             },
         ],
     }
@@ -2998,11 +3008,16 @@ fn install_backend_pack_downloads_verifies_and_extracts() {
     let installed =
         install_backend_pack_with_client(&resolved, home.path(), &mut client, |_| {}).unwrap();
 
-    let dir = home.path().join("backends").join("hip").join("0.13.1");
+    let dir = backend_pack_install_dir(home.path(), &resolved).unwrap();
     assert_eq!(installed.dir, dir);
     assert_eq!(installed.plugin_filename, "ggml-hip.dll");
     assert!(dir.join("ggml-hip.dll").is_file());
-    assert!(dir.join("rocblas-library.zip").is_file());
+    assert!(!dir.join("rocblas-library.zip").exists());
+    assert!(
+        backend_content_object_dir(home.path(), &resolved.files[1])
+            .join("object.json")
+            .is_file()
+    );
     // archive extracted into extract_subdir (zip-slip-safe)
     assert!(
         dir.join("rocblas")
@@ -3011,6 +3026,7 @@ fn install_backend_pack_downloads_verifies_and_extracts() {
             .is_file()
     );
     assert!(dir.join("backend.json").is_file());
+    read_and_verify_installed_backend(&dir, &resolved).unwrap();
 
     // Idempotent: a re-install short-circuits without downloading (an empty
     // response queue would panic in FakeClient::open if it tried).
@@ -3018,6 +3034,408 @@ fn install_backend_pack_downloads_verifies_and_extracts() {
     let again =
         install_backend_pack_with_client(&resolved, home.path(), &mut empty, |_| {}).unwrap();
     assert_eq!(again.backend_id, "hip-radeon");
+
+    let plan = backend_pack_download_plan(home.path(), &resolved).unwrap();
+    assert_eq!(plan.total_bytes, (plugin.len() + archive.len()) as u64);
+    assert_eq!(plan.plugin_bytes, plugin.len() as u64);
+    assert_eq!(plan.vendor_bytes, archive.len() as u64);
+    assert_eq!(plan.required_download_bytes, 0);
+    assert_eq!(plan.required_plugin_bytes, 0);
+    assert_eq!(plan.required_vendor_bytes, 0);
+}
+
+#[cfg(target_os = "windows")]
+struct LocalBackendArtifactClient {
+    by_url: HashMap<String, PathBuf>,
+}
+
+#[cfg(target_os = "windows")]
+impl DownloadClient for LocalBackendArtifactClient {
+    fn open(&mut self, url: &str, range: Option<ByteRange>) -> Result<DownloadResponse, PullError> {
+        let path = self
+            .by_url
+            .get(url)
+            .unwrap_or_else(|| panic!("no local backend artifact mapped for {url}"));
+        let mut bytes = fs::read(path).unwrap_or_else(|error| {
+            panic!(
+                "could not read local backend artifact '{}': {error}",
+                path.display()
+            )
+        });
+        let total = bytes.len() as u64;
+        let start = range.map_or(0, |range| range.start);
+        assert!(start <= total, "range start {start} exceeds {total}");
+        if start > 0 {
+            bytes.drain(..start as usize);
+        }
+        let status = if start == 0 { 200 } else { 206 };
+        Ok(DownloadResponse {
+            status,
+            content_length: Some(bytes.len() as u64),
+            content_range: (start > 0).then(|| format!("bytes {start}-{}/{total}", total - 1)),
+            etag: Some(format!("local-{total}")),
+            reader: Box::new(Cursor::new(bytes)),
+        })
+    }
+}
+
+/// Real Windows pack smoke for release rehearsal. This remains ignored unless
+/// the caller deliberately supplies a dev-signed catalog, its artifact
+/// directory, and an empty isolated OpenASR home. It exercises the same
+/// install, full-file verification, extraction, live ABI/target/driver probe,
+/// and atomic activation pointer as production without publishing local build
+/// artifacts just to make them downloadable over public HTTPS.
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "requires a real locally built Windows CUDA backend pack"]
+fn windows_real_cuda_backend_pack_installs_and_activates() {
+    let catalog_path = PathBuf::from(
+        std::env::var("OPENASR_WINDOWS_GPU_PLUGIN_E2E_CATALOG")
+            .expect("OPENASR_WINDOWS_GPU_PLUGIN_E2E_CATALOG is required"),
+    );
+    let artifact_dir = PathBuf::from(
+        std::env::var("OPENASR_WINDOWS_GPU_PLUGIN_E2E_ARTIFACT_DIR")
+            .expect("OPENASR_WINDOWS_GPU_PLUGIN_E2E_ARTIFACT_DIR is required"),
+    );
+    let home = PathBuf::from(
+        std::env::var("OPENASR_WINDOWS_GPU_PLUGIN_E2E_HOME")
+            .expect("OPENASR_WINDOWS_GPU_PLUGIN_E2E_HOME is required"),
+    );
+    fs::create_dir_all(&home).unwrap();
+    assert!(
+        fs::read_dir(&home).unwrap().next().is_none(),
+        "real backend smoke requires an empty isolated home: {}",
+        home.display()
+    );
+
+    let signature_path = catalog_path.with_file_name(crate::CATALOG_SIGNATURE_FILE_NAME);
+    let signature: crate::CatalogSignatureManifest =
+        serde_json::from_str(&fs::read_to_string(&signature_path).unwrap()).unwrap();
+    let catalog =
+        crate::load_local_catalog_file_with_identity(&catalog_path, &signature.catalog_url, &home)
+            .unwrap();
+    let resolved = crate::resolve_catalog_backend_pull_for_host(
+        &catalog,
+        CatalogBackendVendor::Cuda,
+        &crate::BackendHostAbi::current(),
+    )
+    .unwrap();
+    assert_eq!(resolved.targets, ["sm_86"]);
+
+    let mut client = LocalBackendArtifactClient {
+        by_url: resolved
+            .files
+            .iter()
+            .map(|file| {
+                let path = artifact_dir.join(&file.filename);
+                assert!(path.is_file(), "missing local artifact: {}", path.display());
+                (file.url.clone(), path)
+            })
+            .collect(),
+    };
+    let installed =
+        install_backend_pack_with_client(&resolved, &home, &mut client, |_| {}).unwrap();
+    read_and_verify_installed_backend(&installed.dir, &resolved).unwrap();
+
+    let activated =
+        crate::activate_installed_backend_pack_auto(&catalog, &resolved.backend_id, &home).unwrap();
+    assert_eq!(activated.vendor, CatalogBackendVendor::Cuda);
+    assert_eq!(activated.device_target, "sm_86");
+    assert!(!activated.driver_version.is_empty());
+    assert_eq!(
+        crate::backend_plugin_status(&home)
+            .unwrap()
+            .activated
+            .as_ref(),
+        Some(&activated)
+    );
+
+    // Prove the durable pointer is consumable by the actual neutral-host
+    // runtime, not merely well-formed JSON.  This specifically locks the
+    // catalog-source contract: Desktop/CLI may provide catalog bytes and their
+    // signed identity as separate values, and the first runtime query must use
+    // that same identity rather than silently resolving the embedded/default
+    // catalog and losing the freshly activated entry.
+    let _runtime_env = crate::test_process_env::TestProcessEnvGuard::new([
+        ("OPENASR_HOME", Some(home.as_os_str().to_os_string())),
+        (
+            crate::OPENASR_CATALOG_FILE_ENV_VAR,
+            Some(catalog_path.as_os_str().to_os_string()),
+        ),
+        (
+            crate::OPENASR_CATALOG_IDENTITY_ENV_VAR,
+            Some(std::ffi::OsString::from(&signature.catalog_url)),
+        ),
+        ("OPENASR_CATALOG_URL", None),
+    ]);
+    assert_eq!(
+        crate::ggml_runtime::backend_plugin_activation_status()
+            .unwrap()
+            .as_deref(),
+        Some(resolved.backend_id.as_str())
+    );
+    assert!(
+        crate::ggml_runtime::ggml_available_devices()
+            .iter()
+            .any(|device| device.name == "CUDA0"),
+        "activated CUDA pack must register CUDA0 in the neutral host"
+    );
+}
+
+#[test]
+fn backend_pack_download_plan_accounts_for_fresh_cached_and_partial_bytes() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let first = hip_pack_resolved(&plugin, &archive);
+
+    let fresh = backend_pack_download_plan(home.path(), &first).unwrap();
+    assert_eq!(fresh.total_bytes, (plugin.len() + archive.len()) as u64);
+    assert_eq!(fresh.plugin_bytes, plugin.len() as u64);
+    assert_eq!(fresh.vendor_bytes, archive.len() as u64);
+    assert_eq!(fresh.required_download_bytes, fresh.total_bytes);
+    assert_eq!(fresh.required_plugin_bytes, fresh.plugin_bytes);
+    assert_eq!(fresh.required_vendor_bytes, fresh.vendor_bytes);
+
+    let mut first_client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: plugin.clone(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+    install_backend_pack_with_client(&first, home.path(), &mut first_client, |_| {}).unwrap();
+
+    let mut next = first.clone();
+    next.version = "0.13.2".to_string();
+    let staging = backend_pack_staging_dir(home.path(), &next).unwrap();
+    fs::create_dir_all(&staging).unwrap();
+    let plugin_dest = staging.join(&next.files[0].filename);
+    let (partial, partial_meta) = backend_partial_paths(&plugin_dest).unwrap();
+    let prefix_len = plugin.len() / 2;
+    fs::write(&partial, &plugin[..prefix_len]).unwrap();
+    write_backend_partial_meta(
+        &partial_meta,
+        &next.files[0],
+        Some("stable-etag".to_string()),
+        prefix_len as u64,
+    )
+    .unwrap();
+
+    let resumed = backend_pack_download_plan(home.path(), &next).unwrap();
+    assert_eq!(resumed.total_bytes, fresh.total_bytes);
+    assert_eq!(resumed.required_vendor_bytes, 0);
+    assert_eq!(
+        resumed.required_plugin_bytes,
+        plugin.len() as u64 - prefix_len as u64
+    );
+    assert_eq!(
+        resumed.required_download_bytes,
+        resumed.required_plugin_bytes
+    );
+}
+
+#[test]
+fn complete_backend_partial_is_verified_and_promoted_without_network() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let mut resolved = hip_pack_resolved(&plugin, &tensile_zip_bytes());
+    resolved.files.truncate(1);
+    let staging = backend_pack_staging_dir(home.path(), &resolved).unwrap();
+    fs::create_dir_all(&staging).unwrap();
+    let dest = staging.join(&resolved.files[0].filename);
+    let (partial, partial_meta) = backend_partial_paths(&dest).unwrap();
+    fs::write(&partial, &plugin).unwrap();
+    write_backend_partial_meta(
+        &partial_meta,
+        &resolved.files[0],
+        Some("stable-etag".to_string()),
+        plugin.len() as u64,
+    )
+    .unwrap();
+
+    let plan = backend_pack_download_plan(home.path(), &resolved).unwrap();
+    assert_eq!(plan.required_download_bytes, 0);
+    let mut empty = FakeClient::with_responses(Vec::new());
+    let installed =
+        install_backend_pack_with_client(&resolved, home.path(), &mut empty, |_| {}).unwrap();
+    assert_eq!(
+        fs::read(installed.dir.join("ggml-hip.dll")).unwrap(),
+        plugin
+    );
+    assert!(!partial.exists());
+    assert!(!partial_meta.exists());
+}
+
+#[test]
+fn corrupted_complete_backend_partial_is_not_counted_as_resumable() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let mut resolved = hip_pack_resolved(&plugin, &tensile_zip_bytes());
+    resolved.files.truncate(1);
+    let staging = backend_pack_staging_dir(home.path(), &resolved).unwrap();
+    fs::create_dir_all(&staging).unwrap();
+    let dest = staging.join(&resolved.files[0].filename);
+    let (partial, partial_meta) = backend_partial_paths(&dest).unwrap();
+    let mut corrupted = plugin.clone();
+    corrupted[0] ^= 0xff;
+    fs::write(&partial, corrupted).unwrap();
+    write_backend_partial_meta(&partial_meta, &resolved.files[0], None, plugin.len() as u64)
+        .unwrap();
+
+    let plan = backend_pack_download_plan(home.path(), &resolved).unwrap();
+    assert_eq!(plan.required_download_bytes, plugin.len() as u64);
+}
+
+#[test]
+fn backend_vendor_content_object_is_reused_across_pack_versions() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let first = hip_pack_resolved(&plugin, &archive);
+    let mut first_client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: plugin.clone(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+    install_backend_pack_with_client(&first, home.path(), &mut first_client, |_| {}).unwrap();
+
+    let mut second = first.clone();
+    second.version = "0.13.2".to_string();
+    let mut second_client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: plugin,
+    }]);
+    let installed =
+        install_backend_pack_with_client(&second, home.path(), &mut second_client, |_| {}).unwrap();
+    assert_eq!(second_client.urls(), vec![second.files[0].url.clone()]);
+    assert!(
+        installed
+            .dir
+            .join("rocblas/library/Kernels.so-000-gfx1200.hsaco")
+            .is_file()
+    );
+    read_and_verify_installed_backend(&installed.dir, &second).unwrap();
+}
+
+#[test]
+fn installed_backend_full_verification_rejects_tampered_file() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let mut resolved = hip_pack_resolved(&plugin, &tensile_zip_bytes());
+    resolved.files.truncate(1);
+    let mut client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: plugin,
+    }]);
+    install_backend_pack_with_client(&resolved, home.path(), &mut client, |_| {}).unwrap();
+    let dir = backend_pack_install_dir(home.path(), &resolved).unwrap();
+    fs::write(
+        dir.join("ggml-hip.dll"),
+        minimal_pe_bytes()
+            .into_iter()
+            .chain([7])
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        read_and_verify_installed_backend(&dir, &resolved),
+        Err(PullError::SizeMismatch { .. }) | Err(PullError::ShaMismatch { .. })
+    ));
+}
+
+#[test]
+fn backend_install_lock_is_os_owned_and_exclusive() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("backend-install.lock");
+    let first = BackendInstallLock::acquire(&path).unwrap();
+    assert!(matches!(
+        BackendInstallLock::acquire(&path),
+        Err(PullError::LockHeld { .. })
+    ));
+    drop(first);
+    BackendInstallLock::acquire(&path).unwrap();
+}
+
+#[test]
+fn backend_store_mutation_lock_serializes_install_activation_and_gc() {
+    let home = tempfile::tempdir().unwrap();
+    let first = BackendStoreMutationLock::acquire(home.path()).unwrap();
+    assert!(matches!(
+        BackendStoreMutationLock::acquire(home.path()),
+        Err(PullError::LockHeld { .. })
+    ));
+    drop(first);
+    BackendStoreMutationLock::acquire(home.path()).unwrap();
+}
+
+#[test]
+fn backend_store_gc_retains_requested_pack_and_its_shared_vendor_object() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let first = hip_pack_resolved(&plugin, &archive);
+    let mut first_client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: plugin.clone(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+    install_backend_pack_with_client(&first, home.path(), &mut first_client, |_| {}).unwrap();
+
+    let mut second = first.clone();
+    second.backend_id = "hip-radeon-next".to_string();
+    second.version = "0.13.2".to_string();
+    let mut second_client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: plugin,
+    }]);
+    install_backend_pack_with_client(&second, home.path(), &mut second_client, |_| {}).unwrap();
+
+    let first_dir = backend_pack_install_dir(home.path(), &first).unwrap();
+    let second_dir = backend_pack_install_dir(home.path(), &second).unwrap();
+    let object_dir = backend_content_object_dir(home.path(), &second.files[1]);
+    let report = gc_backend_store(
+        home.path(),
+        [second.backend_id.clone()],
+        Some(Duration::ZERO),
+    )
+    .unwrap();
+    assert!(!first_dir.exists());
+    assert!(second_dir.is_dir());
+    assert!(object_dir.is_dir());
+    assert_eq!(report.removed_pack_directories, 1);
+    assert_eq!(report.removed_content_objects, 0);
+
+    let report = gc_backend_store(home.path(), Vec::new(), Some(Duration::ZERO)).unwrap();
+    assert!(!second_dir.exists());
+    assert!(!object_dir.exists());
+    assert_eq!(report.removed_pack_directories, 1);
+    assert_eq!(report.removed_content_objects, 1);
+}
+
+#[test]
+fn backend_store_gc_reclaims_stale_staging_tree() {
+    let home = tempfile::tempdir().unwrap();
+    let staging = home.path().join("backends/.staging/hip/0.13.1/artifact");
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join("payload.bin"), b"payload").unwrap();
+    let report = gc_backend_store(home.path(), Vec::new(), Some(Duration::ZERO)).unwrap();
+    assert_eq!(report.removed_staging_directories, 1);
+    assert!(!staging.exists());
 }
 
 #[test]
@@ -3051,6 +3469,21 @@ fn install_backend_pack_rejects_unsafe_version_segment() {
             field: "backend.version",
             ..
         }
+    ));
+}
+
+#[test]
+fn backend_pack_download_plan_rejects_unsafe_version_segment() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let mut resolved = hip_pack_resolved(&plugin, &tensile_zip_bytes());
+    resolved.version = "../escape".to_string();
+    assert!(matches!(
+        backend_pack_download_plan(home.path(), &resolved),
+        Err(PullError::InvalidTarget {
+            field: "backend.version",
+            ..
+        })
     ));
 }
 
@@ -3153,7 +3586,7 @@ fn install_backend_pack_retries_stalled_read_and_succeeds() {
     let installed =
         install_backend_pack_with_client(&resolved, home.path(), &mut client, |_| {}).unwrap();
 
-    let dir = home.path().join("backends").join("hip").join("0.13.1");
+    let dir = backend_pack_install_dir(home.path(), &resolved).unwrap();
     assert_eq!(installed.dir, dir);
     assert!(dir.join("ggml-hip.dll").is_file());
     assert_eq!(fs::read(dir.join("ggml-hip.dll")).unwrap(), plugin);
@@ -3178,14 +3611,69 @@ fn install_backend_pack_resumes_after_mid_stream_drop_and_retries() {
     let installed =
         install_backend_pack_with_client(&resolved, home.path(), &mut client, |_| {}).unwrap();
 
-    let dir = home.path().join("backends").join("hip").join("0.13.1");
+    let dir = backend_pack_install_dir(home.path(), &resolved).unwrap();
     assert_eq!(installed.dir, dir);
     assert_eq!(fs::read(dir.join("libbackend.so")).unwrap(), plugin);
     // Second attempt must have asked for a Range starting at the byte the
     // dropped connection had already delivered -- a from-scratch restart
     // would instead show `[None, None]`.
     assert_eq!(client.ranges(), vec![None, Some(700)]);
-    assert!(!dir.join("libbackend.so.partial").exists());
+    let partial = dir.join(".libbackend.so.partial");
+    assert!(!partial.exists());
+    assert!(!dir.join(".libbackend.so.partial.json").exists());
+}
+
+#[test]
+fn backend_pack_resume_survives_process_boundary_metadata_reload() {
+    let home = tempfile::tempdir().unwrap();
+    let mut plugin: Vec<u8> = vec![0x7F, b'E', b'L', b'F'];
+    plugin.extend((0_u32..2000).map(|value| (value % 251) as u8));
+    let mut resolved = hip_pack_resolved(&plugin, &tensile_zip_bytes());
+    resolved.files.truncate(1);
+    {
+        let file = &mut resolved.files[0];
+        file.filename = "libbackend.so".to_string();
+        file.sha256 = sha256_hex(&plugin);
+        file.size_bytes = plugin.len() as u64;
+    }
+
+    let dir = backend_pack_install_dir(home.path(), &resolved).unwrap();
+    fs::create_dir_all(&dir).unwrap();
+    let file = &resolved.files[0];
+    let dest = dir.join(&file.filename);
+    let partial = dir.join(".libbackend.so.partial");
+    let partial_meta = dir.join(".libbackend.so.partial.json");
+    let mut first = BackendMidStreamDropThenResumeClient::new(plugin.clone(), 700);
+    let mut expected_etag = None;
+    assert!(
+        download_backend_file_attempt(
+            &mut first,
+            file,
+            &dest,
+            &partial,
+            &partial_meta,
+            &mut expected_etag,
+            &mut |_| {},
+        )
+        .is_err()
+    );
+    assert_eq!(fs::metadata(&partial).unwrap().len(), 700);
+    assert!(partial_meta.is_file());
+
+    // A new client and a fresh in-memory ETag represent the replacement
+    // process after NSIS terminates the old one. Resume provenance must come
+    // entirely from the stable on-disk metadata.
+    let mut replacement = BackendMidStreamDropThenResumeClient {
+        bytes: plugin.clone(),
+        split: 700,
+        attempts: 1,
+        ranges: Vec::new(),
+    };
+    download_backend_file(&mut replacement, file, &dest, &mut |_| {}).unwrap();
+    assert_eq!(replacement.ranges(), vec![Some(700)]);
+    assert_eq!(fs::read(dest).unwrap(), plugin);
+    assert!(!partial.exists());
+    assert!(!partial_meta.exists());
 }
 
 // -- Concurrent chunked-download tests -------------------------------------

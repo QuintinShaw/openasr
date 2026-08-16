@@ -890,11 +890,13 @@ mod tests {
         fs::write(&source, b"GGUF-original-pack").unwrap();
         let root = temp.path().join("models");
         let first = admit_file(&source, &root, |_| Ok(())).unwrap();
-        force_overwrite_object(&first.object_path, b"corrupt");
+        let object_path = first.object_path.clone();
+        drop(first);
+        force_overwrite_object(&object_path, b"corrupt");
 
         let error = admit_file(&source, &root, |_| Ok(())).unwrap_err();
         assert!(matches!(error, ContentStoreError::SourceChanged { .. }));
-        assert_eq!(fs::read(first.object_path).unwrap(), b"corrupt");
+        assert_eq!(fs::read(object_path).unwrap(), b"corrupt");
     }
 
     #[test]
@@ -1143,23 +1145,17 @@ mod tests {
 
         // Defeating the seal must fail closed -- back to the hashing path
         // (None here) -- never keep handing out the trusted digest.
-        force_overwrite_object(&admitted.object_path, b"GGUF-trusted-gate-XXXX");
-        assert!(
-            !fs::metadata(&admitted.object_path)
-                .unwrap()
-                .permissions()
-                .readonly()
-        );
-        assert_eq!(
-            trusted_object_digest(&admitted.object_path, false, &root),
-            None
-        );
+        let object_path = admitted.object_path.clone();
+        drop(admitted);
+        force_overwrite_object(&object_path, b"GGUF-trusted-gate-XXXX");
+        assert!(!fs::metadata(&object_path).unwrap().permissions().readonly());
+        assert_eq!(trusted_object_digest(&object_path, false, &root), None);
 
         // Layout and seal alone are not enough either: a caller anchored to a
         // *different* root must not trust this object, even sealed.
         let unrelated_root = temp.path().join("other-models");
         assert_eq!(
-            trusted_object_digest(&admitted.object_path, true, &unrelated_root),
+            trusted_object_digest(&object_path, true, &unrelated_root),
             None,
             "an object real and sealed under one root must not be trusted by a caller \
              anchored to a different root"

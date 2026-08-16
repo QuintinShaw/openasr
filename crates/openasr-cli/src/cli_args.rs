@@ -237,6 +237,12 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: ModelPackCommand,
     },
+    /// Internal machine protocol for optional GPU backend packs.
+    #[command(name = "__openasr-backend-plugin", hide = true)]
+    BackendPlugin {
+        #[command(subcommand)]
+        command: BackendPluginCommand,
+    },
     /// Internal helper for sandboxed GGUF C parser probes.
     #[command(name = "__openasr-gguf-c-parser-probe", hide = true)]
     GgufCParserProbe {
@@ -621,6 +627,39 @@ pub(crate) enum Command {
     Apikey {
         #[command(subcommand)]
         command: ApiKeyCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum BackendPluginCommand {
+    /// Print the neutral-host ABI and current activation selector.
+    Status,
+    /// Resolve the unique signed pack for this host ABI without downloading.
+    ResolveProvider {
+        #[arg(value_parser = ["cuda", "hip"])]
+        provider: String,
+    },
+    /// Download and fully verify a signed-catalog pack without activating it.
+    Install { backend_id: String },
+    /// Live-probe and atomically activate an already installed pack.
+    Activate { backend_id: String },
+    /// Install, live-probe, and atomically activate one pack.
+    InstallActivate { backend_id: String },
+    /// Resolve the current host's signed fat pack for a provider, install it,
+    /// and activate it after live target proof.
+    InstallActivateProvider {
+        #[arg(value_parser = ["cuda", "hip"])]
+        provider: String,
+    },
+    /// Remove the optional backend selector; bundled CPU/Vulkan remain.
+    Deactivate,
+    /// Reclaim unselected backend-pack generations and shared vendor objects.
+    /// Active and explicitly retained backend ids are never removed.
+    Gc {
+        #[arg(long = "keep-backend-id")]
+        keep_backend_ids: Vec<String>,
+        #[arg(long, default_value_t = 7 * 24 * 60 * 60)]
+        min_age_seconds: u64,
     },
 }
 
