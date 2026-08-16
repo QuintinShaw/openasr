@@ -449,10 +449,10 @@ pub(crate) enum Command {
         /// Optional exact or best-effort microphone device name.
         #[arg(long)]
         device: Option<String>,
-        /// Simulate live streaming from a local audio file (WAV/MP3/MP4/M4A/WEBM/FLAC/OGG).
+        /// Replay a local audio file through the live pipeline (WAV/MP3/MP4/M4A/WEBM/FLAC/OGG).
         ///
-        /// When set, OpenASR feeds fixed-duration frames from this file into the live pipeline
-        /// instead of capturing from microphone.
+        /// Near-real-time pacing means one hour of audio takes roughly one hour of wall-clock time.
+        /// OpenASR feeds fixed-duration frames from this file instead of capturing from microphone.
         #[arg(long)]
         input_file: Option<PathBuf>,
         /// Model id from the registry.

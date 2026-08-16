@@ -297,6 +297,17 @@ fn help_does_not_list_removed_legacy_backends() {
 }
 
 #[test]
+fn live_input_file_help_documents_near_real_time_pacing() {
+    openasr()
+        .args(["live", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Near-real-time pacing"))
+        .stdout(predicate::str::contains("one hour of audio takes roughly"))
+        .stdout(predicate::str::contains("one hour of wall-clock time"));
+}
+
+#[test]
 fn serve_help_documents_local_default_and_remote_security() {
     openasr()
         .args(["serve", "--help"])
