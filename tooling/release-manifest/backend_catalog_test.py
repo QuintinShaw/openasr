@@ -189,6 +189,107 @@ class BackendCatalogTest(unittest.TestCase):
             with self.assertRaises(backend_catalog.BackendCatalogError):
                 backend_catalog.compile_update_hints(paths, out)
 
+    def test_release_asset_and_published_catalog_gates_bind_exact_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entries = []
+            expected_entries = []
+            for provider, marker in (("cuda", b"cuda"), ("hip", b"hip")):
+                plugin = root / f"ggml-{provider}.dll"
+                vendor = root / f"{provider}-vendor.zip"
+                plugin.write_bytes(marker + b"-plugin")
+                vendor.write_bytes(marker + b"-vendor")
+                files = []
+                for asset, role in ((plugin, "plugin"), (vendor, "archive")):
+                    digest, size = backend_catalog.sha256_size(asset)
+                    record = {
+                        "filename": asset.name,
+                        "url": f"https://dl.openasr.org/core/v1.2.3/{asset.name}",
+                        "mirrors": [
+                            {
+                                "source": "github",
+                                "url": "https://github.com/QuintinShaw/openasr/"
+                                f"releases/download/v1.2.3/{asset.name}",
+                            }
+                        ],
+                        "sha256": digest,
+                        "size_bytes": size,
+                        "role": role,
+                    }
+                    if role == "archive":
+                        record.update(
+                            extract_subdir="vendor", extracted_tree_sha256="d" * 64
+                        )
+                    files.append(record)
+                entry = {
+                    "id": f"{provider}-release",
+                    "vendor": provider,
+                    "version": "1.2.3",
+                    "host_abi": {"fingerprint": "a" * 64},
+                    "targets": ["sm_86" if provider == "cuda" else "gfx1100"],
+                    "files": files,
+                }
+                path = root / f"entry-{provider}.json"
+                path.write_text(json.dumps(entry), encoding="utf-8")
+                entries.append(path)
+                expected_entries.append(entry)
+
+            report = backend_catalog.verify_release_assets(entries, root, "1.2.3")
+            self.assertEqual(report["verified_files"], 4)
+            self.assertEqual(set(report["providers"]), {"cuda", "hip"})
+
+            catalog = root / "catalog.json"
+            catalog.write_text(
+                json.dumps({"schema_version": 1, "models": [], "backends": expected_entries}),
+                encoding="utf-8",
+            )
+            catalog_report = backend_catalog.verify_catalog_entries(catalog, entries)
+            self.assertEqual(
+                catalog_report["verified_backend_ids"], ["cuda-release", "hip-release"]
+            )
+
+            plugin = root / "ggml-cuda.dll"
+            plugin.write_bytes(b"tampered")
+            with self.assertRaises(backend_catalog.BackendCatalogError):
+                backend_catalog.verify_release_assets(entries, root, "1.2.3")
+            with self.assertRaises(backend_catalog.BackendCatalogError):
+                backend_catalog.verify_release_assets(entries, root, "9.9.9")
+
+            bad_catalog = json.loads(catalog.read_text(encoding="utf-8"))
+            bad_catalog["backends"][0]["targets"] = ["sm_89"]
+            catalog.write_text(json.dumps(bad_catalog), encoding="utf-8")
+            with self.assertRaises(backend_catalog.BackendCatalogError):
+                backend_catalog.verify_catalog_entries(catalog, entries)
+
+    def test_release_asset_gate_rejects_path_and_version_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entries = []
+            for provider in ("cuda", "hip"):
+                entry = {
+                    "id": provider,
+                    "vendor": provider,
+                    "version": "9.9.9",
+                    "host_abi": {"fingerprint": "a" * 64},
+                    "targets": [provider],
+                    "files": [
+                        {
+                            "filename": "../escape.dll",
+                            "url": "https://example.invalid/escape.dll",
+                            "sha256": "b" * 64,
+                            "size_bytes": 1,
+                            "role": "plugin",
+                        }
+                    ],
+                }
+                path = root / f"{provider}.json"
+                path.write_text(json.dumps(entry), encoding="utf-8")
+                entries.append(path)
+            with self.assertRaises(backend_catalog.BackendCatalogError):
+                backend_catalog.verify_release_assets(entries, root, "1.2.3")
+            with self.assertRaises(backend_catalog.BackendCatalogError):
+                backend_catalog.verify_release_assets(entries, root, "9.9.9")
+
     def test_artifact_fingerprint_binds_target_driver_and_payload(self):
         entry = {
             "id": "cuda-pack",

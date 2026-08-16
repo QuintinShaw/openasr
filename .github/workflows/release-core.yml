@@ -238,7 +238,7 @@ jobs:
 
           cat highlights.md whats-changed.md install-verify.md > body.md
 
-      - name: Create GitHub Release
+      - name: Create draft GitHub Release
         run: |
           set -euo pipefail
           tag="${{ needs.resolve.outputs.tag }}"
@@ -247,6 +247,7 @@ jobs:
           # create` publishes against that existing tag rather than minting
           # a fresh one.
           gh release create "${tag}" \
+            --draft \
             --title "${tag}" \
             --notes-file body.md \
             dist/*.tar.gz dist/SHA256SUMS

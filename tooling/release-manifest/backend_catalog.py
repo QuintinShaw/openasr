@@ -361,6 +361,133 @@ def merge_catalog(catalog_path: Path, entry_paths: list[Path], out: Path) -> Non
     out.write_text(json.dumps(catalog, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def verify_release_assets(
+    entry_paths: list[Path], asset_directory: Path, expected_version: str
+) -> dict[str, object]:
+    """Bind signed-catalog metadata to the exact release bytes on disk.
+
+    The release workflow emits backend entries and payloads independently.  A
+    maintainer must never sign/serve an entry merely because the JSON parses:
+    every declared file has to be present under its declared basename and its
+    byte size and SHA-256 must match.  This deliberately accepts a directory of
+    already-downloaded release assets so the caller owns network/auth policy.
+    """
+
+    providers: dict[str, str] = {}
+    host_abi: str | None = None
+    verified_files = 0
+    verified_bytes = 0
+    for entry_path in entry_paths:
+        entry = _read_json(entry_path)
+        provider = str(entry.get("vendor", ""))
+        if provider not in {"cuda", "hip"} or provider in providers:
+            raise BackendCatalogError(
+                "release verification requires one unique CUDA and one unique HIP entry"
+            )
+        if str(entry.get("version", "")) != expected_version:
+            raise BackendCatalogError(
+                f"backend '{provider}' version does not match release {expected_version}"
+            )
+        fingerprint = str(entry.get("host_abi", {}).get("fingerprint", ""))
+        if len(fingerprint) != 64:
+            raise BackendCatalogError(f"backend '{provider}' has no complete host ABI")
+        if host_abi is not None and host_abi != fingerprint:
+            raise BackendCatalogError("CUDA and HIP release entries do not share one host ABI")
+        host_abi = fingerprint
+        providers[provider] = str(entry.get("id", ""))
+
+        files = entry.get("files")
+        if not isinstance(files, list) or not files:
+            raise BackendCatalogError(f"backend '{provider}' has no release files")
+        for file in files:
+            if not isinstance(file, dict):
+                raise BackendCatalogError(f"backend '{provider}' has an invalid file record")
+            filename = str(file.get("filename", ""))
+            if (
+                not filename
+                or Path(filename).name != filename
+                or filename in {".", ".."}
+                or "/" in filename
+                or "\\" in filename
+            ):
+                raise BackendCatalogError(
+                    f"backend '{provider}' has an unsafe release filename '{filename}'"
+                )
+            asset = asset_directory / filename
+            if not asset.is_file():
+                raise BackendCatalogError(
+                    f"backend '{provider}' release asset is missing: {filename}"
+                )
+            actual_sha, actual_size = sha256_size(asset)
+            expected_sha = str(file.get("sha256", "")).lower()
+            expected_size = int(file.get("size_bytes", 0))
+            if actual_sha != expected_sha or actual_size != expected_size:
+                raise BackendCatalogError(
+                    f"backend '{provider}' release asset does not match its catalog entry: {filename}"
+                )
+            url = str(file.get("url", ""))
+            canonical_url = (
+                f"https://dl.openasr.org/core/v{expected_version}/{filename}"
+            )
+            if url != canonical_url:
+                raise BackendCatalogError(
+                    f"backend '{provider}' release URL is not canonical for {filename}"
+                )
+            expected_mirror = (
+                "https://github.com/QuintinShaw/openasr/releases/download/"
+                f"v{expected_version}/{filename}"
+            )
+            mirrors = file.get("mirrors", [])
+            if not isinstance(mirrors, list) or not any(
+                isinstance(mirror, dict) and mirror.get("url") == expected_mirror
+                for mirror in mirrors
+            ):
+                raise BackendCatalogError(
+                    f"backend '{provider}' has no canonical GitHub release mirror for {filename}"
+                )
+            verified_files += 1
+            verified_bytes += actual_size
+
+    if set(providers) != {"cuda", "hip"}:
+        raise BackendCatalogError("release verification requires both CUDA and HIP entries")
+    return {
+        "schema_version": 1,
+        "version": expected_version,
+        "host_abi_fingerprint": host_abi,
+        "providers": providers,
+        "verified_files": verified_files,
+        "verified_bytes": verified_bytes,
+    }
+
+
+def verify_catalog_entries(catalog_path: Path, entry_paths: list[Path]) -> dict[str, object]:
+    """Require a catalog to contain the release entries byte-for-byte."""
+
+    catalog = _read_json(catalog_path)
+    catalog_entries = catalog.get("backends", [])
+    if not isinstance(catalog_entries, list):
+        raise BackendCatalogError("catalog.backends must be an array")
+    by_id = {
+        str(entry.get("id")): entry
+        for entry in catalog_entries
+        if isinstance(entry, dict) and entry.get("id")
+    }
+    verified: list[str] = []
+    for entry_path in entry_paths:
+        expected = _read_json(entry_path)
+        backend_id = str(expected.get("id", ""))
+        if not backend_id or by_id.get(backend_id) != expected:
+            raise BackendCatalogError(
+                f"catalog does not contain the exact release backend entry '{backend_id}'"
+            )
+        verified.append(backend_id)
+    return {
+        "schema_version": 1,
+        "catalog": str(catalog_path),
+        "verified_backend_ids": sorted(verified),
+    }
+
+
 def artifact_fingerprint(entry: dict[str, Any]) -> str:
     digest = hashlib.sha256()
     role_tags = {"runtime": 0, "plugin": 1, "archive": 2}
@@ -450,6 +577,13 @@ def main() -> int:
     merge_parser.add_argument("--catalog", type=Path, required=True)
     merge_parser.add_argument("--entry", type=Path, action="append", required=True)
     merge_parser.add_argument("--out", type=Path, required=True)
+    verify_assets_parser = subparsers.add_parser("verify-assets")
+    verify_assets_parser.add_argument("--entry", type=Path, action="append", required=True)
+    verify_assets_parser.add_argument("--asset-directory", type=Path, required=True)
+    verify_assets_parser.add_argument("--version", required=True)
+    verify_catalog_parser = subparsers.add_parser("verify-catalog")
+    verify_catalog_parser.add_argument("--catalog", type=Path, required=True)
+    verify_catalog_parser.add_argument("--entry", type=Path, action="append", required=True)
     hints_parser = subparsers.add_parser("hints")
     hints_parser.add_argument("--entry", type=Path, action="append", required=True)
     hints_parser.add_argument("--out", type=Path, required=True)
@@ -468,6 +602,19 @@ def main() -> int:
             )
         elif args.command == "merge":
             merge_catalog(args.catalog, args.entry, args.out)
+        elif args.command == "verify-assets":
+            print(
+                json.dumps(
+                    verify_release_assets(args.entry, args.asset_directory, args.version),
+                    sort_keys=True,
+                )
+            )
+        elif args.command == "verify-catalog":
+            print(
+                json.dumps(
+                    verify_catalog_entries(args.catalog, args.entry), sort_keys=True
+                )
+            )
         elif args.command == "hints":
             compile_update_hints(args.entry, args.out)
         else:

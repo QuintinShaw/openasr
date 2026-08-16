@@ -107,6 +107,26 @@ upload, and completeness-gate logic without mutating the release's assets
 genuinely incomplete -- that failure is expected and informative, not a bug
 in the dry run).
 
+The core GitHub Release is created as a **draft**. This is load-bearing for the
+Windows plugin topology: CUDA/HIP payload hashes exist only after the release
+matrix has built them, while the neutral host resolves those hashes from the
+production-signed catalog. A draft is not made public until both signed
+distribution planes are complete:
+
+1. Run `scripts/sign-and-verify-backends-manifest.sh vX.Y.Z`.
+2. Run `scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z` locally with
+   the production catalog signing seed. It downloads and hashes every declared
+   CUDA/HIP byte, merges the exact entries, bumps the catalog epoch, and signs
+   the full/public catalogs. Review, commit, and push those catalog files.
+3. Wait for `deploy-catalog.yml` to prove the signed public bytes are live.
+4. Run `scripts/finalize-core-release.sh vX.Y.Z`. It re-verifies the published
+   backends manifest, the live signed catalog, and the exact CUDA+HIP entries;
+   only then does it publish the draft and mark it latest.
+
+None of these scripts publishes code or a catalog implicitly. A failure leaves
+the release draft and therefore unavailable to users; there is no partially
+usable release whose Desktop UI advertises a backend that cannot resolve.
+
 ## Backends-manifest signing (REQUIRED, LOCAL ONLY -- not optional)
 
 Every release that ships a Windows GPU-kernel `backends-manifest.json`

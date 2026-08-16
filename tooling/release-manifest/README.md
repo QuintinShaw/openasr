@@ -168,7 +168,8 @@ is always a local, human-run step:
 
 ## Post-release checklist (local, after `release-binaries.yml` finishes)
 
-Run all three steps from a maintainer machine; none of this runs in CI.
+The GitHub Release remains a draft throughout these steps. Run them from a
+maintainer machine; none of the signing steps runs in CI.
 
 1. **Sign the manifest, attach it to the GitHub release, and self-verify** --
    run `OPENASR_CATALOG_SIGNING_KEY_SEED_HEX=<production seed>
@@ -176,7 +177,18 @@ Run all three steps from a maintainer machine; none of this runs in CI.
    above and `RELEASING.md`). This step is REQUIRED and not optional: the
    release is not signed until this script prints `SIGNED-AND-VERIFIED` and
    exits 0.
-2. **Sync to dl.openasr.org** -- see "dl.openasr.org sync" above
+2. **Prepare and deploy the signed backend catalog** -- run
+   `scripts/prepare-windows-backend-catalog-release.sh v<version>` with the same
+   local production signing seed, review and commit its five catalog/epoch
+   outputs, push them, and wait for `deploy-catalog.yml` to verify the live
+   endpoint. The script downloads and rehashes every CUDA/HIP release byte;
+   unsigned `catalog.backends.candidate.json` is evidence, never an activation
+   source.
+3. **Finalize the draft** -- run `scripts/finalize-core-release.sh v<version>`.
+   It verifies the published manifest signature and requires the live signed
+   catalog to contain the exact release CUDA and HIP entries before it can
+   publish the draft.
+4. **Sync to dl.openasr.org** -- see "dl.openasr.org sync" above
    (`b2_sync.py sync --version <version>`, uploading the Windows sidecar
    archives -- `-vulkan`, `-cuda-sidecar`, `-rocm-sidecar` -- plus
    `backends-manifest.json` and `backends-manifest.signature.json` to
@@ -190,7 +202,7 @@ Run all three steps from a maintainer machine; none of this runs in CI.
    `b2_sync.py` is the ONLY thing that syncs to B2/dl.openasr.org -- step 1's
    script deliberately does not touch B2 at all, so run this step after step
    1 if dl.openasr.org mirroring is wanted for this release.
-3. **Spot-check one signed exe with `signtool`** -- pick one of the archives
+5. **Spot-check one signed exe with `signtool`** -- pick one of the archives
    just uploaded (rotate which GPU leg you check across releases) and confirm
    the Azure Trusted Signing signature is intact and trusted end to end:
 
@@ -203,7 +215,7 @@ Run all three steps from a maintainer machine; none of this runs in CI.
    at launch); a clean run prints a chain up to a trusted root with no
    warnings. Treat any failure as release-blocking -- it means the archive a
    user downloads would fail Windows' own signature check.
-4. **Manually confirm the vendor archives are present and installable** (CI
+6. **Manually confirm the vendor archives are present and installable** (CI
    cannot exercise this on the GPU-less hosted runner -- see this repo's PR/
    commit history for the full "first v2 release" manual checklist): download
    `openasr-vendor-cuda-runtime-<sha12>.zip` /

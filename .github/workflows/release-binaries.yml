@@ -198,7 +198,7 @@ jobs:
             provider: vulkan
             distribution: legacy
             timeout: 120
-          - os: windows-latest
+          - os: windows-2022
             target: x86_64-pc-windows-msvc-cuda
             asset: windows-x86_64-cuda-sidecar
             binary_name: openasr.exe
@@ -244,7 +244,7 @@ jobs:
             provider: vulkan
             distribution: host
             timeout: 120
-          - os: windows-latest
+          - os: windows-2022
             target: x86_64-pc-windows-msvc-cuda-plugin
             asset: windows-x86_64-cuda-plugin
             binary_name: openasr.exe
@@ -566,13 +566,16 @@ jobs:
         if: runner.os == 'Windows' && contains(matrix.features, 'cuda') && env.LEG_SELECTED == 'true'
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
-          # 13.x is the first CUDA line whose host_config.h accepts the VS
-          # 2026 (MSVC 19.5x) toolset on windows-latest; 12.x rejects it with
-          # "unsupported Microsoft Visual Studio version". No VS-integration
-          # sub-package: the build uses the Ninja generator (build.rs).
-          cuda: "13.2.0"
+          # Keep the released Windows plugin on the CUDA 12 ABI so installed
+          # RTX systems with a CUDA-12-capable production driver (including
+          # the validated 566.36 / Driver API 12.7 lane) can load it. Both
+          # CUDA matrix legs are pinned to windows-2022 below: CUDA 12 rejects
+          # the VS 2026 host compiler on windows-latest, while the v143 toolset
+          # is also the host ABI contract recorded in the plugin manifest.
+          # No VS-integration sub-package: build.rs uses Ninja directly.
+          cuda: "12.6.3"
           method: network
-          # CUDA 13 splits the compiler across sub-packages: nvcc is only the
+          # CUDA 12 splits the compiler across sub-packages: nvcc is only the
           # driver, crt carries the front-end headers (include/crt/*), and
           # nvvm carries the cicc device compiler nvcc dispatches to (missing
           # nvvm fails with an unexpanded %CICC_PATH%). cudart supplies the
@@ -1206,7 +1209,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          min_driver_api="13.0.0"
+          min_driver_api="12.0.0"
           if [ "${{ matrix.provider }}" = "hip" ]; then min_driver_api="7.2.0"; fi
           python_bin="python3"
           command -v python3 >/dev/null 2>&1 || python_bin="python"
@@ -1415,6 +1418,7 @@ jobs:
             --out dist/backend-plugin-hints.json
           python3 -m json.tool dist/catalog.backends.candidate.json >/dev/null
           python3 -m json.tool dist/backend-plugin-hints.json >/dev/null
+          sha256sum dist/catalog.backends.candidate.json >> dist/SHA256SUMS
           sha256sum dist/backend-plugin-hints.json >> dist/SHA256SUMS
       - name: Upload backend catalog candidate
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.only_target == ''
@@ -1532,7 +1536,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "release: ${{ steps.tag.outputs.tag }}"
-          find staging -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dll' -o -name 'backend-pack-*.json' -o -name 'backend-plugin-hints.json' -o -name '*.sha256' -o -name 'SHA256SUMS' -o -name 'backends-manifest.json' \) -print | sort
+          find staging -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dll' -o -name 'backend-pack-*.json' -o -name 'backend-plugin-hints.json' -o -name 'catalog.backends.candidate.json' -o -name '*.sha256' -o -name 'SHA256SUMS' -o -name 'backends-manifest.json' \) -print | sort
 
       - name: Upload assets to release
         if: steps.tag.outputs.tag != '' && github.event.inputs.dry_run != 'true'
@@ -1550,7 +1554,7 @@ jobs:
           # on a single-leg `only_target` dispatch) drops out of the arg list
           # instead of being passed to `gh` as a literal, unmatched path.
           shopt -s nullglob
-          assets=(staging/*.tar.gz staging/*.zip staging/*.dll staging/backend-pack-*.json staging/backend-plugin-hints.json staging/*.sha256 staging/SHA256SUMS staging/backends-manifest.json)
+          assets=(staging/*.tar.gz staging/*.zip staging/*.dll staging/backend-pack-*.json staging/backend-plugin-hints.json staging/catalog.backends.candidate.json staging/*.sha256 staging/SHA256SUMS staging/backends-manifest.json)
           # --clobber so a re-run (retrying a flaky leg) replaces stale assets
           # instead of failing on "asset already exists".
           gh release upload "$tag" "${assets[@]}" \
@@ -1630,6 +1634,7 @@ jobs:
           echo "backend-pack-cuda.json" >> "$expected_file"
           echo "backend-pack-hip.json" >> "$expected_file"
           echo "backend-plugin-hints.json" >> "$expected_file"
+          echo "catalog.backends.candidate.json" >> "$expected_file"
           echo "SHA256SUMS" >> "$expected_file"
           sort -o "$expected_file" "$expected_file"
 

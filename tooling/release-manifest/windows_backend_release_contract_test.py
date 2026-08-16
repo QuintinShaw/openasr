@@ -90,6 +90,8 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             'echo "backend-pack-cuda.json"',
             'echo "backend-pack-hip.json"',
             'echo "backend-plugin-hints.json"',
+            'echo "catalog.backends.candidate.json"',
+            "staging/catalog.backends.candidate.json",
         )
         for fragment in required:
             self.assertIn(fragment, self.workflow)
@@ -120,6 +122,19 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             "rocblas",
         ):
             self.assertIn(symbol, self.workflow)
+
+    def test_windows_cuda_release_remains_compatible_with_cuda_12_drivers(self) -> None:
+        for target in (
+            "x86_64-pc-windows-msvc-cuda",
+            "x86_64-pc-windows-msvc-cuda-plugin",
+        ):
+            self.assertRegex(
+                self.workflow,
+                rf"(?m)^\s*- os: windows-2022\s*\n\s*target: {re.escape(target)}\s*$",
+            )
+        self.assertIn('cuda: "12.6.3"', self.workflow)
+        self.assertIn('min_driver_api="12.0.0"', self.workflow)
+        self.assertNotIn('min_driver_api="13.0.0"', self.workflow)
 
 
 if __name__ == "__main__":
