@@ -34,7 +34,7 @@ class BackendCatalogTest(unittest.TestCase):
     def test_compile_binds_actual_plugin_vendor_tree_and_host_abi(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            plugin = root / "ggml-cuda.dll"
+            plugin = root / "openasr-1.2.3-windows-x86_64-cuda-sm_86-plugin.dll"
             plugin.write_bytes(b"MZ-plugin")
             vendor = root / "vendor"
             vendor.mkdir()
@@ -78,7 +78,7 @@ class BackendCatalogTest(unittest.TestCase):
                         "topology": "neutral-backend-dl",
                         "host_abi": {"schema_version": 1, "fingerprint": "a" * 64},
                         "providers": {"cuda": True},
-                        "backend_targets": {"cuda": ["sm_86", "sm_89"]},
+                        "backend_targets": {"cuda": ["sm_86"]},
                         "build_flags": {
                             "backend_dl": True,
                             "shared": True,
@@ -104,10 +104,11 @@ class BackendCatalogTest(unittest.TestCase):
                 mirror_base_url=None,
                 backend_id=None,
                 display_name=None,
+                require_single_target=True,
             )
             entry = backend_catalog.compile_entry(args)
-            self.assertEqual(entry["id"], "cuda-windows-x86_64-aaaaaaaaaaaa-fat")
-            self.assertEqual(entry["targets"], ["sm_86", "sm_89"])
+            self.assertEqual(entry["id"], "cuda-windows-x86_64-aaaaaaaaaaaa-sm_86")
+            self.assertEqual(entry["targets"], ["sm_86"])
             self.assertEqual(entry["min_driver_api"], "13.0.0")
             self.assertEqual(entry["files"][0]["sha256"], backend_catalog.sha256_size(plugin)[0])
             self.assertEqual(entry["files"][1]["extract_subdir"], "vendor")
@@ -144,17 +145,17 @@ class BackendCatalogTest(unittest.TestCase):
             with self.assertRaises(backend_catalog.BackendCatalogError):
                 backend_catalog.merge_catalog(catalog, [duplicate], out)
 
-    def test_update_hints_bind_both_providers_to_one_host_abi(self):
+    def test_update_hints_bind_target_scoped_provider_candidates_to_one_host_abi(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             paths = []
-            for provider in ("cuda", "hip"):
+            for provider, target in (("cuda", "sm_86"), ("cuda", "sm_89"), ("hip", "gfx1100")):
                 entry = {
-                    "id": f"{provider}-pack",
+                    "id": f"{provider}-pack-{target}",
                     "vendor": provider,
                     "version": "1.2.3",
                     "host_abi": {"fingerprint": "a" * 64},
-                    "targets": ["sm_86" if provider == "cuda" else "gfx1100"],
+                    "targets": [target],
                     "min_driver_api": "1.0",
                     "files": [
                         {
@@ -173,19 +174,34 @@ class BackendCatalogTest(unittest.TestCase):
                         },
                     ],
                 }
-                path = root / f"{provider}.json"
+                path = root / f"{provider}-{target}.json"
                 path.write_text(json.dumps(entry), encoding="utf-8")
                 paths.append(path)
             out = root / "hints.json"
             backend_catalog.compile_update_hints(paths, out)
             hints = json.loads(out.read_text(encoding="utf-8"))["windows-x86_64"]
             self.assertEqual(hints["host_abi_fingerprint"], "a" * 64)
-            self.assertEqual(hints["providers"]["cuda"]["size_bytes"], 30)
-            self.assertEqual(len(hints["providers"]["hip"]["artifact_fingerprint"]), 64)
+            self.assertEqual(
+                list(hints["providers"]["cuda"]["targets"]),
+                ["sm_86", "sm_89"],
+            )
+            self.assertEqual(
+                hints["providers"]["cuda"]["targets"]["sm_86"]["size_bytes"], 30
+            )
+            self.assertEqual(
+                len(
+                    hints["providers"]["hip"]["targets"]["gfx1100"]
+                    ["artifact_fingerprint"]
+                ),
+                64,
+            )
+            self.assertEqual(
+                hints["providers"]["cuda"]["vendor"]["filename"], "cuda-vendor.zip"
+            )
 
-            bad = json.loads(paths[1].read_text(encoding="utf-8"))
+            bad = json.loads(paths[-1].read_text(encoding="utf-8"))
             bad["host_abi"]["fingerprint"] = "e" * 64
-            paths[1].write_text(json.dumps(bad), encoding="utf-8")
+            paths[-1].write_text(json.dumps(bad), encoding="utf-8")
             with self.assertRaises(backend_catalog.BackendCatalogError):
                 backend_catalog.compile_update_hints(paths, out)
 

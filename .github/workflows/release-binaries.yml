@@ -80,10 +80,11 @@ jobs:
       # Do not let a hosted-runner image rename silently create an ABI that
       # cannot be reproduced or compared by the signed backend catalog.
       OPENASR_BACKEND_TOOLCHAIN_CONTRACT: ${{ contains(matrix.target, 'windows-msvc') && 'msvc-v143' || 'platform-default' }}
-      # A maintainer may narrow a manual diagnostic build to the exact GPU
-      # under test. Tag/workflow_call releases leave this empty and retain the
-      # portable build.rs defaults.
-      OPENASR_CUDA_GPU_TARGETS: ${{ inputs.cuda_gpu_targets || '' }}
+      # Each release plugin is target-scoped. A manual diagnostic build may
+      # still override a CUDA leg explicitly; tag/workflow_call releases use
+      # the matrix target rather than emitting one opaque fatbin.
+      OPENASR_CUDA_GPU_TARGETS: ${{ matrix.cuda_gpu_target || inputs.cuda_gpu_targets || '' }}
+      OPENASR_HIP_GPU_TARGETS: ${{ matrix.hip_gpu_target || '' }}
       # AMD HIP SDK "PRO Edition" silent-installer release train, matched to
       # llama.cpp's current Windows HIP release job.
       HIPSDK_INSTALLER_VERSION: 26.Q1
@@ -244,23 +245,187 @@ jobs:
             provider: vulkan
             distribution: host
             timeout: 120
+          # Optional packs are intentionally per GPU target. The signed
+          # catalog resolves the one exact target after the live device probe;
+          # it never asks users to download a multi-architecture fat plugin.
+          # Exactly one leg per vendor owns publishing the content-addressed
+          # vendor runtime asset. Every target pack references its SHA, which
+          # avoids parallel release-upload clobbers while preserving reuse.
           - os: windows-2022
-            target: x86_64-pc-windows-msvc-cuda-plugin
-            asset: windows-x86_64-cuda-plugin
+            target: x86_64-pc-windows-msvc-cuda-sm_75-plugin
+            asset: windows-x86_64-cuda-sm_75-plugin
             binary_name: openasr.exe
             archive_ext: dll
             features: cuda
             provider: cuda
             distribution: plugin
+            cuda_gpu_target: "75"
+            vendor_owner: true
             timeout: 180
           - os: windows-2022
-            target: x86_64-pc-windows-msvc-hip-plugin
-            asset: windows-x86_64-rocm-plugin
+            target: x86_64-pc-windows-msvc-cuda-sm_80-plugin
+            asset: windows-x86_64-cuda-sm_80-plugin
+            binary_name: openasr.exe
+            archive_ext: dll
+            features: cuda
+            provider: cuda
+            distribution: plugin
+            cuda_gpu_target: "80"
+            vendor_owner: false
+            timeout: 180
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc-cuda-sm_86-plugin
+            asset: windows-x86_64-cuda-sm_86-plugin
+            binary_name: openasr.exe
+            archive_ext: dll
+            features: cuda
+            provider: cuda
+            distribution: plugin
+            cuda_gpu_target: "86"
+            vendor_owner: false
+            timeout: 180
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc-cuda-sm_89-plugin
+            asset: windows-x86_64-cuda-sm_89-plugin
+            binary_name: openasr.exe
+            archive_ext: dll
+            features: cuda
+            provider: cuda
+            distribution: plugin
+            cuda_gpu_target: "89"
+            vendor_owner: false
+            timeout: 180
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc-cuda-sm_90-plugin
+            asset: windows-x86_64-cuda-sm_90-plugin
+            binary_name: openasr.exe
+            archive_ext: dll
+            features: cuda
+            provider: cuda
+            distribution: plugin
+            cuda_gpu_target: "90"
+            vendor_owner: false
+            timeout: 180
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc-hip-gfx1030-plugin
+            asset: windows-x86_64-rocm-gfx1030-plugin
             binary_name: openasr.exe
             archive_ext: dll
             features: hip
             provider: hip
             distribution: plugin
+            hip_gpu_target: gfx1030
+            vendor_owner: true
+            timeout: 240
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc-hip-gfx1031-plugin
+            asset: windows-x86_64-rocm-gfx1031-plugin
+            binary_name: openasr.exe
+            archive_ext: dll
+            features: hip
+            provider: hip
+            distribution: plugin
+            hip_gpu_target: gfx1031
+            vendor_owner: false
+            timeout: 240
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc-hip-gfx1032-plugin
+            asset: windows-x86_64-rocm-gfx1032-plugin
+            binary_name: openasr.exe
+            archive_ext: dll
+            features: hip
+            provider: hip
+            distribution: plugin
+            hip_gpu_target: gfx1032
+            vendor_owner: false
+            timeout: 240
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc-hip-gfx1035-plugin
+            asset: windows-x86_64-rocm-gfx1035-plugin
+            binary_name: openasr.exe
+            archive_ext: dll
+            features: hip
+            provider: hip
+            distribution: plugin
+            hip_gpu_target: gfx1035
+            vendor_owner: false
+            timeout: 240
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc-hip-gfx1100-plugin
+            asset: windows-x86_64-rocm-gfx1100-plugin
+            binary_name: openasr.exe
+            archive_ext: dll
+            features: hip
+            provider: hip
+            distribution: plugin
+            hip_gpu_target: gfx1100
+            vendor_owner: false
+            timeout: 240
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc-hip-gfx1101-plugin
+            asset: windows-x86_64-rocm-gfx1101-plugin
+            binary_name: openasr.exe
+            archive_ext: dll
+            features: hip
+            provider: hip
+            distribution: plugin
+            hip_gpu_target: gfx1101
+            vendor_owner: false
+            timeout: 240
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc-hip-gfx1102-plugin
+            asset: windows-x86_64-rocm-gfx1102-plugin
+            binary_name: openasr.exe
+            archive_ext: dll
+            features: hip
+            provider: hip
+            distribution: plugin
+            hip_gpu_target: gfx1102
+            vendor_owner: false
+            timeout: 240
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc-hip-gfx1150-plugin
+            asset: windows-x86_64-rocm-gfx1150-plugin
+            binary_name: openasr.exe
+            archive_ext: dll
+            features: hip
+            provider: hip
+            distribution: plugin
+            hip_gpu_target: gfx1150
+            vendor_owner: false
+            timeout: 240
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc-hip-gfx1151-plugin
+            asset: windows-x86_64-rocm-gfx1151-plugin
+            binary_name: openasr.exe
+            archive_ext: dll
+            features: hip
+            provider: hip
+            distribution: plugin
+            hip_gpu_target: gfx1151
+            vendor_owner: false
+            timeout: 240
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc-hip-gfx1200-plugin
+            asset: windows-x86_64-rocm-gfx1200-plugin
+            binary_name: openasr.exe
+            archive_ext: dll
+            features: hip
+            provider: hip
+            distribution: plugin
+            hip_gpu_target: gfx1200
+            vendor_owner: false
+            timeout: 240
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc-hip-gfx1201-plugin
+            asset: windows-x86_64-rocm-gfx1201-plugin
+            binary_name: openasr.exe
+            archive_ext: dll
+            features: hip
+            provider: hip
+            distribution: plugin
+            hip_gpu_target: gfx1201
+            vendor_owner: false
             timeout: 240
           # Windows arm64 (cross-compiled from the x86_64 windows runner via
           # --target aarch64-pc-windows-msvc). CPU-only, no GPU feature.
@@ -787,6 +952,12 @@ jobs:
             Copy-Item (Join-Path $env:RELEASE_DIR "openasr-backend-packs\$provider\openasr-backend-host-abi-v1.json") $distDir -Force
             Copy-Item (Join-Path $env:RELEASE_DIR "openasr-backend-packs\$provider\openasr-backend-build-v1.json") $distDir -Force
             Add-Content $env:GITHUB_ENV "PLUGIN_ASSET_PATH=$pluginAsset"
+            $targetPack = if ($provider -eq "cuda") { "sm_${{ matrix.cuda_gpu_target }}" } else { "${{ matrix.hip_gpu_target }}" }
+            if ([string]::IsNullOrWhiteSpace($targetPack)) {
+              Write-Error "target-scoped plugin leg has no GPU target"
+            }
+            Add-Content $env:GITHUB_ENV "BACKEND_PACK_NAME=backend-pack-$provider-$targetPack.json"
+            Add-Content $env:GITHUB_ENV "VENDOR_OWNER=${{ matrix.vendor_owner }}"
           } else {
             Copy-Item "$env:RELEASE_DIR\${{ matrix.binary_name }}" "$distDir\"
           }
@@ -1225,8 +1396,9 @@ jobs:
             --minimum-driver-api "$min_driver_api" \
             --base-url "https://dl.openasr.org/core/v$OPENASR_VERSION" \
             --mirror-base-url "https://github.com/QuintinShaw/openasr/releases/download/v$OPENASR_VERSION" \
-            --out "dist/backend-pack-${{ matrix.provider }}.json"
-          cat "dist/backend-pack-${{ matrix.provider }}.json"
+            --require-single-target \
+            --out "dist/${BACKEND_PACK_NAME}"
+          cat "dist/${BACKEND_PACK_NAME}"
 
       # Covers every leg that reaches this point, including `experimental:
       # true` ones (windows-arm64, musl) -- they still ship a release asset,
@@ -1242,14 +1414,14 @@ jobs:
         if: runner.os == 'Windows' && matrix.distribution == 'plugin' && env.LEG_SELECTED == 'true'
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: dist/backend-pack-${{ matrix.provider }}.json
+          subject-path: dist/${{ env.BACKEND_PACK_NAME }}
 
       # The vendor archive is also a shipped release asset (schema v2's
       # `vendor_layers`), so it gets the same provenance attestation as the
       # sidecar archive above -- only runs when the previous step actually
       # produced one (cuda/hip legs).
       - name: Attest build provenance (vendor archive)
-        if: env.LEG_SELECTED == 'true' && env.VENDOR_ASSET_NAME != ''
+        if: env.LEG_SELECTED == 'true' && env.VENDOR_ASSET_NAME != '' && env.VENDOR_OWNER == 'true'
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/${{ env.VENDOR_ASSET_NAME }}
@@ -1266,11 +1438,11 @@ jobs:
         run: |
           set -euo pipefail
           paths="dist/openasr-${OPENASR_VERSION}-${{ matrix.asset }}.${{ matrix.archive_ext }}"
-          if [ -n "${VENDOR_ASSET_NAME:-}" ]; then
+          if [ -n "${VENDOR_ASSET_NAME:-}" ] && [ "${VENDOR_OWNER:-false}" = "true" ]; then
             paths="${paths}"$'\n'"dist/${VENDOR_ASSET_NAME}"
           fi
           if [ "${{ matrix.distribution }}" = "plugin" ]; then
-            paths="${paths}"$'\n'"dist/backend-pack-${{ matrix.provider }}.json"
+            paths="${paths}"$'\n'"dist/${BACKEND_PACK_NAME}"
           fi
           {
             echo "UPLOAD_PATHS<<UPLOAD_PATHS_EOF"
@@ -1407,14 +1579,23 @@ jobs:
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.only_target == ''
         run: |
           set -euo pipefail
+          shopt -s nullglob
+          cuda_entries=(dist/backend-pack-cuda-sm_*.json)
+          hip_entries=(dist/backend-pack-hip-gfx*.json)
+          if [ "${#cuda_entries[@]}" -ne 5 ] || [ "${#hip_entries[@]}" -ne 11 ]; then
+            echo "expected 5 CUDA SM packs and 11 HIP gfx packs; found ${#cuda_entries[@]} and ${#hip_entries[@]}" >&2
+            exit 1
+          fi
+          backend_entry_args=()
+          for entry in "${cuda_entries[@]}" "${hip_entries[@]}"; do
+            backend_entry_args+=(--entry "$entry")
+          done
           python3 tooling/release-manifest/backend_catalog.py merge \
             --catalog model-registry/catalog.json \
-            --entry dist/backend-pack-cuda.json \
-            --entry dist/backend-pack-hip.json \
+            "${backend_entry_args[@]}" \
             --out dist/catalog.backends.candidate.json
           python3 tooling/release-manifest/backend_catalog.py hints \
-            --entry dist/backend-pack-cuda.json \
-            --entry dist/backend-pack-hip.json \
+            "${backend_entry_args[@]}" \
             --out dist/backend-plugin-hints.json
           python3 -m json.tool dist/catalog.backends.candidate.json >/dev/null
           python3 -m json.tool dist/backend-plugin-hints.json >/dev/null
@@ -1426,8 +1607,8 @@ jobs:
         with:
           name: backend-catalog-candidate
           path: |
-            dist/backend-pack-cuda.json
-            dist/backend-pack-hip.json
+            dist/backend-pack-cuda-sm_*.json
+            dist/backend-pack-hip-gfx*.json
             dist/backend-plugin-hints.json
             dist/catalog.backends.candidate.json
           if-no-files-found: error
@@ -1612,8 +1793,6 @@ jobs:
             "windows-x86_64-cuda-sidecar:zip"
             "windows-x86_64-rocm-sidecar:zip"
             "windows-x86_64-neutral:zip"
-            "windows-x86_64-cuda-plugin:dll"
-            "windows-x86_64-rocm-plugin:dll"
             "linux-x86_64-vulkan:tar.gz"
             "linux-x86_64-cuda:tar.gz"
             "linux-x86_64-rocm:tar.gz"
@@ -1631,8 +1810,14 @@ jobs:
             echo "openasr-${version}-${target}.${ext}" >> "$expected_file"
           done
           echo "openasr-${version}-xcframework.zip.sha256" >> "$expected_file"
-          echo "backend-pack-cuda.json" >> "$expected_file"
-          echo "backend-pack-hip.json" >> "$expected_file"
+          for sm in 75 80 86 89 90; do
+            echo "openasr-${version}-windows-x86_64-cuda-sm_${sm}-plugin.dll" >> "$expected_file"
+            echo "backend-pack-cuda-sm_${sm}.json" >> "$expected_file"
+          done
+          for gfx in gfx1030 gfx1031 gfx1032 gfx1035 gfx1100 gfx1101 gfx1102 gfx1150 gfx1151 gfx1200 gfx1201; do
+            echo "openasr-${version}-windows-x86_64-rocm-${gfx}-plugin.dll" >> "$expected_file"
+            echo "backend-pack-hip-${gfx}.json" >> "$expected_file"
+          done
           echo "backend-plugin-hints.json" >> "$expected_file"
           echo "catalog.backends.candidate.json" >> "$expected_file"
           echo "SHA256SUMS" >> "$expected_file"

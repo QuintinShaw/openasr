@@ -61,8 +61,20 @@ done
 
 echo "==> downloading backend entries for ${tag}"
 gh release download "$tag" \
-  -p backend-pack-cuda.json -p backend-pack-hip.json \
+  -p 'backend-pack-*.json' \
   -D "$workdir" --clobber
+
+shopt -s nullglob
+backend_entries=("$workdir"/backend-pack-*.json)
+cuda_entries=("$workdir"/backend-pack-cuda-sm_*.json)
+hip_entries=("$workdir"/backend-pack-hip-gfx*.json)
+if [ "${#cuda_entries[@]}" -ne 5 ] || [ "${#hip_entries[@]}" -ne 11 ] || [ "${#backend_entries[@]}" -ne 16 ]; then
+  fail "release ${tag} must contain exactly 5 CUDA SM and 11 HIP gfx backend-pack metadata files"
+fi
+backend_entry_args=()
+for entry in "${backend_entries[@]}"; do
+  backend_entry_args+=(--entry "$entry")
+done
 
 python3 - "$workdir" <<'PY'
 import json
@@ -71,29 +83,31 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-for entry_path in (root / "backend-pack-cuda.json", root / "backend-pack-hip.json"):
+downloaded = set()
+for entry_path in sorted(root.glob("backend-pack-*.json")):
     entry = json.loads(entry_path.read_text(encoding="utf-8"))
     for file in entry.get("files", []):
         name = file.get("filename")
         if not isinstance(name, str) or not name or Path(name).name != name:
             raise SystemExit(f"unsafe backend release filename: {name!r}")
+        if name in downloaded:
+            continue
         subprocess.run(
             ["gh", "release", "download", f"v{entry['version']}", "-p", name, "-D", str(root), "--clobber"],
             check=True,
         )
+        downloaded.add(name)
 PY
 
 echo "==> verifying every release byte against both backend entries"
 python3 tooling/release-manifest/backend_catalog.py verify-assets \
-  --entry "$workdir/backend-pack-cuda.json" \
-  --entry "$workdir/backend-pack-hip.json" \
+  "${backend_entry_args[@]}" \
   --asset-directory "$workdir" \
   --version "$version"
 
 python3 tooling/release-manifest/backend_catalog.py merge \
   --catalog model-registry/catalog.json \
-  --entry "$workdir/backend-pack-cuda.json" \
-  --entry "$workdir/backend-pack-hip.json" \
+  "${backend_entry_args[@]}" \
   --out "$workdir/catalog.merged.json"
 python3 - "$workdir/catalog.merged.json" <<'PY'
 import json
@@ -119,12 +133,10 @@ OPENASR_CATALOG_EPOCH="$new_epoch" \
 
 python3 tooling/release-manifest/backend_catalog.py verify-catalog \
   --catalog model-registry/catalog.json \
-  --entry "$workdir/backend-pack-cuda.json" \
-  --entry "$workdir/backend-pack-hip.json"
+  "${backend_entry_args[@]}"
 python3 tooling/release-manifest/backend_catalog.py verify-catalog \
   --catalog model-registry/catalog.public.json \
-  --entry "$workdir/backend-pack-cuda.json" \
-  --entry "$workdir/backend-pack-hip.json"
+  "${backend_entry_args[@]}"
 python3 tooling/publish-model/scripts/check_catalog_consistency.py
 
 restore=0

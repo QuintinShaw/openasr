@@ -25,10 +25,11 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("verify-catalog", finalize)
         self.assertIn('gh release edit "$tag" --draft=false --latest', finalize)
 
-    def test_finalizer_never_publishes_before_both_cuda_and_hip_entries(self) -> None:
+    def test_finalizer_never_publishes_before_all_cuda_and_hip_target_entries(self) -> None:
         finalize = (ROOT / "scripts/finalize-core-release.sh").read_text(encoding="utf-8")
-        self.assertIn("backend-pack-cuda.json", finalize)
-        self.assertIn("backend-pack-hip.json", finalize)
+        self.assertIn("backend-pack-*.json", finalize)
+        self.assertIn('"${#cuda_entries[@]}" -ne 5', finalize)
+        self.assertIn('"${#hip_entries[@]}" -ne 11', finalize)
         self.assertLess(finalize.index("verify-catalog"), finalize.index("--draft=false"))
 
 

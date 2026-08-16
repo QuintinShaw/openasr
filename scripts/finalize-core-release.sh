@@ -25,9 +25,21 @@ is_draft="$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)" \
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/openasr-release-finalize.XXXXXX")"
 trap 'rm -rf "$workdir"' EXIT
 gh release download "$tag" \
-  -p backend-pack-cuda.json -p backend-pack-hip.json \
+  -p 'backend-pack-*.json' \
   -p backends-manifest.json -p backends-manifest.signature.json \
   -D "$workdir" --clobber
+
+shopt -s nullglob
+backend_entries=("$workdir"/backend-pack-*.json)
+cuda_entries=("$workdir"/backend-pack-cuda-sm_*.json)
+hip_entries=("$workdir"/backend-pack-hip-gfx*.json)
+if [ "${#cuda_entries[@]}" -ne 5 ] || [ "${#hip_entries[@]}" -ne 11 ] || [ "${#backend_entries[@]}" -ne 16 ]; then
+  fail "release ${tag} must contain exactly 5 CUDA SM and 11 HIP gfx backend-pack metadata files"
+fi
+backend_entry_args=()
+for entry in "${backend_entries[@]}"; do
+  backend_entry_args+=(--entry "$entry")
+done
 
 cargo run --quiet -p openasr-cli -- __openasr-verify-backends-manifest \
   "$workdir/backends-manifest.json" \
@@ -45,8 +57,7 @@ OPENASR_CATALOG_IDENTITY="https://catalog.openasr.org/v1/catalog.json" \
   cargo run --quiet -p openasr-cli -- doctor >/dev/null
 python3 tooling/release-manifest/backend_catalog.py verify-catalog \
   --catalog "$workdir/catalog.json" \
-  --entry "$workdir/backend-pack-cuda.json" \
-  --entry "$workdir/backend-pack-hip.json"
+  "${backend_entry_args[@]}"
 
 echo "==> all signed distribution metadata is live; publishing ${tag}"
 gh release edit "$tag" --draft=false --latest

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import struct
 from pathlib import Path
 from typing import Any
@@ -270,13 +271,30 @@ def compile_entry(args: argparse.Namespace) -> dict[str, Any]:
         f"ggml-{provider}.dll",
         f"openasr-{args.version}-windows-x86_64-{release_provider}-plugin.dll",
     }
-    if args.plugin.name.lower() not in expected_plugin_names:
-        raise BackendCatalogError(
-            f"plugin filename must identify exactly one {provider} module"
-        )
     plugin_sha, plugin_size = sha256_size(args.plugin)
     fingerprint = str(host_abi["fingerprint"])
-    backend_id = args.backend_id or f"{provider}-windows-x86_64-{fingerprint[:12]}-fat"
+    require_single_target = bool(getattr(args, "require_single_target", False))
+    if require_single_target and len(targets) != 1:
+        raise BackendCatalogError(
+            f"{provider} target-scoped pack must declare exactly one target, got {targets!r}"
+        )
+    if len(targets) == 1:
+        target_label = targets[0]
+        if not re.fullmatch(r"[A-Za-z0-9_]+", target_label):
+            raise BackendCatalogError(
+                f"{provider} target '{target_label}' is not safe for a release asset name"
+            )
+    else:
+        target_label = "fat"
+    target_asset_name = (
+        f"openasr-{args.version}-windows-x86_64-{release_provider}-{target_label}-plugin.dll"
+    )
+    expected_plugin_names.add(target_asset_name)
+    if args.plugin.name.lower() not in {name.lower() for name in expected_plugin_names}:
+        raise BackendCatalogError(
+            f"plugin filename must identify exactly one {provider} module and its declared target"
+        )
+    backend_id = args.backend_id or f"{provider}-windows-x86_64-{fingerprint[:12]}-{target_label}"
     files: list[dict[str, Any]] = [
         {
             "filename": args.plugin.name,
@@ -373,17 +391,17 @@ def verify_release_assets(
     already-downloaded release assets so the caller owns network/auth policy.
     """
 
-    providers: dict[str, str] = {}
+    providers: dict[str, list[str]] = {}
     host_abi: str | None = None
+    identities: set[tuple[str, str]] = set()
+    vendor_identities: dict[str, tuple[str, str, int, str]] = {}
     verified_files = 0
     verified_bytes = 0
     for entry_path in entry_paths:
         entry = _read_json(entry_path)
         provider = str(entry.get("vendor", ""))
-        if provider not in {"cuda", "hip"} or provider in providers:
-            raise BackendCatalogError(
-                "release verification requires one unique CUDA and one unique HIP entry"
-            )
+        if provider not in {"cuda", "hip"}:
+            raise BackendCatalogError("release verification accepts only CUDA and HIP entries")
         if str(entry.get("version", "")) != expected_version:
             raise BackendCatalogError(
                 f"backend '{provider}' version does not match release {expected_version}"
@@ -394,11 +412,42 @@ def verify_release_assets(
         if host_abi is not None and host_abi != fingerprint:
             raise BackendCatalogError("CUDA and HIP release entries do not share one host ABI")
         host_abi = fingerprint
-        providers[provider] = str(entry.get("id", ""))
+        targets = entry.get("targets")
+        if not isinstance(targets, list) or len(targets) != 1 or not isinstance(targets[0], str):
+            raise BackendCatalogError(
+                f"backend '{provider}' release entry must declare exactly one target"
+            )
+        identity = (provider, targets[0])
+        if identity in identities:
+            raise BackendCatalogError(
+                f"release contains duplicate {provider} target entry '{targets[0]}'"
+            )
+        identities.add(identity)
+        backend_id = str(entry.get("id", ""))
+        if not backend_id:
+            raise BackendCatalogError(f"backend '{provider}' entry has no id")
+        providers.setdefault(provider, []).append(backend_id)
 
         files = entry.get("files")
         if not isinstance(files, list) or not files:
             raise BackendCatalogError(f"backend '{provider}' has no release files")
+        archive_files = [file for file in files if isinstance(file, dict) and file.get("role") == "archive"]
+        if len(archive_files) != 1:
+            raise BackendCatalogError(
+                f"backend '{provider}' target pack must declare exactly one vendor archive"
+            )
+        archive = archive_files[0]
+        vendor_identity = (
+            str(archive.get("filename", "")),
+            str(archive.get("sha256", "")).lower(),
+            int(archive.get("size_bytes", 0)),
+            str(archive.get("extracted_tree_sha256", "")).lower(),
+        )
+        existing_vendor = vendor_identities.setdefault(provider, vendor_identity)
+        if existing_vendor != vendor_identity:
+            raise BackendCatalogError(
+                f"{provider} target packs must share one content-addressed vendor runtime"
+            )
         for file in files:
             if not isinstance(file, dict):
                 raise BackendCatalogError(f"backend '{provider}' has an invalid file record")
@@ -449,7 +498,7 @@ def verify_release_assets(
             verified_bytes += actual_size
 
     if set(providers) != {"cuda", "hip"}:
-        raise BackendCatalogError("release verification requires both CUDA and HIP entries")
+        raise BackendCatalogError("release verification requires CUDA and HIP target packs")
     return {
         "schema_version": 1,
         "version": expected_version,
@@ -525,25 +574,61 @@ def artifact_fingerprint(entry: dict[str, Any]) -> str:
 
 def compile_update_hints(entry_paths: list[Path], out: Path) -> None:
     entries = [_read_json(path) for path in entry_paths]
-    providers: dict[str, dict[str, Any]] = {}
+    providers: dict[str, dict[str, dict[str, Any]]] = {}
+    vendor_identities: dict[str, dict[str, Any]] = {}
     host_abi: str | None = None
     for entry in entries:
         provider = str(entry.get("vendor", ""))
-        if provider not in {"cuda", "hip"} or provider in providers:
-            raise BackendCatalogError("update hints require one CUDA and one HIP entry")
+        if provider not in {"cuda", "hip"}:
+            raise BackendCatalogError("update hints accept only CUDA and HIP entries")
         fingerprint = str(entry.get("host_abi", {}).get("fingerprint", ""))
         if len(fingerprint) != 64:
             raise BackendCatalogError(f"backend '{provider}' has no complete host ABI")
         if host_abi is not None and host_abi != fingerprint:
             raise BackendCatalogError("CUDA and HIP update hints do not share one host ABI")
         host_abi = fingerprint
-        providers[provider] = {
+        targets = entry.get("targets")
+        if not isinstance(targets, list) or len(targets) != 1 or not isinstance(targets[0], str):
+            raise BackendCatalogError(
+                f"update hint '{provider}' must declare exactly one target"
+            )
+        target = targets[0]
+        files = entry.get("files")
+        archive_files = [file for file in files if isinstance(file, dict) and file.get("role") == "archive"] \
+            if isinstance(files, list) else []
+        if len(archive_files) != 1:
+            raise BackendCatalogError(
+                f"update hint '{provider}' target '{target}' has no unique vendor archive"
+            )
+        archive = archive_files[0]
+        vendor_identity = {
+            "filename": archive.get("filename"),
+            "sha256": archive.get("sha256"),
+            "size_bytes": archive.get("size_bytes"),
+            "extracted_tree_sha256": archive.get("extracted_tree_sha256"),
+        }
+        existing_vendor = vendor_identities.setdefault(provider, vendor_identity)
+        if existing_vendor != vendor_identity:
+            raise BackendCatalogError(
+                f"update hints require all {provider} targets to share one vendor artifact identity"
+            )
+        candidates = providers.setdefault(provider, {})
+        if target in candidates:
+            raise BackendCatalogError(f"update hints contain duplicate {provider} target '{target}'")
+        candidates[target] = {
             "backend_id": entry.get("id"),
             "artifact_fingerprint": artifact_fingerprint(entry),
             "size_bytes": sum(int(file.get("size_bytes", 0)) for file in entry.get("files", [])),
         }
     if set(providers) != {"cuda", "hip"}:
-        raise BackendCatalogError("update hints require both CUDA and HIP entries")
+        raise BackendCatalogError("update hints require CUDA and HIP target packs")
+    providers = {
+        provider: {
+            "vendor": vendor_identities[provider],
+            "targets": {target: candidates[target] for target in sorted(candidates)},
+        }
+        for provider, candidates in sorted(providers.items())
+    }
     result = {
         "windows-x86_64": {
             "host_abi_fingerprint": host_abi,
@@ -571,6 +656,7 @@ def main() -> int:
     compile_parser.add_argument("--mirror-base-url")
     compile_parser.add_argument("--backend-id")
     compile_parser.add_argument("--display-name")
+    compile_parser.add_argument("--require-single-target", action="store_true")
     compile_parser.add_argument("--out", type=Path, required=True)
 
     merge_parser = subparsers.add_parser("merge")

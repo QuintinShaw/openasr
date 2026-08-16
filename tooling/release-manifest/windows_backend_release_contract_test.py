@@ -40,7 +40,7 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             self.assertRegex(body, rf"(?m)^\s*{key}: {re.escape(value)}\s*$")
         self.assertNotRegex(body, r"(?m)^\s*experimental:\s*true\s*$")
 
-    def test_terminal_host_and_optional_provider_legs_are_release_blocking(self) -> None:
+    def test_terminal_host_and_target_scoped_provider_legs_are_release_blocking(self) -> None:
         self.assert_matrix_leg(
             "x86_64-pc-windows-msvc-neutral",
             asset="windows-x86_64-neutral",
@@ -48,20 +48,25 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             provider="vulkan",
             distribution="host",
         )
-        self.assert_matrix_leg(
-            "x86_64-pc-windows-msvc-cuda-plugin",
-            asset="windows-x86_64-cuda-plugin",
-            features="cuda",
-            provider="cuda",
-            distribution="plugin",
-        )
-        self.assert_matrix_leg(
-            "x86_64-pc-windows-msvc-hip-plugin",
-            asset="windows-x86_64-rocm-plugin",
-            features="hip",
-            provider="hip",
-            distribution="plugin",
-        )
+        for sm in ("75", "80", "86", "89", "90"):
+            self.assert_matrix_leg(
+                f"x86_64-pc-windows-msvc-cuda-sm_{sm}-plugin",
+                asset=f"windows-x86_64-cuda-sm_{sm}-plugin",
+                features="cuda",
+                provider="cuda",
+                distribution="plugin",
+            )
+        for gfx in (
+            "gfx1030", "gfx1031", "gfx1032", "gfx1035", "gfx1100", "gfx1101",
+            "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ):
+            self.assert_matrix_leg(
+                f"x86_64-pc-windows-msvc-hip-{gfx}-plugin",
+                asset=f"windows-x86_64-rocm-{gfx}-plugin",
+                features="hip",
+                provider="hip",
+                distribution="plugin",
+            )
 
     def test_migration_sidecars_remain_explicit_legacy_builds(self) -> None:
         self.assert_matrix_leg(
@@ -79,16 +84,15 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             distribution="legacy",
         )
 
-    def test_both_optional_plugins_feed_one_catalog_and_update_hint(self) -> None:
+    def test_target_scoped_optional_plugins_feed_one_catalog_and_update_hint(self) -> None:
         required = (
-            "--entry dist/backend-pack-cuda.json",
-            "--entry dist/backend-pack-hip.json",
+            "backend-pack-cuda-sm_*.json",
+            "backend-pack-hip-gfx*.json",
+            "--require-single-target",
             "--out dist/catalog.backends.candidate.json",
             "--out dist/backend-plugin-hints.json",
-            "windows-x86_64-cuda-plugin:dll",
-            "windows-x86_64-rocm-plugin:dll",
-            'echo "backend-pack-cuda.json"',
-            'echo "backend-pack-hip.json"',
+            'echo "backend-pack-cuda-sm_${sm}.json"',
+            'echo "backend-pack-hip-${gfx}.json"',
             'echo "backend-plugin-hints.json"',
             'echo "catalog.backends.candidate.json"',
             "staging/catalog.backends.candidate.json",
@@ -104,6 +108,8 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         self.assertIn('$provider -eq "hip"', self.workflow)
         self.assertIn("VENDOR_LAYER_KEY=cuda-runtime", self.workflow)
         self.assertIn("VENDOR_LAYER_KEY=rocm-runtime", self.workflow)
+        self.assertIn("VENDOR_OWNER", self.workflow)
+        self.assertIn("env.VENDOR_OWNER == 'true'", self.workflow)
         self.assertIn("Resolve Windows binaries to sign", self.workflow)
         self.assertIn("$env:PLUGIN_ASSET_PATH", self.workflow)
         self.assertIn("Attest backend catalog metadata", self.workflow)
@@ -126,7 +132,7 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
     def test_windows_cuda_release_remains_compatible_with_cuda_12_drivers(self) -> None:
         for target in (
             "x86_64-pc-windows-msvc-cuda",
-            "x86_64-pc-windows-msvc-cuda-plugin",
+            "x86_64-pc-windows-msvc-cuda-sm_86-plugin",
         ):
             self.assertRegex(
                 self.workflow,
