@@ -1156,8 +1156,26 @@ fn emit_backend_host_abi(
         backend_impl.clone(),
     ]);
     let backend_api_version = parse_backend_api_version(&backend_impl);
-    let ggml_revision =
-        read_git_revision(source_dir).unwrap_or_else(|| format!("source-{headers_sha256}"));
+    // Source snapshots used by the Desktop packager intentionally contain no
+    // `.git` metadata. Let that packager carry the revision from the clean
+    // source checkout so a host built from an immutable snapshot has the same
+    // ABI identity as optional modules built from the checkout itself. The
+    // content-bearing header/FFI/extension hashes below remain authoritative;
+    // this token cannot make different source bytes compatible.
+    let ggml_revision = env::var("OPENASR_GGML_REVISION_OVERRIDE")
+        .ok()
+        .map(|revision| {
+            assert!(
+                revision.len() == 40
+                    && revision
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+                "OPENASR_GGML_REVISION_OVERRIDE must be a lowercase 40-hex git object id"
+            );
+            revision
+        })
+        .or_else(|| read_git_revision(source_dir))
+        .unwrap_or_else(|| format!("source-{headers_sha256}"));
     let crt = if target.ends_with("windows-msvc") {
         "msvc-md"
     } else if target.ends_with("windows-gnu") {
@@ -1208,6 +1226,7 @@ fn emit_backend_host_abi(
     println!("cargo:rustc-env=OPENASR_GGML_FFI_SHA256={openasr_ffi_sha256}");
     println!("cargo:rustc-env=OPENASR_GGML_EXTENSION_SHA256={openasr_extension_sha256}");
     println!("cargo:rerun-if-env-changed=OPENASR_BACKEND_TOOLCHAIN_CONTRACT");
+    println!("cargo:rerun-if-env-changed=OPENASR_GGML_REVISION_OVERRIDE");
     println!("cargo:rerun-if-changed={}", openasr_ffi.display());
     let json = serde_json::json!({
         "schema_version": 2,
