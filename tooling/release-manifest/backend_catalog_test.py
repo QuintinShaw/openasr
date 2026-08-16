@@ -154,7 +154,10 @@ class BackendCatalogTest(unittest.TestCase):
                     "id": f"{provider}-pack-{target}",
                     "vendor": provider,
                     "version": "1.2.3",
-                    "host_abi": {"fingerprint": "a" * 64},
+                    "host_abi": {
+                        "fingerprint": "a" * 64,
+                        "ggml_revision": "f" * 40,
+                    },
                     "targets": [target],
                     "min_driver_api": "1.0",
                     "files": [
@@ -180,7 +183,10 @@ class BackendCatalogTest(unittest.TestCase):
             out = root / "hints.json"
             backend_catalog.compile_update_hints(paths, out)
             hints = json.loads(out.read_text(encoding="utf-8"))["windows-x86_64"]
+            self.assertEqual(hints["core_version"], "1.2.3")
             self.assertEqual(hints["host_abi_fingerprint"], "a" * 64)
+            self.assertEqual(hints["ggml_revision"], "f" * 40)
+            self.assertEqual(len(hints["catalog_entries_sha256"]), 64)
             self.assertEqual(
                 list(hints["providers"]["cuda"]["targets"]),
                 ["sm_86", "sm_89"],

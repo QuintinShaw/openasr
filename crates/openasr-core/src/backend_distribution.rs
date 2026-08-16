@@ -15,18 +15,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    CatalogBackendVendor, ModelCatalog,
+    CatalogBackendFileRole, CatalogBackendVendor, ModelCatalog,
     atomic_file::write_file_atomically,
+    backend_device_probe::probe_provider_device,
     ggml_runtime::probe_exact_backend_plugin_candidate,
     pull::{
-        BackendStoreMutationLock, InstalledBackend, PullProgress, backend_artifact_fingerprint,
-        backend_pack_install_dir, install_backend_pack, install_backend_pack_locked,
+        BackendStoreMutationLock, InstalledBackend, PreparedBackendRuntimeObjects, PullProgress,
+        backend_artifact_fingerprint, backend_pack_download_plan, backend_pack_install_dir,
+        install_backend_pack, install_backend_pack_locked, prepare_backend_runtime_objects_locked,
         read_and_verify_installed_backend,
     },
-    registry::{
-        resolve_catalog_backend_pull, resolve_catalog_backend_pull_for_host,
-        resolve_compatible_catalog_backend_pull_for_driver,
-    },
+    registry::{resolve_catalog_backend_pull, resolve_compatible_catalog_backend_pull_for_driver},
 };
 
 pub const BACKEND_HOST_ABI_SCHEMA_VERSION: u32 = 2;
@@ -79,6 +78,42 @@ pub struct BackendPluginStatus {
     pub activated: Option<ActivatedBackendPack>,
 }
 
+/// One provider pack prepared for the exact GPU target reported by the live
+/// driver. Preparation installs and verifies bytes but deliberately does not
+/// mutate the activation selector, so a product shell can defer the process
+/// restart until cold start or an explicitly proven idle boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedBackendPack {
+    pub schema_version: u32,
+    pub backend_id: String,
+    pub vendor: CatalogBackendVendor,
+    pub version: String,
+    pub artifact_fingerprint: String,
+    pub host_abi_fingerprint: String,
+    pub device_target: String,
+    pub driver_version: String,
+    pub size_bytes: u64,
+    pub plugin_size_bytes: u64,
+    pub vendor_size_bytes: u64,
+}
+
+/// Download sizing for a provider before consent. Target-specific plugin
+/// bytes are reported as a conservative maximum; the live-device preparation
+/// transaction later selects exactly one target pack.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendProviderDescription {
+    pub schema_version: u32,
+    pub vendor: CatalogBackendVendor,
+    pub host_abi_fingerprint: String,
+    pub target_pack_count: usize,
+    pub size_bytes: u64,
+    pub plugin_size_bytes: u64,
+    pub vendor_size_bytes: u64,
+    pub required_download_size_bytes: u64,
+    pub required_plugin_download_size_bytes: u64,
+    pub required_vendor_download_size_bytes: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum BackendActivationError {
     #[error("backend activation state could not be read from '{path}': {source}")]
@@ -102,6 +137,46 @@ pub enum BackendActivationError {
     Write { path: PathBuf, source: io::Error },
     #[error("backend activation device target and live driver proof must be non-empty")]
     MissingDeviceProof,
+    #[error("the requested provider is unsupported by the live device or driver: {0}")]
+    UnsupportedDevice(String),
+    #[error("the requested provider failed live device discovery ({code}): {message}")]
+    DeviceProbe { code: &'static str, message: String },
+    #[error("no signed backend pack matches live target '{target}': {message}")]
+    NoCatalogMatch { target: String, message: String },
+}
+
+impl BackendActivationError {
+    pub fn machine_failure_class(&self) -> &'static str {
+        match self {
+            Self::UnsupportedDevice(_) | Self::DeviceProbe { .. } | Self::NoCatalogMatch { .. } => {
+                "unsupported_device"
+            }
+            Self::Install(_) | Self::Store(_) => "download",
+            Self::InstalledPack(_)
+            | Self::Resolution(_)
+            | Self::MissingDeviceProof
+            | Self::UnsupportedSchema(_)
+            | Self::Parse { .. } => "verification",
+            Self::Read { .. } | Self::Write { .. } => "io",
+        }
+    }
+
+    pub fn machine_failure_code(&self) -> &'static str {
+        match self {
+            Self::UnsupportedDevice(_) => "unsupported_device",
+            Self::DeviceProbe { code, .. } => code,
+            Self::NoCatalogMatch { .. } => "no_catalog_match",
+            Self::Install(_) => "install_failed",
+            Self::Store(_) => "store_unavailable",
+            Self::InstalledPack(_) => "installed_pack_invalid",
+            Self::Resolution(_) => "catalog_resolution_failed",
+            Self::MissingDeviceProof => "device_proof_missing",
+            Self::UnsupportedSchema(_) => "state_schema_unsupported",
+            Self::Parse { .. } => "state_parse_failed",
+            Self::Read { .. } => "state_read_failed",
+            Self::Write { .. } => "state_write_failed",
+        }
+    }
 }
 
 /// The production transaction for an optional backend pack. The caller names
@@ -133,12 +208,225 @@ pub fn install_and_activate_backend_provider(
     catalog: &ModelCatalog,
     vendor: CatalogBackendVendor,
     home: &Path,
-    progress: impl FnMut(PullProgress),
+    mut progress: impl FnMut(PullProgress),
 ) -> Result<ActivatedBackendPack, BackendActivationError> {
-    let resolved =
-        resolve_catalog_backend_pull_for_host(catalog, vendor, &BackendHostAbi::current())
-            .map_err(|error| BackendActivationError::Resolution(error.to_string()))?;
-    install_and_activate_backend_pack(catalog, &resolved.backend_id, home, progress)
+    let _store_lock = BackendStoreMutationLock::acquire(home)
+        .map_err(|error| BackendActivationError::Store(error.to_string()))?;
+    let prepared =
+        prepare_backend_provider_for_live_device_locked(catalog, vendor, home, &mut progress)?;
+    activate_installed_backend_pack_locked(
+        catalog,
+        &prepared.backend_id,
+        &prepared.device_target,
+        home,
+    )
+}
+
+/// Discover the exact live GPU architecture and install only its signed pack.
+///
+/// CUDA discovery uses the Windows driver DLL and performs no download. HIP
+/// first prepares the runtime/archive objects that are byte-identical across
+/// every host-compatible target pack, then queries the signed HSA/HIP runtime
+/// for the canonical `gfx` target. The global store lock covers bootstrap,
+/// target resolution, and installation so concurrent clients cannot observe a
+/// half-prepared provider generation.
+pub fn prepare_backend_provider_for_live_device(
+    catalog: &ModelCatalog,
+    vendor: CatalogBackendVendor,
+    home: &Path,
+    mut progress: impl FnMut(PullProgress),
+) -> Result<PreparedBackendPack, BackendActivationError> {
+    let _store_lock = BackendStoreMutationLock::acquire(home)
+        .map_err(|error| BackendActivationError::Store(error.to_string()))?;
+    prepare_backend_provider_for_live_device_locked(catalog, vendor, home, &mut progress)
+}
+
+fn prepare_backend_provider_for_live_device_locked(
+    catalog: &ModelCatalog,
+    vendor: CatalogBackendVendor,
+    home: &Path,
+    progress: &mut impl FnMut(PullProgress),
+) -> Result<PreparedBackendPack, BackendActivationError> {
+    if !matches!(
+        vendor,
+        CatalogBackendVendor::Cuda | CatalogBackendVendor::Hip
+    ) {
+        return Err(BackendActivationError::Resolution(
+            "only CUDA and HIP use target-scoped provider preparation".to_string(),
+        ));
+    }
+    let host_abi = BackendHostAbi::current();
+    let runtime = if vendor == CatalogBackendVendor::Hip {
+        let bootstrap = shared_provider_runtime_bootstrap(catalog, vendor, &host_abi)?;
+        prepare_backend_runtime_objects_locked(&bootstrap, home, &mut *progress)
+            .map_err(|error| BackendActivationError::Install(error.to_string()))?
+    } else {
+        PreparedBackendRuntimeObjects::default()
+    };
+    let device = probe_provider_device(vendor, &runtime).map_err(|error| {
+        BackendActivationError::DeviceProbe {
+            code: error.code(),
+            message: error.to_string(),
+        }
+    })?;
+    let resolved = resolve_compatible_catalog_backend_pull_for_driver(
+        catalog,
+        vendor,
+        &host_abi,
+        Some(&device.target),
+        Some(&device.driver_api_version),
+    )
+    .map_err(|error| BackendActivationError::NoCatalogMatch {
+        target: device.target.clone(),
+        message: error.to_string(),
+    })?;
+    install_backend_pack_locked(&resolved, home, &mut *progress)
+        .map_err(|error| BackendActivationError::Install(error.to_string()))?;
+    let plugin_size_bytes = resolved
+        .files
+        .iter()
+        .filter(|file| file.role == CatalogBackendFileRole::Plugin)
+        .try_fold(0_u64, |total, file| total.checked_add(file.size_bytes))
+        .ok_or_else(|| BackendActivationError::Resolution("backend size overflow".to_string()))?;
+    let vendor_size_bytes = resolved
+        .files
+        .iter()
+        .filter(|file| file.role != CatalogBackendFileRole::Plugin)
+        .try_fold(0_u64, |total, file| total.checked_add(file.size_bytes))
+        .ok_or_else(|| BackendActivationError::Resolution("backend size overflow".to_string()))?;
+    let size_bytes = plugin_size_bytes
+        .checked_add(vendor_size_bytes)
+        .ok_or_else(|| BackendActivationError::Resolution("backend size overflow".to_string()))?;
+    Ok(PreparedBackendPack {
+        schema_version: 1,
+        backend_id: resolved.backend_id.clone(),
+        vendor,
+        version: resolved.version.clone(),
+        artifact_fingerprint: backend_artifact_fingerprint(&resolved),
+        host_abi_fingerprint: resolved.host_abi.fingerprint.clone(),
+        device_target: device.target,
+        driver_version: device.driver_api_version,
+        size_bytes,
+        plugin_size_bytes,
+        vendor_size_bytes,
+    })
+}
+
+pub fn describe_backend_provider(
+    catalog: &ModelCatalog,
+    vendor: CatalogBackendVendor,
+    home: &Path,
+) -> Result<BackendProviderDescription, BackendActivationError> {
+    let host_abi = BackendHostAbi::current();
+    let mut variants = catalog
+        .backends
+        .iter()
+        .filter(|backend| backend.vendor == vendor)
+        .filter(|backend| host_abi.is_compatible_with(&backend.host_abi))
+        .map(|backend| resolve_catalog_backend_pull(catalog, &backend.id))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| BackendActivationError::Resolution(error.to_string()))?;
+    variants.sort_by(|left, right| left.backend_id.cmp(&right.backend_id));
+    if variants.is_empty() {
+        return Err(BackendActivationError::Resolution(
+            "no host-compatible provider pack is available".to_string(),
+        ));
+    }
+    if vendor == CatalogBackendVendor::Hip {
+        shared_provider_runtime_bootstrap(catalog, vendor, &host_abi)?;
+    }
+    let mut result = BackendProviderDescription {
+        schema_version: 1,
+        vendor,
+        host_abi_fingerprint: host_abi.fingerprint,
+        target_pack_count: variants.len(),
+        size_bytes: 0,
+        plugin_size_bytes: 0,
+        vendor_size_bytes: 0,
+        required_download_size_bytes: 0,
+        required_plugin_download_size_bytes: 0,
+        required_vendor_download_size_bytes: 0,
+    };
+    for variant in &variants {
+        let plan = backend_pack_download_plan(home, variant)
+            .map_err(|error| BackendActivationError::Install(error.to_string()))?;
+        result.size_bytes = result.size_bytes.max(plan.total_bytes);
+        result.plugin_size_bytes = result.plugin_size_bytes.max(plan.plugin_bytes);
+        result.vendor_size_bytes = result.vendor_size_bytes.max(plan.vendor_bytes);
+        result.required_download_size_bytes = result
+            .required_download_size_bytes
+            .max(plan.required_download_bytes);
+        result.required_plugin_download_size_bytes = result
+            .required_plugin_download_size_bytes
+            .max(plan.required_plugin_bytes);
+        result.required_vendor_download_size_bytes = result
+            .required_vendor_download_size_bytes
+            .max(plan.required_vendor_bytes);
+    }
+    Ok(result)
+}
+
+fn shared_provider_runtime_bootstrap(
+    catalog: &ModelCatalog,
+    vendor: CatalogBackendVendor,
+    host_abi: &BackendHostAbi,
+) -> Result<crate::ResolvedCatalogBackendPull, BackendActivationError> {
+    let mut variants = catalog
+        .backends
+        .iter()
+        .filter(|backend| backend.vendor == vendor)
+        .filter(|backend| host_abi.is_compatible_with(&backend.host_abi))
+        .map(|backend| resolve_catalog_backend_pull(catalog, &backend.id))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| BackendActivationError::Resolution(error.to_string()))?;
+    variants.sort_by(|left, right| left.backend_id.cmp(&right.backend_id));
+    let Some(first) = variants.first() else {
+        return Err(BackendActivationError::Resolution(
+            "no host-compatible provider pack is available".to_string(),
+        ));
+    };
+    let expected = shared_runtime_identity(first);
+    if expected.is_empty() {
+        return Err(BackendActivationError::Resolution(
+            "provider packs omit the signed shared discovery runtime".to_string(),
+        ));
+    }
+    if variants
+        .iter()
+        .skip(1)
+        .any(|candidate| shared_runtime_identity(candidate) != expected)
+    {
+        return Err(BackendActivationError::Resolution(
+            "provider target packs disagree on their shared runtime identity".to_string(),
+        ));
+    }
+    let mut bootstrap = first.clone();
+    bootstrap
+        .files
+        .retain(|file| file.role != CatalogBackendFileRole::Plugin);
+    Ok(bootstrap)
+}
+
+fn shared_runtime_identity(
+    resolved: &crate::ResolvedCatalogBackendPull,
+) -> Vec<(String, String, u64, String, Option<String>, Option<String>)> {
+    let mut identity = resolved
+        .files
+        .iter()
+        .filter(|file| file.role != CatalogBackendFileRole::Plugin)
+        .map(|file| {
+            (
+                file.filename.clone(),
+                file.sha256.clone(),
+                file.size_bytes,
+                format!("{:?}", file.role),
+                file.extract_subdir.clone(),
+                file.extracted_tree_sha256.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    identity.sort();
+    identity
 }
 
 pub fn install_backend_pack_from_catalog(
@@ -427,6 +715,38 @@ impl BackendHostAbi {
 mod tests {
     use super::*;
 
+    fn resolved_with_files(
+        files: Vec<crate::CatalogBackendFile>,
+    ) -> crate::ResolvedCatalogBackendPull {
+        crate::ResolvedCatalogBackendPull {
+            backend_id: "hip-windows-gfx1100".to_string(),
+            vendor: CatalogBackendVendor::Hip,
+            version: "test".to_string(),
+            display_name: "HIP".to_string(),
+            host_abi: BackendHostAbi::current(),
+            targets: vec!["gfx1100".to_string()],
+            min_driver_api: Some("6.0.0".to_string()),
+            files,
+        }
+    }
+
+    fn backend_file(
+        filename: &str,
+        sha256: char,
+        role: CatalogBackendFileRole,
+    ) -> crate::CatalogBackendFile {
+        crate::CatalogBackendFile {
+            filename: filename.to_string(),
+            url: format!("https://example.invalid/{filename}"),
+            mirrors: Vec::new(),
+            sha256: sha256.to_string().repeat(64),
+            size_bytes: 42,
+            role,
+            extract_subdir: None,
+            extracted_tree_sha256: None,
+        }
+    }
+
     fn is_lower_hex(value: &str, len: usize) -> bool {
         value.len() == len
             && value
@@ -461,5 +781,62 @@ mod tests {
         let mut different_schema = current.clone();
         different_schema.schema_version += 1;
         assert!(!current.is_compatible_with(&different_schema));
+    }
+
+    #[test]
+    fn shared_runtime_identity_excludes_target_plugin_but_binds_runtime_bytes() {
+        let first = resolved_with_files(vec![
+            backend_file("ggml-hip.dll", 'a', CatalogBackendFileRole::Plugin),
+            backend_file("hip-runtime.zip", 'b', CatalogBackendFileRole::Archive),
+        ]);
+        let mut second = first.clone();
+        second.files[0].sha256 = "c".repeat(64);
+        second.files[1].url = "https://mirror.invalid/runtime.zip".to_string();
+        assert_eq!(
+            shared_runtime_identity(&first),
+            shared_runtime_identity(&second)
+        );
+
+        second.files[1].sha256 = "d".repeat(64);
+        assert_ne!(
+            shared_runtime_identity(&first),
+            shared_runtime_identity(&second)
+        );
+    }
+
+    #[test]
+    fn machine_failure_contract_is_stable_and_actionable() {
+        let cases = [
+            (
+                BackendActivationError::DeviceProbe {
+                    code: "driver_unavailable",
+                    message: "redacted".to_string(),
+                },
+                "unsupported_device",
+                "driver_unavailable",
+            ),
+            (
+                BackendActivationError::NoCatalogMatch {
+                    target: "sm_86".to_string(),
+                    message: "redacted".to_string(),
+                },
+                "unsupported_device",
+                "no_catalog_match",
+            ),
+            (
+                BackendActivationError::Install("redacted".to_string()),
+                "download",
+                "install_failed",
+            ),
+            (
+                BackendActivationError::InstalledPack("redacted".to_string()),
+                "verification",
+                "installed_pack_invalid",
+            ),
+        ];
+        for (error, class, code) in cases {
+            assert_eq!(error.machine_failure_class(), class);
+            assert_eq!(error.machine_failure_code(), code);
+        }
     }
 }

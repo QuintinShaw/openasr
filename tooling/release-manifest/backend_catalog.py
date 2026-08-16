@@ -577,6 +577,8 @@ def compile_update_hints(entry_paths: list[Path], out: Path) -> None:
     providers: dict[str, dict[str, dict[str, Any]]] = {}
     vendor_identities: dict[str, dict[str, Any]] = {}
     host_abi: str | None = None
+    core_versions: set[str] = set()
+    ggml_revisions: set[str] = set()
     for entry in entries:
         provider = str(entry.get("vendor", ""))
         if provider not in {"cuda", "hip"}:
@@ -587,6 +589,8 @@ def compile_update_hints(entry_paths: list[Path], out: Path) -> None:
         if host_abi is not None and host_abi != fingerprint:
             raise BackendCatalogError("CUDA and HIP update hints do not share one host ABI")
         host_abi = fingerprint
+        core_versions.add(str(entry.get("version", "")).split("+", 1)[0])
+        ggml_revisions.add(str(entry.get("host_abi", {}).get("ggml_revision", "")))
         targets = entry.get("targets")
         if not isinstance(targets, list) or len(targets) != 1 or not isinstance(targets[0], str):
             raise BackendCatalogError(
@@ -622,6 +626,10 @@ def compile_update_hints(entry_paths: list[Path], out: Path) -> None:
         }
     if set(providers) != {"cuda", "hip"}:
         raise BackendCatalogError("update hints require CUDA and HIP target packs")
+    if len(core_versions) != 1 or "" in core_versions:
+        raise BackendCatalogError("update hints do not share one core version")
+    if len(ggml_revisions) != 1 or "" in ggml_revisions:
+        raise BackendCatalogError("update hints do not share one ggml revision")
     providers = {
         provider: {
             "vendor": vendor_identities[provider],
@@ -631,7 +639,16 @@ def compile_update_hints(entry_paths: list[Path], out: Path) -> None:
     }
     result = {
         "windows-x86_64": {
+            "core_version": next(iter(core_versions)),
             "host_abi_fingerprint": host_abi,
+            "ggml_revision": next(iter(ggml_revisions)),
+            "catalog_entries_sha256": hashlib.sha256(
+                json.dumps(
+                    sorted(entries, key=lambda entry: str(entry.get("id", ""))),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
             "providers": providers,
         }
     }

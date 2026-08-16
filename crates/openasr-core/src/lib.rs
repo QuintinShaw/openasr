@@ -1,4 +1,5 @@
 mod atomic_file;
+mod backend_device_probe;
 mod backends_manifest_security;
 mod catalog_security;
 mod catalog_series;
@@ -50,11 +51,12 @@ pub use arch::{
 };
 pub use backend_distribution::{
     ACTIVATED_BACKEND_SCHEMA_VERSION, ActivatedBackendPack, BACKEND_HOST_ABI_SCHEMA_VERSION,
-    BackendActivationError, BackendHostAbi, BackendPluginStatus, activate_installed_backend_pack,
-    activate_installed_backend_pack_auto, activated_backend_path, backend_plugin_status,
-    deactivate_backend_pack, install_and_activate_backend_pack,
+    BackendActivationError, BackendHostAbi, BackendPluginStatus, BackendProviderDescription,
+    PreparedBackendPack, activate_installed_backend_pack, activate_installed_backend_pack_auto,
+    activated_backend_path, backend_plugin_status, deactivate_backend_pack,
+    describe_backend_provider, install_and_activate_backend_pack,
     install_and_activate_backend_provider, install_backend_pack_from_catalog,
-    read_activated_backend,
+    prepare_backend_provider_for_live_device, read_activated_backend,
 };
 pub(crate) mod audio;
 pub mod family_inventory;

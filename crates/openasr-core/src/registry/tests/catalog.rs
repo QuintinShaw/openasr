@@ -2416,7 +2416,7 @@ fn valid_hip_backend_json() -> String {
       "vendor": "hip",
       "version": "0.13.1+643b5659",
       "display_name": "AMD ROCm (HIP)",
-      "targets": ["gfx1100", "gfx1200"],
+      "targets": ["gfx1200"],
       "min_cli_version": "0.1.0",
       "host_abi": {{
         "schema_version": 2,
@@ -2451,10 +2451,7 @@ fn catalog_parser_accepts_backend_entries() {
     assert_eq!(backend.id, "hip-radeon");
     assert_eq!(backend.vendor, CatalogBackendVendor::Hip);
     assert_eq!(backend.host_abi.fingerprint, BACKEND_SHA_A);
-    assert_eq!(
-        backend.targets,
-        vec!["gfx1100".to_string(), "gfx1200".to_string()]
-    );
+    assert_eq!(backend.targets, vec!["gfx1200".to_string()]);
     let plugin = backend
         .files
         .iter()
@@ -2484,6 +2481,26 @@ fn catalog_parser_rejects_backend_without_plugin() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("exactly one plugin file"));
+}
+
+#[test]
+fn catalog_parser_rejects_non_target_scoped_gpu_backends() {
+    for targets in [
+        "[]",
+        "[\"gfx1100\", \"gfx1200\"]",
+        "[\"sm_86\"]",
+        "[\"GFX1200\"]",
+        "[\"gfx90a\"]",
+    ] {
+        let invalid = valid_hip_backend_json().replace("[\"gfx1200\"]", targets);
+        let error = parse_model_catalog(&catalog_json_with_backends(&invalid), "fixture")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("target-scoped HIP") || error.contains("non-canonical device target"),
+            "unexpected validation error for {targets}: {error}"
+        );
+    }
 }
 
 #[test]

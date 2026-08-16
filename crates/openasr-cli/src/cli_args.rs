@@ -634,8 +634,14 @@ pub(crate) enum Command {
 pub(crate) enum BackendPluginCommand {
     /// Print the neutral-host ABI and current activation selector.
     Status,
-    /// Resolve the unique signed pack for this host ABI without downloading.
-    ResolveProvider {
+    /// Report conservative download sizes for all target packs of a provider.
+    DescribeProvider {
+        #[arg(value_parser = ["cuda", "hip"])]
+        provider: String,
+    },
+    /// Discover the live GPU target and install only its signed pack without
+    /// changing the activation selector.
+    PrepareProvider {
         #[arg(value_parser = ["cuda", "hip"])]
         provider: String,
     },
@@ -645,8 +651,8 @@ pub(crate) enum BackendPluginCommand {
     Activate { backend_id: String },
     /// Install, live-probe, and atomically activate one pack.
     InstallActivate { backend_id: String },
-    /// Resolve the current host's signed fat pack for a provider, install it,
-    /// and activate it after live target proof.
+    /// Discover the current GPU target, install its signed pack, and activate
+    /// it after live target proof.
     InstallActivateProvider {
         #[arg(value_parser = ["cuda", "hip"])]
         provider: String,

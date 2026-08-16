@@ -83,6 +83,9 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             provider="hip",
             distribution="legacy",
         )
+        self.assertIn("Enforce legacy Windows sidecar sunset", self.workflow)
+        self.assertIn("guard_legacy_windows_sidecars.py", self.workflow)
+        self.assertIn("windows_gpu_migration.json", self.workflow)
 
     def test_target_scoped_optional_plugins_feed_one_catalog_and_update_hint(self) -> None:
         required = (

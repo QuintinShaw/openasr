@@ -1513,7 +1513,18 @@ fn stage_windows_backend_dl_artifacts(
         );
     }
 
-    for dest in [profile_dir.to_path_buf(), profile_dir.join("deps")] {
+    let flat_destinations = [profile_dir.to_path_buf(), profile_dir.join("deps")];
+    let destinations = flat_destinations
+        .iter()
+        .flat_map(|root| {
+            [
+                root.clone(),
+                root.join("openasr-backend-bundles")
+                    .join(backend_host_abi_fingerprint),
+            ]
+        })
+        .collect::<Vec<_>>();
+    for dest in destinations {
         fs::create_dir_all(&dest).expect("create BACKEND_DL runtime directory");
         // Optional accelerators are never application-directory plugins. Clear
         // stale copies left by a previous build topology before staging the

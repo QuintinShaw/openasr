@@ -548,6 +548,17 @@ jobs:
           fi
           echo "OPENASR_VERSION=${version}" >> "${GITHUB_ENV}"
 
+      - name: Enforce legacy Windows sidecar sunset
+        if: matrix.distribution == 'legacy' && env.LEG_SELECTED == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_bin="python3"
+          command -v python3 >/dev/null 2>&1 || python_bin="python"
+          "${python_bin}" tooling/release-manifest/guard_legacy_windows_sidecars.py \
+            --version "${OPENASR_VERSION}" \
+            --policy tooling/release-manifest/windows_gpu_migration.json
+
       - name: Install Linux audio build dependencies
         if: runner.os == 'Linux' && env.LEG_SELECTED == 'true'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev

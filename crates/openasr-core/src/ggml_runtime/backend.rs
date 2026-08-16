@@ -510,24 +510,25 @@ fn load_bundled_backend_modules() -> Result<(), BackendPluginActivationError> {
     }
     let executable = std::env::current_exe()
         .map_err(|error| BackendPluginActivationError::BundledDirectory(error.to_string()))?;
-    let directory = executable.parent().ok_or_else(|| {
+    let executable_directory = executable.parent().ok_or_else(|| {
         BackendPluginActivationError::BundledDirectory(
             "current executable has no parent directory".to_string(),
         )
     })?;
-    let directory = std::fs::canonicalize(directory)
+    let executable_directory = std::fs::canonicalize(executable_directory)
         .map_err(|error| BackendPluginActivationError::BundledDirectory(error.to_string()))?;
-    if !directory.is_absolute() {
+    if !executable_directory.is_absolute() {
         return Err(BackendPluginActivationError::BundledDirectory(
             "resolved directory is not absolute".to_string(),
         ));
     }
+    let current_abi = BackendHostAbi::current();
+    let directory = bundled_backend_directory_for_host(&executable_directory, &current_abi);
     let manifest_path = directory.join("openasr-backend-bundle-v1.json");
     let manifest_bytes = std::fs::read(&manifest_path)
         .map_err(|error| BackendPluginActivationError::BundledDirectory(error.to_string()))?;
     let manifest: BundledBackendManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|error| BackendPluginActivationError::BundledDirectory(error.to_string()))?;
-    let current_abi = BackendHostAbi::current();
     validate_bundled_backend_manifest(&manifest)
         .map_err(BackendPluginActivationError::BundledDirectory)?;
     if manifest.host_abi_fingerprint != current_abi.fingerprint {
@@ -621,6 +622,23 @@ fn load_bundled_backend_modules() -> Result<(), BackendPluginActivationError> {
     load_best_bundled_backend(&cpu_paths, "cpu", &current_abi.fingerprint)?;
     load_best_bundled_backend(&vulkan_paths, "vulkan", &current_abi.fingerprint)?;
     Ok(())
+}
+
+fn bundled_backend_directory_for_host(
+    executable_directory: &Path,
+    abi: &BackendHostAbi,
+) -> PathBuf {
+    let exact = executable_directory
+        .join("openasr-backend-bundles")
+        .join(&abi.fingerprint);
+    if exact.join("openasr-backend-bundle-v1.json").is_file() {
+        exact
+    } else {
+        // Release bundles intentionally keep the public, flat layout. The
+        // ABI-scoped directory exists in Cargo target trees so simultaneous
+        // feature combinations cannot overwrite one another's local runtime.
+        executable_directory.to_path_buf()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1534,6 +1552,27 @@ unsafe fn cstr_lossy(value: *const c_char) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_backend_directory_prefers_exact_abi_scoped_bundle() {
+        let temp = tempfile::tempdir().expect("temporary executable directory");
+        let abi = BackendHostAbi::current();
+
+        assert_eq!(
+            bundled_backend_directory_for_host(temp.path(), &abi),
+            temp.path()
+        );
+
+        let exact = temp
+            .path()
+            .join("openasr-backend-bundles")
+            .join(&abi.fingerprint);
+        std::fs::create_dir_all(&exact).expect("create exact ABI bundle directory");
+        std::fs::write(exact.join("openasr-backend-bundle-v1.json"), b"{}")
+            .expect("write exact ABI bundle marker");
+
+        assert_eq!(bundled_backend_directory_for_host(temp.path(), &abi), exact);
+    }
 
     fn bundled_file(filename: &str, provider: &str) -> BundledBackendManifestFile {
         BundledBackendManifestFile {

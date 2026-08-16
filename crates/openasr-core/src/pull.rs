@@ -5523,6 +5523,73 @@ pub(crate) fn install_backend_pack_locked(
     install_backend_pack_with_client_locked(resolved, home, &mut client, progress)
 }
 
+/// Downloads and verifies only the provider runtime/archive objects shared by
+/// every target-scoped pack, while the caller holds the global backend-store
+/// mutation lock. This is the HIP discovery bootstrap: no target-specific
+/// plugin is downloaded or made loadable until the trusted runtime reports an
+/// exact `gfx` target. The returned directories are immutable content-object
+/// payload roots suitable for restricted dynamic-library lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedBackendRuntimeFile {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PreparedBackendRuntimeObjects {
+    pub dependency_dirs: Vec<PathBuf>,
+    pub files: Vec<PreparedBackendRuntimeFile>,
+}
+
+pub(crate) fn prepare_backend_runtime_objects_locked(
+    resolved: &ResolvedCatalogBackendPull,
+    home: &Path,
+    mut progress: impl FnMut(PullProgress),
+) -> Result<PreparedBackendRuntimeObjects, PullError> {
+    let mut client = HttpDownloadClient::new()?;
+    let mut dependency_dirs = BTreeSet::new();
+    let mut verified_files = Vec::new();
+    let mut saw_runtime = false;
+    for file in &resolved.files {
+        match file.role {
+            CatalogBackendFileRole::Runtime | CatalogBackendFileRole::Archive => {
+                saw_runtime = true;
+                let object = ensure_backend_content_object(&mut client, file, home, &mut progress)?;
+                let payload = backend_content_object_dir(home, file).join("payload");
+                for materialized in &object.files {
+                    let relative = Path::new(&materialized.relative_path);
+                    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+                    dependency_dirs.insert(payload.join(parent));
+                    verified_files.push(PreparedBackendRuntimeFile {
+                        path: payload.join(relative),
+                        size_bytes: materialized.size_bytes,
+                        sha256: materialized.sha256.clone(),
+                    });
+                }
+            }
+            CatalogBackendFileRole::Plugin => {}
+            CatalogBackendFileRole::Unknown => {
+                return Err(PullError::InvalidTarget {
+                    field: "backend.files.role",
+                    reason: "unknown backend file role".to_string(),
+                });
+            }
+        }
+    }
+    if !saw_runtime {
+        return Err(PullError::InvalidTarget {
+            field: "backend.files",
+            reason: "provider discovery requires a signed shared runtime".to_string(),
+        });
+    }
+    verified_files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(PreparedBackendRuntimeObjects {
+        dependency_dirs: dependency_dirs.into_iter().collect(),
+        files: verified_files,
+    })
+}
+
 fn install_backend_pack_with_client<C: DownloadClient>(
     resolved: &ResolvedCatalogBackendPull,
     home: &Path,

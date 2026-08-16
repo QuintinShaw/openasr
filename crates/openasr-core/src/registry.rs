@@ -1842,14 +1842,12 @@ pub fn resolve_compatible_catalog_backend_pull_for_driver(
         .iter()
         .filter(|backend| backend.vendor == vendor)
         .filter(|backend| host_abi.is_compatible_with(&backend.host_abi))
-        .filter(|backend| {
-            backend.targets.is_empty()
-                || device_target.is_some_and(|target| {
-                    backend
-                        .targets
-                        .iter()
-                        .any(|candidate| candidate.eq_ignore_ascii_case(target))
-                })
+        .filter(|backend| match backend.vendor {
+            CatalogBackendVendor::Cuda | CatalogBackendVendor::Hip => {
+                device_target.is_some_and(|target| backend.targets.as_slice() == [target])
+            }
+            CatalogBackendVendor::Cpu | CatalogBackendVendor::Vulkan => backend.targets.is_empty(),
+            CatalogBackendVendor::Unknown => false,
         })
         .filter(|backend| {
             backend.min_driver_api.as_deref().is_none_or(|minimum| {
@@ -2644,6 +2642,7 @@ fn validate_catalog_backend(backend: &CatalogBackend) -> Result<(), CatalogError
             backend.id
         )));
     }
+    validate_catalog_backend_targets(backend)?;
     let host_abi = &backend.host_abi;
     if host_abi.schema_version != BACKEND_HOST_ABI_SCHEMA_VERSION {
         return Err(CatalogError::InvalidCatalog(format!(
@@ -2789,6 +2788,55 @@ fn validate_catalog_backend(backend: &CatalogBackend) -> Result<(), CatalogError
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_catalog_backend_targets(backend: &CatalogBackend) -> Result<(), CatalogError> {
+    let canonical_target = match backend.vendor {
+        CatalogBackendVendor::Cuda => {
+            let [target] = backend.targets.as_slice() else {
+                return Err(CatalogError::InvalidCatalog(format!(
+                    "backend '{}' must declare exactly one target-scoped CUDA architecture",
+                    backend.id
+                )));
+            };
+            let digits = target.strip_prefix("sm_").unwrap_or_default();
+            (matches!(digits.len(), 2 | 3) && digits.bytes().all(|byte| byte.is_ascii_digit()))
+                .then_some(target)
+        }
+        CatalogBackendVendor::Hip => {
+            let [target] = backend.targets.as_slice() else {
+                return Err(CatalogError::InvalidCatalog(format!(
+                    "backend '{}' must declare exactly one target-scoped HIP architecture",
+                    backend.id
+                )));
+            };
+            let digits = target.strip_prefix("gfx").unwrap_or_default();
+            ((3..=5).contains(&digits.len()) && digits.bytes().all(|byte| byte.is_ascii_digit()))
+                .then_some(target)
+        }
+        CatalogBackendVendor::Cpu | CatalogBackendVendor::Vulkan => {
+            if backend.targets.is_empty() {
+                return Ok(());
+            }
+            return Err(CatalogError::InvalidCatalog(format!(
+                "backend '{}' must not declare CUDA/HIP device targets",
+                backend.id
+            )));
+        }
+        CatalogBackendVendor::Unknown => {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "backend '{}' has an unsupported vendor",
+                backend.id
+            )));
+        }
+    };
+    if canonical_target.is_none() {
+        return Err(CatalogError::InvalidCatalog(format!(
+            "backend '{}' has a non-canonical device target",
+            backend.id
+        )));
     }
     Ok(())
 }
