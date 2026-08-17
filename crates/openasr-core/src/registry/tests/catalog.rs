@@ -579,9 +579,10 @@ fn catalog_translation_model_requires_translation_metadata() {
     model.source_langs.clear();
     catalog.models.push(model);
 
-    let error = super::validate_model_catalog(&catalog, "https://catalog.openasr.org/v1/catalog.json")
-        .unwrap_err()
-        .to_string();
+    let error =
+        super::validate_model_catalog(&catalog, "https://catalog.openasr.org/v1/catalog.json")
+            .unwrap_err()
+            .to_string();
 
     assert!(error.contains("source_langs"));
     assert!(error.contains("must not be empty"));
@@ -594,9 +595,10 @@ fn catalog_translation_model_rejects_one_letter_language_code() {
     model.source_langs = vec!["z".to_string()];
     catalog.models.push(model);
 
-    let error = super::validate_model_catalog(&catalog, "https://catalog.openasr.org/v1/catalog.json")
-        .unwrap_err()
-        .to_string();
+    let error =
+        super::validate_model_catalog(&catalog, "https://catalog.openasr.org/v1/catalog.json")
+            .unwrap_err()
+            .to_string();
 
     assert!(error.contains("source_langs"));
     assert!(error.contains("invalid language code 'z'"));
@@ -608,9 +610,10 @@ fn catalog_non_translation_model_rejects_translation_metadata() {
     catalog.models[0].source_langs = vec!["zh".to_string()];
     catalog.models[0].target_langs = vec!["en".to_string()];
 
-    let error = super::validate_model_catalog(&catalog, "https://catalog.openasr.org/v1/catalog.json")
-        .unwrap_err()
-        .to_string();
+    let error =
+        super::validate_model_catalog(&catalog, "https://catalog.openasr.org/v1/catalog.json")
+            .unwrap_err()
+            .to_string();
 
     assert!(error.contains("translation metadata"));
     assert!(error.contains("not translation-model"));
@@ -727,9 +730,10 @@ fn catalog_capability_pack_requires_capability_metadata() {
     pack.capability = None;
     catalog.models.push(pack);
 
-    let error = super::validate_model_catalog(&catalog, "https://catalog.openasr.org/v1/catalog.json")
-        .unwrap_err()
-        .to_string();
+    let error =
+        super::validate_model_catalog(&catalog, "https://catalog.openasr.org/v1/catalog.json")
+            .unwrap_err()
+            .to_string();
 
     assert!(error.contains("kind capability-pack"));
     assert!(error.contains("no capability metadata"));
@@ -743,9 +747,10 @@ fn catalog_asr_model_rejects_capability_metadata() {
         role: CatalogCapabilityRole::SpeakerEmbedder,
     });
 
-    let error = super::validate_model_catalog(&catalog, "https://catalog.openasr.org/v1/catalog.json")
-        .unwrap_err()
-        .to_string();
+    let error =
+        super::validate_model_catalog(&catalog, "https://catalog.openasr.org/v1/catalog.json")
+            .unwrap_err()
+            .to_string();
 
     assert!(error.contains("capability metadata"));
     assert!(error.contains("asr-model"));
@@ -2495,10 +2500,7 @@ fn catalog_parser_accepts_file_backend_urls_only_for_local_catalog_identity() {
     )
     .unwrap_err()
     .to_string();
-    assert!(
-        error.contains("must use https://"),
-        "{error}"
-    );
+    assert!(error.contains("must use https://"), "{error}");
 }
 
 #[test]
