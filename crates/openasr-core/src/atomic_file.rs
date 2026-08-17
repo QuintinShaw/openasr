@@ -183,20 +183,14 @@ impl AtomicFileSystem for RealAtomicFileSystem {
 }
 
 fn atomic_temp_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("openasr.tmp");
     let sequence = ATOMIC_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     path.with_file_name(format!(
-        ".{file_name}.{}.{}.{}.tmp",
+        ".openasr-{:x}-{now:x}-{sequence:x}.tmp",
         std::process::id(),
-        now,
-        sequence
     ))
 }
 
@@ -422,7 +416,7 @@ mod tests {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap();
-        assert!(temp_file_name.starts_with(".voiceprints.json."));
+        assert!(temp_file_name.starts_with(".openasr-"));
         assert!(temp_file_name.ends_with(".tmp"));
         assert_eq!(fs.target_contents(target), Some(b"new".to_vec()));
         assert!(!fs.temp_exists());
@@ -435,6 +429,19 @@ mod tests {
             fs.state.owner_only_permission_paths.borrow().as_slice(),
             &[temp_path, target.to_path_buf()]
         );
+    }
+
+    #[test]
+    fn atomic_temp_name_stays_short_for_long_backend_metadata_names() {
+        let target = Path::new("/tmp/openasr/deep")
+            .join(".openasr-0.1.34-windows-x86_64-cuda-sm_86-plugin.dll.partial.json");
+        let temp = atomic_temp_path(&target);
+
+        assert_eq!(temp.parent(), target.parent());
+        let temp_name = temp.file_name().unwrap().to_string_lossy();
+        assert!(temp_name.starts_with(".openasr-"));
+        assert!(temp_name.ends_with(".tmp"));
+        assert!(temp_name.len() < target.file_name().unwrap().len());
     }
 
     #[test]
