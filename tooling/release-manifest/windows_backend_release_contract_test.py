@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import re
+import json
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "release-binaries.yml"
+MATRIX = ROOT / "tooling" / "release-manifest" / "release_binaries_matrix.json"
 CORE_BUILD_RS = ROOT / "crates" / "openasr-core" / "build.rs"
 
 
@@ -15,6 +16,7 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.workflow = WORKFLOW.read_text(encoding="utf-8")
         cls.core_build_rs = CORE_BUILD_RS.read_text(encoding="utf-8")
+        cls.matrix = json.loads(MATRIX.read_text(encoding="utf-8"))
 
     def test_backend_abi_is_independent_of_git_checkout_newlines(self) -> None:
         self.assertIn(
@@ -37,22 +39,15 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         provider: str,
         distribution: str,
     ) -> None:
-        leg = re.search(
-            rf"(?ms)^\s*- os: windows[^\n]*\n"
-            rf"\s*target: {re.escape(target)}\n"
-            rf"(?P<body>.*?)(?=^\s*- os:|^\s*steps:)",
-            self.workflow,
-        )
-        self.assertIsNotNone(leg, f"missing Windows release leg {target}")
-        body = leg.group("body")
-        for key, value in (
-            ("asset", asset),
-            ("features", features),
-            ("provider", provider),
-            ("distribution", distribution),
-        ):
-            self.assertRegex(body, rf"(?m)^\s*{key}: {re.escape(value)}\s*$")
-        self.assertNotRegex(body, r"(?m)^\s*experimental:\s*true\s*$")
+        matches = [row for row in self.matrix if row.get("target") == target]
+        self.assertEqual(len(matches), 1, f"missing Windows release leg {target}")
+        body = matches[0]
+        self.assertTrue(str(body.get("os", "")).startswith("windows"), target)
+        self.assertEqual(body.get("asset"), asset)
+        self.assertEqual(body.get("features"), features)
+        self.assertEqual(body.get("provider"), provider)
+        self.assertEqual(body.get("distribution"), distribution)
+        self.assertIsNot(body.get("experimental"), True)
 
     def test_terminal_host_and_target_scoped_provider_legs_are_release_blocking(self) -> None:
         self.assert_matrix_leg(
@@ -143,14 +138,47 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             self.assertIn(symbol, self.workflow)
 
     def test_windows_cuda_release_remains_compatible_with_cuda_12_drivers(self) -> None:
-        self.assertRegex(
-            self.workflow,
-            r"(?m)^\s*- os: windows-2022\s*\n"
-            r"\s*target: x86_64-pc-windows-msvc-cuda-sm_86-plugin\s*$",
+        sm86 = next(
+            row
+            for row in self.matrix
+            if row.get("target") == "x86_64-pc-windows-msvc-cuda-sm_86-plugin"
         )
+        self.assertEqual(sm86.get("os"), "windows-2022")
         self.assertIn('cuda: "12.6.3"', self.workflow)
         self.assertIn('min_driver_api="12.0.0"', self.workflow)
         self.assertNotIn('min_driver_api="13.0.0"', self.workflow)
+
+    def test_dynamic_matrix_is_selected_before_build_jobs_instantiate(self) -> None:
+        self.assertIn("\n  select-matrix:\n", self.workflow)
+        self.assertIn("needs: [select-matrix]", self.workflow)
+        self.assertIn(
+            "include: ${{ fromJSON(needs.select-matrix.outputs.include) }}",
+            self.workflow,
+        )
+        self.assertIn("select_release_matrix.py", self.workflow)
+        self.assertNotIn("LEG_SELECTED", self.workflow)
+
+    def test_full_matrix_has_exactly_one_vendor_owner_per_optional_vendor(self) -> None:
+        cuda_owners = [
+            row["target"]
+            for row in self.matrix
+            if row.get("provider") == "cuda" and row.get("vendor_owner") is True
+        ]
+        hip_owners = [
+            row["target"]
+            for row in self.matrix
+            if row.get("provider") == "hip" and row.get("vendor_owner") is True
+        ]
+        self.assertEqual(cuda_owners, ["x86_64-pc-windows-msvc-cuda-sm_75-plugin"])
+        self.assertEqual(hip_owners, ["x86_64-pc-windows-msvc-hip-gfx1030-plugin"])
+
+    def test_diagnostic_only_target_temporarily_owns_vendor_assets(self) -> None:
+        self.assertIn(
+            "VENDOR_OWNER: ${{ matrix.distribution == 'plugin' && "
+            "((github.event_name == 'workflow_dispatch' && inputs.only_target != '' "
+            "&& matrix.target == inputs.only_target) || matrix.vendor_owner) }}",
+            self.workflow,
+        )
 
     def test_hip_pe_gate_requires_only_direct_runtime_imports(self) -> None:
         self.assertIn(
