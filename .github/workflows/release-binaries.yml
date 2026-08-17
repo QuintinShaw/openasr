@@ -393,7 +393,7 @@ jobs:
           # the VS 2026 host compiler on windows-latest, while the v143 toolset
           # is also the host ABI contract recorded in the plugin manifest.
           # No VS-integration sub-package: build.rs uses Ninja directly.
-          cuda: "12.6.3"
+          cuda: ${{ matrix.cuda_toolkit || '12.6.3' }}
           method: network
           # Use only component names published by the CUDA 12.6 Windows
           # network installer. `crt` and `nvvm` are not standalone 12.6
@@ -1034,8 +1034,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          min_driver_api="12.0.0"
-          if [ "${{ matrix.provider }}" = "hip" ]; then min_driver_api="7.2.0"; fi
+          min_driver_api="${{ matrix.min_driver_api }}"
+          if [ -z "${min_driver_api}" ]; then
+            min_driver_api="12.0.0"
+            if [ "${{ matrix.provider }}" = "hip" ]; then min_driver_api="7.2.0"; fi
+          fi
           python_bin="python3"
           command -v python3 >/dev/null 2>&1 || python_bin="python"
           "$python_bin" tooling/release-manifest/backend_catalog.py compile \

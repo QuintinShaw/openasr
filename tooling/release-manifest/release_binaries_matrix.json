@@ -112,6 +112,22 @@
   },
   {
     "os": "windows-2022",
+    "target": "x86_64-pc-windows-msvc-cuda-sm_120-plugin",
+    "asset": "windows-x86_64-cuda-sm_120-plugin",
+    "binary_name": "openasr.exe",
+    "archive_ext": "dll",
+    "features": "cuda",
+    "provider": "cuda",
+    "distribution": "plugin",
+    "cuda_gpu_target": "120",
+    "cuda_toolkit": "12.8.1",
+    "min_driver_api": "12.8.0",
+    "vendor_owner": false,
+    "experimental": true,
+    "timeout": 180
+  },
+  {
+    "os": "windows-2022",
     "target": "x86_64-pc-windows-msvc-hip-gfx1030-plugin",
     "asset": "windows-x86_64-rocm-gfx1030-plugin",
     "binary_name": "openasr.exe",

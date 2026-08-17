@@ -145,9 +145,17 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             if row.get("target") == "x86_64-pc-windows-msvc-cuda-sm_86-plugin"
         )
         self.assertEqual(sm86.get("os"), "windows-2022")
-        self.assertIn('cuda: "12.6.3"', self.workflow)
+        self.assertIn("matrix.cuda_toolkit || '12.6.3'", self.workflow)
         self.assertIn('min_driver_api="12.0.0"', self.workflow)
         self.assertNotIn('min_driver_api="13.0.0"', self.workflow)
+        sm120 = next(
+            row
+            for row in self.matrix
+            if row.get("target") == "x86_64-pc-windows-msvc-cuda-sm_120-plugin"
+        )
+        self.assertEqual(sm120.get("cuda_toolkit"), "12.8.1")
+        self.assertEqual(sm120.get("min_driver_api"), "12.8.0")
+        self.assertTrue(sm120.get("experimental"))
 
     def test_dynamic_matrix_is_selected_before_build_jobs_instantiate(self) -> None:
         self.assertIn("\n  select-matrix:\n", self.workflow)
