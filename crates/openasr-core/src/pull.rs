@@ -6134,6 +6134,9 @@ fn download_backend_file<C: DownloadClient>(
     if backend_file_matches(dest, file) {
         return Ok(());
     }
+    if let Some(local_path) = file.url.strip_prefix("file://") {
+        return copy_local_backend_file(Path::new(local_path), dest, file, progress);
+    }
     // The parent pack/object directory is already keyed by the full artifact
     // digest. Keep the leaf short enough for Windows MAX_PATH-era tools while
     // the metadata still repeats and verifies the complete sha256 identity.
@@ -6177,6 +6180,49 @@ fn download_backend_file<C: DownloadClient>(
             Err(error) => return Err(error),
         }
     }
+}
+
+fn copy_local_backend_file(
+    source: &Path,
+    dest: &Path,
+    file: &CatalogBackendFile,
+    progress: &mut impl FnMut(PullProgress),
+) -> Result<(), PullError> {
+    progress(PullProgress::DownloadStarted {
+        bytes_total: file.size_bytes,
+        resume_from: 0,
+    });
+    let (size, sha256) = file_size_and_sha256(source)?;
+    if size != file.size_bytes || !sha256.eq_ignore_ascii_case(&file.sha256) {
+        return Err(PullError::InvalidTarget {
+            field: "backend.files",
+            reason: format!(
+                "local file '{}' does not match the signed size/sha256",
+                source.display()
+            ),
+        });
+    }
+    progress(PullProgress::Downloading {
+        bytes_done: size,
+        bytes_total: size,
+    });
+    progress(PullProgress::Verifying { bytes_done: size });
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|source_error| PullError::Io {
+            path: parent.to_path_buf(),
+            source: source_error,
+        })?;
+    }
+    let staging = dest.with_extension("local-copy");
+    fs::copy(source, &staging).map_err(|source_error| PullError::Io {
+        path: staging.clone(),
+        source: source_error,
+    })?;
+    atomic_file::replace_file_atomically(&staging, dest).map_err(|source_error| PullError::Io {
+        path: dest.to_path_buf(),
+        source: source_error,
+    })?;
+    Ok(())
 }
 
 fn discard_backend_partial(partial: &Path, partial_meta: &Path) {

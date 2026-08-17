@@ -350,7 +350,7 @@ fn catalog_capability_packs_are_not_market_listed_but_are_feature_queryable() {
         CatalogCapabilityRole::SpeakerEmbedder,
     ));
 
-    super::validate_model_catalog(&catalog).unwrap();
+    super::validate_model_catalog(&catalog, "https://catalog.openasr.org/v1/catalog.json").unwrap();
 
     let asr_model = catalog
         .models
@@ -384,7 +384,7 @@ fn catalog_kind_matrix_controls_market_listing() {
         .models
         .push(translation_model("private-translator", false));
 
-    super::validate_model_catalog(&catalog).unwrap();
+    super::validate_model_catalog(&catalog, "https://catalog.openasr.org/v1/catalog.json").unwrap();
 
     let mut market_ids: Vec<_> = catalog
         .models
@@ -432,7 +432,7 @@ fn filter_hides_model_with_unrecognized_kind_but_keeps_the_rest() {
         "{notes:?}"
     );
     // The rest of the catalog still loads and validates.
-    super::validate_model_catalog(&catalog).unwrap();
+    super::validate_model_catalog(&catalog, "https://catalog.openasr.org/v1/catalog.json").unwrap();
 }
 
 #[test]
@@ -579,7 +579,7 @@ fn catalog_translation_model_requires_translation_metadata() {
     model.source_langs.clear();
     catalog.models.push(model);
 
-    let error = super::validate_model_catalog(&catalog)
+    let error = super::validate_model_catalog(&catalog, "https://catalog.openasr.org/v1/catalog.json")
         .unwrap_err()
         .to_string();
 
@@ -594,7 +594,7 @@ fn catalog_translation_model_rejects_one_letter_language_code() {
     model.source_langs = vec!["z".to_string()];
     catalog.models.push(model);
 
-    let error = super::validate_model_catalog(&catalog)
+    let error = super::validate_model_catalog(&catalog, "https://catalog.openasr.org/v1/catalog.json")
         .unwrap_err()
         .to_string();
 
@@ -608,7 +608,7 @@ fn catalog_non_translation_model_rejects_translation_metadata() {
     catalog.models[0].source_langs = vec!["zh".to_string()];
     catalog.models[0].target_langs = vec!["en".to_string()];
 
-    let error = super::validate_model_catalog(&catalog)
+    let error = super::validate_model_catalog(&catalog, "https://catalog.openasr.org/v1/catalog.json")
         .unwrap_err()
         .to_string();
 
@@ -727,7 +727,7 @@ fn catalog_capability_pack_requires_capability_metadata() {
     pack.capability = None;
     catalog.models.push(pack);
 
-    let error = super::validate_model_catalog(&catalog)
+    let error = super::validate_model_catalog(&catalog, "https://catalog.openasr.org/v1/catalog.json")
         .unwrap_err()
         .to_string();
 
@@ -743,7 +743,7 @@ fn catalog_asr_model_rejects_capability_metadata() {
         role: CatalogCapabilityRole::SpeakerEmbedder,
     });
 
-    let error = super::validate_model_catalog(&catalog)
+    let error = super::validate_model_catalog(&catalog, "https://catalog.openasr.org/v1/catalog.json")
         .unwrap_err()
         .to_string();
 
@@ -2479,6 +2479,26 @@ fn catalog_parser_accepts_backend_entries() {
         .find(|file| file.role == CatalogBackendFileRole::Archive)
         .expect("archive file");
     assert_eq!(archive.extract_subdir.as_deref(), Some("rocblas/library"));
+}
+
+#[test]
+fn catalog_parser_accepts_file_backend_urls_only_for_local_catalog_identity() {
+    let local = valid_hip_backend_json().replace("https://example.test/", "file://D:/hip-pack/");
+    parse_model_catalog(
+        &catalog_json_with_backends(&local),
+        "file://D:/tmp/catalog.json",
+    )
+    .unwrap();
+    let error = parse_model_catalog(
+        &catalog_json_with_backends(&local),
+        "https://catalog.openasr.org/v1/catalog.json",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("must use https://"),
+        "{error}"
+    );
 }
 
 #[test]

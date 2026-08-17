@@ -1677,7 +1677,7 @@ pub fn parse_model_catalog(contents: &str, source: &str) -> Result<ModelCatalog,
     for note in filter_forward_compatible_catalog(&mut catalog) {
         eprintln!("openasr: {note}");
     }
-    validate_model_catalog(&catalog)?;
+    validate_model_catalog(&catalog, source)?;
     Ok(catalog)
 }
 
@@ -2518,7 +2518,7 @@ fn cache_catalog_security(
     })
 }
 
-fn validate_model_catalog(catalog: &ModelCatalog) -> Result<(), CatalogError> {
+fn validate_model_catalog(catalog: &ModelCatalog, source: &str) -> Result<(), CatalogError> {
     if catalog.schema_version != SUPPORTED_CATALOG_SCHEMA_VERSION {
         return Err(CatalogError::UnsupportedSchema {
             found: catalog.schema_version,
@@ -2627,7 +2627,7 @@ fn validate_model_catalog(catalog: &ModelCatalog) -> Result<(), CatalogError> {
         }
     }
     for backend in &catalog.backends {
-        validate_catalog_backend(backend)?;
+        validate_catalog_backend(backend, source)?;
     }
     Ok(())
 }
@@ -2637,7 +2637,7 @@ fn validate_model_catalog(catalog: &ModelCatalog) -> Result<(), CatalogError> {
 /// (local basename, https URL, non-zero size, 64-hex sha256). Archive files must
 /// declare a safe relative `extract_subdir` (no absolute / `..` traversal); the
 /// other roles must not. Mirrors the model-quant checks above.
-fn validate_catalog_backend(backend: &CatalogBackend) -> Result<(), CatalogError> {
+fn validate_catalog_backend(backend: &CatalogBackend, source: &str) -> Result<(), CatalogError> {
     if backend.id.trim().is_empty() {
         return Err(CatalogError::InvalidCatalog(
             "backend id must not be empty".to_string(),
@@ -2734,7 +2734,9 @@ fn validate_catalog_backend(backend: &CatalogBackend) -> Result<(), CatalogError
                 backend.id, file.filename
             )));
         }
-        if !file.url.starts_with("https://") {
+        if !file.url.starts_with("https://")
+            && !(source.starts_with("file://") && file.url.starts_with("file://"))
+        {
             return Err(CatalogError::InvalidCatalog(format!(
                 "backend '{}' file '{}' URL must use https://",
                 backend.id, file.filename
