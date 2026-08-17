@@ -1,0 +1,13 @@
+name: Rust cache
+description: Wrapper so unused third-party action downloads happen only when the step runs.
+
+inputs:
+  shared-key:
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.shared-key }}

@@ -160,8 +160,12 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         self.assertNotIn("LEG_SELECTED", self.workflow)
         self.assertNotIn("uses: Jimver/cuda-toolkit", self.workflow)
         self.assertNotIn("uses: ggml-org/free-disk-space", self.workflow)
+        self.assertNotIn("uses: azure/trusted-signing-action", self.workflow)
+        self.assertNotIn("uses: Swatinem/rust-cache@v2", self.workflow)
         self.assertIn("uses: ./.github/actions/install-cuda-toolkit-windows", self.workflow)
         self.assertIn("uses: ./.github/actions/free-disk-space", self.workflow)
+        self.assertIn("uses: ./.github/actions/trusted-signing", self.workflow)
+        self.assertIn("uses: ./.github/actions/rust-cache", self.workflow)
 
     def test_full_matrix_has_exactly_one_vendor_owner_per_optional_vendor(self) -> None:
         cuda_owners = [

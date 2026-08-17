@@ -1,0 +1,42 @@
+name: Azure Trusted Signing
+description: Wrapper so non-Windows matrix legs do not download the Azure signing action at job setup.
+
+inputs:
+  azure-tenant-id:
+    required: true
+  azure-client-id:
+    required: true
+  azure-client-secret:
+    required: true
+  endpoint:
+    required: true
+  trusted-signing-account-name:
+    required: true
+  certificate-profile-name:
+    required: true
+  files:
+    required: true
+  file-digest:
+    required: false
+    default: SHA256
+  timestamp-rfc3161:
+    required: true
+  timestamp-digest:
+    required: false
+    default: SHA256
+
+runs:
+  using: composite
+  steps:
+    - uses: azure/trusted-signing-action@v0
+      with:
+        azure-tenant-id: ${{ inputs.azure-tenant-id }}
+        azure-client-id: ${{ inputs.azure-client-id }}
+        azure-client-secret: ${{ inputs.azure-client-secret }}
+        endpoint: ${{ inputs.endpoint }}
+        trusted-signing-account-name: ${{ inputs.trusted-signing-account-name }}
+        certificate-profile-name: ${{ inputs.certificate-profile-name }}
+        files: ${{ inputs.files }}
+        file-digest: ${{ inputs.file-digest }}
+        timestamp-rfc3161: ${{ inputs.timestamp-rfc3161 }}
+        timestamp-digest: ${{ inputs.timestamp-digest }}
