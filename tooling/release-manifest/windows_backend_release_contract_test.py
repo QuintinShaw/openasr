@@ -140,6 +140,17 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         self.assertIn('min_driver_api="12.0.0"', self.workflow)
         self.assertNotIn('min_driver_api="13.0.0"', self.workflow)
 
+    def test_hip_pe_gate_requires_only_direct_runtime_imports(self) -> None:
+        self.assertIn(
+            "foreach ($requiredImport in @('amdhip64', 'libhipblas'))",
+            self.workflow,
+        )
+        self.assertNotIn(
+            "foreach ($requiredImport in @('amdhip64', 'libhipblas', 'rocblas'))",
+            self.workflow,
+        )
+        self.assertIn("rocblas\\library", self.workflow)
+
     def test_neutral_hosts_and_optional_plugins_install_the_vulkan_sdk(self) -> None:
         self.assertIn(
             "NEEDS_WINDOWS_VULKAN_SDK: ${{ matrix.target == "

@@ -1033,7 +1033,11 @@ jobs:
               Write-Error "CUDA plugin unexpectedly imports a HIP runtime"
             }
           } elseif ($provider -eq 'hip') {
-            foreach ($requiredImport in @('amdhip64', 'libhipblas', 'rocblas')) {
+            # The plugin directly imports HIP + hipBLAS. rocBLAS is hipBLAS's
+            # transitive provider and is validated in the signed vendor-layer
+            # tree below; requiring a direct plugin import rejects a correct
+            # ROCm 7.1 link because the linker removes that unused edge.
+            foreach ($requiredImport in @('amdhip64', 'libhipblas')) {
               if ($imports -notmatch "(?im)^\s*$([regex]::Escape($requiredImport))") {
                 Write-Error "HIP plugin does not import $requiredImport"
               }
