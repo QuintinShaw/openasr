@@ -145,6 +145,39 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         self.assertIn('min_driver_api="12.0.0"', self.workflow)
         self.assertNotIn('min_driver_api="13.0.0"', self.workflow)
 
+    def test_neutral_hosts_and_optional_plugins_install_the_vulkan_sdk(self) -> None:
+        self.assertIn(
+            "NEEDS_WINDOWS_VULKAN_SDK: ${{ matrix.target == "
+            "'x86_64-pc-windows-msvc' || contains(matrix.features, 'vulkan') || "
+            "matrix.distribution == 'host' || matrix.distribution == 'plugin' }}",
+            self.workflow,
+        )
+        self.assertIn("env.NEEDS_WINDOWS_VULKAN_SDK == 'true'", self.workflow)
+
+    def test_only_host_archives_bundle_the_vulkan_loader(self) -> None:
+        self.assertIn(
+            "BUNDLES_WINDOWS_VULKAN_LOADER: ${{ matrix.target == "
+            "'x86_64-pc-windows-msvc' || contains(matrix.features, 'vulkan') || "
+            "matrix.distribution == 'host' }}",
+            self.workflow,
+        )
+        self.assertEqual(
+            self.workflow.count("env.BUNDLES_WINDOWS_VULKAN_LOADER == 'true'"),
+            2,
+        )
+
+    def test_windows_cuda_uses_only_cuda_12_6_component_names(self) -> None:
+        self.assertIn(
+            "sub-packages: '[\"nvcc\", \"cudart\", \"cublas\", "
+            "\"cublas_dev\", \"thrust\"]'",
+            self.workflow,
+        )
+        windows_cuda = self.workflow.split(
+            "- name: Install CUDA toolkit (Windows)", 1
+        )[1].split("- name: Install Rust toolchain", 1)[0]
+        self.assertNotIn('"crt"', windows_cuda)
+        self.assertNotIn('"nvvm"', windows_cuda)
+
 
 if __name__ == "__main__":
     unittest.main()

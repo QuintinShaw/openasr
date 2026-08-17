@@ -88,7 +88,11 @@ fn main() {
     // environment variable can never change a production host's topology.
     let legacy_static_windows =
         is_windows && env::var_os("CARGO_FEATURE_LEGACY_WINDOWS_STATIC_SIDECAR").is_some();
-    let use_backend_dl = is_windows && !legacy_static_windows;
+    // The published Windows arm64 leg is CPU-only. There is no arm64 Vulkan
+    // rescue module or optional-GPU pack contract yet, so building the x64
+    // neutral plugin topology for that cross target would both require the
+    // wrong SDK import library and misstate the released capability.
+    let use_backend_dl = is_windows && !is_windows_arm64 && !legacy_static_windows;
     // The neutral Windows host always carries a Vulkan rescue module. CUDA/HIP
     // are optional packs; CPU+Vulkan are the installer-owned LKG and must not
     // depend on a consumer remembering to enable a feature.
@@ -97,7 +101,7 @@ fn main() {
         "cargo:rustc-env=OPENASR_WINDOWS_GGML_TOPOLOGY={}",
         if legacy_static_windows {
             "legacy-static-sidecar"
-        } else if is_windows {
+        } else if is_windows && !is_windows_arm64 {
             "neutral-backend-dl"
         } else {
             "platform-static"
@@ -111,8 +115,7 @@ fn main() {
     // and on the windows-arm64 cross the host-arch fallback would otherwise emit
     // x86 variants whose x86-only GEMM/repack kernels have no ARM implementation
     // and fail the link with unresolved externals (ggml_gemm_q6_K_8x4_q8_K, ...).
-    // So the arm64 cross builds a single ARM64 CPU backend instead (still a
-    // GGML_BACKEND_DL plugin DLL, just not the multi-variant set).
+    // So the arm64 cross builds a single statically linked ARM64 CPU backend.
     let ggml_cpu_all_variants = use_backend_dl && !is_windows_arm64;
     let ggml_native = resolve_ggml_native_enabled(
         feat_native,

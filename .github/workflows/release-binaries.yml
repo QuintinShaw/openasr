@@ -115,6 +115,12 @@ jobs:
       # workflow_call, or a dispatch that leaves only_target empty) builds
       # every leg exactly as before.
       LEG_SELECTED: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.only_target == '' || matrix.target == github.event.inputs.only_target }}
+      # BACKEND_DL compiles the neutral CPU/Vulkan host even when the selected
+      # release artifact is only a CUDA/HIP module. Keep build-time SDK needs
+      # separate from runtime loader packaging: plugin legs need the SDK but
+      # must not publish a second Vulkan loader beside the optional module.
+      NEEDS_WINDOWS_VULKAN_SDK: ${{ matrix.target == 'x86_64-pc-windows-msvc' || contains(matrix.features, 'vulkan') || matrix.distribution == 'host' || matrix.distribution == 'plugin' }}
+      BUNDLES_WINDOWS_VULKAN_LOADER: ${{ matrix.target == 'x86_64-pc-windows-msvc' || contains(matrix.features, 'vulkan') || matrix.distribution == 'host' }}
       # Where the built binary + build.rs-staged runtime DLLs land. A native
       # leg (no matrix.rust_target) builds into target/release; a cross leg
       # (--target <triple>) builds into target/<triple>/release. Every package/
@@ -608,7 +614,7 @@ jobs:
           echo "/opt/rocm/bin" >> "${GITHUB_PATH}"
 
       - name: Install Windows Vulkan SDK
-        if: contains(matrix.features, 'vulkan') && runner.os == 'Windows' && env.LEG_SELECTED == 'true'
+        if: runner.os == 'Windows' && env.NEEDS_WINDOWS_VULKAN_SDK == 'true' && env.LEG_SELECTED == 'true'
         shell: pwsh
         env:
           VULKAN_VERSION: 1.4.313.2
@@ -751,17 +757,13 @@ jobs:
           # No VS-integration sub-package: build.rs uses Ninja directly.
           cuda: "12.6.3"
           method: network
-          # CUDA 12 splits the compiler across sub-packages: nvcc is only the
-          # driver, crt carries the front-end headers (include/crt/*), and
-          # nvvm carries the cicc device compiler nvcc dispatches to (missing
-          # nvvm fails with an unexpanded %CICC_PATH%). cudart supplies the
-          # runtime DLLs shipped in the archive, cublas(+dev) the GEMM
-          # library, thrust the CUB/CCCL headers ggml-cuda's sort/scan
-          # kernels use (still named thrust_13.x in the Windows silent
-          # installer; an unknown name fails the installer with exit code
-          # 3772776473). Network subset keeps this ~GBs smaller than the
-          # full installer.
-          sub-packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "thrust"]'
+          # Use only component names published by the CUDA 12.6 Windows
+          # network installer. `crt` and `nvvm` are not standalone 12.6
+          # components (they were added to later toolkit layouts), so asking
+          # the installer for either fails before any build starts. `nvcc`
+          # carries the compiler payload; cudart supplies the runtime DLL,
+          # cublas(+dev) the GEMM library, and thrust the CUB/CCCL headers.
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust"]'
           use-github-cache: true
 
       - name: Install Rust toolchain
@@ -1115,14 +1117,14 @@ jobs:
       # regardless of cache hit, so a stale/corrupted cache entry can never
       # silently pass.
       - name: Cache Vulkan loader redistributable
-        if: contains(matrix.features, 'vulkan') && runner.os == 'Windows' && env.LEG_SELECTED == 'true'
+        if: runner.os == 'Windows' && env.BUNDLES_WINDOWS_VULKAN_LOADER == 'true' && env.LEG_SELECTED == 'true'
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}\vulkan-runtime-components.zip
           key: vulkan-loader-${{ env.VULKAN_LOADER_VERSION }}
 
       - name: Stage Vulkan loader (LunarG VulkanRT redistributable)
-        if: contains(matrix.features, 'vulkan') && runner.os == 'Windows' && env.LEG_SELECTED == 'true'
+        if: runner.os == 'Windows' && env.BUNDLES_WINDOWS_VULKAN_LOADER == 'true' && env.LEG_SELECTED == 'true'
         shell: pwsh
         # openasr.exe's PE import table names vulkan-1.dll (ggml-vulkan links
         # Vulkan::Vulkan, the SYSTEM Vulkan loader import lib) -- the loader

@@ -1382,7 +1382,7 @@ pub(crate) fn probe_exact_backend_plugin_candidate(
     } else {
         dependency_dir_ptrs.as_ptr()
     };
-    let mut driver = [0_i8; 64];
+    let mut driver = [0 as std::ffi::c_char; 64];
     let ok = unsafe {
         ffi::ggml_backend_probe_verified_v3_utf8(
             path.as_ptr(),
