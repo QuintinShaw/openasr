@@ -178,6 +178,16 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         self.assertNotIn('"crt"', windows_cuda)
         self.assertNotIn('"nvvm"', windows_cuda)
 
+    def test_single_target_dispatch_does_not_build_the_xcframework(self) -> None:
+        xcframework = self.workflow.split("\n  xcframework:\n", 1)[1].split(
+            "\n  checksums:\n", 1
+        )[0]
+        self.assertIn(
+            "if: ${{ github.event_name != 'workflow_dispatch' || "
+            "inputs.only_target == '' }}",
+            xcframework,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

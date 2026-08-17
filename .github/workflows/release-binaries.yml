@@ -1476,6 +1476,10 @@ jobs:
 
   xcframework:
     name: Build OpenASR.xcframework
+    # A single-target diagnostic dispatch must consume only that platform's
+    # runner. The SDK artifact belongs to complete releases, not to a Windows
+    # or Linux `only_target` probe.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.only_target == '' }}
     # Not part of the `build` matrix above: it is a macOS/iOS SDK artifact
     # (three arch slices assembled via `xcodebuild -create-xcframework`), not
     # a CLI binary, so it gets its own job with its own toolchain/packaging
