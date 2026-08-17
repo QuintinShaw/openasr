@@ -16,6 +16,18 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         cls.workflow = WORKFLOW.read_text(encoding="utf-8")
         cls.core_build_rs = CORE_BUILD_RS.read_text(encoding="utf-8")
 
+    def test_backend_abi_is_independent_of_git_checkout_newlines(self) -> None:
+        self.assertIn(
+            "let bytes = normalize_abi_source_newlines(&bytes);",
+            self.core_build_rs,
+        )
+        normalizer = self.core_build_rs.split(
+            "fn normalize_abi_source_newlines", 1
+        )[1].split("fn sha256_hex", 1)[0]
+        self.assertIn("bytes[index] == b'\\r'", normalizer)
+        self.assertIn("Some(&b'\\n')", normalizer)
+        self.assertIn("normalized.push(b'\\n')", normalizer)
+
     def assert_matrix_leg(
         self,
         target: str,

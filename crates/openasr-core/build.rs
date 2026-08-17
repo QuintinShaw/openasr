@@ -1266,12 +1266,32 @@ fn hash_named_files(paths: &[PathBuf]) -> String {
             .to_string_lossy();
         let bytes = fs::read(path)
             .unwrap_or_else(|error| panic!("failed to read ABI input {}: {error}", path.display()));
+        // These inputs are source text. Git may materialize the same committed
+        // bytes as LF on CI and CRLF in a Windows developer checkout; that must
+        // not create two incompatible backend ABIs. Normalize only CRLF pairs,
+        // preserving every other byte (including a deliberate lone CR).
+        let bytes = normalize_abi_source_newlines(&bytes);
         hasher.update((name.len() as u64).to_le_bytes());
         hasher.update(name.as_bytes());
         hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
+        hasher.update(&bytes);
     }
     format!("{:x}", hasher.finalize())
+}
+
+fn normalize_abi_source_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+            normalized.push(b'\n');
+            index += 2;
+        } else {
+            normalized.push(bytes[index]);
+            index += 1;
+        }
+    }
+    normalized
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
