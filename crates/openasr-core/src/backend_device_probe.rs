@@ -15,6 +15,13 @@ pub(crate) struct BackendDeviceProof {
 }
 
 #[derive(Debug, Error)]
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "Windows discovery failure codes remain a stable machine protocol on every host"
+    )
+)]
 pub(crate) enum BackendDeviceProbeError {
     #[error("target-scoped discovery is unsupported for this provider")]
     UnsupportedProvider,
@@ -72,6 +79,7 @@ pub(crate) fn probe_provider_device(
     }
 }
 
+#[cfg(any(windows, test))]
 fn normalize_cuda_driver_version(raw: i32) -> Result<String, String> {
     if raw <= 0 {
         return Err("CUDA driver API returned a non-positive version".to_string());
@@ -79,6 +87,7 @@ fn normalize_cuda_driver_version(raw: i32) -> Result<String, String> {
     Ok(format!("{}.{}.{}", raw / 1000, (raw % 1000) / 10, raw % 10))
 }
 
+#[cfg(any(windows, test))]
 fn normalize_hip_driver_version(raw: i32) -> Result<String, String> {
     if raw <= 0 {
         return Err("HIP driver API returned a non-positive version".to_string());
@@ -94,6 +103,7 @@ fn normalize_hip_driver_version(raw: i32) -> Result<String, String> {
     Ok(raw.to_string())
 }
 
+#[cfg(any(windows, test))]
 fn canonical_hip_target(name: &str) -> Option<String> {
     let name = name.trim().split(':').next()?.to_ascii_lowercase();
     let digits = name.strip_prefix("gfx")?;
