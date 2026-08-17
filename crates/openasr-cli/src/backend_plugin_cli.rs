@@ -5,8 +5,8 @@ use openasr_core::{
     CatalogBackendVendor, PullProgress, activate_installed_backend_pack_auto,
     backend_plugin_status, deactivate_backend_pack, describe_backend_provider, gc_backend_store,
     install_and_activate_backend_pack, install_and_activate_backend_provider,
-    install_backend_pack_from_catalog, load_model_catalog, openasr_home,
-    prepare_backend_provider_for_live_device, resolve_catalog_backend_pull,
+    install_backend_pack_from_catalog, installed_backend_protected_bytes, load_model_catalog,
+    openasr_home, prepare_backend_provider_for_live_device, resolve_catalog_backend_pull,
 };
 use serde_json::json;
 
@@ -49,6 +49,7 @@ pub(crate) fn backend_plugin_command(command: BackendPluginCommand) -> Result<()
             };
             let installed =
                 install_backend_pack_from_catalog(&catalog, &backend_id, &home, print_progress)?;
+            let protected_bytes = installed_backend_protected_bytes(&requested, &home)?;
             println!(
                 "{}",
                 json!({
@@ -61,6 +62,7 @@ pub(crate) fn backend_plugin_command(command: BackendPluginCommand) -> Result<()
                     "host_abi_fingerprint": requested.host_abi.fingerprint,
                     "device_target": device_target,
                     "size_bytes": requested.files.iter().map(|file| file.size_bytes).sum::<u64>(),
+                    "protected_bytes": protected_bytes,
                 })
             );
         }

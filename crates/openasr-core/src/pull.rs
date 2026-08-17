@@ -5523,6 +5523,49 @@ pub(crate) fn install_backend_pack_locked(
     install_backend_pack_with_client_locked(resolved, home, &mut client, progress)
 }
 
+/// Conservative logical bytes that must remain reachable while `resolved` is
+/// installed.  The count is owned by open-core because only the content store
+/// knows which shared runtime objects back a pack.  Directory entries are
+/// walked fail-closed and symlinks are rejected by `safe_tree_stats`; hard-link
+/// aliases are deliberately counted at each protected path so a product shell
+/// never under-budgets a filesystem that had to fall back to copies.
+pub fn installed_backend_protected_bytes(
+    resolved: &ResolvedCatalogBackendPull,
+    home: impl AsRef<Path>,
+) -> Result<u64, PullError> {
+    let home = home.as_ref();
+    let mut roots = BTreeSet::new();
+    roots.insert(backend_pack_install_dir(home, resolved)?);
+    for file in &resolved.files {
+        if matches!(
+            file.role,
+            CatalogBackendFileRole::Runtime | CatalogBackendFileRole::Archive
+        ) {
+            roots.insert(backend_content_object_dir(home, file));
+        }
+    }
+
+    protected_backend_roots_bytes(roots)
+}
+
+fn protected_backend_roots_bytes(
+    roots: impl IntoIterator<Item = PathBuf>,
+) -> Result<u64, PullError> {
+    roots.into_iter().try_fold(0_u64, |total, root| {
+        let bytes = safe_tree_stats(&root)
+            .ok_or_else(|| PullError::RuntimeValidation {
+                path: root,
+                reason: "backend protected-byte tree is missing, unreadable, or contains a symlink"
+                    .to_string(),
+            })?
+            .bytes;
+        total.checked_add(bytes).ok_or(PullError::InvalidTarget {
+            field: "backend protected bytes",
+            reason: "logical byte count overflow".to_string(),
+        })
+    })
+}
+
 /// Downloads and verifies only the provider runtime/archive objects shared by
 /// every target-scoped pack, while the caller holds the global backend-store
 /// mutation lock. This is the HIP discovery bootstrap: no target-specific

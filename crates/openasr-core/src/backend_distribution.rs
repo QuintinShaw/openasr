@@ -22,8 +22,8 @@ use crate::{
     pull::{
         BackendStoreMutationLock, InstalledBackend, PreparedBackendRuntimeObjects, PullProgress,
         backend_artifact_fingerprint, backend_pack_download_plan, backend_pack_install_dir,
-        install_backend_pack, install_backend_pack_locked, prepare_backend_runtime_objects_locked,
-        read_and_verify_installed_backend,
+        install_backend_pack, install_backend_pack_locked, installed_backend_protected_bytes,
+        prepare_backend_runtime_objects_locked, read_and_verify_installed_backend,
     },
     registry::{resolve_catalog_backend_pull, resolve_compatible_catalog_backend_pull_for_driver},
 };
@@ -95,6 +95,10 @@ pub struct PreparedBackendPack {
     pub size_bytes: u64,
     pub plugin_size_bytes: u64,
     pub vendor_size_bytes: u64,
+    /// Conservative logical bytes protected by this installed pack and its
+    /// shared content objects. Product shells use this proof for retention
+    /// budgets without inspecting open-core's private store layout.
+    pub protected_bytes: u64,
 }
 
 /// Download sizing for a provider before consent. Target-specific plugin
@@ -297,6 +301,8 @@ fn prepare_backend_provider_for_live_device_locked(
     let size_bytes = plugin_size_bytes
         .checked_add(vendor_size_bytes)
         .ok_or_else(|| BackendActivationError::Resolution("backend size overflow".to_string()))?;
+    let protected_bytes = installed_backend_protected_bytes(&resolved, home)
+        .map_err(|error| BackendActivationError::InstalledPack(error.to_string()))?;
     Ok(PreparedBackendPack {
         schema_version: 1,
         backend_id: resolved.backend_id.clone(),
@@ -309,6 +315,7 @@ fn prepare_backend_provider_for_live_device_locked(
         size_bytes,
         plugin_size_bytes,
         vendor_size_bytes,
+        protected_bytes,
     })
 }
 

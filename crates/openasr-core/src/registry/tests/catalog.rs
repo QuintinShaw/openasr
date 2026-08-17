@@ -2504,6 +2504,34 @@ fn catalog_parser_rejects_non_target_scoped_gpu_backends() {
 }
 
 #[test]
+fn catalog_parser_rejects_noncanonical_cuda_targets() {
+    let valid_cuda = valid_hip_backend_json()
+        .replace("\"id\": \"hip-radeon\"", "\"id\": \"cuda-geforce\"")
+        .replace("\"vendor\": \"hip\"", "\"vendor\": \"cuda\"")
+        .replace("AMD ROCm (HIP)", "NVIDIA CUDA")
+        .replace("gfx1200", "sm_89")
+        .replace("ggml-hip.dll", "ggml-cuda.dll");
+    assert!(parse_model_catalog(&catalog_json_with_backends(&valid_cuda), "fixture").is_ok());
+
+    for targets in [
+        "[]",
+        "[\"sm_86\", \"sm_89\"]",
+        "[\"gfx1200\"]",
+        "[\"SM_89\"]",
+        "[\"sm_9a\"]",
+    ] {
+        let invalid = valid_cuda.replace("[\"sm_89\"]", targets);
+        let error = parse_model_catalog(&catalog_json_with_backends(&invalid), "fixture")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("target-scoped CUDA") || error.contains("non-canonical device target"),
+            "unexpected validation error for {targets}: {error}"
+        );
+    }
+}
+
+#[test]
 fn catalog_parser_rejects_backend_with_bad_sha256() {
     // Corrupt only the plugin payload digest. Replacing every occurrence of
     // BACKEND_SHA_A also invalidates the host ABI fields and makes this test
@@ -2705,6 +2733,29 @@ fn compatible_backend_resolution_rejects_target_mismatch_and_ambiguity() {
             Some("gfx1100"),
         ),
         Err(BackendResolutionError::AmbiguousCompatibleBackend { .. })
+    ));
+}
+
+#[test]
+fn compatible_gpu_backend_resolution_defends_against_targetless_in_memory_catalogs() {
+    let mut catalog = parse_model_catalog(
+        &catalog_json_with_backends(&valid_hip_backend_json()),
+        "fixture",
+    )
+    .unwrap();
+    let host = catalog.backends[0].host_abi.clone();
+    // Public catalog parsing rejects this already. Keep the resolver defensive
+    // for programmatic callers that construct a catalog in memory.
+    catalog.backends[0].targets.clear();
+    assert!(matches!(
+        resolve_compatible_catalog_backend_pull_for_driver(
+            &catalog,
+            CatalogBackendVendor::Hip,
+            &host,
+            Some("gfx1200"),
+            Some("6.0.0"),
+        ),
+        Err(BackendResolutionError::NoCompatibleBackend { .. })
     ));
 }
 

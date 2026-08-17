@@ -21,6 +21,20 @@ use crate::{
 
 use super::*;
 
+#[test]
+fn backend_protected_bytes_count_every_protected_tree() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack = temp.path().join("pack");
+    let shared = temp.path().join("shared");
+    fs::create_dir_all(pack.join("nested")).unwrap();
+    fs::create_dir_all(&shared).unwrap();
+    fs::write(pack.join("plugin.dll"), [0_u8; 11]).unwrap();
+    fs::write(pack.join("nested").join("backend.json"), [0_u8; 7]).unwrap();
+    fs::write(shared.join("runtime.dll"), [0_u8; 13]).unwrap();
+
+    assert_eq!(protected_backend_roots_bytes([pack, shared]).unwrap(), 31);
+}
+
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 

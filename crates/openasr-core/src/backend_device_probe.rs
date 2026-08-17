@@ -357,6 +357,7 @@ mod windows {
     struct HsaCallbackState {
         get_info: HsaAgentGetInfo,
         targets: BTreeSet<String>,
+        gpu_agent_count: usize,
     }
 
     unsafe extern "C" fn collect_hsa_agent(agent: HsaAgent, data: *mut c_void) -> u32 {
@@ -375,6 +376,7 @@ mod windows {
         {
             return HSA_STATUS_SUCCESS;
         }
+        state.gpu_agent_count += 1;
         let mut name = [0_u8; 64];
         if unsafe { (state.get_info)(agent, HSA_AGENT_INFO_NAME, name.as_mut_ptr().cast()) }
             != HSA_STATUS_SUCCESS
@@ -502,6 +504,7 @@ mod windows {
         let mut state = HsaCallbackState {
             get_info: hsa_get_info,
             targets: BTreeSet::new(),
+            gpu_agent_count: 0,
         };
         let iterate_status = unsafe {
             hsa_iterate(
@@ -523,8 +526,15 @@ mod windows {
                 message: "driver API version query failed".to_string(),
             });
         }
+        let target = if state.targets.is_empty() && state.gpu_agent_count > 0 {
+            return Err(BackendDeviceProbeError::UnknownTarget(
+                "HIP HSA GPU agent did not expose a canonical gfx target".to_string(),
+            ));
+        } else {
+            one_target(state.targets, "HIP")?
+        };
         Ok(BackendDeviceProof {
-            target: one_target(state.targets, "HIP")?,
+            target,
             driver_api_version: normalize_hip_driver_version(driver)
                 .map_err(BackendDeviceProbeError::UnknownTarget)?,
         })
@@ -555,6 +565,26 @@ mod tests {
         );
         assert_eq!(canonical_hip_target("Radeon 7900 XTX"), None);
         assert_eq!(canonical_hip_target("gfx90a"), None);
+    }
+
+    #[test]
+    fn probe_failure_codes_are_stable_machine_contracts() {
+        assert_eq!(
+            BackendDeviceProbeError::NoDevice("CUDA").code(),
+            "no_device"
+        );
+        assert_eq!(
+            BackendDeviceProbeError::AmbiguousTargets {
+                provider: "HIP",
+                targets: "gfx1100, gfx1200".to_string(),
+            }
+            .code(),
+            "ambiguous_targets"
+        );
+        assert_eq!(
+            BackendDeviceProbeError::UnknownTarget("unknown".to_string()).code(),
+            "unknown_target"
+        );
     }
 
     #[cfg(windows)]
