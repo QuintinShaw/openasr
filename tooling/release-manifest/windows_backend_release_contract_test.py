@@ -164,7 +164,8 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         self.assertNotIn("uses: Swatinem/rust-cache@v2", self.workflow)
         self.assertIn("uses: ./.github/actions/install-cuda-toolkit-windows", self.workflow)
         self.assertIn("uses: ./.github/actions/free-disk-space", self.workflow)
-        self.assertIn("uses: ./.github/actions/trusted-signing", self.workflow)
+        self.assertNotIn("uses: actions/attest-build-provenance@v4", self.workflow)
+        self.assertIn("uses: ./.github/actions/attest-build-provenance", self.workflow)
         self.assertIn("uses: ./.github/actions/rust-cache", self.workflow)
 
     def test_full_matrix_has_exactly_one_vendor_owner_per_optional_vendor(self) -> None:

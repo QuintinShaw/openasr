@@ -1059,13 +1059,13 @@ jobs:
       # so they still get provenance. Only the packaged archive is attested,
       # not the SHA256SUMS text file assembled later in `checksums`.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4
+        uses: ./.github/actions/attest-build-provenance
         with:
           subject-path: dist/openasr-${{ env.OPENASR_VERSION }}-${{ matrix.asset }}.${{ matrix.archive_ext }}
 
       - name: Attest backend catalog metadata
         if: runner.os == 'Windows' && matrix.distribution == 'plugin'
-        uses: actions/attest-build-provenance@v4
+        uses: ./.github/actions/attest-build-provenance
         with:
           subject-path: dist/${{ env.BACKEND_PACK_NAME }}
 
@@ -1075,7 +1075,7 @@ jobs:
       # produced one (cuda/hip legs).
       - name: Attest build provenance (vendor archive)
         if: env.VENDOR_ASSET_NAME != '' && env.VENDOR_OWNER == 'true'
-        uses: actions/attest-build-provenance@v4
+        uses: ./.github/actions/attest-build-provenance
         with:
           subject-path: dist/${{ env.VENDOR_ASSET_NAME }}
 
@@ -1181,7 +1181,7 @@ jobs:
 
       # Only the zip is attested, not its .sha256 sidecar text file.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4
+        uses: ./.github/actions/attest-build-provenance
         with:
           subject-path: dist/openasr-${{ env.OPENASR_VERSION }}-xcframework.zip
 
@@ -1264,7 +1264,7 @@ jobs:
           if-no-files-found: error
       - name: Attest backend plugin updater hints
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.only_target == ''
-        uses: actions/attest-build-provenance@v4
+        uses: ./.github/actions/attest-build-provenance
         with:
           subject-path: dist/backend-plugin-hints.json
       - name: Upload SHA256SUMS

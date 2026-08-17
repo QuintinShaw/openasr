@@ -1,0 +1,13 @@
+name: Attest build provenance
+description: Wrapper so unused provenance downloads happen only when the step runs.
+
+inputs:
+  subject-path:
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/attest-build-provenance@v4
+      with:
+        subject-path: ${{ inputs.subject-path }}

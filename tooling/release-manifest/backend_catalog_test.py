@@ -211,6 +211,61 @@ class BackendCatalogTest(unittest.TestCase):
             with self.assertRaises(backend_catalog.BackendCatalogError):
                 backend_catalog.compile_update_hints(paths, out)
 
+    def test_update_hints_allow_content_addressed_cuda_vendor_families(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = []
+            for provider, target, vendor_name in (
+                ("cuda", "sm_86", "cuda-12-6.zip"),
+                ("cuda", "sm_120", "cuda-12-8.zip"),
+                ("hip", "gfx1100", "hip-vendor.zip"),
+            ):
+                entry = {
+                    "id": f"{provider}-pack-{target}",
+                    "vendor": provider,
+                    "version": "1.2.3",
+                    "host_abi": {
+                        "fingerprint": "a" * 64,
+                        "ggml_revision": "f" * 40,
+                    },
+                    "targets": [target],
+                    "min_driver_api": "1.0",
+                    "files": [
+                        {
+                            "filename": f"ggml-{provider}-{target}.dll",
+                            "sha256": "b" * 64,
+                            "size_bytes": 10,
+                            "role": "plugin",
+                        },
+                        {
+                            "filename": vendor_name,
+                            "sha256": "c" * 64,
+                            "size_bytes": 20,
+                            "role": "archive",
+                            "extract_subdir": "vendor",
+                            "extracted_tree_sha256": "d" * 64,
+                        },
+                    ],
+                }
+                path = root / f"{provider}-{target}.json"
+                path.write_text(json.dumps(entry), encoding="utf-8")
+                paths.append(path)
+            out = root / "hints.json"
+            backend_catalog.compile_update_hints(paths, out)
+            hints = json.loads(out.read_text(encoding="utf-8"))["windows-x86_64"]
+            self.assertNotIn("vendor", hints["providers"]["cuda"])
+            self.assertEqual(
+                hints["providers"]["cuda"]["targets"]["sm_86"]["vendor"]["filename"],
+                "cuda-12-6.zip",
+            )
+            self.assertEqual(
+                hints["providers"]["cuda"]["targets"]["sm_120"]["vendor"]["filename"],
+                "cuda-12-8.zip",
+            )
+            self.assertEqual(
+                hints["providers"]["hip"]["vendor"]["filename"], "hip-vendor.zip"
+            )
+
     def test_release_asset_and_published_catalog_gates_bind_exact_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
