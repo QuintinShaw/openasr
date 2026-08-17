@@ -1245,6 +1245,25 @@ pub fn load_model_catalog(
     }
 }
 
+/// Loads only the already-verified on-disk catalog cache. Runtime backend
+/// enumeration can run inside an async server handler, so it must never create
+/// a blocking HTTP client or perform network I/O. Backend installation already
+/// populated this signed cache; a missing or invalid cache therefore fails the
+/// optional activation transaction while bundled CPU/Vulkan remain available.
+pub(crate) fn load_model_catalog_from_verified_cache(
+    catalog_url: Option<&str>,
+    openasr_home: impl AsRef<Path>,
+) -> Result<ModelCatalog, CatalogError> {
+    let home = openasr_home.as_ref();
+    let source = catalog_url.unwrap_or(DEFAULT_CATALOG_URL);
+    let cache_path = default_catalog_cache_path(home);
+    let offline = CatalogError::ReadCatalog {
+        catalog_source: source.to_string(),
+        message: "runtime backend activation is network-free".to_string(),
+    };
+    load_signed_catalog_from_cache(source, home, &cache_path, &offline)
+}
+
 /// Parses `contents` and, for a catalog verified under the PRODUCTION signing
 /// key (see [`catalog_security::participates_in_epoch_floor`]), additionally
 /// refuses one specific data anomaly: a payload that carries any staged

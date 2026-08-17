@@ -1133,6 +1133,20 @@ fn catalog_loader_caches_file_source_and_falls_back_to_cache() {
 }
 
 #[test]
+fn runtime_backend_catalog_load_uses_only_the_verified_cache() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_path = temp.path().join("source-catalog.json");
+    let home = temp.path().join("home");
+    crate::testing::write_local_dev_signed_catalog(&source_path, &catalog_json(), 1);
+    let source = format!("file://{}", source_path.display());
+    load_model_catalog(Some(&source), &home).unwrap();
+    fs::remove_file(&source_path).unwrap();
+
+    let cached = super::load_model_catalog_from_verified_cache(Some(&source), &home);
+    assert_eq!(cached.unwrap().models[0].id, "moonshine-tiny");
+}
+
+#[test]
 fn catalog_loader_falls_back_to_cache_on_network_failure() {
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("source-catalog.json");

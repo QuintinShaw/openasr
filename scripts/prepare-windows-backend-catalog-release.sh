@@ -62,17 +62,35 @@ done
 echo "==> downloading backend entries for ${tag}"
 gh release download "$tag" \
   -p 'backend-pack-*.json' \
+  -p 'backend-hardware-evidence-*.json' \
   -D "$workdir" --clobber
 
 shopt -s nullglob
 backend_entries=("$workdir"/backend-pack-*.json)
+hardware_evidence=("$workdir"/backend-hardware-evidence-*.json)
 cuda_entries=("$workdir"/backend-pack-cuda-sm_*.json)
 hip_entries=("$workdir"/backend-pack-hip-gfx*.json)
 if [ "${#cuda_entries[@]}" -ne 5 ] || [ "${#hip_entries[@]}" -ne 11 ] || [ "${#backend_entries[@]}" -ne 16 ]; then
   fail "release ${tag} must contain exactly 5 CUDA SM and 11 HIP gfx backend-pack metadata files"
 fi
-backend_entry_args=()
+all_backend_entry_args=()
 for entry in "${backend_entries[@]}"; do
+  all_backend_entry_args+=(--entry "$entry")
+done
+[ "${#hardware_evidence[@]}" -gt 0 ] \
+  || fail "release ${tag} has no exact real-hardware backend evidence; build artifacts alone are not publishable catalog claims"
+hardware_evidence_args=()
+for evidence in "${hardware_evidence[@]}"; do
+  hardware_evidence_args+=(--evidence "$evidence")
+done
+python3 tooling/release-manifest/backend_hardware_evidence.py \
+  "${all_backend_entry_args[@]}" "${hardware_evidence_args[@]}" \
+  > "$workdir/hardware-approved-entries.txt"
+mapfile -t approved_entries < "$workdir/hardware-approved-entries.txt"
+[ "${#approved_entries[@]}" -gt 0 ] \
+  || fail "release ${tag} has no backend entry approved by exact hardware evidence"
+backend_entry_args=()
+for entry in "${approved_entries[@]}"; do
   backend_entry_args+=(--entry "$entry")
 done
 
@@ -101,7 +119,7 @@ PY
 
 echo "==> verifying every release byte against both backend entries"
 python3 tooling/release-manifest/backend_catalog.py verify-assets \
-  "${backend_entry_args[@]}" \
+  "${all_backend_entry_args[@]}" \
   --asset-directory "$workdir" \
   --version "$version"
 
@@ -142,6 +160,7 @@ python3 tooling/publish-model/scripts/check_catalog_consistency.py
 restore=0
 echo
 echo "CATALOG-PREPARED for ${tag}"
+echo "  hardware-approved backend entries: ${#approved_entries[@]} of ${#backend_entries[@]} built"
 echo "  epoch: ${old_epoch} -> ${new_epoch}"
 echo "  next: review and commit model-registry/catalog{,.public}{,.signature}.json + catalog.epoch"
 echo "  then push the catalog commit, wait for deploy-catalog.yml, and run:"

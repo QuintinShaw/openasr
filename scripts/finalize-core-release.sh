@@ -26,18 +26,36 @@ workdir="$(mktemp -d "${TMPDIR:-/tmp}/openasr-release-finalize.XXXXXX")"
 trap 'rm -rf "$workdir"' EXIT
 gh release download "$tag" \
   -p 'backend-pack-*.json' \
+  -p 'backend-hardware-evidence-*.json' \
   -p backends-manifest.json -p backends-manifest.signature.json \
   -D "$workdir" --clobber
 
 shopt -s nullglob
 backend_entries=("$workdir"/backend-pack-*.json)
+hardware_evidence=("$workdir"/backend-hardware-evidence-*.json)
 cuda_entries=("$workdir"/backend-pack-cuda-sm_*.json)
 hip_entries=("$workdir"/backend-pack-hip-gfx*.json)
 if [ "${#cuda_entries[@]}" -ne 5 ] || [ "${#hip_entries[@]}" -ne 11 ] || [ "${#backend_entries[@]}" -ne 16 ]; then
   fail "release ${tag} must contain exactly 5 CUDA SM and 11 HIP gfx backend-pack metadata files"
 fi
-backend_entry_args=()
+all_backend_entry_args=()
 for entry in "${backend_entries[@]}"; do
+  all_backend_entry_args+=(--entry "$entry")
+done
+[ "${#hardware_evidence[@]}" -gt 0 ] \
+  || fail "release ${tag} has no exact real-hardware backend evidence"
+hardware_evidence_args=()
+for evidence in "${hardware_evidence[@]}"; do
+  hardware_evidence_args+=(--evidence "$evidence")
+done
+python3 tooling/release-manifest/backend_hardware_evidence.py \
+  "${all_backend_entry_args[@]}" "${hardware_evidence_args[@]}" \
+  > "$workdir/hardware-approved-entries.txt"
+mapfile -t approved_entries < "$workdir/hardware-approved-entries.txt"
+[ "${#approved_entries[@]}" -gt 0 ] \
+  || fail "release ${tag} has no backend entry approved by exact hardware evidence"
+backend_entry_args=()
+for entry in "${approved_entries[@]}"; do
   backend_entry_args+=(--entry "$entry")
 done
 
@@ -58,6 +76,9 @@ OPENASR_CATALOG_IDENTITY="https://catalog.openasr.org/v1/catalog.json" \
 python3 tooling/release-manifest/backend_catalog.py verify-catalog \
   --catalog "$workdir/catalog.json" \
   "${backend_entry_args[@]}"
+python3 tooling/release-manifest/backend_hardware_evidence.py \
+  "${all_backend_entry_args[@]}" "${hardware_evidence_args[@]}" \
+  --catalog "$workdir/catalog.json" --version "$version" >/dev/null
 
 echo "==> all signed distribution metadata is live; publishing ${tag}"
 gh release edit "$tag" --draft=false --latest

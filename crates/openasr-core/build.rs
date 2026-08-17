@@ -7,8 +7,8 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-#[path = "src/pe_authenticode.rs"]
-mod pe_authenticode;
+#[path = "src/pe_image_identity.rs"]
+mod pe_image_identity;
 #[path = "src/windows_cmake_cache.rs"]
 mod windows_cmake_cache;
 
@@ -1164,7 +1164,7 @@ fn emit_backend_host_abi(
     // this token cannot make different source bytes compatible.
     let ggml_revision = env::var("OPENASR_GGML_REVISION_OVERRIDE")
         .ok()
-        .map(|revision| {
+        .inspect(|revision| {
             assert!(
                 revision.len() == 40
                     && revision
@@ -1172,7 +1172,6 @@ fn emit_backend_host_abi(
                         .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
                 "OPENASR_GGML_REVISION_OVERRIDE must be a lowercase 40-hex git object id"
             );
-            revision
         })
         .or_else(|| read_git_revision(source_dir))
         .unwrap_or_else(|| format!("source-{headers_sha256}"));
@@ -1404,7 +1403,7 @@ fn stage_windows_backend_dl_artifacts(
             };
             let bytes = fs::read(path)
                 .unwrap_or_else(|error| panic!("hash bundled backend {}: {error}", path.display()));
-            let image = pe_authenticode::pe_image_identity(&bytes).unwrap_or_else(|error| {
+            let image = pe_image_identity::pe_image_identity(&bytes).unwrap_or_else(|error| {
                 panic!("derive stable PE identity for {}: {error}", path.display())
             });
             (
@@ -1416,7 +1415,7 @@ fn stage_windows_backend_dl_artifacts(
                     "image_sha256": image.sha256.clone(),
                     "image_size_bytes": image.size_bytes,
                 }),
-                pe_authenticode::BackendBundleContractEntry {
+                pe_image_identity::BackendBundleContractEntry {
                     filename,
                     provider: provider.to_string(),
                     image_sha256: image.sha256,
@@ -1425,18 +1424,48 @@ fn stage_windows_backend_dl_artifacts(
             )
         })
         .collect::<Vec<_>>();
-    let bundled_contract_sha256 = pe_authenticode::backend_bundle_contract_sha256(
+    let bundled_contract_sha256 = pe_image_identity::backend_bundle_contract_sha256(
         backend_host_abi_fingerprint,
         &manifest_files
             .iter()
             .map(|(_, contract)| contract.clone())
             .collect::<Vec<_>>(),
     );
+    let provider_contract = |provider: &str| {
+        pe_image_identity::backend_bundle_contract_sha256(
+            backend_host_abi_fingerprint,
+            &manifest_files
+                .iter()
+                .map(|(_, contract)| contract)
+                .filter(|contract| contract.provider == "host" || contract.provider == provider)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    };
+    let bundled_cpu_contract_sha256 = provider_contract("cpu");
+    let bundled_vulkan_contract_sha256 = provider_contract("vulkan");
     println!("cargo:rustc-env=OPENASR_BUNDLED_BACKEND_CONTRACT_SHA256={bundled_contract_sha256}");
+    println!("cargo:rustc-env=OPENASR_BUNDLED_CPU_CONTRACT_SHA256={bundled_cpu_contract_sha256}");
+    println!(
+        "cargo:rustc-env=OPENASR_BUNDLED_VULKAN_CONTRACT_SHA256={bundled_vulkan_contract_sha256}"
+    );
+    println!("cargo:rerun-if-env-changed=OPENASR_BUNDLED_VULKAN_LOADER_SHA256");
+    if let Ok(loader_sha256) = env::var("OPENASR_BUNDLED_VULKAN_LOADER_SHA256") {
+        assert!(
+            loader_sha256.len() == 64
+                && loader_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "OPENASR_BUNDLED_VULKAN_LOADER_SHA256 must be lowercase 64-hex"
+        );
+        println!("cargo:rustc-env=OPENASR_BUNDLED_VULKAN_LOADER_SHA256={loader_sha256}");
+    }
     let mut bundled_manifest = serde_json::to_vec(&serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "host_abi_fingerprint": backend_host_abi_fingerprint,
         "bundle_contract_sha256": bundled_contract_sha256,
+        "cpu_contract_sha256": bundled_cpu_contract_sha256,
+        "vulkan_contract_sha256": bundled_vulkan_contract_sha256,
         "files": manifest_files
             .iter()
             .map(|(file, _)| file)

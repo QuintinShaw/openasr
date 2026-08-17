@@ -27,11 +27,6 @@ pub(crate) enum BackendDeviceProbeError {
     DiscoveryRuntimeUnavailable(String),
     #[error("{0} reported no supported GPU")]
     NoDevice(&'static str),
-    #[error("{provider} adapters require different target packs: {targets}")]
-    AmbiguousTargets {
-        provider: &'static str,
-        targets: String,
-    },
     #[error("the provider reported an invalid target: {0}")]
     UnknownTarget(String),
     #[error("the {provider} driver query failed: {message}")]
@@ -51,7 +46,6 @@ impl BackendDeviceProbeError {
             Self::DriverUnavailable { .. } => "driver_unavailable",
             Self::DiscoveryRuntimeUnavailable(_) => "discovery_runtime_unavailable",
             Self::NoDevice(_) => "no_device",
-            Self::AmbiguousTargets { .. } => "ambiguous_targets",
             Self::UnknownTarget(_) => "unknown_target",
             Self::DriverQueryFailed { .. } => "driver_query_failed",
             Self::UnsupportedPlatform => "platform_unsupported",
@@ -65,11 +59,11 @@ pub(crate) fn probe_provider_device(
 ) -> Result<BackendDeviceProof, BackendDeviceProbeError> {
     #[cfg(windows)]
     {
-        return match vendor {
+        match vendor {
             CatalogBackendVendor::Cuda => windows::probe_cuda(),
             CatalogBackendVendor::Hip => windows::probe_hip(runtime),
             _ => Err(BackendDeviceProbeError::UnsupportedProvider),
-        };
+        }
     }
     #[cfg(not(windows))]
     {
@@ -110,7 +104,6 @@ fn canonical_hip_target(name: &str) -> Option<String> {
 #[cfg(windows)]
 mod windows {
     use std::{
-        collections::BTreeSet,
         ffi::c_void,
         fs::File,
         io::Read as _,
@@ -250,22 +243,6 @@ mod windows {
         .join(filename))
     }
 
-    fn one_target(
-        targets: BTreeSet<String>,
-        provider: &'static str,
-    ) -> Result<String, BackendDeviceProbeError> {
-        if targets.is_empty() {
-            return Err(BackendDeviceProbeError::NoDevice(provider));
-        }
-        if targets.len() != 1 {
-            return Err(BackendDeviceProbeError::AmbiguousTargets {
-                provider,
-                targets: targets.into_iter().collect::<Vec<_>>().join(", "),
-            });
-        }
-        Ok(targets.into_iter().next().expect("one target"))
-    }
-
     pub(super) fn probe_cuda() -> Result<BackendDeviceProof, BackendDeviceProbeError> {
         type CuInit = unsafe extern "system" fn(u32) -> i32;
         type CuDeviceGetCount = unsafe extern "system" fn(*mut i32) -> i32;
@@ -314,23 +291,22 @@ mod windows {
         if unsafe { get_count(&mut count) } != 0 || count <= 0 {
             return Err(BackendDeviceProbeError::NoDevice("CUDA"));
         }
-        let mut targets = BTreeSet::new();
-        for ordinal in 0..count {
-            let mut device = 0;
-            let mut major = 0;
-            let mut minor = 0;
-            if unsafe { get_device(&mut device, ordinal) } != 0
-                || unsafe { get_attribute(&mut major, CUDA_COMPUTE_CAPABILITY_MAJOR, device) } != 0
-                || unsafe { get_attribute(&mut minor, CUDA_COMPUTE_CAPABILITY_MINOR, device) } != 0
-                || major <= 0
-                || minor < 0
-            {
-                return Err(BackendDeviceProbeError::DriverQueryFailed {
-                    provider: "CUDA",
-                    message: format!("could not inspect device ordinal {ordinal}"),
-                });
-            }
-            targets.insert(format!("sm_{major}{minor}"));
+        // Target-scoped packs follow the provider's primary device (ordinal
+        // zero). A mixed-GPU workstation is valid; rejecting it merely because
+        // another adapter has a different SM makes the CUDA lifecycle unusable.
+        let mut device = 0;
+        let mut major = 0;
+        let mut minor = 0;
+        if unsafe { get_device(&mut device, 0) } != 0
+            || unsafe { get_attribute(&mut major, CUDA_COMPUTE_CAPABILITY_MAJOR, device) } != 0
+            || unsafe { get_attribute(&mut minor, CUDA_COMPUTE_CAPABILITY_MINOR, device) } != 0
+            || major <= 0
+            || minor < 0
+        {
+            return Err(BackendDeviceProbeError::DriverQueryFailed {
+                provider: "CUDA",
+                message: "could not inspect primary device ordinal 0".to_string(),
+            });
         }
         let mut driver = 0;
         if unsafe { get_driver(&mut driver) } != 0 {
@@ -340,7 +316,7 @@ mod windows {
             });
         }
         Ok(BackendDeviceProof {
-            target: one_target(targets, "CUDA")?,
+            target: format!("sm_{major}{minor}"),
             driver_api_version: normalize_cuda_driver_version(driver)
                 .map_err(BackendDeviceProbeError::UnknownTarget)?,
         })
@@ -356,7 +332,7 @@ mod windows {
 
     struct HsaCallbackState {
         get_info: HsaAgentGetInfo,
-        targets: BTreeSet<String>,
+        primary_target: Option<String>,
         gpu_agent_count: usize,
     }
 
@@ -387,10 +363,11 @@ mod windows {
             .iter()
             .position(|byte| *byte == 0)
             .unwrap_or(name.len());
-        if let Ok(name) = std::str::from_utf8(&name[..length])
+        if state.gpu_agent_count == 1
+            && let Ok(name) = std::str::from_utf8(&name[..length])
             && let Some(target) = canonical_hip_target(name)
         {
-            state.targets.insert(target);
+            state.primary_target = Some(target);
         }
         HSA_STATUS_SUCCESS
     }
@@ -503,7 +480,7 @@ mod windows {
         }
         let mut state = HsaCallbackState {
             get_info: hsa_get_info,
-            targets: BTreeSet::new(),
+            primary_target: None,
             gpu_agent_count: 0,
         };
         let iterate_status = unsafe {
@@ -526,13 +503,15 @@ mod windows {
                 message: "driver API version query failed".to_string(),
             });
         }
-        let target = if state.targets.is_empty() && state.gpu_agent_count > 0 {
-            return Err(BackendDeviceProbeError::UnknownTarget(
-                "HIP HSA GPU agent did not expose a canonical gfx target".to_string(),
-            ));
-        } else {
-            one_target(state.targets, "HIP")?
-        };
+        let target = state.primary_target.ok_or_else(|| {
+            if state.gpu_agent_count > 0 {
+                BackendDeviceProbeError::UnknownTarget(
+                    "HIP primary HSA GPU agent did not expose a canonical gfx target".to_string(),
+                )
+            } else {
+                BackendDeviceProbeError::NoDevice("HIP")
+            }
+        })?;
         Ok(BackendDeviceProof {
             target,
             driver_api_version: normalize_hip_driver_version(driver)
@@ -572,14 +551,6 @@ mod tests {
         assert_eq!(
             BackendDeviceProbeError::NoDevice("CUDA").code(),
             "no_device"
-        );
-        assert_eq!(
-            BackendDeviceProbeError::AmbiguousTargets {
-                provider: "HIP",
-                targets: "gfx1100, gfx1200".to_string(),
-            }
-            .code(),
-            "ambiguous_targets"
         );
         assert_eq!(
             BackendDeviceProbeError::UnknownTarget("unknown".to_string()).code(),

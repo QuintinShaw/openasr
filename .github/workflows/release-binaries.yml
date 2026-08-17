@@ -853,6 +853,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            export OPENASR_BUNDLED_VULKAN_LOADER_SHA256="$VULKAN_LOADER_DLL_SHA256"
+          fi
           if [ "${{ matrix.zigbuild }}" = "true" ]; then
             cargo zigbuild --release -p openasr-cli --target ${{ matrix.rust_target }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
           else

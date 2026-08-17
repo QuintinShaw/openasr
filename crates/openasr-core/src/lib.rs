@@ -13,7 +13,7 @@ mod catalog_series;
 #[cfg(test)]
 mod cuda_targets;
 mod http;
-mod pe_authenticode;
+mod pe_image_identity;
 #[cfg(test)]
 mod windows_cmake_cache;
 

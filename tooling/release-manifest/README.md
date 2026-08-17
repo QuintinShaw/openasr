@@ -177,18 +177,26 @@ maintainer machine; none of the signing steps runs in CI.
    above and `RELEASING.md`). This step is REQUIRED and not optional: the
    release is not signed until this script prints `SIGNED-AND-VERIFIED` and
    exits 0.
-2. **Prepare and deploy the signed backend catalog** -- run
+2. **Attach exact hardware evidence** -- add one
+   `backend-hardware-evidence-*.json` release asset for every target intended
+   for activation. Each receipt binds the release entry, plugin digest, ABI
+   fingerprint, binary, model and workload; requires at least five fresh
+   processes; and proves FullDevice execution without CPU fallback. The 5 CUDA
+   and 11 HIP build matrix is artifact coverage, not a hardware-validation
+   claim.
+3. **Prepare and deploy the signed backend catalog** -- run
    `scripts/prepare-windows-backend-catalog-release.sh v<version>` with the same
    local production signing seed, review and commit its five catalog/epoch
    outputs, push them, and wait for `deploy-catalog.yml` to verify the live
-   endpoint. The script downloads and rehashes every CUDA/HIP release byte;
-   unsigned `catalog.backends.candidate.json` is evidence, never an activation
-   source.
-3. **Finalize the draft** -- run `scripts/finalize-core-release.sh v<version>`.
+   endpoint. The script downloads and rehashes every CUDA/HIP release byte, but
+   merges only the target entries selected by matching hardware receipts;
+   unsigned `catalog.backends.candidate.json` is build evidence, never an
+   activation source.
+4. **Finalize the draft** -- run `scripts/finalize-core-release.sh v<version>`.
    It verifies the published manifest signature and requires the live signed
-   catalog to contain the exact release CUDA and HIP entries before it can
+   catalog target set to equal the exact hardware-approved subset before it can
    publish the draft.
-4. **Sync to dl.openasr.org** -- see "dl.openasr.org sync" above
+5. **Sync to dl.openasr.org** -- see "dl.openasr.org sync" above
    (`b2_sync.py sync --version <version>`, uploading the Windows sidecar
    archives -- `-vulkan`, `-cuda-sidecar`, `-rocm-sidecar` -- plus
    `backends-manifest.json` and `backends-manifest.signature.json` to

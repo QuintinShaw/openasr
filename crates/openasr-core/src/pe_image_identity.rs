@@ -1,4 +1,4 @@
-//! Stable byte identities for signed Windows PE backend modules.
+//! Stable executable-image identities for Windows PE backend modules.
 //!
 //! Authenticode appends a certificate table and updates the PE checksum and
 //! security-directory entry. Hashing the complete file therefore produces a
@@ -6,7 +6,9 @@
 //! image is unchanged. The identity below follows the Authenticode exclusion
 //! rules for exactly those mutable regions. It is used only as a build/runtime
 //! contract; the manifest still carries and verifies the SHA-256 of the final
-//! file bytes as the corruption check.
+//! file bytes as the trust-bound corruption check. This module does not perform
+//! WinVerifyTrust or certificate-chain validation and must not be described as
+//! an Authenticode policy.
 
 use sha2::{Digest as _, Sha256};
 
