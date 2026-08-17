@@ -89,13 +89,13 @@ jobs:
       # llama.cpp's current Windows HIP release job.
       HIPSDK_INSTALLER_VERSION: 26.Q1
       # Windows Vulkan loader (vulkan-1.dll) redistributable, bundled into the
-      # windows-x86_64-vulkan CLI zip -- see the "Stage Vulkan loader" step
+      # windows-x86_64-neutral CLI zip -- see the "Stage Vulkan loader" step
       # below for why (#132: STATUS_DLL_NOT_FOUND on machines with no GPU
       # driver). This is a *runtime redistributable* pin, independent of
       # VULKAN_VERSION above (that one pins the *build-time* SDK used to
       # compile/link openasr.exe). Kept in lockstep with the desktop product's
       # Vulkan loader staging script, which pins the identical
-      # version + both hashes for the desktop sidecar bundle -- bump all three
+      # version + both hashes for the desktop neutral-host bundle -- bump all three
       # together in both places, cross-checked against LunarG's own published
       # hash at https://vulkan.lunarg.com/sdk/sha/<version>/windows/VulkanRT-X64-<version>-Components.zip.json.
       VULKAN_LOADER_VERSION: 1.4.350.0
@@ -137,19 +137,10 @@ jobs:
     # renames the asset, never the build feature flag); gnu libc is the
     # unsuffixed default, musl would carry `-musl`.
     #
-    # Windows-kernel-dist v2: the two Windows GPU legs (cuda, hip) carry an
-    # extra `-sidecar` asset suffix (`windows-x86_64-cuda-sidecar`,
-    # `windows-x86_64-rocm-sidecar`) -- their vendor GPU runtime DLLs (NVIDIA
-    # cudart/cuBLAS, AMD rocBLAS/hipBLAS) are staged and packaged SEPARATELY
-    # as a large, content-addressed `openasr-vendor-<cuda|rocm>-runtime-<sha12>.zip`
-    # archive (see the "Stage archive contents"/"Build deterministic vendor
-    # archive" steps below and `docs/backend-kernels.md`'s schema v2 section),
-    # so the per-release "sidecar" archive this asset name lands on is just
-    # `openasr.exe` + docs -- small enough that later core releases only ever
-    # re-download this part, reusing a cached vendor layer. The Windows Vulkan
-    # and CPU legs, and every Linux GPU leg, stay self-contained (no `-sidecar`
-    # suffix, no vendor split) -- schema v2's `backends-manifest.json` is
-    # Windows-only (see that doc's "only windows-x86_64 exists today" note).
+    # Windows releases use one neutral GGML_BACKEND_DL host. It bundles the
+    # CPU/Vulkan rescue modules and Vulkan loader; target-scoped CUDA/HIP
+    # plugins plus content-addressed vendor runtimes are separate artifacts.
+    # Legacy whole-engine Vulkan/CUDA/HIP sidecars ended with core 0.1.33.
     #
     # NOTE: jobs.verify-completeness below hardcodes this same asset/ext list
     # (TARGETS, now friendly asset names) to assert the release ends up with
@@ -193,55 +184,10 @@ jobs:
             asset: windows-x86_64
             binary_name: openasr.exe
             archive_ext: zip
-          # GPU-feature Windows variants. The hosted runners have no GPU, so
-          # these jobs validate "compiles + links + (where the loader allows)
-          # launches"; GPU inference is validated on real hardware.
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc-vulkan
-            asset: windows-x86_64-vulkan
-            binary_name: openasr.exe
-            archive_ext: zip
-            features: vulkan,legacy-windows-static-sidecar
-            provider: vulkan
-            distribution: legacy
-            timeout: 120
-          - os: windows-2022
-            target: x86_64-pc-windows-msvc-cuda
-            asset: windows-x86_64-cuda-sidecar
-            binary_name: openasr.exe
-            archive_ext: zip
-            features: cuda,legacy-windows-static-sidecar
-            provider: cuda
-            distribution: legacy
-            timeout: 180
-          # AMD HIP variant. Builds openasr-core's default consumer RDNA2/3/
-          # 3.5/4 fat code object (gfx1030/31/32/35, gfx1100/01/02, gfx1150/
-          # 51, gfx1200/01; see hip_gpu_targets() in build.rs for provenance).
-          # HIP is statically linked (build.rs use_backend_dl is false for HIP),
-          # but still dynamically loads the ROCm runtime/BLAS DLLs staged
-          # below, so it cannot launch on this GPU-less, driver-less runner
-          # any more than the CUDA leg can; build + package only.
-          # Asset is `-rocm` (not `-hip`) to match the Linux AMD leg's name,
-          # plus the `-sidecar` suffix (see the "Windows-kernel-dist v2"
-          # comment above).
-          # Pinned to windows-2022 like llama.cpp's HIP release job:
-          # windows-latest's VS 2026 STL declares the C99 floating
-          # comparison macros (isgreater & co.) in a way ROCm clang's HIP
-          # wrapper headers cannot overload ("__device__ function cannot
-          # overload __host__ __device__ function" in __clang_hip_cmath.h),
-          # so the device compile only works against the VS 2022 STL.
-          - os: windows-2022
-            target: x86_64-pc-windows-msvc-hip
-            asset: windows-x86_64-rocm-sidecar
-            binary_name: openasr.exe
-            archive_ext: zip
-            features: hip,legacy-windows-static-sidecar
-            provider: hip
-            distribution: legacy
-            timeout: 240
-          # R1 terminal architecture. The neutral host bundles only CPU and
-          # Vulkan BACKEND_DL modules; CUDA/HIP are exact-ABI optional packs.
-          # Legacy whole-exe sidecars above remain for one release cycle.
+          # Terminal Windows architecture. The neutral host bundles only CPU
+          # and Vulkan BACKEND_DL modules; CUDA/HIP are exact-ABI optional
+          # packs. Hosted runners prove build/package contracts; real GPU
+          # inference remains gated by exact hardware evidence.
           - os: windows-latest
             target: x86_64-pc-windows-msvc-neutral
             asset: windows-x86_64-neutral
@@ -553,17 +499,6 @@ jobs:
             exit 1
           fi
           echo "OPENASR_VERSION=${version}" >> "${GITHUB_ENV}"
-
-      - name: Enforce legacy Windows sidecar sunset
-        if: matrix.distribution == 'legacy' && env.LEG_SELECTED == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python_bin="python3"
-          command -v python3 >/dev/null 2>&1 || python_bin="python"
-          "${python_bin}" tooling/release-manifest/guard_legacy_windows_sidecars.py \
-            --version "${OPENASR_VERSION}" \
-            --policy tooling/release-manifest/windows_gpu_migration.json
 
       - name: Install Linux audio build dependencies
         if: runner.os == 'Linux' && env.LEG_SELECTED == 'true'
@@ -983,16 +918,16 @@ jobs:
           # the archive must carry them or the binary cannot launch. build.rs
           # stages them next to the binary in target/release. Windows plugin
           # legs also build a neutral host, but publish only the selected
-          # optional module below; legacy GPU sidecars and non-Windows GPU
-          # builds remain platform-static.
+          # optional module below; non-Windows GPU builds remain
+          # platform-static.
           if ($distribution -ne "plugin") {
             Get-ChildItem "$env:RELEASE_DIR" -Filter "ggml*.dll" | Copy-Item -Destination "$distDir\"
             Get-ChildItem "$env:RELEASE_DIR" -Filter "openasr-backend-*-v1.json" -ErrorAction SilentlyContinue |
               Copy-Item -Destination "$distDir\"
           }
-          # Windows-kernel-dist v2: the vendor GPU runtime DLLs (NVIDIA cudart/
+          # Optional-plugin vendor GPU runtime DLLs (NVIDIA cudart/
           # cuBLAS, AMD rocBLAS/hipBLAS) are staged into a SEPARATE directory
-          # from $distDir (the small, per-release "sidecar" archive), so they
+          # from $distDir and the target-scoped plugin, so they
           # can ship as their own large, content-addressed `vendor_layers`
           # archive instead -- see the "Build deterministic vendor archive"
           # step below and `docs/backend-kernels.md`'s schema v2 section. This
@@ -1000,7 +935,7 @@ jobs:
           # binary staleness bug: keeping the vendor layer cached and
           # version-independent means a core upgrade does not re-download the
           # multi-hundred-MB GPU runtime when its content hash is unchanged.
-          # The per-core sidecar/plugin can itself still be large and must not
+          # The per-core plugin can itself still be large and must not
           # be described to users as a small or zero-download update.
           if ($distribution -eq "plugin") {
             $vendorDir = "dist\$archive-vendor"
@@ -1153,7 +1088,7 @@ jobs:
         #
         # Mirrors the desktop product's Vulkan loader staging script
         # (identical version pin + identical two-layer hash verification) for
-        # the desktop sidecar bundle. Fail-closed throughout: a download
+        # the desktop neutral-host bundle. Fail-closed throughout: a download
         # failure, a hash mismatch at either layer, or a missing extracted
         # file all throw -- there is no silent fallback to an unverified DLL.
         run: |
@@ -1434,7 +1369,7 @@ jobs:
 
       # The vendor archive is also a shipped release asset (schema v2's
       # `vendor_layers`), so it gets the same provenance attestation as the
-      # sidecar archive above -- only runs when the previous step actually
+      # plugin artifact above -- only runs when the previous step actually
       # produced one (cuda/hip legs).
       - name: Attest build provenance (vendor archive)
         if: env.LEG_SELECTED == 'true' && env.VENDOR_ASSET_NAME != '' && env.VENDOR_OWNER == 'true'
@@ -1442,7 +1377,7 @@ jobs:
         with:
           subject-path: dist/${{ env.VENDOR_ASSET_NAME }}
 
-      # Bundles the sidecar archive path with the vendor archive path (cuda/
+      # Bundles the plugin artifact path with the vendor archive path (cuda/
       # hip only) into one multi-line env var, so "Upload archive" below has a
       # single code path shared by every leg instead of a conditional `path:`
       # (actions/upload-artifact's glob resolution does not behave well with a
@@ -1571,13 +1506,8 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      # Checked out FIRST, before anything is downloaded/generated into the
-      # workspace: actions/checkout defaults to `clean: true` (`git clean
-      # -ffdx`), which would otherwise wipe the untracked staging/dist
-      # directories the later steps populate. Only needed for the
-      # backends-manifest step below (version + source commit), but harmless
-      # for every other run, so it stays unconditional here rather than
-      # threading the `only_target` skip condition through step ordering.
+      # Checked out before generated artifacts so actions/checkout cannot
+      # clean the staging/dist directories populated by later steps.
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.ref }}
@@ -1644,44 +1574,6 @@ jobs:
           path: dist/SHA256SUMS
           if-no-files-found: error
 
-      # UNSIGNED backends-manifest.json (schema_version: 2): the per-release
-      # index the desktop app uses to download a switchable Windows GPU-kernel
-      # sidecar (vulkan/cuda/hip) at runtime, plus (for cuda/hip) the separate
-      # content-addressed `vendor_layers` archive each sidecar's `vendor_layer`
-      # field points at -- see `docs/backend-kernels.md`'s schema v2 section.
-      # Only hashes/sizes already-public archives -- no secret involved, so
-      # (unlike signing) this is safe to run in CI. Skipped on a single-leg
-      # `only_target` dispatch (same gate `verify-completeness` uses below):
-      # that run intentionally produces only one archive, not the full
-      # Windows GPU sidecar+vendor set this needs.
-      - name: Generate backends-manifest.json (unsigned)
-        if: github.event_name != 'workflow_dispatch' || github.event.inputs.only_target == ''
-        run: |
-          set -euo pipefail
-          version="$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')"
-          commit="$(git rev-parse HEAD)"
-          python3 tooling/release-manifest/backends_manifest.py generate \
-            --version "$version" --source-commit "$commit" \
-            --dist-dir dist --out dist/backends-manifest.json
-          cat dist/backends-manifest.json
-      # NOT uploaded pre-signed: `backends-manifest.signature.json` is a
-      # separate, maintainer-run LOCAL step (the Ed25519 signing seed never
-      # enters CI -- same policy as the model catalog, see
-      # tooling/publish-model/scripts/publish_catalog.sh). After this
-      # workflow finishes, sign and attach the signature with:
-      #   OPENASR_CATALOG_SIGNING_KEY_SEED_HEX=<real seed> \
-      #     cargo run -p openasr-cli -- __openasr-sign-backends-manifest \
-      #       backends-manifest.json --out backends-manifest.signature.json \
-      #       --manifest-url https://dl.openasr.org/core/v<version>/backends-manifest.json
-      #   gh release upload v<version> backends-manifest.signature.json --clobber
-      - name: Upload backends-manifest.json
-        if: github.event_name != 'workflow_dispatch' || github.event.inputs.only_target == ''
-        uses: actions/upload-artifact@v7
-        with:
-          name: backends-manifest
-          path: dist/backends-manifest.json
-          if-no-files-found: error
-
   upload-to-release:
     name: Upload assets to release
     needs: checksums
@@ -1737,7 +1629,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "release: ${{ steps.tag.outputs.tag }}"
-          find staging -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dll' -o -name 'backend-pack-*.json' -o -name 'backend-plugin-hints.json' -o -name 'catalog.backends.candidate.json' -o -name '*.sha256' -o -name 'SHA256SUMS' -o -name 'backends-manifest.json' \) -print | sort
+          find staging -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dll' -o -name 'backend-pack-*.json' -o -name 'backend-plugin-hints.json' -o -name 'catalog.backends.candidate.json' -o -name '*.sha256' -o -name 'SHA256SUMS' \) -print | sort
 
       - name: Upload assets to release
         if: steps.tag.outputs.tag != '' && github.event.inputs.dry_run != 'true'
@@ -1750,12 +1642,10 @@ jobs:
             echo "release ${tag} does not exist yet -- release-core.yml should create it before calling this workflow" >&2
             exit 1
           fi
-          # nullglob so a pattern with no matches (e.g. no *.sha256 sidecars
-          # if the xcframework leg did not run, or no backends-manifest.json
-          # on a single-leg `only_target` dispatch) drops out of the arg list
-          # instead of being passed to `gh` as a literal, unmatched path.
+          # nullglob drops optional unmatched artifact patterns instead of
+          # passing them to `gh` as literal paths.
           shopt -s nullglob
-          assets=(staging/*.tar.gz staging/*.zip staging/*.dll staging/backend-pack-*.json staging/backend-plugin-hints.json staging/catalog.backends.candidate.json staging/*.sha256 staging/SHA256SUMS staging/backends-manifest.json)
+          assets=(staging/*.tar.gz staging/*.zip staging/*.dll staging/backend-pack-*.json staging/backend-plugin-hints.json staging/catalog.backends.candidate.json staging/*.sha256 staging/SHA256SUMS)
           # --clobber so a re-run (retrying a flaky leg) replaces stale assets
           # instead of failing on "asset already exists".
           gh release upload "$tag" "${assets[@]}" \
@@ -1809,9 +1699,6 @@ jobs:
             "macos-x86_64:tar.gz"
             "macos-arm64:tar.gz"
             "windows-x86_64:zip"
-            "windows-x86_64-vulkan:zip"
-            "windows-x86_64-cuda-sidecar:zip"
-            "windows-x86_64-rocm-sidecar:zip"
             "windows-x86_64-neutral:zip"
             "linux-x86_64-vulkan:tar.gz"
             "linux-x86_64-cuda:tar.gz"
@@ -1860,15 +1747,11 @@ jobs:
           fi
           echo "release ${tag} has all $(wc -l < "$expected_file" | tr -d ' ') expected assets."
 
-          # Windows-kernel-dist v2 vendor_layers archives: these are named
+          # Optional-plugin vendor runtime archives are named
           # openasr-vendor-<layer>-<sha12>.zip, content-addressed by their own
           # sha256, so (unlike every asset above) the exact filename cannot be
-          # hardcoded into TARGETS -- check by glob pattern instead. Every
-          # release that ships a cuda-sidecar/rocm-sidecar archive above must
-          # also ship the vendor layer archive that entry's `vendor_layer`
-          # field points at (see backends_manifest.py's BACKENDS mapping), or
-          # the desktop app's kernel switch would download a sidecar it can
-          # never actually launch.
+          # hardcoded into TARGETS. Every complete target-plugin set must also
+          # ship the shared runtime referenced by its backend-pack metadata.
           for vendor_key in cuda-runtime rocm-runtime; do
             if ! grep -Eq "^openasr-vendor-${vendor_key}-[0-9a-f]{12,}\.zip\$" "$actual_file"; then
               echo "::error::release ${tag} is missing an openasr-vendor-${vendor_key}-<sha12>.zip vendor archive asset"
@@ -1876,106 +1759,3 @@ jobs:
             fi
           done
           echo "release ${tag} also has both expected vendor_layers archives (cuda-runtime, rocm-runtime)."
-
-  verify-backends-manifest-signature:
-    name: Verify backends-manifest signature (SECONDARY safety net, post-release probe)
-    needs: upload-to-release
-    # SECONDARY safety net only. The PRIMARY gate is now the local, atomic
-    # `scripts/sign-and-verify-backends-manifest.sh vX.Y.Z` (see RELEASING.md
-    # "Backends-manifest signing"), which signs, uploads, AND re-verifies the
-    # published asset as one fail-loud step a maintainer runs by hand right
-    # after this workflow finishes. This job exists only to catch the case
-    # where a release somehow got announced without that script having been
-    # run at all -- it is read-only fixed-it-forward guard for the exact gap
-    # that shipped core 0.1.16-0.1.19 with a never-signed
-    # backends-manifest.json: the Ed25519 signing seed is LOCAL ONLY
-    # (tooling/release-manifest/README.md "Signing" -- never enters CI, same
-    # as the model catalog), so this job only GETs the already-published
-    # `backends-manifest.json` + `backends-manifest.signature.json` release
-    # assets and verifies the signature against openasr-core's built-in
-    # production trust root. It never signs, never touches the seed, never
-    # writes a release asset.
-    #
-    # Timing: the LOCAL signing step is a maintainer action that happens
-    # AFTER this whole workflow finishes (see RELEASING.md's "Backends-
-    # manifest signing" and tooling/release-manifest/README.md's "Post-
-    # release checklist"), so gate this to `workflow_dispatch` only -- on the
-    # automatic push-tag/workflow_call trigger that creates the release, the
-    # signature cannot exist yet, and probing then would make this job
-    # structurally red on every fresh release instead of catching a
-    # forgotten signing step. Re-run this workflow via `workflow_dispatch`
-    # with `ref: v<version>` (optionally `only_target` set to any already-green
-    # leg, to skip rebuilding the whole matrix) as an OPTIONAL extra check
-    # after `scripts/sign-and-verify-backends-manifest.sh` has already been
-    # run and passed locally -- not as a substitute for running it.
-    if: ${{ github.event_name == 'workflow_dispatch' && needs.upload-to-release.outputs.tag != '' }}
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: recursive
-          ref: ${{ inputs.ref || github.ref }}
-
-      - name: Resolve workspace version
-        run: |
-          set -euo pipefail
-          version="$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')"
-          if [ -z "${version}" ]; then
-            echo "could not read workspace version from Cargo.toml" >&2
-            exit 1
-          fi
-          echo "OPENASR_VERSION=${version}" >> "${GITHUB_ENV}"
-
-      - name: Download backends-manifest + signature from the release
-        run: |
-          set -euo pipefail
-          tag="${{ needs.upload-to-release.outputs.tag }}"
-          mkdir -p manifest-probe
-          if ! gh release download "$tag" --repo "${{ github.repository }}" \
-              -p backends-manifest.json -p backends-manifest.signature.json \
-              -D manifest-probe --clobber; then
-            echo "::error::backends-manifest signature missing for release ${tag} -- did you forget the LOCAL-only signing step (tooling/release-manifest/README.md 'Signing': __openasr-sign-backends-manifest, then 'gh release upload ${tag} backends-manifest.signature.json')? Do not ship this release until it is signed."
-            exit 1
-          fi
-          if [ ! -s manifest-probe/backends-manifest.json ] || [ ! -s manifest-probe/backends-manifest.signature.json ]; then
-            echo "::error::backends-manifest.json and/or backends-manifest.signature.json are not attached to release ${tag} -- run the LOCAL-only signing step and 'gh release upload' before shipping."
-            exit 1
-          fi
-
-      - name: Install Linux audio build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install 1.95.0 --profile minimal
-          rustup default 1.95.0
-          rustc --version
-          cargo --version
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: verify-backends-manifest-signature
-
-      # Reuses openasr-core's own verify_backends_manifest_signature (the
-      # SAME function the desktop app calls, hardcoded to the real
-      # production trust root) via the __openasr-verify-backends-manifest
-      # CLI probe -- no crypto or trust-root duplication here. --manifest-url
-      # MUST be the canonical dl.openasr.org URL (what the signature is
-      # actually bound to, per canonical_manifest_url), regardless of the
-      # fact this step fetched the bytes from GitHub Releases, not
-      # dl.openasr.org itself (mirrors the multi-mirror fix for #145).
-      - name: Verify signature against the production trust root
-        run: |
-          set -euo pipefail
-          tag="${{ needs.upload-to-release.outputs.tag }}"
-          expected_url="https://dl.openasr.org/core/v${OPENASR_VERSION}/backends-manifest.json"
-          if ! cargo run --quiet -p openasr-cli -- __openasr-verify-backends-manifest \
-              manifest-probe/backends-manifest.json \
-              --signature manifest-probe/backends-manifest.signature.json \
-              --manifest-url "$expected_url"; then
-            echo "::error::backends-manifest signature for release ${tag} does not verify (missing/invalid/wrong URL) -- do not ship this release until it is re-signed. See tooling/release-manifest/README.md 'Signing'."
-            exit 1
-          fi
-          echo "backends-manifest signature for ${tag} verifies against ${expected_url}."

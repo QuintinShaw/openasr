@@ -22,7 +22,7 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("verify-catalog", prepare)
         self.assertIn("backend_hardware_evidence.py", prepare)
         self.assertIn("catalog.openasr.org/v1/catalog.json", finalize)
-        self.assertIn("__openasr-verify-backends-manifest", finalize)
+        self.assertNotIn("backends-manifest", finalize)
         self.assertIn("verify-catalog", finalize)
         self.assertIn("backend_hardware_evidence.py", finalize)
         self.assertIn('gh release edit "$tag" --draft=false --latest', finalize)

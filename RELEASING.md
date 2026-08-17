@@ -110,108 +110,38 @@ in the dry run).
 The core GitHub Release is created as a **draft**. This is load-bearing for the
 Windows plugin topology: CUDA/HIP payload hashes exist only after the release
 matrix has built them, while the neutral host resolves those hashes from the
-production-signed catalog. A draft is not made public until both signed
-distribution planes are complete:
+production-signed catalog. Core 0.1.34 and later publish no legacy whole-engine
+Windows sidecars and no per-release `backends-manifest.json`. A draft is not
+made public until the signed catalog distribution plane is complete:
 
-1. Run `scripts/sign-and-verify-backends-manifest.sh vX.Y.Z`.
-2. Attach one `backend-hardware-evidence-*.json` receipt for every target that
+1. Attach one `backend-hardware-evidence-*.json` receipt for every target that
    is intended to become runtime-selectable. A receipt is accepted only when it
    matches the exact release entry, plugin digest, ABI fingerprint, binary,
    model and workload; proves at least five fresh processes; and records
    FullDevice execution with no CPU fallback. Building a target is not hardware
    evidence.
-3. Run `scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z` locally with
+2. Run `scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z` locally with
    the production catalog signing seed. It downloads and hashes all 5 CUDA and
    11 HIP build artifacts, but merges only the exact target entries approved by
    those receipts. It then bumps the catalog epoch and signs the full/public
    catalogs. Review, commit, and push those catalog files.
-4. Wait for `deploy-catalog.yml` to prove the signed public bytes are live.
-5. Run `scripts/finalize-core-release.sh vX.Y.Z`. It re-verifies the published
-   backends manifest and requires the live signed catalog target set to equal
-   the hardware-approved subset exactly; only then does it publish the draft
-   and mark it latest.
+3. Wait for `deploy-catalog.yml` to prove the signed public bytes are live.
+4. Run `scripts/finalize-core-release.sh vX.Y.Z`. It requires the live signed
+   catalog target set to equal the hardware-approved subset exactly; only then
+   does it publish the draft and mark it latest.
 
 None of these scripts publishes code or a catalog implicitly. A failure leaves
 the release draft and therefore unavailable to users; there is no partially
 usable release whose Desktop UI advertises a backend that cannot resolve.
 
-## Backends-manifest signing (REQUIRED, LOCAL ONLY -- not optional)
+## Legacy backends manifests
 
-Every release that ships a Windows GPU-kernel `backends-manifest.json`
-(schema v2 -- see `tooling/release-manifest/README.md`) is **not complete**
-until that manifest is signed and the signature is verified against the
-actual published release asset. This is the exact gap that shipped core
-0.1.16-0.1.19 with a never-signed manifest: the signing seed
-(`OPENASR_CATALOG_SIGNING_KEY_SEED_HEX`) is LOCAL ONLY and must never enter
-CI, so it cannot be automated away -- but "a maintainer must remember to run
-three commands afterwards" is exactly the kind of step that gets forgotten.
-
-**The primary gate is a single atomic script, not a checklist:**
-
-```bash
-OPENASR_CATALOG_SIGNING_KEY_SEED_HEX=<real production seed> \
-  scripts/sign-and-verify-backends-manifest.sh vX.Y.Z
-```
-
-Run this once `release-binaries.yml` has finished and its `checksums` job has
-attached the unsigned `backends-manifest.json` to the release. The script:
-
-1. downloads the unsigned manifest from the release and signs it with
-   `__openasr-sign-backends-manifest`;
-2. uploads `backends-manifest.signature.json` to the release;
-3. **re-downloads** the manifest + signature it just published (not the
-   local copies) and self-verifies them with
-   `__openasr-verify-backends-manifest` against the production trust root.
-
-Any of the three steps failing aborts immediately with a `SIGNING/VERIFY
-FAILED for vX.Y.Z` banner and a non-zero exit. Treat that exactly like a
-failed test: **the release is not signed and must not be announced or
-shipped until the script exits 0 with `SIGNED-AND-VERIFIED`.** Do not fall
-back to running the old individual `gh`/`cargo run` commands by hand except
-to debug why the script itself failed.
-
-**This script never touches dl.openasr.org/B2.** That sync has exactly one
-authoritative entry point, `tooling/release-manifest/b2_sync.py`, and it
-already covers the signature file -- `b2_sync.py sync` is a generic
-per-file uploader (keys by `core/v<version>/<basename>`), not a manifest-only
-tool, so passing it `backends-manifest.signature.json` alongside
-`backends-manifest.json` and the Windows sidecar archives works today. Run
-the two steps in this order:
-
-```bash
-# 1. Sign, publish to the GitHub release, and self-verify (REQUIRED, this section):
-OPENASR_CATALOG_SIGNING_KEY_SEED_HEX=<real production seed> \
-  scripts/sign-and-verify-backends-manifest.sh vX.Y.Z
-
-# 2. Sync to dl.openasr.org (OPTIONAL CDN-fronting step -- see
-#    tooling/release-manifest/README.md's "dl.openasr.org sync"; download the
-#    two files back from the release first, since step 1 does not leave them
-#    on disk):
-gh release download vX.Y.Z -p backends-manifest.json -p backends-manifest.signature.json
-python3 tooling/release-manifest/b2_sync.py sync --version X.Y.Z \
-  backends-manifest.json backends-manifest.signature.json \
-  <windows-sidecar-archives...>
-```
-
-Step 1 (signing) is release-blocking. Step 2 (B2 sync) stays what it has
-always been: optional, local, and never release-blocking -- GitHub Releases
-alone is a fully usable distribution point (see `tooling/release-manifest/README.md`'s
-"dl.openasr.org sync" section for why).
-
-This step cannot be folded into `scripts/bump-version.sh` (that script runs
-*before* the tag is pushed and before CI has built the release archives the
-manifest is generated from -- the unsigned `backends-manifest.json` does not
-exist yet at that point). It is, by construction, the last step of a
-release.
-
-CI also runs a **secondary safety net** -- `release-binaries.yml`'s
-`verify-backends-manifest-signature` job (`workflow_dispatch` only, since the
-signature cannot exist until after this local script has run). It performs
-the exact same re-download-and-verify check `sign-and-verify-backends-manifest.sh`
-already does. Treat a red run there as confirmation the local step above was
-skipped, not as the primary way this gets caught -- the local script above
-is the primary gate; CI's job is a fallback in case a release ever gets
-announced without it having been run.
+`backends-manifest.json`, its signature, and the whole-engine Windows GPU
+sidecars are historical compatibility tooling for core 0.1.33 and earlier.
+Do not generate, sign, attach, or CDN-sync them for core 0.1.34 or later.
+Current releases distribute one neutral Windows host plus target-scoped
+CUDA/HIP backend packs; the production-signed model/backend catalog is their
+only activation trust plane.
 
 ## Homebrew tap
 

@@ -1,4 +1,10 @@
-# Release backends manifest
+# Legacy release backends manifest
+
+> Historical compatibility only. Core 0.1.33 is the final release allowed to
+> use this manifest and whole-engine Windows GPU sidecars. Core 0.1.34 and
+> later publish a neutral BACKEND_DL host plus target-scoped CUDA/HIP backend
+> packs through the production-signed catalog. Do not invoke this manifest
+> generation/signing flow for new releases.
 
 Generates `backends-manifest.json`: the per-release index the desktop app
 reads to download a switchable Windows GPU-kernel sidecar (vulkan / cuda /

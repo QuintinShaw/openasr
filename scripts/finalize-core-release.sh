@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Publish a draft core release only after both signed runtime manifests are live.
+# Publish a draft core release only after the signed runtime catalog is live.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,7 +27,6 @@ trap 'rm -rf "$workdir"' EXIT
 gh release download "$tag" \
   -p 'backend-pack-*.json' \
   -p 'backend-hardware-evidence-*.json' \
-  -p backends-manifest.json -p backends-manifest.signature.json \
   -D "$workdir" --clobber
 
 shopt -s nullglob
@@ -59,11 +58,6 @@ for entry in "${approved_entries[@]}"; do
   backend_entry_args+=(--entry "$entry")
 done
 
-cargo run --quiet -p openasr-cli -- __openasr-verify-backends-manifest \
-  "$workdir/backends-manifest.json" \
-  --signature "$workdir/backends-manifest.signature.json" \
-  --manifest-url "https://dl.openasr.org/core/v${version}/backends-manifest.json"
-
 cache_bust="$(date +%s)"
 curl -fsSL "https://catalog.openasr.org/v1/catalog.json?release=${tag}-${cache_bust}" \
   -o "$workdir/catalog.json"
@@ -80,6 +74,6 @@ python3 tooling/release-manifest/backend_hardware_evidence.py \
   "${all_backend_entry_args[@]}" "${hardware_evidence_args[@]}" \
   --catalog "$workdir/catalog.json" --version "$version" >/dev/null
 
-echo "==> all signed distribution metadata is live; publishing ${tag}"
+echo "==> signed backend catalog is live; publishing ${tag}"
 gh release edit "$tag" --draft=false --latest
 echo "RELEASE-PUBLISHED ${tag}"

@@ -68,24 +68,20 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
                 distribution="plugin",
             )
 
-    def test_migration_sidecars_remain_explicit_legacy_builds(self) -> None:
-        self.assert_matrix_leg(
-            "x86_64-pc-windows-msvc-cuda",
-            asset="windows-x86_64-cuda-sidecar",
-            features="cuda,legacy-windows-static-sidecar",
-            provider="cuda",
-            distribution="legacy",
-        )
-        self.assert_matrix_leg(
-            "x86_64-pc-windows-msvc-hip",
-            asset="windows-x86_64-rocm-sidecar",
-            features="hip,legacy-windows-static-sidecar",
-            provider="hip",
-            distribution="legacy",
-        )
-        self.assertIn("Enforce legacy Windows sidecar sunset", self.workflow)
-        self.assertIn("guard_legacy_windows_sidecars.py", self.workflow)
-        self.assertIn("windows_gpu_migration.json", self.workflow)
+    def test_terminal_release_has_no_legacy_windows_sidecar_rail(self) -> None:
+        for obsolete in (
+            "x86_64-pc-windows-msvc-vulkan",
+            "x86_64-pc-windows-msvc-cuda\n",
+            "x86_64-pc-windows-msvc-hip\n",
+            "windows-x86_64-vulkan",
+            "windows-x86_64-cuda-sidecar",
+            "windows-x86_64-rocm-sidecar",
+            "legacy-windows-static-sidecar",
+            "distribution: legacy",
+            "Generate backends-manifest.json",
+            "verify-backends-manifest-signature",
+        ):
+            self.assertNotIn(obsolete, self.workflow)
 
     def test_target_scoped_optional_plugins_feed_one_catalog_and_update_hint(self) -> None:
         required = (
@@ -133,14 +129,11 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             self.assertIn(symbol, self.workflow)
 
     def test_windows_cuda_release_remains_compatible_with_cuda_12_drivers(self) -> None:
-        for target in (
-            "x86_64-pc-windows-msvc-cuda",
-            "x86_64-pc-windows-msvc-cuda-sm_86-plugin",
-        ):
-            self.assertRegex(
-                self.workflow,
-                rf"(?m)^\s*- os: windows-2022\s*\n\s*target: {re.escape(target)}\s*$",
-            )
+        self.assertRegex(
+            self.workflow,
+            r"(?m)^\s*- os: windows-2022\s*\n"
+            r"\s*target: x86_64-pc-windows-msvc-cuda-sm_86-plugin\s*$",
+        )
         self.assertIn('cuda: "12.6.3"', self.workflow)
         self.assertIn('min_driver_api="12.0.0"', self.workflow)
         self.assertNotIn('min_driver_api="13.0.0"', self.workflow)
