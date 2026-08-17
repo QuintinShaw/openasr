@@ -203,6 +203,19 @@
   },
   {
     "os": "windows-2022",
+    "target": "x86_64-pc-windows-msvc-hip-gfx1103-plugin",
+    "asset": "windows-x86_64-rocm-gfx1103-plugin",
+    "binary_name": "openasr.exe",
+    "archive_ext": "dll",
+    "features": "hip",
+    "provider": "hip",
+    "distribution": "plugin",
+    "hip_gpu_target": "gfx1103",
+    "vendor_owner": false,
+    "timeout": 240
+  },
+  {
+    "os": "windows-2022",
     "target": "x86_64-pc-windows-msvc-hip-gfx1150-plugin",
     "asset": "windows-x86_64-rocm-gfx1150-plugin",
     "binary_name": "openasr.exe",
@@ -224,6 +237,32 @@
     "provider": "hip",
     "distribution": "plugin",
     "hip_gpu_target": "gfx1151",
+    "vendor_owner": false,
+    "timeout": 240
+  },
+  {
+    "os": "windows-2022",
+    "target": "x86_64-pc-windows-msvc-hip-gfx1152-plugin",
+    "asset": "windows-x86_64-rocm-gfx1152-plugin",
+    "binary_name": "openasr.exe",
+    "archive_ext": "dll",
+    "features": "hip",
+    "provider": "hip",
+    "distribution": "plugin",
+    "hip_gpu_target": "gfx1152",
+    "vendor_owner": false,
+    "timeout": 240
+  },
+  {
+    "os": "windows-2022",
+    "target": "x86_64-pc-windows-msvc-hip-gfx1153-plugin",
+    "asset": "windows-x86_64-rocm-gfx1153-plugin",
+    "binary_name": "openasr.exe",
+    "archive_ext": "dll",
+    "features": "hip",
+    "provider": "hip",
+    "distribution": "plugin",
+    "hip_gpu_target": "gfx1153",
     "vendor_owner": false,
     "timeout": 240
   },

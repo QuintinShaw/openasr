@@ -31,7 +31,7 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         finalize = (ROOT / "scripts/finalize-core-release.sh").read_text(encoding="utf-8")
         self.assertIn("backend-pack-*.json", finalize)
         self.assertIn('"${#cuda_entries[@]}" -ne 5', finalize)
-        self.assertIn('"${#hip_entries[@]}" -ne 11', finalize)
+        self.assertIn('"${#hip_entries[@]}" -ne 14', finalize)
         self.assertLess(finalize.index("verify-catalog"), finalize.index("--draft=false"))
 
 

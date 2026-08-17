@@ -70,8 +70,8 @@ backend_entries=("$workdir"/backend-pack-*.json)
 hardware_evidence=("$workdir"/backend-hardware-evidence-*.json)
 cuda_entries=("$workdir"/backend-pack-cuda-sm_*.json)
 hip_entries=("$workdir"/backend-pack-hip-gfx*.json)
-if [ "${#cuda_entries[@]}" -ne 5 ] || [ "${#hip_entries[@]}" -ne 11 ] || [ "${#backend_entries[@]}" -ne 16 ]; then
-  fail "release ${tag} must contain exactly 5 CUDA SM and 11 HIP gfx backend-pack metadata files"
+if [ "${#cuda_entries[@]}" -ne 5 ] || [ "${#hip_entries[@]}" -ne 14 ] || [ "${#backend_entries[@]}" -ne 19 ]; then
+  fail "release ${tag} must contain exactly 5 CUDA SM and 14 HIP gfx backend-pack metadata files"
 fi
 all_backend_entry_args=()
 for entry in "${backend_entries[@]}"; do

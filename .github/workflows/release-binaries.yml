@@ -227,7 +227,7 @@ jobs:
       # llama.cpp's ubuntu-rocm release job uses.
       - name: Free up disk space
         if: runner.os == 'Linux' && contains(matrix.features, 'hip')
-        uses: ggml-org/free-disk-space@v1.3.1
+        uses: ./.github/actions/free-disk-space
         with:
           tool-cache: true
 
@@ -369,7 +369,7 @@ jobs:
 
       - name: Install CUDA toolkit (Linux)
         if: runner.os == 'Linux' && contains(matrix.features, 'cuda')
-        uses: Jimver/cuda-toolkit@v0.2.35
+        uses: ./.github/actions/install-cuda-toolkit-linux
         with:
           cuda: "13.2.0"
           method: network
@@ -384,7 +384,7 @@ jobs:
 
       - name: Install CUDA toolkit (Windows)
         if: runner.os == 'Windows' && contains(matrix.features, 'cuda')
-        uses: Jimver/cuda-toolkit@v0.2.35
+        uses: ./.github/actions/install-cuda-toolkit-windows
         with:
           # Keep the released Windows plugin on the CUDA 12 ABI so installed
           # RTX systems with a CUDA-12-capable production driver (including
@@ -1232,8 +1232,8 @@ jobs:
           shopt -s nullglob
           cuda_entries=(dist/backend-pack-cuda-sm_*.json)
           hip_entries=(dist/backend-pack-hip-gfx*.json)
-          if [ "${#cuda_entries[@]}" -ne 5 ] || [ "${#hip_entries[@]}" -ne 11 ]; then
-            echo "expected 5 CUDA SM packs and 11 HIP gfx packs; found ${#cuda_entries[@]} and ${#hip_entries[@]}" >&2
+          if [ "${#cuda_entries[@]}" -ne 5 ] || [ "${#hip_entries[@]}" -ne 14 ]; then
+            echo "expected 5 CUDA SM packs and 14 HIP gfx packs; found ${#cuda_entries[@]} and ${#hip_entries[@]}" >&2
             exit 1
           fi
           backend_entry_args=()
@@ -1421,7 +1421,7 @@ jobs:
             echo "openasr-${version}-windows-x86_64-cuda-sm_${sm}-plugin.dll" >> "$expected_file"
             echo "backend-pack-cuda-sm_${sm}.json" >> "$expected_file"
           done
-          for gfx in gfx1030 gfx1031 gfx1032 gfx1035 gfx1100 gfx1101 gfx1102 gfx1150 gfx1151 gfx1200 gfx1201; do
+          for gfx in gfx1030 gfx1031 gfx1032 gfx1035 gfx1100 gfx1101 gfx1102 gfx1103 gfx1150 gfx1151 gfx1152 gfx1153 gfx1200 gfx1201; do
             echo "openasr-${version}-windows-x86_64-rocm-${gfx}-plugin.dll" >> "$expected_file"
             echo "backend-pack-hip-${gfx}.json" >> "$expected_file"
           done

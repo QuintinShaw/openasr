@@ -1,0 +1,24 @@
+name: Install CUDA toolkit (Windows)
+description: Wrapper so unused matrix legs do not download Jimver/cuda-toolkit at job setup.
+
+inputs:
+  cuda:
+    required: true
+  method:
+    required: false
+    default: network
+  sub-packages:
+    required: true
+  use-github-cache:
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - uses: Jimver/cuda-toolkit@v0.2.35
+      with:
+        cuda: ${{ inputs.cuda }}
+        method: ${{ inputs.method }}
+        sub-packages: ${{ inputs.sub-packages }}
+        use-github-cache: ${{ inputs.use-github-cache }}

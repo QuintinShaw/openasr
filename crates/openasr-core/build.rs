@@ -2140,6 +2140,9 @@ fn hip_gpu_targets() -> String {
     // of llama.cpp's current Windows HIP release list (gfx1030/31/32,
     // gfx1100/01/02, gfx1150/51, gfx1200/01) and gfx1035 from a competing
     // ASR product's HIP build, biased toward RDNA2/3/4 gaming/consumer cards.
+    // Windows exact-target plugins may also build gfx1103/1152/1153 as
+    // candidates via OPENASR_HIP_GPU_TARGETS; those stay out of this fat
+    // default until the Linux ROCm toolchain proves them.
     // Deliberately excludes CDNA/datacenter compute cards (gfx906/908/90a):
     // those are compute accelerators, not something an end user's desktop/
     // laptop ships, and would meaningfully lengthen every HIP build for a

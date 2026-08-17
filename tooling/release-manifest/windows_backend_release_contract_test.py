@@ -67,7 +67,8 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             )
         for gfx in (
             "gfx1030", "gfx1031", "gfx1032", "gfx1035", "gfx1100", "gfx1101",
-            "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+            "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153",
+            "gfx1200", "gfx1201",
         ):
             self.assert_matrix_leg(
                 f"x86_64-pc-windows-msvc-hip-{gfx}-plugin",
@@ -157,6 +158,10 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         )
         self.assertIn("select_release_matrix.py", self.workflow)
         self.assertNotIn("LEG_SELECTED", self.workflow)
+        self.assertNotIn("uses: Jimver/cuda-toolkit", self.workflow)
+        self.assertNotIn("uses: ggml-org/free-disk-space", self.workflow)
+        self.assertIn("uses: ./.github/actions/install-cuda-toolkit-windows", self.workflow)
+        self.assertIn("uses: ./.github/actions/free-disk-space", self.workflow)
 
     def test_full_matrix_has_exactly_one_vendor_owner_per_optional_vendor(self) -> None:
         cuda_owners = [

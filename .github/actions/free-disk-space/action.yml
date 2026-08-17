@@ -1,0 +1,14 @@
+name: Free disk space
+description: Wrapper so unused matrix legs do not download ggml-org/free-disk-space at job setup.
+
+inputs:
+  tool-cache:
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - uses: ggml-org/free-disk-space@v1.3.1
+      with:
+        tool-cache: ${{ inputs.tool-cache }}
