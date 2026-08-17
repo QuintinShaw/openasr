@@ -188,13 +188,16 @@ def compile_bundled_manifest(
 
 def materialized_tree_sha256(root: Path, extract_subdir: str) -> str:
     files: list[tuple[str, int, str]] = []
-    for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
         relative = path.relative_to(root).as_posix()
         relative = f"{extract_subdir}/{relative}" if extract_subdir else relative
         sha256, size = sha256_size(path)
         files.append((relative, size, sha256))
     if not files:
         raise BackendCatalogError("vendor runtime tree is empty")
+    files.sort(key=lambda item: item[0])
     digest = hashlib.sha256(b"openasr-backend-tree-v1\0")
     for relative, size, sha256 in files:
         encoded = relative.encode("utf-8")

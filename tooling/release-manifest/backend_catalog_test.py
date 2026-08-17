@@ -31,6 +31,25 @@ def minimal_pe(marker: bytes, certificate: bytes = b"") -> bytes:
 
 
 class BackendCatalogTest(unittest.TestCase):
+    def test_vendor_tree_digest_sorts_posix_paths_not_filesystem_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "B.bin").write_bytes(b"upper")
+            (root / "a.bin").write_bytes(b"lower")
+            digest = backend_catalog.materialized_tree_sha256(root, "vendor")
+            rows = [("vendor/B.bin", 5, hashlib.sha256(b"upper").hexdigest()),
+                    ("vendor/a.bin", 5, hashlib.sha256(b"lower").hexdigest())]
+            rows.sort(key=lambda item: item[0])
+            expected = hashlib.sha256(b"openasr-backend-tree-v1\0")
+            for relative, size, sha256 in rows:
+                encoded = relative.encode("utf-8")
+                expected.update(struct.pack("<Q", len(encoded)))
+                expected.update(encoded)
+                expected.update(struct.pack("<Q", size))
+                expected.update(sha256.encode("ascii"))
+            self.assertEqual(digest, expected.hexdigest())
+            self.assertEqual([item[0] for item in rows], ["vendor/B.bin", "vendor/a.bin"])
+
     def test_compile_binds_actual_plugin_vendor_tree_and_host_abi(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

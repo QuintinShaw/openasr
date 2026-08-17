@@ -2637,6 +2637,13 @@ fn validate_model_catalog(catalog: &ModelCatalog, source: &str) -> Result<(), Ca
 /// (local basename, https URL, non-zero size, 64-hex sha256). Archive files must
 /// declare a safe relative `extract_subdir` (no absolute / `..` traversal); the
 /// other roles must not. Mirrors the model-quant checks above.
+/// Production catalogs may only point at https payloads. A local-dev
+/// `file://` catalog identity may also point at `file://` payloads so a
+/// HIP/CUDA candidate pack can be installed offline.
+fn backend_file_url_is_allowed(source: &str, url: &str) -> bool {
+    url.starts_with("https://") || (source.starts_with("file://") && url.starts_with("file://"))
+}
+
 fn validate_catalog_backend(backend: &CatalogBackend, source: &str) -> Result<(), CatalogError> {
     if backend.id.trim().is_empty() {
         return Err(CatalogError::InvalidCatalog(
@@ -2734,9 +2741,7 @@ fn validate_catalog_backend(backend: &CatalogBackend, source: &str) -> Result<()
                 backend.id, file.filename
             )));
         }
-        if !file.url.starts_with("https://")
-            && !(source.starts_with("file://") && file.url.starts_with("file://"))
-        {
+        if !backend_file_url_is_allowed(source, &file.url) {
             return Err(CatalogError::InvalidCatalog(format!(
                 "backend '{}' file '{}' URL must use https://",
                 backend.id, file.filename
