@@ -128,11 +128,16 @@ fn main() {
 
     // OpenMP CPU threading is on by default (~2x CPU). It links cleanly for the
     // CPU/CUDA/Vulkan builds (ggml-cpu is compiled by MSVC, whose `/openmp`
-    // resolves against the system `vcomp`), but it is unsupported on three targets:
+    // resolves against the system `vcomp`), but it is unsupported on these targets:
     //  - Windows HIP: HIP compiles the whole project with ROCm's clang, whose
     //    `-fopenmp` emits LLVM `__kmpc_*` calls, and ROCm for Windows ships no
     //    `libomp`, so `hip + openmp` fails to link (LNK2019 __kmpc_*). HIP runs
     //    decode on the GPU, so CPU OpenMP is not a meaningful loss.
+    //  - Windows arm64: the x86_64-hosted cross build uses clang-cl because
+    //    ggml's ARM CPU backend rejects MSVC cl. The release toolchain does not
+    //    ship a target-arm64 libomp, so enabling OpenMP leaves unresolved
+    //    `__kmpc_*`/`omp_*` imports. CPU threading still comes from ggml's own
+    //    thread pool.
     //  - macOS: Apple clang has no bundled `libomp` and the Mac path uses
     //    Metal/Accelerate; leave its build behavior unchanged.
     //  - android: bionic ships no `libgomp` and lacks `pthread_setaffinity` (the
@@ -149,7 +154,7 @@ fn main() {
             Some("0" | "off" | "OFF" | "false" | "FALSE")
         );
     let openmp_unsupported_target =
-        is_macos || is_ios || is_android || is_musl || (feat_hip && is_windows);
+        is_macos || is_ios || is_android || is_musl || is_windows_arm64 || (feat_hip && is_windows);
     let effective_openmp = openmp_requested && !openmp_unsupported_target;
     if openmp_requested && !effective_openmp && feat_hip && is_windows {
         println!(

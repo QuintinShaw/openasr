@@ -7,12 +7,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "release-binaries.yml"
+CORE_BUILD_RS = ROOT / "crates" / "openasr-core" / "build.rs"
 
 
 class WindowsBackendReleaseContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.workflow = WORKFLOW.read_text(encoding="utf-8")
+        cls.core_build_rs = CORE_BUILD_RS.read_text(encoding="utf-8")
 
     def assert_matrix_leg(
         self,
@@ -180,6 +182,12 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             "inputs.only_target == '' }}",
             xcframework,
         )
+
+    def test_windows_arm64_cross_build_disables_openmp(self) -> None:
+        openmp_contract = self.core_build_rs.split(
+            "let openmp_unsupported_target =", 1
+        )[1].split(";", 1)[0]
+        self.assertIn("is_windows_arm64", openmp_contract)
 
 
 if __name__ == "__main__":
