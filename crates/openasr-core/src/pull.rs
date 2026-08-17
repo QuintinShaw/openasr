@@ -280,6 +280,8 @@ pub enum PullError {
     GgufPreflight { path: PathBuf, reason: String },
     #[error("Downloaded backend file failed binary preflight for '{path}': {reason}")]
     BackendFilePreflight { path: PathBuf, reason: String },
+    #[error("Unexpected file in installed backend pack '{path}'")]
+    UnexpectedInstalledBackendFile { path: PathBuf },
     #[error("Downloaded pack failed runtime path validation for '{path}': {reason}")]
     RuntimeValidation { path: PathBuf, reason: String },
     #[error("Installed model pack not found: {reference}")]
@@ -5378,6 +5380,7 @@ pub fn verify_installed_backend(
             reason: "installed plugin does not match the signed catalog entry".to_string(),
         });
     }
+    let mut allowed_relative_paths = BTreeSet::from(["backend.json".to_string()]);
     for (installed_file, catalog_file) in installed.files.iter().zip(&resolved.files) {
         if installed_file.materialized_files.is_empty() {
             return Err(PullError::InvalidTarget {
@@ -5401,6 +5404,7 @@ pub fn verify_installed_backend(
                     reason: format!("duplicate path '{}'", materialized.relative_path),
                 });
             }
+            allowed_relative_paths.insert(materialized.relative_path.clone());
             let path = dir.join(&materialized.relative_path);
             let (actual_size, actual_sha256) = file_size_and_sha256(&path)?;
             if actual_size != materialized.size_bytes {
@@ -5465,6 +5469,16 @@ pub fn verify_installed_backend(
                     reason: "unknown backend file role".to_string(),
                 });
             }
+        }
+    }
+    // Installed packs are a closed file set. Windows LoadLibraryEx with
+    // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR will load unsigned sibling DLLs that
+    // never appear in the signed materialized list.
+    for actual in collect_materialized_files(dir)? {
+        if !allowed_relative_paths.contains(&actual.relative_path) {
+            return Err(PullError::UnexpectedInstalledBackendFile {
+                path: dir.join(&actual.relative_path),
+            });
         }
     }
     Ok(())

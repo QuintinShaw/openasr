@@ -3368,6 +3368,54 @@ fn installed_backend_full_verification_rejects_tampered_file() {
 }
 
 #[test]
+fn installed_backend_full_verification_rejects_unexpected_file() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let mut resolved = hip_pack_resolved(&plugin, &tensile_zip_bytes());
+    resolved.files.truncate(1);
+    let mut client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: plugin,
+    }]);
+    install_backend_pack_with_client(&resolved, home.path(), &mut client, |_| {}).unwrap();
+    let dir = backend_pack_install_dir(home.path(), &resolved).unwrap();
+    fs::write(dir.join("cublas64_12.dll"), b"planted").unwrap();
+
+    let error = read_and_verify_installed_backend(&dir, &resolved).unwrap_err();
+    assert!(matches!(
+        error,
+        PullError::UnexpectedInstalledBackendFile { .. }
+    ));
+    assert!(
+        error
+            .to_string()
+            .contains("Unexpected file in installed backend pack")
+    );
+}
+
+#[test]
+fn installed_backend_full_verification_accepts_declared_files_only() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let resolved = hip_pack_resolved(&plugin, &archive);
+    let mut client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: plugin,
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+    let installed =
+        install_backend_pack_with_client(&resolved, home.path(), &mut client, |_| {}).unwrap();
+
+    read_and_verify_installed_backend(&installed.dir, &resolved).unwrap();
+}
+
+#[test]
 fn backend_install_lock_is_os_owned_and_exclusive() {
     let home = tempfile::tempdir().unwrap();
     let path = home.path().join("backend-install.lock");
