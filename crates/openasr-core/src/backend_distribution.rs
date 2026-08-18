@@ -692,6 +692,77 @@ pub(crate) fn verified_backend_dependency_dirs(
     Ok(dependency_dirs.into_iter().collect())
 }
 
+/// hipBLASLt / rocBLAS look up Tensile `.dat`/`.co` via these process env
+/// vars, not via the Windows DLL search path. Leaving them unset makes
+/// `libhipblaslt.dll` walk from its own module path; a `\\?\` extended
+/// path from `canonicalize` then crashes at first GEMM (`0xC0000005`).
+const HIPBLASLT_TENSILE_LIBPATH: &str = "HIPBLASLT_TENSILE_LIBPATH";
+const ROCBLAS_TENSILE_LIBPATH: &str = "ROCBLAS_TENSILE_LIBPATH";
+
+pub(crate) fn tensile_env_name_for_library_dir(dir: &Path) -> Option<&'static str> {
+    let name = dir.file_name()?;
+    let parent = dir.parent()?.file_name()?;
+    if !name.eq_ignore_ascii_case("library") {
+        return None;
+    }
+    if parent.eq_ignore_ascii_case("hipblaslt") {
+        Some(HIPBLASLT_TENSILE_LIBPATH)
+    } else if parent.eq_ignore_ascii_case("rocblas") {
+        Some(ROCBLAS_TENSILE_LIBPATH)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn path_for_vendor_env(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        PathBuf::from(&*rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+pub(crate) fn bind_verified_hip_kernel_libpaths(dependency_dirs: &[PathBuf]) {
+    for dir in dependency_dirs {
+        let Some(key) = tensile_env_name_for_library_dir(dir) else {
+            continue;
+        };
+        set_verified_kernel_libpath(key, &path_for_vendor_env(dir));
+    }
+}
+
+fn set_verified_kernel_libpath(key: &str, value: &Path) {
+    #[expect(
+        unsafe_code,
+        reason = "bind hipBLASLt/rocBLAS Tensile search to the verified vendor tree"
+    )]
+    unsafe {
+        std::env::set_var(key, value);
+    }
+    // MSVC CRT caches getenv() at startup. SetEnvironmentVariableW alone is
+    // invisible to libhipblaslt / rocblas if they call getenv/_wgetenv.
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let key_wide: Vec<u16> = std::ffi::OsStr::new(key)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let value_wide: Vec<u16> = value.as_os_str().encode_wide().chain(Some(0)).collect();
+        unsafe extern "C" {
+            fn _wputenv_s(varname: *const u16, value_string: *const u16) -> i32;
+        }
+        #[expect(
+            unsafe_code,
+            reason = "refresh MSVC CRT getenv cache so hipBLASLt sees Tensile libpath"
+        )]
+        let _ = unsafe { _wputenv_s(key_wide.as_ptr(), value_wide.as_ptr()) };
+    }
+}
+
 impl BackendHostAbi {
     pub fn current() -> Self {
         Self {
@@ -845,5 +916,41 @@ mod tests {
             assert_eq!(error.machine_failure_class(), class);
             assert_eq!(error.machine_failure_code(), code);
         }
+    }
+
+    #[test]
+    fn tensile_env_name_binds_only_hip_vendor_library_dirs() {
+        assert_eq!(
+            tensile_env_name_for_library_dir(Path::new(r"E:\pack\vendor\hipblaslt\library")),
+            Some(HIPBLASLT_TENSILE_LIBPATH)
+        );
+        assert_eq!(
+            tensile_env_name_for_library_dir(Path::new(r"E:\pack\vendor\rocblas\library")),
+            Some(ROCBLAS_TENSILE_LIBPATH)
+        );
+        assert_eq!(
+            tensile_env_name_for_library_dir(Path::new(r"E:\pack\vendor")),
+            None
+        );
+        assert_eq!(
+            tensile_env_name_for_library_dir(Path::new(r"E:\pack\vendor\amdhip64")),
+            None
+        );
+    }
+
+    #[test]
+    fn vendor_env_path_strips_windows_extended_prefix() {
+        assert_eq!(
+            path_for_vendor_env(Path::new(r"\\?\E:\hip\vendor\hipblaslt\library")),
+            PathBuf::from(r"E:\hip\vendor\hipblaslt\library")
+        );
+        assert_eq!(
+            path_for_vendor_env(Path::new(r"\\?\UNC\server\share\library")),
+            PathBuf::from(r"\\server\share\library")
+        );
+        assert_eq!(
+            path_for_vendor_env(Path::new(r"E:\hip\vendor\hipblaslt\library")),
+            PathBuf::from(r"E:\hip\vendor\hipblaslt\library")
+        );
     }
 }
