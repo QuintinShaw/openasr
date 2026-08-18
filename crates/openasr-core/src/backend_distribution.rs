@@ -719,7 +719,7 @@ pub(crate) fn path_for_vendor_env(path: &Path) -> PathBuf {
     if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
         PathBuf::from(format!(r"\\{rest}"))
     } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
-        PathBuf::from(&*rest)
+        PathBuf::from(rest)
     } else {
         path.to_path_buf()
     }
@@ -920,22 +920,26 @@ mod tests {
 
     #[test]
     fn tensile_env_name_binds_only_hip_vendor_library_dirs() {
+        let hipblaslt = PathBuf::from("pack")
+            .join("vendor")
+            .join("hipblaslt")
+            .join("library");
+        let rocblas = PathBuf::from("pack")
+            .join("vendor")
+            .join("rocblas")
+            .join("library");
+        let vendor = PathBuf::from("pack").join("vendor");
+        let amdhip64 = vendor.join("amdhip64");
         assert_eq!(
-            tensile_env_name_for_library_dir(Path::new(r"E:\pack\vendor\hipblaslt\library")),
+            tensile_env_name_for_library_dir(&hipblaslt),
             Some(HIPBLASLT_TENSILE_LIBPATH)
         );
         assert_eq!(
-            tensile_env_name_for_library_dir(Path::new(r"E:\pack\vendor\rocblas\library")),
+            tensile_env_name_for_library_dir(&rocblas),
             Some(ROCBLAS_TENSILE_LIBPATH)
         );
-        assert_eq!(
-            tensile_env_name_for_library_dir(Path::new(r"E:\pack\vendor")),
-            None
-        );
-        assert_eq!(
-            tensile_env_name_for_library_dir(Path::new(r"E:\pack\vendor\amdhip64")),
-            None
-        );
+        assert_eq!(tensile_env_name_for_library_dir(&vendor), None);
+        assert_eq!(tensile_env_name_for_library_dir(&amdhip64), None);
     }
 
     #[test]
