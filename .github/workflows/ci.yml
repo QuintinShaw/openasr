@@ -38,7 +38,22 @@ jobs:
         with:
           submodules: recursive
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake libasound2-dev
+        timeout-minutes: 5
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eu
+          ok=0
+          for attempt in 1 2 3; do
+            if sudo apt-get update -o Acquire::Retries=3 \
+              && sudo apt-get install -y -o DPkg::Lock::Timeout=60 cmake libasound2-dev; then
+              ok=1
+              break
+            fi
+            echo "apt-get attempt ${attempt}/3 failed" >&2
+            sleep $((attempt * 10))
+          done
+          test "$ok" -eq 1
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
@@ -82,7 +97,22 @@ jobs:
         with:
           submodules: recursive
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake libasound2-dev
+        timeout-minutes: 5
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eu
+          ok=0
+          for attempt in 1 2 3; do
+            if sudo apt-get update -o Acquire::Retries=3 \
+              && sudo apt-get install -y -o DPkg::Lock::Timeout=60 cmake libasound2-dev; then
+              ok=1
+              break
+            fi
+            echo "apt-get attempt ${attempt}/3 failed" >&2
+            sleep $((attempt * 10))
+          done
+          test "$ok" -eq 1
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt
