@@ -14,6 +14,9 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         finalize = (ROOT / "scripts/finalize-core-release.sh").read_text(encoding="utf-8")
+        publish = (
+            ROOT / "tooling/publish-model/scripts/publish_catalog.sh"
+        ).read_text(encoding="utf-8")
 
         self.assertIn("gh release create", release)
         self.assertIn("--draft", release)
@@ -21,10 +24,17 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("publish_catalog.sh", prepare)
         self.assertIn("verify-catalog", prepare)
         self.assertIn("backend_hardware_evidence.py", prepare)
+        self.assertIn("tr -d '\\r'", prepare)
+        self.assertIn('source.read_text(encoding="utf-8")', publish)
+        self.assertLess(
+            prepare.index("preflighting local catalog signer toolchain"),
+            prepare.index("downloading backend entries"),
+        )
         self.assertIn("catalog.openasr.org/v1/catalog.json", finalize)
         self.assertNotIn("backends-manifest", finalize)
         self.assertIn("verify-catalog", finalize)
         self.assertIn("backend_hardware_evidence.py", finalize)
+        self.assertIn("tr -d '\\r'", finalize)
         self.assertIn('gh release edit "$tag" --draft=false --latest', finalize)
 
     def test_finalizer_never_publishes_before_all_cuda_and_hip_target_entries(self) -> None:

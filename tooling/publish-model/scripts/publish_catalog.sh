@@ -98,7 +98,7 @@ from pathlib import Path
 
 source = Path(sys.argv[1])
 target = Path(sys.argv[2])
-catalog = json.loads(source.read_text())
+catalog = json.loads(source.read_text(encoding="utf-8"))
 public_models = [model for model in catalog.get("models", []) if model.get("public") is True]
 if not public_models:
     raise SystemExit("catalog has no public:true models; refusing to publish an empty public catalog")

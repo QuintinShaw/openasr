@@ -41,6 +41,9 @@ is_draft="$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)" \
   || fail "GitHub release ${tag} does not exist"
 [ "$is_draft" = "true" ] || fail "release ${tag} is not a draft; backend catalog must be live before publication"
 
+echo "==> preflighting local catalog signer toolchain"
+cargo test -p openasr-core bundled_catalog_json_parses_and_matches_registry_cards --no-run >/dev/null
+
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/openasr-backend-catalog.XXXXXX")"
 restore=1
 cleanup() {
@@ -86,7 +89,9 @@ done
 python3 tooling/release-manifest/backend_hardware_evidence.py \
   "${all_backend_entry_args[@]}" "${hardware_evidence_args[@]}" \
   > "$workdir/hardware-approved-entries.txt"
-mapfile -t approved_entries < "$workdir/hardware-approved-entries.txt"
+# Native Windows Python writes CRLF even when invoked from Git Bash. Strip
+# the record terminator before using each emitted path as an argv value.
+mapfile -t approved_entries < <(tr -d '\r' < "$workdir/hardware-approved-entries.txt")
 [ "${#approved_entries[@]}" -gt 0 ] \
   || fail "release ${tag} has no backend entry approved by hardware evidence"
 backend_entry_args=()
