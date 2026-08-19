@@ -1012,6 +1012,15 @@ jobs:
           if ("${{ matrix.distribution }}" -ne "plugin" -and "${{ matrix.provider }}" -ne "cuda" -and "${{ matrix.provider }}" -ne "hip" -and "${{ matrix.rust_target }}" -eq "") {
             & "$env:DIST_DIR\${{ matrix.binary_name }}" --version
             if ($LASTEXITCODE -ne 0) { exit 1 }
+            $doctor = & "$env:DIST_DIR\${{ matrix.binary_name }}" doctor 2>&1 | Out-String
+            Write-Host $doctor
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            if ($doctor -notmatch "bundled CPU/Vulkan modules: verified") {
+              throw "staged neutral host did not verify its post-signing CPU/Vulkan bundle"
+            }
+            if ($doctor -match "ggml: best backend unavailable" -or $doctor -match "CPU backend unavailable") {
+              throw "staged neutral host could not initialize its bundled CPU rescue backend"
+            }
           }
           if ("${{ matrix.distribution }}" -ne "plugin") {
             Compress-Archive -Path "$env:DIST_DIR" -DestinationPath "dist\$env:ARCHIVE_NAME.${{ matrix.archive_ext }}" -Force

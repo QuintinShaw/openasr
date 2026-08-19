@@ -442,8 +442,23 @@ class BackendCatalogTest(unittest.TestCase):
             result = json.loads(out.read_text(encoding="utf-8"))
 
             self.assertEqual(result["host_abi_fingerprint"], fingerprint)
-            self.assertEqual(result["schema_version"], 2)
+            self.assertEqual(result["schema_version"], 3)
             self.assertEqual(len(result["bundle_contract_sha256"]), 64)
+            self.assertEqual(
+                result["cpu_contract_sha256"],
+                backend_catalog.provider_bundle_contract_sha256(
+                    fingerprint, result["files"], "cpu"
+                ),
+            )
+            self.assertEqual(
+                result["vulkan_contract_sha256"],
+                backend_catalog.provider_bundle_contract_sha256(
+                    fingerprint, result["files"], "vulkan"
+                ),
+            )
+            self.assertNotEqual(
+                result["cpu_contract_sha256"], result["vulkan_contract_sha256"]
+            )
             self.assertEqual(
                 {entry["provider"] for entry in result["files"]},
                 {"host", "cpu", "vulkan", "dependency"},

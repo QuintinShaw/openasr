@@ -110,6 +110,19 @@ def bundle_contract_sha256(host_abi_fingerprint: str, files: list[dict[str, Any]
     return digest.hexdigest()
 
 
+def provider_bundle_contract_sha256(
+    host_abi_fingerprint: str, files: list[dict[str, Any]], provider: str
+) -> str:
+    """Bind the common host DLLs plus exactly one bundled provider rail."""
+
+    selected = [
+        entry
+        for entry in files
+        if entry["provider"] == "host" or entry["provider"] == provider
+    ]
+    return bundle_contract_sha256(host_abi_fingerprint, selected)
+
+
 def compile_bundled_manifest(
     directory: Path,
     host_abi_path: Path,
@@ -177,9 +190,15 @@ def compile_bundled_manifest(
         )
 
     result = {
-        "schema_version": 2,
+        "schema_version": 3,
         "host_abi_fingerprint": fingerprint,
         "bundle_contract_sha256": bundle_contract_sha256(fingerprint, files),
+        "cpu_contract_sha256": provider_bundle_contract_sha256(
+            fingerprint, files, "cpu"
+        ),
+        "vulkan_contract_sha256": provider_bundle_contract_sha256(
+            fingerprint, files, "vulkan"
+        ),
         "files": files,
     }
     out.parent.mkdir(parents=True, exist_ok=True)
