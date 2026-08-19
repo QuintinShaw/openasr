@@ -122,15 +122,9 @@ jobs:
     permissions:
       contents: read
       packages: read
-    # Linux CPU uses the locked openasr-ci-linux image
-    # (ghcr.io/quintinshaw/openasr-ci-linux@sha256:702284855863f1c6330eec503ac4570ff2cc844a958ceb7d2e2af5837633dcdc).
-    # Linux CUDA pins the official nvidia/cuda 13.2.0 devel amd64 digest
-    # nvidia/cuda:13.2.0-devel-ubuntu22.04@sha256:c7732db6b0128a468fab3d4c45d7063e075e7001c96e0b5303bb406cd59eb8c3
-    # (index sha256:46a7128f65491ae6ed6e3a4ef31fc140a4ca77d5dddb68a4350fea9d53a95c5f,
-    # verified 2026-08-20 via docker buildx imagetools inspect).
-    # Linux ROCm pins the official rocm/dev-ubuntu-22.04:7.2.1 digest
-    # rocm/dev-ubuntu-22.04:7.2.1@sha256:42851dac319afce41cf993e25f95005b7f2cd0a0f6abd32ad8f25cd876ec56df
-    # (verified 2026-08-20 via docker buildx imagetools inspect).
+    # Linux CPU / CUDA / ROCm pins live in
+    # .github/ci/linux-build-env.lock, linux-cuda.lock, linux-rocm.lock
+    # and tooling/release-manifest/release_binaries_matrix.json.
     # Windows/macOS/arm64/musl/vulkan omit matrix.container and run on the host.
     # Credentials are sent only to GHCR; Docker Hub pulls stay anonymous.
     container: ${{ matrix.container && fromJSON(startsWith(matrix.container, 'ghcr.io/') && format('{{"image":{0},"credentials":{{"username":{1},"password":{2}}}}}', toJSON(matrix.container), toJSON(github.actor), toJSON(github.token)) || format('{{"image":{0}}}', toJSON(matrix.container))) || fromJSON('null') }}
@@ -254,6 +248,7 @@ jobs:
 
       - name: Prepare Linux container
         if: runner.os == 'Linux' && matrix.container
+        shell: bash
         run: |
           set -euo pipefail
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -290,7 +285,7 @@ jobs:
           tool-cache: true
 
       - name: Install Linux ROCm/HIP SDK
-        if: runner.os == 'Linux' && contains(matrix.features, 'hip') && !contains(matrix.container, 'rocm/')
+        if: runner.os == 'Linux' && contains(matrix.features, 'hip') && !contains(matrix.container, 'rocm/') && !contains(matrix.container, 'openasr-ci-linux-rocm')
         # AMD's official apt repo (the recipe llama.cpp's ubuntu-22-rocm)
         # release job uses). rocm-hip-sdk provides hipcc/the HIP clang
         # toolchain, rocBLAS, and hipBLAS; ROCM_PATH lets both cmake's
@@ -426,7 +421,7 @@ jobs:
           Add-Content $env:GITHUB_PATH "$hipRoot\bin"
 
       - name: Install CUDA toolkit (Linux)
-        if: runner.os == 'Linux' && contains(matrix.features, 'cuda') && !contains(matrix.container, 'nvidia/cuda')
+        if: runner.os == 'Linux' && contains(matrix.features, 'cuda') && !contains(matrix.container, 'nvidia/cuda') && !contains(matrix.container, 'openasr-ci-linux-cuda')
         uses: ./.github/actions/install-cuda-toolkit-linux
         with:
           cuda: "13.2.0"

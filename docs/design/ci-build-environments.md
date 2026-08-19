@@ -27,30 +27,23 @@ change.
 
 ### CUDA 13.2.0
 
-- Official pin used by release-binaries today:
-  `nvidia/cuda:13.2.0-devel-ubuntu22.04@sha256:c7732db6b0128a468fab3d4c45d7063e075e7001c96e0b5303bb406cd59eb8c3`
-  (linux/amd64 manifest). Index digest
-  `sha256:46a7128f65491ae6ed6e3a4ef31fc140a4ca77d5dddb68a4350fea9d53a95c5f`.
-- Verified on 2026-08-20 with `docker buildx imagetools inspect`.
-- Wrapper (not yet consumed): `.github/ci/linux-cuda/`, published by
+- Consumer pin: `.github/ci/linux-cuda.lock`
+  (`ghcr.io/quintinshaw/openasr-ci-linux-cuda@sha256:7d3a80aa…`).
+- Wrapper source: `.github/ci/linux-cuda/`, published by
   `.github/workflows/ci-linux-cuda-env.yml` on its own path changes only.
-- After that workflow produces a GHCR digest, copy it into a future
-  `.github/ci/linux-cuda.lock` and point the CUDA release leg at GHCR.
-
-The official image already has nvcc 13.2.0. The release job rustups from
-`rust-toolchain.toml` and apt-installs CMake/Ninja/ALSA until the wrapper
-digest exists.
+- Base: official
+  `nvidia/cuda:13.2.0-devel-ubuntu22.04@sha256:c7732db6b0128a468fab3d4c45d7063e075e7001c96e0b5303bb406cd59eb8c3`
+  (linux/amd64). The wrapper adds git, cmake, ninja, ALSA, and a non-root user
+  so `actions/checkout` and bash steps work.
 
 ### ROCm 7.2.1
 
-- Official pin used by release-binaries today:
-  `rocm/dev-ubuntu-22.04:7.2.1@sha256:42851dac319afce41cf993e25f95005b7f2cd0a0f6abd32ad8f25cd876ec56df`.
-- Verified on 2026-08-20 with `docker buildx imagetools inspect`.
-- Wrapper (not yet consumed): `.github/ci/linux-rocm/`, published by
+- Consumer pin: `.github/ci/linux-rocm.lock`
+  (`ghcr.io/quintinshaw/openasr-ci-linux-rocm@sha256:fc83ea99…`).
+- Wrapper source: `.github/ci/linux-rocm/`, published by
   `.github/workflows/ci-linux-rocm-env.yml` on its own path changes only.
-
-Same extras story as CUDA: hipcc comes from the official image; rustup and
-a short apt extras step run in the job.
+- Base: official
+  `rocm/dev-ubuntu-22.04:7.2.1@sha256:42851dac319afce41cf993e25f95005b7f2cd0a0f6abd32ad8f25cd876ec56df`.
 
 Do not change those CUDA/ROCm versions to match a newer toolkit. Live
 release pins win.

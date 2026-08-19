@@ -75,11 +75,11 @@ class SelectReleaseMatrixTests(unittest.TestCase):
         )
         self.assertEqual(
             rows["x86_64-unknown-linux-gnu-cuda"]["container"],
-            "nvidia/cuda:13.2.0-devel-ubuntu22.04@sha256:c7732db6b0128a468fab3d4c45d7063e075e7001c96e0b5303bb406cd59eb8c3",
+            "ghcr.io/quintinshaw/openasr-ci-linux-cuda@sha256:7d3a80aae720b6e726c71f2da726857039abf52e9f32d0f8ae1f68b8a7de3a77",
         )
         self.assertEqual(
             rows["x86_64-unknown-linux-gnu-rocm"]["container"],
-            "rocm/dev-ubuntu-22.04:7.2.1@sha256:42851dac319afce41cf993e25f95005b7f2cd0a0f6abd32ad8f25cd876ec56df",
+            "ghcr.io/quintinshaw/openasr-ci-linux-rocm@sha256:fc83ea993728463fc6666139304fc1221d4b34327179af223102459f73193212",
         )
         self.assertNotIn("container", rows["x86_64-unknown-linux-gnu-vulkan"])
         self.assertNotIn("container", rows["aarch64-unknown-linux-gnu"])

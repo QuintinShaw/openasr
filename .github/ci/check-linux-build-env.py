@@ -31,6 +31,22 @@ APTGET_FORBIDDEN = {
 
 LINUX_CI_MATRIX = ROOT / "tooling/release-manifest/release_binaries_matrix.json"
 LINUX_CI_MATRIX_TARGETS = ("x86_64-unknown-linux-gnu",)
+GPU_LOCKS = (
+    (
+        "x86_64-unknown-linux-gnu-cuda",
+        ROOT / ".github/ci/linux-cuda.lock",
+        re.compile(
+            r"ghcr\.io/quintinshaw/openasr-ci-linux-cuda@sha256:[0-9a-f]{64}"
+        ),
+    ),
+    (
+        "x86_64-unknown-linux-gnu-rocm",
+        ROOT / ".github/ci/linux-rocm.lock",
+        re.compile(
+            r"ghcr\.io/quintinshaw/openasr-ci-linux-rocm@sha256:[0-9a-f]{64}"
+        ),
+    ),
+)
 
 
 def main() -> None:
@@ -69,6 +85,20 @@ def main() -> None:
                 failures.append(
                     f"{LINUX_CI_MATRIX}: {target} container must be {expected}, "
                     f"found {container!r}"
+                )
+        for target, lock_path, pattern in GPU_LOCKS:
+            pinned = lock_path.read_text(encoding="utf-8").strip()
+            if pattern.fullmatch(pinned) is None:
+                failures.append(f"invalid GPU image lock {lock_path}: {pinned!r}")
+                continue
+            row = by_target.get(target)
+            if row is None:
+                failures.append(f"{LINUX_CI_MATRIX}: missing release leg {target}")
+                continue
+            if row.get("container") != pinned:
+                failures.append(
+                    f"{LINUX_CI_MATRIX}: {target} container must be {pinned}, "
+                    f"found {row.get('container')!r}"
                 )
 
     if failures:
