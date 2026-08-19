@@ -66,10 +66,11 @@ on:
 permissions:
   contents: write
 
-# Serialize by target ref. Never cancel a release that is already building:
-# a later dispatch or tag retry must wait, not preempt in-flight artifacts.
+# Serialize a full matrix by ref. Diagnostic only_target dispatches share the
+# ref but must not queue behind (or replace) each other. Never cancel a
+# release that is already building: a later retry must wait.
 concurrency:
-  group: release-binaries-${{ inputs.ref || github.ref_name || github.ref }}
+  group: release-binaries-${{ inputs.ref || github.ref_name || github.ref }}-${{ inputs.only_target || 'all' }}
   cancel-in-progress: false
 
 jobs:
