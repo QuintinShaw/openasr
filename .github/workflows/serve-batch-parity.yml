@@ -21,6 +21,10 @@ concurrency:
   group: serve-batch-parity-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  packages: read
+
 env:
   CARGO_TERM_COLOR: always
   # Public moonshine-tiny q8_0 pack pinned to its immutable HF revision so the
@@ -32,13 +36,15 @@ jobs:
   cpu-real-pack-parity:
     name: moonshine CPU real-pack parity
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/quintinshaw/openasr-ci-linux@sha256:de3fd9f5a7d0b7ddce162ff9efda410a5b0c05252a63e29223d4b6d3728fb6d4
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake
 
       - uses: dtolnay/rust-toolchain@1.95.0
 

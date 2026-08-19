@@ -20,6 +20,10 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  packages: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -32,28 +36,16 @@ jobs:
   lint:
     name: Rust lint (fmt, clippy, catalog, python)
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/quintinshaw/openasr-ci-linux@sha256:de3fd9f5a7d0b7ddce162ff9efda410a5b0c05252a63e29223d4b6d3728fb6d4
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - name: Install build dependencies
-        timeout-minutes: 5
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          set -eu
-          ok=0
-          for attempt in 1 2 3; do
-            if sudo apt-get update -o Acquire::Retries=3 \
-              && sudo apt-get install -y -o DPkg::Lock::Timeout=60 cmake libasound2-dev; then
-              ok=1
-              break
-            fi
-            echo "apt-get attempt ${attempt}/3 failed" >&2
-            sleep $((attempt * 10))
-          done
-          test "$ok" -eq 1
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
@@ -69,8 +61,8 @@ jobs:
         run: python3 tooling/publish-model/scripts/check_catalog_consistency.py
       - name: GPU weight placement gate
         run: scripts/gpu-weight-placement-gate.sh
-      - name: Install python test dependencies
-        run: python3 -m pip install --user numpy
+      - name: Verify preinstalled Python test dependencies
+        run: python3 -c 'import numpy; print(numpy.__version__)'
       - name: Public source hygiene gate
         run: python3 tooling/check_public_source_hygiene.py
       - name: Python helper gates
@@ -91,28 +83,16 @@ jobs:
     # GitHub-hosted: runs for pushes and every PR, including forks (the repo is
     # public, so hosted-runner minutes are free and unlimited).
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/quintinshaw/openasr-ci-linux@sha256:de3fd9f5a7d0b7ddce162ff9efda410a5b0c05252a63e29223d4b6d3728fb6d4
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - name: Install build dependencies
-        timeout-minutes: 5
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          set -eu
-          ok=0
-          for attempt in 1 2 3; do
-            if sudo apt-get update -o Acquire::Retries=3 \
-              && sudo apt-get install -y -o DPkg::Lock::Timeout=60 cmake libasound2-dev; then
-              ok=1
-              break
-            fi
-            echo "apt-get attempt ${attempt}/3 failed" >&2
-            sleep $((attempt * 10))
-          done
-          test "$ok" -eq 1
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt
