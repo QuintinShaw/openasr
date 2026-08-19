@@ -36,7 +36,14 @@ RUN success=0; \
     test "${success}" -eq 1; \
     rm -rf /var/lib/apt/lists/*
 
+RUN groupadd --gid 1001 openasr-ci \
+    && useradd --uid 1001 --gid 1001 --home-dir /github/home \
+      --create-home --shell /bin/bash openasr-ci
+
 COPY --chmod=0755 verify.sh /usr/local/bin/openasr-ci-verify
+
+USER 1001:1001
+
 RUN openasr-ci-verify
 
 LABEL org.opencontainers.image.source="https://github.com/QuintinShaw/openasr" \
