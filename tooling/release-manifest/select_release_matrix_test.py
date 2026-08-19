@@ -67,6 +67,24 @@ class SelectReleaseMatrixTests(unittest.TestCase):
         self.assertIn("fromJSON(needs.select-matrix.outputs.include)", workflow)
         self.assertIn("\n  select-matrix:\n", workflow)
 
+    def test_linux_release_legs_pin_digest_containers(self) -> None:
+        rows = {row["target"]: row for row in load_matrix()}
+        self.assertEqual(
+            rows["x86_64-unknown-linux-gnu"]["container"],
+            "ghcr.io/quintinshaw/openasr-ci-linux@sha256:702284855863f1c6330eec503ac4570ff2cc844a958ceb7d2e2af5837633dcdc",
+        )
+        self.assertEqual(
+            rows["x86_64-unknown-linux-gnu-cuda"]["container"],
+            "nvidia/cuda:13.2.0-devel-ubuntu22.04@sha256:c7732db6b0128a468fab3d4c45d7063e075e7001c96e0b5303bb406cd59eb8c3",
+        )
+        self.assertEqual(
+            rows["x86_64-unknown-linux-gnu-rocm"]["container"],
+            "rocm/dev-ubuntu-22.04:7.2.1@sha256:42851dac319afce41cf993e25f95005b7f2cd0a0f6abd32ad8f25cd876ec56df",
+        )
+        self.assertNotIn("container", rows["x86_64-unknown-linux-gnu-vulkan"])
+        self.assertNotIn("container", rows["aarch64-unknown-linux-gnu"])
+        self.assertNotIn("container", rows["x86_64-pc-windows-msvc-neutral"])
+
 
 if __name__ == "__main__":
     unittest.main()

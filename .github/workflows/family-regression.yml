@@ -41,18 +41,69 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     timeout-minutes: 90
     steps:
+      - name: Try published release CLI
+        id: published
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET_SUFFIX: linux-x86_64
+        run: |
+          set -uo pipefail
+          available=false
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          asset="openasr-${version}-${ASSET_SUFFIX}.tar.gz"
+          workdir="${RUNNER_TEMP}/published-cli"
+          mkdir -p "${workdir}"
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${tag}"
+          if json="$(curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${api}")" \
+            && asset_url="$(ASSET="${asset}" python3 -c '
+          import json, os, sys
+          rel = json.loads(sys.stdin.read())
+          name = os.environ["ASSET"]
+          for item in rel.get("assets", []):
+              if item.get("name") == name and item.get("url"):
+                  print(item["url"])
+                  raise SystemExit(0)
+          raise SystemExit(2)
+          ' <<<"${json}")" \
+            && curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              -o "${workdir}/${asset}" \
+              "${asset_url}" \
+            && tar -xzf "${workdir}/${asset}" -C "${workdir}" \
+            && bin="$(find "${workdir}" -type f -name openasr | head -n 1)" \
+            && test -n "${bin}" \
+            && cp "${bin}" "${workdir}/openasr" \
+            && chmod +x "${workdir}/openasr" \
+            && "${workdir}/openasr" --version; then
+            available=true
+          fi
+          echo "available=${available}" >> "${GITHUB_OUTPUT}"
+          if [ "${available}" != "true" ]; then
+            echo "published ${asset} is not usable; falling back to a local release build"
+          fi
       - uses: actions/checkout@v7
+        if: steps.published.outputs.available != 'true'
         with:
           submodules: recursive
       - name: Prepare pinned Linux build environment
+        if: steps.published.outputs.available != 'true'
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           openasr-ci-verify
       - uses: dtolnay/rust-toolchain@1.95.0
+        if: steps.published.outputs.available != 'true'
       - uses: Swatinem/rust-cache@v2
+        if: steps.published.outputs.available != 'true'
         with:
           shared-key: family-regression-ubuntu-latest
       - name: Build openasr CLI
+        if: steps.published.outputs.available != 'true'
         # The binary is shared with the case jobs via an artifact, and
         # GitHub's x86 runner fleet mixes CPU generations, so host-tuned ggml
         # kernels can SIGILL on a different case runner (same rule as
@@ -60,6 +111,12 @@ jobs:
         env:
           OPENASR_GGML_NATIVE: "0"
         run: cargo build --release -p openasr-cli
+      - name: Stage published release CLI
+        if: steps.published.outputs.available == 'true'
+        run: |
+          mkdir -p target/release
+          cp "${RUNNER_TEMP}/published-cli/openasr" target/release/openasr
+          chmod +x target/release/openasr
       - uses: actions/upload-artifact@v7
         with:
           name: openasr-cli-ubuntu-latest
@@ -71,17 +128,73 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 90
     steps:
+      - name: Try published release CLI
+        id: published
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET_SUFFIX: macos-arm64
+        run: |
+          set -uo pipefail
+          available=false
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          asset="openasr-${version}-${ASSET_SUFFIX}.tar.gz"
+          workdir="${RUNNER_TEMP}/published-cli"
+          mkdir -p "${workdir}"
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${tag}"
+          if json="$(curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${api}")" \
+            && asset_url="$(ASSET="${asset}" python3 -c '
+          import json, os, sys
+          rel = json.loads(sys.stdin.read())
+          name = os.environ["ASSET"]
+          for item in rel.get("assets", []):
+              if item.get("name") == name and item.get("url"):
+                  print(item["url"])
+                  raise SystemExit(0)
+          raise SystemExit(2)
+          ' <<<"${json}")" \
+            && curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              -o "${workdir}/${asset}" \
+              "${asset_url}" \
+            && tar -xzf "${workdir}/${asset}" -C "${workdir}" \
+            && bin="$(find "${workdir}" -type f -name openasr | head -n 1)" \
+            && test -n "${bin}" \
+            && cp "${bin}" "${workdir}/openasr" \
+            && chmod +x "${workdir}/openasr" \
+            && "${workdir}/openasr" --version; then
+            available=true
+          fi
+          echo "available=${available}" >> "${GITHUB_OUTPUT}"
+          if [ "${available}" != "true" ]; then
+            echo "published ${asset} is not usable; falling back to a local release build"
+          fi
       - uses: actions/checkout@v7
+        if: steps.published.outputs.available != 'true'
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@1.95.0
+        if: steps.published.outputs.available != 'true'
       - uses: Swatinem/rust-cache@v2
+        if: steps.published.outputs.available != 'true'
         with:
           shared-key: family-regression-macos-15
       - name: Build openasr CLI
+        if: steps.published.outputs.available != 'true'
         env:
           OPENASR_GGML_NATIVE: "0"
         run: cargo build --release -p openasr-cli
+      - name: Stage published release CLI
+        if: steps.published.outputs.available == 'true'
+        run: |
+          mkdir -p target/release
+          cp "${RUNNER_TEMP}/published-cli/openasr" target/release/openasr
+          chmod +x target/release/openasr
       - uses: actions/upload-artifact@v7
         with:
           name: openasr-cli-macos-15

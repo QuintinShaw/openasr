@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from pathlib import Path
+import json
 import re
 
 
@@ -14,7 +15,22 @@ CONSUMERS = {
     ".github/workflows/public-hf-e2e.yml": 1,
     ".github/workflows/release-core.yml": 1,
     ".github/workflows/serve-batch-parity.yml": 1,
+    # release-binaries.yml pins the CPU linux image once (see matrix JSON for
+    # the matching container field). It still apt-gets on arm64/musl/vulkan
+    # host legs and official CUDA/ROCm image extras, so it is not apt-free.
+    ".github/workflows/release-binaries.yml": 1,
 }
+
+APTGET_FORBIDDEN = {
+    ".github/workflows/ci.yml",
+    ".github/workflows/family-regression.yml",
+    ".github/workflows/public-hf-e2e.yml",
+    ".github/workflows/release-core.yml",
+    ".github/workflows/serve-batch-parity.yml",
+}
+
+LINUX_CI_MATRIX = ROOT / "tooling/release-manifest/release_binaries_matrix.json"
+LINUX_CI_MATRIX_TARGETS = ("x86_64-unknown-linux-gnu",)
 
 
 def main() -> None:
@@ -31,8 +47,29 @@ def main() -> None:
                 f"{relative}: expected {expected_count} reference(s) to {expected}, "
                 f"found {references}"
             )
-        if "apt-get" in text:
+        if relative in APTGET_FORBIDDEN and "apt-get" in text:
             failures.append(f"{relative}: routine consumer must not run apt-get")
+
+    matrix = json.loads(LINUX_CI_MATRIX.read_text(encoding="utf-8"))
+    if not isinstance(matrix, list):
+        failures.append(f"{LINUX_CI_MATRIX}: expected a JSON array")
+    else:
+        by_target = {
+            row.get("target"): row
+            for row in matrix
+            if isinstance(row, dict) and isinstance(row.get("target"), str)
+        }
+        for target in LINUX_CI_MATRIX_TARGETS:
+            row = by_target.get(target)
+            if row is None:
+                failures.append(f"{LINUX_CI_MATRIX}: missing release leg {target}")
+                continue
+            container = row.get("container")
+            if container != expected:
+                failures.append(
+                    f"{LINUX_CI_MATRIX}: {target} container must be {expected}, "
+                    f"found {container!r}"
+                )
 
     if failures:
         raise SystemExit("\n".join(failures))
