@@ -12,6 +12,7 @@ CONSUMERS = {
     ".github/workflows/ci.yml": 2,
     ".github/workflows/family-regression.yml": 1,
     ".github/workflows/public-hf-e2e.yml": 1,
+    ".github/workflows/release-core.yml": 1,
     ".github/workflows/serve-batch-parity.yml": 1,
 }
 

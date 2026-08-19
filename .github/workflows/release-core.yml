@@ -141,17 +141,10 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             asset: macos-arm64
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            asset: linux-x86_64
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
-        # ggml (build.rs -> CMake) plus ALSA headers for cpal.
-        run: sudo apt-get update && sudo apt-get install -y cmake libasound2-dev
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -183,9 +176,66 @@ jobs:
           path: dist/openasr-${{ needs.resolve.outputs.version }}-${{ matrix.asset }}.tar.gz
           if-no-files-found: error
 
+  build-linux:
+    name: Build x86_64-unknown-linux-gnu
+    needs: resolve
+    if: needs.resolve.outputs.should_release == 'true' && success()
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/quintinshaw/openasr-ci-linux@sha256:702284855863f1c6330eec503ac4570ff2cc844a958ceb7d2e2af5837633dcdc
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+      attestations: write
+    env:
+      OPENASR_GGML_NATIVE: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Prepare pinned Linux build environment
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          openasr-ci-verify
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-x86_64-unknown-linux-gnu
+      - name: Build release binary
+        run: cargo build --release -p openasr-cli
+      - name: Smoke release binary
+        run: |
+          ./target/release/openasr --version
+          ./target/release/openasr --help
+      - name: Package archive
+        run: |
+          set -euo pipefail
+          version="${{ needs.resolve.outputs.version }}"
+          stage="dist/openasr-${version}-linux-x86_64"
+          mkdir -p "${stage}"
+          cp target/release/openasr "${stage}/"
+          cp README.md LICENSE "${stage}/"
+          tar -czf "dist/openasr-${version}-linux-x86_64.tar.gz" \
+            -C dist "openasr-${version}-linux-x86_64"
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/openasr-${{ needs.resolve.outputs.version }}-linux-x86_64.tar.gz
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: openasr-x86_64-unknown-linux-gnu
+          path: dist/openasr-${{ needs.resolve.outputs.version }}-linux-x86_64.tar.gz
+          if-no-files-found: error
+
   release:
     name: Publish release
-    needs: [resolve, build]
+    needs: [resolve, build, build-linux]
     if: needs.resolve.outputs.should_release == 'true' && success()
     runs-on: ubuntu-latest
     env:
