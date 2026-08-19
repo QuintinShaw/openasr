@@ -1012,6 +1012,8 @@ jobs:
           if ("${{ matrix.distribution }}" -ne "plugin" -and "${{ matrix.provider }}" -ne "cuda" -and "${{ matrix.provider }}" -ne "hip" -and "${{ matrix.rust_target }}" -eq "") {
             & "$env:DIST_DIR\${{ matrix.binary_name }}" --version
             if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          if ("${{ matrix.distribution }}" -eq "host" -and "${{ matrix.rust_target }}" -eq "") {
             $doctor = & "$env:DIST_DIR\${{ matrix.binary_name }}" doctor 2>&1 | Out-String
             Write-Host $doctor
             if ($LASTEXITCODE -ne 0) { exit 1 }
