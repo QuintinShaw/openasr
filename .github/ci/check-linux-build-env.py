@@ -15,10 +15,6 @@ CONSUMERS = {
     ".github/workflows/public-hf-e2e.yml": 1,
     ".github/workflows/release-core.yml": 1,
     ".github/workflows/serve-batch-parity.yml": 1,
-    # release-binaries.yml pins the CPU linux image once (see matrix JSON for
-    # the matching container field). It still apt-gets on arm64/musl/vulkan
-    # host legs and official CUDA/ROCm image extras, so it is not apt-free.
-    ".github/workflows/release-binaries.yml": 1,
 }
 
 APTGET_FORBIDDEN = {
