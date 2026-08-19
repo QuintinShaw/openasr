@@ -183,13 +183,15 @@ maintainer machine; none of the signing steps runs in CI.
    above and `RELEASING.md`). This step is REQUIRED and not optional: the
    release is not signed until this script prints `SIGNED-AND-VERIFIED` and
    exits 0.
-2. **Attach exact hardware evidence** -- add one
-   `backend-hardware-evidence-*.json` release asset for every target intended
-   for activation. Each receipt binds the release entry, plugin digest, ABI
-   fingerprint, binary, model and workload; requires at least five fresh
-   processes; and proves FullDevice execution without CPU fallback. The 5 CUDA
-   and 11 HIP build matrix is artifact coverage, not a hardware-validation
-   claim.
+2. **Attach hardware evidence** -- add `backend-hardware-evidence-*.json`
+   release assets for each provider intended for activation. Schema v1 approves
+   one exact tested target. Schema v2 may approve an explicit provider matrix
+   from one representative target only when the receipt binds the tested plugin
+   plus the sorted target set and every target-scoped artifact fingerprint.
+   Both require at least five fresh processes and prove FullDevice execution
+   without CPU fallback. The 6 CUDA and 14 HIP build matrix is artifact coverage;
+   a schema v2 matrix receipt records an explicit compatibility policy and does
+   not claim that every target ran on hardware.
 3. **Prepare and deploy the signed backend catalog** -- run
    `scripts/prepare-windows-backend-catalog-release.sh v<version>` with the same
    local production signing seed, review and commit its five catalog/epoch
@@ -200,7 +202,7 @@ maintainer machine; none of the signing steps runs in CI.
    activation source.
 4. **Finalize the draft** -- run `scripts/finalize-core-release.sh v<version>`.
    It verifies the published manifest signature and requires the live signed
-   catalog target set to equal the exact hardware-approved subset before it can
+   catalog target set to equal the hardware-approved subset before it can
    publish the draft.
 5. **Sync to dl.openasr.org** -- see "dl.openasr.org sync" above
    (`b2_sync.py sync --version <version>`, uploading the Windows sidecar

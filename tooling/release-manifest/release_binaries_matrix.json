@@ -122,8 +122,7 @@
     "cuda_gpu_target": "120",
     "cuda_toolkit": "12.8.1",
     "min_driver_api": "12.8.0",
-    "vendor_owner": false,
-    "experimental": true,
+    "vendor_owner": true,
     "timeout": 180
   },
   {

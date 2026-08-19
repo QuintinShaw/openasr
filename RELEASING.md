@@ -114,16 +114,18 @@ production-signed catalog. Core 0.1.34 and later publish no legacy whole-engine
 Windows sidecars and no per-release `backends-manifest.json`. A draft is not
 made public until the signed catalog distribution plane is complete:
 
-1. Attach one `backend-hardware-evidence-*.json` receipt for every target that
-   is intended to become runtime-selectable. A receipt is accepted only when it
-   matches the exact release entry, plugin digest, ABI fingerprint, binary,
-   model and workload; proves at least five fresh processes; and records
-   FullDevice execution with no CPU fallback. Building a target is not hardware
-   evidence.
+1. Attach `backend-hardware-evidence-*.json` receipts for every provider that is
+   intended to become runtime-selectable. Schema v1 approves only the exact
+   tested target. Schema v2 may approve an explicit provider target matrix from
+   one representative target, but it binds the tested plugin digest plus the
+   complete target list and artifact fingerprint of every approved entry. Both
+   schemas require at least five fresh processes, FullDevice execution, and no
+   CPU fallback. Building a target is not hardware evidence, and a matrix receipt
+   is an explicit compatibility policy rather than a claim that every GPU ran.
 2. Run `scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z` locally with
-   the production catalog signing seed. It downloads and hashes all 5 CUDA and
-   11 HIP build artifacts, but merges only the exact target entries approved by
-   those receipts. It then bumps the catalog epoch and signs the full/public
+   the production catalog signing seed. It downloads and hashes all 6 CUDA and
+   14 HIP build artifacts, but merges only the target entries approved by those
+   receipts. It then bumps the catalog epoch and signs the full/public
    catalogs. Review, commit, and push those catalog files.
 3. Wait for `deploy-catalog.yml` to prove the signed public bytes are live.
 4. Run `scripts/finalize-core-release.sh vX.Y.Z`. It requires the live signed

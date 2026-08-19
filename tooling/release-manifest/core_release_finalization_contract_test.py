@@ -30,7 +30,7 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
     def test_finalizer_never_publishes_before_all_cuda_and_hip_target_entries(self) -> None:
         finalize = (ROOT / "scripts/finalize-core-release.sh").read_text(encoding="utf-8")
         self.assertIn("backend-pack-*.json", finalize)
-        self.assertIn('"${#cuda_entries[@]}" -ne 5', finalize)
+        self.assertIn('"${#cuda_entries[@]}" -ne 6', finalize)
         self.assertIn('"${#hip_entries[@]}" -ne 14', finalize)
         self.assertLess(finalize.index("verify-catalog"), finalize.index("--draft=false"))
 

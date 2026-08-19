@@ -34,15 +34,15 @@ backend_entries=("$workdir"/backend-pack-*.json)
 hardware_evidence=("$workdir"/backend-hardware-evidence-*.json)
 cuda_entries=("$workdir"/backend-pack-cuda-sm_*.json)
 hip_entries=("$workdir"/backend-pack-hip-gfx*.json)
-if [ "${#cuda_entries[@]}" -ne 5 ] || [ "${#hip_entries[@]}" -ne 14 ] || [ "${#backend_entries[@]}" -ne 19 ]; then
-  fail "release ${tag} must contain exactly 5 CUDA SM and 14 HIP gfx backend-pack metadata files"
+if [ "${#cuda_entries[@]}" -ne 6 ] || [ "${#hip_entries[@]}" -ne 14 ] || [ "${#backend_entries[@]}" -ne 20 ]; then
+  fail "release ${tag} must contain exactly 6 CUDA SM and 14 HIP gfx backend-pack metadata files"
 fi
 all_backend_entry_args=()
 for entry in "${backend_entries[@]}"; do
   all_backend_entry_args+=(--entry "$entry")
 done
 [ "${#hardware_evidence[@]}" -gt 0 ] \
-  || fail "release ${tag} has no exact real-hardware backend evidence"
+  || fail "release ${tag} has no real-hardware backend evidence"
 hardware_evidence_args=()
 for evidence in "${hardware_evidence[@]}"; do
   hardware_evidence_args+=(--evidence "$evidence")
@@ -52,7 +52,7 @@ python3 tooling/release-manifest/backend_hardware_evidence.py \
   > "$workdir/hardware-approved-entries.txt"
 mapfile -t approved_entries < "$workdir/hardware-approved-entries.txt"
 [ "${#approved_entries[@]}" -gt 0 ] \
-  || fail "release ${tag} has no backend entry approved by exact hardware evidence"
+  || fail "release ${tag} has no backend entry approved by hardware evidence"
 backend_entry_args=()
 for entry in "${approved_entries[@]}"; do
   backend_entry_args+=(--entry "$entry")

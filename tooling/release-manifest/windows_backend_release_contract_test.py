@@ -100,8 +100,8 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             "--require-single-target",
             "--out dist/catalog.backends.candidate.json",
             "--out dist/backend-plugin-hints.json",
-            'echo "backend-pack-cuda-sm_${sm}.json"',
-            'echo "backend-pack-hip-${gfx}.json"',
+            'names.append(f"backend-pack-cuda-sm_{row[\'cuda_gpu_target\']}.json")',
+            'names.append(f"backend-pack-hip-{row[\'hip_gpu_target\']}.json")',
             'echo "backend-plugin-hints.json"',
             'echo "catalog.backends.candidate.json"',
             "staging/catalog.backends.candidate.json",
@@ -155,7 +155,8 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         )
         self.assertEqual(sm120.get("cuda_toolkit"), "12.8.1")
         self.assertEqual(sm120.get("min_driver_api"), "12.8.0")
-        self.assertTrue(sm120.get("experimental"))
+        self.assertIsNot(sm120.get("experimental"), True)
+        self.assertTrue(sm120.get("vendor_owner"))
 
     def test_dynamic_matrix_is_selected_before_build_jobs_instantiate(self) -> None:
         self.assertIn("\n  select-matrix:\n", self.workflow)
@@ -200,7 +201,9 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
 
     def test_failed_aggregation_can_reuse_completed_build_artifacts(self) -> None:
         self.assertIn("source_run_id:", self.workflow)
-        self.assertIn("gh run download \"$SOURCE_RUN_ID\"", self.workflow)
+        self.assertIn("supplemental_source_run_id:", self.workflow)
+        self.assertIn("promote_cuda_targets:", self.workflow)
+        self.assertIn('gh run download "$run_id"', self.workflow)
         self.assertIn("inputs.source_run_id == ''", self.workflow)
         self.assertIn("inputs.source_run_id != ''", self.workflow)
         self.assertIn("Upload recovered assets to release", self.workflow)
@@ -219,7 +222,7 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             for row in self.matrix
             if row.get("provider") == "hip" and not row.get("experimental", False)
         ]
-        self.assertEqual(len(required_cuda), 5)
+        self.assertEqual(len(required_cuda), 6)
         self.assertEqual(len(required_hip), 14)
         self.assertEqual(
             [f'backend-pack-cuda-sm_{row["cuda_gpu_target"]}.json' for row in required_cuda],
@@ -229,13 +232,14 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
                 "backend-pack-cuda-sm_86.json",
                 "backend-pack-cuda-sm_89.json",
                 "backend-pack-cuda-sm_90.json",
+                "backend-pack-cuda-sm_120.json",
             ],
         )
         self.assertIn('not row.get("experimental", False)', self.workflow)
         self.assertIn('entry="dist/backend-pack-cuda-sm_${target}.json"', self.workflow)
         self.assertIn('entry="dist/backend-pack-hip-${target}.json"', self.workflow)
 
-    def test_full_matrix_has_exactly_one_vendor_owner_per_optional_vendor(self) -> None:
+    def test_full_matrix_has_one_vendor_owner_per_distinct_runtime(self) -> None:
         cuda_owners = [
             row["target"]
             for row in self.matrix
@@ -246,7 +250,13 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             for row in self.matrix
             if row.get("provider") == "hip" and row.get("vendor_owner") is True
         ]
-        self.assertEqual(cuda_owners, ["x86_64-pc-windows-msvc-cuda-sm_75-plugin"])
+        self.assertEqual(
+            cuda_owners,
+            [
+                "x86_64-pc-windows-msvc-cuda-sm_75-plugin",
+                "x86_64-pc-windows-msvc-cuda-sm_120-plugin",
+            ],
+        )
         self.assertEqual(hip_owners, ["x86_64-pc-windows-msvc-hip-gfx1030-plugin"])
 
     def test_diagnostic_only_target_temporarily_owns_vendor_assets(self) -> None:
