@@ -12,8 +12,9 @@ name: Release binaries
 #      this explicit call the full release matrix silently never builds.
 #   3. workflow_dispatch -- manual re-run/dry-run, with the same `ref` input
 #      as workflow_call so a maintainer can target an existing tag (e.g. to
-#      retry a failed platform leg, or dry-run the upload/completeness logic
-#      against an already-released tag without touching its assets).
+#      retry a failed platform leg, recover aggregation from a completed run's
+#      immutable artifacts, or dry-run the upload/completeness logic against an
+#      already-released tag without touching its assets).
 on:
   workflow_dispatch:
     inputs:
@@ -30,6 +31,10 @@ on:
         description: "Build only this matrix.target key (empty = all legs; for validating a single platform without the full matrix)"
         required: false
         default: ""
+      source_run_id:
+        description: "Reuse immutable build artifacts from this completed release-core run and execute only aggregation/upload/completeness"
+        required: false
+        default: ""
       cuda_gpu_targets:
         description: "Optional CUDA arch list for a diagnostic workflow_dispatch build (empty = release defaults)"
         required: false
@@ -38,6 +43,11 @@ on:
     inputs:
       ref:
         description: "Git ref (tag) to build"
+        required: false
+        type: string
+        default: ""
+      source_run_id:
+        description: "Existing release-core run whose immutable build artifacts should be finalized"
         required: false
         type: string
         default: ""
@@ -82,12 +92,14 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     needs: [select-matrix]
+    if: ${{ inputs.source_run_id == '' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout || 60 }}
     # Escape hatch for future legs whose toolchain story is still settling:
     # mark them `experimental: true` and they may fail without failing the
-    # run (their archives simply drop out of the artifact set) until they
-    # prove green. Every current leg has, so none carry the flag today.
+    # run (their archives simply drop out of the required artifact set) until
+    # they prove green. A successful experimental artifact is still checksummed
+    # and attested, but it does not silently enter the activation catalog.
     continue-on-error: ${{ matrix.experimental || false }}
     # Build legs only package and upload immutable workflow artifacts. Release
     # provenance is generated once, after the complete matrix is collected, so
@@ -1088,7 +1100,7 @@ jobs:
     # A single-target diagnostic dispatch must consume only that platform's
     # runner. The SDK artifact belongs to complete releases, not to a Windows
     # or Linux `only_target` probe.
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.only_target == '' }}
+    if: ${{ inputs.source_run_id == '' && (github.event_name != 'workflow_dispatch' || inputs.only_target == '') }}
     # Not part of the `build` matrix above: it is a macOS/iOS SDK artifact
     # (three arch slices assembled via `xcodebuild -create-xcframework`), not
     # a CLI binary, so it gets its own job with its own toolchain/packaging
@@ -1167,10 +1179,13 @@ jobs:
     # Never assemble, attest, or upload a partial release. Experimental matrix
     # legs already express their own continue-on-error policy; every required
     # build and the complete-release xcframework must have reached its upload.
-    if: ${{ !cancelled() && needs.select-matrix.result == 'success' && needs.build.result == 'success' && (needs.xcframework.result == 'success' || needs.xcframework.result == 'skipped') }}
+    if: ${{ !cancelled() && needs.select-matrix.result == 'success' && ((github.event_name == 'workflow_dispatch' && inputs.source_run_id != '' && inputs.only_target == '') || (inputs.source_run_id == '' && needs.build.result == 'success' && (needs.xcframework.result == 'success' || needs.xcframework.result == 'skipped'))) }}
     runs-on: ubuntu-latest
+    outputs:
+      recovery_tag: ${{ steps.upload_recovered.outputs.tag }}
     permissions:
-      contents: read
+      actions: read
+      contents: write
       id-token: write
       attestations: write
     steps:
@@ -1180,10 +1195,29 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
       - name: Download archives
+        if: inputs.source_run_id == ''
         uses: actions/download-artifact@v8
         with:
           path: staging
           merge-multiple: true
+      - name: Download archives from source run
+        if: inputs.source_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]] || {
+            echo "source_run_id must be a positive Actions run id" >&2
+            exit 1
+          }
+          status="$(gh run view "$SOURCE_RUN_ID" --repo "${{ github.repository }}" --json status --jq .status)"
+          [ "$status" = "completed" ] || {
+            echo "source run $SOURCE_RUN_ID is not completed" >&2
+            exit 1
+          }
+          mkdir -p staging
+          gh run download "$SOURCE_RUN_ID" --repo "${{ github.repository }}" --dir staging
       - name: Generate SHA256SUMS
         run: |
           set -euo pipefail
@@ -1197,13 +1231,42 @@ jobs:
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.only_target == ''
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          cuda_entries=(dist/backend-pack-cuda-sm_*.json)
-          hip_entries=(dist/backend-pack-hip-gfx*.json)
-          if [ "${#cuda_entries[@]}" -ne 5 ] || [ "${#hip_entries[@]}" -ne 14 ]; then
-            echo "expected 5 CUDA SM packs and 14 HIP gfx packs; found ${#cuda_entries[@]} and ${#hip_entries[@]}" >&2
+          mapfile -t cuda_targets < <(python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          matrix = json.loads(Path("tooling/release-manifest/release_binaries_matrix.json").read_text())
+          for row in matrix:
+              if row.get("provider") == "cuda" and not row.get("experimental", False):
+                  print(row["cuda_gpu_target"])
+          PY
+          )
+          mapfile -t hip_targets < <(python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          matrix = json.loads(Path("tooling/release-manifest/release_binaries_matrix.json").read_text())
+          for row in matrix:
+              if row.get("provider") == "hip" and not row.get("experimental", False):
+                  print(row["hip_gpu_target"])
+          PY
+          )
+          if [ "${#cuda_targets[@]}" -ne 5 ] || [ "${#hip_targets[@]}" -ne 14 ]; then
+            echo "release matrix must define exactly 5 required CUDA SM and 14 required HIP gfx targets" >&2
             exit 1
           fi
+          cuda_entries=()
+          for target in "${cuda_targets[@]}"; do
+            entry="dist/backend-pack-cuda-${target}.json"
+            [ -f "$entry" ] || { echo "missing required CUDA entry: $entry" >&2; exit 1; }
+            cuda_entries+=("$entry")
+          done
+          hip_entries=()
+          for target in "${hip_targets[@]}"; do
+            entry="dist/backend-pack-hip-${target}.json"
+            [ -f "$entry" ] || { echo "missing required HIP entry: $entry" >&2; exit 1; }
+            hip_entries+=("$entry")
+          done
           backend_entry_args=()
           for entry in "${cuda_entries[@]}" "${hip_entries[@]}"; do
             backend_entry_args+=(--entry "$entry")
@@ -1275,10 +1338,34 @@ jobs:
           path: dist/SHA256SUMS
           if-no-files-found: error
 
+      - name: Upload recovered assets to release
+        id: upload_recovered
+        if: inputs.source_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ref="${{ inputs.ref }}"
+          case "$ref" in
+            refs/tags/*) tag="${ref#refs/tags/}" ;;
+            v[0-9]*.*) tag="$ref" ;;
+            *) echo "recovery ref must be an existing vX.Y.Z tag" >&2; exit 1 ;;
+          esac
+          is_draft="$(gh release view "$tag" --repo "${{ github.repository }}" --json isDraft --jq .isDraft)"
+          [ "$is_draft" = "true" ] || {
+            echo "recovery only uploads to an existing draft release" >&2
+            exit 1
+          }
+          shopt -s nullglob
+          assets=(dist/*.tar.gz dist/*.zip dist/*.dll dist/backend-pack-*.json dist/backend-plugin-hints.json dist/catalog.backends.candidate.json dist/*.sha256 dist/SHA256SUMS)
+          [ "${#assets[@]}" -gt 0 ] || { echo "no recovered release assets found" >&2; exit 1; }
+          gh release upload "$tag" "${assets[@]}" --repo "${{ github.repository }}" --clobber
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
   upload-to-release:
     name: Upload assets to release
     needs: checksums
-    if: ${{ !cancelled() && needs.checksums.result == 'success' }}
+    if: ${{ !cancelled() && inputs.source_run_id == '' && needs.checksums.result == 'success' }}
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
@@ -1358,14 +1445,15 @@ jobs:
 
   verify-completeness:
     name: Verify release completeness
-    needs: upload-to-release
+    needs: [checksums, upload-to-release]
     # Single-leg dispatch runs (only_target set) intentionally produce just
     # one archive, not the full asset set this job asserts on -- skip the
     # completeness gate for those runs instead of failing it by design.
-    if: ${{ needs.upload-to-release.outputs.tag != '' && (github.event_name != 'workflow_dispatch' || github.event.inputs.only_target == '') }}
+    if: ${{ always() && !cancelled() && needs.checksums.result == 'success' && (needs.upload-to-release.result == 'success' || inputs.source_run_id != '') && (github.event_name != 'workflow_dispatch' || inputs.only_target == '') }}
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.checksums.outputs.recovery_tag || needs.upload-to-release.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1391,7 +1479,8 @@ jobs:
         # `experimental`, add its asset:ext here) once it proves green.
         run: |
           set -euo pipefail
-          tag="${{ needs.upload-to-release.outputs.tag }}"
+          tag="${RELEASE_TAG}"
+          [ -n "$tag" ] || { echo "release tag is empty" >&2; exit 1; }
           version="${OPENASR_VERSION}"
 
           TARGETS=(

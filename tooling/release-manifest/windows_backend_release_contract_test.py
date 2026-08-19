@@ -198,6 +198,31 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         self.assertIn("run: sleep 90", checksums)
         self.assertIn("needs.build.result == 'success'", checksums)
 
+    def test_failed_aggregation_can_reuse_completed_build_artifacts(self) -> None:
+        self.assertIn("source_run_id:", self.workflow)
+        self.assertIn("gh run download \"$SOURCE_RUN_ID\"", self.workflow)
+        self.assertIn("inputs.source_run_id == ''", self.workflow)
+        self.assertIn("inputs.source_run_id != ''", self.workflow)
+        self.assertIn("Upload recovered assets to release", self.workflow)
+        self.assertIn("recovery only uploads to an existing draft release", self.workflow)
+
+    def test_catalog_candidate_uses_only_release_blocking_plugin_targets(self) -> None:
+        required_cuda = [
+            row
+            for row in self.matrix
+            if row.get("provider") == "cuda" and not row.get("experimental", False)
+        ]
+        required_hip = [
+            row
+            for row in self.matrix
+            if row.get("provider") == "hip" and not row.get("experimental", False)
+        ]
+        self.assertEqual(len(required_cuda), 5)
+        self.assertEqual(len(required_hip), 14)
+        self.assertIn('not row.get("experimental", False)', self.workflow)
+        self.assertIn('entry="dist/backend-pack-cuda-${target}.json"', self.workflow)
+        self.assertIn('entry="dist/backend-pack-hip-${target}.json"', self.workflow)
+
     def test_full_matrix_has_exactly_one_vendor_owner_per_optional_vendor(self) -> None:
         cuda_owners = [
             row["target"]
@@ -269,8 +294,8 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             "\n  checksums:\n", 1
         )[0]
         self.assertIn(
-            "if: ${{ github.event_name != 'workflow_dispatch' || "
-            "inputs.only_target == '' }}",
+            "if: ${{ inputs.source_run_id == '' && "
+            "(github.event_name != 'workflow_dispatch' || inputs.only_target == '') }}",
             xcframework,
         )
 
