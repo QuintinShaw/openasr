@@ -31,6 +31,15 @@ def minimal_pe(marker: bytes, certificate: bytes = b"") -> bytes:
 
 
 class BackendCatalogTest(unittest.TestCase):
+    def test_json_writer_is_utf8_with_lf_on_every_host(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "catalog.json"
+            backend_catalog._write_utf8_lf(output, {"label": "粤语", "items": [1, 2]})
+            payload = output.read_bytes()
+            self.assertNotIn(b"\r", payload)
+            self.assertTrue(payload.endswith(b"\n"))
+            self.assertEqual(json.loads(payload), {"label": "粤语", "items": [1, 2]})
+
     def test_vendor_tree_digest_sorts_posix_paths_not_filesystem_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

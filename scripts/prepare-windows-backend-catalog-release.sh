@@ -141,7 +141,7 @@ from pathlib import Path
 path = Path(sys.argv[1])
 catalog = json.loads(path.read_text(encoding="utf-8"))
 catalog["generated_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-path.write_text(json.dumps(catalog, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+path.write_bytes((json.dumps(catalog, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
 PY
 
 old_epoch="$(tr -d '[:space:]' < model-registry/catalog.epoch)"

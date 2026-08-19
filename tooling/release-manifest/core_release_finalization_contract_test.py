@@ -26,6 +26,8 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("backend_hardware_evidence.py", prepare)
         self.assertIn("tr -d '\\r'", prepare)
         self.assertIn('source.read_text(encoding="utf-8")', publish)
+        self.assertIn("path.write_bytes", prepare)
+        self.assertIn("target.write_bytes", publish)
         self.assertLess(
             prepare.index("preflighting local catalog signer toolchain"),
             prepare.index("downloading backend entries"),

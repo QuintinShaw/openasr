@@ -119,7 +119,7 @@ projection = {
 language_labels = catalog.get("language_labels")
 if language_labels:
     projection["language_labels"] = language_labels
-target.write_text(json.dumps(projection, indent=2, sort_keys=False) + "\n")
+target.write_bytes((json.dumps(projection, indent=2, sort_keys=False) + "\n").encode("utf-8"))
 print(len(public_models))
 PY
 )"

@@ -21,6 +21,13 @@ class BackendCatalogError(ValueError):
     pass
 
 
+def _write_utf8_lf(path: Path, value: object) -> None:
+    """Write stable catalog JSON bytes on every host OS."""
+
+    payload = json.dumps(value, indent=2, ensure_ascii=False) + "\n"
+    path.write_bytes(payload.encode("utf-8"))
+
+
 def sha256_size(path: Path) -> tuple[str, int]:
     digest = hashlib.sha256()
     size = 0
@@ -202,7 +209,7 @@ def compile_bundled_manifest(
         "files": files,
     }
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _write_utf8_lf(out, result)
 
 
 def materialized_tree_sha256(root: Path, extract_subdir: str) -> str:
@@ -398,7 +405,7 @@ def merge_catalog(catalog_path: Path, entry_paths: list[Path], out: Path) -> Non
         identities[key] = backend_id
     catalog["backends"] = [by_id[key] for key in sorted(by_id)]
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(catalog, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _write_utf8_lf(out, catalog)
 
 
 def verify_release_assets(
@@ -668,7 +675,7 @@ def compile_update_hints(entry_paths: list[Path], out: Path) -> None:
         }
     }
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _write_utf8_lf(out, result)
 
 
 def main() -> int:
@@ -715,9 +722,7 @@ def main() -> int:
         if args.command == "compile":
             entry = compile_entry(args)
             args.out.parent.mkdir(parents=True, exist_ok=True)
-            args.out.write_text(
-                json.dumps(entry, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-            )
+            _write_utf8_lf(args.out, entry)
         elif args.command == "merge":
             merge_catalog(args.catalog, args.entry, args.out)
         elif args.command == "verify-assets":
