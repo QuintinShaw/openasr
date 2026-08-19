@@ -25,6 +25,10 @@ permissions:
   contents: read
   packages: read
 
+defaults:
+  run:
+    shell: bash
+
 env:
   CARGO_TERM_COLOR: always
   # Public moonshine-tiny q8_0 pack pinned to its immutable HF revision so the
