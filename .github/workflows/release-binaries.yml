@@ -89,16 +89,11 @@ jobs:
     # run (their archives simply drop out of the artifact set) until they
     # prove green. Every current leg has, so none carry the flag today.
     continue-on-error: ${{ matrix.experimental || false }}
-    # id-token/attestations for the build-provenance attestation step below
-    # (every leg, including experimental ones, since they still ship a
-    # release asset); this job only reads the repo and uploads a workflow
-    # artifact, so contents stays read-only (narrower than the
-    # workflow-level default, and within whatever release-core.yml's
-    # `binaries` job granted when this runs via workflow_call).
+    # Build legs only package and upload immutable workflow artifacts. Release
+    # provenance is generated once, after the complete matrix is collected, so
+    # a transparency-log outage can retry without rebuilding every GPU target.
     permissions:
       contents: read
-      id-token: write
-      attestations: write
     # Distributed binaries must be portable. build.rs auto-enables GGML_NATIVE
     # (-march=native) when host==target on x86, which is correct for local
     # build-and-run but would tune these released x86 binaries to the CI
@@ -1058,31 +1053,6 @@ jobs:
             --out "dist/${BACKEND_PACK_NAME}"
           cat "dist/${BACKEND_PACK_NAME}"
 
-      # Covers every leg that reaches this point, including `experimental:
-      # true` ones (windows-arm64, musl) -- they still ship a release asset,
-      # so they still get provenance. Only the packaged archive is attested,
-      # not the SHA256SUMS text file assembled later in `checksums`.
-      - name: Attest build provenance
-        uses: ./.github/actions/attest-build-provenance
-        with:
-          subject-path: dist/openasr-${{ env.OPENASR_VERSION }}-${{ matrix.asset }}.${{ matrix.archive_ext }}
-
-      - name: Attest backend catalog metadata
-        if: runner.os == 'Windows' && matrix.distribution == 'plugin'
-        uses: ./.github/actions/attest-build-provenance
-        with:
-          subject-path: dist/${{ env.BACKEND_PACK_NAME }}
-
-      # The vendor archive is also a shipped release asset (schema v2's
-      # `vendor_layers`), so it gets the same provenance attestation as the
-      # plugin artifact above -- only runs when the previous step actually
-      # produced one (cuda/hip legs).
-      - name: Attest build provenance (vendor archive)
-        if: env.VENDOR_ASSET_NAME != '' && env.VENDOR_OWNER == 'true'
-        uses: ./.github/actions/attest-build-provenance
-        with:
-          subject-path: dist/${{ env.VENDOR_ASSET_NAME }}
-
       # Bundles the plugin artifact path with the vendor archive path (cuda/
       # hip only) into one multi-line env var, so "Upload archive" below has a
       # single code path shared by every leg instead of a conditional `path:`
@@ -1129,13 +1099,11 @@ jobs:
     # ad-hoc dev-time builds off any branch; see the comment there.
     runs-on: macos-latest
     timeout-minutes: 60
-    # id-token/attestations for the build-provenance attestation step below;
-    # this job only reads the repo and uploads a workflow artifact, so
-    # contents stays read-only.
+    # This job only packages and uploads an immutable workflow artifact.
+    # Provenance is generated centrally by `checksums` with every release
+    # subject in one statement.
     permissions:
       contents: read
-      id-token: write
-      attestations: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1184,12 +1152,6 @@ jobs:
           (cd dist && shasum -a 256 "${archive}.zip" > "${archive}.zip.sha256")
           cat "dist/${archive}.zip.sha256"
 
-      # Only the zip is attested, not its .sha256 sidecar text file.
-      - name: Attest build provenance
-        uses: ./.github/actions/attest-build-provenance
-        with:
-          subject-path: dist/openasr-${{ env.OPENASR_VERSION }}-xcframework.zip
-
       - name: Upload xcframework archive
         uses: actions/upload-artifact@v7
         with:
@@ -1202,9 +1164,10 @@ jobs:
   checksums:
     name: Collect checksums
     needs: [select-matrix, build, xcframework]
-    # Sum whatever archives were produced even if one matrix leg failed, so a
-    # single flaky variant does not block checksums for the rest.
-    if: ${{ !cancelled() && needs.select-matrix.result == 'success' }}
+    # Never assemble, attest, or upload a partial release. Experimental matrix
+    # legs already express their own continue-on-error policy; every required
+    # build and the complete-release xcframework must have reached its upload.
+    if: ${{ !cancelled() && needs.select-matrix.result == 'success' && needs.build.result == 'success' && (needs.xcframework.result == 'success' || needs.xcframework.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1254,8 +1217,7 @@ jobs:
             --out dist/backend-plugin-hints.json
           python3 -m json.tool dist/catalog.backends.candidate.json >/dev/null
           python3 -m json.tool dist/backend-plugin-hints.json >/dev/null
-          sha256sum dist/catalog.backends.candidate.json >> dist/SHA256SUMS
-          sha256sum dist/backend-plugin-hints.json >> dist/SHA256SUMS
+          (cd dist && sha256sum catalog.backends.candidate.json backend-plugin-hints.json >> SHA256SUMS)
       - name: Upload backend catalog candidate
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.only_target == ''
         uses: actions/upload-artifact@v7
@@ -1267,11 +1229,45 @@ jobs:
             dist/backend-plugin-hints.json
             dist/catalog.backends.candidate.json
           if-no-files-found: error
-      - name: Attest backend plugin updater hints
-        if: github.event_name != 'workflow_dispatch' || github.event.inputs.only_target == ''
-        uses: ./.github/actions/attest-build-provenance
+      # Public repositories use Sigstore's public Rekor transparency log for
+      # GitHub artifact attestations. Keep that external service off the
+      # expensive matrix legs: one statement binds every final release subject
+      # listed in SHA256SUMS (actions/attest supports up to 1024 subjects).
+      # Each action invocation already has internal network retries; these
+      # bounded outer attempts cover a timeout after Rekor accepted an entry
+      # but before its inclusion record was fetched. A failed third attempt
+      # fails only this lightweight aggregation job, so "re-run failed jobs"
+      # never recompiles CUDA/HIP.
+      - name: Attest release subjects (attempt 1)
+        id: attest_release_1
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v4
         with:
-          subject-path: dist/backend-plugin-hints.json
+          subject-checksums: dist/SHA256SUMS
+
+      - name: Back off before attestation retry 2
+        if: steps.attest_release_1.outcome != 'success'
+        shell: bash
+        run: sleep 30
+
+      - name: Attest release subjects (attempt 2)
+        id: attest_release_2
+        if: steps.attest_release_1.outcome != 'success'
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - name: Back off before attestation retry 3
+        if: steps.attest_release_1.outcome != 'success' && steps.attest_release_2.outcome != 'success'
+        shell: bash
+        run: sleep 90
+
+      - name: Attest release subjects (attempt 3)
+        if: steps.attest_release_1.outcome != 'success' && steps.attest_release_2.outcome != 'success'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-checksums: dist/SHA256SUMS
       - name: Upload SHA256SUMS
         uses: actions/upload-artifact@v7
         with:

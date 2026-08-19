@@ -118,10 +118,10 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         self.assertIn("VENDOR_LAYER_KEY=cuda-runtime", self.workflow)
         self.assertIn("VENDOR_LAYER_KEY=rocm-runtime", self.workflow)
         self.assertIn("VENDOR_OWNER", self.workflow)
-        self.assertIn("env.VENDOR_OWNER == 'true'", self.workflow)
+        self.assertIn('[ "${VENDOR_OWNER:-false}" = "true" ]', self.workflow)
         self.assertIn("Resolve Windows binaries to sign", self.workflow)
         self.assertIn("$env:PLUGIN_ASSET_PATH", self.workflow)
-        self.assertIn("Attest backend catalog metadata", self.workflow)
+        self.assertIn("Attest release subjects (attempt 1)", self.workflow)
         self.assertIn("Verify optional backend PE contract", self.workflow)
         for symbol in (
             "ggml_backend_init",
@@ -172,9 +172,31 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         self.assertNotIn("uses: Swatinem/rust-cache@v2", self.workflow)
         self.assertIn("uses: ./.github/actions/install-cuda-toolkit-windows", self.workflow)
         self.assertIn("uses: ./.github/actions/free-disk-space", self.workflow)
-        self.assertNotIn("uses: actions/attest-build-provenance@v4", self.workflow)
-        self.assertIn("uses: ./.github/actions/attest-build-provenance", self.workflow)
+        self.assertNotIn("uses: ./.github/actions/attest-build-provenance", self.workflow)
+        self.assertEqual(
+            self.workflow.count("uses: actions/attest-build-provenance@v4"), 3
+        )
         self.assertIn("uses: ./.github/actions/rust-cache", self.workflow)
+
+    def test_release_provenance_is_aggregated_and_retryable(self) -> None:
+        build = self.workflow.split("\n  build:\n", 1)[1].split(
+            "\n  xcframework:\n", 1
+        )[0]
+        xcframework = self.workflow.split("\n  xcframework:\n", 1)[1].split(
+            "\n  checksums:\n", 1
+        )[0]
+        checksums = self.workflow.split("\n  checksums:\n", 1)[1].split(
+            "\n  upload-to-release:\n", 1
+        )[0]
+
+        self.assertNotIn("actions/attest", build)
+        self.assertNotIn("actions/attest", xcframework)
+        self.assertIn("subject-checksums: dist/SHA256SUMS", checksums)
+        self.assertEqual(checksums.count("subject-checksums: dist/SHA256SUMS"), 3)
+        self.assertIn("continue-on-error: true", checksums)
+        self.assertIn("run: sleep 30", checksums)
+        self.assertIn("run: sleep 90", checksums)
+        self.assertIn("needs.build.result == 'success'", checksums)
 
     def test_full_matrix_has_exactly_one_vendor_owner_per_optional_vendor(self) -> None:
         cuda_owners = [
