@@ -219,8 +219,18 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         ]
         self.assertEqual(len(required_cuda), 5)
         self.assertEqual(len(required_hip), 14)
+        self.assertEqual(
+            [f'backend-pack-cuda-sm_{row["cuda_gpu_target"]}.json' for row in required_cuda],
+            [
+                "backend-pack-cuda-sm_75.json",
+                "backend-pack-cuda-sm_80.json",
+                "backend-pack-cuda-sm_86.json",
+                "backend-pack-cuda-sm_89.json",
+                "backend-pack-cuda-sm_90.json",
+            ],
+        )
         self.assertIn('not row.get("experimental", False)', self.workflow)
-        self.assertIn('entry="dist/backend-pack-cuda-${target}.json"', self.workflow)
+        self.assertIn('entry="dist/backend-pack-cuda-sm_${target}.json"', self.workflow)
         self.assertIn('entry="dist/backend-pack-hip-${target}.json"', self.workflow)
 
     def test_full_matrix_has_exactly_one_vendor_owner_per_optional_vendor(self) -> None:

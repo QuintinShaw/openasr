@@ -1257,7 +1257,7 @@ jobs:
           fi
           cuda_entries=()
           for target in "${cuda_targets[@]}"; do
-            entry="dist/backend-pack-cuda-${target}.json"
+            entry="dist/backend-pack-cuda-sm_${target}.json"
             [ -f "$entry" ] || { echo "missing required CUDA entry: $entry" >&2; exit 1; }
             cuda_entries+=("$entry")
           done
