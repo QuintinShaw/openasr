@@ -19,32 +19,39 @@ concurrency:
   group: family-regression-${{ github.ref }}
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  packages: read
+
+defaults:
+  run:
+    shell: bash
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-cli:
-    name: Build CLI (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        # macos pinned (not macos-latest, which migrates to macOS 26 from
-        # 2026-06-15): the regression net's environment must not drift
-        # under the alias.
-        os: [ubuntu-latest, macos-15]
-    runs-on: ${{ matrix.os }}
+  build-cli-linux:
+    name: Build CLI (ubuntu-latest)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/quintinshaw/openasr-ci-linux@sha256:de3fd9f5a7d0b7ddce162ff9efda410a5b0c05252a63e29223d4b6d3728fb6d4
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - name: Install build dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake libasound2-dev
+      - name: Prepare pinned Linux build environment
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          openasr-ci-verify
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: family-regression-${{ matrix.os }}
+          shared-key: family-regression-ubuntu-latest
       - name: Build openasr CLI
         # The binary is shared with the case jobs via an artifact, and
         # GitHub's x86 runner fleet mixes CPU generations, so host-tuned ggml
@@ -55,13 +62,35 @@ jobs:
         run: cargo build --release -p openasr-cli
       - uses: actions/upload-artifact@v7
         with:
-          name: openasr-cli-${{ matrix.os }}
+          name: openasr-cli-ubuntu-latest
+          path: target/release/openasr
+          retention-days: 3
+
+  build-cli-macos:
+    name: Build CLI (macos-15)
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: family-regression-macos-15
+      - name: Build openasr CLI
+        env:
+          OPENASR_GGML_NATIVE: "0"
+        run: cargo build --release -p openasr-cli
+      - uses: actions/upload-artifact@v7
+        with:
+          name: openasr-cli-macos-15
           path: target/release/openasr
           retention-days: 3
 
   family:
     name: ${{ matrix.case.name }} (${{ matrix.os }})
-    needs: build-cli
+    needs: [build-cli-linux, build-cli-macos]
     strategy:
       # A single family failure must stay readable and must not cancel the
       # rest of the net.

@@ -8,6 +8,8 @@ not a product or release image.
 - Consumer workflows pin the verified GHCR digest, never a mutable tag.
 - The publish workflow verifies C/C++, CMake, ALSA, and Python/NumPy before a
   digest is eligible for consumers.
+- Each consumer runs the image-owned `openasr-ci-verify` contract and marks the
+  mounted checkout as a Git safe directory before invoking repository scripts.
 
 To change the dependency contract, update the Dockerfile in the same pull
 request. After the image workflow succeeds, copy its immutable digest into the

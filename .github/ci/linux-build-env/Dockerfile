@@ -36,7 +36,9 @@ RUN success=0; \
     test "${success}" -eq 1; \
     rm -rf /var/lib/apt/lists/*
 
+COPY --chmod=0755 verify.sh /usr/local/bin/openasr-ci-verify
+RUN openasr-ci-verify
+
 LABEL org.opencontainers.image.source="https://github.com/QuintinShaw/openasr" \
       org.opencontainers.image.description="Pinned Linux build environment for OpenASR CI" \
       org.opencontainers.image.licenses="Apache-2.0"
-

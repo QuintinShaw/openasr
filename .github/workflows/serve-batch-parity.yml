@@ -50,6 +50,11 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Prepare pinned Linux build environment
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          openasr-ci-verify
+
       - uses: dtolnay/rust-toolchain@1.95.0
 
       - uses: Swatinem/rust-cache@v2

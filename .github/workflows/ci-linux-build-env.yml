@@ -45,14 +45,7 @@ jobs:
       - name: Verify published image contract
         env:
           IMAGE: ghcr.io/quintinshaw/openasr-ci-linux@${{ steps.build.outputs.digest }}
-        run: |
-          set -euo pipefail
-          docker run --rm "$IMAGE" bash -euc '
-            cmake --version
-            cc --version
-            pkg-config --exists alsa
-            python3 -c "import numpy; print(numpy.__version__)"
-          '
+        run: docker run --rm "$IMAGE" openasr-ci-verify
 
       - name: Record immutable consumer reference
         env:
