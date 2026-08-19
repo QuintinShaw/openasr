@@ -269,7 +269,7 @@ jobs:
       # preinstalled toolchains this job never touches first. Same action
       # llama.cpp's ubuntu-rocm release job uses.
       - name: Free up disk space
-        if: runner.os == 'Linux' && contains(matrix.features, 'hip')
+        if: runner.os == 'Linux' && contains(matrix.features, 'hip') && !matrix.container
         uses: ./.github/actions/free-disk-space
         with:
           tool-cache: true
