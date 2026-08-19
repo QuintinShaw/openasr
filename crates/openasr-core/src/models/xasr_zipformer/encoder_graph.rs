@@ -6839,9 +6839,12 @@ mod tests {
         config.graph_size = 2_048;
         let mut runner = GgmlCpuGraphRunner::new(config)
             .expect("accelerated (Vulkan) ggml backend should initialize on the smoke runner");
-        assert_eq!(
-            ExecutionProvider::from_backend_name(&runner.backend_label()),
-            ExecutionProvider::Vulkan,
+        // `GgmlCpuGraphRunner::new` has already attested the Exact request
+        // against the initialized device's typed provider.  Check the shared
+        // runtime capability here; `backend_label()` is a composite diagnostic
+        // string (`Gpu:Vulkan`) and must never be parsed as a raw backend name.
+        assert!(
+            runner.backend_capabilities().is_vulkan(),
             "smoke test must execute on the exact Vulkan route"
         );
 
