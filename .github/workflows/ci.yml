@@ -41,7 +41,7 @@ jobs:
     name: Rust lint (fmt, clippy, catalog, python)
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/quintinshaw/openasr-ci-linux@sha256:de3fd9f5a7d0b7ddce162ff9efda410a5b0c05252a63e29223d4b6d3728fb6d4
+      image: ghcr.io/quintinshaw/openasr-ci-linux@sha256:4b479dd9ac4e1618cd693cbf3ec8fba762c6984beadfb5dff8ac105287da12d0
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -54,6 +54,8 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           openasr-ci-verify
+      - name: Linux build environment drift gate
+        run: python3 .github/ci/check-linux-build-env.py
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
@@ -92,7 +94,7 @@ jobs:
     # public, so hosted-runner minutes are free and unlimited).
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/quintinshaw/openasr-ci-linux@sha256:de3fd9f5a7d0b7ddce162ff9efda410a5b0c05252a63e29223d4b6d3728fb6d4
+      image: ghcr.io/quintinshaw/openasr-ci-linux@sha256:4b479dd9ac4e1618cd693cbf3ec8fba762c6984beadfb5dff8ac105287da12d0
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}

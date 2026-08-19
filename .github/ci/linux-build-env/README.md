@@ -13,5 +13,6 @@ not a product or release image.
 
 To change the dependency contract, update the Dockerfile in the same pull
 request. After the image workflow succeeds, copy its immutable digest into the
-consumer workflow declarations and let their ordinary tests validate the new
-environment.
+consumer workflow declarations and `.github/ci/linux-build-env.lock`, then let
+their ordinary tests validate the new environment. The lint job rejects partial
+digest updates and any reintroduced `apt-get` in routine consumers.

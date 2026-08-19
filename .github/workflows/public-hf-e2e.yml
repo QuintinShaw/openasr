@@ -43,7 +43,7 @@ jobs:
     name: Pull public pack and transcribe
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/quintinshaw/openasr-ci-linux@sha256:de3fd9f5a7d0b7ddce162ff9efda410a5b0c05252a63e29223d4b6d3728fb6d4
+      image: ghcr.io/quintinshaw/openasr-ci-linux@sha256:4b479dd9ac4e1618cd693cbf3ec8fba762c6984beadfb5dff8ac105287da12d0
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
