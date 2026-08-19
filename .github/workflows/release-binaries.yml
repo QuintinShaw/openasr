@@ -1222,7 +1222,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          find staging -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dll' -o -name 'backend-pack-*.json' \) -exec cp {} dist/ \;
+          find staging -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dll' -o -name '*.sha256' -o -name 'backend-pack-*.json' \) -exec cp {} dist/ \;
           cd dist
           sha256sum * > SHA256SUMS
           cat SHA256SUMS

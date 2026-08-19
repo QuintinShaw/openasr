@@ -205,6 +205,8 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         self.assertIn("inputs.source_run_id != ''", self.workflow)
         self.assertIn("Upload recovered assets to release", self.workflow)
         self.assertIn("recovery only uploads to an existing draft release", self.workflow)
+        self.assertIn("-name '*.sha256'", self.workflow)
+        self.assertIn("dist/*.sha256", self.workflow)
 
     def test_catalog_candidate_uses_only_release_blocking_plugin_targets(self) -> None:
         required_cuda = [
