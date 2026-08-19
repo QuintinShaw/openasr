@@ -11,3 +11,5 @@ cc --version
 hipcc --version
 pkg-config --exists alsa
 python3 --version
+test -e /opt/rocm/lib/cmake/hipblas/hipblas-config.cmake
+test -e /opt/rocm/lib/cmake/rocblas/rocblas-config.cmake

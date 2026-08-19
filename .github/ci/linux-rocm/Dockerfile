@@ -1,8 +1,7 @@
 # Linux ROCm CI build environment
 #
-# Wrapper around the official AMD ROCm 7.2.1 devel image. Release consumers in
-# this change still pin that official digest directly; switch them to the
-# published GHCR digest only after this workflow has produced one.
+# Wrapper around the official AMD ROCm 7.2.1 devel image plus hipBLAS/rocBLAS
+# (the official devel image has hipcc but not the BLAS cmake packages).
 #
 # Base digest verified 2026-08-20 with `docker buildx imagetools inspect`
 # rocm/dev-ubuntu-22.04:7.2.1:
@@ -30,7 +29,8 @@ RUN success=0; \
           python3-pip \
           unzip \
           xz-utils \
-          zstd; then \
+          zstd \
+          rocm-hip-sdk; then \
         success=1; \
         break; \
       fi; \
