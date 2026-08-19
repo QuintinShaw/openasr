@@ -194,6 +194,9 @@ jobs:
       attestations: write
     env:
       OPENASR_GGML_NATIVE: "0"
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7
         with:
