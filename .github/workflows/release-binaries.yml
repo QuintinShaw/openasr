@@ -219,32 +219,24 @@ jobs:
         include: ${{ fromJSON(needs.select-matrix.outputs.include) }}
 
     steps:
-      # Official CUDA/ROCm devel images do not ship git. actions/checkout then
-      # falls back to the REST zip API, which cannot fetch submodules. Clone
-      # with git after installing it; every other runner already has git.
-      - uses: actions/checkout@v7
-        if: ${{ !contains(matrix.container, 'nvidia/cuda') && !contains(matrix.container, 'rocm/') }}
-        with:
-          submodules: recursive
-          ref: ${{ inputs.ref || github.ref }}
-
-      - name: Install git and clone (official GPU image)
+      # Official CUDA/ROCm devel images do not ship git. Without it,
+      # actions/checkout falls back to the REST zip API and cannot fetch
+      # submodules. Install git first, mark the workspace safe, then use
+      # the same checkout as every other leg.
+      - name: Install git (official GPU image)
         if: ${{ contains(matrix.container, 'nvidia/cuda') || contains(matrix.container, 'rocm/') }}
-        env:
-          REPO_REF: ${{ inputs.ref || github.sha }}
-          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -y
           apt-get install -y --no-install-recommends git ca-certificates
-          git clone --depth 1 \
-            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" .
-          git fetch --depth 1 origin "${REPO_REF}"
-          git checkout --force FETCH_HEAD
-          git submodule update --init --recursive --depth 1
-          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          git config --global --add safe.directory '*'
+
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Resolve workspace version
         shell: bash
