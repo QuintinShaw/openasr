@@ -1,0 +1,31 @@
+name: Setup cbindgen
+description: Restore ~/.cargo/bin/cbindgen from cache, otherwise cargo-install it.
+
+runs:
+  using: composite
+  steps:
+    - name: Cache cbindgen
+      id: cache
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/bin/cbindgen
+          ~/.cargo/bin/cbindgen.exe
+        key: cbindgen-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+
+    - name: Install cbindgen
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if command -v cbindgen >/dev/null 2>&1; then
+          cbindgen --version
+          exit 0
+        fi
+        cargo install cbindgen --locked
+        cbindgen --version
+
+    - name: Verify cached cbindgen
+      if: steps.cache.outputs.cache-hit == 'true'
+      shell: bash
+      run: cbindgen --version

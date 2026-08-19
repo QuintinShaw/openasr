@@ -83,8 +83,7 @@ jobs:
           python3 -m unittest discover -s tooling/family-regression -p 'test_*.py'
           python3 -m unittest discover -s tooling/release-manifest -p '*_test.py'
       - run: cargo clippy --all-targets -- -D warnings
-      - name: Install cbindgen
-        run: cargo install cbindgen --locked
+      - uses: ./.github/actions/setup-cbindgen
       - name: FFI header drift gate
         run: scripts/generate-ffi-header.sh --check
 
