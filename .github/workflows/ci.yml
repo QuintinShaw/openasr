@@ -41,7 +41,7 @@ jobs:
     name: Rust lint (fmt, clippy, catalog, python)
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/quintinshaw/openasr-ci-linux@sha256:4b479dd9ac4e1618cd693cbf3ec8fba762c6984beadfb5dff8ac105287da12d0
+      image: ghcr.io/quintinshaw/openasr-ci-linux@sha256:702284855863f1c6330eec503ac4570ff2cc844a958ceb7d2e2af5837633dcdc
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -94,7 +94,7 @@ jobs:
     # public, so hosted-runner minutes are free and unlimited).
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/quintinshaw/openasr-ci-linux@sha256:4b479dd9ac4e1618cd693cbf3ec8fba762c6984beadfb5dff8ac105287da12d0
+      image: ghcr.io/quintinshaw/openasr-ci-linux@sha256:702284855863f1c6330eec503ac4570ff2cc844a958ceb7d2e2af5837633dcdc
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
