@@ -39,7 +39,7 @@ change.
 ### ROCm 7.2.1
 
 - Consumer pin: `.github/ci/linux-rocm.lock`
-  (`ghcr.io/quintinshaw/openasr-ci-linux-rocm@sha256:fc83ea99…`).
+  (`ghcr.io/quintinshaw/openasr-ci-linux-rocm@sha256:98ed2646…`).
 - Wrapper source: `.github/ci/linux-rocm/`, published by
   `.github/workflows/ci-linux-rocm-env.yml` on its own path changes only.
 - Base: official

@@ -79,7 +79,7 @@ class SelectReleaseMatrixTests(unittest.TestCase):
         )
         self.assertEqual(
             rows["x86_64-unknown-linux-gnu-rocm"]["container"],
-            "ghcr.io/quintinshaw/openasr-ci-linux-rocm@sha256:fc83ea993728463fc6666139304fc1221d4b34327179af223102459f73193212",
+            "ghcr.io/quintinshaw/openasr-ci-linux-rocm@sha256:98ed26463af7dfd6bb4a3235145a914531fcd2c2a7c3ea8422cc8c9ad30b5917",
         )
         self.assertNotIn("container", rows["x86_64-unknown-linux-gnu-vulkan"])
         self.assertNotIn("container", rows["aarch64-unknown-linux-gnu"])
