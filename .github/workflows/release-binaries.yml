@@ -110,6 +110,11 @@ jobs:
     if: ${{ inputs.source_run_id == '' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout || 60 }}
+    # Container images (CUDA/ROCm wrappers, official devel) default to sh.
+    # Windows steps that need PowerShell set shell: pwsh explicitly.
+    defaults:
+      run:
+        shell: bash
     # Escape hatch for future legs whose toolchain story is still settling:
     # mark them `experimental: true` and they may fail without failing the
     # run (their archives simply drop out of the required artifact set) until
