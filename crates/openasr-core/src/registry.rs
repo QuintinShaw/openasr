@@ -1914,10 +1914,10 @@ pub fn resolve_compatible_catalog_backend_pull_for_driver(
 /// there (`ggml-backend-reg.cpp` treats a null/empty minimum as no floor).
 /// `probe_exact_backend_plugin_candidate` / `load_exact_backend_plugin` apply
 /// this at the FFI boundary so a caller cannot pass the catalog floor through.
-pub(crate) fn live_backend_driver_floor<'a>(
+pub(crate) fn live_backend_driver_floor(
     vendor: CatalogBackendVendor,
-    min_driver_api: Option<&'a str>,
-) -> Option<&'a str> {
+    min_driver_api: Option<&str>,
+) -> Option<&str> {
     match vendor {
         CatalogBackendVendor::Hip => None,
         _ => min_driver_api,
