@@ -134,7 +134,8 @@ use super::graph_config::{
     whisper_encoder_prelude_graph_config, whisper_runtime_graph_config,
 };
 use super::mel::{
-    WHISPER_CHANNELS, WHISPER_SAMPLE_RATE_HZ, whisper_mel_features_from_prepared_audio_v0,
+    WHISPER_CHANNELS, WHISPER_HOP_LENGTH, WHISPER_SAMPLE_RATE_HZ,
+    whisper_mel_features_from_prepared_audio_v0,
 };
 use super::runtime_contract::{WhisperGgmlExecutionMetadata, validate_whisper_execution_metadata};
 #[cfg(test)]
@@ -156,13 +157,14 @@ use crate::models::decode_policy_component_registry::{
 use crate::models::decode_token_history::{
     build_longform_token_history_carry, context_window_budget,
 };
+use crate::models::seq2seq_dtw_alignment::dtw_align_token_frames;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
     Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeStopReason,
 };
 use crate::models::seq2seq_word_timestamps::{
-    Seq2SeqTokenTime, seq2seq_word_timestamps_from_generated_tokens,
-    seq2seq_word_timestamps_from_token_times,
+    Seq2SeqTokenSpan, Seq2SeqTokenTime, seq2seq_word_timestamps_from_generated_tokens,
+    seq2seq_word_timestamps_from_token_spans, seq2seq_word_timestamps_from_token_times,
 };
 
 const WHISPER_STREAMING_EXECUTOR_ID: &str = "whisper-ggml-snapshot-streaming-executor-v1";
@@ -5820,6 +5822,70 @@ fn whisper_cross_attention_word_timestamps(
     // withheld rather than misattributed by position.
     let probabilities_aligned = generated_probabilities.len() == token_alignments.len();
     let duration = audio_duration_seconds.max(0.0);
+    let decode_text = |token_ids: &[u32]| tokenizer.decode_text_token_ids(token_ids);
+
+    // Prefer a DTW pass over the per-token cross-attention rows. DTW assigns
+    // every token an ordered, non-overlapping span of frames, so word spans
+    // follow where each token's attention sits instead of smearing the
+    // timeline at the midpoint between smeared centers of mass.
+    let frame_resolution = token_alignments
+        .first()
+        .map(|a| a.frame_probs.len())
+        .unwrap_or(0);
+    if frame_resolution > 0 {
+        // The cross-attention window is the padded encoder window at a fixed
+        // 0.02s/frame (160-sample hop doubled through two strided convs, then
+        // downsampled 2x by the encoder: 1500 frames for a 30s window), so
+        // frames map to absolute wall-clock time from clip start, NOT a fraction
+        // of `duration`. Stretching the axis to `[0, duration]` (as a
+        // center-of-mass midpoint map does) would compress every timestamp for
+        // any clip shorter than the 30s window, which is the common case.
+        let seconds_per_frame = 2.0_f32 * WHISPER_HOP_LENGTH as f32 / WHISPER_SAMPLE_RATE_HZ as f32;
+        // Restrict the DTW frame axis to the audio actually present. Whisper
+        // zero-pads short clips to the full window, so without this slice the
+        // monotone path is forced to end on the last padding frame and dumps
+        // the trailing tokens across the silence, stretching the final words.
+        // This mirrors the reference's `weights[..., start: end]`, where `end`
+        // is the segment's decoded end token (here, the clip duration, since a
+        // no-timestamps window decode emits no explicit end token).
+        let audio_end_frame = (duration / seconds_per_frame).ceil() as usize;
+        let dtw_frame_end = audio_end_frame.clamp(1, frame_resolution);
+        let dtw_frame_start = 0usize;
+        let attention: Vec<Vec<f32>> = token_alignments
+            .iter()
+            .map(|alignment| alignment.frame_probs[dtw_frame_start..dtw_frame_end].to_vec())
+            .collect();
+        if let Some(spans) = dtw_align_token_frames(&attention) {
+            let token_spans: Vec<Seq2SeqTokenSpan> = token_alignments
+                .iter()
+                .enumerate()
+                .zip(spans.iter())
+                .map(|((index, alignment), span)| Seq2SeqTokenSpan {
+                    token_id: alignment.token_id,
+                    // Add the slice offset back so frames are window-absolute.
+                    frame_start: span.frame_start.saturating_add(dtw_frame_start),
+                    frame_end: span.frame_end.saturating_add(dtw_frame_start),
+                    probability: probabilities_aligned.then(|| generated_probabilities[index]),
+                })
+                .collect();
+            return seq2seq_word_timestamps_from_token_spans(
+                &token_spans,
+                0.0,
+                duration,
+                seconds_per_frame,
+                BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+                &decode_text,
+            )
+            .map_err(
+                |error| WhisperGgmlExecutorError::DecoderInvalidTokenDecode {
+                    reason: format!("whisper DTW word timestamp token decode failed: {error}"),
+                },
+            );
+        }
+    }
+
+    // Degenerate input (empty/ragged attention) has no alignment; fall back to
+    // the per-token center of mass.
     let token_times = token_alignments
         .iter()
         .enumerate()
@@ -5836,7 +5902,7 @@ fn whisper_cross_attention_word_timestamps(
         0.0,
         duration,
         BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
-        &|token_ids| tokenizer.decode_text_token_ids(token_ids),
+        &decode_text,
     )
     .map_err(
         |error| WhisperGgmlExecutorError::DecoderInvalidTokenDecode {
@@ -5876,6 +5942,14 @@ fn cross_attention_center_seconds(
     )
 }
 
+/// The encoder-frame span the DTW path should align onto, derived from the
+/// explicit `<|start|>` / `<|end|>` timestamp tokens Whisper decodes around
+/// each segment. Returns `(start_frame, end_frame)` (end exclusive). The
+/// start comes from the last timestamp token at or before the first text
+/// token; the end from the first timestamp token at or after the last text
+/// token. Missing or non-monotone bounds degrade to the full window, which is
+/// the correct behavior for single-window or `.en` decodes that emit no
+/// timestamp tokens.
 struct WhisperGreedyDecodeStepRunnerAdapter<'a> {
     execution: &'a WhisperGgmlExecutionMetadata,
     decoder_weights: &'a WhisperDecoderWeightSeam,

@@ -13,6 +13,23 @@ pub(crate) struct Seq2SeqTokenTime {
     pub probability: Option<f32>,
 }
 
+/// Per-token frame span for DTW-aligned word reconstruction. `frame_start`
+/// and `frame_end` are frame indices (end exclusive) within one window of
+/// `frame_resolution` frames. Because DTW output tiles the window
+/// monotonically, `frame_end` of one token equals `frame_start` of the next,
+/// so a word's span (first token's start to last token's end) is monotone by
+/// construction. A span with equal start and end is an empty subword whose
+/// edge resolves to that frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Seq2SeqTokenSpan {
+    pub token_id: u32,
+    pub frame_start: usize,
+    pub frame_end: usize,
+    /// Softmax probability of this token at its decode step, when captured.
+    /// A word's confidence is the mean over its contributing tokens.
+    pub probability: Option<f32>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct WordCenter {
     word: String,
@@ -70,6 +87,10 @@ impl WordAccumulator {
             center_seconds,
             confidence,
         })
+    }
+
+    fn last_char(&self) -> Option<char> {
+        self.text.chars().next_back()
     }
 }
 
@@ -181,7 +202,7 @@ pub(crate) fn seq2seq_word_timestamps_from_token_times<E>(
                 contributed_to_current = false;
                 continue;
             }
-            if han_script_boundary_before(ch, &current) {
+            if han_script_boundary_before(ch, current.last_char()) {
                 if let Some(word) = current.finish(segment_start, segment_end) {
                     words.push(word);
                 }
@@ -205,12 +226,225 @@ pub(crate) fn seq2seq_word_timestamps_from_token_times<E>(
     ))
 }
 
+/// Reconstruct word timestamps from per-token DTW frame spans.
+///
+/// A word spans from its first contributing token's `frame_start` to its last
+/// contributing token's `frame_end`. Frame indices are **window-absolute**
+/// (the caller has already added the DTW slice offset back), so a frame maps
+/// to a fixed wall-clock position `frame * seconds_per_frame` rather than a
+/// fraction of the segment. This mirrors the reference DTW, whose frame axis is
+/// the padded encoder window (0.02s/frame for Whisper) and is clamped to the
+/// real audio end: stretching the window to `[segment_start, segment_end]`
+/// (as a center-of-mass midpoint map does) would compress every timestamp when
+/// the encoded window is shorter than a full segment, which is the case for any
+/// clip shorter than the window since the frontend zero-pads it to a fixed
+/// length. Because DTW spans tile the window monotonically, the resulting
+/// timeline is monotone and words never overlap, with each span following where
+/// its attention sits rather than a smeared center-of-mass midpoint. The
+/// character-to-word folding is shared with the center-of-mass path; a word's
+/// confidence is the average soft-probability over its contributing tokens.
+pub(crate) fn seq2seq_word_timestamps_from_token_spans<E>(
+    token_spans: &[Seq2SeqTokenSpan],
+    segment_start: f32,
+    segment_end: f32,
+    seconds_per_frame: f32,
+    postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind,
+    decode_text_token_ids: &dyn Fn(&[u32]) -> Result<String, E>,
+) -> Result<Vec<WordTimestamp>, E> {
+    let (segment_start, segment_end) = sanitize_segment_span(segment_start, segment_end);
+    if token_spans.is_empty() || !(seconds_per_frame > 0.0) {
+        return Ok(Vec::new());
+    }
+    let duration = segment_end;
+    let frame_to_time = |frame: usize| frame as f32 * seconds_per_frame;
+
+    // Pass 1: incremental decode into one (text, frame span) piece per token,
+    // mirroring the center-of-mass path so the word stream matches the
+    // postprocessed transcript.
+    struct SpanPiece {
+        text: String,
+        frame_start: usize,
+        frame_end: usize,
+        probability: Option<f32>,
+    }
+    let mut pieces = Vec::with_capacity(token_spans.len());
+    let mut full_decoded = String::new();
+    let mut prefix_tokens = Vec::with_capacity(token_spans.len());
+    let mut previous_decoded = String::new();
+    for span in token_spans {
+        let frame_end = span.frame_end.max(span.frame_start);
+        prefix_tokens.push(span.token_id);
+        let decoded = decode_text_token_ids(&prefix_tokens)?;
+        let piece = match decoded.strip_prefix(&previous_decoded) {
+            Some(rest) => rest.to_string(),
+            None => {
+                let shared = common_prefix_len(&previous_decoded, &decoded);
+                decoded[shared..].to_string()
+            }
+        };
+        previous_decoded = decoded;
+        if piece.is_empty() {
+            continue;
+        }
+        full_decoded.push_str(&piece);
+        pieces.push(SpanPiece {
+            text: piece,
+            frame_start: span.frame_start,
+            frame_end,
+            probability: span.probability,
+        });
+    }
+    if pieces.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let transcript_byte_start = seq2seq_transcript_byte_start(postprocess_kind, &full_decoded);
+
+    // Pass 2: fold transcript characters into words, carrying the DTW frame
+    // span of the first and last token that contributed to each word.
+    let mut words = Vec::new();
+    let mut current = SpanWordAccumulator::new();
+    let mut byte_offset = 0usize;
+    for piece in &pieces {
+        let mut contributed_to_current = false;
+        for ch in piece.text.chars() {
+            let ch_offset = byte_offset;
+            byte_offset += ch.len_utf8();
+            if ch_offset < transcript_byte_start {
+                continue;
+            }
+            if ch.is_whitespace() {
+                if let Some(word) = current.finish() {
+                    words.push(word);
+                }
+                contributed_to_current = false;
+                continue;
+            }
+            if han_script_boundary_before(ch, current.last_char()) {
+                if let Some(word) = current.finish() {
+                    words.push(word);
+                }
+                contributed_to_current = false;
+            }
+            current.push_char(
+                ch,
+                piece.frame_start,
+                piece.frame_end,
+                piece.probability,
+                &mut contributed_to_current,
+            );
+        }
+    }
+    if let Some(word) = current.finish() {
+        words.push(word);
+    }
+
+    // Monotone, non-overlapping timeline clamped to the real audio. DTW spans
+    // already tile the window (the first word's begin lands on the decoded
+    // start-token frame, the last content word's end on the end-token frame),
+    // so the clamps only trim a span that runs past the clip end -- the
+    // frontend zero-pads the tail of the window, so the final word must not
+    // stretch into that silence.
+    let mut timestamps = Vec::with_capacity(words.len());
+    let mut previous_end = segment_start;
+    for word in &words {
+        let raw_start = frame_to_time(word.frame_start).clamp(segment_start, duration);
+        let start = raw_start.max(previous_end);
+        let end = frame_to_time(word.frame_end).clamp(start, duration);
+        previous_end = end;
+        timestamps.push(WordTimestamp {
+            word: word.word.clone(),
+            start,
+            end,
+            confidence: word.confidence,
+        });
+    }
+    Ok(timestamps)
+}
+
+/// Word built from a DTW frame span: `frame_start` is its first contributing
+/// token's start frame, `frame_end` its last contributing token's end frame.
+#[derive(Debug, Clone)]
+struct SpannedWord {
+    word: String,
+    frame_start: usize,
+    frame_end: usize,
+    confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SpanWordAccumulator {
+    text: String,
+    frame_start: Option<usize>,
+    frame_end: Option<usize>,
+    probability_sum: f32,
+    probability_count: usize,
+}
+
+impl SpanWordAccumulator {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn last_char(&self) -> Option<char> {
+        self.text.chars().next_back()
+    }
+
+    /// Fold one content character into the current word. The word's frame
+    /// span is the union of its contributing tokens' spans, and its
+    /// confidence is the mean over those tokens' captured probabilities
+    /// (one contribution per token, as in the center-of-mass accumulator).
+    fn push_char(
+        &mut self,
+        ch: char,
+        frame_start: usize,
+        frame_end: usize,
+        probability: Option<f32>,
+        contributed: &mut bool,
+    ) {
+        self.text.push(ch);
+        if !*contributed {
+            if self.frame_start.is_none() {
+                self.frame_start = Some(frame_start);
+            }
+            let existing_end = self.frame_end.unwrap_or(0);
+            self.frame_end = Some(existing_end.max(frame_end));
+            if let Some(probability) = probability {
+                self.probability_sum += probability;
+                self.probability_count = self.probability_count.saturating_add(1);
+            }
+            *contributed = true;
+        }
+    }
+
+    fn finish(&mut self) -> Option<SpannedWord> {
+        let word = self.text.trim().to_string();
+        let (Some(frame_start), Some(frame_end)) = (self.frame_start, self.frame_end) else {
+            *self = Self::default();
+            return None;
+        };
+        if word.is_empty() {
+            *self = Self::default();
+            return None;
+        }
+        let confidence = (self.probability_count > 0)
+            .then(|| (self.probability_sum / self.probability_count as f32).clamp(0.0, 1.0));
+        *self = Self::default();
+        Some(SpannedWord {
+            word,
+            frame_start,
+            frame_end,
+            confidence,
+        })
+    }
+}
+
 /// Word boundary in unspaced CJK text: a Han ideograph always starts a new
 /// word, and an alphanumeric character after a Han-final word starts a new
 /// word ("用Rust写" -> 用 / Rust / 写). Trailing CJK punctuation stays attached
 /// to the ideograph it follows ("好，" is one word).
-fn han_script_boundary_before(ch: char, current: &WordAccumulator) -> bool {
-    let Some(last) = current.text.chars().next_back() else {
+fn han_script_boundary_before(ch: char, previous_char: Option<char>) -> bool {
+    let Some(last) = previous_char else {
         return false;
     };
     if is_han_ideograph(ch) {
@@ -443,5 +677,157 @@ mod tests {
         assert_eq!(texts, ["你", "好，", "用", "Rust", "写", "代", "码"]);
         assert!(words.windows(2).all(|pair| pair[0].end <= pair[1].start));
         assert!((words[3].confidence.unwrap() - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dtw_spans_drive_word_boundaries() {
+        let pieces = |ids: &[u32]| {
+            Ok::<_, std::convert::Infallible>(
+                ids.iter()
+                    .map(|id| match id {
+                        1 => "open",
+                        2 => "asr",
+                        3 => " rocks",
+                        other => panic!("unexpected token {other}"),
+                    })
+                    .collect::<String>(),
+            )
+        };
+        // 0.5s/frame. "openasr" spans tokens 0..2 (frames 0..4 -> 0..2s),
+        // "rocks" token 2 (frames 4..8 -> 2..4s). Confidence averages the
+        // contributing tokens.
+        let token_spans = vec![
+            Seq2SeqTokenSpan {
+                token_id: 1,
+                frame_start: 0,
+                frame_end: 2,
+                probability: Some(0.9),
+            },
+            Seq2SeqTokenSpan {
+                token_id: 2,
+                frame_start: 2,
+                frame_end: 4,
+                probability: Some(0.5),
+            },
+            Seq2SeqTokenSpan {
+                token_id: 3,
+                frame_start: 4,
+                frame_end: 8,
+                probability: None,
+            },
+        ];
+
+        let words = seq2seq_word_timestamps_from_token_spans(
+            &token_spans,
+            0.0,
+            4.0,
+            0.5,
+            BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+            &pieces,
+        )
+        .unwrap();
+
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].word, "openasr");
+        assert_eq!(words[1].word, "rocks");
+        assert_eq!(words[0].start, 0.0);
+        assert_eq!(words[0].end, 2.0);
+        assert_eq!(words[1].start, 2.0);
+        assert_eq!(words[1].end, 4.0);
+        assert!((words[0].confidence.unwrap() - 0.7).abs() < 1e-6);
+        assert_eq!(words[1].confidence, None);
+    }
+
+    #[test]
+    fn dtw_spans_keep_cjk_monotone() {
+        let pieces = |ids: &[u32]| {
+            Ok::<_, std::convert::Infallible>(
+                ids.iter()
+                    .map(|id| match id {
+                        1 => "你好",
+                        2 => "世界",
+                        other => panic!("unexpected token {other}"),
+                    })
+                    .collect::<String>(),
+            )
+        };
+        let token_spans = vec![
+            Seq2SeqTokenSpan {
+                token_id: 1,
+                frame_start: 0,
+                frame_end: 4,
+                probability: Some(0.9),
+            },
+            Seq2SeqTokenSpan {
+                token_id: 2,
+                frame_start: 4,
+                frame_end: 8,
+                probability: Some(0.8),
+            },
+        ];
+
+        let words = seq2seq_word_timestamps_from_token_spans(
+            &token_spans,
+            0.0,
+            4.0,
+            0.5,
+            BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+            &pieces,
+        )
+        .unwrap();
+
+        let texts = words.iter().map(|w| w.word.as_str()).collect::<Vec<_>>();
+        assert_eq!(texts, ["你", "好", "世", "界"]);
+        assert!(words.windows(2).all(|pair| pair[0].end <= pair[1].start));
+        assert_eq!(words[0].start, 0.0);
+        assert_eq!(words[2].start, 2.0);
+    }
+
+    #[test]
+    fn dtw_spans_clamp_to_clip_duration() {
+        let pieces = |ids: &[u32]| {
+            Ok::<_, std::convert::Infallible>(
+                ids.iter()
+                    .map(|id| match id {
+                        1 => "hey",
+                        2 => " now",
+                        other => panic!("unexpected token {other}"),
+                    })
+                    .collect::<String>(),
+            )
+        };
+        // 0.5s/frame, clip is only 2.0s long but the attention window stretches
+        // to frame 8 (4.0s). The second word's span runs past the clip and must
+        // clamp to 2.0s; the first word (frames 0..2) stays at 0..1s.
+        let token_spans = vec![
+            Seq2SeqTokenSpan {
+                token_id: 1,
+                frame_start: 0,
+                frame_end: 2,
+                probability: None,
+            },
+            Seq2SeqTokenSpan {
+                token_id: 2,
+                frame_start: 4,
+                frame_end: 8,
+                probability: None,
+            },
+        ];
+
+        let words = seq2seq_word_timestamps_from_token_spans(
+            &token_spans,
+            0.0,
+            2.0,
+            0.5,
+            BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+            &pieces,
+        )
+        .unwrap();
+
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].start, 0.0);
+        assert_eq!(words[0].end, 1.0);
+        assert_eq!(words[1].start, 2.0);
+        assert_eq!(words[1].end, 2.0);
     }
 }

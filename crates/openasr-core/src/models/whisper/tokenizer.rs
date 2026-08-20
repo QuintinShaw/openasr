@@ -311,7 +311,7 @@ impl WhisperTokenizer {
         // so drop any token id at or beyond that first timestamp id. The `.en`
         // no-timestamps decode never selects ids in this range, leaving those
         // transcripts byte-identical.
-        let first_timestamp_token_id = self.notimestamps_token_id.and_then(|id| id.checked_add(1));
+        let first_timestamp_token_id = self.first_timestamp_token_id();
         let mut bytes = Vec::new();
         for token_id in token_ids {
             if self.special_token_ids.contains(token_id) {
@@ -428,6 +428,14 @@ impl WhisperTokenizer {
 
     pub fn no_timestamps_token_id(&self) -> Option<u32> {
         self.notimestamps_token_id
+    }
+
+    /// The id of the first Whisper timestamp token (`<|0.00|>`). Whisper places
+    /// the 1501 timestamp tokens (`<|0.00|>` ... `<|30.00|>`) in a contiguous
+    /// range immediately after `<|notimestamps|>`, so the first one is
+    /// `notimestamps + 1`. `None` if the pack lacks `<|notimestamps|>`.
+    pub fn first_timestamp_token_id(&self) -> Option<u32> {
+        self.notimestamps_token_id.and_then(|id| id.checked_add(1))
     }
 
     pub fn initial_prompt_token_ids(&self) -> Result<Vec<u32>, NativeAsrError> {

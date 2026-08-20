@@ -74,6 +74,7 @@ pub(crate) mod safetensors_json;
 pub(crate) mod sensevoice;
 pub(crate) mod sentencepiece_word_timestamps;
 pub(crate) mod seq2seq_decoder_state;
+pub(crate) mod seq2seq_dtw_alignment;
 pub(crate) mod seq2seq_greedy_decode;
 mod seq2seq_serve_batch;
 pub(crate) mod seq2seq_word_timestamps;
