@@ -2778,6 +2778,9 @@ mod model_session_capacity_error_tests {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
+
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;

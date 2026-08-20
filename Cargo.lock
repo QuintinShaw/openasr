@@ -1641,8 +1641,17 @@ dependencies = [
 name = "openasr-client"
 version = "0.1.35"
 dependencies = [
+ "futures-util",
  "openasr-core",
+ "openasr-server",
+ "rcgen",
  "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
 ]
 
 [[package]]
@@ -1683,9 +1692,12 @@ version = "0.1.35"
 dependencies = [
  "hound",
  "libc",
+ "openasr-client",
  "openasr-core",
+ "openasr-server",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -55,6 +55,12 @@ use openasr_core::{
 /// packs, and remove one. See the module for how it keeps the "no silent
 /// download" and "verification stays in the open core" boundaries.
 mod market;
+mod remote;
+
+pub use remote::{
+    OpenAsrRemoteClient, OpenAsrRemotePairingStatus, OpenAsrRemoteRealtime,
+    OpenAsrRemoteRealtimeEventCallback, OpenAsrRemoteSecretStore,
+};
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
@@ -137,6 +143,10 @@ pub enum OpenAsrStatus {
     PullCanceled = 8,
     /// The process-owned native execution services could not be constructed.
     InitializationFailed = 9,
+    /// An opt-in remote (LAN) pairing, transcription, or realtime call failed:
+    /// TLS/TOFU pin mismatch, pairing rejection, transport error, or a remote
+    /// HTTP/WebSocket error. Consult [`openasr_last_error_message`].
+    RemoteFailed = 10,
 }
 
 /// PCM sample encoding accepted by [`openasr_transcribe_pcm`].
@@ -1278,6 +1288,14 @@ fn write_wav_16khz_mono_f32(path: &std::path::Path, samples: &[f32]) -> Result<(
     writer
         .finalize()
         .map_err(|error| format!("finalize wav: {error}"))
+}
+
+pub(crate) fn result_from_text(text: String) -> OpenAsrResult {
+    OpenAsrResult {
+        text: cstring_lossy(text),
+        language: None,
+        segments: Vec::new(),
+    }
 }
 
 fn build_result(transcription: Transcription, with_segments: bool) -> OpenAsrResult {

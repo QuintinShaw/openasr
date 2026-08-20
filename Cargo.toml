@@ -25,6 +25,7 @@ authors = ["OpenASR contributors"]
 # [workspace.package] via `version.workspace = true`, so a release bump only
 # ever touches that one field (see scripts/bump-version.sh, RELEASING.md).
 openasr-core = { path = "crates/openasr-core" }
+openasr-client = { path = "crates/openasr-client" }
 openasr-server = { path = "crates/openasr-server" }
 openasr-system-audio = { path = "crates/openasr-system-audio" }
 anyhow = "1.0"

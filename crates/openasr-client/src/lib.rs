@@ -1,14 +1,20 @@
-//! Client-side trust primitives for connecting to a remote OpenASR compute server.
+//! Client-side trust primitives and the LAN remote-compute protocol.
 //!
 //! This crate is intentionally open source. It owns the code that decides
-//! **which** TLS server certificate a client will trust — trust-on-first-use
-//! (TOFU) fingerprint pinning. Keeping this auditable, rather than buried inside
-//! an unauditable client, is the whole point of OpenASR's client trust model
-//! (the same reason Signal's client is open): a privacy product whose
+//! **which** TLS server certificate a client will trust -- trust-on-first-use
+//! (TOFU) fingerprint pinning -- and the pairing / transcription / realtime
+//! protocol that uses that pin. Keeping this auditable, rather than buried
+//! inside an unauditable client, is the whole point of OpenASR's client trust
+//! model (the same reason Signal's client is open): a privacy product whose
 //! "where does my audio go?" decision is unauditable is worthless.
 //!
-//! The desktop (or any other client) links this crate and never reimplements the
-//! trust decision itself.
+//! Observed vs expected fingerprints and safety codes are compared here.
+//! Host apps (Swift/TS) display the safety code; they must not reimplement
+//! `observed == expected`.
+//!
+//! LAN only: callers pass a manual IP/port. There is no Bonjour, relay, or
+//! cloud fallback. Non-loopback servers already fail closed without TLS +
+//! pairing; this client never skips TLS.
 
 use std::sync::{Arc, Mutex};
 
@@ -18,6 +24,18 @@ use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
+
+mod client;
+mod error;
+mod secret;
+mod tls;
+
+pub use client::{
+    ClientStatus, PairingPoll, PairingStart, RealtimeSession, RealtimeWorker, RemoteClient,
+    TranscriptionResponse, spawn_realtime_worker,
+};
+pub use error::ClientError;
+pub use secret::{MemorySecretStore, SecretStore, credential_account};
 
 /// Normalize a certificate fingerprint to lowercase hex with all non-hex
 /// characters stripped, so user-pasted fingerprints (with colons, spaces, or
@@ -33,6 +51,12 @@ pub fn normalize_fingerprint(fingerprint: &str) -> String {
 /// A rustls [`ServerCertVerifier`] that authenticates a server purely by its
 /// SHA-256 certificate fingerprint: pinned to an expected value if one is given,
 /// otherwise trust-on-first-use (the first observed fingerprint is recorded).
+///
+/// Hostname / SAN matching is intentionally not a hard failure. Self-signed
+/// OpenASR certs are commonly issued for `127.0.0.1` / `localhost` even when
+/// the daemon binds a LAN IP or `0.0.0.0`. The pin (and the signature check
+/// proving key possession) is the identity; treating a SAN mismatch as fatal
+/// would make TOFU unusable on LAN.
 #[derive(Debug, Default)]
 pub struct TofuServerVerifier {
     fingerprint: Mutex<Option<String>>,

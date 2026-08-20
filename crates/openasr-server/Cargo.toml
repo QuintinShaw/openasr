@@ -10,6 +10,9 @@ rust-version.workspace = true
 authors.workspace = true
 
 [features]
+## Loopback TLS+pairing fixture for dependent crates' integration tests.
+## Not a product API; do not enable in release builds.
+test-support = []
 ## Accelerator backends — forwarded 1:1 to openasr-core so `serve --backend
 ## native` can run on GPU when the binary is built with the matching feature.
 cuda = ["openasr-core/cuda"]
