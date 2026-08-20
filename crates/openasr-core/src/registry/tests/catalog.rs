@@ -2541,12 +2541,7 @@ fn catalog_parser_rejects_non_target_scoped_gpu_backends() {
 
 #[test]
 fn catalog_parser_rejects_noncanonical_cuda_targets() {
-    let valid_cuda = valid_hip_backend_json()
-        .replace("\"id\": \"hip-radeon\"", "\"id\": \"cuda-geforce\"")
-        .replace("\"vendor\": \"hip\"", "\"vendor\": \"cuda\"")
-        .replace("AMD ROCm (HIP)", "NVIDIA CUDA")
-        .replace("gfx1200", "sm_89")
-        .replace("ggml-hip.dll", "ggml-cuda.dll");
+    let valid_cuda = valid_cuda_backend_json();
     assert!(parse_model_catalog(&catalog_json_with_backends(&valid_cuda), "fixture").is_ok());
 
     for targets in [
@@ -2795,30 +2790,71 @@ fn compatible_gpu_backend_resolution_defends_against_targetless_in_memory_catalo
     ));
 }
 
+fn valid_cuda_backend_json() -> String {
+    valid_hip_backend_json()
+        .replace("\"id\": \"hip-radeon\"", "\"id\": \"cuda-geforce\"")
+        .replace("\"vendor\": \"hip\"", "\"vendor\": \"cuda\"")
+        .replace("AMD ROCm (HIP)", "NVIDIA CUDA")
+        .replace("gfx1200", "sm_89")
+        .replace("ggml-hip.dll", "ggml-cuda.dll")
+}
+
 #[test]
-fn compatible_backend_resolution_requires_a_parseable_driver_at_or_above_the_floor() {
+fn compatible_cuda_backend_resolution_requires_a_parseable_driver_at_or_above_the_floor() {
     let mut catalog = parse_model_catalog(
-        &catalog_json_with_backends(&valid_hip_backend_json()),
+        &catalog_json_with_backends(&valid_cuda_backend_json()),
         "fixture",
     )
     .unwrap();
-    catalog.backends[0].min_driver_api = Some("24.10.1".to_string());
+    catalog.backends[0].min_driver_api = Some("12.8.0".to_string());
     let host = catalog.backends[0].host_abi.clone();
 
-    for driver in [None, Some(""), Some("unknown"), Some("24.10.0")] {
+    for driver in [None, Some(""), Some("unknown"), Some("12.7.0")] {
         assert!(matches!(
             resolve_compatible_catalog_backend_pull_for_driver(
                 &catalog,
-                CatalogBackendVendor::Hip,
+                CatalogBackendVendor::Cuda,
                 &host,
-                Some("gfx1200"),
+                Some("sm_89"),
                 driver,
             ),
             Err(BackendResolutionError::NoCompatibleBackend { .. })
         ));
     }
 
-    for driver in [Some("24.10.1"), Some("24.10.1.0"), Some("25.1")] {
+    for driver in [Some("12.8.0"), Some("12.8.0.0"), Some("13.0")] {
+        assert_eq!(
+            resolve_compatible_catalog_backend_pull_for_driver(
+                &catalog,
+                CatalogBackendVendor::Cuda,
+                &host,
+                Some("sm_89"),
+                driver,
+            )
+            .unwrap()
+            .backend_id,
+            "cuda-geforce"
+        );
+    }
+}
+
+#[test]
+fn compatible_hip_backend_resolution_ignores_bundled_runtime_driver_floor() {
+    let mut catalog = parse_model_catalog(
+        &catalog_json_with_backends(&valid_hip_backend_json()),
+        "fixture",
+    )
+    .unwrap();
+    catalog.backends[0].min_driver_api = Some("7.2.0".to_string());
+    let host = catalog.backends[0].host_abi.clone();
+
+    for driver in [
+        None,
+        Some(""),
+        Some("unknown"),
+        Some("7.1.51"),
+        Some("7.2.0"),
+    ] {
         assert_eq!(
             resolve_compatible_catalog_backend_pull_for_driver(
                 &catalog,
@@ -2832,4 +2868,20 @@ fn compatible_backend_resolution_requires_a_parseable_driver_at_or_above_the_flo
             "hip-radeon"
         );
     }
+}
+
+#[test]
+fn live_backend_driver_floor_drops_only_hip_catalog_minimum() {
+    assert_eq!(
+        live_backend_driver_floor(CatalogBackendVendor::Hip, Some("7.2.0")),
+        None
+    );
+    assert_eq!(
+        live_backend_driver_floor(CatalogBackendVendor::Cuda, Some("12.8.0")),
+        Some("12.8.0")
+    );
+    assert_eq!(
+        live_backend_driver_floor(CatalogBackendVendor::Vulkan, Some("1.3.0")),
+        Some("1.3.0")
+    );
 }
