@@ -21,6 +21,56 @@
 /// before alignment. Matches whisper-timestamped's default of 9.
 const DTW_MEDIAN_FILTER_WIDTH: usize = 9;
 
+/// Padding, in frames, left around the detected speech band so a token whose
+/// single strongest frame sits just inside an edge still owns its full onset
+/// and offset. 10 frames is 0.2s at Whisper's 0.02s/frame.
+const SPEECH_BAND_MARGIN_FRAMES: usize = 10;
+
+/// Frame index band the DTW path should align onto, derived from where each
+/// token's cross-attention actually peaks. Returns `[start, end)` (end
+/// exclusive) within `frame_count`, or `None` when the rows are empty or
+/// non-finite and no band can be computed (the caller then falls back to the
+/// clip-duration window).
+///
+/// whisper-timestamped bounds its DTW to the decoded `<|start|>`/`<|end|>`
+/// timestamp tokens (`weights[..., start: end]`). OpenASR decodes
+/// `<|notimestamps|>`, so it has no such tokens. The closest signal remains the
+/// cross-attention: every decoded token is a real spoken syllable, and its
+/// head-averaged attention concentrates on the frames where that syllable
+/// sounds, so the band from the earliest to the latest per-token peak brackets
+/// the spoken text. This is robust to the softmax diffuse floor (each row still
+/// spreads a small mass over every frame, so a summed envelope never fully
+/// drops at the tail) and to trailing non-speech or leading silence the model
+/// ignored, because neither hosts a per-token peak. Without this the monotone
+/// DTW path runs the whole padded window, stretching the first word's start to
+/// frame 0 and the last word's end to the window tail.
+pub(crate) fn speech_frame_bounds(attention: &[Vec<f32>]) -> Option<(usize, usize)> {
+    let frame_count = attention.first()?.len();
+    if frame_count == 0 {
+        return None;
+    }
+    let mut earliest: Option<usize> = None;
+    let mut latest: Option<usize> = None;
+    for row in attention.iter().filter(|row| row.len() == frame_count) {
+        let (dominant_frame, &dominant_value) = row
+            .iter()
+            .enumerate()
+            .filter(|&(_, &value)| value.is_finite())
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))?;
+        if dominant_value > 0.0 {
+            earliest =
+                Some(earliest.map_or(dominant_frame, |existing| existing.min(dominant_frame)));
+            latest = Some(latest.map_or(dominant_frame, |existing| existing.max(dominant_frame)));
+        }
+    }
+    let earliest = earliest?;
+    let latest = latest?;
+    let margin = SPEECH_BAND_MARGIN_FRAMES;
+    let start = earliest.saturating_sub(margin);
+    let end = (latest + 1).saturating_add(margin).min(frame_count);
+    Some((start, end.max(start + 1)))
+}
+
 /// Per-token frame span within one audio window. `frame_end` is exclusive so
 /// ordered tokens always satisfy `span[k].frame_end == span[k + 1].frame_start`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,5 +366,67 @@ mod tests {
         let attention = vec![vec![0.125; frames]; 4];
         let spans = dtw_align_token_frames(&attention).unwrap();
         assert_tiled(&spans, frames);
+    }
+
+    /// A row that concentrates its attention on a single dominant `peak` frame
+    /// (its argmax) with a diffuse floor elsewhere, like a real cross-attention
+    /// row. `peak` must be strictly the argmax so the band tracks it exactly.
+    fn attention_peaking_at(frames: usize, peak: usize) -> Vec<f32> {
+        let mut row = vec![0.001_f32; frames];
+        row[peak] = 1.0;
+        let total: f32 = row.iter().sum();
+        row.iter().map(|v| v / total).collect()
+    }
+
+    #[test]
+    fn speech_bounds_bracket_the_token_peaks() {
+        let frames = 120;
+        // Two tokens peaking at frames 30 and 90: the band must cover both
+        // peaks plus a small margin, and drop the leading/trailing padding.
+        let attention = vec![
+            attention_peaking_at(frames, 30),
+            attention_peaking_at(frames, 90),
+        ];
+        let (start, end) = speech_frame_bounds(&attention).unwrap();
+        // Band = [first_peak - margin, last_peak + 1 + margin) = [20, 101).
+        assert_eq!((start, end), (30 - 10, 90 + 1 + 10), "band {start}..{end}");
+        assert!(start > 0, "band should drop the leading padding");
+        assert!(end < frames, "band should drop the trailing padding");
+    }
+
+    #[test]
+    fn speech_bounds_stop_before_the_ignored_tail() {
+        // Mirrors the real clip: tokens attend only in the first third, then a
+        // loud non-speech tail the model ignored (no per-token peak there). The
+        // band must stop well before the tail rather than run to frame_count.
+        let frames = 300;
+        let attention = vec![
+            attention_peaking_at(frames, 40),
+            attention_peaking_at(frames, 90),
+            attention_peaking_at(frames, 140),
+        ];
+        let (start, end) = speech_frame_bounds(&attention).unwrap();
+        assert!(
+            end <= 160,
+            "band bled toward the ignored tail: end={end} of {frames}"
+        );
+        assert_eq!(start, 40 - 10);
+    }
+
+    #[test]
+    fn speech_bounds_all_zero_attention_is_none() {
+        assert!(speech_frame_bounds(&[vec![0.0; 16], vec![0.0; 16]]).is_none());
+        assert!(speech_frame_bounds(&[]).is_none());
+        assert!(speech_frame_bounds(&[vec![]]).is_none());
+    }
+
+    #[test]
+    fn speech_bounds_single_token_uses_margin() {
+        // One token mid-window: the band is its peak plus the margin on either
+        // side, clamped to the window.
+        let frames = 200;
+        let attention = vec![attention_peaking_at(frames, 100)];
+        let (start, end) = speech_frame_bounds(&attention).unwrap();
+        assert_eq!((start, end), (90, 111));
     }
 }

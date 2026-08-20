@@ -157,7 +157,7 @@ use crate::models::decode_policy_component_registry::{
 use crate::models::decode_token_history::{
     build_longform_token_history_carry, context_window_budget,
 };
-use crate::models::seq2seq_dtw_alignment::dtw_align_token_frames;
+use crate::models::seq2seq_dtw_alignment::{dtw_align_token_frames, speech_frame_bounds};
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
     Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeStopReason,
@@ -5841,16 +5841,29 @@ fn whisper_cross_attention_word_timestamps(
         // center-of-mass midpoint map does) would compress every timestamp for
         // any clip shorter than the 30s window, which is the common case.
         let seconds_per_frame = 2.0_f32 * WHISPER_HOP_LENGTH as f32 / WHISPER_SAMPLE_RATE_HZ as f32;
-        // Restrict the DTW frame axis to the audio actually present. Whisper
-        // zero-pads short clips to the full window, so without this slice the
-        // monotone path is forced to end on the last padding frame and dumps
-        // the trailing tokens across the silence, stretching the final words.
-        // This mirrors the reference's `weights[..., start: end]`, where `end`
-        // is the segment's decoded end token (here, the clip duration, since a
-        // no-timestamps window decode emits no explicit end token).
-        let audio_end_frame = (duration / seconds_per_frame).ceil() as usize;
-        let dtw_frame_end = audio_end_frame.clamp(1, frame_resolution);
-        let dtw_frame_start = 0usize;
+        let full_window = token_alignments
+            .iter()
+            .map(|alignment| alignment.frame_probs.clone())
+            .collect::<Vec<Vec<f32>>>();
+        // Restrict the DTW frame axis to where the tokens' cross-attention actually
+        // lands. The model emits `<|notimestamps|>` so there is no decoded
+        // `<|start|>`/`<|end|>` to slice `weights[..., start: end]` on (as
+        // whisper-timestamped does); the closest signal is the attention
+        // envelope itself, which ignores leading silence and trailing
+        // non-speech the model did not attend to. Without this the monotone
+        // path runs the whole padded window, stretching the first word's start
+        // to frame 0 and the last word's end to the window tail.
+        let (dtw_frame_start, dtw_frame_end) = speech_frame_bounds(&full_window).map_or_else(
+            // No usable attention: fall back to the encoded clip duration so
+            // the last word still owns the real audio end.
+            move || {
+                (
+                    0usize,
+                    ((duration / seconds_per_frame).ceil() as usize).clamp(1, frame_resolution),
+                )
+            },
+            |(start, end)| (start, end.clamp(start + 1, frame_resolution)),
+        );
         let attention: Vec<Vec<f32>> = token_alignments
             .iter()
             .map(|alignment| alignment.frame_probs[dtw_frame_start..dtw_frame_end].to_vec())
