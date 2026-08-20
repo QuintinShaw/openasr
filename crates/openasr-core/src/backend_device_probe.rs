@@ -2,11 +2,17 @@
 //! is downloaded.
 //!
 //! CUDA is queried through the OS-provided driver DLL. HIP uses only the
-//! signed, content-addressed ROCr/HIP runtime objects prepared from the public
+//! signed, content-addressed HIP runtime objects prepared from the public
 //! backend catalog. Neither path links a GPU runtime into the neutral host.
 
 use crate::{CatalogBackendVendor, pull::PreparedBackendRuntimeObjects};
 use thiserror::Error;
+
+#[cfg(any(windows, test))]
+use std::{fs::File, io::Read as _, path::PathBuf};
+
+#[cfg(any(windows, test))]
+use sha2::{Digest as _, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BackendDeviceProof {
@@ -111,18 +117,86 @@ fn canonical_hip_target(name: &str) -> Option<String> {
         .then(|| format!("gfx{digits}"))
 }
 
+/// Windows HIP redistributes `amdhip64.dll` or a versioned sibling such as
+/// `amdhip64_7.dll`. The match is case-insensitive and requires a purely
+/// numeric version suffix when present.
+#[cfg(any(windows, test))]
+fn is_windows_hip_runtime_dll_name(file_name: &str) -> bool {
+    let name = file_name.to_ascii_lowercase();
+    if name == "amdhip64.dll" {
+        return true;
+    }
+    let Some(stem) = name.strip_prefix("amdhip64_") else {
+        return false;
+    };
+    let Some(digits) = stem.strip_suffix(".dll") else {
+        return false;
+    };
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+#[cfg(any(windows, test))]
+fn find_verified_hip_runtime_library(
+    runtime: &PreparedBackendRuntimeObjects,
+) -> Result<PathBuf, String> {
+    let mut matches = runtime.files.iter().filter(|file| {
+        file.path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_windows_hip_runtime_dll_name)
+    });
+    let proof = matches.next().ok_or_else(|| {
+        "verified HIP runtime omitted amdhip64.dll or amdhip64_<version>.dll".to_string()
+    })?;
+    if matches.next().is_some() {
+        return Err("verified HIP runtime declared more than one HIP runtime DLL".to_string());
+    }
+    let path = proof
+        .path
+        .canonicalize()
+        .map_err(|error| format!("verified HIP runtime file could not be resolved: {error}"))?;
+    let inside_verified_root = runtime.dependency_dirs.iter().any(|directory| {
+        directory
+            .canonicalize()
+            .is_ok_and(|directory| path.starts_with(directory))
+    });
+    if !inside_verified_root {
+        return Err("verified HIP runtime file escaped its content object".to_string());
+    }
+    let metadata = path
+        .metadata()
+        .map_err(|error| format!("verified HIP runtime metadata failed: {error}"))?;
+    if !metadata.is_file() || metadata.len() != proof.size_bytes {
+        return Err("verified HIP runtime size changed before loading".to_string());
+    }
+    let mut file = File::open(&path)
+        .map_err(|error| format!("verified HIP runtime could not be reopened: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("verified HIP runtime rehash failed: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if !actual.eq_ignore_ascii_case(&proof.sha256) {
+        return Err("verified HIP runtime hash changed before loading".to_string());
+    }
+    Ok(path)
+}
+
 #[cfg(windows)]
 mod windows {
     use std::{
         ffi::c_void,
-        fs::File,
-        io::Read as _,
         os::windows::ffi::OsStrExt,
         path::{Path, PathBuf},
         sync::Mutex,
     };
-
-    use sha2::{Digest as _, Sha256};
 
     use windows_sys::Win32::{
         Foundation::FreeLibrary,
@@ -138,17 +212,71 @@ mod windows {
 
     use super::{
         BackendDeviceProbeError, BackendDeviceProof, canonical_hip_target,
-        normalize_cuda_driver_version, normalize_hip_driver_version,
+        find_verified_hip_runtime_library, normalize_cuda_driver_version,
+        normalize_hip_driver_version,
     };
     use crate::pull::PreparedBackendRuntimeObjects;
 
     const CUDA_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
     const CUDA_COMPUTE_CAPABILITY_MINOR: i32 = 76;
-    const HSA_STATUS_SUCCESS: u32 = 0;
-    const HSA_AGENT_INFO_NAME: u32 = 0;
-    const HSA_AGENT_INFO_DEVICE: u32 = 17;
-    const HSA_DEVICE_TYPE_GPU: u32 = 1;
+    const HIP_SUCCESS: i32 = 0;
+    const HIP_ERROR_NO_DEVICE: i32 = 100;
+    /// Frozen HIP 6 `hipDeviceProp_tR0600` size on Windows x64, measured from
+    /// ROCm 7.1 `hip_runtime_api.h` with `__HIP_PLATFORM_AMD__`. HIP 6+ aliases
+    /// `hipDeviceProp_t` / `hipGetDeviceProperties` onto this R0600 record, so
+    /// the write size cannot grow under the discovery host.
+    const HIP_R0600_SIZE: usize = 1472;
+    /// Offset of `char gcnArchName[256]` in that record: CUDA-compat prefix,
+    /// then `int reserved[63]` at 780 and `int hipReserved[32]` at 1032.
+    const HIP_R0600_GCN_ARCH_NAME_OFFSET: usize = 1160;
+    const HIP_R0600_GCN_ARCH_NAME_LEN: usize = 256;
     static HIP_DISCOVERY_LOAD_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Pinned HIP 6 R0600 device-property write target.
+    ///
+    /// `hipGetDevicePropertiesR0600` is the stable HIP 6+ ABI. We do not copy
+    /// the unstable `hipDeviceProp_t` field list: `hipDeviceArch_t` is a
+    /// bitfield record, and the HIP-only tail after `gcnArchName` is unread.
+    /// The host allocates the full R0600 size so the runtime write cannot
+    /// overflow, and reads `gcnArchName` at its documented offset rather than
+    /// scanning the buffer for a `gfx` token.
+    #[repr(C, align(8))]
+    struct HipDevicePropR0600 {
+        _prefix: [u8; HIP_R0600_GCN_ARCH_NAME_OFFSET],
+        gcn_arch_name: [u8; HIP_R0600_GCN_ARCH_NAME_LEN],
+        _suffix:
+            [u8; HIP_R0600_SIZE - HIP_R0600_GCN_ARCH_NAME_OFFSET - HIP_R0600_GCN_ARCH_NAME_LEN],
+    }
+
+    const _: () = {
+        assert!(std::mem::size_of::<HipDevicePropR0600>() == HIP_R0600_SIZE);
+        assert!(std::mem::align_of::<HipDevicePropR0600>() == 8);
+        assert!(
+            std::mem::offset_of!(HipDevicePropR0600, gcn_arch_name)
+                == HIP_R0600_GCN_ARCH_NAME_OFFSET
+        );
+    };
+
+    impl HipDevicePropR0600 {
+        fn zeroed() -> Self {
+            Self {
+                _prefix: [0; HIP_R0600_GCN_ARCH_NAME_OFFSET],
+                gcn_arch_name: [0; HIP_R0600_GCN_ARCH_NAME_LEN],
+                _suffix: [0; HIP_R0600_SIZE
+                    - HIP_R0600_GCN_ARCH_NAME_OFFSET
+                    - HIP_R0600_GCN_ARCH_NAME_LEN],
+            }
+        }
+
+        fn gcn_arch_name(&self) -> Option<&str> {
+            let length = self
+                .gcn_arch_name
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(self.gcn_arch_name.len());
+            std::str::from_utf8(&self.gcn_arch_name[..length]).ok()
+        }
+    }
 
     struct DynamicLibrary(windows_sys::Win32::Foundation::HMODULE);
 
@@ -332,196 +460,88 @@ mod windows {
         })
     }
 
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct HsaAgent {
-        handle: u64,
-    }
-
-    type HsaAgentGetInfo = unsafe extern "C" fn(HsaAgent, u32, *mut c_void) -> u32;
-
-    struct HsaCallbackState {
-        get_info: HsaAgentGetInfo,
-        primary_target: Option<String>,
-        gpu_agent_count: usize,
-    }
-
-    unsafe extern "C" fn collect_hsa_agent(agent: HsaAgent, data: *mut c_void) -> u32 {
-        // SAFETY: `data` points to HsaCallbackState for the synchronous
-        // hsa_iterate_agents call; HSA supplies a valid agent handle.
-        let state = unsafe { &mut *(data.cast::<HsaCallbackState>()) };
-        let mut device_type = 0_u32;
-        if unsafe {
-            (state.get_info)(
-                agent,
-                HSA_AGENT_INFO_DEVICE,
-                (&mut device_type as *mut u32).cast(),
-            )
-        } != HSA_STATUS_SUCCESS
-            || device_type != HSA_DEVICE_TYPE_GPU
-        {
-            return HSA_STATUS_SUCCESS;
-        }
-        state.gpu_agent_count += 1;
-        let mut name = [0_u8; 64];
-        if unsafe { (state.get_info)(agent, HSA_AGENT_INFO_NAME, name.as_mut_ptr().cast()) }
-            != HSA_STATUS_SUCCESS
-        {
-            return HSA_STATUS_SUCCESS;
-        }
-        let length = name
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(name.len());
-        if state.gpu_agent_count == 1
-            && let Ok(name) = std::str::from_utf8(&name[..length])
-            && let Some(target) = canonical_hip_target(name)
-        {
-            state.primary_target = Some(target);
-        }
-        HSA_STATUS_SUCCESS
-    }
-
-    fn find_verified_runtime_library(
-        runtime: &PreparedBackendRuntimeObjects,
-        filename: &str,
-    ) -> Result<PathBuf, String> {
-        let mut matches = runtime.files.iter().filter(|file| {
-            file.path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.eq_ignore_ascii_case(filename))
-        });
-        let proof = matches
-            .next()
-            .ok_or_else(|| format!("verified HIP runtime omitted {filename}"))?;
-        if matches.next().is_some() {
-            return Err(format!(
-                "verified HIP runtime declared more than one {filename}"
-            ));
-        }
-        let path = proof
-            .path
-            .canonicalize()
-            .map_err(|error| format!("verified HIP runtime file could not be resolved: {error}"))?;
-        let inside_verified_root = runtime.dependency_dirs.iter().any(|directory| {
-            directory
-                .canonicalize()
-                .is_ok_and(|directory| path.starts_with(directory))
-        });
-        if !inside_verified_root {
-            return Err("verified HIP runtime file escaped its content object".to_string());
-        }
-        let metadata = path
-            .metadata()
-            .map_err(|error| format!("verified HIP runtime metadata failed: {error}"))?;
-        if !metadata.is_file() || metadata.len() != proof.size_bytes {
-            return Err("verified HIP runtime size changed before loading".to_string());
-        }
-        let mut file = File::open(&path)
-            .map_err(|error| format!("verified HIP runtime could not be reopened: {error}"))?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0_u8; 128 * 1024];
-        loop {
-            let read = file
-                .read(&mut buffer)
-                .map_err(|error| format!("verified HIP runtime rehash failed: {error}"))?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        let actual = format!("{:x}", hasher.finalize());
-        if !actual.eq_ignore_ascii_case(&proof.sha256) {
-            return Err("verified HIP runtime hash changed before loading".to_string());
-        }
-        Ok(path)
-    }
-
     pub(super) fn probe_hip(
         runtime: &PreparedBackendRuntimeObjects,
     ) -> Result<BackendDeviceProof, BackendDeviceProbeError> {
-        type HsaInit = unsafe extern "C" fn() -> u32;
-        type HsaShutdown = unsafe extern "C" fn() -> u32;
-        type HsaIterate = unsafe extern "C" fn(
-            unsafe extern "C" fn(HsaAgent, *mut c_void) -> u32,
-            *mut c_void,
-        ) -> u32;
+        type HipInit = unsafe extern "C" fn(u32) -> i32;
+        type HipGetDeviceCount = unsafe extern "C" fn(*mut i32) -> i32;
+        type HipDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> i32;
+        type HipGetDevicePropertiesR0600 =
+            unsafe extern "C" fn(*mut HipDevicePropR0600, i32) -> i32;
         type HipDriverGetVersion = unsafe extern "C" fn(*mut i32) -> i32;
 
         let runtime_error = BackendDeviceProbeError::DiscoveryRuntimeUnavailable;
         let _load_guard = HIP_DISCOVERY_LOAD_LOCK
             .lock()
             .map_err(|_| runtime_error("HIP discovery loader lock was poisoned".to_string()))?;
-        let hsa_path =
-            find_verified_runtime_library(runtime, "hsa-runtime64.dll").map_err(runtime_error)?;
-        let hip_path =
-            find_verified_runtime_library(runtime, "amdhip64.dll").map_err(runtime_error)?;
+        let hip_path = find_verified_hip_runtime_library(runtime).map_err(runtime_error)?;
         let _search_directories =
             DllSearchDirectories::add(&runtime.dependency_dirs).map_err(runtime_error)?;
         let search_flags = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
             | LOAD_LIBRARY_SEARCH_USER_DIRS
             | LOAD_LIBRARY_SEARCH_SYSTEM32;
-        let hsa = DynamicLibrary::load(&hsa_path, search_flags).map_err(runtime_error)?;
         let hip = DynamicLibrary::load(&hip_path, search_flags).map_err(runtime_error)?;
-        // SAFETY: signatures are the stable HSA/HIP C ABIs; both handles stay
-        // live until discovery and shutdown complete.
-        let hsa_init: HsaInit =
-            unsafe { std::mem::transmute(hsa.symbol(b"hsa_init\0").map_err(runtime_error)?) };
-        let hsa_shutdown: HsaShutdown =
-            unsafe { std::mem::transmute(hsa.symbol(b"hsa_shut_down\0").map_err(runtime_error)?) };
-        let hsa_iterate: HsaIterate = unsafe {
-            std::mem::transmute(hsa.symbol(b"hsa_iterate_agents\0").map_err(runtime_error)?)
-        };
-        let hsa_get_info: HsaAgentGetInfo = unsafe {
-            std::mem::transmute(hsa.symbol(b"hsa_agent_get_info\0").map_err(runtime_error)?)
-        };
-        let hip_driver: HipDriverGetVersion = unsafe {
-            std::mem::transmute(
-                hip.symbol(b"hipDriverGetVersion\0")
-                    .map_err(runtime_error)?,
-            )
-        };
-        if unsafe { hsa_init() } != HSA_STATUS_SUCCESS {
+        // SAFETY: signatures are the stable HIP runtime C ABI; the handle stays
+        // live until discovery returns. The host never links hip_runtime.
+        let symbol = |name| hip.symbol(name).map_err(runtime_error);
+        let init: HipInit = unsafe { std::mem::transmute(symbol(b"hipInit\0")?) };
+        let get_count: HipGetDeviceCount =
+            unsafe { std::mem::transmute(symbol(b"hipGetDeviceCount\0")?) };
+        let get_device: HipDeviceGet = unsafe { std::mem::transmute(symbol(b"hipDeviceGet\0")?) };
+        let get_props: HipGetDevicePropertiesR0600 =
+            unsafe { std::mem::transmute(symbol(b"hipGetDevicePropertiesR0600\0")?) };
+        let get_driver: HipDriverGetVersion =
+            unsafe { std::mem::transmute(symbol(b"hipDriverGetVersion\0")?) };
+        if unsafe { init(0) } != HIP_SUCCESS {
             return Err(BackendDeviceProbeError::DriverQueryFailed {
                 provider: "HIP",
-                message: "HSA runtime initialization failed".to_string(),
+                message: "runtime initialization failed".to_string(),
             });
         }
-        let mut state = HsaCallbackState {
-            get_info: hsa_get_info,
-            primary_target: None,
-            gpu_agent_count: 0,
-        };
-        let iterate_status = unsafe {
-            hsa_iterate(
-                collect_hsa_agent,
-                (&mut state as *mut HsaCallbackState).cast(),
-            )
-        };
-        let shutdown_status = unsafe { hsa_shutdown() };
-        if iterate_status != HSA_STATUS_SUCCESS || shutdown_status != HSA_STATUS_SUCCESS {
+        let mut count = 0;
+        let count_status = unsafe { get_count(&mut count) };
+        if count_status == HIP_ERROR_NO_DEVICE {
+            return Err(BackendDeviceProbeError::NoDevice("HIP"));
+        }
+        if count_status != HIP_SUCCESS {
             return Err(BackendDeviceProbeError::DriverQueryFailed {
                 provider: "HIP",
-                message: "HSA device enumeration failed".to_string(),
+                message: "device count query failed".to_string(),
+            });
+        }
+        if count <= 0 {
+            return Err(BackendDeviceProbeError::NoDevice("HIP"));
+        }
+        // Target-scoped packs follow the provider's primary device (ordinal
+        // zero), matching the CUDA discovery policy. `hipDeviceGet` is the HIP
+        // runtime analogue of CUDA `cuDeviceGet`; properties then read
+        // `gcnArchName` through the frozen R0600 ABI.
+        let mut device = 0;
+        let mut prop = HipDevicePropR0600::zeroed();
+        if unsafe { get_device(&mut device, 0) } != HIP_SUCCESS
+            || unsafe { get_props(&mut prop, device) } != HIP_SUCCESS
+        {
+            return Err(BackendDeviceProbeError::DriverQueryFailed {
+                provider: "HIP",
+                message: "could not inspect primary device ordinal 0".to_string(),
             });
         }
         let mut driver = 0;
-        if unsafe { hip_driver(&mut driver) } != 0 {
+        if unsafe { get_driver(&mut driver) } != HIP_SUCCESS {
             return Err(BackendDeviceProbeError::DriverQueryFailed {
                 provider: "HIP",
                 message: "driver API version query failed".to_string(),
             });
         }
-        let target = state.primary_target.ok_or_else(|| {
-            if state.gpu_agent_count > 0 {
+        let target = prop
+            .gcn_arch_name()
+            .and_then(canonical_hip_target)
+            .ok_or_else(|| {
                 BackendDeviceProbeError::UnknownTarget(
-                    "HIP primary HSA GPU agent did not expose a canonical gfx target".to_string(),
+                    "HIP primary device ordinal 0 did not expose a canonical gfx target"
+                        .to_string(),
                 )
-            } else {
-                BackendDeviceProbeError::NoDevice("HIP")
-            }
-        })?;
+            })?;
         Ok(BackendDeviceProof {
             target,
             driver_api_version: normalize_hip_driver_version(driver)
@@ -533,6 +553,8 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pull::PreparedBackendRuntimeFile;
+    use std::path::Path;
 
     #[test]
     fn provider_driver_versions_match_plugin_probe_normalization() {
@@ -566,6 +588,81 @@ mod tests {
             BackendDeviceProbeError::UnknownTarget("unknown".to_string()).code(),
             "unknown_target"
         );
+        assert_eq!(
+            BackendDeviceProbeError::DiscoveryRuntimeUnavailable("missing".to_string()).code(),
+            "discovery_runtime_unavailable"
+        );
+    }
+
+    #[test]
+    fn windows_hip_runtime_dll_name_accepts_unversioned_and_digit_suffix() {
+        assert!(is_windows_hip_runtime_dll_name("amdhip64.dll"));
+        assert!(is_windows_hip_runtime_dll_name("AMDHIP64.DLL"));
+        assert!(is_windows_hip_runtime_dll_name("amdhip64_7.dll"));
+        assert!(is_windows_hip_runtime_dll_name("AmdHip64_70.DLL"));
+        assert!(!is_windows_hip_runtime_dll_name("hsa-runtime64.dll"));
+        assert!(!is_windows_hip_runtime_dll_name("amdhip64_.dll"));
+        assert!(!is_windows_hip_runtime_dll_name("amdhip64_7.1.dll"));
+        assert!(!is_windows_hip_runtime_dll_name("amdhip64_7.dll.bak"));
+        assert!(!is_windows_hip_runtime_dll_name("libamdhip64.so"));
+    }
+
+    fn hashed_runtime_file(
+        directory: &Path,
+        name: &str,
+        contents: &[u8],
+    ) -> PreparedBackendRuntimeFile {
+        let path = directory.join(name);
+        std::fs::write(&path, contents).unwrap();
+        PreparedBackendRuntimeFile {
+            path,
+            size_bytes: contents.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(contents)),
+        }
+    }
+
+    #[test]
+    fn verified_hip_runtime_selects_versioned_amdhip64_dll() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = hashed_runtime_file(directory.path(), "amdhip64_7.dll", b"hip-runtime");
+        let ignored = hashed_runtime_file(directory.path(), "hsa-runtime64.dll", b"not-hip");
+        let runtime = PreparedBackendRuntimeObjects {
+            dependency_dirs: vec![directory.path().to_path_buf()],
+            files: vec![ignored, file],
+        };
+        let path = find_verified_hip_runtime_library(&runtime).unwrap();
+        assert!(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("amdhip64_7.dll"))
+        );
+    }
+
+    #[test]
+    fn verified_hip_runtime_rejects_two_matching_dlls() {
+        let directory = tempfile::tempdir().unwrap();
+        let unversioned = hashed_runtime_file(directory.path(), "amdhip64.dll", b"hip-a");
+        let versioned = hashed_runtime_file(directory.path(), "amdhip64_7.dll", b"hip-b");
+        let runtime = PreparedBackendRuntimeObjects {
+            dependency_dirs: vec![directory.path().to_path_buf()],
+            files: vec![unversioned, versioned],
+        };
+        let error = find_verified_hip_runtime_library(&runtime).unwrap_err();
+        assert!(error.contains("more than one HIP runtime DLL"));
+        assert!(!error.to_ascii_lowercase().contains("hsa-runtime64"));
+    }
+
+    #[test]
+    fn verified_hip_runtime_missing_dll_does_not_mention_hsa() {
+        let directory = tempfile::tempdir().unwrap();
+        let ignored = hashed_runtime_file(directory.path(), "hsa-runtime64.dll", b"not-hip");
+        let runtime = PreparedBackendRuntimeObjects {
+            dependency_dirs: vec![directory.path().to_path_buf()],
+            files: vec![ignored],
+        };
+        let error = find_verified_hip_runtime_library(&runtime).unwrap_err();
+        assert!(error.contains("amdhip64.dll or amdhip64_<version>.dll"));
+        assert!(!error.to_ascii_lowercase().contains("hsa-runtime64"));
     }
 
     #[cfg(windows)]

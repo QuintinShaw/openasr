@@ -230,7 +230,7 @@ pub fn install_and_activate_backend_provider(
 ///
 /// CUDA discovery uses the Windows driver DLL and performs no download. HIP
 /// first prepares the runtime/archive objects that are byte-identical across
-/// every host-compatible target pack, then queries the signed HSA/HIP runtime
+/// every host-compatible target pack, then queries the signed HIP runtime
 /// for the canonical `gfx` target. The global store lock covers bootstrap,
 /// target resolution, and installation so concurrent clients cannot observe a
 /// half-prepared provider generation.
