@@ -464,9 +464,8 @@ jobs:
 
       - name: Install official Linux GPU image extras
         if: runner.os == 'Linux' && (contains(matrix.container, 'nvidia/cuda') || contains(matrix.container, 'rocm/'))
-        # Official devel images ship the toolkit but not ALSA/cmake/ninja.
-        # Our GHCR wrappers add those; consumers stay on the official digest
-        # until a published wrapper digest exists.
+        # Fallback only if a matrix row still points at an official NVIDIA/ROCm
+        # devel image. Current CUDA/ROCm legs use GHCR wrappers and skip this.
         run: |
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive

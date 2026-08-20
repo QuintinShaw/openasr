@@ -1,8 +1,7 @@
 # Linux CUDA CI build environment
 #
-# Wrapper around the official NVIDIA CUDA 13.2.0 devel image. Release consumers
-# in this change still pin that official digest directly; switch them to the
-# published GHCR digest only after this workflow has produced one.
+# Wrapper around the official NVIDIA CUDA 13.2.0 devel image. Release
+# consumers pin the published GHCR digest in .github/ci/linux-cuda.lock.
 #
 # Base digest verified 2026-08-20 with `docker buildx imagetools inspect`
 # nvidia/cuda:13.2.0-devel-ubuntu22.04:
