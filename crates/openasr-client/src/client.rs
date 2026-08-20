@@ -998,10 +998,7 @@ mod tests {
         client.restore_connected(&fingerprint, "device-1").unwrap();
         assert_eq!(client.status(), ClientStatus::Connected);
         assert_eq!(client.device_id(), Some("device-1"));
-        assert_eq!(
-            client.server_fingerprint(),
-            Some(fingerprint.as_str())
-        );
+        assert_eq!(client.server_fingerprint(), Some(fingerprint.as_str()));
     }
 
     #[test]
