@@ -169,9 +169,11 @@ jobs:
     # the called workflow's checksum aggregation job consumes OIDC and writes
     # one build-provenance statement for the complete release subject set.
     permissions:
+      actions: read
       contents: write
       id-token: write
       attestations: write
+      packages: read
     uses: ./.github/workflows/release-binaries.yml
     with:
       ref: ${{ needs.resolve.outputs.tag }}
