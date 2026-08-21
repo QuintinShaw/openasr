@@ -36,7 +36,6 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
                 permission_rank[requested],
                 f"release-core reusable caller grants {scope}: {granted}, below {requested}",
             )
-
     def test_reusable_release_declares_every_referenced_input(self) -> None:
         binaries = (ROOT / ".github/workflows/release-binaries.yml").read_text(
             encoding="utf-8"
