@@ -4872,11 +4872,36 @@ fn materialized_tree_sha256(files: &[InstalledBackendMaterializedFile]) -> Strin
     format!("{:x}", hasher.finalize())
 }
 
-fn collect_materialized_files(
+fn installed_backend_relative_path(root: &Path, path: &Path) -> Result<String, PullError> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| PullError::BackendFilePreflight {
+            path: path.to_path_buf(),
+            reason: "payload path escaped its content object".to_string(),
+        })?;
+    let relative_path = relative
+        .components()
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| PullError::BackendFilePreflight {
+            path: path.to_path_buf(),
+            reason: "payload path is not UTF-8".to_string(),
+        })?
+        .join("/");
+    validate_safe_relative_path("backend payload path", &relative_path).map_err(|reason| {
+        PullError::BackendFilePreflight {
+            path: path.to_path_buf(),
+            reason,
+        }
+    })?;
+    Ok(relative_path)
+}
+
+fn walk_installed_backend_files(
     root: &Path,
-) -> Result<Vec<InstalledBackendMaterializedFile>, PullError> {
+    mut on_file: impl FnMut(&Path, &str) -> Result<(), PullError>,
+) -> Result<(), PullError> {
     let mut pending = vec![root.to_path_buf()];
-    let mut files = Vec::new();
     while let Some(dir) = pending.pop() {
         let entries = fs::read_dir(&dir).map_err(|source| PullError::Io {
             path: dir.clone(),
@@ -4910,37 +4935,69 @@ fn collect_materialized_files(
                         .to_string(),
                 });
             }
-            let relative =
-                path.strip_prefix(root)
-                    .map_err(|_| PullError::BackendFilePreflight {
-                        path: path.clone(),
-                        reason: "payload path escaped its content object".to_string(),
-                    })?;
-            let relative_path = relative
-                .components()
-                .map(|component| component.as_os_str().to_str())
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| PullError::BackendFilePreflight {
-                    path: path.clone(),
-                    reason: "payload path is not UTF-8".to_string(),
-                })?
-                .join("/");
-            validate_safe_relative_path("backend payload path", &relative_path).map_err(
-                |reason| PullError::BackendFilePreflight {
-                    path: path.clone(),
-                    reason,
-                },
-            )?;
-            let (size_bytes, sha256) = file_size_and_sha256(&path)?;
-            files.push(InstalledBackendMaterializedFile {
-                relative_path,
-                sha256,
-                size_bytes,
-            });
+            let relative_path = installed_backend_relative_path(root, &path)?;
+            on_file(&path, &relative_path)?;
         }
     }
+    Ok(())
+}
+
+fn collect_materialized_files(
+    root: &Path,
+) -> Result<Vec<InstalledBackendMaterializedFile>, PullError> {
+    let mut files = Vec::new();
+    walk_installed_backend_files(root, |path, relative_path| {
+        let (size_bytes, sha256) = file_size_and_sha256(path)?;
+        files.push(InstalledBackendMaterializedFile {
+            relative_path: relative_path.to_string(),
+            sha256,
+            size_bytes,
+        });
+        Ok(())
+    })?;
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(files)
+}
+
+fn is_backend_load_image_relative_path(relative_path: &str) -> bool {
+    Path::new(relative_path)
+        .extension()
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("dll")
+                || extension.eq_ignore_ascii_case("so")
+                || extension.eq_ignore_ascii_case("dylib")
+        })
+}
+
+/// How thoroughly an installed backend pack is checked before use.
+///
+/// `Full` is the fail-closed install/repair gate: every materialized file is
+/// size/hash verified and the install tree is a closed set.
+///
+/// `LoadImages` is the activation hot path. HIP vendor trees contain thousands
+/// of Tensile/hsaco objects that DllMain never maps; hashing them twice at
+/// process start dominated `ggml_backend` on hosts without SHA-NI. Activation
+/// still authenticates `backend.json`, still checks the signed archive tree
+/// digest from recorded materialized hashes, still hashes the plugin and every
+/// native library image, and still rejects extra sibling libraries the loader
+/// would map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstalledBackendVerifyScope {
+    Full,
+    LoadImages,
+}
+
+fn should_hash_installed_backend_file(
+    relative_path: &str,
+    plugin_filename: &str,
+    scope: InstalledBackendVerifyScope,
+) -> bool {
+    match scope {
+        InstalledBackendVerifyScope::Full => true,
+        InstalledBackendVerifyScope::LoadImages => {
+            relative_path == plugin_filename || is_backend_load_image_relative_path(relative_path)
+        }
+    }
 }
 
 fn backend_content_object_dir(home: &Path, file: &CatalogBackendFile) -> PathBuf {
@@ -5341,10 +5398,24 @@ fn materialize_backend_content_object(
 /// Verify an installed backend against the exact signed-catalog resolution.
 /// Marker paths are never trusted: `dir` is supplied by the caller and every
 /// declared artifact is size/hash/preflight checked before native code loads.
+///
+/// This is the install/repair gate ([`InstalledBackendVerifyScope::Full`]).
+/// Runtime plugin activation must use
+/// [`read_and_verify_installed_backend_for_activation`] so Tensile/hsaco
+/// payloads are not re-hashed on the load path.
 pub fn verify_installed_backend(
     dir: &Path,
     installed: &InstalledBackend,
     resolved: &ResolvedCatalogBackendPull,
+) -> Result<(), PullError> {
+    verify_installed_backend_with_scope(dir, installed, resolved, InstalledBackendVerifyScope::Full)
+}
+
+pub fn verify_installed_backend_with_scope(
+    dir: &Path,
+    installed: &InstalledBackend,
+    resolved: &ResolvedCatalogBackendPull,
+    scope: InstalledBackendVerifyScope,
 ) -> Result<(), PullError> {
     let expected_vendor = backend_vendor_dirname(resolved.vendor)?;
     if installed.schema_version != INSTALLED_BACKEND_SCHEMA_VERSION
@@ -5405,6 +5476,13 @@ pub fn verify_installed_backend(
                 });
             }
             allowed_relative_paths.insert(materialized.relative_path.clone());
+            if !should_hash_installed_backend_file(
+                &materialized.relative_path,
+                &installed.plugin_filename,
+                scope,
+            ) {
+                continue;
+            }
             let path = dir.join(&materialized.relative_path);
             let (actual_size, actual_sha256) = file_size_and_sha256(&path)?;
             if actual_size != materialized.size_bytes {
@@ -5471,22 +5549,42 @@ pub fn verify_installed_backend(
             }
         }
     }
-    // Installed packs are a closed file set. Windows LoadLibraryEx with
-    // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR will load unsigned sibling DLLs that
-    // never appear in the signed materialized list.
-    for actual in collect_materialized_files(dir)? {
-        if !allowed_relative_paths.contains(&actual.relative_path) {
-            return Err(PullError::UnexpectedInstalledBackendFile {
-                path: dir.join(&actual.relative_path),
-            });
+    match scope {
+        InstalledBackendVerifyScope::Full => {
+            // Installed packs are a closed file set. Windows LoadLibraryEx with
+            // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR will load unsigned sibling DLLs
+            // that never appear in the signed materialized list.
+            for actual in collect_materialized_files(dir)? {
+                if !allowed_relative_paths.contains(&actual.relative_path) {
+                    return Err(PullError::UnexpectedInstalledBackendFile {
+                        path: dir.join(&actual.relative_path),
+                    });
+                }
+            }
+        }
+        InstalledBackendVerifyScope::LoadImages => {
+            // Activation only has to refuse extra mapped images. Extra Tensile
+            // objects are not a DllMain TOCTOU; hashing or enumerating them as
+            // unexpected files is the install-path job.
+            walk_installed_backend_files(dir, |path, relative_path| {
+                if is_backend_load_image_relative_path(relative_path)
+                    && !allowed_relative_paths.contains(relative_path)
+                {
+                    return Err(PullError::UnexpectedInstalledBackendFile {
+                        path: path.to_path_buf(),
+                    });
+                }
+                Ok(())
+            })?;
         }
     }
     Ok(())
 }
 
-pub fn read_and_verify_installed_backend(
+fn read_and_verify_installed_backend_with_scope(
     dir: &Path,
     resolved: &ResolvedCatalogBackendPull,
+    scope: InstalledBackendVerifyScope,
 ) -> Result<InstalledBackend, PullError> {
     let marker_path = dir.join("backend.json");
     let text = fs::read_to_string(&marker_path).map_err(|source| PullError::Io {
@@ -5498,9 +5596,31 @@ pub fn read_and_verify_installed_backend(
             path: marker_path,
             source,
         })?;
-    verify_installed_backend(dir, &installed, resolved)?;
+    verify_installed_backend_with_scope(dir, &installed, resolved, scope)?;
     installed.dir = dir.to_path_buf();
     Ok(installed)
+}
+
+pub fn read_and_verify_installed_backend(
+    dir: &Path,
+    resolved: &ResolvedCatalogBackendPull,
+) -> Result<InstalledBackend, PullError> {
+    read_and_verify_installed_backend_with_scope(dir, resolved, InstalledBackendVerifyScope::Full)
+}
+
+/// Activation-path verification: identity + mapped images only.
+///
+/// Install and other callers must keep using [`read_and_verify_installed_backend`],
+/// which remains [`InstalledBackendVerifyScope::Full`].
+pub fn read_and_verify_installed_backend_for_activation(
+    dir: &Path,
+    resolved: &ResolvedCatalogBackendPull,
+) -> Result<InstalledBackend, PullError> {
+    read_and_verify_installed_backend_with_scope(
+        dir,
+        resolved,
+        InstalledBackendVerifyScope::LoadImages,
+    )
 }
 
 /// Download, verify, and install a resolved backend plugin pack into

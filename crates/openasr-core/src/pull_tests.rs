@@ -3416,6 +3416,68 @@ fn installed_backend_full_verification_accepts_declared_files_only() {
 }
 
 #[test]
+fn installed_backend_load_images_skips_tampered_non_dll_archive_payload() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let resolved = hip_pack_resolved(&plugin, &archive);
+    let mut client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: plugin,
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+    let installed =
+        install_backend_pack_with_client(&resolved, home.path(), &mut client, |_| {}).unwrap();
+    let hsaco = installed
+        .dir
+        .join("rocblas")
+        .join("library")
+        .join("Kernels.so-000-gfx1200.hsaco");
+    let mut bytes = fs::read(&hsaco).unwrap();
+    bytes[0] ^= 0xff;
+    fs::write(&hsaco, bytes).unwrap();
+
+    assert!(matches!(
+        read_and_verify_installed_backend(&installed.dir, &resolved),
+        Err(PullError::ShaMismatch { .. })
+    ));
+    read_and_verify_installed_backend_for_activation(&installed.dir, &resolved).unwrap();
+}
+
+#[test]
+fn installed_backend_load_images_rejects_unexpected_dll() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let resolved = hip_pack_resolved(&plugin, &archive);
+    let mut client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: plugin,
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+    let installed =
+        install_backend_pack_with_client(&resolved, home.path(), &mut client, |_| {}).unwrap();
+    fs::write(installed.dir.join("planted.dll"), b"planted").unwrap();
+
+    let error =
+        read_and_verify_installed_backend_for_activation(&installed.dir, &resolved).unwrap_err();
+    assert!(matches!(
+        error,
+        PullError::UnexpectedInstalledBackendFile { .. }
+    ));
+}
+
+#[test]
 fn backend_install_lock_is_os_owned_and_exclusive() {
     let home = tempfile::tempdir().unwrap();
     let path = home.path().join("backend-install.lock");
