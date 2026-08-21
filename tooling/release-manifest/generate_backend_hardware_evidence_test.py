@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -82,9 +84,18 @@ import hashlib
 import json
 import os
 import pathlib
+import shutil
 import sys
 
 args = sys.argv[1:]
+if args == ["doctor"]:
+    catalog = pathlib.Path(os.environ["OPENASR_CATALOG_FILE"])
+    home = pathlib.Path(os.environ["OPENASR_HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(catalog, home / "catalog.json")
+    shutil.copyfile(catalog.with_name("catalog.signature.json"), home / "catalog.signature.json")
+    print("Model registry: ok")
+    raise SystemExit(0)
 if args == ["__openasr-backend-plugin", "status"]:
     print(%s)
     raise SystemExit(0)
@@ -118,6 +129,8 @@ receipt = {
     "transcript": {"text_sha256": "2" * 64},
 }
 pathlib.Path(value("--out")).write_text(json.dumps(receipt), encoding="utf-8")
+if os.environ.get("OPENASR_TEST_MUTATE_CATALOG") == "1":
+    (pathlib.Path(os.environ["OPENASR_HOME"]) / "catalog.json").write_text("tampered")
 """
             % json.dumps(json.dumps(activation)),
             encoding="utf-8",
@@ -135,14 +148,61 @@ pathlib.Path(value("--out")).write_text(json.dumps(receipt), encoding="utf-8")
                 companion,
                 "openasr-1.2.3-windows-x86_64-neutral/ggml.dll",
             )
+        candidate = self.root / "catalog.backends.candidate.json"
+        candidate_value = {
+            "schema_version": 1,
+            "models": [
+                {
+                    "id": "test",
+                    "quants": [
+                        {
+                            "pull": "test:q8",
+                            "sha256": self._sha(model_pack),
+                            "size_bytes": model_pack.stat().st_size,
+                        }
+                    ],
+                }
+            ],
+            "backends": [entry],
+        }
+        candidate.write_text(json.dumps(candidate_value), encoding="utf-8")
+        preview = self.root / "catalog.json"
+        preview_value = json.loads(json.dumps(candidate_value))
+        for file in preview_value["backends"][0]["files"]:
+            file["url"] = (
+                generate._core_payload_file_url(plugin)
+                if file["role"] == "plugin"
+                else generate._core_payload_file_url(vendor)
+            )
+            file["mirrors"] = []
+        preview.write_text(json.dumps(preview_value), encoding="utf-8")
+        signature = self.root / "catalog.signature.json"
+        signature.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "catalog_url": preview.resolve().as_uri(),
+                    "catalog_sha256": self._sha(preview),
+                    "catalog_epoch": 1,
+                    "signature": {
+                        "algorithm": "ed25519",
+                        "key_id": "openasr-catalog-local-dev-v1",
+                        "value": "7" * 128,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
         checksums = self.root / "SHA256SUMS"
-        subjects = [neutral, plugin, vendor, entry_path]
+        subjects = [neutral, plugin, vendor, candidate, entry_path]
         checksums.write_text(
             "".join(f"{self._sha(path)}  {path.name}\n" for path in subjects),
             encoding="utf-8",
         )
         home = self.root / "home"
         home.mkdir()
+        shutil.copyfile(preview, home / "catalog.json")
+        shutil.copyfile(signature, home / "catalog.signature.json")
         args = argparse.Namespace(
             entry=[entry_path],
             provider="cuda",
@@ -151,6 +211,9 @@ pathlib.Path(value("--out")).write_text(json.dumps(receipt), encoding="utf-8")
             neutral_archive=neutral,
             plugin=plugin,
             vendor_archive=vendor,
+            catalog_candidate=candidate,
+            catalog=preview,
+            catalog_signature=signature,
             checksums=checksums,
             repo="example/openasr",
             signer_workflow="example/openasr/.github/workflows/release-binaries.yml",
@@ -158,7 +221,7 @@ pathlib.Path(value("--out")).write_text(json.dumps(receipt), encoding="utf-8")
             model_pack=model_pack,
             audio=audio,
             home=home,
-            catalog_url="file:///catalog.json",
+            catalog_url=preview.resolve().as_uri(),
             core_commit="1" * 40,
             fresh_process_runs=5,
             output=self.root / "backend-hardware-evidence-v1.2.3-cuda.json",
@@ -248,6 +311,54 @@ pathlib.Path(value("--out")).write_text(json.dumps(receipt), encoding="utf-8")
         companion.write_bytes(b"tampered")
         with self.assertRaises(gate.EvidenceError):
             generate._verify_neutral_extraction(args.neutral_archive, args.binary)
+
+    def test_preview_catalog_rejects_unattested_model_pack(self) -> None:
+        args, _ = self._fixture()
+        args.model_pack.write_bytes(b"different-model")
+        with self.assertRaises(gate.EvidenceError):
+            generate.generate(args)
+
+    def test_preview_catalog_rejects_changes_outside_local_payload_urls(self) -> None:
+        args, _ = self._fixture()
+        preview = json.loads(args.catalog.read_text(encoding="utf-8"))
+        preview["models"][0]["id"] = "tampered"
+        args.catalog.write_text(json.dumps(preview), encoding="utf-8")
+        signature = json.loads(args.catalog_signature.read_text(encoding="utf-8"))
+        signature["catalog_sha256"] = self._sha(args.catalog)
+        args.catalog_signature.write_text(json.dumps(signature), encoding="utf-8")
+        with self.assertRaises(gate.EvidenceError):
+            generate.generate(args)
+
+    def test_child_environment_removes_higher_priority_catalog_overrides(self) -> None:
+        args, _ = self._fixture()
+        inherited = {
+            "OPENASR_CATALOG_FILE": "C:/wrong/catalog.json",
+            "OPENASR_CATALOG_IDENTITY": "https://wrong.invalid/catalog.json",
+            "OPENASR_CATALOG_SIGNING_KEY_SEED_HEX": "secret",
+        }
+        with mock.patch.dict(os.environ, inherited, clear=False):
+            env = generate._evidence_environment(args)
+        self.assertEqual(env["OPENASR_CATALOG_FILE"], str(args.catalog.resolve()))
+        self.assertEqual(env["OPENASR_CATALOG_IDENTITY"], args.catalog_url)
+        self.assertNotIn("OPENASR_CATALOG_SIGNING_KEY_SEED_HEX", env)
+        self.assertEqual(env["OPENASR_CATALOG_URL"], args.catalog_url)
+
+    def test_runner_rejects_catalog_cache_changed_by_child(self) -> None:
+        args, _ = self._fixture()
+
+        def attested(path: Path, **_: str) -> dict[str, str]:
+            return {
+                "filename": path.name,
+                "sha256": self._sha(path),
+                "verification_sha256": "a" * 64,
+            }
+
+        with (
+            mock.patch.object(generate, "_verify_attestation", side_effect=attested),
+            mock.patch.dict(os.environ, {"OPENASR_TEST_MUTATE_CATALOG": "1"}),
+            self.assertRaises(gate.EvidenceError),
+        ):
+            generate.generate(args)
 
     def test_runner_rechecks_neutral_tree_after_child_processes(self) -> None:
         args, _ = self._fixture()

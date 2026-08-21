@@ -124,7 +124,11 @@ made public until the signed catalog distribution plane is complete:
    `backend-hardware-audit-*.json` raw audit. The runner verifies every release
    subject against `SHA256SUMS` and GitHub build provenance, proves the executed
    binary and its complete companion-file tree match the neutral release ZIP,
-   owns at least five fresh child processes, checks the exact activation before
+   restricts the local preview catalog to exact file-URL substitutions from the
+   attested candidate, cryptographically preflights its local-dev signature in
+   a fresh empty home, checks the evidence-home cache is the same signed pair,
+   and checks the model pack against that candidate. It owns at least five fresh
+   child processes, checks the exact activation before
    and after each child, and binds each raw receipt to a unique nonce. Model and
    audio inputs are content-hash bound but are not release subjects. The
    summary's `evidence_sha256` is the

@@ -289,6 +289,105 @@ def _verify_local_backend_payloads(
     return plugin_sha, archive_sha
 
 
+def _verify_preview_catalog(
+    *,
+    candidate_path: Path,
+    preview_path: Path,
+    signature_path: Path,
+    catalog_url: str,
+    tested: gate.EntryIdentity,
+    plugin: Path,
+    vendor_archive: Path,
+    model: str,
+    model_pack: Path,
+) -> tuple[str, str, str]:
+    expected_url = preview_path.resolve().as_uri()
+    if catalog_url != expected_url:
+        raise gate.EvidenceError(
+            f"--catalog-url must equal the canonical preview URI: {expected_url}"
+        )
+    if signature_path.resolve() != preview_path.with_name(
+        "catalog.signature.json"
+    ).resolve():
+        raise gate.EvidenceError(
+            "--catalog-signature must be catalog.signature.json beside --catalog"
+        )
+
+    candidate = _load_json(candidate_path)
+    preview = _load_json(preview_path)
+    expected_preview = json.loads(json.dumps(candidate))
+    matching_backends = [
+        backend
+        for backend in expected_preview.get("backends", [])
+        if isinstance(backend, dict) and backend.get("id") == tested.backend_id
+    ]
+    if len(matching_backends) != 1:
+        raise gate.EvidenceError(
+            "candidate catalog does not contain exactly one tested backend"
+        )
+    role_paths = {
+        "plugin": _core_payload_file_url(plugin),
+        "archive": _core_payload_file_url(vendor_archive),
+    }
+    seen_roles: set[str] = set()
+    for file in matching_backends[0].get("files", []):
+        if not isinstance(file, dict) or file.get("role") not in role_paths:
+            raise gate.EvidenceError("tested candidate backend has an unexpected file role")
+        role = file["role"]
+        if role in seen_roles:
+            raise gate.EvidenceError("tested candidate backend has a duplicate file role")
+        seen_roles.add(role)
+        file["url"] = role_paths[role]
+        file["mirrors"] = []
+    if seen_roles != set(role_paths):
+        raise gate.EvidenceError("tested candidate backend lacks plugin/vendor payloads")
+    if preview != expected_preview:
+        raise gate.EvidenceError(
+            "preview catalog differs from the attested candidate outside exact local URLs"
+        )
+
+    model_matches: list[dict[str, Any]] = []
+    for model_entry in candidate.get("models", []):
+        if not isinstance(model_entry, dict):
+            continue
+        for quant in model_entry.get("quants", []):
+            if isinstance(quant, dict) and quant.get("pull") == model:
+                model_matches.append(quant)
+    if len(model_matches) != 1:
+        raise gate.EvidenceError(
+            "candidate catalog does not contain exactly one requested model pull"
+        )
+    model_pack_sha = _sha256_file(model_pack)
+    model_metadata = model_matches[0]
+    if (
+        model_metadata.get("sha256") != model_pack_sha
+        or model_metadata.get("size_bytes") != model_pack.stat().st_size
+    ):
+        raise gate.EvidenceError(
+            "model pack does not match the attested candidate catalog"
+        )
+
+    signature = _load_json(signature_path)
+    signature_value = signature.get("signature")
+    if (
+        signature.get("schema_version") != 1
+        or signature.get("catalog_url") != catalog_url
+        or signature.get("catalog_sha256") != _sha256_file(preview_path)
+        or type(signature.get("catalog_epoch")) is not int
+        or signature["catalog_epoch"] < 1
+        or not isinstance(signature_value, dict)
+        or signature_value.get("algorithm") != "ed25519"
+        or signature_value.get("key_id") != "openasr-catalog-local-dev-v1"
+    ):
+        raise gate.EvidenceError("preview catalog signature metadata is invalid")
+    gate._lower_hex(signature_value.get("value"), 128, "preview catalog signature")
+    return (
+        _sha256_file(candidate_path),
+        _sha256_file(preview_path),
+        _sha256_file(signature_path),
+    )
+
+
 def _activation_matches(
     status: object,
     tested: gate.EntryIdentity,
@@ -404,9 +503,13 @@ def _run_receipt(
     model_pack_sha: str,
     env: dict[str, str],
     output: Path,
+    home: Path,
+    preview_catalog_sha: str,
+    preview_signature_sha: str,
 ) -> tuple[dict[str, Any], str]:
     nonce = uuid.uuid4().hex
     scope = f"{base_scope}/{nonce}"
+    _catalog_cache_matches(home, preview_catalog_sha, preview_signature_sha)
     activation_before = _status(binary, env)
     _activation_matches(activation_before, tested)
     command = [
@@ -445,6 +548,7 @@ def _run_receipt(
     ended_at = _utc_now()
     activation_after = _status(binary, env)
     _activation_matches(activation_after, tested)
+    _catalog_cache_matches(home, preview_catalog_sha, preview_signature_sha)
     if process.returncode != 0:
         raise gate.EvidenceError(
             f"fresh process failed with exit {process.returncode}: "
@@ -480,12 +584,90 @@ def _run_receipt(
     )
 
 
+def _core_payload_file_url(path: Path) -> str:
+    """Return the literal file:// path syntax understood by the v0.1.36 core."""
+    return "file://" + str(path.resolve()).replace("\\", "/")
+
+
+def _evidence_environment(args: argparse.Namespace) -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("OPENASR_CATALOG_SIGNING_KEY_SEED_HEX", None)
+    env.update(
+        {
+            "OPENASR_HOME": str(args.home),
+            "OPENASR_CATALOG_URL": args.catalog_url,
+            "OPENASR_CATALOG_FILE": str(args.catalog.resolve()),
+            "OPENASR_CATALOG_IDENTITY": args.catalog_url,
+            "OPENASR_GGML_BACKEND": args.provider,
+            "OPENASR_OFFLINE": "1",
+        }
+    )
+    return env
+
+
+def _catalog_cache_matches(
+    home: Path,
+    preview_catalog_sha: str,
+    preview_signature_sha: str,
+) -> None:
+    cached_catalog = home / "catalog.json"
+    cached_signature = home / "catalog.signature.json"
+    if (
+        not cached_catalog.is_file()
+        or not cached_signature.is_file()
+        or _sha256_file(cached_catalog) != preview_catalog_sha
+        or _sha256_file(cached_signature) != preview_signature_sha
+    ):
+        raise gate.EvidenceError(
+            "OPENASR_HOME does not cache the exact preview catalog/signature pair"
+        )
+
+
+def _verify_catalog_signature_with_fresh_home(
+    *,
+    binary: Path,
+    env: dict[str, str],
+    preview_catalog_sha: str,
+    preview_signature_sha: str,
+) -> dict[str, str]:
+    with tempfile.TemporaryDirectory(prefix="openasr-catalog-preflight-") as temp:
+        fresh_home = Path(temp)
+        preflight_env = env.copy()
+        preflight_env["OPENASR_HOME"] = str(fresh_home)
+        completed = subprocess.run(
+            [str(binary), "doctor"],
+            env=preflight_env,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if completed.returncode != 0:
+            raise gate.EvidenceError(
+                "fresh-home catalog signature preflight failed: "
+                + completed.stderr.decode("utf-8", errors="replace").strip()
+            )
+        _catalog_cache_matches(
+            fresh_home, preview_catalog_sha, preview_signature_sha
+        )
+        return {
+            "stdout_sha256": _sha256_bytes(completed.stdout),
+            "stderr_sha256": _sha256_bytes(completed.stderr),
+            "cached_catalog_sha256": _sha256_file(fresh_home / "catalog.json"),
+            "cached_signature_sha256": _sha256_file(
+                fresh_home / "catalog.signature.json"
+            ),
+        }
+
+
 def generate(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
     required_files = [
         args.binary,
         args.neutral_archive,
         args.plugin,
         args.vendor_archive,
+        args.catalog_candidate,
+        args.catalog,
+        args.catalog_signature,
         args.model_pack,
         args.audio,
         args.checksums,
@@ -496,22 +678,15 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
             raise gate.EvidenceError(f"required file is missing: {path}")
     if not args.home.is_dir():
         raise gate.EvidenceError(f"evidence home is missing: {args.home}")
-    if not args.catalog_url.startswith("file://"):
-        raise gate.EvidenceError("--catalog-url must be a local file:// preview catalog")
     if args.fresh_process_runs < 5:
         raise gate.EvidenceError("--fresh-process-runs must be at least 5")
     gate._lower_hex(args.core_commit, 40, "core_commit")
 
-    provider_entries, tested = _release_entries(
-        args.entry, args.provider, args.device_target
-    )
-    plugin_sha, vendor_archive_sha = _verify_local_backend_payloads(
-        tested, args.plugin, args.vendor_archive
-    )
     release_subjects = [
         args.neutral_archive,
         args.plugin,
         args.vendor_archive,
+        args.catalog_candidate,
         *args.entry,
     ]
     attestations = _verify_release_subjects(
@@ -521,24 +696,57 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
         signer_workflow=args.signer_workflow,
         source_digest=args.core_commit,
     )
+    attested_sha_by_name = {
+        subject["filename"]: subject["sha256"] for subject in attestations
+    }
+    provider_entries, tested = _release_entries(
+        args.entry, args.provider, args.device_target
+    )
+    plugin_sha, vendor_archive_sha = _verify_local_backend_payloads(
+        tested, args.plugin, args.vendor_archive
+    )
+    catalog_candidate_sha, preview_catalog_sha, preview_signature_sha = (
+        _verify_preview_catalog(
+            candidate_path=args.catalog_candidate,
+            preview_path=args.catalog,
+            signature_path=args.catalog_signature,
+            catalog_url=args.catalog_url,
+            tested=tested,
+            plugin=args.plugin,
+            vendor_archive=args.vendor_archive,
+            model=args.model,
+            model_pack=args.model_pack,
+        )
+    )
+    if attested_sha_by_name.get(args.catalog_candidate.name) != catalog_candidate_sha:
+        raise gate.EvidenceError(
+            "candidate catalog changed between preview validation and provenance verification"
+        )
     binary_sha, neutral_tree_sha = _verify_neutral_extraction(
         args.neutral_archive, args.binary
     )
     neutral_archive_sha = _sha256_file(args.neutral_archive)
+    for path, actual_sha in (
+        (args.neutral_archive, neutral_archive_sha),
+        (args.plugin, plugin_sha),
+        (args.vendor_archive, vendor_archive_sha),
+    ):
+        if attested_sha_by_name.get(path.name) != actual_sha:
+            raise gate.EvidenceError(
+                f"release subject changed after provenance verification: {path}"
+            )
     workload_sha = _sha256_file(args.audio)
     model_pack_sha = _sha256_file(args.model_pack)
     generator_sha = _sha256_file(Path(__file__))
 
-    env = os.environ.copy()
-    env.pop("OPENASR_CATALOG_SIGNING_KEY_SEED_HEX", None)
-    env.update(
-        {
-            "OPENASR_HOME": str(args.home),
-            "OPENASR_CATALOG_URL": args.catalog_url,
-            "OPENASR_GGML_BACKEND": args.provider,
-            "OPENASR_OFFLINE": "1",
-        }
+    env = _evidence_environment(args)
+    catalog_signature_preflight = _verify_catalog_signature_with_fresh_home(
+        binary=args.binary,
+        env=env,
+        preview_catalog_sha=preview_catalog_sha,
+        preview_signature_sha=preview_signature_sha,
     )
+    _catalog_cache_matches(args.home, preview_catalog_sha, preview_signature_sha)
     scope = f"{RUN_SCOPE}-v{tested.version}-{args.provider}"
     runs: list[dict[str, Any]] = []
     transcript_hashes: set[str] = set()
@@ -557,6 +765,9 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
                 model_pack_sha=model_pack_sha,
                 env=env,
                 output=root / f"receipt-{index + 1}.json",
+                home=args.home,
+                preview_catalog_sha=preview_catalog_sha,
+                preview_signature_sha=preview_signature_sha,
             )
             runs.append(run)
             transcript_hashes.add(transcript_sha)
@@ -566,11 +777,15 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
         raise gate.EvidenceError("fresh child processes did not have unique nonces")
     if len(transcript_hashes) != 1:
         raise gate.EvidenceError("fresh child processes did not produce one stable transcript")
+    _catalog_cache_matches(args.home, preview_catalog_sha, preview_signature_sha)
 
     unchanged_inputs = {
-        args.neutral_archive: neutral_archive_sha,
-        args.plugin: plugin_sha,
-        args.vendor_archive: vendor_archive_sha,
+        **{
+            path: attested_sha_by_name[path.name]
+            for path in release_subjects
+        },
+        args.catalog: preview_catalog_sha,
+        args.catalog_signature: preview_signature_sha,
         args.audio: workload_sha,
         args.model_pack: model_pack_sha,
     }
@@ -597,6 +812,11 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
         "neutral_extracted_tree_sha256": neutral_tree_sha,
         "plugin_sha256": plugin_sha,
         "vendor_archive_sha256": vendor_archive_sha,
+        "catalog_candidate_sha256": catalog_candidate_sha,
+        "preview_catalog_url": args.catalog_url,
+        "preview_catalog_sha256": preview_catalog_sha,
+        "preview_catalog_signature_sha256": preview_signature_sha,
+        "catalog_signature_preflight": catalog_signature_preflight,
         "workload_sha256": workload_sha,
         "model_pack_sha256": model_pack_sha,
         "checksums_sha256": _sha256_file(args.checksums),
@@ -718,6 +938,9 @@ def main() -> int:
     parser.add_argument("--neutral-archive", type=Path, required=True)
     parser.add_argument("--plugin", type=Path, required=True)
     parser.add_argument("--vendor-archive", type=Path, required=True)
+    parser.add_argument("--catalog-candidate", type=Path, required=True)
+    parser.add_argument("--catalog", type=Path, required=True)
+    parser.add_argument("--catalog-signature", type=Path, required=True)
     parser.add_argument("--checksums", type=Path, required=True)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--signer-workflow", required=True)
