@@ -327,6 +327,19 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         )[1].split(";", 1)[0]
         self.assertIn("is_windows_arm64", openmp_contract)
 
+    def test_plugin_legs_build_openasr_core_not_cli(self) -> None:
+        build = self.workflow.split("\n  build:\n", 1)[1].split(
+            "\n  xcframework:\n", 1
+        )[0]
+        self.assertIn('[ "${{ matrix.distribution }}" = "plugin" ]', build)
+        self.assertIn('crate="openasr-core"', build)
+        self.assertIn('crate="openasr-cli"', build)
+        self.assertIn('-p "${crate}"', build)
+        self.assertNotIn("cargo build --release -p openasr-cli", build)
+        self.assertNotIn("cargo zigbuild --release -p openasr-cli", build)
+        self.assertIn("Verify optional backend PE contract", build)
+        self.assertIn("openasr-backend-packs\\$provider\\ggml-$provider.dll", build)
+
 
 if __name__ == "__main__":
     unittest.main()

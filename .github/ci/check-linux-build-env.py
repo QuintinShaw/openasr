@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from pathlib import Path
+import json
 import re
 
 
@@ -16,6 +17,33 @@ CONSUMERS = {
     ".github/workflows/serve-batch-parity.yml": 1,
 }
 
+APTGET_FORBIDDEN = {
+    ".github/workflows/ci.yml",
+    ".github/workflows/family-regression.yml",
+    ".github/workflows/public-hf-e2e.yml",
+    ".github/workflows/release-core.yml",
+    ".github/workflows/serve-batch-parity.yml",
+}
+
+LINUX_CI_MATRIX = ROOT / "tooling/release-manifest/release_binaries_matrix.json"
+LINUX_CI_MATRIX_TARGETS = ("x86_64-unknown-linux-gnu",)
+GPU_LOCKS = (
+    (
+        "x86_64-unknown-linux-gnu-cuda",
+        ROOT / ".github/ci/linux-cuda.lock",
+        re.compile(
+            r"ghcr\.io/quintinshaw/openasr-ci-linux-cuda@sha256:[0-9a-f]{64}"
+        ),
+    ),
+    (
+        "x86_64-unknown-linux-gnu-rocm",
+        ROOT / ".github/ci/linux-rocm.lock",
+        re.compile(
+            r"ghcr\.io/quintinshaw/openasr-ci-linux-rocm@sha256:[0-9a-f]{64}"
+        ),
+    ),
+)
+
 
 def main() -> None:
     expected = LOCK.read_text(encoding="utf-8").strip()
@@ -31,8 +59,43 @@ def main() -> None:
                 f"{relative}: expected {expected_count} reference(s) to {expected}, "
                 f"found {references}"
             )
-        if "apt-get" in text:
+        if relative in APTGET_FORBIDDEN and "apt-get" in text:
             failures.append(f"{relative}: routine consumer must not run apt-get")
+
+    matrix = json.loads(LINUX_CI_MATRIX.read_text(encoding="utf-8"))
+    if not isinstance(matrix, list):
+        failures.append(f"{LINUX_CI_MATRIX}: expected a JSON array")
+    else:
+        by_target = {
+            row.get("target"): row
+            for row in matrix
+            if isinstance(row, dict) and isinstance(row.get("target"), str)
+        }
+        for target in LINUX_CI_MATRIX_TARGETS:
+            row = by_target.get(target)
+            if row is None:
+                failures.append(f"{LINUX_CI_MATRIX}: missing release leg {target}")
+                continue
+            container = row.get("container")
+            if container != expected:
+                failures.append(
+                    f"{LINUX_CI_MATRIX}: {target} container must be {expected}, "
+                    f"found {container!r}"
+                )
+        for target, lock_path, pattern in GPU_LOCKS:
+            pinned = lock_path.read_text(encoding="utf-8").strip()
+            if pattern.fullmatch(pinned) is None:
+                failures.append(f"invalid GPU image lock {lock_path}: {pinned!r}")
+                continue
+            row = by_target.get(target)
+            if row is None:
+                failures.append(f"{LINUX_CI_MATRIX}: missing release leg {target}")
+                continue
+            if row.get("container") != pinned:
+                failures.append(
+                    f"{LINUX_CI_MATRIX}: {target} container must be {pinned}, "
+                    f"found {row.get('container')!r}"
+                )
 
     if failures:
         raise SystemExit("\n".join(failures))

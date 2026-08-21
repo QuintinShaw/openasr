@@ -1,18 +1,18 @@
-name: CI Linux build environment
+name: CI Linux ROCm build environment
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - ".github/ci/linux-build-env/**"
-      - ".github/workflows/ci-linux-build-env.yml"
+      - ".github/ci/linux-rocm/**"
+      - ".github/workflows/ci-linux-rocm-env.yml"
 
 permissions:
   contents: read
   packages: write
 
 concurrency:
-  group: ci-linux-build-env-${{ github.ref }}
+  group: ci-linux-rocm-env-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -20,7 +20,7 @@ jobs:
     name: Build, publish, and verify
     if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
 
@@ -36,16 +36,16 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: .github/ci/linux-build-env
+          context: .github/ci/linux-rocm
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/quintinshaw/openasr-ci-linux:${{ github.sha }}
+          tags: ghcr.io/quintinshaw/openasr-ci-linux-rocm:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Verify published image contract
         env:
-          IMAGE: ghcr.io/quintinshaw/openasr-ci-linux@${{ steps.build.outputs.digest }}
+          IMAGE: ghcr.io/quintinshaw/openasr-ci-linux-rocm@${{ steps.build.outputs.digest }}
         run: docker run --rm "$IMAGE" openasr-ci-verify
 
       - name: Record immutable consumer reference
@@ -53,9 +53,9 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           {
-            echo "### Linux CI build environment"
+            echo "### Linux ROCm CI build environment"
             echo
             echo '```text'
-            echo "ghcr.io/quintinshaw/openasr-ci-linux@${DIGEST}"
+            echo "ghcr.io/quintinshaw/openasr-ci-linux-rocm@${DIGEST}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

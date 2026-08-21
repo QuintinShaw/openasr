@@ -88,6 +88,11 @@ cmake --build E:\hip --target ggml-hip -j
 `AMDGPU_TARGETS`, which is deprecated; not `CMAKE_HIP_ARCHITECTURES`, which is
 only read on the Linux `enable_language(HIP)` path).
 
+Release plugin legs do not invoke this cmake recipe directly. They run
+`cargo build -p openasr-core --release --features hip` so `build.rs` keeps the
+same cmake flag contract and stages
+`target\release\openasr-backend-packs\hip\ggml-hip.dll`.
+
 **`GGML_HIP_ROCWMMA_FATTN=OFF` is load-bearing.** OFF keeps the native MMA-F16
 flash-attn path that the vendored naive-masked-attention workaround (pinned to
 ggml commit `643b5659`) targets; ON would divert to the slower `fattn-wmma-f16`
@@ -116,12 +121,23 @@ extracts that DLL, stages the CUDA runtime/cuBLAS vendor tree separately,
 compiles one signed catalog entry, and publishes both byte identities. Other
 platforms retain their platform-specific static distribution topology.
 
-For a local Windows build, use the normal release command and select the GPU
+Release plugin legs compile `openasr-core` only so CMake still stages
+`target\release\openasr-backend-packs\cuda\ggml-cuda.dll` with the same flags
+the CLI build would have used. They do not compile `openasr-cli`.
+
+For a local Windows host+plugin build, use the CLI crate and select the GPU
 targets explicitly when validating one machine:
 
 ```text
 set OPENASR_CUDA_GPU_TARGETS=86
 cargo build -p openasr-cli --release --features cuda
+```
+
+The matching release plugin command is:
+
+```text
+set OPENASR_CUDA_GPU_TARGETS=86
+cargo build -p openasr-core --release --features cuda
 ```
 
 The resulting optional module is staged under

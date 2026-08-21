@@ -72,6 +72,12 @@ typedef enum OpenAsrStatus {
    * The process-owned native execution services could not be constructed.
    */
   OPEN_ASR_STATUS_INITIALIZATION_FAILED = 9,
+  /**
+   * An opt-in remote (LAN) pairing, transcription, or realtime call failed:
+   * TLS/TOFU pin mismatch, pairing rejection, transport error, or a remote
+   * HTTP/WebSocket error. Consult [`openasr_last_error_message`].
+   */
+  OPEN_ASR_STATUS_REMOTE_FAILED = 10,
 } OpenAsrStatus;
 
 /**
@@ -158,6 +164,14 @@ typedef enum OpenAsrPullPhase {
 } OpenAsrPullPhase;
 
 /**
+ * Outcome of [`openasr_remote_poll_pairing`].
+ */
+typedef enum OpenAsrRemotePairingStatus {
+  OPEN_ASR_REMOTE_PAIRING_STATUS_PENDING = 0,
+  OPEN_ASR_REMOTE_PAIRING_STATUS_APPROVED = 1,
+} OpenAsrRemotePairingStatus;
+
+/**
  * Opaque handle to a fetched-and-verified model catalog. Obtained from
  * [`openasr_catalog_fetch`], read as JSON with [`openasr_catalog_json`], passed
  * to [`openasr_pull_model`], [`openasr_install_local_pack`], or
@@ -184,6 +198,25 @@ typedef struct OpenAsrCatalog OpenAsrCatalog;
 typedef struct OpenAsrEngine OpenAsrEngine;
 
 typedef struct OpenAsrModel OpenAsrModel;
+
+/**
+ * Opaque remote-compute client. Create with [`openasr_remote_client_create`]
+ * or restore with [`openasr_remote_restore_connected`]; free with
+ * [`openasr_remote_client_free`]. Holds the pairing session and, once
+ * approved, the bearer token inside the injected secret store -- never as a
+ * C string the caller is expected to keep.
+ *
+ * **Not thread-safe.** Do not call any `openasr_remote_*` function on the same
+ * client (or its realtime session) from multiple threads. Do not call any
+ * `openasr_remote_*` function from an [`OpenAsrRemoteRealtimeEventCallback`].
+ */
+typedef struct OpenAsrRemoteClient OpenAsrRemoteClient;
+
+/**
+ * Opaque remote realtime session. Create with [`openasr_remote_realtime_start`],
+ * stop with [`openasr_remote_realtime_stop`].
+ */
+typedef struct OpenAsrRemoteRealtime OpenAsrRemoteRealtime;
 
 /**
  * Opaque transcription result. Free with [`openasr_result_free`]; read it
@@ -272,6 +305,37 @@ typedef void (*OpenAsrPullProgressCallback)(void *user_data,
  * function pointer to never cancel. Must not unwind.
  */
 typedef bool (*OpenAsrPullCancelCallback)(void *user_data);
+
+/**
+ * Optional injected secret store (keychain / callback). Pass null to
+ * [`openasr_remote_client_create`] / [`openasr_remote_restore_connected`] to
+ * use an in-memory store. A non-null vtable must provide `store`, `load`, and
+ * `free_secret`; missing any of those fails closed instead of falling back to
+ * an in-memory store. `delete_secret` is optional.
+ *
+ * `store`: `secret` is valid only for the duration of this callback. The
+ * implementor must copy the bytes if they need to retain them.
+ *
+ * `load` must write a freshly allocated C string to `out_secret` on success
+ * (0) or null if the account is missing. `free_secret` must free that string;
+ * the FFI copies the secret into Rust and immediately calls `free_secret`. A
+ * successful non-null `load` without `free_secret` is an error.
+ */
+typedef struct OpenAsrRemoteSecretStore {
+  void *user_data;
+  int32_t (*store)(void *user_data, const char *account, const char *secret);
+  int32_t (*load)(void *user_data, const char *account, char **out_secret);
+  void (*free_secret)(char *secret);
+  int32_t (*delete_secret)(void *user_data, const char *account);
+} OpenAsrRemoteSecretStore;
+
+/**
+ * Incremental realtime event callback. `text` is valid only for the duration
+ * of the call. The callback may run on a background thread. **Do not call any
+ * `openasr_remote_*` function from this callback** -- the client and session
+ * are not re-entrant.
+ */
+typedef void (*OpenAsrRemoteRealtimeEventCallback)(void *user_data, const char *text);
 
 #ifdef __cplusplus
 extern "C" {
@@ -839,6 +903,136 @@ enum OpenAsrStatus openasr_remove_model_with_engine(const struct OpenAsrEngine *
  * `out_*_json` out-parameters above and not already freed.
  */
 void openasr_string_free(char *string);
+
+/**
+ * Creates a remote-compute client for a LAN host/port. `device_name` is sent
+ * on [`openasr_remote_begin_pairing`]. `secret_store` may be null (in-memory).
+ * A non-null store must provide `store`, `load`, and `free_secret`.
+ *
+ * **Not thread-safe.** See [`OpenAsrRemoteClient`].
+ *
+ * # Safety
+ * `host` and `device_name` must be valid NUL-terminated UTF-8. `out_client`
+ * must point to writable storage for one `*mut OpenAsrRemoteClient`.
+ */
+enum OpenAsrStatus openasr_remote_client_create(const char *host,
+                                                uint16_t port,
+                                                const char *device_name,
+                                                const struct OpenAsrRemoteSecretStore *secret_store,
+                                                struct OpenAsrRemoteClient **out_client);
+
+/**
+ * Restore a previously paired client from persisted host/port/fingerprint/
+ * device id. The bearer token is loaded from `secret_store`; C must not pass
+ * a token. Missing token or a fingerprint that does not match the stored
+ * account fails closed.
+ *
+ * **Not thread-safe.** See [`OpenAsrRemoteClient`].
+ *
+ * # Safety
+ * `host`, `device_name`, `fingerprint`, and `device_id` must be valid
+ * NUL-terminated UTF-8. `out_client` must point to writable storage for one
+ * `*mut OpenAsrRemoteClient`.
+ */
+enum OpenAsrStatus openasr_remote_restore_connected(const char *host,
+                                                    uint16_t port,
+                                                    const char *device_name,
+                                                    const char *fingerprint,
+                                                    const char *device_id,
+                                                    const struct OpenAsrRemoteSecretStore *secret_store,
+                                                    struct OpenAsrRemoteClient **out_client);
+
+/**
+ * Frees a remote client. Null is a no-op. Stop any realtime session first.
+ *
+ * # Safety
+ * `client`, if non-null, must be a live handle from [`openasr_remote_client_create`].
+ */
+void openasr_remote_client_free(struct OpenAsrRemoteClient *client);
+
+/**
+ * Begin pairing. On success, `*out_safety_code` is a borrowed C string owned
+ * by `client` (valid until the next mutating call or free). The TLS-vs-response
+ * safety-code match has already been checked in `openasr-client`.
+ *
+ * # Safety
+ * `client` must be live. `out_safety_code` must be writable.
+ */
+enum OpenAsrStatus openasr_remote_begin_pairing(struct OpenAsrRemoteClient *client,
+                                                const char **out_safety_code);
+
+/**
+ * Poll an in-progress pairing request. Does not return the bearer token.
+ *
+ * # Safety
+ * `client` must be live. `out_status` must be writable.
+ */
+enum OpenAsrStatus openasr_remote_poll_pairing(struct OpenAsrRemoteClient *client,
+                                               enum OpenAsrRemotePairingStatus *out_status);
+
+/**
+ * Cancel in-progress pairing or disconnect a connected session. Drops the
+ * stored token from the secret store when a device id is present.
+ *
+ * # Safety
+ * `client` must be live.
+ */
+enum OpenAsrStatus openasr_remote_cancel(struct OpenAsrRemoteClient *client);
+
+/**
+ * Transcribe in-memory PCM through the paired remote server. 16 kHz mono.
+ *
+ * # Safety
+ * Same pointer rules as [`crate::openasr_transcribe_pcm`].
+ */
+enum OpenAsrStatus openasr_remote_transcribe_pcm(struct OpenAsrRemoteClient *client,
+                                                 const char *model,
+                                                 const void *pcm,
+                                                 uintptr_t pcm_len_samples,
+                                                 enum OpenAsrPcmFormat format,
+                                                 uint32_t sample_rate_hz,
+                                                 struct OpenAsrResult **out_result);
+
+/**
+ * Start a pinned WSS realtime session. Completes the server handshake
+ * (`audio.input.configure` then `session.start` for 16 kHz mono pcm16le) with
+ * `model` before returning, so [`openasr_remote_realtime_feed`] is legal.
+ * Incoming text frames are delivered to `on_message` (may be called from a
+ * background thread, and must not call any `openasr_remote_*` function). The
+ * bearer token stays on the Rust handle.
+ *
+ * **Not thread-safe.** See [`OpenAsrRemoteClient`].
+ *
+ * # Safety
+ * `client` must be live and paired. `model` must be a valid NUL-terminated
+ * UTF-8 C string. `out_session` must be writable.
+ */
+enum OpenAsrStatus openasr_remote_realtime_start(struct OpenAsrRemoteClient *client,
+                                                 const char *model,
+                                                 OpenAsrRemoteRealtimeEventCallback on_message,
+                                                 void *user_data,
+                                                 struct OpenAsrRemoteRealtime **out_session);
+
+/**
+ * Feed PCM16LE samples into an open remote realtime session. The session must
+ * have been returned by a successful [`openasr_remote_realtime_start`]
+ * (handshake completed). Feeding before start fails closed.
+ *
+ * # Safety
+ * `session` must be live. `pcm16le` must point to `sample_count` i16 samples.
+ */
+enum OpenAsrStatus openasr_remote_realtime_feed(struct OpenAsrRemoteRealtime *session,
+                                                const int16_t *pcm16le,
+                                                uintptr_t sample_count);
+
+/**
+ * Stop a remote realtime session. Null is a no-op.
+ *
+ * # Safety
+ * `session`, if non-null, must be a live handle from
+ * [`openasr_remote_realtime_start`].
+ */
+void openasr_remote_realtime_stop(struct OpenAsrRemoteRealtime *session);
 
 #ifdef __cplusplus
 }  // extern "C"

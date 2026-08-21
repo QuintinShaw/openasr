@@ -15,7 +15,7 @@ use std::{fs::OpenOptions, io::Read as _, os::windows::fs::OpenOptionsExt};
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
 use super::ffi;
-use crate::registry::load_model_catalog_from_verified_cache;
+use crate::registry::{live_backend_driver_floor, load_model_catalog_from_verified_cache};
 use crate::{
     CatalogBackendVendor, ExecutionProvider,
     backend_distribution::{ActivatedBackendPack, BackendHostAbi, read_activated_backend},
@@ -1151,7 +1151,7 @@ fn activate_selected_backend_plugin()
         &plugin_path,
         &dependency_dirs,
         &device_target,
-        requested.min_driver_api.as_deref(),
+        live_backend_driver_floor(requested.vendor, requested.min_driver_api.as_deref()),
     )?;
     let resolved = resolve_compatible_catalog_backend_pull_for_driver(
         &catalog,
@@ -1179,7 +1179,7 @@ fn activate_selected_backend_plugin()
         &plugin_path,
         &dependency_dirs,
         &device_target,
-        resolved.min_driver_api.as_deref(),
+        live_backend_driver_floor(resolved.vendor, resolved.min_driver_api.as_deref()),
     )?;
     Ok(Some(ActivatedBackendRuntime {
         backend_id,
@@ -1276,6 +1276,7 @@ fn load_exact_backend_plugin(
     device_target: &str,
     minimum_driver: Option<&str>,
 ) -> Result<(), BackendPluginActivationError> {
+    let minimum_driver = live_backend_driver_floor(vendor, minimum_driver);
     let path = path_to_utf8_cstring(backend_id, plugin_path)?;
     let abi = CString::new(BackendHostAbi::current().fingerprint)
         .expect("backend ABI fingerprint is hexadecimal");
@@ -1367,6 +1368,7 @@ pub(crate) fn probe_exact_backend_plugin_candidate(
     device_target: &str,
     minimum_driver: Option<&str>,
 ) -> Result<String, BackendPluginActivationError> {
+    let minimum_driver = live_backend_driver_floor(vendor, minimum_driver);
     let path = path_to_utf8_cstring(backend_id, plugin_path)?;
     let abi = CString::new(BackendHostAbi::current().fingerprint)
         .expect("backend ABI fingerprint is hexadecimal");

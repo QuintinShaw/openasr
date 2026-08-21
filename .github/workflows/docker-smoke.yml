@@ -26,8 +26,16 @@ jobs:
         with:
           submodules: recursive
 
+      - uses: docker/setup-buildx-action@v3
+
       - name: Build image
-        run: docker build -t openasr:ci .
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: openasr:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max,ignore-error=true
 
       - name: Start container
         # Mock smoke: the image default CMD is the fail-closed native server,

@@ -18,10 +18,15 @@ crate-type = ["staticlib", "cdylib", "lib"]
 
 [dependencies]
 openasr-core.workspace = true
+openasr-client.workspace = true
 libc.workspace = true
 tempfile.workspace = true
 serde_json.workspace = true
 hound = "3.5"
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread"] }
+
+[dev-dependencies]
+openasr-server = { workspace = true, features = ["test-support"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }

@@ -66,6 +66,13 @@ on:
 permissions:
   contents: write
 
+# Serialize a full matrix by ref. Diagnostic only_target dispatches share the
+# ref but must not queue behind (or replace) each other. Never cancel a
+# release that is already building: a later retry must wait.
+concurrency:
+  group: release-binaries-${{ inputs.ref || github.ref_name || github.ref }}-${{ inputs.only_target || 'all' }}
+  cancel-in-progress: false
+
 jobs:
   select-matrix:
     name: Select release matrix
@@ -103,6 +110,11 @@ jobs:
     if: ${{ inputs.source_run_id == '' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout || 60 }}
+    # Container images (CUDA/ROCm wrappers, official devel) default to sh.
+    # Windows steps that need PowerShell set shell: pwsh explicitly.
+    defaults:
+      run:
+        shell: bash
     # Escape hatch for future legs whose toolchain story is still settling:
     # mark them `experimental: true` and they may fail without failing the
     # run (their archives simply drop out of the required artifact set) until
@@ -114,6 +126,13 @@ jobs:
     # a transparency-log outage can retry without rebuilding every GPU target.
     permissions:
       contents: read
+      packages: read
+    # Linux CPU / CUDA / ROCm pins live in
+    # .github/ci/linux-build-env.lock, linux-cuda.lock, linux-rocm.lock
+    # and tooling/release-manifest/release_binaries_matrix.json.
+    # Windows/macOS/arm64/musl/vulkan omit matrix.container and run on the host.
+    # Credentials are sent only to GHCR; Docker Hub pulls stay anonymous.
+    container: ${{ matrix.container && fromJSON(startsWith(matrix.container, 'ghcr.io/') && format('{{"image":{0},"credentials":{{"username":{1},"password":{2}}}}}', toJSON(matrix.container), toJSON(github.actor), toJSON(github.token)) || format('{{"image":{0}}}', toJSON(matrix.container))) || fromJSON('null') }}
     # Distributed binaries must be portable. build.rs auto-enables GGML_NATIVE
     # (-march=native) when host==target on x86, which is correct for local
     # build-and-run but would tune these released x86 binaries to the CI
@@ -199,6 +218,20 @@ jobs:
         include: ${{ fromJSON(needs.select-matrix.outputs.include) }}
 
     steps:
+      # Official CUDA/ROCm devel images do not ship git. Without it,
+      # actions/checkout falls back to the REST zip API and cannot fetch
+      # submodules. Install git first, mark the workspace safe, then use
+      # the same checkout as every other leg.
+      - name: Install git (official GPU image)
+        if: ${{ contains(matrix.container, 'nvidia/cuda') || contains(matrix.container, 'rocm/') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y --no-install-recommends git ca-certificates
+          git config --global --add safe.directory '*'
+
       - uses: actions/checkout@v7
         with:
           submodules: recursive
@@ -218,8 +251,18 @@ jobs:
           fi
           echo "OPENASR_VERSION=${version}" >> "${GITHUB_ENV}"
 
+      - name: Prepare Linux container
+        if: runner.os == 'Linux' && matrix.container
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          if command -v openasr-ci-verify >/dev/null 2>&1; then
+            openasr-ci-verify
+          fi
+
       - name: Install Linux audio build dependencies
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.container
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
 
       - name: Install Linux Vulkan SDK
@@ -241,13 +284,13 @@ jobs:
       # preinstalled toolchains this job never touches first. Same action
       # llama.cpp's ubuntu-rocm release job uses.
       - name: Free up disk space
-        if: runner.os == 'Linux' && contains(matrix.features, 'hip')
+        if: runner.os == 'Linux' && contains(matrix.features, 'hip') && !matrix.container
         uses: ./.github/actions/free-disk-space
         with:
           tool-cache: true
 
       - name: Install Linux ROCm/HIP SDK
-        if: runner.os == 'Linux' && contains(matrix.features, 'hip')
+        if: runner.os == 'Linux' && contains(matrix.features, 'hip') && !contains(matrix.container, 'rocm/') && !contains(matrix.container, 'openasr-ci-linux-rocm')
         # AMD's official apt repo (the recipe llama.cpp's ubuntu-22-rocm)
         # release job uses). rocm-hip-sdk provides hipcc/the HIP clang
         # toolchain, rocBLAS, and hipBLAS; ROCM_PATH lets both cmake's
@@ -383,7 +426,7 @@ jobs:
           Add-Content $env:GITHUB_PATH "$hipRoot\bin"
 
       - name: Install CUDA toolkit (Linux)
-        if: runner.os == 'Linux' && contains(matrix.features, 'cuda')
+        if: runner.os == 'Linux' && contains(matrix.features, 'cuda') && !contains(matrix.container, 'nvidia/cuda') && !contains(matrix.container, 'openasr-ci-linux-cuda')
         uses: ./.github/actions/install-cuda-toolkit-linux
         with:
           cuda: "13.2.0"
@@ -419,8 +462,35 @@ jobs:
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust"]'
           use-github-cache: true
 
-      - name: Install Rust toolchain
+      - name: Install official Linux GPU image extras
+        if: runner.os == 'Linux' && (contains(matrix.container, 'nvidia/cuda') || contains(matrix.container, 'rocm/'))
+        # Fallback only if a matrix row still points at an official NVIDIA/ROCm
+        # devel image. Current CUDA/ROCm legs use GHCR wrappers and skip this.
         run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y --no-install-recommends \
+            cmake ninja-build libasound2-dev pkg-config git curl python3 ca-certificates
+          if [ -d /usr/local/cuda ]; then
+            echo "CUDA_PATH=/usr/local/cuda" >> "${GITHUB_ENV}"
+            echo "CUDA_HOME=/usr/local/cuda" >> "${GITHUB_ENV}"
+          fi
+          if [ -d /opt/rocm ]; then
+            echo "ROCM_PATH=/opt/rocm" >> "${GITHUB_ENV}"
+            echo "HIP_PATH=/opt/rocm" >> "${GITHUB_ENV}"
+            echo "/opt/rocm/bin" >> "${GITHUB_PATH}"
+          fi
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
+            echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+            export PATH="${HOME}/.cargo/bin:${PATH}"
+          fi
           rustup toolchain install 1.95.0 --profile minimal
           rustup default 1.95.0
           rustc --version
@@ -435,9 +505,15 @@ jobs:
         run: rustup target add ${{ matrix.rust_target }}
 
       - uses: ./.github/actions/rust-cache
+        id: rust-cache
         continue-on-error: true
         with:
           shared-key: release-binaries-${{ matrix.target }}
+
+      - name: Report rust-cache outcome
+        if: steps.rust-cache.outcome != 'success'
+        shell: bash
+        run: echo "::warning::rust-cache failed (outcome=${{ steps.rust-cache.outcome }}); continuing compile without cache"
 
       # musl legs are cross-compiled with cargo-zigbuild: zig cc/c++ is a
       # self-contained clang + bundled musl libc/libc++ cross toolchain, so no
@@ -509,10 +585,15 @@ jobs:
           if [ "${{ runner.os }}" = "Windows" ]; then
             export OPENASR_BUNDLED_VULKAN_LOADER_SHA256="$VULKAN_LOADER_DLL_SHA256"
           fi
-          if [ "${{ matrix.zigbuild }}" = "true" ]; then
-            cargo zigbuild --release -p openasr-cli --target ${{ matrix.rust_target }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+          if [ "${{ matrix.distribution }}" = "plugin" ]; then
+            crate="openasr-core"
           else
-            cargo build --release -p openasr-cli ${{ matrix.rust_target && format('--target {0}', matrix.rust_target) || '' }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+            crate="openasr-cli"
+          fi
+          if [ "${{ matrix.zigbuild }}" = "true" ]; then
+            cargo zigbuild --release -p "${crate}" --target ${{ matrix.rust_target }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+          else
+            cargo build --release -p "${crate}" ${{ matrix.rust_target && format('--target {0}', matrix.rust_target) || '' }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
           fi
 
       # Same GPU-less-runner caveat as the Windows CUDA/HIP legs: those two
@@ -1168,12 +1249,17 @@ jobs:
           cargo --version
 
       - uses: ./.github/actions/rust-cache
+        id: rust-cache
         continue-on-error: true
         with:
           shared-key: release-binaries-xcframework
 
-      - name: Install cbindgen
-        run: cargo install cbindgen --locked
+      - name: Report rust-cache outcome
+        if: steps.rust-cache.outcome != 'success'
+        shell: bash
+        run: echo "::warning::rust-cache failed (outcome=${{ steps.rust-cache.outcome }}); continuing compile without cache"
+
+      - uses: ./.github/actions/setup-cbindgen
 
       - name: Header drift gate
         run: scripts/generate-ffi-header.sh --check

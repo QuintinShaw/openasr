@@ -25,7 +25,10 @@ use crate::{
         install_backend_pack, install_backend_pack_locked, installed_backend_protected_bytes,
         prepare_backend_runtime_objects_locked, read_and_verify_installed_backend,
     },
-    registry::{resolve_catalog_backend_pull, resolve_compatible_catalog_backend_pull_for_driver},
+    registry::{
+        live_backend_driver_floor, resolve_catalog_backend_pull,
+        resolve_compatible_catalog_backend_pull_for_driver,
+    },
 };
 
 pub const BACKEND_HOST_ABI_SCHEMA_VERSION: u32 = 2;
@@ -230,7 +233,7 @@ pub fn install_and_activate_backend_provider(
 ///
 /// CUDA discovery uses the Windows driver DLL and performs no download. HIP
 /// first prepares the runtime/archive objects that are byte-identical across
-/// every host-compatible target pack, then queries the signed HSA/HIP runtime
+/// every host-compatible target pack, then queries the signed HIP runtime
 /// for the canonical `gfx` target. The global store lock covers bootstrap,
 /// target resolution, and installation so concurrent clients cannot observe a
 /// half-prepared provider generation.
@@ -501,7 +504,7 @@ fn activate_installed_backend_pack_auto_locked(
             &plugin_path,
             &dependency_dirs,
             target,
-            requested.min_driver_api.as_deref(),
+            live_backend_driver_floor(requested.vendor, requested.min_driver_api.as_deref()),
         )
         .is_ok()
         {

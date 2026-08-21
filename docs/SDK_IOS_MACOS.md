@@ -26,6 +26,9 @@ plus a generated header, not a Rust-shaped API.
   for a native app that has no CLI or local server to lean on.
 - Error codes + last-error text; every call is panic-safe (no unwind crosses
   the FFI boundary; see `crates/openasr-ffi/src/lib.rs` module docs).
+- Opt-in remote client (LAN, manual IP) for pairing and pinned-TLS
+  transcription / realtime (`openasr_remote_*`). Default remains local
+  on-device inference.
 
 **Not in v1**: the local HTTP server. SDK consumers can still bring and manage
 their own `.oasr` packs directly (`openasr_model_open`), but the market API above

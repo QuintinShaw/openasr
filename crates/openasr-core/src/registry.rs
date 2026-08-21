@@ -1847,8 +1847,15 @@ pub fn resolve_compatible_catalog_backend_pull(
 }
 
 /// Resolve one exact backend pack using the signed host ABI, device target,
-/// and driver-API floor. A pack that declares `min_driver_api` is never selected when
-/// the caller cannot provide a parseable current driver version.
+/// and (for CUDA) the driver-API floor.
+///
+/// CUDA probes OS `nvcuda.dll`, so a pack that declares `min_driver_api` is
+/// never selected when the caller cannot provide a parseable current driver
+/// at or above that floor.
+///
+/// HIP discovery LoadLibrary's the signed vendor zip from the same catalog
+/// row, so `hipDriverGetVersion` is the pack's own runtime, not the user's
+/// kernel driver. HIP matches on vendor + host ABI + exact target only.
 pub fn resolve_compatible_catalog_backend_pull_for_driver(
     catalog: &ModelCatalog,
     vendor: CatalogBackendVendor,
@@ -1868,10 +1875,11 @@ pub fn resolve_compatible_catalog_backend_pull_for_driver(
             CatalogBackendVendor::Cpu | CatalogBackendVendor::Vulkan => backend.targets.is_empty(),
             CatalogBackendVendor::Unknown => false,
         })
-        .filter(|backend| {
-            backend.min_driver_api.as_deref().is_none_or(|minimum| {
+        .filter(|backend| match backend.vendor {
+            CatalogBackendVendor::Hip => true,
+            _ => backend.min_driver_api.as_deref().is_none_or(|minimum| {
                 current_driver.is_some_and(|current| driver_version_at_least(current, minimum))
-            })
+            }),
         })
         .collect::<Vec<_>>();
     let vendor = backend_vendor_label(vendor).to_string();
@@ -1897,6 +1905,23 @@ pub fn resolve_compatible_catalog_backend_pull_for_driver(
         });
     }
     Ok(resolved_catalog_backend_pull(matches[0]))
+}
+
+/// Driver floor forwarded into the ggml live probe/load.
+///
+/// CUDA compares against OS nvcuda. HIP's live runtime is the signed vendor
+/// zip already selected by catalog identity; do not re-apply `min_driver_api`
+/// there (`ggml-backend-reg.cpp` treats a null/empty minimum as no floor).
+/// `probe_exact_backend_plugin_candidate` / `load_exact_backend_plugin` apply
+/// this at the FFI boundary so a caller cannot pass the catalog floor through.
+pub(crate) fn live_backend_driver_floor(
+    vendor: CatalogBackendVendor,
+    min_driver_api: Option<&str>,
+) -> Option<&str> {
+    match vendor {
+        CatalogBackendVendor::Hip => None,
+        _ => min_driver_api,
+    }
 }
 
 fn driver_version_at_least(current: &str, minimum: &str) -> bool {
