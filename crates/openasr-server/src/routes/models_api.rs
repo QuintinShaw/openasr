@@ -49,6 +49,7 @@ pub(crate) async fn set_default_model(
     persist_default_pack(&home, &pack, preference)?;
     if runtime.backend == BackendKind::Native {
         runtime.rebind_native_model_pack(Some(pack.path.clone()))?;
+        crate::realtime::spawn_boot_native_warmup(runtime.clone());
     }
     Ok(Json(default_model_response(
         &home,

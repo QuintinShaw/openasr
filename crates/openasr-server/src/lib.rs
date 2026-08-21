@@ -1381,6 +1381,7 @@ impl ServerRuntime {
         self.native_execution.has_active_sessions()
             || idle_activity::native_activity_active_count() > 0
             || realtime::native_streaming_workers_occupy_slot()
+            || realtime::native_warmup_in_flight()
     }
 
     /// Rebinds the single in-process native pack. Fail-closed with 409 when a

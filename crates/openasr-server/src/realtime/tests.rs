@@ -2699,6 +2699,51 @@ async fn boot_native_warmup_skips_when_the_runtime_slot_is_occupied() {
 }
 
 #[tokio::test]
+async fn boot_warmup_does_not_consume_the_user_session_slot() {
+    let warm_calls = Arc::new(AtomicUsize::new(0));
+    let session = Box::new(SlowWarmNativeSession {
+        inner: TestServerNativeSession::new("boot-warmup-no-permit"),
+        warm_sleep: Duration::from_millis(200),
+        warm_calls: Arc::clone(&warm_calls),
+    });
+    let key = test_native_streaming_worker_key("boot-warmup-no-permit");
+    let runtime = ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::new(NonZeroUsize::new(1).unwrap()),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: None.into(),
+    };
+    let handle = tokio::spawn(attach_and_run_boot_warmup(key, session, None));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let permit = runtime
+        .acquire_native_execution("native:boot-warmup-no-permit", None)
+        .expect("boot warmup must not occupy the user session slot");
+    drop(permit);
+    handle
+        .await
+        .expect("boot warmup task must not panic")
+        .expect("boot warmup must succeed");
+    assert_eq!(warm_calls.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn wait_while_native_warmup_in_flight_unblocks_when_lease_drops() {
+    let lease = try_begin_native_warmup().expect("warmup lease must be free");
+    let waiter = tokio::spawn(wait_while_native_warmup_in_flight());
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !waiter.is_finished(),
+        "waiter must block while the warmup lease is held"
+    );
+    drop(lease);
+    tokio::time::timeout(Duration::from_millis(200), waiter)
+        .await
+        .expect("waiter must unblock when the warmup lease drops")
+        .expect("waiter must not panic");
+}
+
+#[tokio::test]
 async fn health_answers_immediately_while_boot_warmup_is_artificially_slow() {
     use tower::ServiceExt;
 

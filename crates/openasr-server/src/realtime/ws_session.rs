@@ -1067,6 +1067,7 @@ impl WsSession {
                     return Err(());
                 }
             };
+        super::wait_while_native_warmup_in_flight().await;
         let model_session_permit = match self
             .runtime
             .acquire_native_execution(&model_session_key, resolved_route.as_ref())

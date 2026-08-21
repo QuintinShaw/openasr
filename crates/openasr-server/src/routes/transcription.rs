@@ -2061,6 +2061,7 @@ pub(crate) async fn transcribe_with_runtime(
                 let resolved_route = resolve_execution_route_for_target(request.execution_target)
                     .map_err(ApiError::Backend)?;
                 let model_session_key = native_model_session_key(&adapter)?;
+                crate::realtime::wait_while_native_warmup_in_flight_blocking();
                 let model_session_permit = runtime
                     .acquire_native_execution(&model_session_key, resolved_route.as_ref())?;
                 run_admitted_native_transcription(model_session_permit, move || {
