@@ -71,7 +71,7 @@ class SelectReleaseMatrixTests(unittest.TestCase):
         rows = {row["target"]: row for row in load_matrix()}
         self.assertEqual(
             rows["x86_64-unknown-linux-gnu"]["container"],
-            "ghcr.io/quintinshaw/openasr-ci-linux@sha256:702284855863f1c6330eec503ac4570ff2cc844a958ceb7d2e2af5837633dcdc",
+            "ghcr.io/quintinshaw/openasr-ci-linux@sha256:f23309a658b73be941a5ef52ce6441aa53f3ed4051befbbd4a0da69729708a16",
         )
         self.assertEqual(
             rows["x86_64-unknown-linux-gnu-cuda"]["container"],
