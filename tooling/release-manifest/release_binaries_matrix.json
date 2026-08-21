@@ -5,7 +5,7 @@
     "asset": "linux-x86_64",
     "binary_name": "openasr",
     "archive_ext": "tar.gz",
-    "container": "ghcr.io/quintinshaw/openasr-ci-linux@sha256:f23309a658b73be941a5ef52ce6441aa53f3ed4051befbbd4a0da69729708a16"
+    "container": "ghcr.io/quintinshaw/openasr-ci-linux@sha256:8ddcfdea6a758bab0c14a9108de9b3876d23f44bcf815db109593b370f8b1c29"
   },
   {
     "os": "ubuntu-22.04-arm",
