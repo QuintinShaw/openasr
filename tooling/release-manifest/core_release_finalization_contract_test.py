@@ -9,6 +9,26 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class CoreReleaseFinalizationContractTests(unittest.TestCase):
+    def test_reusable_release_declares_every_referenced_input(self) -> None:
+        binaries = (ROOT / ".github/workflows/release-binaries.yml").read_text(
+            encoding="utf-8"
+        )
+        workflow_call = re.search(
+            r"(?ms)^  workflow_call:\n(?P<body>.*?)(?=^  # Formal releases)",
+            binaries,
+        )
+        self.assertIsNotNone(workflow_call)
+        declared = set(
+            re.findall(r"(?m)^      ([a-z][a-z0-9_]*):$", workflow_call.group("body"))
+        )
+        referenced = set(re.findall(r"\binputs\.([a-z][a-z0-9_]*)", binaries))
+
+        self.assertEqual(
+            referenced - declared,
+            set(),
+            "workflow_call must declare every inputs.* value used by the reusable workflow",
+        )
+
     def test_core_release_stays_draft_until_signed_backend_catalog_is_live(self) -> None:
         release = (ROOT / ".github/workflows/release-core.yml").read_text(encoding="utf-8")
         prepare = (ROOT / "scripts/prepare-windows-backend-catalog-release.sh").read_text(

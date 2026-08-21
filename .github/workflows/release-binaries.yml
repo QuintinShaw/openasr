@@ -54,6 +54,31 @@ on:
         required: false
         type: string
         default: ""
+      supplemental_source_run_id:
+        description: "Optional completed single-target run whose immutable artifacts supplement source_run_id during recovery"
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: "Evaluate upload/completeness logic but do not upload or edit the release"
+        required: false
+        type: boolean
+        default: false
+      only_target:
+        description: "Build only this matrix.target key (empty = all legs; for validating a single platform without the full matrix)"
+        required: false
+        type: string
+        default: ""
+      promote_cuda_targets:
+        description: "Comma-separated experimental CUDA targets to promote during a recovery (for example 120)"
+        required: false
+        type: string
+        default: ""
+      cuda_gpu_targets:
+        description: "Optional CUDA arch list for a diagnostic workflow_dispatch build (empty = release defaults)"
+        required: false
+        type: string
+        default: ""
   # Formal releases enter through release-core.yml's workflow_call. Keeping
   # a second push:tags entrypoint used to race the orchestrator and could run
   # the same expensive matrix twice for one annotated tag.
