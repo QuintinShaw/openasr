@@ -903,7 +903,7 @@ async fn capabilities_endpoint_reflects_active_xasr_phrase_bias_capability() {
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root),
+        model_pack_path: Some(pack_root).into(),
     });
 
     let response = app
@@ -1006,7 +1006,7 @@ async fn native_transcription_without_installed_model_fails_closed_and_never_dow
             native_execution: openasr_server::NativeExecutionSupervisor::default(),
             ffmpeg_bin: None,
             ffmpeg_bin_explicit: false,
-            model_pack_path: None,
+            model_pack_path: None.into(),
         },
         openasr_server::DistributionRuntime {
             openasr_home: Some(home.clone()),
@@ -1065,7 +1065,7 @@ async fn daemon_starts_and_reports_ready_with_zero_models_installed() {
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: None,
+        model_pack_path: None.into(),
     };
     runtime
         .validate()
@@ -1137,7 +1137,7 @@ async fn health_reports_model_bound_but_not_resident_before_any_load() {
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root),
+        model_pack_path: Some(pack_root).into(),
     });
 
     let response = app
@@ -1791,6 +1791,197 @@ async fn default_model_endpoint_rejects_uninstalled_pack() {
             .as_str()
             .unwrap()
             .contains("Installed model pack not found")
+    );
+}
+
+fn native_runtime_with_pack(pack: Option<std::path::PathBuf>) -> openasr_server::ServerRuntime {
+    openasr_server::ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        native_execution: openasr_server::NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: pack.into(),
+    }
+}
+
+fn install_native_pack(
+    home: &std::path::Path,
+    model_id: &str,
+    pull: &str,
+    quant: &str,
+    suffix: &str,
+    spec: TinyGgufFixtureSpec,
+) -> std::path::PathBuf {
+    std::fs::create_dir_all(home).unwrap();
+    let staging = home.join(format!("{model_id}-staging.oasr"));
+    write_tiny_gguf_runtime_source(&staging, &spec).expect("write installed native pack");
+    let bytes = std::fs::read(&staging).unwrap();
+    std::fs::remove_file(&staging).unwrap();
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let object = home
+        .join("models")
+        .join("objects")
+        .join("sha256")
+        .join(&sha256)
+        .join("content");
+    std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+    std::fs::write(&object, &bytes).unwrap();
+    let reference = home.join(format!("models/refs/{model_id}/{quant}.json"));
+    std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+    let pack = openasr_core::InstalledPack {
+        model_id: model_id.to_string(),
+        display_name: model_id.to_string(),
+        quant: quant.to_string(),
+        suffix: suffix.to_string(),
+        pull: pull.to_string(),
+        filename: format!("{model_id}-{quant}.oasr"),
+        path: object.clone(),
+        url: format!("https://example.invalid/{model_id}.oasr"),
+        hf_revision: "test".to_string(),
+        sha256,
+        size_bytes: bytes.len() as u64,
+        installed_at_unix_seconds: 1,
+        source: None,
+    };
+    std::fs::write(reference, serde_json::to_vec_pretty(&pack).unwrap()).unwrap();
+    object
+}
+
+async fn json_request(
+    app: Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    let body = if let Some(body) = body {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+        Body::from(body.to_string())
+    } else {
+        Body::empty()
+    };
+    let response = app.oneshot(builder.body(body).unwrap()).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let parsed = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, parsed)
+}
+
+#[tokio::test]
+async fn set_default_rebinds_native_bound_pack_without_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let moonshine = install_native_pack(
+        &home,
+        "moonshine-tiny",
+        "moonshine-tiny:q8",
+        "q8_0",
+        "q8",
+        TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready("moonshine-tiny"),
+    );
+    let whisper = install_native_pack(
+        &home,
+        "whisper-tiny",
+        "whisper-tiny:q4",
+        "q4_0",
+        "q4",
+        TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed("whisper-tiny"),
+    );
+    let runtime = native_runtime_with_pack(Some(moonshine.clone()));
+    let app = openasr_server::app_with_runtime_and_distribution(
+        runtime.clone(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let (status, health) = json_request(app.clone(), "GET", "/health", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["model_installed"], true);
+
+    let (status, models) = json_request(app.clone(), "GET", "/v1/models", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(models["data"][0]["id"], "moonshine-tiny");
+
+    let (status, default) = json_request(
+        app.clone(),
+        "POST",
+        "/v1/models/default",
+        Some(serde_json::json!({ "pull": "whisper-tiny:q4" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(default["default_model"], "whisper-tiny");
+
+    let (status, health) = json_request(app.clone(), "GET", "/health", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["model_installed"], true);
+
+    let (status, models) = json_request(app, "GET", "/v1/models", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(models["data"][0]["id"], "whisper-tiny");
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(whisper.as_path())
+    );
+}
+
+#[tokio::test]
+async fn set_default_binds_unbound_native_runtime_without_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let moonshine = install_native_pack(
+        &home,
+        "moonshine-tiny",
+        "moonshine-tiny:q8",
+        "q8_0",
+        "q8",
+        TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready("moonshine-tiny"),
+    );
+    let runtime = native_runtime_with_pack(None);
+    let app = openasr_server::app_with_runtime_and_distribution(
+        runtime.clone(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let (status, health) = json_request(app.clone(), "GET", "/health", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["model_installed"], false);
+
+    let (status, models) = json_request(app.clone(), "GET", "/v1/models", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(models["data"].as_array().unwrap().is_empty());
+
+    let (status, default) = json_request(
+        app.clone(),
+        "POST",
+        "/v1/models/default",
+        Some(serde_json::json!({ "pull": "moonshine-tiny:q8" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(default["default_model"], "moonshine-tiny");
+
+    let (status, health) = json_request(app.clone(), "GET", "/health", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["model_installed"], true);
+
+    let (status, models) = json_request(app, "GET", "/v1/models", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(models["data"][0]["id"], "moonshine-tiny");
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(moonshine.as_path())
     );
 }
 
@@ -2500,7 +2691,7 @@ fn native_server_runtime_with_no_model_pack_is_accepted_at_startup_validation() 
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: None,
+        model_pack_path: None.into(),
     }
     .validate()
     .expect("zero installed models must not block server startup");
@@ -2516,7 +2707,7 @@ fn native_server_runtime_falls_back_to_path_stem_when_metadata_model_id_is_retir
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root),
+        model_pack_path: Some(pack_root).into(),
     }
     .validate()
     .expect("runtime should fall back to path stem model id");
@@ -2532,7 +2723,7 @@ fn native_server_runtime_falls_back_to_path_stem_when_metadata_model_id_is_inval
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root),
+        model_pack_path: Some(pack_root).into(),
     }
     .validate()
     .expect("runtime should fall back to path stem model id");
@@ -2548,7 +2739,7 @@ fn native_server_runtime_rejects_reserved_oasr_container_magic() {
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root),
+        model_pack_path: Some(pack_root).into(),
     }
     .validate()
     .unwrap_err()
@@ -3439,7 +3630,7 @@ async fn failed_native_transcription_clears_id_scoped_progress_and_control() {
             native_execution: openasr_server::NativeExecutionSupervisor::default(),
             ffmpeg_bin: None,
             ffmpeg_bin_explicit: false,
-            model_pack_path: None,
+            model_pack_path: None.into(),
         },
         openasr_server::DistributionRuntime {
             openasr_home: Some(temp.path().join("home")),
@@ -4642,7 +4833,7 @@ async fn transcriptions_with_native_backend_fail_closed() {
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root.clone()),
+        model_pack_path: Some(pack_root.clone()).into(),
     });
     let wav_bytes = sample_wav_bytes();
     let request = multipart_request("whisper-runtime", "sample.wav", &wav_bytes);
@@ -4665,7 +4856,7 @@ async fn transcriptions_with_native_xasr_hotword_returns_model_unsupported_error
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root),
+        model_pack_path: Some(pack_root).into(),
     });
     let wav_bytes = sample_wav_bytes();
     let request = multipart_request_with_extra_fields(
@@ -4697,7 +4888,7 @@ async fn transcriptions_with_native_backend_model_mismatch_returns_bad_request()
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root.clone()),
+        model_pack_path: Some(pack_root.clone()).into(),
     });
     let wav_bytes = sample_wav_bytes();
     // A genuinely different base id (not a quant-pin of the pack id): since
@@ -4734,7 +4925,7 @@ async fn transcriptions_with_native_backend_accepts_quant_alias_against_legacy_h
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root.clone()),
+        model_pack_path: Some(pack_root.clone()).into(),
     });
     let wav_bytes = sample_wav_bytes();
     let request = multipart_request("mimo-v2.5-asr:q4", "sample.wav", &wav_bytes);
@@ -4760,7 +4951,7 @@ async fn transcriptions_with_native_backend_matches_normalized_path_stem_after_r
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root),
+        model_pack_path: Some(pack_root).into(),
     });
     let wav_bytes = sample_wav_bytes();
     let request = multipart_request("native-pack", "sample.wav", &wav_bytes);
@@ -4790,7 +4981,7 @@ async fn transcriptions_with_native_backend_and_diarize_returns_bad_request() {
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root.clone()),
+        model_pack_path: Some(pack_root.clone()).into(),
     });
     let wav_bytes = sample_wav_bytes();
     let request = multipart_request_with_diarize("whisper-runtime", "sample.wav", &wav_bytes, true);
@@ -4810,7 +5001,7 @@ async fn transcriptions_with_native_backend_reject_retired_legacy_model_alias() 
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: None,
+        model_pack_path: None.into(),
     });
     let wav_bytes = sample_wav_bytes();
     let request = multipart_request("whisper-tiny:q4_0", "sample.wav", &wav_bytes);
@@ -4839,7 +5030,7 @@ async fn transcriptions_with_native_backend_accepts_live_catalog_family_bare_met
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root.clone()),
+        model_pack_path: Some(pack_root.clone()).into(),
     });
     let wav_bytes = sample_wav_bytes();
     let request = multipart_request("whisper-large-v3-turbo:q4_k", "sample.wav", &wav_bytes);
@@ -4862,7 +5053,7 @@ async fn stream_transcriptions_with_native_backend_reject_empty_model_form_value
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root),
+        model_pack_path: Some(pack_root).into(),
     });
     let wav_bytes = sample_wav_bytes();
     let request = multipart_request_with_options(
@@ -4888,7 +5079,7 @@ async fn stream_transcriptions_with_mock_backend_emits_protocol_events() {
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: None,
+        model_pack_path: None.into(),
     });
     let wav_bytes = sample_wav_bytes();
     let request = multipart_request_with_options(
@@ -4929,7 +5120,7 @@ async fn stream_transcription_succeeds_when_history_cannot_be_recorded() {
             native_execution: openasr_server::NativeExecutionSupervisor::default(),
             ffmpeg_bin: None,
             ffmpeg_bin_explicit: false,
-            model_pack_path: None,
+            model_pack_path: None.into(),
         },
         openasr_server::DistributionRuntime {
             openasr_home: Some(home),
@@ -4967,7 +5158,7 @@ async fn static_bearer_remote_compute_stream_transcription_records_server_histor
             native_execution: openasr_server::NativeExecutionSupervisor::default(),
             ffmpeg_bin: None,
             ffmpeg_bin_explicit: false,
-            model_pack_path: None,
+            model_pack_path: None.into(),
         },
         openasr_server::DistributionRuntime {
             openasr_home: Some(temp.path().join("home")),
@@ -5031,7 +5222,7 @@ async fn stream_transcriptions_with_native_backend_reject_srt_response_format() 
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root),
+        model_pack_path: Some(pack_root).into(),
     });
     let wav_bytes = sample_wav_bytes();
     let request = multipart_request_with_options(
@@ -5060,7 +5251,7 @@ async fn stream_transcriptions_with_native_backend_reject_model_mismatch() {
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root),
+        model_pack_path: Some(pack_root).into(),
     });
     let wav_bytes = sample_wav_bytes();
     let request = multipart_request_with_options(
@@ -5091,7 +5282,7 @@ async fn stream_transcriptions_with_native_xasr_hotword_emits_model_unsupported_
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root),
+        model_pack_path: Some(pack_root).into(),
     });
     let wav_bytes = sample_wav_bytes();
     let request = multipart_request_with_extra_fields(
@@ -5129,7 +5320,7 @@ async fn stream_transcriptions_with_native_backend_reject_missing_model_pack_pat
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: None,
+        model_pack_path: None.into(),
     });
     let wav_bytes = sample_wav_bytes();
     // The streaming endpoint's synchronous multipart parse only runs the retired-id
@@ -5165,7 +5356,7 @@ async fn transcriptions_with_native_backend_srt_stays_fail_closed_for_unexecutab
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root.clone()),
+        model_pack_path: Some(pack_root.clone()).into(),
     });
     let wav_bytes = sample_wav_bytes();
     let request = multipart_request_with_options(
@@ -5194,7 +5385,7 @@ async fn models_with_native_backend_lists_loaded_local_pack_id() {
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root),
+        model_pack_path: Some(pack_root).into(),
     });
     let response = app
         .oneshot(
@@ -5222,7 +5413,7 @@ async fn models_with_native_backend_and_no_pack_lists_empty_instead_of_erroring(
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: None,
+        model_pack_path: None.into(),
     });
     let response = app
         .oneshot(

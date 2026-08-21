@@ -543,16 +543,49 @@ pub(crate) enum OpenAsrEncoderAttentionSpan {
     LocalChunked,
 }
 
-/// Partial-result granularity of a family's streaming executor. Infrastructure
-/// property (how partials are produced), not a per-model semantic: `FrameSync`
-/// appends fixed low-latency chunks and never revises already-emitted text;
-/// `Buffered` re-decodes a growing/windowed buffer and may revise prior
-/// partials. Declared once on the architecture descriptor and
-/// derived into the streaming dispatch at build time.
+/// How a family produces streaming partials. Declared once on the architecture
+/// descriptor and derived into streaming dispatch at build time -- not a second
+/// per-model table.
+///
+/// `FrameSyncAppend` (xasr): `push_audio` emits append-only token chunks and
+/// never revises already-emitted text.
+/// `RevisableSnapshot`: each Poll re-decodes a growing/windowed buffer;
+/// incomplete windows are expected to produce displayable text that may revise
+/// prior partials (qwen, firered-aed, whisper, moonshine, CTC, ...).
+/// `UtteranceComplete`: ChatML utterance LLMs whose incomplete windows may
+/// legally decode to empty (for example FunASR `/sil`); partials may append a
+/// short endpoint-silence tail to elicit unstable overlay text. FINAL always
+/// uses the real unpadded audio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamingPartialGranularity {
-    FrameSync,
-    Buffered,
+    FrameSyncAppend,
+    RevisableSnapshot,
+    UtteranceComplete,
+}
+
+impl StreamingPartialGranularity {
+    pub const fn is_frame_sync_append(self) -> bool {
+        matches!(self, Self::FrameSyncAppend)
+    }
+
+    /// Only utterance-complete snapshot families may pad a short silence tail
+    /// onto a PARTIAL window. FINAL / FinalizeReuse never take this hint.
+    pub const fn allows_partial_endpoint_hint(self) -> bool {
+        matches!(self, Self::UtteranceComplete)
+    }
+}
+
+/// Streaming partial granularity declared on a builtin architecture row, looked
+/// up by GGUF `model_architecture`. Unknown architectures fail closed to
+/// [`StreamingPartialGranularity::RevisableSnapshot`] (no endpoint-silence
+/// hint) rather than inventing frame-sync or utterance-complete behavior.
+pub(crate) fn streaming_partial_granularity_for_model_architecture(
+    model_architecture: &str,
+) -> StreamingPartialGranularity {
+    OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(model_architecture)
+        .map(|descriptor| descriptor.execution_contract.streaming_partial_granularity)
+        .unwrap_or(StreamingPartialGranularity::RevisableSnapshot)
 }
 
 /// Which decode driver owns the family's token loop. A dedicated topology is
@@ -1584,7 +1617,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::SharedCohereTranscribeV1,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
-            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            streaming_partial_granularity: StreamingPartialGranularity::RevisableSnapshot,
             speaker_segmentation: SpeakerSegmentationSource::External,
             word_timestamp_source: WordTimestampSource::Native,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
@@ -1689,7 +1722,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeSensitive,
-            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            streaming_partial_granularity: StreamingPartialGranularity::RevisableSnapshot,
             speaker_segmentation: SpeakerSegmentationSource::External,
             word_timestamp_source: WordTimestampSource::Native,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
@@ -1773,7 +1806,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             adapter_binding: GgmlAdapterBindingStrategy::Qwen3AsrLoraV1,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::SharedQwen3AsrV1,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
-            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            streaming_partial_granularity: StreamingPartialGranularity::RevisableSnapshot,
             speaker_segmentation: SpeakerSegmentationSource::External,
             word_timestamp_source: WordTimestampSource::Native,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
@@ -1872,7 +1905,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
-            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            streaming_partial_granularity: StreamingPartialGranularity::RevisableSnapshot,
             speaker_segmentation: SpeakerSegmentationSource::External,
             word_timestamp_source: WordTimestampSource::Native,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
@@ -1971,7 +2004,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
-            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            streaming_partial_granularity: StreamingPartialGranularity::RevisableSnapshot,
             speaker_segmentation: SpeakerSegmentationSource::External,
             word_timestamp_source: WordTimestampSource::Native,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
@@ -2057,7 +2090,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
-            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            streaming_partial_granularity: StreamingPartialGranularity::RevisableSnapshot,
             speaker_segmentation: SpeakerSegmentationSource::External,
             word_timestamp_source: WordTimestampSource::Native,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
@@ -2147,7 +2180,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
-            streaming_partial_granularity: StreamingPartialGranularity::FrameSync,
+            streaming_partial_granularity: StreamingPartialGranularity::FrameSyncAppend,
             speaker_segmentation: SpeakerSegmentationSource::External,
             word_timestamp_source: WordTimestampSource::Native,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
@@ -2247,7 +2280,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             adapter_binding: GgmlAdapterBindingStrategy::MoonshineLoraV1,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
-            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            streaming_partial_granularity: StreamingPartialGranularity::RevisableSnapshot,
             speaker_segmentation: SpeakerSegmentationSource::External,
             word_timestamp_source: WordTimestampSource::Native,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
@@ -2348,7 +2381,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
-            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            streaming_partial_granularity: StreamingPartialGranularity::RevisableSnapshot,
             speaker_segmentation: SpeakerSegmentationSource::External,
             word_timestamp_source: WordTimestampSource::ForcedAligner,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
@@ -2447,7 +2480,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
-            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            streaming_partial_granularity: StreamingPartialGranularity::RevisableSnapshot,
             speaker_segmentation: SpeakerSegmentationSource::External,
             word_timestamp_source: WordTimestampSource::ForcedAligner,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
@@ -2538,7 +2571,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
-            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            streaming_partial_granularity: StreamingPartialGranularity::RevisableSnapshot,
             speaker_segmentation: SpeakerSegmentationSource::External,
             word_timestamp_source: WordTimestampSource::ForcedAligner,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
@@ -2636,7 +2669,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
-            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            // ChatML utterance LLM: incomplete windows may legally decode empty.
+            streaming_partial_granularity: StreamingPartialGranularity::UtteranceComplete,
             speaker_segmentation: SpeakerSegmentationSource::External,
             word_timestamp_source: WordTimestampSource::ForcedAligner,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
@@ -2731,7 +2765,9 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
-            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            // ChatML utterance LLM: incomplete windows often decode `/sil` and
+            // may legally be empty until an endpoint hint or real pause.
+            streaming_partial_granularity: StreamingPartialGranularity::UtteranceComplete,
             speaker_segmentation: SpeakerSegmentationSource::External,
             word_timestamp_source: WordTimestampSource::ForcedAligner,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
@@ -2818,7 +2854,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
-            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            // ChatML utterance LLM: incomplete windows may legally decode empty.
+            streaming_partial_granularity: StreamingPartialGranularity::UtteranceComplete,
             speaker_segmentation: SpeakerSegmentationSource::External,
             word_timestamp_source: WordTimestampSource::ForcedAligner,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
@@ -2911,7 +2948,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
-            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            // ChatML utterance LLM: incomplete windows may legally decode empty.
+            streaming_partial_granularity: StreamingPartialGranularity::UtteranceComplete,
             speaker_segmentation: SpeakerSegmentationSource::InDecoder,
             word_timestamp_source: WordTimestampSource::ForcedAligner,
             // Product invocation envelope: ordinary VAD slicing aims at 30s and
@@ -3039,7 +3077,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
-            streaming_partial_granularity: StreamingPartialGranularity::Buffered,
+            streaming_partial_granularity: StreamingPartialGranularity::RevisableSnapshot,
             // Greedy decode rides the one shared seq2seq driver via the policy
             // embedded in this row (see AGENTS.md's single-driver invariant);
             // this family provides a `Seq2SeqGreedyDecodeStepExecutor` and a

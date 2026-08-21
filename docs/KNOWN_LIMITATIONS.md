@@ -21,9 +21,12 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   streaming executor gets live partials, and every built-in ASR family
   (Qwen3-ASR, Whisper, Cohere Transcribe, Moonshine, Parakeet-CTC, wav2vec2-CTC,
   SenseVoice, Dolphin, and X-ASR) registers one -- a startup completeness gate
-  rejects any family that does not. X-ASR is frame-sync (append-only partials);
-  every other family re-decodes a growing window (may revise partials, FINAL is
-  byte-identical to offline). Official published packs with public product
+  rejects any family that does not. X-ASR is frame-sync-append (append-only
+  partials); ChatML utterance LLMs (FunASR-Nano, FireRed-LLM, MiMo-ASR, MOSS)
+  are utterance-complete snapshots (incomplete windows may be empty; partials
+  may use a short endpoint-silence hint); every other family is a revisable
+  snapshot (incomplete windows should produce text, FINAL is byte-identical to
+  offline). Official published packs with public product
   guarantees are still pending.
 - Universal Voice ID is currently a local **file-transcription** feature. MOSS
   supplies its own speaker turns; all other ASR families use FireRed Stream-VAD,

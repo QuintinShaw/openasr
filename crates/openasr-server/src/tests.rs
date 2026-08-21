@@ -1586,7 +1586,7 @@ fn realtime_capabilities_for_native_runtime_come_from_model_pack() {
         native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root),
+        model_pack_path: Some(pack_root).into(),
     };
 
     let capabilities = realtime_capabilities_for_runtime(&runtime);
@@ -1601,6 +1601,184 @@ fn realtime_capabilities_for_native_runtime_come_from_model_pack() {
         capabilities.diarization.reason,
         Some(openasr_core::realtime::REALTIME_VOICE_ID_UNSUPPORTED_REASON)
     );
+}
+
+#[test]
+fn bound_model_pack_path_is_shared_across_runtime_clones() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack_a = temp.path().join("pack-a.oasr");
+    let pack_b = temp.path().join("pack-b.oasr");
+    write_mock_gguf_runtime_source(&pack_a, Some("whisper-tiny"));
+    write_mock_gguf_runtime_source(&pack_b, Some("whisper-base"));
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_a.clone()).into(),
+    };
+    let cloned = runtime.clone();
+
+    runtime
+        .rebind_native_model_pack(Some(pack_b.clone()))
+        .expect("idle native runtime must rebind in-process");
+
+    assert_eq!(
+        cloned.model_pack_path.current().as_deref(),
+        Some(pack_b.as_path())
+    );
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(pack_b.as_path())
+    );
+}
+
+#[test]
+fn rebind_native_model_pack_returns_conflict_while_session_is_active() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack_a = temp.path().join("pack-a.oasr");
+    let pack_b = temp.path().join("pack-b.oasr");
+    write_mock_gguf_runtime_source(&pack_a, Some("whisper-tiny"));
+    write_mock_gguf_runtime_source(&pack_b, Some("whisper-base"));
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_a.clone()).into(),
+    };
+    let _permit = runtime
+        .acquire_native_execution("native:whisper-tiny@busy-rebind", None)
+        .unwrap();
+
+    let error = runtime
+        .rebind_native_model_pack(Some(pack_b))
+        .expect_err("busy rebind must fail closed");
+    assert!(
+        matches!(error, ApiError::Conflict(_)),
+        "expected 409 conflict, got {error}"
+    );
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(pack_a.as_path())
+    );
+}
+
+#[tokio::test]
+async fn set_default_model_http_returns_conflict_when_native_session_is_busy() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let pack_a = write_installed_pack_ref(
+        &home,
+        "whisper-tiny",
+        "whisper-tiny:q4",
+        "q4_0",
+        "q4",
+        "whisper-tiny",
+    );
+    let _pack_b = write_installed_pack_ref(
+        &home,
+        "whisper-base",
+        "whisper-base:q4",
+        "q4_0",
+        "q4",
+        "whisper-base",
+    );
+
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_a.clone()).into(),
+    };
+    let _permit = runtime
+        .acquire_native_execution("native:whisper-tiny@busy-rebind-http", None)
+        .unwrap();
+    let app = app_with_runtime_and_distribution(
+        runtime.clone(),
+        DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/default")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "pull": "whisper-base:q4" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        parsed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("native transcription or realtime session is running")
+    );
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(pack_a.as_path())
+    );
+}
+
+fn write_installed_pack_ref(
+    home: &std::path::Path,
+    model_id: &str,
+    pull: &str,
+    quant: &str,
+    suffix: &str,
+    metadata_model_id: &str,
+) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+
+    std::fs::create_dir_all(home).unwrap();
+    let staging = home.join(format!("{model_id}-staging.oasr"));
+    write_mock_gguf_runtime_source(&staging, Some(metadata_model_id));
+    let bytes = std::fs::read(&staging).unwrap();
+    std::fs::remove_file(&staging).unwrap();
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let object = home
+        .join("models")
+        .join("objects")
+        .join("sha256")
+        .join(&sha256)
+        .join("content");
+    std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+    std::fs::write(&object, &bytes).unwrap();
+    let reference = home.join(format!("models/refs/{model_id}/{quant}.json"));
+    std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+    let pack = InstalledPack {
+        model_id: model_id.to_string(),
+        display_name: model_id.to_string(),
+        quant: quant.to_string(),
+        suffix: suffix.to_string(),
+        pull: pull.to_string(),
+        filename: format!("{model_id}-{quant}.oasr"),
+        path: object.clone(),
+        url: format!("https://example.invalid/{model_id}.oasr"),
+        hf_revision: "test".to_string(),
+        sha256,
+        size_bytes: bytes.len() as u64,
+        installed_at_unix_seconds: 1,
+        source: None,
+    };
+    std::fs::write(reference, serde_json::to_vec_pretty(&pack).unwrap()).unwrap();
+    object
 }
 
 #[tokio::test]
@@ -1644,7 +1822,7 @@ fn native_server_runtime_rejects_directory_runtime_source() {
         native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root),
+        model_pack_path: Some(pack_root).into(),
     };
     let error = runtime.validate().unwrap_err().to_string();
     assert!(
@@ -2522,7 +2700,7 @@ fn native_server_runtime_rejects_non_gguf_runtime_source_file() {
         native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_path),
+        model_pack_path: Some(pack_path).into(),
     };
     let error = runtime.validate().unwrap_err().to_string();
     assert!(
@@ -2541,7 +2719,7 @@ fn native_server_runtime_rejects_directory_runtime_source_without_file_fallback(
         native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root),
+        model_pack_path: Some(pack_root).into(),
     };
     let error = runtime.validate().unwrap_err().to_string();
     assert!(
@@ -2562,7 +2740,7 @@ async fn native_transcribe_stays_fail_closed_with_local_pack_only_validation() {
         native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root),
+        model_pack_path: Some(pack_root).into(),
     };
     let request = TranscriptionRequest::new(sample_wav, "whisper-large-v3-turbo");
     let error = transcribe_with_runtime(
@@ -2652,7 +2830,7 @@ async fn native_transcribe_accepts_a_real_uploaded_aac_file_past_audio_preparati
         native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_root),
+        model_pack_path: Some(pack_root).into(),
     };
     let transcription = transcribe_with_runtime(
         runtime,
@@ -2697,7 +2875,7 @@ async fn native_audio_preparation_does_not_consume_model_capacity() {
         native_execution: NativeExecutionSupervisor::new(std::num::NonZeroUsize::new(1).unwrap()),
         ffmpeg_bin: Some(converter),
         ffmpeg_bin_explicit: true,
-        model_pack_path: Some(pack_path),
+        model_pack_path: Some(pack_path).into(),
     };
     let request_runtime = runtime.clone();
     let request = TranscriptionRequest::new(input_path, "whisper-large-v3-turbo");

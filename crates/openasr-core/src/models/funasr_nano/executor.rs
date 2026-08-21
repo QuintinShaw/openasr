@@ -831,6 +831,10 @@ impl FunasrNanoGgmlExecutor {
             .execution_context
             .decode_work_progress_observer()
             .cloned();
+        let decoder_unstable_decode_text = request
+            .execution_context
+            .unstable_decode_text_observer()
+            .cloned();
         let result = if let Some(runtime) = unified_gpu_runtime.as_ref() {
             runtime
                 .call_mut_fallible(move |state| {
@@ -843,6 +847,7 @@ impl FunasrNanoGgmlExecutor {
                         kv_capacity,
                         &decoder_control,
                         decoder_decode_work_progress.as_ref(),
+                        decoder_unstable_decode_text.as_ref(),
                     );
                     state.decoder.release_session_scoped_buffers();
                     result
@@ -862,6 +867,7 @@ impl FunasrNanoGgmlExecutor {
                         kv_capacity,
                         &decoder_control,
                         decoder_decode_work_progress.as_ref(),
+                        decoder_unstable_decode_text.as_ref(),
                     );
                     runtime.release_session_scoped_buffers();
                     result
@@ -906,6 +912,7 @@ fn decode_with_decoder(
     kv_capacity: Qwen3AsrKvCacheCapacity,
     control: &Arc<crate::api::backend::TranscriptionControl>,
     decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
+    unstable_decode_text: Option<&crate::api::backend::UnstableDecodeTextObserver>,
 ) -> Result<Seq2SeqGreedyDecodeResult, FunasrNanoExecutorError> {
     let audio_pad_end = decode_prompt
         .audio_pad_start_index
@@ -954,6 +961,7 @@ fn decode_with_decoder(
         map_registry_error,
         control,
         decode_work_progress,
+        unstable_decode_text,
     )
     .map_err(|error| FunasrNanoExecutorError::GreedyDecodeFailed {
         reason: error.to_string(),
@@ -1231,6 +1239,7 @@ mod tests {
                 )
                 .expect("test KV capacity"),
                 &control,
+                None,
                 None,
             )
             .expect("decode");

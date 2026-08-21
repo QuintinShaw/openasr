@@ -4,8 +4,9 @@ Real-model regression net for every public model family: pull the family's
 smallest checkpoint at its smallest quant from the public catalog (the real
 user chain, including catalog signature verification), transcribe a committed
 fixture on the CPU backend, and compare the transcript against committed
-goldens. Driven by `.github/workflows/family-regression.yml` (nightly, `v*`
-release tags, and manual dispatch).
+goldens. Driven by `.github/workflows/family-regression.yml` (nightly, after a
+release is published, and manual dispatch). It reuses the latest published
+Linux/macOS CLI assets instead of compiling duplicate release binaries.
 
 ## Run one case locally
 

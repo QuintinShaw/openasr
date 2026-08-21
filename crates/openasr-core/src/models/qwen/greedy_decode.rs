@@ -75,6 +75,7 @@ pub(crate) fn run_qwen3_greedy_decode_loop(
     decode_text_token_ids: &dyn Fn(&[u32]) -> Result<String, Qwen3AsrGreedyDecodeError>,
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
+    unstable_decode_text: Option<&crate::api::backend::UnstableDecodeTextObserver>,
 ) -> Result<Qwen3AsrGreedyDecodeResult, Qwen3AsrGreedyDecodeError> {
     let output = run_builtin_seq2seq_decode_policy(
         crate::QWEN3_ASR_DECODE_POLICY_ID,
@@ -88,6 +89,7 @@ pub(crate) fn run_qwen3_greedy_decode_loop(
         map_registry_error,
         control,
         decode_work_progress,
+        unstable_decode_text,
     )?;
     Ok(Qwen3AsrGreedyDecodeResult {
         generated_tokens: output.generated_tokens,
@@ -306,6 +308,7 @@ mod tests {
             &decode_text_token_ids,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
             None,
+            None,
         )
         .unwrap();
 
@@ -351,6 +354,7 @@ mod tests {
             &decode_text_token_ids,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
             None,
+            None,
         )
         .unwrap();
 
@@ -390,6 +394,7 @@ mod tests {
             &mut step_executor,
             &decode_text_token_ids,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
             None,
         )
         .expect_err("no EOT should fail closed");
@@ -441,6 +446,7 @@ mod tests {
             &decode_text_token_ids,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
             None,
+            None,
         )
         .expect("stop-token decode succeeds");
         assert_eq!(
@@ -471,6 +477,7 @@ mod tests {
             &mut looping_executor,
             &decode_text_token_ids,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
             None,
         )
         .expect("guard-stopped decode still returns the kept prefix");

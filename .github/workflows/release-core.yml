@@ -1,8 +1,8 @@
 name: Release core
 
 # Version-bump-triggered release. When the workspace version in the root
-# Cargo.toml changes on main, this builds the `openasr` CLI for the platforms the
-# desktop app consumes and publishes a GitHub Release tagged `vX.Y.Z`. Editing
+# Cargo.toml changes on main, this creates the draft GitHub Release tagged
+# `vX.Y.Z`, then delegates every distributable build to one release matrix. Editing
 # Cargo.toml without changing the version (deps, metadata) is a safe no-op because
 # the resolve job exits cleanly when a Release for `vX.Y.Z` already exists.
 # `workflow_dispatch` lets the maintainer cut the very first release (no bump)
@@ -109,144 +109,15 @@ jobs:
             echo "RELEASE_HIGHLIGHTS_EOF"
           } >> "${GITHUB_OUTPUT}"
 
-  build:
-    name: Build ${{ matrix.target }}
-    needs: resolve
-    if: needs.resolve.outputs.should_release == 'true' && success()
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    # Initial archives only bootstrap the draft release. The full release
-    # matrix replaces them and centrally attests every final subject, avoiding
-    # duplicate Rekor calls before the expensive matrix begins.
-    permissions:
-      contents: read
-    # Distributed binaries must be portable across end-user CPUs. build.rs
-    # auto-enables GGML_NATIVE (-march=native) when host==target on x86, which
-    # would tune the released Linux binary to the CI runner and SIGILL elsewhere.
-    # Force it off; power users tune locally.
-    env:
-      OPENASR_GGML_NATIVE: "0"
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # macOS arm64: what the OpenASR Desktop app consumes. `asset` is the
-          # friendly, user-facing filename segment (see release-binaries.yml's
-          # naming note); it MUST match the name release-binaries.yml re-uploads
-          # for the same platform, or the release ends up with both a triple-
-          # named and a friendly-named archive (the --clobber re-upload only
-          # replaces an identically named asset).
-          - os: macos-14
-            target: aarch64-apple-darwin
-            asset: macos-arm64
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: release-${{ matrix.target }}
-      - name: Build release binary
-        run: cargo build --release -p openasr-cli
-      - name: Smoke release binary
-        run: |
-          ./target/release/openasr --version
-          ./target/release/openasr --help
-      - name: Package archive
-        run: |
-          set -euo pipefail
-          version="${{ needs.resolve.outputs.version }}"
-          asset="${{ matrix.asset }}"
-          stage="dist/openasr-${version}-${asset}"
-          mkdir -p "${stage}"
-          cp target/release/openasr "${stage}/"
-          cp README.md LICENSE "${stage}/"
-          tar -czf "dist/openasr-${version}-${asset}.tar.gz" -C dist "openasr-${version}-${asset}"
-      - name: Upload archive
-        uses: actions/upload-artifact@v7
-        with:
-          name: openasr-${{ matrix.target }}
-          path: dist/openasr-${{ needs.resolve.outputs.version }}-${{ matrix.asset }}.tar.gz
-          if-no-files-found: error
-
-  build-linux:
-    name: Build x86_64-unknown-linux-gnu
-    needs: resolve
-    if: needs.resolve.outputs.should_release == 'true' && success()
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/quintinshaw/openasr-ci-linux@sha256:702284855863f1c6330eec503ac4570ff2cc844a958ceb7d2e2af5837633dcdc
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    timeout-minutes: 60
-    permissions:
-      contents: read
-      packages: read
-    env:
-      OPENASR_GGML_NATIVE: "0"
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: recursive
-      - name: Prepare pinned Linux build environment
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          openasr-ci-verify
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: release-x86_64-unknown-linux-gnu
-      - name: Build release binary
-        run: cargo build --release -p openasr-cli
-      - name: Smoke release binary
-        run: |
-          ./target/release/openasr --version
-          ./target/release/openasr --help
-      - name: Package archive
-        run: |
-          set -euo pipefail
-          version="${{ needs.resolve.outputs.version }}"
-          stage="dist/openasr-${version}-linux-x86_64"
-          mkdir -p "${stage}"
-          cp target/release/openasr "${stage}/"
-          cp README.md LICENSE "${stage}/"
-          tar -czf "dist/openasr-${version}-linux-x86_64.tar.gz" \
-            -C dist "openasr-${version}-linux-x86_64"
-      - name: Upload archive
-        uses: actions/upload-artifact@v7
-        with:
-          name: openasr-x86_64-unknown-linux-gnu
-          path: dist/openasr-${{ needs.resolve.outputs.version }}-linux-x86_64.tar.gz
-          if-no-files-found: error
-
   release:
-    name: Publish release
-    needs: [resolve, build, build-linux]
+    name: Create draft release
+    needs: resolve
     if: needs.resolve.outputs.should_release == 'true' && success()
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7
-      - name: Download build archives
-        uses: actions/download-artifact@v8
-        with:
-          path: staging
-          merge-multiple: true
-      - name: Collect archives and checksums
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          find staging -name '*.tar.gz' -exec cp {} dist/ \;
-          cd dist
-          sha256sum *.tar.gz > SHA256SUMS
-          cat SHA256SUMS
-
       - name: Assemble release notes (Highlights / What's Changed / Install & Verify)
         env:
           HIGHLIGHTS: ${{ needs.resolve.outputs.highlights }}
@@ -268,11 +139,8 @@ jobs:
             -f "tag_name=${tag}" -f "target_commitish=${{ github.sha }}" \
             --jq .body > whats-changed.md
 
-          # Install & Verify: stub for now (this job's own build only covers
-          # macOS arm64 + Linux x86_64; the full multi-platform matrix hasn't
-          # built yet). The `finalize-notes` job below replaces this section
-          # with the real asset list once `binaries` (release-binaries.yml)
-          # finishes uploading everything.
+          # Install & Verify starts empty. The `finalize-notes` job below
+          # replaces it from the complete, attested matrix's real asset list.
           printf '' | scripts/render-install-verify.sh \
             "${{ needs.resolve.outputs.version }}" "${{ github.repository }}" "${tag}" \
             > install-verify.md
@@ -290,8 +158,7 @@ jobs:
           gh release create "${tag}" \
             --draft \
             --title "${tag}" \
-            --notes-file body.md \
-            dist/*.tar.gz dist/SHA256SUMS
+            --notes-file body.md
 
   binaries:
     name: Build full release matrix
@@ -337,102 +204,3 @@ jobs:
           python3 scripts/splice-install-verify.py current-body.md install-verify.md > new-body.md
 
           gh release edit "$tag" --notes-file new-body.md
-
-  docker-images:
-    name: Publish Docker Hub images
-    # Needs the full asset matrix so Dockerfile.release / Dockerfile.cuda.release
-    # can download the just-published linux-x86_64, linux-arm64, and
-    # linux-x86_64-cuda archives (+ SHA256SUMS). A red Docker job fails this
-    # workflow leg only -- it must never delete or roll back the GitHub Release
-    # the earlier jobs already published.
-    needs: [resolve, release, binaries]
-    if: needs.resolve.outputs.should_release == 'true' && success()
-    permissions:
-      contents: read
-    uses: ./.github/workflows/docker-release.yml
-    with:
-      version: ${{ needs.resolve.outputs.version }}
-      tag: ${{ needs.resolve.outputs.tag }}
-      push: true
-      mark_latest: true
-      variants: all
-    secrets: inherit
-
-  update-homebrew-tap:
-    name: Update Homebrew tap formula
-    # Needs the full asset matrix (binaries), not just the core build job's
-    # macOS arm64 + Linux x86_64 -- the formula also ships a Linux arm64
-    # target, which only release-binaries.yml's matrix produces.
-    needs: [resolve, release, binaries]
-    if: needs.resolve.outputs.should_release == 'true' && success()
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@v7
-      - name: Check for tap credentials
-        id: check
-        run: |
-          if [ -n "${{ secrets.HOMEBREW_TAP_TOKEN }}" ]; then
-            echo "has_token=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "has_token=false" >> "${GITHUB_OUTPUT}"
-            # ::notice, not ::error/::warning -- a maintainer who has not set
-            # up the tap yet should see a green release, not a red one, for a
-            # step that is inherently optional infrastructure.
-            echo "::notice::HOMEBREW_TAP_TOKEN secret not set -- skipping Homebrew tap formula update. See RELEASING.md for the fine-grained PAT this needs."
-          fi
-      - name: Checkout quintinshaw/homebrew-tap
-        if: steps.check.outputs.has_token == 'true'
-        uses: actions/checkout@v7
-        with:
-          repository: QuintinShaw/homebrew-tap
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          path: homebrew-tap
-      - name: Compute per-target sha256 from the release's SHA256SUMS
-        if: steps.check.outputs.has_token == 'true'
-        id: sums
-        run: |
-          set -euo pipefail
-          tag="${{ needs.resolve.outputs.tag }}"
-          version="${{ needs.resolve.outputs.version }}"
-          curl -fsSL -o SHA256SUMS \
-            "https://github.com/${{ github.repository }}/releases/download/${tag}/SHA256SUMS"
-
-          sha_for() {
-            grep -F " openasr-${version}-$1.tar.gz" SHA256SUMS | awk '{print $1}'
-          }
-          for target in macos-arm64 linux-x86_64 linux-arm64; do
-            sha="$(sha_for "$target")"
-            if [ -z "$sha" ]; then
-              echo "::error::no SHA256SUMS entry for openasr-${version}-${target}.tar.gz -- did release-binaries.yml ship that target?"
-              exit 1
-            fi
-            echo "${target}=${sha}" >> shas.env
-          done
-          cat shas.env
-      - name: Update Formula/openasr.rb
-        if: steps.check.outputs.has_token == 'true'
-        run: |
-          set -euo pipefail
-          args=()
-          while IFS='=' read -r target sha; do
-            args+=(--sha256 "${target}=${sha}")
-          done < shas.env
-          python3 scripts/update-homebrew-formula.py \
-            homebrew-tap/Formula/openasr.rb "${{ needs.resolve.outputs.version }}" \
-            "${args[@]}"
-      - name: Commit and push
-        if: steps.check.outputs.has_token == 'true'
-        run: |
-          set -euo pipefail
-          cd homebrew-tap
-          if git diff --quiet; then
-            echo "formula already up to date -- nothing to commit"
-            exit 0
-          fi
-          git config user.name "openasr-release-bot"
-          git config user.email "release-bot@users.noreply.github.com"
-          git add Formula/openasr.rb
-          git commit -m "openasr ${{ needs.resolve.outputs.tag }}"
-          git push origin main

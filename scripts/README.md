@@ -24,7 +24,7 @@ Local engineering scripts for validation and iteration.
     `finalize-notes` job).
 - `update-homebrew-formula.py`
   - Bump `Formula/openasr.rb`'s version and per-target sha256 in place (used
-    by `.github/workflows/release-core.yml`'s `update-homebrew-tap` job
+    by `.github/workflows/publish-core-channels.yml` after the release is public
     against a checkout of `QuintinShaw/homebrew-tap`). See `RELEASING.md`'s
     "Homebrew tap" section.
 - `generate_longform_pause_probe.py`

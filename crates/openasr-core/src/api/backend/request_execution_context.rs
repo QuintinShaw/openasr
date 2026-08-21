@@ -55,6 +55,33 @@ impl WorkProgressObserver {
     }
 }
 
+/// Cloneable request-local observer for postprocessed unstable decode text.
+///
+/// The shared greedy loop reports each new displayable prefix before EOT so a
+/// streaming Poll can emit `transcript.partial` without waiting for the stop
+/// token. Empty postprocessed prefixes (for example FunASR `/sil` stripped to
+/// nothing) are not reported.
+#[derive(Clone)]
+pub(crate) struct UnstableDecodeTextObserver(Arc<dyn Fn(&str) + Send + Sync + 'static>);
+
+impl fmt::Debug for UnstableDecodeTextObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("UnstableDecodeTextObserver(..)")
+    }
+}
+
+impl UnstableDecodeTextObserver {
+    #[allow(dead_code)] // installed only by tests; live Poll must not fan prefixes
+    pub(crate) fn new(observer: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(observer))
+    }
+
+    #[allow(dead_code)] // paired with `new`; production Poll leaves the observer unset
+    pub(crate) fn report(&self, text: &str) {
+        (self.0)(text);
+    }
+}
+
 /// Per-request execution context threaded explicitly through every decode
 /// dispatch surface. See the module docs for why this replaced the
 /// thread-local control binding.
@@ -71,6 +98,10 @@ pub struct RequestExecutionContext {
     /// use the typed constructor below instead of inventing another callback
     /// transport or process-global registry.
     decode_work_progress: Option<WorkProgressObserver>,
+    /// Optional mid-greedy unstable text sink. Streaming partials install this
+    /// so the shared decode driver can emit revisable prefixes before EOT;
+    /// FINAL / offline paths leave it unset.
+    unstable_decode_text: Option<UnstableDecodeTextObserver>,
 }
 
 // Manual, not derived: `TranscriptionControl` holds a `Mutex`/`Condvar` and
@@ -94,6 +125,7 @@ impl RequestExecutionContext {
             request_id,
             control,
             decode_work_progress: None,
+            unstable_decode_text: None,
         }
     }
 
@@ -108,11 +140,29 @@ impl RequestExecutionContext {
             request_id: self.request_id.clone(),
             control: Arc::clone(&self.control),
             decode_work_progress: Some(observer),
+            unstable_decode_text: self.unstable_decode_text.clone(),
         }
     }
 
     pub(crate) fn decode_work_progress_observer(&self) -> Option<&WorkProgressObserver> {
         self.decode_work_progress.as_ref()
+    }
+
+    #[allow(dead_code)] // reserved for a live mid-decode flush; snapshot Poll must not fan out prefixes
+    pub(crate) fn with_unstable_decode_text_observer(
+        &self,
+        observer: UnstableDecodeTextObserver,
+    ) -> Self {
+        Self {
+            request_id: self.request_id.clone(),
+            control: Arc::clone(&self.control),
+            decode_work_progress: self.decode_work_progress.clone(),
+            unstable_decode_text: Some(observer),
+        }
+    }
+
+    pub(crate) fn unstable_decode_text_observer(&self) -> Option<&UnstableDecodeTextObserver> {
+        self.unstable_decode_text.as_ref()
     }
 
     /// A context with no external owner: nothing can ever cancel or pause
@@ -172,6 +222,7 @@ impl RequestExecutionContext {
             request_id: None,
             control: Arc::new(TranscriptionControl::detached()),
             decode_work_progress: None,
+            unstable_decode_text: None,
         }
     }
 

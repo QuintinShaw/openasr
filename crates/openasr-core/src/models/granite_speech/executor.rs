@@ -606,6 +606,10 @@ impl GraniteSpeechGgmlExecutor {
             .execution_context
             .decode_work_progress_observer()
             .cloned();
+        let unstable_decode_text = request
+            .execution_context
+            .unstable_decode_text_observer()
+            .cloned();
         let result = actor
             .call_mut(move |prepared| {
                 let decode_result = (|| {
@@ -698,6 +702,7 @@ impl GraniteSpeechGgmlExecutor {
                         map_registry_error,
                         &control,
                         decode_work_progress.as_ref(),
+                        unstable_decode_text.as_ref(),
                     )
                     .map_err(|error| {
                         GraniteSpeechGgmlExecutorError::DecodeFailed {

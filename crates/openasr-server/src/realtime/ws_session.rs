@@ -466,8 +466,8 @@ fn realtime_phrase_bias_rejection_message(
     capability: openasr_core::api::backend::BackendFeatureCapability,
 ) -> String {
     if runtime.backend == openasr_core::BackendKind::Native
-        && let Some(path) = runtime.model_pack_path.as_deref()
-        && let Some(adapter) = native_runtime_model_adapter_for_path(path)
+        && let Some(path) = runtime.model_pack_path.current()
+        && let Some(adapter) = native_runtime_model_adapter_for_path(&path)
     {
         return format!(
             "Realtime phrase bias / hotword boosting is not supported by the active native model family '{}' ({}); session.start was rejected instead of silently ignoring hotwords.",
@@ -1012,7 +1012,7 @@ impl WsSession {
         partial_results: bool,
         word_timestamps: bool,
     ) -> Result<(), ()> {
-        let Some(model_pack_path) = self.runtime.model_pack_path.clone() else {
+        let Some(model_pack_path) = self.runtime.model_pack_path.current() else {
             self.emit_error(
                 RealtimeErrorCode::StartupConfigError,
                 "Native realtime streaming requires an explicit local runtime pack path.",
@@ -1067,6 +1067,7 @@ impl WsSession {
                     return Err(());
                 }
             };
+        super::wait_while_native_warmup_in_flight().await;
         let model_session_permit = match self
             .runtime
             .acquire_native_execution(&model_session_key, resolved_route.as_ref())

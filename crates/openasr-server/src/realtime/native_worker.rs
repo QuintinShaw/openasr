@@ -5,13 +5,13 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
 
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::ModelSessionPermit;
 
@@ -1041,17 +1041,77 @@ pub(crate) fn warm_up_native_streaming_session_once(
 /// `inference_threads`/`execution_target` override that differs from the
 /// saved preference, or the bound pack having changed since boot.
 ///
-/// Dedup with a concurrent real attach is structural, not a flag: this
-/// attaches its own short-lived "session" to the same
-/// [`NativeStreamingWorkerKey`] a matching real WS attach would use, sends
-/// `Warm`, waits for it to finish, and only then releases the worker -- the
-/// worker thread processes one attached session's commands at a time, so a
-/// real attach for the same key that arrives mid-warm-up queues behind this
-/// one instead of racing a second cold build. Whichever attach's `Warm`
-/// actually runs first pays the cost once (see the thread-local
-/// `WARMED_AT_GENERATION` gate in `warm_up_native_streaming_session_once`);
-/// every later attach on that thread reuses the now-warm state, until an
-/// `idle_unload` eviction bumps the generation and forces a re-warm.
+/// Dedup with a concurrent real attach is a process-wide warmup lease, not a
+/// user session permit: this never takes `max-native-sessions-per-model`. A
+/// real WS/transcription acquire waits until the lease drops, then takes the
+/// user slot and attaches. If a user session already holds a slot, warmup is
+/// opportunistic and returns without attaching -- the live request's own `Warm`
+/// pays the load. Whichever `Warm` actually runs first pays the cost once
+/// (see the thread-local `WARMED_AT_GENERATION` gate in
+/// `warm_up_native_streaming_session_once`); every later attach on that thread
+/// reuses the now-warm state, until an `idle_unload` eviction bumps the
+/// generation and forces a re-warm.
+/// Whether any native streaming worker currently has an attached (or attaching)
+/// session occupying its slot. Used by default-model rebind to fail closed
+/// rather than tearing down in-flight realtime work.
+pub(crate) fn native_streaming_workers_occupy_slot() -> bool {
+    let Some(registry) = SHARED_NATIVE_STREAMING_WORKERS.get() else {
+        return false;
+    };
+    let workers = registry
+        .lock()
+        .expect("native streaming worker registry mutex poisoned");
+    workers
+        .values()
+        .any(|entry| entry.state.active_or_attaching.load(Ordering::Acquire) > 0)
+}
+
+static NATIVE_WARMUP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+fn native_warmup_notify() -> &'static Notify {
+    static NOTIFY: OnceLock<Notify> = OnceLock::new();
+    NOTIFY.get_or_init(Notify::new)
+}
+
+pub(crate) fn native_warmup_in_flight() -> bool {
+    NATIVE_WARMUP_IN_FLIGHT.load(Ordering::Acquire)
+}
+
+pub(crate) struct NativeWarmupLease {
+    _private: (),
+}
+
+pub(crate) fn try_begin_native_warmup() -> Option<NativeWarmupLease> {
+    NATIVE_WARMUP_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| NativeWarmupLease { _private: () })
+}
+
+impl Drop for NativeWarmupLease {
+    fn drop(&mut self) {
+        NATIVE_WARMUP_IN_FLIGHT.store(false, Ordering::Release);
+        native_warmup_notify().notify_waiters();
+    }
+}
+
+pub(crate) async fn wait_while_native_warmup_in_flight() {
+    let started = Instant::now();
+    let notify = native_warmup_notify();
+    while native_warmup_in_flight() && started.elapsed() < Duration::from_secs(60) {
+        let _ = tokio::time::timeout(Duration::from_millis(50), notify.notified()).await;
+    }
+}
+
+/// Blocking counterpart for `spawn_blocking` transcription: same 60s cap, no
+/// tokio runtime. Call immediately before `acquire_native_execution`.
+pub(crate) fn wait_while_native_warmup_in_flight_blocking() {
+    let started = Instant::now();
+    while native_warmup_in_flight() && started.elapsed() < Duration::from_secs(60) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 pub(crate) fn spawn_boot_native_warmup(runtime: ServerRuntime) {
     tokio::spawn(async move {
         warm_up_default_native_streaming_worker(runtime).await;
@@ -1062,13 +1122,21 @@ pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime
     if runtime.backend != openasr_core::BackendKind::Native {
         return;
     }
-    let Some(model_pack_path) = runtime.model_pack_path.clone() else {
+    let Some(model_pack_path) = runtime.model_pack_path.current() else {
         // Fresh install / no model installed yet: nothing to warm. The daemon
-        // still serves `/health`; a bound pack arrives on a future restart.
+        // still serves `/health`; a later default-model rebind binds a pack
+        // in-process without restart, and the next request path loads it.
         return;
     };
-    // Warmup is opportunistic. It must not queue behind an active request or
-    // allocate a second runtime; a real request owns the capacity slot first.
+    // Opportunistic: a live user session already owns the slot and will Warm
+    // itself. Never take `max-native-sessions-per-model`; that slot is only
+    // for transcription/realtime. Coalesce overlapping boot/rebind spawns.
+    if runtime.native_execution.has_active_sessions() {
+        return;
+    }
+    let Some(_lease) = try_begin_native_warmup() else {
+        return;
+    };
     let preferences_home = openasr_core::openasr_home().ok();
     let inference_threads = preferences_home
         .as_deref()
@@ -1082,15 +1150,6 @@ pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime
     .ok()
     .flatten();
     let Some(adapter) = openasr_core::native_runtime_model_adapter_for_path(&model_pack_path)
-    else {
-        return;
-    };
-    let Ok(model_session_key) = crate::routes::transcription::native_model_session_key(&adapter)
-    else {
-        return;
-    };
-    let Ok(model_session_permit) =
-        runtime.acquire_native_execution(&model_session_key, resolved_route.as_ref())
     else {
         return;
     };
@@ -1143,7 +1202,7 @@ pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime
         inference_threads,
     );
     let diagnostic_key = key.clone();
-    if let Err(error) = attach_and_run_boot_warmup(key, session, Some(model_session_permit)).await {
+    if let Err(error) = attach_and_run_boot_warmup(key, session, None).await {
         openasr_core::stage_timing::log_event(
             "realtime_warmup",
             format_args!(
@@ -1237,7 +1296,7 @@ impl RealtimeBackendWorkerKey {
         Self {
             backend: runtime.backend.to_string(),
             ffmpeg_bin: runtime.ffmpeg_bin.clone(),
-            model_pack_path: runtime.model_pack_path.clone(),
+            model_pack_path: runtime.model_pack_path.current(),
         }
     }
 }

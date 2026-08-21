@@ -326,6 +326,10 @@ impl MoonshineGgmlExecutor {
                         .execution_context
                         .decode_work_progress_observer()
                         .cloned(),
+                    request
+                        .execution_context
+                        .unstable_decode_text_observer()
+                        .cloned(),
                 )?
             };
 
@@ -521,6 +525,7 @@ impl MoonshineGgmlExecutor {
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
         control: Arc<crate::api::backend::TranscriptionControl>,
         decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
+        unstable_decode_text: Option<crate::api::backend::UnstableDecodeTextObserver>,
     ) -> Result<super::decoder_graph::MoonshineDecodeOutput, MoonshineGgmlExecutorError> {
         let tokenizer = prepared.tokenizer.clone();
         let metadata = prepared.metadata;
@@ -545,6 +550,7 @@ impl MoonshineGgmlExecutor {
                     audio_duration_seconds,
                     &control,
                     decode_work_progress.as_ref(),
+                    unstable_decode_text.as_ref(),
                 )
             })
             .map_err(|error| Self::map_actor_error("decoder", error))?

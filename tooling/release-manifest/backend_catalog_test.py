@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 import backend_catalog
 
@@ -172,6 +173,300 @@ class BackendCatalogTest(unittest.TestCase):
             duplicate.write_text(json.dumps(dict(old, id="cuda-duplicate")), encoding="utf-8")
             with self.assertRaises(backend_catalog.BackendCatalogError):
                 backend_catalog.merge_catalog(catalog, [duplicate], out)
+
+    def test_merge_replaces_same_id_slot_when_plugin_bytes_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = {
+                "id": "hip-windows-x86_64-aaaaaaaaaaaa-gfx1200",
+                "vendor": "hip",
+                "version": "0.1.34",
+                "host_abi": {"fingerprint": "a" * 64},
+                "targets": ["gfx1200"],
+                "files": [{"filename": "old.dll", "sha256": "1" * 64}],
+            }
+            cuda = {
+                "id": "cuda-windows-x86_64-aaaaaaaaaaaa-sm_90",
+                "vendor": "cuda",
+                "version": "0.1.34",
+                "host_abi": {"fingerprint": "a" * 64},
+                "targets": ["sm_90"],
+                "files": [{"filename": "cuda.dll", "sha256": "2" * 64}],
+            }
+            catalog = root / "catalog.json"
+            catalog.write_text(json.dumps({"backends": [old, cuda]}), encoding="utf-8")
+            new = dict(
+                old,
+                version="0.1.35",
+                files=[{"filename": "new.dll", "sha256": "3" * 64}],
+            )
+            entry = root / "entry.json"
+            entry.write_text(json.dumps(new), encoding="utf-8")
+            out = root / "out.json"
+            backend_catalog.merge_catalog(catalog, [entry], out)
+            merged = json.loads(out.read_text())["backends"]
+            by_id = {item["id"]: item for item in merged}
+            self.assertEqual(set(by_id), {old["id"], cuda["id"]})
+            self.assertEqual(by_id[old["id"]]["version"], "0.1.35")
+            self.assertEqual(by_id[old["id"]]["files"][0]["filename"], "new.dll")
+            self.assertEqual(by_id[cuda["id"]]["version"], "0.1.34")
+
+            conflict = root / "conflict.json"
+            conflict.write_text(json.dumps(dict(new, files=[{"filename": "other.dll"}])), encoding="utf-8")
+            with self.assertRaises(backend_catalog.BackendCatalogError):
+                backend_catalog.merge_catalog(catalog, [entry, conflict], out)
+
+    def test_verify_catalog_cdn_requires_live_canonical_urls_for_the_release_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog = Path(tmp) / "catalog.json"
+            plugin_url = "https://dl.openasr.org/core/v0.1.35/hip.dll"
+            vendor_url = "https://dl.openasr.org/core/v0.1.35/vendor.zip"
+            catalog.write_text(
+                json.dumps(
+                    {
+                        "backends": [
+                            {
+                                "id": "hip-gfx1200",
+                                "vendor": "hip",
+                                "version": "0.1.35",
+                                "files": [
+                                    {
+                                        "filename": "hip.dll",
+                                        "url": plugin_url,
+                                        "size_bytes": 70,
+                                        "sha256": "a" * 64,
+                                    },
+                                    {
+                                        "filename": "vendor.zip",
+                                        "url": vendor_url,
+                                        "size_bytes": 200,
+                                        "sha256": "b" * 64,
+                                    },
+                                ],
+                            },
+                            {
+                                "id": "cuda-sm90",
+                                "vendor": "cuda",
+                                "version": "0.1.34",
+                                "files": [
+                                    {
+                                        "filename": "cuda.dll",
+                                        "url": "https://dl.openasr.org/core/v0.1.34/cuda.dll",
+                                        "size_bytes": 10,
+                                        "sha256": "c" * 64,
+                                    }
+                                ],
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            heads = {plugin_url: (200, 70), vendor_url: (200, 200)}
+            result = backend_catalog.verify_catalog_cdn(
+                catalog, "0.1.35", head=lambda url: heads[url]
+            )
+            self.assertEqual(result["versions"], ["0.1.35"])
+            self.assertEqual(result["verified_urls"], [plugin_url, vendor_url])
+
+            heads[vendor_url] = (404, None)
+            with self.assertRaises(backend_catalog.BackendCatalogError):
+                backend_catalog.verify_catalog_cdn(
+                    catalog, "0.1.35", head=lambda url: heads[url]
+                )
+
+    def test_verify_catalog_cdn_without_version_gates_every_backend_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog = Path(tmp) / "catalog.json"
+            urls = {
+                "https://dl.openasr.org/core/v0.1.34/cuda.dll": (200, 10),
+                "https://dl.openasr.org/core/v0.1.35/hip.dll": (200, 20),
+            }
+            catalog.write_text(
+                json.dumps(
+                    {
+                        "backends": [
+                            {
+                                "vendor": "cuda",
+                                "version": "0.1.34",
+                                "files": [
+                                    {
+                                        "filename": "cuda.dll",
+                                        "url": next(iter(urls)),
+                                        "size_bytes": 10,
+                                        "sha256": "a" * 64,
+                                    }
+                                ],
+                            },
+                            {
+                                "vendor": "hip",
+                                "version": "0.1.35",
+                                "files": [
+                                    {
+                                        "filename": "hip.dll",
+                                        "url": "https://dl.openasr.org/core/v0.1.35/hip.dll",
+                                        "size_bytes": 20,
+                                        "sha256": "b" * 64,
+                                    }
+                                ],
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = backend_catalog.verify_catalog_cdn(
+                catalog, head=lambda url: urls[url]
+            )
+            self.assertEqual(result["versions"], ["0.1.34", "0.1.35"])
+            self.assertEqual(result["verified_urls"], sorted(urls))
+
+    def test_verify_catalog_cdn_rejects_conflicting_duplicate_url_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog = Path(tmp) / "catalog.json"
+            url = "https://dl.openasr.org/core/v0.1.35/shared.zip"
+            catalog.write_text(
+                json.dumps(
+                    {
+                        "backends": [
+                            {
+                                "vendor": "cuda",
+                                "version": "0.1.35",
+                                "files": [
+                                    {
+                                        "filename": "shared.zip",
+                                        "url": url,
+                                        "size_bytes": 10,
+                                        "sha256": "a" * 64,
+                                    }
+                                ],
+                            },
+                            {
+                                "vendor": "hip",
+                                "version": "0.1.35",
+                                "files": [
+                                    {
+                                        "filename": "shared.zip",
+                                        "url": url,
+                                        "size_bytes": 999,
+                                        "sha256": "a" * 64,
+                                    }
+                                ],
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                backend_catalog.BackendCatalogError, "conflicting signed metadata"
+            ):
+                backend_catalog.verify_catalog_cdn(catalog, head=lambda _: (200, 10))
+
+    def test_verify_catalog_cdn_rejects_same_size_duplicate_with_different_sha256(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog = Path(tmp) / "catalog.json"
+            url = "https://dl.openasr.org/core/v0.1.35/shared.zip"
+            catalog.write_text(
+                json.dumps(
+                    {
+                        "backends": [
+                            {
+                                "vendor": vendor,
+                                "version": "0.1.35",
+                                "files": [
+                                    {
+                                        "filename": "shared.zip",
+                                        "url": url,
+                                        "size_bytes": 10,
+                                        "sha256": digest * 64,
+                                    }
+                                ],
+                            }
+                            for vendor, digest in (("cuda", "a"), ("hip", "b"))
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                backend_catalog.BackendCatalogError, "conflicting signed metadata"
+            ):
+                backend_catalog.verify_catalog_cdn(catalog, head=lambda _: (200, 10))
+
+    def test_verify_catalog_cdn_probes_identical_duplicate_metadata_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog = Path(tmp) / "catalog.json"
+            url = "https://dl.openasr.org/core/v0.1.35/shared.zip"
+            record = {
+                "filename": "shared.zip",
+                "url": url,
+                "size_bytes": 10,
+                "sha256": "a" * 64,
+            }
+            catalog.write_text(
+                json.dumps(
+                    {
+                        "backends": [
+                            {"vendor": vendor, "version": "0.1.35", "files": [record]}
+                            for vendor in ("cuda", "hip")
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            calls = []
+
+            backend_catalog.verify_catalog_cdn(
+                catalog, head=lambda candidate: calls.append(candidate) or (200, 10)
+            )
+
+            self.assertEqual(calls, [url])
+
+    def test_verify_catalog_cdn_requires_filename_exactly_in_canonical_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog = Path(tmp) / "catalog.json"
+            catalog.write_text(
+                json.dumps(
+                    {
+                        "backends": [
+                            {
+                                "vendor": "cuda",
+                                "version": "0.1.35",
+                                "files": [
+                                    {
+                                        "filename": "signed-name.zip",
+                                        "url": "https://dl.openasr.org/core/v0.1.35/other-name.zip",
+                                        "size_bytes": 10,
+                                        "sha256": "a" * 64,
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                backend_catalog.BackendCatalogError, "not the canonical CDN URL"
+            ):
+                backend_catalog.verify_catalog_cdn(catalog, head=lambda _: (200, 10))
+
+    def test_head_cdn_url_bounds_and_retries_curl(self):
+        completed = backend_catalog.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="HTTP/2 200\ncontent-length: 42\n", stderr=""
+        )
+        with mock.patch.object(backend_catalog.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(backend_catalog.head_cdn_url("https://example.invalid/file"), (200, 42))
+
+        command = run.call_args.args[0]
+        self.assertIn("--connect-timeout", command)
+        self.assertIn("--max-time", command)
+        self.assertIn("--retry", command)
+        self.assertIn("--retry-all-errors", command)
 
     def test_update_hints_bind_target_scoped_provider_candidates_to_one_host_abi(self):
         with tempfile.TemporaryDirectory() as tmp:

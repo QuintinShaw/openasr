@@ -100,6 +100,10 @@ impl NativeExecutionSupervisor {
         self.admission.try_acquire(model_identity)
     }
 
+    pub(crate) fn has_active_sessions(&self) -> bool {
+        self.admission.has_active_sessions()
+    }
+
     pub fn max_concurrent_sessions_per_model(&self) -> NonZeroUsize {
         self.admission.limit()
     }
@@ -152,6 +156,10 @@ impl ModelSessionAdmission {
             model_identity,
             permit: Some(permit),
         })
+    }
+
+    pub(crate) fn has_active_sessions(&self) -> bool {
+        self.lock_state().slots.values().any(|slot| slot.active > 0)
     }
 
     #[cfg(test)]
@@ -233,6 +241,18 @@ mod tests {
 
         assert_eq!(admission.active_slot_count(), 0);
         assert!(admission.try_acquire("native:whisper-small@pack-a").is_ok());
+    }
+
+    #[test]
+    fn has_active_sessions_tracks_live_permits() {
+        let admission = admission(1);
+        assert!(!admission.has_active_sessions());
+        let first = admission
+            .try_acquire("native:whisper-small@pack-a")
+            .unwrap();
+        assert!(admission.has_active_sessions());
+        drop(first);
+        assert!(!admission.has_active_sessions());
     }
 
     #[test]

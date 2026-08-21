@@ -859,6 +859,7 @@ fn run_moss_td_decoder_with_runtime(
     tokenizer: MossTdTokenizer,
     control: Arc<crate::api::backend::TranscriptionControl>,
     decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
+    unstable_decode_text: Option<crate::api::backend::UnstableDecodeTextObserver>,
 ) -> Result<MossTdDecodeOutput, MossTdExecutorError> {
     if std::env::var_os("OPENASR_MOSS_TD_PROFILE").is_some() {
         eprintln!(
@@ -910,6 +911,7 @@ fn run_moss_td_decoder_with_runtime(
         map_registry_error,
         &control,
         decode_work_progress.as_ref(),
+        unstable_decode_text.as_ref(),
     );
     // Release this request's per-token grow-to-fit host buffer before the
     // runtime goes back into the cache -- unconditionally, on both success
@@ -961,6 +963,7 @@ fn run_moss_td_decoder_with_cached_runtime(
     tokenizer: MossTdTokenizer,
     control: Arc<crate::api::backend::TranscriptionControl>,
     decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
+    unstable_decode_text: Option<crate::api::backend::UnstableDecodeTextObserver>,
 ) -> Result<MossTdDecodeOutput, MossTdExecutorError> {
     let decode_prompt_token_ids = decode_prompt_token_ids.to_vec();
     let audio_pad_positions = audio_pad_positions.to_vec();
@@ -978,6 +981,7 @@ fn run_moss_td_decoder_with_cached_runtime(
                 tokenizer,
                 control,
                 decode_work_progress,
+                unstable_decode_text,
             )
         })
         .map_err(|error| MossTdExecutorError::RuntimeOwnershipFailed {
@@ -1528,6 +1532,10 @@ impl MossTdGgmlExecutor {
             .execution_context
             .decode_work_progress_observer()
             .cloned();
+        let unstable_decode_text = request
+            .execution_context
+            .unstable_decode_text_observer()
+            .cloned();
         let decoded = match unified_runtime.as_ref() {
             Some(actor) => {
                 let token_ids = decode_prompt.token_ids;
@@ -1545,6 +1553,7 @@ impl MossTdGgmlExecutor {
                             tokenizer,
                             control,
                             decode_work_progress,
+                            unstable_decode_text,
                         )
                     })
                     .map_err(|error| MossTdExecutorError::RuntimeOwnershipFailed {
@@ -1566,6 +1575,7 @@ impl MossTdGgmlExecutor {
                     tokenizer,
                     control,
                     decode_work_progress,
+                    unstable_decode_text,
                 )?
             }
         };

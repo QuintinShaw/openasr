@@ -260,8 +260,9 @@ fn project_descriptor(descriptor: OpenAsrArchitectureDescriptor) -> ModelFamilyI
                 execution_contract.execution_capabilities,
             ),
             streaming_partial_granularity: match execution_contract.streaming_partial_granularity {
-                StreamingPartialGranularity::FrameSync => "frame-sync",
-                StreamingPartialGranularity::Buffered => "buffered",
+                StreamingPartialGranularity::FrameSyncAppend => "frame-sync-append",
+                StreamingPartialGranularity::RevisableSnapshot => "revisable-snapshot",
+                StreamingPartialGranularity::UtteranceComplete => "utterance-complete",
             }
             .to_string(),
             speaker_segmentation: match execution_contract.speaker_segmentation {

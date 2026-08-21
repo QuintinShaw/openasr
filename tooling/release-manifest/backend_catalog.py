@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """Compile verified backend build artifacts into signed-catalog entries.
 
-This tool never signs or downloads. It derives every byte identity from the
-staged release files and preserves prior ABI-scoped entries when merging, so
-older neutral hosts can continue resolving their compatible pack.
+This tool never signs or downloads payload bytes. It derives every byte identity
+from the staged release files. Merging preserves prior ABI-scoped entries so
+older neutral hosts can keep resolving their compatible pack, and replaces
+same-ABI slots in place when a later plugin build reuses the stable target id.
+verify-cdn HEADs the signed file URLs so a release cannot go public while the
+canonical CDN prefix is empty.
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import re
 import struct
+import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -380,15 +386,23 @@ def merge_catalog(catalog_path: Path, entry_paths: list[Path], out: Path) -> Non
     existing = catalog.get("backends", [])
     if not isinstance(existing, list):
         raise BackendCatalogError("catalog.backends must be an array")
-    entries = [_read_json(path) for path in entry_paths]
-    by_id: dict[str, dict[str, Any]] = {}
-    for entry in [*existing, *entries]:
+    incoming: dict[str, dict[str, Any]] = {}
+    for entry in [_read_json(path) for path in entry_paths]:
         backend_id = entry.get("id")
         if not isinstance(backend_id, str) or not backend_id:
             raise BackendCatalogError("every backend entry needs a non-empty id")
-        if backend_id in by_id and by_id[backend_id] != entry:
+        if backend_id in incoming and incoming[backend_id] != entry:
             raise BackendCatalogError(f"backend id '{backend_id}' has conflicting entries")
+        incoming[backend_id] = entry
+    by_id: dict[str, dict[str, Any]] = {}
+    for entry in existing:
+        backend_id = entry.get("id")
+        if not isinstance(backend_id, str) or not backend_id:
+            raise BackendCatalogError("every backend entry needs a non-empty id")
         by_id[backend_id] = entry
+    # Same host ABI keeps a stable id. A later release therefore replaces the
+    # slot's plugin bytes in place instead of colliding with the prior version.
+    by_id.update(incoming)
 
     identities: dict[tuple[str, str, tuple[str, ...]], str] = {}
     for backend_id, entry in by_id.items():
@@ -554,6 +568,128 @@ def verify_catalog_entries(catalog_path: Path, entry_paths: list[Path]) -> dict[
     }
 
 
+def head_cdn_url(url: str) -> tuple[int, int | None]:
+    # Cloudflare on dl.openasr.org rejects Python-urllib's default User-Agent
+    # with HTTP 403. curl is the maintainer-host probe used everywhere else.
+    completed = subprocess.run(
+        [
+            "curl",
+            "-sS",
+            "-I",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "20",
+            "--retry",
+            "2",
+            "--retry-delay",
+            "1",
+            "--retry-all-errors",
+            url,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise BackendCatalogError(
+            f"CDN HEAD failed for {url}: {completed.stderr.strip() or completed.returncode}"
+        )
+    status: int | None = None
+    length: int | None = None
+    for line in completed.stdout.splitlines():
+        if line.startswith("HTTP/"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                status = int(parts[1])
+        elif line.lower().startswith("content-length:"):
+            value = line.split(":", 1)[1].strip()
+            if value.isdigit():
+                length = int(value)
+    if status is None:
+        raise BackendCatalogError(f"CDN HEAD failed for {url}: no HTTP status")
+    return status, length
+
+
+def verify_catalog_cdn(
+    catalog_path: Path,
+    version: str | None = None,
+    head: Callable[[str], tuple[int, int | None]] | None = None,
+) -> dict[str, object]:
+    """Require signed CUDA/HIP file URLs to be live before catalog deployment."""
+
+    catalog = _read_json(catalog_path)
+    head_fn = head or head_cdn_url
+    seen: dict[str, tuple[str, str, int, str]] = {}
+    checked_versions: set[str] = set()
+    for entry in catalog.get("backends", []):
+        if not isinstance(entry, dict):
+            continue
+        entry_version = str(entry.get("version", ""))
+        if entry.get("vendor") not in {"cuda", "hip"} or (
+            version is not None and entry_version != version
+        ):
+            continue
+        for file in entry.get("files", []):
+            if not isinstance(file, dict):
+                raise BackendCatalogError("backend file records must be objects")
+            filename = str(file.get("filename", ""))
+            url = str(file.get("url", ""))
+            size = int(file.get("size_bytes", 0))
+            sha256 = str(file.get("sha256", "")).lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+                raise BackendCatalogError(
+                    f"backend file '{filename}' has an invalid signed sha256"
+                )
+            canonical_url = f"https://dl.openasr.org/core/v{entry_version}/{filename}"
+            if not entry_version or url != canonical_url:
+                raise BackendCatalogError(
+                    f"backend file '{filename}' is not the canonical CDN URL for {entry_version or '<missing version>'}"
+                )
+            identity = (entry_version, filename, size, sha256)
+            if url in seen:
+                if seen[url] != identity:
+                    raise BackendCatalogError(
+                        f"conflicting signed metadata for duplicate CDN URL '{url}': "
+                        f"first={seen[url]!r} later={identity!r}"
+                    )
+                continue
+            seen[url] = identity
+            checked_versions.add(entry_version)
+    if not seen:
+        scope = f"version {version}" if version is not None else "the catalog"
+        raise BackendCatalogError(
+            f"catalog has no CUDA/HIP backend files for {scope} to verify on CDN"
+        )
+
+    def probe(item: tuple[str, tuple[str, str, int, str]]) -> str:
+        url, (entry_version, filename, size, _sha256) = item
+        status, length = head_fn(url)
+        if status != 200 or length != size:
+            raise BackendCatalogError(
+                f"CDN object missing or size-mismatched for '{filename}': "
+                f"HEAD {url} -> {status} content-length={length} signed_size={size}. "
+                f"Run scripts/sync-windows-backend-cdn.sh v{entry_version} before catalog deployment."
+            )
+        return url
+
+    items = sorted(seen.items())
+    if head is None and len(items) > 1:
+        # Network HEADs are independent. Bound parallelism so a catalog with
+        # many target packs does not turn deploy/finalize into a long serial
+        # TLS loop, while curl's timeout/retry bounds every worker.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(items))) as pool:
+            checked = list(pool.map(probe, items))
+    else:
+        # Injected probes stay deterministic for unit tests and local callers.
+        checked = [probe(item) for item in items]
+    return {
+        "schema_version": 1,
+        "versions": sorted(checked_versions),
+        "verified_urls": sorted(checked),
+    }
+
+
 def artifact_fingerprint(entry: dict[str, Any]) -> str:
     digest = hashlib.sha256()
     role_tags = {"runtime": 0, "plugin": 1, "archive": 2}
@@ -709,6 +845,12 @@ def main() -> int:
     verify_catalog_parser = subparsers.add_parser("verify-catalog")
     verify_catalog_parser.add_argument("--catalog", type=Path, required=True)
     verify_catalog_parser.add_argument("--entry", type=Path, action="append", required=True)
+    verify_cdn_parser = subparsers.add_parser("verify-cdn")
+    verify_cdn_parser.add_argument("--catalog", type=Path, required=True)
+    verify_cdn_parser.add_argument(
+        "--version",
+        help="limit the gate to one X.Y.Z release; omit to verify every signed backend URL",
+    )
     hints_parser = subparsers.add_parser("hints")
     hints_parser.add_argument("--entry", type=Path, action="append", required=True)
     hints_parser.add_argument("--out", type=Path, required=True)
@@ -736,6 +878,12 @@ def main() -> int:
             print(
                 json.dumps(
                     verify_catalog_entries(args.catalog, args.entry), sort_keys=True
+                )
+            )
+        elif args.command == "verify-cdn":
+            print(
+                json.dumps(
+                    verify_catalog_cdn(args.catalog, args.version), sort_keys=True
                 )
             )
         elif args.command == "hints":

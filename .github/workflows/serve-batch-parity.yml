@@ -7,14 +7,12 @@ name: Serve-batch real-pack parity
 # tests in `cargo test` run on tiny synthetic fixtures only; this lane is the
 # real-weight correctness backstop. moonshine is a seq2seq family riding the same
 # shared nn/decoder.rs seam as whisper/cohere, so it is a strong proxy for the
-# seq2seq batched path. Runs on PRs into main (gates the merge) and on demand.
+# seq2seq batched path. Runs on PRs into main (gates the merge) and on demand;
+# the already-gated merge commit is not rebuilt a second time.
 
 on:
   workflow_dispatch:
   pull_request:
-    branches: [main]
-  # Post-merge backstop on main.
-  push:
     branches: [main]
 
 concurrency:

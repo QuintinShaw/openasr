@@ -93,7 +93,7 @@
             }
           ]
         },
-        "streaming_partial_granularity": "buffered",
+        "streaming_partial_granularity": "revisable-snapshot",
         "speaker_segmentation": "external",
         "emits_punctuation": true,
         "supports_phrase_bias": true,
@@ -224,7 +224,7 @@
             }
           ]
         },
-        "streaming_partial_granularity": "buffered",
+        "streaming_partial_granularity": "revisable-snapshot",
         "speaker_segmentation": "external",
         "emits_punctuation": false,
         "supports_phrase_bias": true,
@@ -346,7 +346,7 @@
             }
           ]
         },
-        "streaming_partial_granularity": "buffered",
+        "streaming_partial_granularity": "revisable-snapshot",
         "speaker_segmentation": "external",
         "emits_punctuation": false,
         "supports_phrase_bias": false,
@@ -470,7 +470,7 @@
             }
           ]
         },
-        "streaming_partial_granularity": "buffered",
+        "streaming_partial_granularity": "utterance-complete",
         "speaker_segmentation": "external",
         "emits_punctuation": null,
         "supports_phrase_bias": false,
@@ -593,7 +593,7 @@
             }
           ]
         },
-        "streaming_partial_granularity": "buffered",
+        "streaming_partial_granularity": "utterance-complete",
         "speaker_segmentation": "external",
         "emits_punctuation": null,
         "supports_phrase_bias": false,
@@ -729,7 +729,7 @@
             }
           ]
         },
-        "streaming_partial_granularity": "buffered",
+        "streaming_partial_granularity": "revisable-snapshot",
         "speaker_segmentation": "external",
         "emits_punctuation": true,
         "supports_phrase_bias": true,
@@ -876,7 +876,7 @@
             }
           ]
         },
-        "streaming_partial_granularity": "buffered",
+        "streaming_partial_granularity": "utterance-complete",
         "speaker_segmentation": "external",
         "emits_punctuation": null,
         "supports_phrase_bias": false,
@@ -989,7 +989,7 @@
             }
           ]
         },
-        "streaming_partial_granularity": "buffered",
+        "streaming_partial_granularity": "revisable-snapshot",
         "speaker_segmentation": "external",
         "emits_punctuation": true,
         "supports_phrase_bias": true,
@@ -1120,7 +1120,7 @@
             }
           ]
         },
-        "streaming_partial_granularity": "buffered",
+        "streaming_partial_granularity": "utterance-complete",
         "speaker_segmentation": "in-decoder",
         "emits_punctuation": null,
         "supports_phrase_bias": false,
@@ -1230,7 +1230,7 @@
             }
           ]
         },
-        "streaming_partial_granularity": "buffered",
+        "streaming_partial_granularity": "revisable-snapshot",
         "speaker_segmentation": "external",
         "emits_punctuation": null,
         "supports_phrase_bias": true,
@@ -1370,7 +1370,7 @@
             }
           ]
         },
-        "streaming_partial_granularity": "buffered",
+        "streaming_partial_granularity": "revisable-snapshot",
         "speaker_segmentation": "external",
         "emits_punctuation": true,
         "supports_phrase_bias": false,
@@ -1516,7 +1516,7 @@
             }
           ]
         },
-        "streaming_partial_granularity": "buffered",
+        "streaming_partial_granularity": "revisable-snapshot",
         "speaker_segmentation": "external",
         "emits_punctuation": true,
         "supports_phrase_bias": true,
@@ -1628,7 +1628,7 @@
             }
           ]
         },
-        "streaming_partial_granularity": "buffered",
+        "streaming_partial_granularity": "revisable-snapshot",
         "speaker_segmentation": "external",
         "emits_punctuation": true,
         "supports_phrase_bias": true,
@@ -1736,7 +1736,7 @@
             }
           ]
         },
-        "streaming_partial_granularity": "buffered",
+        "streaming_partial_granularity": "revisable-snapshot",
         "speaker_segmentation": "external",
         "emits_punctuation": null,
         "supports_phrase_bias": true,
@@ -1941,7 +1941,7 @@
             }
           ]
         },
-        "streaming_partial_granularity": "buffered",
+        "streaming_partial_granularity": "revisable-snapshot",
         "speaker_segmentation": "external",
         "emits_punctuation": true,
         "supports_phrase_bias": true,
@@ -2056,7 +2056,7 @@
             }
           ]
         },
-        "streaming_partial_granularity": "frame-sync",
+        "streaming_partial_granularity": "frame-sync-append",
         "speaker_segmentation": "external",
         "emits_punctuation": true,
         "supports_phrase_bias": false,

@@ -24,7 +24,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -262,30 +262,24 @@ pub async fn serve_with_launch_options(
     launch_options: ServerLaunchOptions,
 ) -> anyhow::Result<()> {
     // Boot stage timing: each phase logged as its own timestamped line so a
-    // slow daemon start (validate/bind/router-build/model-bind) can be
-    // attributed to a specific phase from `daemon.log` alone, instead of
-    // guessing from wall-clock reads of surrounding, untimed events. Additive
-    // only -- the existing "OpenASR server listening on ..." banners below are
-    // left byte-for-byte unchanged, since `crates/openasr-cli/tests/cli.rs`
-    // waits on that exact prefix and the desktop sidecar's readiness probe
-    // must keep working unmodified.
+    // slow daemon start (validate/bind/router-build) can be attributed to a
+    // specific phase from `daemon.log` alone, instead of guessing from
+    // wall-clock reads of surrounding, untimed events. Additive only -- the
+    // existing "OpenASR server listening on ..." banners below are left
+    // byte-for-byte unchanged, since `crates/openasr-cli/tests/cli.rs` waits
+    // on that exact prefix and the desktop sidecar's readiness probe must keep
+    // working unmodified.
+    //
+    // Listen and `/health` must succeed before optional GPU plugin load
+    // (`ggml_runtime_info` / `ensure_backends_loaded`). CUDA and HIP are the
+    // same signed-plugin path; a missing model pack is a normal start, and
+    // plugin init is process-lifetime work, not model-bind work.
     let boot_started = Instant::now();
-    let mut stage_started = boot_started;
-    // Device/backend metadata only (name, kind, memory, buffer alignment) --
-    // never model, audio, or file-path data -- so a Vulkan/Metal/CPU
-    // misdetection or misalignment (see issues #153/#154/#155) is visible
-    // from `daemon.log` alone, without relying on the reporter's own
-    // "backend used" field.
-    openasr_core::stage_timing::log_event(
-        "server_boot",
-        format_args!(
-            "stage=ggml_backend {}",
-            openasr_core::ggml_runtime_boot_summary(&openasr_core::ggml_runtime_info())
-        ),
-    );
     // Host system facts (OS/CPU/RAM) -- diagnostics only, no user data -- so a
     // bug report's `daemon.log` + the desktop's `desktop.log` are enough to
-    // triage without asking the reporter for their OS/CPU/RAM by hand.
+    // triage without asking the reporter for their OS/CPU/RAM by hand. Cheap
+    // and independent of optional GPU plugins, so it stays on the listen path.
+    let stage_started = Instant::now();
     openasr_core::stage_timing::log_event(
         "server_boot",
         format_args!(
@@ -293,20 +287,22 @@ pub async fn serve_with_launch_options(
             openasr_core::host_system_boot_summary()
         ),
     );
+    openasr_core::stage_timing::log_stage("server_boot", "host_system", stage_started.elapsed());
+    let stage_started = Instant::now();
     validate_listen_security(addr, &launch_options)?;
     openasr_core::stage_timing::log_stage(
         "server_boot",
         "validate_listen_security",
         stage_started.elapsed(),
     );
-    stage_started = Instant::now();
+    let stage_started = Instant::now();
     runtime.validate()?;
     openasr_core::stage_timing::log_stage(
         "server_boot",
         "runtime_validate",
         stage_started.elapsed(),
     );
-    stage_started = Instant::now();
+    let stage_started = Instant::now();
     let listener = TcpListener::bind(addr).await?;
     // Shadow the requested `addr` (which may be an OS-assigned wildcard like
     // `:0`) with the listener's actual bound address so everything below --
@@ -336,7 +332,7 @@ pub async fn serve_with_launch_options(
     }
     match &launch_options.tls.clone() {
         ServerTlsConfig::Disabled => {
-            stage_started = Instant::now();
+            let stage_started = Instant::now();
             let app = app_with_runtime_and_distribution_and_launch_options(
                 runtime,
                 DistributionRuntime::default(),
@@ -355,10 +351,11 @@ pub async fn serve_with_launch_options(
                 ),
             );
             println!("OpenASR server listening on http://{addr}");
+            spawn_ggml_backend_boot_log();
             axum::serve(listener, app).await?;
         }
         ServerTlsConfig::SelfSigned { subject_alt_names } => {
-            stage_started = Instant::now();
+            let stage_started = Instant::now();
             let identity = load_or_generate_self_signed_tls_identity(
                 subject_alt_names,
                 launch_options.tls_identity_store.as_deref(),
@@ -372,7 +369,7 @@ pub async fn serve_with_launch_options(
             launch_options.auth = launch_options.auth.with_pairing_safety_code(Some(
                 pairing_safety_code_for_certificate_fingerprint(&identity.certificate_sha256),
             ));
-            stage_started = Instant::now();
+            let stage_started = Instant::now();
             let app = app_with_runtime_and_distribution_and_launch_options(
                 runtime,
                 DistributionRuntime::default(),
@@ -394,10 +391,37 @@ pub async fn serve_with_launch_options(
                 "OpenASR server listening on https://{addr} (certificate sha256:{}, pairing code {})",
                 identity.certificate_sha256, identity.pairing_safety_code
             );
+            spawn_ggml_backend_boot_log();
             axum::serve(TlsListener::new(listener, identity.acceptor), app).await?;
         }
     }
     Ok(())
+}
+
+/// Loads optional signed GPU plugins (CUDA/HIP/Vulkan via the same
+/// `ggml_runtime_info` path) after the process is already listening.
+/// CUDA and HIP are not special-cased: both are process-lifetime plugins
+/// selected by the current `active.json`, independent of which model pack
+/// is bound. Blocking the listen path on `ggml_cuda_init` / `LoadLibrary`
+/// made `--no-model` start pay GPU init; the banner and `/health` must not
+/// wait for that.
+fn spawn_ggml_backend_boot_log() {
+    tokio::task::spawn_blocking(|| {
+        let stage_started = Instant::now();
+        let info = openasr_core::ggml_runtime_info();
+        openasr_core::stage_timing::log_stage(
+            "server_boot",
+            "ggml_backend",
+            stage_started.elapsed(),
+        );
+        openasr_core::stage_timing::log_event(
+            "server_boot",
+            format_args!(
+                "stage=ggml_backend {}",
+                openasr_core::ggml_runtime_boot_summary(&info)
+            ),
+        );
+    });
 }
 
 /// Validity window for a freshly generated self-signed TLS identity: long
@@ -1205,6 +1229,76 @@ fn resolve_instance_token(launch_option: Option<String>) -> Option<String> {
         .or_else(|| launch_option.filter(|value| !value.is_empty()))
 }
 
+/// Process-wide bound native pack path shared by every `ServerRuntime` clone.
+///
+/// Model bind is in-process state, independent of optional GPU plugin load
+/// (CUDA/HIP/Vulkan via `active.json`). `POST /v1/models/default` rebinds this
+/// without restarting the process. One bound pack at a time.
+#[derive(Clone)]
+pub struct BoundModelPackPath {
+    inner: Arc<RwLock<Option<PathBuf>>>,
+}
+
+impl std::fmt::Debug for BoundModelPackPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("BoundModelPackPath")
+            .field(&self.current())
+            .finish()
+    }
+}
+
+impl PartialEq for BoundModelPackPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.current() == other.current()
+    }
+}
+
+impl Eq for BoundModelPackPath {}
+
+impl Default for BoundModelPackPath {
+    fn default() -> Self {
+        Self::from(None)
+    }
+}
+
+impl From<Option<PathBuf>> for BoundModelPackPath {
+    fn from(path: Option<PathBuf>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(path)),
+        }
+    }
+}
+
+impl BoundModelPackPath {
+    fn lock_read(&self) -> std::sync::RwLockReadGuard<'_, Option<PathBuf>> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lock_write(&self) -> std::sync::RwLockWriteGuard<'_, Option<PathBuf>> {
+        self.inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn current(&self) -> Option<PathBuf> {
+        self.lock_read().clone()
+    }
+
+    pub fn is_some(&self) -> bool {
+        self.lock_read().is_some()
+    }
+
+    pub fn is_none(&self) -> bool {
+        self.lock_read().is_none()
+    }
+
+    fn set(&self, path: Option<PathBuf>) {
+        *self.lock_write() = path;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerRuntime {
     pub backend: BackendKind,
@@ -1217,7 +1311,7 @@ pub struct ServerRuntime {
     /// `AudioPreparationOptions::with_ffmpeg_bin_explicit`. Only an explicit
     /// choice skips the in-process symphonia decode path.
     pub ffmpeg_bin_explicit: bool,
-    pub model_pack_path: Option<std::path::PathBuf>,
+    pub model_pack_path: BoundModelPackPath,
 }
 
 impl Default for ServerRuntime {
@@ -1227,7 +1321,7 @@ impl Default for ServerRuntime {
             native_execution: NativeExecutionSupervisor::default(),
             ffmpeg_bin: None,
             ffmpeg_bin_explicit: false,
-            model_pack_path: None,
+            model_pack_path: BoundModelPackPath::default(),
         }
     }
 }
@@ -1253,7 +1347,7 @@ impl ServerRuntime {
     }
 
     /// Validates the runtime is *safe to serve with*, not that a model is
-    /// installed: no model bound at all (`model_pack_path: None`) is a normal
+    /// installed: no model bound at all (`model_pack_path` empty) is a normal
     /// state for a fresh install with zero pulled models, and the daemon must
     /// still start and answer `/health` in that state. Only a `model_pack_path`
     /// that is actually set but fails to validate (bad path, corrupt/foreign
@@ -1264,10 +1358,10 @@ impl ServerRuntime {
         match self.backend {
             BackendKind::Mock => Ok(()),
             BackendKind::Native => {
-                let Some(model_pack_path) = self.model_pack_path.as_deref() else {
+                let Some(model_pack_path) = self.model_pack_path.current() else {
                     return Ok(());
                 };
-                let _ = validate_native_runtime_pack(model_pack_path)?;
+                let _ = validate_native_runtime_pack(&model_pack_path)?;
                 Ok(())
             }
         }
@@ -1281,6 +1375,45 @@ impl ServerRuntime {
             BackendKind::Mock => true,
             BackendKind::Native => self.model_pack_path.is_some(),
         }
+    }
+
+    pub(crate) fn native_rebind_blocked(&self) -> bool {
+        self.native_execution.has_active_sessions()
+            || idle_activity::native_activity_active_count() > 0
+            || realtime::native_streaming_workers_occupy_slot()
+            || realtime::native_warmup_in_flight()
+    }
+
+    /// Rebinds the single in-process native pack. Fail-closed with 409 when a
+    /// native transcription or realtime worker currently occupies a slot so
+    /// in-flight work is not torn down. Unloads idle runtime caches so a
+    /// same-id reinstall (path unchanged, file replaced) cannot keep serving
+    /// the previous bytes. Mock backends never call this.
+    pub(crate) fn rebind_native_model_pack(
+        &self,
+        new_path: Option<PathBuf>,
+    ) -> Result<(), ApiError> {
+        if self.backend != BackendKind::Native {
+            return Ok(());
+        }
+        if self.native_rebind_blocked() {
+            return Err(ApiError::Conflict(
+                "Cannot change the default model while a native transcription or realtime session is running."
+                    .to_string(),
+            ));
+        }
+        if let Some(path) = new_path.as_deref() {
+            let _ = validate_native_runtime_pack(path).map_err(ApiError::Backend)?;
+        }
+        self.model_pack_path.set(new_path);
+        if !self.native_rebind_blocked() {
+            self.native_execution
+                .execution_services()
+                .unload_idle_native_model_runtime_caches();
+            idle_activity::bump_native_unload_generation();
+            invalidate_cached_native_realtime_capabilities();
+        }
+        Ok(())
     }
 
     /// Whether the bound model's runtime is resident right now (surfaced by
@@ -2025,11 +2158,11 @@ async fn models(State(runtime): State<ServerRuntime>) -> Result<Json<ModelsRespo
             // No model bound is a normal fresh-install state, not an error:
             // report an empty model list rather than fail-closed here (the
             // transcription path is the fail-closed boundary for "no model").
-            match runtime.model_pack_path.as_deref() {
+            match runtime.model_pack_path.current() {
                 None => Vec::new(),
                 Some(model_pack_path) => {
-                    let adapter =
-                        validate_native_runtime_pack(model_pack_path).map_err(ApiError::Backend)?;
+                    let adapter = validate_native_runtime_pack(&model_pack_path)
+                        .map_err(ApiError::Backend)?;
                     let identity = resolve_verified_native_runtime_model_identity(&adapter, None)
                         .map_err(ApiError::Backend)?;
                     vec![identity.model_id]
@@ -2066,6 +2199,7 @@ async fn capabilities(
     let transcription = if runtime.backend == BackendKind::Native {
         runtime
             .model_pack_path
+            .current()
             .as_deref()
             .map(native_runtime_transcription_capabilities_for_path)
             .unwrap_or_else(|| TranscriptionBackendCapabilities::for_backend_kind(runtime.backend))
@@ -2102,6 +2236,7 @@ pub(crate) fn realtime_capabilities_for_runtime(
     let mut capabilities = if runtime.backend == BackendKind::Native {
         runtime
             .model_pack_path
+            .current()
             .as_deref()
             .map(cached_native_realtime_capabilities_for_path)
             .unwrap_or_else(|| RealtimeBackendCapabilities::for_backend_kind(runtime.backend))
@@ -2124,14 +2259,11 @@ pub(crate) fn realtime_capabilities_for_runtime_and_distribution(
 }
 
 /// Deriving realtime capabilities reads GGUF metadata from disk; every session
-/// asks 2-3 times, so memoize per pack path. Installed packs are
-/// content-immutable (a model switch relaunches the daemon with a new
-/// `--model-pack`), so path-keyed caching is safe for the daemon's lifetime.
+/// asks 2-3 times, so memoize per pack path. A default-model rebind can replace
+/// the file at the same path (same-id reinstall) or switch to another pack, so
+/// the cache is dropped on rebind rather than trusted for the process lifetime.
 fn cached_native_realtime_capabilities_for_path(path: &Path) -> RealtimeBackendCapabilities {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<PathBuf, RealtimeBackendCapabilities>>,
-    > = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cache = native_realtime_capabilities_cache();
     if let Ok(cache) = cache.lock()
         && let Some(capabilities) = cache.get(path)
     {
@@ -2142,6 +2274,18 @@ fn cached_native_realtime_capabilities_for_path(path: &Path) -> RealtimeBackendC
         cache.insert(path.to_path_buf(), capabilities);
     }
     capabilities
+}
+
+fn native_realtime_capabilities_cache()
+-> &'static Mutex<HashMap<PathBuf, RealtimeBackendCapabilities>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, RealtimeBackendCapabilities>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn invalidate_cached_native_realtime_capabilities() {
+    if let Ok(mut cache) = native_realtime_capabilities_cache().lock() {
+        cache.clear();
+    }
 }
 
 // TS export for the HTTP daemon response wire contract (`/health`,

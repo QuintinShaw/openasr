@@ -33,13 +33,24 @@ pub(crate) async fn default_model(
 }
 
 pub(crate) async fn set_default_model(
+    State(runtime): State<ServerRuntime>,
     Extension(distribution): Extension<DistributionContext>,
     Json(request): Json<SetDefaultRequest>,
 ) -> Result<Json<DefaultModelResponse>, ApiError> {
     let home = distribution.openasr_home()?;
     let pack = resolve_installed_pack_for_default(&home, distribution.catalog_source(), &request)?;
     let preference = request.quant_preference_for_pack(&pack);
+    if runtime.backend == BackendKind::Native && runtime.native_rebind_blocked() {
+        return Err(ApiError::Conflict(
+            "Cannot change the default model while a native transcription or realtime session is running."
+                .to_string(),
+        ));
+    }
     persist_default_pack(&home, &pack, preference)?;
+    if runtime.backend == BackendKind::Native {
+        runtime.rebind_native_model_pack(Some(pack.path.clone()))?;
+        crate::realtime::spawn_boot_native_warmup(runtime.clone());
+    }
     Ok(Json(default_model_response(
         &home,
         distribution.catalog_source(),

@@ -1,11 +1,15 @@
 name: CI
 
 on:
+  # Normal changes are validated by their pull_request run. The only direct
+  # main commit allowed by RELEASING.md is the version bump, so keep a narrow
+  # push trigger for that commit without double-billing every merged PR.
   push:
     branches: [main]
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "tooling/system-audio-check/Cargo.lock"
   pull_request:
     paths-ignore:
       - "docs/**"

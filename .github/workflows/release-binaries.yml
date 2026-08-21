@@ -1,16 +1,11 @@
 name: Release binaries
 
-# Three ways in:
-#   1. push: tags v* -- a maintainer pushes an annotated release tag directly
-#      (e.g. `git push --follow-tags` from scripts/bump-version.sh). Real tag
-#      pushes fire this natively.
-#   2. workflow_call -- release-core.yml calls this workflow directly (as a
-#      job, not a webhook) right after it creates the vX.Y.Z tag + GitHub
-#      Release. This is required because a tag created through the GITHUB_TOKEN
-#      API does *not* fire the `push: tags` event (GitHub does not cascade
-#      Actions-token-authored pushes into further workflow runs), so without
-#      this explicit call the full release matrix silently never builds.
-#   3. workflow_dispatch -- manual re-run/dry-run, with the same `ref` input
+# Two ways in:
+#   1. workflow_call -- release-core.yml calls this workflow directly after it
+#      creates the draft GitHub Release. This is the only formal release-matrix
+#      entrypoint; accepting the annotated tag push here as well used to race
+#      the orchestrator and could build the same expensive matrix twice.
+#   2. workflow_dispatch -- manual re-run/dry-run, with the same `ref` input
 #      as workflow_call so a maintainer can target an existing tag (e.g. to
 #      retry a failed platform leg, recover aggregation from a completed run's
 #      immutable artifacts, or dry-run the upload/completeness logic against an
@@ -59,9 +54,9 @@ on:
         required: false
         type: string
         default: ""
-  push:
-    tags:
-      - "v*"
+  # Formal releases enter through release-core.yml's workflow_call. Keeping
+  # a second push:tags entrypoint used to race the orchestrator and could run
+  # the same expensive matrix twice for one annotated tag.
 
 permissions:
   contents: write
@@ -1004,7 +999,7 @@ jobs:
         # This workflow has no `pull_request` trigger (see the trigger
         # comment at the top of this file), so a fork PR never reaches this
         # job with -- or without -- secrets. Every run that gets here is a
-        # real tag push, release-core.yml's workflow_call, or a maintainer's
+        # release-core.yml's workflow_call or a maintainer's
         # workflow_dispatch, all of which do have repo secrets. The only
         # legitimate no-secrets case is a maintainer smoke-testing build/
         # package logic via workflow_dispatch with dry_run=true before the

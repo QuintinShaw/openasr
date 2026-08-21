@@ -91,7 +91,12 @@ python3 tooling/release-manifest/backend_hardware_evidence.py \
   > "$workdir/hardware-approved-entries.txt"
 # Native Windows Python writes CRLF even when invoked from Git Bash. Strip
 # the record terminator before using each emitted path as an argv value.
-mapfile -t approved_entries < <(tr -d '\r' < "$workdir/hardware-approved-entries.txt")
+# Portable read loop (not mapfile) so macOS stock bash 3.2 can sign.
+approved_entries=()
+while IFS= read -r line || [ -n "$line" ]; do
+  [ -n "$line" ] || continue
+  approved_entries+=("$line")
+done < <(tr -d '\r' < "$workdir/hardware-approved-entries.txt")
 [ "${#approved_entries[@]}" -gt 0 ] \
   || fail "release ${tag} has no backend entry approved by hardware evidence"
 backend_entry_args=()
@@ -132,6 +137,14 @@ python3 tooling/release-manifest/backend_catalog.py merge \
   --catalog model-registry/catalog.json \
   "${backend_entry_args[@]}" \
   --out "$workdir/catalog.merged.json"
+
+# Payload first, metadata last: refuse to sign URLs that are not already live.
+# deploy-catalog.yml repeats this read-only gate, and the finalizer checks the
+# deployed signed projection once more before publishing the draft release.
+python3 tooling/release-manifest/backend_catalog.py verify-cdn \
+  --catalog "$workdir/catalog.merged.json" \
+  --version "$version"
+
 python3 - "$workdir/catalog.merged.json" <<'PY'
 import json
 import sys
@@ -168,5 +181,5 @@ echo "CATALOG-PREPARED for ${tag}"
 echo "  hardware-approved backend entries: ${#approved_entries[@]} of ${#backend_entries[@]} built"
 echo "  epoch: ${old_epoch} -> ${new_epoch}"
 echo "  next: review and commit model-registry/catalog{,.public}{,.signature}.json + catalog.epoch"
-echo "  then push the catalog commit, wait for deploy-catalog.yml, and run:"
+echo "  then push the catalog commit, wait for deploy-catalog.yml (which rechecks CDN), and run:"
 echo "    scripts/finalize-core-release.sh ${tag}"

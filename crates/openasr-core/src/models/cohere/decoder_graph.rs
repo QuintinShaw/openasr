@@ -174,6 +174,7 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
     audio_duration_seconds: f32,
     control: &Arc<crate::TranscriptionControl>,
     decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
+    unstable_decode_text: Option<&crate::api::backend::UnstableDecodeTextObserver>,
 ) -> Result<CohereDecoderGraphDecodeOutput, CohereDecoderGraphError> {
     let decode_text_token_ids = |token_ids: &[u32]| {
         tokenizer.decode_text_token_ids(token_ids).map_err(|error| {
@@ -215,6 +216,7 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
         &decode_text_token_ids,
         control,
         decode_work_progress,
+        unstable_decode_text,
     ) {
         Ok(output) => output,
         Err(CohereTranscribeGreedyDecodeError::EotNotReachedBeforeMaxTokens {

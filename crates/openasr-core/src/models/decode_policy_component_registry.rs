@@ -460,6 +460,7 @@ pub(crate) fn run_builtin_seq2seq_decode_policy<E>(
     map_registry_error: fn(BuiltinDecodePolicyComponentRegistryError) -> E,
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
+    unstable_decode_text: Option<&crate::api::backend::UnstableDecodeTextObserver>,
 ) -> Result<Seq2SeqGreedyDecodeResult, E> {
     let descriptor = resolve_builtin_decode_policy(decode_policy_id).map_err(map_registry_error)?;
     let config = build_builtin_seq2seq_decode_policy_config(
@@ -496,6 +497,7 @@ pub(crate) fn run_builtin_seq2seq_decode_policy<E>(
                 &mut on_topk,
                 control,
                 decode_work_progress,
+                unstable_decode_text,
             )
         }
         // Fail closed: a CTC policy must never route through the seq2seq loop.
@@ -1119,6 +1121,7 @@ mod tests {
             |error| error.to_string(),
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
             None,
+            None,
         )
         .expect("decode policy dispatch");
 
@@ -1164,6 +1167,7 @@ mod tests {
             |error| error.to_string(),
             |error| error.to_string(),
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
             None,
         )
         .expect("decode policy dispatch");
@@ -1215,6 +1219,7 @@ mod tests {
             |error| error.to_string(),
             |error| error.to_string(),
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
             None,
         )
         .expect("decode policy dispatch");

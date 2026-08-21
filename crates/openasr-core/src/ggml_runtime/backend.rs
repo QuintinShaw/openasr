@@ -3,6 +3,7 @@ use std::{
     ffi::{CStr, CString, c_char, c_int, c_void},
     path::{Component, Path, PathBuf},
     ptr::{self, NonNull},
+    time::Instant,
 };
 
 use serde::Deserialize;
@@ -24,7 +25,8 @@ use crate::{
         BackendBundleContractEntry, backend_bundle_contract_sha256, pe_image_identity,
     },
     pull::{
-        backend_artifact_fingerprint, backend_pack_install_dir, read_and_verify_installed_backend,
+        backend_artifact_fingerprint, backend_pack_install_dir,
+        read_and_verify_installed_backend_for_activation,
     },
     resolve_catalog_backend_pull, resolve_compatible_catalog_backend_pull_for_driver,
     resolve_local_catalog_env_override,
@@ -1099,13 +1101,17 @@ fn activate_selected_backend_plugin()
             reason: error.to_string(),
         }
     })?;
-    let installed =
-        read_and_verify_installed_backend(&install_dir, &requested).map_err(|error| {
-            BackendPluginActivationError::InstalledPackInvalid {
-                backend_id: backend_id.clone(),
-                reason: error.to_string(),
-            }
+    let stage_started = Instant::now();
+    let installed = read_and_verify_installed_backend_for_activation(&install_dir, &requested)
+        .map_err(|error| BackendPluginActivationError::InstalledPackInvalid {
+            backend_id: backend_id.clone(),
+            reason: error.to_string(),
         })?;
+    crate::stage_timing::log_stage(
+        "server_boot",
+        "ggml_backend_verify1",
+        stage_started.elapsed(),
+    );
     let canonical_dir = std::fs::canonicalize(&install_dir).map_err(|error| {
         BackendPluginActivationError::InstalledPackInvalid {
             backend_id: backend_id.clone(),
@@ -1134,17 +1140,27 @@ fn activate_selected_backend_plugin()
     if requested.vendor == CatalogBackendVendor::Hip {
         crate::backend_distribution::bind_verified_hip_kernel_libpaths(&dependency_dirs);
     }
+    let stage_started = Instant::now();
     let _load_guards =
         lock_verified_backend_load_files(&backend_id, &plugin_path, &dependency_dirs)?;
-    // Rehash while write/delete sharing is denied. The first verification
-    // establishes paths and the second proves those locked bytes still match
-    // the signed catalog immediately before any DllMain can run.
-    read_and_verify_installed_backend(&install_dir, &requested).map_err(|error| {
-        BackendPluginActivationError::InstalledPackInvalid {
+    crate::stage_timing::log_stage("server_boot", "ggml_backend_lock", stage_started.elapsed());
+    // Rehash mapped images while write/delete sharing is denied. Both
+    // passes use LoadImages: the first establishes identity and image
+    // hashes, the second proves the locked DLL bytes still match the
+    // signed catalog immediately before any DllMain can run.
+    let stage_started = Instant::now();
+    read_and_verify_installed_backend_for_activation(&install_dir, &requested).map_err(
+        |error| BackendPluginActivationError::InstalledPackInvalid {
             backend_id: backend_id.clone(),
             reason: error.to_string(),
-        }
-    })?;
+        },
+    )?;
+    crate::stage_timing::log_stage(
+        "server_boot",
+        "ggml_backend_verify2",
+        stage_started.elapsed(),
+    );
+    let stage_started = Instant::now();
     let live_driver = probe_exact_backend_plugin_candidate(
         &backend_id,
         requested.vendor,
@@ -1153,6 +1169,7 @@ fn activate_selected_backend_plugin()
         &device_target,
         live_backend_driver_floor(requested.vendor, requested.min_driver_api.as_deref()),
     )?;
+    crate::stage_timing::log_stage("server_boot", "ggml_backend_probe", stage_started.elapsed());
     let resolved = resolve_compatible_catalog_backend_pull_for_driver(
         &catalog,
         requested.vendor,
@@ -1173,6 +1190,7 @@ fn activate_selected_backend_plugin()
             ),
         });
     }
+    let stage_started = Instant::now();
     load_exact_backend_plugin(
         &backend_id,
         resolved.vendor,
@@ -1181,6 +1199,7 @@ fn activate_selected_backend_plugin()
         &device_target,
         live_backend_driver_floor(resolved.vendor, resolved.min_driver_api.as_deref()),
     )?;
+    crate::stage_timing::log_stage("server_boot", "ggml_backend_load", stage_started.elapsed());
     Ok(Some(ActivatedBackendRuntime {
         backend_id,
         provider: execution_provider_for_catalog_vendor(resolved.vendor),

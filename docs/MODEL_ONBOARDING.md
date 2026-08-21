@@ -180,21 +180,26 @@ Live captions / dictation cadence is **descriptor-driven**, not something you
 tune per family and not something the `.oasr` pack declares. There is no pack
 metadata streaming flag and there is no third "buffered file-per-utterance"
 realtime mode to wire up — that old path was removed. A realtime session can only
-land on one of two shared mechanisms:
+land on one of the shared mechanisms declared by `StreamingPartialGranularity`:
 
-- **Incremental re-decode** (the default for every non-frame-sync family): the
+- **Revisable snapshot** (the default for encoder-decoder / CTC families): the
   shared driver re-decodes a growing/windowed buffer on an adaptive cadence, so
   partials appear *while the user is still speaking* and the FINAL is
-  byte-identical to offline `execute()`. Implement
-  `GgmlAsrStreamingExecutor` for your executor — reuse
-  `build_seq2seq_streaming_session` (offline re-decode; works for CTC/attention
-  and seq2seq alike) or `build_ctc_streaming_driver` (when you have a cheap
-  CTC-greedy partial surface) — and declare
-  `StreamingPartialGranularity::Buffered` in the execution facet. The shared
-  inventory projection wires it into the dispatch.
-- **Frame-sync** (append-only, never revises emitted text): only for genuinely
-  frame-synchronous architectures like X-ASR. Declare
-  `StreamingPartialGranularity::FrameSync` in the same facet.
+  byte-identical to offline `execute()`. Incomplete windows are expected to
+  produce displayable text. Implement `GgmlAsrStreamingExecutor` for your
+  executor — reuse `build_seq2seq_streaming_session` (offline re-decode; works
+  for CTC/attention and seq2seq alike) or `build_ctc_streaming_driver` (when you
+  have a cheap CTC-greedy partial surface) — and declare
+  `StreamingPartialGranularity::RevisableSnapshot` in the execution facet. The
+  shared inventory projection wires it into the dispatch.
+- **Utterance-complete snapshot** (ChatML utterance LLMs such as FunASR-Nano):
+  incomplete windows may legally decode empty. Declare
+  `StreamingPartialGranularity::UtteranceComplete` in the same facet. The shared
+  driver may pad a short silence tail onto PARTIAL windows only; FINAL still
+  uses the real unpadded audio.
+- **Frame-sync append** (append-only, never revises emitted text): only for
+  genuinely frame-synchronous architectures like X-ASR. Declare
+  `StreamingPartialGranularity::FrameSyncAppend` in the same facet.
 
 If the descriptor factory returns an executor without a valid streaming path, the startup
 completeness gate in `build_builtin_ggml_streaming_execution_dispatch` **fails

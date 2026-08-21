@@ -5,21 +5,24 @@ name: Family Regression
 # signature-verified) and transcribe a committed fixture on the CPU backend,
 # comparing against committed goldens (tooling/family-regression/goldens/).
 #
-# Runs nightly, on release tags (release gate), and on demand. Kept outside
+# Runs nightly, after a release is published, and on demand. Kept outside
 # push/PR CI because it performs real network downloads and native inference.
+# Nightly/manual runs reuse the latest published CLI too; a raw tag no longer
+# races the release matrix and falls back to two duplicate local builds.
 
 on:
   workflow_dispatch:
   schedule:
     - cron: "23 4 * * *"
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
 
 concurrency:
   group: family-regression-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
+  attestations: read
   contents: read
   packages: read
 
@@ -33,6 +36,10 @@ env:
 jobs:
   build-cli-linux:
     name: Build CLI (ubuntu-latest)
+    # The public repository also hosts desktop-vX.Y.Z releases. Those do not
+    # carry open-core CLI assets and must skip this workflow without a red run.
+    if: >-
+      ${{ github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v') }}
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/quintinshaw/openasr-ci-linux@sha256:702284855863f1c6330eec503ac4570ff2cc844a958ceb7d2e2af5837633dcdc
@@ -41,59 +48,52 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     timeout-minutes: 90
     steps:
-      - name: Try published release CLI
+      - uses: actions/checkout@v7
+      - name: Resolve and fetch published release CLI
         id: published
-        if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
           ASSET_SUFFIX: linux-x86_64
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -uo pipefail
           available=false
-          tag="${GITHUB_REF_NAME}"
+          tag="${RELEASE_TAG}"
+          if [ -z "${tag}" ]; then
+            tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+          fi
           version="${tag#v}"
           asset="openasr-${version}-${ASSET_SUFFIX}.tar.gz"
           workdir="${RUNNER_TEMP}/published-cli"
           mkdir -p "${workdir}"
-          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${tag}"
-          if json="$(curl -fsSL \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              "${api}")" \
-            && asset_url="$(ASSET="${asset}" python3 -c '
-          import json, os, sys
-          rel = json.loads(sys.stdin.read())
-          name = os.environ["ASSET"]
-          for item in rel.get("assets", []):
-              if item.get("name") == name and item.get("url"):
-                  print(item["url"])
-                  raise SystemExit(0)
-          raise SystemExit(2)
-          ' <<<"${json}")" \
-            && curl -fsSL \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/octet-stream" \
-              -o "${workdir}/${asset}" \
-              "${asset_url}" \
-            && tar -xzf "${workdir}/${asset}" -C "${workdir}" \
-            && bin="$(find "${workdir}" -type f -name openasr | head -n 1)" \
-            && test -n "${bin}" \
-            && cp "${bin}" "${workdir}/openasr" \
-            && chmod +x "${workdir}/openasr" \
-            && "${workdir}/openasr" --version; then
-            available=true
+          if gh release download "${tag}" --repo "${GITHUB_REPOSITORY}" \
+              --dir "${workdir}" --pattern "${asset}" --pattern SHA256SUMS; then
+            python3 tooling/release-manifest/release_asset_verifier.py \
+              --asset "${workdir}/${asset}" --checksums "${workdir}/SHA256SUMS" || exit 1
+            gh attestation verify "${workdir}/${asset}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release-binaries.yml" || exit 1
+            if tar -xzf "${workdir}/${asset}" -C "${workdir}" \
+              && bin="$(find "${workdir}" -type f -name openasr | head -n 1)" \
+              && test -n "${bin}" \
+              && cp "${bin}" "${workdir}/openasr" \
+              && chmod +x "${workdir}/openasr" \
+              && "${workdir}/openasr" --version; then
+              available=true
+            fi
           fi
           echo "available=${available}" >> "${GITHUB_OUTPUT}"
           if [ "${available}" != "true" ]; then
-            echo "published ${asset} is not usable; falling back to a local release build"
+            if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+              echo "::error::published release ${tag} is missing usable ${asset}; refusing a duplicate local build"
+              exit 1
+            fi
+            echo "published ${asset} is not usable; falling back to a local release build for this diagnostic run"
           fi
-      - uses: actions/checkout@v7
-        if: steps.published.outputs.available != 'true'
-        with:
-          submodules: recursive
       - name: Prepare pinned Linux build environment
         if: steps.published.outputs.available != 'true'
         run: |
+          git submodule update --init --recursive
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           openasr-ci-verify
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -125,59 +125,56 @@ jobs:
 
   build-cli-macos:
     name: Build CLI (macos-15)
+    if: >-
+      ${{ github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v') }}
     runs-on: macos-15
     timeout-minutes: 90
     steps:
-      - name: Try published release CLI
+      - uses: actions/checkout@v7
+      - name: Resolve and fetch published release CLI
         id: published
-        if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
           ASSET_SUFFIX: macos-arm64
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -uo pipefail
           available=false
-          tag="${GITHUB_REF_NAME}"
+          tag="${RELEASE_TAG}"
+          if [ -z "${tag}" ]; then
+            tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+          fi
           version="${tag#v}"
           asset="openasr-${version}-${ASSET_SUFFIX}.tar.gz"
           workdir="${RUNNER_TEMP}/published-cli"
           mkdir -p "${workdir}"
-          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${tag}"
-          if json="$(curl -fsSL \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              "${api}")" \
-            && asset_url="$(ASSET="${asset}" python3 -c '
-          import json, os, sys
-          rel = json.loads(sys.stdin.read())
-          name = os.environ["ASSET"]
-          for item in rel.get("assets", []):
-              if item.get("name") == name and item.get("url"):
-                  print(item["url"])
-                  raise SystemExit(0)
-          raise SystemExit(2)
-          ' <<<"${json}")" \
-            && curl -fsSL \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/octet-stream" \
-              -o "${workdir}/${asset}" \
-              "${asset_url}" \
-            && tar -xzf "${workdir}/${asset}" -C "${workdir}" \
-            && bin="$(find "${workdir}" -type f -name openasr | head -n 1)" \
-            && test -n "${bin}" \
-            && cp "${bin}" "${workdir}/openasr" \
-            && chmod +x "${workdir}/openasr" \
-            && "${workdir}/openasr" --version; then
-            available=true
+          if gh release download "${tag}" --repo "${GITHUB_REPOSITORY}" \
+              --dir "${workdir}" --pattern "${asset}" --pattern SHA256SUMS; then
+            python3 tooling/release-manifest/release_asset_verifier.py \
+              --asset "${workdir}/${asset}" --checksums "${workdir}/SHA256SUMS" || exit 1
+            gh attestation verify "${workdir}/${asset}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release-binaries.yml" || exit 1
+            if tar -xzf "${workdir}/${asset}" -C "${workdir}" \
+              && bin="$(find "${workdir}" -type f -name openasr | head -n 1)" \
+              && test -n "${bin}" \
+              && cp "${bin}" "${workdir}/openasr" \
+              && chmod +x "${workdir}/openasr" \
+              && "${workdir}/openasr" --version; then
+              available=true
+            fi
           fi
           echo "available=${available}" >> "${GITHUB_OUTPUT}"
           if [ "${available}" != "true" ]; then
-            echo "published ${asset} is not usable; falling back to a local release build"
+            if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+              echo "::error::published release ${tag} is missing usable ${asset}; refusing a duplicate local build"
+              exit 1
+            fi
+            echo "published ${asset} is not usable; falling back to a local release build for this diagnostic run"
           fi
-      - uses: actions/checkout@v7
+      - name: Initialize open-core submodules
         if: steps.published.outputs.available != 'true'
-        with:
-          submodules: recursive
+        run: git submodule update --init --recursive
       - uses: dtolnay/rust-toolchain@1.95.0
         if: steps.published.outputs.available != 'true'
       - uses: Swatinem/rust-cache@v2
@@ -204,6 +201,8 @@ jobs:
   family:
     name: ${{ matrix.case.name }} (${{ matrix.os }})
     needs: [build-cli-linux, build-cli-macos]
+    if: >-
+      ${{ github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v') }}
     strategy:
       # A single family failure must stay readable and must not cancel the
       # rest of the net.

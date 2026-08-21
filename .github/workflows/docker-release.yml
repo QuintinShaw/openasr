@@ -1,9 +1,10 @@
 name: Docker release
 
 # Build (and optionally push) CPU + CUDA runtime images to Docker Hub from
-# published GitHub Release assets. Release-core calls this after the full
-# binary matrix lands so the images match the just-published CLI; a failed
-# Docker job does not delete or roll back the GitHub Release.
+# published GitHub Release assets. publish-core-channels.yml calls this only
+# after the signed catalog/CDN finalizer publishes the draft, so secondary
+# channels cannot get ahead of the canonical CLI release; a failed Docker job
+# does not delete or roll back the GitHub Release.
 #
 # Images (Docker Hub namespace `quintinshaw`, repository `openasr`):
 #   CPU  (linux/amd64 + linux/arm64):

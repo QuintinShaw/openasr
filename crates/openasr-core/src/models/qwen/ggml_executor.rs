@@ -1144,6 +1144,10 @@ impl Qwen3AsrGgmlExecutor {
             .execution_context
             .decode_work_progress_observer()
             .cloned();
+        let unstable_decode_text_for_actor = request
+            .execution_context
+            .unstable_decode_text_observer()
+            .cloned();
         let fused_top1_hint_allowed = qwen_fused_top1_hint_allowed(
             request.request_options.word_timestamps,
             request
@@ -1195,6 +1199,7 @@ impl Qwen3AsrGgmlExecutor {
                     &decode_text_token_ids_for_actor,
                     &control_for_actor,
                     decode_work_progress_for_actor.as_ref(),
+                    unstable_decode_text_for_actor.as_ref(),
                 );
                 // A failed compute may poison the reusable graph. Always
                 // release session-scoped buffers before the actor goes idle.

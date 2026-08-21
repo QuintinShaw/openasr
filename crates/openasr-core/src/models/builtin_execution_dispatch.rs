@@ -503,7 +503,7 @@ mod tests {
             if architecture
                 .execution_contract
                 .streaming_partial_granularity
-                == StreamingPartialGranularity::FrameSync
+                == StreamingPartialGranularity::FrameSyncAppend
             {
                 manifest_frame_sync.insert(descriptor.model_architecture);
             }
@@ -523,7 +523,55 @@ mod tests {
         }
         assert_eq!(
             manifest_frame_sync, dispatch_frame_sync,
-            "FrameSync architecture set must equal the streaming dispatch FrameSync set"
+            "FrameSyncAppend architecture set must equal the streaming dispatch FrameSync set"
+        );
+    }
+
+    #[test]
+    fn utterance_complete_is_declared_on_chatml_utterance_llms_only() {
+        let architecture_registry = OpenAsrArchitectureRegistry::with_builtins();
+        let granularity = |architecture: &str| {
+            architecture_registry
+                .find_by_model_architecture(architecture)
+                .expect(architecture)
+                .execution_contract
+                .streaming_partial_granularity
+        };
+        assert_eq!(
+            granularity(crate::arch::FUNASR_NANO_GGML_ARCHITECTURE_ID),
+            StreamingPartialGranularity::UtteranceComplete
+        );
+        assert_eq!(
+            granularity(crate::arch::FIRERED_LLM_GGML_ARCHITECTURE_ID),
+            StreamingPartialGranularity::UtteranceComplete
+        );
+        assert_eq!(
+            granularity(crate::arch::MIMO_ASR_GGML_ARCHITECTURE_ID),
+            StreamingPartialGranularity::UtteranceComplete
+        );
+        assert_eq!(
+            granularity(crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID),
+            StreamingPartialGranularity::UtteranceComplete
+        );
+        assert_eq!(
+            granularity(crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID),
+            StreamingPartialGranularity::RevisableSnapshot
+        );
+        assert_eq!(
+            granularity(crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID),
+            StreamingPartialGranularity::RevisableSnapshot
+        );
+        assert_eq!(
+            granularity(crate::arch::WHISPER_GGML_ARCHITECTURE_ID),
+            StreamingPartialGranularity::RevisableSnapshot
+        );
+        assert_eq!(
+            granularity(crate::arch::GRANITE_SPEECH_GGML_ARCHITECTURE_ID),
+            StreamingPartialGranularity::RevisableSnapshot
+        );
+        assert_eq!(
+            granularity(crate::arch::XASR_ZIPFORMER_GGML_ARCHITECTURE_ID),
+            StreamingPartialGranularity::FrameSyncAppend
         );
     }
 
