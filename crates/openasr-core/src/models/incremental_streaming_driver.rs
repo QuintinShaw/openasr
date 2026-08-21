@@ -217,6 +217,18 @@ where
             request_options.prompt = Some(prompt);
             request_options.prompt_token_ids = None;
         }
+        let clipped_audio;
+        let audio = match resident_decoder_state.invocation_envelope() {
+            Some(envelope) if audio.samples_f32.len() > envelope.max_samples() => {
+                let start = audio.samples_f32.len() - envelope.max_samples();
+                clipped_audio =
+                    crate::models::ggml_asr_executor::GgmlAsrPreparedAudioView::mono_16khz(
+                        audio.samples_f32[start..].to_vec(),
+                    );
+                &clipped_audio
+            }
+            _ => audio,
+        };
         let decoder_state = match resident_decoder_state.invocation_envelope() {
             None => resident_decoder_state.clone(),
             Some(envelope) => {
@@ -1012,8 +1024,8 @@ mod tests {
     use std::{
         collections::VecDeque,
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
         },
     };
 
@@ -1360,8 +1372,8 @@ mod tests {
             _ => unreachable!("expected partial update"),
         };
         assert_ne!(second_id, first_id);
-        assert_eq!(second_id.0 .0, "utt_win_000002");
-        assert_eq!(second_id.1 .0, "seg_win_000002");
+        assert_eq!(second_id.0.0, "utt_win_000002");
+        assert_eq!(second_id.1.0, "seg_win_000002");
     }
 
     #[test]
