@@ -386,7 +386,7 @@ async fn realtime_backend_job_canceled_before_dispatch_releases_capacity_promptl
         native_execution: NativeExecutionSupervisor::new(NonZeroUsize::new(1).unwrap()),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_path),
+        model_pack_path: Some(pack_path).into(),
     };
 
     // One second of a real (non-silent) tone rather than jfk.wav: keeps input
@@ -2441,7 +2441,7 @@ async fn session_start_waits_for_native_warm_without_publishing_lifecycle() {
         native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_path),
+        model_pack_path: Some(pack_path).into(),
     };
     let (event_sender, mut event_receiver) = mpsc::channel(16);
     let mut session = WsSession::new(runtime, test_distribution(), event_sender);
@@ -2670,7 +2670,7 @@ async fn boot_native_warmup_skips_when_the_runtime_slot_is_occupied() {
         native_execution: NativeExecutionSupervisor::new(NonZeroUsize::new(1).unwrap()),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_path),
+        model_pack_path: Some(pack_path).into(),
     };
     let occupied_slot = runtime
         .acquire_native_execution("test-content", None)
@@ -3366,7 +3366,7 @@ async fn native_realtime_server_smoke_with_real_qwen_pack() {
         native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_path),
+        model_pack_path: Some(pack_path).into(),
     };
     let mut session = WsSession::new(runtime, test_distribution(), event_sender);
     session.native_decode_timeout_override = Some(Duration::from_secs(180));
@@ -3751,7 +3751,7 @@ async fn session_capabilities_event_reports_frame_sync_only_for_xasr_zipformer()
         native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(xasr_path),
+        model_pack_path: Some(xasr_path).into(),
     };
     let (xasr_event_sender, mut xasr_event_receiver) = mpsc::channel(8);
     let mut xasr_session = WsSession::new(xasr_runtime, test_distribution(), xasr_event_sender);
@@ -3771,7 +3771,7 @@ async fn session_capabilities_event_reports_frame_sync_only_for_xasr_zipformer()
         native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(qwen_path),
+        model_pack_path: Some(qwen_path).into(),
     };
     let (qwen_event_sender, mut qwen_event_receiver) = mpsc::channel(8);
     let mut qwen_session = WsSession::new(qwen_runtime, test_distribution(), qwen_event_sender);
@@ -3984,7 +3984,7 @@ async fn fallback_capacity_rejection_is_backend_not_ready_and_recoverable() {
         native_execution: NativeExecutionSupervisor::new(NonZeroUsize::new(1).unwrap()),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_path),
+        model_pack_path: Some(pack_path).into(),
     };
     let occupied_route = crate::routes::transcription::resolve_execution_route_for_target(None)
         .expect("fixture route resolve must succeed")
@@ -4117,7 +4117,7 @@ async fn session_start_rejects_xasr_hotwords_from_active_native_capabilities() {
         native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_path),
+        model_pack_path: Some(pack_path).into(),
     };
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(runtime, test_distribution(), event_sender);
@@ -4160,7 +4160,7 @@ async fn session_start_accepts_hotwords_for_supporting_native_model() {
         native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_path),
+        model_pack_path: Some(pack_path).into(),
     };
     let (event_sender, _event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(runtime, test_distribution(), event_sender);
@@ -4203,7 +4203,7 @@ async fn local_native_streaming_session_rejects_voice_id() {
         native_execution: crate::NativeExecutionSupervisor::default(),
         ffmpeg_bin: None,
         ffmpeg_bin_explicit: false,
-        model_pack_path: Some(pack_path),
+        model_pack_path: Some(pack_path).into(),
     };
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(runtime, test_distribution(), event_sender);

@@ -1052,6 +1052,21 @@ pub(crate) fn warm_up_native_streaming_session_once(
 /// `WARMED_AT_GENERATION` gate in `warm_up_native_streaming_session_once`);
 /// every later attach on that thread reuses the now-warm state, until an
 /// `idle_unload` eviction bumps the generation and forces a re-warm.
+/// Whether any native streaming worker currently has an attached (or attaching)
+/// session occupying its slot. Used by default-model rebind to fail closed
+/// rather than tearing down in-flight realtime work.
+pub(crate) fn native_streaming_workers_occupy_slot() -> bool {
+    let Some(registry) = SHARED_NATIVE_STREAMING_WORKERS.get() else {
+        return false;
+    };
+    let workers = registry
+        .lock()
+        .expect("native streaming worker registry mutex poisoned");
+    workers
+        .values()
+        .any(|entry| entry.state.active_or_attaching.load(Ordering::Acquire) > 0)
+}
+
 pub(crate) fn spawn_boot_native_warmup(runtime: ServerRuntime) {
     tokio::spawn(async move {
         warm_up_default_native_streaming_worker(runtime).await;
@@ -1062,9 +1077,10 @@ pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime
     if runtime.backend != openasr_core::BackendKind::Native {
         return;
     }
-    let Some(model_pack_path) = runtime.model_pack_path.clone() else {
+    let Some(model_pack_path) = runtime.model_pack_path.current() else {
         // Fresh install / no model installed yet: nothing to warm. The daemon
-        // still serves `/health`; a bound pack arrives on a future restart.
+        // still serves `/health`; a later default-model rebind binds a pack
+        // in-process without restart, and the next request path loads it.
         return;
     };
     // Warmup is opportunistic. It must not queue behind an active request or
@@ -1237,7 +1253,7 @@ impl RealtimeBackendWorkerKey {
         Self {
             backend: runtime.backend.to_string(),
             ffmpeg_bin: runtime.ffmpeg_bin.clone(),
-            model_pack_path: runtime.model_pack_path.clone(),
+            model_pack_path: runtime.model_pack_path.current(),
         }
     }
 }

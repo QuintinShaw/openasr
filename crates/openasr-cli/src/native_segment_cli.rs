@@ -654,7 +654,7 @@ pub(super) async fn serve(
             ),
             ffmpeg_bin,
             ffmpeg_bin_explicit,
-            model_pack_path: model_source.model_pack_path,
+            model_pack_path: model_source.model_pack_path.into(),
         },
         launch_options,
     )

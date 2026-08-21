@@ -2027,7 +2027,7 @@ pub(crate) async fn transcribe_with_runtime(
         }
         BackendKind::Native => {
             tokio::task::spawn_blocking(move || {
-                let model_pack_path = runtime.model_pack_path.clone().ok_or_else(|| {
+                let model_pack_path = runtime.model_pack_path.current().ok_or_else(|| {
                     ApiError::Backend(openasr_core::BackendError::NativeModelPackPathRejected {
                         reason: format!(
                             "Model '{}' is not installed. No models are installed on this server yet -- install one first (openasr pull {}, or via the model market).",
