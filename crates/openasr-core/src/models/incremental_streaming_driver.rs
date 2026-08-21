@@ -219,15 +219,16 @@ where
         }
         let clipped_audio;
         let audio = match resident_decoder_state.invocation_envelope() {
-            Some(envelope) if audio.samples_f32.len() > envelope.max_samples() => {
-                let start = audio.samples_f32.len() - envelope.max_samples();
-                clipped_audio =
-                    crate::models::ggml_asr_executor::GgmlAsrPreparedAudioView::mono_16khz(
-                        audio.samples_f32[start..].to_vec(),
-                    );
-                &clipped_audio
+            Some(envelope) => {
+                match clip_streaming_audio_to_max_samples(audio, envelope.max_samples()) {
+                    Some(clipped) => {
+                        clipped_audio = clipped;
+                        &clipped_audio
+                    }
+                    None => audio,
+                }
             }
-            _ => audio,
+            None => audio,
         };
         let decoder_state = match resident_decoder_state.invocation_envelope() {
             None => resident_decoder_state.clone(),
@@ -449,6 +450,21 @@ fn audio_with_endpoint_silence(
     let mut samples = audio.samples_f32.to_vec();
     samples.resize(samples.len().saturating_add(extra), 0.0);
     GgmlAsrPreparedAudioView::mono_16khz(samples)
+}
+
+/// Keep the trailing `max_samples` when a live Poll outgrows the resident
+/// invocation envelope. `None` means the buffer already fits.
+fn clip_streaming_audio_to_max_samples(
+    audio: &GgmlAsrPreparedAudioView<'static>,
+    max_samples: usize,
+) -> Option<GgmlAsrPreparedAudioView<'static>> {
+    let len = audio.samples_f32.len();
+    if len <= max_samples {
+        return None;
+    }
+    Some(GgmlAsrPreparedAudioView::mono_16khz(
+        audio.samples_f32[len - max_samples..].to_vec(),
+    ))
 }
 
 /// A PARTIAL decode that covered the WHOLE current buffer, kept so a terminal
@@ -1890,6 +1906,16 @@ mod tests {
         assert_eq!(updates.len(), 1);
         assert_eq!(text_of(&updates[0]).0, window.trim());
         assert!(!text_of(&updates[0]).2);
+    }
+
+    #[test]
+    fn clip_streaming_audio_keeps_the_trailing_envelope() {
+        let samples: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let audio = GgmlAsrPreparedAudioView::mono_16khz(samples);
+        assert!(clip_streaming_audio_to_max_samples(&audio, 8).is_none());
+        assert!(clip_streaming_audio_to_max_samples(&audio, 9).is_none());
+        let clipped = clip_streaming_audio_to_max_samples(&audio, 3).expect("overflow");
+        assert_eq!(clipped.samples_f32.as_ref(), &[5.0, 6.0, 7.0]);
     }
 
     #[test]
