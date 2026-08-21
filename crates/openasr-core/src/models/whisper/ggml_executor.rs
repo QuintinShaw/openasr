@@ -158,7 +158,7 @@ use crate::models::decode_token_history::{
     build_longform_token_history_carry, context_window_budget,
 };
 use crate::models::seq2seq_dtw_alignment::{
-    dtw_align_token_frames, speech_frame_bounds, token_text_carries_speech,
+    dtw_align_token_frames, speech_frame_bounds, token_text_carries_speech, whisper_timestamp_frame,
 };
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
@@ -5767,7 +5767,7 @@ fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudioView) -> f32 {
 
 /// How a whisper decode derives word timestamps for a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WhisperWordTimestampMode {
+pub(crate) enum WhisperWordTimestampMode {
     /// No word timestamps requested.
     Off,
     /// User-requested word timestamps: collect per-token cross-attention
@@ -5782,7 +5782,7 @@ enum WhisperWordTimestampMode {
     PostHocAnchors,
 }
 
-fn whisper_word_timestamp_mode(
+pub(crate) fn whisper_word_timestamp_mode(
     request_options: &GgmlAsrExecutionOptions,
 ) -> WhisperWordTimestampMode {
     if !request_options.word_timestamps {
@@ -5808,6 +5808,68 @@ fn whisper_decoder_cross_attention_flags(
         cross_flash_attention_enabled && !collect_cross_attention,
         collect_cross_attention,
     )
+}
+
+/// Maximal runs of consecutive text (non-timestamp) tokens in the generated
+/// stream, as inclusive index ranges into `token_ids`: the words between two
+/// decoded timestamp tokens form one segment. The timestamp tokens separating
+/// the runs supply each segment's `[start, end]` DTW band.
+fn text_token_runs(token_ids: &[u32], is_timestamp: &dyn Fn(u32) -> bool) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut index = 0usize;
+    let len = token_ids.len();
+    while index < len {
+        if is_timestamp(token_ids[index]) {
+            index += 1;
+            continue;
+        }
+        let lo = index;
+        while index < len && !is_timestamp(token_ids[index]) {
+            index += 1;
+        }
+        let hi = index.saturating_sub(1);
+        if lo <= hi {
+            runs.push((lo, hi));
+        }
+    }
+    runs
+}
+
+/// The window-absolute frame band a text-token run should DTW onto, from the
+/// nearest `<|start|>` / `<|end|>` timestamp tokens that bracket it (mirrors
+/// whisper-timestamped's per-segment `weights[..., start: end]` slice). The
+/// start is the nearest timestamp token at or before the run, the end the first
+/// after it. A missing bound degrades to the window edge (frame 0 / final
+/// frame) so a leading-leak or an early-EOT tail still yields a band rather
+/// than dropping the segment. Returns `None` only when the pack has no
+/// timestamp vocabulary or the band is empty.
+fn run_frame_bounds(
+    lo: usize,
+    hi: usize,
+    token_ids: &[u32],
+    timestamp_begin: Option<u32>,
+    frame_resolution: usize,
+) -> Option<(usize, usize)> {
+    let timestamp_begin = timestamp_begin?;
+    let frame_of = |id: u32| whisper_timestamp_frame(id, timestamp_begin).min(frame_resolution);
+    // The start is the nearest decoded timestamp at or before the run (frame 0
+    // when the run starts the stream, e.g. a leading <|0.00|> leak); the end is
+    // the first decoded timestamp at or after the run's last text token
+    // (the final frame when EOT ends the stream before an end timestamp).
+    let start_frame = token_ids
+        .get(..=lo)
+        .and_then(|window| window.iter().rev().find(|&&id| id >= timestamp_begin))
+        .copied()
+        .map(frame_of)
+        .unwrap_or(0);
+    let end_frame = token_ids
+        .get(hi..)
+        .and_then(|window| window.iter().find(|&&id| id >= timestamp_begin).copied())
+        .map_or(frame_resolution, frame_of);
+    if end_frame <= start_frame {
+        return None;
+    }
+    Some((start_frame, end_frame.min(frame_resolution)))
 }
 
 fn whisper_cross_attention_word_timestamps(
@@ -5847,69 +5909,146 @@ fn whisper_cross_attention_word_timestamps(
             .iter()
             .map(|alignment| alignment.frame_probs.clone())
             .collect::<Vec<Vec<f32>>>();
-        // Bracket the DTW frame axis on the attention of the tokens that
-        // actually carry speech. The model emits `<|notimestamps|>` so there is
-        // no decoded `<|start|>`/`<|end|>` to slice `weights[..., start: end]`
-        // on (as whisper-timestamped does); the closest signal is the attention
-        // envelope of content tokens, which ignores leading silence and trailing
-        // non-speech the model did not attend to. Punctuation/subword tokens are
-        // excluded: they carry no audible span of their own and their
-        // cross-attention is the diffuse mass that bleeds into nearby silence or
-        // the trailing non-speech, so letting one set the band end would stretch
-        // the final word far past where the speech stops (whisper-timestamped
-        // excludes a trailing final punctuation for the same reason). Without
-        // this the monotone path runs the whole padded window, stretching the
-        // first word's start to frame 0 and the last word's end to the tail.
-        let is_content: Vec<bool> = token_alignments
-            .iter()
-            .map(|alignment| {
-                tokenizer
-                    .decode_text_token_ids(&[alignment.token_id])
-                    .map_or(false, |text| token_text_carries_speech(&text))
-            })
-            .collect();
-        let (dtw_frame_start, dtw_frame_end) = speech_frame_bounds(&full_window, &is_content)
-            .map_or_else(
-                // No usable content attention: fall back to the encoded clip
-                // duration so the last word still owns the real audio end.
-                move || {
-                    (
-                        0usize,
-                        ((duration / seconds_per_frame).ceil() as usize).clamp(1, frame_resolution),
-                    )
-                },
-                |(start, end)| (start, end.clamp(start + 1, frame_resolution)),
-            );
-        let attention: Vec<Vec<f32>> = token_alignments
-            .iter()
-            .map(|alignment| alignment.frame_probs[dtw_frame_start..dtw_frame_end].to_vec())
-            .collect();
-        if let Some(spans) = dtw_align_token_frames(&attention) {
-            let token_spans: Vec<Seq2SeqTokenSpan> = token_alignments
+
+        // If the decode was run without `<|notimestamps|>` (word-timestamp
+        // mode), the model emits the per-segment `<|start|>`/`<|end|>`
+        // timestamp tokens. Like whisper-timestamped, slice the DTW to each
+        // segment's `[start, end]` band so a silence gap between segments does
+        // not stretch the last word of one segment across the gap into the next.
+        // A timestamp token maps to its frame directly (token id offset from
+        // `<|0.00|>` is its frame number).
+        let timestamp_begin = tokenizer.first_timestamp_token_id();
+        let token_ids: Vec<u32> = token_alignments.iter().map(|a| a.token_id).collect();
+        let is_ts = |id: u32| timestamp_begin.is_some_and(|begin| id >= begin);
+
+        // Maximal runs of consecutive text tokens (the words); timestamp tokens
+        // separate them into segments.
+        let runs = text_token_runs(&token_ids, &is_ts);
+        // When no segment is bracketed by decoded timestamps, run a single DTW
+        // over the whole window bracketed on the content-token attention peaks
+        // (the no-timestamps degrade; see `speech_frame_bounds`).
+        let bracketed_by_timestamps = runs.iter().any(|(lo, hi)| {
+            run_frame_bounds(*lo, *hi, &token_ids, timestamp_begin, frame_resolution).is_some()
+        });
+        if bracketed_by_timestamps {
+            let mut words = Vec::new();
+            for (lo, hi) in &runs {
+                let Some((band_start, band_end)) =
+                    run_frame_bounds(*lo, *hi, &token_ids, timestamp_begin, frame_resolution)
+                else {
+                    continue;
+                };
+                let attention: Vec<Vec<f32>> = full_window[*lo..=*hi]
+                    .iter()
+                    .map(|row| row[band_start.min(row.len())..band_end.min(row.len())].to_vec())
+                    .collect();
+                let Some(spans) = dtw_align_token_frames(&attention) else {
+                    continue;
+                };
+                let band_width = band_end.saturating_sub(band_start);
+                let token_spans: Vec<Seq2SeqTokenSpan> = spans
+                    .iter()
+                    .enumerate()
+                    .map(|(rel, span)| {
+                        let index = lo + rel;
+                        let token_id = token_alignments[index].token_id;
+                        Seq2SeqTokenSpan {
+                            token_id,
+                            // Add the slice offset back so frames are window-absolute.
+                            frame_start: span.frame_start.saturating_add(band_start),
+                            frame_end: span.frame_end.min(band_width).saturating_add(band_start),
+                            probability: (probabilities_aligned
+                                && index < generated_probabilities.len())
+                            .then(|| generated_probabilities[index]),
+                        }
+                    })
+                    .collect();
+                if token_spans.is_empty() {
+                    continue;
+                }
+                // A per-segment decode failure is non-fatal: keep the other
+                // segments' words rather than dropping the whole transcript.
+                if let Ok(block_words) = seq2seq_word_timestamps_from_token_spans(
+                    &token_spans,
+                    0.0,
+                    duration,
+                    seconds_per_frame,
+                    BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+                    &decode_text,
+                ) {
+                    words.extend(block_words);
+                }
+            }
+            if !words.is_empty() {
+                return Ok(words);
+            }
+            // Every bracketed run failed to align: fall through to the
+            // center-of-mass degrade below.
+        } else {
+            // No decoded timestamps: bracket the DTW frame axis on the
+            // attention of the tokens that actually carry speech. The
+            // cross-attention envelope of content tokens ignores leading
+            // silence and trailing non-speech the model did not attend to.
+            // Punctuation/subword tokens are excluded: they carry no audible
+            // span of their own and their cross-attention is the diffuse mass
+            // that bleeds into nearby silence or the trailing non-speech, so
+            // letting one set the band end would stretch the final word far
+            // past where the speech stops (whisper-timestamped excludes a
+            // trailing final punctuation for the same reason).
+            let is_content: Vec<bool> = token_alignments
                 .iter()
-                .enumerate()
-                .zip(spans.iter())
-                .map(|((index, alignment), span)| Seq2SeqTokenSpan {
-                    token_id: alignment.token_id,
-                    // Add the slice offset back so frames are window-absolute.
-                    frame_start: span.frame_start.saturating_add(dtw_frame_start),
-                    frame_end: span.frame_end.saturating_add(dtw_frame_start),
-                    probability: probabilities_aligned.then(|| generated_probabilities[index]),
+                .map(|alignment| {
+                    tokenizer
+                        .decode_text_token_ids(&[alignment.token_id])
+                        .is_ok_and(|text| token_text_carries_speech(&text))
                 })
                 .collect();
-            return seq2seq_word_timestamps_from_token_spans(
-                &token_spans,
-                0.0,
-                duration,
-                seconds_per_frame,
-                BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
-                &decode_text,
-            )
-            .map_err(
-                |error| WhisperGgmlExecutorError::DecoderInvalidTokenDecode {
-                    reason: format!("whisper DTW word timestamp token decode failed: {error}"),
-                },
-            );
+            let (dtw_frame_start, dtw_frame_end) = speech_frame_bounds(&full_window, &is_content)
+                .map_or_else(
+                    // No usable content attention: fall back to the encoded clip
+                    // duration so the last word still owns the real audio end.
+                    move || {
+                        (
+                            0usize,
+                            ((duration / seconds_per_frame).ceil() as usize)
+                                .clamp(1, frame_resolution),
+                        )
+                    },
+                    |(start, end)| (start, end.clamp(start + 1, frame_resolution)),
+                );
+            let attention: Vec<Vec<f32>> = full_window
+                .iter()
+                .map(|row| {
+                    row[dtw_frame_start.min(row.len())..dtw_frame_end.min(row.len())].to_vec()
+                })
+                .collect();
+            if let Some(spans) = dtw_align_token_frames(&attention) {
+                let token_spans: Vec<Seq2SeqTokenSpan> = token_alignments
+                    .iter()
+                    .enumerate()
+                    .zip(spans.iter())
+                    .map(|((index, alignment), span)| Seq2SeqTokenSpan {
+                        token_id: alignment.token_id,
+                        // Add the slice offset back so frames are window-absolute.
+                        frame_start: span.frame_start.saturating_add(dtw_frame_start),
+                        frame_end: span.frame_end.saturating_add(dtw_frame_start),
+                        probability: probabilities_aligned.then(|| generated_probabilities[index]),
+                    })
+                    .collect();
+                return seq2seq_word_timestamps_from_token_spans(
+                    &token_spans,
+                    0.0,
+                    duration,
+                    seconds_per_frame,
+                    BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+                    &decode_text,
+                )
+                .map_err(|error| {
+                    WhisperGgmlExecutorError::DecoderInvalidTokenDecode {
+                        reason: format!("whisper DTW word timestamp token decode failed: {error}"),
+                    }
+                });
+            }
         }
     }
 

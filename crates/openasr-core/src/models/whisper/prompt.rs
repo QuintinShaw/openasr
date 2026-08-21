@@ -65,6 +65,11 @@ pub(crate) fn build_whisper_initial_prompt_tokens(
         language: override_language.or(request_options.language.as_deref()),
         task: request_options.task,
         is_multilingual: execution.vocab_size > WHISPER_ENGLISH_ONLY_MAX_VOCAB_SIZE,
+        // Only the user-requested DTW word-timestamp path decodes the leading
+        // <|0.00|>/per-segment timestamp tokens; plain and diarization-forced
+        // decodes keep the byte-identical <notimestamps> prompt.
+        decode_timestamps: super::ggml_executor::whisper_word_timestamp_mode(request_options)
+            == super::ggml_executor::WhisperWordTimestampMode::CrossAttention,
     };
     let prompt_init_tokens = tokenizer
         .decoder_prefix(decoder_start_token_id, &prefix_spec)

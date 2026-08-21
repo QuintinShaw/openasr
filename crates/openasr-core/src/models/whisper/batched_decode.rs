@@ -1645,6 +1645,7 @@ mod tests {
                     language: Some("fr"),
                     task: crate::TranscriptionTask::Translate,
                     is_multilingual: true,
+                    decode_timestamps: false,
                 },
             )
             .expect("prefix");

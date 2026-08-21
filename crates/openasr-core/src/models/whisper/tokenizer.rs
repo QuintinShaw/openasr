@@ -90,6 +90,11 @@ pub struct WhisperPrefixSpec<'a> {
     pub language: Option<&'a str>,
     pub task: TranscriptionTask,
     pub is_multilingual: bool,
+    /// When true, seed the decoder with the leading `<|0.00|>` timestamp token
+    /// instead of `<|notimestamps|>` so the model decodes the per-segment
+    /// `<|start|>`/`<|end|>` timestamp tokens the DTW word-aligner slices on.
+    /// Only the user-requested word-timestamp path sets this.
+    pub decode_timestamps: bool,
 }
 
 impl WhisperPrefixSpec<'_> {
@@ -100,6 +105,7 @@ impl WhisperPrefixSpec<'_> {
             language: None,
             task: TranscriptionTask::Transcribe,
             is_multilingual,
+            decode_timestamps: false,
         }
     }
 }
@@ -385,6 +391,16 @@ impl WhisperTokenizer {
                     prefix.push(token_id);
                 }
             }
+        }
+        // Word-timestamp mode decodes the per-segment `<|start|>`/`<|end|>`
+        // timestamp tokens the DTW word-aligner slices on (mirrors
+        // whisper-timestamped's `without_timestamps=False`, whose prompt is the
+        // control tokens with NO `<|notimestamps|>`). A large multilingual
+        // checkpoint then emits a leading timestamp followed by the alternating
+        // start/text/end sequence. A pack without the timestamp vocabulary (or a
+        // request that should keep the no-timestamps decode) is unchanged.
+        if spec.decode_timestamps {
+            return Ok(prefix);
         }
         if let Some(token_id) = self.notimestamps_token_id {
             prefix.push(token_id);
@@ -953,6 +969,23 @@ mod tests {
                 .expect("default prefix"),
             vec![7, 42]
         );
+        // The word-timestamp path drops <|notimestamps|> (like whisper-
+        // timestamped's `without_timestamps=False`) so the model decodes the
+        // leading <start> and per-segment timestamp tokens.
+        assert_eq!(
+            tokenizer
+                .decoder_prefix(
+                    7,
+                    &WhisperPrefixSpec {
+                        language: None,
+                        task: TranscriptionTask::Transcribe,
+                        is_multilingual: false,
+                        decode_timestamps: true,
+                    }
+                )
+                .expect("timestamp prefix"),
+            vec![7]
+        );
     }
 
     #[test]
@@ -1003,6 +1036,7 @@ mod tests {
                     language: Some("en"),
                     task: TranscriptionTask::Transcribe,
                     is_multilingual: true,
+                    decode_timestamps: false,
                 },
             )
             .expect("explicit en prefix");
@@ -1020,6 +1054,7 @@ mod tests {
                         language: Some("en"),
                         task: TranscriptionTask::Translate,
                         is_multilingual: true,
+                        decode_timestamps: false,
                     }
                 )
                 .unwrap_err(),
@@ -1033,6 +1068,7 @@ mod tests {
                         language: Some("fr"),
                         task: TranscriptionTask::Transcribe,
                         is_multilingual: true,
+                        decode_timestamps: false,
                     }
                 )
                 .unwrap_err(),
@@ -1072,6 +1108,7 @@ mod tests {
                         language: Some(" FR "),
                         task: TranscriptionTask::Transcribe,
                         is_multilingual: true,
+                        decode_timestamps: false,
                     }
                 )
                 .expect("prefix"),
@@ -1086,6 +1123,7 @@ mod tests {
                         language: None,
                         task: TranscriptionTask::Translate,
                         is_multilingual: true,
+                        decode_timestamps: false,
                     }
                 )
                 .expect("prefix"),

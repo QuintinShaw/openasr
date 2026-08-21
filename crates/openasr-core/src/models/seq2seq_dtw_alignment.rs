@@ -142,13 +142,14 @@ pub(crate) fn dtw_align_token_frames(attention: &[Vec<f32>]) -> Option<Vec<Token
     Some(token_spans_from_path(&path, token_count, frame_count))
 }
 
-/// Per-token DTW cost row: median-smooth the attention, sharpen it with a
-/// softmax, L2-normalize across frames so every token carries comparable
-/// energy, then negate so the DTW minimizes cost (maximizes attention).
-/// The reference pipeline head-averages before these steps; the caller's
-/// frame rows are already head-averaged and normalized, so the remaining
-/// stages are applied directly.
-fn row_alignment_cost(row: &[f32]) -> Vec<f64> {
+/// Per-token alignment weights: median-smooth the attention, sharpen it with a
+/// softmax, then L2-normalize across frames so every token carries comparable
+/// energy. Returns the (non-negative) weight row; the DTW cost row is its
+/// negation, and the disfluency peak search reads the row directly. The
+/// reference pipeline head-averages before these steps; the caller's frame
+/// rows are already head-averaged and normalized, so the remaining stages are
+/// applied directly.
+fn row_alignment_weights(row: &[f32]) -> Vec<f64> {
     let smoothed = median_filter_row(row, DTW_MEDIAN_FILTER_WIDTH);
     let sharpened = softmax_row(&smoothed);
     let mut norm = 0.0_f64;
@@ -156,14 +157,32 @@ fn row_alignment_cost(row: &[f32]) -> Vec<f64> {
         let value = weight as f64;
         norm += value * value;
     }
-    if norm > 0.0 && norm.is_finite() {
-        let inv_norm = 1.0 / norm.sqrt();
-        return sharpened
-            .iter()
-            .map(|&weight| -((weight as f64) * inv_norm))
-            .collect();
-    }
-    vec![0.0_f64; row.len()]
+    let inv_norm = if norm > 0.0 && norm.is_finite() {
+        1.0 / norm.sqrt()
+    } else {
+        0.0
+    };
+    sharpened
+        .iter()
+        .map(|&weight| (weight as f64) * inv_norm)
+        .collect()
+}
+
+/// Per-token DTW cost row: the negated L2-normalized alignment weights, so the
+/// DTW minimizes cost (maximizes attention).
+fn row_alignment_cost(row: &[f32]) -> Vec<f64> {
+    row_alignment_weights(row)
+        .iter()
+        .map(|&weight| -weight)
+        .collect()
+}
+
+/// Frame index a Whisper timestamp token maps to within the padded window. The
+/// 1501 timestamp tokens (`<|0.00|>` ... `<|30.00|>`) are contiguous right
+/// after `<|notimestamps|>`; the token offset from `<|0.00|>` is exactly its
+/// frame number (`n * 0.02s` into the 1500-frame window).
+pub(crate) fn whisper_timestamp_frame(token_id: u32, timestamp_begin: u32) -> usize {
+    token_id.saturating_sub(timestamp_begin) as usize
 }
 
 /// Centered sliding median over the frame axis, clamped at the row edges.
