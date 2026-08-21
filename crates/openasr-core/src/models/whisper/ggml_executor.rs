@@ -810,6 +810,7 @@ struct WhisperDecoderActorJob {
     loaded_f16_weight_mode: WhisperGpuLoadedF16WeightMode,
     control: Arc<crate::api::backend::TranscriptionControl>,
     decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
+    unstable_decode_text: Option<crate::api::backend::UnstableDecodeTextObserver>,
     expected_loaded_weight_binding: Option<GgmlLoadedWeightBindingIdentity>,
 }
 
@@ -947,6 +948,7 @@ impl WhisperDecoderActorJob {
                 &self.trace,
                 &self.control,
                 self.decode_work_progress.as_ref(),
+                self.unstable_decode_text.as_ref(),
             )
         })();
         if !self.allow_persistent_session_reuse {
@@ -4935,6 +4937,7 @@ fn execute_whisper_with_prepared_runtime(
             loaded_f16_weight_mode: gpu_loaded_f16_weight_mode,
             control: Arc::clone(&execution_context.control),
             decode_work_progress: execution_context.decode_work_progress_observer().cloned(),
+            unstable_decode_text: execution_context.unstable_decode_text_observer().cloned(),
             expected_loaded_weight_binding: None,
         };
         return unified_actor
@@ -5001,6 +5004,7 @@ fn execute_whisper_with_prepared_runtime(
         loaded_f16_weight_mode: gpu_loaded_f16_weight_mode,
         control: Arc::clone(&execution_context.control),
         decode_work_progress: execution_context.decode_work_progress_observer().cloned(),
+        unstable_decode_text: execution_context.unstable_decode_text_observer().cloned(),
         expected_loaded_weight_binding: None,
     };
     let run_encoder = || {
@@ -6157,6 +6161,7 @@ fn run_whisper_decode_loop(
     trace: &WhisperGgmlTrace,
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
+    unstable_decode_text: Option<&crate::api::backend::UnstableDecodeTextObserver>,
 ) -> Result<WhisperExecutionOutput, WhisperGgmlExecutorError> {
     let prelude_summary = match prelude_result {
         WhisperEncoderPreludeSeamResult::GraphExecuted {
@@ -6368,6 +6373,7 @@ fn run_whisper_decode_loop(
         &decode_text_token_ids,
         control,
         decode_work_progress,
+        unstable_decode_text,
     ) {
         Ok(decode) => {
             decode_loop_span.finish_with_extra(

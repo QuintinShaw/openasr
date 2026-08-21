@@ -93,6 +93,7 @@ pub(crate) fn run_moonshine_decoder_short_form_with_runtime(
     audio_duration_seconds: f32,
     control: &Arc<crate::api::backend::TranscriptionControl>,
     decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
+    unstable_decode_text: Option<&crate::api::backend::UnstableDecodeTextObserver>,
 ) -> Result<MoonshineDecodeOutput, MoonshineDecoderGraphError> {
     runtime.populate_cross_attention_cache(encoder_output)?;
     let mut step_executor = MoonshineDecoderStepExecutor { runtime };
@@ -159,6 +160,7 @@ pub(crate) fn run_moonshine_decoder_short_form_with_runtime(
         },
         control,
         decode_work_progress,
+        unstable_decode_text,
     ) {
         Ok(output) => output,
         Err(Seq2SeqGreedyDecodeError::EotNotReachedBeforeMaxTokens {

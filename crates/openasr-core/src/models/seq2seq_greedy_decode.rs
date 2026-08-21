@@ -1,7 +1,7 @@
 use thiserror::Error;
 
-use crate::api::backend::WorkProgressObserver;
 use crate::api::backend::{DecodeTruncation, DecodeTruncationReason};
+use crate::api::backend::{UnstableDecodeTextObserver, WorkProgressObserver};
 use crate::models::phrase_bias_decode::{TokenPhraseBias, apply_phrase_bias_to_logits};
 
 /// Largest token n-gram the degenerate-loop guard inspects (token ids, not
@@ -234,6 +234,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_with_adapter_v0<E>(
     on_topk: &mut dyn FnMut(usize, &[f32]),
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     decode_work_progress: Option<&WorkProgressObserver>,
+    unstable_decode_text: Option<&UnstableDecodeTextObserver>,
 ) -> Result<Seq2SeqGreedyDecodeResult, E> {
     struct ClosureTokenDecoder<'a, E> {
         decode_text_token_ids: &'a dyn Fn(&[u32]) -> Result<String, E>,
@@ -253,6 +254,27 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_with_adapter_v0<E>(
         decode_text_token_ids,
         map_family_error_to_shared: map_token_decoder_error_to_shared,
     };
+    let mut last_unstable = String::new();
+    let mut on_generated_tokens = |tokens: &[u32]| {
+        let Some(observer) = unstable_decode_text else {
+            return;
+        };
+        let Ok(raw) = (decode_text_token_ids)(tokens) else {
+            return;
+        };
+        let text = normalize_text(raw);
+        let trimmed = text.trim();
+        if trimmed.is_empty() || trimmed == last_unstable {
+            return;
+        }
+        last_unstable.clear();
+        last_unstable.push_str(trimmed);
+        observer.report(&last_unstable);
+    };
+    let mut on_generated_tokens_ref: Option<&mut dyn FnMut(&[u32])> = None;
+    if unstable_decode_text.is_some() {
+        on_generated_tokens_ref = Some(&mut on_generated_tokens);
+    }
     let output = run_seq2seq_greedy_decode_loop_v0(
         config,
         step_executor,
@@ -261,6 +283,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_with_adapter_v0<E>(
         on_topk,
         control,
         decode_work_progress,
+        on_generated_tokens_ref,
     )
     .map_err(map_shared_error_to_family)?;
     Ok(Seq2SeqGreedyDecodeResult {
@@ -290,6 +313,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
     on_topk: &mut dyn FnMut(usize, &[f32]),
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     decode_work_progress: Option<&WorkProgressObserver>,
+    mut on_generated_tokens: Option<&mut dyn FnMut(&[u32])>,
 ) -> Result<Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeError> {
     if config.initial_prompt_tokens.is_empty() {
         return Err(Seq2SeqGreedyDecodeError::EmptyInitialPrompt);
@@ -339,6 +363,9 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
         }
         generated.push(selection.token_id);
         generated_probabilities.push(selection.probability);
+        if let Some(hook) = on_generated_tokens.as_mut() {
+            hook(&generated);
+        }
 
         // Degenerate greedy loops (the same short phrase emitted back to back
         // forever - "gugugu", or a phrase repeated 5+ times) are not honest
@@ -360,6 +387,9 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
             );
             generated.truncate(loop_hit.keep_len);
             generated_probabilities.truncate(loop_hit.keep_len);
+            if let Some(hook) = on_generated_tokens.as_mut() {
+                hook(&generated);
+            }
             // Reported as its own stop reason, never as a stop token: the
             // decode ends here, but the audio past the loop was never
             // transcribed and callers must be able to see that.
@@ -700,6 +730,7 @@ mod tests {
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
             None,
+            None,
         )
         .unwrap();
 
@@ -761,6 +792,7 @@ mod tests {
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
             None,
+            None,
         )
         .unwrap_err();
 
@@ -817,6 +849,7 @@ mod tests {
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
             None,
+            None,
         )
         .unwrap();
 
@@ -857,6 +890,7 @@ mod tests {
             &mut no_token_trace,
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
             None,
         )
         .unwrap();
@@ -905,6 +939,7 @@ mod tests {
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
             Some(&observer),
+            None,
         )
         .unwrap();
 
@@ -1192,6 +1227,7 @@ mod tests {
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
             None,
+            None,
         )
         .unwrap_err();
 
@@ -1256,6 +1292,7 @@ mod tests {
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
             None,
+            None,
         )
         .unwrap();
 
@@ -1313,6 +1350,7 @@ mod tests {
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
             None,
+            None,
         )
         .unwrap();
 
@@ -1364,6 +1402,7 @@ mod tests {
             &mut no_token_trace,
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
             None,
         )
         .unwrap();
@@ -1636,6 +1675,7 @@ mod tests {
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
             None,
+            None,
         )
         .expect("guard should finish the decode, not error out");
 
@@ -1752,6 +1792,7 @@ mod tests {
                 &mut no_topk_trace,
                 &worker_control,
                 None,
+                None,
             );
             (result, step_executor.logits_calls)
         });
@@ -1823,9 +1864,129 @@ mod tests {
             &mut no_topk_trace,
             &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
             None,
+            None,
         )
         .expect("no-control path stays successful");
         assert_eq!(output.text, "hello");
         assert_eq!(step_executor.logits_calls, 3);
+    }
+
+    #[test]
+    fn greedy_loop_reports_postprocessed_unstable_prefixes_before_eot() {
+        let mut step_executor = SyntheticStepExecutor {
+            vocab_size: 16,
+            sequence: vec![1, 2, 7],
+            logits_calls: 0,
+        };
+        let token_decoder_table = BTreeMap::from([(1_u32, "/sil"), (2_u32, " hello")]);
+        let decode_text_token_ids = move |token_ids: &[u32]| {
+            let mut out = String::new();
+            for token_id in token_ids {
+                out.push_str(token_decoder_table.get(token_id).copied().unwrap_or("?"));
+            }
+            Ok::<String, Seq2SeqGreedyDecodeError>(out)
+        };
+        let config = Seq2SeqGreedyDecodeConfig {
+            initial_prompt_tokens: vec![42],
+            eot_token_id: 7,
+            stop_token_ids: Vec::new(),
+            vocab_size: 16,
+            max_generated_tokens: 8,
+            suppress_first_step_token_ids: Vec::new(),
+            suppress_token_ids: Vec::new(),
+            phrase_biases: Vec::new(),
+        };
+        let mut no_token_trace = |_: usize, _: u32, _: bool| {};
+        let mut no_topk_trace = |_: usize, _: &[f32]| {};
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_observer = std::sync::Arc::clone(&observed);
+        let observer = UnstableDecodeTextObserver::new(move |text: &str| {
+            observed_for_observer
+                .lock()
+                .expect("unstable observations")
+                .push(text.to_string());
+        });
+
+        let output = run_seq2seq_greedy_decode_loop_with_adapter_v0(
+            &config,
+            &mut step_executor,
+            &decode_text_token_ids,
+            |error| error,
+            |error| error,
+            &|text| {
+                crate::models::decode_policy_component_registry::apply_seq2seq_text_postprocess(
+                    crate::models::decode_policy_component_registry::BuiltinDecodePolicySeq2SeqTextPostprocessKind::FunAsrNanoStripControlMarkersV0,
+                    &text,
+                )
+            },
+            &mut no_token_trace,
+            &mut no_topk_trace,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
+            Some(&observer),
+        )
+        .unwrap();
+
+        assert_eq!(output.text, "hello");
+        assert_eq!(
+            *observed.lock().expect("unstable observations"),
+            vec!["hello".to_string()]
+        );
+    }
+
+    #[test]
+    fn greedy_loop_emits_each_new_displayable_prefix_before_the_final_text() {
+        let mut step_executor = SyntheticStepExecutor {
+            vocab_size: 16,
+            sequence: vec![1, 2, 7],
+            logits_calls: 0,
+        };
+        let token_decoder = SyntheticTokenDecoder {
+            table: BTreeMap::from([(1, "he"), (2, "llo")]),
+        };
+        let config = Seq2SeqGreedyDecodeConfig {
+            initial_prompt_tokens: vec![42],
+            eot_token_id: 7,
+            stop_token_ids: Vec::new(),
+            vocab_size: 16,
+            max_generated_tokens: 8,
+            suppress_first_step_token_ids: Vec::new(),
+            suppress_token_ids: Vec::new(),
+            phrase_biases: Vec::new(),
+        };
+        let mut no_token_trace = |_: usize, _: u32, _: bool| {};
+        let mut no_topk_trace = |_: usize, _: &[f32]| {};
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_observer = std::sync::Arc::clone(&observed);
+        let observer = UnstableDecodeTextObserver::new(move |text: &str| {
+            observed_for_observer
+                .lock()
+                .expect("unstable observations")
+                .push(text.to_string());
+        });
+        let decode_text_token_ids =
+            |token_ids: &[u32]| token_decoder.decode_text_token_ids(token_ids);
+
+        let output = run_seq2seq_greedy_decode_loop_with_adapter_v0(
+            &config,
+            &mut step_executor,
+            &decode_text_token_ids,
+            |error| error,
+            |error| error,
+            &|text| text,
+            &mut no_token_trace,
+            &mut no_topk_trace,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
+            Some(&observer),
+        )
+        .unwrap();
+
+        assert_eq!(output.generated_tokens, vec![1, 2]);
+        assert_eq!(output.text, "hello");
+        assert_eq!(
+            *observed.lock().expect("unstable observations"),
+            vec!["he".to_string(), "hello".to_string()]
+        );
     }
 }

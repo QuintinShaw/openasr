@@ -506,7 +506,7 @@ pub(crate) mod source_tree_audit {
         use crate::ggml_runtime::AutoGpuPolicy;
         use crate::models::ggml_family_adapter::LanguageFamilyHint;
 
-        let value = StreamingPartialGranularity::FrameSync;
+        let value = StreamingPartialGranularity::FrameSyncAppend;
         let _dispatch_ty: crate::StreamingPartialGranularity = value;
         let base = base_descriptor();
         let _ = OpenAsrArchitectureDescriptor {

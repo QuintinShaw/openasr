@@ -18,7 +18,6 @@ use crate::api::native::{
 use crate::arch::{
     GRANITE_SPEECH_GGML_ADAPTER_ID, GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
     GRANITE_SPEECH_MODEL_FAMILY, OpenAsrArchitectureRegistry, OpenAsrPhraseBiasStrategy,
-    StreamingPartialGranularity,
 };
 use crate::device::{
     execution_policy::{
@@ -60,7 +59,7 @@ pub use native_transcribe::{
     refine_existing_transcription_timeline,
 };
 pub use request_execution_context::RequestExecutionContext;
-pub(crate) use request_execution_context::WorkProgressObserver;
+pub(crate) use request_execution_context::{UnstableDecodeTextObserver, WorkProgressObserver};
 pub use transcription_control::{
     GgmlAbortCallbackGuard, SliceBoundaryControl, TranscriptionControl,
 };
@@ -397,16 +396,16 @@ fn native_runtime_streaming_capabilities_for_descriptor(
         return NativeAsrCapabilities::native_offline();
     };
     // Partial granularity is a property of the registered streaming executor:
-    // frame-sync (append-only, never revises) vs buffered (re-decodes a growing
-    // window). Only xasr-zipformer is frame-sync today.
+    // frame-sync-append (append-only, never revises) vs revisable snapshot
+    // vs utterance-complete snapshot. Only xasr-zipformer is frame-sync today.
     NativeAsrCapabilities::native_true_streaming()
         .with_partial_results(true)
-        .with_frame_sync_partials(matches!(
+        .with_frame_sync_partials(
             architecture
                 .execution_contract
-                .streaming_partial_granularity,
-            StreamingPartialGranularity::FrameSync
-        ))
+                .streaming_partial_granularity
+                .is_frame_sync_append(),
+        )
 }
 
 /// Phrase-bias capability for one runtime pack.

@@ -628,6 +628,7 @@ impl FireRedAedGgmlExecutor {
         tokenizer: FireRedTokenizer,
         control: Arc<crate::api::backend::TranscriptionControl>,
         decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
+        unstable_decode_text: Option<crate::api::backend::UnstableDecodeTextObserver>,
         backend: GgmlCpuGraphBackend,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
     ) -> Result<super::decoder_graph::FireRedAedGreedyDecodeOutput, FireRedAedExecutorError> {
@@ -649,6 +650,7 @@ impl FireRedAedGgmlExecutor {
                     |ids| tokenizer.decode(ids).map_err(|error| error.to_string()),
                     &control,
                     decode_work_progress.as_ref(),
+                    unstable_decode_text.as_ref(),
                 )
             })
             .map_err(|error| Self::map_actor_error("decoder", error))?
@@ -668,6 +670,7 @@ impl FireRedAedGgmlExecutor {
         tokenizer: FireRedTokenizer,
         control: Arc<crate::api::backend::TranscriptionControl>,
         decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
+        unstable_decode_text: Option<crate::api::backend::UnstableDecodeTextObserver>,
     ) -> Result<super::decoder_graph::FireRedAedGreedyDecodeOutput, FireRedAedExecutorError> {
         runtime
             .call_mut_fallible(move |runtime| {
@@ -680,6 +683,7 @@ impl FireRedAedGgmlExecutor {
                     |ids| tokenizer.decode(ids).map_err(|error| error.to_string()),
                     &control,
                     decode_work_progress.as_ref(),
+                    unstable_decode_text.as_ref(),
                 )
             })
             .map_err(|error| Self::map_actor_error("unified-decoder", error))?
@@ -871,6 +875,10 @@ impl FireRedAedGgmlExecutor {
             .execution_context
             .decode_work_progress_observer()
             .cloned();
+        let unstable_decode_text = request
+            .execution_context
+            .unstable_decode_text_observer()
+            .cloned();
         let decode = match unified_gpu_runtime.as_ref() {
             Some(runtime) => self.decode_with_unified_gpu_runtime(
                 runtime,
@@ -881,6 +889,7 @@ impl FireRedAedGgmlExecutor {
                 tokenizer,
                 control,
                 decode_work_progress,
+                unstable_decode_text,
             )?,
             None => self.decode_with_owned_runtime(
                 preflight,
@@ -891,6 +900,7 @@ impl FireRedAedGgmlExecutor {
                 tokenizer,
                 control,
                 decode_work_progress,
+                unstable_decode_text,
                 backend,
                 greedy_step_output_mode,
             )?,

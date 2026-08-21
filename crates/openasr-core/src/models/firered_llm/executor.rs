@@ -549,6 +549,7 @@ fn run_firered_llm_decode_with_runtime(
     tokenizer: FireRedLlmTokenizer,
     control: Arc<crate::api::backend::TranscriptionControl>,
     decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
+    unstable_decode_text: Option<crate::api::backend::UnstableDecodeTextObserver>,
     profile_enabled: bool,
 ) -> Result<Seq2SeqGreedyDecodeResult, FireRedLlmExecutorError> {
     if profile_enabled {
@@ -598,6 +599,7 @@ fn run_firered_llm_decode_with_runtime(
         map_registry_error,
         &control,
         decode_work_progress.as_ref(),
+        unstable_decode_text.as_ref(),
     );
     decoder.release_session_scoped_buffers();
     decode_result.map_err(|error| FireRedLlmExecutorError::GreedyDecodeFailed {
@@ -1013,6 +1015,10 @@ impl FireRedLlmGgmlExecutor {
             .execution_context
             .decode_work_progress_observer()
             .cloned();
+        let decoder_unstable_decode_text = request
+            .execution_context
+            .unstable_decode_text_observer()
+            .cloned();
         let profile_enabled = std::env::var_os("OPENASR_FIRERED_LLM_PROFILE").is_some();
         let terminate_unified_after_decode = request
             .request_options
@@ -1030,6 +1036,7 @@ impl FireRedLlmGgmlExecutor {
                         decoder_tokenizer,
                         decoder_control,
                         decoder_decode_work_progress,
+                        decoder_unstable_decode_text,
                         profile_enabled,
                     )
                 };
@@ -1058,6 +1065,7 @@ impl FireRedLlmGgmlExecutor {
                             decoder_tokenizer,
                             decoder_control,
                             decoder_decode_work_progress,
+                            decoder_unstable_decode_text,
                             profile_enabled,
                         )
                     })

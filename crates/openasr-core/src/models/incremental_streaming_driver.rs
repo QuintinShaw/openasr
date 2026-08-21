@@ -28,7 +28,10 @@ use crate::models::ggml_streaming_session::{
 };
 use crate::models::graph_runtime_config::install_request_inference_threads_override;
 use crate::models::streaming_partial_cadence::PartialDecodeCadence;
-use crate::{NativeAsrSession, RealtimeAudioFrame, TranscriptUpdate, Transcription};
+use crate::{
+    NativeAsrSession, RealtimeAudioFrame, StreamingPartialGranularity, TranscriptUpdate,
+    Transcription,
+};
 
 // Whisper-Streaming best practice: a PARTIAL re-decodes the whole current segment
 // with full context, not a tiny sliding window — a small window loses context and
@@ -150,6 +153,11 @@ pub(crate) const STREAMING_PARTIAL_TUNING_FAST_SNAPSHOT: StreamingPartialTuning 
 pub(crate) const STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT: StreamingPartialTuning =
     StreamingPartialTuning::new(300, 500, None);
 
+/// Short trailing silence appended only to [`StreamingPartialGranularity::UtteranceComplete`]
+/// PARTIAL windows so ChatML utterance LLMs treat the current speech as complete
+/// enough to emit text. Never applied to FINAL or FinalizeReuse.
+pub(crate) const UTTERANCE_COMPLETE_PARTIAL_ENDPOINT_SILENCE_MS: u64 = 400;
+
 /// Build the streaming driver for a runtime family's `start_streaming_session`.
 /// Each decode rebuilds [`GgmlAsrExecutionViewRequest`] from `request` plus the
 /// current audio and installs the request's thread-count override on the decode
@@ -193,8 +201,15 @@ where
     // the session request, not a thread-local): every per-frame request this
     // driver builds for the life of the session copies it in directly.
     let resolved_runtime = request.resolved_runtime;
+    let partial_granularity = crate::arch::streaming_partial_granularity_for_model_architecture(
+        request.selected_family.model_architecture,
+    );
+    let unstable_sink: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let unstable_sink_for_request = std::sync::Arc::clone(&unstable_sink);
     let make_request = move |audio: &GgmlAsrPreparedAudioView<'static>,
-                             partial_prompt: Option<&str>|
+                             partial_prompt: Option<&str>,
+                             emit_unstable: bool|
           -> Result<
         GgmlAsrExecutionViewRequest<'static>,
         GgmlAsrExecutionError,
@@ -246,16 +261,33 @@ where
             // transcription id and no cancel/pause control surface today --
             // an uncancellable context is a real, well-formed context that
             // simply has no other holder, not an omitted one.
-            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
-                "per-frame streaming decode: this request type carries no \
-                 execution-context field of its own yet, and a live session ends by \
-                 the caller dropping it rather than canceling a transcription id",
-            )),
+            execution_context: {
+                let context = crate::RequestExecutionContext::uncancellable(
+                    "per-frame streaming decode: this request type carries no \
+                     execution-context field of its own yet, and a live session ends by \
+                     the caller dropping it rather than canceling a transcription id",
+                );
+                let context = if emit_unstable {
+                    let sink = std::sync::Arc::clone(&unstable_sink_for_request);
+                    context.with_unstable_decode_text_observer(
+                        crate::api::backend::UnstableDecodeTextObserver::new(move |text: &str| {
+                            sink.lock()
+                                .expect("unstable decode text sink")
+                                .push(text.to_string());
+                        }),
+                    )
+                } else {
+                    context
+                };
+                std::sync::Arc::new(context)
+            },
         })
     };
 
     let transcribe = Box::new(
-        move |audio: &GgmlAsrPreparedAudioView<'static>, partial_prompt: Option<&str>| {
+        move |audio: &GgmlAsrPreparedAudioView<'static>,
+              partial_prompt: Option<&str>,
+              kind: StreamingDecodeKind| {
             let _execution_scope =
                 crate::models::native_execution_services::install_native_execution_services(
                     decode_execution_services.as_ref(),
@@ -271,8 +303,31 @@ where
             // carried on `make_request`'s `resolved_runtime` field above).
             let _backend_override =
                 install_request_backend_override(backend_preference.request_backend_override());
-            decode(&executor, &make_request(audio, partial_prompt)?)
-                .map(|result| result.transcription)
+            let emit_unstable = kind == StreamingDecodeKind::Partial;
+            if emit_unstable {
+                unstable_sink
+                    .lock()
+                    .expect("unstable decode text sink")
+                    .clear();
+            }
+            let transcription = decode(
+                &executor,
+                &make_request(audio, partial_prompt, emit_unstable)?,
+            )
+            .map(|result| result.transcription)?;
+            let unstable_texts = if emit_unstable {
+                unstable_sink
+                    .lock()
+                    .expect("unstable decode text sink")
+                    .drain(..)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            Ok(StreamingDecodeOutput {
+                transcription,
+                unstable_texts,
+            })
         },
     );
     let mut driver = IncrementalStreamingTranscriptDriver::new(
@@ -287,7 +342,8 @@ where
     .with_partial_cadence(partial_floor_ms)
     .with_first_partial_audio_ms(u64::from(tuning.first_partial_audio_ms))
     .with_partial_window_ms(tuning.window_ms)
-    .with_partial_prompt_tail_words(tuning.partial_prompt_tail_words());
+    .with_partial_prompt_tail_words(tuning.partial_prompt_tail_words())
+    .with_partial_granularity(partial_granularity);
     if let Some(minimum_encodable_samples) = tuning.minimum_encodable_samples() {
         driver = driver.with_minimum_encodable_samples(minimum_encodable_samples);
     }
@@ -336,10 +392,23 @@ where
 /// Decode the accumulated audio for a streaming partial/final. Family-specific
 /// streaming decode keeps live-session semantics such as serve-batch bypass, while
 /// the returned FINAL remains byte-identical to offline `execute()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamingDecodeKind {
+    Partial,
+    Final,
+    WarmUp,
+}
+
+pub(crate) struct StreamingDecodeOutput {
+    transcription: Transcription,
+    unstable_texts: Vec<String>,
+}
+
 type StreamingTranscriber = dyn FnMut(
         &GgmlAsrPreparedAudioView<'static>,
         Option<&str>,
-    ) -> Result<Transcription, GgmlAsrExecutionError>
+        StreamingDecodeKind,
+    ) -> Result<StreamingDecodeOutput, GgmlAsrExecutionError>
     + Send;
 
 /// Whether a character is sentence-terminal (Chinese or ASCII), used to cut a
@@ -393,6 +462,16 @@ fn merge_partial_prompt(base_prompt: Option<&str>, partial_prompt: Option<&str>)
         return Some(partial.to_string());
     };
     Some(format!("{base}\n{partial}"))
+}
+
+fn audio_with_endpoint_silence(
+    audio: &GgmlAsrPreparedAudioView<'static>,
+    silence_ms: u64,
+) -> GgmlAsrPreparedAudioView<'static> {
+    let extra = (silence_ms as usize).saturating_mul(SAMPLES_PER_MS_16KHZ);
+    let mut samples = audio.samples_f32.to_vec();
+    samples.resize(samples.len().saturating_add(extra), 0.0);
+    GgmlAsrPreparedAudioView::mono_16khz(samples)
 }
 
 /// A PARTIAL decode that covered the WHOLE current buffer, kept so a terminal
@@ -451,6 +530,10 @@ pub(crate) struct IncrementalStreamingTranscriptDriver {
     /// Cached whole-buffer PARTIAL decode reused by an unchanged terminal
     /// finalize (see [`FinalizeReuse`]).
     finalize_reuse: Option<FinalizeReuse>,
+    /// How this family's incomplete windows produce partials. Drives the
+    /// utterance-complete endpoint-silence hint; FINAL never consults it for
+    /// audio contents.
+    partial_granularity: StreamingPartialGranularity,
     /// Instrumentation: terminal finalizes served from the reuse cache vs a full
     /// re-decode. Read by the driver's tests; the fast/slow accounting is not
     /// consumed in production builds.
@@ -492,6 +575,7 @@ impl IncrementalStreamingTranscriptDriver {
             partial_prompt_tail_words: None,
             minimum_encodable_samples: None,
             finalize_reuse: None,
+            partial_granularity: StreamingPartialGranularity::RevisableSnapshot,
             finalize_reuse_hits: 0,
             finalize_reuse_misses: 0,
         };
@@ -536,6 +620,14 @@ impl IncrementalStreamingTranscriptDriver {
         self
     }
 
+    pub(crate) fn with_partial_granularity(
+        mut self,
+        partial_granularity: StreamingPartialGranularity,
+    ) -> Self {
+        self.partial_granularity = partial_granularity;
+        self
+    }
+
     /// Whether the current buffer has fewer samples than the family's encoder
     /// can turn into output (a no-op / `None` floor never blocks a decode).
     fn buffer_below_minimum_encodable_samples(&self) -> bool {
@@ -568,7 +660,7 @@ impl IncrementalStreamingTranscriptDriver {
         prompt: Option<&str>,
     ) -> Result<Transcription, GgmlAsrExecutionError> {
         let audio = self.buffer.prepared_audio_snapshot();
-        (self.transcribe)(&audio, prompt)
+        Ok((self.transcribe)(&audio, prompt, StreamingDecodeKind::Final)?.transcription)
     }
 
     fn decode_warm_up_silence(&mut self) -> Result<(), GgmlAsrExecutionError> {
@@ -577,7 +669,7 @@ impl IncrementalStreamingTranscriptDriver {
             STREAMING_WARM_UP_AUDIO_MS
                 * SAMPLES_PER_MS_16KHZ
         ]);
-        let _ = (self.transcribe)(&audio, None)?;
+        let _ = (self.transcribe)(&audio, None, StreamingDecodeKind::WarmUp)?;
         Ok(())
     }
 
@@ -699,8 +791,21 @@ impl IncrementalStreamingTranscriptDriver {
             .min(audio_end_ms);
         let window_dur_ms = audio_end_ms.saturating_sub(window_start_ms).max(1);
         let audio = self.buffer.prepared_audio_window(window_dur_ms);
+        let used_endpoint_hint = self.partial_granularity.allows_partial_endpoint_hint();
+        let audio = if used_endpoint_hint {
+            audio_with_endpoint_silence(&audio, UTTERANCE_COMPLETE_PARTIAL_ENDPOINT_SILENCE_MS)
+        } else {
+            audio
+        };
         let prompt = self.partial_prompt_tail();
-        let transcription = (self.transcribe)(&audio, prompt.as_deref())?;
+        let output = (self.transcribe)(&audio, prompt.as_deref(), StreamingDecodeKind::Partial)?;
+        let transcription = output.transcription;
+        let mut emitted: Vec<GgmlAsrStreamingTranscriptUpdate> = Vec::new();
+        for text in &output.unstable_texts {
+            if let Some(update) = self.emit_update(text, false) {
+                emitted.push(update);
+            }
+        }
 
         // If this decode spanned the WHOLE buffer (the window reached sample 0),
         // its prepared audio is byte-identical to `prepared_audio_snapshot`, so a
@@ -708,8 +813,11 @@ impl IncrementalStreamingTranscriptDriver {
         // decode instead of re-running it. Any later drain in this same call, or
         // any new audio before finalize, changes the coverage and invalidates the
         // reuse (the match in `finish_updates` fails and it re-decodes).
-        let spans_whole_buffer = window_dur_ms.saturating_mul(SAMPLES_PER_MS_16KHZ as u64)
-            >= self.buffer.sample_count() as u64;
+        // Endpoint-silence padding must never enter FinalizeReuse: FINAL has to
+        // see the real unpadded samples.
+        let spans_whole_buffer = !used_endpoint_hint
+            && window_dur_ms.saturating_mul(SAMPLES_PER_MS_16KHZ as u64)
+                >= self.buffer.sample_count() as u64;
         self.finalize_reuse = spans_whole_buffer.then(|| FinalizeReuse {
             start_ms: self.buffer.start_ms(),
             end_ms: self.buffer.end_ms(),
@@ -731,7 +839,6 @@ impl IncrementalStreamingTranscriptDriver {
         );
         let chars: Vec<char> = decoded.chars().collect();
         let total = chars.len();
-        let mut emitted: Vec<GgmlAsrStreamingTranscriptUpdate> = Vec::new();
         if total == 0 {
             return Ok(emitted);
         }
@@ -996,6 +1103,25 @@ mod tests {
         }
     }
 
+    fn decode_ok(
+        transcription: Transcription,
+    ) -> Result<StreamingDecodeOutput, GgmlAsrExecutionError> {
+        Ok(StreamingDecodeOutput {
+            transcription,
+            unstable_texts: Vec::new(),
+        })
+    }
+
+    fn decode_with_unstables(
+        transcription: Transcription,
+        unstable_texts: Vec<String>,
+    ) -> Result<StreamingDecodeOutput, GgmlAsrExecutionError> {
+        Ok(StreamingDecodeOutput {
+            transcription,
+            unstable_texts,
+        })
+    }
+
     /// Build a driver whose streaming decode returns scripted text per tick.
     fn driver(script: VecDeque<&'static str>) -> IncrementalStreamingTranscriptDriver {
         let mut script = script;
@@ -1005,10 +1131,10 @@ mod tests {
             "utt_tok",
             "seg_tok",
             10,
-            Box::new(move |audio, _prompt| {
+            Box::new(move |audio, _prompt, _kind| {
                 assert!(!audio.samples_f32.is_empty());
                 let text = script.pop_front().unwrap_or("");
-                Ok(transcription(text))
+                decode_ok(transcription(text))
             }),
         )
     }
@@ -1032,13 +1158,13 @@ mod tests {
             "utt_warm",
             "seg_warm",
             1,
-            Box::new(move |audio, _prompt| {
+            Box::new(move |audio, _prompt, _kind| {
                 calls_for_decode.fetch_add(1, Ordering::SeqCst);
                 lengths_for_decode
                     .lock()
                     .expect("sample length mutex poisoned")
                     .push(audio.samples_f32.len());
-                Ok(transcription("ignored warm text"))
+                decode_ok(transcription("ignored warm text"))
             }),
         );
 
@@ -1105,7 +1231,7 @@ mod tests {
             // still produces stable absolute word names (w0 w1 …) — exactly what a
             // real model would, giving a deterministic, reproducible decode to test
             // the proportional time-stability segmentation against.
-            Box::new(|audio, _prompt| Ok(windowed_transcription(audio))),
+            Box::new(|audio, _prompt, _kind| decode_ok(windowed_transcription(audio))),
         )
         .with_partial_window_ms(window_ms)
     }
@@ -1160,12 +1286,12 @@ mod tests {
             "utt_prompt",
             "seg_prompt",
             0,
-            Box::new(move |audio, prompt| {
+            Box::new(move |audio, prompt, _kind| {
                 prompts_for_decode
                     .lock()
                     .expect("prompt mutex poisoned")
                     .push(prompt.map(str::to_string));
-                Ok(windowed_transcription(audio))
+                decode_ok(windowed_transcription(audio))
             }),
         )
         .with_partial_window_ms(40)
@@ -1194,12 +1320,12 @@ mod tests {
             "utt_no_prompt",
             "seg_no_prompt",
             0,
-            Box::new(move |audio, prompt| {
+            Box::new(move |audio, prompt, _kind| {
                 prompts_for_decode
                     .lock()
                     .expect("prompt mutex poisoned")
                     .push(prompt.map(str::to_string));
-                Ok(windowed_transcription(audio))
+                decode_ok(windowed_transcription(audio))
             }),
         )
         .with_partial_window_ms(40);
@@ -1224,9 +1350,9 @@ mod tests {
             "utt_text_only",
             "seg_text_only",
             0,
-            Box::new(move |_audio, _prompt| {
+            Box::new(move |_audio, _prompt, _kind| {
                 let text = script.pop_front().unwrap_or("");
-                Ok(text_only_transcription(text))
+                decode_ok(text_only_transcription(text))
             }),
         )
         .with_partial_window_ms(2_000);
@@ -1322,13 +1448,13 @@ mod tests {
             "utt_trim_final",
             "seg_trim_final",
             0,
-            Box::new(move |_audio, _prompt| {
+            Box::new(move |_audio, _prompt, _kind| {
                 let text = texts_for_decode
                     .lock()
                     .expect("script mutex poisoned")
                     .pop_front()
                     .unwrap_or("");
-                Ok(text_only_transcription(text))
+                decode_ok(text_only_transcription(text))
             }),
         )
         .with_partial_window_ms(30_000);
@@ -1371,9 +1497,9 @@ mod tests {
             "utt_reuse",
             "seg_reuse",
             0,
-            Box::new(move |audio, _prompt| {
+            Box::new(move |audio, _prompt, _kind| {
                 calls.fetch_add(1, Ordering::SeqCst);
-                Ok(windowed_transcription(audio))
+                decode_ok(windowed_transcription(audio))
             }),
         )
         .with_partial_window_ms(window_ms)
@@ -1510,9 +1636,9 @@ mod tests {
             "utt_min_final",
             "seg_min_final",
             0,
-            Box::new(move |_audio, _prompt| {
+            Box::new(move |_audio, _prompt, _kind| {
                 calls_for_decode.fetch_add(1, Ordering::SeqCst);
-                Ok(transcription("should never be reached"))
+                decode_ok(transcription("should never be reached"))
             }),
         )
         .with_partial_results(false)
@@ -1774,5 +1900,126 @@ mod tests {
             observed_backend_during_decode(crate::GgmlAsrBackendPreference::Accelerated);
         assert_eq!(accel_override, Some(RequestBackendPreference::Accelerated));
         assert_ne!(accel_backend, GgmlCpuGraphBackend::Cpu);
+    }
+
+    #[test]
+    fn mid_decode_unstable_prefixes_emit_partials_before_the_complete_window_text() {
+        let mut driver = IncrementalStreamingTranscriptDriver::new(
+            "token-incremental-test-executor",
+            crate::QWEN3_ASR_GGML_ADAPTER_ID,
+            "utt_unstable",
+            "seg_unstable",
+            1,
+            Box::new(move |audio, _prompt, kind| {
+                assert_eq!(kind, StreamingDecodeKind::Partial);
+                assert!(!audio.samples_f32.is_empty());
+                decode_with_unstables(
+                    transcription("hello world"),
+                    vec!["hello".to_string(), "hello world".to_string()],
+                )
+            }),
+        );
+        driver.push_audio(frame(1, 0)).unwrap();
+        let updates = driver.poll_updates().unwrap();
+        let texts: Vec<_> = updates.iter().map(|update| text_of(update).0).collect();
+        assert_eq!(texts, vec!["hello", "hello world"]);
+        assert!(updates.iter().all(|update| !text_of(update).2));
+    }
+
+    #[test]
+    fn utterance_complete_endpoint_silence_is_partial_only_and_final_matches_unpadded_greedy() {
+        let kinds = Arc::new(Mutex::new(Vec::new()));
+        let lengths = Arc::new(Mutex::new(Vec::new()));
+        let kinds_for_decode = Arc::clone(&kinds);
+        let lengths_for_decode = Arc::clone(&lengths);
+        let mut driver = IncrementalStreamingTranscriptDriver::new(
+            "token-incremental-test-executor",
+            crate::QWEN3_ASR_GGML_ADAPTER_ID,
+            "utt_endpoint",
+            "seg_endpoint",
+            1,
+            Box::new(move |audio, _prompt, kind| {
+                kinds_for_decode.lock().expect("kind mutex").push(kind);
+                lengths_for_decode
+                    .lock()
+                    .expect("length mutex")
+                    .push(audio.samples_f32.len());
+                let text = match kind {
+                    StreamingDecodeKind::WarmUp => "",
+                    StreamingDecodeKind::Partial | StreamingDecodeKind::Final => "hello",
+                };
+                decode_ok(transcription(text))
+            }),
+        )
+        .with_partial_granularity(StreamingPartialGranularity::UtteranceComplete)
+        .with_partial_window_ms(30_000);
+
+        driver.push_audio(frame(1, 0)).unwrap();
+        let partial = driver.poll_updates().unwrap();
+        assert_eq!(text_of(&partial[0]), ("hello", 1, false));
+        let final_ = driver.finish_updates().unwrap();
+        assert_eq!(text_of(&final_[0]), ("hello", 2, true));
+        assert_eq!(driver.finalize_reuse_hits, 0);
+
+        let recorded_kinds = kinds.lock().expect("kind mutex").clone();
+        let recorded_lengths = lengths.lock().expect("length mutex").clone();
+        assert_eq!(
+            recorded_kinds,
+            vec![StreamingDecodeKind::Partial, StreamingDecodeKind::Final]
+        );
+        assert_eq!(recorded_lengths.len(), 2);
+        assert!(
+            recorded_lengths[0] > recorded_lengths[1],
+            "partial must carry endpoint silence the final does not: {recorded_lengths:?}"
+        );
+        assert_eq!(
+            recorded_lengths[0] - recorded_lengths[1],
+            (UTTERANCE_COMPLETE_PARTIAL_ENDPOINT_SILENCE_MS as usize) * SAMPLES_PER_MS_16KHZ
+        );
+    }
+
+    #[test]
+    fn empty_stripped_partial_does_not_swallow_a_later_non_empty_update() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_decode = Arc::clone(&calls);
+        let mut driver = IncrementalStreamingTranscriptDriver::new(
+            "token-incremental-test-executor",
+            crate::QWEN3_ASR_GGML_ADAPTER_ID,
+            "utt_sil",
+            "seg_sil",
+            1,
+            Box::new(move |audio, _prompt, kind| {
+                assert!(!audio.samples_f32.is_empty());
+                let text = match kind {
+                    StreamingDecodeKind::WarmUp => "",
+                    StreamingDecodeKind::Partial => {
+                        if calls_for_decode.fetch_add(1, Ordering::SeqCst) == 0 {
+                            ""
+                        } else {
+                            "hello"
+                        }
+                    }
+                    StreamingDecodeKind::Final => "hello",
+                };
+                decode_ok(transcription(text))
+            }),
+        );
+        driver.push_audio(frame(1, 0)).unwrap();
+        let first = driver.poll_updates().unwrap();
+        assert!(
+            first.is_empty(),
+            "stripped-empty incomplete window must not emit a successful empty partial: {first:?}"
+        );
+        let mut second = Vec::new();
+        for i in 2..=8 {
+            driver.push_audio(frame(i, (i - 1) * 20)).unwrap();
+            second = driver.poll_updates().unwrap();
+            if !second.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(text_of(&second[0]), ("hello", 1, false));
+        let final_ = driver.finish_updates().unwrap();
+        assert_eq!(text_of(&final_[0]), ("hello", 2, true));
     }
 }

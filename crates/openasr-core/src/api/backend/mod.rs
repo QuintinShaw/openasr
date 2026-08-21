@@ -11,7 +11,6 @@ mod native;
 mod request_context;
 
 pub use mock::transcribe_with_mock_backend;
-pub(crate) use native::WorkProgressObserver;
 pub use native::{
     GgmlAbortCallbackGuard, LegacyNativeTranscriptionProgress, NativeBackend,
     NativeBackendExecutor, NativeRuntimeModelAdapter, NativeRuntimeModelIdSource,
@@ -26,6 +25,7 @@ pub use native::{
     resolve_local_native_runtime_model_identity, validate_local_native_model_pack_path,
     verify_native_runtime_model_pack_path,
 };
+pub(crate) use native::{UnstableDecodeTextObserver, WorkProgressObserver};
 pub use request_context::{
     FailureCategory, RequestSource, format_failure_context_line, format_request_context_line,
     log_failure_context, log_request_context,

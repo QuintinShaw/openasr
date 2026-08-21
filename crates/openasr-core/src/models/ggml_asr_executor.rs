@@ -1700,10 +1700,8 @@ impl GgmlAsrExecutionDispatch {
     /// `false` -- fail closed to the buffered/no-partial-guarantee default
     /// rather than assume low-latency partials.
     pub fn is_frame_sync_for(&self, descriptor: &GgmlFamilyAdapterDescriptor) -> bool {
-        matches!(
-            self.streaming_partial_granularity_for(descriptor),
-            Some(StreamingPartialGranularity::FrameSync)
-        )
+        self.streaming_partial_granularity_for(descriptor)
+            .is_some_and(StreamingPartialGranularity::is_frame_sync_append)
     }
 
     /// Returns the partial-result granularity registered for `descriptor`, if
@@ -2932,11 +2930,11 @@ mod tests {
         let mixed_dispatch = GgmlAsrExecutionDispatch::default()
             .with_streaming_partial_granularity_for_adapter(
                 whisper.adapter_id,
-                StreamingPartialGranularity::FrameSync,
+                StreamingPartialGranularity::FrameSyncAppend,
             )
             .with_streaming_partial_granularity_for_adapter(
                 qwen.adapter_id,
-                StreamingPartialGranularity::Buffered,
+                StreamingPartialGranularity::RevisableSnapshot,
             );
         assert!(mixed_dispatch.is_frame_sync_for(&whisper));
         assert!(!mixed_dispatch.is_frame_sync_for(&qwen));
@@ -2944,7 +2942,7 @@ mod tests {
         let capability_dispatch = GgmlAsrExecutionDispatch::default()
             .with_streaming_partial_granularity_for_capability(
                 qwen.execution_capability,
-                StreamingPartialGranularity::FrameSync,
+                StreamingPartialGranularity::FrameSyncAppend,
             );
         assert!(capability_dispatch.is_frame_sync_for(&qwen));
     }
