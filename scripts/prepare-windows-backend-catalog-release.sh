@@ -137,6 +137,14 @@ python3 tooling/release-manifest/backend_catalog.py merge \
   --catalog model-registry/catalog.json \
   "${backend_entry_args[@]}" \
   --out "$workdir/catalog.merged.json"
+
+# Payload first, metadata last: refuse to sign URLs that are not already live.
+# deploy-catalog.yml repeats this read-only gate, and the finalizer checks the
+# deployed signed projection once more before publishing the draft release.
+python3 tooling/release-manifest/backend_catalog.py verify-cdn \
+  --catalog "$workdir/catalog.merged.json" \
+  --version "$version"
+
 python3 - "$workdir/catalog.merged.json" <<'PY'
 import json
 import sys
@@ -173,5 +181,5 @@ echo "CATALOG-PREPARED for ${tag}"
 echo "  hardware-approved backend entries: ${#approved_entries[@]} of ${#backend_entries[@]} built"
 echo "  epoch: ${old_epoch} -> ${new_epoch}"
 echo "  next: review and commit model-registry/catalog{,.public}{,.signature}.json + catalog.epoch"
-echo "  then push the catalog commit, wait for deploy-catalog.yml, and run:"
+echo "  then push the catalog commit, wait for deploy-catalog.yml (which rechecks CDN), and run:"
 echo "    scripts/finalize-core-release.sh ${tag}"

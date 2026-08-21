@@ -12,6 +12,7 @@ canonical CDN prefix is empty.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import re
@@ -571,7 +572,21 @@ def head_cdn_url(url: str) -> tuple[int, int | None]:
     # Cloudflare on dl.openasr.org rejects Python-urllib's default User-Agent
     # with HTTP 403. curl is the maintainer-host probe used everywhere else.
     completed = subprocess.run(
-        ["curl", "-sI", url],
+        [
+            "curl",
+            "-sS",
+            "-I",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "20",
+            "--retry",
+            "2",
+            "--retry-delay",
+            "1",
+            "--retry-all-errors",
+            url,
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -598,19 +613,22 @@ def head_cdn_url(url: str) -> tuple[int, int | None]:
 
 def verify_catalog_cdn(
     catalog_path: Path,
-    version: str,
+    version: str | None = None,
     head: Callable[[str], tuple[int, int | None]] | None = None,
 ) -> dict[str, object]:
-    """Require every signed CUDA/HIP file URL for this version to be live on CDN."""
+    """Require signed CUDA/HIP file URLs to be live before catalog deployment."""
 
     catalog = _read_json(catalog_path)
     head_fn = head or head_cdn_url
-    checked: list[str] = []
-    seen: set[str] = set()
+    seen: dict[str, tuple[str, str, int]] = {}
+    checked_versions: set[str] = set()
     for entry in catalog.get("backends", []):
         if not isinstance(entry, dict):
             continue
-        if str(entry.get("version")) != version or entry.get("vendor") not in {"cuda", "hip"}:
+        entry_version = str(entry.get("version", ""))
+        if entry.get("vendor") not in {"cuda", "hip"} or (
+            version is not None and entry_version != version
+        ):
             continue
         for file in entry.get("files", []):
             if not isinstance(file, dict):
@@ -618,26 +636,53 @@ def verify_catalog_cdn(
             filename = str(file.get("filename", ""))
             url = str(file.get("url", ""))
             size = int(file.get("size_bytes", 0))
+            canonical_url = f"https://dl.openasr.org/core/v{entry_version}/{filename}"
+            if not entry_version or url != canonical_url:
+                raise BackendCatalogError(
+                    f"backend file '{filename}' is not the canonical CDN URL for {entry_version or '<missing version>'}"
+                )
+            identity = (entry_version, filename, size)
             if url in seen:
+                if seen[url] != identity:
+                    raise BackendCatalogError(
+                        f"conflicting signed metadata for duplicate CDN URL '{url}': "
+                        f"first={seen[url]!r} later={identity!r}"
+                    )
                 continue
-            seen.add(url)
-            if not url.startswith(f"https://dl.openasr.org/core/v{version}/"):
-                raise BackendCatalogError(
-                    f"backend file '{filename}' is not the canonical CDN URL for {version}"
-                )
-            status, length = head_fn(url)
-            if status != 200 or length != size:
-                raise BackendCatalogError(
-                    f"CDN object missing or size-mismatched for '{filename}': "
-                    f"HEAD {url} -> {status} content-length={length} signed_size={size}. "
-                    f"Run scripts/sync-windows-backend-cdn.sh v{version} before finalize."
-                )
-            checked.append(url)
-    if not checked:
+            seen[url] = identity
+            checked_versions.add(entry_version)
+    if not seen:
+        scope = f"version {version}" if version is not None else "the catalog"
         raise BackendCatalogError(
-            f"catalog has no CUDA/HIP backend files for version {version} to verify on CDN"
+            f"catalog has no CUDA/HIP backend files for {scope} to verify on CDN"
         )
-    return {"schema_version": 1, "version": version, "verified_urls": sorted(checked)}
+
+    def probe(item: tuple[str, tuple[str, str, int]]) -> str:
+        url, (entry_version, filename, size) = item
+        status, length = head_fn(url)
+        if status != 200 or length != size:
+            raise BackendCatalogError(
+                f"CDN object missing or size-mismatched for '{filename}': "
+                f"HEAD {url} -> {status} content-length={length} signed_size={size}. "
+                f"Run scripts/sync-windows-backend-cdn.sh v{entry_version} before catalog deployment."
+            )
+        return url
+
+    items = sorted(seen.items())
+    if head is None and len(items) > 1:
+        # Network HEADs are independent. Bound parallelism so a catalog with
+        # many target packs does not turn deploy/finalize into a long serial
+        # TLS loop, while curl's timeout/retry bounds every worker.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(items))) as pool:
+            checked = list(pool.map(probe, items))
+    else:
+        # Injected probes stay deterministic for unit tests and local callers.
+        checked = [probe(item) for item in items]
+    return {
+        "schema_version": 1,
+        "versions": sorted(checked_versions),
+        "verified_urls": sorted(checked),
+    }
 
 
 def artifact_fingerprint(entry: dict[str, Any]) -> str:
@@ -797,7 +842,10 @@ def main() -> int:
     verify_catalog_parser.add_argument("--entry", type=Path, action="append", required=True)
     verify_cdn_parser = subparsers.add_parser("verify-cdn")
     verify_cdn_parser.add_argument("--catalog", type=Path, required=True)
-    verify_cdn_parser.add_argument("--version", required=True)
+    verify_cdn_parser.add_argument(
+        "--version",
+        help="limit the gate to one X.Y.Z release; omit to verify every signed backend URL",
+    )
     hints_parser = subparsers.add_parser("hints")
     hints_parser.add_argument("--entry", type=Path, action="append", required=True)
     hints_parser.add_argument("--out", type=Path, required=True)

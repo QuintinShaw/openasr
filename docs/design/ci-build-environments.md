@@ -14,7 +14,7 @@ pins three Linux environments and leaves Windows on the hosted VS image.
 - Publish: `.github/workflows/ci-linux-build-env.yml`, only when that tree
   changes. Tag pushes do not publish.
 - Consumers: `ci.yml`, `family-regression.yml`, `public-hf-e2e.yml`,
-  `release-core.yml`, `serve-batch-parity.yml`, and the
+  `serve-batch-parity.yml`, and the
   `x86_64-unknown-linux-gnu` release-binaries leg.
 - Contract: `.github/ci/check-linux-build-env.py` requires every listed
   consumer to pin the lock digest. Fully migrated consumers must not

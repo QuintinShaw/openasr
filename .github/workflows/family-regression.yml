@@ -5,15 +5,17 @@ name: Family Regression
 # signature-verified) and transcribe a committed fixture on the CPU backend,
 # comparing against committed goldens (tooling/family-regression/goldens/).
 #
-# Runs nightly, on release tags (release gate), and on demand. Kept outside
+# Runs nightly, after a release is published, and on demand. Kept outside
 # push/PR CI because it performs real network downloads and native inference.
+# Nightly/manual runs reuse the latest published CLI too; a raw tag no longer
+# races the release matrix and falls back to two duplicate local builds.
 
 on:
   workflow_dispatch:
   schedule:
     - cron: "23 4 * * *"
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
 
 concurrency:
   group: family-regression-${{ github.ref }}
@@ -41,16 +43,19 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     timeout-minutes: 90
     steps:
-      - name: Try published release CLI
+      - name: Resolve and fetch published release CLI
         id: published
-        if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
           ASSET_SUFFIX: linux-x86_64
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -uo pipefail
           available=false
-          tag="${GITHUB_REF_NAME}"
+          tag="${RELEASE_TAG}"
+          if [ -z "${tag}" ]; then
+            tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+          fi
           version="${tag#v}"
           asset="openasr-${version}-${ASSET_SUFFIX}.tar.gz"
           workdir="${RUNNER_TEMP}/published-cli"
@@ -85,7 +90,11 @@ jobs:
           fi
           echo "available=${available}" >> "${GITHUB_OUTPUT}"
           if [ "${available}" != "true" ]; then
-            echo "published ${asset} is not usable; falling back to a local release build"
+            if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+              echo "::error::published release ${tag} is missing usable ${asset}; refusing a duplicate local build"
+              exit 1
+            fi
+            echo "published ${asset} is not usable; falling back to a local release build for this diagnostic run"
           fi
       - uses: actions/checkout@v7
         if: steps.published.outputs.available != 'true'
@@ -128,16 +137,19 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 90
     steps:
-      - name: Try published release CLI
+      - name: Resolve and fetch published release CLI
         id: published
-        if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
           ASSET_SUFFIX: macos-arm64
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -uo pipefail
           available=false
-          tag="${GITHUB_REF_NAME}"
+          tag="${RELEASE_TAG}"
+          if [ -z "${tag}" ]; then
+            tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+          fi
           version="${tag#v}"
           asset="openasr-${version}-${ASSET_SUFFIX}.tar.gz"
           workdir="${RUNNER_TEMP}/published-cli"
@@ -172,7 +184,11 @@ jobs:
           fi
           echo "available=${available}" >> "${GITHUB_OUTPUT}"
           if [ "${available}" != "true" ]; then
-            echo "published ${asset} is not usable; falling back to a local release build"
+            if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+              echo "::error::published release ${tag} is missing usable ${asset}; refusing a duplicate local build"
+              exit 1
+            fi
+            echo "published ${asset} is not usable; falling back to a local release build for this diagnostic run"
           fi
       - uses: actions/checkout@v7
         if: steps.published.outputs.available != 'true'

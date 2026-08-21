@@ -4,8 +4,8 @@ name: Deploy catalog
 # when it changes on main. Signing happens locally (the seed never enters CI); this
 # workflow only ships the already-signed, already-committed bytes with a scoped
 # CLOUDFLARE_API_TOKEN. The ed25519 signature is cryptographically verified by the
-# `rust` job's bundled-/public-projection gates on the same push; here we add cheap
-# consistency guardrails plus a post-deploy check.
+# self-contained pre-deploy gates below; the expensive full Rust CI intentionally
+# does not rerun for this direct release-operator catalog push.
 #
 # `gate-released-binary-compat` runs BEFORE `deploy` (see `needs:` below): catalog
 # data and CLI binaries ship on independent cadences, so a catalog edit that is
@@ -23,8 +23,11 @@ on:
   push:
     branches: [main]
     paths:
+      - "model-registry/catalog.json"
+      - "model-registry/catalog.signature.json"
       - "model-registry/catalog.public.json"
       - "model-registry/catalog.public.signature.json"
+      - "model-registry/catalog.epoch"
       - "cloudflare/catalog/**"
   workflow_dispatch:
 
@@ -41,6 +44,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+
+      - name: Verify generated catalog and production signatures
+        run: |
+          tooling/publish-model/scripts/regenerate_all.sh --check
+          python3 tooling/publish-model/scripts/check_catalog_consistency.py
 
       - name: Gate candidate catalog against the latest released CLI binary
         env:
@@ -72,6 +80,11 @@ jobs:
           assert all(m.get("public") is True for m in catalog["models"]), "public catalog must contain only public:true models"
           print(f"OK: {len(catalog['models'])} public model(s); sha256 + canonical url consistent")
           PY
+
+      - name: Verify signed backend payloads are live before metadata deployment
+        run: |
+          python3 tooling/release-manifest/backend_catalog.py verify-cdn \
+            --catalog model-registry/catalog.public.json
 
       - name: Deploy to Cloudflare
         uses: cloudflare/wrangler-action@v3

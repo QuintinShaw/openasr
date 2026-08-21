@@ -169,4 +169,5 @@ PY
 echo
 echo "BACKEND-CDN-SYNCED for ${tag}"
 echo "  uploaded ${#sync_files[@]} hardware-approved objects to https://dl.openasr.org/core/v${version}/"
-echo "  next: scripts/finalize-core-release.sh ${tag}"
+echo "  next: load the production catalog signing seed and run:"
+echo "    scripts/prepare-windows-backend-catalog-release.sh ${tag}"

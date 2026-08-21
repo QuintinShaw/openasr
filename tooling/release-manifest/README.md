@@ -101,7 +101,12 @@ per-mirror fetch URL there instead is the bug this fixes (#145: every mirror
 except the primary CDN failed signature verification, since the signed
 payload only ever names the canonical host).
 
-## dl.openasr.org sync
+## Legacy dl.openasr.org sync (0.1.33 and earlier only)
+
+For core 0.1.34 and later, do not use the whole-engine example below. Run
+`scripts/sync-windows-backend-cdn.sh vX.Y.Z`; it derives the exact
+hardware-approved target-scoped files from release metadata, uploads them, and
+HEAD-verifies the canonical CDN objects before catalog signing is allowed.
 
 `b2_sync.py` -- uploads files to `core/v<version>/<filename>` in the SAME
 Backblaze B2 bucket / Cloudflare Worker the desktop installers
@@ -172,72 +177,10 @@ is always a local, human-run step:
   releases ever need CI-driven publish, that is a separate, explicit
   go-ahead (which secrets, which trigger) -- not a default.
 
-## Post-release checklist (local, after `release-binaries.yml` finishes)
+## Current release checklist
 
-The GitHub Release remains a draft throughout these steps. Run them from a
-maintainer machine; none of the signing steps runs in CI.
-
-1. **Sign the manifest, attach it to the GitHub release, and self-verify** --
-   run `OPENASR_CATALOG_SIGNING_KEY_SEED_HEX=<production seed>
-   scripts/sign-and-verify-backends-manifest.sh v<version>` (see "Signing"
-   above and `RELEASING.md`). This step is REQUIRED and not optional: the
-   release is not signed until this script prints `SIGNED-AND-VERIFIED` and
-   exits 0.
-2. **Attach hardware evidence** -- add `backend-hardware-evidence-*.json`
-   release assets for each provider intended for activation. Schema v1 approves
-   one exact tested target. Schema v2 may approve an explicit provider matrix
-   from one representative target only when the receipt binds the tested plugin
-   plus the sorted target set and every target-scoped artifact fingerprint.
-   Both require at least five fresh processes and prove FullDevice execution
-   without CPU fallback. The 6 CUDA and 14 HIP build matrix is artifact coverage;
-   a schema v2 matrix receipt records an explicit compatibility policy and does
-   not claim that every target ran on hardware.
-3. **Prepare and deploy the signed backend catalog** -- run
-   `scripts/prepare-windows-backend-catalog-release.sh v<version>` with the same
-   local production signing seed, review and commit its five catalog/epoch
-   outputs, push them, and wait for `deploy-catalog.yml` to verify the live
-   endpoint. The script downloads and rehashes every CUDA/HIP release byte, but
-   merges only the target entries selected by matching hardware receipts;
-   unsigned `catalog.backends.candidate.json` is build evidence, never an
-   activation source.
-4. **Finalize the draft** -- run `scripts/finalize-core-release.sh v<version>`.
-   It verifies the published manifest signature and requires the live signed
-   catalog target set to equal the hardware-approved subset before it can
-   publish the draft.
-5. **Sync to dl.openasr.org** -- see "dl.openasr.org sync" above
-   (`b2_sync.py sync --version <version>`, uploading the Windows sidecar
-   archives -- `-vulkan`, `-cuda-sidecar`, `-rocm-sidecar` -- plus
-   `backends-manifest.json` and `backends-manifest.signature.json` to
-   `core/v<version>/` in the shared `openasr-releases` B2 bucket). The B2
-   vars (`B2_S3_ENDPOINT` / `B2_APPLICATION_KEY_ID` / `B2_APPLICATION_KEY`)
-   come from `source ~/.openasr/b2-release.env` in the running shell -- never
-   repo secrets, never a shell-profile export. `sync-vendor` for the
-   vendor_layers archives is OPTIONAL (see above) and not part of this
-   release-blocking checklist --
-   GitHub Releases (already populated by `release-binaries.yml`) is enough.
-   `b2_sync.py` is the ONLY thing that syncs to B2/dl.openasr.org -- step 1's
-   script deliberately does not touch B2 at all, so run this step after step
-   1 if dl.openasr.org mirroring is wanted for this release.
-5. **Spot-check one signed exe with `signtool`** -- pick one of the archives
-   just uploaded (rotate which GPU leg you check across releases) and confirm
-   the Azure Trusted Signing signature is intact and trusted end to end:
-
-   ```powershell
-   Expand-Archive dist\openasr-<version>-windows-x86_64-vulkan.zip -DestinationPath tmp-verify
-   signtool verify /pa /v tmp-verify\openasr.exe
-   ```
-
-   `/pa` uses the default authenticode policy (what Windows actually enforces
-   at launch); a clean run prints a chain up to a trusted root with no
-   warnings. Treat any failure as release-blocking -- it means the archive a
-   user downloads would fail Windows' own signature check.
-6. **Manually confirm the vendor archives are present and installable** (CI
-   cannot exercise this on the GPU-less hosted runner -- see this repo's PR/
-   commit history for the full "first v2 release" manual checklist): download
-   `openasr-vendor-cuda-runtime-<sha12>.zip` /
-   `-rocm-runtime-<sha12>.zip` from the release, confirm the filename's
-   embedded short hash actually prefixes `sha256sum`'s output, and confirm the
-   corresponding sidecar archive's `openasr.exe --version` launches once the
-   vendor archive's DLLs are placed on `PATH` next to it (desktop's own
-   install-order contract: vendor layer first, then the sidecar `--version`
-   probe -- see `docs/backend-kernels.md`'s "Disk layout" section).
+For core 0.1.34 and later, the manifest workflow in this document is retired.
+Follow the authoritative checklist in `RELEASING.md`: hardware evidence, B2/CDN
+payload sync, catalog preparation/signing, catalog deployment (with a repeated
+CDN gate), then draft finalization (with the third CDN gate). Metadata must
+never become live before every URL it signs.

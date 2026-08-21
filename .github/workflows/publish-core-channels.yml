@@ -1,0 +1,228 @@
+name: Publish core channels
+
+# Secondary channels move only after the draft GitHub release has passed the
+# signed-catalog + backend-CDN finalizer and is actually published. Building
+# these channels from a draft used to expose Docker/Homebrew before the
+# canonical release distribution plane was ready.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published latest core tag to repair, e.g. v0.1.35"
+        required: true
+        type: string
+
+concurrency:
+  group: publish-core-channels-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Verify published latest release
+    # The public repo also hosts desktop-vX.Y.Z releases. Ignore those release
+    # events without painting the repository red; a manual repair still runs
+    # and fails closed on an invalid tag.
+    if: >-
+      ${{
+        github.repository == 'QuintinShaw/openasr' &&
+        (github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v'))
+      }}
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${EVENT_TAG:-$INPUT_TAG}"
+          if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::expected a stable vX.Y.Z release tag, got '$tag'"
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          release="$(gh api "repos/${{ github.repository }}/releases/tags/${tag}")"
+          if [ "$(jq -r .draft <<<"$release")" != "false" ] || [ "$(jq -r .prerelease <<<"$release")" != "false" ]; then
+            echo "::error::${tag} is not a published stable release"
+            exit 1
+          fi
+          latest="$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name)"
+          if [ "$latest" != "$tag" ]; then
+            echo "::error::refusing to move latest channels backwards: ${tag} is not GitHub latest (${latest})"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  distribution-gate:
+    name: Re-verify live catalog and backend CDN
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+      - name: Download release trust metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-metadata
+          gh release download "$TAG" \
+            --pattern 'backend-pack-*.json' \
+            --pattern 'backend-hardware-evidence-*.json' \
+            --dir release-metadata
+      - name: Require the finalizer's live distribution invariants
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          entries=(release-metadata/backend-pack-*.json)
+          cuda_entries=(release-metadata/backend-pack-cuda-sm_*.json)
+          hip_entries=(release-metadata/backend-pack-hip-gfx*.json)
+          evidence=(release-metadata/backend-hardware-evidence-*.json)
+          if [ "${#entries[@]}" -ne 20 ] || [ "${#cuda_entries[@]}" -ne 6 ] || [ "${#hip_entries[@]}" -ne 14 ]; then
+            echo "::error::release must contain exactly 6 CUDA and 14 HIP backend-pack metadata files"
+            exit 1
+          fi
+          [ "${#evidence[@]}" -gt 0 ] || {
+            echo "::error::release has no hardware evidence"; exit 1;
+          }
+
+          entry_args=()
+          for entry in "${entries[@]}"; do entry_args+=(--entry "$entry"); done
+          evidence_args=()
+          for receipt in "${evidence[@]}"; do evidence_args+=(--evidence "$receipt"); done
+          python3 tooling/release-manifest/backend_hardware_evidence.py \
+            "${entry_args[@]}" "${evidence_args[@]}" \
+            > approved-entries.txt
+          approved_args=()
+          while IFS= read -r entry || [ -n "$entry" ]; do
+            [ -n "$entry" ] || continue
+            approved_args+=(--entry "$entry")
+          done < <(tr -d '\r' < approved-entries.txt)
+          [ "${#approved_args[@]}" -gt 0 ] || {
+            echo "::error::release has no hardware-approved backend entry"; exit 1;
+          }
+
+          cache_bust="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          curl -fsSL "https://catalog.openasr.org/v1/catalog.json?channels=${cache_bust}" -o catalog.json
+          curl -fsSL "https://catalog.openasr.org/v1/catalog.signature.json?channels=${cache_bust}" -o catalog.signature.json
+          # Exercise the live pair through the currently-shipping CLI. This is
+          # the same runtime Ed25519/epoch/registry gate deploy-catalog uses,
+          # not merely a comparison against self-declared signature metadata.
+          scripts/gate-catalog-against-released-binary.sh \
+            catalog.json catalog.signature.json
+          python3 - <<'PY'
+          import hashlib, json
+          raw = open("catalog.json", "rb").read()
+          sig = json.load(open("catalog.signature.json", encoding="utf-8"))
+          assert hashlib.sha256(raw).hexdigest() == sig["catalog_sha256"], "live catalog sha256 does not match its signature record"
+          assert sig["catalog_url"] == "https://catalog.openasr.org/v1/catalog.json", "live catalog has a non-canonical signed identity"
+          PY
+          python3 tooling/release-manifest/backend_catalog.py verify-catalog \
+            --catalog catalog.json "${approved_args[@]}"
+          python3 tooling/release-manifest/backend_hardware_evidence.py \
+            "${entry_args[@]}" "${evidence_args[@]}" \
+            --catalog catalog.json --version "$VERSION" >/dev/null
+          python3 tooling/release-manifest/backend_catalog.py verify-cdn \
+            --catalog catalog.json --version "$VERSION"
+
+  docker-images:
+    name: Publish Docker Hub images
+    needs: [resolve, distribution-gate]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/docker-release.yml
+    with:
+      version: ${{ needs.resolve.outputs.version }}
+      tag: ${{ needs.resolve.outputs.tag }}
+      ref: ${{ needs.resolve.outputs.tag }}
+      push: true
+      mark_latest: true
+      variants: all
+    secrets: inherit
+
+  update-homebrew-tap:
+    name: Update Homebrew tap formula
+    needs: [resolve, distribution-gate]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+      - name: Check for tap credentials
+        id: check
+        run: |
+          if [ -n "${{ secrets.HOMEBREW_TAP_TOKEN }}" ]; then
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::HOMEBREW_TAP_TOKEN secret not set -- skipping Homebrew tap update"
+          fi
+      - name: Checkout quintinshaw/homebrew-tap
+        if: steps.check.outputs.has_token == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: QuintinShaw/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+      - name: Compute release checksums
+        if: steps.check.outputs.has_token == 'true'
+        run: |
+          set -euo pipefail
+          tag="${{ needs.resolve.outputs.tag }}"
+          version="${{ needs.resolve.outputs.version }}"
+          curl -fsSL -o SHA256SUMS \
+            "https://github.com/${{ github.repository }}/releases/download/${tag}/SHA256SUMS"
+          sha_for() {
+            grep -F " openasr-${version}-$1.tar.gz" SHA256SUMS | awk '{print $1}'
+          }
+          for target in macos-arm64 linux-x86_64 linux-arm64; do
+            sha="$(sha_for "$target")"
+            [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || {
+              echo "::error::missing valid SHA256SUMS entry for openasr-${version}-${target}.tar.gz"
+              exit 1
+            }
+            echo "${target}=${sha}" >> shas.env
+          done
+      - name: Update Formula/openasr.rb
+        if: steps.check.outputs.has_token == 'true'
+        run: |
+          set -euo pipefail
+          args=()
+          while IFS='=' read -r target sha; do
+            args+=(--sha256 "${target}=${sha}")
+          done < shas.env
+          python3 scripts/update-homebrew-formula.py \
+            homebrew-tap/Formula/openasr.rb "${{ needs.resolve.outputs.version }}" \
+            "${args[@]}"
+      - name: Commit and push
+        if: steps.check.outputs.has_token == 'true'
+        run: |
+          set -euo pipefail
+          cd homebrew-tap
+          if git diff --quiet; then
+            echo "formula already up to date -- nothing to commit"
+            exit 0
+          fi
+          git config user.name "openasr-release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git add Formula/openasr.rb
+          git commit -m "chore(formula): update openasr to ${{ needs.resolve.outputs.version }}"
+          git push origin main

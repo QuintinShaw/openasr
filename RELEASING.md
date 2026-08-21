@@ -7,7 +7,8 @@ Feature, fix, and any other content changes go through pull requests as usual.
 The release bump itself is the exception: a maintainer pushes it directly to
 `main` as a single `chore(release)` commit plus its annotated `vX.Y.Z` tag.
 Routing the bump through a PR adds nothing (the release fires on the merge
-commit anyway) and CI runs on `main` push regardless.
+commit anyway). Routine CI is PR-only to avoid rebuilding every merge; its
+narrow `main` push gate runs only for this direct `chore(release)` commit.
 
 ## Versioning
 
@@ -62,16 +63,14 @@ bump, or CI's `--locked` builds fail:
      origin (failing loudly if it's missing -- see step 2);
    - exits cleanly if a GitHub Release for `vX.Y.Z` already exists (so
      unrelated `Cargo.toml` edits and re-runs are no-ops);
-   - otherwise builds its own macOS-arm64 + Linux-x86_64 binaries, reads the
-     tag annotation for Highlights, and creates the GitHub Release with a
-     three-part body (see below);
+   - otherwise reads the tag annotation for Highlights and immediately creates
+     an empty draft GitHub Release with a three-part body (see below);
    - then calls `.github/workflows/release-binaries.yml` directly (as a
-     `workflow_call`, not a webhook -- tags created through the
-     `GITHUB_TOKEN` API do not cascade into further Actions triggers, so a
-     real `push: tags` event alone would never fire for a tag this workflow
-     created) to build the full release matrix (Linux x86_64/arm64, macOS
+     `workflow_call`, the only formal matrix entrypoint) to build the full
+     release matrix (Linux x86_64/arm64, macOS
      x86_64/arm64, Windows, plus Vulkan/CUDA/HIP feature variants) and
-     upload every archive to the same release;
+     upload every archive to the draft. There is no bootstrap macOS/Linux
+     rebuild and no second `push: tags` matrix racing the orchestrator;
    - `release-binaries.yml`'s own completeness gate then asserts the release
      ends up with every expected platform archive, failing the run if one is
      missing instead of silently shipping a partial release;
@@ -96,8 +95,10 @@ No pre-release channels: the core releases plain `X.Y.Z` versions only.
 ## Manual runs
 
 `workflow_dispatch` on the `Release core` workflow performs the same
-resolve-and-release for the version currently on `main` (useful for retries;
-it is idempotent thanks to the existing-release check).
+resolve-and-release for the version currently on `main`. It can create a
+missing draft, but an already-existing draft is an intentional no-op; recover
+failed matrix legs through the `Release binaries` workflow below rather than
+starting a competing second orchestrator.
 
 `workflow_dispatch` on `Release binaries` (`.github/workflows/release-binaries.yml`)
 independently rebuilds/re-uploads the full matrix for an existing tag: pass
@@ -122,25 +123,29 @@ made public until the signed catalog distribution plane is complete:
    schemas require at least five fresh processes, FullDevice execution, and no
    CPU fallback. Building a target is not hardware evidence, and a matrix receipt
    is an explicit compatibility policy rather than a claim that every GPU ran.
-2. Run `scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z` locally with
-   the production catalog signing seed. It downloads and hashes all 6 CUDA and
-   14 HIP build artifacts, but merges only the target entries approved by those
-   receipts. It then bumps the catalog epoch and signs the full/public
-   catalogs. Review, commit, and push those catalog files.
-3. Wait for `deploy-catalog.yml` to prove the signed public bytes are live.
-4. Run `scripts/sync-windows-backend-cdn.sh vX.Y.Z` locally with the B2
+2. Run `scripts/sync-windows-backend-cdn.sh vX.Y.Z` locally with the B2
    release credentials. It copies the hardware-approved plugin and vendor
    files to `https://dl.openasr.org/core/vX.Y.Z/`. The signed catalog's
    `files[].url` values point only at this prefix; GitHub release mirrors are
    not a runtime download fallback.
+3. Run `scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z` locally with
+   the production catalog signing seed. It downloads and hashes all 6 CUDA and
+   14 HIP build artifacts, but merges only the target entries approved by those
+   receipts. Before touching the catalog it verifies that every selected CDN
+   payload is already live, then bumps the epoch and signs the full/public
+   catalogs. Review, commit, and push those catalog files.
+4. Wait for `deploy-catalog.yml` to repeat the no-credential CDN gate and prove
+   the signed public bytes are live. Metadata is never deployed ahead of its
+   immutable payloads.
 5. Run `scripts/finalize-core-release.sh vX.Y.Z`. It requires the live signed
    catalog target set to equal the hardware-approved subset exactly, and it
    HEADs every signed CDN URL for that version; only then does it publish the
    draft and mark it latest.
 
 None of these scripts publishes code or a catalog implicitly. A failure leaves
-the release draft and therefore unavailable to users; there is no partially
-usable release whose Desktop UI advertises a backend that cannot resolve.
+the release draft and therefore unavailable to users. Publishing the GitHub
+release triggers `publish-core-channels.yml`, which moves Docker/Homebrew only
+after the canonical catalog/CDN plane is complete.
 
 ## Legacy backends manifests
 
@@ -153,7 +158,7 @@ only activation trust plane.
 
 ## Homebrew tap
 
-`release-core.yml`'s final job, `update-homebrew-tap`, bumps
+`publish-core-channels.yml` bumps
 `Formula/openasr.rb` in [`QuintinShaw/homebrew-tap`](https://github.com/QuintinShaw/homebrew-tap)
 (version + per-target sha256 for `macos-arm64`, `linux-x86_64`, `linux-arm64`,
 read from the just-published release's `SHA256SUMS`) and pushes straight to
@@ -172,9 +177,9 @@ hand, once the secret exists).
 
 ## Docker Hub images
 
-`release-core.yml`'s `docker-images` job runs after the full binary matrix
-(`binaries`) and builds runtime images from the just-published Linux release
-assets (no second cargo build inside Docker):
+`publish-core-channels.yml` runs only after the GitHub draft is published by
+the catalog/CDN finalizer. It builds runtime images from the published Linux
+release assets (no second cargo build inside Docker):
 
 - CPU multi-arch (`linux/amd64` + `linux/arm64`) from
   `openasr-<version>-linux-x86_64.tar.gz` / `linux-arm64.tar.gz` via
@@ -214,4 +219,3 @@ gh workflow run docker-release.yml \
 
 Local source-build Dockerfiles (`Dockerfile`, `Dockerfile.cuda`) remain for
 development and `docker-smoke.yml`; they are not the release path.
-
