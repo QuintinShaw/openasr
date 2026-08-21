@@ -117,12 +117,24 @@ made public until the signed catalog distribution plane is complete:
 
 1. Attach `backend-hardware-evidence-*.json` receipts for every provider that is
    intended to become runtime-selectable. Schema v1 approves only the exact
-   tested target. Schema v2 may approve an explicit provider target matrix from
-   one representative target, but it binds the tested plugin digest plus the
-   complete target list and artifact fingerprint of every approved entry. Both
-   schemas require at least five fresh processes, FullDevice execution, and no
-   CPU fallback. Building a target is not hardware evidence, and a matrix receipt
-   is an explicit compatibility policy rather than a claim that every GPU ran.
+   tested target; schema v2 may approve an explicit provider matrix. For 0.1.36,
+   produce schema v2 with
+   `tooling/release-manifest/generate_backend_hardware_evidence.py` and attach
+   both its `backend-hardware-evidence-*.json` summary and separately named
+   `backend-hardware-audit-*.json` raw audit. The runner verifies every release
+   subject against `SHA256SUMS` and GitHub build provenance, proves the executed
+   binary and its complete companion-file tree match the neutral release ZIP,
+   owns at least five fresh child processes, checks the exact activation before
+   and after each child, and binds each raw receipt to a unique nonce. Model and
+   audio inputs are content-hash bound but are not release subjects. The
+   summary's `evidence_sha256` is the
+   canonical raw-audit digest. The v0.1.36 tag gate validates the schema-v2
+   summary and provider matrix; it does not parse the raw audit, which must be
+   downloaded and independently checked before catalog publication. A future
+   release may make that binding part of the tag-integrated schema. A
+   provider-matrix receipt is compatibility policy, not a claim that every GPU
+   ran. Building a target, copying one receipt five times, scheduler/hybrid
+   execution, or CPU/other-provider compute is rejected.
 2. Run `scripts/sync-windows-backend-cdn.sh vX.Y.Z` locally with the B2
    release credentials. It copies the hardware-approved plugin and vendor
    files to `https://dl.openasr.org/core/vX.Y.Z/`. The signed catalog's
