@@ -71,10 +71,12 @@ impl fmt::Debug for UnstableDecodeTextObserver {
 }
 
 impl UnstableDecodeTextObserver {
+    #[allow(dead_code)] // installed only by tests; live Poll must not fan prefixes
     pub(crate) fn new(observer: impl Fn(&str) + Send + Sync + 'static) -> Self {
         Self(Arc::new(observer))
     }
 
+    #[allow(dead_code)] // paired with `new`; production Poll leaves the observer unset
     pub(crate) fn report(&self, text: &str) {
         (self.0)(text);
     }
