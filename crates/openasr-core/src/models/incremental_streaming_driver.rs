@@ -204,12 +204,8 @@ where
     let partial_granularity = crate::arch::streaming_partial_granularity_for_model_architecture(
         request.selected_family.model_architecture,
     );
-    let unstable_sink: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let unstable_sink_for_request = std::sync::Arc::clone(&unstable_sink);
     let make_request = move |audio: &GgmlAsrPreparedAudioView<'static>,
-                             partial_prompt: Option<&str>,
-                             emit_unstable: bool|
+                             partial_prompt: Option<&str>|
           -> Result<
         GgmlAsrExecutionViewRequest<'static>,
         GgmlAsrExecutionError,
@@ -262,24 +258,16 @@ where
             // an uncancellable context is a real, well-formed context that
             // simply has no other holder, not an omitted one.
             execution_context: {
-                let context = crate::RequestExecutionContext::uncancellable(
+                // Snapshot Poll is synchronous: the websocket only sees events after
+                // greedy returns. Installing a per-token observer here would collect
+                // one prefix per token and fan them out as transcript.partials, which
+                // trips Native ASR `max_queued_events` (64) and kills the live session.
+                // The completed window text below is the one overlay this driver emits.
+                std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
                     "per-frame streaming decode: this request type carries no \
                      execution-context field of its own yet, and a live session ends by \
                      the caller dropping it rather than canceling a transcription id",
-                );
-                let context = if emit_unstable {
-                    let sink = std::sync::Arc::clone(&unstable_sink_for_request);
-                    context.with_unstable_decode_text_observer(
-                        crate::api::backend::UnstableDecodeTextObserver::new(move |text: &str| {
-                            sink.lock()
-                                .expect("unstable decode text sink")
-                                .push(text.to_string());
-                        }),
-                    )
-                } else {
-                    context
-                };
-                std::sync::Arc::new(context)
+                ))
             },
         })
     };
@@ -287,7 +275,7 @@ where
     let transcribe = Box::new(
         move |audio: &GgmlAsrPreparedAudioView<'static>,
               partial_prompt: Option<&str>,
-              kind: StreamingDecodeKind| {
+              _kind: StreamingDecodeKind| {
             let _execution_scope =
                 crate::models::native_execution_services::install_native_execution_services(
                     decode_execution_services.as_ref(),
@@ -303,31 +291,9 @@ where
             // carried on `make_request`'s `resolved_runtime` field above).
             let _backend_override =
                 install_request_backend_override(backend_preference.request_backend_override());
-            let emit_unstable = kind == StreamingDecodeKind::Partial;
-            if emit_unstable {
-                unstable_sink
-                    .lock()
-                    .expect("unstable decode text sink")
-                    .clear();
-            }
-            let transcription = decode(
-                &executor,
-                &make_request(audio, partial_prompt, emit_unstable)?,
-            )
-            .map(|result| result.transcription)?;
-            let unstable_texts = if emit_unstable {
-                unstable_sink
-                    .lock()
-                    .expect("unstable decode text sink")
-                    .drain(..)
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            Ok(StreamingDecodeOutput {
-                transcription,
-                unstable_texts,
-            })
+            let transcription = decode(&executor, &make_request(audio, partial_prompt)?)
+                .map(|result| result.transcription)?;
+            Ok(StreamingDecodeOutput { transcription })
         },
     );
     let mut driver = IncrementalStreamingTranscriptDriver::new(
@@ -401,7 +367,6 @@ pub(crate) enum StreamingDecodeKind {
 
 pub(crate) struct StreamingDecodeOutput {
     transcription: Transcription,
-    unstable_texts: Vec<String>,
 }
 
 type StreamingTranscriber = dyn FnMut(
@@ -801,11 +766,6 @@ impl IncrementalStreamingTranscriptDriver {
         let output = (self.transcribe)(&audio, prompt.as_deref(), StreamingDecodeKind::Partial)?;
         let transcription = output.transcription;
         let mut emitted: Vec<GgmlAsrStreamingTranscriptUpdate> = Vec::new();
-        for text in &output.unstable_texts {
-            if let Some(update) = self.emit_update(text, false) {
-                emitted.push(update);
-            }
-        }
 
         // If this decode spanned the WHOLE buffer (the window reached sample 0),
         // its prepared audio is byte-identical to `prepared_audio_snapshot`, so a
@@ -1052,8 +1012,8 @@ mod tests {
     use std::{
         collections::VecDeque,
         sync::{
-            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
         },
     };
 
@@ -1106,20 +1066,7 @@ mod tests {
     fn decode_ok(
         transcription: Transcription,
     ) -> Result<StreamingDecodeOutput, GgmlAsrExecutionError> {
-        Ok(StreamingDecodeOutput {
-            transcription,
-            unstable_texts: Vec::new(),
-        })
-    }
-
-    fn decode_with_unstables(
-        transcription: Transcription,
-        unstable_texts: Vec<String>,
-    ) -> Result<StreamingDecodeOutput, GgmlAsrExecutionError> {
-        Ok(StreamingDecodeOutput {
-            transcription,
-            unstable_texts,
-        })
+        Ok(StreamingDecodeOutput { transcription })
     }
 
     /// Build a driver whose streaming decode returns scripted text per tick.
@@ -1413,8 +1360,8 @@ mod tests {
             _ => unreachable!("expected partial update"),
         };
         assert_ne!(second_id, first_id);
-        assert_eq!(second_id.0.0, "utt_win_000002");
-        assert_eq!(second_id.1.0, "seg_win_000002");
+        assert_eq!(second_id.0 .0, "utt_win_000002");
+        assert_eq!(second_id.1 .0, "seg_win_000002");
     }
 
     #[test]
@@ -1903,27 +1850,34 @@ mod tests {
     }
 
     #[test]
-    fn mid_decode_unstable_prefixes_emit_partials_before_the_complete_window_text() {
+    fn snapshot_poll_keeps_overlay_events_under_native_backpressure() {
+        // Native ASR sessions cap queued events at 64. A snapshot Poll that
+        // fanned out one transcript.partial per decoded token would kill a live
+        // FireRed/Qwen session mid-utterance. The overlay is one window text.
+        let window: String = (0..80).map(|index| format!("token{index} ")).collect();
+        let window_for_decode = window.clone();
         let mut driver = IncrementalStreamingTranscriptDriver::new(
             "token-incremental-test-executor",
             crate::QWEN3_ASR_GGML_ADAPTER_ID,
-            "utt_unstable",
-            "seg_unstable",
+            "utt_backpressure",
+            "seg_backpressure",
             1,
             Box::new(move |audio, _prompt, kind| {
                 assert_eq!(kind, StreamingDecodeKind::Partial);
                 assert!(!audio.samples_f32.is_empty());
-                decode_with_unstables(
-                    transcription("hello world"),
-                    vec!["hello".to_string(), "hello world".to_string()],
-                )
+                decode_ok(transcription(&window_for_decode))
             }),
         );
         driver.push_audio(frame(1, 0)).unwrap();
         let updates = driver.poll_updates().unwrap();
-        let texts: Vec<_> = updates.iter().map(|update| text_of(update).0).collect();
-        assert_eq!(texts, vec!["hello", "hello world"]);
-        assert!(updates.iter().all(|update| !text_of(update).2));
+        assert!(
+            updates.len() < 64,
+            "snapshot poll emitted {} events, which would trip max_queued_events",
+            updates.len()
+        );
+        assert_eq!(updates.len(), 1);
+        assert_eq!(text_of(&updates[0]).0, window.trim());
+        assert!(!text_of(&updates[0]).2);
     }
 
     #[test]

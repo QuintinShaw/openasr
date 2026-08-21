@@ -146,6 +146,7 @@ impl RequestExecutionContext {
         self.decode_work_progress.as_ref()
     }
 
+    #[allow(dead_code)] // reserved for a live mid-decode flush; snapshot Poll must not fan out prefixes
     pub(crate) fn with_unstable_decode_text_observer(
         &self,
         observer: UnstableDecodeTextObserver,
