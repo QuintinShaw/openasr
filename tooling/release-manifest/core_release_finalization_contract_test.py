@@ -21,7 +21,7 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
             re.findall(r"(?m)^      ([a-z-]+): (read|write)$", caller)
         )
         requested_permissions = re.findall(
-            r"(?m)^      ([a-z-]+): (read|write)$", binaries
+            r"(?m)^(?:  |      )([a-z-]+): (read|write)$", binaries
         )
         permission_rank = {"read": 1, "write": 2}
 
@@ -54,6 +54,11 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
             referenced - declared,
             set(),
             "workflow_call must declare every inputs.* value used by the reusable workflow",
+        )
+        self.assertNotIn(
+            "github.event.inputs.",
+            binaries,
+            "shared dispatch/call inputs must use the typed inputs context",
         )
 
     def test_core_release_stays_draft_until_signed_backend_catalog_is_live(self) -> None:

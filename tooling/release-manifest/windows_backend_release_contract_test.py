@@ -262,8 +262,8 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
     def test_diagnostic_only_target_temporarily_owns_vendor_assets(self) -> None:
         self.assertIn(
             "VENDOR_OWNER: ${{ matrix.distribution == 'plugin' && "
-            "((github.event_name == 'workflow_dispatch' && inputs.only_target != '' "
-            "&& matrix.target == inputs.only_target) || matrix.vendor_owner) }}",
+            "((inputs.only_target != '' && matrix.target == inputs.only_target) "
+            "|| matrix.vendor_owner) }}",
             self.workflow,
         )
 
