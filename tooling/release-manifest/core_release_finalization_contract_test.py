@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -94,6 +95,37 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertNotIn('tags: ["v*"]', family)
         self.assertIn("releases/latest", family)
         self.assertIn("refusing a duplicate local build", family)
+        self.assertEqual(family.count("release_asset_verifier.py"), 2)
+        self.assertEqual(family.count("--pattern SHA256SUMS"), 2)
+        self.assertEqual(family.count("gh attestation verify"), 2)
+        self.assertEqual(family.count("--signer-workflow"), 2)
+        self.assertIn("attestations: read", family)
+
+    def test_family_regression_ignores_non_core_release_tags(self) -> None:
+        family = (ROOT / ".github/workflows/family-regression.yml").read_text(
+            encoding="utf-8"
+        )
+        jobs = family.split("\njobs:\n", maxsplit=1)[1]
+        starts = list(re.finditer(r"(?m)^  ([a-z0-9-]+):\n", jobs))
+        self.assertGreater(len(starts), 0)
+
+        guard = (
+            "github.event_name != 'release' || "
+            "startsWith(github.event.release.tag_name, 'v')"
+        )
+        for index, match in enumerate(starts):
+            end = starts[index + 1].start() if index + 1 < len(starts) else len(jobs)
+            block = jobs[match.start() : end]
+            self.assertIn(
+                guard,
+                block,
+                f"family-regression job {match.group(1)!r} accepts desktop-v* releases",
+            )
+
+    def test_push_ci_cannot_be_bypassed_with_a_commit_message_prefix(self) -> None:
+        ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+        self.assertNotIn("github.event.head_commit.message", ci)
 
 
 if __name__ == "__main__":

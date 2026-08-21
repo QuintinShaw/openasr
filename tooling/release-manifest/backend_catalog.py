@@ -620,7 +620,7 @@ def verify_catalog_cdn(
 
     catalog = _read_json(catalog_path)
     head_fn = head or head_cdn_url
-    seen: dict[str, tuple[str, str, int]] = {}
+    seen: dict[str, tuple[str, str, int, str]] = {}
     checked_versions: set[str] = set()
     for entry in catalog.get("backends", []):
         if not isinstance(entry, dict):
@@ -636,12 +636,17 @@ def verify_catalog_cdn(
             filename = str(file.get("filename", ""))
             url = str(file.get("url", ""))
             size = int(file.get("size_bytes", 0))
+            sha256 = str(file.get("sha256", "")).lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+                raise BackendCatalogError(
+                    f"backend file '{filename}' has an invalid signed sha256"
+                )
             canonical_url = f"https://dl.openasr.org/core/v{entry_version}/{filename}"
             if not entry_version or url != canonical_url:
                 raise BackendCatalogError(
                     f"backend file '{filename}' is not the canonical CDN URL for {entry_version or '<missing version>'}"
                 )
-            identity = (entry_version, filename, size)
+            identity = (entry_version, filename, size, sha256)
             if url in seen:
                 if seen[url] != identity:
                     raise BackendCatalogError(
@@ -657,8 +662,8 @@ def verify_catalog_cdn(
             f"catalog has no CUDA/HIP backend files for {scope} to verify on CDN"
         )
 
-    def probe(item: tuple[str, tuple[str, str, int]]) -> str:
-        url, (entry_version, filename, size) = item
+    def probe(item: tuple[str, tuple[str, str, int, str]]) -> str:
+        url, (entry_version, filename, size, _sha256) = item
         status, length = head_fn(url)
         if status != 200 or length != size:
             raise BackendCatalogError(

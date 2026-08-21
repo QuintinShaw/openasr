@@ -43,7 +43,6 @@ jobs:
   # independent caches and don't clobber each other's incremental artifacts.
   lint:
     name: Rust lint (fmt, clippy, catalog, python)
-    if: github.event_name != 'push' || startsWith(github.event.head_commit.message, 'chore(release):')
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/quintinshaw/openasr-ci-linux@sha256:702284855863f1c6330eec503ac4570ff2cc844a958ceb7d2e2af5837633dcdc
@@ -94,7 +93,6 @@ jobs:
 
   test:
     name: Rust test (nextest, doctests, sys-audio)
-    if: github.event_name != 'push' || startsWith(github.event.head_commit.message, 'chore(release):')
     # GitHub-hosted: runs for pushes and every PR, including forks (the repo is
     # public, so hosted-runner minutes are free and unlimited).
     runs-on: ubuntu-latest
@@ -135,7 +133,6 @@ jobs:
         run: cargo test --workspace --doc
 
   system-audio-macos:
-    if: github.event_name != 'push' || startsWith(github.event.head_commit.message, 'chore(release):')
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -154,7 +151,6 @@ jobs:
 
   ios-compile:
     name: iOS compile gate (aarch64-apple-ios)
-    if: github.event_name != 'push' || startsWith(github.event.head_commit.message, 'chore(release):')
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -180,7 +176,6 @@ jobs:
         run: cargo check -p openasr-core -p openasr-ffi --target aarch64-apple-ios
 
   dependency-policy:
-    if: github.event_name != 'push' || startsWith(github.event.head_commit.message, 'chore(release):')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

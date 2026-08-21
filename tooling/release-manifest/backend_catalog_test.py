@@ -234,11 +234,13 @@ class BackendCatalogTest(unittest.TestCase):
                                         "filename": "hip.dll",
                                         "url": plugin_url,
                                         "size_bytes": 70,
+                                        "sha256": "a" * 64,
                                     },
                                     {
                                         "filename": "vendor.zip",
                                         "url": vendor_url,
                                         "size_bytes": 200,
+                                        "sha256": "b" * 64,
                                     },
                                 ],
                             },
@@ -251,6 +253,7 @@ class BackendCatalogTest(unittest.TestCase):
                                         "filename": "cuda.dll",
                                         "url": "https://dl.openasr.org/core/v0.1.34/cuda.dll",
                                         "size_bytes": 10,
+                                        "sha256": "c" * 64,
                                     }
                                 ],
                             },
@@ -291,6 +294,7 @@ class BackendCatalogTest(unittest.TestCase):
                                         "filename": "cuda.dll",
                                         "url": next(iter(urls)),
                                         "size_bytes": 10,
+                                        "sha256": "a" * 64,
                                     }
                                 ],
                             },
@@ -302,6 +306,7 @@ class BackendCatalogTest(unittest.TestCase):
                                         "filename": "hip.dll",
                                         "url": "https://dl.openasr.org/core/v0.1.35/hip.dll",
                                         "size_bytes": 20,
+                                        "sha256": "b" * 64,
                                     }
                                 ],
                             },
@@ -328,14 +333,24 @@ class BackendCatalogTest(unittest.TestCase):
                                 "vendor": "cuda",
                                 "version": "0.1.35",
                                 "files": [
-                                    {"filename": "shared.zip", "url": url, "size_bytes": 10}
+                                    {
+                                        "filename": "shared.zip",
+                                        "url": url,
+                                        "size_bytes": 10,
+                                        "sha256": "a" * 64,
+                                    }
                                 ],
                             },
                             {
                                 "vendor": "hip",
                                 "version": "0.1.35",
                                 "files": [
-                                    {"filename": "shared.zip", "url": url, "size_bytes": 999}
+                                    {
+                                        "filename": "shared.zip",
+                                        "url": url,
+                                        "size_bytes": 999,
+                                        "sha256": "a" * 64,
+                                    }
                                 ],
                             },
                         ]
@@ -348,6 +363,67 @@ class BackendCatalogTest(unittest.TestCase):
                 backend_catalog.BackendCatalogError, "conflicting signed metadata"
             ):
                 backend_catalog.verify_catalog_cdn(catalog, head=lambda _: (200, 10))
+
+    def test_verify_catalog_cdn_rejects_same_size_duplicate_with_different_sha256(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog = Path(tmp) / "catalog.json"
+            url = "https://dl.openasr.org/core/v0.1.35/shared.zip"
+            catalog.write_text(
+                json.dumps(
+                    {
+                        "backends": [
+                            {
+                                "vendor": vendor,
+                                "version": "0.1.35",
+                                "files": [
+                                    {
+                                        "filename": "shared.zip",
+                                        "url": url,
+                                        "size_bytes": 10,
+                                        "sha256": digest * 64,
+                                    }
+                                ],
+                            }
+                            for vendor, digest in (("cuda", "a"), ("hip", "b"))
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                backend_catalog.BackendCatalogError, "conflicting signed metadata"
+            ):
+                backend_catalog.verify_catalog_cdn(catalog, head=lambda _: (200, 10))
+
+    def test_verify_catalog_cdn_probes_identical_duplicate_metadata_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog = Path(tmp) / "catalog.json"
+            url = "https://dl.openasr.org/core/v0.1.35/shared.zip"
+            record = {
+                "filename": "shared.zip",
+                "url": url,
+                "size_bytes": 10,
+                "sha256": "a" * 64,
+            }
+            catalog.write_text(
+                json.dumps(
+                    {
+                        "backends": [
+                            {"vendor": vendor, "version": "0.1.35", "files": [record]}
+                            for vendor in ("cuda", "hip")
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            calls = []
+
+            backend_catalog.verify_catalog_cdn(
+                catalog, head=lambda candidate: calls.append(candidate) or (200, 10)
+            )
+
+            self.assertEqual(calls, [url])
 
     def test_verify_catalog_cdn_requires_filename_exactly_in_canonical_url(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -364,6 +440,7 @@ class BackendCatalogTest(unittest.TestCase):
                                         "filename": "signed-name.zip",
                                         "url": "https://dl.openasr.org/core/v0.1.35/other-name.zip",
                                         "size_bytes": 10,
+                                        "sha256": "a" * 64,
                                     }
                                 ],
                             }
