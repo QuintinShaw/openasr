@@ -4,6 +4,8 @@ This image removes networked `apt-get` work from routine Linux CI jobs. It is
 not a product or release image.
 
 - The base image is pinned by digest.
+- GitHub CLI is pinned by version and SHA-256, and its attestation verifier is
+  part of the image contract.
 - Every source revision is published under its commit SHA.
 - Consumer workflows pin the verified GHCR digest, never a mutable tag.
 - The publish workflow verifies C/C++, CMake, GitHub CLI, ALSA, and
