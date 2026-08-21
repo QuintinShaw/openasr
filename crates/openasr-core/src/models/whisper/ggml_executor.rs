@@ -157,7 +157,9 @@ use crate::models::decode_policy_component_registry::{
 use crate::models::decode_token_history::{
     build_longform_token_history_carry, context_window_budget,
 };
-use crate::models::seq2seq_dtw_alignment::{dtw_align_token_frames, speech_frame_bounds};
+use crate::models::seq2seq_dtw_alignment::{
+    dtw_align_token_frames, speech_frame_bounds, token_text_carries_speech,
+};
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
     Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeStopReason,
@@ -5845,25 +5847,39 @@ fn whisper_cross_attention_word_timestamps(
             .iter()
             .map(|alignment| alignment.frame_probs.clone())
             .collect::<Vec<Vec<f32>>>();
-        // Restrict the DTW frame axis to where the tokens' cross-attention actually
-        // lands. The model emits `<|notimestamps|>` so there is no decoded
-        // `<|start|>`/`<|end|>` to slice `weights[..., start: end]` on (as
-        // whisper-timestamped does); the closest signal is the attention
-        // envelope itself, which ignores leading silence and trailing
-        // non-speech the model did not attend to. Without this the monotone
-        // path runs the whole padded window, stretching the first word's start
-        // to frame 0 and the last word's end to the window tail.
-        let (dtw_frame_start, dtw_frame_end) = speech_frame_bounds(&full_window).map_or_else(
-            // No usable attention: fall back to the encoded clip duration so
-            // the last word still owns the real audio end.
-            move || {
-                (
-                    0usize,
-                    ((duration / seconds_per_frame).ceil() as usize).clamp(1, frame_resolution),
-                )
-            },
-            |(start, end)| (start, end.clamp(start + 1, frame_resolution)),
-        );
+        // Bracket the DTW frame axis on the attention of the tokens that
+        // actually carry speech. The model emits `<|notimestamps|>` so there is
+        // no decoded `<|start|>`/`<|end|>` to slice `weights[..., start: end]`
+        // on (as whisper-timestamped does); the closest signal is the attention
+        // envelope of content tokens, which ignores leading silence and trailing
+        // non-speech the model did not attend to. Punctuation/subword tokens are
+        // excluded: they carry no audible span of their own and their
+        // cross-attention is the diffuse mass that bleeds into nearby silence or
+        // the trailing non-speech, so letting one set the band end would stretch
+        // the final word far past where the speech stops (whisper-timestamped
+        // excludes a trailing final punctuation for the same reason). Without
+        // this the monotone path runs the whole padded window, stretching the
+        // first word's start to frame 0 and the last word's end to the tail.
+        let is_content: Vec<bool> = token_alignments
+            .iter()
+            .map(|alignment| {
+                tokenizer
+                    .decode_text_token_ids(&[alignment.token_id])
+                    .map_or(false, |text| token_text_carries_speech(&text))
+            })
+            .collect();
+        let (dtw_frame_start, dtw_frame_end) = speech_frame_bounds(&full_window, &is_content)
+            .map_or_else(
+                // No usable content attention: fall back to the encoded clip
+                // duration so the last word still owns the real audio end.
+                move || {
+                    (
+                        0usize,
+                        ((duration / seconds_per_frame).ceil() as usize).clamp(1, frame_resolution),
+                    )
+                },
+                |(start, end)| (start, end.clamp(start + 1, frame_resolution)),
+            );
         let attention: Vec<Vec<f32>> = token_alignments
             .iter()
             .map(|alignment| alignment.frame_probs[dtw_frame_start..dtw_frame_end].to_vec())

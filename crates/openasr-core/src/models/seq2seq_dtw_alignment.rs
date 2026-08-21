@@ -21,10 +21,28 @@
 /// before alignment. Matches whisper-timestamped's default of 9.
 const DTW_MEDIAN_FILTER_WIDTH: usize = 9;
 
+/// Whether a token's decoded text carries real speech and so may bracket the
+/// DTW alignment window.
+///
+/// Punctuation and whitespace tokens ("` .`", "` ,`", "` .,`") attach to a
+/// neighbouring content word but carry no audible span of their own, and their
+/// cross-attention is precisely the diffuse mass that bleeds into surrounding
+/// silence or non-speech. whisper-timestamped excludes a trailing final
+/// punctuation from segment timing for the same reason
+/// (`include_punctuation_in_timing = False`). Letting such a token set the
+/// earliest/latest bounds would stretch the band past the spoken audio -- e.g.
+/// the "." after a word attending into the ignored trailing music stretches the
+/// final word's end far past where the speech actually stops. Whichever tokens
+/// survive this filter bracket the band on each side; combined
+/// word+punctuation pieces (e.g. "Okay,") contain a letter and so stay.
+pub(crate) fn token_text_carries_speech(text: &str) -> bool {
+    text.chars().any(|ch| ch.is_alphanumeric())
+}
+
 /// Padding, in frames, left around the detected speech band so a token whose
 /// single strongest frame sits just inside an edge still owns its full onset
 /// and offset. 10 frames is 0.2s at Whisper's 0.02s/frame.
-const SPEECH_BAND_MARGIN_FRAMES: usize = 10;
+pub(crate) const DTW_SPEECH_BAND_MARGIN_FRAMES: usize = 10;
 
 /// Frame index band the DTW path should align onto, derived from where each
 /// token's cross-attention actually peaks. Returns `[start, end)` (end
@@ -35,23 +53,35 @@ const SPEECH_BAND_MARGIN_FRAMES: usize = 10;
 /// whisper-timestamped bounds its DTW to the decoded `<|start|>`/`<|end|>`
 /// timestamp tokens (`weights[..., start: end]`). OpenASR decodes
 /// `<|notimestamps|>`, so it has no such tokens. The closest signal remains the
-/// cross-attention: every decoded token is a real spoken syllable, and its
+/// cross-attention: each decoded token is a real spoken syllable, and its
 /// head-averaged attention concentrates on the frames where that syllable
 /// sounds, so the band from the earliest to the latest per-token peak brackets
 /// the spoken text. This is robust to the softmax diffuse floor (each row still
 /// spreads a small mass over every frame, so a summed envelope never fully
 /// drops at the tail) and to trailing non-speech or leading silence the model
-/// ignored, because neither hosts a per-token peak. Without this the monotone
-/// DTW path runs the whole padded window, stretching the first word's start to
-/// frame 0 and the last word's end to the window tail.
-pub(crate) fn speech_frame_bounds(attention: &[Vec<f32>]) -> Option<(usize, usize)> {
+/// ignored, because neither hosts a per-token peak.
+///
+/// `is_content` holds one flag per row; only rows whose flag is `true` may
+/// bracket the band. Passing `token_text_carries_speech` per token keeps
+/// punctuation/subword tokens (whose attention is the diffuse mass that bleeds
+/// into nearby silence) from stretching the band, as whisper-timestamped does
+/// for a trailing final punctuation. Without this the monotone DTW path runs
+/// the whole padded window, stretching the first word's start to frame 0 and
+/// the last word's end to the window tail.
+pub(crate) fn speech_frame_bounds(
+    attention: &[Vec<f32>],
+    is_content: &[bool],
+) -> Option<(usize, usize)> {
     let frame_count = attention.first()?.len();
     if frame_count == 0 {
         return None;
     }
     let mut earliest: Option<usize> = None;
     let mut latest: Option<usize> = None;
-    for row in attention.iter().filter(|row| row.len() == frame_count) {
+    for (index, row) in attention.iter().enumerate() {
+        if row.len() != frame_count || !is_content.get(index).copied().unwrap_or(false) {
+            continue;
+        }
         let (dominant_frame, &dominant_value) = row
             .iter()
             .enumerate()
@@ -65,7 +95,7 @@ pub(crate) fn speech_frame_bounds(attention: &[Vec<f32>]) -> Option<(usize, usiz
     }
     let earliest = earliest?;
     let latest = latest?;
-    let margin = SPEECH_BAND_MARGIN_FRAMES;
+    let margin = DTW_SPEECH_BAND_MARGIN_FRAMES;
     let start = earliest.saturating_sub(margin);
     let end = (latest + 1).saturating_add(margin).min(frame_count);
     Some((start, end.max(start + 1)))
@@ -269,6 +299,18 @@ fn token_spans_from_path(
 mod tests {
     use super::*;
 
+    #[test]
+    fn content_detection_keeps_letters_drops_punctuation_and_space() {
+        assert!(token_text_carries_speech(" Okay"));
+        assert!(token_text_carries_speech("got"));
+        assert!(token_text_carries_speech("dog."));
+        assert!(token_text_carries_speech("a1"));
+        assert!(!token_text_carries_speech(" ."));
+        assert!(!token_text_carries_speech(" ,"));
+        assert!(!token_text_carries_speech(" "));
+        assert!(!token_text_carries_speech("!?"))
+    }
+
     /// A smooth, normalized bump centered on `center` within a `frames`-long
     /// window. Real cross-attention rows are soft over several frames, unlike
     /// a single-frame spike (which the median filter would legitimately
@@ -387,7 +429,8 @@ mod tests {
             attention_peaking_at(frames, 30),
             attention_peaking_at(frames, 90),
         ];
-        let (start, end) = speech_frame_bounds(&attention).unwrap();
+        let all_content = vec![true; attention.len()];
+        let (start, end) = speech_frame_bounds(&attention, &all_content).unwrap();
         // Band = [first_peak - margin, last_peak + 1 + margin) = [20, 101).
         assert_eq!((start, end), (30 - 10, 90 + 1 + 10), "band {start}..{end}");
         assert!(start > 0, "band should drop the leading padding");
@@ -405,7 +448,8 @@ mod tests {
             attention_peaking_at(frames, 90),
             attention_peaking_at(frames, 140),
         ];
-        let (start, end) = speech_frame_bounds(&attention).unwrap();
+        let all_content = vec![true; attention.len()];
+        let (start, end) = speech_frame_bounds(&attention, &all_content).unwrap();
         assert!(
             end <= 160,
             "band bled toward the ignored tail: end={end} of {frames}"
@@ -414,10 +458,47 @@ mod tests {
     }
 
     #[test]
+    fn speech_bounds_ignores_non_content_tokens() {
+        // A content token peaking mid-window plus a punctuation token whose only
+        // peak sits deep in the ignored trailing region. The punctuation peak
+        // must not stretch the band; the band brackets the content token alone.
+        let frames = 300;
+        let attention = vec![
+            attention_peaking_at(frames, 40),  // " dog"
+            attention_peaking_at(frames, 270), // " ." (attends into ignored music)
+        ];
+        let content = vec![true, false];
+        let (_, end) = speech_frame_bounds(&attention, &content).unwrap();
+        assert!(
+            end < 300,
+            "punctuation token stretched the band into the ignored tail: end={end}"
+        );
+        // Content-only band = [30, 51); the punctuation peak at 270 is ignored.
+        assert_eq!(
+            end,
+            40 + 1 + 10,
+            "band should bracket the content peak only"
+        );
+    }
+
+    #[test]
     fn speech_bounds_all_zero_attention_is_none() {
-        assert!(speech_frame_bounds(&[vec![0.0; 16], vec![0.0; 16]]).is_none());
-        assert!(speech_frame_bounds(&[]).is_none());
-        assert!(speech_frame_bounds(&[vec![]]).is_none());
+        assert!(speech_frame_bounds(&[vec![0.0; 16], vec![0.0; 16]], &[true, true]).is_none());
+        assert!(speech_frame_bounds(&[], &[]).is_none());
+        assert!(speech_frame_bounds(&[Vec::new()], &[]).is_none());
+    }
+
+    #[test]
+    fn speech_bounds_all_non_content_is_none() {
+        // Every token filtered out (pure punctuation) -> no content to bracket
+        // the band -> None, so the caller falls back to the duration window.
+        let frames = 30;
+        let attention = vec![
+            attention_peaking_at(frames, 10),
+            attention_peaking_at(frames, 20),
+        ];
+        let content = vec![false, false];
+        assert!(speech_frame_bounds(&attention, &content).is_none());
     }
 
     #[test]
@@ -426,7 +507,8 @@ mod tests {
         // side, clamped to the window.
         let frames = 200;
         let attention = vec![attention_peaking_at(frames, 100)];
-        let (start, end) = speech_frame_bounds(&attention).unwrap();
+        let content = vec![true];
+        let (start, end) = speech_frame_bounds(&attention, &content).unwrap();
         assert_eq!((start, end), (90, 111));
     }
 }
