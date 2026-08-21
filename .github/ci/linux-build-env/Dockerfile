@@ -17,6 +17,7 @@ RUN success=0; \
           curl \
           file \
           git \
+          gh \
           jq \
           libasound2-dev \
           ninja-build \
