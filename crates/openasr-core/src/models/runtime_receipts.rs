@@ -42,6 +42,52 @@ pub enum RuntimeReceiptAvailability {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeReceiptMetric {
+    Known(u64),
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeBackendOwnedReliability {
+    Complete,
+    Incomplete,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeResourceState {
+    Reserved,
+    Reconciled,
+    Committed,
+    Quarantined,
+    Released,
+}
+
+/// Safe native evidence attached to a reservation resource. Values are
+/// projections only: unavailable fields remain typed unavailable and no raw
+/// backend identity, pointer, or path reaches this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeNativeMemoryEvidence {
+    pub domain_kind: Option<SafeMemoryDomainKind>,
+    pub provider: Option<ExecutionProvider>,
+    pub backend_owned_reliability: RuntimeBackendOwnedReliability,
+    pub heap_index: Option<u32>,
+    pub total_bytes: RuntimeReceiptMetric,
+    pub budget_bytes: RuntimeReceiptMetric,
+    pub free_bytes: RuntimeReceiptMetric,
+    pub used_bytes: RuntimeReceiptMetric,
+    pub backend_owned_live_bytes: RuntimeReceiptMetric,
+    pub backend_owned_cached_bytes: RuntimeReceiptMetric,
+    pub backend_owned_workspace_bytes: RuntimeReceiptMetric,
+    pub backend_owned_high_water_bytes: RuntimeReceiptMetric,
+    pub stats_generation: RuntimeReceiptMetric,
+    pub quote_generation: RuntimeReceiptMetric,
+    pub claim_flags: u32,
+    pub observation_confidence: Option<MemoryObservationConfidence>,
+    pub broker_pending_bytes: RuntimeReceiptMetric,
+    pub broker_committed_bytes: RuntimeReceiptMetric,
+    pub broker_unreclaimable_bytes: RuntimeReceiptMetric,
+}
+
 impl RuntimeReceiptAvailability {
     pub(crate) const fn is_available(self) -> bool {
         matches!(self, Self::Available)
@@ -132,6 +178,7 @@ pub struct RuntimeResourceDescriptor {
     pub retained_bytes: u64,
     pub quote_confidence: QuoteConfidence,
     pub observation_confidence: Option<MemoryObservationConfidence>,
+    pub native: Option<RuntimeNativeMemoryEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +201,12 @@ pub enum RuntimeReceiptEvent {
         resource_id: RuntimeResourceId,
         descriptor: RuntimeResourceDescriptor,
     },
+    ResourceStateChanged {
+        owner_id: RuntimeOwnerId,
+        resource_id: RuntimeResourceId,
+        state: RuntimeResourceState,
+        descriptor: RuntimeResourceDescriptor,
+    },
     ResourceReleased {
         owner_id: RuntimeOwnerId,
         resource_id: RuntimeResourceId,
@@ -164,6 +217,7 @@ pub enum RuntimeReceiptEvent {
 pub struct LiveRuntimeResource {
     pub id: RuntimeResourceId,
     pub descriptor: RuntimeResourceDescriptor,
+    pub state: RuntimeResourceState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -348,7 +402,16 @@ impl RuntimeReceiptCollector {
             retained_bytes,
             quote_confidence,
             observation_confidence,
+            native: None,
         })
+    }
+
+    pub(crate) fn with_native_evidence(
+        mut descriptor: RuntimeResourceDescriptor,
+        native: RuntimeNativeMemoryEvidence,
+    ) -> RuntimeResourceDescriptor {
+        descriptor.native = Some(native);
+        descriptor
     }
 
     pub(crate) fn lane_projection(
@@ -506,6 +569,7 @@ impl RuntimeReceiptCollector {
                 LiveRuntimeResource {
                     id: resource_id,
                     descriptor: descriptor.clone(),
+                    state: RuntimeResourceState::Reserved,
                 },
             );
         Self::append_event(
@@ -522,6 +586,61 @@ impl RuntimeReceiptCollector {
             owner_id,
             resource_id,
         })
+    }
+
+    pub(crate) fn update_resource(
+        &self,
+        owner_id: RuntimeOwnerId,
+        resource_id: RuntimeResourceId,
+        descriptor: RuntimeResourceDescriptor,
+    ) -> bool {
+        if !self.is_available() {
+            return false;
+        }
+        let mut state = self.lock_state();
+        let Some(owner) = state.live_owners.get_mut(&owner_id) else {
+            Self::mark_incomplete(&mut state, ReceiptCompletenessReason::InvalidLifecycle);
+            return false;
+        };
+        let Some(resource) = owner.resources.get_mut(&resource_id) else {
+            Self::mark_incomplete(&mut state, ReceiptCompletenessReason::InvalidLifecycle);
+            return false;
+        };
+        resource.descriptor = descriptor;
+        true
+    }
+
+    pub(crate) fn transition_resource(
+        &self,
+        owner_id: RuntimeOwnerId,
+        resource_id: RuntimeResourceId,
+        next_state: RuntimeResourceState,
+    ) -> bool {
+        if !self.is_available() {
+            return false;
+        }
+        let mut state = self.lock_state();
+        let Some(owner) = state.live_owners.get_mut(&owner_id) else {
+            Self::mark_incomplete(&mut state, ReceiptCompletenessReason::InvalidLifecycle);
+            return false;
+        };
+        let Some(resource) = owner.resources.get_mut(&resource_id) else {
+            Self::mark_incomplete(&mut state, ReceiptCompletenessReason::InvalidLifecycle);
+            return false;
+        };
+        resource.state = next_state;
+        let descriptor = resource.descriptor.clone();
+        Self::append_event(
+            &mut state,
+            self.event_capacity,
+            RuntimeReceiptEvent::ResourceStateChanged {
+                owner_id,
+                resource_id,
+                state: next_state,
+                descriptor,
+            },
+        );
+        true
     }
 
     fn release_resource(&self, owner_id: RuntimeOwnerId, resource_id: RuntimeResourceId) {
@@ -681,6 +800,18 @@ impl fmt::Debug for RuntimeResourceGuard {
             .field("owner_id", &self.owner_id)
             .field("resource_id", &self.resource_id)
             .finish_non_exhaustive()
+    }
+}
+
+impl RuntimeResourceGuard {
+    pub(crate) fn set_state(&self, state: RuntimeResourceState) {
+        self.collector
+            .transition_resource(self.owner_id, self.resource_id, state);
+    }
+
+    pub(crate) fn update_descriptor(&self, descriptor: RuntimeResourceDescriptor) {
+        self.collector
+            .update_resource(self.owner_id, self.resource_id, descriptor);
     }
 }
 

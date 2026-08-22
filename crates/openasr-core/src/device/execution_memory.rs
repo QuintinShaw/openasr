@@ -23,6 +23,11 @@ use std::{
 
 use thiserror::Error;
 
+use crate::models::runtime_receipts::{
+    RuntimeOwnerDescriptor, RuntimeReceiptCollector, RuntimeReceiptMetric,
+    RuntimeResourceDescriptor, RuntimeResourceGuard, RuntimeResourceState,
+};
+
 /// Physical budget identity. Multiple APIs exposing the same PCI device must
 /// resolve to the same key before asking the broker.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -831,6 +836,8 @@ impl DeviceMemoryBrokerSet {
                     holds_exclusive_gate,
                     cohort,
                     quarantine_bytes: request.peak_bytes,
+                    receipt_resource: None,
+                    receipt_descriptor: None,
                 });
             }
             let state = if entries.is_empty() {
@@ -842,6 +849,7 @@ impl DeviceMemoryBrokerSet {
                 broker: Arc::clone(self),
                 entries,
                 state,
+                receipt_owner: None,
             });
         }
         drop(accounts);
@@ -904,6 +912,10 @@ struct ReservationEntry {
     /// transaction can commit. Reconciliation evidence may raise this above
     /// the provider's provisional estimate.
     quarantine_bytes: u64,
+    /// Diagnostic-only native ownership context. It mirrors this entry's
+    /// lifecycle but never participates in admission or accounting.
+    receipt_resource: Option<RuntimeResourceGuard>,
+    receipt_descriptor: Option<RuntimeResourceDescriptor>,
 }
 
 /// RAII ownership for all physical domains retained by one concrete runtime
@@ -913,9 +925,102 @@ pub struct DeviceMemoryReservationBatch {
     broker: Arc<DeviceMemoryBrokerSet>,
     entries: Vec<ReservationEntry>,
     state: ReservationState,
+    /// Diagnostic-only owner context. Declared after entries so resource guards
+    /// drop before their owner guard and cannot leave dangling receipt rows.
+    receipt_owner: Option<crate::models::runtime_receipts::RuntimeOwnerGuard>,
 }
 
 impl DeviceMemoryReservationBatch {
+    /// Attaches bounded receipt evidence to an already-admitted batch. This is
+    /// deliberately post-admission and one-way: receipt allocation cannot
+    /// reject, resize, or otherwise alter the broker ledger.
+    pub(crate) fn attach_receipt(
+        &mut self,
+        collector: RuntimeReceiptCollector,
+        owner_descriptor: RuntimeOwnerDescriptor,
+        resources: Vec<(MemoryDomainKey, RuntimeResourceDescriptor)>,
+    ) {
+        if !collector.is_available() || self.entries.is_empty() {
+            return;
+        }
+        let mut resources = resources.into_iter().collect::<HashMap<_, _>>();
+        let owner = collector.start_owner(
+            owner_descriptor,
+            crate::models::native_execution_services::current_execution_cache_attempt_id(),
+        );
+        let Some(owner_id) = owner.owner_id() else {
+            return;
+        };
+        for entry in &mut self.entries {
+            let Some(descriptor) = resources.remove(&entry.domain) else {
+                continue;
+            };
+            entry.receipt_resource = collector.acquire_resource(owner_id, descriptor.clone());
+            entry.receipt_descriptor = entry.receipt_resource.as_ref().map(|_| descriptor);
+        }
+        self.receipt_owner = Some(owner);
+    }
+
+    pub(crate) fn update_receipt_descriptors(
+        &mut self,
+        resources: Vec<(MemoryDomainKey, RuntimeResourceDescriptor)>,
+    ) {
+        let mut resources = resources.into_iter().collect::<HashMap<_, _>>();
+        for entry in &mut self.entries {
+            let (Some(resource), Some(descriptor)) = (
+                entry.receipt_resource.as_ref(),
+                resources.remove(&entry.domain),
+            ) else {
+                continue;
+            };
+            resource.update_descriptor(descriptor.clone());
+            entry.receipt_descriptor = Some(descriptor);
+        }
+    }
+    fn refresh_receipt_broker_projection(&self) {
+        for entry in &self.entries {
+            let Some(resource) = entry.receipt_resource.as_ref() else {
+                continue;
+            };
+            let Some(mut descriptor) = entry.receipt_descriptor.clone() else {
+                continue;
+            };
+            let Some(native) = descriptor.native.as_mut() else {
+                continue;
+            };
+            let usage = self.broker.usage(&entry.domain);
+            native.broker_pending_bytes = RuntimeReceiptMetric::Known(usage.pending_bytes);
+            native.broker_committed_bytes = RuntimeReceiptMetric::Known(usage.committed_bytes);
+            native.broker_unreclaimable_bytes =
+                RuntimeReceiptMetric::Known(usage.unreclaimable_bytes);
+            resource.update_descriptor(descriptor.clone());
+        }
+    }
+
+    pub(crate) fn domain_usage(&self, domain: &MemoryDomainKey) -> DeviceMemoryUsage {
+        self.broker.usage(domain)
+    }
+
+    fn transition_receipt_state(&self, next_state: RuntimeResourceState) {
+        for entry in &self.entries {
+            if let Some(resource) = entry.receipt_resource.as_ref() {
+                resource.set_state(next_state);
+            }
+        }
+    }
+
+    fn prepare_receipt_descriptor(
+        entry: &mut ReservationEntry,
+        peak_bytes: u64,
+        retained_bytes: u64,
+    ) {
+        if let Some(mut descriptor) = entry.receipt_descriptor.clone() {
+            descriptor.peak_bytes = descriptor.peak_bytes.max(peak_bytes);
+            descriptor.retained_bytes = descriptor.retained_bytes.max(retained_bytes);
+            entry.receipt_descriptor = Some(descriptor);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -1106,8 +1211,19 @@ impl DeviceMemoryReservationBatch {
             account.committed_bytes += *committed_bytes;
             release_exclusive_child(account, entry);
             entry.committed_bytes = *committed_bytes;
+            let reconciliation = by_domain
+                .get(&entry.domain)
+                .expect("reconciliation domain set validated above");
+            Self::prepare_receipt_descriptor(
+                entry,
+                reconciliation.actual_peak_bytes,
+                reconciliation.actual_retained_bytes,
+            );
         }
         drop(accounts);
+        self.refresh_receipt_broker_projection();
+        self.transition_receipt_state(RuntimeResourceState::Reconciled);
+        self.transition_receipt_state(RuntimeResourceState::Committed);
         self.state = ReservationState::Committed;
         Ok(())
     }
@@ -1153,6 +1269,9 @@ impl DeviceMemoryReservationBatch {
                 account.quarantined = true;
             }
         }
+        drop(accounts);
+        self.refresh_receipt_broker_projection();
+        self.transition_receipt_state(RuntimeResourceState::Quarantined);
         self.state = ReservationState::Quarantined;
     }
 
@@ -1291,7 +1410,11 @@ impl DeviceMemoryReservationBatch {
             account.committed_bytes += *committed_bytes;
             release_exclusive_child(account, entry);
             entry.committed_bytes = *committed_bytes;
+            Self::prepare_receipt_descriptor(entry, *committed_bytes, *committed_bytes);
         }
+        drop(accounts);
+        self.refresh_receipt_broker_projection();
+        self.transition_receipt_state(RuntimeResourceState::Committed);
         self.state = ReservationState::Committed;
         Ok(())
     }
@@ -1317,6 +1440,9 @@ impl DeviceMemoryReservationBatch {
                 ReservationState::Quarantined | ReservationState::Released => {}
             }
         }
+        drop(accounts);
+        self.refresh_receipt_broker_projection();
+        self.transition_receipt_state(RuntimeResourceState::Released);
         self.state = ReservationState::Released;
     }
 }
@@ -2215,6 +2341,108 @@ mod tests {
         assert!(broker.usage(&domain()).quarantined);
     }
 
+    #[test]
+    fn receipt_lifecycle_mirrors_commit_quarantine_and_release_without_changing_ledger() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let collector = RuntimeReceiptCollector::new_for_test(
+            crate::models::native_execution_services::NativeExecutionScopeId::next(),
+            64,
+        )
+        .unwrap();
+        let mut lease = broker
+            .try_reserve_batch(vec![request(
+                domain(),
+                7 * GIB,
+                GIB,
+                GIB / 2,
+                "native-hook",
+            )])
+            .unwrap();
+        let owner = collector
+            .owner_descriptor("native-memory-test", None, Some("native-hook"), None)
+            .unwrap();
+        let resource = collector
+            .resource_descriptor(
+                "native-memory-domain",
+                &domain(),
+                GIB,
+                GIB,
+                GIB / 2,
+                QuoteConfidence::CommittedUpperBound,
+                Some(MemoryObservationConfidence::DeviceSnapshot),
+            )
+            .unwrap();
+        lease.attach_receipt(collector.clone(), owner, vec![(domain(), resource)]);
+        assert_eq!(
+            collector.snapshot().live_owners[0]
+                .resources
+                .values()
+                .next()
+                .unwrap()
+                .state,
+            RuntimeResourceState::Reserved
+        );
+        lease.commit_quoted().unwrap();
+        assert_eq!(
+            collector.snapshot().live_owners[0]
+                .resources
+                .values()
+                .next()
+                .unwrap()
+                .state,
+            RuntimeResourceState::Committed
+        );
+        assert_eq!(broker.usage(&domain()).committed_bytes, GIB / 2);
+        lease.quarantine();
+        assert_eq!(
+            collector.snapshot().live_owners[0]
+                .resources
+                .values()
+                .next()
+                .unwrap()
+                .state,
+            RuntimeResourceState::Quarantined
+        );
+        drop(lease);
+        assert_eq!(broker.usage(&domain()).unreclaimable_bytes, GIB / 2);
+        assert_eq!(collector.summary().live_owner_count, 0);
+    }
+
+    #[test]
+    fn unavailable_receipts_are_a_no_op_and_never_block_admission() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let unavailable = RuntimeReceiptCollector::new_with_entropy_failure_for_test(
+            crate::models::native_execution_services::NativeExecutionScopeId::next(),
+        );
+        let available = RuntimeReceiptCollector::new_for_test(
+            crate::models::native_execution_services::NativeExecutionScopeId::next(),
+            8,
+        )
+        .unwrap();
+        let owner = available
+            .owner_descriptor("unavailable", None, None, None)
+            .unwrap();
+        let mut lease = broker
+            .try_reserve_batch(vec![request(
+                domain(),
+                7 * GIB,
+                1,
+                1,
+                "receipt-unavailable",
+            )])
+            .unwrap();
+        lease.attach_receipt(unavailable.clone(), owner, Vec::new());
+        assert_eq!(unavailable.summary().live_owner_count, 0);
+        assert_eq!(broker.usage(&domain()).pending_bytes, 1);
+        drop(lease);
+        assert_eq!(broker.usage(&domain()), DeviceMemoryUsage::default());
+    }
     #[test]
     fn impossible_free_snapshot_is_clamped_to_total() {
         let normalized = DeviceMemorySnapshot {
