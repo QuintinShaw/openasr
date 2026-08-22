@@ -69,7 +69,8 @@ pub(crate) use cpu_graph::{
     GgmlBackendCapabilities, GgmlCpuGraphBuilder, GgmlCpuTensor, GgmlFlashAttentionPrecision,
     GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext,
     GgmlMatmulPrecision, GgmlNativeGqaCapability, GgmlPersistentGraphSession, GgmlRopeExtParams,
-    GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlStaticTensor, GgmlStaticTensorArena, ResidentDeviceCopyCapability,
+    ResidentHostImportCapability,
 };
 pub(crate) use env_flags::{env_toggle_with_raw, env_var_truthy};
 pub use execution_telemetry::{

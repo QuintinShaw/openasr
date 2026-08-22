@@ -49,6 +49,11 @@
 //!   host owner, prepared-runtime owner, or dedicated pinned actor. Family-local
 //!   `unsafe impl Send` wrappers and retired thread-affine checkout shapes are
 //!   forbidden.
+//!
+//! - **Resident footprint:** [`resident_footprint_inventory_is_complete`] locks every
+//!   live descriptor to a validated, backend-neutral topology with both binding
+//!   alternatives, explicit split/unified variants, and bounded checkout/session
+//!   limits. Construction/publication contracts are tested below.
 
 #![cfg(test)]
 
@@ -56,6 +61,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::arch::OpenAsrArchitectureRegistry;
+use crate::arch::runtime_footprint::{ResidentPlacementVariant, ResidentRepresentation};
 use crate::models::family_source_gates::ProductionSyntax;
 
 /// The committed K1 inventory (see the file's own header for the contract).
@@ -83,6 +89,150 @@ const RESIDENT_CACHE_PRIMITIVES: &[&str] = &[
     "AdmittedHostObjectCache",
     "PreparedRuntimeCache",
     "runtime_prepared_registry",
+];
+
+/// Construction/publication surfaces are explicit so adding a new owner path
+/// requires an inventory row and a reviewable symbol, rather than merely adding a
+/// word to a denylist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ResidentSurface {
+    Models,
+    GgmlRuntime,
+    Auxiliary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResidentSiteStatus {
+    Active,
+    CompatibilitySeam,
+}
+
+const RESIDENT_CONSTRUCTION_PUBLICATION_INVENTORY: &[(
+    ResidentSurface,
+    &str,
+    &str,
+    ResidentSiteStatus,
+)] = &[
+    (
+        ResidentSurface::Models,
+        "models/admitted_exclusive_object_pool.rs",
+        "AdmittedExclusiveObjectPool",
+        ResidentSiteStatus::Active,
+    ),
+    (
+        ResidentSurface::Models,
+        "models/admitted_host_object_cache.rs",
+        "AdmittedHostObjectCache",
+        ResidentSiteStatus::Active,
+    ),
+    (
+        ResidentSurface::Models,
+        "models/admitted_pinned_runtime_actor_pool.rs",
+        "AdmittedPinnedRuntimeActorCheckoutPool",
+        ResidentSiteStatus::Active,
+    ),
+    (
+        ResidentSurface::Models,
+        "models/admitted_pinned_runtime_actor_pool.rs",
+        "AdmittedPinnedRuntimeActorPool",
+        ResidentSiteStatus::Active,
+    ),
+    (
+        ResidentSurface::Models,
+        "models/admitted_pinned_runtime_actor_pool.rs",
+        "PinnedRuntimeActorCheckout",
+        ResidentSiteStatus::Active,
+    ),
+    (
+        ResidentSurface::Models,
+        "models/prepared_runtime_cache.rs",
+        "PreparedRuntimeCache",
+        ResidentSiteStatus::Active,
+    ),
+    (
+        ResidentSurface::Models,
+        "models/runtime_prepared_registry.rs",
+        "BuiltinPreparedRuntimeCache",
+        ResidentSiteStatus::Active,
+    ),
+    (
+        ResidentSurface::Models,
+        "models/resident_owner.rs",
+        "ResidentCheckoutPool",
+        ResidentSiteStatus::CompatibilitySeam,
+    ),
+    (
+        ResidentSurface::GgmlRuntime,
+        "ggml_runtime/backend_memory.rs",
+        "BackendMemoryAbi",
+        ResidentSiteStatus::Active,
+    ),
+    (
+        ResidentSurface::GgmlRuntime,
+        "ggml_runtime/backend_memory_admission.rs",
+        "NativeMemoryAllocationTransaction",
+        ResidentSiteStatus::Active,
+    ),
+    (
+        ResidentSurface::GgmlRuntime,
+        "ggml_runtime/cpu_graph.rs",
+        "GgmlLoadedWeightContext",
+        ResidentSiteStatus::CompatibilitySeam,
+    ),
+    (
+        ResidentSurface::GgmlRuntime,
+        "ggml_runtime/cpu_graph.rs",
+        "LOADED_WEIGHT_CONTEXT_BY_KEY",
+        ResidentSiteStatus::CompatibilitySeam,
+    ),
+    (
+        ResidentSurface::GgmlRuntime,
+        "ggml_runtime/cpu_graph.rs",
+        "THREAD_BACKEND_CACHE_BY_KIND",
+        ResidentSiteStatus::CompatibilitySeam,
+    ),
+    (
+        ResidentSurface::GgmlRuntime,
+        "ggml_runtime/cpu_graph.rs",
+        "GgmlCpuStepBufferPool",
+        ResidentSiteStatus::Active,
+    ),
+    (
+        ResidentSurface::Auxiliary,
+        "models/policy_resolved_aux_runtime.rs",
+        "AuxiliaryRuntimeOwnerCache",
+        ResidentSiteStatus::Active,
+    ),
+    (
+        ResidentSurface::Auxiliary,
+        "models/policy_resolved_aux_runtime.rs",
+        "AuxiliaryPinnedRuntimeCacheKey",
+        ResidentSiteStatus::Active,
+    ),
+    (
+        ResidentSurface::Auxiliary,
+        "models/policy_resolved_aux_runtime.rs",
+        "AuxiliaryRuntimeCacheKey",
+        ResidentSiteStatus::Active,
+    ),
+    (
+        ResidentSurface::Auxiliary,
+        "diarize/embed/policy_runtime.rs",
+        "AuxiliaryRuntimeCacheKey",
+        ResidentSiteStatus::Active,
+    ),
+    (
+        ResidentSurface::Auxiliary,
+        "diarize/segment/policy_runtime.rs",
+        "AuxiliaryRuntimeCacheKey",
+        ResidentSiteStatus::Active,
+    ),
+    (
+        ResidentSurface::Auxiliary,
+        "diarize/vad/firered_stream/realtime_runtime.rs",
+        "PinnedRuntimeActorCheckout",
+        ResidentSiteStatus::Active,
+    ),
 ];
 
 /// The dedicated-executor file names that mark a `models/<family>/` directory
@@ -127,6 +277,243 @@ fn models_relative(models_dir: &Path, file: &Path) -> String {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn source_relative(src_root: &Path, file: &Path) -> String {
+    file.strip_prefix(src_root)
+        .expect("file under src root")
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn resident_symbol_class(symbol: &str) -> Option<&'static str> {
+    let lower = symbol.to_ascii_lowercase();
+    if lower.starts_with("test") || lower.contains("profile") {
+        return None;
+    }
+    if matches!(
+        symbol,
+        "BackendMemoryAbi"
+            | "GgmlLoadedWeightContext"
+            | "GgmlCpuStepBufferPool"
+            | "LOADED_WEIGHT_CONTEXT_BY_KEY"
+            | "THREAD_BACKEND_CACHE_BY_KIND"
+    ) {
+        return Some(match symbol {
+            "BackendMemoryAbi" => "backend-memory",
+            "GgmlLoadedWeightContext" => "loaded-weight-context",
+            "GgmlCpuStepBufferPool" => "step-buffer-pool",
+            "LOADED_WEIGHT_CONTEXT_BY_KEY" | "THREAD_BACKEND_CACHE_BY_KIND" => "tls-cache",
+            _ => unreachable!(),
+        });
+    }
+    if lower.contains("residentcache") {
+        Some("resident-cache")
+    } else if lower.contains("runtimecache")
+        && !lower.contains("cachekey")
+        && !lower.contains("error")
+    {
+        Some("runtime-cache")
+    } else if lower.ends_with("runtimepool")
+        || lower.ends_with("runtimeownerpool")
+        || lower.ends_with("actorpool")
+    {
+        Some("actor-pool")
+    } else if lower.ends_with("actorcheckout") {
+        Some("actor-checkout")
+    } else if lower == "admittedexclusiveobjectpool"
+        || lower == "admittedhostobjectcache"
+        || lower == "admittedpinnedruntimeactorpool"
+        || lower == "admittedpinnedruntimeactorcheckoutpool"
+        || lower == "builtinpreparedruntimecache"
+        || lower == "preparedruntimecache"
+        || lower == "auxiliaryruntimeownercache"
+        || lower == "auxiliarypinnedruntimecachekey"
+        || lower == "auxiliaryruntimecachekey"
+        || lower == "residentcheckoutpool"
+        || lower == "nativememoryallocationtransaction"
+        || lower == "pinnedruntimeactorcheckout"
+    {
+        Some("resident-owner")
+    } else {
+        None
+    }
+}
+
+fn resident_inventory_set() -> BTreeSet<(String, String, String)> {
+    let mut inventory: BTreeSet<_> = RESIDENT_CONSTRUCTION_PUBLICATION_INVENTORY
+        .iter()
+        .filter(|(_, path, symbol, _)| {
+            !matches!(
+                (*path, *symbol),
+                (
+                    "diarize/embed/policy_runtime.rs",
+                    "AuxiliaryRuntimeCacheKey"
+                ) | (
+                    "diarize/segment/policy_runtime.rs",
+                    "AuxiliaryRuntimeCacheKey"
+                ) | (
+                    "diarize/vad/firered_stream/realtime_runtime.rs",
+                    "PinnedRuntimeActorCheckout"
+                )
+            )
+        })
+        .filter_map(|(_, path, symbol, _)| {
+            resident_symbol_class(symbol).map(|class| {
+                (
+                    (*path).to_string(),
+                    (*symbol).to_string(),
+                    class.to_string(),
+                )
+            })
+        })
+        .collect();
+    for (path, symbol) in [
+        ("models/cohere/ggml_executor.rs", "CohereDecoderRuntimePool"),
+        ("models/cohere/ggml_executor.rs", "CohereEncoderRuntimePool"),
+        ("models/cohere/ggml_executor.rs", "CohereUnifiedRuntimePool"),
+        ("models/dolphin/executor.rs", "DolphinPreparedRuntimePool"),
+        (
+            "models/firered_aed/executor.rs",
+            "FireRedAedDecoderRuntimePool",
+        ),
+        (
+            "models/firered_aed/executor.rs",
+            "FireRedAedEncoderRuntimePool",
+        ),
+        (
+            "models/firered_aed/executor.rs",
+            "FireRedAedRuntimeOwnerPool",
+        ),
+        (
+            "models/firered_llm/executor.rs",
+            "FireRedLlmDecoderRuntimePool",
+        ),
+        (
+            "models/firered_llm/executor.rs",
+            "FireRedLlmUnifiedRuntimePool",
+        ),
+        (
+            "models/funasr_nano/executor.rs",
+            "FunasrNanoDecoderRuntimePool",
+        ),
+        (
+            "models/funasr_nano/executor.rs",
+            "FunasrNanoEncoderAdapterRuntimePool",
+        ),
+        (
+            "models/funasr_nano/executor.rs",
+            "FunasrNanoUnifiedRuntimePool",
+        ),
+        (
+            "models/granite_speech/executor.rs",
+            "GraniteSpeechPreparedRuntimePool",
+        ),
+        ("models/mimo_asr/executor.rs", "MimoAsrPreparedRuntimePool"),
+        (
+            "models/moonshine/ggml_executor.rs",
+            "MoonshineDecoderRuntimePool",
+        ),
+        (
+            "models/moonshine/ggml_executor.rs",
+            "MoonshineEncoderRuntimePool",
+        ),
+        (
+            "models/moss_transcribe_diarize/executor.rs",
+            "MossTdDecoderRuntimePool",
+        ),
+        (
+            "models/moss_transcribe_diarize/executor.rs",
+            "MossTdEncoderRuntimePool",
+        ),
+        (
+            "models/moss_transcribe_diarize/executor.rs",
+            "MossTdUnifiedRuntimePool",
+        ),
+        ("models/parakeet_ctc/executor.rs", "ParakeetCtcRuntimePool"),
+        ("models/parakeet_tdt/executor.rs", "ParakeetTdtRuntimePool"),
+        (
+            "models/qwen/ggml_executor.rs",
+            "Qwen3AsrAudioEncoderRuntimePool",
+        ),
+        (
+            "models/qwen/ggml_executor.rs",
+            "Qwen3AsrDecoderActorCheckout",
+        ),
+        ("models/qwen/ggml_executor.rs", "Qwen3AsrDecoderRuntimePool"),
+        ("models/qwen/ggml_executor.rs", "Qwen3AsrRuntimeOwnerPool"),
+        ("models/sensevoice/executor.rs", "SenseVoiceRuntimePool"),
+        ("models/wav2vec2_ctc/executor.rs", "Wav2Vec2RuntimePool"),
+        (
+            "models/whisper/ggml_executor.rs",
+            "WhisperDecoderRuntimePool",
+        ),
+        (
+            "models/whisper/ggml_executor.rs",
+            "WhisperEncoderRuntimePool",
+        ),
+        (
+            "models/whisper/ggml_executor.rs",
+            "WhisperUnifiedRuntimePool",
+        ),
+        ("models/xasr_zipformer/runtime.rs", "XasrRuntimeActorPool"),
+    ] {
+        inventory.insert((
+            path.to_string(),
+            symbol.to_string(),
+            if symbol.ends_with("ActorCheckout") {
+                "actor-checkout".to_string()
+            } else {
+                "actor-pool".to_string()
+            },
+        ));
+    }
+    inventory
+}
+
+fn declared_symbols(source: &str) -> impl Iterator<Item = String> + '_ {
+    source.lines().filter_map(|line| {
+        let mut line = line.trim();
+        for prefix in ["pub(crate) ", "pub(super) ", "pub ", "unsafe "] {
+            line = line.strip_prefix(prefix).unwrap_or(line);
+        }
+        for keyword in ["struct ", "enum ", "type ", "static ", "const ", "impl "] {
+            let Some(rest) = line.strip_prefix(keyword) else {
+                continue;
+            };
+            let symbol: String = rest
+                .chars()
+                .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+                .collect();
+            if !symbol.is_empty() {
+                return Some(symbol);
+            }
+        }
+        None
+    })
+}
+
+/// Inventory-independent machine discovery. It scans declarations and TLS/static
+/// publication shapes across the supplied Rust source tree, classifies only
+/// resident-shaped symbols, and returns `(path, symbol, class)` identities.
+fn discover_resident_construction_inventory(src_root: &Path) -> BTreeSet<(String, String, String)> {
+    let mut files = Vec::new();
+    collect_rs_files(src_root, &mut files);
+    let mut discovered = BTreeSet::new();
+    for file in files {
+        let relative = source_relative(src_root, &file);
+        let source = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("read resident source {}: {error}", file.display()));
+        for symbol in declared_symbols(&source) {
+            let Some(class) = resident_symbol_class(&symbol) else {
+                continue;
+            };
+            discovered.insert((relative.clone(), symbol, class.to_string()));
+        }
+    }
+    discovered
 }
 
 /// K1: the on-disk set of host-f32 loader sites must equal the committed
@@ -218,6 +605,175 @@ fn registered_ggml_executor_families() -> BTreeSet<String> {
         .iter()
         .map(|descriptor| descriptor.identity.module_slug.to_string())
         .collect()
+}
+
+#[test]
+fn resident_footprint_inventory_is_complete() {
+    let registry = OpenAsrArchitectureRegistry::with_builtins();
+    let descriptors = registry.descriptors();
+    assert_eq!(
+        descriptors.len(),
+        16,
+        "the live ASR inventory must have one resident footprint row per architecture"
+    );
+
+    let mut module_slugs = BTreeSet::new();
+    for descriptor in descriptors {
+        assert!(
+            module_slugs.insert(descriptor.identity.module_slug),
+            "resident footprint inventory has a duplicate module slug: {}",
+            descriptor.identity.module_slug
+        );
+        descriptor
+            .resident_footprint
+            .validate()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "resident footprint for {} is invalid: {error:?}",
+                    descriptor.identity.model_architecture
+                )
+            });
+        assert!(
+            descriptor.resident_footprint.component_count() > 0,
+            "resident footprint for {} is empty",
+            descriptor.identity.model_architecture
+        );
+
+        for component in descriptor.resident_footprint.components() {
+            assert!(
+                component
+                    .representations()
+                    .contains(&ResidentRepresentation::HostImportedBinding),
+                "{} component {} must declare host-import representation alternative",
+                descriptor.identity.model_architecture,
+                component.component()
+            );
+            assert!(
+                component
+                    .representations()
+                    .contains(&ResidentRepresentation::DeviceCopiedBinding),
+                "{} component {} must declare device-copy representation alternative",
+                descriptor.identity.model_architecture,
+                component.component()
+            );
+            assert!(
+                component.checkout().max_instances() > 0,
+                "{} component {} has an unbounded/zero checkout maximum",
+                descriptor.identity.model_architecture,
+                component.component()
+            );
+        }
+        for placement in [
+            ResidentPlacementVariant::Unified,
+            ResidentPlacementVariant::Split,
+        ] {
+            assert!(
+                descriptor
+                    .resident_footprint
+                    .components()
+                    .iter()
+                    .any(|component| component.placement_variants().contains(&placement)),
+                "{} resident footprint has no component for {placement:?} placement",
+                descriptor.identity.model_architecture
+            );
+        }
+    }
+}
+
+#[test]
+fn resident_construction_publication_inventory_is_complete() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut surfaces = BTreeSet::new();
+    for (surface, relative, symbol, _status) in RESIDENT_CONSTRUCTION_PUBLICATION_INVENTORY {
+        let path = root.join(relative);
+        assert!(
+            path.is_file(),
+            "resident inventory path is missing: {relative}"
+        );
+        surfaces.insert(*surface);
+        let syntax = ProductionSyntax::collect(&path);
+        assert!(
+            syntax.references_identifier(symbol) || syntax.calls_or_invokes_method(symbol),
+            "resident inventory path {relative} does not expose canonical symbol {symbol}"
+        );
+    }
+    assert!(surfaces.contains(&ResidentSurface::Models));
+    assert!(surfaces.contains(&ResidentSurface::GgmlRuntime));
+    assert!(surfaces.contains(&ResidentSurface::Auxiliary));
+}
+
+#[test]
+fn k5_machine_discovery_matches_resident_construction_inventory_both_directions() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let discovered = discover_resident_construction_inventory(&root);
+    let inventory = resident_inventory_set();
+    let unlisted: Vec<_> = discovered.difference(&inventory).cloned().collect();
+    let stale: Vec<_> = inventory.difference(&discovered).cloned().collect();
+    assert!(
+        unlisted.is_empty(),
+        "K5 resident construction discovery found unlisted surfaces: {unlisted:?}"
+    );
+    assert!(
+        stale.is_empty(),
+        "K5 resident construction inventory has stale surfaces: {stale:?}"
+    );
+
+    let fixture_root = tempfile::tempdir().expect("K5 fixture root");
+    std::fs::write(
+        fixture_root.path().join("fixture.rs"),
+        "struct FooResidentCache;\n",
+    )
+    .expect("write K5 resident fixture");
+    let fixture = (
+        "fixture.rs".to_string(),
+        "FooResidentCache".to_string(),
+        "resident-cache".to_string(),
+    );
+    let fixture_discovered = discover_resident_construction_inventory(fixture_root.path());
+    assert!(
+        fixture_discovered.contains(&fixture),
+        "K5 fixture must be discovered from real Rust syntax"
+    );
+    assert!(
+        fixture_discovered
+            .difference(&inventory)
+            .any(|row| row == &fixture),
+        "K5 fixture must fail the unlisted-side difference"
+    );
+}
+
+#[test]
+fn compatibility_seams_are_explicitly_inventoried() {
+    let seams: BTreeSet<_> = RESIDENT_CONSTRUCTION_PUBLICATION_INVENTORY
+        .iter()
+        .filter_map(|(_, path, symbol, status)| {
+            (*status == ResidentSiteStatus::CompatibilitySeam).then_some((*path, *symbol))
+        })
+        .collect();
+    assert!(seams.contains(&("ggml_runtime/cpu_graph.rs", "LOADED_WEIGHT_CONTEXT_BY_KEY")));
+    assert!(seams.contains(&("ggml_runtime/cpu_graph.rs", "THREAD_BACKEND_CACHE_BY_KIND")));
+    assert!(seams.contains(&("models/resident_owner.rs", "ResidentCheckoutPool")));
+}
+
+#[test]
+fn footprint_construction_is_arch_private() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/arch/runtime_footprint.rs");
+    let source = std::fs::read_to_string(path).expect("read footprint source");
+    for forbidden in [
+        "pub(crate) struct ResidentTopologyInputs",
+        "pub(crate) const fn new(components",
+        "pub(crate) const fn new(\n        component:",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "family/model code must not receive a public footprint construction seam: {forbidden}"
+        );
+    }
+    assert!(source.contains("pub(super) struct ResidentTopologyInputs"));
+    assert!(source.contains("pub(super) const fn new(components"));
+    assert!(!source.contains("    pub(crate) architecture:"));
+    assert!(!source.contains("    pub(crate) spec:"));
+    assert!(!source.contains("    pub(crate) verified_pack:"));
 }
 
 /// K2 completeness lock: the inventory-derived family set must equal the

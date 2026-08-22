@@ -1706,13 +1706,76 @@ impl GgmlStaticTensorArenaUsage {
     }
 }
 
+#[allow(dead_code)]
+enum GgmlWeightMaterialization {
+    HostImported {
+        source_identity: super::StrongFileIdentity,
+        _buffer: GgmlBackendBufferGuard,
+        _mmap: std::sync::Arc<Mmap>,
+        _pack_weight_residency: Option<PackWeightResidencyHandle>,
+    },
+    DeviceCopied {
+        lane: crate::models::native_execution_services::ExecutionLaneKey,
+        _buffer: GgmlBackendBufferGuard,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GgmlWeightMaterializationKind {
+    HostImported,
+    DeviceCopied,
+}
+
+#[allow(dead_code)]
+impl GgmlWeightMaterialization {
+    fn kind(&self) -> GgmlWeightMaterializationKind {
+        match self {
+            Self::HostImported { .. } => GgmlWeightMaterializationKind::HostImported,
+            Self::DeviceCopied { .. } => GgmlWeightMaterializationKind::DeviceCopied,
+        }
+    }
+
+    fn host_import_capability_for_kind(
+        kind: GgmlWeightMaterializationKind,
+        source_identity: Option<super::StrongFileIdentity>,
+    ) -> Option<ResidentHostImportCapability> {
+        match (kind, source_identity) {
+            (GgmlWeightMaterializationKind::HostImported, Some(source_identity)) => {
+                Some(ResidentHostImportCapability { source_identity })
+            }
+            (GgmlWeightMaterializationKind::HostImported, None)
+            | (GgmlWeightMaterializationKind::DeviceCopied, _) => None,
+        }
+    }
+
+    fn host_import_capability(&self) -> Option<ResidentHostImportCapability> {
+        match self {
+            Self::HostImported {
+                source_identity, ..
+            } => Self::host_import_capability_for_kind(self.kind(), Some(*source_identity)),
+            Self::DeviceCopied { .. } => Self::host_import_capability_for_kind(self.kind(), None),
+        }
+    }
+
+    fn buffer(&self) -> &GgmlBackendBufferGuard {
+        match self {
+            Self::HostImported { _buffer, .. } | Self::DeviceCopied { _buffer, .. } => _buffer,
+        }
+    }
+
+    fn mmap(&self) -> Option<&std::sync::Arc<Mmap>> {
+        match self {
+            Self::HostImported { _mmap, .. } => Some(_mmap),
+            Self::DeviceCopied { .. } => None,
+        }
+    }
+}
+
 struct GgmlLoadedWeightContextInner {
+    #[allow(dead_code)]
+    materialization: GgmlWeightMaterialization,
     _context: GgmlContextGuard,
-    _buffer: GgmlBackendBufferGuard,
-    _mmap: Option<std::sync::Arc<Mmap>>,
-    /// Shared SystemMemory charge for this open pack mapping (FILE_BACKED host
-    /// import path). Kept alive for every stage that binds the same mmap.
-    _pack_weight_residency: Option<PackWeightResidencyHandle>,
     tensors: HashMap<String, GgmlLoadedTensor>,
 }
 
@@ -1724,6 +1787,61 @@ struct GgmlLoadedWeightContextInner {
 #[derive(Clone)]
 pub(crate) struct GgmlLoadedWeightContext {
     inner: Rc<GgmlLoadedWeightContextInner>,
+}
+
+/// Opaque proof that the real GGML loaded-weight import completed for one
+/// exact source generation. Only this module can construct it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ResidentHostImportCapability {
+    source_identity: super::StrongFileIdentity,
+}
+
+/// Opaque proof that a real GGML device-copy allocation has been selected on
+/// one concrete execution lane. Only the backend seam can construct it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ResidentDeviceCopyCapability {
+    lane: crate::models::native_execution_services::ExecutionLaneKey,
+}
+
+impl GgmlLoadedWeightContext {
+    #[allow(dead_code)]
+    pub(crate) fn resident_host_import_capability(&self) -> Option<ResidentHostImportCapability> {
+        self.inner.materialization.host_import_capability()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resident_device_copy_capability(&self) -> Option<ResidentDeviceCopyCapability> {
+        match &self.inner.materialization {
+            GgmlWeightMaterialization::HostImported { .. } => None,
+            GgmlWeightMaterialization::DeviceCopied { lane, .. } => {
+                Some(ResidentDeviceCopyCapability { lane: lane.clone() })
+            }
+        }
+    }
+}
+
+impl ResidentHostImportCapability {
+    pub(crate) fn proves_preflight(self, preflight: &super::GgufRuntimeSourcePreflight) -> bool {
+        self.source_identity == preflight.runtime_source().strong_file_identity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(source_identity: super::StrongFileIdentity) -> Self {
+        Self { source_identity }
+    }
+}
+
+impl ResidentDeviceCopyCapability {
+    pub(crate) fn lane(&self) -> &crate::models::native_execution_services::ExecutionLaneKey {
+        &self.lane
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        lane: crate::models::native_execution_services::ExecutionLaneKey,
+    ) -> Self {
+        Self { lane }
+    }
 }
 
 /// Opaque diagnostic identity for one pack-wide native weight binding.
@@ -2215,6 +2333,7 @@ impl GgmlCpuGraphRunner {
             source,
             &reader,
             self.backend.raw,
+            self.backend_kind,
             require_direct_backend_matmul_support,
         )?;
         LOADED_WEIGHT_CONTEXT_BY_KEY.with(|cache| {
@@ -2540,9 +2659,20 @@ impl GgmlLoadedWeightContext {
     }
 
     fn record_receipt_reuse(&self) {
-        self.inner._buffer.record_receipt_reuse();
-        if let Some(residency) = self.inner._pack_weight_residency.as_ref() {
-            residency.record_receipt_reuse();
+        match &self.inner.materialization {
+            GgmlWeightMaterialization::HostImported {
+                _buffer,
+                _pack_weight_residency,
+                ..
+            } => {
+                _buffer.record_receipt_reuse();
+                if let Some(residency) = _pack_weight_residency.as_ref() {
+                    residency.record_receipt_reuse();
+                }
+            }
+            GgmlWeightMaterialization::DeviceCopied { _buffer, .. } => {
+                _buffer.record_receipt_reuse();
+            }
         }
     }
 
@@ -2560,6 +2690,7 @@ impl GgmlLoadedWeightContext {
         source: &GgmlRuntimeSource,
         reader: &GgufTensorDataReader,
         backend: NonNull<c_void>,
+        backend_kind: GgmlCpuGraphBackend,
         require_direct_backend_matmul_support: bool,
     ) -> Result<Self, GgmlCpuGraphError> {
         let path = source.path();
@@ -2610,15 +2741,20 @@ impl GgmlLoadedWeightContext {
         if require_direct_backend_matmul_support {
             validate_direct_backend_matmul_weight_support(context.raw, backend, path)?;
         }
-        let (buffer, mmap, pack_weight_residency) =
-            match maybe_allocate_weight_buffer_from_host_ptr(backend, reader)? {
-                Some((buffer, mmap, residency)) => (buffer, Some(mmap), residency),
-                None => (
-                    GgmlBackendBufferGuard::allocate_weights(context.raw, backend)?,
-                    None,
-                    None,
+        let materialization = match maybe_allocate_weight_buffer_from_host_ptr(backend, reader)? {
+            Some((buffer, mmap, residency)) => GgmlWeightMaterialization::HostImported {
+                source_identity: source.strong_file_identity(),
+                _buffer: buffer,
+                _mmap: mmap,
+                _pack_weight_residency: residency,
+            },
+            None => GgmlWeightMaterialization::DeviceCopied {
+                lane: crate::models::native_execution_services::current_execution_lane_key(
+                    backend_kind,
                 ),
-            };
+                _buffer: GgmlBackendBufferGuard::allocate_weights(context.raw, backend)?,
+            },
+        };
         let mut tensors = HashMap::new();
         let mut tensor_raw = unsafe { ffi::ggml_get_first_tensor(context.raw.as_ptr()) };
         while let Some(raw) = NonNull::new(tensor_raw) {
@@ -2631,10 +2767,14 @@ impl GgmlLoadedWeightContext {
                     ),
                 }
             })?;
-            if let Some(mmap) = mmap.as_ref() {
+            if let Some(mmap) = materialization.mmap() {
                 let addr = unsafe { mmap.as_ptr().add(payload.start).cast_mut().cast::<c_void>() };
                 let status = unsafe {
-                    ffi::ggml_backend_tensor_alloc(buffer.raw().as_ptr(), raw.as_ptr(), addr)
+                    ffi::ggml_backend_tensor_alloc(
+                        materialization.buffer().raw().as_ptr(),
+                        raw.as_ptr(),
+                        addr,
+                    )
                 };
                 if status != ffi::GGML_STATUS_SUCCESS {
                     return Err(GgmlCpuGraphError::LoadedWeightContextFailed {
@@ -2659,10 +2799,8 @@ impl GgmlLoadedWeightContext {
         drop(gguf_ctx);
         Ok(Self {
             inner: Rc::new(GgmlLoadedWeightContextInner {
+                materialization,
                 _context: context,
-                _buffer: buffer,
-                _mmap: mmap,
-                _pack_weight_residency: pack_weight_residency,
                 tensors,
             }),
         })
@@ -10316,12 +10454,13 @@ mod tests {
         GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphCpuAcceleratorPolicy,
         GgmlCpuGraphError, GgmlCpuGraphOutputSpec, GgmlCpuGraphOutputValue, GgmlCpuGraphRunner,
         GgmlCpuGraphThreadingWorkload, GgmlCpuTensor, GgmlLstmGateOrder, GgmlMatmulPrecision,
-        GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor, GpuProbeCache,
-        GpuProbeOutcome, GpuProbeState, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS,
-        backend_satisfies_execution_placement, flash_attn_ext_head_dim_supported_on_backend,
-        gpu_probe_failed_log_message, gpu_probe_log_message,
-        install_test_graph_compute_status_override, install_test_tensor_readback_status_override,
-        memory_admission_failure, mul_mat_requires_f32_precision_to_preserve_rhs_range,
+        GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor, GgmlWeightMaterialization,
+        GgmlWeightMaterializationKind, GpuProbeCache, GpuProbeOutcome, GpuProbeState,
+        METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS, backend_satisfies_execution_placement,
+        flash_attn_ext_head_dim_supported_on_backend, gpu_probe_failed_log_message,
+        gpu_probe_log_message, install_test_graph_compute_status_override,
+        install_test_tensor_readback_status_override, memory_admission_failure,
+        mul_mat_requires_f32_precision_to_preserve_rhs_range,
         reset_test_compute_gate_attempt_count, reset_test_native_graph_submission_count,
         reset_test_tensor_readback_count, runtime_gpu_is_available,
         scheduler_allows_cpu_participants, test_compute_gate_attempt_count,
@@ -12747,7 +12886,27 @@ mod tests {
         assert_eq!(r2, vec![0]);
     }
 
-    /// goals 7+8 Step 1 BLOCKER de-risk: prove a `GgmlCpuGraphBuilder` graph can
+    #[test]
+    fn copied_weight_materialization_cannot_issue_host_import_capability() {
+        let identity = crate::ggml_runtime::StrongFileIdentity::test_fixture(11);
+        assert!(
+            GgmlWeightMaterialization::host_import_capability_for_kind(
+                GgmlWeightMaterializationKind::DeviceCopied,
+                Some(identity),
+            )
+            .is_none(),
+            "copied-buffer fallback must not issue a host-import capability"
+        );
+        assert!(
+            GgmlWeightMaterialization::host_import_capability_for_kind(
+                GgmlWeightMaterializationKind::HostImported,
+                Some(identity),
+            )
+            .is_some(),
+            "only host-import materialization may issue the host capability"
+        );
+    }
+
     /// `mul_mat` a zero-copy `GgmlLoadedWeightContext` leaf (a tensor that lives in
     /// a SEPARATE ggml context, bound via `ggml_backend_tensor_alloc`, never
     /// `set_input`/`set_f32_slice`'d) and compute the correct result. cohere binds
@@ -12814,6 +12973,14 @@ mod tests {
         let loaded = runner
             .load_gguf_weight_context(&runtime_source)
             .expect("load zero-copy weight context");
+        assert!(
+            loaded.resident_host_import_capability().is_some(),
+            "mmap-backed host materialization must sign as host import"
+        );
+        assert!(
+            loaded.resident_device_copy_capability().is_none(),
+            "host-import materialization must not sign as device copy"
+        );
         let shared_loaded = runner
             .load_gguf_weight_context(&runtime_source)
             .expect("share the live pack-wide weight context");

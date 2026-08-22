@@ -28,7 +28,8 @@ use thiserror::Error;
 use crate::NativeAsrError;
 use crate::NativeAsrSession;
 use crate::api::backend::{Segment, Transcription};
-use crate::arch::FIRERED_LLM_DECODE_POLICY_ID;
+use crate::arch::{FIRERED_LLM_DECODE_POLICY_ID, firered_llm_unified_runtime_enabled};
+#[cfg(test)]
 use crate::device::execution_policy::ExecutionPlacement;
 use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
@@ -221,23 +222,6 @@ impl FireRedLlmUnifiedRuntimeState {
         )?;
         Ok(bytes.finish())
     }
-}
-
-fn firered_llm_unified_runtime_enabled(
-    allow_unified_runtime: bool,
-    backend: GgmlCpuGraphBackend,
-    backend_preference: Option<&RequestBackendPreference>,
-    placement: Option<ExecutionPlacement>,
-) -> bool {
-    allow_unified_runtime
-        && backend == GgmlCpuGraphBackend::Gpu
-        && placement == Some(ExecutionPlacement::FullDevice)
-        && matches!(
-            backend_preference,
-            Some(RequestBackendPreference::Exact(route))
-                if route.addressability.is_exactly_addressable()
-                    && matches!(route.provider, ExecutionProvider::Cuda | ExecutionProvider::Vulkan)
-        )
 }
 
 const FIRERED_LLM_EXECUTOR_ID: &str = crate::arch::FIRERED_LLM_EXECUTOR_COMPONENT_ID;
