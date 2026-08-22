@@ -860,6 +860,7 @@ impl FireRedDecoderGraphRuntime {
                 cross_frame_count: self.cross_frame_count,
                 cross_kv_max_positions: self.decoder_state.cross_attention.resident_positions,
                 cross_hidden_size: d_model,
+                collect_cross_attention: false,
             };
             let weights = Seq2SeqLayerWeights {
                 self_attn_norm_weight: layer.self_attn_norm_weight.as_graph_tensor(),
@@ -1218,6 +1219,7 @@ impl FireRedDecoderGraphRuntime {
                 cross_frame_count,
                 cross_kv_max_positions: resident_cross_positions,
                 cross_hidden_size: d_model,
+                collect_cross_attention: false,
             };
             let weights = Seq2SeqLayerWeights {
                 self_attn_norm_weight: layer.self_attn_norm_weight.as_graph_tensor(),

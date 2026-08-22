@@ -20,6 +20,7 @@ use super::runtime_contract::CohereTranscribeExecutionMetadata;
 use super::tokenizer::CohereTranscribeTokenizer;
 use super::weights::{CohereMatrixLayout, CohereMatrixWeight, CohereVectorWeight};
 use crate::PhraseBiasConfig;
+use crate::api::backend::WordTimestamp;
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, BuiltinSeq2SeqDecodePolicyConfigInput,
 };
@@ -28,11 +29,17 @@ use crate::models::device_greedy_token::{
     first_max_token_id_from_reversed_argmax,
 };
 use crate::models::seq2seq_decoder_state::Seq2SeqDecoderState;
+use crate::models::seq2seq_dtw_alignment::{
+    dtw_align_token_frames, speech_frame_bounds, token_text_carries_speech,
+};
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
     Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeStopReason,
 };
-use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
+use crate::models::seq2seq_word_timestamps::{
+    Seq2SeqTokenSpan, seq2seq_word_timestamps_from_generated_tokens,
+    seq2seq_word_timestamps_from_token_spans,
+};
 use crate::nn::decoder::{
     Seq2SeqReusableDecodeGraph, build_causal_mask_f16_bits, build_fixed_kv_attention_mask_bits,
     build_fixed_kv_attention_mask_bits_for_sequences, reusable_decode_graph_supported_for_runner,
@@ -206,6 +213,12 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
         vocab_size: metadata.vocab_size,
         max_generated_tokens,
     };
+    // Word-timestamp capture switches the last decoder layer to the unfused
+    // f32 cross-attention for every incremental step so the per-token frame
+    // row can be DTW-aligned. Off otherwise: the default fused path stays
+    // byte-identical (and diarization-forced anchors stay post-hoc, like
+    // whisper's `PostHocAnchors` mode, since `word_timestamps` is false then).
+    decoder_runtime.collect_cross_attention = word_timestamps;
     let mut step_executor =
         CohereDecoderGraphStepExecutor::from_runtime(decoder_runtime, encoder_output)?;
     let decode = match run_cohere_transcribe_greedy_decode_loop(
@@ -241,6 +254,28 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
         }
     };
     let text = decode.text.trim().to_string();
+    // Align the captured per-token cross-attention rows to the audio timeline
+    // with a monotone DTW pass, and use the resulting word spans in place of
+    // the uniform post-hoc timestamps. If the DTW pass returns nothing (empty
+    // / ragged input, all-punctuation decode), `cohere_plain_transcription...`
+    // degrades to the center-of-mass path below.
+    let dtw_words = (word_timestamps && !step_executor.token_alignments.is_empty())
+        .then(|| {
+            let alignments = std::mem::take(&mut step_executor.token_alignments);
+            cohere_dtw_word_timestamps(
+                &alignments,
+                metadata,
+                &decode.generated_probabilities,
+                audio_duration_seconds,
+                &decode_text_token_ids,
+            )
+            .map_err(|error| CohereDecoderGraphError::InvalidInput {
+                reason: error.to_string(),
+            })
+        })
+        .transpose()?
+        .filter(|words| !words.is_empty());
+    let plain_words_override = dtw_words.as_ref();
     let transcription = if request_diarization_from_prompt(prompt_tokens, tokenizer) {
         let segments = cohere_diarized_segments_from_generated_tokens(
             tokenizer,
@@ -253,6 +288,7 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
                 text,
                 &decode.generated_tokens,
                 &decode.generated_probabilities,
+                plain_words_override.map(|w| w.to_vec()),
                 word_timestamps,
                 audio_duration_seconds,
                 &decode_text_token_ids,
@@ -279,6 +315,7 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
             text,
             &decode.generated_tokens,
             &decode.generated_probabilities,
+            plain_words_override.map(|w| w.to_vec()),
             word_timestamps,
             audio_duration_seconds,
             &decode_text_token_ids,
@@ -300,15 +337,175 @@ fn request_diarization_from_prompt(
         .any(|token_id| tokenizer.token_content_by_id(*token_id) == Some("<|diarize|>"))
 }
 
+/// Align per-token cross-attention frame rows to the audio timeline with a
+/// monotone DTW pass and fold them into word timestamps, mirroring whisper's
+/// no-timestamp DTW degrade. `token_alignments` pairs each generated (non-EOT)
+/// token with its decoder's last-layer cross-attention frame row. Cohere
+/// decodes `<|notimestamps|>` so there are no timestamp tokens: the DTW window
+/// is bracketed on the content tokens' own attention peaks (leading/trailing
+/// silence the model ignored is never bracketed by a peak, so it stays off the
+/// timeline), and each content-token peak still owns its real audio span.
+pub(crate) fn cohere_dtw_word_timestamps<E>(
+    token_alignments: &[(u32, Vec<f32>)],
+    metadata: CohereTranscribeExecutionMetadata,
+    generated_probabilities: &[f32],
+    duration: f32,
+    decode_text: &dyn Fn(&[u32]) -> Result<String, E>,
+) -> Result<Vec<WordTimestamp>, E> {
+    let frame_count = token_alignments
+        .first()
+        .map(|alignment| alignment.1.len())
+        .unwrap_or(0);
+    if frame_count == 0 {
+        return Ok(Vec::new());
+    }
+    // The three strided convs (k3,s2,p1) sub-sample the mel axis 8x, so one
+    // encoder frame is 8 mel hops of audio; frames map to absolute wall-clock
+    // time from clip start at that rate, not a fraction of `duration`.
+    let hop = metadata.hop_length;
+    let sample_rate = metadata.sample_rate_hz;
+    if hop == 0 || sample_rate == 0 {
+        return Ok(Vec::new());
+    }
+    let seconds_per_frame = 8.0 * hop as f32 / sample_rate as f32;
+    if !seconds_per_frame.is_finite() || seconds_per_frame <= 0.0 {
+        return Ok(Vec::new());
+    }
+    let duration = duration.max(0.0);
+    let full_window = token_alignments
+        .iter()
+        .map(|alignment| alignment.1.clone())
+        .collect::<Vec<Vec<f32>>>();
+    if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
+        for (row_index, alignment) in token_alignments.iter().enumerate() {
+            let text = decode_text(&[alignment.0]).unwrap_or_default();
+            let (peak_frame, &peak_value) = alignment
+                .1
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap_or((0, &0.0));
+            let mut top_vec = alignment
+                .1
+                .iter()
+                .enumerate()
+                .map(|(frame, value)| (frame, *value))
+                .collect::<Vec<_>>();
+            top_vec.sort_by(|a, b| b.1.total_cmp(&a.1));
+            top_vec.truncate(4);
+            let top = top_vec
+                .iter()
+                .map(|(frame, value)| format!("{frame}@{value:.4}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let peak_secs = peak_frame as f32 * seconds_per_frame;
+            eprintln!(
+                "cohere cross row {row_index} token={} text={text:?} peak@{peak_frame}({peak_secs:.2}s)={peak_value:.4} top=[{top}]",
+                alignment.0
+            );
+        }
+    }
+    let is_content: Vec<bool> = token_alignments
+        .iter()
+        .map(|alignment| {
+            decode_text(&[alignment.0]).is_ok_and(|text| token_text_carries_speech(&text))
+        })
+        .collect();
+    // Cohere's last-layer cross-attention is diffuse and front-loaded on real
+    // audio: several unrelated tokens share one early "priming" frame peak, so
+    // the per-token peaks are not a clean monotone order and the DTW pass
+    // over-spreads the first words (measured TempErr worse than the uniform
+    // baseline on every clip available). Only trust the DTW word spans when the
+    // content-token attention peaks are order-aligned; otherwise return empty
+    // and let the caller keep the proven uniform post-hoc timestamps.
+    //
+    // `dtw_window` starts as the raw attention. When the raw peak order
+    // zig-zags, one more chance is given after masking the dominant early
+    // "sinks": an early frame that is the global max for a dominant share of
+    // the rows is a shared diffuse-attention artifact, not evidence for where
+    // any one token is spoken. Stripping it lets each masked row's
+    // next-strongest frame (its real region) surface, which restores a
+    // monotone peak order on clips where every non-artifact row already
+    // pointed the right way. Rejected after both tests -> uniform fallback.
+    let dtw_window: Option<Vec<Vec<f32>>> =
+        if cross_attention_peaks_order_aligned(&full_window, &is_content) {
+            None
+        } else {
+            match mask_dominant_early_sinks(&full_window) {
+                Some(window) if cross_attention_peaks_order_aligned(&window, &is_content) => {
+                    if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
+                        eprintln!("cohere cross gate: order restored after sink strip, using DTW");
+                    }
+                    Some(window)
+                }
+                _ => {
+                    if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
+                        eprintln!("cohere cross gate: peaks not order-aligned, using uniform");
+                    }
+                    return Ok(Vec::new());
+                }
+            }
+        };
+    // The band is always derived from the unmasked raw attention: masking
+    // zeroed frames would corrupt the earliest-peak bound, and the DTW cost
+    // normalizes each row anyway, so the slice only needs the right range.
+    let (band_start, band_end) = speech_frame_bounds(&full_window, &is_content).map_or_else(
+        move || {
+            (
+                0usize,
+                ((duration / seconds_per_frame).ceil() as usize).clamp(1, frame_count),
+            )
+        },
+        |(start, end)| (start, end.clamp(start + 1, frame_count)),
+    );
+    if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
+        eprintln!(
+            "cohere cross band=({band_start},{band_end}) frames={frame_count} spf={seconds_per_frame}"
+        );
+    }
+    let attention: Vec<Vec<f32>> = dtw_window
+        .as_ref()
+        .unwrap_or(&full_window)
+        .iter()
+        .map(|row| row[band_start.min(row.len())..band_end.min(row.len())].to_vec())
+        .collect();
+    let Some(spans) = dtw_align_token_frames(&attention) else {
+        return Ok(Vec::new());
+    };
+    let probabilities_aligned = generated_probabilities.len() == token_alignments.len();
+    let token_spans: Vec<Seq2SeqTokenSpan> = token_alignments
+        .iter()
+        .enumerate()
+        .zip(spans.iter())
+        .map(|((index, alignment), span)| Seq2SeqTokenSpan {
+            token_id: alignment.0,
+            frame_start: span.frame_start.saturating_add(band_start),
+            frame_end: span.frame_end.saturating_add(band_start),
+            probability: probabilities_aligned.then(|| generated_probabilities[index]),
+        })
+        .collect();
+    seq2seq_word_timestamps_from_token_spans(
+        &token_spans,
+        0.0,
+        duration,
+        seconds_per_frame,
+        BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+        decode_text,
+    )
+}
+
 fn cohere_plain_transcription_from_generated_tokens(
     text: String,
     generated_tokens: &[u32],
     generated_probabilities: &[f32],
+    words_override: Option<Vec<WordTimestamp>>,
     word_timestamps: bool,
     audio_duration_seconds: f32,
     decode_text_token_ids: &dyn Fn(&[u32]) -> Result<String, CohereTranscribeGreedyDecodeError>,
 ) -> Result<Transcription, CohereDecoderGraphError> {
-    let words = if word_timestamps {
+    let words = if let Some(override_words) = words_override {
+        override_words
+    } else if word_timestamps {
         seq2seq_word_timestamps_from_generated_tokens(
             generated_tokens,
             generated_probabilities,
@@ -506,6 +703,16 @@ pub(crate) struct CohereDecoderGraphRuntime {
     reuse_cross_frame_count: usize,
     cached_positions: usize,
     n_seq: usize,
+    /// When true, every incremental step runs the unfused f32 cross-attention
+    /// in the last decoder layer so the per-token frame-probability row can be
+    /// captured for DTW word-timestamp alignment (see whisper's capture path).
+    /// Word timestamps are the only consumer; off otherwise to keep the default
+    /// fused-kernel decode path byte-identical.
+    collect_cross_attention: bool,
+    /// Head-averaged last-layer cross-attention frame row captured by the most
+    /// recent incremental step, consumed (via `std::mem::take`) by the step
+    /// executor to build the per-token alignment side channel.
+    cross_attention_frame_probs: Option<Vec<f32>>,
     // Every graph-visible handle and persistent session above must drop before
     // its metadata/state arena, loaded roots, and backend runner.
     arena: GgmlStaticTensorArena,
@@ -606,6 +813,10 @@ struct CohereDecoderCrossCacheLayerRuntime {
 
 struct CohereDecoderGraphStepExecutor<'a> {
     runtime: &'a mut CohereDecoderGraphRuntime,
+    /// When set (word-timestamp capture is on), every incremental step that
+    /// emitted a frame-probability row is paired with the token that step
+    /// generated, mirroring whisper's `token_alignments` side channel.
+    token_alignments: Vec<(u32, Vec<f32>)>,
 }
 
 impl<'a> CohereDecoderGraphStepExecutor<'a> {
@@ -614,7 +825,10 @@ impl<'a> CohereDecoderGraphStepExecutor<'a> {
         encoder_output: &CohereTranscribeEncoderOutput,
     ) -> Result<Self, CohereDecoderGraphError> {
         runtime.populate_cross_attention_cache(encoder_output)?;
-        Ok(Self { runtime })
+        Ok(Self {
+            runtime,
+            token_alignments: Vec::new(),
+        })
     }
 }
 
@@ -629,11 +843,21 @@ impl Seq2SeqGreedyDecodeStepExecutor for CohereDecoderGraphStepExecutor<'_> {
             .copied()
             .chain(input.generated_tokens.iter().copied())
             .collect::<Vec<_>>();
-        self.runtime.compute_step_output(&prefix).map_err(|error| {
+        let output = self.runtime.compute_step_output(&prefix).map_err(|error| {
             Seq2SeqGreedyDecodeError::DecoderStepFailed {
                 reason: error.to_string(),
             }
-        })
+        })?;
+        // Only incremental single-token steps produce a captured frame row;
+        // the prompt step's cross-attention (token_count = prompt length) is
+        // not per-token and is dropped.
+        if let (Some(token_id), Some(frame_probs)) = (
+            input.generated_tokens.last().copied(),
+            std::mem::take(&mut self.runtime.cross_attention_frame_probs),
+        ) {
+            self.token_alignments.push((token_id, frame_probs));
+        }
+        Ok(output)
     }
 }
 
@@ -849,6 +1073,8 @@ impl CohereDecoderGraphRuntime {
             reuse_cross_frame_count: 0,
             cached_positions: 0,
             n_seq,
+            collect_cross_attention: false,
+            cross_attention_frame_probs: None,
         })
     }
 
@@ -1598,7 +1824,15 @@ impl CohereDecoderGraphRuntime {
         let total_token_count = position_offset
             .checked_add(token_count)
             .ok_or(CohereDecoderGraphError::ShapeOverflow)?;
-        if position_offset > 0 && token_count == 1 && self.supports_reusable_decode_graph() {
+        if position_offset > 0
+            && token_count == 1
+            && !self.collect_cross_attention
+            && self.supports_reusable_decode_graph()
+        {
+            // Word-timestamp capture needs the unfused f32 cross-attention in
+            // the last layer; the reusable persistent graph bakes in the fused
+            // flash path, so when capture is on we fall through to the
+            // full-graph rebuild below.
             return self.compute_reused_incremental_step_output(
                 decode_tokens[0],
                 position_offset,
@@ -1746,7 +1980,7 @@ impl CohereDecoderGraphRuntime {
             final_state: state,
         });
 
-        state = compose_seq2seq_decoder_layer_stack(
+        let (mut state, cross_frame_probs) = compose_seq2seq_decoder_layer_stack(
             &mut graph,
             state,
             hidden,
@@ -1762,7 +1996,9 @@ impl CohereDecoderGraphRuntime {
             self_attention_mask,
             &mut uploads,
             &mut prompt_debug_tensors,
+            self.collect_cross_attention && token_count == 1,
         )?;
+        let cross_frame_probs = cross_frame_probs.filter(|_| self.collect_cross_attention);
 
         state = apply_affine_norm(
             &graph,
@@ -1852,13 +2088,21 @@ impl CohereDecoderGraphRuntime {
         }
         // Allocate the decode graph through the scheduler's gallocr for
         // liveness-based buffer reuse before uploading inputs, same ordering as
-        // the sibling firered/moonshine decoders.
-        graph
-            .prepare_outputs_for_upload(&[output_root])
-            .map_err(|source| CohereDecoderGraphError::GraphBuildFailed {
-                step: "ggml_prepare_outputs(logits)",
-                source,
+        // the sibling firered/moonshine decoders. The captured cross-attention
+        // tensor is a second root so its backend storage is not recycled.
+        let mut prepare_roots = vec![output_root];
+        if let Some(cross_frame_probs) = cross_frame_probs {
+            prepare_roots.push(cross_frame_probs);
+        }
+        {
+            let roots: &[_] = &prepare_roots;
+            graph.prepare_outputs_for_upload(roots).map_err(|source| {
+                CohereDecoderGraphError::GraphBuildFailed {
+                    step: "ggml_prepare_outputs(logits)",
+                    source,
+                }
             })?;
+        }
         for upload in uploads {
             upload.apply(&mut graph)?;
         }
@@ -1896,6 +2140,48 @@ impl CohereDecoderGraphRuntime {
                         reason: "missing logits output".to_string(),
                     },
                 )?,
+                greedy_token_hint: None,
+            }
+        } else if let Some(cross_frame_probs) = cross_frame_probs {
+            // Word-timestamp capture: word timestamps always force FullLogits
+            // (top1 is None), so read the logits row and the last layer's
+            // cross-attention frame row back in one compute pass.
+            let frame_count = self
+                .cross_layers
+                .first()
+                .map(|layer| layer.frame_count)
+                .unwrap_or(0);
+            let heads = self.metadata.decoder_heads;
+            let expected_probs = frame_count
+                .checked_mul(heads)
+                .ok_or(CohereDecoderGraphError::ShapeOverflow)?;
+            let outputs = graph
+                .compute_outputs_f32(&[
+                    (logits, self.metadata.vocab_size),
+                    (cross_frame_probs, expected_probs),
+                ])
+                .map_err(|error| CohereDecoderGraphError::GraphExecutionFailed {
+                    reason: error.to_string(),
+                })?;
+            if outputs.len() != 2 {
+                return Err(CohereDecoderGraphError::InvalidInput {
+                    reason: "cross-attention capture expected two outputs".to_string(),
+                });
+            }
+            let (logits_row, frame_row) = {
+                let mut iter = outputs.into_iter();
+                (
+                    iter.next().expect("logits output present"),
+                    iter.next().expect("cross-attention output present"),
+                )
+            };
+            self.cross_attention_frame_probs = Some(average_cross_attention_frame_row(
+                &frame_row,
+                frame_count,
+                heads,
+            )?);
+            Seq2SeqGreedyDecodeStepLogitsOutput {
+                logits: logits_row,
                 greedy_token_hint: None,
             }
         } else {
@@ -2282,7 +2568,7 @@ impl CohereDecoderGraphRuntime {
         )?;
         let mut uploads = Vec::new();
         let mut prompt_debug_tensors = None;
-        state = compose_seq2seq_decoder_layer_stack(
+        let (mut state, batched_probs) = compose_seq2seq_decoder_layer_stack(
             &mut graph,
             state,
             hidden,
@@ -2298,7 +2584,9 @@ impl CohereDecoderGraphRuntime {
             Some(attention_mask),
             &mut uploads,
             &mut prompt_debug_tensors,
+            false,
         )?;
+        debug_assert!(batched_probs.is_none());
         debug_assert!(uploads.is_empty());
 
         state = apply_affine_norm(
@@ -2503,7 +2791,7 @@ impl CohereDecoderGraphRuntime {
         )?;
         let mut uploads = Vec::new();
         let mut prompt_debug_tensors = None;
-        state = compose_seq2seq_decoder_layer_stack(
+        let (mut state, reuse_probs) = compose_seq2seq_decoder_layer_stack(
             graph,
             state,
             hidden,
@@ -2519,7 +2807,9 @@ impl CohereDecoderGraphRuntime {
             Some(attention_mask),
             &mut uploads,
             &mut prompt_debug_tensors,
+            false,
         )?;
+        debug_assert!(reuse_probs.is_none());
         debug_assert!(uploads.is_empty());
 
         state = apply_affine_norm(
@@ -2642,6 +2932,160 @@ fn map_reversed_top1_token(
     })
 }
 
+/// Head-average a captured `[frame_count, token_count, heads]` f32
+/// cross-attention row into one length-`frame_count` probability vector.
+/// Layout mirrors whisper's capture: element `(frame, token, head)` lives at
+/// `frame + frame_count * (token + token_count * head)`, with the token axis
+/// collapsing (`token_count == 1`) for the incremental steps.
+fn average_cross_attention_frame_row(
+    attention: &[f32],
+    frame_count: usize,
+    heads: usize,
+) -> Result<Vec<f32>, CohereDecoderGraphError> {
+    if frame_count == 0 || heads == 0 {
+        return Err(CohereDecoderGraphError::InvalidInput {
+            reason: "cross-attention capture produced an empty dimension".to_string(),
+        });
+    }
+    let expected = frame_count
+        .checked_mul(heads)
+        .ok_or(CohereDecoderGraphError::ShapeOverflow)?;
+    if attention.len() != expected {
+        return Err(CohereDecoderGraphError::InvalidInput {
+            reason: format!(
+                "cross-attention capture length mismatch: got {}, expected {expected}",
+                attention.len()
+            ),
+        });
+    }
+    let inv_heads = 1.0 / heads as f32;
+    Ok((0..frame_count)
+        .map(|frame| {
+            (0..heads)
+                .map(|head| attention[frame + frame_count * head])
+                .sum::<f32>()
+                * inv_heads
+        })
+        .collect())
+}
+
+/// Whether the per-token cross-attention peaks, read in decode order, form a
+/// monotone (non-decreasing) frame sequence over the content tokens, allowing
+/// ties and single-frame jitter.
+///
+/// A clean alignment signal has each content token's strongest frame at or
+/// after the previous content token's strongest frame (the speech is left to
+/// right, so the attention follows it). Cohere's last-layer cross-attention is
+/// instead diffuse and front-loaded: several unrelated tokens share one early
+/// "priming" frame as their global max, so the peak sequence zig-zags and the
+/// DTW pass over-spreads the first words past where they are spoken (measured
+/// worse than the uniform post-hoc baseline on every available clip). Only a
+/// non-zig-zag peak sequence is a trustworthy DTW input; anything else should
+/// fall back to the uniform timestamps. Returns `true` (vacuously aligned) when
+/// fewer than two content peaks can be formed, leaving the decision to the DTW
+/// pass itself.
+fn cross_attention_peaks_order_aligned(attention: &[Vec<f32>], is_content: &[bool]) -> bool {
+    const TOLERANCE_FRAMES: usize = 1;
+    let mut previous_peak: Option<usize> = None;
+    for (index, row) in attention.iter().enumerate() {
+        if !is_content.get(index).copied().unwrap_or(false) || row.is_empty() {
+            continue;
+        }
+        let peak = row
+            .iter()
+            .enumerate()
+            .filter(|&(_, &value)| value.is_finite())
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(frame, _)| frame);
+        let Some(peak) = peak else {
+            continue;
+        };
+        if let Some(previous) = previous_peak {
+            // A backward jump of two or more frames is a zig-zag (ties and a
+            // single-frame jitter are tolerated).
+            if peak
+                .checked_add(TOLERANCE_FRAMES)
+                .is_some_and(|shifted| shifted < previous)
+            {
+                return false;
+            }
+        }
+        previous_peak = Some(peak);
+    }
+    true
+}
+
+/// Search horizon, in frames, for the dominant-early-sink mask. ~0.8s at the
+/// family's 0.08s/frame; the shared "priming" attention sits at the start of
+/// the window, so only early frames are candidates. Late peaks are never
+/// masked because they may carry the one token's real speech location.
+const SINK_STRIP_SEARCH_FRAMES: usize = 10;
+
+/// Returns a copy of `window` with each dominant early sink frame zeroed in
+/// every row, or `None` when no frame qualifies.
+///
+/// A dominant early sink is a frame within [`SINK_STRIP_SEARCH_FRAMES`] that
+/// is the strict-majority global max of the rows. On diffuse, front-loaded
+/// decodes one such shared priming frame steals the argmax from most tokens,
+/// and its removal is what exposes each row's next-strongest frame (the
+/// token's real region) so the order gate can re-test. The caller must still
+/// re-run `cross_attention_peaks_order_aligned` on the result: this function
+/// only removes the artifact, the gate decides whether the cleaned signal is
+/// trustworthy. A row whose only finite mass sat on a masked frame has no
+/// valid peak after the strip, which the order gate reads as a missing peak
+/// and ignores; when enough rows lose their peak the order collapses and the
+/// gate rejects (the safe outcome).
+fn mask_dominant_early_sinks(window: &[Vec<f32>]) -> Option<Vec<Vec<f32>>> {
+    let row_count = window.len();
+    let frame_count = window.first()?.len();
+    if frame_count == 0 {
+        return None;
+    }
+    let search = SINK_STRIP_SEARCH_FRAMES.min(frame_count);
+    let mut peak_counts = vec![0usize; search];
+    for row in window {
+        let (peak, &value) = row
+            .iter()
+            .enumerate()
+            .filter(|&(_, &value)| value.is_finite())
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))?;
+        if value > 0.0 && peak < search {
+            peak_counts[peak] += 1;
+        }
+    }
+    let mut masked = vec![false; search];
+    let mut sinks = Vec::new();
+    for frame in 0..search {
+        if peak_counts[frame].saturating_mul(2) > row_count {
+            masked[frame] = true;
+            sinks.push(frame);
+        }
+    }
+    if sinks.is_empty() {
+        return None;
+    }
+    if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
+        eprintln!("cohere cross sink strip: masking frames {sinks:?}");
+    }
+    Some(
+        window
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .map(|(frame, &value)| {
+                        if frame < search && masked[frame] {
+                            0.0
+                        } else {
+                            value
+                        }
+                    })
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
 fn compute_greedy_step_output_for_graph<'a>(
     graph: &mut crate::ggml_runtime::GgmlCpuGraphBuilder<'a>,
     logits: GgmlCpuTensor<'a>,
@@ -2726,8 +3170,17 @@ fn compose_seq2seq_decoder_layer_stack<'a>(
     self_attention_mask: Option<crate::ggml_runtime::GgmlCpuTensor<'a>>,
     uploads: &mut Vec<DecoderUpload<'a>>,
     prompt_debug_tensors: &mut Option<CoherePromptDebugTensors<'a>>,
-) -> Result<crate::ggml_runtime::GgmlCpuTensor<'a>, CohereDecoderGraphError> {
-    seq2seq_layer_stack(
+    collect_last_cross_attention: bool,
+) -> Result<
+    (
+        crate::ggml_runtime::GgmlCpuTensor<'a>,
+        Option<crate::ggml_runtime::GgmlCpuTensor<'a>>,
+    ),
+    CohereDecoderGraphError,
+> {
+    let last_layer_index = layers.len().saturating_sub(1);
+    let mut last_probs = None;
+    let state = seq2seq_layer_stack(
         graph,
         state,
         layers,
@@ -2740,7 +3193,7 @@ fn compose_seq2seq_decoder_layer_stack<'a>(
             ),
         },
         |graph, state, layer_idx, layer_runtime, cross_runtime, self_kv_runtime| {
-            apply_decoder_layer(
+            let (state, probs) = apply_decoder_layer(
                 graph,
                 state,
                 hidden,
@@ -2760,9 +3213,15 @@ fn compose_seq2seq_decoder_layer_stack<'a>(
                 } else {
                     None
                 },
-            )
+                collect_last_cross_attention && layer_idx == last_layer_index,
+            )?;
+            if layer_idx == last_layer_index {
+                last_probs = probs;
+            }
+            Ok(state)
         },
-    )
+    )?;
+    Ok((state, last_probs))
 }
 
 fn apply_decoder_layer<'a>(
@@ -2781,7 +3240,14 @@ fn apply_decoder_layer<'a>(
     self_attention_mask: Option<crate::ggml_runtime::GgmlCpuTensor<'a>>,
     uploads: &mut Vec<DecoderUpload<'a>>,
     mut prompt_debug_tensors: Option<&mut Option<CoherePromptDebugTensors<'a>>>,
-) -> Result<crate::ggml_runtime::GgmlCpuTensor<'a>, CohereDecoderGraphError> {
+    collect_cross_attention: bool,
+) -> Result<
+    (
+        crate::ggml_runtime::GgmlCpuTensor<'a>,
+        Option<crate::ggml_runtime::GgmlCpuTensor<'a>>,
+    ),
+    CohereDecoderGraphError,
+> {
     use crate::nn::decoder::{
         CrossKvHandle, SelfKvHandle, Seq2SeqLayerConfig, Seq2SeqLayerWeights, seq2seq_layer,
     };
@@ -2814,6 +3280,7 @@ fn apply_decoder_layer<'a>(
         cross_frame_count: cross_runtime.frame_count,
         cross_kv_max_positions: cross_runtime.capacity_frames,
         cross_hidden_size: cross_runtime.hidden_size,
+        collect_cross_attention,
     };
     let weights = Seq2SeqLayerWeights {
         self_attn_norm_weight: layer.attn_ln_weight.as_graph_tensor(),
@@ -2879,7 +3346,7 @@ fn apply_decoder_layer<'a>(
         debug.h0_after_ca = block.taps.after_cross_attn;
         debug.h0_after_ffn = block.taps.after_ffn;
     }
-    Ok(block.output)
+    Ok((block.output, block.last_token_cross_attention))
 }
 
 fn emit_cohere_debug_prompt_intermediates_if_enabled(outputs: &[Vec<f32>]) {
@@ -4102,6 +4569,462 @@ mod tests {
             assert_eq!(logits.len(), metadata.vocab_size);
             assert!(logits.iter().all(|value| value.is_finite()));
         });
+    }
+
+    #[test]
+    fn decoder_runtime_captures_cross_attention_frame_row() {
+        with_forced_cpu_backend_for_test(|| {
+            let (_runtime_path, preflight) = write_runtime_ready_preflight();
+            let metadata =
+                super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
+                    &preflight.metadata,
+                )
+                .expect("parse metadata");
+            let reader = build_runtime_tensor_reader_from_preflight(&preflight).expect("reader");
+            let decoder_weights =
+                super::super::decoder_weights::load_cohere_transcribe_decoder_weights_from_reader(
+                    &reader, metadata,
+                )
+                .expect("decoder weights");
+            let tokenizer = super::super::tokenizer::CohereTranscribeTokenizer::from_gguf_metadata(
+                &preflight.metadata,
+            )
+            .expect("tokenizer");
+            let prompt = super::super::prompt::build_cohere_transcribe_decode_prompt(
+                &tokenizer,
+                metadata.decoder_start_token_id,
+                Some("en"),
+                &GgmlAsrExecutionOptions::default(),
+            )
+            .expect("prompt");
+            let encoder_output = sample_encoder_output(metadata);
+            let frames = encoder_output.frame_count;
+            let mut runtime = CohereDecoderGraphRuntime::new(
+                &decoder_weights,
+                metadata,
+                decoder_state(metadata, frames, frames),
+                encoder_output.hidden_size,
+                GgmlCpuGraphBackend::Cpu,
+                false,
+            )
+            .expect("decoder runtime");
+            runtime
+                .populate_cross_attention_cache(&encoder_output)
+                .expect("populate cross cache");
+
+            // Prompt step: no per-token capture (collect_cross_attention off).
+            let logits = runtime
+                .compute_step_logits(&prompt.token_ids)
+                .expect("prompt step logits");
+            assert_eq!(logits.len(), metadata.vocab_size);
+            assert!(runtime.cross_attention_frame_probs.is_none());
+
+            // Enable capture; an incremental (single new token) step must
+            // switch to the unfused f32 cross-attention and capture a
+            // head-averaged frame row of the right length, with finite
+            // non-negative values summing to ~1 over frames.
+            runtime.collect_cross_attention = true;
+            let mut next_prefix = prompt.token_ids.clone();
+            next_prefix.push(prompt.token_ids[0]);
+            let step = runtime
+                .compute_step_output(&next_prefix)
+                .expect("incremental step output");
+            let frame_rows = std::mem::take(&mut runtime.cross_attention_frame_probs)
+                .expect("incremental step should capture cross-attention");
+            assert_eq!(frame_rows.len(), frames);
+            assert!(
+                frame_rows
+                    .iter()
+                    .all(|value| value.is_finite() && *value >= 0.0)
+            );
+            let sum: f32 = frame_rows.iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 0.05,
+                "softmax row should sum to ~1, got {sum}"
+            );
+            // Logits must still be produced for the argmax step.
+            let _ = step.logits;
+        });
+    }
+
+    #[test]
+    fn average_cross_attention_frame_row_head_averages_and_validates() {
+        // 3 frames, 2 heads -> layout [frame, token, head]; token_count == 1.
+        // [frame, token, head] with token_count==1; element (frame, head) lives
+        // at frame + frames*head, so a 3-frame/2-head row is 6 floats.
+        let attention = vec![
+            1.0, 0.0, 0.5, // frame 0, frame 1, frame 2 -- head 0
+            0.5, 0.5, 1.0, // frame 0, frame 1, frame 2 -- head 1
+        ];
+        let out = average_cross_attention_frame_row(&attention, 3, 2).expect("row");
+        assert_eq!(out.len(), 3);
+        assert!((out[0] - 0.75_f32).abs() < 1e-5);
+        assert!((out[1] - 0.25_f32).abs() < 1e-5);
+        assert!((out[2] - 0.75_f32).abs() < 1e-5);
+        // Wrong length is rejected, not silently truncated.
+        assert!(
+            average_cross_attention_frame_row(&attention, 3, 3).is_err(),
+            "mismatched length must be an error"
+        );
+        assert!(average_cross_attention_frame_row(&attention, 0, 2).is_err());
+    }
+
+    #[test]
+    fn cohere_dtw_word_timestamps_returns_empty_without_alignments() {
+        let (_runtime_path, preflight) = write_runtime_ready_preflight();
+        let metadata = super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
+            &preflight.metadata,
+        )
+        .expect("parse metadata");
+        let decode_text = |_token_ids: &[u32]| Ok(String::new());
+        let words = cohere_dtw_word_timestamps::<()>(&[], metadata, &[], 1.0, &decode_text)
+            .expect("dtw words");
+        assert!(words.is_empty(), "no alignments -> no words");
+    }
+
+    #[test]
+    fn cohere_dtw_word_timestamps_places_word_at_earlier_attention() {
+        let (_runtime_path, preflight) = write_runtime_ready_preflight();
+        let metadata = super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
+            &preflight.metadata,
+        )
+        .expect("parse metadata");
+        let seconds_per_frame = 8.0 * metadata.hop_length as f32 / metadata.sample_rate_hz as f32;
+        let frames = 12;
+        // Two "words": token 0 peaks early, token 1 peaks late. Each frame row
+        // is a unit-spike (its attention concentrated on one frame).
+        let mut row0 = vec![0.01f32; frames];
+        row0[2] = 0.97;
+        let mut row1 = vec![0.01f32; frames];
+        row1[9] = 0.97;
+        let alignments = vec![(5u32, row0), (6u32, row1)];
+        let decode_text = |token_ids: &[u32]| {
+            let mut decoded = String::new();
+            for &token_id in token_ids {
+                match token_id {
+                    5 => decoded.push_str("hi"),
+                    6 => decoded.push_str(" there"),
+                    _ => {}
+                }
+            }
+            Ok(decoded)
+        };
+        let duration = (frames as f32) * seconds_per_frame;
+        let words = cohere_dtw_word_timestamps::<()>(
+            &alignments,
+            metadata,
+            &[0.99, 0.99],
+            duration,
+            &decode_text,
+        )
+        .expect("dtw words");
+        assert_eq!(words.len(), 2, "expected two words, got {words:?}");
+        assert_eq!(words[0].word, "hi");
+        assert_eq!(words[1].word, "there");
+        // Monotone timeline and the words sit on their respective attention
+        // frames rather than being smeared to the midpoint.
+        assert!(words[0].start < words[1].end);
+        assert!(words[0].start < 3.0 * seconds_per_frame + 1e-3);
+        assert!(words[1].end > 8.0 * seconds_per_frame + 1e-3);
+    }
+
+    #[test]
+    fn cross_attention_peaks_order_aligned_gate() {
+        let spike = |frames: usize, peak: usize| {
+            let mut row = vec![0.01f32; frames];
+            row[peak] = 0.97;
+            row
+        };
+        // Monotone non-decreasing peaks form a clean left-to-right order.
+        assert!(cross_attention_peaks_order_aligned(
+            &[spike(12, 2), spike(12, 2), spike(12, 5), spike(12, 9)],
+            &[true; 4]
+        ));
+        // A backward jump of two or more frames is the diffuse front-loaded
+        // zig-zag the gate must reject.
+        assert!(!cross_attention_peaks_order_aligned(
+            &[spike(12, 9), spike(12, 2)],
+            &[true; 2]
+        ));
+        // Ties and a single frame of jitter are tolerated (not a zig-zag).
+        assert!(cross_attention_peaks_order_aligned(
+            &[spike(12, 5), spike(12, 5), spike(12, 4), spike(12, 5)],
+            &[true; 4]
+        ));
+        // Non-content (punctuation) rows are skipped, so a diffuse peak in
+        // them cannot break the order of the surrounding content peaks.
+        assert!(cross_attention_peaks_order_aligned(
+            &[spike(12, 9), spike(12, 0), spike(12, 10)],
+            &[true, false, true]
+        ));
+        // Fewer than two content peaks -> vacuously aligned (left to the DTW).
+        assert!(cross_attention_peaks_order_aligned(
+            &[spike(12, 7)],
+            &[true]
+        ));
+    }
+
+    // Builds a "sink-dominated" row: an early sink frame at frame `sink` holds
+    // the global max, with the token's real region (a lower value) at `real`.
+    // After stripping `sink` this row's argmax becomes `real`.
+    fn sink_row(frames: usize, sink: usize, real: usize) -> Vec<f32> {
+        let mut row = vec![0.01f32; frames];
+        row[sink] = 0.5;
+        row[real] = 0.4;
+        row
+    }
+
+    // A "right-pointing" row whose own speech location is already its global
+    // max (it escaped the priming artifact).
+    fn right_row(frames: usize, real: usize) -> Vec<f32> {
+        let mut row = vec![0.01f32; frames];
+        row[real] = 0.5;
+        row
+    }
+
+    #[test]
+    fn mask_dominant_early_sinks_detects_and_strips_the_shared_peak() {
+        let frames = 12;
+        // A dominant sink at frame 2 is the *global* max for a strict majority
+        // (4 of 5) of the rows; the fifth row peaks elsewhere.
+        let raw = vec![
+            sink_row(frames, 2, 4),
+            sink_row(frames, 2, 5),
+            sink_row(frames, 2, 6),
+            sink_row(frames, 2, 7),
+            right_row(frames, 9),
+        ];
+        let striped = mask_dominant_early_sinks(&raw).expect("a sink must be found");
+        assert_eq!(striped.len(), raw.len());
+        for (raw_row, striped_row) in raw.iter().zip(&striped) {
+            assert_eq!(
+                striped_row[2], 0.0,
+                "sink frame must be zeroed in every row"
+            );
+            for (frame, (a, b)) in raw_row.iter().zip(striped_row).enumerate() {
+                if frame != 2 {
+                    assert_eq!(a, b, "non-sink frames stay untouched");
+                }
+            }
+        }
+        // Frame 2 is the argmax of only 2 of 4 rows: not a strict majority
+        // (2*2 > 4 is false), so no sink qualifies.
+        assert!(
+            mask_dominant_early_sinks(&[
+                sink_row(frames, 2, 4),
+                sink_row(frames, 2, 5),
+                right_row(frames, 8),
+                right_row(frames, 9),
+            ])
+            .is_none()
+        );
+        // A shared peak beyond the 10-frame search horizon is out of scope
+        // (late peaks carry a token's real region and must never be masked).
+        assert!(
+            mask_dominant_early_sinks(&[right_row(frames, 11), right_row(frames, 11),]).is_none()
+        );
+        // Empty first row -> no frame count -> nothing to strip.
+        assert!(mask_dominant_early_sinks(&[Vec::new(), vec![0.01; frames]]).is_none());
+    }
+
+    #[test]
+    fn sink_strip_restores_order_for_diffuse_front_loaded_decode() {
+        let frames = 44;
+        // The measured cohere artifact: one early sink (frame 3) steals the
+        // argmax from most rows while each row's real region walks left to
+        // right. One row sits *right* of another sink row, so the raw peak
+        // order zig-zags (rejected); after the sink is stripped the reals are
+        // monotone left to right (accepted).
+        let rows = vec![
+            sink_row(frames, 3, 10),
+            sink_row(frames, 3, 13),
+            right_row(frames, 16),
+            sink_row(frames, 3, 19),
+            sink_row(frames, 3, 22),
+            sink_row(frames, 3, 25),
+            sink_row(frames, 3, 28),
+            right_row(frames, 40),
+        ];
+        let is_content = vec![true; rows.len()];
+        assert!(
+            !cross_attention_peaks_order_aligned(&rows, &is_content),
+            "raw zig-zag must be rejected before stripping"
+        );
+        let striped = mask_dominant_early_sinks(&rows).expect("sink frame 3 must be found");
+        assert!(
+            cross_attention_peaks_order_aligned(&striped, &is_content),
+            "stripping the dominant sink must restore a monotone peak order"
+        );
+    }
+
+    #[test]
+    fn cohere_dtw_word_timestamps_uses_dtw_when_sink_strip_restores_order() {
+        let (_runtime_path, preflight) = write_runtime_ready_preflight();
+        let metadata = super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
+            &preflight.metadata,
+        )
+        .expect("parse metadata");
+        let seconds_per_frame = 8.0 * metadata.hop_length as f32 / metadata.sample_rate_hz as f32;
+        let frames = 44;
+        // Eight content words with the diffuse front-loaded artifact (same
+        // shape as the unit test above): the raw peak order zig-zags, so only
+        // the sink-stripped re-test can admit the DTW pass and emit spans.
+        let rows = vec![
+            sink_row(frames, 3, 10),
+            sink_row(frames, 3, 13),
+            right_row(frames, 16),
+            sink_row(frames, 3, 19),
+            sink_row(frames, 3, 22),
+            sink_row(frames, 3, 25),
+            sink_row(frames, 3, 28),
+            right_row(frames, 40),
+        ];
+        let token_ids = [10u32, 11, 12, 13, 14, 15, 16, 17];
+        let alignments: Vec<(u32, Vec<f32>)> = token_ids
+            .iter()
+            .zip(rows.iter())
+            .map(|(&token_id, row)| (token_id, row.clone()))
+            .collect();
+        let decode_text = |token_ids: &[u32]| {
+            let mut decoded = String::new();
+            for &token_id in token_ids {
+                match token_id {
+                    10 => decoded.push_str("And"),
+                    11 => decoded.push_str(" so"),
+                    12 => decoded.push_str(" my"),
+                    13 => decoded.push_str(" fellow"),
+                    14 => decoded.push_str(" country"),
+                    15 => decoded.push_str(" can"),
+                    16 => decoded.push_str(" for"),
+                    17 => decoded.push_str(" you"),
+                    _ => {}
+                }
+            }
+            Ok(decoded)
+        };
+        let duration = (frames as f32) * seconds_per_frame;
+        let words = cohere_dtw_word_timestamps::<()>(
+            &alignments,
+            metadata,
+            &vec![0.99; token_ids.len()],
+            duration,
+            &decode_text,
+        )
+        .expect("dtw words");
+        assert!(
+            !words.is_empty(),
+            "sink-stripped monotone peaks must produce DTW word spans, got empty"
+        );
+        let actual_words: Vec<&str> = words.iter().map(|word| word.word.as_str()).collect();
+        assert_eq!(
+            actual_words,
+            ["And", "so", "my", "fellow", "country", "can", "for", "you"],
+            "word stream must match the transcript"
+        );
+        // DTW spans tile the band monotonically: non-decreasing, no overlap,
+        // and within the clip (the uniform path would spread them evenly).
+        for pair in words.windows(2) {
+            assert!(pair[0].start <= pair[1].start);
+            assert!(pair[0].end - 1e-6 <= pair[1].start);
+        }
+        assert!(words.last().is_some_and(|last| last.end <= duration + 1e-3));
+    }
+
+    #[test]
+    fn cohere_dtw_word_timestamps_falls_back_when_sink_strip_cannot_save_order() {
+        let (_runtime_path, preflight) = write_runtime_ready_preflight();
+        let metadata = super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
+            &preflight.metadata,
+        )
+        .expect("parse metadata");
+        let seconds_per_frame = 8.0 * metadata.hop_length as f32 / metadata.sample_rate_hz as f32;
+        let frames = 44;
+        // A dominant sink at frame 3 is present (3 of 4 rows peak there), but
+        // the reals still zig-zag after it is stripped (a middle word's real
+        // sits *after* the last one), so no amount of stripping makes the
+        // signal trustworthy and the caller keeps the uniform timestamps.
+        let rows = vec![
+            sink_row(frames, 3, 12),
+            right_row(frames, 16),
+            sink_row(frames, 3, 30),
+            sink_row(frames, 3, 20),
+        ];
+        let token_ids = [10u32, 11, 12, 13];
+        let alignments: Vec<(u32, Vec<f32>)> = token_ids
+            .iter()
+            .zip(rows.iter())
+            .map(|(&token_id, row)| (token_id, row.clone()))
+            .collect();
+        let decode_text = |token_ids: &[u32]| {
+            let mut decoded = String::new();
+            for &token_id in token_ids {
+                match token_id {
+                    10 => decoded.push_str("And"),
+                    11 => decoded.push_str(" so"),
+                    12 => decoded.push_str(" my"),
+                    13 => decoded.push_str(" fellow"),
+                    _ => {}
+                }
+            }
+            Ok(decoded)
+        };
+        let duration = (frames as f32) * seconds_per_frame;
+        let words = cohere_dtw_word_timestamps::<()>(
+            &alignments,
+            metadata,
+            &vec![0.99; token_ids.len()],
+            duration,
+            &decode_text,
+        )
+        .expect("dtw words");
+        assert!(
+            words.is_empty(),
+            "zig-zag surviving the sink strip must fall back (empty), got {words:?}"
+        );
+    }
+
+    #[test]
+    fn cohere_dtw_word_timestamps_falls_back_when_peaks_not_aligned() {
+        let (_runtime_path, preflight) = write_runtime_ready_preflight();
+        let metadata = super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
+            &preflight.metadata,
+        )
+        .expect("parse metadata");
+        let seconds_per_frame = 8.0 * metadata.hop_length as f32 / metadata.sample_rate_hz as f32;
+        let frames = 12;
+        // Two content words, but the second attends *earlier* than the first
+        // (the diffuse front-loaded artifact). The gate rejects the DTW pass
+        // and returns empty so the caller keeps the uniform post-hoc
+        // timestamps instead of the over-spread spans the DTW would emit.
+        let mut row0 = vec![0.01f32; frames];
+        row0[9] = 0.97;
+        let mut row1 = vec![0.01f32; frames];
+        row1[2] = 0.97;
+        let alignments = vec![(5u32, row0), (6u32, row1)];
+        let decode_text = |token_ids: &[u32]| {
+            let mut decoded = String::new();
+            for &token_id in token_ids {
+                match token_id {
+                    5 => decoded.push_str("hi"),
+                    6 => decoded.push_str(" there"),
+                    _ => {}
+                }
+            }
+            Ok(decoded)
+        };
+        let duration = (frames as f32) * seconds_per_frame;
+        let words = cohere_dtw_word_timestamps::<()>(
+            &alignments,
+            metadata,
+            &[0.99, 0.99],
+            duration,
+            &decode_text,
+        )
+        .expect("dtw words");
+        assert!(
+            words.is_empty(),
+            "non-order-aligned peaks must fall back (empty), got {words:?}"
+        );
     }
 
     #[test]

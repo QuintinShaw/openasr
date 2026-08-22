@@ -1616,7 +1616,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             supports_source_language_hint: true,
             adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
             prepared_runtime: OpenAsrPreparedRuntimeStrategy::SharedCohereTranscribeV1,
-            word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
+            // User-requested word timestamps switch the last decoder layer to
+            // its unfused f32 cross-attention each incremental step so the
+            // per-token frame row can be DTW-aligned; that can perturb the
+            // transcript via FP accumulation differences (whisper's same
+            // exception), so it is DecodeSensitive, not free to force on.
+            word_timestamps: OpenAsrWordTimestampStrategy::DecodeSensitive,
             streaming_partial_granularity: StreamingPartialGranularity::RevisableSnapshot,
             speaker_segmentation: SpeakerSegmentationSource::External,
             word_timestamp_source: WordTimestampSource::Native,

@@ -273,6 +273,13 @@ pub(crate) struct Seq2SeqLayerConfig {
     /// stride while masks/attention use only the active logical frames.
     pub cross_kv_max_positions: usize,
     pub cross_hidden_size: usize,
+    /// `true` -> the cross-attention of this block is deliberately
+    /// UNFUSED (`mul_mat` + `soft_max_ext`, f32) so the frame-axis softmax
+    /// weights can be captured as `Seq2SeqLayerOutput::last_token_cross_attention`
+    /// for word-timestamp alignment. Off for every block that only consumes
+    /// the fused-attention context, so the default decode path stays
+    /// byte-identical to the pre-capture behavior.
+    pub collect_cross_attention: bool,
 }
 
 /// Handle to one layer's persistent self-attention KV cache (f16,
@@ -350,6 +357,14 @@ pub(crate) struct Seq2SeqLayerOutput<'a> {
     /// `Some((mask, bits))` when `token_count > 1`. The caller must defer this
     /// f16 upload to after `set_output`, preserving the original ordering.
     pub deferred_self_mask: Option<(GgmlCpuTensor<'a>, Arc<[u16]>)>,
+    /// Per-token cross-attention weight over each encoder frame, present only
+    /// when `Seq2SeqLayerConfig::collect_cross_attention` is set. A plain
+    /// `[frame_count, token_count, heads]` f32 contiguous tensor: the frame-axis
+    /// softmax of the explicit (unfused) cross-attention. The caller marks it
+    /// as a graph output and reads back `frame_count * token_count * heads`
+    /// floats. Exists only for word-timestamp alignment consumers; the fused
+    /// kernel is otherwise byte-identical to the pre-capture behavior.
+    pub last_token_cross_attention: Option<GgmlCpuTensor<'a>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1074,18 +1089,53 @@ where
         "decoder_cross_v",
         map_err,
     )?;
-    let context = graph
-        .flash_attn_ext(q, cross_k, cross_v, None, scale, 0.0, 0.0)
-        .map_err(|source| map_err("ggml_flash_attn_ext(cross)", source))?;
-    let context = merge_seq2seq_attention_context(
-        graph,
-        context,
-        hidden,
-        token_count,
-        n_seq,
-        "ggml_reshape_2d(cross_merge)",
-        map_err,
-    )?;
+    let (context, last_token_cross_attention) = if config.collect_cross_attention {
+        let q = graph
+            .cont(q)
+            .map_err(|source| map_err("decoder_cross_q_cont", source))?;
+        let scores = graph
+            .mul_mat(cross_k, q)
+            .map_err(|source| map_err("ggml_mul_mat(cross_qk)", source))?;
+        let scores = graph
+            .cont(scores)
+            .map_err(|source| map_err("ggml_cont(cross_qk)", source))?;
+        let probs = graph
+            .soft_max_ext(scores, None, scale, 0.0)
+            .map_err(|source| map_err("ggml_soft_max_ext(cross_qk)", source))?;
+        let v_t = graph
+            .permute(cross_v, 1, 0, 2, 3)
+            .map_err(|source| map_err("ggml_permute(cross_v_t)", source))?;
+        let v_t = graph
+            .cont(v_t)
+            .map_err(|source| map_err("ggml_cont(cross_v_t)", source))?;
+        let context = graph
+            .mul_mat(v_t, probs)
+            .map_err(|source| map_err("ggml_mul_mat(cross_av)", source))?;
+        let context = merge_seq2seq_attention_context(
+            graph,
+            context,
+            hidden,
+            token_count,
+            n_seq,
+            "ggml_reshape_2d(cross_merge)",
+            map_err,
+        )?;
+        (context, Some(probs))
+    } else {
+        let context = graph
+            .flash_attn_ext(q, cross_k, cross_v, None, scale, 0.0, 0.0)
+            .map_err(|source| map_err("ggml_flash_attn_ext(cross)", source))?;
+        let context = merge_seq2seq_attention_context(
+            graph,
+            context,
+            hidden,
+            token_count,
+            n_seq,
+            "ggml_reshape_2d(cross_merge)",
+            map_err,
+        )?;
+        (context, None)
+    };
     let cross_attn = apply_linear_with_bias(
         graph,
         context,
@@ -1161,6 +1211,7 @@ where
             after_ffn,
         },
         deferred_self_mask,
+        last_token_cross_attention,
     })
 }
 
@@ -2781,6 +2832,7 @@ mod tests {
                 cross_frame_count: CROSS_FRAMES,
                 cross_kv_max_positions: CROSS_FRAMES,
                 cross_hidden_size: HIDDEN,
+                collect_cross_attention: false,
             },
             Seq2SeqLayerWeights {
                 self_attn_norm_weight: norm_weight,
