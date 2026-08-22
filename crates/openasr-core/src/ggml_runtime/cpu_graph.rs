@@ -253,28 +253,33 @@ impl GgmlBackendCapabilities {
     }
 }
 
-/// Request-level output requirement consumed by the shared output planner.
+/// Request/result contract consumed by the shared output planner.
 ///
-/// The variants name the result contract, not an optimization hint. A compact
-/// result is available only through the explicit `NativeFirstMaxToken` contract;
-/// generic tie-breaking semantics never authorize it.
+/// The variants name the result contract, not an optimization hint. Token
+/// families request `NativeFirstMaxTokenOrFullLogits`: the native compact
+/// result is used only with complete evidence and otherwise falls back to
+/// `FullLogits`. `CompleteScores` is reserved for a host oracle that consumes
+/// the complete score vector.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum GgmlRequestOutputRequirement {
+pub enum GgmlDecodeOutputContract {
     /// Return the complete logits tensor.
     FullLogits,
-    /// Return the complete score vector needed by the caller.
-    #[default]
+    /// Return the complete score vector required by a host score oracle.
     CompleteScores,
-    /// Return one token selected by the validated native first-max contract.
-    NativeFirstMaxToken,
+    /// Return a native first-max token when proven, otherwise full logits.
+    #[default]
+    NativeFirstMaxTokenOrFullLogits,
 }
+
+/// Compatibility alias for callers that still use the request-oriented name.
+pub type GgmlRequestOutputRequirement = GgmlDecodeOutputContract;
 
 /// Immutable output decision shared by family graph code and runtime ownership.
 ///
 /// `FullLogits` and `CompleteScores` are distinct complete-result contracts.
 /// `NativeFirstMaxToken` is selected only when the shared runtime has internal
-/// evidence for that exact capability; unknown evidence falls back to
-/// `CompleteScores`.
+/// evidence for that exact capability; unknown evidence falls back uniquely to
+/// `FullLogits`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GgmlDecodeOutputPlan {
     FullLogits,
@@ -425,18 +430,20 @@ impl GgmlLaneDecodeEvidence {
 }
 
 fn plan_decode_output(
-    requirement: GgmlRequestOutputRequirement,
+    contract: GgmlDecodeOutputContract,
     evidence: GgmlLaneDecodeEvidence,
 ) -> GgmlDecodeOutputPlan {
-    match requirement {
-        GgmlRequestOutputRequirement::FullLogits => GgmlDecodeOutputPlan::FullLogits,
-        GgmlRequestOutputRequirement::CompleteScores => GgmlDecodeOutputPlan::CompleteScores,
-        GgmlRequestOutputRequirement::NativeFirstMaxToken
+    match contract {
+        GgmlDecodeOutputContract::FullLogits => GgmlDecodeOutputPlan::FullLogits,
+        GgmlDecodeOutputContract::CompleteScores => GgmlDecodeOutputPlan::CompleteScores,
+        GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits
             if evidence.compact_selector.supports_native_first_max_token() =>
         {
             GgmlDecodeOutputPlan::NativeFirstMaxToken
         }
-        GgmlRequestOutputRequirement::NativeFirstMaxToken => GgmlDecodeOutputPlan::CompleteScores,
+        GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits => {
+            GgmlDecodeOutputPlan::FullLogits
+        }
     }
 }
 
@@ -886,7 +893,7 @@ impl GgmlNativeGqaCapability {
 pub struct ResolvedFamilyRuntimeInput {
     backend: GgmlCpuGraphBackend,
     native_gqa: GgmlNativeGqaCapability,
-    output_requirement: GgmlRequestOutputRequirement,
+    output_contract: GgmlDecodeOutputContract,
     output_plan: GgmlDecodeOutputPlan,
     reuse_mode: GgmlDecodeReuseMode,
 }
@@ -898,40 +905,55 @@ impl ResolvedFamilyRuntimeInput {
     /// `GgmlAsrBackendPreference::request_backend_override()`) and pass it
     /// straight in; this never installs anything, so there is no global
     /// state for a thread boundary to lose.
+    ///
+    /// This compatibility constructor defaults to the token-safe
+    /// `NativeFirstMaxTokenOrFullLogits` contract. Score-vector families must
+    /// call [`Self::resolve_with_output_contract`] and explicitly select
+    /// `CompleteScores`.
     pub fn resolve(preference: Option<RequestBackendPreference>, policy: AutoGpuPolicy) -> Self {
-        Self::resolve_with_output_requirement(
+        Self::resolve_with_output_contract(
             preference,
             policy,
-            GgmlRequestOutputRequirement::CompleteScores,
+            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
         )
     }
 
-    /// Resolves the shared output plan without exposing lane evidence to family
-    /// code. Native compact output remains unknown until the selected device's
-    /// support, shape, lane, backend, persistence, and family evidence are all
-    /// wired into this shared runtime seam.
-    pub fn resolve_with_output_requirement(
+    /// Resolves a family request with an explicit output contract. This is the
+    /// required seam for score-vector host oracles and for token families that
+    /// need the native-first-max/full-logits fallback contract.
+    pub fn resolve_with_output_contract(
         preference: Option<RequestBackendPreference>,
         policy: AutoGpuPolicy,
-        output_requirement: GgmlRequestOutputRequirement,
+        output_contract: GgmlDecodeOutputContract,
     ) -> Self {
         let backend =
             GgmlCpuGraphConfig::resolve_family_backend_for_preference(preference.clone(), policy);
         // Do not infer compact support from provider names, backend classes, or
         // generic first/last-max semantics. Until the selected-device proof is
-        // connected here, every native compact request fails closed.
+        // connected here, every native compact request falls back to FullLogits.
         let evidence = GgmlLaneDecodeEvidence::unknown();
         Self {
             backend,
             native_gqa: resolve_native_gqa_capability(preference.as_ref(), backend),
-            output_requirement,
-            output_plan: plan_decode_output(output_requirement, evidence),
+            output_contract,
+            output_plan: plan_decode_output(output_contract, evidence),
             reuse_mode: if evidence.reuse.is_validated() {
                 GgmlDecodeReuseMode::ReusableGraph
             } else {
                 GgmlDecodeReuseMode::FreshGraph
             },
         }
+    }
+
+    /// Compatibility spelling for callers using the former requirement name.
+    /// The argument remains explicit, so it cannot silently select the
+    /// score-vector fallback.
+    pub fn resolve_with_output_requirement(
+        preference: Option<RequestBackendPreference>,
+        policy: AutoGpuPolicy,
+        output_requirement: GgmlRequestOutputRequirement,
+    ) -> Self {
+        Self::resolve_with_output_contract(preference, policy, output_requirement)
     }
 
     /// The backend resolved for this request, already passed through the
@@ -948,9 +970,14 @@ impl ResolvedFamilyRuntimeInput {
         self.native_gqa
     }
 
-    /// The request's semantic requirement before lane evidence is applied.
+    /// The explicit request/result contract selected by the family.
+    pub fn output_contract(self) -> GgmlDecodeOutputContract {
+        self.output_contract
+    }
+
+    /// Compatibility accessor for callers using the former requirement name.
     pub fn output_requirement(self) -> GgmlRequestOutputRequirement {
-        self.output_requirement
+        self.output_contract
     }
 
     /// The single resolved output plan. Families must consume this result
@@ -11705,7 +11732,7 @@ mod tests {
     #[test]
     fn decode_output_planner_is_explicit_and_fail_closed() {
         use super::{
-            GgmlDecodeOutputPlan, GgmlLaneDecodeEvidence, GgmlRequestOutputRequirement,
+            GgmlDecodeOutputContract, GgmlDecodeOutputPlan, GgmlLaneDecodeEvidence,
             plan_decode_output,
         };
 
@@ -11716,39 +11743,39 @@ mod tests {
         let cases = [
             (
                 "full logits stays full logits",
-                GgmlRequestOutputRequirement::FullLogits,
+                GgmlDecodeOutputContract::FullLogits,
                 native,
                 GgmlDecodeOutputPlan::FullLogits,
             ),
             (
-                "complete scores stays complete scores",
-                GgmlRequestOutputRequirement::CompleteScores,
+                "score-vector host oracle stays complete scores",
+                GgmlDecodeOutputContract::CompleteScores,
                 native,
                 GgmlDecodeOutputPlan::CompleteScores,
             ),
             (
                 "native first max uses its named capability",
-                GgmlRequestOutputRequirement::NativeFirstMaxToken,
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
                 native,
                 GgmlDecodeOutputPlan::NativeFirstMaxToken,
             ),
             (
-                "generic first max oracle alone cannot compact",
-                GgmlRequestOutputRequirement::NativeFirstMaxToken,
+                "first-max token falls back to full logits",
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
                 first_oracle_only,
-                GgmlDecodeOutputPlan::CompleteScores,
+                GgmlDecodeOutputPlan::FullLogits,
             ),
             (
-                "generic last max oracle alone cannot compact",
-                GgmlRequestOutputRequirement::NativeFirstMaxToken,
+                "last-max oracle alone falls back to full logits",
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
                 last_oracle_only,
-                GgmlDecodeOutputPlan::CompleteScores,
+                GgmlDecodeOutputPlan::FullLogits,
             ),
             (
-                "unknown evidence fails closed",
-                GgmlRequestOutputRequirement::NativeFirstMaxToken,
+                "unknown evidence falls back to full logits",
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
                 unknown,
-                GgmlDecodeOutputPlan::CompleteScores,
+                GgmlDecodeOutputPlan::FullLogits,
             ),
         ];
 
@@ -11774,7 +11801,7 @@ mod tests {
     #[test]
     fn resolved_family_runtime_output_plan_never_uses_provider_name_as_capability() {
         use super::{
-            GgmlDecodeOutputPlan, GgmlRequestOutputRequirement, RequestBackendPreference,
+            GgmlDecodeOutputContract, GgmlDecodeOutputPlan, RequestBackendPreference,
             ResolvedFamilyRuntimeInput,
         };
         use crate::device::execution_route::{
@@ -11800,14 +11827,14 @@ mod tests {
             ExecutionProvider::Metal,
             ExecutionProvider::Unknown,
         ] {
-            let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_requirement(
+            let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
                 Some(exact(provider)),
                 super::AutoGpuPolicy::AllBackends,
-                GgmlRequestOutputRequirement::NativeFirstMaxToken,
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
             );
             assert_eq!(
                 resolved.output_plan(),
-                GgmlDecodeOutputPlan::CompleteScores,
+                GgmlDecodeOutputPlan::FullLogits,
                 "provider name must not authorize native compact output: {provider:?}"
             );
         }
@@ -11818,6 +11845,16 @@ mod tests {
                 super::AutoGpuPolicy::AllBackends,
             )
             .output_plan(),
+            GgmlDecodeOutputPlan::FullLogits
+        );
+
+        let score_vector = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+            Some(exact(ExecutionProvider::Cuda)),
+            super::AutoGpuPolicy::AllBackends,
+            GgmlDecodeOutputContract::CompleteScores,
+        );
+        assert_eq!(
+            score_vector.output_plan(),
             GgmlDecodeOutputPlan::CompleteScores
         );
     }
