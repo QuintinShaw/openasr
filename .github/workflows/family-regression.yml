@@ -5,12 +5,34 @@ name: Family Regression
 # signature-verified) and transcribe a committed fixture on the CPU backend,
 # comparing against committed goldens (tooling/family-regression/goldens/).
 #
-# Runs nightly, after a release is published, and on demand. Kept outside
-# push/PR CI because it performs real network downloads and native inference.
-# Nightly/manual runs reuse the latest published CLI too; a raw tag no longer
-# races the release matrix and falls back to two duplicate local builds.
+# This workflow's existing matrix is intentionally CPU-only/post-release
+# monitoring. It is not the publication blocker. Pre-publication callers must
+# use the reusable `workflow_call` contract above with immutable candidate,
+# staging-catalog, and correctness-matrix artifacts; release finalization also
+# consumes the same bound matrix before catalog activation.
 
 on:
+  # This reusable entrypoint is the pre-publication contract seam. The release
+  # orchestrator must call it with staged candidate artifacts before catalog
+  # activation; the release event below remains monitoring only.
+  workflow_call:
+    inputs:
+      pre_publication:
+        description: "Require a release-candidate family regression contract"
+        required: true
+        type: boolean
+      candidate_cli_artifact:
+        description: "Artifact name containing the immutable candidate CLI"
+        required: false
+        type: string
+      staging_catalog_artifact:
+        description: "Artifact name containing the staging catalog snapshot"
+        required: false
+        type: string
+      correctness_matrix_artifact:
+        description: "Artifact name containing the projected correctness matrix"
+        required: false
+        type: string
   workflow_dispatch:
   schedule:
     - cron: "23 4 * * *"
@@ -34,6 +56,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  pre-publication-contract:
+    name: Pre-publication family regression contract
+    if: ${{ inputs.pre_publication == true && (github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v')) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require immutable staged evidence inputs
+        env:
+          CANDIDATE_CLI: ${{ inputs.candidate_cli_artifact }}
+          STAGING_CATALOG: ${{ inputs.staging_catalog_artifact }}
+          CORRECTNESS_MATRIX: ${{ inputs.correctness_matrix_artifact }}
+        run: |
+          set -euo pipefail
+          test -n "$CANDIDATE_CLI" || { echo "candidate CLI artifact is required" >&2; exit 1; }
+          test -n "$STAGING_CATALOG" || { echo "staging catalog artifact is required" >&2; exit 1; }
+          test -n "$CORRECTNESS_MATRIX" || { echo "correctness matrix artifact is required" >&2; exit 1; }
+          echo "pre-publication contract inputs accepted; staged artifact jobs must consume these exact identities"
+
   build-cli-linux:
     name: Build CLI (ubuntu-latest)
     # The public repository also hosts desktop-vX.Y.Z releases. Those do not

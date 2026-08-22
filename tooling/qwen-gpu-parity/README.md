@@ -51,7 +51,9 @@ Overrides (env):
 
 ## CI
 
-`.github/workflows/qwen-gpu-parity.yml` runs this on the self-hosted
-`[self-hosted, Windows, X64, HIP]` runner (the HIP compile-gate runner), on
-demand and on PRs that touch the qwen decode / attention / ggml runtime. If that
-runner is frequently offline, narrow the trigger to `workflow_dispatch` only.
+`.github/workflows/qwen-gpu-parity.yml` is a manual-dispatch diagnostic on the
+self-hosted `[self-hosted, Windows, X64, HIP]` runner. It is not evidence until a
+successful run binds the candidate binary, provider/device, pack, fixture, and
+per-step token trace. The workflow is projected into the common family/provider
+correctness matrix; a shared ggml path or build-only result does not approve the
+qwen GPU lane. No successful run is implied by this documentation.

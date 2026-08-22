@@ -33,6 +33,8 @@ trap 'rm -rf "$workdir"' EXIT
 gh release download "$tag" \
   -p 'backend-pack-*.json' \
   -p 'backend-hardware-evidence-*.json' \
+  -p 'gpu-correctness-matrix.v1.json' \
+  -p 'gpu-correctness-receipt-*.json' \
   -D "$workdir" --clobber
 
 shopt -s nullglob
@@ -66,6 +68,20 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < <(tr -d '\r' < "$workdir/hardware-approved-entries.txt")
 [ "${#approved_entries[@]}" -gt 0 ] \
   || fail "release ${tag} has no backend entry approved by hardware evidence"
+
+correctness_matrix="$workdir/gpu-correctness-matrix.v1.json"
+[ -f "$correctness_matrix" ] \
+  || fail "release ${tag} has no staged GPU correctness matrix"
+correctness_receipts=("$workdir"/gpu-correctness-receipt-*.json)
+[ "${#correctness_receipts[@]}" -gt 0 ] \
+  || fail "release ${tag} has no staged GPU correctness receipts"
+correctness_receipt_args=()
+for receipt in "${correctness_receipts[@]}"; do
+  correctness_receipt_args+=(--receipt "$receipt")
+done
+python3 tooling/release-manifest/gpu_correctness_gate.py validate \
+  --manifest "$correctness_matrix" "${correctness_receipt_args[@]}"
+
 backend_entry_args=()
 for entry in "${approved_entries[@]}"; do
   backend_entry_args+=(--entry "$entry")

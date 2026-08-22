@@ -117,8 +117,9 @@ made public until the signed catalog distribution plane is complete:
 
 1. Attach `backend-hardware-evidence-*.json` receipts for every provider that is
    intended to become runtime-selectable. Schema v1 approves only the exact
-   tested target; schema v2 may approve an explicit provider matrix. For 0.1.36,
-   produce schema v2 with
+   tested target; schema v2 may approve an explicit provider matrix. Placement
+   and resource evidence remains separate from model token correctness. For
+   0.1.36, produce schema v2 with
    `tooling/release-manifest/generate_backend_hardware_evidence.py` and attach
    both its `backend-hardware-evidence-*.json` summary and separately named
    `backend-hardware-audit-*.json` raw audit. The runner verifies every release
@@ -139,21 +140,33 @@ made public until the signed catalog distribution plane is complete:
    provider-matrix receipt is compatibility policy, not a claim that every GPU
    ran. Building a target, copying one receipt five times, scheduler/hybrid
    execution, or CPU/other-provider compute is rejected.
-2. Run `scripts/sync-windows-backend-cdn.sh vX.Y.Z` locally with the B2
+2. Attach exactly one projected `gpu-correctness-matrix.v1.json` plus its bound
+   `gpu-correctness-receipt-*.json` set. Generate the projection from
+   `tooling/model-family-inventory.v1.json`, the staging model catalog, and the
+   staging backend catalog. The matrix requires separate build/packaging,
+   placement/resource, and token/transcript evidence; cold and same-process
+   reuse are distinct cells. A missing, stale, CPU-only, placement-only, or
+   differently bound receipt fails the finalizer. The matrix is evidence
+   requirements only and never fabricates a hardware result.
+3. Before catalog activation, call the reusable pre-publication contract in
+   `.github/workflows/family-regression.yml` with the immutable candidate CLI,
+   staging catalog, and correctness-matrix artifacts. Its existing release and
+   nightly jobs remain CPU-only post-release monitoring.
+4. Run `scripts/sync-windows-backend-cdn.sh vX.Y.Z` locally with the B2
    release credentials. It copies the hardware-approved plugin and vendor
    files to `https://dl.openasr.org/core/vX.Y.Z/`. The signed catalog's
    `files[].url` values point only at this prefix; GitHub release mirrors are
    not a runtime download fallback.
-3. Run `scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z` locally with
+5. Run `scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z` locally with
    the production catalog signing seed. It downloads and hashes all 6 CUDA and
    14 HIP build artifacts, but merges only the target entries approved by those
    receipts. Before touching the catalog it verifies that every selected CDN
    payload is already live, then bumps the epoch and signs the full/public
    catalogs. Review, commit, and push those catalog files.
-4. Wait for `deploy-catalog.yml` to repeat the no-credential CDN gate and prove
+6. Wait for `deploy-catalog.yml` to repeat the no-credential CDN gate and prove
    the signed public bytes are live. Metadata is never deployed ahead of its
    immutable payloads.
-5. Run `scripts/finalize-core-release.sh vX.Y.Z`. It requires the live signed
+7. Run `scripts/finalize-core-release.sh vX.Y.Z`. It requires the live signed
    catalog target set to equal the hardware-approved subset exactly, and it
    HEADs every signed CDN URL for that version; only then does it publish the
    draft and mark it latest.

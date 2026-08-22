@@ -328,8 +328,13 @@ A migration is complete only when:
 
 A staged/public-ready model additionally satisfies the Step 5 catalog,
 family-audit, real-weight receipt, and family-regression obligations appropriate
-to that scope. Passing this architecture contract alone never implies that a
-model is published or performance-qualified.
+to that scope. The existing family-regression matrix is intentionally
+CPU-only/post-publication monitoring; it cannot block publication. Before
+catalog activation, the release candidate must call the reusable
+`family-regression.yml` pre-publication contract with immutable candidate,
+staging-catalog, and correctness-matrix artifacts, and the release finalizer
+must validate the generated family/provider matrix. Passing this architecture
+contract alone never implies that a model is published or performance-qualified.
 
 Do not leave a compatibility alias merely to make a stale example compile. The
 source tree and the docs must teach the current path so a later contributor

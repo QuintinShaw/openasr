@@ -106,6 +106,11 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("verify-cdn", finalize)
         self.assertIn("backend_hardware_evidence.py", finalize)
         self.assertIn("tr -d '\\r'", finalize)
+        self.assertIn("gpu-correctness-matrix.v1.json", finalize)
+        self.assertIn("gpu-correctness-receipt-*.json", finalize)
+        self.assertIn("gpu_correctness_gate.py validate", finalize)
+        self.assertIn("has no staged GPU correctness matrix", finalize)
+        self.assertIn("has no staged GPU correctness receipts", finalize)
         self.assertIn('gh release edit "$tag" --draft=false --latest', finalize)
         self.assertLess(finalize.index("verify-cdn"), finalize.index("--draft=false"))
 
@@ -152,6 +157,11 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertEqual(family.count("gh attestation verify"), 2)
         self.assertEqual(family.count("--signer-workflow"), 2)
         self.assertIn("attestations: read", family)
+        self.assertIn("workflow_call:", family)
+        self.assertIn("pre_publication", family)
+        self.assertIn("candidate_cli_artifact", family)
+        self.assertIn("correctness_matrix_artifact", family)
+        self.assertIn("CPU-only/post-release", family)
 
     def test_family_regression_ignores_non_core_release_tags(self) -> None:
         family = (ROOT / ".github/workflows/family-regression.yml").read_text(

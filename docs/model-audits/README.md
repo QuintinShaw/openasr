@@ -26,10 +26,15 @@ release quality, not paperwork: filling one should take an afternoon.
   `tooling/publish-model/scripts/audit_form.py`.
 - **Ships with the release:** the completed form is part of the release; keep
   it updated when a dimension's status changes (e.g. a Deferred item lands).
-- **Existing families:** families public before this policy are grandfathered
-  in `audit_form.py` (`PRE_AUDIT_FAMILIES`) and get backfilled on the rolling
-  audit matrix. When a family's form lands, remove it from that set -- the set
-  only shrinks, never grows.
+- **Existing families:** `PRE_AUDIT_FAMILIES` is retained only as a migration
+  ledger for source-tree reporting. It is not a release exemption: a missing
+  form fails closed. For every public family/provider lane that the architecture
+  inventory marks Auto-eligible or explicitly selectable, the structured backend
+  table must contain current positive Supported, Golden-verified, and utilization
+  answers (CPU may use `N/A` for utilization). `Untested`, `Deferred`, `No`,
+  missing, or stale cells never approve a lane. An explicit `No` remains useful
+  only when the inventory does not advertise that provider, and must include the
+  non-activation reason and unlock condition.
 
 ## Filling guidance
 

@@ -1,14 +1,9 @@
 name: qwen GPU parity gate
 
-# Catches GPU-only qwen inference regressions that the Linux/ARM CI cannot see
-# (it has no discrete GPU): asserts the qwen3-asr transcript on the auto-selected
-# GPU backend matches the CPU reference for the committed audio fixtures. This is
-# the gate that would have caught the RDNA4 / gfx1200 native-GQA flash-broadcast
-# bug, where recognition degenerated into garbled, repeated tokens on the GPU
-# while CPU stayed correct. Runs on the self-hosted Windows HIP runner (same
-# runner as the HIP compile gate) -- GitHub-hosted runners have no AMD GPU, so
-# this stays pinned to that dedicated hardware. Maintainer AMD hardware gate,
-# dispatch manually after registering the runner.
+# Manual diagnostic only. A successful run must be uploaded as a bound receipt
+# before it can close the qwen/provider cell in the common correctness matrix;
+# workflow execution itself is not a release claim. The self-hosted Windows HIP
+# runner is required because GitHub-hosted runners have no AMD GPU.
 
 on:
   workflow_dispatch:
