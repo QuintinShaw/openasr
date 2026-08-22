@@ -253,39 +253,33 @@ impl GgmlBackendCapabilities {
     }
 }
 
-/// Semantic tie policy supplied by a model family's host decode oracle.
-///
-/// This is deliberately backend-neutral: a lane may only use a compact device
-/// selector when it has evidence for the requested policy. Adding another
-/// family oracle extends this enum without exposing backend details to family
-/// code.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum GgmlFamilyTieOracle {
-    #[default]
-    FirstMaximum,
-    LastMaximum,
-}
-
 /// Request-level output requirement consumed by the shared output planner.
 ///
-/// `Complete` is the conservative default. A compact selector is an optional
-/// optimization and is never selected merely because a backend is GPU-class.
+/// The variants name the result contract, not an optimization hint. A compact
+/// result is available only through the explicit `NativeFirstMaxToken` contract;
+/// generic tie-breaking semantics never authorize it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum GgmlRequestOutputRequirement {
+    /// Return the complete logits tensor.
+    FullLogits,
+    /// Return the complete score vector needed by the caller.
     #[default]
-    Complete,
-    CompactAllowed,
+    CompleteScores,
+    /// Return one token selected by the validated native first-max contract.
+    NativeFirstMaxToken,
 }
 
 /// Immutable output decision shared by family graph code and runtime ownership.
 ///
-/// The compact variant carries the semantic family oracle rather than a
-/// provider-specific operation or a preselected token. Unknown lane evidence
-/// always resolves to `Complete`.
+/// `FullLogits` and `CompleteScores` are distinct complete-result contracts.
+/// `NativeFirstMaxToken` is selected only when the shared runtime has internal
+/// evidence for that exact capability; unknown evidence falls back to
+/// `CompleteScores`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GgmlDecodeOutputPlan {
-    Complete,
-    SemanticCompact { tie_oracle: GgmlFamilyTieOracle },
+    FullLogits,
+    CompleteScores,
+    NativeFirstMaxToken,
 }
 
 /// Reuse decision resolved alongside the output plan.
@@ -299,37 +293,43 @@ pub enum GgmlDecodeReuseMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GgmlLaneEvidence {
     Unknown,
+    #[cfg(test)]
     Validated,
 }
 
 impl GgmlLaneEvidence {
+    #[cfg(test)]
     const fn is_validated(self) -> bool {
         matches!(self, Self::Validated)
     }
+
+    #[cfg(not(test))]
+    const fn is_validated(self) -> bool {
+        false
+    }
 }
 
-/// Internal evidence for a lane's semantic compact selector. This is not
-/// exposed to families; they receive only the resolved output plan.
+/// Internal evidence for a native compact token result. Generic first/last
+/// maximum semantics are deliberately not capabilities: they cannot authorize
+/// the native result contract without the selected device's complete proof.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GgmlLaneCompactSelectorEvidence {
     first_max: GgmlLaneEvidence,
     last_max: GgmlLaneEvidence,
+    native_first_max_token: GgmlLaneEvidence,
 }
 
 impl GgmlLaneCompactSelectorEvidence {
-    #[cfg(test)]
     const fn unknown() -> Self {
         Self {
             first_max: GgmlLaneEvidence::Unknown,
             last_max: GgmlLaneEvidence::Unknown,
+            native_first_max_token: GgmlLaneEvidence::Unknown,
         }
     }
 
-    const fn supports(self, tie_oracle: GgmlFamilyTieOracle) -> bool {
-        match tie_oracle {
-            GgmlFamilyTieOracle::FirstMaximum => self.first_max.is_validated(),
-            GgmlFamilyTieOracle::LastMaximum => self.last_max.is_validated(),
-        }
+    const fn supports_native_first_max_token(self) -> bool {
+        self.native_first_max_token.is_validated()
     }
 }
 
@@ -374,7 +374,6 @@ struct GgmlLaneDecodeEvidence {
 }
 
 impl GgmlLaneDecodeEvidence {
-    #[cfg(test)]
     const fn unknown() -> Self {
         Self {
             compact_selector: GgmlLaneCompactSelectorEvidence::unknown(),
@@ -383,19 +382,13 @@ impl GgmlLaneDecodeEvidence {
     }
 
     #[cfg(test)]
-    const fn validated_for(tie_oracle: GgmlFamilyTieOracle) -> Self {
-        let selector = match tie_oracle {
-            GgmlFamilyTieOracle::FirstMaximum => GgmlLaneCompactSelectorEvidence {
-                first_max: GgmlLaneEvidence::Validated,
-                last_max: GgmlLaneEvidence::Unknown,
-            },
-            GgmlFamilyTieOracle::LastMaximum => GgmlLaneCompactSelectorEvidence {
-                first_max: GgmlLaneEvidence::Unknown,
-                last_max: GgmlLaneEvidence::Validated,
-            },
-        };
+    const fn validated_native_first_max_token() -> Self {
         Self {
-            compact_selector: selector,
+            compact_selector: GgmlLaneCompactSelectorEvidence {
+                first_max: GgmlLaneEvidence::Unknown,
+                last_max: GgmlLaneEvidence::Unknown,
+                native_first_max_token: GgmlLaneEvidence::Validated,
+            },
             reuse: GgmlLaneReuseEvidence {
                 persistent_input_refresh: GgmlLaneEvidence::Validated,
                 persistent_output_refresh: GgmlLaneEvidence::Validated,
@@ -405,52 +398,45 @@ impl GgmlLaneDecodeEvidence {
             },
         }
     }
-}
 
-fn plan_decode_output(
-    tie_oracle: GgmlFamilyTieOracle,
-    requirement: GgmlRequestOutputRequirement,
-    evidence: GgmlLaneDecodeEvidence,
-) -> GgmlDecodeOutputPlan {
-    if matches!(requirement, GgmlRequestOutputRequirement::CompactAllowed)
-        && evidence.compact_selector.supports(tie_oracle)
-    {
-        GgmlDecodeOutputPlan::SemanticCompact { tie_oracle }
-    } else {
-        GgmlDecodeOutputPlan::Complete
+    #[cfg(test)]
+    const fn validated_generic_first_max_only() -> Self {
+        Self {
+            compact_selector: GgmlLaneCompactSelectorEvidence {
+                first_max: GgmlLaneEvidence::Validated,
+                last_max: GgmlLaneEvidence::Unknown,
+                native_first_max_token: GgmlLaneEvidence::Unknown,
+            },
+            reuse: GgmlLaneReuseEvidence::unknown(),
+        }
+    }
+
+    #[cfg(test)]
+    const fn validated_generic_last_max_only() -> Self {
+        Self {
+            compact_selector: GgmlLaneCompactSelectorEvidence {
+                first_max: GgmlLaneEvidence::Unknown,
+                last_max: GgmlLaneEvidence::Validated,
+                native_first_max_token: GgmlLaneEvidence::Unknown,
+            },
+            reuse: GgmlLaneReuseEvidence::unknown(),
+        }
     }
 }
 
-fn resolve_lane_decode_evidence(
-    preference: Option<&RequestBackendPreference>,
-    backend: GgmlCpuGraphBackend,
-) -> GgmlLaneDecodeEvidence {
-    // Native ARGMAX_FIRST is a typed operation fact. Reusable-graph evidence is
-    // intentionally unknown until the production-shape persistence probes pass.
-    // In particular, a generic accelerated preference and an unknown provider
-    // cannot authorize compact output.
-    let first_max_validated = match backend {
-        GgmlCpuGraphBackend::Cpu => true,
-        GgmlCpuGraphBackend::Metal => false,
-        GgmlCpuGraphBackend::Gpu => matches!(
-            preference,
-            Some(RequestBackendPreference::Exact(route))
-                if matches!(
-                    route.provider,
-                    ExecutionProvider::Cuda | ExecutionProvider::Hip | ExecutionProvider::Vulkan
-                )
-        ),
-    };
-    GgmlLaneDecodeEvidence {
-        compact_selector: GgmlLaneCompactSelectorEvidence {
-            first_max: if first_max_validated {
-                GgmlLaneEvidence::Validated
-            } else {
-                GgmlLaneEvidence::Unknown
-            },
-            last_max: GgmlLaneEvidence::Unknown,
-        },
-        reuse: GgmlLaneReuseEvidence::unknown(),
+fn plan_decode_output(
+    requirement: GgmlRequestOutputRequirement,
+    evidence: GgmlLaneDecodeEvidence,
+) -> GgmlDecodeOutputPlan {
+    match requirement {
+        GgmlRequestOutputRequirement::FullLogits => GgmlDecodeOutputPlan::FullLogits,
+        GgmlRequestOutputRequirement::CompleteScores => GgmlDecodeOutputPlan::CompleteScores,
+        GgmlRequestOutputRequirement::NativeFirstMaxToken
+            if evidence.compact_selector.supports_native_first_max_token() =>
+        {
+            GgmlDecodeOutputPlan::NativeFirstMaxToken
+        }
+        GgmlRequestOutputRequirement::NativeFirstMaxToken => GgmlDecodeOutputPlan::CompleteScores,
     }
 }
 
@@ -900,7 +886,6 @@ impl GgmlNativeGqaCapability {
 pub struct ResolvedFamilyRuntimeInput {
     backend: GgmlCpuGraphBackend,
     native_gqa: GgmlNativeGqaCapability,
-    tie_oracle: GgmlFamilyTieOracle,
     output_requirement: GgmlRequestOutputRequirement,
     output_plan: GgmlDecodeOutputPlan,
     reuse_mode: GgmlDecodeReuseMode,
@@ -917,29 +902,30 @@ impl ResolvedFamilyRuntimeInput {
         Self::resolve_with_output_requirement(
             preference,
             policy,
-            GgmlFamilyTieOracle::default(),
-            GgmlRequestOutputRequirement::Complete,
+            GgmlRequestOutputRequirement::CompleteScores,
         )
     }
 
-    /// Resolves the shared output plan without changing the legacy two-argument
-    /// constructor. Family code supplies only its semantic oracle and whether
-    /// the request needs complete output; lane evidence remains runtime-owned.
+    /// Resolves the shared output plan without exposing lane evidence to family
+    /// code. Native compact output remains unknown until the selected device's
+    /// support, shape, lane, backend, persistence, and family evidence are all
+    /// wired into this shared runtime seam.
     pub fn resolve_with_output_requirement(
         preference: Option<RequestBackendPreference>,
         policy: AutoGpuPolicy,
-        tie_oracle: GgmlFamilyTieOracle,
         output_requirement: GgmlRequestOutputRequirement,
     ) -> Self {
         let backend =
             GgmlCpuGraphConfig::resolve_family_backend_for_preference(preference.clone(), policy);
-        let evidence = resolve_lane_decode_evidence(preference.as_ref(), backend);
+        // Do not infer compact support from provider names, backend classes, or
+        // generic first/last-max semantics. Until the selected-device proof is
+        // connected here, every native compact request fails closed.
+        let evidence = GgmlLaneDecodeEvidence::unknown();
         Self {
             backend,
             native_gqa: resolve_native_gqa_capability(preference.as_ref(), backend),
-            tie_oracle,
             output_requirement,
-            output_plan: plan_decode_output(tie_oracle, output_requirement, evidence),
+            output_plan: plan_decode_output(output_requirement, evidence),
             reuse_mode: if evidence.reuse.is_validated() {
                 GgmlDecodeReuseMode::ReusableGraph
             } else {
@@ -960,11 +946,6 @@ impl ResolvedFamilyRuntimeInput {
     /// Exact CUDA/Vulkan route, while HIP and unknown providers fail closed.
     pub(crate) fn native_gqa_capability(self) -> GgmlNativeGqaCapability {
         self.native_gqa
-    }
-
-    /// The family oracle captured by the shared output planner.
-    pub fn tie_oracle(self) -> GgmlFamilyTieOracle {
-        self.tie_oracle
     }
 
     /// The request's semantic requirement before lane evidence is applied.
@@ -11722,66 +11703,64 @@ mod tests {
     }
 
     #[test]
-    fn decode_output_planner_is_tie_aware_and_fail_closed() {
+    fn decode_output_planner_is_explicit_and_fail_closed() {
         use super::{
-            GgmlDecodeOutputPlan, GgmlFamilyTieOracle, GgmlLaneDecodeEvidence,
-            GgmlRequestOutputRequirement, plan_decode_output,
+            GgmlDecodeOutputPlan, GgmlLaneDecodeEvidence, GgmlRequestOutputRequirement,
+            plan_decode_output,
         };
 
-        let first = GgmlLaneDecodeEvidence::validated_for(GgmlFamilyTieOracle::FirstMaximum);
-        let last = GgmlLaneDecodeEvidence::validated_for(GgmlFamilyTieOracle::LastMaximum);
+        let native = GgmlLaneDecodeEvidence::validated_native_first_max_token();
         let unknown = GgmlLaneDecodeEvidence::unknown();
+        let first_oracle_only = GgmlLaneDecodeEvidence::validated_generic_first_max_only();
+        let last_oracle_only = GgmlLaneDecodeEvidence::validated_generic_last_max_only();
         let cases = [
             (
-                "complete requirement wins",
-                GgmlFamilyTieOracle::FirstMaximum,
-                GgmlRequestOutputRequirement::Complete,
-                first,
-                GgmlDecodeOutputPlan::Complete,
+                "full logits stays full logits",
+                GgmlRequestOutputRequirement::FullLogits,
+                native,
+                GgmlDecodeOutputPlan::FullLogits,
             ),
             (
-                "validated first oracle selects semantic compact output",
-                GgmlFamilyTieOracle::FirstMaximum,
-                GgmlRequestOutputRequirement::CompactAllowed,
-                first,
-                GgmlDecodeOutputPlan::SemanticCompact {
-                    tie_oracle: GgmlFamilyTieOracle::FirstMaximum,
-                },
+                "complete scores stays complete scores",
+                GgmlRequestOutputRequirement::CompleteScores,
+                native,
+                GgmlDecodeOutputPlan::CompleteScores,
             ),
             (
-                "a different oracle stays complete",
-                GgmlFamilyTieOracle::FirstMaximum,
-                GgmlRequestOutputRequirement::CompactAllowed,
-                last,
-                GgmlDecodeOutputPlan::Complete,
+                "native first max uses its named capability",
+                GgmlRequestOutputRequirement::NativeFirstMaxToken,
+                native,
+                GgmlDecodeOutputPlan::NativeFirstMaxToken,
             ),
             (
-                "unknown evidence stays complete",
-                GgmlFamilyTieOracle::FirstMaximum,
-                GgmlRequestOutputRequirement::CompactAllowed,
+                "generic first max oracle alone cannot compact",
+                GgmlRequestOutputRequirement::NativeFirstMaxToken,
+                first_oracle_only,
+                GgmlDecodeOutputPlan::CompleteScores,
+            ),
+            (
+                "generic last max oracle alone cannot compact",
+                GgmlRequestOutputRequirement::NativeFirstMaxToken,
+                last_oracle_only,
+                GgmlDecodeOutputPlan::CompleteScores,
+            ),
+            (
+                "unknown evidence fails closed",
+                GgmlRequestOutputRequirement::NativeFirstMaxToken,
                 unknown,
-                GgmlDecodeOutputPlan::Complete,
-            ),
-            (
-                "validated last oracle remains extensible",
-                GgmlFamilyTieOracle::LastMaximum,
-                GgmlRequestOutputRequirement::CompactAllowed,
-                last,
-                GgmlDecodeOutputPlan::SemanticCompact {
-                    tie_oracle: GgmlFamilyTieOracle::LastMaximum,
-                },
+                GgmlDecodeOutputPlan::CompleteScores,
             ),
         ];
 
-        for (name, oracle, requirement, evidence, expected) in cases {
+        for (name, requirement, evidence, expected) in cases {
             assert_eq!(
-                plan_decode_output(oracle, requirement, evidence),
+                plan_decode_output(requirement, evidence),
                 expected,
                 "planner case: {name}"
             );
         }
         assert_eq!(
-            first.reuse,
+            native.reuse,
             super::GgmlLaneReuseEvidence {
                 persistent_input_refresh: super::GgmlLaneEvidence::Validated,
                 persistent_output_refresh: super::GgmlLaneEvidence::Validated,
@@ -11793,10 +11772,10 @@ mod tests {
     }
 
     #[test]
-    fn resolved_family_runtime_output_plan_uses_typed_lane_identity() {
+    fn resolved_family_runtime_output_plan_never_uses_provider_name_as_capability() {
         use super::{
-            GgmlDecodeOutputPlan, GgmlDecodeReuseMode, GgmlFamilyTieOracle,
-            GgmlRequestOutputRequirement, RequestBackendPreference, ResolvedFamilyRuntimeInput,
+            GgmlDecodeOutputPlan, GgmlRequestOutputRequirement, RequestBackendPreference,
+            ResolvedFamilyRuntimeInput,
         };
         use crate::device::execution_route::{
             DeviceAddressability, ExecutionProvider, ResolvedExecutionRoute, RouteDeviceKind,
@@ -11809,39 +11788,37 @@ mod tests {
                 registry_ordinal: 0,
                 kind: RouteDeviceKind::Accelerated,
                 addressability: DeviceAddressability::NotExactlyAddressable {
-                    reason: "typed output planner fixture",
+                    reason: "provider-name capability fixture",
                 },
             })
         };
 
-        let validated = ResolvedFamilyRuntimeInput::resolve_with_output_requirement(
-            Some(exact(ExecutionProvider::Cuda)),
-            super::AutoGpuPolicy::AllBackends,
-            GgmlFamilyTieOracle::FirstMaximum,
-            GgmlRequestOutputRequirement::CompactAllowed,
-        );
-        assert_eq!(
-            validated.output_plan(),
-            GgmlDecodeOutputPlan::SemanticCompact {
-                tie_oracle: GgmlFamilyTieOracle::FirstMaximum,
-            }
-        );
-        assert_eq!(validated.reuse_mode(), GgmlDecodeReuseMode::FreshGraph);
+        for provider in [
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Vulkan,
+            ExecutionProvider::Metal,
+            ExecutionProvider::Unknown,
+        ] {
+            let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_requirement(
+                Some(exact(provider)),
+                super::AutoGpuPolicy::AllBackends,
+                GgmlRequestOutputRequirement::NativeFirstMaxToken,
+            );
+            assert_eq!(
+                resolved.output_plan(),
+                GgmlDecodeOutputPlan::CompleteScores,
+                "provider name must not authorize native compact output: {provider:?}"
+            );
+        }
 
-        let unknown = ResolvedFamilyRuntimeInput::resolve_with_output_requirement(
-            Some(exact(ExecutionProvider::Unknown)),
-            super::AutoGpuPolicy::AllBackends,
-            GgmlFamilyTieOracle::FirstMaximum,
-            GgmlRequestOutputRequirement::CompactAllowed,
-        );
-        assert_eq!(unknown.output_plan(), GgmlDecodeOutputPlan::Complete);
         assert_eq!(
             ResolvedFamilyRuntimeInput::resolve(
                 Some(exact(ExecutionProvider::Cuda)),
                 super::AutoGpuPolicy::AllBackends,
             )
             .output_plan(),
-            GgmlDecodeOutputPlan::Complete
+            GgmlDecodeOutputPlan::CompleteScores
         );
     }
 
