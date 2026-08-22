@@ -31,7 +31,7 @@ $Root = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $Exe = if ($env:OPENASR_QWEN_PARITY_EXE) { $env:OPENASR_QWEN_PARITY_EXE } else { Join-Path $Root "target\release\openasr.exe" }
 $ModelId = if ($env:OPENASR_QWEN_PARITY_MODEL) { $env:OPENASR_QWEN_PARITY_MODEL } else { "qwen3-asr-0.6b" }
 $Quant = if ($env:OPENASR_QWEN_PARITY_QUANT) { $env:OPENASR_QWEN_PARITY_QUANT } else { "q8_0" }
-$OpenAsrHome = if ($env:OPENASR_HOME) { $env:OPENASR_HOME } else { Join-Path $env:USERPROFILE ".openasr" }
+$Pack = if ($env:OPENASR_QWEN_PARITY_PACK) { $env:OPENASR_QWEN_PARITY_PACK } else { Join-Path $OpenAsrHome ("models\{0}\{1}\{0}-{1}.oasr" -f $ModelId, $Quant) }
 $ExpectedProvider = if ($env:OPENASR_QWEN_PARITY_EXPECTED_PROVIDER) { $env:OPENASR_QWEN_PARITY_EXPECTED_PROVIDER } else { Fail "OPENASR_QWEN_PARITY_EXPECTED_PROVIDER is required" 2 }
 $ExpectedDevice = if ($env:OPENASR_QWEN_PARITY_EXPECTED_DEVICE) { $env:OPENASR_QWEN_PARITY_EXPECTED_DEVICE } else { Fail "OPENASR_QWEN_PARITY_EXPECTED_DEVICE is required" 2 }
 $TraceDir = if ($env:OPENASR_QWEN_PARITY_TRACE_DIR) { $env:OPENASR_QWEN_PARITY_TRACE_DIR } else { Fail "OPENASR_QWEN_PARITY_TRACE_DIR is required" 2 }
@@ -59,15 +59,31 @@ if (!(Test-Path -LiteralPath $Pack)) {
 }
 
 function Invoke-Transcribe {
-    param([string]$Audio, [string]$Backend)
+    param([string]$Audio, [string]$Backend, [string]$TraceMode = "")
     $prev = [Environment]::GetEnvironmentVariable("OPENASR_GGML_BACKEND", "Process")
+    $prevTrace = [Environment]::GetEnvironmentVariable("OPENASR_SEQ2SEQ_TRACE_FILE", "Process")
+    $prevMode = [Environment]::GetEnvironmentVariable("OPENASR_SEQ2SEQ_TRACE_MODE", "Process")
+    $prevProvider = [Environment]::GetEnvironmentVariable("OPENASR_SEQ2SEQ_TRACE_PROVIDER", "Process")
+    $prevDevice = [Environment]::GetEnvironmentVariable("OPENASR_SEQ2SEQ_TRACE_DEVICE", "Process")
     try {
         [Environment]::SetEnvironmentVariable("OPENASR_GGML_BACKEND", $Backend, "Process")
+        if ($TraceMode) {
+            $tracePath = Join-Path $TraceDir ("gpu-{0}-{1}.jsonl" -f $TraceMode, (Split-Path -Leaf $Audio))
+            if (Test-Path $tracePath) { Remove-Item $tracePath -Force }
+            [Environment]::SetEnvironmentVariable("OPENASR_SEQ2SEQ_TRACE_FILE", $tracePath, "Process")
+            [Environment]::SetEnvironmentVariable("OPENASR_SEQ2SEQ_TRACE_MODE", $TraceMode, "Process")
+            [Environment]::SetEnvironmentVariable("OPENASR_SEQ2SEQ_TRACE_PROVIDER", $ExpectedProvider, "Process")
+            [Environment]::SetEnvironmentVariable("OPENASR_SEQ2SEQ_TRACE_DEVICE", $ExpectedDevice, "Process")
+        }
         $out = & $Exe transcribe $Audio --backend native --model-pack $Pack --format text 2>$null
         if ($LASTEXITCODE -ne 0) { return $null }
         return ($out | Out-String).Trim()
     } finally {
         [Environment]::SetEnvironmentVariable("OPENASR_GGML_BACKEND", $prev, "Process")
+        [Environment]::SetEnvironmentVariable("OPENASR_SEQ2SEQ_TRACE_FILE", $prevTrace, "Process")
+        [Environment]::SetEnvironmentVariable("OPENASR_SEQ2SEQ_TRACE_MODE", $prevMode, "Process")
+        [Environment]::SetEnvironmentVariable("OPENASR_SEQ2SEQ_TRACE_PROVIDER", $prevProvider, "Process")
+        [Environment]::SetEnvironmentVariable("OPENASR_SEQ2SEQ_TRACE_DEVICE", $prevDevice, "Process")
     }
 }
 
@@ -82,11 +98,6 @@ if ($bestBackendLine -notmatch [regex]::Escape($ExpectedProvider)) {
 if ($bestBackendLine -notmatch [regex]::Escape($ExpectedDevice)) {
     Fail "Expected physical device '$ExpectedDevice' was not selected: $bestBackendLine" 1
 }
-$traceFiles = @(Get-ChildItem -LiteralPath $TraceDir -File -Filter "*.jsonl")
-if (!($traceFiles.Name -match "cold") -or !($traceFiles.Name -match "reuse")) {
-    Fail "Trace directory must contain explicitly named cold and reuse traces" 1
-}
-
 $failures = 0
 foreach ($audio in $AudioList) {
     if (!(Test-Path -LiteralPath $audio)) {
@@ -95,16 +106,23 @@ foreach ($audio in $AudioList) {
     $name = Split-Path -Leaf $audio
     $cpu = Invoke-Transcribe -Audio $audio -Backend "cpu"
     if ($null -eq $cpu) { Write-Warning "CPU transcribe FAILED for $name"; $failures += 1; continue }
-    $gpu = Invoke-Transcribe -Audio $audio -Backend ""  # empty => auto-select (GPU)
-    if ($null -eq $gpu) { Write-Warning "default(GPU) transcribe FAILED for $name"; $failures += 1; continue }
-    if ($cpu -eq $gpu) {
-        Write-Host "PASS  $name  GPU==CPU : $gpu"
+    $gpuCold = Invoke-Transcribe -Audio $audio -Backend "" -TraceMode "cold"
+    $gpuReuse = Invoke-Transcribe -Audio $audio -Backend "" -TraceMode "reuse"
+    if ($null -eq $gpuCold -or $null -eq $gpuReuse) { Write-Warning "GPU cold/reuse transcribe FAILED for $name"; $failures += 1; continue }
+    if ($cpu -eq $gpuCold -and $gpuCold -eq $gpuReuse) {
+        Write-Host "PASS  $name  GPU cold/reuse==CPU : $gpuCold"
     } else {
         Write-Host "FAIL  $name  GPU!=CPU"
         Write-Host "  CPU: $cpu"
-        Write-Host "  GPU: $gpu"
+        Write-Host "  GPU cold: $gpuCold"
+        Write-Host "  GPU reuse: $gpuReuse"
         $failures += 1
     }
+}
+
+$traceFiles = @(Get-ChildItem -LiteralPath $TraceDir -File -Filter "*.jsonl")
+if ($traceFiles.Count -lt 2 -or !($traceFiles.Name -match "cold") -or !($traceFiles.Name -match "reuse")) {
+    Fail "Runtime did not emit both cold and reuse per-step traces" 1
 }
 
 if ($failures -ne 0) {

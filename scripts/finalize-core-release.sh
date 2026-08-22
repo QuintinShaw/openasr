@@ -39,6 +39,9 @@ gh release download "$tag" \
   -p 'gpu-correctness-source-model-catalog.json' \
   -p 'gpu-correctness-source-backend-catalog.json' \
   -p 'gpu-correctness-trace-*.jsonl' \
+  -p 'openasr-*' \
+  -p 'SHA256SUMS' \
+  -p 'release-correctness-binding.v1.json' \
   -D "$workdir" --clobber
 
 shopt -s nullglob
@@ -111,6 +114,54 @@ deploy_run_id="${OPENASR_DEPLOY_CATALOG_RUN_ID:-}"
 deploy_conclusion="$(gh run view "$deploy_run_id" --json conclusion --jq .conclusion)"
 [ "$deploy_conclusion" = "success" ] \
   || fail "catalog deploy run $deploy_run_id did not succeed (conclusion=$deploy_conclusion)"
+
+# Build and verify the single external binding from the actual release assets,
+# SHA256SUMS, source snapshots, deployed catalog bytes, and deploy-run metadata.
+# The matrix/receipts cannot self-authorize these anchors.
+tag_commit="$(gh api "repos/${GITHUB_REPOSITORY:-QuintinShaw/openasr}/git/ref/tags/${tag}" --jq .object.sha 2>/dev/null || true)"
+[ -n "$tag_commit" ] || fail "cannot resolve tag commit for ${tag}"
+export OPENASR_RELEASE_TAG="$tag"
+gh run view "$deploy_run_id" --json workflowName,conclusion,event,headSha,headBranch,databaseId > "$workdir/deploy-run-raw.json"
+python3 - "$workdir/deploy-run-raw.json" "$workdir/deploy-run.json" <<'PY'
+import json, sys
+raw = json.load(open(sys.argv[1], encoding="utf-8"))
+json.dump({
+    "workflow_name": raw.get("workflowName"),
+    "conclusion": raw.get("conclusion"),
+    "event": raw.get("event"),
+    "head_sha": raw.get("headSha"),
+    "head_branch": raw.get("headBranch"),
+    "database_id": raw.get("databaseId"),
+    "caller_run_id": __import__("os").environ.get("OPENASR_RELEASE_ORCHESTRATOR_RUN_ID", ""),
+    "release_tag": __import__("os").environ.get("OPENASR_RELEASE_TAG", ""),
+}, open(sys.argv[2], "w", encoding="utf-8"), sort_keys=True)
+PY
+cache_bust="$(date +%s)"
+curl -fsSL "https://catalog.openasr.org/v1/catalog.json?release=${tag}-${cache_bust}" -o "$workdir/deployed-catalog.json"
+curl -fsSL "https://catalog.openasr.org/v1/catalog.signature.json?release=${tag}-${cache_bust}" -o "$workdir/deployed-catalog.signature.json"
+binding="$workdir/release-correctness-binding.v1.json"
+[ -f "$binding" ] || fail "release ${tag} has no external correctness binding"
+plugin_sha256="$(python3 - "$correctness_matrix" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["artifact_contract"]["plugin_sha256"])
+PY
+)"
+asset_args=()
+for asset in "$workdir"/openasr-*; do
+  [ -f "$asset" ] && asset_args+=(--asset "$asset")
+done
+[ "${#asset_args[@]}" -gt 0 ] || fail "release ${tag} has no candidate release assets"
+python3 tooling/release-manifest/release_correctness_binding.py verify \
+  --binding "$binding" --tag "$tag" --tag-commit "$tag_commit" \
+  --orchestrator-run-id "${OPENASR_RELEASE_ORCHESTRATOR_RUN_ID:-}" \
+  --plugin-sha256 "$plugin_sha256" --matrix "$correctness_matrix" \
+  --inventory "$workdir/gpu-correctness-source-inventory.json" \
+  --model-catalog "$workdir/gpu-correctness-source-model-catalog.json" \
+  --backend-catalog "$workdir/gpu-correctness-source-backend-catalog.json" \
+  --public-catalog "$workdir/deployed-catalog.json" \
+  --public-signature "$workdir/deployed-catalog.signature.json" \
+  --sha256sums "$workdir/SHA256SUMS" --deploy-run "$workdir/deploy-run.json" \
+  "${asset_args[@]}"
 
 backend_entry_args=()
 for entry in "${approved_entries[@]}"; do

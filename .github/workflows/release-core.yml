@@ -22,6 +22,28 @@ on:
     paths:
       - "Cargo.toml"
   workflow_dispatch:
+    inputs:
+      candidate_cli_artifact:
+        required: true
+        type: string
+      staging_catalog_artifact:
+        required: true
+        type: string
+      correctness_artifact:
+        required: true
+        type: string
+      correctness_sources_artifact:
+        required: true
+        type: string
+      correctness_traces_artifact:
+        required: true
+        type: string
+      public_catalog_artifact:
+        required: true
+        type: string
+      public_catalog_signature_artifact:
+        required: true
+        type: string
 
 # tag annotation is read-only (git fetch); write scope is for creating the
 # release and calling release-binaries.yml (contents: write).
@@ -183,10 +205,37 @@ jobs:
     # ship an unsigned Windows release binary" gate.
     secrets: inherit
 
-  finalize-notes:
+  prepublication-family:
+    name: Pre-publication family correctness gate
+    needs: [resolve, binaries]
+    if: needs.resolve.outputs.should_release == 'true' && success() && github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/family-regression.yml
+    with:
+      pre_publication: true
+      candidate_cli_artifact: ${{ inputs.candidate_cli_artifact }}
+      staging_catalog_artifact: ${{ inputs.staging_catalog_artifact }}
+      correctness_matrix_artifact: ${{ inputs.correctness_artifact }}
+    secrets: inherit
+
+  deploy-catalog:
+    name: Deploy candidate catalog after correctness
+    needs: [resolve, binaries, prepublication-family]
+    if: needs.resolve.outputs.should_release == 'true' && success() && github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/deploy-catalog.yml
+    with:
+      correctness_artifact: ${{ inputs.correctness_artifact }}
+      correctness_sources_artifact: ${{ inputs.correctness_sources_artifact }}
+      correctness_traces_artifact: ${{ inputs.correctness_traces_artifact }}
+      public_catalog_artifact: ${{ inputs.public_catalog_artifact }}
+      public_catalog_signature_artifact: ${{ inputs.public_catalog_signature_artifact }}
+      orchestrator_run_id: ${{ github.run_id }}
+      release_tag: ${{ needs.resolve.outputs.tag }}
+    secrets: inherit
+
+
     name: Finalize Install & Verify with real assets
-    needs: [resolve, release, binaries]
-    if: needs.resolve.outputs.should_release == 'true' && success()
+    needs: [resolve, release, binaries, prepublication-family, deploy-catalog]
+    if: needs.resolve.outputs.should_release == 'true' && success() && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}

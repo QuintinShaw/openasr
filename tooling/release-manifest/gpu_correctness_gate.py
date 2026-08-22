@@ -235,6 +235,34 @@ def _hex_digest(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
 
 
+def parse_trace_artifact(path: Path) -> dict[str, Any]:
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not events or events[0].get("schema") != "openasr.gpu-correctness-trace.v1" or events[0].get("event") != "header":
+        raise MatrixError(f"{path} lacks the strict runtime trace header")
+    header = events[0]
+    if header.get("mode") not in {"cold", "reuse"} or not isinstance(header.get("provider"), str) or not isinstance(header.get("device"), str):
+        raise MatrixError(f"{path} has invalid runtime trace identity")
+    tokens: dict[int, dict[str, Any]] = {}
+    topks: dict[int, list[dict[str, Any]]] = {}
+    for event in events[1:]:
+        if event.get("schema") != "openasr.gpu-correctness-trace.v1" or not isinstance(event.get("step_index"), int):
+            raise MatrixError(f"{path} contains an unversioned or malformed trace event")
+        step = event["step_index"]
+        if event.get("event") == "token":
+            if not isinstance(event.get("token_id"), int) or event["token_id"] < 0:
+                raise MatrixError(f"{path} contains an invalid token event")
+            tokens[step] = event
+        elif event.get("event") == "top_k":
+            items = event.get("items")
+            if not isinstance(items, list) or not items or any(not isinstance(item, dict) or not isinstance(item.get("value"), (int, float)) for item in items):
+                raise MatrixError(f"{path} contains an invalid top-k event")
+            topks[step] = items
+        else:
+            raise MatrixError(f"{path} contains an unknown trace event")
+    if not tokens or set(tokens) != set(topks):
+        raise MatrixError(f"{path} does not contain matching per-step token and top-k events")
+    return {"mode": header["mode"], "provider": header["provider"], "device": header["device"], "steps": sorted(tokens)}
+
 def _evidence_for(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     document = _read(path)
     if document.get("schema") != RECEIPT_SCHEMA:
@@ -319,6 +347,7 @@ def validate_matrix(
     if not trace_paths:
         raise MatrixError("validation requires immutable token/logits trace artifacts")
     trace_hashes = {path.name: _sha256(path) for path in trace_paths}
+    trace_semantics = {path.name: parse_trace_artifact(path) for path in trace_paths}
     cells = matrix.get("cells")
     if not isinstance(cells, list) or not cells:
         raise MatrixError("correctness matrix has no cells")
@@ -418,6 +447,9 @@ def validate_matrix(
             token_trace = trace["token_trace"]
             if token_trace.get("label") not in trace_hashes or trace_hashes[token_trace["label"]] != token_trace.get("sha256"):
                 raise MatrixError(f"{path} token trace artifact content hash does not verify")
+            semantics = trace_semantics[token_trace["label"]]
+            if semantics["mode"] != mode or semantics["provider"] != provider or semantics["device"] != evidence.get("device"):
+                raise MatrixError(f"{path} trace header does not match receipt execution identity")
             if lane["output_plan"]["requires_complete_output"]:
                 logits = trace.get("logits")
                 if not isinstance(logits, dict) or not _hex_digest(logits.get("sha256")):

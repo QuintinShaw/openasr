@@ -29,9 +29,6 @@ on:
       pack_artifact:
         required: true
         type: string
-      trace_artifact:
-        required: true
-        type: string
       correctness_receipt_artifact:
         required: true
         type: string
@@ -76,11 +73,6 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          name: ${{ inputs.trace_artifact }}
-          path: staging/traces
-
-      - uses: actions/download-artifact@v8
-        with:
           name: ${{ inputs.correctness_receipt_artifact }}
           path: staging/receipts
 
@@ -120,16 +112,11 @@ jobs:
           "OPENASR_QWEN_PARITY_PACK=$((Resolve-Path "$env:OPENASR_HOME\qwen.oasr").Path)" | Out-File -FilePath $env:GITHUB_ENV -Append
           "OPENASR_HOME=$env:OPENASR_HOME" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Verify qwen cold/reuse runtime traces
+      - name: Trace producer environment
         shell: pwsh
         run: |
           $traceDir = Join-Path $env:RUNNER_TEMP "qwen-traces"
           New-Item -ItemType Directory -Force -Path $traceDir | Out-Null
-          Copy-Item (Join-Path $pwd "staging\traces\*") $traceDir -Force
-          $traces = @(Get-ChildItem -Path $traceDir -Filter *.jsonl)
-          if ($traces.Count -lt 2 -or -not ($traces.Name -match "cold") -or -not ($traces.Name -match "reuse")) {
-            Write-Error "trace artifact must contain non-empty cold and reuse per-step traces"; exit 1
-          }
           "OPENASR_QWEN_PARITY_TRACE_DIR=$traceDir" | Out-File -FilePath $env:GITHUB_ENV -Append
           "OPENASR_QWEN_PARITY_EXPECTED_PROVIDER=${{ inputs.expected_provider }}" | Out-File -FilePath $env:GITHUB_ENV -Append
           "OPENASR_QWEN_PARITY_EXPECTED_DEVICE=${{ inputs.expected_device }}" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -139,3 +126,21 @@ jobs:
         run: |
           if (-not $env:OPENASR_HIP_GPU_TARGETS) { $env:OPENASR_HIP_GPU_TARGETS = "gfx1200" }
           pwsh tooling/qwen-gpu-parity/run.ps1
+
+      - name: Verify and upload runtime-produced traces
+        shell: pwsh
+        run: |
+          $traces = @(Get-ChildItem -Path $env:OPENASR_QWEN_PARITY_TRACE_DIR -Filter *.jsonl)
+          if ($traces.Count -lt 2 -or -not ($traces.Name -match "cold") -or -not ($traces.Name -match "reuse")) {
+            Write-Error "runtime did not produce non-empty cold/reuse per-step traces"; exit 1
+          }
+          $receipts = @(Get-ChildItem -Path staging/receipts -Filter gpu-correctness-receipt-*.json -Recurse)
+          if ($receipts.Count -eq 0) { Write-Error "immutable correctness receipt artifact is missing"; exit 1 }
+          Get-FileHash $traces.FullName,$receipts.FullName -Algorithm SHA256
+          "QWEN_TRACE_ARTIFACT_COUNT=$($traces.Count)" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - uses: actions/upload-artifact@v8
+        with:
+          name: qwen-gpu-parity-runtime-output-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/qwen-traces
+            staging/receipts

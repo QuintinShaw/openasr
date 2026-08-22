@@ -110,7 +110,14 @@ class GpuCorrectnessGateTests(unittest.TestCase):
             path = Path(temp) / "receipt.json"
             path.write_text(json.dumps({"schema": GATE.RECEIPT_SCHEMA}))
             trace = Path(temp) / "trace.jsonl"
-            trace.write_text("empty")
+            trace.write_text(
+                json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "header", "mode": "cold", "provider": "cpu", "device": "test-cpu"})
+                + "\n"
+                + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "token", "step_index": 0, "token_id": 1})
+                + "\n"
+                + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "top_k", "step_index": 0, "items": [{"token_id": 1, "value": 1.0}]})
+                + "\n"
+            )
             with self.assertRaisesRegex(GATE.MatrixError, "no versioned correctness evidence"):
                 GATE.validate_matrix(
                     matrix,
@@ -123,6 +130,15 @@ class GpuCorrectnessGateTests(unittest.TestCase):
                 )
 
     def receipt(self, cell: dict, evidence_class: str, mode: str) -> dict:
+        token_content = (
+            json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "header", "mode": mode, "provider": cell["provider"], "device": f"test-{cell['provider']}"})
+            + "\n"
+            + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "token", "step_index": 0, "token_id": 7, "is_eot": 0})
+            + "\n"
+            + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "top_k", "step_index": 0, "items": [{"token_id": 7, "value": 1.25}, {"token_id": 8, "value": 0.75}]})
+            + "\n"
+        )
+        token_hash = hashlib.sha256(token_content.encode()).hexdigest()
         evidence = {
             "schema": GATE.EVIDENCE_SCHEMA,
             "contract": "openasr.gpu-correctness-artifact.v1",
@@ -158,8 +174,8 @@ class GpuCorrectnessGateTests(unittest.TestCase):
                         "tie_policy": cell["output_plan"]["tie_policy"],
                     },
                     "trace": {
-                        "token_trace": {"label": "token.jsonl", "sha256": hashlib.sha256(b"token").hexdigest()},
-                        "logits": {"label": "logits.jsonl", "sha256": hashlib.sha256(b"logits").hexdigest()},
+                        "token_trace": {"label": f"token-{cell['provider']}-{mode}.jsonl", "sha256": token_hash},
+                        "logits": {"label": f"logits-{cell['provider']}-{mode}.jsonl", "sha256": token_hash},
                         "top_k": [{"token_id": 7, "value": 1.25}],
                         "top1_top2_margin": 0.5,
                     },
@@ -220,10 +236,24 @@ class GpuCorrectnessGateTests(unittest.TestCase):
                 )
             )
             paths.append(build)
-            token_trace = Path(temp) / "token.jsonl"
-            token_trace.write_text("token")
-            logits_trace = Path(temp) / "logits.jsonl"
-            logits_trace.write_text("logits")
+            trace_paths: list[Path] = []
+            providers = sorted({cell["provider"] for cell in matrix["cells"]})
+            for provider in providers:
+                for mode in ("cold", "reuse"):
+                    token_content = (
+                        json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "header", "mode": mode, "provider": provider, "device": f"test-{provider}"})
+                        + "\n"
+                        + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "token", "step_index": 0, "token_id": 7, "is_eot": 0})
+                        + "\n"
+                        + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "top_k", "step_index": 0, "items": [{"token_id": 7, "value": 1.25}, {"token_id": 8, "value": 0.75}]})
+                        + "\n"
+                    )
+                    token_trace = Path(temp) / f"token-{provider}-{mode}.jsonl"
+                    token_trace.write_text(token_content)
+                    trace_paths.append(token_trace)
+                    logits_trace = Path(temp) / f"logits-{provider}-{mode}.jsonl"
+                    logits_trace.write_text(token_content)
+                    trace_paths.append(logits_trace)
             GATE.validate_matrix(
                 matrix,
                 paths,
@@ -231,10 +261,34 @@ class GpuCorrectnessGateTests(unittest.TestCase):
                 catalog=self.catalog,
                 backend_catalog=self.backends,
                 source_digests=self.source_digests,
-                trace_paths=[token_trace, logits_trace],
+                trace_paths=trace_paths,
             )
 
-    def test_cross_family_or_stale_receipt_is_rejected(self) -> None:
+    def test_trace_semantic_forgery_is_rejected(self) -> None:
+        matrix = self.project()
+        cell = matrix["cells"][0]
+        receipt = self.receipt(cell, "token_transcript", "cold")
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "forged.json"
+            path.write_text(json.dumps(receipt))
+            trace = Path(temp) / receipt["evidence"]["trace"]["token_trace"]["label"]
+            trace.write_text(
+                json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "header", "mode": "cold", "provider": cell["provider"], "device": f"test-{cell['provider']}"})
+                + "\n"
+                + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "token", "step_index": 0, "token_id": 7})
+                + "\n"
+            )
+            with self.assertRaisesRegex(GATE.MatrixError, "matching per-step"):
+                GATE.validate_matrix(
+                    matrix,
+                    [path],
+                    inventory=self.inventory,
+                    catalog=self.catalog,
+                    backend_catalog=self.backends,
+                    source_digests=self.source_digests,
+                    trace_paths=[trace],
+                )
+
         matrix = self.project()
         cell = matrix["cells"][0]
         receipt = self.receipt(cell, "token_transcript", "cold")
@@ -243,7 +297,14 @@ class GpuCorrectnessGateTests(unittest.TestCase):
             path = Path(temp) / "stale.json"
             path.write_text(json.dumps(receipt))
             trace = Path(temp) / "trace.jsonl"
-            trace.write_text("empty")
+            trace.write_text(
+                json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "header", "mode": "cold", "provider": "cpu", "device": "test-cpu"})
+                + "\n"
+                + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "token", "step_index": 0, "token_id": 1})
+                + "\n"
+                + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "top_k", "step_index": 0, "items": [{"token_id": 1, "value": 1.0}]})
+                + "\n"
+            )
             with self.assertRaisesRegex(GATE.MatrixError, "stale"):
                 GATE.validate_matrix(
                     matrix,
