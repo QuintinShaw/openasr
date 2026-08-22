@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-08-21T04:15:52+00:00",
+  "generated_at": "2026-08-22T07:58:34+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -4254,14 +4254,14 @@
     {
       "id": "hip-windows-x86_64-2f4dca947ac2-gfx1030",
       "vendor": "hip",
-      "version": "0.1.35",
+      "version": "0.1.36",
       "display_name": "OpenASR HIP backend",
       "description": "Optional verified GPU backend for the neutral Windows host.",
       "targets": [
         "gfx1030"
       ],
       "min_driver_api": "7.2.0",
-      "min_cli_version": "0.1.35",
+      "min_cli_version": "0.1.36",
       "host_abi": {
         "compile_flags_sha256": "0ea8dcac32453ece2d3e6bc252f5bad3349a042d1713fb609d0bfd17bfcc6ff1",
         "crt": "msvc-md",
@@ -4277,25 +4277,25 @@
       },
       "files": [
         {
-          "filename": "openasr-0.1.35-windows-x86_64-rocm-gfx1030-plugin.dll",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1030-plugin.dll",
+          "filename": "openasr-0.1.36-windows-x86_64-rocm-gfx1030-plugin.dll",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1030-plugin.dll",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1030-plugin.dll"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1030-plugin.dll"
             }
           ],
-          "sha256": "139fc131d61e794e35e4f67d921a2d49a71bfd74fe3fcbcfb1271c8dc8cd72f9",
-          "size_bytes": 60836616,
+          "sha256": "d849a6e1b8a9660f274c4e08e9765f13f8899e442db29487914865af849582f9",
+          "size_bytes": 60836624,
           "role": "plugin"
         },
         {
           "filename": "openasr-vendor-rocm-runtime-3715ddbe841d.zip",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
             }
           ],
           "sha256": "3715ddbe841d99d3d464c6f048cc572b0e7cb3e75fd6a94e06cd85f31f932d8c",
@@ -4309,14 +4309,14 @@
     {
       "id": "hip-windows-x86_64-2f4dca947ac2-gfx1031",
       "vendor": "hip",
-      "version": "0.1.35",
+      "version": "0.1.36",
       "display_name": "OpenASR HIP backend",
       "description": "Optional verified GPU backend for the neutral Windows host.",
       "targets": [
         "gfx1031"
       ],
       "min_driver_api": "7.2.0",
-      "min_cli_version": "0.1.35",
+      "min_cli_version": "0.1.36",
       "host_abi": {
         "compile_flags_sha256": "0ea8dcac32453ece2d3e6bc252f5bad3349a042d1713fb609d0bfd17bfcc6ff1",
         "crt": "msvc-md",
@@ -4332,25 +4332,25 @@
       },
       "files": [
         {
-          "filename": "openasr-0.1.35-windows-x86_64-rocm-gfx1031-plugin.dll",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1031-plugin.dll",
+          "filename": "openasr-0.1.36-windows-x86_64-rocm-gfx1031-plugin.dll",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1031-plugin.dll",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1031-plugin.dll"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1031-plugin.dll"
             }
           ],
-          "sha256": "760fa501b1d9a07bda3aba471f8f0e2b1913920931f093a1a178723224dee9d2",
+          "sha256": "6c0a1c1569356525dc6a8f5ddcbea8849286e2c191373e53902628e0252b038f",
           "size_bytes": 60836616,
           "role": "plugin"
         },
         {
           "filename": "openasr-vendor-rocm-runtime-3715ddbe841d.zip",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
             }
           ],
           "sha256": "3715ddbe841d99d3d464c6f048cc572b0e7cb3e75fd6a94e06cd85f31f932d8c",
@@ -4364,14 +4364,14 @@
     {
       "id": "hip-windows-x86_64-2f4dca947ac2-gfx1032",
       "vendor": "hip",
-      "version": "0.1.35",
+      "version": "0.1.36",
       "display_name": "OpenASR HIP backend",
       "description": "Optional verified GPU backend for the neutral Windows host.",
       "targets": [
         "gfx1032"
       ],
       "min_driver_api": "7.2.0",
-      "min_cli_version": "0.1.35",
+      "min_cli_version": "0.1.36",
       "host_abi": {
         "compile_flags_sha256": "0ea8dcac32453ece2d3e6bc252f5bad3349a042d1713fb609d0bfd17bfcc6ff1",
         "crt": "msvc-md",
@@ -4387,25 +4387,25 @@
       },
       "files": [
         {
-          "filename": "openasr-0.1.35-windows-x86_64-rocm-gfx1032-plugin.dll",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1032-plugin.dll",
+          "filename": "openasr-0.1.36-windows-x86_64-rocm-gfx1032-plugin.dll",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1032-plugin.dll",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1032-plugin.dll"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1032-plugin.dll"
             }
           ],
-          "sha256": "a8174bc348e89ef0668e292db0d09d627d6f3136f38bfa1699f7c13214598827",
+          "sha256": "0ee2188ef68a5c616ccda661faadefb417d6b24e31be2c8ac43c53dac659ea5f",
           "size_bytes": 60836624,
           "role": "plugin"
         },
         {
           "filename": "openasr-vendor-rocm-runtime-3715ddbe841d.zip",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
             }
           ],
           "sha256": "3715ddbe841d99d3d464c6f048cc572b0e7cb3e75fd6a94e06cd85f31f932d8c",
@@ -4419,14 +4419,14 @@
     {
       "id": "hip-windows-x86_64-2f4dca947ac2-gfx1035",
       "vendor": "hip",
-      "version": "0.1.35",
+      "version": "0.1.36",
       "display_name": "OpenASR HIP backend",
       "description": "Optional verified GPU backend for the neutral Windows host.",
       "targets": [
         "gfx1035"
       ],
       "min_driver_api": "7.2.0",
-      "min_cli_version": "0.1.35",
+      "min_cli_version": "0.1.36",
       "host_abi": {
         "compile_flags_sha256": "0ea8dcac32453ece2d3e6bc252f5bad3349a042d1713fb609d0bfd17bfcc6ff1",
         "crt": "msvc-md",
@@ -4442,25 +4442,25 @@
       },
       "files": [
         {
-          "filename": "openasr-0.1.35-windows-x86_64-rocm-gfx1035-plugin.dll",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1035-plugin.dll",
+          "filename": "openasr-0.1.36-windows-x86_64-rocm-gfx1035-plugin.dll",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1035-plugin.dll",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1035-plugin.dll"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1035-plugin.dll"
             }
           ],
-          "sha256": "3827c3e621e7fdf6139ccd828182cd4cb137fc8e113fa4136abc9a05e549fe36",
+          "sha256": "c8e686789167b960e12077b8f942bd645b127f4c29bd82b4a19a7524d3d2fd8d",
           "size_bytes": 60836616,
           "role": "plugin"
         },
         {
           "filename": "openasr-vendor-rocm-runtime-3715ddbe841d.zip",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
             }
           ],
           "sha256": "3715ddbe841d99d3d464c6f048cc572b0e7cb3e75fd6a94e06cd85f31f932d8c",
@@ -4474,14 +4474,14 @@
     {
       "id": "hip-windows-x86_64-2f4dca947ac2-gfx1100",
       "vendor": "hip",
-      "version": "0.1.35",
+      "version": "0.1.36",
       "display_name": "OpenASR HIP backend",
       "description": "Optional verified GPU backend for the neutral Windows host.",
       "targets": [
         "gfx1100"
       ],
       "min_driver_api": "7.2.0",
-      "min_cli_version": "0.1.35",
+      "min_cli_version": "0.1.36",
       "host_abi": {
         "compile_flags_sha256": "0ea8dcac32453ece2d3e6bc252f5bad3349a042d1713fb609d0bfd17bfcc6ff1",
         "crt": "msvc-md",
@@ -4497,25 +4497,25 @@
       },
       "files": [
         {
-          "filename": "openasr-0.1.35-windows-x86_64-rocm-gfx1100-plugin.dll",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1100-plugin.dll",
+          "filename": "openasr-0.1.36-windows-x86_64-rocm-gfx1100-plugin.dll",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1100-plugin.dll",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1100-plugin.dll"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1100-plugin.dll"
             }
           ],
-          "sha256": "92bd6121f3b55ab0e732495f1c2cd845c0ac232e973851d9566d60c54a8fe346",
-          "size_bytes": 71829264,
+          "sha256": "5879b171ca3bae55d871756cd01b03bb39474c56c83e240ff06bc303f07ae2cb",
+          "size_bytes": 71829256,
           "role": "plugin"
         },
         {
           "filename": "openasr-vendor-rocm-runtime-3715ddbe841d.zip",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
             }
           ],
           "sha256": "3715ddbe841d99d3d464c6f048cc572b0e7cb3e75fd6a94e06cd85f31f932d8c",
@@ -4529,14 +4529,14 @@
     {
       "id": "hip-windows-x86_64-2f4dca947ac2-gfx1101",
       "vendor": "hip",
-      "version": "0.1.35",
+      "version": "0.1.36",
       "display_name": "OpenASR HIP backend",
       "description": "Optional verified GPU backend for the neutral Windows host.",
       "targets": [
         "gfx1101"
       ],
       "min_driver_api": "7.2.0",
-      "min_cli_version": "0.1.35",
+      "min_cli_version": "0.1.36",
       "host_abi": {
         "compile_flags_sha256": "0ea8dcac32453ece2d3e6bc252f5bad3349a042d1713fb609d0bfd17bfcc6ff1",
         "crt": "msvc-md",
@@ -4552,25 +4552,25 @@
       },
       "files": [
         {
-          "filename": "openasr-0.1.35-windows-x86_64-rocm-gfx1101-plugin.dll",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1101-plugin.dll",
+          "filename": "openasr-0.1.36-windows-x86_64-rocm-gfx1101-plugin.dll",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1101-plugin.dll",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1101-plugin.dll"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1101-plugin.dll"
             }
           ],
-          "sha256": "b58ee3c0d98b4819e8b75b1d3e93d16cc5cb54ccf165bf3bef1c3d8f91182132",
-          "size_bytes": 71816976,
+          "sha256": "d1f46ce29e705ea6697c3a2bc4a792798491083a6112a25d60073d161b530e73",
+          "size_bytes": 71816968,
           "role": "plugin"
         },
         {
           "filename": "openasr-vendor-rocm-runtime-3715ddbe841d.zip",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
             }
           ],
           "sha256": "3715ddbe841d99d3d464c6f048cc572b0e7cb3e75fd6a94e06cd85f31f932d8c",
@@ -4584,14 +4584,14 @@
     {
       "id": "hip-windows-x86_64-2f4dca947ac2-gfx1102",
       "vendor": "hip",
-      "version": "0.1.35",
+      "version": "0.1.36",
       "display_name": "OpenASR HIP backend",
       "description": "Optional verified GPU backend for the neutral Windows host.",
       "targets": [
         "gfx1102"
       ],
       "min_driver_api": "7.2.0",
-      "min_cli_version": "0.1.35",
+      "min_cli_version": "0.1.36",
       "host_abi": {
         "compile_flags_sha256": "0ea8dcac32453ece2d3e6bc252f5bad3349a042d1713fb609d0bfd17bfcc6ff1",
         "crt": "msvc-md",
@@ -4607,25 +4607,25 @@
       },
       "files": [
         {
-          "filename": "openasr-0.1.35-windows-x86_64-rocm-gfx1102-plugin.dll",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1102-plugin.dll",
+          "filename": "openasr-0.1.36-windows-x86_64-rocm-gfx1102-plugin.dll",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1102-plugin.dll",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1102-plugin.dll"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1102-plugin.dll"
             }
           ],
-          "sha256": "4b7c22646e9c585ff5a70180e7f5e64c40918ad1fa9e7d86b89cde6f6f7ce5f0",
-          "size_bytes": 71769864,
+          "sha256": "565e55165e245a0570a0a0e9848d238a9cea49a1f077ee924b5ac8b6403d6731",
+          "size_bytes": 71769872,
           "role": "plugin"
         },
         {
           "filename": "openasr-vendor-rocm-runtime-3715ddbe841d.zip",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
             }
           ],
           "sha256": "3715ddbe841d99d3d464c6f048cc572b0e7cb3e75fd6a94e06cd85f31f932d8c",
@@ -4639,14 +4639,14 @@
     {
       "id": "hip-windows-x86_64-2f4dca947ac2-gfx1103",
       "vendor": "hip",
-      "version": "0.1.35",
+      "version": "0.1.36",
       "display_name": "OpenASR HIP backend",
       "description": "Optional verified GPU backend for the neutral Windows host.",
       "targets": [
         "gfx1103"
       ],
       "min_driver_api": "7.2.0",
-      "min_cli_version": "0.1.35",
+      "min_cli_version": "0.1.36",
       "host_abi": {
         "compile_flags_sha256": "0ea8dcac32453ece2d3e6bc252f5bad3349a042d1713fb609d0bfd17bfcc6ff1",
         "crt": "msvc-md",
@@ -4662,25 +4662,25 @@
       },
       "files": [
         {
-          "filename": "openasr-0.1.35-windows-x86_64-rocm-gfx1103-plugin.dll",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1103-plugin.dll",
+          "filename": "openasr-0.1.36-windows-x86_64-rocm-gfx1103-plugin.dll",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1103-plugin.dll",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1103-plugin.dll"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1103-plugin.dll"
             }
           ],
-          "sha256": "67b0eb9b3d16c97042df4e85d5ed790bb0b6c222fcb13fb42b32d4f9173c6e52",
+          "sha256": "5ff4e6a89fe329c21987b08bf6e9276638666697c4d6c4c8924712f272995e9c",
           "size_bytes": 71753488,
           "role": "plugin"
         },
         {
           "filename": "openasr-vendor-rocm-runtime-3715ddbe841d.zip",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
             }
           ],
           "sha256": "3715ddbe841d99d3d464c6f048cc572b0e7cb3e75fd6a94e06cd85f31f932d8c",
@@ -4694,14 +4694,14 @@
     {
       "id": "hip-windows-x86_64-2f4dca947ac2-gfx1150",
       "vendor": "hip",
-      "version": "0.1.35",
+      "version": "0.1.36",
       "display_name": "OpenASR HIP backend",
       "description": "Optional verified GPU backend for the neutral Windows host.",
       "targets": [
         "gfx1150"
       ],
       "min_driver_api": "7.2.0",
-      "min_cli_version": "0.1.35",
+      "min_cli_version": "0.1.36",
       "host_abi": {
         "compile_flags_sha256": "0ea8dcac32453ece2d3e6bc252f5bad3349a042d1713fb609d0bfd17bfcc6ff1",
         "crt": "msvc-md",
@@ -4717,25 +4717,25 @@
       },
       "files": [
         {
-          "filename": "openasr-0.1.35-windows-x86_64-rocm-gfx1150-plugin.dll",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1150-plugin.dll",
+          "filename": "openasr-0.1.36-windows-x86_64-rocm-gfx1150-plugin.dll",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1150-plugin.dll",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1150-plugin.dll"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1150-plugin.dll"
             }
           ],
-          "sha256": "8e849da488027e6850dd9ebbc8549bbff31bfbeeafd6b1379b83486e8da05372",
-          "size_bytes": 71759120,
+          "sha256": "94338d83f4482440853464158cee1de5bb5c1eb7ab8fd945fc15c50e781cfd15",
+          "size_bytes": 71759112,
           "role": "plugin"
         },
         {
           "filename": "openasr-vendor-rocm-runtime-3715ddbe841d.zip",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
             }
           ],
           "sha256": "3715ddbe841d99d3d464c6f048cc572b0e7cb3e75fd6a94e06cd85f31f932d8c",
@@ -4749,14 +4749,14 @@
     {
       "id": "hip-windows-x86_64-2f4dca947ac2-gfx1151",
       "vendor": "hip",
-      "version": "0.1.35",
+      "version": "0.1.36",
       "display_name": "OpenASR HIP backend",
       "description": "Optional verified GPU backend for the neutral Windows host.",
       "targets": [
         "gfx1151"
       ],
       "min_driver_api": "7.2.0",
-      "min_cli_version": "0.1.35",
+      "min_cli_version": "0.1.36",
       "host_abi": {
         "compile_flags_sha256": "0ea8dcac32453ece2d3e6bc252f5bad3349a042d1713fb609d0bfd17bfcc6ff1",
         "crt": "msvc-md",
@@ -4772,25 +4772,25 @@
       },
       "files": [
         {
-          "filename": "openasr-0.1.35-windows-x86_64-rocm-gfx1151-plugin.dll",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1151-plugin.dll",
+          "filename": "openasr-0.1.36-windows-x86_64-rocm-gfx1151-plugin.dll",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1151-plugin.dll",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1151-plugin.dll"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1151-plugin.dll"
             }
           ],
-          "sha256": "1cf545270cf444951c7afa0ea8fa4b38da42eca7ca707a7bf3b31d9962511682",
-          "size_bytes": 71843080,
+          "sha256": "a27cfc0ffbed0796b334159fd8a16506ce1dc936a3f5921c18ad38e3369fad3b",
+          "size_bytes": 71843088,
           "role": "plugin"
         },
         {
           "filename": "openasr-vendor-rocm-runtime-3715ddbe841d.zip",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
             }
           ],
           "sha256": "3715ddbe841d99d3d464c6f048cc572b0e7cb3e75fd6a94e06cd85f31f932d8c",
@@ -4804,14 +4804,14 @@
     {
       "id": "hip-windows-x86_64-2f4dca947ac2-gfx1152",
       "vendor": "hip",
-      "version": "0.1.35",
+      "version": "0.1.36",
       "display_name": "OpenASR HIP backend",
       "description": "Optional verified GPU backend for the neutral Windows host.",
       "targets": [
         "gfx1152"
       ],
       "min_driver_api": "7.2.0",
-      "min_cli_version": "0.1.35",
+      "min_cli_version": "0.1.36",
       "host_abi": {
         "compile_flags_sha256": "0ea8dcac32453ece2d3e6bc252f5bad3349a042d1713fb609d0bfd17bfcc6ff1",
         "crt": "msvc-md",
@@ -4827,25 +4827,25 @@
       },
       "files": [
         {
-          "filename": "openasr-0.1.35-windows-x86_64-rocm-gfx1152-plugin.dll",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1152-plugin.dll",
+          "filename": "openasr-0.1.36-windows-x86_64-rocm-gfx1152-plugin.dll",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1152-plugin.dll",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1152-plugin.dll"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1152-plugin.dll"
             }
           ],
-          "sha256": "3226148af60729d97c4f630f9c3a10fa7e94b95fe6ef9fad1edd9dc95c3cad22",
+          "sha256": "c56c568e34916f82b31e250ed57d7835c36430f04f7ada061ea537be6c16dba5",
           "size_bytes": 71759120,
           "role": "plugin"
         },
         {
           "filename": "openasr-vendor-rocm-runtime-3715ddbe841d.zip",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
             }
           ],
           "sha256": "3715ddbe841d99d3d464c6f048cc572b0e7cb3e75fd6a94e06cd85f31f932d8c",
@@ -4859,14 +4859,14 @@
     {
       "id": "hip-windows-x86_64-2f4dca947ac2-gfx1153",
       "vendor": "hip",
-      "version": "0.1.35",
+      "version": "0.1.36",
       "display_name": "OpenASR HIP backend",
       "description": "Optional verified GPU backend for the neutral Windows host.",
       "targets": [
         "gfx1153"
       ],
       "min_driver_api": "7.2.0",
-      "min_cli_version": "0.1.35",
+      "min_cli_version": "0.1.36",
       "host_abi": {
         "compile_flags_sha256": "0ea8dcac32453ece2d3e6bc252f5bad3349a042d1713fb609d0bfd17bfcc6ff1",
         "crt": "msvc-md",
@@ -4882,25 +4882,25 @@
       },
       "files": [
         {
-          "filename": "openasr-0.1.35-windows-x86_64-rocm-gfx1153-plugin.dll",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1153-plugin.dll",
+          "filename": "openasr-0.1.36-windows-x86_64-rocm-gfx1153-plugin.dll",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1153-plugin.dll",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1153-plugin.dll"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1153-plugin.dll"
             }
           ],
-          "sha256": "3c807dab99a4f1443e2b40c07a6fb076411b1378f39d9be0b68bc32e29eb1bd9",
-          "size_bytes": 71759120,
+          "sha256": "ec900dac19c6af597efd164ce9554045eb8c61bb268c07eb4acfa2dd369c2dfb",
+          "size_bytes": 71759112,
           "role": "plugin"
         },
         {
           "filename": "openasr-vendor-rocm-runtime-3715ddbe841d.zip",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
             }
           ],
           "sha256": "3715ddbe841d99d3d464c6f048cc572b0e7cb3e75fd6a94e06cd85f31f932d8c",
@@ -4914,14 +4914,14 @@
     {
       "id": "hip-windows-x86_64-2f4dca947ac2-gfx1200",
       "vendor": "hip",
-      "version": "0.1.35",
+      "version": "0.1.36",
       "display_name": "OpenASR HIP backend",
       "description": "Optional verified GPU backend for the neutral Windows host.",
       "targets": [
         "gfx1200"
       ],
       "min_driver_api": "7.2.0",
-      "min_cli_version": "0.1.35",
+      "min_cli_version": "0.1.36",
       "host_abi": {
         "compile_flags_sha256": "0ea8dcac32453ece2d3e6bc252f5bad3349a042d1713fb609d0bfd17bfcc6ff1",
         "crt": "msvc-md",
@@ -4937,25 +4937,25 @@
       },
       "files": [
         {
-          "filename": "openasr-0.1.35-windows-x86_64-rocm-gfx1200-plugin.dll",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1200-plugin.dll",
+          "filename": "openasr-0.1.36-windows-x86_64-rocm-gfx1200-plugin.dll",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1200-plugin.dll",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1200-plugin.dll"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1200-plugin.dll"
             }
           ],
-          "sha256": "e79d4b80a6d1e6861235ac8d940000f936919fe7829a2f34d9dac2ec222bc904",
-          "size_bytes": 73533704,
+          "sha256": "d13b61a399d056dba9fea011bf50614259e221b85e8fa1749051f6f7f06153db",
+          "size_bytes": 73533712,
           "role": "plugin"
         },
         {
           "filename": "openasr-vendor-rocm-runtime-3715ddbe841d.zip",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
             }
           ],
           "sha256": "3715ddbe841d99d3d464c6f048cc572b0e7cb3e75fd6a94e06cd85f31f932d8c",
@@ -4969,14 +4969,14 @@
     {
       "id": "hip-windows-x86_64-2f4dca947ac2-gfx1201",
       "vendor": "hip",
-      "version": "0.1.35",
+      "version": "0.1.36",
       "display_name": "OpenASR HIP backend",
       "description": "Optional verified GPU backend for the neutral Windows host.",
       "targets": [
         "gfx1201"
       ],
       "min_driver_api": "7.2.0",
-      "min_cli_version": "0.1.35",
+      "min_cli_version": "0.1.36",
       "host_abi": {
         "compile_flags_sha256": "0ea8dcac32453ece2d3e6bc252f5bad3349a042d1713fb609d0bfd17bfcc6ff1",
         "crt": "msvc-md",
@@ -4992,25 +4992,25 @@
       },
       "files": [
         {
-          "filename": "openasr-0.1.35-windows-x86_64-rocm-gfx1201-plugin.dll",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1201-plugin.dll",
+          "filename": "openasr-0.1.36-windows-x86_64-rocm-gfx1201-plugin.dll",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1201-plugin.dll",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-0.1.35-windows-x86_64-rocm-gfx1201-plugin.dll"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-0.1.36-windows-x86_64-rocm-gfx1201-plugin.dll"
             }
           ],
-          "sha256": "9983b7c0fb3768465274b47755f8cdc888ed010abba1ba805ea8998cbebbca2c",
+          "sha256": "35d8b1f6a90f62b7c431383b89ef70a984f8dd8edf309492ce8749ccd2d79d61",
           "size_bytes": 73533712,
           "role": "plugin"
         },
         {
           "filename": "openasr-vendor-rocm-runtime-3715ddbe841d.zip",
-          "url": "https://dl.openasr.org/core/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
+          "url": "https://dl.openasr.org/core/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip",
           "mirrors": [
             {
               "source": "github",
-              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.35/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
+              "url": "https://github.com/QuintinShaw/openasr/releases/download/v0.1.36/openasr-vendor-rocm-runtime-3715ddbe841d.zip"
             }
           ],
           "sha256": "3715ddbe841d99d3d464c6f048cc572b0e7cb3e75fd6a94e06cd85f31f932d8c",
