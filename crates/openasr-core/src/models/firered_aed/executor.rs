@@ -34,15 +34,15 @@ use crate::arch::FIRERED_AED_GGML_ADAPTER_ID;
 use crate::device::execution_policy::ExecutionPlacement;
 use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgufRuntimeSourcePreflight, RequestBackendPreference,
-    request_backend_override,
+    GgmlCpuGraphBackend, GgmlDecodeOutputPlan, GgmlDecodeReuseMode, GgufRuntimeSourcePreflight,
+    RequestBackendPreference, ResolvedFamilyRuntimeInput, request_backend_override,
 };
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
     PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
 };
 use crate::models::device_greedy_token::{
-    DeviceGreedyStepOutputMode, device_greedy_step_output_mode,
+    DeviceGreedyStepOutputMode, device_greedy_step_output_mode_for_resolved_runtime,
 };
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
@@ -69,7 +69,6 @@ use super::encoder_graph::{
     FireRedEncoderGraphRuntime, FireRedEncoderOutput, predicted_encoder_time_frames,
 };
 use super::frontend::{FireRedFbankFrontend, apply_cmvn};
-use super::graph_config::firered_decoder_graph_config;
 use super::runtime_contract::{FireRedAedExecutionMetadata, parse_firered_aed_execution_metadata};
 use super::tokenizer::FireRedTokenizer;
 
@@ -91,7 +90,8 @@ type FireRedAedDecoderRuntimeCacheKey = (
     PackContentKey,
     ExecutionLaneKey,
     Seq2SeqResidentCapacity,
-    DeviceGreedyStepOutputMode,
+    GgmlDecodeOutputPlan,
+    GgmlDecodeReuseMode,
 );
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -99,7 +99,8 @@ struct FireRedAedRuntimeOwnerCacheKey {
     content: PackContentKey,
     lane: ExecutionLaneKey,
     resident_capacity: Seq2SeqResidentCapacity,
-    greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    output_plan: GgmlDecodeOutputPlan,
+    reuse_mode: GgmlDecodeReuseMode,
 }
 
 type FireRedAedEncoderRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
@@ -146,16 +147,18 @@ impl FireRedAedRuntimeOwnerState {
     fn system_memory_quote(
         metadata: FireRedAedExecutionMetadata,
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
-        backend: GgmlCpuGraphBackend,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
         pack_content_id: &str,
     ) -> Result<SystemMemoryAllocationQuote, String> {
+        let backend = resolved_runtime.backend();
         let encoder = FireRedEncoderGraphRuntime::system_memory_quote(metadata, pack_content_id)?;
         let decoder = FireRedDecoderGraphRuntime::system_memory_quote(
             metadata,
             decoder_state,
             backend,
             greedy_step_output_mode,
+            resolved_runtime.reuse_mode(),
             pack_content_id,
         )?;
         let (peak, retained) = unified_runtime_system_memory_shape(
@@ -302,6 +305,7 @@ fn allocate_decoder_runtime_owner(
     decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
     backend: GgmlCpuGraphBackend,
     greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    reuse_mode: GgmlDecodeReuseMode,
     quote: SystemMemoryAllocationQuote,
 ) -> Result<SystemMemoryOwner<FireRedDecoderGraphRuntime>, FireRedAedExecutorError> {
     match SystemMemoryOwner::try_allocate_transaction(quote, || {
@@ -311,6 +315,7 @@ fn allocate_decoder_runtime_owner(
             decoder_state,
             backend,
             greedy_step_output_mode,
+            reuse_mode,
         )
         .map_err(|error| FireRedAedExecutorError::DecoderFailed {
             reason: error.to_string(),
@@ -374,6 +379,7 @@ fn allocate_unified_runtime_owner(
     decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
     backend: GgmlCpuGraphBackend,
     greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    reuse_mode: GgmlDecodeReuseMode,
     quote: SystemMemoryAllocationQuote,
 ) -> Result<SystemMemoryOwner<FireRedAedRuntimeOwnerState>, FireRedAedExecutorError> {
     match SystemMemoryOwner::try_allocate_transaction(quote, || {
@@ -390,6 +396,7 @@ fn allocate_unified_runtime_owner(
             decoder_state,
             backend,
             greedy_step_output_mode,
+            reuse_mode,
         )
         .map_err(|error| FireRedAedExecutorError::DecoderFailed {
             reason: error.to_string(),
@@ -489,14 +496,19 @@ impl FireRedAedGgmlExecutor {
         preflight: &GgufRuntimeSourcePreflight,
         metadata: FireRedAedExecutionMetadata,
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
-        backend: GgmlCpuGraphBackend,
-        greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<FireRedAedDecoderRuntime, FireRedAedExecutorError> {
+        let backend = resolved_runtime.backend();
+        let greedy_step_output_mode =
+            device_greedy_step_output_mode_for_resolved_runtime(resolved_runtime);
+        let output_plan = resolved_runtime.output_plan();
+        let reuse_mode = resolved_runtime.reuse_mode();
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
             decoder_state.resident_capacity(),
-            greedy_step_output_mode,
+            output_plan,
+            reuse_mode,
         );
         let preflight = preflight.clone();
         let pack_content_id = preflight.runtime_source.content_id().to_string();
@@ -508,6 +520,7 @@ impl FireRedAedGgmlExecutor {
                     decoder_state,
                     backend,
                     greedy_step_output_mode,
+                    reuse_mode,
                     &pack_content_id,
                 )
                 .map_err(|reason| Self::map_runtime_ownership_error("decoder", reason))?;
@@ -520,6 +533,7 @@ impl FireRedAedGgmlExecutor {
                     decoder_state,
                     backend,
                     greedy_step_output_mode,
+                    reuse_mode,
                     quote,
                 )
             },
@@ -532,14 +546,19 @@ impl FireRedAedGgmlExecutor {
         preflight: &GgufRuntimeSourcePreflight,
         metadata: FireRedAedExecutionMetadata,
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
-        backend: GgmlCpuGraphBackend,
-        greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<FireRedAedRuntimeOwner, FireRedAedExecutorError> {
+        let backend = resolved_runtime.backend();
+        let greedy_step_output_mode =
+            device_greedy_step_output_mode_for_resolved_runtime(resolved_runtime);
+        let output_plan = resolved_runtime.output_plan();
+        let reuse_mode = resolved_runtime.reuse_mode();
         let key = FireRedAedRuntimeOwnerCacheKey {
             content: PackContentKey::for_runtime_source(&preflight.runtime_source),
             lane: current_execution_lane_key(backend),
             resident_capacity: decoder_state.resident_capacity(),
-            greedy_step_output_mode,
+            output_plan,
+            reuse_mode,
         };
         let preflight = preflight.clone();
         let pack_content_id = preflight.runtime_source.content_id().to_string();
@@ -549,7 +568,7 @@ impl FireRedAedGgmlExecutor {
                 let quote = FireRedAedRuntimeOwnerState::system_memory_quote(
                     metadata,
                     decoder_state,
-                    backend,
+                    resolved_runtime,
                     greedy_step_output_mode,
                     &pack_content_id,
                 )
@@ -563,6 +582,7 @@ impl FireRedAedGgmlExecutor {
                     decoder_state,
                     backend,
                     greedy_step_output_mode,
+                    reuse_mode,
                     quote,
                 )
             },
@@ -629,16 +649,10 @@ impl FireRedAedGgmlExecutor {
         control: Arc<crate::api::backend::TranscriptionControl>,
         decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
         unstable_decode_text: Option<crate::api::backend::UnstableDecodeTextObserver>,
-        backend: GgmlCpuGraphBackend,
-        greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<super::decoder_graph::FireRedAedGreedyDecodeOutput, FireRedAedExecutorError> {
-        let runtime = self.checkout_decoder_runtime(
-            preflight,
-            metadata,
-            decoder_state,
-            backend,
-            greedy_step_output_mode,
-        )?;
+        let runtime =
+            self.checkout_decoder_runtime(preflight, metadata, decoder_state, resolved_runtime)?;
         runtime
             .call_mut(move |runtime| {
                 runtime.activate_decoder_state(decoder_state)?;
@@ -704,7 +718,7 @@ impl FireRedAedGgmlExecutor {
         self.encoder_runtimes
             .evict_where(|(pack, _)| pack.pack_content_id == pack_content_id);
         self.decoder_runtimes
-            .evict_where(|(pack, _, _, _)| pack.pack_content_id == pack_content_id);
+            .evict_where(|(pack, _, _, _, _)| pack.pack_content_id == pack_content_id);
         self.unified_gpu_runtimes
             .evict_where(|key| key.content.pack_content_id == pack_content_id);
     }
@@ -833,25 +847,19 @@ impl FireRedAedGgmlExecutor {
             });
         }
 
-        let backend = request.resolved_runtime.backend();
-        let decoder_config = firered_decoder_graph_config(backend);
+        let resolved_runtime = request.resolved_runtime;
+        let backend = resolved_runtime.backend();
         let backend_preference = request_backend_override();
         let placement = current_execution_placement();
-        let greedy_step_output_mode = device_greedy_step_output_mode(
-            backend,
-            decoder_config.use_scheduler,
-            backend_preference.as_ref(),
-            placement,
-        );
         let unified_gpu_runtime = if allow_unified_gpu_runtime
+            && resolved_runtime.reuse_mode() == GgmlDecodeReuseMode::ReusableGraph
             && unified_runtime_owner_enabled(backend, backend_preference.as_ref(), placement)
         {
             Some(self.checkout_unified_gpu_runtime(
                 preflight,
                 metadata,
                 decoder_state,
-                backend,
-                greedy_step_output_mode,
+                resolved_runtime,
             )?)
         } else {
             None
@@ -901,8 +909,7 @@ impl FireRedAedGgmlExecutor {
                 control,
                 decode_work_progress,
                 unstable_decode_text,
-                backend,
-                greedy_step_output_mode,
+                resolved_runtime,
             )?,
         };
 
@@ -1099,6 +1106,23 @@ mod tests {
                     .expect("physical key"),
                 },
         })
+    }
+
+    #[test]
+    fn exact_cuda_and_vulkan_fire_red_routes_keep_gpu_full_logits_and_fresh_reuse() {
+        for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
+            let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_requirement(
+                Some(exactly_addressable_preference(provider)),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+                crate::ggml_runtime::GgmlRequestOutputRequirement::NativeFirstMaxToken,
+            );
+            assert_eq!(resolved.backend(), GgmlCpuGraphBackend::Gpu);
+            assert_eq!(
+                device_greedy_step_output_mode_for_resolved_runtime(resolved),
+                DeviceGreedyStepOutputMode::FullLogits
+            );
+            assert_eq!(resolved.reuse_mode(), GgmlDecodeReuseMode::FreshGraph);
+        }
     }
 
     #[test]
@@ -1565,11 +1589,13 @@ mod tests {
             "expected a non-trivial greedy decode to exercise many incremental steps, got {generated} tokens"
         );
 
-        let mut reused_runtime = FireRedDecoderGraphRuntime::new(
+        let mut reused_runtime = FireRedDecoderGraphRuntime::new_with_greedy_step_output_mode(
             preflight,
             metadata,
             decoder_runtime_state(metadata, encoder_output.frame_count),
             GgmlCpuGraphBackend::Metal,
+            DeviceGreedyStepOutputMode::FullLogits,
+            GgmlDecodeReuseMode::ReusableGraph,
         )
         .expect("build Metal decoder runtime (reused pass)");
         reused_runtime

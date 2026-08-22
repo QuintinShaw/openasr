@@ -15,8 +15,8 @@
 //! ([`crate::nn::decoder::seq2seq_layer`]): pre-norm causal self-attention
 //! with an f16 KV cache, pre-norm cross-attention over cross-KV precomputed
 //! once from the encoder output, and a GELU feed-forward. On the
-//! single-backend GPU path (`nn::decoder::reusable_decode_graph_supported`:
-//! GPU-class backend, scheduler off -- the Metal default, see
+//! single-backend GPU path when the immutable runtime planner authorizes reuse
+//! (`GgmlDecodeReuseMode::ReusableGraph` plus the runner's capability check; see
 //! [`super::graph_config`]) the single-token incremental step runs through a
 //! build-once/re-run [`Seq2SeqReusableDecodeGraph`] (fixed-span self-KV via
 //! `set_rows` + an externally-uploaded attention mask, the cohere/moonshine
@@ -31,8 +31,8 @@ use thiserror::Error;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext, GgmlStaticTensor,
-    GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
+    GgmlDecodeReuseMode, GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext,
+    GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinSeq2SeqDecodePolicyConfigInput, run_builtin_seq2seq_decode_policy,
@@ -165,6 +165,7 @@ pub(crate) struct FireRedDecoderGraphRuntime {
     reuse_cross_frame_count: usize,
     cached_positions: usize,
     greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    reuse_mode: GgmlDecodeReuseMode,
 }
 
 /// The static-tensor arena plus everything allocated directly in it
@@ -186,6 +187,7 @@ fn build_firered_decoder_arena_state(
     self_kv_capacity_positions: usize,
     cross_capacity_frames: usize,
     greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    reuse_mode: GgmlDecodeReuseMode,
 ) -> Result<FireRedDecoderArenaState, FireRedDecoderError> {
     let arena = runner
         .start_static_tensor_arena(firered_decoder_arena_context_bytes(
@@ -281,7 +283,9 @@ fn build_firered_decoder_arena_state(
     // untouched malloc'd CPU arena
     // pages would otherwise stay uncommitted until the decode actually wrote
     // them.
-    if reusable_decode_graph_supported_for_runner(runner) {
+    if reuse_mode == GgmlDecodeReuseMode::ReusableGraph
+        && reusable_decode_graph_supported_for_runner(runner)
+    {
         let self_kv_tensor_bytes = metadata
             .head_dim
             .checked_mul(self_kv_capacity_positions)
@@ -318,6 +322,7 @@ impl FireRedDecoderGraphRuntime {
         decoder_state: Seq2SeqDecoderState,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        reuse_mode: GgmlDecodeReuseMode,
         pack_content_id: &str,
     ) -> Result<crate::models::system_memory_owner::SystemMemoryAllocationQuote, String> {
         decoder_state
@@ -328,7 +333,8 @@ impl FireRedDecoderGraphRuntime {
         let transient = firered_decoder_construction_transient_system_memory_bytes(
             metadata,
             decoder_state,
-            reusable_decode_graph_supported(config.backend, config.use_scheduler),
+            reusable_decode_graph_supported(config.backend, config.use_scheduler)
+                && reuse_mode == GgmlDecodeReuseMode::ReusableGraph,
             greedy_step_output_mode,
         )?;
         let peak = retained.checked_add(transient).ok_or_else(|| {
@@ -397,7 +403,8 @@ impl FireRedDecoderGraphRuntime {
         firered_decoder_construction_transient_system_memory_bytes(
             self.metadata,
             self.decoder_state,
-            reusable_decode_graph_supported_for_runner(&self.runner),
+            reusable_decode_graph_supported_for_runner(&self.runner)
+                && self.reuse_mode == GgmlDecodeReuseMode::ReusableGraph,
             self.greedy_step_output_mode,
         )
     }
@@ -414,6 +421,7 @@ impl FireRedDecoderGraphRuntime {
             decoder_state,
             backend,
             DeviceGreedyStepOutputMode::FullLogits,
+            GgmlDecodeReuseMode::FreshGraph,
         )
     }
 
@@ -423,6 +431,7 @@ impl FireRedDecoderGraphRuntime {
         decoder_state: Seq2SeqDecoderState,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        reuse_mode: GgmlDecodeReuseMode,
     ) -> Result<Self, FireRedDecoderError> {
         decoder_state
             .validate()
@@ -453,7 +462,8 @@ impl FireRedDecoderGraphRuntime {
         let runner =
             GgmlCpuGraphRunner::new(config).map_err(|source| map_err("runner_init", source))?;
         if greedy_step_output_mode == DeviceGreedyStepOutputMode::DeviceTop1
-            && !reusable_decode_graph_supported_for_runner(&runner)
+            && (reuse_mode != GgmlDecodeReuseMode::ReusableGraph
+                || !reusable_decode_graph_supported_for_runner(&runner))
         {
             return Err(FireRedDecoderError::InvalidInput {
                 reason: "device top-1 requires a direct GPU-class decoder runner".to_string(),
@@ -469,6 +479,7 @@ impl FireRedDecoderGraphRuntime {
             decoder_state.self_attention.resident_positions,
             cross_capacity_frames,
             greedy_step_output_mode,
+            reuse_mode,
         )?;
 
         Ok(Self {
@@ -489,6 +500,7 @@ impl FireRedDecoderGraphRuntime {
             reuse_cross_frame_count: 0,
             cached_positions: 0,
             greedy_step_output_mode,
+            reuse_mode,
         })
     }
 
@@ -678,10 +690,9 @@ impl FireRedDecoderGraphRuntime {
     /// Compute logits for the next token given the full token prefix so far
     /// (prompt + already-generated tokens). Incremental: after the first call
     /// (which may prefill more than one token), every subsequent call must
-    /// append exactly one new token. On the single-backend GPU path a
-    /// single-token incremental step runs through the build-once/re-run
-    /// reusable decode graph ([`Self::compute_reused_incremental_step_logits`]);
-    /// everywhere else (prefill, CPU, scheduler-on) it rebuilds a fresh graph.
+    /// append exactly one new token. A single-token step may use the
+    /// planner-authorized build-once/re-run graph; unknown reuse evidence
+    /// rebuilds a fresh graph.
     pub(crate) fn compute_step_logits(
         &mut self,
         decoder_tokens: &[u32],
@@ -1012,11 +1023,12 @@ impl FireRedDecoderGraphRuntime {
         Ok(output)
     }
 
-    /// Reused decode graphs with in-place resident KV are only correct on the
-    /// single-backend GPU path (see `nn::decoder::reusable_decode_graph_supported`);
-    /// everywhere else the rebuild-per-step path above stays authoritative.
+    /// Reused decode graphs are opt-in from the immutable runtime planner and
+    /// still require the runner's local capability check. Unknown evidence is
+    /// therefore always a fresh graph, even on a GPU-class backend.
     fn supports_reusable_decode_graph(&self) -> bool {
-        reusable_decode_graph_supported_for_runner(&self.runner)
+        self.reuse_mode == GgmlDecodeReuseMode::ReusableGraph
+            && reusable_decode_graph_supported_for_runner(&self.runner)
     }
 
     /// Single-token incremental step through the build-once/re-run persistent
@@ -1387,8 +1399,9 @@ fn map_reversed_top1_token(
 /// firered-aed decodes through the shared seq2seq greedy driver: every step
 /// recomputes logits for the full `<sos> ++ generated` prefix (the incremental
 /// KV cache inside [`Self::compute_step_logits`] makes this cheap after the
-/// prefill). Exact direct CUDA/Vulkan requests return only a first-max top-1
-/// hint; every other route returns full logits and keeps the host argmax path.
+/// prefill). The output plan is resolved by `ResolvedFamilyRuntimeInput`; until
+/// selected-device evidence is connected, every production route returns full
+/// logits and keeps the host argmax path.
 impl Seq2SeqGreedyDecodeStepExecutor for FireRedDecoderGraphRuntime {
     fn decode_step_logits(
         &mut self,
