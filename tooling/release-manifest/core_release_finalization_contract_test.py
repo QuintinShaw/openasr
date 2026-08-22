@@ -9,6 +9,58 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class CoreReleaseFinalizationContractTests(unittest.TestCase):
+    def test_release_caller_grants_every_permission_requested_by_reusable_jobs(self) -> None:
+        release = (ROOT / ".github/workflows/release-core.yml").read_text(encoding="utf-8")
+        binaries = (ROOT / ".github/workflows/release-binaries.yml").read_text(
+            encoding="utf-8"
+        )
+        caller = release.split("\n  binaries:\n", maxsplit=1)[1].split(
+            "\n  finalize-notes:\n", maxsplit=1
+        )[0]
+        caller_permissions = dict(
+            re.findall(r"(?m)^      ([a-z-]+): (read|write)$", caller)
+        )
+        requested_permissions = re.findall(
+            r"(?m)^(?:  |      )([a-z-]+): (read|write)$", binaries
+        )
+        permission_rank = {"read": 1, "write": 2}
+
+        for scope, requested in requested_permissions:
+            granted = caller_permissions.get(scope)
+            self.assertIsNotNone(
+                granted,
+                f"release-core reusable caller does not grant requested {scope}: {requested}",
+            )
+            self.assertGreaterEqual(
+                permission_rank[granted],
+                permission_rank[requested],
+                f"release-core reusable caller grants {scope}: {granted}, below {requested}",
+            )
+    def test_reusable_release_declares_every_referenced_input(self) -> None:
+        binaries = (ROOT / ".github/workflows/release-binaries.yml").read_text(
+            encoding="utf-8"
+        )
+        workflow_call = re.search(
+            r"(?ms)^  workflow_call:\n(?P<body>.*?)(?=^  # Formal releases)",
+            binaries,
+        )
+        self.assertIsNotNone(workflow_call)
+        declared = set(
+            re.findall(r"(?m)^      ([a-z][a-z0-9_]*):$", workflow_call.group("body"))
+        )
+        referenced = set(re.findall(r"\binputs\.([a-z][a-z0-9_]*)", binaries))
+
+        self.assertEqual(
+            referenced - declared,
+            set(),
+            "workflow_call must declare every inputs.* value used by the reusable workflow",
+        )
+        self.assertNotIn(
+            "github.event.inputs.",
+            binaries,
+            "shared dispatch/call inputs must use the typed inputs context",
+        )
+
     def test_core_release_stays_draft_until_signed_backend_catalog_is_live(self) -> None:
         release = (ROOT / ".github/workflows/release-core.yml").read_text(encoding="utf-8")
         prepare = (ROOT / "scripts/prepare-windows-backend-catalog-release.sh").read_text(

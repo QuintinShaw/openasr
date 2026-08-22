@@ -8,5 +8,7 @@ fi
 
 cmake --version
 cc --version
+gh --version
+gh attestation verify --help >/dev/null
 pkg-config --exists alsa
 python3 -c 'import numpy; print(numpy.__version__)'

@@ -1,6 +1,8 @@
 FROM ubuntu:24.04@sha256:d78ab76437b1afc5f01e223d6bf0172763f404bb166441328845adbef44518cb
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG GH_VERSION=2.98.0
+ARG GH_LINUX_AMD64_SHA256=3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -35,6 +37,15 @@ RUN success=0; \
     done; \
     test "${success}" -eq 1; \
     rm -rf /var/lib/apt/lists/*
+
+RUN curl --fail --location --retry 3 \
+      --output /tmp/gh.tar.gz \
+      "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+    && echo "${GH_LINUX_AMD64_SHA256}  /tmp/gh.tar.gz" | sha256sum --check --strict \
+    && tar --extract --gzip --file /tmp/gh.tar.gz \
+      --directory /usr/local/bin --strip-components=2 \
+      "gh_${GH_VERSION}_linux_amd64/bin/gh" \
+    && rm /tmp/gh.tar.gz
 
 RUN groupadd --gid 1001 openasr-ci \
     && useradd --uid 1001 --gid 1001 --home-dir /github/home \

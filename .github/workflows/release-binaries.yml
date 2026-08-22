@@ -54,6 +54,31 @@ on:
         required: false
         type: string
         default: ""
+      supplemental_source_run_id:
+        description: "Optional completed single-target run whose immutable artifacts supplement source_run_id during recovery"
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: "Evaluate upload/completeness logic but do not upload or edit the release"
+        required: false
+        type: boolean
+        default: false
+      only_target:
+        description: "Build only this matrix.target key (empty = all legs; for validating a single platform without the full matrix)"
+        required: false
+        type: string
+        default: ""
+      promote_cuda_targets:
+        description: "Comma-separated experimental CUDA targets to promote during a recovery (for example 120)"
+        required: false
+        type: string
+        default: ""
+      cuda_gpu_targets:
+        description: "Optional CUDA arch list for a diagnostic workflow_dispatch build (empty = release defaults)"
+        required: false
+        type: string
+        default: ""
   # Formal releases enter through release-core.yml's workflow_call. Keeping
   # a second push:tags entrypoint used to race the orchestrator and could run
   # the same expensive matrix twice for one annotated tag.
@@ -175,8 +200,7 @@ jobs:
       # Full releases keep the hard-coded CUDA/HIP vendor owners. A diagnostic
       # exact-target dispatch must still upload that target's plugin + vendor
       # zip, so the selected plugin temporarily owns vendor publishing.
-      # workflow_call has no only_target input and must keep matrix.vendor_owner.
-      VENDOR_OWNER: ${{ matrix.distribution == 'plugin' && ((github.event_name == 'workflow_dispatch' && inputs.only_target != '' && matrix.target == inputs.only_target) || matrix.vendor_owner) }}
+      VENDOR_OWNER: ${{ matrix.distribution == 'plugin' && ((inputs.only_target != '' && matrix.target == inputs.only_target) || matrix.vendor_owner) }}
       # Where the built binary + build.rs-staged runtime DLLs land. A native
       # leg (no matrix.rust_target) builds into target/release; a cross leg
       # (--target <triple>) builds into target/<triple>/release. Every package/
@@ -1014,7 +1038,7 @@ jobs:
           fi
 
       - name: Refuse to ship an unsigned Windows release binary
-        if: runner.os == 'Windows' && steps.signing-check.outputs.have_secrets != 'true' && github.event.inputs.dry_run != 'true'
+        if: runner.os == 'Windows' && steps.signing-check.outputs.have_secrets != 'true' && !inputs.dry_run
         shell: bash
         run: |
           echo "::error::AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_CLIENT_SECRET are not set -- refusing to package an unsigned Windows release binary. Configure the Azure Trusted Signing service principal secrets (see the desktop product's Windows signing docs for the account/profile this reuses), or re-run this workflow_dispatch with dry_run=true to build without signing for local debugging only." >&2
@@ -1350,7 +1374,7 @@ jobs:
           cat SHA256SUMS
 
       - name: Compile ABI-scoped backend catalog candidate
-        if: github.event_name != 'workflow_dispatch' || github.event.inputs.only_target == ''
+        if: inputs.only_target == ''
         env:
           PROMOTE_CUDA_TARGETS: ${{ inputs.promote_cuda_targets || '' }}
         run: |
@@ -1423,7 +1447,7 @@ jobs:
           python3 -m json.tool dist/backend-plugin-hints.json >/dev/null
           (cd dist && sha256sum catalog.backends.candidate.json backend-plugin-hints.json >> SHA256SUMS)
       - name: Upload backend catalog candidate
-        if: github.event_name != 'workflow_dispatch' || github.event.inputs.only_target == ''
+        if: inputs.only_target == ''
         uses: actions/upload-artifact@v7
         with:
           name: backend-catalog-candidate
@@ -1561,7 +1585,7 @@ jobs:
           find staging -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dll' -o -name 'backend-pack-*.json' -o -name 'backend-plugin-hints.json' -o -name 'catalog.backends.candidate.json' -o -name '*.sha256' -o -name 'SHA256SUMS' \) -print | sort
 
       - name: Upload assets to release
-        if: steps.tag.outputs.tag != '' && github.event.inputs.dry_run != 'true'
+        if: steps.tag.outputs.tag != '' && !inputs.dry_run
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -1581,7 +1605,7 @@ jobs:
             --repo "${{ github.repository }}" --clobber
 
       - name: Dry run -- skipping upload
-        if: steps.tag.outputs.tag != '' && github.event.inputs.dry_run == 'true'
+        if: steps.tag.outputs.tag != '' && inputs.dry_run
         run: echo "dry_run=true -- not uploading to ${{ steps.tag.outputs.tag }} (evaluated condition/logic only)"
 
   verify-completeness:
@@ -1590,7 +1614,7 @@ jobs:
     # Single-leg dispatch runs (only_target set) intentionally produce just
     # one archive, not the full asset set this job asserts on -- skip the
     # completeness gate for those runs instead of failing it by design.
-    if: ${{ always() && !cancelled() && needs.checksums.result == 'success' && (needs.upload-to-release.result == 'success' || inputs.source_run_id != '') && (github.event_name != 'workflow_dispatch' || inputs.only_target == '') }}
+    if: ${{ always() && !cancelled() && needs.checksums.result == 'success' && (needs.upload-to-release.result == 'success' || inputs.source_run_id != '') && inputs.only_target == '' }}
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
