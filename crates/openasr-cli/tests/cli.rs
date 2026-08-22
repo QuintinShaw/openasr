@@ -1941,11 +1941,74 @@ fn pull_installs_local_pack_from_catalog_reference() {
         .stdout(predicate::str::contains("moonshine-tiny:q8"))
         .stdout(predicate::str::contains(&sha256));
 
+    let config = openasr_core::load_config(home.path()).expect("load config after pull");
+    assert_eq!(
+        config.default_model, None,
+        "pull must not choose an ASR default"
+    );
+    assert!(
+        !home.path().join("default.json").exists(),
+        "pull must not create the default-pack pointer"
+    );
     openasr_with_home(home.path())
         .args(["list"])
         .assert()
         .success()
         .stdout(predicate::str::contains("moonshine-tiny:q8"));
+}
+
+#[test]
+fn pull_preserves_existing_default_selection() {
+    let home = temp_home();
+    let temp = tempfile::tempdir().expect("pull fixture tempdir");
+    let pack = temp.path().join("moonshine-tiny-q8_0.oasr");
+    write_moonshine_oasr_v1_fixture(&pack, "moonshine-tiny");
+    let bytes = std::fs::read(&pack).expect("read pack fixture");
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let catalog = temp.path().join("catalog.json");
+    write_catalog_fixture(&catalog, &sha256, bytes.len() as u64);
+    let catalog_url = format!("file://{}", catalog.display());
+    let args = [
+        "pull",
+        "moonshine-tiny:q8",
+        "--catalog-url",
+        catalog_url.as_str(),
+        "--from",
+        pack.to_str().expect("pack path"),
+    ];
+
+    openasr_with_home(home.path()).args(args).assert().success();
+    let installed = openasr_core::list_installed_packs(home.path())
+        .expect("load installed pack after local pull")
+        .into_iter()
+        .next()
+        .expect("local pull must install a pack");
+    openasr_core::save_default_model_selection(
+        home.path(),
+        installed.model_id.clone(),
+        openasr_core::QuantPreference::pinned(&installed.quant),
+    )
+    .expect("write explicit default config fixture");
+    openasr_core::persist_default_pack_pointer(home.path(), &installed)
+        .expect("write valid default pointer fixture");
+
+    let config_before = std::fs::read(home.path().join("config.json"))
+        .expect("read configured default before pull");
+    let pointer_before =
+        std::fs::read(home.path().join("default.json")).expect("read default pointer before pull");
+
+    openasr_with_home(home.path()).args(args).assert().success();
+
+    assert_eq!(
+        std::fs::read(home.path().join("config.json")).expect("read configured default after pull"),
+        config_before,
+        "ordinary pull must not rewrite config default selection"
+    );
+    assert_eq!(
+        std::fs::read(home.path().join("default.json")).expect("read default pointer after pull"),
+        pointer_before,
+        "ordinary pull must not rewrite default pointer"
+    );
 }
 
 #[test]

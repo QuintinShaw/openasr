@@ -15,8 +15,13 @@ by:
 - `openasr-cli`'s `serve`/`transcribe`/`live` pack resolution
   (`crates/openasr-cli/src/native_segment_cli.rs`) for the "no `--model`
   passed" case.
-- `openasr pull`'s auto-set-default-on-install behavior
-  (`crates/openasr-cli/src/pull_cli.rs`).
+- `openasr-cli`'s `pull` and consent-pull handlers read this state when they
+  resolve a model, but they only install and report packs. Neither ordinary
+  `openasr pull` nor a consent pull writes `config.json` or `default.json`.
+
+Default selection is changed only by an explicit activation operation or the
+server's explicit default-model API. Installing a pack is not activation, so a
+pull must never advance or replace the user's selection state.
 
 No shell, frontend, or new server/CLI code may reimplement this resolution or
 fabricate a default from in-memory state. If a new surface needs "what is the
