@@ -46,7 +46,6 @@ use crate::device::{
         ranked_preferred_accelerated_devices, resolve_execution_route,
     },
 };
-
 const F32_WIDTH_BYTES: usize = std::mem::size_of::<f32>();
 const F16_WIDTH_BYTES: usize = std::mem::size_of::<u16>();
 const I32_WIDTH_BYTES: usize = std::mem::size_of::<i32>();
@@ -2206,7 +2205,9 @@ impl GgmlCpuGraphRunner {
                     source.path(),
                 )?;
             }
-            return Ok(GgmlLoadedWeightContext { inner });
+            let loaded = GgmlLoadedWeightContext { inner };
+            loaded.record_receipt_reuse();
+            return Ok(loaded);
         }
 
         let reader = build_reader()?;
@@ -2536,6 +2537,13 @@ impl Drop for GgmlCpuGraphRunner {
 impl GgmlLoadedWeightContext {
     pub(crate) fn tensor(&self, name: &str) -> Option<GgmlLoadedTensor> {
         self.inner.tensors.get(name).copied()
+    }
+
+    fn record_receipt_reuse(&self) {
+        self.inner._buffer.record_receipt_reuse();
+        if let Some(residency) = self.inner._pack_weight_residency.as_ref() {
+            residency.record_receipt_reuse();
+        }
     }
 
     #[cfg(test)]
@@ -6935,6 +6943,9 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             self.ensure_scheduler_graph_active(graph)?;
         }
         if self.frozen {
+            if let Some(buffer) = self.buffer.as_ref() {
+                buffer.record_receipt_reuse();
+            }
             return Ok(());
         }
         self.frozen = true;
@@ -6963,6 +6974,9 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     ) -> Result<(), GgmlCpuGraphError> {
         self.ensure_not_poisoned()?;
         if self.frozen {
+            if let Some(allocator) = self.graph_allocator.as_ref() {
+                allocator.record_receipt_reuse();
+            }
             return Ok(());
         }
         let allocator = allocate(graph, self.backend)?;
@@ -9747,6 +9761,14 @@ impl GgmlGraphAllocatorGuard {
     fn requested_bytes(&self) -> u64 {
         self.requested_bytes
     }
+
+    fn record_receipt_reuse(&self) {
+        match &self._ownership {
+            #[cfg(test)]
+            GgmlGraphAllocatorOwnership::Direct { .. } => {}
+            GgmlGraphAllocatorOwnership::Admitted { _owner } => _owner.record_receipt_reuse(),
+        }
+    }
 }
 
 enum GgmlBackendBufferOwnership {
@@ -9857,6 +9879,14 @@ impl GgmlBackendBufferGuard {
             true,
             native_allocate,
         )
+    }
+
+    fn record_receipt_reuse(&self) {
+        match &self.ownership {
+            #[cfg(test)]
+            GgmlBackendBufferOwnership::Direct(_) => {}
+            GgmlBackendBufferOwnership::Admitted(allocation) => allocation.record_receipt_reuse(),
+        }
     }
 
     fn raw(&self) -> NonNull<c_void> {
@@ -10170,7 +10200,16 @@ fn maybe_allocate_weight_buffer_from_host_ptr(
     // Host import is a zero-copy optimization, not a semantic requirement.
     // If native import fails after residency was acquired, drop the handle
     // (last owner refunds) and let the caller fall back to a backend buffer.
-    Ok(attempt.ok().map(|buffer| (buffer, mmap, residency)))
+    let Some(buffer) = attempt.ok() else {
+        return Ok(None);
+    };
+    // The pack-level receipt is attached only after this stage's native
+    // HOST_IMPORT succeeded; the shared residency Arc makes the attach happen
+    // once across all co-located contexts/backends.
+    if let Some(residency) = residency.as_ref() {
+        residency.attach_receipt();
+    }
+    Ok(Some((buffer, mmap, residency)))
 }
 
 fn validate_direct_backend_matmul_weight_support(
