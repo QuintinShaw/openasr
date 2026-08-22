@@ -26,10 +26,10 @@ GPU decode path.
 
 ## What it does
 
-For each configured audio path (default: the committed `fixtures/jfk.wav`) it
-transcribes with `OPENASR_GGML_BACKEND=cpu` (reference) and with the
-auto-selected backend (GPU), and fails if the two transcripts differ. On a host
-with no GPU backend it is a no-op (exit 0).
+For each configured audio path the producer compares CPU reference output with
+an explicitly selected GPU provider/device and requires cold and same-process
+reuse per-step traces. Missing GPU, fixture, pack, candidate identity, or trace
+is a hard failure; there is no CPU-only success path.
 
 ## Run it locally
 
@@ -51,9 +51,8 @@ Overrides (env):
 
 ## CI
 
-`.github/workflows/qwen-gpu-parity.yml` is a manual-dispatch diagnostic on the
-self-hosted `[self-hosted, Windows, X64, HIP]` runner. It is not evidence until a
-successful run binds the candidate binary, provider/device, pack, fixture, and
-per-step token trace. The workflow is projected into the common family/provider
-correctness matrix; a shared ggml path or build-only result does not approve the
-qwen GPU lane. No successful run is implied by this documentation.
+The workflow requires immutable candidate CLI, staging catalog, exact `.oasr`
+pack, correctness matrix/receipt, expected provider/device, and runtime-produced
+cold/reuse per-step trace artifacts. It fails closed when any is absent,
+unstable, mismatched, or when the host selects CPU/another device. A transcript
+comparison without those identity-bound traces is not a passing run.

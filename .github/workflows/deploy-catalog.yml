@@ -1,11 +1,8 @@
 name: Deploy catalog
 
-# Deploys the signed PUBLIC catalog projection to Cloudflare (catalog.openasr.org)
-# when it changes on main. Signing happens locally (the seed never enters CI); this
-# workflow only ships the already-signed, already-committed bytes with a scoped
-# CLOUDFLARE_API_TOKEN. The ed25519 signature is cryptographically verified by the
-# self-contained pre-deploy gates below; the expensive full Rust CI intentionally
-# does not rerun for this direct release-operator catalog push.
+# Deploys the signed PUBLIC catalog projection only as a reusable stage of the
+# release orchestrator. It never deploys because a catalog file changed on main;
+# the caller supplies immutable candidate catalog and correctness artifacts.
 #
 # `gate-released-binary-compat` runs BEFORE `deploy` (see `needs:` below): catalog
 # data and CLI binaries ship on independent cadences, so a catalog edit that is
@@ -20,22 +17,74 @@ name: Deploy catalog
 # catalog shape, this gate should (and will, automatically, with no edits here)
 # start passing that catalog again.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "model-registry/catalog.json"
-      - "model-registry/catalog.signature.json"
-      - "model-registry/catalog.public.json"
-      - "model-registry/catalog.public.signature.json"
-      - "model-registry/catalog.epoch"
-      - "cloudflare/catalog/**"
-  workflow_dispatch:
+  # Catalog deployment is a release-orchestrator stage, never a direct main-push
+  # side effect. The caller must provide the immutable candidate artifacts and
+  # correctness evidence; the finalizer invokes this only after the gate passes.
+  workflow_call:
+    inputs:
+      correctness_artifact:
+        required: true
+        type: string
+      correctness_sources_artifact:
+        required: true
+        type: string
+      correctness_traces_artifact:
+        required: true
+        type: string
+      public_catalog_artifact:
+        required: true
+        type: string
+      public_catalog_signature_artifact:
+        required: true
+        type: string
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
 
 concurrency:
   group: deploy-catalog
   cancel-in-progress: false
 
 jobs:
+  gate-correctness:
+    name: Verify immutable correctness matrix and receipts
+    if: github.repository == 'QuintinShaw/openasr'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download staged correctness artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.correctness_artifact }}
+          path: staging/correctness
+      - name: Download canonical source snapshots
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.correctness_sources_artifact }}
+          path: staging/sources
+      - name: Download immutable trace artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.correctness_traces_artifact }}
+          path: staging/traces
+      - name: Verify matrix, source digests, artifact bindings, and trace contents
+        run: |
+          set -euo pipefail
+          matrix="$(find staging/correctness -name 'gpu-correctness-matrix.v1.json' -type f -print -quit)"
+          inventory="$(find staging/sources -name 'gpu-correctness-source-inventory.json' -type f -print -quit)"
+          catalog="$(find staging/sources -name 'gpu-correctness-source-model-catalog.json' -type f -print -quit)"
+          backends="$(find staging/sources -name 'gpu-correctness-source-backend-catalog.json' -type f -print -quit)"
+          test -n "$matrix" -a -n "$inventory" -a -n "$catalog" -a -n "$backends"
+          mapfile -t receipts < <(find staging/correctness -name 'gpu-correctness-receipt-*.json' -type f | sort)
+          mapfile -t traces < <(find staging/traces -type f -name 'gpu-correctness-trace-*.jsonl' | sort)
+          test "${#receipts[@]}" -gt 0
+          test "${#traces[@]}" -gt 0
+          receipt_args=(); for item in "${receipts[@]}"; do receipt_args+=(--receipt "$item"); done
+          trace_args=(); for item in "${traces[@]}"; do trace_args+=(--trace "$item"); done
+          python3 tooling/release-manifest/gpu_correctness_gate.py validate \
+            --manifest "$matrix" --inventory "$inventory" --catalog "$catalog" \
+            --backend-catalog "$backends" "${receipt_args[@]}" "${trace_args[@]}"
+
   gate-released-binary-compat:
     # Same repo scope as `deploy`: this reads public GitHub releases only (no
     # secrets needed), but it exists to guard this repo's production deploy,
@@ -44,22 +93,41 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-
-      - name: Verify generated catalog and production signatures
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.public_catalog_artifact }}
+          path: staging/public
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.public_catalog_signature_artifact }}
+          path: staging/public
+      - name: Verify candidate public catalog contents
         run: |
-          tooling/publish-model/scripts/regenerate_all.sh --check
-          python3 tooling/publish-model/scripts/check_catalog_consistency.py
+          set -euo pipefail
+          catalog="$(find staging/public -name catalog.json -type f -print -quit)"
+          signature="$(find staging/public -name catalog.signature.json -type f -print -quit)"
+          test -n "$catalog" -a -n "$signature"
+          sha256sum "$catalog" "$signature"
+          python3 - "$catalog" "$signature" <<'PY'
+          import hashlib, json, pathlib, sys
+          raw = pathlib.Path(sys.argv[1]).read_bytes()
+          sig = json.loads(pathlib.Path(sys.argv[2]).read_text())
+          catalog = json.loads(raw)
+          assert hashlib.sha256(raw).hexdigest() == sig["catalog_sha256"]
+          assert sig["catalog_url"] == "https://catalog.openasr.org/v1/catalog.json"
+          assert catalog.get("models") and all(item.get("public") is True for item in catalog["models"])
+          PY
 
       - name: Gate candidate catalog against the latest released CLI binary
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          scripts/gate-catalog-against-released-binary.sh \
-            model-registry/catalog.public.json \
-            model-registry/catalog.public.signature.json
+          catalog="$(find staging/public -name catalog.json -type f -print -quit)"
+          signature="$(find staging/public -name catalog.signature.json -type f -print -quit)"
+          scripts/gate-catalog-against-released-binary.sh "$catalog" "$signature"
 
   deploy:
-    needs: gate-released-binary-compat
+    needs: [gate-correctness, gate-released-binary-compat]
     # Forks should never attempt to deploy to the maintainer's Cloudflare
     # account (and would fail anyway without CLOUDFLARE_API_TOKEN).
     if: github.repository == 'QuintinShaw/openasr'
@@ -67,12 +135,26 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Verify committed public catalog (consistent + public-only)
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.public_catalog_artifact }}
+          path: staging/public
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.public_catalog_signature_artifact }}
+          path: staging/public
+      - name: Verify candidate public catalog
         run: |
+          set -euo pipefail
+          catalog="$(find staging/public -name catalog.json -type f -print -quit)"
+          signature="$(find staging/public -name catalog.signature.json -type f -print -quit)"
+          test -n "$catalog" -a -n "$signature"
+          cp "$catalog" candidate-catalog.json
+          cp "$signature" candidate-catalog.signature.json
           python3 - <<'PY'
           import hashlib, json
-          raw = open("model-registry/catalog.public.json", "rb").read()
-          sig = json.load(open("model-registry/catalog.public.signature.json"))
+          raw = open("candidate-catalog.json", "rb").read()
+          sig = json.load(open("candidate-catalog.signature.json"))
           catalog = json.loads(raw)
           assert hashlib.sha256(raw).hexdigest() == sig["catalog_sha256"], "catalog.public.json sha256 != signature.catalog_sha256"
           assert sig["catalog_url"] == "https://catalog.openasr.org/v1/catalog.json", "catalog_url is not the canonical signed identity"
@@ -84,7 +166,7 @@ jobs:
       - name: Verify signed backend payloads are live before metadata deployment
         run: |
           python3 tooling/release-manifest/backend_catalog.py verify-cdn \
-            --catalog model-registry/catalog.public.json
+            --catalog candidate-catalog.json
 
       - name: Deploy to Cloudflare
         uses: cloudflare/wrangler-action@v3
@@ -98,8 +180,8 @@ jobs:
           # Stage the committed signed bytes as the served static assets, then deploy.
           preCommands: |
             mkdir -p public
-            cp ../../model-registry/catalog.public.json public/catalog.json
-            cp ../../model-registry/catalog.public.signature.json public/catalog.signature.json
+            cp ../../candidate-catalog.json public/catalog.json
+            cp ../../candidate-catalog.signature.json public/catalog.signature.json
           command: deploy
 
       - name: Verify live endpoint serves the committed public projection
@@ -112,14 +194,14 @@ jobs:
             bust="cb=${GITHUB_SHA}-${attempt}"
             curl -fsSL "$base/catalog.json?$bust" -o /tmp/live-catalog.json
             curl -fsSL "$base/catalog.signature.json?$bust" -o /tmp/live-catalog.sig.json
-            if cmp -s /tmp/live-catalog.json model-registry/catalog.public.json \
-              && cmp -s /tmp/live-catalog.sig.json model-registry/catalog.public.signature.json; then
+            if cmp -s /tmp/live-catalog.json candidate-catalog.json \
+              && cmp -s /tmp/live-catalog.sig.json candidate-catalog.signature.json; then
               break
             fi
             if [ "$attempt" = "12" ]; then
               echo "::error::live catalog still differs from the committed public projection after $attempt attempts"
-              cmp /tmp/live-catalog.json model-registry/catalog.public.json || true
-              cmp /tmp/live-catalog.sig.json model-registry/catalog.public.signature.json || true
+              cmp /tmp/live-catalog.json candidate-catalog.json || true
+              cmp /tmp/live-catalog.sig.json candidate-catalog.signature.json || true
               exit 1
             fi
             echo "live catalog not yet consistent (attempt $attempt); retrying in 10s"

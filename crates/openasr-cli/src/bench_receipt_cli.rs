@@ -274,8 +274,11 @@ pub(crate) fn bench_receipt_short_audio(
             })?;
     }
     // A generic native receipt records only typed placement telemetry produced
-    // by the runtime. It is not a release correctness approval; strict trace
-    // publication above remains the only approval-producing path.
+    // by the runtime. It is not a release correctness approval; token-transcript
+    // evidence requires the runtime token-trace producer and immutable matrix
+    // bindings. Strict trace publication above remains the only
+    // approval-producing path.
+    let receipt_evidence = None;
     let receipt = ShortAudioReceipt::try_new(ShortAudioReceipt {
         schema: SHORT_AUDIO_RECEIPT_SCHEMA.to_string(),
         core_commit,
@@ -318,7 +321,7 @@ pub(crate) fn bench_receipt_short_audio(
         transcript: ShortAudioReceiptTranscript::from_text(last_text),
         placement: device_label,
         observed_placement: (!observed_placement.is_empty()).then_some(observed_placement),
-        evidence: None,
+        evidence: receipt_evidence,
         scope: options.scope.to_string(),
         notes,
         decode_diagnostics: None,

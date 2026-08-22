@@ -32,13 +32,15 @@ The evidence object has one disjoint `evidence_class`:
 | `placement_resource` | Selected provider/device, resolved placement, and observed resource/compute result | Token or transcript correctness |
 | `token_transcript` | Family host-oracle parity for a declared output plan and fresh/reuse mode | Packaging completeness unless the artifact bindings are separately checked |
 
-`token_transcript` additionally requires `family`, `provider`, `execution.mode`
-(`fresh` or `reuse`), `output_plan` (`kind`, complete logits/scores versus
-semantic compact selection, and `tie_policy`), `family_oracle`, a SHA-256 token
-trace, optional logits hash, and bounded top-k/margin summaries. These fields
-are evidence identities, not runtime policy inputs. A placement receipt cannot
-be substituted for a token receipt, and a CPU full-logits receipt cannot close a
-GPU compact-selector cell.
+`token_transcript` additionally requires `family`, `model_id`, `quant`, concrete
+runtime topology, provider/device/placement, capture and scheduler mode,
+`execution.mode` (`cold` or `reuse`), a resolved output plan, a typed family
+oracle/tie policy, SHA-256 token trace artifact, optional logits artifact, and
+bounded top-k/margin summaries. All evidence classes carry the strict
+`openasr.gpu-correctness-artifact.v1` contract, matrix digest, candidate release
+subject/core commit, binary/plugin/pack/fixture identity, and all three
+inventory/model/backend catalog digests. The validator hashes the supplied
+trace files; a digest written into JSON without matching content is rejected.
 
 ## Correctness extension
 
@@ -121,16 +123,20 @@ The command is an **explicit tooling surface**. It does not change the default
   placeholder; native receipts must bind real pack bytes.
 - `evidence.schema` must equal `openasr.short-audio-receipt.evidence.v1`; its
   class is one of `build_packaging`, `placement_resource`, or
-  `token_transcript`, and a passing class has all three artifact SHA-256
-  bindings.
-- `token_transcript` evidence must carry a family oracle, resolved output plan,
-  fresh/reuse mode, token trace hash, and bounded logits/top-k/margin summary.
-  `placement_resource` requires observed placement. Classes are never
-  interchangeable.
-  executes a ggml graph, `observed_placement` is populated from runtime
-  telemetry and the emitter fails closed if the observed compute violates the
-  resolved FullDevice/Hybrid placement. Older v0 receipts remain readable
-  because this evidence field and all lifecycle memory fields are optional.
+  `token_transcript`, and the strict artifact contract must be present.
+- `matrix_sha256`, candidate release subject/core commit, catalog digests,
+  binary/plugin/pack/fixture identities, topology, capture/scheduler mode, and
+  model/quant bindings must match the canonical staging matrix.
+- `token_transcript` evidence must carry a family oracle, resolved typed output
+  plan, cold/reuse mode, non-empty token trace artifact, and bounded logits/top-k/
+  margin summary. `placement_resource` requires observed placement. Classes are
+  never interchangeable. The generic bench command refuses native output until
+  the runtime trace producer is connected; it cannot emit a fixed `evidence:null`
+  correctness claim.
+- When a native accelerated run executes a ggml graph, `observed_placement` is
+  populated from runtime telemetry and the emitter fails closed if observed
+  compute violates the resolved FullDevice/Hybrid placement. Older v0 receipts
+  remain readable because the evidence field is optional.
 
 ## Relationship to pack preflight
 

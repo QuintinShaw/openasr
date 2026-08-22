@@ -7,6 +7,34 @@ name: qwen GPU parity gate
 
 on:
   workflow_dispatch:
+    inputs:
+      candidate_cli_artifact:
+        required: true
+        type: string
+      candidate_plugin_artifact:
+        required: true
+        type: string
+      staging_catalog_artifact:
+        required: true
+        type: string
+      correctness_matrix_artifact:
+        required: true
+        type: string
+      expected_provider:
+        required: true
+        type: string
+      expected_device:
+        required: true
+        type: string
+      pack_artifact:
+        required: true
+        type: string
+      trace_artifact:
+        required: true
+        type: string
+      correctness_receipt_artifact:
+        required: true
+        type: string
 
 concurrency:
   group: qwen-gpu-parity-${{ github.ref }}
@@ -25,7 +53,36 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.candidate_cli_artifact }}
+          path: staging/candidate
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.candidate_plugin_artifact }}
+          path: staging/plugin
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.staging_catalog_artifact }}
+          path: staging/catalog
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.correctness_matrix_artifact }}
+          path: staging/correctness
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.pack_artifact }}
+          path: staging/pack
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.trace_artifact }}
+          path: staging/traces
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.correctness_receipt_artifact }}
+          path: staging/receipts
 
       - name: Verify HIP SDK toolchain
         shell: pwsh
@@ -39,16 +96,43 @@ jobs:
           }
           Write-Host "HIP SDK: $hipRoot"
 
-      - name: Build openasr-cli (HIP)
+      - name: Verify immutable candidate CLI and matrix inputs
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if (-not $env:OPENASR_HIP_GPU_TARGETS) { $env:OPENASR_HIP_GPU_TARGETS = "gfx1200" }
-          cargo build -p openasr-cli --release --features hip
+          $candidate = Get-ChildItem -Path staging/candidate -Filter *.exe -Recurse | Select-Object -First 1
+          if (-not $candidate) { Write-Error "candidate CLI executable is missing"; exit 1 }
+          gh attestation verify $candidate.FullName --repo $env:GITHUB_REPOSITORY --signer-workflow "$env:GITHUB_REPOSITORY/.github/workflows/release-binaries.yml"
+          $catalog = Get-ChildItem -Path staging/catalog -Filter catalog.json -Recurse | Select-Object -First 1
+          $plugin = Get-ChildItem -Path staging/plugin -File -Recurse | Select-Object -First 1
+          $matrix = Get-ChildItem -Path staging/correctness -Filter gpu-correctness-matrix.v1.json -Recurse | Select-Object -First 1
+          $pack = Get-ChildItem -Path staging/pack -Filter *.oasr -Recurse | Select-Object -First 1
+          $receipt = Get-ChildItem -Path staging/receipts -Filter gpu-correctness-receipt-*.json -Recurse | Select-Object -First 1
+          if (-not $catalog -or -not $matrix -or -not $pack -or -not $receipt -or -not $plugin) { Write-Error "candidate catalog, matrix, plugin, exact pack, or correctness receipt is missing"; exit 1 }
+          Get-FileHash $candidate.FullName,$plugin.FullName,$catalog.FullName,$matrix.FullName,$pack.FullName,$receipt.FullName -Algorithm SHA256
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\openasr-qwen-home" | Out-Null
+          Copy-Item $candidate.FullName target\release\openasr.exe -Force
+          $env:OPENASR_HOME = "$env:RUNNER_TEMP\openasr-qwen-home"
+          Copy-Item $catalog.FullName "$env:OPENASR_HOME\catalog.json" -Force
+          Copy-Item $pack.FullName "$env:OPENASR_HOME\qwen.oasr" -Force
+          "OPENASR_QWEN_PARITY_EXE=$((Resolve-Path target\release\openasr.exe).Path)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "OPENASR_QWEN_PARITY_PACK=$((Resolve-Path "$env:OPENASR_HOME\qwen.oasr").Path)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "OPENASR_HOME=$env:OPENASR_HOME" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Ensure qwen3-asr-0.6b pack is available
+      - name: Verify qwen cold/reuse runtime traces
         shell: pwsh
         run: |
-          .\target\release\openasr.exe pull qwen3-asr-0.6b
+          $traceDir = Join-Path $env:RUNNER_TEMP "qwen-traces"
+          New-Item -ItemType Directory -Force -Path $traceDir | Out-Null
+          Copy-Item (Join-Path $pwd "staging\traces\*") $traceDir -Force
+          $traces = @(Get-ChildItem -Path $traceDir -Filter *.jsonl)
+          if ($traces.Count -lt 2 -or -not ($traces.Name -match "cold") -or -not ($traces.Name -match "reuse")) {
+            Write-Error "trace artifact must contain non-empty cold and reuse per-step traces"; exit 1
+          }
+          "OPENASR_QWEN_PARITY_TRACE_DIR=$traceDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "OPENASR_QWEN_PARITY_EXPECTED_PROVIDER=${{ inputs.expected_provider }}" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "OPENASR_QWEN_PARITY_EXPECTED_DEVICE=${{ inputs.expected_device }}" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: qwen GPU vs CPU transcript parity
         shell: pwsh

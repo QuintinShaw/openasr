@@ -35,6 +35,10 @@ gh release download "$tag" \
   -p 'backend-hardware-evidence-*.json' \
   -p 'gpu-correctness-matrix.v1.json' \
   -p 'gpu-correctness-receipt-*.json' \
+  -p 'gpu-correctness-source-inventory.json' \
+  -p 'gpu-correctness-source-model-catalog.json' \
+  -p 'gpu-correctness-source-backend-catalog.json' \
+  -p 'gpu-correctness-trace-*.jsonl' \
   -D "$workdir" --clobber
 
 shopt -s nullglob
@@ -73,14 +77,40 @@ correctness_matrix="$workdir/gpu-correctness-matrix.v1.json"
 [ -f "$correctness_matrix" ] \
   || fail "release ${tag} has no staged GPU correctness matrix"
 correctness_receipts=("$workdir"/gpu-correctness-receipt-*.json)
+correctness_traces=("$workdir"/gpu-correctness-trace-*.jsonl)
 [ "${#correctness_receipts[@]}" -gt 0 ] \
   || fail "release ${tag} has no staged GPU correctness receipts"
+[ "${#correctness_traces[@]}" -gt 0 ] \
+  || fail "release ${tag} has no staged GPU trace artifacts"
+for source in \
+  "$workdir/gpu-correctness-source-inventory.json" \
+  "$workdir/gpu-correctness-source-model-catalog.json" \
+  "$workdir/gpu-correctness-source-backend-catalog.json"; do
+  [ -f "$source" ] || fail "release ${tag} is missing a canonical correctness source snapshot: $source"
+done
 correctness_receipt_args=()
 for receipt in "${correctness_receipts[@]}"; do
   correctness_receipt_args+=(--receipt "$receipt")
 done
+correctness_trace_args=()
+for trace in "${correctness_traces[@]}"; do
+  correctness_trace_args+=(--trace "$trace")
+done
 python3 tooling/release-manifest/gpu_correctness_gate.py validate \
-  --manifest "$correctness_matrix" "${correctness_receipt_args[@]}"
+  --manifest "$correctness_matrix" \
+  --inventory "$workdir/gpu-correctness-source-inventory.json" \
+  --catalog "$workdir/gpu-correctness-source-model-catalog.json" \
+  --backend-catalog "$workdir/gpu-correctness-source-backend-catalog.json" \
+  "${correctness_receipt_args[@]}" "${correctness_trace_args[@]}"
+
+# The reusable deploy workflow is the only catalog activation path. Requiring
+# its successful run here makes publishing the GitHub release strictly follow
+# correctness validation and public-catalog deployment.
+deploy_run_id="${OPENASR_DEPLOY_CATALOG_RUN_ID:-}"
+[ -n "$deploy_run_id" ] || fail "set OPENASR_DEPLOY_CATALOG_RUN_ID to the successful reusable catalog-deploy run"
+deploy_conclusion="$(gh run view "$deploy_run_id" --json conclusion --jq .conclusion)"
+[ "$deploy_conclusion" = "success" ] \
+  || fail "catalog deploy run $deploy_run_id did not succeed (conclusion=$deploy_conclusion)"
 
 backend_entry_args=()
 for entry in "${approved_entries[@]}"; do

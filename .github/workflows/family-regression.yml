@@ -61,17 +61,44 @@ jobs:
     if: ${{ inputs.pre_publication == true && (github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v')) }}
     runs-on: ubuntu-latest
     steps:
-      - name: Require immutable staged evidence inputs
+      - uses: actions/checkout@v7
+      - name: Download immutable candidate inputs
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ${{ inputs.candidate_cli_artifact }}
+          merge-multiple: true
+          path: staging/candidate
+      - name: Download staging catalog and correctness matrix
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ${{ inputs.staging_catalog_artifact }}
+          merge-multiple: true
+          path: staging/catalog
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: ${{ inputs.correctness_matrix_artifact }}
+          merge-multiple: true
+          path: staging/correctness
+      - name: Verify artifact contents and provenance before family work
         env:
-          CANDIDATE_CLI: ${{ inputs.candidate_cli_artifact }}
-          STAGING_CATALOG: ${{ inputs.staging_catalog_artifact }}
-          CORRECTNESS_MATRIX: ${{ inputs.correctness_matrix_artifact }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          test -n "$CANDIDATE_CLI" || { echo "candidate CLI artifact is required" >&2; exit 1; }
-          test -n "$STAGING_CATALOG" || { echo "staging catalog artifact is required" >&2; exit 1; }
-          test -n "$CORRECTNESS_MATRIX" || { echo "correctness matrix artifact is required" >&2; exit 1; }
-          echo "pre-publication contract inputs accepted; staged artifact jobs must consume these exact identities"
+          candidate="$(find staging/candidate -type f -perm -111 -print -quit)"
+          catalog="$(find staging/catalog -type f -name 'catalog.json' -print -quit)"
+          matrix="$(find staging/correctness -type f -name 'gpu-correctness-matrix.v1.json' -print -quit)"
+          test -n "$candidate" -a -n "$catalog" -a -n "$matrix"
+          sha256sum "$candidate" "$catalog" "$matrix"
+          python3 - "$catalog" "$matrix" <<'PY'
+          import json, pathlib, sys
+          for raw in sys.argv[1:]:
+              value = json.loads(pathlib.Path(raw).read_text())
+              assert isinstance(value, dict), raw
+          PY
+          gh attestation verify "$candidate" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-binaries.yml" || {
+            echo "candidate CLI has no verifiable provenance" >&2; exit 1;
+          }
+          echo "immutable candidate, staging catalog, and matrix contents verified"
 
   build-cli-linux:
     name: Build CLI (ubuntu-latest)

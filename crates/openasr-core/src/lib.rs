@@ -193,16 +193,19 @@ pub use metrics::{
 pub use models::pack_verifier::{PackCandidate, PackVerificationError, PackVerifier, VerifiedPack};
 pub use short_audio_receipt::{
     DecodeFirstDivergenceClass, EncoderDecoderSplitLane, EncoderDecoderSplitProbeRecord,
-    SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE, SHORT_AUDIO_RECEIPT_EVIDENCE_SCHEMA,
-    SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS, SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK,
-    SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioArtifactIdentity, ShortAudioExecutionMode,
-    ShortAudioFamilyOracle, ShortAudioOutputPlan, ShortAudioReceipt, ShortAudioReceiptArtifacts,
+    SHORT_AUDIO_RECEIPT_ARTIFACT_CONTRACT, SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE,
+    SHORT_AUDIO_RECEIPT_EVIDENCE_SCHEMA, SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS,
+    SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK, SHORT_AUDIO_RECEIPT_SCHEMA,
+    ShortAudioArtifactIdentity, ShortAudioCaptureMode, ShortAudioCatalogDigests,
+    ShortAudioEvidenceClass, ShortAudioExecutionMode, ShortAudioFamilyOracle, ShortAudioOutputPlan,
+    ShortAudioOutputPlanKind, ShortAudioReceipt, ShortAudioReceiptArtifacts,
     ShortAudioReceiptAudio, ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptDecodeStep,
     ShortAudioReceiptError, ShortAudioReceiptEvidence, ShortAudioReceiptLoadError,
     ShortAudioReceiptMetrics, ShortAudioReceiptOutputPlan, ShortAudioReceiptPack,
     ShortAudioReceiptReuseMode, ShortAudioReceiptRun, ShortAudioReceiptTranscript,
-    ShortAudioTopKSummary, median_f64, receipt_os_id, resolve_core_commit, sha256_file,
-    sha256_hex_bytes, validate_core_commit,
+    ShortAudioReuseMode, ShortAudioSchedulerMode, ShortAudioTiePolicy, ShortAudioTopKSummary,
+    median_f64, receipt_os_id, resolve_core_commit, sha256_file, sha256_hex_bytes,
+    validate_core_commit,
 };
 pub use subtitle::{
     TimelinePrecisionPolicy, TimelineQuality, WordAnchorQuality, WordAnchorValidation,

@@ -74,6 +74,10 @@ pub enum ShortAudioReceiptError {
     TokenEvidenceIncomplete,
     #[error("short-audio receipt token top-k or margin summary is invalid")]
     InvalidTopKSummary,
+    #[error("short-audio receipt output plan and family oracle do not match")]
+    OutputPlanOracleMismatch,
+    #[error("short-audio receipt evidence binding does not match the outer receipt")]
+    EvidenceBindingMismatch,
     #[error("short-audio receipt core_commit must be a 40-hex git sha, got {actual:?}")]
     InvalidCoreCommit { actual: String },
     #[error("short-audio receipt rtf_median requires non-empty rtf_samples when present")]
@@ -275,6 +279,12 @@ impl ShortAudioReceipt {
 
         if let Some(evidence) = &self.evidence {
             evidence.validate(self.observed_placement.as_ref())?;
+            if evidence.core_commit != self.core_commit
+                || evidence.model_id != self.pack.model_id
+                || evidence.quant != self.pack.quant
+            {
+                return Err(ShortAudioReceiptError::EvidenceBindingMismatch);
+            }
         }
 
         match (self.metrics.rtf_median, self.metrics.rtf_samples.is_empty()) {
@@ -327,9 +337,57 @@ impl ShortAudioReceiptTranscript {
     }
 }
 
-/// optional extension makes old receipts readable while making their absence
-/// explicit: a plain short-audio receipt is never GPU token-correctness proof.
+/// Versioned correctness evidence nested in the v0 receipt.
 pub const SHORT_AUDIO_RECEIPT_EVIDENCE_SCHEMA: &str = "openasr.short-audio-receipt.evidence.v1";
+
+/// stricter than the legacy v0 receipt so a hand-written partial JSON object
+/// cannot become a release proof.
+pub const SHORT_AUDIO_RECEIPT_ARTIFACT_CONTRACT: &str = "openasr.gpu-correctness-artifact.v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortAudioEvidenceClass {
+    BuildPackaging,
+    PlacementResource,
+    TokenTranscript,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortAudioReuseMode {
+    Cold,
+    Reuse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortAudioCaptureMode {
+    Disabled,
+    Enabled,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortAudioSchedulerMode {
+    Disabled,
+    Enabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortAudioTiePolicy {
+    FirstMaximum,
+    LastMaximum,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortAudioOutputPlanKind {
+    FullLogits,
+    CompleteScores,
+    NativeFirstMaxToken,
+}
 
 /// Evidence classes are intentionally disjoint. A passing placement receipt
 /// cannot be consumed as token correctness, and a packaging receipt cannot
@@ -337,12 +395,22 @@ pub const SHORT_AUDIO_RECEIPT_EVIDENCE_SCHEMA: &str = "openasr.short-audio-recei
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShortAudioReceiptEvidence {
     pub schema: String,
-    pub evidence_class: String,
+    pub contract: String,
+    pub evidence_class: ShortAudioEvidenceClass,
+    pub matrix_sha256: String,
+    pub candidate_release_subject: String,
+    pub core_commit: String,
+    pub catalog_digests: ShortAudioCatalogDigests,
     pub family: String,
+    pub model_id: String,
+    pub quant: String,
+    pub topology: String,
     pub provider: String,
     /// Stable bounded device label or opaque identity; never a local path.
     pub device: String,
     pub placement: String,
+    pub capture_mode: ShortAudioCaptureMode,
+    pub scheduler_mode: ShortAudioSchedulerMode,
     pub result: String,
     pub artifacts: ShortAudioReceiptArtifacts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -356,8 +424,16 @@ pub struct ShortAudioReceiptEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShortAudioCatalogDigests {
+    pub inventory_sha256: String,
+    pub model_catalog_sha256: String,
+    pub backend_catalog_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShortAudioReceiptArtifacts {
     pub binary: ShortAudioArtifactIdentity,
+    pub plugin: ShortAudioArtifactIdentity,
     pub pack: ShortAudioArtifactIdentity,
     pub fixture: ShortAudioArtifactIdentity,
 }
@@ -372,29 +448,29 @@ pub struct ShortAudioArtifactIdentity {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShortAudioOutputPlan {
-    pub kind: String,
-    pub logits_or_scores: String,
-    pub tie_policy: String,
+    pub kind: ShortAudioOutputPlanKind,
+    pub requires_complete_output: bool,
+    pub tie_policy: ShortAudioTiePolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShortAudioFamilyOracle {
     pub family: String,
-    pub tie_policy: String,
+    pub tie_policy: ShortAudioTiePolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShortAudioExecutionMode {
-    pub mode: String,
+    pub mode: ShortAudioReuseMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_rebuild_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShortAudioTraceSummary {
-    pub token_trace_sha256: String,
+    pub token_trace: ShortAudioArtifactIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub logits_sha256: Option<String>,
+    pub logits: Option<ShortAudioArtifactIdentity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub top_k: Vec<ShortAudioTopKSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -417,37 +493,59 @@ impl ShortAudioReceiptEvidence {
                 actual: self.schema.clone(),
             });
         }
+        if self.contract != SHORT_AUDIO_RECEIPT_ARTIFACT_CONTRACT {
+            return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                field: "correctness.contract",
+                actual: self.contract.clone(),
+            });
+        }
         for (field, value) in [
-            ("correctness.evidence_class", self.evidence_class.as_str()),
+            ("correctness.matrix_sha256", self.matrix_sha256.as_str()),
+            (
+                "correctness.candidate_release_subject",
+                self.candidate_release_subject.as_str(),
+            ),
+            ("correctness.core_commit", self.core_commit.as_str()),
             ("correctness.family", self.family.as_str()),
+            ("correctness.model_id", self.model_id.as_str()),
+            ("correctness.quant", self.quant.as_str()),
+            ("correctness.topology", self.topology.as_str()),
             ("correctness.provider", self.provider.as_str()),
             ("correctness.device", self.device.as_str()),
             ("correctness.placement", self.placement.as_str()),
             ("correctness.result", self.result.as_str()),
         ] {
             require_non_empty(field, value)?;
-            if value.len() > 128 || value.contains(['\n', '\r']) {
+            if value.len() > 256 || value.contains(['\n', '\r']) {
                 return Err(ShortAudioReceiptError::InvalidEvidenceField {
                     field,
                     actual: value.to_string(),
                 });
             }
         }
+        validate_sha256_hex("correctness.matrix_sha256", &self.matrix_sha256).map_err(
+            |actual| ShortAudioReceiptError::InvalidEvidenceDigest {
+                field: "correctness.matrix_sha256",
+                actual,
+            },
+        )?;
+        validate_core_commit(&self.core_commit)?;
+        self.catalog_digests.validate()?;
         if self.result != "pass" {
             return Err(ShortAudioReceiptError::EvidenceNotPassing {
-                evidence_class: self.evidence_class.clone(),
+                evidence_class: format!("{:?}", self.evidence_class),
                 result: self.result.clone(),
             });
         }
         self.artifacts.validate()?;
-        match self.evidence_class.as_str() {
-            "build_packaging" => {}
-            "placement_resource" => {
+        match self.evidence_class {
+            ShortAudioEvidenceClass::BuildPackaging => {}
+            ShortAudioEvidenceClass::PlacementResource => {
                 if observed_placement.is_none() {
                     return Err(ShortAudioReceiptError::PlacementEvidenceMissing);
                 }
             }
-            "token_transcript" => {
+            ShortAudioEvidenceClass::TokenTranscript => {
                 if self.output_plan.is_none()
                     || self.family_oracle.is_none()
                     || self.execution.is_none()
@@ -455,33 +553,44 @@ impl ShortAudioReceiptEvidence {
                 {
                     return Err(ShortAudioReceiptError::TokenEvidenceIncomplete);
                 }
+                let plan = self.output_plan.as_ref().expect("checked above");
+                let oracle = self.family_oracle.as_ref().expect("checked above");
+                if oracle.family != self.family || oracle.tie_policy != plan.tie_policy {
+                    return Err(ShortAudioReceiptError::OutputPlanOracleMismatch);
+                }
+                if matches!(plan.kind, ShortAudioOutputPlanKind::NativeFirstMaxToken)
+                    && plan.requires_complete_output
+                {
+                    return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                        field: "correctness.output_plan.requires_complete_output",
+                        actual: "true for native compact token plan".to_string(),
+                    });
+                }
+                if !matches!(plan.kind, ShortAudioOutputPlanKind::NativeFirstMaxToken)
+                    && !plan.requires_complete_output
+                {
+                    return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                        field: "correctness.output_plan.requires_complete_output",
+                        actual: "false for complete output plan".to_string(),
+                    });
+                }
                 let execution = self.execution.as_ref().expect("checked above");
-                if execution.mode != "fresh" && execution.mode != "reuse" {
+                if execution.mode != ShortAudioReuseMode::Cold
+                    && execution.mode != ShortAudioReuseMode::Reuse
+                {
                     return Err(ShortAudioReceiptError::InvalidEvidenceField {
                         field: "correctness.execution.mode",
-                        actual: execution.mode.clone(),
+                        actual: format!("{:?}", execution.mode),
                     });
                 }
                 let trace = self.trace.as_ref().expect("checked above");
-                validate_sha256_hex(
-                    "correctness.trace.token_trace_sha256",
-                    &trace.token_trace_sha256,
-                )
-                .map_err(|actual| {
-                    ShortAudioReceiptError::InvalidEvidenceDigest {
-                        field: "correctness.trace.token_trace_sha256",
-                        actual,
-                    }
-                })?;
-                if let Some(logits) = &trace.logits_sha256 {
-                    validate_sha256_hex("correctness.trace.logits_sha256", logits).map_err(
-                        |actual| ShortAudioReceiptError::InvalidEvidenceDigest {
-                            field: "correctness.trace.logits_sha256",
-                            actual,
-                        },
-                    )?;
+                trace.token_trace.validate()?;
+                if let Some(logits) = &trace.logits {
+                    logits.validate()?;
                 }
-                if trace.top_k.len() > 32 || trace.top_k.iter().any(|item| !item.value.is_finite())
+                if trace.top_k.is_empty()
+                    || trace.top_k.len() > 32
+                    || trace.top_k.iter().any(|item| !item.value.is_finite())
                 {
                     return Err(ShortAudioReceiptError::InvalidTopKSummary);
                 }
@@ -492,37 +601,60 @@ impl ShortAudioReceiptEvidence {
                     return Err(ShortAudioReceiptError::InvalidTopKSummary);
                 }
             }
-            _ => {
-                return Err(ShortAudioReceiptError::InvalidEvidenceField {
-                    field: "correctness.evidence_class",
-                    actual: self.evidence_class.clone(),
-                });
-            }
         }
         Ok(())
     }
 }
 
+impl ShortAudioCatalogDigests {
+    fn validate(&self) -> Result<(), ShortAudioReceiptError> {
+        for (field, value) in [
+            (
+                "correctness.catalog_digests.inventory_sha256",
+                &self.inventory_sha256,
+            ),
+            (
+                "correctness.catalog_digests.model_catalog_sha256",
+                &self.model_catalog_sha256,
+            ),
+            (
+                "correctness.catalog_digests.backend_catalog_sha256",
+                &self.backend_catalog_sha256,
+            ),
+        ] {
+            validate_sha256_hex(field, value).map_err(|actual| {
+                ShortAudioReceiptError::InvalidEvidenceDigest {
+                    field: "correctness.catalog_digests",
+                    actual,
+                }
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl ShortAudioArtifactIdentity {
+    fn validate(&self) -> Result<(), ShortAudioReceiptError> {
+        require_non_empty("correctness.artifacts.label", &self.label)?;
+        if self.label.len() > 128 || self.label.contains(['\n', '\r', '/', '\\']) {
+            return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                field: "correctness.artifacts.label",
+                actual: self.label.clone(),
+            });
+        }
+        validate_sha256_hex("correctness.artifacts.sha256", &self.sha256).map_err(|actual| {
+            ShortAudioReceiptError::InvalidEvidenceDigest {
+                field: "correctness.artifacts.sha256",
+                actual,
+            }
+        })
+    }
+}
+
 impl ShortAudioReceiptArtifacts {
     fn validate(&self) -> Result<(), ShortAudioReceiptError> {
-        for (field, identity) in [
-            ("correctness.artifacts.binary", &self.binary),
-            ("correctness.artifacts.pack", &self.pack),
-            ("correctness.artifacts.fixture", &self.fixture),
-        ] {
-            require_non_empty(field, &identity.label)?;
-            if identity.label.len() > 128 || identity.label.contains(['\n', '\r', '/', '\\']) {
-                return Err(ShortAudioReceiptError::InvalidEvidenceField {
-                    field,
-                    actual: identity.label.clone(),
-                });
-            }
-            validate_sha256_hex("correctness.artifacts.sha256", &identity.sha256).map_err(
-                |actual| ShortAudioReceiptError::InvalidEvidenceDigest {
-                    field: "correctness.artifacts.sha256",
-                    actual,
-                },
-            )?;
+        for identity in [&self.binary, &self.plugin, &self.pack, &self.fixture] {
+            identity.validate()?;
         }
         Ok(())
     }
@@ -828,51 +960,67 @@ mod tests {
     }
 
     fn sample_artifacts() -> ShortAudioReceiptArtifacts {
+        let identity = |label: &str, sha256: &str| ShortAudioArtifactIdentity {
+            label: label.to_string(),
+            sha256: sha256.repeat(64),
+            size_bytes: Some(10),
+        };
         ShortAudioReceiptArtifacts {
-            binary: ShortAudioArtifactIdentity {
-                label: "openasr-test-binary".to_string(),
-                sha256: "c".repeat(64),
-                size_bytes: Some(10),
-            },
-            pack: ShortAudioArtifactIdentity {
-                label: "fixture-pack".to_string(),
-                sha256: "d".repeat(64),
-                size_bytes: Some(20),
-            },
-            fixture: ShortAudioArtifactIdentity {
-                label: "jfk-short".to_string(),
-                sha256: "e".repeat(64),
-                size_bytes: Some(30),
-            },
+            binary: identity("openasr-test-binary", "c"),
+            plugin: identity("cuda-plugin", "d"),
+            pack: identity("fixture-pack", "e"),
+            fixture: identity("jfk-short", "f"),
         }
     }
 
-    fn sample_token_evidence(mode: &str) -> ShortAudioReceiptEvidence {
+    fn sample_token_evidence(mode: ShortAudioReuseMode) -> ShortAudioReceiptEvidence {
         ShortAudioReceiptEvidence {
             schema: SHORT_AUDIO_RECEIPT_EVIDENCE_SCHEMA.to_string(),
-            evidence_class: "token_transcript".to_string(),
+            contract: SHORT_AUDIO_RECEIPT_ARTIFACT_CONTRACT.to_string(),
+            evidence_class: ShortAudioEvidenceClass::TokenTranscript,
+            matrix_sha256: "a".repeat(64),
+            candidate_release_subject: "v0.1.36-test".to_string(),
+            core_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            catalog_digests: ShortAudioCatalogDigests {
+                inventory_sha256: "1".repeat(64),
+                model_catalog_sha256: "2".repeat(64),
+                backend_catalog_sha256: "3".repeat(64),
+            },
             family: "qwen".to_string(),
+            model_id: "funasr-nano:q4_k".to_string(),
+            quant: "q4_k".to_string(),
+            topology: "causal-self-attention-kv".to_string(),
             provider: "cuda".to_string(),
             device: "cuda0".to_string(),
             placement: "full_device".to_string(),
+            capture_mode: ShortAudioCaptureMode::Disabled,
+            scheduler_mode: ShortAudioSchedulerMode::Disabled,
             result: "pass".to_string(),
             artifacts: sample_artifacts(),
             output_plan: Some(ShortAudioOutputPlan {
-                kind: "full_logits".to_string(),
-                logits_or_scores: "complete".to_string(),
-                tie_policy: "first_maximum".to_string(),
+                kind: ShortAudioOutputPlanKind::FullLogits,
+                requires_complete_output: true,
+                tie_policy: ShortAudioTiePolicy::FirstMaximum,
             }),
             family_oracle: Some(ShortAudioFamilyOracle {
                 family: "qwen".to_string(),
-                tie_policy: "first_maximum".to_string(),
+                tie_policy: ShortAudioTiePolicy::FirstMaximum,
             }),
             execution: Some(ShortAudioExecutionMode {
-                mode: mode.to_string(),
+                mode,
                 graph_rebuild_reason: None,
             }),
             trace: Some(ShortAudioTraceSummary {
-                token_trace_sha256: "f".repeat(64),
-                logits_sha256: Some("a".repeat(64)),
+                token_trace: ShortAudioArtifactIdentity {
+                    label: "token-trace.jsonl".to_string(),
+                    sha256: "4".repeat(64),
+                    size_bytes: Some(12),
+                },
+                logits: Some(ShortAudioArtifactIdentity {
+                    label: "logits.jsonl".to_string(),
+                    sha256: "5".repeat(64),
+                    size_bytes: Some(20),
+                }),
                 top_k: vec![ShortAudioTopKSummary {
                     token_id: 7,
                     value: 1.25,
@@ -885,14 +1033,14 @@ mod tests {
     #[test]
     fn token_evidence_validates_as_a_separate_class() {
         let mut receipt = sample_receipt();
-        receipt.evidence = Some(sample_token_evidence("fresh"));
+        receipt.evidence = Some(sample_token_evidence(ShortAudioReuseMode::Cold));
         ShortAudioReceipt::try_new(receipt).expect("complete token evidence should validate");
     }
 
     #[test]
     fn token_evidence_rejects_missing_trace() {
         let mut receipt = sample_receipt();
-        let mut evidence = sample_token_evidence("reuse");
+        let mut evidence = sample_token_evidence(ShortAudioReuseMode::Reuse);
         evidence.trace = None;
         receipt.evidence = Some(evidence);
         assert!(matches!(
@@ -904,8 +1052,8 @@ mod tests {
     #[test]
     fn placement_evidence_cannot_approve_without_observed_placement() {
         let mut receipt = sample_receipt();
-        let mut evidence = sample_token_evidence("fresh");
-        evidence.evidence_class = "placement_resource".to_string();
+        let mut evidence = sample_token_evidence(ShortAudioReuseMode::Cold);
+        evidence.evidence_class = ShortAudioEvidenceClass::PlacementResource;
         evidence.output_plan = None;
         evidence.family_oracle = None;
         evidence.execution = None;

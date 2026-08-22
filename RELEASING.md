@@ -140,15 +140,24 @@ made public until the signed catalog distribution plane is complete:
    provider-matrix receipt is compatibility policy, not a claim that every GPU
    ran. Building a target, copying one receipt five times, scheduler/hybrid
    execution, or CPU/other-provider compute is rejected.
-2. Attach exactly one projected `gpu-correctness-matrix.v1.json` plus its bound
-   `gpu-correctness-receipt-*.json` set. Generate the projection from
-   `tooling/model-family-inventory.v1.json`, the staging model catalog, and the
-   staging backend catalog. The matrix requires separate build/packaging,
-   placement/resource, and token/transcript evidence; cold and same-process
-   reuse are distinct cells. A missing, stale, CPU-only, placement-only, or
-   differently bound receipt fails the finalizer. The matrix is evidence
-   requirements only and never fabricates a hardware result.
-3. Before catalog activation, call the reusable pre-publication contract in
+2. Attach exactly one projected `gpu-correctness-matrix.v1.json`, canonical source
+   snapshots, immutable `gpu-correctness-receipt-*.json` files, and the actual
+   `gpu-correctness-trace-*.jsonl` artifacts. Generate the projection from the
+   candidate architecture inventory, staging model catalog, and staging backend
+   catalog, and bind the candidate release subject/core commit, binary/plugin,
+   pack, fixture, and catalog digests into every receipt. The validator
+   re-hashes the source snapshots and trace contents and re-projects the matrix;
+   a copied or partial JSON receipt cannot pass. The matrix requires separate
+   build/packaging, placement/resource, and token/transcript evidence for every
+   concrete family/model/quant/topology/provider/placement/capture/scheduler/
+   kernel bucket and cold/reuse mode. A missing, stale, wrong-artifact,
+   placement-only, CPU-only, or partial matrix fails the finalizer.
+3. The only catalog deployment entrypoint is the reusable
+   `.github/workflows/deploy-catalog.yml` called by the release orchestrator.
+   It has no `push: branches: [main]` trigger, downloads candidate catalog and
+   correctness artifacts, verifies their hashes/provenance/content, runs the
+   correctness gate, and deploys the candidate catalog only after that gate.
+4. Before catalog activation, call the reusable pre-publication contract in
    `.github/workflows/family-regression.yml` with the immutable candidate CLI,
    staging catalog, and correctness-matrix artifacts. Its existing release and
    nightly jobs remain CPU-only post-release monitoring.
@@ -163,13 +172,19 @@ made public until the signed catalog distribution plane is complete:
    receipts. Before touching the catalog it verifies that every selected CDN
    payload is already live, then bumps the epoch and signs the full/public
    catalogs. Review, commit, and push those catalog files.
-6. Wait for `deploy-catalog.yml` to repeat the no-credential CDN gate and prove
-   the signed public bytes are live. Metadata is never deployed ahead of its
-   immutable payloads.
-7. Run `scripts/finalize-core-release.sh vX.Y.Z`. It requires the live signed
-   catalog target set to equal the hardware-approved subset exactly, and it
-   HEADs every signed CDN URL for that version; only then does it publish the
-   draft and mark it latest.
+6. Invoke the reusable `deploy-catalog.yml` workflow from the release
+   orchestrator with the candidate public catalog/signature, correctness matrix,
+   canonical source snapshots, receipts, and trace artifact names. It downloads
+   and validates those exact artifacts, then deploys the public catalog only
+   after correctness and released-binary compatibility gates pass. Record its
+   successful run id as `OPENASR_DEPLOY_CATALOG_RUN_ID`.
+7. Wait for the no-credential CDN gate and prove the signed public bytes are
+   live. Metadata is never deployed ahead of its immutable payloads.
+8. Run `scripts/finalize-core-release.sh vX.Y.Z` with
+   `OPENASR_DEPLOY_CATALOG_RUN_ID` set. The finalizer refuses to publish the
+   GitHub draft unless that reusable deploy run succeeded, the live signed
+   catalog target set equals the hardware-approved subset, and every signed CDN
+   URL for that version is live.
 
 None of these scripts publishes code or a catalog implicitly. A failure leaves
 the release draft and therefore unavailable to users. Publishing the GitHub
