@@ -60,7 +60,8 @@ pub(crate) use backend_memory::{
 pub(crate) use cpu_graph::GgmlLstmGateOrder;
 pub use cpu_graph::{
     AutoGpuPolicy, GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, RequestBackendOverrideGuard,
+    GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlDecodeOutputPlan, GgmlDecodeReuseMode,
+    GgmlFamilyTieOracle, GgmlRequestOutputRequirement, RequestBackendOverrideGuard,
     RequestBackendPreference, ResolvedFamilyRuntimeInput, install_request_backend_override,
     request_backend_override, resolve_request_execution_route,
 };
