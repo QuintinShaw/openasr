@@ -964,7 +964,7 @@ impl GraniteDecoderLoadedWeights {
 /// mmap'd pack. The session's forward code is identical for both -- it only ever
 /// asks for `layer_weights`/`final_norm_weight`/`lm_head_weight`.
 pub(crate) enum GraniteDecoderWeights {
-    Arena(GraniteDecoderWeightArena),
+    Arena(Box<GraniteDecoderWeightArena>),
     Loaded(GraniteDecoderLoadedWeights),
 }
 

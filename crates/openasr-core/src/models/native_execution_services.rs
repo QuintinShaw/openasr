@@ -43,6 +43,7 @@ use super::{
     },
     executor_component_registry::BuiltinStatefulExecutorScope,
     ggml_asr_executor::GgmlAsrExecutionDispatch,
+    runtime_receipts::{RuntimeReceiptCollector, SafeExecutionLaneProjection},
 };
 
 static NEXT_EXECUTION_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
@@ -74,6 +75,11 @@ thread_local! {
     /// request's [`NativeExecutionServices`] and is installed only while that
     /// request (or an explicitly propagated worker) is inside native code.
     static CURRENT_EXECUTION_MEMORY_BROKER: RefCell<Option<Arc<DeviceMemoryBrokerSet>>> = const {
+        RefCell::new(None)
+    };
+    /// Explicitly propagated diagnostic collector for one service root. It is
+    /// never consulted by admission or fallback.
+    static CURRENT_EXECUTION_RECEIPTS: RefCell<Option<RuntimeReceiptCollector>> = const {
         RefCell::new(None)
     };
     /// Placement selected by the active policy candidate. Graph-runtime
@@ -376,6 +382,19 @@ pub(crate) struct ExecutionLaneKey {
 }
 
 impl ExecutionLaneKey {
+    #[allow(dead_code)]
+    pub(crate) fn receipt_projection(
+        &self,
+        collector: &RuntimeReceiptCollector,
+    ) -> Option<SafeExecutionLaneProjection> {
+        collector.lane_projection(
+            self.device.route.provider,
+            &self.device.route.stable_id,
+            self.placement,
+            self.backend,
+        )
+    }
+
     pub(crate) fn backend(&self) -> GgmlCpuGraphBackend {
         self.backend
     }
@@ -391,7 +410,7 @@ impl ExecutionLaneKey {
 pub struct NativeExecutionScopeId(u64);
 
 impl NativeExecutionScopeId {
-    fn next() -> Self {
+    pub(crate) fn next() -> Self {
         Self(NEXT_EXECUTION_SCOPE_ID.fetch_add(1, Ordering::Relaxed))
     }
 }
@@ -399,7 +418,7 @@ impl NativeExecutionScopeId {
 /// Identity of the outermost transactional cache-publication attempt. Nested
 /// auxiliary candidates inherit it and merge their journals into the parent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct ExecutionCacheAttemptId(u64);
+pub struct ExecutionCacheAttemptId(u64);
 
 impl ExecutionCacheAttemptId {
     fn next() -> Self {
@@ -426,6 +445,7 @@ impl Drop for NativeExecutionScopeGuard {
 pub(crate) struct NativeExecutionContext {
     scope_id: NativeExecutionScopeId,
     memory_broker: Arc<DeviceMemoryBrokerSet>,
+    runtime_receipts: RuntimeReceiptCollector,
     backend_preference: Option<RequestBackendPreference>,
     placement: Option<ExecutionPlacement>,
     observation_sink: Option<ExecutionObservationSink>,
@@ -491,6 +511,7 @@ impl NativeExecutionContext {
         Ok(Some(Self {
             scope_id: first.scope_id,
             memory_broker: Arc::clone(&first.memory_broker),
+            runtime_receipts: first.runtime_receipts.clone(),
             backend_preference: first.backend_preference.clone(),
             placement: first.placement,
             observation_sink: first.observation_sink.clone(),
@@ -513,6 +534,7 @@ pub(crate) enum NativeExecutionContextError {
 pub(crate) struct NativeExecutionContextGuard {
     scope: NativeExecutionScopeGuard,
     previous_memory_broker: Option<Arc<DeviceMemoryBrokerSet>>,
+    previous_receipts: Option<RuntimeReceiptCollector>,
     previous_placement: Option<ExecutionPlacement>,
     previous_observation_sink: Option<ExecutionObservationSink>,
     previous_failure_sink: Option<ExecutionCandidateFailureSink>,
@@ -525,6 +547,9 @@ impl Drop for NativeExecutionContextGuard {
     fn drop(&mut self) {
         CURRENT_EXECUTION_MEMORY_BROKER.with(|current| {
             *current.borrow_mut() = self.previous_memory_broker.take();
+        });
+        CURRENT_EXECUTION_RECEIPTS.with(|current| {
+            *current.borrow_mut() = self.previous_receipts.take();
         });
         CURRENT_EXECUTION_PLACEMENT.with(|current| current.set(self.previous_placement));
         CURRENT_EXECUTION_OBSERVATION_SINK.with(|current| {
@@ -636,9 +661,11 @@ pub(crate) fn current_native_execution_scope_id() -> Option<NativeExecutionScope
 pub(crate) fn current_native_execution_context() -> Option<NativeExecutionContext> {
     let scope_id = current_native_execution_scope_id()?;
     let memory_broker = current_native_execution_memory_broker()?;
+    let runtime_receipts = current_runtime_receipts()?;
     Some(NativeExecutionContext {
         scope_id,
         memory_broker,
+        runtime_receipts,
         backend_preference: request_backend_override(),
         placement: current_execution_placement(),
         observation_sink: current_execution_observation_sink(),
@@ -653,6 +680,12 @@ pub(crate) fn current_native_execution_context() -> Option<NativeExecutionContex
 /// through the committed reservation they retain.
 pub(crate) fn current_native_execution_memory_broker() -> Option<Arc<DeviceMemoryBrokerSet>> {
     CURRENT_EXECUTION_MEMORY_BROKER.with(|current| current.borrow().clone())
+}
+
+/// Returns the explicitly propagated owner-receipt collector, if native code is
+/// executing under a service root.
+pub(crate) fn current_runtime_receipts() -> Option<RuntimeReceiptCollector> {
+    CURRENT_EXECUTION_RECEIPTS.with(|current| current.borrow().clone())
 }
 
 pub(crate) fn current_execution_placement() -> Option<ExecutionPlacement> {
@@ -928,6 +961,8 @@ pub(crate) fn install_native_execution_context(
     let scope = install_native_execution_scope(context.scope_id);
     let previous_memory_broker = CURRENT_EXECUTION_MEMORY_BROKER
         .with(|current| current.replace(Some(context.memory_broker)));
+    let previous_receipts =
+        CURRENT_EXECUTION_RECEIPTS.with(|current| current.replace(Some(context.runtime_receipts)));
     let previous_placement =
         CURRENT_EXECUTION_PLACEMENT.with(|current| current.replace(context.placement));
     let previous_observation_sink = CURRENT_EXECUTION_OBSERVATION_SINK
@@ -941,6 +976,7 @@ pub(crate) fn install_native_execution_context(
     NativeExecutionContextGuard {
         scope,
         previous_memory_broker,
+        previous_receipts,
         previous_placement,
         previous_observation_sink,
         previous_failure_sink,
@@ -957,6 +993,7 @@ pub(crate) fn install_native_execution_services(
     install_native_execution_context(NativeExecutionContext {
         scope_id: services.scope_id,
         memory_broker: Arc::clone(&services.memory_broker),
+        runtime_receipts: services.runtime_receipts.clone(),
         // Preserve an enclosing policy attempt. Legacy direct callers have no
         // enclosing values and continue to install `None` for all three.
         backend_preference: request_backend_override(),
@@ -987,6 +1024,7 @@ pub(crate) fn install_execution_candidate_attempt(
     install_native_execution_context(NativeExecutionContext {
         scope_id: services.scope_id,
         memory_broker: Arc::clone(&services.memory_broker),
+        runtime_receipts: services.runtime_receipts.clone(),
         backend_preference,
         placement: Some(candidate.placement),
         observation_sink: current_execution_observation_sink(),
@@ -1181,6 +1219,7 @@ pub struct NativeExecutionServices {
     scope_id: NativeExecutionScopeId,
     policy_resolver: Arc<dyn ExecutionPolicyResolver>,
     memory_broker: Arc<DeviceMemoryBrokerSet>,
+    runtime_receipts: RuntimeReceiptCollector,
     auxiliary_runtime_owners: super::policy_resolved_aux_runtime::AuxiliaryRuntimeOwnerCache,
     firered_punc_actors: super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorPool<
         super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
@@ -1224,6 +1263,18 @@ impl NativeExecutionServices {
         policy_resolver: Arc<dyn ExecutionPolicyResolver>,
         memory_broker: Arc<DeviceMemoryBrokerSet>,
     ) -> Result<Self, NativeExecutionServicesError> {
+        Self::new_with_broker_and_receipt_factory(
+            policy_resolver,
+            memory_broker,
+            RuntimeReceiptCollector::new,
+        )
+    }
+
+    fn new_with_broker_and_receipt_factory(
+        policy_resolver: Arc<dyn ExecutionPolicyResolver>,
+        memory_broker: Arc<DeviceMemoryBrokerSet>,
+        receipt_factory: impl FnOnce(NativeExecutionScopeId) -> RuntimeReceiptCollector,
+    ) -> Result<Self, NativeExecutionServicesError> {
         let executor_scope = BuiltinStatefulExecutorScope::new().map_err(|error| {
             NativeExecutionServicesError::DispatchBuild {
                 dispatch_kind: "executor-scope",
@@ -1244,10 +1295,12 @@ impl NativeExecutionServices {
                 }
             })?;
 
+        let scope_id = NativeExecutionScopeId::next();
         Ok(Self {
-            scope_id: NativeExecutionScopeId::next(),
+            scope_id,
             policy_resolver,
-            memory_broker,
+            memory_broker: Arc::clone(&memory_broker),
+            runtime_receipts: receipt_factory(scope_id),
             auxiliary_runtime_owners:
                 super::policy_resolved_aux_runtime::AuxiliaryRuntimeOwnerCache::default(),
             firered_punc_actors:
@@ -1306,6 +1359,10 @@ impl NativeExecutionServices {
 
     pub fn memory_broker(&self) -> &Arc<DeviceMemoryBrokerSet> {
         &self.memory_broker
+    }
+
+    pub fn runtime_receipts(&self) -> &RuntimeReceiptCollector {
+        &self.runtime_receipts
     }
 
     pub(crate) fn auxiliary_runtime_owners(
@@ -1426,6 +1483,19 @@ pub(crate) fn test_native_execution_services() -> Arc<NativeExecutionServices> {
             Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy::default())),
         )
         .expect("builtin native execution services must construct for tests"),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_native_execution_services_with_entropy_failure() -> Arc<NativeExecutionServices>
+{
+    Arc::new(
+        NativeExecutionServices::new_with_broker_and_receipt_factory(
+            Arc::new(DefaultExecutionPolicyResolver),
+            Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy::default())),
+            RuntimeReceiptCollector::new_with_entropy_failure_for_test,
+        )
+        .expect("receipt entropy failure must not block service construction"),
     )
 }
 
@@ -1634,8 +1704,16 @@ mod tests {
         let candidate = cpu_candidate();
         let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
             let context = current_native_execution_context().expect("candidate context");
+            let scope_id = services.scope_id();
             std::thread::spawn(move || {
                 let _guard = install_native_execution_context(context);
+                assert_eq!(
+                    current_runtime_receipts()
+                        .expect("propagated receipt collector")
+                        .snapshot()
+                        .scope_id,
+                    scope_id
+                );
                 record_current_execution_candidate_failure(ExecutionCandidateFailure::capacity(
                     "worker-allocation",
                     "worker request-local failure",
@@ -1903,11 +1981,118 @@ mod tests {
     }
 
     #[test]
+    fn native_root_receipts_capture_system_memory_owner_lifecycle() {
+        let services = test_native_execution_services();
+        let candidate = cpu_candidate();
+        let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            let cache = super::super::admitted_host_object_cache::AdmittedHostObjectCache::new(
+                super::super::admitted_host_object_cache::AdmittedHostObjectCacheLimits::new(1, 8),
+            );
+            let first = cache
+                .get_or_try_insert_with(
+                    "receipt-system-memory",
+                    || Ok::<_, String>((1, ())),
+                    |()| {
+                        super::super::system_memory_owner::SystemMemoryOwner::try_allocate(
+                            super::super::system_memory_owner::SystemMemoryAllocationQuote::new(
+                                "receipt-system-memory-fixture",
+                                1,
+                                1,
+                            )
+                            .expect("fixture quote"),
+                            || {
+                                Ok(super::super::system_memory_owner::SystemMemoryAllocationOutcome::new(
+                                    vec![0_u8; 1],
+                                    1,
+                                    1,
+                                ))
+                            },
+                        )
+                        .map(Arc::new)
+                        .map_err(|error| error.to_string())
+                    },
+                    || "cache lock poisoned".to_string(),
+                )
+                .expect("one-byte host owner should be admitted");
+            let second = cache
+                .ready(&"receipt-system-memory")
+                .expect("published host owner should be reusable");
+            assert!(Arc::ptr_eq(&first, &second));
+            let live = services.runtime_receipts().summary();
+            assert_eq!(live.live_owner_count, 1);
+            assert_eq!(live.live_resource_count, 1);
+            assert!(
+                services
+                    .runtime_receipts()
+                    .snapshot()
+                    .events
+                    .iter()
+                    .any(|event| matches!(
+                        event,
+                        super::super::runtime_receipts::RuntimeReceiptEvent::OwnerReused { .. }
+                    ))
+            );
+            drop(first);
+            drop(second);
+            cache.clear();
+            let released = services.runtime_receipts().summary();
+            assert_eq!(released.live_owner_count, 0);
+            assert_eq!(released.live_resource_count, 0);
+            Ok::<_, String>(())
+        });
+        assert!(outcome.result.is_ok());
+        assert!(outcome.candidate_failure.is_none());
+    }
+    #[test]
+    fn entropy_failure_keeps_service_execution_alive_and_reports_unavailable() {
+        let services = test_native_execution_services_with_entropy_failure();
+        let snapshot = services.runtime_receipts().snapshot();
+        assert!(matches!(
+            snapshot.availability,
+            super::super::runtime_receipts::RuntimeReceiptAvailability::Unavailable {
+                reason: super::super::runtime_receipts::RuntimeReceiptUnavailableReason::EntropyUnavailable,
+            }
+        ));
+        assert!(!snapshot.completeness.complete);
+        assert_eq!(snapshot.live_owners.len(), 0);
+
+        let candidate = cpu_candidate();
+        let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            let owner =
+                super::super::system_memory_owner::SystemMemoryOwner::try_reserve_invocation(
+                    "entropy-failure-execution-fixture",
+                    1,
+                )
+                .map_err(|error| error.to_string())?;
+            assert_eq!(owner.committed_requested_bytes(), 1);
+            drop(owner);
+            Ok::<_, String>(())
+        });
+        assert!(outcome.result.is_ok());
+        assert!(outcome.candidate_failure.is_none());
+        assert_eq!(services.runtime_receipts().summary().live_owner_count, 0);
+        assert!(matches!(
+            services.runtime_receipts().summary().completeness.reason,
+            Some(super::super::runtime_receipts::ReceiptCompletenessReason::Unavailable(
+                super::super::runtime_receipts::RuntimeReceiptUnavailableReason::EntropyUnavailable
+            ))
+        ));
+    }
+
+    #[test]
     fn independently_constructed_local_roots_share_the_process_memory_ledger() {
         let first = NativeExecutionServices::for_local_process().unwrap();
         let second = NativeExecutionServices::for_local_process().unwrap();
         assert_ne!(first.scope_id(), second.scope_id());
         assert!(Arc::ptr_eq(first.memory_broker(), second.memory_broker()));
+        assert_eq!(
+            first.runtime_receipts().snapshot().scope_id,
+            first.scope_id()
+        );
+        assert_eq!(
+            second.runtime_receipts().snapshot().scope_id,
+            second.scope_id()
+        );
     }
 
     #[test]
@@ -2064,6 +2249,11 @@ mod tests {
         assert_ne!(cuda0_lane, lane_for(&hybrid));
         assert_eq!(cuda0_lane.backend(), GgmlCpuGraphBackend::Gpu);
         assert_eq!(cuda0_lane.placement(), ExecutionPlacement::FullDevice);
+        let projection = cuda0_lane
+            .receipt_projection(services.runtime_receipts())
+            .expect("entropy-backed lane projection");
+        assert_eq!(projection.provider, ExecutionProvider::Cuda);
+        assert_eq!(projection.placement, ExecutionPlacement::FullDevice);
     }
 
     #[test]

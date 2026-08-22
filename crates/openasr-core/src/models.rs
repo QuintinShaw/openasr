@@ -67,6 +67,7 @@ pub(crate) mod runtime_memory;
 pub(crate) mod runtime_pack_contract;
 pub(crate) mod runtime_preflight;
 pub(crate) mod runtime_prepared_registry;
+pub mod runtime_receipts;
 pub(crate) mod runtime_selection_metadata;
 pub(crate) mod runtime_tensor_contract_registry;
 pub(crate) mod runtime_weight_component_registry;

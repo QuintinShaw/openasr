@@ -742,7 +742,10 @@ where
             .lookup_or_reserve(key, None)
             .map_err(|_| map_poisoned_lock())?
         {
-            SingleFlightWeightedLookup::Ready(value) => Ok(value),
+            SingleFlightWeightedLookup::Ready(value) => {
+                value.record_receipt_reuse();
+                Ok(value)
+            }
             SingleFlightWeightedLookup::Build(permit) => {
                 let (quoted_weight, allocation_quote) = quote()?;
                 let retain = permit
@@ -759,7 +762,9 @@ where
     }
 
     pub(crate) fn ready(&self, key: &K) -> Option<AdmittedHostObject<T>> {
-        self.core.ready(key)
+        let value = self.core.ready(key)?;
+        value.record_receipt_reuse();
+        Some(value)
     }
 
     pub(crate) fn clear(&self) {
