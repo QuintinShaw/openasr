@@ -1916,6 +1916,70 @@ fn hidden_gguf_c_parser_probe_emits_metadata_and_tensor_index_json() {
 }
 
 #[test]
+fn config_default_model_is_v2_first_and_rejects_legacy_mutation() {
+    let home = temp_home();
+    openasr_core::save_config(
+        home.path(),
+        &openasr_core::OpenAsrConfig {
+            default_model: Some("stale-model".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("persist stale legacy default fixture");
+    openasr_core::default_selection::persist_v2_record(
+        home.path(),
+        openasr_core::default_selection::ActiveModelSelectionV2 {
+            schema_version:
+                openasr_core::default_selection::ACTIVE_MODEL_SELECTION_V2_SCHEMA_VERSION,
+            selection_generation: 0,
+            status: openasr_core::default_selection::ActiveModelSelectionStatus::Unset,
+            pull: None,
+            model_id: None,
+            quant: None,
+            architecture_id: None,
+            expected_pack: None,
+            quant_preference: openasr_core::QuantPreference::Auto,
+            execution_intent: "auto".to_string(),
+            checksum: String::new(),
+        },
+    )
+    .expect("persist V2 Unset fixture");
+
+    openasr_with_home(home.path())
+        .args(["config", "get", "default_model"])
+        .assert()
+        .success()
+        .stdout("<unset>\n");
+
+    openasr_with_home(home.path())
+        .args(["config", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default_model=<unset>"))
+        .stdout(predicate::str::contains("default_model=stale-model").not());
+
+    openasr_with_home(home.path())
+        .args(["config", "set", "default_model", "new-model"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("/v1/models/default"))
+        .stderr(predicate::str::contains(
+            "desktop default-model activation surface",
+        ))
+        .stderr(predicate::str::contains("pull").not());
+
+    openasr_with_home(home.path())
+        .args(["config", "unset", "default_model"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("/v1/models/default"))
+        .stderr(predicate::str::contains(
+            "desktop default-model activation surface",
+        ))
+        .stderr(predicate::str::contains("pull").not());
+}
+
+#[test]
 fn pull_installs_local_pack_from_catalog_reference() {
     let home = temp_home();
     let temp = tempfile::tempdir().expect("tempdir");

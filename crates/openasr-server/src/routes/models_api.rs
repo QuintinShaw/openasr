@@ -46,7 +46,22 @@ pub(crate) async fn set_default_model(
                 .to_string(),
         ));
     }
-    persist_default_pack(&home, &pack, preference)?;
+    let commit = persist_default_pack(&home, &pack, preference)?;
+    if let openasr_core::default_selection::DefaultSelectionCommitOutcome::NotCommitted { reason } =
+        &commit
+    {
+        return Err(ApiError::BadRequest(format!(
+            "default model was not committed: {reason}"
+        )));
+    }
+    if let openasr_core::default_selection::DefaultSelectionCommitOutcome::V2CommittedProjectionFailed {
+        reason,
+    } = &commit
+    {
+        eprintln!(
+            "openasr-server: default V2 committed but legacy projection repair is pending: {reason}"
+        );
+    }
     if runtime.backend == BackendKind::Native {
         runtime.rebind_native_model_pack(Some(pack.path.clone()))?;
         crate::realtime::spawn_boot_native_warmup(runtime.clone());
@@ -74,7 +89,22 @@ pub(crate) async fn delete_model(
         .as_ref()
         .is_some_and(|pack| default_pull.as_deref() == Some(pack.pull.as_str()))
     {
-        clear_default_model_selection(&home)?;
+        let clear_outcome = clear_default_model_selection(&home)?;
+        match &clear_outcome {
+            openasr_core::default_selection::DefaultSelectionCommitOutcome::NotCommitted {
+                reason,
+            } => {
+                return Err(ApiError::BadRequest(format!(
+                    "default clear was not committed: {reason}"
+                )));
+            }
+            openasr_core::default_selection::DefaultSelectionCommitOutcome::V2Committed => {}
+            openasr_core::default_selection::DefaultSelectionCommitOutcome::V2CommittedProjectionFailed {
+                reason,
+            } => eprintln!(
+                "openasr-server: default V2 clear committed; legacy projection repair is pending: {reason}"
+            ),
+        }
     }
     Ok(Json(DeleteModelResponse {
         deleted: removed.is_some(),
@@ -242,14 +272,16 @@ pub(crate) fn persist_default_pack(
     home: &Path,
     pack: &InstalledPack,
     quant_preference: QuantPreference,
-) -> Result<(), ApiError> {
-    Ok(openasr_core::default_selection::persist(
+) -> Result<openasr_core::default_selection::DefaultSelectionCommitOutcome, ApiError> {
+    Ok(openasr_core::default_selection::persist_detailed(
         home,
         pack,
         quant_preference,
     )?)
 }
 
-pub(crate) fn clear_default_model_selection(home: &Path) -> Result<(), ApiError> {
-    Ok(openasr_core::default_selection::clear(home)?)
+pub(crate) fn clear_default_model_selection(
+    home: &Path,
+) -> Result<openasr_core::default_selection::DefaultSelectionCommitOutcome, ApiError> {
+    Ok(openasr_core::default_selection::clear_detailed(home)?)
 }

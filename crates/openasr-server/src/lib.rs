@@ -303,6 +303,30 @@ pub async fn serve_with_launch_options(
         stage_started.elapsed(),
     );
     let stage_started = Instant::now();
+    let home = openasr_home()?;
+    let migration = openasr_core::default_selection::migrate_legacy_to_v2(&home)?;
+    let projection = openasr_core::default_selection::repair_compat_projection(&home)?;
+    if let openasr_core::default_selection::DefaultSelectionCommitOutcome::V2CommittedProjectionFailed {
+        reason,
+    } = &projection
+    {
+        eprintln!(
+            "openasr-server: default V2 is valid but compatibility projection repair is pending: {reason}"
+        );
+    }
+    openasr_core::stage_timing::log_event(
+        "server_boot",
+        format_args!(
+            "stage=default_selection_migration migrated={}",
+            migration.is_some()
+        ),
+    );
+    openasr_core::stage_timing::log_stage(
+        "server_boot",
+        "default_selection_migration",
+        stage_started.elapsed(),
+    );
+    let stage_started = Instant::now();
     let listener = TcpListener::bind(addr).await?;
     // Shadow the requested `addr` (which may be an OS-assigned wildcard like
     // `:0`) with the listener's actual bound address so everything below --
@@ -2623,6 +2647,15 @@ impl From<openasr_core::default_selection::DefaultSelectionError> for ApiError {
             }
             openasr_core::default_selection::DefaultSelectionError::Catalog(error) => {
                 Self::Catalog(error)
+            }
+            openasr_core::default_selection::DefaultSelectionError::NotCommitted { reason } => {
+                Self::BadRequest(format!("default selection was not committed: {reason}"))
+            }
+            openasr_core::default_selection::DefaultSelectionError::Corrupt { path, reason } => {
+                Self::BadRequest(format!(
+                    "active default selection is corrupt at {}: {reason}",
+                    path.display()
+                ))
             }
         }
     }

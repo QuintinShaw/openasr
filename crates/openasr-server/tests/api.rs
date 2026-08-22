@@ -643,6 +643,78 @@ async fn config_endpoint_roundtrips_versioned_preferences() {
 }
 
 #[tokio::test]
+async fn config_endpoint_honors_v2_unset_over_stale_legacy_config_on_get_put() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let mut legacy = openasr_core::OpenAsrConfigDocument::default();
+    legacy.config.default_model = Some("stale-model".to_string());
+    openasr_core::save_config_document(&home, &legacy).unwrap();
+    openasr_core::default_selection::persist_v2_record(
+        &home,
+        openasr_core::default_selection::ActiveModelSelectionV2 {
+            schema_version:
+                openasr_core::default_selection::ACTIVE_MODEL_SELECTION_V2_SCHEMA_VERSION,
+            selection_generation: 0,
+            status: openasr_core::default_selection::ActiveModelSelectionStatus::Unset,
+            pull: None,
+            model_id: None,
+            quant: None,
+            architecture_id: None,
+            expected_pack: None,
+            quant_preference: openasr_core::QuantPreference::Auto,
+            execution_intent: "auto".to_string(),
+            checksum: String::new(),
+        },
+    )
+    .unwrap();
+
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/config")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let mut document: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(document["default_model"].is_null());
+    document["preferences"]["language"] = serde_json::json!("en");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/config")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(document.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let saved: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(saved["default_model"].is_null());
+    assert_eq!(saved["preferences"]["language"], "en");
+
+    let persisted: Value =
+        serde_json::from_slice(&std::fs::read(home.join("config.json")).unwrap()).unwrap();
+    assert!(persisted["default_model"].is_null());
+}
+
+#[tokio::test]
 async fn config_endpoint_rejects_invalid_whole_object_update() {
     let temp = tempfile::tempdir().unwrap();
     let distribution = openasr_server::DistributionRuntime {
@@ -656,7 +728,7 @@ async fn config_endpoint_rejects_invalid_whole_object_update() {
     );
 
     let mut document = serde_json::json!({
-        "default_model": "whisper-large-v3-turbo",
+        "default_model": null,
         "default_backend": "bogus-xyz",
         "media": {},
         "preferences": {
@@ -770,7 +842,7 @@ async fn preferences_only_put_merges_partial_preferences() {
     );
 
     let initial = serde_json::json!({
-        "default_model": "whisper-large-v3-turbo",
+        "default_model": null,
         "default_backend": "mock",
         "media": { "ffmpeg_bin": null },
         "preferences": {

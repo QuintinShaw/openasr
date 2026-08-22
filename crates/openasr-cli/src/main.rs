@@ -611,31 +611,73 @@ fn show_model(target: &str) -> Result<()> {
 
 fn config_command(command: ConfigCommand) -> Result<()> {
     let home = openasr_home()?;
+    if matches!(&command, ConfigCommand::RecoverDefault) {
+        let outcome = openasr_core::default_selection::recover_corrupt_v2_detailed(&home)
+            .context("Could not recover the corrupt V2 default selection")?;
+        match outcome {
+            openasr_core::default_selection::DefaultSelectionRecoveryOutcome::Committed {
+                record,
+                ..
+            } => println!(
+                "Recovered default selection to {:?} (generation {}).",
+                record.status, record.selection_generation
+            ),
+            openasr_core::default_selection::DefaultSelectionRecoveryOutcome::ProjectionFailed {
+                record,
+                reason,
+                ..
+            } => {
+                eprintln!(
+                    "Warning: V2 default selection was recovered to {:?} (generation {}), but compatibility projection repair is pending: {reason}",
+                    record.status, record.selection_generation
+                );
+                println!(
+                    "Recovered default selection to {:?} (generation {}).",
+                    record.status, record.selection_generation
+                );
+            }
+        }
+        return Ok(());
+    }
     let mut config = load_config(&home)?;
 
     match command {
-        ConfigCommand::List => print_config(&config),
+        ConfigCommand::List => print_config(&home, &config)?,
         ConfigCommand::Get { key } => {
             let key = ConfigKey::from_str(&key)?;
-            println!(
-                "{}",
-                config.get(key).unwrap_or_else(|| UNSET_VALUE.to_string())
-            );
+            let value = if key == ConfigKey::DefaultModel {
+                openasr_core::default_selection::current_default_model(&home)?
+            } else {
+                config.get(key)
+            };
+            println!("{}", value.unwrap_or_else(|| UNSET_VALUE.to_string()));
         }
         ConfigCommand::Set { key, value } => {
             let key = ConfigKey::from_str(&key)?;
+            reject_legacy_default_model_mutation(key)?;
             set_config_value(&mut config, key, value)?;
             save_config(&home, &config)?;
             println!("Set {}.", key.as_str());
         }
         ConfigCommand::Unset { key } => {
             let key = ConfigKey::from_str(&key)?;
+            reject_legacy_default_model_mutation(key)?;
             config.unset(key);
             save_config(&home, &config)?;
             println!("Unset {}.", key.as_str());
         }
+        ConfigCommand::RecoverDefault => unreachable!("handled before loading config"),
     }
 
+    Ok(())
+}
+
+fn reject_legacy_default_model_mutation(key: ConfigKey) -> Result<()> {
+    if key == ConfigKey::DefaultModel {
+        bail!(
+            "default_model is managed by the default-selection authority; use the daemon's /v1/models/default endpoint or the desktop default-model activation surface instead."
+        );
+    }
     Ok(())
 }
 
@@ -840,19 +882,26 @@ fn catalog_fingerprint_command() -> Result<()> {
     Ok(())
 }
 
-fn print_config(config: &OpenAsrConfig) {
+fn print_config(home: &Path, config: &OpenAsrConfig) -> Result<()> {
+    let current_default = openasr_core::default_selection::current_default_model(home)?;
     for key in [
         ConfigKey::DefaultModel,
         ConfigKey::DefaultBackend,
         ConfigKey::MediaFfmpegBin,
         ConfigKey::DownloadSource,
     ] {
+        let value = if key == ConfigKey::DefaultModel {
+            current_default.clone()
+        } else {
+            config.get(key)
+        };
         println!(
             "{}={}",
             key.as_str(),
-            config.get(key).unwrap_or_else(|| UNSET_VALUE.to_string())
+            value.unwrap_or_else(|| UNSET_VALUE.to_string())
         );
     }
+    Ok(())
 }
 
 fn doctor() -> Result<()> {
