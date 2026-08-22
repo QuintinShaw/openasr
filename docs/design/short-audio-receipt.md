@@ -15,7 +15,41 @@ capability and does **not** replace pack install sealing
 openasr.short-audio-receipt.v0
 ```
 
-## Field summary
+`openasr.short-audio-receipt.v0` remains the only top-level receipt schema. A
+receipt may carry an optional, versioned `evidence` object with schema
+`openasr.short-audio-receipt.evidence.v1`. Old v0 JSON remains readable, but a
+receipt without this object is explicitly not GPU token-correctness evidence.
+The extension is privacy-safe and bounded: provider, opaque stable device
+label, and placement are short labels; artifact bindings are labels, SHA-256
+hashes, and optional sizes; no raw audio, weights, secrets, or unnecessary
+local paths are recorded.
+
+The evidence object has one disjoint `evidence_class`:
+
+| Class | Proves | Cannot prove |
+| --- | --- | --- |
+| `build_packaging` | Candidate binary/pack/fixture artifact identity and packaging result | Runtime placement or model token correctness |
+| `placement_resource` | Selected provider/device, resolved placement, and observed resource/compute result | Token or transcript correctness |
+| `token_transcript` | Family host-oracle parity for a declared output plan and fresh/reuse mode | Packaging completeness unless the artifact bindings are separately checked |
+
+`token_transcript` additionally requires `family`, `provider`, `execution.mode`
+(`fresh` or `reuse`), `output_plan` (`kind`, complete logits/scores versus
+semantic compact selection, and `tie_policy`), `family_oracle`, a SHA-256 token
+trace, optional logits hash, and bounded top-k/margin summaries. These fields
+are evidence identities, not runtime policy inputs. A placement receipt cannot
+be substituted for a token receipt, and a CPU full-logits receipt cannot close a
+GPU compact-selector cell.
+
+## Correctness extension
+
+The release matrix projects every public family/provider lane from the
+architecture inventory, public model catalog, and staged backend catalog. Each
+cell requires separate build/packaging, placement/resource, and token/transcript
+receipts for both cold and same-process reuse where applicable. The matrix is a
+staging requirement document; it must not claim a result for a provider that has
+not produced a bound receipt. The finalizer fails closed on missing, stale,
+wrong-artifact, placement-only, CPU-only, or partial matrices.
+
 
 | Field | Required | Notes |
 | --- | --- | --- |
@@ -48,6 +82,7 @@ openasr.short-audio-receipt.v0
 | `transcript.text_sha256` | yes | Lowercase hex sha256 of the UTF-8 transcript bytes. |
 | `placement` | yes | Legacy/requested placement label retained for v0 compatibility. It is not proof of where graph compute ran. |
 | `observed_placement` | no | Actual graph-node placement observed during compute: total/compute-node counts by backend, graph compute count, output bytes, and bounded fallback samples. Native Metal acceptance requires selected-device compute and rejects disallowed CPU/alternate-accelerator compute according to the execution placement. |
+| `evidence` | no | Versioned, class-separated build/placement/token evidence; omission preserves legacy readability but is never GPU token approval. |
 | `scope` | yes | Default `short-audio-gate`. |
 | `notes` | no | Free-form annotations. |
 
@@ -84,7 +119,14 @@ The command is an **explicit tooling surface**. It does not change the default
   match the median of the samples.
 - Mock backend receipts may use an all-zero pack digest only as a plumbing
   placeholder; native receipts must bind real pack bytes.
-- `placement` alone is never accelerator proof. When a native accelerated run
+- `evidence.schema` must equal `openasr.short-audio-receipt.evidence.v1`; its
+  class is one of `build_packaging`, `placement_resource`, or
+  `token_transcript`, and a passing class has all three artifact SHA-256
+  bindings.
+- `token_transcript` evidence must carry a family oracle, resolved output plan,
+  fresh/reuse mode, token trace hash, and bounded logits/top-k/margin summary.
+  `placement_resource` requires observed placement. Classes are never
+  interchangeable.
   executes a ggml graph, `observed_placement` is populated from runtime
   telemetry and the emitter fails closed if the observed compute violates the
   resolved FullDevice/Hybrid placement. Older v0 receipts remain readable

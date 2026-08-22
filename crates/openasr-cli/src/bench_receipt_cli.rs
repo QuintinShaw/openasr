@@ -318,6 +318,7 @@ pub(crate) fn bench_receipt_short_audio(
         transcript: ShortAudioReceiptTranscript::from_text(last_text),
         placement: device_label,
         observed_placement: (!observed_placement.is_empty()).then_some(observed_placement),
+        evidence: None,
         scope: options.scope.to_string(),
         notes,
         decode_diagnostics: None,

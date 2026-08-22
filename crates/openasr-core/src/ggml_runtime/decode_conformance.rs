@@ -1028,6 +1028,7 @@ mod tests {
             transcript: ShortAudioReceiptTranscript::from_text(""),
             placement: "cpu".to_string(),
             observed_placement: None,
+            evidence: None,
             scope: SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE.to_string(),
             notes: Vec::new(),
             decode_diagnostics: Some(decode_diagnostics),
