@@ -5745,17 +5745,19 @@ struct RuntimeReceiptIdentityDelta {
     owner_ids_removed: Vec<openasr_core::runtime_receipts::RuntimeOwnerId>,
     resource_ids_added: Vec<openasr_core::runtime_receipts::RuntimeResourceId>,
     resource_ids_removed: Vec<openasr_core::runtime_receipts::RuntimeResourceId>,
+    /// Final live resources whose retained-byte evidence was newly observed or changed
+    /// after warm-up. This is stronger than an event-count delta because it names
+    /// the retained evidence that belongs to an active offline owner.
+    offline_owned_retained_resource_ids: Vec<openasr_core::runtime_receipts::RuntimeResourceId>,
     event_count_before: usize,
     event_count_after: usize,
 }
 
 impl RuntimeReceiptIdentityDelta {
     fn has_observable_change(&self) -> bool {
-        self.event_count_after > self.event_count_before
-            || !self.owner_ids_added.is_empty()
-            || !self.owner_ids_removed.is_empty()
+        !self.owner_ids_added.is_empty()
             || !self.resource_ids_added.is_empty()
-            || !self.resource_ids_removed.is_empty()
+            || !self.offline_owned_retained_resource_ids.is_empty()
     }
 }
 
@@ -5813,51 +5815,57 @@ fn receipt_lanes(
     lanes
 }
 
+fn is_active_resource_state(state: openasr_core::runtime_receipts::RuntimeResourceState) -> bool {
+    matches!(
+        state,
+        openasr_core::runtime_receipts::RuntimeResourceState::Reserved
+            | openasr_core::runtime_receipts::RuntimeResourceState::Reconciled
+            | openasr_core::runtime_receipts::RuntimeResourceState::Committed
+            | openasr_core::runtime_receipts::RuntimeResourceState::Quarantined
+    )
+}
+
 fn receipt_identity_sets(
     snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
 ) -> (
     BTreeSet<openasr_core::runtime_receipts::RuntimeOwnerId>,
     BTreeSet<openasr_core::runtime_receipts::RuntimeResourceId>,
 ) {
-    use openasr_core::runtime_receipts::RuntimeReceiptEvent;
-
-    let mut owner_ids = snapshot
+    let owner_ids = snapshot
         .live_owners
         .iter()
         .map(|owner| owner.id)
         .collect::<BTreeSet<_>>();
-    let mut resource_ids = snapshot
+    let resource_ids = snapshot
         .live_owners
         .iter()
-        .flat_map(|owner| owner.resources.values().map(|resource| resource.id))
+        .flat_map(|owner| {
+            owner.resources.values().filter_map(|resource| {
+                is_active_resource_state(resource.state).then_some(resource.id)
+            })
+        })
         .collect::<BTreeSet<_>>();
-    for event in &snapshot.events {
-        match event {
-            RuntimeReceiptEvent::OwnerCreated { owner_id, .. }
-            | RuntimeReceiptEvent::OwnerReused { owner_id, .. }
-            | RuntimeReceiptEvent::OwnerReleased { owner_id, .. } => {
-                owner_ids.insert(*owner_id);
-            }
-            RuntimeReceiptEvent::ResourceAcquired {
-                owner_id,
-                resource_id,
-                ..
-            }
-            | RuntimeReceiptEvent::ResourceStateChanged {
-                owner_id,
-                resource_id,
-                ..
-            }
-            | RuntimeReceiptEvent::ResourceReleased {
-                owner_id,
-                resource_id,
-            } => {
-                owner_ids.insert(*owner_id);
-                resource_ids.insert(*resource_id);
-            }
-        }
-    }
     (owner_ids, resource_ids)
+}
+
+fn live_retained_resource_metrics(
+    snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+) -> BTreeMap<openasr_core::runtime_receipts::RuntimeResourceId, Option<u64>> {
+    use openasr_core::runtime_receipts::RuntimeReceiptMetric;
+
+    snapshot
+        .live_owners
+        .iter()
+        .flat_map(|owner| owner.resources.values())
+        .filter(|resource| is_active_resource_state(resource.state))
+        .map(|resource| {
+            let retained = match resource.descriptor.retained {
+                RuntimeReceiptMetric::Known(bytes) => Some(bytes),
+                RuntimeReceiptMetric::Unavailable | RuntimeReceiptMetric::Unknown => None,
+            };
+            (resource.id, retained)
+        })
+        .collect()
 }
 
 fn receipt_identity_delta(
@@ -5866,6 +5874,16 @@ fn receipt_identity_delta(
 ) -> RuntimeReceiptIdentityDelta {
     let (before_owners, before_resources) = receipt_identity_sets(before);
     let (after_owners, after_resources) = receipt_identity_sets(after);
+    let before_retained = live_retained_resource_metrics(before);
+    let offline_owned_retained_resource_ids = live_retained_resource_metrics(after)
+        .into_iter()
+        .filter_map(|(resource_id, retained)| {
+            retained
+                .is_some()
+                .then(|| before_retained.get(&resource_id) != Some(&retained))
+                .and_then(|changed| changed.then_some(resource_id))
+        })
+        .collect();
     RuntimeReceiptIdentityDelta {
         owner_ids_added: after_owners.difference(&before_owners).copied().collect(),
         owner_ids_removed: before_owners.difference(&after_owners).copied().collect(),
@@ -5877,6 +5895,7 @@ fn receipt_identity_delta(
             .difference(&after_resources)
             .copied()
             .collect(),
+        offline_owned_retained_resource_ids,
         event_count_before: before.events.len(),
         event_count_after: after.events.len(),
     }
@@ -5904,26 +5923,26 @@ where
     if resources.is_empty() {
         return HostOwnerAttribution::AttributionIncomplete;
     }
+    let mut same_owner_equivalent = false;
+    let mut distinct_owner_equivalent = false;
     for (index, left) in resources.iter().enumerate() {
         for right in resources.iter().skip(index + 1) {
-            if left.owner_id == right.owner_id
-                && left.key == right.key
+            if left.key == right.key
                 && left.retained_bytes.abs_diff(expected_retained) <= retained_tolerance
                 && right.retained_bytes.abs_diff(expected_retained) <= retained_tolerance
             {
-                return HostOwnerAttribution::RejectedSingleOrNonEquivalentOwners;
+                if left.owner_id == right.owner_id {
+                    same_owner_equivalent = true;
+                } else {
+                    distinct_owner_equivalent = true;
+                }
             }
         }
     }
-    if resources.iter().enumerate().any(|(index, left)| {
-        resources.iter().skip(index + 1).any(|right| {
-            left.owner_id != right.owner_id
-                && left.key == right.key
-                && left.retained_bytes.abs_diff(expected_retained) <= retained_tolerance
-                && right.retained_bytes.abs_diff(expected_retained) <= retained_tolerance
-        })
-    }) {
+    if distinct_owner_equivalent {
         HostOwnerAttribution::SupportedEquivalentDuplicatedWeights
+    } else if same_owner_equivalent {
+        HostOwnerAttribution::RejectedSingleOrNonEquivalentOwners
     } else {
         HostOwnerAttribution::RejectedSingleOrNonEquivalentOwners
     }
@@ -5942,80 +5961,346 @@ struct HistoricalWeight {
     retained_bytes: u64,
 }
 
+#[derive(Debug, Clone)]
+struct ReplayedOwner {
+    descriptor: Option<openasr_core::runtime_receipts::RuntimeOwnerDescriptor>,
+    released: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ReplayedResource {
+    descriptor: Option<openasr_core::runtime_receipts::RuntimeResourceDescriptor>,
+    state: openasr_core::runtime_receipts::RuntimeResourceState,
+    released: bool,
+    release_event_seen: bool,
+}
+
+#[derive(Debug, Clone)]
+enum ReceiptLifecycleEvent {
+    OwnerCreated {
+        owner_id: openasr_core::runtime_receipts::RuntimeOwnerId,
+        descriptor: Option<openasr_core::runtime_receipts::RuntimeOwnerDescriptor>,
+    },
+    OwnerReused {
+        owner_id: openasr_core::runtime_receipts::RuntimeOwnerId,
+    },
+    OwnerReleased {
+        owner_id: openasr_core::runtime_receipts::RuntimeOwnerId,
+    },
+    ResourceAcquired {
+        owner_id: openasr_core::runtime_receipts::RuntimeOwnerId,
+        resource_id: openasr_core::runtime_receipts::RuntimeResourceId,
+        descriptor: Option<openasr_core::runtime_receipts::RuntimeResourceDescriptor>,
+    },
+    ResourceStateChanged {
+        owner_id: openasr_core::runtime_receipts::RuntimeOwnerId,
+        resource_id: openasr_core::runtime_receipts::RuntimeResourceId,
+        state: openasr_core::runtime_receipts::RuntimeResourceState,
+        descriptor: Option<openasr_core::runtime_receipts::RuntimeResourceDescriptor>,
+    },
+    ResourceReleased {
+        owner_id: openasr_core::runtime_receipts::RuntimeOwnerId,
+        resource_id: openasr_core::runtime_receipts::RuntimeResourceId,
+    },
+}
+
+#[derive(Debug, Default)]
+struct ReplayedReceiptLifecycle {
+    owners: BTreeMap<openasr_core::runtime_receipts::RuntimeOwnerId, ReplayedOwner>,
+    resources: BTreeMap<
+        (
+            openasr_core::runtime_receipts::RuntimeOwnerId,
+            openasr_core::runtime_receipts::RuntimeResourceId,
+        ),
+        ReplayedResource,
+    >,
+    saw_release: bool,
+}
+
+fn replay_receipt_lifecycle(
+    events: impl IntoIterator<Item = ReceiptLifecycleEvent>,
+) -> Result<ReplayedReceiptLifecycle, ()> {
+    use openasr_core::runtime_receipts::RuntimeResourceState;
+
+    let mut replay = ReplayedReceiptLifecycle::default();
+    for event in events {
+        match event {
+            ReceiptLifecycleEvent::OwnerCreated {
+                owner_id,
+                descriptor,
+            } => {
+                if replay
+                    .owners
+                    .insert(
+                        owner_id,
+                        ReplayedOwner {
+                            descriptor,
+                            released: false,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(());
+                }
+            }
+            ReceiptLifecycleEvent::OwnerReused { owner_id } => {
+                let Some(owner) = replay.owners.get(&owner_id) else {
+                    return Err(());
+                };
+                if owner.released {
+                    return Err(());
+                }
+            }
+            ReceiptLifecycleEvent::OwnerReleased { owner_id } => {
+                let Some(owner) = replay.owners.get(&owner_id) else {
+                    return Err(());
+                };
+                if owner.released {
+                    return Err(());
+                }
+                if replay
+                    .resources
+                    .iter()
+                    .any(|((resource_owner, _), resource)| {
+                        *resource_owner == owner_id && !resource.released
+                    })
+                {
+                    return Err(());
+                }
+                replay
+                    .owners
+                    .get_mut(&owner_id)
+                    .expect("owner was checked above")
+                    .released = true;
+                replay.saw_release = true;
+            }
+            ReceiptLifecycleEvent::ResourceAcquired {
+                owner_id,
+                resource_id,
+                descriptor,
+            } => {
+                let Some(owner) = replay.owners.get(&owner_id) else {
+                    return Err(());
+                };
+                if owner.released
+                    || replay
+                        .resources
+                        .insert(
+                            (owner_id, resource_id),
+                            ReplayedResource {
+                                descriptor,
+                                state: RuntimeResourceState::Reserved,
+                                released: false,
+                                release_event_seen: false,
+                            },
+                        )
+                        .is_some()
+                {
+                    return Err(());
+                }
+            }
+            ReceiptLifecycleEvent::ResourceStateChanged {
+                owner_id,
+                resource_id,
+                state,
+                descriptor,
+            } => {
+                let Some(owner) = replay.owners.get(&owner_id) else {
+                    return Err(());
+                };
+                if owner.released {
+                    return Err(());
+                }
+                let Some(resource) = replay.resources.get_mut(&(owner_id, resource_id)) else {
+                    return Err(());
+                };
+                if resource.released {
+                    return Err(());
+                }
+                resource.descriptor = descriptor;
+                resource.state = state;
+                if state == RuntimeResourceState::Released {
+                    resource.released = true;
+                    replay.saw_release = true;
+                }
+            }
+            ReceiptLifecycleEvent::ResourceReleased {
+                owner_id,
+                resource_id,
+            } => {
+                let Some(owner) = replay.owners.get(&owner_id) else {
+                    return Err(());
+                };
+                if owner.released {
+                    return Err(());
+                }
+                let Some(resource) = replay.resources.get_mut(&(owner_id, resource_id)) else {
+                    return Err(());
+                };
+                if resource.release_event_seen {
+                    return Err(());
+                }
+                resource.released = true;
+                resource.release_event_seen = true;
+                resource.state = RuntimeResourceState::Released;
+                replay.saw_release = true;
+            }
+        }
+    }
+    Ok(replay)
+}
+
 fn historical_weights(
     snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
 ) -> Result<Vec<HistoricalWeight>, ()> {
     use openasr_core::runtime_receipts::{RuntimeReceiptEvent, RuntimeReceiptMetric};
 
-    let mut owners = BTreeMap::new();
-    let mut resources = BTreeMap::new();
-    for event in &snapshot.events {
-        match event {
-            RuntimeReceiptEvent::OwnerCreated {
-                owner_id,
-                descriptor,
-                ..
-            } => {
-                owners.insert(*owner_id, *descriptor);
-            }
-            RuntimeReceiptEvent::ResourceAcquired {
-                owner_id,
-                resource_id,
-                descriptor,
-            }
-            | RuntimeReceiptEvent::ResourceStateChanged {
-                owner_id,
-                resource_id,
-                descriptor,
-                ..
-            } => {
-                resources.insert((*owner_id, *resource_id), descriptor.clone());
-            }
-            RuntimeReceiptEvent::OwnerReused { .. }
-            | RuntimeReceiptEvent::OwnerReleased { .. }
-            | RuntimeReceiptEvent::ResourceReleased { .. } => {}
-        }
-    }
-    for owner in &snapshot.live_owners {
-        owners.insert(owner.id, owner.descriptor);
-        for resource in owner.resources.values() {
-            resources.insert((owner.id, resource.id), resource.descriptor.clone());
-        }
-    }
-
-    if owners.is_empty() || resources.is_empty() {
-        return Err(());
-    }
-    if owners.keys().any(|owner_id| {
-        !resources
-            .keys()
-            .any(|(resource_owner, _)| resource_owner == owner_id)
-    }) {
-        // A live or released owner with no resource is not evidence of a
-        // single-owner result; it is an incomplete coverage case.
-        return Err(());
-    }
-
-    let mut result = Vec::with_capacity(resources.len());
-    for ((owner_id, _resource_id), descriptor) in resources {
-        let owner = owners.get(&owner_id).ok_or(())?;
-        let Some(content) = owner.content else {
-            return Err(());
-        };
-        let Some(lane) = owner.lane else {
-            return Err(());
-        };
-        let Some(domain) = descriptor.domain else {
-            return Err(());
-        };
-        let RuntimeReceiptMetric::Known(retained_bytes) = descriptor.retained else {
-            return Err(());
-        };
-        result.push(HistoricalWeight {
+    let lifecycle_events = snapshot.events.iter().map(|event| match event {
+        RuntimeReceiptEvent::OwnerCreated {
             owner_id,
-            key: (owner.component, content, lane, descriptor.kind, domain),
-            retained_bytes,
-        });
+            descriptor,
+            ..
+        } => ReceiptLifecycleEvent::OwnerCreated {
+            owner_id: *owner_id,
+            descriptor: Some(*descriptor),
+        },
+        RuntimeReceiptEvent::OwnerReused { owner_id, .. } => ReceiptLifecycleEvent::OwnerReused {
+            owner_id: *owner_id,
+        },
+        RuntimeReceiptEvent::OwnerReleased { owner_id, .. } => {
+            ReceiptLifecycleEvent::OwnerReleased {
+                owner_id: *owner_id,
+            }
+        }
+        RuntimeReceiptEvent::ResourceAcquired {
+            owner_id,
+            resource_id,
+            descriptor,
+        } => ReceiptLifecycleEvent::ResourceAcquired {
+            owner_id: *owner_id,
+            resource_id: *resource_id,
+            descriptor: Some(descriptor.clone()),
+        },
+        RuntimeReceiptEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state,
+            descriptor,
+        } => ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id: *owner_id,
+            resource_id: *resource_id,
+            state: *state,
+            descriptor: Some(descriptor.clone()),
+        },
+        RuntimeReceiptEvent::ResourceReleased {
+            owner_id,
+            resource_id,
+        } => ReceiptLifecycleEvent::ResourceReleased {
+            owner_id: *owner_id,
+            resource_id: *resource_id,
+        },
+    });
+    let replay = replay_receipt_lifecycle(lifecycle_events)?;
+
+    // A release proves that the corresponding historical evidence is no longer
+    // live at snapshot time. Never turn it into a duplicate-weight claim.
+    if replay.saw_release {
+        return Err(());
+    }
+    if replay.owners.is_empty() || replay.resources.is_empty() {
+        return Err(());
+    }
+
+    let mut snapshot_owners = BTreeMap::new();
+    for owner in &snapshot.live_owners {
+        if snapshot_owners.insert(owner.id, owner).is_some() {
+            return Err(());
+        }
+        if owner.resources.is_empty() {
+            return Err(());
+        }
+        let Some(replayed_owner) = replay.owners.get(&owner.id) else {
+            return Err(());
+        };
+        if replayed_owner.released || replayed_owner.descriptor.as_ref() != Some(&owner.descriptor)
+        {
+            return Err(());
+        }
+    }
+
+    // Every replayed active owner/resource must still be represented by the
+    // complete live snapshot. A truncated or stale event stream is inconclusive.
+    for (owner_id, owner) in &replay.owners {
+        if owner.released {
+            continue;
+        }
+        let Some(snapshot_owner) = snapshot_owners.get(owner_id) else {
+            return Err(());
+        };
+        for ((resource_owner, resource_id), resource) in &replay.resources {
+            if resource_owner != owner_id {
+                continue;
+            }
+            if resource.released || !is_active_resource_state(resource.state) {
+                return Err(());
+            }
+            let Some(snapshot_resource) = snapshot_owner.resources.get(resource_id) else {
+                return Err(());
+            };
+            if snapshot_resource.state != resource.state
+                || resource.descriptor.as_ref() != Some(&snapshot_resource.descriptor)
+            {
+                return Err(());
+            }
+        }
+    }
+
+    let mut result = Vec::new();
+    for owner in &snapshot.live_owners {
+        let replayed_owner = replay.owners.get(&owner.id).ok_or(())?;
+        let Some(content) = replayed_owner
+            .descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.content)
+        else {
+            return Err(());
+        };
+        let Some(lane) = replayed_owner
+            .descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.lane)
+        else {
+            return Err(());
+        };
+        for resource in owner.resources.values() {
+            if !is_active_resource_state(resource.state) {
+                return Err(());
+            }
+            let replayed = replay.resources.get(&(owner.id, resource.id)).ok_or(())?;
+            let Some(descriptor) = replayed.descriptor.as_ref() else {
+                return Err(());
+            };
+            let Some(domain) = descriptor.domain else {
+                return Err(());
+            };
+            let RuntimeReceiptMetric::Known(retained_bytes) = descriptor.retained else {
+                return Err(());
+            };
+            result.push(HistoricalWeight {
+                owner_id: owner.id,
+                key: (
+                    replayed_owner.descriptor.as_ref().ok_or(())?.component,
+                    content,
+                    lane,
+                    descriptor.kind,
+                    domain,
+                ),
+                retained_bytes,
+            });
+        }
+    }
+    if result.is_empty() {
+        return Err(());
     }
     Ok(result)
 }
@@ -6085,7 +6370,12 @@ fn validate_firered_llm_catalog_identity(
         projection.adapter_id,
         projection.architecture
     );
-    let parsed = openasr_core::parse_model_ref(projection.model_id.trim()).map_err(|error| {
+    if projection.model_id != EXPECTED_MODEL_FAMILY {
+        return Err(format!(
+            "expected {expected}; actual safe projection ({actual})"
+        ));
+    }
+    let parsed = openasr_core::parse_model_ref(&projection.model_id).map_err(|error| {
         format!("expected {expected}; actual safe projection ({actual}); invalid model id: {error}")
     })?;
     if parsed.family != EXPECTED_MODEL_FAMILY
@@ -6145,7 +6435,14 @@ fn firered_catalog_identity_rejects_aed_and_punctuation_projections() {
         architecture: "firered-llm-conformer-adapter-qwen2".to_string(),
     };
     assert!(validate_firered_llm_catalog_identity(&valid).is_ok());
-    for rejected in ["firered-aed-l-v2", "firered-punc", "not-firered"] {
+    for rejected in [
+        "firered-aed-l-v2",
+        "firered-punc",
+        "not-firered",
+        " firered2-llm",
+        "firered2-llm ",
+        "firered2-llm\n",
+    ] {
         let mut projection = valid.clone();
         projection.model_id = rejected.to_string();
         let error = validate_firered_llm_catalog_identity(&projection).unwrap_err();
@@ -6191,32 +6488,153 @@ fn equivalent_weights_require_distinct_owner_ids() {
 }
 
 #[test]
-fn empty_or_unchanged_receipt_coverage_is_inconclusive() {
+fn cross_owner_equivalence_wins_over_same_owner_pair() {
+    let resources = vec![
+        WeightObservation {
+            owner_id: 1_u8,
+            key: "same",
+            retained_bytes: 5_090_000_000,
+        },
+        WeightObservation {
+            owner_id: 1_u8,
+            key: "same",
+            retained_bytes: 5_090_000_001,
+        },
+        WeightObservation {
+            owner_id: 2_u8,
+            key: "same",
+            retained_bytes: 5_090_000_002,
+        },
+    ];
+    assert_eq!(
+        classify_equivalent_weight_resources(&resources, 5_090_000_000, 512 * 1024 * 1024),
+        HostOwnerAttribution::SupportedEquivalentDuplicatedWeights
+    );
+}
+
+#[test]
+fn event_count_without_active_or_retained_evidence_is_inconclusive() {
     let empty = empty_runtime_receipt_snapshot();
     let delta = RuntimeReceiptIdentityDelta {
         owner_ids_added: Vec::new(),
         owner_ids_removed: Vec::new(),
         resource_ids_added: Vec::new(),
         resource_ids_removed: Vec::new(),
-        event_count_before: 3,
-        event_count_after: 3,
+        offline_owned_retained_resource_ids: Vec::new(),
+        event_count_before: 0,
+        event_count_after: 1,
     };
     assert!(!delta.has_observable_change());
     assert_eq!(
         evaluate_host_owner_attribution(&empty, &delta),
         HostOwnerAttribution::AttributionIncomplete
     );
-    let changed_delta = RuntimeReceiptIdentityDelta {
-        event_count_before: 0,
-        event_count_after: 1,
+
+    let with_retained_evidence = RuntimeReceiptIdentityDelta {
+        offline_owned_retained_resource_ids: vec![
+            openasr_core::runtime_receipts::RuntimeResourceId {
+                scope_id: empty.scope_id,
+                ordinal: 1,
+            },
+        ],
         ..delta
     };
+    assert!(with_retained_evidence.has_observable_change());
+}
+
+#[test]
+fn lifecycle_replay_rejects_unknown_and_tracks_release_coverage() {
+    use openasr_core::runtime_receipts::{RuntimeOwnerId, RuntimeResourceId, RuntimeResourceState};
+
+    let scope_id = empty_runtime_receipt_snapshot().scope_id;
+    let owner_id = RuntimeOwnerId {
+        scope_id,
+        ordinal: 1,
+    };
+    let resource_id = RuntimeResourceId {
+        scope_id,
+        ordinal: 1,
+    };
+    assert!(
+        replay_receipt_lifecycle([ReceiptLifecycleEvent::OwnerReleased { owner_id },]).is_err()
+    );
+    assert!(
+        replay_receipt_lifecycle([
+            ReceiptLifecycleEvent::OwnerCreated {
+                owner_id,
+                descriptor: None,
+            },
+            ReceiptLifecycleEvent::ResourceReleased {
+                owner_id,
+                resource_id,
+            },
+        ])
+        .is_err()
+    );
+
+    let replay = replay_receipt_lifecycle([
+        ReceiptLifecycleEvent::OwnerCreated {
+            owner_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceAcquired {
+            owner_id,
+            resource_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state: RuntimeResourceState::Committed,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceReleased {
+            owner_id,
+            resource_id,
+        },
+        ReceiptLifecycleEvent::OwnerReleased { owner_id },
+    ])
+    .expect("valid owner/resource release lifecycle");
+    assert!(replay.saw_release);
+    assert!(replay.resources[&(owner_id, resource_id)].released);
+    assert!(replay.owners[&owner_id].released);
+
+    let mut released_snapshot = empty_runtime_receipt_snapshot();
+    released_snapshot.events = vec![
+        openasr_core::runtime_receipts::RuntimeReceiptEvent::OwnerReleased {
+            owner_id,
+            attempt_id: None,
+        },
+        openasr_core::runtime_receipts::RuntimeReceiptEvent::ResourceReleased {
+            owner_id,
+            resource_id,
+        },
+    ];
+    assert!(receipt_identity_sets(&released_snapshot).0.is_empty());
+    assert!(receipt_identity_sets(&released_snapshot).1.is_empty());
+    assert!(historical_weights(&released_snapshot).is_err());
+}
+
+#[test]
+fn missing_live_snapshot_coverage_is_inconclusive() {
+    let empty = empty_runtime_receipt_snapshot();
+    let delta = RuntimeReceiptIdentityDelta {
+        owner_ids_added: vec![openasr_core::runtime_receipts::RuntimeOwnerId {
+            scope_id: empty.scope_id,
+            ordinal: 1,
+        }],
+        owner_ids_removed: Vec::new(),
+        resource_ids_added: Vec::new(),
+        resource_ids_removed: Vec::new(),
+        offline_owned_retained_resource_ids: Vec::new(),
+        event_count_before: 0,
+        event_count_after: 1,
+    };
     assert_eq!(
-        evaluate_host_owner_attribution(&empty, &changed_delta),
+        evaluate_host_owner_attribution(&empty, &delta),
         HostOwnerAttribution::AttributionIncomplete
     );
 }
-
 #[test]
 fn attribution_report_persists_atomically_in_requested_directory() {
     let temp = tempfile::tempdir().unwrap();
@@ -6234,6 +6652,7 @@ fn attribution_report_persists_atomically_in_requested_directory() {
             owner_ids_removed: Vec::new(),
             resource_ids_added: Vec::new(),
             resource_ids_removed: Vec::new(),
+            offline_owned_retained_resource_ids: Vec::new(),
             event_count_before: 1,
             event_count_after: 2,
         },
