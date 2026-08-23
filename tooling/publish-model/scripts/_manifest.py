@@ -325,7 +325,15 @@ def ensure_release_public_allowed(model: str, entry: dict, public: bool) -> None
         )
 
 
-def ensure_release_audit_form(model: str, entry: dict, public: bool, *, audit_dir: Path | None = None) -> None:
+def ensure_release_audit_form(
+    model: str,
+    entry: dict,
+    public: bool,
+    *,
+    audit_dir: Path | None = None,
+    inventory_path: Path | None = None,
+    catalog_path: Path | None = None,
+) -> None:
     """`--public` entries require a completed release audit form for the
     model's family (docs/model-audits/<family>.md; see audit_form.py for the
     fail-closed checks and the pre-policy grandfather set).
@@ -333,7 +341,12 @@ def ensure_release_audit_form(model: str, entry: dict, public: bool, *, audit_di
     if not public:
         return
     try:
-        validate_family_audit_form(entry.get("family"), audit_dir=audit_dir)
+        validate_family_audit_form(
+            entry.get("family"),
+            audit_dir=audit_dir,
+            inventory_path=inventory_path,
+            catalog_path=catalog_path,
+        )
     except AuditFormError as error:
         raise SystemExit(f"{model}: release-audit gate failed: {error}") from None
 

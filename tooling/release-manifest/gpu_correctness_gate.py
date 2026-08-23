@@ -296,15 +296,58 @@ def _evidence_for(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     return document, evidence
 
 
-def validate_matrix(
+def expected_receipt_keys(matrix: dict[str, Any]) -> tuple[
+    set[tuple[str, str, str, str, str, str]],
+    dict[tuple[str, str, str, str], dict[str, Any]],
+]:
+    """Return exact-cell receipt keys. Untested lanes stay required; they are not skipped."""
+    cells = matrix.get("cells")
+    if not isinstance(cells, list) or not cells:
+        raise MatrixError("correctness matrix has no cells")
+    expected: set[tuple[str, str, str, str, str, str]] = set()
+    cell_by_lane: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for cell in cells:
+        if not isinstance(cell, dict):
+            raise MatrixError("correctness matrix contains a non-object cell")
+        family, provider = cell.get("family"), cell.get("provider")
+        model_id, quant = cell.get("model_id"), cell.get("quant")
+        modes = cell.get("reuse_modes")
+        if not all(isinstance(value, str) and value for value in (family, provider, model_id, quant)) or modes != ["cold", "reuse"]:
+            raise MatrixError("matrix cell lacks family/model/quant/provider or cold/reuse requirements")
+        for field in ("topology", "kernel_coverage_bucket", "output_plan"):
+            if not isinstance(cell.get(field), dict):
+                raise MatrixError(f"matrix cell {family}/{model_id}:{quant} lacks {field}")
+        if cell.get("capture_mode") not in {"disabled", "enabled", "unsupported"} or cell.get("scheduler_mode") not in {"disabled", "enabled"}:
+            raise MatrixError(f"matrix cell {family}/{model_id}:{quant} lacks capture/scheduler policy")
+        plan = cell["output_plan"]
+        if plan.get("kind") not in {"full_logits", "complete_scores", "native_first_max_token"} or plan.get("tie_policy") not in {"first_maximum", "last_maximum"}:
+            raise MatrixError(f"matrix cell {family}/{model_id}:{quant} lacks a concrete output plan")
+        coverage = cell["kernel_coverage_bucket"]
+        if not isinstance(coverage.get("members"), list) or coverage.get("members") != [f"{model_id}:{quant}"]:
+            raise MatrixError("kernel coverage bucket silently merges cells")
+        required_classes = cell.get("required_receipt_classes")
+        if not isinstance(required_classes, list) or set(required_classes) != {"placement_resource", "token_transcript"}:
+            raise MatrixError(f"matrix cell {family}/{model_id}:{quant} lacks separate receipt classes")
+        activation_modes = cell.get("activation_modes")
+        if not isinstance(activation_modes, list) or any(mode not in {"auto", "explicit"} for mode in activation_modes):
+            raise MatrixError(f"matrix cell {family}/{model_id}:{quant} lacks Auto/explicit activation modes")
+        for mode in modes:
+            for evidence_class in required_classes:
+                key = (family, model_id, quant, provider, mode, evidence_class)
+                if key in expected:
+                    raise MatrixError(f"duplicate correctness cell {key}")
+                expected.add(key)
+                cell_by_lane[(family, model_id, quant, provider)] = cell
+    return expected, cell_by_lane
+
+
+def _bind_matrix_snapshots(
     matrix: dict[str, Any],
-    receipt_paths: list[Path],
     *,
-    inventory: dict[str, Any] | None = None,
-    catalog: dict[str, Any] | None = None,
-    backend_catalog: dict[str, Any] | None = None,
-    source_digests: dict[str, str] | None = None,
-    trace_paths: list[Path] | None = None,
+    inventory: dict[str, Any] | None,
+    catalog: dict[str, Any] | None,
+    backend_catalog: dict[str, Any] | None,
+    source_digests: dict[str, str] | None,
 ) -> None:
     _require_schema(matrix, SCHEMA, "correctness matrix")
     claimed_matrix_sha = matrix.get("matrix_sha256")
@@ -344,45 +387,32 @@ def validate_matrix(
     )
     if projected != matrix:
         raise MatrixError("matrix does not match a fresh canonical projection of its source snapshots")
+
+
+def closed_receipt_keys(
+    matrix: dict[str, Any],
+    receipt_paths: list[Path],
+    *,
+    inventory: dict[str, Any] | None = None,
+    catalog: dict[str, Any] | None = None,
+    backend_catalog: dict[str, Any] | None = None,
+    source_digests: dict[str, str] | None = None,
+    trace_paths: list[Path] | None = None,
+) -> tuple[set[tuple[str, str, str, str, str, str]], set[str]]:
+    """Validate each receipt against exact cells without skipping missing lanes."""
+    _bind_matrix_snapshots(
+        matrix,
+        inventory=inventory,
+        catalog=catalog,
+        backend_catalog=backend_catalog,
+        source_digests=source_digests,
+    )
     if not trace_paths:
         raise MatrixError("validation requires immutable token/logits trace artifacts")
     trace_hashes = {path.name: _sha256(path) for path in trace_paths}
     trace_semantics = {path.name: parse_trace_artifact(path) for path in trace_paths}
-    cells = matrix.get("cells")
-    if not isinstance(cells, list) or not cells:
-        raise MatrixError("correctness matrix has no cells")
-    expected: set[tuple[str, str, str, str, str, str]] = set()
-    cell_by_lane: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-    for cell in cells:
-        if not isinstance(cell, dict):
-            raise MatrixError("correctness matrix contains a non-object cell")
-        family, provider = cell.get("family"), cell.get("provider")
-        model_id, quant = cell.get("model_id"), cell.get("quant")
-        modes = cell.get("reuse_modes")
-        if not all(isinstance(value, str) and value for value in (family, provider, model_id, quant)) or modes != ["cold", "reuse"]:
-            raise MatrixError("matrix cell lacks family/model/quant/provider or cold/reuse requirements")
-        for field in ("topology", "kernel_coverage_bucket", "output_plan"):
-            if not isinstance(cell.get(field), dict):
-                raise MatrixError(f"matrix cell {family}/{model_id}:{quant} lacks {field}")
-        if cell.get("capture_mode") not in {"disabled", "enabled", "unsupported"} or cell.get("scheduler_mode") not in {"disabled", "enabled"}:
-            raise MatrixError(f"matrix cell {family}/{model_id}:{quant} lacks capture/scheduler policy")
-        plan = cell["output_plan"]
-        if plan.get("kind") not in {"full_logits", "complete_scores", "native_first_max_token"} or plan.get("tie_policy") not in {"first_maximum", "last_maximum"}:
-            raise MatrixError(f"matrix cell {family}/{model_id}:{quant} lacks a concrete output plan")
-        coverage = cell["kernel_coverage_bucket"]
-        if not isinstance(coverage.get("members"), list) or coverage.get("members") != [f"{model_id}:{quant}"]:
-            raise MatrixError("kernel coverage bucket silently merges cells")
-        required_classes = cell.get("required_receipt_classes")
-        if not isinstance(required_classes, list) or set(required_classes) != {"placement_resource", "token_transcript"}:
-            raise MatrixError(f"matrix cell {family}/{model_id}:{quant} lacks separate receipt classes")
-        for mode in modes:
-            for evidence_class in required_classes:
-                key = (family, model_id, quant, provider, mode, evidence_class)
-                if key in expected:
-                    raise MatrixError(f"duplicate correctness cell {key}")
-                expected.add(key)
-                cell_by_lane[(family, model_id, quant, provider)] = cell
-    receipts: set[tuple[str, str, str, str]] = set()
+    expected, cell_by_lane = expected_receipt_keys(matrix)
+    receipts: set[tuple[str, str, str, str, str, str]] = set()
     classes: set[str] = set()
     for path in receipt_paths:
         document, evidence = _evidence_for(path)
@@ -465,6 +495,71 @@ def validate_matrix(
         if key in receipts:
             raise MatrixError(f"duplicate evidence for correctness cell {key}")
         receipts.add(key)
+    unknown = sorted(receipts - expected)
+    if unknown:
+        raise MatrixError(f"receipts are not bound to projected matrix cells: {unknown}")
+    return receipts, classes
+
+
+def lane_activation_modes(
+    matrix: dict[str, Any],
+    closed_keys: set[tuple[str, str, str, str, str, str]],
+) -> dict[tuple[str, str, str, str], tuple[str, ...]]:
+    """Return Auto/explicit modes only for lanes with complete receipts.
+
+    Advertised CUDA, physical Vulkan, and HIP cells stay in the map when
+    untested. Empty modes mean the lane exists and is not selectable.
+    """
+    expected, cell_by_lane = expected_receipt_keys(matrix)
+    allowlist: dict[tuple[str, str, str, str], tuple[str, ...]] = {}
+    for lane, cell in cell_by_lane.items():
+        needed = {key for key in expected if key[:4] == lane}
+        modes = tuple(cell["activation_modes"]) if needed <= closed_keys else ()
+        allowlist[lane] = modes
+    return allowlist
+
+
+def require_activation(
+    matrix: dict[str, Any],
+    closed_keys: set[tuple[str, str, str, str, str, str]],
+    *,
+    provider: str,
+    mode: str,
+) -> None:
+    """Fail closed if Auto or explicit selection is requested for an unproven cell."""
+    if mode not in {"auto", "explicit"}:
+        raise MatrixError(f"{mode} is not an activation mode")
+    allowlist = lane_activation_modes(matrix, closed_keys)
+    matching = [key for key in allowlist if key[3] == provider]
+    if not matching:
+        raise MatrixError(f"{provider} is not a projected activation lane")
+    blocked = [key for key in matching if mode not in allowlist[key]]
+    if blocked:
+        raise MatrixError(
+            f"{provider} {mode} is not selectable without closed correctness receipts: {blocked}"
+        )
+
+
+def validate_matrix(
+    matrix: dict[str, Any],
+    receipt_paths: list[Path],
+    *,
+    inventory: dict[str, Any] | None = None,
+    catalog: dict[str, Any] | None = None,
+    backend_catalog: dict[str, Any] | None = None,
+    source_digests: dict[str, str] | None = None,
+    trace_paths: list[Path] | None = None,
+) -> None:
+    expected, _cell_by_lane = expected_receipt_keys(matrix)
+    receipts, classes = closed_receipt_keys(
+        matrix,
+        receipt_paths,
+        inventory=inventory,
+        catalog=catalog,
+        backend_catalog=backend_catalog,
+        source_digests=source_digests,
+        trace_paths=trace_paths,
+    )
     missing = sorted(expected - receipts)
     if missing:
         raise MatrixError(f"correctness matrix is incomplete; missing receipts: {missing}")
@@ -474,6 +569,10 @@ def validate_matrix(
     missing_global = sorted(set(required_global) - classes)
     if missing_global:
         raise MatrixError(f"correctness matrix is incomplete; missing global receipts: {missing_global}")
+    for cell in matrix["cells"]:
+        provider = cell["provider"]
+        for mode in cell["activation_modes"]:
+            require_activation(matrix, receipts, provider=provider, mode=mode)
 
 
 def main() -> int:

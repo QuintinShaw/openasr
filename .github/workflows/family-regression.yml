@@ -5,11 +5,12 @@ name: Family Regression
 # signature-verified) and transcribe a committed fixture on the CPU backend,
 # comparing against committed goldens (tooling/family-regression/goldens/).
 #
-# This workflow's existing matrix is intentionally CPU-only/post-release
-# monitoring. It is not the publication blocker. Pre-publication callers must
-# use the reusable `workflow_call` contract above with immutable candidate,
-# staging-catalog, and correctness-matrix artifacts; release finalization also
-# consumes the same bound matrix before catalog activation.
+# Nightly and published-release jobs remain CPU-only/post-release monitoring.
+# They cannot authorize catalog or release activation. The reusable
+# `workflow_call` with `pre_publication: true` is the candidate blocker:
+# release-core must call it with immutable candidate, staging-catalog, and
+# correctness-matrix artifacts before deploy-catalog. The finalizer also
+# consumes the same bound matrix before flipping a draft public.
 
 on:
   # This reusable entrypoint is the pre-publication contract seam. The release

@@ -86,6 +86,58 @@ class ReleaseCorrectnessBindingTests(unittest.TestCase):
             with self.assertRaisesRegex(BINDING.BindingError, "matrix model catalog digest|binding does not match"):
                 BINDING.verify_binding(binding, args)
 
+    def test_family_regression_is_candidate_blocker_not_post_publish_monitor(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        family = (root / ".github/workflows/family-regression.yml").read_text(encoding="utf-8")
+        release = (root / ".github/workflows/release-core.yml").read_text(encoding="utf-8")
+        deploy = (root / ".github/workflows/deploy-catalog.yml").read_text(encoding="utf-8")
+        self.assertIn("workflow_call:", family)
+        self.assertIn("pre_publication:", family)
+        self.assertIn("required: true", family.split("pre_publication:", maxsplit=1)[1])
+        self.assertIn("candidate_cli_artifact:", family)
+        self.assertIn("correctness_matrix_artifact:", family)
+        self.assertIn("uses: ./.github/workflows/family-regression.yml", release)
+        self.assertIn("pre_publication: true", release)
+        self.assertIn("needs: [resolve, binaries, prepublication-family]", release)
+        self.assertLess(release.index("prepublication-family:"), release.index("deploy-catalog:"))
+        self.assertLess(release.index("prepublication-family:"), release.index("finalize-notes:"))
+        self.assertNotIn("It is not the publication blocker", family)
+        self.assertIn("gate-correctness:", deploy)
+        self.assertIn("gpu_correctness_gate.py validate", deploy)
+        self.assertIn("needs: [gate-correctness, gate-released-binary-compat]", deploy)
+        self.assertLess(deploy.index("gate-correctness:"), deploy.index("\n  deploy:"))
+
+    def test_binding_cannot_activate_without_the_deploy_catalog_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            deploy = root / "deploy.json"
+            deploy.write_text(
+                json.dumps(
+                    {
+                        "workflow_name": "Deploy catalog",
+                        "conclusion": "success",
+                        "event": "release",
+                        "caller_run_id": "123",
+                        "release_tag": "v0.1.37",
+                        "head_sha": "b" * 40,
+                    }
+                )
+            )
+            with self.assertRaisesRegex(BINDING.BindingError, "release orchestrator"):
+                BINDING.validate_deploy_run(
+                    {
+                        "workflow_name": "Deploy catalog",
+                        "conclusion": "success",
+                        "event": "release",
+                        "caller_run_id": "123",
+                        "release_tag": "v0.1.37",
+                        "head_sha": "b" * 40,
+                    },
+                    "123",
+                    "v0.1.37",
+                    "b" * 40,
+                )
+
     def test_unrelated_successful_run_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

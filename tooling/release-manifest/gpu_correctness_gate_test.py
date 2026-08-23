@@ -316,17 +316,107 @@ class GpuCorrectnessGateTests(unittest.TestCase):
                     trace_paths=[trace],
                 )
 
+    def bind_kwargs(self, traces: list[Path]) -> dict:
+        return {
+            "inventory": self.inventory,
+            "catalog": self.catalog,
+            "backend_catalog": self.backends,
+            "source_digests": self.source_digests,
+            "trace_paths": traces,
+        }
+
+    def write_token_traces(self, root: Path, receipt: dict) -> list[Path]:
+        evidence = receipt["evidence"]
+        traces = []
+        if evidence.get("evidence_class") != "token_transcript":
+            dummy = root / "trace.jsonl"
+            dummy.write_text(
+                json.dumps(
+                    {
+                        "schema": "openasr.gpu-correctness-trace.v1",
+                        "event": "header",
+                        "mode": evidence["execution"]["mode"],
+                        "provider": evidence["provider"],
+                        "device": evidence["device"],
+                    }
+                )
+                + "\n"
+                + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "token", "step_index": 0, "token_id": 1})
+                + "\n"
+                + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "top_k", "step_index": 0, "items": [{"token_id": 1, "value": 1.0}]})
+                + "\n"
+            )
+            return [dummy]
+        token_content = (
+            json.dumps(
+                {
+                    "schema": "openasr.gpu-correctness-trace.v1",
+                    "event": "header",
+                    "mode": evidence["execution"]["mode"],
+                    "provider": evidence["provider"],
+                    "device": evidence["device"],
+                }
+            )
+            + "\n"
+            + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "token", "step_index": 0, "token_id": 7, "is_eot": 0})
+            + "\n"
+            + json.dumps(
+                {
+                    "schema": "openasr.gpu-correctness-trace.v1",
+                    "event": "top_k",
+                    "step_index": 0,
+                    "items": [{"token_id": 7, "value": 1.25}, {"token_id": 8, "value": 0.75}],
+                }
+            )
+            + "\n"
+        )
+        for field in ("token_trace", "logits"):
+            path = root / evidence["trace"][field]["label"]
+            path.write_text(token_content)
+            traces.append(path)
+        return traces
+
     def test_cpu_receipt_cannot_close_gpu_cell(self) -> None:
         matrix = self.project()
         cuda = next(cell for cell in matrix["cells"] if cell["provider"] == "cuda")
         cpu = next(cell for cell in matrix["cells"] if cell["provider"] == "cpu")
         self.assertEqual((cuda["model_id"], cuda["quant"]), (cpu["model_id"], cpu["quant"]))
         with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
             receipt = self.receipt(cpu, "token_transcript", "cold")
-            path = Path(temp) / "cpu-as-gpu.json"
+            path = root / "cpu-as-gpu.json"
             path.write_text(json.dumps(receipt))
-            token_label = receipt["evidence"]["trace"]["token_trace"]["label"]
-            token_content = (
+            traces = self.write_token_traces(root, receipt)
+            kwargs = self.bind_kwargs(traces)
+            expected, lanes = GATE.expected_receipt_keys(matrix)
+            self.assertIn((cuda["family"], cuda["model_id"], cuda["quant"], "cuda"), lanes)
+            self.assertTrue(any(key[3] == "cuda" for key in expected))
+            closed, _classes = GATE.closed_receipt_keys(matrix, [path], **kwargs)
+            self.assertTrue(any(key[3] == "cpu" for key in closed))
+            self.assertFalse(any(key[3] == "cuda" for key in closed))
+            allow = GATE.lane_activation_modes(matrix, closed)
+            cuda_key = (cuda["family"], cuda["model_id"], cuda["quant"], "cuda")
+            self.assertIn(cuda_key, allow)
+            self.assertEqual(allow[cuda_key], ())
+            with self.assertRaisesRegex(GATE.MatrixError, "not selectable"):
+                GATE.require_activation(matrix, closed, provider="cuda", mode="auto")
+            with self.assertRaisesRegex(GATE.MatrixError, "not selectable"):
+                GATE.require_activation(matrix, closed, provider="cuda", mode="explicit")
+            with self.assertRaisesRegex(GATE.MatrixError, r"missing receipts:.*'cuda'"):
+                GATE.validate_matrix(matrix, [path], **kwargs)
+
+    def test_cpu_trace_cannot_be_relabeled_as_gpu(self) -> None:
+        matrix = self.project()
+        cpu = next(cell for cell in matrix["cells"] if cell["provider"] == "cpu")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            receipt = self.receipt(cpu, "token_transcript", "cold")
+            receipt["evidence"]["provider"] = "cuda"
+            receipt["evidence"]["device"] = "test-cuda"
+            path = root / "relabeled.json"
+            path.write_text(json.dumps(receipt))
+            traces = self.write_token_traces(root, receipt)
+            traces[0].write_text(
                 json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "header", "mode": "cold", "provider": "cpu", "device": "test-cpu"})
                 + "\n"
                 + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "token", "step_index": 0, "token_id": 7, "is_eot": 0})
@@ -334,47 +424,101 @@ class GpuCorrectnessGateTests(unittest.TestCase):
                 + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "top_k", "step_index": 0, "items": [{"token_id": 7, "value": 1.25}, {"token_id": 8, "value": 0.75}]})
                 + "\n"
             )
-            token_trace = Path(temp) / token_label
-            token_trace.write_text(token_content)
-            logits_label = receipt["evidence"]["trace"]["logits"]["label"]
-            logits_trace = Path(temp) / logits_label
-            logits_trace.write_text(token_content)
-            with self.assertRaisesRegex(GATE.MatrixError, "incomplete|missing receipts"):
-                GATE.validate_matrix(
-                    matrix,
-                    [path],
-                    inventory=self.inventory,
-                    catalog=self.catalog,
-                    backend_catalog=self.backends,
-                    source_digests=self.source_digests,
-                    trace_paths=[token_trace, logits_trace],
-                )
+            with self.assertRaisesRegex(GATE.MatrixError, "trace header does not match"):
+                GATE.closed_receipt_keys(matrix, [path], **self.bind_kwargs(traces))
 
     def test_placement_receipt_cannot_close_token_cell(self) -> None:
         matrix = self.project()
         cell = next(item for item in matrix["cells"] if item["provider"] == "cuda")
         with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "placement-only.json"
-            path.write_text(json.dumps(self.receipt(cell, "placement_resource", "cold")))
+            root = Path(temp)
+            receipt = self.receipt(cell, "placement_resource", "cold")
+            path = root / "placement-only.json"
+            path.write_text(json.dumps(receipt))
+            traces = self.write_token_traces(root, receipt)
+            kwargs = self.bind_kwargs(traces)
+            closed, _classes = GATE.closed_receipt_keys(matrix, [path], **kwargs)
+            self.assertTrue(any(key[5] == "placement_resource" and key[3] == "cuda" for key in closed))
+            self.assertFalse(any(key[5] == "token_transcript" for key in closed))
+            allow = GATE.lane_activation_modes(matrix, closed)
+            cuda_key = (cell["family"], cell["model_id"], cell["quant"], "cuda")
+            self.assertIn(cuda_key, allow)
+            self.assertEqual(allow[cuda_key], ())
+            with self.assertRaisesRegex(GATE.MatrixError, "not selectable"):
+                GATE.require_activation(matrix, closed, provider="cuda", mode="auto")
+            with self.assertRaisesRegex(GATE.MatrixError, r"missing receipts:.*token_transcript"):
+                GATE.validate_matrix(matrix, [path], **kwargs)
+
+    def test_placement_relabeled_as_token_cannot_close_token_cell(self) -> None:
+        matrix = self.project()
+        cell = next(item for item in matrix["cells"] if item["provider"] == "cuda")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            receipt = self.receipt(cell, "placement_resource", "cold")
+            traces = self.write_token_traces(root, receipt)
+            receipt["evidence"]["evidence_class"] = "token_transcript"
+            path = root / "placement-as-token.json"
+            path.write_text(json.dumps(receipt))
+            with self.assertRaisesRegex(GATE.MatrixError, "token evidence lacks"):
+                GATE.closed_receipt_keys(matrix, [path], **self.bind_kwargs(traces))
+
+    def test_cuda_vulkan_hip_without_receipts_cannot_auto_or_explicit(self) -> None:
+        inventory = copy.deepcopy(self.inventory)
+        inventory["families"][0]["execution"]["execution_capabilities"]["providers"] = [
+            {"provider": "cuda", "full_device": True, "hybrid": False},
+            {"provider": "vulkan", "full_device": True, "hybrid": False},
+            {"provider": "hip", "full_device": True, "hybrid": False},
+        ]
+        self.inventory = inventory
+        self.backends = {
+            "backends": [
+                {"id": "cuda-test", "vendor": "cuda"},
+                {"id": "vulkan-test", "vendor": "vulkan"},
+                {"id": "hip-test", "vendor": "hip"},
+            ]
+        }
+        matrix = self.project()
+        providers = {cell["provider"] for cell in matrix["cells"]}
+        self.assertEqual(providers, {"cpu", "cuda", "vulkan", "hip"})
+        expected, lanes = GATE.expected_receipt_keys(matrix)
+        for provider in ("cuda", "vulkan", "hip"):
+            matching = [cell for cell in matrix["cells"] if cell["provider"] == provider]
+            self.assertTrue(matching)
+            for cell in matching:
+                self.assertEqual(cell["activation_modes"], ["explicit", "auto"])
+                self.assertIn((cell["family"], cell["model_id"], cell["quant"], provider), lanes)
+            self.assertTrue(any(key[3] == provider for key in expected))
+        with tempfile.TemporaryDirectory() as temp:
             trace = Path(temp) / "trace.jsonl"
             trace.write_text(
-                json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "header", "mode": "cold", "provider": "cuda", "device": "test-cuda"})
+                json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "header", "mode": "cold", "provider": "cpu", "device": "test-cpu"})
                 + "\n"
                 + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "token", "step_index": 0, "token_id": 1})
                 + "\n"
                 + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "top_k", "step_index": 0, "items": [{"token_id": 1, "value": 1.0}]})
                 + "\n"
             )
-            with self.assertRaisesRegex(GATE.MatrixError, "incomplete|missing receipts"):
-                GATE.validate_matrix(
-                    matrix,
-                    [path],
-                    inventory=self.inventory,
-                    catalog=self.catalog,
-                    backend_catalog=self.backends,
-                    source_digests=self.source_digests,
-                    trace_paths=[trace],
-                )
+            kwargs = self.bind_kwargs([trace])
+            closed, _classes = GATE.closed_receipt_keys(matrix, [], **kwargs)
+            self.assertEqual(closed, set())
+            allow = GATE.lane_activation_modes(matrix, closed)
+            for provider in ("cuda", "vulkan", "hip"):
+                provider_keys = [key for key in allow if key[3] == provider]
+                self.assertTrue(provider_keys)
+                self.assertTrue(all(allow[key] == () for key in provider_keys))
+                with self.assertRaisesRegex(GATE.MatrixError, "not selectable"):
+                    GATE.require_activation(matrix, closed, provider=provider, mode="auto")
+                with self.assertRaisesRegex(GATE.MatrixError, "not selectable"):
+                    GATE.require_activation(matrix, closed, provider=provider, mode="explicit")
+            error = None
+            try:
+                GATE.validate_matrix(matrix, [], **kwargs)
+            except GATE.MatrixError as raised:
+                error = str(raised)
+            self.assertIsNotNone(error)
+            self.assertIn("missing receipts", error)
+            for provider in ("cuda", "vulkan", "hip"):
+                self.assertIn(f"'{provider}'", error)
 
 
 if __name__ == "__main__":
