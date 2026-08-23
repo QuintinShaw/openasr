@@ -272,6 +272,8 @@ pub enum DaemonHistoryStoreError {
     NotFound(String),
     #[error("History entry revision conflict: expected {expected}, current {actual}")]
     RevisionConflict { expected: u64, actual: u64 },
+    #[error("History entry revision is outside the supported range: {revision}")]
+    RevisionOutOfRange { revision: u64 },
     #[error("Invalid speaker assignment: {0}")]
     InvalidSpeakerAssignment(String),
     #[error("Could not create history directory '{path}': {source}")]
@@ -421,6 +423,7 @@ impl DaemonHistoryStore {
         assignments: &[DaemonHistorySpeakerAssignment],
     ) -> Result<DaemonHistoryDetail, DaemonHistoryStoreError> {
         validate_history_id(id)?;
+        revision_to_sql(expected_revision)?;
         if assignments.is_empty() {
             return Err(DaemonHistoryStoreError::InvalidSpeakerAssignment(
                 "assignments must not be empty".into(),
@@ -463,15 +466,14 @@ impl DaemonHistoryStore {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
-                        row.get::<_, i64>(2)?,
+                        row_revision(row, 2)?,
                     ))
                 },
             )
             .optional()
             .map_err(DaemonHistoryStoreError::Query)?
             .ok_or_else(|| DaemonHistoryStoreError::NotFound(id.to_string()))?;
-        let (text, segments_json, revision) = row;
-        let actual_revision = revision.max(0) as u64;
+        let (text, segments_json, actual_revision) = row;
         if actual_revision != expected_revision {
             return Err(DaemonHistoryStoreError::RevisionConflict {
                 expected: expected_revision,
@@ -500,10 +502,10 @@ impl DaemonHistoryStore {
                 "transcript body cannot be serialized: {error}"
             ))
         })?;
-        let new_revision = actual_revision.saturating_add(1);
+        let new_revision = next_history_revision(actual_revision)?;
         tx.execute(
             "UPDATE history_entries SET segments_json = ?1, revision = ?2 WHERE id = ?3",
-            params![segments_json, new_revision as i64, id],
+            params![segments_json, revision_to_sql(new_revision)?, id],
         )
         .map_err(DaemonHistoryStoreError::Query)?;
         tx.commit().map_err(DaemonHistoryStoreError::Query)?;
@@ -525,6 +527,7 @@ impl DaemonHistoryStore {
         transcription: &crate::api::backend::Transcription,
     ) -> Result<DaemonHistoryDetail, DaemonHistoryStoreError> {
         validate_history_id(id)?;
+        revision_to_sql(expected_revision)?;
         let mut conn = self.connection()?;
         let tx = conn.transaction().map_err(DaemonHistoryStoreError::Query)?;
         let row = tx
@@ -535,15 +538,14 @@ impl DaemonHistoryStore {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
-                        row.get::<_, i64>(2)?,
+                        row_revision(row, 2)?,
                     ))
                 },
             )
             .optional()
             .map_err(DaemonHistoryStoreError::Query)?
             .ok_or_else(|| DaemonHistoryStoreError::NotFound(id.to_string()))?;
-        let (model, source_name, revision) = row;
-        let actual_revision = revision.max(0) as u64;
+        let (model, source_name, actual_revision) = row;
         if actual_revision != expected_revision {
             return Err(DaemonHistoryStoreError::RevisionConflict {
                 expected: expected_revision,
@@ -577,7 +579,7 @@ impl DaemonHistoryStore {
             source_name.as_deref().unwrap_or(""),
             transcription.text
         );
-        let new_revision = actual_revision.saturating_add(1);
+        let new_revision = next_history_revision(actual_revision)?;
         tx.execute(
             "UPDATE history_entries SET text = ?1, segments_json = ?2, preview = ?3, \
              formats = ?4, revision = ?5 WHERE id = ?6",
@@ -586,7 +588,7 @@ impl DaemonHistoryStore {
                 segments_json,
                 preview,
                 formats_json,
-                new_revision as i64,
+                revision_to_sql(new_revision)?,
                 id
             ],
         )
@@ -618,6 +620,7 @@ impl DaemonHistoryStore {
         expected_revision: u64,
     ) -> Result<bool, DaemonHistoryStoreError> {
         validate_history_id(id)?;
+        let expected_revision_sql = revision_to_sql(expected_revision)?;
         let mut conn = self.connection()?;
         // Take the writer lock before classifying a failed conditional delete.
         // Otherwise another writer could change the row between the DELETE and
@@ -626,12 +629,10 @@ impl DaemonHistoryStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(DaemonHistoryStoreError::Query)?;
-        let expected_revision_u64 = expected_revision;
-        let expected_revision = i64::try_from(expected_revision).unwrap_or(i64::MAX);
         let removed = tx
             .execute(
                 "DELETE FROM history_entries WHERE id = ?1 AND revision = ?2",
-                params![id, expected_revision],
+                params![id, expected_revision_sql],
             )
             .map_err(DaemonHistoryStoreError::Query)?;
 
@@ -646,7 +647,7 @@ impl DaemonHistoryStore {
             .query_row(
                 "SELECT revision FROM history_entries WHERE id = ?1",
                 params![id],
-                |row| row.get::<_, i64>(0),
+                |row| row_revision(row, 0),
             )
             .optional()
             .map_err(DaemonHistoryStoreError::Query)?;
@@ -656,23 +657,10 @@ impl DaemonHistoryStore {
                 Ok(false)
             }
             Some(actual_revision) => Err(DaemonHistoryStoreError::RevisionConflict {
-                expected: expected_revision_u64,
-                actual: actual_revision.max(0) as u64,
+                expected: expected_revision,
+                actual: actual_revision,
             }),
         }
-    }
-
-    pub fn delete(&self, id: &str) -> Result<bool, DaemonHistoryStoreError> {
-        validate_history_id(id)?;
-        let mut conn = self.connection()?;
-        let tx = conn.transaction().map_err(DaemonHistoryStoreError::Query)?;
-        tx.execute("DELETE FROM history_entries_fts WHERE id = ?1", params![id])
-            .map_err(DaemonHistoryStoreError::Query)?;
-        let removed = tx
-            .execute("DELETE FROM history_entries WHERE id = ?1", params![id])
-            .map_err(DaemonHistoryStoreError::Query)?;
-        tx.commit().map_err(DaemonHistoryStoreError::Query)?;
-        Ok(removed > 0)
     }
 
     pub fn delete_older_than(
@@ -1017,6 +1005,11 @@ fn apply_speaker_assignments(
     }
 }
 
+fn row_revision(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<u64> {
+    let revision: i64 = row.get(column)?;
+    u64::try_from(revision).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, revision))
+}
+
 /// Builds a [`DaemonHistoryEntry`] from a row selected via [`ENTRY_COLUMNS`].
 /// `formats` is derived here from whether `segments_json` actually holds
 /// segments, not read back from the persisted `formats` column: that column
@@ -1049,7 +1042,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<DaemonHistoryEntry>
             .and_then(DaemonHistoryProvenance::parse),
         formats: formats_for_content(has_segments),
         preview: row.get(10)?,
-        revision: row.get::<_, i64>(11)?.max(0) as u64,
+        revision: row_revision(row, 11)?,
     })
 }
 
@@ -1070,6 +1063,19 @@ fn like_substring_pattern(needle: &str) -> String {
 
 pub fn history_dir(openasr_home: impl AsRef<Path>) -> PathBuf {
     openasr_home.as_ref().join("history")
+}
+
+const MAX_HISTORY_REVISION: u64 = i64::MAX as u64;
+
+fn revision_to_sql(revision: u64) -> Result<i64, DaemonHistoryStoreError> {
+    i64::try_from(revision).map_err(|_| DaemonHistoryStoreError::RevisionOutOfRange { revision })
+}
+
+fn next_history_revision(revision: u64) -> Result<u64, DaemonHistoryStoreError> {
+    revision
+        .checked_add(1)
+        .filter(|next| *next <= MAX_HISTORY_REVISION)
+        .ok_or(DaemonHistoryStoreError::RevisionOutOfRange { revision })
 }
 
 fn validate_history_id(id: &str) -> Result<(), DaemonHistoryStoreError> {
@@ -1162,6 +1168,7 @@ fn unix_millis_now() -> u128 {
 mod tests {
     use super::*;
     use crate::api::backend::WordTimestamp;
+    use std::sync::{Arc, Barrier};
 
     #[test]
     fn daemon_history_store_records_lists_gets_and_deletes() {
@@ -1228,7 +1235,7 @@ mod tests {
         assert!(srt.contains("00:00:00,000 --> 00:00:01,500"), "{srt}");
         assert!(srt.contains("hello OpenASR history"), "{srt}");
 
-        assert!(store.delete(&entry.id).unwrap());
+        assert!(store.delete_if_revision(&entry.id, entry.revision).unwrap());
         assert!(store.list().unwrap().is_empty());
         assert!(store.get(&entry.id).unwrap().is_none());
     }
@@ -1280,6 +1287,153 @@ mod tests {
                 .unwrap()
         );
         assert!(!store.delete_if_revision("hist-missing", 0).unwrap());
+    }
+
+    #[test]
+    fn daemon_history_store_conditional_delete_serializes_against_concurrent_update() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DaemonHistoryStore::open(temp.path());
+        let entry = record_history_for_test(&store, "original transcript");
+
+        // Hold an uncommitted writer update while the delete starts on a second
+        // connection. The delete must wait for this commit, then reject the
+        // stale revision rather than observing/deleting the old row.
+        let mut conn = store.connection().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute(
+            "UPDATE history_entries SET text = 'newer transcript', preview = 'newer transcript', \
+             revision = revision + 1 WHERE id = ?1",
+            params![entry.id],
+        )
+        .unwrap();
+        tx.execute(
+            "DELETE FROM history_entries_fts WHERE id = ?1",
+            params![entry.id],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO history_entries_fts (id, search_text) VALUES (?1, 'newer transcript')",
+            params![entry.id],
+        )
+        .unwrap();
+
+        let delete_store = DaemonHistoryStore::open(temp.path());
+        let id = entry.id.clone();
+        let start = Arc::new(Barrier::new(2));
+        let delete_start = Arc::clone(&start);
+        let handle = std::thread::spawn(move || {
+            delete_start.wait();
+            delete_store.delete_if_revision(&id, entry.revision)
+        });
+        start.wait();
+        tx.commit().unwrap();
+
+        assert!(matches!(
+            handle.join().unwrap().unwrap_err(),
+            DaemonHistoryStoreError::RevisionConflict {
+                expected: 0,
+                actual: 1
+            }
+        ));
+        let retained = store.get(&entry.id).unwrap().unwrap();
+        assert_eq!(retained.text, "newer transcript");
+        assert_eq!(retained.entry.revision, 1);
+        assert_eq!(
+            store
+                .query(&DaemonHistoryQuery {
+                    search: Some("newer".into()),
+                    ..Default::default()
+                })
+                .unwrap()
+                .total,
+            1
+        );
+        assert_eq!(
+            store
+                .query(&DaemonHistoryQuery {
+                    search: Some("original".into()),
+                    ..Default::default()
+                })
+                .unwrap()
+                .total,
+            0
+        );
+
+        assert!(store.delete_if_revision(&entry.id, 1).unwrap());
+        assert_eq!(
+            store
+                .query(&DaemonHistoryQuery {
+                    search: Some("newer".into()),
+                    ..Default::default()
+                })
+                .unwrap()
+                .total,
+            0
+        );
+    }
+
+    #[test]
+    fn daemon_history_store_rejects_revision_overflow_without_deleting_or_updating() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DaemonHistoryStore::open(temp.path());
+        let entry = record_history_for_test(&store, "max revision");
+        let conn = store.connection().unwrap();
+        conn.execute(
+            "UPDATE history_entries SET revision = ?1 WHERE id = ?2",
+            params![i64::MAX, entry.id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let max = i64::MAX as u64;
+        assert_eq!(store.get(&entry.id).unwrap().unwrap().entry.revision, max);
+        assert!(matches!(
+            store.delete_if_revision(&entry.id, u64::MAX),
+            Err(DaemonHistoryStoreError::RevisionOutOfRange { revision: u64::MAX })
+        ));
+        assert_eq!(store.get(&entry.id).unwrap().unwrap().entry.revision, max);
+        assert!(matches!(
+            store.replace_transcript(
+                &entry.id,
+                max,
+                &crate::api::backend::Transcription {
+                    text: "must not update".into(),
+                    ..Default::default()
+                }
+            ),
+            Err(DaemonHistoryStoreError::RevisionOutOfRange { revision })
+                if revision == max
+        ));
+        assert_eq!(store.get(&entry.id).unwrap().unwrap().text, "max revision");
+        assert!(store.delete_if_revision(&entry.id, max).unwrap());
+    }
+
+    #[test]
+    fn daemon_history_store_rejects_negative_persisted_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DaemonHistoryStore::open(temp.path());
+        let entry = record_history_for_test(&store, "negative revision");
+        let conn = store.connection().unwrap();
+        conn.execute(
+            "UPDATE history_entries SET revision = -1 WHERE id = ?1",
+            params![entry.id],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(store.get(&entry.id).is_err());
+        assert!(store.delete_if_revision(&entry.id, 0).is_err());
+        let conn = store.connection().unwrap();
+        let revision: i64 = conn
+            .query_row(
+                "SELECT revision FROM history_entries WHERE id = ?1",
+                params![entry.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revision, -1);
     }
 
     #[test]

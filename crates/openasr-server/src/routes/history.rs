@@ -274,7 +274,10 @@ fn history_assignment_error(
         DaemonHistoryStoreError::RevisionConflict { .. } => ApiError::Conflict(error.to_string()),
         DaemonHistoryStoreError::InvalidId { .. }
         | DaemonHistoryStoreError::InvalidSpeakerAssignment(_)
-        | DaemonHistoryStoreError::InvalidRecord { .. } => ApiError::BadRequest(error.to_string()),
+        | DaemonHistoryStoreError::InvalidRecord { .. }
+        | DaemonHistoryStoreError::RevisionOutOfRange { .. } => {
+            ApiError::BadRequest(error.to_string())
+        }
         other => ApiError::History(other),
     }
 }
@@ -282,10 +285,15 @@ fn history_assignment_error(
 pub(crate) async fn history_delete(
     AxumPath(id): AxumPath<String>,
     Extension(distribution): Extension<DistributionContext>,
+    headers: HeaderMap,
 ) -> Result<Json<DeleteHistoryResponse>, ApiError> {
+    let expected_revision = parse_required_quoted_if_match(&headers)?;
     let home = distribution.openasr_home()?;
     let store = DaemonHistoryStore::open(&home);
-    if !store.delete(&id).map_err(ApiError::History)? {
+    if !store
+        .delete_if_revision(&id, expected_revision)
+        .map_err(history_assignment_error)?
+    {
         return Err(ApiError::NotFound(format!("History entry not found: {id}")));
     }
     Ok(Json(DeleteHistoryResponse { deleted: true, id }))
@@ -365,5 +373,15 @@ mod tests {
             },
         );
         assert!(matches!(err, ApiError::Conflict(_)));
+    }
+
+    #[test]
+    fn revision_out_of_range_maps_to_bad_request() {
+        let err = history_assignment_error(
+            openasr_core::realtime::history::DaemonHistoryStoreError::RevisionOutOfRange {
+                revision: u64::MAX,
+            },
+        );
+        assert!(matches!(err, ApiError::BadRequest(_)));
     }
 }

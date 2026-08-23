@@ -4366,6 +4366,7 @@ async fn transcriptions_record_file_history_in_sqlite_store() {
             Request::builder()
                 .method("DELETE")
                 .uri(format!("/v1/history/{id}"))
+                .header("if-match", format!("\"{}\"", entry["revision"]))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -4385,6 +4386,106 @@ async fn transcriptions_record_file_history_in_sqlite_store() {
     let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
     let parsed: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(parsed["data"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn history_delete_requires_matching_if_match_revision() {
+    use openasr_core::realtime::history::{
+        DaemonHistoryKind, DaemonHistoryProvenance, DaemonHistoryRecord, DaemonHistoryStore,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    enable_history(&temp);
+    let home = temp.path().join("home");
+    let store = DaemonHistoryStore::open(&home);
+    let entry = store
+        .record(DaemonHistoryRecord {
+            kind: DaemonHistoryKind::File,
+            model: "whisper-large-v3-turbo".into(),
+            source_name: Some("sample.wav".into()),
+            duration_seconds: None,
+            output_format: Some(ResponseFormat::Text),
+            diarization_active: Some(false),
+            provenance: Some(DaemonHistoryProvenance::Recorded),
+            text: "original transcript".into(),
+            segments: Vec::new(),
+            subtitle_cues: Vec::new(),
+            timeline_quality: None,
+        })
+        .unwrap();
+    store
+        .replace_transcript(
+            &entry.id,
+            entry.revision,
+            &openasr_core::Transcription {
+                text: "newer transcript".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/history/{}", entry.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/history/{}", entry.id))
+                .header(header::IF_MATCH, "\"0\"")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/history/{}", entry.id))
+                .header(header::IF_MATCH, "\"1\"")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/history/{}", entry.id))
+                .header(header::IF_MATCH, "\"1\"")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
