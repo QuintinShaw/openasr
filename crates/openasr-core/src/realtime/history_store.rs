@@ -56,6 +56,15 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+#[cfg(test)]
+use std::{
+    cell::Cell,
+    sync::{
+        Condvar, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
 use crate::ResponseFormat;
 use crate::api::backend::Segment;
 use crate::subtitle::TimelineQuality;
@@ -64,6 +73,52 @@ use crate::subtitle::TimelineQuality;
 /// [`DaemonHistoryStore::connection`]. See that method for why this can't
 /// rely on `busy_timeout` alone.
 static CONNECTION_SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+// Test-only handshake: the callback fires only once this delete connection's
+// BEGIN IMMEDIATE actually encounters the writer-held SQLite lock.
+thread_local! {
+    static TEST_HISTORY_BUSY_HANDLER_ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+static TEST_HISTORY_BUSY_WAITING: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+static TEST_HISTORY_BUSY_WAITER: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
+
+#[cfg(test)]
+fn arm_test_history_busy_handler() {
+    TEST_HISTORY_BUSY_WAITING.store(false, Ordering::Release);
+    TEST_HISTORY_BUSY_HANDLER_ARMED.with(|armed| armed.set(true));
+}
+
+#[cfg(test)]
+fn disarm_test_history_busy_handler() {
+    TEST_HISTORY_BUSY_HANDLER_ARMED.with(|armed| armed.set(false));
+}
+
+#[cfg(test)]
+fn test_history_busy_handler(_count: i32) -> bool {
+    TEST_HISTORY_BUSY_WAITING.store(true, Ordering::Release);
+    let (_, waiter) = TEST_HISTORY_BUSY_WAITER.get_or_init(|| (Mutex::new(()), Condvar::new()));
+    waiter.notify_all();
+    true
+}
+
+#[cfg(test)]
+fn install_test_history_busy_handler(conn: &Connection) -> rusqlite::Result<()> {
+    conn.busy_handler(Some(test_history_busy_handler))
+}
+
+#[cfg(test)]
+fn wait_for_test_history_busy_handler() {
+    let (lock, waiter) = TEST_HISTORY_BUSY_WAITER.get_or_init(|| (Mutex::new(()), Condvar::new()));
+    let mut guard = lock.lock().unwrap();
+    while !TEST_HISTORY_BUSY_WAITING.load(Ordering::Acquire) {
+        guard = waiter.wait(guard).unwrap();
+    }
+}
 
 /// Columns shared by every query that needs to build a [`DaemonHistoryEntry`]
 /// via [`row_to_entry`]. Deliberately selects `segments_json` instead of the
@@ -622,6 +677,10 @@ impl DaemonHistoryStore {
         validate_history_id(id)?;
         let expected_revision_sql = revision_to_sql(expected_revision)?;
         let mut conn = self.connection()?;
+        #[cfg(test)]
+        if TEST_HISTORY_BUSY_HANDLER_ARMED.with(Cell::get) {
+            install_test_history_busy_handler(&conn).map_err(DaemonHistoryStoreError::Query)?;
+        }
         // Take the writer lock before classifying a failed conditional delete.
         // Otherwise another writer could change the row between the DELETE and
         // the diagnostic SELECT, reintroducing the very TOCTOU this primitive
@@ -1325,9 +1384,13 @@ mod tests {
         let delete_start = Arc::clone(&start);
         let handle = std::thread::spawn(move || {
             delete_start.wait();
-            delete_store.delete_if_revision(&id, entry.revision)
+            arm_test_history_busy_handler();
+            let result = delete_store.delete_if_revision(&id, entry.revision);
+            disarm_test_history_busy_handler();
+            result
         });
         start.wait();
+        wait_for_test_history_busy_handler();
         tx.commit().unwrap();
 
         assert!(matches!(
