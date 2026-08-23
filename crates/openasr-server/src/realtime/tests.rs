@@ -1,8 +1,17 @@
 //! Unit tests for the realtime module. Pure code-motion from `realtime.rs`.
 
-use std::{fs, num::NonZeroUsize};
+use std::{
+    fs,
+    io::{Read, Write},
+    num::NonZeroUsize,
+};
+
+use sha2::{Digest, Sha256};
 
 use super::*;
+use crate::routes::transcription::{
+    resolve_execution_route_for_target, validate_native_runtime_pack,
+};
 use crate::{NativeExecutionSupervisor, PairingCredentialState};
 
 fn test_distribution() -> DistributionContext {
@@ -5702,4 +5711,320 @@ fn diarize_sample_spans_map_split_samples_to_stream_time() {
     let rebased = rebase_diarize_sample_spans(spans, 480);
     assert_eq!(rebased, vec![(0, 1_030), (160, 1_040)]);
     assert_eq!(diarize_sample_abs_ms(&rebased, 0), Some(1_030));
+}
+
+#[derive(Debug, serde::Serialize)]
+struct HostOwnerAttributionReport {
+    schema: &'static str,
+    pack_path: String,
+    pack_sha256: String,
+    model_id: String,
+    requested_backend: String,
+    requested_target: String,
+    observed_providers: Vec<String>,
+    attribution: HostOwnerAttribution,
+    baseline: openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+    after_startup_warmup: openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+    after_offline_transcribe: openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+}
+
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+enum HostOwnerAttribution {
+    SupportedEquivalentDuplicatedWeights,
+    RejectedSingleOrNonEquivalentOwners,
+    AttributionIncomplete,
+}
+
+fn hash_file_sha256(path: &std::path::Path) -> std::io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn receipt_provider_names(
+    snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+) -> Vec<String> {
+    let mut providers = snapshot
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            openasr_core::runtime_receipts::RuntimeReceiptEvent::OwnerCreated {
+                descriptor,
+                ..
+            } => descriptor
+                .lane
+                .map(|lane| lane.provider.as_str().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    providers.sort();
+    providers.dedup();
+    providers
+}
+
+fn receipt_lanes(
+    snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+) -> Vec<openasr_core::runtime_receipts::SafeExecutionLaneProjection> {
+    let mut lanes = snapshot
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            openasr_core::runtime_receipts::RuntimeReceiptEvent::OwnerCreated {
+                descriptor,
+                ..
+            } => descriptor.lane,
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    lanes.sort_by_key(|lane| format!("{lane:?}"));
+    lanes.dedup();
+    lanes
+}
+
+fn evaluate_host_owner_attribution(
+    snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+) -> HostOwnerAttribution {
+    use openasr_core::runtime_receipts::{RuntimeReceiptAvailability, RuntimeReceiptMetric};
+
+    if !matches!(snapshot.availability, RuntimeReceiptAvailability::Available)
+        || !snapshot.completeness.complete
+    {
+        return HostOwnerAttribution::AttributionIncomplete;
+    }
+
+    let mut resources = Vec::new();
+    for owner in &snapshot.live_owners {
+        for resource in owner.resources.values() {
+            let RuntimeReceiptMetric::Known(retained) = resource.descriptor.retained else {
+                return HostOwnerAttribution::AttributionIncomplete;
+            };
+            let Some(lane) = owner.descriptor.lane else {
+                return HostOwnerAttribution::AttributionIncomplete;
+            };
+            let Some(content) = owner.descriptor.content else {
+                // A redacted-but-absent content key cannot bind two owners to the
+                // same pack. Do not infer duplication from RSS or component names.
+                return HostOwnerAttribution::AttributionIncomplete;
+            };
+            resources.push((
+                owner.descriptor.component,
+                content,
+                lane,
+                resource.descriptor.kind,
+                resource.descriptor.domain,
+                retained,
+            ));
+        }
+    }
+
+    let expected = 5_090_000_000_u64;
+    let tolerance = 512 * 1024 * 1024_u64;
+    let equivalent = resources.iter().enumerate().any(|(index, left)| {
+        resources.iter().skip(index + 1).any(|right| {
+            left.0 == right.0
+                && left.1 == right.1
+                && left.2 == right.2
+                && left.3 == right.3
+                && left.4 == right.4
+                && left.5.abs_diff(expected) <= tolerance
+                && right.5.abs_diff(expected) <= tolerance
+        })
+    });
+    if equivalent {
+        HostOwnerAttribution::SupportedEquivalentDuplicatedWeights
+    } else {
+        // A single owner, different components, or a different retained-size
+        // shape rejects the duplicated-weight hypothesis. 11.49 GB is never a
+        // pass condition; the decision is based on owner/resource receipts.
+        HostOwnerAttribution::RejectedSingleOrNonEquivalentOwners
+    }
+}
+
+/// Host-local Phase-0 incident harness. It intentionally uses one injected
+/// service root for startup warm-up and offline transcription, then records the
+/// v1 receipt snapshot plus a strong pack identity under the isolated home.
+#[tokio::test]
+#[ignore = "host-local: set OPENASR_FIRERED_LLM_PACK and OPENASR_GGML_BACKEND=cpu|metal|vulkan"]
+async fn firered_llm_owner_attribution_host_local_phase0() {
+    let pack_path = match openasr_core::testing::external_test_fixture_path(
+        "OPENASR_FIRERED_LLM_PACK",
+        "FireRed2 LLM .oasr pack",
+    ) {
+        Ok(path) => path,
+        Err(skip) => {
+            eprintln!("SKIP: {skip}");
+            return;
+        }
+    };
+    let audio_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav");
+    if !audio_path.is_file() {
+        eprintln!("SKIP: missing real audio fixture {}", audio_path.display());
+        return;
+    }
+
+    let requested_backend = match std::env::var("OPENASR_GGML_BACKEND").as_deref() {
+        Ok("cpu") | Ok("metal") | Ok("vulkan") => std::env::var("OPENASR_GGML_BACKEND").unwrap(),
+        Ok(other) => panic!("unsupported OPENASR_GGML_BACKEND={other}; use cpu, metal, or vulkan"),
+        Err(_) => {
+            eprintln!("SKIP: OPENASR_GGML_BACKEND must explicitly select cpu, metal, or vulkan");
+            return;
+        }
+    };
+    let target = if requested_backend == "cpu" {
+        openasr_core::ExecutionTarget::Cpu
+    } else {
+        openasr_core::ExecutionTarget::Accelerated
+    };
+    let route = resolve_execution_route_for_target(Some(target))
+        .expect("explicit target route resolution must not fail");
+    if target == openasr_core::ExecutionTarget::Accelerated && route.is_none() {
+        eprintln!("SKIP: requested accelerated provider is unavailable on this host");
+        return;
+    }
+    if let Some(route) = route.as_ref()
+        && route.provider.as_str() != requested_backend
+    {
+        eprintln!(
+            "SKIP: requested provider {requested_backend} resolved to {}",
+            route.provider.as_str()
+        );
+        return;
+    }
+
+    let pack_sha256 = hash_file_sha256(&pack_path).expect("hash real FireRed pack");
+    let adapter = validate_native_runtime_pack(&pack_path)
+        .expect("OPENASR_FIRERED_LLM_PACK must be a valid native runtime pack");
+    let identity = adapter
+        .verified_runtime_model_identity(None)
+        .expect("validated pack must expose a verified model identity");
+    assert!(
+        identity.model_id.to_ascii_lowercase().contains("firered"),
+        "OPENASR_FIRERED_LLM_PACK resolved to unexpected model id {}",
+        identity.model_id
+    );
+
+    let home = tempfile::tempdir().expect("create isolated OPENASR_HOME");
+    let home_path = home.path().to_path_buf();
+    let _home_guard = EnvVarGuard::set("OPENASR_HOME", &home_path);
+    let _backend_guard = EnvVarGuard::set("OPENASR_GGML_BACKEND", &requested_backend);
+    let mut preferences = openasr_core::config::load_config_document(&home_path).unwrap();
+    preferences.preferences.execution_target = target;
+    openasr_core::config::save_config_document(&home_path, &preferences).unwrap();
+
+    let services = std::sync::Arc::new(
+        openasr_core::NativeExecutionServices::for_local_process()
+            .expect("isolated native execution service root must construct"),
+    );
+    let runtime = ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::with_execution_services(
+            NonZeroUsize::new(1).unwrap(),
+            std::sync::Arc::clone(&services),
+        ),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_path.clone()).into(),
+    };
+    let baseline = services.runtime_receipts().snapshot();
+    assert!(matches!(
+        baseline.availability,
+        openasr_core::runtime_receipts::RuntimeReceiptAvailability::Available
+    ));
+    assert!(baseline.completeness.complete);
+
+    // This is the same startup warm-up path used by the server, with the same
+    // pack, isolated preference target, service root, and exact lane selection.
+    warm_up_default_native_streaming_worker(runtime.clone()).await;
+    let after_startup_warmup = services.runtime_receipts().snapshot();
+    assert!(after_startup_warmup.completeness.complete);
+    let startup_lanes = receipt_lanes(&after_startup_warmup);
+    assert!(
+        !startup_lanes.is_empty(),
+        "startup warm-up must emit an actual execution lane receipt"
+    );
+
+    let mut request =
+        openasr_core::TranscriptionRequest::new(audio_path, identity.model_id.clone());
+    request.model_pack_path = Some(pack_path.clone());
+    request.execution_target = Some(target);
+    let transcription = transcribe_with_runtime(
+        runtime,
+        request,
+        std::sync::Arc::new(openasr_core::RequestExecutionContext::uncancellable(
+            "host-local owner attribution",
+        )),
+    )
+    .await
+    .expect("validated FireRed pack must transcribe the real fixture offline");
+    assert!(!transcription.text.trim().is_empty());
+    let after_offline_transcribe = services.runtime_receipts().snapshot();
+    assert_eq!(
+        after_offline_transcribe.schema,
+        openasr_core::runtime_receipts::RUNTIME_RECEIPT_SCHEMA
+    );
+    assert!(after_offline_transcribe.completeness.complete);
+    assert!(
+        after_offline_transcribe.events.iter().any(|event| matches!(
+            event,
+            openasr_core::runtime_receipts::RuntimeReceiptEvent::OwnerCreated { .. }
+        )),
+        "receipt lifecycle must include owner creation"
+    );
+    assert!(
+        after_offline_transcribe.events.iter().any(|event| matches!(
+            event,
+            openasr_core::runtime_receipts::RuntimeReceiptEvent::ResourceAcquired { .. }
+        )),
+        "receipt lifecycle must include resource acquisition"
+    );
+    assert!(
+        after_offline_transcribe.events.iter().any(|event| matches!(
+            event,
+            openasr_core::runtime_receipts::RuntimeReceiptEvent::OwnerReleased { .. }
+        )),
+        "receipt lifecycle must include owner release"
+    );
+
+    let observed_providers = receipt_provider_names(&after_offline_transcribe);
+    assert!(
+        !observed_providers.is_empty(),
+        "receipt must report the actual execution provider"
+    );
+    assert_eq!(
+        receipt_lanes(&after_offline_transcribe),
+        startup_lanes,
+        "startup warm-up and offline transcription must use the same exact receipt lane"
+    );
+    if requested_backend == "cpu" {
+        assert_eq!(observed_providers, vec!["cpu"]);
+    } else {
+        assert_eq!(observed_providers, vec![requested_backend.clone()]);
+    }
+
+    let report = HostOwnerAttributionReport {
+        schema: after_offline_transcribe.schema,
+        pack_path: pack_path.display().to_string(),
+        pack_sha256,
+        model_id: identity.model_id,
+        requested_backend,
+        requested_target: format!("{target:?}"),
+        observed_providers,
+        attribution: evaluate_host_owner_attribution(&after_offline_transcribe),
+        baseline,
+        after_startup_warmup,
+        after_offline_transcribe,
+    };
+    let report_path = home_path.join("runtime-owner-attribution.json");
+    let report_contents = serde_json::to_vec_pretty(&report).expect("serialize attribution report");
+    fs::write(&report_path, report_contents).expect("persist attribution report");
+    eprintln!("owner attribution report: {}", report_path.display());
 }
