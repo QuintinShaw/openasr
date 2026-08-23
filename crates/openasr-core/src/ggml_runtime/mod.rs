@@ -75,12 +75,17 @@ pub(crate) use cpu_graph::{
 };
 pub use decode_conformance::{
     DecodeFirstDivergenceClass, EncoderDecoderSplitLane, EncoderDecoderSplitProbeRecord,
-    SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS, ShortAudioReceiptDecodeDiagnostics,
-    ShortAudioReceiptDecodeStep, ShortAudioReceiptOutputPlan, ShortAudioReceiptReuseMode,
+    EncoderKernelStageClass, SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS,
+    ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptDecodeStep, ShortAudioReceiptOutputPlan,
+    ShortAudioReceiptReuseMode,
 };
 #[allow(unused_imports)]
 pub(crate) use decode_conformance::{
-    DiagnosticFamilyCompactPolicy, classify_four_quadrant_first_divergence,
+    DiagnosticFamilyCompactPolicy, DiagnosticFourQuadrantClassificationInput,
+    EncoderKernelStageChecksumPair, EncoderKernelStageClassification,
+    EncoderKernelStageClassificationInput, EncoderKernelStageLayerChecksums,
+    classify_encoder_kernel_stage, classify_four_quadrant_first_divergence,
+    diagnostic_host_first_max_token, diagnostic_logits_sha256, diagnostic_top2,
     run_diagnostic_dual_output_conformance, run_diagnostic_four_quadrant_cpu_probe,
     synthetic_cpu_encoder_decoder_split_record,
 };

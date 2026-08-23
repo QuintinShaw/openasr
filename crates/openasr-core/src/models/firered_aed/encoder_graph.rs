@@ -209,6 +209,25 @@ impl FireRedEncoderGraphRuntime {
         )
     }
 
+    /// Test-only bisection twin of [`Self::encode`]; does not change the
+    /// production encoder graph.
+    #[cfg(test)]
+    pub(crate) fn encode_with_layer_taps(
+        &mut self,
+        cmvn_features: &[f32],
+        n_frames: usize,
+        tap_layer_idx: Option<usize>,
+    ) -> Result<FireRedEncoderTapDump, FireRedEncoderError> {
+        encode_with_layer_taps(
+            &mut self.runner,
+            &self.weights,
+            self.metadata,
+            cmvn_features,
+            n_frames,
+            tap_layer_idx,
+        )
+    }
+
     pub(crate) fn release_transient_compute_memory(&mut self) -> Result<(), FireRedEncoderError> {
         self.runner
             .release_transient_scheduler_working_set()
@@ -1984,3 +2003,7 @@ mod parity_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "encoder_kernel_stage_probe.rs"]
+mod encoder_kernel_stage_probe;

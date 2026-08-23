@@ -243,6 +243,194 @@ pub struct DiagnosticFourQuadrantClassificationInput<'a> {
     pub cpu_reference: Option<&'a [i32]>,
 }
 
+/// First FireRed encoder kernel-stage fork between two checksumed runs.
+///
+/// Intra-block order is `ffn1_out` -> `attn_out` (relative-position attention)
+/// -> `conv_out` (depthwise) -> `ffn2_out` -> `block_out`. This enum is the
+/// contract three-way split; macaron FFN, subsample stem, and "no fork" all
+/// collapse to [`Self::InsufficientEvidence`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncoderKernelStageClass {
+    RelativePositionAttention,
+    DepthwiseConvolution,
+    EncoderReadback,
+    InsufficientEvidence,
+}
+
+/// Bit-exact SHA-256 pair (`diagnostic_logits_sha256` hex) for one tap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncoderKernelStageChecksumPair<'a> {
+    pub cpu: &'a str,
+    pub accel: &'a str,
+}
+
+impl EncoderKernelStageChecksumPair<'_> {
+    fn differs(self) -> bool {
+        self.cpu != self.accel
+    }
+}
+
+/// Per-layer checksums for encoder kernel-stage classification.
+///
+/// Values are hex SHA-256 strings, not family tensor types, so the classifier
+/// can sit in the shared diagnostic module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncoderKernelStageLayerChecksums<'a> {
+    pub layer_index: usize,
+    pub ffn1_out: Option<EncoderKernelStageChecksumPair<'a>>,
+    pub attn_out: Option<EncoderKernelStageChecksumPair<'a>>,
+    pub conv_out: Option<EncoderKernelStageChecksumPair<'a>>,
+    pub ffn2_out: Option<EncoderKernelStageChecksumPair<'a>>,
+    pub block_out: Option<EncoderKernelStageChecksumPair<'a>>,
+}
+
+/// Checksum-string input for [`classify_encoder_kernel_stage`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncoderKernelStageClassificationInput<'a> {
+    pub subsample: Option<EncoderKernelStageChecksumPair<'a>>,
+    pub layers: &'a [EncoderKernelStageLayerChecksums<'a>],
+    pub encoder_output: Option<EncoderKernelStageChecksumPair<'a>>,
+}
+
+/// Class plus the first diverging layer/tap, when the evidence names one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncoderKernelStageClassification {
+    pub class: EncoderKernelStageClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_divergent_layer: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_divergent_tap: Option<String>,
+}
+
+fn encoder_kernel_stage_result(
+    class: EncoderKernelStageClass,
+    layer: Option<usize>,
+    tap: Option<&'static str>,
+) -> EncoderKernelStageClassification {
+    EncoderKernelStageClassification {
+        class,
+        first_divergent_layer: layer,
+        first_divergent_tap: tap.map(str::to_string),
+    }
+}
+
+/// Classify the first CPU-vs-accelerator encoder kernel-stage divergence.
+///
+/// Checksums are opaque hex strings; the caller must hash with the same
+/// bit-exact `f32::to_bits` little-endian SHA-256 as
+/// [`diagnostic_logits_sha256`].
+pub fn classify_encoder_kernel_stage(
+    input: EncoderKernelStageClassificationInput<'_>,
+) -> EncoderKernelStageClassification {
+    if input
+        .subsample
+        .is_some_and(EncoderKernelStageChecksumPair::differs)
+    {
+        return encoder_kernel_stage_result(
+            EncoderKernelStageClass::InsufficientEvidence,
+            None,
+            Some("subsample_out"),
+        );
+    }
+
+    let mut first_block_divergence: Option<&EncoderKernelStageLayerChecksums<'_>> = None;
+    for layer in input.layers {
+        if let Some(block_out) = layer.block_out
+            && block_out.differs()
+        {
+            first_block_divergence = Some(layer);
+            break;
+        }
+    }
+
+    if let Some(layer) = first_block_divergence {
+        let Some(ffn1) = layer.ffn1_out else {
+            return encoder_kernel_stage_result(
+                EncoderKernelStageClass::InsufficientEvidence,
+                Some(layer.layer_index),
+                Some("block_out"),
+            );
+        };
+        let Some(attn) = layer.attn_out else {
+            return encoder_kernel_stage_result(
+                EncoderKernelStageClass::InsufficientEvidence,
+                Some(layer.layer_index),
+                Some("block_out"),
+            );
+        };
+        let Some(conv) = layer.conv_out else {
+            return encoder_kernel_stage_result(
+                EncoderKernelStageClass::InsufficientEvidence,
+                Some(layer.layer_index),
+                Some("block_out"),
+            );
+        };
+        let Some(ffn2) = layer.ffn2_out else {
+            return encoder_kernel_stage_result(
+                EncoderKernelStageClass::InsufficientEvidence,
+                Some(layer.layer_index),
+                Some("block_out"),
+            );
+        };
+
+        if ffn1.differs() {
+            return encoder_kernel_stage_result(
+                EncoderKernelStageClass::InsufficientEvidence,
+                Some(layer.layer_index),
+                Some("ffn1_out"),
+            );
+        }
+        if attn.differs() {
+            return encoder_kernel_stage_result(
+                EncoderKernelStageClass::RelativePositionAttention,
+                Some(layer.layer_index),
+                Some("attn_out"),
+            );
+        }
+        if conv.differs() {
+            return encoder_kernel_stage_result(
+                EncoderKernelStageClass::DepthwiseConvolution,
+                Some(layer.layer_index),
+                Some("conv_out"),
+            );
+        }
+        if ffn2.differs() {
+            return encoder_kernel_stage_result(
+                EncoderKernelStageClass::InsufficientEvidence,
+                Some(layer.layer_index),
+                Some("ffn2_out"),
+            );
+        }
+        let tap = if layer
+            .block_out
+            .is_some_and(EncoderKernelStageChecksumPair::differs)
+        {
+            "block_out"
+        } else {
+            "encoder_output"
+        };
+        return encoder_kernel_stage_result(
+            EncoderKernelStageClass::EncoderReadback,
+            Some(layer.layer_index),
+            Some(tap),
+        );
+    }
+
+    if input
+        .encoder_output
+        .is_some_and(EncoderKernelStageChecksumPair::differs)
+    {
+        return encoder_kernel_stage_result(
+            EncoderKernelStageClass::EncoderReadback,
+            None,
+            Some("encoder_output"),
+        );
+    }
+
+    encoder_kernel_stage_result(EncoderKernelStageClass::InsufficientEvidence, None, None)
+}
+
 /// Host first-max oracle: the lowest finite index wins exact ties.
 pub fn diagnostic_host_first_max_token(logits: &[f32]) -> Option<i32> {
     let mut best_index = None;
@@ -893,6 +1081,180 @@ mod tests {
             }),
             DecodeFirstDivergenceClass::EncoderCrossKvAllQuadrants
         );
+    }
+
+    const SAME: EncoderKernelStageChecksumPair<'static> = EncoderKernelStageChecksumPair {
+        cpu: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        accel: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    };
+    const DIFF: EncoderKernelStageChecksumPair<'static> = EncoderKernelStageChecksumPair {
+        cpu: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        accel: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    };
+
+    fn kernel_stage_layer(
+        layer_index: usize,
+        intra: Option<(
+            EncoderKernelStageChecksumPair<'static>,
+            EncoderKernelStageChecksumPair<'static>,
+            EncoderKernelStageChecksumPair<'static>,
+            EncoderKernelStageChecksumPair<'static>,
+        )>,
+        block_out: EncoderKernelStageChecksumPair<'static>,
+    ) -> EncoderKernelStageLayerChecksums<'static> {
+        let (ffn1_out, attn_out, conv_out, ffn2_out) = match intra {
+            Some((ffn1, attn, conv, ffn2)) => (Some(ffn1), Some(attn), Some(conv), Some(ffn2)),
+            None => (None, None, None, None),
+        };
+        EncoderKernelStageLayerChecksums {
+            layer_index,
+            ffn1_out,
+            attn_out,
+            conv_out,
+            ffn2_out,
+            block_out: Some(block_out),
+        }
+    }
+
+    #[test]
+    fn classify_encoder_kernel_stage_contract_cases() {
+        let missing_intra = [kernel_stage_layer(0, None, DIFF)];
+        let missing = classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+            subsample: Some(SAME),
+            layers: &missing_intra,
+            encoder_output: Some(DIFF),
+        });
+        assert_eq!(missing.class, EncoderKernelStageClass::InsufficientEvidence);
+        assert_eq!(missing.first_divergent_layer, Some(0));
+
+        let subsample_layers = [kernel_stage_layer(0, Some((SAME, DIFF, SAME, SAME)), DIFF)];
+        let subsample = classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+            subsample: Some(DIFF),
+            layers: &subsample_layers,
+            encoder_output: Some(DIFF),
+        });
+        assert_eq!(
+            subsample.class,
+            EncoderKernelStageClass::InsufficientEvidence
+        );
+        assert_eq!(
+            subsample.first_divergent_tap.as_deref(),
+            Some("subsample_out")
+        );
+
+        let layer0_same = kernel_stage_layer(0, Some((SAME, SAME, SAME, SAME)), SAME);
+        let attn_layers = [
+            layer0_same,
+            kernel_stage_layer(1, Some((SAME, DIFF, SAME, SAME)), DIFF),
+        ];
+        let attn = classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+            subsample: Some(SAME),
+            layers: &attn_layers,
+            encoder_output: Some(DIFF),
+        });
+        assert_eq!(
+            attn.class,
+            EncoderKernelStageClass::RelativePositionAttention
+        );
+        assert_eq!(attn.first_divergent_layer, Some(1));
+        assert_eq!(attn.first_divergent_tap.as_deref(), Some("attn_out"));
+
+        let conv_layers = [kernel_stage_layer(0, Some((SAME, SAME, DIFF, SAME)), DIFF)];
+        let conv = classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+            subsample: Some(SAME),
+            layers: &conv_layers,
+            encoder_output: Some(DIFF),
+        });
+        assert_eq!(conv.class, EncoderKernelStageClass::DepthwiseConvolution);
+        assert_eq!(conv.first_divergent_tap.as_deref(), Some("conv_out"));
+
+        let ffn1_layers = [kernel_stage_layer(0, Some((DIFF, DIFF, SAME, SAME)), DIFF)];
+        let ffn1 = classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+            subsample: Some(SAME),
+            layers: &ffn1_layers,
+            encoder_output: Some(DIFF),
+        });
+        assert_eq!(ffn1.class, EncoderKernelStageClass::InsufficientEvidence);
+        assert_eq!(ffn1.first_divergent_tap.as_deref(), Some("ffn1_out"));
+
+        let ffn2_layers = [kernel_stage_layer(0, Some((SAME, SAME, SAME, DIFF)), DIFF)];
+        let ffn2 = classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+            subsample: Some(SAME),
+            layers: &ffn2_layers,
+            encoder_output: Some(DIFF),
+        });
+        assert_eq!(ffn2.class, EncoderKernelStageClass::InsufficientEvidence);
+        assert_eq!(ffn2.first_divergent_tap.as_deref(), Some("ffn2_out"));
+
+        let readback_block_layers = [kernel_stage_layer(0, Some((SAME, SAME, SAME, SAME)), DIFF)];
+        let readback_block = classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+            subsample: Some(SAME),
+            layers: &readback_block_layers,
+            encoder_output: Some(DIFF),
+        });
+        assert_eq!(
+            readback_block.class,
+            EncoderKernelStageClass::EncoderReadback
+        );
+        assert_eq!(
+            readback_block.first_divergent_tap.as_deref(),
+            Some("block_out")
+        );
+
+        let matching_layers = [kernel_stage_layer(0, Some((SAME, SAME, SAME, SAME)), SAME)];
+        let readback_output =
+            classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+                subsample: Some(SAME),
+                layers: &matching_layers,
+                encoder_output: Some(DIFF),
+            });
+        assert_eq!(
+            readback_output.class,
+            EncoderKernelStageClass::EncoderReadback
+        );
+        assert_eq!(readback_output.first_divergent_layer, None);
+        assert_eq!(
+            readback_output.first_divergent_tap.as_deref(),
+            Some("encoder_output")
+        );
+
+        let all_same = classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+            subsample: Some(SAME),
+            layers: &matching_layers,
+            encoder_output: Some(SAME),
+        });
+        assert_eq!(
+            all_same.class,
+            EncoderKernelStageClass::InsufficientEvidence
+        );
+        assert_eq!(all_same.first_divergent_layer, None);
+        assert_eq!(all_same.first_divergent_tap, None);
+    }
+
+    #[test]
+    fn classify_encoder_kernel_stage_serde_is_snake_case() {
+        let encoded = serde_json::to_string(&EncoderKernelStageClass::RelativePositionAttention)
+            .expect("serialize class");
+        assert_eq!(encoded, "\"relative_position_attention\"");
+        assert_eq!(
+            serde_json::to_string(&EncoderKernelStageClass::DepthwiseConvolution)
+                .expect("serialize class"),
+            "\"depthwise_convolution\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EncoderKernelStageClass::EncoderReadback)
+                .expect("serialize class"),
+            "\"encoder_readback\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EncoderKernelStageClass::InsufficientEvidence)
+                .expect("serialize class"),
+            "\"insufficient_evidence\""
+        );
+        let hashed = diagnostic_logits_sha256(&[1.0, -0.0, 2.5]);
+        assert_eq!(hashed.len(), 64);
+        assert_eq!(hashed, diagnostic_logits_sha256(&[1.0, -0.0, 2.5]));
+        assert_ne!(hashed, diagnostic_logits_sha256(&[1.0, 0.0, 2.5]));
     }
 
     #[test]
