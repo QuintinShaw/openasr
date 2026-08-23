@@ -298,19 +298,12 @@ pub enum GgmlDecodeReuseMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GgmlLaneEvidence {
     Unknown,
-    #[cfg(test)]
     Validated,
 }
 
 impl GgmlLaneEvidence {
-    #[cfg(test)]
     const fn is_validated(self) -> bool {
         matches!(self, Self::Validated)
-    }
-
-    #[cfg(not(test))]
-    const fn is_validated(self) -> bool {
-        false
     }
 }
 
@@ -386,6 +379,19 @@ impl GgmlLaneDecodeEvidence {
         }
     }
 
+    /// CPU is the only production lane with proven native `ARGMAX_FIRST`.
+    /// Reuse stays unknown, so the planner still emits FreshGraph.
+    const fn cpu_native_first_max_token() -> Self {
+        Self {
+            compact_selector: GgmlLaneCompactSelectorEvidence {
+                first_max: GgmlLaneEvidence::Unknown,
+                last_max: GgmlLaneEvidence::Unknown,
+                native_first_max_token: GgmlLaneEvidence::Validated,
+            },
+            reuse: GgmlLaneReuseEvidence::unknown(),
+        }
+    }
+
     #[cfg(test)]
     const fn validated_native_first_max_token() -> Self {
         Self {
@@ -426,6 +432,13 @@ impl GgmlLaneDecodeEvidence {
             },
             reuse: GgmlLaneReuseEvidence::unknown(),
         }
+    }
+}
+
+fn lane_decode_evidence_for_backend(backend: GgmlCpuGraphBackend) -> GgmlLaneDecodeEvidence {
+    match backend {
+        GgmlCpuGraphBackend::Cpu => GgmlLaneDecodeEvidence::cpu_native_first_max_token(),
+        GgmlCpuGraphBackend::Metal | GgmlCpuGraphBackend::Gpu => GgmlLaneDecodeEvidence::unknown(),
     }
 }
 
@@ -928,10 +941,11 @@ impl ResolvedFamilyRuntimeInput {
     ) -> Self {
         let backend =
             GgmlCpuGraphConfig::resolve_family_backend_for_preference(preference.clone(), policy);
-        // Do not infer compact support from provider names, backend classes, or
-        // generic first/last-max semantics. Until the selected-device proof is
-        // connected here, every native compact request falls back to FullLogits.
-        let evidence = GgmlLaneDecodeEvidence::unknown();
+        // Compact native first-max is authorized only for the proven CPU lane.
+        // Metal/CUDA/Vulkan/HIP stay Unknown and therefore FullLogits. Generic
+        // first/last-max semantics never authorize the compact result. Reuse
+        // evidence stays Unknown in production, so every lane is FreshGraph.
+        let evidence = lane_decode_evidence_for_backend(backend);
         Self {
             backend,
             native_gqa: resolve_native_gqa_capability(preference.as_ref(), backend),
@@ -4074,6 +4088,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.new_tensor_checked(raw, "ggml_get_rows")
     }
 
+    #[allow(dead_code)] // last-max primitive; unused until a native last-max lane is authorized
     pub(crate) fn top1_argmax(
         &self,
         input: GgmlCpuTensor<'a>,
@@ -4107,49 +4122,6 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.ensure_tensor_contiguous(input, "ggml_argmax_first input")?;
         let raw = unsafe { ffi::ggml_argmax_first(self.context.as_ptr(), input.raw.as_ptr()) };
         self.new_tensor_checked(raw, "ggml_argmax_first")
-    }
-
-    /// OpenASR greedy top-1 uses first-max tie semantics. Native ggml argmax
-    /// returns the last exact max, so reverse every logits row first and let the
-    /// caller map each returned reversed index back to the original id.
-    pub(crate) fn top1_argmax_first_max_reversed(
-        &self,
-        input: GgmlCpuTensor<'a>,
-        reverse_indices: GgmlCpuTensor<'a>,
-    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
-        let shape = self.tensor_shape_4d(input)?;
-        if shape[2] != 1 || shape[3] != 1 {
-            return Err(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "ggml_first_max_argmax input must be a rank-2 row matrix",
-            });
-        }
-        let index_shape = self.tensor_shape_4d(reverse_indices)?;
-        if index_shape != [shape[0], 1, 1, 1] {
-            return Err(GgmlCpuGraphError::UnsupportedInputs {
-                reason: "ggml_first_max_argmax reverse index shape mismatch",
-            });
-        }
-        self.ensure_tensor_type(input, ffi::GGML_TYPE_F32, "ggml_first_max_argmax input")?;
-        self.ensure_tensor_type(
-            reverse_indices,
-            ffi::GGML_TYPE_I32,
-            "ggml_first_max_argmax reverse indices",
-        )?;
-
-        let reversed = if shape[1] == 1 {
-            let logits_as_rows = self.reshape_2d(input, 1, shape[0])?;
-            let reversed = self.get_rows(logits_as_rows, reverse_indices)?;
-            let reversed = self.cont(reversed)?;
-            self.reshape_2d(reversed, shape[0], 1)?
-        } else {
-            // `get_rows` selects along ne1. Transpose [vocab, rows] into
-            // [rows, vocab], select vocab rows in reverse order, then restore
-            // the original row-major logits shape before row-wise argmax.
-            let transposed = self.cont(self.transpose(input)?)?;
-            let reversed_transposed = self.get_rows(transposed, reverse_indices)?;
-            self.cont(self.transpose(reversed_transposed)?)?
-        };
-        self.top1_argmax(reversed)
     }
 
     #[cfg(test)]
@@ -11958,6 +11930,15 @@ mod tests {
             score_vector.output_plan(),
             GgmlDecodeOutputPlan::CompleteScores
         );
+
+        let cpu = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+            Some(RequestBackendPreference::CpuOnly),
+            super::AutoGpuPolicy::AllBackends,
+            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+        );
+        assert_eq!(cpu.backend(), super::GgmlCpuGraphBackend::Cpu);
+        assert_eq!(cpu.output_plan(), GgmlDecodeOutputPlan::NativeFirstMaxToken);
+        assert_eq!(cpu.reuse_mode(), super::GgmlDecodeReuseMode::FreshGraph);
     }
 
     #[test]
@@ -15176,55 +15157,6 @@ mod tests {
             .expect("top_k(1) should compute");
         assert_eq!(top1_index, vec![3]);
         assert_eq!(topk_index, vec![3]);
-    }
-
-    #[test]
-    fn rowwise_first_max_argmax_preserves_tie_order() {
-        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
-            .expect("cpu graph runner should initialize");
-        let mut arena = runner
-            .start_static_tensor_arena(1024 * 1024)
-            .expect("static arena should initialize");
-        let reverse_indices = arena
-            .new_tensor_1d_i32(4, "reverse_indices")
-            .expect("reverse-index allocation should succeed");
-        arena
-            .set_i32_slice(reverse_indices, &[3, 2, 1, 0], "reverse_indices")
-            .expect("reverse indices upload should succeed");
-
-        let mut graph = runner.start_graph();
-        let logits = graph
-            .new_tensor_2d_f32(4, 3, "rowwise_logits")
-            .expect("logits allocation should succeed");
-        graph
-            .set_input(logits)
-            .expect("logits set_input should succeed");
-        let top1 = graph
-            .top1_argmax_first_max_reversed(logits, arena.graph_tensor(reverse_indices))
-            .expect("rowwise first-max argmax should build");
-        graph
-            .set_output(top1)
-            .expect("set_output should succeed before allocation");
-        graph
-            .set_f32_slice(
-                logits,
-                &[
-                    1.0, 5.0, 5.0, 2.0, // first maximum is index 1
-                    9.0, 3.0, 2.0, 1.0, // maximum is index 0
-                    7.0, 7.0, 7.0, 7.0, // first maximum is index 0
-                ],
-                "rowwise_logits",
-            )
-            .expect("logits upload should succeed");
-
-        let reversed = graph
-            .compute_output_i32(top1, 3)
-            .expect("rowwise argmax should compute");
-        let original = reversed
-            .into_iter()
-            .map(|index| 3 - index)
-            .collect::<Vec<_>>();
-        assert_eq!(original, vec![1, 0, 0]);
     }
 
     #[test]

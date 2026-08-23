@@ -702,6 +702,7 @@ unsafe extern "C" {
         a: GgmlTensorRaw,
         b: GgmlTensorRaw,
     ) -> GgmlTensorRaw;
+    #[allow(dead_code)] // last-max binding; unused until a native last-max lane is authorized
     pub(crate) fn ggml_argmax(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
     pub(crate) fn ggml_argmax_first(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
     #[cfg(test)]

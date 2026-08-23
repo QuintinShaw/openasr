@@ -279,17 +279,11 @@ fn cohere_greedy_step_output_mode(
     word_timestamps: bool,
     debug_tokens: bool,
 ) -> DeviceGreedyStepOutputMode {
-    // Cohere never consumes the compact plan. Keep the conversion explicit so
-    // adapter, phrase-bias, timestamp, debug, streaming, and serve-batch paths
-    // cannot accidentally authorize a device-selected token.
     let output_mode = match resolved_runtime.output_plan() {
+        GgmlDecodeOutputPlan::NativeFirstMaxToken => DeviceGreedyStepOutputMode::DeviceTop1,
         GgmlDecodeOutputPlan::FullLogits | GgmlDecodeOutputPlan::CompleteScores => {
             DeviceGreedyStepOutputMode::FullLogits
         }
-        // Cohere's host decode consumes phrase bias, timestamps, and text
-        // observers; even a future compact planner proof must not authorize a
-        // device-selected token for this family.
-        GgmlDecodeOutputPlan::NativeFirstMaxToken => DeviceGreedyStepOutputMode::FullLogits,
     };
     let _ = (
         force_full_logits,

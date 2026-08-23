@@ -37,10 +37,7 @@ use crate::ggml_runtime::{
 use crate::models::decode_policy_component_registry::{
     BuiltinSeq2SeqDecodePolicyConfigInput, run_builtin_seq2seq_decode_policy,
 };
-use crate::models::device_greedy_token::{
-    DeviceGreedyStepOutputMode, first_max_argmax_reverse_indices,
-    first_max_token_id_from_reversed_argmax,
-};
+use crate::models::device_greedy_token::{DeviceGreedyStepOutputMode, device_top1_token_id};
 use crate::models::seq2seq_decoder_state::Seq2SeqDecoderState;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeStepExecutor,
@@ -96,14 +93,8 @@ fn map_err(step: &'static str, source: GgmlCpuGraphError) -> FireRedDecoderError
 /// into their own backend buffer sized from the tensors' actual shapes
 /// (`ggml_backend_alloc_ctx_tensors`), independent of this context's size.
 /// Previously hardcoded to a flat 256 MiB regardless of layer count.
-fn firered_decoder_arena_context_bytes(
-    decoder_n_layers: usize,
-    greedy_step_output_mode: DeviceGreedyStepOutputMode,
-) -> usize {
+fn firered_decoder_arena_context_bytes(decoder_n_layers: usize) -> usize {
     let tensor_count = FIRERED_DECODER_ARENA_FIXED_TENSORS
-        .saturating_add(usize::from(
-            greedy_step_output_mode == DeviceGreedyStepOutputMode::DeviceTop1,
-        ))
         .saturating_add(FIRERED_DECODER_ARENA_TENSORS_PER_LAYER.saturating_mul(decoder_n_layers));
     GgmlCpuGraphConfig::metadata_context_bytes(tensor_count)
 }
@@ -141,9 +132,6 @@ pub(crate) struct FireRedDecoderGraphRuntime {
     /// Shared zero bias for the two bias-free K projections (self-attn and
     /// cross-attn `w_ks`), length `d_model`.
     zero_bias: GgmlStaticTensor,
-    /// Reverse vocabulary rows used to preserve the shared driver's first-max
-    /// tie semantics when a direct CUDA/Vulkan graph returns only top-1.
-    argmax_reverse_indices: Option<GgmlStaticTensor>,
     cross_layers: Vec<FireRedDecoderCrossCacheLayer>,
     self_kv_layers: Vec<FireRedDecoderSelfKvLayer>,
     decoder_state: Seq2SeqDecoderState,
@@ -176,7 +164,6 @@ pub(crate) struct FireRedDecoderGraphRuntime {
 struct FireRedDecoderArenaState {
     arena: GgmlStaticTensorArena,
     zero_bias: GgmlStaticTensor,
-    argmax_reverse_indices: Option<GgmlStaticTensor>,
     cross_layers: Vec<FireRedDecoderCrossCacheLayer>,
     self_kv_layers: Vec<FireRedDecoderSelfKvLayer>,
 }
@@ -186,28 +173,17 @@ fn build_firered_decoder_arena_state(
     metadata: &FireRedAedExecutionMetadata,
     self_kv_capacity_positions: usize,
     cross_capacity_frames: usize,
-    greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    _greedy_step_output_mode: DeviceGreedyStepOutputMode,
     reuse_mode: GgmlDecodeReuseMode,
 ) -> Result<FireRedDecoderArenaState, FireRedDecoderError> {
     let arena = runner
         .start_static_tensor_arena(firered_decoder_arena_context_bytes(
             metadata.decoder_n_layers,
-            greedy_step_output_mode,
         ))
         .map_err(|source| map_err("static_tensor_arena", source))?;
     let zero_bias = arena
         .new_tensor_1d_f32(metadata.d_model, "firered_dec_zero_bias")
         .map_err(|source| map_err("zero_bias_alloc", source))?;
-    let argmax_reverse_indices =
-        if greedy_step_output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
-            Some(
-                arena
-                    .new_tensor_1d_i32(metadata.vocab_size, "firered_dec_argmax_reverse_indices")
-                    .map_err(|source| map_err("argmax_reverse_indices_alloc", source))?,
-            )
-        } else {
-            None
-        };
     let mut cross_layers = Vec::with_capacity(metadata.decoder_n_layers);
     let mut self_kv_layers = Vec::with_capacity(metadata.decoder_n_layers);
     for _ in 0..metadata.decoder_n_layers {
@@ -254,16 +230,6 @@ fn build_firered_decoder_arena_state(
             "firered_dec_zero_bias",
         )
         .map_err(|source| map_err("zero_bias_upload", source))?;
-    if let Some(reverse_indices) = argmax_reverse_indices {
-        arena
-            .set_i32_slice(
-                reverse_indices,
-                &first_max_argmax_reverse_indices(metadata.vocab_size)
-                    .map_err(|source| map_err("argmax_reverse_indices", source))?,
-                "firered_dec_argmax_reverse_indices",
-            )
-            .map_err(|source| map_err("argmax_reverse_indices_upload", source))?;
-    }
 
     // Zero-fill the persistent self-KV tensors so the fixed-span reusable
     // decode graph's masked (not-yet-written) rows never feed uninitialized
@@ -306,7 +272,6 @@ fn build_firered_decoder_arena_state(
     Ok(FireRedDecoderArenaState {
         arena,
         zero_bias,
-        argmax_reverse_indices,
         cross_layers,
         self_kv_layers,
     })
@@ -461,14 +426,6 @@ impl FireRedDecoderGraphRuntime {
         let persistent_graph_context_bytes = config.context_bytes;
         let runner =
             GgmlCpuGraphRunner::new(config).map_err(|source| map_err("runner_init", source))?;
-        if greedy_step_output_mode == DeviceGreedyStepOutputMode::DeviceTop1
-            && (reuse_mode != GgmlDecodeReuseMode::ReusableGraph
-                || !reusable_decode_graph_supported_for_runner(&runner))
-        {
-            return Err(FireRedDecoderError::InvalidInput {
-                reason: "device top-1 requires a direct GPU-class decoder runner".to_string(),
-            });
-        }
         let loaded = runner
             .load_gguf_weight_context_from_preflight(preflight)
             .map_err(|source| map_err("load_gguf_weight_context", source))?;
@@ -491,7 +448,6 @@ impl FireRedDecoderGraphRuntime {
             persistent_graph_context_bytes,
             arena: arena_state.arena,
             zero_bias: arena_state.zero_bias,
-            argmax_reverse_indices: arena_state.argmax_reverse_indices,
             cross_layers: arena_state.cross_layers,
             self_kv_layers: arena_state.self_kv_layers,
             decoder_state,
@@ -939,17 +895,9 @@ impl FireRedDecoderGraphRuntime {
             .mul_mat(self.weights.out_proj_weight.as_graph_tensor(), last_state)
             .map_err(|source| map_err("output_proj", source))?;
         let top1 = if output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
-            let reverse_indices =
-                self.argmax_reverse_indices
-                    .ok_or(FireRedDecoderError::InvalidInput {
-                        reason: "device top-1 reverse indices are unavailable".to_string(),
-                    })?;
             Some(
                 graph
-                    .top1_argmax_first_max_reversed(
-                        logits,
-                        self.arena.graph_tensor(reverse_indices),
-                    )
+                    .top1_argmax_first_max(logits)
                     .map_err(|source| map_err("output_top1", source))?,
             )
         } else {
@@ -992,7 +940,7 @@ impl FireRedDecoderGraphRuntime {
 
         let output = match top1 {
             Some(top1) => {
-                let reversed_token_id = graph
+                let token_id = graph
                     .compute_output_i32(top1, 1)
                     .map_err(|error| FireRedDecoderError::GraphExecutionFailed {
                         reason: error.to_string(),
@@ -1004,8 +952,8 @@ impl FireRedDecoderGraphRuntime {
                     })?;
                 Seq2SeqGreedyDecodeStepLogitsOutput {
                     logits: Vec::new(),
-                    greedy_token_hint: Some(map_reversed_top1_token(
-                        reversed_token_id,
+                    greedy_token_hint: Some(map_device_top1_token(
+                        token_id,
                         self.metadata.vocab_size,
                     )?),
                 }
@@ -1112,7 +1060,7 @@ impl FireRedDecoderGraphRuntime {
 
         let output = match top1 {
             Some(top1) => {
-                let reversed_token_id = graph
+                let token_id = graph
                     .compute_output_i32(top1, 1)
                     .map_err(|error| FireRedDecoderError::GraphExecutionFailed {
                         reason: error.to_string(),
@@ -1124,8 +1072,8 @@ impl FireRedDecoderGraphRuntime {
                     })?;
                 Seq2SeqGreedyDecodeStepLogitsOutput {
                     logits: Vec::new(),
-                    greedy_token_hint: Some(map_reversed_top1_token(
-                        reversed_token_id,
+                    greedy_token_hint: Some(map_device_top1_token(
+                        token_id,
                         self.metadata.vocab_size,
                     )?),
                 }
@@ -1299,17 +1247,9 @@ impl FireRedDecoderGraphRuntime {
             .mul_mat(self.weights.out_proj_weight.as_graph_tensor(), last_state)
             .map_err(|source| map_err("reuse_output_proj", source))?;
         let top1 = if output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
-            let reverse_indices =
-                self.argmax_reverse_indices
-                    .ok_or(FireRedDecoderError::InvalidInput {
-                        reason: "device top-1 reverse indices are unavailable".to_string(),
-                    })?;
             Some(
                 graph
-                    .top1_argmax_first_max_reversed(
-                        logits,
-                        self.arena.graph_tensor(reverse_indices),
-                    )
+                    .top1_argmax_first_max(logits)
                     .map_err(|source| map_err("reuse_output_top1", source))?,
             )
         } else {
@@ -1352,23 +1292,14 @@ fn firered_decoder_construction_transient_system_memory_bytes(
     metadata: FireRedAedExecutionMetadata,
     decoder_state: Seq2SeqDecoderState,
     reusable_graph_supported: bool,
-    greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    _greedy_step_output_mode: DeviceGreedyStepOutputMode,
 ) -> Result<u64, String> {
     let zero_bias_bytes = metadata
         .d_model
         .checked_mul(std::mem::size_of::<f32>())
         .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or_else(|| "firered-aed zero-bias staging byte count overflowed".to_string())?;
-    let reverse_indices_bytes = if greedy_step_output_mode == DeviceGreedyStepOutputMode::DeviceTop1
-    {
-        quoted_vec_capacity_bytes::<i32>(
-            metadata.vocab_size,
-            "firered-aed argmax reverse-index staging",
-        )?
-    } else {
-        0
-    };
-    let base_transient = zero_bias_bytes.max(reverse_indices_bytes);
+    let base_transient = zero_bias_bytes;
     if !reusable_graph_supported {
         return Ok(base_transient);
     }
@@ -1382,26 +1313,20 @@ fn firered_decoder_construction_transient_system_memory_bytes(
     Ok(base_transient.max(self_kv_zero_bytes))
 }
 
-fn map_reversed_top1_token(
-    reversed_token_id: i32,
-    vocab_size: usize,
-) -> Result<u32, FireRedDecoderError> {
-    let token_id = first_max_token_id_from_reversed_argmax(reversed_token_id, vocab_size).map_err(
-        |error| FireRedDecoderError::GraphExecutionFailed {
+fn map_device_top1_token(token_id: i32, vocab_size: usize) -> Result<u32, FireRedDecoderError> {
+    device_top1_token_id(token_id, vocab_size).map_err(|error| {
+        FireRedDecoderError::GraphExecutionFailed {
             reason: error.to_string(),
-        },
-    )?;
-    u32::try_from(token_id).map_err(|_| FireRedDecoderError::GraphExecutionFailed {
-        reason: format!("device top-1 token id {token_id} does not fit u32"),
+        }
     })
 }
 
 /// firered-aed decodes through the shared seq2seq greedy driver: every step
 /// recomputes logits for the full `<sos> ++ generated` prefix (the incremental
 /// KV cache inside [`Self::compute_step_logits`] makes this cheap after the
-/// prefill). The output plan is resolved by `ResolvedFamilyRuntimeInput`; until
-/// selected-device evidence is connected, every production route returns full
-/// logits and keeps the host argmax path.
+/// prefill). The output plan is resolved by `ResolvedFamilyRuntimeInput`; only
+/// a proven CPU native first-max plan uses compact device top-1. Unproven lanes
+/// keep FullDevice execution and read back complete logits.
 impl Seq2SeqGreedyDecodeStepExecutor for FireRedDecoderGraphRuntime {
     fn decode_step_logits(
         &mut self,

@@ -10,9 +10,7 @@ use crate::ggml_runtime::{
     GgufTensorDataReader, env_toggle_with_raw,
 };
 #[cfg(test)]
-use crate::models::device_greedy_token::{
-    first_max_argmax_reverse_indices, first_max_token_id_from_reversed_argmax,
-};
+use crate::models::device_greedy_token::device_top1_token_id;
 
 use super::graph_config::{qwen_decoder_graph_config, qwen_runtime_graph_config};
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
@@ -25,7 +23,7 @@ pub(crate) const DEFAULT_RMS_NORM_EPSILON: f32 = 1e-6;
 // argmax. Keep a small structural margin for metadata-only views without
 // coupling this helper to the whole decoder's much larger graph budget.
 const QWEN3_LLM_LOGITS_GRAPH_NODE_CAPACITY: usize = 64;
-const QWEN3_LLM_LOGITS_STATIC_TENSOR_COUNT: usize = 3;
+const QWEN3_LLM_LOGITS_STATIC_TENSOR_COUNT: usize = 2;
 const OPENASR_QWEN3_LLM_LOGITS_GGML_ENV: &str = "OPENASR_QWEN3_LLM_LOGITS_GGML";
 static NEXT_LOGITS_HEAD_RUNTIME_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
@@ -769,8 +767,6 @@ struct Qwen3AsrLlmLogitsHeadGraphExecutor {
     arena: GgmlStaticTensorArena,
     output_norm_weight: GgmlStaticTensor,
     output_weight: GgmlStaticTensor,
-    #[cfg(test)]
-    argmax_reverse_indices: GgmlStaticTensor,
 }
 
 impl fmt::Debug for Qwen3AsrLlmLogitsHeadGraphExecutor {
@@ -825,9 +821,6 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
             output_weight.ggml_type,
             "qwen_llm_logits_output_weight",
         )?;
-        #[cfg(test)]
-        let argmax_reverse_indices =
-            arena.new_tensor_1d_i32(vocab_size, "qwen_llm_logits_argmax_reverse_indices")?;
         arena.set_f32_slice(
             norm,
             output_norm_weight,
@@ -838,12 +831,6 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
             output_weight.payload.bytes(),
             "qwen_llm_logits_output_weight",
         )?;
-        #[cfg(test)]
-        arena.set_i32_slice(
-            argmax_reverse_indices,
-            &first_max_argmax_reverse_indices(vocab_size)?,
-            "qwen_llm_logits_argmax_reverse_indices",
-        )?;
         Ok(Self {
             d_model,
             vocab_size,
@@ -852,8 +839,6 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
             arena,
             output_norm_weight: norm,
             output_weight: weight,
-            #[cfg(test)]
-            argmax_reverse_indices,
         })
     }
 
@@ -940,18 +925,19 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
         let normed = graph.rms_norm(hidden_tensor, self.rms_norm_epsilon)?;
         let normed = graph.mul(normed, self.arena.graph_tensor(self.output_norm_weight))?;
         let logits = graph.mul_mat(self.arena.graph_tensor(self.output_weight), normed)?;
-        let top1 = graph.top1_argmax_first_max_reversed(
-            logits,
-            self.arena.graph_tensor(self.argmax_reverse_indices),
-        )?;
+        let top1 = graph.top1_argmax_first_max(logits)?;
         graph.set_output(top1)?;
         graph.prepare_outputs_for_upload(&[top1])?;
         graph.set_f32_slice(hidden_tensor, hidden, "qwen_llm_logits_top1_hidden_rows")?;
         graph
             .compute_output_i32(top1, row_count)?
             .into_iter()
-            .map(|reversed_token_id| {
-                first_max_token_id_from_reversed_argmax(reversed_token_id, self.vocab_size)
+            .map(|token_id| {
+                device_top1_token_id(token_id, self.vocab_size).and_then(|id| {
+                    i32::try_from(id).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "device top-1 token id does not fit i32",
+                    })
+                })
             })
             .collect()
     }

@@ -50,36 +50,22 @@ pub(crate) fn device_greedy_step_output_mode(
     DeviceGreedyStepOutputMode::FullLogits
 }
 
-pub(crate) fn first_max_argmax_reverse_indices(
+pub(crate) fn device_top1_token_id(
+    token_id: i32,
     vocab_size: usize,
-) -> Result<Vec<i32>, GgmlCpuGraphError> {
-    (0..vocab_size)
-        .rev()
-        .map(|index| {
-            i32::try_from(index).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
-                reason: "first-max argmax vocab index exceeds ggml int boundary",
-            })
-        })
-        .collect()
-}
-
-pub(crate) fn first_max_token_id_from_reversed_argmax(
-    reversed_token_id: i32,
-    vocab_size: usize,
-) -> Result<i32, GgmlCpuGraphError> {
-    let reversed_index =
-        usize::try_from(reversed_token_id).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
-            reason: "first-max argmax reversed token id is negative",
-        })?;
-    if reversed_index >= vocab_size {
+) -> Result<u32, GgmlCpuGraphError> {
+    let token = u32::try_from(token_id).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+        reason: "device top-1 token id is negative",
+    })?;
+    if usize::try_from(token)
+        .ok()
+        .is_none_or(|id| id >= vocab_size)
+    {
         return Err(GgmlCpuGraphError::UnsupportedInputs {
-            reason: "first-max argmax reversed token id is outside vocab size",
+            reason: "device top-1 token id is outside vocab size",
         });
     }
-    let original_index = vocab_size - 1 - reversed_index;
-    i32::try_from(original_index).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
-        reason: "first-max argmax token id exceeds ggml int boundary",
-    })
+    Ok(token)
 }
 
 #[cfg(test)]
@@ -130,19 +116,30 @@ mod tests {
     }
 
     #[test]
-    fn complete_output_plan_is_the_only_production_default() {
-        let resolved = ResolvedFamilyRuntimeInput::resolve(None, AutoGpuPolicy::AllBackends);
+    fn cpu_lane_authorizes_native_first_max_without_reuse() {
+        let resolved = ResolvedFamilyRuntimeInput::resolve(
+            Some(RequestBackendPreference::CpuOnly),
+            AutoGpuPolicy::AllBackends,
+        );
+        assert_eq!(resolved.backend(), GgmlCpuGraphBackend::Cpu);
+        assert_eq!(
+            resolved.output_plan(),
+            GgmlDecodeOutputPlan::NativeFirstMaxToken
+        );
+        assert_eq!(
+            resolved.reuse_mode(),
+            crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph
+        );
         assert_eq!(
             device_greedy_step_output_mode_for_resolved_runtime(resolved),
-            DeviceGreedyStepOutputMode::FullLogits
+            DeviceGreedyStepOutputMode::DeviceTop1
         );
     }
 
     #[test]
-    fn cpu_graph_first_max_oracle_mapping_remains_testable_without_production_reachability() {
-        assert_eq!(
-            first_max_token_id_from_reversed_argmax(2, 4).expect("mapped token"),
-            1
-        );
+    fn device_top1_token_id_rejects_out_of_range_values() {
+        assert_eq!(device_top1_token_id(2, 4).expect("in-range token"), 2);
+        assert!(device_top1_token_id(-1, 4).is_err());
+        assert!(device_top1_token_id(4, 4).is_err());
     }
 }

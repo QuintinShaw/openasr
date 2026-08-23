@@ -1189,7 +1189,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_decode_plan_stays_full_logits_and_fresh_without_evidence() {
+    fn resolved_cpu_decode_plan_uses_native_first_max_without_reuse() {
         let resolved = ResolvedFamilyRuntimeInput::resolve(
             Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
             crate::ggml_runtime::AutoGpuPolicy::AllBackends,
@@ -1198,11 +1198,14 @@ mod tests {
             resolved.output_contract(),
             GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits
         );
-        assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
+        assert_eq!(
+            resolved.output_plan(),
+            GgmlDecodeOutputPlan::NativeFirstMaxToken
+        );
         assert_eq!(resolved.reuse_mode(), GgmlDecodeReuseMode::FreshGraph);
         assert_eq!(
             moonshine_greedy_step_output_mode(resolved, false, false, false, false),
-            DeviceGreedyStepOutputMode::FullLogits
+            DeviceGreedyStepOutputMode::DeviceTop1
         );
     }
 

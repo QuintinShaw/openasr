@@ -26,9 +26,7 @@ use super::decoder_contract::{QwenDecoderContract, QwenDecoderContractGeometry};
 use super::graph_config::qwen_decoder_graph_config;
 use super::kv_cache::{Qwen3AsrKvCacheCapacity, Qwen3AsrLayerKvCacheState};
 #[cfg(test)]
-use crate::models::device_greedy_token::{
-    first_max_argmax_reverse_indices, first_max_token_id_from_reversed_argmax,
-};
+use crate::models::device_greedy_token::device_top1_token_id;
 
 use super::logits_head::{Qwen3AsrLlmFusedLogitsHeadSpec, Qwen3AsrLlmLogitsHead};
 use super::lora::{QwenLayerLoraSlots, QwenLoraAdapter, new_qwen_lora_slot};
@@ -1101,7 +1099,6 @@ struct Qwen3AsrLlmFusedLogitsHeadHandles {
     rms_norm_epsilon: f32,
     output_norm_weight: GgmlStaticTensor,
     output_weight: LlmWeightHandle,
-    argmax_reverse_indices: GgmlStaticTensor,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2050,8 +2047,6 @@ fn allocate_fused_logits_head_tensors(
 
     let output_norm_weight =
         arena.new_tensor_1d_f32(dims.d_model, "qwen_llm_fused_output_norm_weight")?;
-    let argmax_reverse_indices =
-        arena.new_tensor_1d_i32(spec.vocab_size, "qwen_llm_fused_argmax_reverse_indices")?;
     let output_weight =
         match loaded.and_then(|context| context.tensor(spec.output_weight_tensor_name)) {
             Some(tensor) => LlmWeightHandle::Loaded(tensor),
@@ -2068,7 +2063,6 @@ fn allocate_fused_logits_head_tensors(
         rms_norm_epsilon: spec.rms_norm_epsilon,
         output_norm_weight,
         output_weight,
-        argmax_reverse_indices,
     })
 }
 
@@ -2082,11 +2076,6 @@ fn upload_fused_logits_head_weights(
         handles.output_norm_weight,
         spec.output_norm_weight,
         "qwen_llm_fused_output_norm_weight",
-    )?;
-    arena.set_i32_slice(
-        handles.argmax_reverse_indices,
-        &first_max_argmax_reverse_indices(spec.vocab_size)?,
-        "qwen_llm_fused_argmax_reverse_indices",
     )?;
     if let Some(output_weight) = handles.output_weight.arena_handle() {
         arena.set_bytes_slice(
@@ -2114,26 +2103,15 @@ fn build_fused_logits_top1<'a>(
     let normed = graph.rms_norm(state, logits_head.rms_norm_epsilon)?;
     let normed = graph.mul(normed, arena.graph_tensor(logits_head.output_norm_weight))?;
     let logits = graph.mul_mat(logits_head.output_weight.as_graph_tensor(arena), normed)?;
-    graph.top1_argmax_first_max_reversed(
-        logits,
-        arena.graph_tensor(logits_head.argmax_reverse_indices),
-    )
+    graph.top1_argmax_first_max(logits)
 }
 
 #[cfg(test)]
 fn validate_fused_top1_token_id(
-    reversed_token_id: i32,
+    token_id: i32,
     vocab_size: usize,
 ) -> Result<u32, GgmlCpuGraphError> {
-    let token_id =
-        first_max_token_id_from_reversed_argmax(reversed_token_id, vocab_size).map_err(|_| {
-            GgmlCpuGraphError::UnsupportedInputs {
-                reason: "whole-decoder fused top1 token id is outside vocab size",
-            }
-        })?;
-    u32::try_from(token_id).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
-        reason: "whole-decoder fused top1 token id is outside vocab size",
-    })
+    device_top1_token_id(token_id, vocab_size)
 }
 
 /// Upload one decode layer's weight data into the previously-allocated arena

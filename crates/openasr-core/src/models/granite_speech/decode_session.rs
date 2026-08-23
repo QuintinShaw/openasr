@@ -77,12 +77,9 @@ use std::collections::HashMap;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
     GgmlKvElementType, GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlPersistentGraphSession,
-    GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlRopeExtParams,
 };
-use crate::models::device_greedy_token::{
-    DeviceGreedyStepOutputMode, first_max_argmax_reverse_indices,
-    first_max_token_id_from_reversed_argmax,
-};
+use crate::models::device_greedy_token::{DeviceGreedyStepOutputMode, device_top1_token_id};
 use crate::models::mapped_token_embedding::MappedTokenEmbeddingDeviceSpec;
 use crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeStepLogitsOutput;
 use crate::models::system_memory_owner::{
@@ -423,9 +420,6 @@ pub(crate) struct GraniteSpeechDecodeSession {
     /// `runner`, `weights`/`_loaded`, and the `resident_kv` arena, all declared
     /// below and therefore dropped after it.
     reuse: Option<GraniteReusableDecodeGraph>,
-    /// Device-only first-max support. Declared before `runner` so reusable
-    /// graphs borrowing its reverse-index tensor drop first.
-    greedy_top1: Option<GraniteDeviceGreedyTop1State>,
     greedy_step_output_mode: DeviceGreedyStepOutputMode,
     config: GraniteSpeechDecoderConfig,
     runner: GgmlCpuGraphRunner,
@@ -498,11 +492,6 @@ struct GraniteReusableDecodeGraph {
     top1: Option<GgmlCpuTensor<'static>>,
 }
 
-struct GraniteDeviceGreedyTop1State {
-    arena: GgmlStaticTensorArena,
-    reverse_indices: GgmlStaticTensor,
-}
-
 #[derive(Clone, Copy)]
 struct GraniteDeviceTokenEmbedding {
     tensor: GgmlLoadedTensor,
@@ -529,43 +518,11 @@ impl GraniteReusableDecodeInput<'_> {
     }
 }
 
-fn build_device_greedy_top1_state(
-    runner: &GgmlCpuGraphRunner,
-    vocab_size: usize,
-    output_mode: DeviceGreedyStepOutputMode,
-) -> Result<Option<GraniteDeviceGreedyTop1State>, GraniteSpeechDecoderError> {
-    if output_mode == DeviceGreedyStepOutputMode::FullLogits {
-        return Ok(None);
-    }
-    let mut arena = runner
-        .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(1))
-        .map_err(map_ggml("device_top1_arena"))?;
-    let reverse_indices = arena
-        .new_tensor_1d_i32(vocab_size, "granite_argmax_reverse_indices")
-        .map_err(map_ggml("device_top1_reverse_indices_alloc"))?;
-    arena
-        .set_i32_slice(
-            reverse_indices,
-            &first_max_argmax_reverse_indices(vocab_size)
-                .map_err(map_ggml("device_top1_reverse_indices"))?,
-            "granite_argmax_reverse_indices",
-        )
-        .map_err(map_ggml("device_top1_reverse_indices_upload"))?;
-    Ok(Some(GraniteDeviceGreedyTop1State {
-        arena,
-        reverse_indices,
-    }))
-}
-
-fn map_reversed_top1_token(
-    reversed_token_id: i32,
+fn map_device_top1_token(
+    token_id: i32,
     vocab_size: usize,
 ) -> Result<u32, GraniteSpeechDecoderError> {
-    let token_id = first_max_token_id_from_reversed_argmax(reversed_token_id, vocab_size)
-        .map_err(map_ggml("device_top1_map_token"))?;
-    u32::try_from(token_id).map_err(|_| GraniteSpeechDecoderError::Shape {
-        reason: format!("granite device top-1 token id {token_id} does not fit u32"),
-    })
+    device_top1_token_id(token_id, vocab_size).map_err(map_ggml("device_top1_map_token"))
 }
 
 impl GraniteSpeechDecodeSession {
@@ -580,19 +537,10 @@ impl GraniteSpeechDecodeSession {
     }
 
     pub(crate) fn quoted_construction_transient_system_memory_bytes(
-        config: &GraniteSpeechDecoderConfig,
-        output_mode: DeviceGreedyStepOutputMode,
+        _config: &GraniteSpeechDecoderConfig,
+        _output_mode: DeviceGreedyStepOutputMode,
     ) -> Result<u64, String> {
-        if output_mode == DeviceGreedyStepOutputMode::FullLogits {
-            return Ok(0);
-        }
-        config
-            .vocab_size
-            .checked_mul(std::mem::size_of::<i32>())
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or_else(|| {
-                "granite device top-1 reverse-index staging byte count overflowed".to_string()
-            })
+        Ok(0)
     }
 
     pub(crate) fn construction_transient_system_memory_bytes(&self) -> Result<u64, String> {
@@ -690,19 +638,8 @@ impl GraniteSpeechDecodeSession {
         loaded: Option<GgmlLoadedWeightContext>,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
     ) -> Result<Self, GraniteSpeechDecoderError> {
-        if greedy_step_output_mode == DeviceGreedyStepOutputMode::DeviceTop1
-            && (runner.backend_kind() != GgmlCpuGraphBackend::Gpu
-                || !reusable_decode_graph_supported_for_runner(&runner))
-        {
-            return Err(GraniteSpeechDecoderError::Shape {
-                reason: "granite device top-1 requires a direct GPU decoder runner".to_string(),
-            });
-        }
-        let greedy_top1 =
-            build_device_greedy_top1_state(&runner, config.vocab_size, greedy_step_output_mode)?;
         Ok(Self {
             reuse: None,
-            greedy_top1,
             greedy_step_output_mode,
             config,
             runner,
@@ -806,7 +743,6 @@ impl GraniteSpeechDecodeSession {
                 GraniteResidentPrefillInput::Embeddings(embeddings),
                 n_tokens,
                 DeviceGreedyStepOutputMode::FullLogits,
-                self.greedy_top1.as_ref(),
             )?;
             debug_assert!(output.greedy_token_hint.is_none());
             self.seq_len = n_tokens;
@@ -910,7 +846,6 @@ impl GraniteSpeechDecodeSession {
             },
             n_tokens,
             self.greedy_step_output_mode,
-            self.greedy_top1.as_ref(),
         )?;
         self.seq_len = n_tokens;
         self.prefilled = true;
@@ -1185,10 +1120,7 @@ impl GraniteSpeechDecodeSession {
                     })?;
                 Seq2SeqGreedyDecodeStepLogitsOutput {
                     logits: Vec::new(),
-                    greedy_token_hint: Some(map_reversed_top1_token(
-                        reversed_token_id,
-                        vocab_size,
-                    )?),
+                    greedy_token_hint: Some(map_device_top1_token(reversed_token_id, vocab_size)?),
                 }
             }
             None => Seq2SeqGreedyDecodeStepLogitsOutput {
@@ -1375,18 +1307,9 @@ impl GraniteSpeechDecodeSession {
             .scale(logits_raw, 1.0 / config.logits_scaling)
             .map_err(map_ggml("reuse_logits_scale"))?;
         let top1 = if output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
-            let state =
-                self.greedy_top1
-                    .as_ref()
-                    .ok_or_else(|| GraniteSpeechDecoderError::Shape {
-                        reason: "granite device top-1 reverse indices are unavailable".to_string(),
-                    })?;
             Some(
                 graph
-                    .top1_argmax_first_max_reversed(
-                        logits,
-                        state.arena.graph_tensor(state.reverse_indices),
-                    )
+                    .top1_argmax_first_max(logits)
                     .map_err(map_ggml("reuse_output_top1"))?,
             )
         } else {
@@ -1665,7 +1588,6 @@ fn run_prefill_graph_seeding_resident(
     input: GraniteResidentPrefillInput<'_>,
     n_tokens: usize,
     output_mode: DeviceGreedyStepOutputMode,
-    greedy_top1: Option<&GraniteDeviceGreedyTop1State>,
 ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, GraniteSpeechDecoderError> {
     let head_dim = config.head_dim;
     let hidden_size = config.hidden_size;
@@ -1878,15 +1800,9 @@ fn run_prefill_graph_seeding_resident(
         .map_err(map_ggml("seed_prefill_logits_scale"))?;
 
     let top1 = if output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
-        let state = greedy_top1.ok_or_else(|| GraniteSpeechDecoderError::Shape {
-            reason: "granite device top-1 reverse indices are unavailable".to_string(),
-        })?;
         Some(
             graph
-                .top1_argmax_first_max_reversed(
-                    logits,
-                    state.arena.graph_tensor(state.reverse_indices),
-                )
+                .top1_argmax_first_max(logits)
                 .map_err(map_ggml("seed_prefill_output_top1"))?,
         )
     } else {
@@ -1971,7 +1887,7 @@ fn run_prefill_graph_seeding_resident(
                 })?;
             Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
                 logits: Vec::new(),
-                greedy_token_hint: Some(map_reversed_top1_token(reversed_token_id, vocab_size)?),
+                greedy_token_hint: Some(map_device_top1_token(reversed_token_id, vocab_size)?),
             })
         }
         None => Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
@@ -2295,7 +2211,7 @@ mod tests {
     }
 
     #[test]
-    fn device_top1_quote_counts_only_reverse_index_construction_staging() {
+    fn device_top1_quote_has_no_reverse_index_construction_staging() {
         let config = tiny_config();
         assert_eq!(
             GraniteSpeechDecodeSession::quoted_construction_transient_system_memory_bytes(
@@ -2311,15 +2227,7 @@ mod tests {
                 DeviceGreedyStepOutputMode::DeviceTop1,
             )
             .expect("device top-1 construction quote"),
-            (config.vocab_size * std::mem::size_of::<i32>()) as u64
-        );
-    }
-
-    #[test]
-    fn device_top1_reverse_mapping_preserves_first_max_token_id() {
-        assert_eq!(
-            map_reversed_top1_token(2, 4).expect("reverse top-1 mapping"),
-            1
+            0
         );
     }
 
