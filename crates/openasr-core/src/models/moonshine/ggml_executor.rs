@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+
 use thiserror::Error;
 
 use super::batched_decode::{
@@ -118,6 +121,19 @@ type MoonshineEncoderRuntimeActor =
     PinnedRuntimeActorCheckout<MoonshineEncoderRuntimeCacheKey, MoonshineEncoderActorState>;
 type MoonshineDecoderRuntimeActor =
     PinnedRuntimeActorCheckout<MoonshineDecoderRuntimeCacheKey, MoonshineDecoderActorState>;
+
+#[cfg(test)]
+static DECODER_OWNER_GRAPH_CONFIG_PROBE: OnceLock<Mutex<Option<MoonshineGraphConfigIdentity>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn record_decoder_owner_graph_config(config: GgmlCpuGraphConfig) {
+    *DECODER_OWNER_GRAPH_CONFIG_PROBE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("decoder owner graph config probe lock") =
+        Some(moonshine_graph_config_identity(config));
+}
 
 #[derive(Debug, Error)]
 enum MoonshineGgmlExecutorError {
@@ -539,6 +555,8 @@ impl MoonshineGgmlExecutor {
             key,
             move || Ok((0, (preflight, prepared, adapter))),
             move |(preflight, prepared, adapter)| {
+                #[cfg(test)]
+                record_decoder_owner_graph_config(decoder_config);
                 let runtime = MoonshineDecoderGraphRuntime::new_with_greedy_step_output_mode(
                     MoonshineDecoderRuntimeInput {
                         decoder_weights: &prepared.decoder_weights,
@@ -836,9 +854,15 @@ fn map_decoder_error(error: MoonshineDecoderGraphError) -> MoonshineGgmlExecutor
 #[cfg(test)]
 mod tests {
     use super::super::graph_config::moonshine_graph_config_identity;
+    use super::super::prepared_runtime::MoonshinePreparedRuntime;
+    use super::super::tokenizer::MoonshineTokenizer;
+    use super::super::weights::{
+        MoonshineDecoderLayerWeights, MoonshineDecoderWeights, MoonshineEncoderLayerWeights,
+        MoonshineEncoderWeights, MoonshineWeight,
+    };
     use super::{
-        ExecutionLaneKey, MoonshineDecodeFeatureKey, can_use_moonshine_serve_batch,
-        moonshine_greedy_step_output_mode,
+        DECODER_OWNER_GRAPH_CONFIG_PROBE, ExecutionLaneKey, MoonshineDecodeFeatureKey,
+        MoonshineGgmlExecutor, can_use_moonshine_serve_batch, moonshine_greedy_step_output_mode,
     };
     use crate::device::execution_policy::ExecutionPlacement;
     use crate::device::execution_route::{
@@ -847,10 +871,16 @@ mod tests {
     };
     use crate::ggml_runtime::{
         AutoGpuPolicy, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlDecodeOutputContract,
-        GgmlDecodeOutputPlan, GgmlDecodeReuseMode, RequestBackendPreference,
-        ResolvedFamilyRuntimeInput,
+        GgmlDecodeOutputPlan, GgmlDecodeReuseMode, GgufMetadataValue, GgufRuntimeSourcePreflight,
+        RequestBackendPreference, ResolvedFamilyRuntimeInput, validate_ggml_runtime_source_path,
+        write_gguf_file_v0,
     };
     use crate::models::device_greedy_token::DeviceGreedyStepOutputMode;
+    use crate::models::seq2seq_decoder_state::{Seq2SeqDecoderState, Seq2SeqStateAxis};
+    use crate::models::system_memory_owner::SystemMemoryOwner;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use tempfile::tempdir;
 
     fn fresh_runtime() -> ResolvedFamilyRuntimeInput {
         ResolvedFamilyRuntimeInput::resolve(
@@ -870,6 +900,83 @@ mod tests {
                     .expect("synthetic PCI key is valid"),
             },
         })
+    }
+
+    fn dummy_weight(name: &str) -> MoonshineWeight {
+        MoonshineWeight {
+            name: name.to_string(),
+            dims: vec![1],
+            values: vec![0.0],
+        }
+    }
+
+    fn dummy_prepared_runtime() -> MoonshinePreparedRuntime {
+        let mut tokenizer_values: BTreeMap<String, GgufMetadataValue> = BTreeMap::new();
+        tokenizer_values.insert(
+            "tokenizer.ggml.model".to_string(),
+            GgufMetadataValue::String("llama".to_string()),
+        );
+        tokenizer_values.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            GgufMetadataValue::StringArray(vec![
+                "<pad>".to_string(),
+                "<s>".to_string(),
+                "</s>".to_string(),
+            ]),
+        );
+        let tokenizer_metadata = crate::GgufMetadata::from_values_for_test(tokenizer_values);
+        let tokenizer = MoonshineTokenizer::from_gguf_metadata(&tokenizer_metadata)
+            .expect("dummy tokenizer metadata");
+        let metadata = super::super::runtime_contract::MoonshineExecutionMetadata {
+            vocab_size: 3,
+            d_model: 1,
+            encoder_layers: 0,
+            decoder_layers: 0,
+            n_heads: 1,
+            head_dim: 1,
+            rotary_dim: 0,
+            encoder_ffn_dim: 1,
+            decoder_ffn_dim: 1,
+            decoder_max_context: 1,
+            bos_token_id: 1,
+            eos_token_id: 2,
+            sample_rate_hz: 16_000,
+            rope_theta: 10_000.0,
+        };
+        MoonshinePreparedRuntime {
+            metadata,
+            tokenizer,
+            encoder_weights: MoonshineEncoderWeights {
+                conv1_weight: dummy_weight("enc.conv1.weight"),
+                conv2_weight: dummy_weight("enc.conv2.weight"),
+                conv2_bias: dummy_weight("enc.conv2.bias"),
+                conv3_weight: dummy_weight("enc.conv3.weight"),
+                conv3_bias: dummy_weight("enc.conv3.bias"),
+                groupnorm_weight: dummy_weight("enc.groupnorm.weight"),
+                groupnorm_bias: dummy_weight("enc.groupnorm.bias"),
+                out_norm: dummy_weight("enc.out_norm.weight"),
+                layers: Vec::<MoonshineEncoderLayerWeights>::new(),
+            },
+            decoder_weights: MoonshineDecoderWeights {
+                embedding: MoonshineWeight {
+                    name: "dec.emb.weight".to_string(),
+                    dims: vec![3, 1],
+                    values: vec![0.0; 3],
+                },
+                out_norm: dummy_weight("dec.out_norm.weight"),
+                layers: Vec::<MoonshineDecoderLayerWeights>::new(),
+            },
+        }
+    }
+
+    fn empty_runtime_source_preflight() -> (tempfile::TempDir, GgufRuntimeSourcePreflight) {
+        let directory = tempdir().expect("temporary runtime directory");
+        let path = directory.path().join("moonshine-empty.gguf");
+        write_gguf_file_v0(&path, &BTreeMap::new(), &[]).expect("write empty GGUF");
+        let source = validate_ggml_runtime_source_path(&path).expect("validate empty GGUF");
+        let preflight =
+            GgufRuntimeSourcePreflight::from_runtime_source(&source).expect("preflight empty GGUF");
+        (directory, preflight)
     }
 
     #[test]
@@ -911,6 +1018,89 @@ mod tests {
             .with_native_execution_lane(candidate.clone());
         assert_eq!(context.native_execution_lane(), Some(&candidate));
     }
+    #[test]
+    fn checkout_owner_consumes_captured_decoder_config_after_late_overrides() {
+        let captured_config = crate::test_process_env::with_test_process_env(
+            [(GgmlCpuGraphConfig::THREADS_ENV, None)],
+            || {
+                let _request_threads =
+                    crate::models::graph_runtime_config::install_request_inference_threads_override(
+                        Some(2),
+                    );
+                super::super::graph_config::moonshine_decoder_graph_config(
+                    GgmlCpuGraphBackend::Cpu,
+                    None,
+                )
+            },
+        );
+        let captured_identity = moonshine_graph_config_identity(captured_config);
+        *DECODER_OWNER_GRAPH_CONFIG_PROBE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("decoder owner graph config probe lock") = None;
+
+        let (_directory, preflight) = empty_runtime_source_preflight();
+        let prepared = Arc::new(SystemMemoryOwner::without_allocation(
+            dummy_prepared_runtime(),
+        ));
+        let decoder_state = Seq2SeqDecoderState {
+            self_attention: Seq2SeqStateAxis {
+                logical_positions: 1,
+                resident_positions: 1,
+                hard_position_cap: 1,
+            },
+            cross_attention: Seq2SeqStateAxis {
+                logical_positions: 1,
+                resident_positions: 1,
+                hard_position_cap: 1,
+            },
+        };
+        let lane = ExecutionLaneKey::unscoped_for_backend(GgmlCpuGraphBackend::Cpu);
+        let feature_key = MoonshineDecodeFeatureKey {
+            output_mode: DeviceGreedyStepOutputMode::FullLogits,
+            adapter_active: false,
+            phrase_bias_active: false,
+            word_timestamps: false,
+            streaming: true,
+            serve_batch: false,
+        };
+
+        let _late_request_threads =
+            crate::models::graph_runtime_config::install_request_inference_threads_override(Some(
+                8,
+            ));
+        let result = crate::test_process_env::with_test_process_env(
+            [(
+                GgmlCpuGraphConfig::THREADS_ENV,
+                Some(std::ffi::OsString::from("64")),
+            )],
+            || {
+                MoonshineGgmlExecutor::default().checkout_decoder_runtime(
+                    &preflight,
+                    prepared,
+                    None,
+                    decoder_state,
+                    fresh_runtime(),
+                    captured_config,
+                    lane,
+                    DeviceGreedyStepOutputMode::FullLogits,
+                    feature_key,
+                )
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "synthetic owner runtime should build through checkout"
+        );
+        let observed_identity = DECODER_OWNER_GRAPH_CONFIG_PROBE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("decoder owner graph config probe lock")
+            .take()
+            .expect("decoder owner build reached config consumer");
+        assert_eq!(observed_identity, captured_identity);
+    }
+
     #[test]
     fn graph_config_key_isolates_effective_thread_topology() {
         let mut one =
