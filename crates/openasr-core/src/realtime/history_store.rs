@@ -59,10 +59,8 @@ use thiserror::Error;
 #[cfg(test)]
 use std::{
     cell::Cell,
-    sync::{
-        Condvar, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Condvar, Mutex, OnceLock},
+    time::Instant,
 };
 
 use crate::ResponseFormat;
@@ -82,14 +80,32 @@ thread_local! {
 }
 
 #[cfg(test)]
-static TEST_HISTORY_BUSY_WAITING: AtomicBool = AtomicBool::new(false);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestHistoryBusyState {
+    Idle,
+    Armed,
+    Waiting,
+    Release,
+    Cancel,
+}
 
 #[cfg(test)]
-static TEST_HISTORY_BUSY_WAITER: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
+const TEST_HISTORY_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+static TEST_HISTORY_BUSY_WAITER: OnceLock<(Mutex<TestHistoryBusyState>, Condvar)> = OnceLock::new();
+
+#[cfg(test)]
+fn test_history_busy_waiter() -> &'static (Mutex<TestHistoryBusyState>, Condvar) {
+    TEST_HISTORY_BUSY_WAITER
+        .get_or_init(|| (Mutex::new(TestHistoryBusyState::Idle), Condvar::new()))
+}
 
 #[cfg(test)]
 fn arm_test_history_busy_handler() {
-    TEST_HISTORY_BUSY_WAITING.store(false, Ordering::Release);
+    let (lock, waiter) = test_history_busy_waiter();
+    *lock.lock().unwrap() = TestHistoryBusyState::Armed;
+    waiter.notify_all();
     TEST_HISTORY_BUSY_HANDLER_ARMED.with(|armed| armed.set(true));
 }
 
@@ -99,11 +115,57 @@ fn disarm_test_history_busy_handler() {
 }
 
 #[cfg(test)]
-fn test_history_busy_handler(_count: i32) -> bool {
-    TEST_HISTORY_BUSY_WAITING.store(true, Ordering::Release);
-    let (_, waiter) = TEST_HISTORY_BUSY_WAITER.get_or_init(|| (Mutex::new(()), Condvar::new()));
+fn cancel_test_history_busy_handler() {
+    let (lock, waiter) = test_history_busy_waiter();
+    *lock.lock().unwrap() = TestHistoryBusyState::Cancel;
     waiter.notify_all();
-    true
+}
+
+#[cfg(test)]
+fn release_test_history_busy_handler() {
+    let (lock, waiter) = test_history_busy_waiter();
+    *lock.lock().unwrap() = TestHistoryBusyState::Release;
+    waiter.notify_all();
+}
+
+#[cfg(test)]
+fn reset_test_history_busy_handler() {
+    let (lock, waiter) = test_history_busy_waiter();
+    *lock.lock().unwrap() = TestHistoryBusyState::Idle;
+    waiter.notify_all();
+}
+
+#[cfg(test)]
+fn test_history_busy_handler(_count: i32) -> bool {
+    let (lock, waiter) = test_history_busy_waiter();
+    let mut state = lock.lock().unwrap();
+    if *state != TestHistoryBusyState::Armed {
+        return false;
+    }
+    *state = TestHistoryBusyState::Waiting;
+    waiter.notify_all();
+    let deadline = Instant::now() + TEST_HISTORY_BUSY_TIMEOUT;
+    while *state == TestHistoryBusyState::Waiting {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            *state = TestHistoryBusyState::Cancel;
+            waiter.notify_all();
+            return false;
+        }
+        let (next_state, timeout) = waiter.wait_timeout(state, remaining).unwrap();
+        state = next_state;
+        if timeout.timed_out() && *state == TestHistoryBusyState::Waiting {
+            *state = TestHistoryBusyState::Cancel;
+            waiter.notify_all();
+            return false;
+        }
+    }
+    if *state == TestHistoryBusyState::Release {
+        *state = TestHistoryBusyState::Idle;
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -112,11 +174,38 @@ fn install_test_history_busy_handler(conn: &Connection) -> rusqlite::Result<()> 
 }
 
 #[cfg(test)]
-fn wait_for_test_history_busy_handler() {
-    let (lock, waiter) = TEST_HISTORY_BUSY_WAITER.get_or_init(|| (Mutex::new(()), Condvar::new()));
-    let mut guard = lock.lock().unwrap();
-    while !TEST_HISTORY_BUSY_WAITING.load(Ordering::Acquire) {
-        guard = waiter.wait(guard).unwrap();
+fn wait_for_test_history_busy_handler(timeout: Duration) -> Result<(), String> {
+    let (lock, waiter) = test_history_busy_waiter();
+    let mut state = lock.lock().unwrap();
+    let deadline = Instant::now() + timeout;
+    loop {
+        match *state {
+            TestHistoryBusyState::Waiting => return Ok(()),
+            TestHistoryBusyState::Cancel => {
+                return Err("busy handler cancelled before signal".into());
+            }
+            TestHistoryBusyState::Idle => {}
+            TestHistoryBusyState::Armed | TestHistoryBusyState::Release => {}
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let observed = *state;
+            *state = TestHistoryBusyState::Cancel;
+            waiter.notify_all();
+            return Err(format!(
+                "timed out waiting for SQLite busy signal (state={observed:?})"
+            ));
+        }
+        let (next_state, timeout_result) = waiter.wait_timeout(state, remaining).unwrap();
+        state = next_state;
+        if timeout_result.timed_out() {
+            let observed = *state;
+            *state = TestHistoryBusyState::Cancel;
+            waiter.notify_all();
+            return Err(format!(
+                "timed out waiting for SQLite busy signal (state={observed:?})"
+            ));
+        }
     }
 }
 
@@ -1349,6 +1438,16 @@ mod tests {
     }
 
     #[test]
+    fn daemon_history_busy_signal_timeout_cancels_without_hanging() {
+        arm_test_history_busy_handler();
+        let error = wait_for_test_history_busy_handler(Duration::from_millis(50)).unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        cancel_test_history_busy_handler();
+        disarm_test_history_busy_handler();
+        reset_test_history_busy_handler();
+    }
+
+    #[test]
     fn daemon_history_store_conditional_delete_serializes_against_concurrent_update() {
         let temp = tempfile::tempdir().unwrap();
         let store = DaemonHistoryStore::open(temp.path());
@@ -1390,11 +1489,29 @@ mod tests {
             result
         });
         start.wait();
-        wait_for_test_history_busy_handler();
-        tx.commit().unwrap();
+        if let Err(error) = wait_for_test_history_busy_handler(Duration::from_secs(2)) {
+            cancel_test_history_busy_handler();
+            drop(tx);
+            let worker_result = handle.join().unwrap();
+            reset_test_history_busy_handler();
+            panic!("{error}; delete worker result: {worker_result:?}");
+        }
+        if let Err(error) = tx.commit() {
+            cancel_test_history_busy_handler();
+            let worker_result = handle.join().unwrap();
+            reset_test_history_busy_handler();
+            panic!(
+                "could not commit concurrent update: {error}; delete worker result: {worker_result:?}"
+            );
+        }
+        // The writer commit happened while the delete worker was blocked in
+        // its busy handler; release it only after the newer revision is durable.
+        release_test_history_busy_handler();
+        let delete_result = handle.join().unwrap();
+        reset_test_history_busy_handler();
 
         assert!(matches!(
-            handle.join().unwrap().unwrap_err(),
+            delete_result.unwrap_err(),
             DaemonHistoryStoreError::RevisionConflict {
                 expected: 0,
                 actual: 1
