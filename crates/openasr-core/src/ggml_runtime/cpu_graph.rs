@@ -1502,6 +1502,7 @@ impl GgmlStaticTensor {
     pub(crate) fn as_graph_tensor<'a>(self) -> GgmlCpuTensor<'a> {
         GgmlCpuTensor {
             raw: self.raw,
+            owner_context: None,
             _marker: PhantomData,
         }
     }
@@ -1516,6 +1517,7 @@ impl GgmlLoadedTensor {
     pub(crate) fn as_graph_tensor<'a>(self) -> GgmlCpuTensor<'a> {
         GgmlCpuTensor {
             raw: self.raw,
+            owner_context: None,
             _marker: PhantomData,
         }
     }
@@ -1524,7 +1526,37 @@ impl GgmlLoadedTensor {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct GgmlCpuTensor<'a> {
     raw: NonNull<c_void>,
+    /// Provenance is carried with every graph-local tensor so output readback
+    /// cannot use a tensor borrowed from another builder or a static arena.
+    /// `None` denotes an externally owned input/weight tensor, never a valid
+    /// graph-local output declaration.
+    #[allow(dead_code)]
+    owner_context: Option<NonNull<c_void>>,
     _marker: PhantomData<&'a ()>,
+}
+
+/// Typed, lifecycle-bound declaration for one graph output. This is the only
+/// heterogeneous readback surface: callers declare each already-marked output
+/// before execution and receive values in the same order after one compute.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+pub(crate) enum GgmlCpuGraphOutputSpec<'a> {
+    F32 {
+        tensor: GgmlCpuTensor<'a>,
+        expected_len: usize,
+    },
+    I32 {
+        tensor: GgmlCpuTensor<'a>,
+        expected_len: usize,
+    },
+}
+
+/// Value returned by [`GgmlCpuGraphBuilder::compute_declared_outputs`].
+#[derive(Debug, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum GgmlCpuGraphOutputValue {
+    F32(Vec<f32>),
+    I32(Vec<i32>),
 }
 
 pub(crate) struct GgmlCpuGraphBuilder<'a> {
@@ -1553,6 +1585,10 @@ pub(crate) struct GgmlCpuGraphBuilder<'a> {
     frozen: bool,
     prepared_graph: Option<NonNull<c_void>>,
     side_effect_roots: Vec<NonNull<c_void>>,
+    /// Tensor identities explicitly marked with `set_output`. Readback only
+    /// accepts declarations from this set; ggml's raw tensor flag alone is not
+    /// enough because it cannot prove this builder owns the tensor.
+    declared_output_tensors: HashSet<usize>,
     /// A failed graph may already have committed `cpy`/`set_rows` nodes into
     /// resident model state. Never execute or upload through that graph again:
     /// its owner must drop it and rebuild a fresh session. Backend handles are
@@ -1973,6 +2009,7 @@ impl GgmlCpuGraphRunner {
             frozen: false,
             prepared_graph: None,
             side_effect_roots: Vec::new(),
+            declared_output_tensors: HashSet::new(),
             poisoned_after_failed_compute: false,
             direct_graph_private_prepared: false,
             direct_graph_private_pending: Vec::new(),
@@ -2170,6 +2207,7 @@ impl GgmlCpuGraphRunner {
             frozen: false,
             prepared_graph: None,
             side_effect_roots: Vec::new(),
+            declared_output_tensors: HashSet::new(),
             poisoned_after_failed_compute: false,
             direct_graph_private_prepared: false,
             direct_graph_private_pending: Vec::new(),
@@ -2639,6 +2677,7 @@ impl GgmlStaticTensorArena {
     pub(crate) fn graph_tensor<'a>(&self, tensor: GgmlStaticTensor) -> GgmlCpuTensor<'a> {
         GgmlCpuTensor {
             raw: tensor.raw,
+            owner_context: None,
             _marker: PhantomData,
         }
     }
@@ -3469,6 +3508,8 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     ) -> Result<(), GgmlCpuGraphError> {
         self.ensure_can_extend_graph("ggml_set_output")?;
         unsafe { ffi::ggml_set_output(tensor.raw.as_ptr()) };
+        self.declared_output_tensors
+            .insert(tensor.raw.as_ptr() as usize);
         Ok(())
     }
 
@@ -6063,6 +6104,8 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.ensure_scheduler_graph_active(graph)?;
         self.prepare_direct_graph_private_gate(graph)?;
         self.record_execution_placement(graph);
+        #[cfg(test)]
+        TEST_COMPUTE_GATE_ATTEMPT_COUNT.with(|count| count.set(count.get().saturating_add(1)));
         let compute = compute_graph_with_current_job_cancel(self.backend, self.scheduler, graph);
         let result = self.finish_compute_result(compute);
         if result.is_ok()
@@ -6232,6 +6275,92 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         Ok(outputs.remove(0))
     }
 
+    /// Executes the graph once and reads every declared output in declaration
+    /// order. The declaration is checked before allocation/compute, so a bad
+    /// type, shape, ownership, output flag, or duplicate cannot trigger a
+    /// partial execution or a second retry.
+    #[allow(dead_code)]
+    pub(crate) fn compute_declared_outputs(
+        &mut self,
+        outputs: &[GgmlCpuGraphOutputSpec<'a>],
+    ) -> Result<Vec<GgmlCpuGraphOutputValue>, GgmlCpuGraphError> {
+        self.ensure_not_poisoned()?;
+        if outputs.is_empty() {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "at least one output tensor is required",
+            });
+        }
+
+        let mut validated = Vec::with_capacity(outputs.len());
+        let mut seen = HashSet::with_capacity(outputs.len());
+        for output in outputs {
+            let (tensor, expected_type, expected_len) = match *output {
+                GgmlCpuGraphOutputSpec::F32 {
+                    tensor,
+                    expected_len,
+                } => (tensor, ffi::GGML_TYPE_F32, expected_len),
+                GgmlCpuGraphOutputSpec::I32 {
+                    tensor,
+                    expected_len,
+                } => (tensor, ffi::GGML_TYPE_I32, expected_len),
+            };
+            self.validate_declared_output(tensor, expected_type, expected_len, &mut seen)?;
+            let element_width = if expected_type == ffi::GGML_TYPE_F32 {
+                F32_WIDTH_BYTES
+            } else {
+                I32_WIDTH_BYTES
+            };
+            let expected_nbytes = expected_len.checked_mul(element_width).ok_or(
+                GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "tensor byte width overflow",
+                },
+            )?;
+            validated.push((tensor, expected_type, expected_len, expected_nbytes));
+        }
+
+        let graph_prepared = self.prepared_graph.is_some();
+        let graph = if let Some(graph) = self.prepared_graph {
+            graph
+        } else {
+            self.ensure_backend_buffer()?;
+            self.build_forward_graph_iter(validated.iter().map(|(tensor, _, _, _)| *tensor))?
+        };
+        if self.scheduler.is_some() && !graph_prepared {
+            self.allocate_scheduler_graph_for_compute(graph)?;
+        }
+        self.compute_graph_with_memory_gate(graph)?;
+
+        let mut results = Vec::with_capacity(validated.len());
+        for (tensor, expected_type, expected_len, expected_nbytes) in validated {
+            if expected_type == ffi::GGML_TYPE_F32 {
+                let mut values = vec![0.0_f32; expected_len];
+                let status = unsafe {
+                    read_tensor_bytes(
+                        tensor.raw.as_ptr(),
+                        values.as_mut_ptr().cast::<c_void>(),
+                        0,
+                        expected_nbytes,
+                    )
+                };
+                self.finish_readback_status(status)?;
+                results.push(GgmlCpuGraphOutputValue::F32(values));
+            } else {
+                let mut values = vec![0_i32; expected_len];
+                let status = unsafe {
+                    read_tensor_bytes(
+                        tensor.raw.as_ptr(),
+                        values.as_mut_ptr().cast::<c_void>(),
+                        0,
+                        expected_nbytes,
+                    )
+                };
+                self.finish_readback_status(status)?;
+                results.push(GgmlCpuGraphOutputValue::I32(values));
+            }
+        }
+        Ok(results)
+    }
+
     pub(crate) fn compute_outputs_f32(
         &mut self,
         outputs: &[(GgmlCpuTensor<'a>, usize)],
@@ -6288,7 +6417,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     output_nbytes,
                 )
             };
-            map_compute_status(status)?;
+            self.finish_readback_status(status)?;
             results.push(values);
         }
         Ok(results)
@@ -6353,11 +6482,16 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     target.len() * F32_WIDTH_BYTES,
                 )
             };
-            map_compute_status(status)?;
+            self.finish_readback_status(status)?;
         }
         Ok(())
     }
 
+    /// Compatibility surface for existing family graphs. Unlike
+    /// `compute_declared_outputs`, these tensors may be persistent external
+    /// state taps that ggml intentionally does not mark as outputs. It still
+    /// validates every requested type/byte width before one graph compute and
+    /// never exposes a raw readback operation.
     pub(crate) fn compute_outputs_f32_i32(
         &mut self,
         f32_outputs: &[(GgmlCpuTensor<'a>, usize)],
@@ -6441,7 +6575,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     output_nbytes,
                 )
             };
-            map_compute_status(status)?;
+            self.finish_readback_status(status)?;
             f32_results.push(values);
         }
 
@@ -6456,7 +6590,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     output_nbytes,
                 )
             };
-            map_compute_status(status)?;
+            self.finish_readback_status(status)?;
             i32_results.push(values);
         }
 
@@ -6532,7 +6666,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 output_nbytes,
             )
         };
-        map_compute_status(status)?;
+        self.finish_readback_status(status)?;
         Ok(values)
     }
 
@@ -6576,6 +6710,79 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.graph_allocator = Some(allocator);
         self.frozen = true;
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn validate_declared_output(
+        &self,
+        tensor: GgmlCpuTensor<'a>,
+        expected_type: i32,
+        expected_len: usize,
+        seen: &mut HashSet<usize>,
+    ) -> Result<(), GgmlCpuGraphError> {
+        if tensor.owner_context != Some(self.context) {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "output tensor does not belong to this graph builder context",
+            });
+        }
+        let address = tensor.raw.as_ptr() as usize;
+        if !self.declared_output_tensors.contains(&address) {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "output tensor was not marked with set_output",
+            });
+        }
+        if !seen.insert(address) {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "duplicate output tensor declaration",
+            });
+        }
+        self.ensure_tensor_type(tensor, expected_type, "declared graph output")?;
+        self.ensure_tensor_contiguous(tensor, "declared graph output")?;
+        let actual_len = self.tensor_nelements(tensor)?;
+        if actual_len != expected_len {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "declared graph output element count mismatch",
+            });
+        }
+        let element_width = if expected_type == ffi::GGML_TYPE_F32 {
+            F32_WIDTH_BYTES
+        } else {
+            I32_WIDTH_BYTES
+        };
+        let expected_nbytes = expected_len.checked_mul(element_width).ok_or(
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "tensor byte width overflow",
+            },
+        )?;
+        let actual_nbytes = self.tensor_nbytes(tensor);
+        if actual_nbytes != expected_nbytes {
+            return Err(GgmlCpuGraphError::OutputByteSizeMismatch {
+                expected: expected_nbytes,
+                actual: actual_nbytes,
+            });
+        }
+        Ok(())
+    }
+
+    /// A readback error happens after a successful compute, so it must poison
+    /// the graph just like a terminal compute result. In particular this does
+    /// not re-enter the memory gate or touch already-finalized leases.
+    fn finish_readback_status(&mut self, status: c_int) -> Result<(), GgmlCpuGraphError> {
+        if status == ffi::GGML_STATUS_SUCCESS {
+            return Ok(());
+        }
+        self.poisoned_after_failed_compute = true;
+        let mapped = map_compute_status(status);
+        if matches!(
+            mapped,
+            Err(GgmlCpuGraphError::DeviceLost | GgmlCpuGraphError::BackendPoisoned)
+        ) {
+            mark_backend_poisoned_sticky(self.backend);
+            if let Some(owner) = &self.scheduler_memory_owner {
+                owner.poisoned.store(true, Ordering::Release);
+            }
+        }
+        mapped
     }
 
     fn ensure_not_poisoned(&self) -> Result<(), GgmlCpuGraphError> {
@@ -6742,6 +6949,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         NonNull::new(raw)
             .map(|raw| GgmlCpuTensor {
                 raw,
+                owner_context: Some(self.context),
                 _marker: PhantomData,
             })
             .ok_or(GgmlCpuGraphError::TensorAllocationFailed {
@@ -7934,6 +8142,18 @@ thread_local! {
     /// issued through [`read_tensor_bytes`], so tests can assert that a
     /// terminal graph-compute failure produced zero readbacks.
     static TEST_TENSOR_READBACK_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only seam: counts calls that passed the Rust-side gate and entered
+    /// `compute_graph_with_current_job_cancel`. This is an attempt count, not
+    /// proof that native FFI submission occurred; use the native-submission
+    /// counter below for that assertion.
+    static TEST_COMPUTE_GATE_ATTEMPT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only seam: counts actual invocations of one of ggml's native graph
+    /// submission entry points. Test status overrides deliberately do not
+    /// increment it because they bypass native FFI.
+    static TEST_NATIVE_GRAPH_SUBMISSION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only seam: substitutes the next tensor-get completion status after
+    /// a graph has computed successfully. Cleared after one use.
+    static TEST_TENSOR_READBACK_STATUS_OVERRIDE: RefCell<Option<c_int>> = const { RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -7956,6 +8176,41 @@ pub(crate) fn reset_test_tensor_readback_count() {
     TEST_TENSOR_READBACK_COUNT.with(|count| count.set(0));
 }
 
+#[cfg(test)]
+fn take_test_tensor_readback_status_override() -> Option<c_int> {
+    TEST_TENSOR_READBACK_STATUS_OVERRIDE.with(|cell| cell.borrow_mut().take())
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_tensor_readback_status_override(status: c_int) {
+    TEST_TENSOR_READBACK_STATUS_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(status));
+}
+
+#[cfg(test)]
+pub(crate) fn test_compute_gate_attempt_count() -> usize {
+    TEST_COMPUTE_GATE_ATTEMPT_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_compute_gate_attempt_count() {
+    TEST_COMPUTE_GATE_ATTEMPT_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn test_native_graph_submission_count() -> usize {
+    TEST_NATIVE_GRAPH_SUBMISSION_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_native_graph_submission_count() {
+    TEST_NATIVE_GRAPH_SUBMISSION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn record_test_native_graph_submission() {
+    TEST_NATIVE_GRAPH_SUBMISSION_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+}
+
 /// Thin wrapper around `ggml_backend_tensor_get` used by every production
 /// readback call site, so the terminal-failure regression tests can observe
 /// how many actual tensor reads happen (must be zero after a poisoned graph
@@ -7967,7 +8222,12 @@ unsafe fn read_tensor_bytes(
     size: usize,
 ) -> c_int {
     #[cfg(test)]
-    TEST_TENSOR_READBACK_COUNT.with(|count| count.set(count.get() + 1));
+    {
+        TEST_TENSOR_READBACK_COUNT.with(|count| count.set(count.get() + 1));
+        if let Some(status) = take_test_tensor_readback_status_override() {
+            return status;
+        }
+    }
     unsafe { ffi::ggml_backend_tensor_get(tensor, data, offset, size) }
 }
 
@@ -8020,8 +8280,14 @@ fn compute_graph_with_current_job_cancel(
     let Some(flag) = super::thread_job_cancel_flag() else {
         return Ok(unsafe {
             scheduler.map_or_else(
-                || ffi::ggml_backend_graph_compute(backend.as_ptr(), graph.as_ptr()),
+                || {
+                    #[cfg(test)]
+                    record_test_native_graph_submission();
+                    ffi::ggml_backend_graph_compute(backend.as_ptr(), graph.as_ptr())
+                },
                 |scheduler| {
+                    #[cfg(test)]
+                    record_test_native_graph_submission();
                     ffi::ggml_backend_sched_graph_compute(scheduler.as_ptr(), graph.as_ptr())
                 },
             )
@@ -8033,6 +8299,8 @@ fn compute_graph_with_current_job_cancel(
     let data = Arc::as_ptr(&flag) as *mut c_void;
     let status = unsafe {
         if let Some(scheduler) = scheduler {
+            #[cfg(test)]
+            record_test_native_graph_submission();
             ffi::ggml_backend_sched_graph_compute_with_abort(
                 scheduler.as_ptr(),
                 graph.as_ptr(),
@@ -8041,6 +8309,8 @@ fn compute_graph_with_current_job_cancel(
                 &mut capability,
             )
         } else {
+            #[cfg(test)]
+            record_test_native_graph_submission();
             ffi::ggml_backend_graph_compute_with_abort(
                 backend.as_ptr(),
                 graph.as_ptr(),
@@ -9746,14 +10016,19 @@ mod tests {
     use super::{
         AutoGpuPolicy, GPU_PROBE_NEGATIVE_TTL, GgmlBackendCapabilities, GgmlContextGuard,
         GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphCpuAcceleratorPolicy,
-        GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlCpuTensor,
-        GgmlLstmGateOrder, GgmlMatmulPrecision, GgmlPersistentGraphSession, GgmlRopeExtParams,
-        GgmlStaticTensor, GpuProbeCache, GpuProbeOutcome, GpuProbeState,
-        METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS, backend_satisfies_execution_placement,
-        flash_attn_ext_head_dim_supported_on_backend, gpu_probe_failed_log_message,
-        gpu_probe_log_message, memory_admission_failure,
-        mul_mat_requires_f32_precision_to_preserve_rhs_range, runtime_gpu_is_available,
-        scheduler_allows_cpu_participants, validate_graph_cancel_capability,
+        GgmlCpuGraphError, GgmlCpuGraphOutputSpec, GgmlCpuGraphOutputValue, GgmlCpuGraphRunner,
+        GgmlCpuGraphThreadingWorkload, GgmlCpuTensor, GgmlLstmGateOrder, GgmlMatmulPrecision,
+        GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor, GpuProbeCache,
+        GpuProbeOutcome, GpuProbeState, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS,
+        backend_satisfies_execution_placement, flash_attn_ext_head_dim_supported_on_backend,
+        gpu_probe_failed_log_message, gpu_probe_log_message,
+        install_test_graph_compute_status_override, install_test_tensor_readback_status_override,
+        memory_admission_failure, mul_mat_requires_f32_precision_to_preserve_rhs_range,
+        reset_test_compute_gate_attempt_count, reset_test_native_graph_submission_count,
+        reset_test_tensor_readback_count, runtime_gpu_is_available,
+        scheduler_allows_cpu_participants, test_compute_gate_attempt_count,
+        test_native_graph_submission_count, test_tensor_readback_count,
+        validate_graph_cancel_capability,
     };
 
     #[test]
@@ -11300,6 +11575,175 @@ mod tests {
                 GgmlCpuGraphBackend::Cpu
             );
         }
+    }
+
+    #[test]
+    fn declared_heterogeneous_outputs_compute_once_and_preserve_declaration_order() {
+        reset_test_compute_gate_attempt_count();
+        reset_test_native_graph_submission_count();
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("runner should initialize");
+        let mut graph = runner.start_graph();
+        let input = graph.new_tensor_1d_f32(3, "input").expect("input");
+        graph.set_input(input).expect("input flag");
+        let doubled = graph.add(input, input).expect("doubled output");
+        let winner = graph.top1_argmax(input).expect("i32 output");
+        graph.set_output(doubled).expect("f32 output flag");
+        graph.set_output(winner).expect("i32 output flag");
+        graph
+            .set_f32_slice(input, &[1.0, 3.0, 2.0], "input")
+            .expect("input upload");
+
+        let outputs = graph
+            .compute_declared_outputs(&[
+                GgmlCpuGraphOutputSpec::F32 {
+                    tensor: doubled,
+                    expected_len: 3,
+                },
+                GgmlCpuGraphOutputSpec::I32 {
+                    tensor: winner,
+                    expected_len: 1,
+                },
+            ])
+            .expect("one heterogeneous graph compute");
+
+        assert_eq!(test_compute_gate_attempt_count(), 1);
+        assert_eq!(test_native_graph_submission_count(), 1);
+        assert_eq!(
+            outputs,
+            vec![
+                GgmlCpuGraphOutputValue::F32(vec![2.0, 6.0, 4.0]),
+                GgmlCpuGraphOutputValue::I32(vec![1]),
+            ]
+        );
+    }
+
+    #[test]
+    fn declared_output_validation_rejects_type_size_output_and_duplicates_before_compute() {
+        // Keep each builder in its own scope: the test seam proves validation
+        // failures have not reached the native compute submission.
+        for case in ["type", "size", "non-output", "duplicate"] {
+            reset_test_compute_gate_attempt_count();
+            let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+                .expect("runner should initialize");
+            let mut graph = runner.start_graph();
+            let input = graph.new_tensor_1d_f32(2, "input").expect("input");
+            graph.set_input(input).expect("input flag");
+            let output = graph.add(input, input).expect("output");
+            if case != "non-output" {
+                graph.set_output(output).expect("output flag");
+            }
+            graph
+                .set_f32_slice(input, &[1.0, 2.0], "input")
+                .expect("input upload");
+
+            let result = match case {
+                "type" => graph.compute_declared_outputs(&[GgmlCpuGraphOutputSpec::I32 {
+                    tensor: output,
+                    expected_len: 2,
+                }]),
+                "size" => graph.compute_declared_outputs(&[GgmlCpuGraphOutputSpec::F32 {
+                    tensor: output,
+                    expected_len: 1,
+                }]),
+                "non-output" => graph.compute_declared_outputs(&[GgmlCpuGraphOutputSpec::F32 {
+                    tensor: output,
+                    expected_len: 2,
+                }]),
+                "duplicate" => graph.compute_declared_outputs(&[
+                    GgmlCpuGraphOutputSpec::F32 {
+                        tensor: output,
+                        expected_len: 2,
+                    },
+                    GgmlCpuGraphOutputSpec::F32 {
+                        tensor: output,
+                        expected_len: 2,
+                    },
+                ]),
+                _ => unreachable!(),
+            };
+            assert!(result.is_err(), "{case} declaration must fail");
+            assert_eq!(
+                test_compute_gate_attempt_count(),
+                0,
+                "{case} must not compute"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_output_terminal_failure_poison_prevents_recompute() {
+        reset_test_compute_gate_attempt_count();
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("runner should initialize");
+        let mut graph = runner.start_graph();
+        let input = graph.new_tensor_1d_f32(1, "input").expect("input");
+        graph.set_input(input).expect("input flag");
+        let output = graph.add(input, input).expect("output");
+        graph.set_output(output).expect("output flag");
+        graph
+            .set_f32_slice(input, &[1.0], "input")
+            .expect("input upload");
+        install_test_graph_compute_status_override(ffi::GGML_STATUS_BACKEND_POISONED);
+
+        assert!(matches!(
+            graph.compute_declared_outputs(&[GgmlCpuGraphOutputSpec::F32 {
+                tensor: output,
+                expected_len: 1,
+            }]),
+            Err(GgmlCpuGraphError::BackendPoisoned)
+        ));
+        assert_eq!(test_compute_gate_attempt_count(), 1);
+        assert!(matches!(
+            graph.compute_declared_outputs(&[GgmlCpuGraphOutputSpec::F32 {
+                tensor: output,
+                expected_len: 1,
+            }]),
+            Err(GgmlCpuGraphError::GraphSessionPoisoned)
+        ));
+        assert_eq!(test_compute_gate_attempt_count(), 1);
+    }
+
+    #[test]
+    fn declared_output_readback_failure_poisons_without_resubmitting() {
+        reset_test_compute_gate_attempt_count();
+        reset_test_native_graph_submission_count();
+        reset_test_tensor_readback_count();
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("runner should initialize");
+        let mut graph = runner.start_graph();
+        let input = graph.new_tensor_1d_f32(1, "input").expect("input");
+        graph.set_input(input).expect("input flag");
+        let output = graph.add(input, input).expect("output");
+        graph.set_output(output).expect("output flag");
+        graph
+            .set_f32_slice(input, &[1.0], "input")
+            .expect("input upload");
+        install_test_tensor_readback_status_override(ffi::GGML_STATUS_EXECUTION_FAILED);
+
+        assert!(matches!(
+            graph.compute_declared_outputs(&[GgmlCpuGraphOutputSpec::F32 {
+                tensor: output,
+                expected_len: 1,
+            }]),
+            Err(GgmlCpuGraphError::ExecutionFailed)
+        ));
+        assert_eq!(test_compute_gate_attempt_count(), 1);
+        assert_eq!(test_native_graph_submission_count(), 1);
+        assert_eq!(test_tensor_readback_count(), 1);
+
+        assert!(matches!(
+            graph.compute_declared_outputs(&[GgmlCpuGraphOutputSpec::F32 {
+                tensor: output,
+                expected_len: 1,
+            }]),
+            Err(GgmlCpuGraphError::GraphSessionPoisoned)
+        ));
+        // `finish_readback_status` does not revisit compute, admission, or the
+        // already-finalized backend-private lease reconciliation path.
+        assert_eq!(test_compute_gate_attempt_count(), 1);
+        assert_eq!(test_native_graph_submission_count(), 1);
+        assert_eq!(test_tensor_readback_count(), 1);
     }
 
     #[test]
