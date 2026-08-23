@@ -4452,6 +4452,36 @@ async fn history_delete_requires_matching_if_match_revision() {
             Request::builder()
                 .method("DELETE")
                 .uri(format!("/v1/history/{}", entry.id))
+                .header(header::IF_MATCH, "\"1\"")
+                .header(header::IF_MATCH, "\"1\"")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/history/{}", entry.id))
+                .header(header::IF_MATCH, "\"1\"")
+                .header(header::IF_MATCH, "\"0\"")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/history/{}", entry.id))
                 .header(header::IF_MATCH, "\"0\"")
                 .body(Body::empty())
                 .unwrap(),

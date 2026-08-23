@@ -229,9 +229,16 @@ pub(crate) async fn history_assign_speakers(
 }
 
 fn parse_required_quoted_if_match(headers: &HeaderMap) -> Result<u64, ApiError> {
-    let raw = headers
-        .get(header::IF_MATCH)
-        .ok_or_else(|| ApiError::BadRequest("If-Match is required".into()))?
+    let mut values = headers.get_all(header::IF_MATCH).iter();
+    let raw = values
+        .next()
+        .ok_or_else(|| ApiError::BadRequest("If-Match is required".into()))?;
+    if values.next().is_some() {
+        return Err(ApiError::BadRequest(
+            "If-Match must contain exactly one value".into(),
+        ));
+    }
+    let raw = raw
         .to_str()
         .map_err(|_| ApiError::BadRequest("Invalid If-Match header".into()))?;
     parse_quoted_revision(raw)
@@ -345,6 +352,13 @@ mod tests {
         assert!(parse_required_quoted_if_match(&headers).is_err());
         headers.insert(header::IF_MATCH, HeaderValue::from_static("\"3\""));
         assert_eq!(parse_required_quoted_if_match(&headers).unwrap(), 3);
+
+        headers.append(header::IF_MATCH, HeaderValue::from_static("\"3\""));
+        assert!(parse_required_quoted_if_match(&headers).is_err());
+        headers.remove(header::IF_MATCH);
+        headers.append(header::IF_MATCH, HeaderValue::from_static("\"2\""));
+        headers.append(header::IF_MATCH, HeaderValue::from_static("\"3\""));
+        assert!(parse_required_quoted_if_match(&headers).is_err());
     }
 
     #[test]
