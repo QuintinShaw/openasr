@@ -1,0 +1,143 @@
+{
+  "schema": "openasr.short-audio-receipt.v0",
+  "core_commit": "533bc76971c2b012f2bec8bdc87d709c762e6ba6",
+  "pack": {
+    "model_id": "xasr-zh-en:q8",
+    "content_sha256": "a0201070212ceff3a37d8dafd21455209ea48721d1b53b31e8eff328fc573fdb",
+    "size_bytes": 175711040,
+    "quant": "q8_0"
+  },
+  "audio": {
+    "path_or_label": "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/fixtures/jfk.wav",
+    "sha256": "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e",
+    "duration_s": 11.0
+  },
+  "run": {
+    "backend": "native",
+    "device": "cpu",
+    "os": "darwin",
+    "command": [
+      "openasr",
+      "bench-receipt",
+      "short-audio",
+      "--audio",
+      "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/fixtures/jfk.wav",
+      "--backend",
+      "native",
+      "--device",
+      "cpu",
+      "--out",
+      "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/docs/design/gpu-decode-correctness-evidence/layer3-receipts/xasr-zh-en-q8-cpu-cold-jfk.json",
+      "--runs",
+      "1",
+      "--warmup-runs",
+      "0",
+      "--scope",
+      "layer3-xasr-zh-en-q8-cpu-cold-jfk",
+      "--model",
+      "xasr-zh-en:q8",
+      "--core-commit",
+      "533bc76971c2b012f2bec8bdc87d709c762e6ba6"
+    ],
+    "env_allowlist": {
+      "OPENASR_HOME": "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/tmp/openasr-home",
+      "OPENASR_OFFLINE": "1"
+    },
+    "warmup": "cold",
+    "cache_state": "empty"
+  },
+  "metrics": {
+    "rtf_samples": [
+      0.06427804918181818
+    ],
+    "rtf_median": 0.06427804918181818,
+    "peak_rss_bytes": 435568640,
+    "peak_rss_before_model_bytes": 16695296,
+    "rss_before_model_bytes": 16695296,
+    "rss_after_model_bytes": 435568640,
+    "phys_footprint_before_model_bytes": 4834624,
+    "phys_footprint_after_model_bytes": 231737728,
+    "peak_phys_footprint_before_model_bytes": 4834624,
+    "peak_phys_footprint_bytes": 231885184,
+    "measurement_method": "wall_clock_process_elapsed"
+  },
+  "transcript": {
+    "text": "And so my fellow americans ask not what your country can do for you. Ask what you can do for your country.",
+    "text_sha256": "4360be9492f54671c2806e40ecb4f96b61c2586ea8e114505cc4eb62861b8208"
+  },
+  "placement": "cpu",
+  "observed_placement": {
+    "direct_graph_computes": 0,
+    "scheduler_graph_computes": 50,
+    "observed_nodes_by_backend": {
+      "BLAS": 17,
+      "CPU": 4154
+    },
+    "observed_compute_nodes_by_backend": {
+      "BLAS": 9,
+      "CPU": 2807
+    },
+    "observed_node_output_bytes_by_backend": {
+      "BLAS": 4047616,
+      "CPU": 82785216
+    },
+    "fallback_node_samples_by_backend": {
+      "BLAS": [
+        {
+          "name": "node_14",
+          "op": "MUL_MAT",
+          "output_bytes": 144768
+        },
+        {
+          "name": "node_24",
+          "op": "MUL_MAT",
+          "output_bytes": 262656
+        },
+        {
+          "name": "node_41",
+          "op": "MUL_MAT",
+          "output_bytes": 700416
+        },
+        {
+          "name": "node_51",
+          "op": "MUL_MAT",
+          "output_bytes": 233472
+        },
+        {
+          "name": "node_1671",
+          "op": "MUL_MAT",
+          "output_bytes": 4736
+        },
+        {
+          "name": "node_1850",
+          "op": "MUL_MAT",
+          "output_bytes": 4736
+        },
+        {
+          "name": "node_2029",
+          "op": "MUL_MAT",
+          "output_bytes": 4736
+        },
+        {
+          "name": "node_2208",
+          "op": "MUL_MAT",
+          "output_bytes": 4736
+        },
+        {
+          "name": "node_2387",
+          "op": "MUL_MAT",
+          "output_bytes": 4736
+        }
+      ]
+    }
+  },
+  "scope": "layer3-xasr-zh-en-q8-cpu-cold-jfk",
+  "notes": [
+    "placement is the requested device; observed_placement reports actual ggml graph-node backends",
+    "measurement_method=wall_clock_process_elapsed"
+  ],
+  "decode_diagnostics": {
+    "output_plan": "full_logits",
+    "reuse_mode": "fresh_graph"
+  }
+}

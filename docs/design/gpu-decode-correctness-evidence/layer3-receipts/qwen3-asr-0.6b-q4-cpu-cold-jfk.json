@@ -1,0 +1,361 @@
+{
+  "schema": "openasr.short-audio-receipt.v0",
+  "core_commit": "533bc76971c2b012f2bec8bdc87d709c762e6ba6",
+  "pack": {
+    "model_id": "qwen3-asr-0.6b:q4",
+    "content_sha256": "f71b8c2a5a60b2ee0d598064b9ab2c0bc01b41ffddfc40b49fd7f195097da6f8",
+    "size_bytes": 631027552,
+    "quant": "q4_k"
+  },
+  "audio": {
+    "path_or_label": "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/fixtures/jfk.wav",
+    "sha256": "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e",
+    "duration_s": 11.0
+  },
+  "run": {
+    "backend": "native",
+    "device": "cpu",
+    "os": "darwin",
+    "command": [
+      "openasr",
+      "bench-receipt",
+      "short-audio",
+      "--audio",
+      "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/fixtures/jfk.wav",
+      "--backend",
+      "native",
+      "--device",
+      "cpu",
+      "--out",
+      "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/docs/design/gpu-decode-correctness-evidence/layer3-receipts/qwen3-asr-0.6b-q4-cpu-cold-jfk.json",
+      "--runs",
+      "1",
+      "--warmup-runs",
+      "0",
+      "--scope",
+      "layer3-qwen3-asr-0.6b-q4-cpu-cold-jfk",
+      "--model",
+      "qwen3-asr-0.6b:q4",
+      "--core-commit",
+      "533bc76971c2b012f2bec8bdc87d709c762e6ba6"
+    ],
+    "env_allowlist": {
+      "OPENASR_HOME": "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/tmp/openasr-home",
+      "OPENASR_OFFLINE": "1"
+    },
+    "warmup": "cold",
+    "cache_state": "empty"
+  },
+  "metrics": {
+    "rtf_samples": [
+      0.2000767007272727
+    ],
+    "rtf_median": 0.2000767007272727,
+    "peak_rss_bytes": 1060618240,
+    "peak_rss_before_model_bytes": 16777216,
+    "rss_before_model_bytes": 16777216,
+    "rss_after_model_bytes": 1012547584,
+    "phys_footprint_before_model_bytes": 4916544,
+    "phys_footprint_after_model_bytes": 420335232,
+    "peak_phys_footprint_before_model_bytes": 4916544,
+    "peak_phys_footprint_bytes": 468995776,
+    "measurement_method": "wall_clock_process_elapsed"
+  },
+  "transcript": {
+    "text": "And so, my fellow Americans, ask not what your country can do for you; ask what you can do for your country.",
+    "text_sha256": "c3d6020f49a0762c0ffe655f3ba99ee0131325bfea9ff68aed8ad096350db99f"
+  },
+  "placement": "cpu",
+  "observed_placement": {
+    "direct_graph_computes": 0,
+    "scheduler_graph_computes": 80,
+    "observed_nodes_by_backend": {
+      "BLAS": 15522,
+      "CPU": 32474
+    },
+    "observed_compute_nodes_by_backend": {
+      "BLAS": 112,
+      "CPU": 32340
+    },
+    "observed_node_output_bytes_by_backend": {
+      "BLAS": 663955456,
+      "CPU": 2225669796
+    },
+    "fallback_node_samples_by_backend": {
+      "BLAS": [
+        {
+          "name": "node_13",
+          "op": "MUL_MAT",
+          "output_bytes": 16896000
+        },
+        {
+          "name": "node_23",
+          "op": "MUL_MAT",
+          "output_bytes": 4392960
+        },
+        {
+          "name": "node_43",
+          "op": "MUL_MAT",
+          "output_bytes": 512512
+        },
+        {
+          "name": "node_48",
+          "op": "MUL_MAT",
+          "output_bytes": 512512
+        },
+        {
+          "name": "node_53",
+          "op": "MUL_MAT",
+          "output_bytes": 512512
+        },
+        {
+          "name": "node_61",
+          "op": "MUL_MAT",
+          "output_bytes": 512512
+        },
+        {
+          "name": "node_67",
+          "op": "MUL_MAT",
+          "output_bytes": 2050048
+        },
+        {
+          "name": "node_70",
+          "op": "MUL_MAT",
+          "output_bytes": 512512
+        },
+        {
+          "name": "node_76",
+          "op": "MUL_MAT",
+          "output_bytes": 512512
+        },
+        {
+          "name": "node_81",
+          "op": "MUL_MAT",
+          "output_bytes": 512512
+        },
+        {
+          "name": "node_86",
+          "op": "MUL_MAT",
+          "output_bytes": 512512
+        },
+        {
+          "name": "node_94",
+          "op": "MUL_MAT",
+          "output_bytes": 512512
+        },
+        {
+          "name": "node_100",
+          "op": "MUL_MAT",
+          "output_bytes": 2050048
+        },
+        {
+          "name": "node_103",
+          "op": "MUL_MAT",
+          "output_bytes": 512512
+        },
+        {
+          "name": "node_109",
+          "op": "MUL_MAT",
+          "output_bytes": 512512
+        },
+        {
+          "name": "node_114",
+          "op": "MUL_MAT",
+          "output_bytes": 512512
+        }
+      ]
+    }
+  },
+  "scope": "layer3-qwen3-asr-0.6b-q4-cpu-cold-jfk",
+  "notes": [
+    "placement is the requested device; observed_placement reports actual ggml graph-node backends",
+    "measurement_method=wall_clock_process_elapsed",
+    "decode_stop=stop_token"
+  ],
+  "decode_diagnostics": {
+    "output_plan": "full_logits",
+    "reuse_mode": "fresh_graph",
+    "steps": [
+      {
+        "step": 0,
+        "token_id": 11528,
+        "top2_margin": 5.8087664,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 1,
+        "token_id": 6364,
+        "top2_margin": 6.3578854,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 2,
+        "token_id": 151704,
+        "top2_margin": 8.754492,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 3,
+        "token_id": 3036,
+        "top2_margin": 11.868124,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 4,
+        "token_id": 773,
+        "top2_margin": 15.112223,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 5,
+        "token_id": 11,
+        "top2_margin": 1.1974487,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 6,
+        "token_id": 847,
+        "top2_margin": 11.954683,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 7,
+        "token_id": 12357,
+        "top2_margin": 8.922653,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 8,
+        "token_id": 8877,
+        "top2_margin": 6.8376446,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 9,
+        "token_id": 11,
+        "top2_margin": 5.719803,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 10,
+        "token_id": 2548,
+        "top2_margin": 9.706642,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 11,
+        "token_id": 537,
+        "top2_margin": 9.794186,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 12,
+        "token_id": 1128,
+        "top2_margin": 4.5288544,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 13,
+        "token_id": 697,
+        "top2_margin": 10.243778,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 14,
+        "token_id": 3146,
+        "top2_margin": 11.006456,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 15,
+        "token_id": 646,
+        "top2_margin": 14.062452,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 16,
+        "token_id": 653,
+        "top2_margin": 15.624685,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 17,
+        "token_id": 369,
+        "top2_margin": 14.499781,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 18,
+        "token_id": 498,
+        "top2_margin": 13.7968235,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 19,
+        "token_id": 26,
+        "top2_margin": 0.20228958,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 20,
+        "token_id": 2548,
+        "top2_margin": 11.727455,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 21,
+        "token_id": 1128,
+        "top2_margin": 8.420439,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 22,
+        "token_id": 498,
+        "top2_margin": 13.206518,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 23,
+        "token_id": 646,
+        "top2_margin": 13.140551,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 24,
+        "token_id": 653,
+        "top2_margin": 15.912373,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 25,
+        "token_id": 369,
+        "top2_margin": 16.561066,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 26,
+        "token_id": 697,
+        "top2_margin": 14.810198,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 27,
+        "token_id": 3146,
+        "top2_margin": 11.609337,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 28,
+        "token_id": 13,
+        "top2_margin": 11.6639,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 29,
+        "token_id": 151645,
+        "top2_margin": 12.635027,
+        "graph_rebuilt": true
+      }
+    ]
+  }
+}

@@ -1,0 +1,268 @@
+{
+  "schema": "openasr.short-audio-receipt.v0",
+  "core_commit": "533bc76971c2b012f2bec8bdc87d709c762e6ba6",
+  "pack": {
+    "model_id": "firered-aed-l-v2:q4",
+    "content_sha256": "b24853f159ed85192b527601190bf31b904e3f62957b8a26418a78c07a5b5688",
+    "size_bytes": 1062435296,
+    "quant": "q4_k"
+  },
+  "audio": {
+    "path_or_label": "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/fixtures/jfk.wav",
+    "sha256": "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e",
+    "duration_s": 11.0
+  },
+  "run": {
+    "backend": "native",
+    "device": "metal",
+    "os": "darwin",
+    "command": [
+      "openasr",
+      "bench-receipt",
+      "short-audio",
+      "--audio",
+      "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/fixtures/jfk.wav",
+      "--backend",
+      "native",
+      "--device",
+      "metal",
+      "--out",
+      "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/docs/design/gpu-decode-correctness-evidence/layer3-receipts/firered-aed-l-v2-q4-metal-reuse-jfk.json",
+      "--runs",
+      "1",
+      "--warmup-runs",
+      "1",
+      "--scope",
+      "layer3-firered-aed-l-v2-q4-metal-reuse-jfk",
+      "--model",
+      "firered-aed-l-v2:q4",
+      "--core-commit",
+      "533bc76971c2b012f2bec8bdc87d709c762e6ba6"
+    ],
+    "env_allowlist": {
+      "OPENASR_HOME": "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/tmp/openasr-home",
+      "OPENASR_OFFLINE": "1"
+    },
+    "warmup": "warm",
+    "cache_state": "populated"
+  },
+  "metrics": {
+    "rtf_samples": [
+      0.07644441663636364
+    ],
+    "rtf_median": 0.07644441663636364,
+    "peak_rss_bytes": 62210048,
+    "peak_rss_before_model_bytes": 16728064,
+    "rss_before_model_bytes": 16728064,
+    "rss_after_model_bytes": 59719680,
+    "phys_footprint_before_model_bytes": 4867392,
+    "phys_footprint_after_model_bytes": 30852928,
+    "peak_phys_footprint_before_model_bytes": 4867392,
+    "peak_phys_footprint_bytes": 33228672,
+    "measurement_method": "wall_clock_process_elapsed"
+  },
+  "transcript": {
+    "text": "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR YOUR COUNTRY",
+    "text_sha256": "ed6620943006642fb8a8c6117ae8d16f386de03bc2ed2867113b3d01dbce0fe8"
+  },
+  "placement": "metal",
+  "observed_placement": {
+    "direct_graph_computes": 62,
+    "scheduler_graph_computes": 0,
+    "observed_nodes_by_backend": {
+      "MTL0": 160524
+    },
+    "observed_compute_nodes_by_backend": {
+      "MTL0": 72402
+    },
+    "observed_node_output_bytes_by_backend": {
+      "MTL0": 11876057280
+    }
+  },
+  "scope": "layer3-firered-aed-l-v2-q4-metal-reuse-jfk",
+  "notes": [
+    "placement is the requested device; observed_placement reports actual ggml graph-node backends",
+    "measurement_method=wall_clock_process_elapsed",
+    "decode_stop=stop_token"
+  ],
+  "decode_diagnostics": {
+    "output_plan": "full_logits",
+    "reuse_mode": "fresh_graph",
+    "steps": [
+      {
+        "step": 0,
+        "token_id": 65,
+        "top2_margin": 5.3945475,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 1,
+        "token_id": 813,
+        "top2_margin": 6.067112,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 2,
+        "token_id": 586,
+        "top2_margin": 6.7550936,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 3,
+        "token_id": 297,
+        "top2_margin": 7.485565,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 4,
+        "token_id": 536,
+        "top2_margin": 8.23302,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 5,
+        "token_id": 56,
+        "top2_margin": 3.9955058,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 6,
+        "token_id": 266,
+        "top2_margin": 9.71658,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 7,
+        "token_id": 405,
+        "top2_margin": 7.32166,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 8,
+        "token_id": 70,
+        "top2_margin": 2.6699286,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 9,
+        "token_id": 92,
+        "top2_margin": 6.448672,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 10,
+        "token_id": 496,
+        "top2_margin": 7.9546022,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 11,
+        "token_id": 611,
+        "top2_margin": 5.8219867,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 12,
+        "token_id": 962,
+        "top2_margin": 5.445981,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 13,
+        "token_id": 1001,
+        "top2_margin": 5.9243307,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 14,
+        "token_id": 202,
+        "top2_margin": 5.378028,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 15,
+        "token_id": 164,
+        "top2_margin": 8.186483,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 16,
+        "token_id": 227,
+        "top2_margin": 9.136419,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 17,
+        "token_id": 312,
+        "top2_margin": 6.9587293,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 18,
+        "token_id": 999,
+        "top2_margin": 9.020035,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 19,
+        "token_id": 92,
+        "top2_margin": 5.272184,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 20,
+        "token_id": 496,
+        "top2_margin": 6.82341,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 21,
+        "token_id": 962,
+        "top2_margin": 4.005415,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 22,
+        "token_id": 999,
+        "top2_margin": 8.771133,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 23,
+        "token_id": 164,
+        "top2_margin": 6.227703,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 24,
+        "token_id": 227,
+        "top2_margin": 6.8267508,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 25,
+        "token_id": 312,
+        "top2_margin": 7.112417,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 26,
+        "token_id": 1001,
+        "top2_margin": 6.0129275,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 27,
+        "token_id": 202,
+        "top2_margin": 7.57543,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 28,
+        "token_id": 4,
+        "top2_margin": 8.315489,
+        "graph_rebuilt": true
+      }
+    ]
+  }
+}

@@ -1,0 +1,355 @@
+{
+  "schema": "openasr.short-audio-receipt.v0",
+  "core_commit": "533bc76971c2b012f2bec8bdc87d709c762e6ba6",
+  "pack": {
+    "model_id": "firered-aed-l-v2:q4",
+    "content_sha256": "b24853f159ed85192b527601190bf31b904e3f62957b8a26418a78c07a5b5688",
+    "size_bytes": 1062435296,
+    "quant": "q4_k"
+  },
+  "audio": {
+    "path_or_label": "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/fixtures/jfk.wav",
+    "sha256": "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e",
+    "duration_s": 11.0
+  },
+  "run": {
+    "backend": "native",
+    "device": "cpu",
+    "os": "darwin",
+    "command": [
+      "openasr",
+      "bench-receipt",
+      "short-audio",
+      "--audio",
+      "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/fixtures/jfk.wav",
+      "--backend",
+      "native",
+      "--device",
+      "cpu",
+      "--out",
+      "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/docs/design/gpu-decode-correctness-evidence/layer3-receipts/firered-aed-l-v2-q4-cpu-cold-jfk.json",
+      "--runs",
+      "1",
+      "--warmup-runs",
+      "0",
+      "--scope",
+      "layer3-firered-aed-l-v2-q4-cpu-cold-jfk",
+      "--model",
+      "firered-aed-l-v2:q4",
+      "--core-commit",
+      "533bc76971c2b012f2bec8bdc87d709c762e6ba6"
+    ],
+    "env_allowlist": {
+      "OPENASR_HOME": "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/tmp/openasr-home",
+      "OPENASR_OFFLINE": "1"
+    },
+    "warmup": "cold",
+    "cache_state": "empty"
+  },
+  "metrics": {
+    "rtf_samples": [
+      0.20105543945454543
+    ],
+    "rtf_median": 0.20105543945454543,
+    "peak_rss_bytes": 1151270912,
+    "peak_rss_before_model_bytes": 16859136,
+    "rss_before_model_bytes": 16859136,
+    "rss_after_model_bytes": 1151270912,
+    "phys_footprint_before_model_bytes": 4998464,
+    "phys_footprint_after_model_bytes": 120786880,
+    "peak_phys_footprint_before_model_bytes": 4998464,
+    "peak_phys_footprint_bytes": 120901568,
+    "measurement_method": "wall_clock_process_elapsed"
+  },
+  "transcript": {
+    "text": "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR YOUR COUNTRY",
+    "text_sha256": "ed6620943006642fb8a8c6117ae8d16f386de03bc2ed2867113b3d01dbce0fe8"
+  },
+  "placement": "cpu",
+  "observed_placement": {
+    "direct_graph_computes": 0,
+    "scheduler_graph_computes": 31,
+    "observed_nodes_by_backend": {
+      "BLAS": 20837,
+      "CPU": 59297
+    },
+    "observed_compute_nodes_by_backend": {
+      "BLAS": 209,
+      "CPU": 35912
+    },
+    "observed_node_output_bytes_by_backend": {
+      "BLAS": 2858796864,
+      "CPU": 2186242848
+    },
+    "fallback_node_samples_by_backend": {
+      "BLAS": [
+        {
+          "name": "node_24",
+          "op": "MUL_MAT",
+          "output_bytes": 1408000
+        },
+        {
+          "name": "node_29",
+          "op": "MUL_MAT",
+          "output_bytes": 5632000
+        },
+        {
+          "name": "node_32",
+          "op": "MUL_MAT",
+          "output_bytes": 1408000
+        },
+        {
+          "name": "node_39",
+          "op": "MUL_MAT",
+          "output_bytes": 1408000
+        },
+        {
+          "name": "node_53",
+          "op": "MUL_MAT",
+          "output_bytes": 1408000
+        },
+        {
+          "name": "node_64",
+          "op": "MUL_MAT",
+          "output_bytes": 2810880
+        },
+        {
+          "name": "node_71",
+          "op": "MUL_MAT",
+          "output_bytes": 1408000
+        },
+        {
+          "name": "node_77",
+          "op": "MUL_MAT",
+          "output_bytes": 1408000
+        },
+        {
+          "name": "node_83",
+          "op": "MUL_MAT",
+          "output_bytes": 5632000
+        },
+        {
+          "name": "node_99",
+          "op": "MUL_MAT",
+          "output_bytes": 1408000
+        },
+        {
+          "name": "node_104",
+          "op": "MUL_MAT",
+          "output_bytes": 5632000
+        },
+        {
+          "name": "node_107",
+          "op": "MUL_MAT",
+          "output_bytes": 1408000
+        },
+        {
+          "name": "node_117",
+          "op": "MUL_MAT",
+          "output_bytes": 5632000
+        },
+        {
+          "name": "node_120",
+          "op": "MUL_MAT",
+          "output_bytes": 1408000
+        },
+        {
+          "name": "node_127",
+          "op": "MUL_MAT",
+          "output_bytes": 1408000
+        },
+        {
+          "name": "node_141",
+          "op": "MUL_MAT",
+          "output_bytes": 1408000
+        }
+      ]
+    }
+  },
+  "scope": "layer3-firered-aed-l-v2-q4-cpu-cold-jfk",
+  "notes": [
+    "placement is the requested device; observed_placement reports actual ggml graph-node backends",
+    "measurement_method=wall_clock_process_elapsed",
+    "decode_stop=stop_token"
+  ],
+  "decode_diagnostics": {
+    "output_plan": "full_logits",
+    "reuse_mode": "fresh_graph",
+    "steps": [
+      {
+        "step": 0,
+        "token_id": 65,
+        "top2_margin": 5.4455686,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 1,
+        "token_id": 813,
+        "top2_margin": 6.090693,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 2,
+        "token_id": 586,
+        "top2_margin": 6.7684,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 3,
+        "token_id": 297,
+        "top2_margin": 7.649542,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 4,
+        "token_id": 536,
+        "top2_margin": 8.249033,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 5,
+        "token_id": 56,
+        "top2_margin": 3.9530528,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 6,
+        "token_id": 266,
+        "top2_margin": 9.7947235,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 7,
+        "token_id": 405,
+        "top2_margin": 7.2909575,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 8,
+        "token_id": 70,
+        "top2_margin": 2.6604147,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 9,
+        "token_id": 92,
+        "top2_margin": 6.336727,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 10,
+        "token_id": 496,
+        "top2_margin": 7.937955,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 11,
+        "token_id": 611,
+        "top2_margin": 5.841078,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 12,
+        "token_id": 962,
+        "top2_margin": 5.458845,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 13,
+        "token_id": 1001,
+        "top2_margin": 6.0205135,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 14,
+        "token_id": 202,
+        "top2_margin": 5.3080816,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 15,
+        "token_id": 164,
+        "top2_margin": 8.136116,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 16,
+        "token_id": 227,
+        "top2_margin": 9.15218,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 17,
+        "token_id": 312,
+        "top2_margin": 7.1299334,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 18,
+        "token_id": 999,
+        "top2_margin": 8.968801,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 19,
+        "token_id": 92,
+        "top2_margin": 5.1967225,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 20,
+        "token_id": 496,
+        "top2_margin": 6.8276978,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 21,
+        "token_id": 962,
+        "top2_margin": 3.9827282,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 22,
+        "token_id": 999,
+        "top2_margin": 8.683471,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 23,
+        "token_id": 164,
+        "top2_margin": 6.2318125,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 24,
+        "token_id": 227,
+        "top2_margin": 6.769456,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 25,
+        "token_id": 312,
+        "top2_margin": 7.1060395,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 26,
+        "token_id": 1001,
+        "top2_margin": 6.0061903,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 27,
+        "token_id": 202,
+        "top2_margin": 7.6097455,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 28,
+        "token_id": 4,
+        "top2_margin": 8.337805,
+        "graph_rebuilt": true
+      }
+    ]
+  }
+}

@@ -1,0 +1,91 @@
+{
+  "schema": "openasr.short-audio-receipt.v0",
+  "core_commit": "533bc76971c2b012f2bec8bdc87d709c762e6ba6",
+  "pack": {
+    "model_id": "xasr-zh-en:q8",
+    "content_sha256": "a0201070212ceff3a37d8dafd21455209ea48721d1b53b31e8eff328fc573fdb",
+    "size_bytes": 175711040,
+    "quant": "q8_0"
+  },
+  "audio": {
+    "path_or_label": "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/fixtures/jfk.wav",
+    "sha256": "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e",
+    "duration_s": 11.0
+  },
+  "run": {
+    "backend": "native",
+    "device": "metal",
+    "os": "darwin",
+    "command": [
+      "openasr",
+      "bench-receipt",
+      "short-audio",
+      "--audio",
+      "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/fixtures/jfk.wav",
+      "--backend",
+      "native",
+      "--device",
+      "metal",
+      "--out",
+      "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/docs/design/gpu-decode-correctness-evidence/layer3-receipts/xasr-zh-en-q8-metal-cold-jfk.json",
+      "--runs",
+      "1",
+      "--warmup-runs",
+      "0",
+      "--scope",
+      "layer3-xasr-zh-en-q8-metal-cold-jfk",
+      "--model",
+      "xasr-zh-en:q8",
+      "--core-commit",
+      "533bc76971c2b012f2bec8bdc87d709c762e6ba6"
+    ],
+    "env_allowlist": {
+      "OPENASR_HOME": "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/tmp/openasr-home",
+      "OPENASR_OFFLINE": "1"
+    },
+    "warmup": "cold",
+    "cache_state": "empty"
+  },
+  "metrics": {
+    "rtf_samples": [
+      0.08013180309090909
+    ],
+    "rtf_median": 0.08013180309090909,
+    "peak_rss_bytes": 434274304,
+    "peak_rss_before_model_bytes": 16711680,
+    "rss_before_model_bytes": 16711680,
+    "rss_after_model_bytes": 434274304,
+    "phys_footprint_before_model_bytes": 4851008,
+    "phys_footprint_after_model_bytes": 230050240,
+    "peak_phys_footprint_before_model_bytes": 4851008,
+    "peak_phys_footprint_bytes": 230050240,
+    "measurement_method": "wall_clock_process_elapsed"
+  },
+  "transcript": {
+    "text": "And so my fellow americans ask not what your country can do for you. Ask what you can do for your country.",
+    "text_sha256": "4360be9492f54671c2806e40ecb4f96b61c2586ea8e114505cc4eb62861b8208"
+  },
+  "placement": "metal",
+  "observed_placement": {
+    "direct_graph_computes": 433,
+    "scheduler_graph_computes": 0,
+    "observed_nodes_by_backend": {
+      "MTL0": 4188
+    },
+    "observed_compute_nodes_by_backend": {
+      "MTL0": 2829
+    },
+    "observed_node_output_bytes_by_backend": {
+      "MTL0": 86926080
+    }
+  },
+  "scope": "layer3-xasr-zh-en-q8-metal-cold-jfk",
+  "notes": [
+    "placement is the requested device; observed_placement reports actual ggml graph-node backends",
+    "measurement_method=wall_clock_process_elapsed"
+  ],
+  "decode_diagnostics": {
+    "output_plan": "full_logits",
+    "reuse_mode": "fresh_graph"
+  }
+}

@@ -1,0 +1,274 @@
+{
+  "schema": "openasr.short-audio-receipt.v0",
+  "core_commit": "533bc76971c2b012f2bec8bdc87d709c762e6ba6",
+  "pack": {
+    "model_id": "qwen3-asr-0.6b:q4",
+    "content_sha256": "f71b8c2a5a60b2ee0d598064b9ab2c0bc01b41ffddfc40b49fd7f195097da6f8",
+    "size_bytes": 631027552,
+    "quant": "q4_k"
+  },
+  "audio": {
+    "path_or_label": "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/fixtures/jfk.wav",
+    "sha256": "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e",
+    "duration_s": 11.0
+  },
+  "run": {
+    "backend": "native",
+    "device": "metal",
+    "os": "darwin",
+    "command": [
+      "openasr",
+      "bench-receipt",
+      "short-audio",
+      "--audio",
+      "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/fixtures/jfk.wav",
+      "--backend",
+      "native",
+      "--device",
+      "metal",
+      "--out",
+      "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/docs/design/gpu-decode-correctness-evidence/layer3-receipts/qwen3-asr-0.6b-q4-metal-cold-jfk.json",
+      "--runs",
+      "1",
+      "--warmup-runs",
+      "0",
+      "--scope",
+      "layer3-qwen3-asr-0.6b-q4-metal-cold-jfk",
+      "--model",
+      "qwen3-asr-0.6b:q4",
+      "--core-commit",
+      "533bc76971c2b012f2bec8bdc87d709c762e6ba6"
+    ],
+    "env_allowlist": {
+      "OPENASR_HOME": "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/tmp/openasr-home",
+      "OPENASR_OFFLINE": "1"
+    },
+    "warmup": "cold",
+    "cache_state": "empty"
+  },
+  "metrics": {
+    "rtf_samples": [
+      0.24287484472727272
+    ],
+    "rtf_median": 0.24287484472727272,
+    "peak_rss_bytes": 496304128,
+    "peak_rss_before_model_bytes": 16678912,
+    "rss_before_model_bytes": 16678912,
+    "rss_after_model_bytes": 483688448,
+    "phys_footprint_before_model_bytes": 4818240,
+    "phys_footprint_after_model_bytes": 263408832,
+    "peak_phys_footprint_before_model_bytes": 4818240,
+    "peak_phys_footprint_bytes": 276401408,
+    "measurement_method": "wall_clock_process_elapsed"
+  },
+  "transcript": {
+    "text": "And so, my fellow Americans, ask not what your country can do for you; ask what you can do for your country.",
+    "text_sha256": "c3d6020f49a0762c0ffe655f3ba99ee0131325bfea9ff68aed8ad096350db99f"
+  },
+  "placement": "metal",
+  "observed_placement": {
+    "direct_graph_computes": 218,
+    "scheduler_graph_computes": 0,
+    "observed_nodes_by_backend": {
+      "MTL0": 168230
+    },
+    "observed_compute_nodes_by_backend": {
+      "MTL0": 115726
+    },
+    "observed_node_output_bytes_by_backend": {
+      "MTL0": 3253447844
+    }
+  },
+  "scope": "layer3-qwen3-asr-0.6b-q4-metal-cold-jfk",
+  "notes": [
+    "placement is the requested device; observed_placement reports actual ggml graph-node backends",
+    "measurement_method=wall_clock_process_elapsed",
+    "decode_stop=stop_token"
+  ],
+  "decode_diagnostics": {
+    "output_plan": "full_logits",
+    "reuse_mode": "fresh_graph",
+    "steps": [
+      {
+        "step": 0,
+        "token_id": 11528,
+        "top2_margin": 5.9773874,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 1,
+        "token_id": 6364,
+        "top2_margin": 6.2626534,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 2,
+        "token_id": 151704,
+        "top2_margin": 8.896377,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 3,
+        "token_id": 3036,
+        "top2_margin": 12.204504,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 4,
+        "token_id": 773,
+        "top2_margin": 15.115471,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 5,
+        "token_id": 11,
+        "top2_margin": 1.3536377,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 6,
+        "token_id": 847,
+        "top2_margin": 11.696262,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 7,
+        "token_id": 12357,
+        "top2_margin": 9.146946,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 8,
+        "token_id": 8877,
+        "top2_margin": 7.012182,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 9,
+        "token_id": 11,
+        "top2_margin": 5.798649,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 10,
+        "token_id": 2548,
+        "top2_margin": 9.578697,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 11,
+        "token_id": 537,
+        "top2_margin": 10.111717,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 12,
+        "token_id": 1128,
+        "top2_margin": 4.3677444,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 13,
+        "token_id": 697,
+        "top2_margin": 10.020184,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 14,
+        "token_id": 3146,
+        "top2_margin": 11.644468,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 15,
+        "token_id": 646,
+        "top2_margin": 14.557346,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 16,
+        "token_id": 653,
+        "top2_margin": 15.95192,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 17,
+        "token_id": 369,
+        "top2_margin": 14.634575,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 18,
+        "token_id": 498,
+        "top2_margin": 13.946491,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 19,
+        "token_id": 26,
+        "top2_margin": 0.075035095,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 20,
+        "token_id": 2548,
+        "top2_margin": 11.681038,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 21,
+        "token_id": 1128,
+        "top2_margin": 8.792858,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 22,
+        "token_id": 498,
+        "top2_margin": 13.465599,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 23,
+        "token_id": 646,
+        "top2_margin": 13.5858345,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 24,
+        "token_id": 653,
+        "top2_margin": 16.354279,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 25,
+        "token_id": 369,
+        "top2_margin": 16.887947,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 26,
+        "token_id": 697,
+        "top2_margin": 14.248047,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 27,
+        "token_id": 3146,
+        "top2_margin": 11.56255,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 28,
+        "token_id": 13,
+        "top2_margin": 11.990906,
+        "graph_rebuilt": true
+      },
+      {
+        "step": 29,
+        "token_id": 151645,
+        "top2_margin": 12.297211,
+        "graph_rebuilt": true
+      }
+    ]
+  }
+}
