@@ -42,6 +42,40 @@ pub(crate) async fn set_default_model(
     let home = distribution.openasr_home()?;
     let pack = resolve_installed_pack_for_default(&home, distribution.catalog_source(), &request)?;
     let preference = request.quant_preference_for_pack(&pack);
+    let intent = crate::realtime::realtime_execution_target_preference(&home)
+        .map(openasr_core::device::execution_policy::ExecutionIntent::from)
+        .unwrap_or(openasr_core::device::execution_policy::ExecutionIntent::Auto);
+    activate_default_model_blocking(
+        &runtime,
+        &home,
+        &pack,
+        preference,
+        intent,
+        DefaultModelActivationMode::PersistSelection,
+    )?;
+
+    Ok(Json(default_model_response(
+        &home,
+        distribution.catalog_source(),
+        runtime.model_pack_path.current().as_deref(),
+    )?))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DefaultModelActivationMode {
+    PersistSelection,
+    ReactivateDurableSelection,
+}
+
+pub(crate) fn activate_default_model_blocking(
+    runtime: &ServerRuntime,
+    home: &Path,
+    pack: &InstalledPack,
+    preference: QuantPreference,
+    intent: openasr_core::device::execution_policy::ExecutionIntent,
+    mode: DefaultModelActivationMode,
+) -> Result<openasr_core::DefaultModelActivationIdentity, ApiError> {
+    let _activation_barrier = runtime.begin_native_activation()?;
     if runtime.backend == BackendKind::Native && runtime.native_rebind_blocked() {
         return Err(ApiError::Conflict(
             "Cannot change the default model while a native transcription or realtime session is running."
@@ -56,9 +90,6 @@ pub(crate) async fn set_default_model(
                 "default model pack is not a verified activation pack: {error}"
             ))
         })?;
-    let intent = crate::realtime::realtime_execution_target_preference(&home)
-        .map(openasr_core::device::execution_policy::ExecutionIntent::from)
-        .unwrap_or(openasr_core::device::execution_policy::ExecutionIntent::Auto);
     let services = runtime.native_execution.execution_services();
     let resolved_activation = openasr_core::resolve_default_model_activation(
         services.as_ref(),
@@ -72,12 +103,23 @@ pub(crate) async fn set_default_model(
     })?;
     let facts = resolved_activation.facts().clone();
     let identity = facts.identity().clone();
-    let prepared = openasr_core::DefaultModelActivationJournalFactory {
-        home: home.clone(),
-        pack: pack.clone(),
-        preference,
-    }
-    .prepare(
+    let journal = match mode {
+        DefaultModelActivationMode::PersistSelection => {
+            openasr_core::DefaultModelActivationJournalFactory::persist_selection(
+                home.to_path_buf(),
+                pack.clone(),
+                preference,
+            )
+        }
+        DefaultModelActivationMode::ReactivateDurableSelection => {
+            openasr_core::DefaultModelActivationJournalFactory::reactivate_durable_selection(
+                home.to_path_buf(),
+                pack.clone(),
+                preference,
+            )
+        }
+    };
+    let prepared = journal.prepare(
         openasr_core::DefaultModelActivationCandidate {
             pull: pack.pull.clone(),
             path: pack.path.clone(),
@@ -95,7 +137,11 @@ pub(crate) async fn set_default_model(
     let reserved = prepared.reserve(reservation);
     debug_assert_eq!(reserved.stage(), openasr_core::ActivationStage::Reserved);
 
-    let staged = NativePackRebindOwner::stage(&runtime, Some(pack.path.clone()))?;
+    let staged = NativeActivationStagedOwner::stage(
+        &runtime,
+        identity.path().to_path_buf(),
+        identity.pack_content_id().to_string(),
+    );
     let materialized = reserved.materialize(std::iter::once(staged));
     debug_assert_eq!(
         materialized.stage(),
@@ -103,9 +149,9 @@ pub(crate) async fn set_default_model(
     );
 
     let pending = materialized.begin_attestation(NativeActivationAttestation {
-        identity,
+        identity: identity.clone(),
         runtime: runtime.clone(),
-        home: home.clone(),
+        home: home.to_path_buf(),
         reservation_context,
     });
     debug_assert_eq!(
@@ -139,52 +185,56 @@ pub(crate) async fn set_default_model(
     // Durable V2 is the commit frontier. Live publication is the non-fallible
     // follow-up: it must not run before persist, and a failed persist must
     // leave the previous live path in place.
-    if runtime.backend == BackendKind::Native {
-        runtime.rebind_native_model_pack(Some(pack.path.clone()))?;
-    }
-
-    Ok(Json(default_model_response(
-        &home,
-        distribution.catalog_source(),
-        runtime.model_pack_path.current().as_deref(),
-    )?))
+    let published_identity = identity.clone();
+    runtime.publish_attested_native_model(identity);
+    Ok(published_identity)
 }
 
-struct NativePackRebindOwner {
+struct NativeActivationStagedOwner {
     runtime: ServerRuntime,
-    previous: Option<PathBuf>,
+    candidate_path: PathBuf,
+    candidate_content_id: String,
+    previous_path: Option<PathBuf>,
 }
 
-impl NativePackRebindOwner {
-    fn stage(runtime: &ServerRuntime, _new_path: Option<PathBuf>) -> Result<Self, ApiError> {
-        Ok(Self {
+impl NativeActivationStagedOwner {
+    fn stage(
+        runtime: &ServerRuntime,
+        candidate_path: PathBuf,
+        candidate_content_id: String,
+    ) -> Self {
+        Self {
             runtime: runtime.clone(),
-            previous: runtime.model_pack_path.current(),
-        })
+            candidate_path,
+            candidate_content_id,
+            previous_path: runtime.model_pack_path.current(),
+        }
     }
 
-    fn restore(&mut self) -> Result<(), String> {
+    fn discard_candidate(&mut self) -> Result<(), String> {
         if self.runtime.backend != BackendKind::Native {
             return Ok(());
         }
-        if self.runtime.model_pack_path.current() == self.previous {
+        if self.previous_path.as_deref() == Some(self.candidate_path.as_path()) {
             return Ok(());
         }
         self.runtime
-            .rebind_native_model_pack(self.previous.clone())
-            .map_err(|error| error.to_string())
+            .native_execution
+            .execution_services()
+            .evict_prepared_runtime_content_id(&self.candidate_content_id);
+        Ok(())
     }
 }
 
-impl openasr_core::StagedOwner for NativePackRebindOwner {
+impl openasr_core::StagedOwner for NativeActivationStagedOwner {
     type Error = String;
 
     fn teardown(&mut self) -> Result<(), Self::Error> {
-        self.restore()
+        self.discard_candidate()
     }
 
     fn quarantine(&mut self) -> Result<(), Self::Error> {
-        self.restore()
+        self.discard_candidate()
     }
 }
 

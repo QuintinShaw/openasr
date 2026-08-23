@@ -234,6 +234,146 @@ fn is_logical_intent(value: &str) -> bool {
         && value.split(':').all(is_logical_atom)
 }
 
+fn encode_intent_atom(value: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn decode_intent_atom(value: &str) -> Result<String, String> {
+    if value.is_empty() || value.len() % 2 != 0 {
+        return Err("encoded execution-intent atom has an invalid length".to_string());
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let digits = std::str::from_utf8(pair)
+            .map_err(|_| "encoded execution-intent atom is not ASCII".to_string())?;
+        bytes.push(
+            u8::from_str_radix(digits, 16)
+                .map_err(|_| "encoded execution-intent atom is not hexadecimal".to_string())?,
+        );
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| "encoded execution-intent atom is not valid UTF-8".to_string())
+}
+
+fn execution_provider_from_wire(
+    value: &str,
+) -> Result<crate::device::execution_route::ExecutionProvider, String> {
+    use crate::device::execution_route::ExecutionProvider;
+    match value {
+        "cpu" => Ok(ExecutionProvider::Cpu),
+        "metal" => Ok(ExecutionProvider::Metal),
+        "cuda" => Ok(ExecutionProvider::Cuda),
+        "hip" => Ok(ExecutionProvider::Hip),
+        "vulkan" => Ok(ExecutionProvider::Vulkan),
+        "accelerator" => Ok(ExecutionProvider::Accelerator),
+        "unknown" => Ok(ExecutionProvider::Unknown),
+        _ => Err(format!("unknown persisted execution provider {value}")),
+    }
+}
+
+/// Stable, path-free wire form stored in [`ActiveModelSelectionV2`]. Exact
+/// selectors hex-encode provider-local identifiers so arbitrary device names
+/// cannot violate the record's logical-value grammar.
+pub fn execution_intent_to_v2_wire(
+    intent: &crate::device::execution_policy::ExecutionIntent,
+) -> String {
+    use crate::device::{
+        execution_policy::{AcceleratedDeviceConstraint, ExecutionIntent},
+        execution_route::{ExactDeviceSelector, ExecutionHardwareVendor},
+    };
+    match intent {
+        ExecutionIntent::Auto => "auto".to_string(),
+        ExecutionIntent::CpuOnly => "cpu_only".to_string(),
+        ExecutionIntent::AcceleratedOnly => "accelerated_only".to_string(),
+        ExecutionIntent::ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint::Provider(
+            provider,
+        )) => format!("provider:{}", provider.as_str()),
+        ExecutionIntent::ConstrainedAcceleratedOnly(
+            AcceleratedDeviceConstraint::HardwareVendor(vendor),
+        ) => format!(
+            "vendor:{}",
+            match vendor {
+                ExecutionHardwareVendor::Apple => "apple",
+                ExecutionHardwareVendor::Nvidia => "nvidia",
+                ExecutionHardwareVendor::Amd => "amd",
+                ExecutionHardwareVendor::Intel => "intel",
+            }
+        ),
+        ExecutionIntent::Exact(ExactDeviceSelector::PhysicalKey(key)) => {
+            format!("exact_physical:{}", encode_intent_atom(key.as_str()))
+        }
+        ExecutionIntent::Exact(ExactDeviceSelector::StableId {
+            provider,
+            stable_id,
+        }) => format!(
+            "exact_stable:{}:{}",
+            provider.map_or("any", |provider| provider.as_str()),
+            encode_intent_atom(stable_id)
+        ),
+    }
+}
+
+pub fn execution_intent_from_v2_wire(
+    value: &str,
+) -> Result<crate::device::execution_policy::ExecutionIntent, String> {
+    use crate::device::{
+        execution_policy::{AcceleratedDeviceConstraint, ExecutionIntent},
+        execution_route::{ExactDeviceSelector, ExecutionHardwareVendor, PhysicalResourceKey},
+    };
+    match value {
+        "auto" => return Ok(ExecutionIntent::Auto),
+        "cpu_only" => return Ok(ExecutionIntent::CpuOnly),
+        "accelerated_only" => return Ok(ExecutionIntent::AcceleratedOnly),
+        _ => {}
+    }
+    if let Some(provider) = value.strip_prefix("provider:") {
+        return Ok(ExecutionIntent::ConstrainedAcceleratedOnly(
+            AcceleratedDeviceConstraint::Provider(execution_provider_from_wire(provider)?),
+        ));
+    }
+    if let Some(vendor) = value.strip_prefix("vendor:") {
+        let vendor = match vendor {
+            "apple" => ExecutionHardwareVendor::Apple,
+            "nvidia" => ExecutionHardwareVendor::Nvidia,
+            "amd" => ExecutionHardwareVendor::Amd,
+            "intel" => ExecutionHardwareVendor::Intel,
+            _ => return Err(format!("unknown persisted execution vendor {vendor}")),
+        };
+        return Ok(ExecutionIntent::ConstrainedAcceleratedOnly(
+            AcceleratedDeviceConstraint::HardwareVendor(vendor),
+        ));
+    }
+    if let Some(encoded) = value.strip_prefix("exact_physical:") {
+        let decoded = decode_intent_atom(encoded)?;
+        let key = PhysicalResourceKey::new(decoded)
+            .ok_or_else(|| "persisted exact physical key is empty".to_string())?;
+        return Ok(ExecutionIntent::Exact(ExactDeviceSelector::PhysicalKey(
+            key,
+        )));
+    }
+    if let Some(rest) = value.strip_prefix("exact_stable:") {
+        let (provider, encoded) = rest
+            .split_once(':')
+            .ok_or_else(|| "persisted exact stable selector is malformed".to_string())?;
+        let provider = if provider == "any" {
+            None
+        } else {
+            Some(execution_provider_from_wire(provider)?)
+        };
+        return Ok(ExecutionIntent::Exact(ExactDeviceSelector::StableId {
+            provider,
+            stable_id: decode_intent_atom(encoded)?,
+        }));
+    }
+    Err(format!("unknown persisted execution intent {value}"))
+}
+
 impl ActiveModelSelectionV2 {
     fn checksum_payload(&self) -> Result<Vec<u8>, serde_json::Error> {
         let mut unsigned = self.clone();
@@ -649,6 +789,37 @@ pub fn persist_detailed(
     pack: &InstalledPack,
     quant_preference: QuantPreference,
 ) -> Result<DefaultSelectionCommitOutcome, DefaultSelectionError> {
+    persist_detailed_with_activation_metadata(home, pack, quant_preference, None, "auto")
+}
+
+/// Activation-only writer. The ordinary legacy projection API above keeps its
+/// historical `auto`/unknown-architecture metadata; the attested server path
+/// supplies the immutable architecture and user execution intent resolved by
+/// the activation plan.
+pub fn persist_activation_detailed(
+    home: &Path,
+    pack: &InstalledPack,
+    quant_preference: QuantPreference,
+    architecture_id: &str,
+    execution_intent: &crate::device::execution_policy::ExecutionIntent,
+) -> Result<DefaultSelectionCommitOutcome, DefaultSelectionError> {
+    let execution_intent = execution_intent_to_v2_wire(execution_intent);
+    persist_detailed_with_activation_metadata(
+        home,
+        pack,
+        quant_preference,
+        Some(architecture_id),
+        &execution_intent,
+    )
+}
+
+fn persist_detailed_with_activation_metadata(
+    home: &Path,
+    pack: &InstalledPack,
+    quant_preference: QuantPreference,
+    architecture_id: Option<&str>,
+    execution_intent: &str,
+) -> Result<DefaultSelectionCommitOutcome, DefaultSelectionError> {
     let _lock = selection_write_lock();
     let _file_lock = SelectionFileLock::acquire(home)?;
     if persist_commit_failpoint_enabled() {
@@ -671,16 +842,13 @@ pub fn persist_detailed(
         pull: Some(pack.pull.clone()),
         model_id: Some(pack.model_id.clone()),
         quant: Some(pack.quant.clone()),
-        // InstalledPack is a legacy projection and predates architecture identity.
-        // New activation callers may provide the exact architecture through the
-        // record builder; legacy writes retain the logical model identity only.
-        architecture_id: None,
+        architecture_id: architecture_id.map(str::to_string),
         expected_pack: Some(ExpectedPackIdentityV2 {
             sha256: pack.sha256.clone(),
             size_bytes: pack.size_bytes,
         }),
         quant_preference: quant_preference.clone(),
-        execution_intent: "auto".to_string(),
+        execution_intent: execution_intent.to_string(),
         checksum: String::new(),
     };
     let record = match record.with_checksum() {

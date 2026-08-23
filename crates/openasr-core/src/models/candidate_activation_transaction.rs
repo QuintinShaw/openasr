@@ -1358,6 +1358,8 @@ pub struct DefaultModelActivationCandidate {
 pub struct DefaultModelActivationPlan {
     path: std::path::PathBuf,
     pack_content_id: String,
+    architecture_id: String,
+    execution_intent: crate::device::execution_policy::ExecutionIntent,
     resolved_runtime: ResolvedFamilyRuntimeInput,
     resident_topology: DefaultModelResidentTopologyPlan,
 }
@@ -1366,12 +1368,16 @@ impl DefaultModelActivationPlan {
     pub(crate) fn new(
         path: std::path::PathBuf,
         pack_content_id: String,
+        architecture_id: String,
+        execution_intent: crate::device::execution_policy::ExecutionIntent,
         resolved_runtime: ResolvedFamilyRuntimeInput,
         resident_topology: DefaultModelResidentTopologyPlan,
     ) -> Self {
         Self {
             path,
             pack_content_id,
+            architecture_id,
+            execution_intent,
             resolved_runtime,
             resident_topology,
         }
@@ -1383,6 +1389,14 @@ impl DefaultModelActivationPlan {
 
     pub fn pack_content_id(&self) -> &str {
         &self.pack_content_id
+    }
+
+    pub fn architecture_id(&self) -> &str {
+        &self.architecture_id
+    }
+
+    pub fn execution_intent(&self) -> &crate::device::execution_policy::ExecutionIntent {
+        &self.execution_intent
     }
 
     pub fn resolved_runtime(&self) -> ResolvedFamilyRuntimeInput {
@@ -1400,6 +1414,8 @@ impl DefaultModelActivationPlan {
     pub fn matches_identity(&self, identity: &DefaultModelActivationIdentity) -> bool {
         self.path == identity.path
             && self.pack_content_id == identity.pack_content_id
+            && self.architecture_id == identity.architecture_id
+            && self.execution_intent == identity.execution_intent
             && self.output_plan() == identity.output_plan
             && self.reuse_mode() == identity.reuse_mode
             && self.resident_topology == identity.resident_topology
@@ -1431,6 +1447,8 @@ pub struct DefaultModelActivationIdentity {
     pull: String,
     path: std::path::PathBuf,
     pack_content_id: String,
+    architecture_id: String,
+    execution_intent: crate::device::execution_policy::ExecutionIntent,
     candidate: ExecutionCandidate,
     output_plan: GgmlDecodeOutputPlan,
     reuse_mode: GgmlDecodeReuseMode,
@@ -1442,6 +1460,8 @@ impl DefaultModelActivationIdentity {
         pull: String,
         path: std::path::PathBuf,
         pack_content_id: String,
+        architecture_id: String,
+        execution_intent: crate::device::execution_policy::ExecutionIntent,
         candidate: ExecutionCandidate,
         output_plan: GgmlDecodeOutputPlan,
         reuse_mode: GgmlDecodeReuseMode,
@@ -1451,6 +1471,8 @@ impl DefaultModelActivationIdentity {
             pull,
             path,
             pack_content_id,
+            architecture_id,
+            execution_intent,
             candidate,
             output_plan,
             reuse_mode,
@@ -1468,6 +1490,14 @@ impl DefaultModelActivationIdentity {
 
     pub fn pack_content_id(&self) -> &str {
         &self.pack_content_id
+    }
+
+    pub fn architecture_id(&self) -> &str {
+        &self.architecture_id
+    }
+
+    pub fn execution_intent(&self) -> &crate::device::execution_policy::ExecutionIntent {
+        &self.execution_intent
     }
 
     pub const fn candidate(&self) -> &ExecutionCandidate {
@@ -1520,9 +1550,16 @@ impl ActivationReservation for NoopActivationReservation {
 /// Factory for the production default-model publication journal. Persist of
 /// V2 happens only when an attested transaction commits.
 pub struct DefaultModelActivationJournalFactory {
-    pub home: std::path::PathBuf,
-    pub pack: crate::InstalledPack,
-    pub preference: crate::QuantPreference,
+    home: std::path::PathBuf,
+    pack: crate::InstalledPack,
+    preference: crate::QuantPreference,
+    publication: DefaultModelActivationPublication,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefaultModelActivationPublication {
+    PersistSelection,
+    ReactivateDurableSelection,
 }
 
 /// Opaque production journal. Families and the server cannot call publish.
@@ -1530,9 +1567,38 @@ pub struct DefaultModelActivationJournal {
     home: std::path::PathBuf,
     pack: crate::InstalledPack,
     preference: crate::QuantPreference,
+    architecture_id: String,
+    execution_intent: crate::device::execution_policy::ExecutionIntent,
+    publication: DefaultModelActivationPublication,
 }
 
 impl DefaultModelActivationJournalFactory {
+    pub fn persist_selection(
+        home: std::path::PathBuf,
+        pack: crate::InstalledPack,
+        preference: crate::QuantPreference,
+    ) -> Self {
+        Self {
+            home,
+            pack,
+            preference,
+            publication: DefaultModelActivationPublication::PersistSelection,
+        }
+    }
+
+    pub fn reactivate_durable_selection(
+        home: std::path::PathBuf,
+        pack: crate::InstalledPack,
+        preference: crate::QuantPreference,
+    ) -> Self {
+        Self {
+            home,
+            pack,
+            preference,
+            publication: DefaultModelActivationPublication::ReactivateDurableSelection,
+        }
+    }
+
     pub fn prepare(
         self,
         candidate: DefaultModelActivationCandidate,
@@ -1565,7 +1631,7 @@ impl
     fn build(
         self,
         _candidate: &DefaultModelActivationCandidate,
-        _facts: &ResolvedExecutionFacts<
+        facts: &ResolvedExecutionFacts<
             DefaultModelActivationPlan,
             DefaultModelActivationLane,
             DefaultModelActivationIdentity,
@@ -1575,6 +1641,9 @@ impl
             home: self.home,
             pack: self.pack,
             preference: self.preference,
+            architecture_id: facts.plan().architecture_id().to_string(),
+            execution_intent: facts.plan().execution_intent().clone(),
+            publication: self.publication,
         }
     }
 }
@@ -1598,16 +1667,50 @@ impl
             DefaultModelActivationIdentity,
         >,
     ) -> Result<(), PublicationFailure<Self::Error>> {
-        match crate::default_selection::persist_detailed(
-            &self.home,
-            &self.pack,
-            self.preference.clone(),
-        ) {
-            Ok(crate::default_selection::DefaultSelectionCommitOutcome::NotCommitted {
-                reason,
-            }) => Err(PublicationFailure::Rejected(reason)),
-            Ok(_) => Ok(()),
-            Err(error) => Err(PublicationFailure::Rejected(error.to_string())),
+        match self.publication {
+            DefaultModelActivationPublication::PersistSelection => {
+                match crate::default_selection::persist_activation_detailed(
+                    &self.home,
+                    &self.pack,
+                    self.preference.clone(),
+                    &self.architecture_id,
+                    &self.execution_intent,
+                ) {
+                    Ok(crate::default_selection::DefaultSelectionCommitOutcome::NotCommitted {
+                        reason,
+                    }) => Err(PublicationFailure::Rejected(reason)),
+                    Ok(_) => Ok(()),
+                    Err(error) => Err(PublicationFailure::Rejected(error.to_string())),
+                }
+            }
+            DefaultModelActivationPublication::ReactivateDurableSelection => {
+                let durable = crate::default_selection::read_active_model_selection_v2(&self.home)
+                    .map_err(|error| PublicationFailure::Rejected(error.to_string()))?;
+                let durable_matches_plan = durable.as_ref().is_some_and(|record| {
+                    record
+                        .architecture_id
+                        .as_deref()
+                        .map_or(true, |architecture| architecture == self.architecture_id)
+                        && crate::default_selection::execution_intent_from_v2_wire(
+                            &record.execution_intent,
+                        )
+                        .is_ok_and(|intent| intent == self.execution_intent)
+                });
+                match crate::default_selection::resolve_with_catalog(&self.home, None) {
+                    Ok(crate::default_selection::DefaultModelResolution::Installed(pack))
+                        if pack.path == self.pack.path
+                            && pack.sha256.eq_ignore_ascii_case(&self.pack.sha256)
+                            && pack.size_bytes == self.pack.size_bytes
+                            && durable_matches_plan =>
+                    {
+                        Ok(())
+                    }
+                    Ok(_) => Err(PublicationFailure::Rejected(
+                        "durable default selection changed during startup reactivation".to_string(),
+                    )),
+                    Err(error) => Err(PublicationFailure::Rejected(error.to_string())),
+                }
+            }
         }
     }
 

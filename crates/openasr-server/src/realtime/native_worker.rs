@@ -1113,12 +1113,39 @@ pub(crate) fn wait_while_native_warmup_in_flight_blocking() {
     }
 }
 
-pub(crate) fn spawn_boot_native_warmup(runtime: ServerRuntime) {
-    // Same shipped attestation entry as set-default. Failure must not persist
-    // V2 or publish an unattested runtime as the live default; errors stay
-    // local to this background task.
-    tokio::spawn(async move {
-        let _ = probe_native_activation(runtime, None, None, None).await;
+pub(crate) fn spawn_boot_native_warmup(runtime: ServerRuntime, home: PathBuf) {
+    // Reactivation walks the same verify -> resolve -> reserve -> materialize
+    // -> attest -> reconcile transaction as set-default. Its journal only
+    // validates that the durable V2 request is still current; it never writes
+    // a new generation during boot.
+    tokio::task::spawn_blocking(move || {
+        let Some(requested_path) = runtime.model_pack_path.requested_path() else {
+            return;
+        };
+        let Ok(Some(record)) =
+            openasr_core::default_selection::read_active_model_selection_v2(&home)
+        else {
+            return;
+        };
+        let Ok(packs) = openasr_core::list_installed_packs(&home) else {
+            return;
+        };
+        let Some(pack) = packs.into_iter().find(|pack| pack.path == requested_path) else {
+            return;
+        };
+        let Ok(intent) = openasr_core::default_selection::execution_intent_from_v2_wire(
+            &record.execution_intent,
+        ) else {
+            return;
+        };
+        let _ = crate::activate_default_model_blocking(
+            &runtime,
+            &home,
+            &pack,
+            record.quant_preference,
+            intent,
+            crate::DefaultModelActivationMode::ReactivateDurableSelection,
+        );
     });
 }
 

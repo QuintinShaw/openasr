@@ -2259,34 +2259,133 @@ async fn set_default_model_http_real_probe_attests_plan_lane_and_live_backend() 
         runtime.model_pack_path.current().as_deref(),
         Some(next_path.as_path())
     );
+    let durable = openasr_core::default_selection::read_active_model_selection_v2(&home)
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.execution_intent, "cpu_only");
+    assert!(durable.architecture_id.is_some());
+}
+
+#[test]
+fn active_runtime_barrier_closes_session_admission_race() {
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: None.into(),
+    };
+
+    let activation = runtime.begin_native_activation().unwrap();
+    assert!(matches!(
+        runtime.acquire_native_execution("activation-barrier", None),
+        Err(ApiError::Conflict(_))
+    ));
+    drop(activation);
+
+    let permit = runtime
+        .acquire_native_execution("activation-barrier", None)
+        .unwrap();
+    let activation = runtime.begin_native_activation().unwrap();
+    assert!(runtime.native_rebind_blocked());
+    drop(activation);
+    drop(permit);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boot_reactivation_attests_v2_before_publishing_active_runtime() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut config = openasr_core::load_config_document(&home).unwrap();
+    config.preferences.execution_target = openasr_core::ExecutionTarget::Cpu;
+    openasr_core::save_config_document(&home, &config).unwrap();
+    let pack_path = write_installed_pack_ref(
+        &home,
+        "cohere-transcribe-restart",
+        "cohere-transcribe-restart:q4",
+        "q4_0",
+        "q4",
+        "cohere-transcribe-restart",
+    );
+    let pack = installed_pack_by_pull(&home, "cohere-transcribe-restart:q4");
+    let verified = openasr_core::PackVerifier
+        .verify_candidate(openasr_core::PackCandidate::new(pack.path.clone()))
+        .unwrap();
+    openasr_core::default_selection::persist_activation_detailed(
+        &home,
+        &pack,
+        QuantPreference::pinned(&pack.quant),
+        verified.model_architecture(),
+        &openasr_core::device::execution_policy::ExecutionIntent::CpuOnly,
+    )
+    .unwrap();
+    let durable_before =
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap();
+
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: ActiveRuntimeSlot::requested(Some(pack_path.clone())),
+    };
+    assert!(runtime.model_pack_path.current().is_none());
+    assert_eq!(
+        runtime.model_pack_path.requested_path().as_deref(),
+        Some(pack_path.as_path())
+    );
+
+    realtime::spawn_boot_native_warmup(runtime.clone(), home.clone());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while runtime.model_pack_path.current().is_none() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(pack_path.as_path())
+    );
+    assert_eq!(
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap(),
+        durable_before,
+        "startup reactivation must validate, not rewrite, durable V2"
+    );
+    let services = runtime.native_execution.execution_services();
+    assert_eq!(
+        services
+            .runtime_receipts()
+            .reconcile_live_leases_quiescent(services.memory_broker()),
+        openasr_core::runtime_receipts::LeaseReceiptShadow::Matched
+    );
 }
 
 #[test]
 fn set_default_model_http_stage_does_not_publish_live() {
     let source = include_str!("routes/models_api.rs");
     let owner_impl = source
-        .split("impl NativePackRebindOwner")
+        .split("impl NativeActivationStagedOwner")
         .nth(1)
-        .expect("NativePackRebindOwner impl");
+        .expect("NativeActivationStagedOwner impl");
     let stage = owner_impl
-        .split("fn restore")
+        .split("fn discard_candidate")
         .next()
-        .expect("stage precedes restore");
+        .expect("stage precedes discard");
     assert!(
         stage.contains("fn stage("),
-        "expected NativePackRebindOwner::stage in source audit window"
+        "expected NativeActivationStagedOwner::stage in source audit window"
     );
     assert!(
         !stage.contains("rebind_native_model_pack"),
         "materialize/stage must not publish live: {stage}"
     );
     let set_default = source
-        .split("pub(crate) async fn set_default_model")
+        .split("pub(crate) fn activate_default_model_blocking")
         .nth(1)
-        .expect("set_default_model")
-        .split("pub(crate) async fn delete_model")
+        .expect("activate_default_model_blocking")
+        .split("struct NativeActivationStagedOwner")
         .next()
-        .expect("set_default_model body");
+        .expect("activation body");
     assert!(
         !set_default.contains("NoopActivationReservation"),
         "set_default_model must not reserve with NoopActivationReservation"
@@ -2308,7 +2407,7 @@ fn set_default_model_http_stage_does_not_publish_live() {
         .find("commit_activation")
         .expect("persist/commit must exist");
     let publish_idx = set_default
-        .find("rebind_native_model_pack")
+        .find("publish_attested_native_model")
         .expect("live publication must exist after persist");
     assert!(
         persist_idx < publish_idx,
@@ -2317,29 +2416,29 @@ fn set_default_model_http_stage_does_not_publish_live() {
 }
 
 #[test]
-fn spawn_boot_native_warmup_uses_set_default_attestation_entry() {
+fn spawn_boot_native_warmup_uses_set_default_transaction_entry() {
     let source = include_str!("realtime/native_worker.rs");
     let spawn = source
         .split("pub(crate) fn spawn_boot_native_warmup")
         .nth(1)
         .expect("spawn_boot_native_warmup")
-        .split("pub(crate) async fn probe_native_activation")
+        .split("/// Attest a candidate pack")
         .next()
         .expect("spawn_boot_native_warmup body");
     assert!(
-        spawn.contains("probe_native_activation("),
-        "boot warmup must use the same shipped attestation entry as set-default: {spawn}"
+        spawn.contains("activate_default_model_blocking(")
+            && spawn.contains("ReactivateDurableSelection"),
+        "boot warmup must use the same complete transaction entry as set-default: {spawn}"
     );
     assert!(
         !spawn.contains("warm_up_default_native_streaming_worker"),
         "boot warmup must not bypass probe_native_activation: {spawn}"
     );
     assert!(
-        !spawn.contains("commit_activation")
-            && !spawn.contains("rebind_native_model_pack")
+        !spawn.contains("rebind_native_model_pack")
             && !spawn.contains("persist_detailed")
-            && !spawn.contains("persist_default"),
-        "failed boot warmup must not persist V2 or publish live: {spawn}"
+            && !spawn.contains("PersistSelection"),
+        "boot reactivation must not bypass the read-only durable journal: {spawn}"
     );
 }
 

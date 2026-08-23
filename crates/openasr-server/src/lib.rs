@@ -349,7 +349,7 @@ pub async fn serve_with_launch_options(
     // anything below that could block, so it never gates bind/serve/health.
     // See `spawn_boot_native_warmup`'s doc comment for the dedup story with a
     // concurrent real WS attach.
-    realtime::spawn_boot_native_warmup(runtime.clone());
+    realtime::spawn_boot_native_warmup(runtime.clone(), home.clone());
     // idle_unload: only spawn the reaper when the resolved policy is not
     // `never` (`idle_unload_after` is `None` for `never` and for every
     // existing caller/test that does not set it, so this is a no-op there).
@@ -1290,78 +1290,155 @@ fn resolve_instance_token(launch_option: Option<String>) -> Option<String> {
         .or_else(|| launch_option.filter(|value| !value.is_empty()))
 }
 
-/// Process-wide bound native pack path shared by every `ServerRuntime` clone.
+/// Process-wide active-runtime publication slot shared by every
+/// [`ServerRuntime`] clone.
 ///
-/// Model bind is in-process state, independent of optional GPU plugin load
-/// (CUDA/HIP/Vulkan via `active.json`). `POST /v1/models/default` rebinds this
-/// without restarting the process. One bound pack at a time.
+/// The requested path and the active binding are deliberately distinct. A
+/// fresh process may discover a durable V2 request, but it is not active until
+/// startup re-verifies and re-attests it. Set-default publishes an attested
+/// identity with one non-fallible pointer exchange only after V2 commits.
 #[derive(Clone)]
-pub struct BoundModelPackPath {
-    inner: Arc<RwLock<Option<PathBuf>>>,
+pub struct ActiveRuntimeSlot {
+    inner: Arc<RwLock<ActiveRuntimeSlotState>>,
+    /// Serializes activation against new session admission. Existing sessions
+    /// are checked after acquiring this gate; new sessions take the same gate
+    /// briefly while obtaining their model permit, closing the durable-commit
+    /// versus live-publication race.
+    activation_barrier: Arc<Mutex<()>>,
     /// Test-only failpoint honored inside the shipped
     /// [`crate::realtime::probe_native_activation`]. Production leaves this
     /// unset so live warmup runs.
     activation_probe_failpoint: Arc<RwLock<Option<Result<(), String>>>>,
 }
 
-impl std::fmt::Debug for BoundModelPackPath {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveRuntimeBinding {
+    path: PathBuf,
+    attested_identity: Option<openasr_core::DefaultModelActivationIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveRuntimeSlotState {
+    requested_path: Option<PathBuf>,
+    active: Option<ActiveRuntimeBinding>,
+}
+
+/// Compatibility name retained for embedders while the implementation is an
+/// active-runtime slot rather than a path authority.
+pub type BoundModelPackPath = ActiveRuntimeSlot;
+
+impl std::fmt::Debug for ActiveRuntimeSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("BoundModelPackPath")
-            .field(&self.current())
+        f.debug_struct("ActiveRuntimeSlot")
+            .field("requested", &self.requested_path())
+            .field("active", &self.current())
             .finish()
     }
 }
 
-impl PartialEq for BoundModelPackPath {
+impl PartialEq for ActiveRuntimeSlot {
     fn eq(&self, other: &Self) -> bool {
-        self.current() == other.current()
+        *self.lock_read() == *other.lock_read()
     }
 }
 
-impl Eq for BoundModelPackPath {}
+impl Eq for ActiveRuntimeSlot {}
 
-impl Default for BoundModelPackPath {
+impl Default for ActiveRuntimeSlot {
     fn default() -> Self {
         Self::from(None)
     }
 }
 
-impl From<Option<PathBuf>> for BoundModelPackPath {
+impl From<Option<PathBuf>> for ActiveRuntimeSlot {
     fn from(path: Option<PathBuf>) -> Self {
+        // Existing embedded callers pass an already-bound path. Daemon startup
+        // uses `requested` below so durable intent is never mistaken for live
+        // process memory.
+        let active = path.clone().map(|path| ActiveRuntimeBinding {
+            path,
+            attested_identity: None,
+        });
         Self {
-            inner: Arc::new(RwLock::new(path)),
+            inner: Arc::new(RwLock::new(ActiveRuntimeSlotState {
+                requested_path: path,
+                active,
+            })),
+            activation_barrier: Arc::new(Mutex::new(())),
             activation_probe_failpoint: Arc::new(RwLock::new(None)),
         }
     }
 }
 
-impl BoundModelPackPath {
-    fn lock_read(&self) -> std::sync::RwLockReadGuard<'_, Option<PathBuf>> {
+impl ActiveRuntimeSlot {
+    /// Constructs the daemon's startup state from durable requested intent.
+    /// The path is not returned by [`Self::current`] until reactivation passes.
+    pub fn requested(path: Option<PathBuf>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(ActiveRuntimeSlotState {
+                requested_path: path,
+                active: None,
+            })),
+            activation_barrier: Arc::new(Mutex::new(())),
+            activation_probe_failpoint: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    fn lock_read(&self) -> std::sync::RwLockReadGuard<'_, ActiveRuntimeSlotState> {
         self.inner
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn lock_write(&self) -> std::sync::RwLockWriteGuard<'_, Option<PathBuf>> {
+    fn lock_write(&self) -> std::sync::RwLockWriteGuard<'_, ActiveRuntimeSlotState> {
         self.inner
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn current(&self) -> Option<PathBuf> {
-        self.lock_read().clone()
+        self.lock_read()
+            .active
+            .as_ref()
+            .map(|binding| binding.path.clone())
+    }
+
+    pub fn requested_path(&self) -> Option<PathBuf> {
+        self.lock_read().requested_path.clone()
     }
 
     pub fn is_some(&self) -> bool {
-        self.lock_read().is_some()
+        self.lock_read().active.is_some()
     }
 
     pub fn is_none(&self) -> bool {
-        self.lock_read().is_none()
+        self.lock_read().active.is_none()
     }
 
-    fn set(&self, path: Option<PathBuf>) {
-        *self.lock_write() = path;
+    fn set_legacy_binding(&self, path: Option<PathBuf>) {
+        let mut state = self.lock_write();
+        state.requested_path = path.clone();
+        state.active = path.map(|path| ActiveRuntimeBinding {
+            path,
+            attested_identity: None,
+        });
+    }
+
+    fn publish_attested(&self, identity: openasr_core::DefaultModelActivationIdentity) {
+        let path = identity.path().to_path_buf();
+        let mut state = self.lock_write();
+        state.requested_path = Some(path.clone());
+        state.active = Some(ActiveRuntimeBinding {
+            path,
+            attested_identity: Some(identity),
+        });
+    }
+
+    fn active_identity(&self) -> Option<openasr_core::DefaultModelActivationIdentity> {
+        self.lock_read()
+            .active
+            .as_ref()
+            .and_then(|binding| binding.attested_identity.clone())
     }
 
     /// Inject a result into the shipped activation probe. Production leaves
@@ -1423,10 +1500,31 @@ impl ServerRuntime {
         verified_model_identity: &str,
         route: Option<&openasr_core::ResolvedExecutionRoute>,
     ) -> Result<ModelSessionPermit, ApiError> {
+        let _activation_gate = match self.model_pack_path.activation_barrier.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(ApiError::Conflict(
+                    "Cannot start a native session while the active model is changing.".to_string(),
+                ));
+            }
+        };
         let identity = openasr_core::admission_identity_for_route(verified_model_identity, route);
         self.native_execution
             .try_acquire(identity)
             .map_err(ApiError::ModelSessionCapacity)
+    }
+
+    pub(crate) fn begin_native_activation(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, ApiError> {
+        match self.model_pack_path.activation_barrier.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => Err(ApiError::Conflict(
+                "Another native model activation is already running.".to_string(),
+            )),
+        }
     }
 
     /// Validates the runtime is *safe to serve with*, not that a model is
@@ -1479,6 +1577,7 @@ impl ServerRuntime {
         if self.backend != BackendKind::Native {
             return Ok(());
         }
+        let _activation_gate = self.begin_native_activation()?;
         if self.native_rebind_blocked() {
             return Err(ApiError::Conflict(
                 "Cannot change the default model while a native transcription or realtime session is running."
@@ -1488,7 +1587,7 @@ impl ServerRuntime {
         if let Some(path) = new_path.as_deref() {
             let _ = validate_native_runtime_pack(path).map_err(ApiError::Backend)?;
         }
-        self.model_pack_path.set(new_path);
+        self.model_pack_path.set_legacy_binding(new_path);
         if !self.native_rebind_blocked() {
             self.native_execution
                 .execution_services()
@@ -1497,6 +1596,27 @@ impl ServerRuntime {
             invalidate_cached_native_realtime_capabilities();
         }
         Ok(())
+    }
+
+    /// Publishes one already-attested identity after durable V2 commit. All
+    /// fallible checks happen before this call while the activation barrier is
+    /// held, so the live pointer exchange itself cannot return an error.
+    pub(crate) fn publish_attested_native_model(
+        &self,
+        identity: openasr_core::DefaultModelActivationIdentity,
+    ) {
+        let previous = self.model_pack_path.active_identity();
+        self.model_pack_path.publish_attested(identity.clone());
+        if self.backend == BackendKind::Native
+            && let Some(previous) = previous
+            && previous.pack_content_id() != identity.pack_content_id()
+        {
+            self.native_execution
+                .execution_services()
+                .evict_prepared_runtime_content_id(previous.pack_content_id());
+        }
+        idle_activity::bump_native_unload_generation();
+        invalidate_cached_native_realtime_capabilities();
     }
 
     /// Whether the bound model's runtime is resident right now (surfaced by

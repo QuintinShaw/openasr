@@ -1737,6 +1737,8 @@ pub fn resolve_default_model_activation(
     let plan = DefaultModelActivationPlan::new(
         path.clone(),
         pack_content_id.clone(),
+        architecture_id.to_string(),
+        intent.clone(),
         resolved_runtime,
         resident_topology.clone(),
     );
@@ -1745,6 +1747,8 @@ pub fn resolve_default_model_activation(
         pull,
         path,
         pack_content_id,
+        architecture_id.to_string(),
+        intent,
         candidate.clone(),
         plan.output_plan(),
         plan.reuse_mode(),

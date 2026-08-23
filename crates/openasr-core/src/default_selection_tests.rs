@@ -624,3 +624,58 @@ fn v2_exact_checksum_mismatch_resolves_not_installed() {
         DefaultModelResolution::NotInstalled("whisper-small".to_string())
     );
 }
+
+#[test]
+fn v2_execution_intent_wire_round_trips_every_selector_shape() {
+    use crate::device::{
+        execution_policy::{AcceleratedDeviceConstraint, ExecutionIntent},
+        execution_route::{
+            ExactDeviceSelector, ExecutionHardwareVendor, ExecutionProvider, PhysicalResourceKey,
+        },
+    };
+
+    let intents = vec![
+        ExecutionIntent::Auto,
+        ExecutionIntent::CpuOnly,
+        ExecutionIntent::AcceleratedOnly,
+        ExecutionIntent::ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint::Provider(
+            ExecutionProvider::Cuda,
+        )),
+        ExecutionIntent::ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint::HardwareVendor(
+            ExecutionHardwareVendor::Amd,
+        )),
+        ExecutionIntent::Exact(ExactDeviceSelector::PhysicalKey(
+            PhysicalResourceKey::new("0000:c1:00.0").unwrap(),
+        )),
+        ExecutionIntent::Exact(ExactDeviceSelector::StableId {
+            provider: Some(ExecutionProvider::Vulkan),
+            stable_id: "Vulkan device/0: discrete".to_string(),
+        }),
+        ExecutionIntent::Exact(ExactDeviceSelector::StableId {
+            provider: None,
+            stable_id: "provider-local 设备".to_string(),
+        }),
+    ];
+
+    for intent in intents {
+        let wire = execution_intent_to_v2_wire(&intent);
+        assert!(is_logical_intent(&wire), "wire must stay logical: {wire}");
+        assert_eq!(execution_intent_from_v2_wire(&wire).unwrap(), intent);
+    }
+}
+
+#[test]
+fn v2_execution_intent_wire_rejects_malformed_exact_identifiers() {
+    for wire in [
+        "exact_physical:",
+        "exact_physical:0",
+        "exact_stable:cuda:",
+        "exact_stable:not-a-provider:43505530",
+        "unknown_intent",
+    ] {
+        assert!(
+            execution_intent_from_v2_wire(wire).is_err(),
+            "malformed wire unexpectedly accepted: {wire}"
+        );
+    }
+}
