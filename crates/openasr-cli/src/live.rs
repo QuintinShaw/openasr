@@ -137,7 +137,7 @@ pub(crate) async fn run_live(
     let config = load_config(&home)?;
     let catalog = load_cli_model_catalog(&home)?;
     let cards = runtime_registry(catalog.as_ref()).context("Could not load model registry")?;
-    let model_ref = selected_model_ref(options.model, &config, &cards);
+    let model_ref = selected_model_ref(options.model, &home)?;
     let card = find_model(&cards, &model_ref)?.card;
     let backend = resolve_backend(options.backend, &config)?;
     // CLI-only consent-pull: native without an explicit --model-pack ensures the

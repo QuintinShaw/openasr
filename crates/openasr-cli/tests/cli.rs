@@ -64,6 +64,48 @@ fn temp_home() -> TempDir {
     tempfile::tempdir().expect("temporary OPENASR_HOME")
 }
 
+fn persist_v2_unset(home: &Path) {
+    openasr_core::default_selection::persist_v2_record(
+        home,
+        openasr_core::default_selection::ActiveModelSelectionV2 {
+            schema_version:
+                openasr_core::default_selection::ACTIVE_MODEL_SELECTION_V2_SCHEMA_VERSION,
+            selection_generation: 0,
+            status: openasr_core::default_selection::ActiveModelSelectionStatus::Unset,
+            pull: None,
+            model_id: None,
+            quant: None,
+            architecture_id: None,
+            expected_pack: None,
+            quant_preference: openasr_core::QuantPreference::Auto,
+            execution_intent: "auto".to_string(),
+            checksum: String::new(),
+        },
+    )
+    .expect("persist V2 unset selection");
+}
+
+fn persist_v2_not_installed(home: &Path, model_id: &str) {
+    openasr_core::default_selection::persist_v2_record(
+        home,
+        openasr_core::default_selection::ActiveModelSelectionV2 {
+            schema_version:
+                openasr_core::default_selection::ACTIVE_MODEL_SELECTION_V2_SCHEMA_VERSION,
+            selection_generation: 0,
+            status: openasr_core::default_selection::ActiveModelSelectionStatus::NotInstalled,
+            pull: Some(model_id.to_string()),
+            model_id: Some(model_id.to_string()),
+            quant: None,
+            architecture_id: None,
+            expected_pack: None,
+            quant_preference: openasr_core::QuantPreference::Auto,
+            execution_intent: "auto".to_string(),
+            checksum: String::new(),
+        },
+    )
+    .expect("persist V2 selected model");
+}
+
 fn temp_input_wav() -> tempfile::NamedTempFile {
     let file = tempfile::Builder::new()
         .prefix("openasr-test-")
@@ -1977,6 +2019,106 @@ fn config_default_model_is_v2_first_and_rejects_legacy_mutation() {
             "desktop default-model activation surface",
         ))
         .stderr(predicate::str::contains("pull").not());
+}
+
+#[test]
+fn native_segment_and_live_ignore_stale_legacy_default_when_v2_is_unset() {
+    let home = temp_home();
+    openasr_core::save_config(
+        home.path(),
+        &openasr_core::OpenAsrConfig {
+            default_model: Some("stale-model".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("persist stale legacy default fixture");
+    persist_v2_unset(home.path());
+
+    let input = temp_input_wav();
+    openasr_with_home(home.path())
+        .args([
+            "transcribe",
+            "--backend",
+            "mock",
+            input.path().to_str().expect("input path"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("using qwen3-asr-0.6b"))
+        .stderr(predicate::str::contains("stale-model").not());
+
+    openasr_with_home(home.path())
+        .args([
+            "live",
+            "--backend",
+            "mock",
+            "--input-file",
+            input.path().to_str().expect("input path"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("stale-model").not());
+}
+
+#[test]
+fn transcribe_language_prevalidation_uses_v2_selected_model() {
+    let home = temp_home();
+    openasr_core::save_config(
+        home.path(),
+        &openasr_core::OpenAsrConfig {
+            default_model: Some("whisper-large-v3".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("persist stale legacy default fixture");
+    persist_v2_not_installed(home.path(), "moonshine-tiny");
+
+    let input = valid_temp_input_wav();
+    openasr_with_home(home.path())
+        .args([
+            "transcribe",
+            "--backend",
+            "mock",
+            "--language",
+            "fr",
+            input.path().to_str().expect("input path"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("moonshine-tiny"))
+        .stderr(predicate::str::contains("whisper-large-v3").not());
+}
+
+#[test]
+fn doctor_and_config_report_v2_selected_model_over_legacy_projection() {
+    let home = temp_home();
+    openasr_core::save_config(
+        home.path(),
+        &openasr_core::OpenAsrConfig {
+            default_model: Some("stale-model".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("persist stale legacy default fixture");
+    persist_v2_not_installed(home.path(), "moonshine-tiny");
+
+    openasr_with_home(home.path())
+        .args(["config", "get", "default_model"])
+        .assert()
+        .success()
+        .stdout("moonshine-tiny\n");
+    openasr_with_home(home.path())
+        .args(["config", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default_model=moonshine-tiny"))
+        .stdout(predicate::str::contains("default_model=stale-model").not());
+    openasr_with_home(home.path())
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Default model: moonshine-tiny"))
+        .stdout(predicate::str::contains("stale-model").not());
 }
 
 #[test]
