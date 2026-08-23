@@ -47,7 +47,7 @@ use crate::nn::decoder::{
     allocate_zeroed_llm_resident_kv_arena, build_fixed_kv_attention_mask_bits,
     build_fixed_kv_attention_mask_bits_for_query_rows,
     build_fixed_kv_attention_mask_bits_for_sequences, compose_llm_decoder_layer_stack,
-    resolve_production_llm_kv_cache_policy_from_env, reusable_decode_graph_supported_for_runner,
+    resolve_production_llm_kv_cache_policy_from_env, reusable_decode_graph_supported,
 };
 use crate::nn::half::f32_slice_to_f16_bits;
 
@@ -3084,14 +3084,12 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         self.runner.backend_label()
     }
 
-    /// Graph reuse is only correct on the single-backend GPU path (Metal or
-    /// the generic discrete-GPU lane — HIP/CUDA/Vulkan); the non-scheduler CPU
-    /// compute mis-recomputes a reused graph that writes its KV in place, while
-    /// the multi-backend scheduler drops refreshed per-token inputs.
+    /// Graph reuse is authorized only by the immutable planner reuse_mode.
+    /// GPU class is placement, not proof; production evidence is Unknown so
+    /// this stays FreshGraph. Compact first-max is a separate output_plan.
     pub(crate) fn supports_graph_reuse(&self) -> bool {
         self.resolved_runtime.output_plan() == GgmlDecodeOutputPlan::FullLogits
-            && self.resolved_runtime.reuse_mode() == GgmlDecodeReuseMode::ReusableGraph
-            && reusable_decode_graph_supported_for_runner(&self.runner)
+            && reusable_decode_graph_supported(self.resolved_runtime.reuse_mode())
     }
 
     pub(crate) fn supports_fused_top1(&self) -> bool {

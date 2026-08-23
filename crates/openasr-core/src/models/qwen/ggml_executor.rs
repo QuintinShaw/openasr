@@ -260,6 +260,7 @@ fn qwen_unified_runtime_owner_enabled(
 ) -> bool {
     let backend = resolved_runtime.backend();
     if backend != GgmlCpuGraphBackend::Gpu
+        || resolved_runtime.reuse_mode() != crate::ggml_runtime::GgmlDecodeReuseMode::ReusableGraph
         || !native_gqa.is_validated()
         || !native_logits_runtime
         || placement != Some(ExecutionPlacement::FullDevice)
@@ -899,7 +900,6 @@ impl Qwen3AsrGgmlExecutor {
         // The serve-batch owner loads the pack itself; it needs the path, not
         // the content id.
         let runtime_cache_path = canonical_runtime_cache_path(runtime_source.path());
-        let serve_batch_graph_config = super::graph_config::qwen_runtime_graph_config(backend);
         // Serve-batch remains an independent owner topology in this change.
         // In particular, do not build and retain an otherwise-idle unified
         // decoder merely to run its encoder before handing decode to the batch
@@ -912,8 +912,8 @@ impl Qwen3AsrGgmlExecutor {
         .filter(|_| {
             !skip_serve_batch
                 && !adapter_active
-                && serve_batch_graph_config.backend.is_gpu_class()
-                && !serve_batch_graph_config.use_scheduler
+                && request.resolved_runtime.reuse_mode()
+                    == crate::ggml_runtime::GgmlDecodeReuseMode::ReusableGraph
                 && native_gqa.is_validated()
         });
         let native_logits_runtime = prepared_runtime_owner
@@ -1112,8 +1112,9 @@ impl Qwen3AsrGgmlExecutor {
         // constructor, so a resident graph never aliases a materialized host
         // path (and vice versa).
         let kv_cache_started_at = qwen_decode_profile_start();
-        let decoder_config = qwen_runtime_graph_config(backend);
-        let host_mode = if decoder_config.backend.is_gpu_class() && !decoder_config.use_scheduler {
+        let host_mode = if request.resolved_runtime.reuse_mode()
+            == crate::ggml_runtime::GgmlDecodeReuseMode::ReusableGraph
+        {
             Qwen3AsrHostKvMode::ResidentOnly
         } else {
             Qwen3AsrHostKvMode::Materialized
@@ -2178,11 +2179,9 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor<'_> {
         } else {
             None
         };
-        // `run_step_auto` reuses the built decode graph across tokens only on
-        // the direct single-GPU lane (`is_gpu_class && !scheduler`). CPU
-        // compute and multi-backend scheduler paths rebuild the growing-KV
-        // graph each token because their in-place-KV reuse path is not
-        // byte-identical -- see `supports_graph_reuse`'s doc comment.
+        // `run_step_auto` reuses the built decode graph across tokens only
+        // when the immutable planner reuse_mode is ReusableGraph. Unproven
+        // lanes rebuild the growing-KV graph each token.
         let step = self
             .whole_decoder
             .run_step_auto(

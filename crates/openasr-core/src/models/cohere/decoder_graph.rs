@@ -32,7 +32,7 @@ use crate::models::seq2seq_greedy_decode::{
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::nn::decoder::{
     Seq2SeqReusableDecodeGraph, build_causal_mask_f16_bits, build_fixed_kv_attention_mask_bits,
-    build_fixed_kv_attention_mask_bits_for_sequences, reusable_decode_graph_supported_for_runner,
+    build_fixed_kv_attention_mask_bits_for_sequences, reusable_decode_graph_supported,
     seq2seq_layer_stack,
 };
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
@@ -1917,8 +1917,7 @@ impl CohereDecoderGraphRuntime {
     }
 
     fn supports_reusable_decode_graph(&self) -> bool {
-        self.reuse_mode == GgmlDecodeReuseMode::ReusableGraph
-            && reusable_decode_graph_supported_for_runner(&self.runner)
+        reusable_decode_graph_supported(self.reuse_mode)
     }
 
     fn compute_reused_incremental_step_output(

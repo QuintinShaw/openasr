@@ -1706,38 +1706,32 @@ fn whisper_carry_producer_honors_the_effective_carry_switch() {
 }
 
 #[test]
-fn whisper_serve_batch_allows_longform_on_direct_gpu_lane() {
-    let mut direct_gpu = GgmlCpuGraphConfig::conservative_default();
-    direct_gpu.backend = GgmlCpuGraphBackend::Gpu;
-    direct_gpu.use_scheduler = false;
+fn whisper_serve_batch_requires_planner_reusable_graph() {
     let request_options = GgmlAsrExecutionOptions {
         longform: Some(crate::LongFormOptions::default()),
         ..GgmlAsrExecutionOptions::default()
     };
 
+    assert!(!whisper_can_use_serve_batch(
+        crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph,
+        &request_options,
+        true
+    ));
     assert!(whisper_can_use_serve_batch(
-        direct_gpu,
+        crate::ggml_runtime::GgmlDecodeReuseMode::ReusableGraph,
         &request_options,
         true
     ));
 }
 
 #[test]
-fn whisper_serve_batch_rejects_scheduler_and_cpu_lanes() {
+fn whisper_serve_batch_rejects_unproven_reuse() {
     let request_options = GgmlAsrExecutionOptions::default();
-    let mut scheduler_gpu = GgmlCpuGraphConfig::conservative_default();
-    scheduler_gpu.backend = GgmlCpuGraphBackend::Gpu;
-    scheduler_gpu.use_scheduler = true;
-    let mut cpu = GgmlCpuGraphConfig::conservative_default();
-    cpu.backend = GgmlCpuGraphBackend::Cpu;
-    cpu.use_scheduler = false;
-
     assert!(!whisper_can_use_serve_batch(
-        scheduler_gpu,
+        crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph,
         &request_options,
         false
     ));
-    assert!(!whisper_can_use_serve_batch(cpu, &request_options, false));
 }
 
 #[test]

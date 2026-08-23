@@ -16,8 +16,8 @@
 //! with an f16 KV cache, pre-norm cross-attention over cross-KV precomputed
 //! once from the encoder output, and a GELU feed-forward. On the
 //! single-backend GPU path when the immutable runtime planner authorizes reuse
-//! (`GgmlDecodeReuseMode::ReusableGraph` plus the runner's capability check; see
-//! [`super::graph_config`]) the single-token incremental step runs through a
+//! (`GgmlDecodeReuseMode::ReusableGraph`; see [`super::graph_config`]) the
+//! single-token incremental step runs through a
 //! build-once/re-run [`Seq2SeqReusableDecodeGraph`] (fixed-span self-KV via
 //! `set_rows` + an externally-uploaded attention mask, the cohere/moonshine
 //! pattern), eliminating the per-token graph rebuild; prefill and every CPU
@@ -47,7 +47,7 @@ use crate::models::seq2seq_greedy_decode::{
 use crate::nn::decoder::{
     CrossKvHandle, SelfKvHandle, Seq2SeqLayerConfig, Seq2SeqLayerWeights,
     Seq2SeqReusableDecodeGraph, build_causal_mask_f16_bits, build_fixed_kv_attention_mask_bits,
-    reusable_decode_graph_supported, reusable_decode_graph_supported_for_runner, seq2seq_layer,
+    reusable_decode_graph_supported, seq2seq_layer,
 };
 use crate::nn::ffn::FeedForwardActivation;
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
@@ -239,19 +239,11 @@ fn build_firered_decoder_arena_state(
     // softmax. Same convention as `allocate_zeroed_llm_resident_kv_arena`
     // (the all-zero f16 bit pattern is 0.0).
     //
-    // Gated to runners where the reusable decode graph can actually activate
-    // (`reusable_decode_graph_supported_for_runner` is a pure function of the
-    // runner's backend + scheduler config, fixed for the runner's lifetime):
-    // the rebuild-per-step path views only written rows, so on CPU /
-    // scheduler-on runners no unwritten row is ever read and the fill is pure
-    // waste -- worse than waste, actually, because touching every byte of the
-    // full planner-reserved cache commits all of its pages up front where the
-    // untouched malloc'd CPU arena
-    // pages would otherwise stay uncommitted until the decode actually wrote
-    // them.
-    if reuse_mode == GgmlDecodeReuseMode::ReusableGraph
-        && reusable_decode_graph_supported_for_runner(runner)
-    {
+    // Gated to the immutable planner reuse mode. The rebuild-per-step path
+    // views only written rows, so FreshGraph never reads an unwritten row and
+    // the fill is waste -- worse than waste, because touching every byte of
+    // the full planner-reserved cache commits all of its pages up front.
+    if reusable_decode_graph_supported(reuse_mode) {
         let self_kv_tensor_bytes = metadata
             .head_dim
             .checked_mul(self_kv_capacity_positions)
@@ -285,7 +277,7 @@ impl FireRedDecoderGraphRuntime {
     pub(crate) fn system_memory_quote(
         metadata: FireRedAedExecutionMetadata,
         decoder_state: Seq2SeqDecoderState,
-        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        _backend: crate::ggml_runtime::GgmlCpuGraphBackend,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
         reuse_mode: GgmlDecodeReuseMode,
         pack_content_id: &str,
@@ -294,12 +286,10 @@ impl FireRedDecoderGraphRuntime {
             .validate()
             .map_err(|error| error.to_string())?;
         let retained = Self::quoted_retained_system_memory_bytes(metadata)?;
-        let config = firered_decoder_graph_config(backend);
         let transient = firered_decoder_construction_transient_system_memory_bytes(
             metadata,
             decoder_state,
-            reusable_decode_graph_supported(config.backend, config.use_scheduler)
-                && reuse_mode == GgmlDecodeReuseMode::ReusableGraph,
+            reusable_decode_graph_supported(reuse_mode),
             greedy_step_output_mode,
         )?;
         let peak = retained.checked_add(transient).ok_or_else(|| {
@@ -368,8 +358,7 @@ impl FireRedDecoderGraphRuntime {
         firered_decoder_construction_transient_system_memory_bytes(
             self.metadata,
             self.decoder_state,
-            reusable_decode_graph_supported_for_runner(&self.runner)
-                && self.reuse_mode == GgmlDecodeReuseMode::ReusableGraph,
+            reusable_decode_graph_supported(self.reuse_mode),
             self.greedy_step_output_mode,
         )
     }
@@ -971,12 +960,10 @@ impl FireRedDecoderGraphRuntime {
         Ok(output)
     }
 
-    /// Reused decode graphs are opt-in from the immutable runtime planner and
-    /// still require the runner's local capability check. Unknown evidence is
-    /// therefore always a fresh graph, even on a GPU-class backend.
+    /// Reused decode graphs are opt-in from the immutable runtime planner.
+    /// Unknown evidence is always a fresh graph, even on a GPU-class backend.
     fn supports_reusable_decode_graph(&self) -> bool {
-        self.reuse_mode == GgmlDecodeReuseMode::ReusableGraph
-            && reusable_decode_graph_supported_for_runner(&self.runner)
+        reusable_decode_graph_supported(self.reuse_mode)
     }
 
     /// Single-token incremental step through the build-once/re-run persistent
