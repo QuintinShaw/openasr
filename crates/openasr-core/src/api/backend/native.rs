@@ -615,8 +615,11 @@ impl NativeStreamingSessionCandidateBuilder for NativeStreamingSessionCandidateF
             self.execution_services.as_ref(),
             candidate,
             || {
-                let resolved_runtime =
-                    resolved_runtime_for_candidate(candidate, self.auto_gpu_policy);
+                let resolved_runtime = resolved_runtime_for_family_candidate(
+                    candidate,
+                    self.auto_gpu_policy,
+                    &self.selected_family,
+                );
                 let planning_input = crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput::for_streaming_session(
                     self.verified_pack.preflight(),
                     &self.request_options,
@@ -1294,9 +1297,10 @@ fn coarse_backend_preference_for_candidate(
     }
 }
 
-fn resolved_runtime_for_candidate(
+fn resolved_runtime_for_family_candidate(
     candidate: &ExecutionCandidate,
     auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
+    selected_family: &crate::GgmlFamilyAdapterDescriptor,
 ) -> crate::ggml_runtime::ResolvedFamilyRuntimeInput {
     let preference = match candidate.placement {
         ExecutionPlacement::CpuOnly => Some(RequestBackendPreference::CpuOnly),
@@ -1304,7 +1308,15 @@ fn resolved_runtime_for_candidate(
             RequestBackendPreference::Exact(candidate.device.route.clone()),
         ),
     };
-    crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(preference, auto_gpu_policy)
+    if selected_family.adapter_id == crate::arch::FIRERED_AED_GGML_ADAPTER_ID {
+        crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+            preference,
+            auto_gpu_policy,
+            crate::ggml_runtime::GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+        )
+    } else {
+        crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(preference, auto_gpu_policy)
+    }
 }
 
 fn native_ggml_streaming_error_to_asr(

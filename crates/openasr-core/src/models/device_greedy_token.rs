@@ -87,9 +87,7 @@ mod tests {
     use crate::device::execution_route::{
         DeviceAddressability, ResolvedExecutionRoute, RouteDeviceKind,
     };
-    use crate::ggml_runtime::{
-        AutoGpuPolicy, GgmlCpuGraphBackend, GgmlRequestOutputRequirement, RequestBackendPreference,
-    };
+    use crate::ggml_runtime::{AutoGpuPolicy, GgmlCpuGraphBackend, RequestBackendPreference};
 
     use super::*;
 
@@ -113,13 +111,13 @@ mod tests {
             crate::device::execution_route::ExecutionProvider::Cuda,
             crate::device::execution_route::ExecutionProvider::Vulkan,
         ] {
-            let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_requirement(
+            let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
                 Some(exact_preference(provider)),
                 AutoGpuPolicy::AllBackends,
-                GgmlRequestOutputRequirement::NativeFirstMaxToken,
+                crate::ggml_runtime::GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
             );
             assert_eq!(resolved.backend(), GgmlCpuGraphBackend::Gpu);
-            assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::CompleteScores);
+            assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
             assert_eq!(
                 resolved.reuse_mode(),
                 crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph

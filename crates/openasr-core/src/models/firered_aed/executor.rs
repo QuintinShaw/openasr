@@ -1111,12 +1111,13 @@ mod tests {
     #[test]
     fn exact_cuda_and_vulkan_fire_red_routes_keep_gpu_full_logits_and_fresh_reuse() {
         for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
-            let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_requirement(
+            let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
                 Some(exactly_addressable_preference(provider)),
                 crate::ggml_runtime::AutoGpuPolicy::AllBackends,
-                crate::ggml_runtime::GgmlRequestOutputRequirement::NativeFirstMaxToken,
+                crate::ggml_runtime::GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
             );
             assert_eq!(resolved.backend(), GgmlCpuGraphBackend::Gpu);
+            assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
             assert_eq!(
                 device_greedy_step_output_mode_for_resolved_runtime(resolved),
                 DeviceGreedyStepOutputMode::FullLogits

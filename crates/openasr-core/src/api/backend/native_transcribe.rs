@@ -2396,7 +2396,7 @@ fn run_native_transcription_impl(
         .first()
         .expect("execution policy plans are non-empty");
     let resolved_runtime_for_request =
-        resolved_runtime_for_candidate(primary_candidate, auto_gpu_policy);
+        resolved_runtime_for_family_candidate(primary_candidate, auto_gpu_policy, &selected_family);
     // Actual device class after candidate selection: Auto may land on Metal/GPU
     // even though the intent-only provisional plan used AutoOrCpu weights.
     let resolved_backend_class =
@@ -4092,9 +4092,10 @@ fn run_dispatch_once(
     execution_context: &Arc<crate::RequestExecutionContext>,
 ) -> Result<GgmlAsrExecutionResult, BackendError> {
     let runtime_preflight = verified_pack.preflight();
-    let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+    let resolved_runtime = resolved_runtime_for_family_preference(
         resolved_preference,
         auto_gpu_policy,
+        selected_family,
     );
     let execution_request = GgmlAsrExecutionViewRequest {
         execution_services: Arc::clone(execution_services),
@@ -4250,6 +4251,34 @@ fn execution_policy_error_to_backend(error: ExecutionPolicyError) -> BackendErro
             reason: format!("could not resolve an execution candidate: {other}"),
         },
     }
+}
+
+fn resolved_runtime_for_family_preference(
+    preference: Option<RequestBackendPreference>,
+    auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
+    selected_family: &GgmlFamilyAdapterDescriptor,
+) -> crate::ggml_runtime::ResolvedFamilyRuntimeInput {
+    if selected_family.adapter_id == crate::arch::FIRERED_AED_GGML_ADAPTER_ID {
+        crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+            preference,
+            auto_gpu_policy,
+            crate::ggml_runtime::GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+        )
+    } else {
+        crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(preference, auto_gpu_policy)
+    }
+}
+
+fn resolved_runtime_for_family_candidate(
+    candidate: &ExecutionCandidate,
+    auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
+    selected_family: &GgmlFamilyAdapterDescriptor,
+) -> crate::ggml_runtime::ResolvedFamilyRuntimeInput {
+    resolved_runtime_for_family_preference(
+        request_backend_preference_for_candidate(candidate),
+        auto_gpu_policy,
+        selected_family,
+    )
 }
 
 fn resolved_runtime_for_candidate(
