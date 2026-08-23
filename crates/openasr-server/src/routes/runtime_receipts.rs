@@ -5,7 +5,7 @@
 //! deliberately serializes only keyed/redacted identifiers.
 
 use crate::*;
-use axum::{Json, extract::Query};
+use axum::{extract::Query, Json};
 use openasr_core::runtime_receipts::{
     LiveRuntimeOwner, RuntimeOwnerId, RuntimeReceiptAvailability, RuntimeReceiptEvent,
     RuntimeReceiptMetric, RuntimeReceiptSnapshot, RuntimeResourceId, RuntimeResourceState,
@@ -587,6 +587,9 @@ fn format_receipt_unavailable_reason(
         openasr_core::runtime_receipts::RuntimeReceiptUnavailableReason::EntropyUnavailable => {
             "entropy-unavailable"
         }
+        openasr_core::runtime_receipts::RuntimeReceiptUnavailableReason::IdentityExhausted => {
+            "identity-exhausted"
+        }
     }
 }
 
@@ -645,5 +648,47 @@ mod tests {
         assert_eq!(json["unavailable_reason"], "entropy-unavailable");
         assert_eq!(json["snapshot_completeness"]["complete"], false);
         assert_eq!(json["daemon_start_identity"]["pid"], 42);
+    }
+
+    #[test]
+    fn identity_exhausted_is_projected_and_not_folded_to_known_zero() {
+        let snapshot = ServerRuntime::default().runtime_receipt_snapshot();
+        let snapshot = RuntimeReceiptSnapshot {
+            availability: RuntimeReceiptAvailability::Unavailable {
+                reason: openasr_core::runtime_receipts::RuntimeReceiptUnavailableReason::
+                    IdentityExhausted,
+            },
+            completeness: openasr_core::runtime_receipts::ReceiptCompleteness {
+                complete: false,
+                reason: Some(
+                    openasr_core::runtime_receipts::ReceiptCompletenessReason::IdentityExhausted,
+                ),
+                dropped_events: 0,
+                dropped_owners: 0,
+                rejected_resources: 0,
+            },
+            ..snapshot
+        };
+        let response = RuntimeReceiptResponse::from_snapshot(
+            snapshot,
+            ServerStartIdentity {
+                pid: 42,
+                nonce: None,
+                started_at_unix_secs: None,
+            },
+            None,
+            MAX_EVENT_LIMIT,
+        );
+        let json = serde_json::to_value(response).expect("serialize receipt response");
+        assert_eq!(json["availability"], "unavailable");
+        assert_eq!(json["unavailable_reason"], "identity-exhausted");
+        assert_eq!(json["snapshot_completeness"]["complete"], false);
+        assert_eq!(json["snapshot_completeness"]["reason"], "IdentityExhausted");
+        let rendered = json.to_string();
+        assert!(!rendered.contains("\"status\":\"known\""));
+        assert!(!rendered.contains("owner-0"));
+        assert!(!rendered.contains("resource-0"));
+        assert_ne!(json["unavailable_reason"], serde_json::json!(0));
+        assert_ne!(json["unavailable_reason"], "known");
     }
 }

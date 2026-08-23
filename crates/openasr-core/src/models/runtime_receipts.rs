@@ -33,6 +33,7 @@ const MAX_RESOURCES_PER_OWNER: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RuntimeReceiptUnavailableReason {
     EntropyUnavailable,
+    IdentityExhausted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -101,6 +102,7 @@ impl RuntimeReceiptAvailability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ReceiptCompletenessReason {
     Unavailable(RuntimeReceiptUnavailableReason),
+    IdentityExhausted,
     EventCapacityExceeded,
     OwnerCapacityExceeded,
     ResourceCapacityExceeded,
@@ -277,6 +279,7 @@ pub struct RuntimeReceiptSnapshot {
 struct RuntimeReceiptState {
     next_owner_ordinal: AtomicU64,
     next_resource_ordinal: AtomicU64,
+    identity_exhausted: bool,
     live_owners: BTreeMap<RuntimeOwnerId, LiveRuntimeOwner>,
     events: VecDeque<RuntimeReceiptEvent>,
     dropped_events: u64,
@@ -326,6 +329,32 @@ impl RuntimeReceiptCollector {
         event_capacity: usize,
         fill_entropy: impl FnOnce(&mut [u8; 32]) -> Result<(), ()>,
     ) -> Result<Self, RuntimeReceiptError> {
+        Self::new_with_capacity_entropy_and_ordinals(scope_id, event_capacity, 1, 1, fill_entropy)
+    }
+
+    #[cfg(test)]
+    fn new_for_test_with_ordinals(
+        scope_id: NativeExecutionScopeId,
+        event_capacity: usize,
+        next_owner_ordinal: u64,
+        next_resource_ordinal: u64,
+    ) -> Result<Self, RuntimeReceiptError> {
+        Self::new_with_capacity_entropy_and_ordinals(
+            scope_id,
+            event_capacity,
+            next_owner_ordinal,
+            next_resource_ordinal,
+            |key| getrandom::fill(key).map_err(|_| ()),
+        )
+    }
+
+    fn new_with_capacity_entropy_and_ordinals(
+        scope_id: NativeExecutionScopeId,
+        event_capacity: usize,
+        next_owner_ordinal: u64,
+        next_resource_ordinal: u64,
+        fill_entropy: impl FnOnce(&mut [u8; 32]) -> Result<(), ()>,
+    ) -> Result<Self, RuntimeReceiptError> {
         if event_capacity == 0 {
             return Err(RuntimeReceiptError::ZeroCapacity);
         }
@@ -352,8 +381,9 @@ impl RuntimeReceiptCollector {
             availability,
             event_capacity,
             state: Arc::new(Mutex::new(RuntimeReceiptState {
-                next_owner_ordinal: AtomicU64::new(1),
-                next_resource_ordinal: AtomicU64::new(1),
+                next_owner_ordinal: AtomicU64::new(next_owner_ordinal),
+                next_resource_ordinal: AtomicU64::new(next_resource_ordinal),
+                identity_exhausted: false,
                 live_owners: BTreeMap::new(),
                 events: VecDeque::with_capacity(event_capacity),
                 dropped_events: 0,
@@ -373,6 +403,9 @@ impl RuntimeReceiptCollector {
     }
 
     fn digest(&self, domain: &[u8], value: &str) -> Option<RedactedIdentity> {
+        if !self.is_available() {
+            return None;
+        }
         let key = self.key?;
         let mut hasher = Sha256::new();
         hasher.update(b"openasr.runtime-receipt.v1");
@@ -490,6 +523,39 @@ impl RuntimeReceiptCollector {
         }
     }
 
+    fn state_is_available(&self, state: &RuntimeReceiptState) -> bool {
+        self.availability.is_available() && !state.identity_exhausted
+    }
+
+    fn availability_for_state(&self, state: &RuntimeReceiptState) -> RuntimeReceiptAvailability {
+        if state.identity_exhausted {
+            RuntimeReceiptAvailability::Unavailable {
+                reason: RuntimeReceiptUnavailableReason::IdentityExhausted,
+            }
+        } else {
+            self.availability
+        }
+    }
+
+    fn mark_identity_exhausted(state: &mut RuntimeReceiptState) {
+        state.identity_exhausted = true;
+        Self::mark_incomplete(state, ReceiptCompletenessReason::IdentityExhausted);
+    }
+
+    fn allocate_ordinal(counter: &AtomicU64) -> Option<u64> {
+        // 0 is the exhausted sentinel, never a legal identity. The last legal
+        // ordinal (`u64::MAX`) is handed out once; the counter then stores 0 so
+        // the next allocation cannot wrap or reuse that identity.
+        counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |ordinal| {
+                if ordinal == 0 {
+                    return None;
+                }
+                Some(ordinal.checked_add(1).unwrap_or(0))
+            })
+            .ok()
+    }
+
     fn append_event(state: &mut RuntimeReceiptState, capacity: usize, event: RuntimeReceiptEvent) {
         if state.events.len() == capacity {
             state.events.pop_front();
@@ -500,7 +566,8 @@ impl RuntimeReceiptCollector {
     }
 
     pub(crate) fn is_available(&self) -> bool {
-        self.availability.is_available()
+        let state = self.lock_state();
+        self.state_is_available(&state)
     }
 
     pub(crate) fn start_owner(
@@ -508,18 +575,22 @@ impl RuntimeReceiptCollector {
         descriptor: RuntimeOwnerDescriptor,
         attempt_id: Option<ExecutionCacheAttemptId>,
     ) -> RuntimeOwnerGuard {
-        if !self.is_available() {
+        let mut state = self.lock_state();
+        if !self.state_is_available(&state) {
             return RuntimeOwnerGuard::empty();
         }
-        let mut state = self.lock_state();
         if state.live_owners.len() >= MAX_LIVE_OWNERS {
             state.dropped_owners = state.dropped_owners.saturating_add(1);
             Self::mark_incomplete(&mut state, ReceiptCompletenessReason::OwnerCapacityExceeded);
             return RuntimeOwnerGuard::empty();
         }
+        let Some(ordinal) = Self::allocate_ordinal(&state.next_owner_ordinal) else {
+            Self::mark_identity_exhausted(&mut state);
+            return RuntimeOwnerGuard::empty();
+        };
         let owner_id = RuntimeOwnerId {
             scope_id: self.scope_id,
-            ordinal: state.next_owner_ordinal.fetch_add(1, Ordering::Relaxed),
+            ordinal,
         };
         let owner_descriptor = descriptor;
         state.live_owners.insert(
@@ -551,10 +622,10 @@ impl RuntimeReceiptCollector {
         owner_id: RuntimeOwnerId,
         attempt_id: Option<ExecutionCacheAttemptId>,
     ) -> bool {
-        if !self.is_available() {
+        let mut state = self.lock_state();
+        if !self.state_is_available(&state) {
             return false;
         }
-        let mut state = self.lock_state();
         if !state.live_owners.contains_key(&owner_id) {
             Self::mark_incomplete(&mut state, ReceiptCompletenessReason::InvalidLifecycle);
             return false;
@@ -571,10 +642,10 @@ impl RuntimeReceiptCollector {
     }
 
     pub(crate) fn record_notification_coalesced(&self) {
-        if !self.is_available() {
+        let mut state = self.lock_state();
+        if !self.state_is_available(&state) {
             return;
         }
-        let mut state = self.lock_state();
         state.dropped_notifications = state.dropped_notifications.saturating_add(1);
         Self::mark_incomplete(
             &mut state,
@@ -587,10 +658,10 @@ impl RuntimeReceiptCollector {
         owner_id: RuntimeOwnerId,
         descriptor: RuntimeResourceDescriptor,
     ) -> Option<RuntimeResourceGuard> {
-        if !self.is_available() {
+        let mut state = self.lock_state();
+        if !self.state_is_available(&state) {
             return None;
         }
-        let mut state = self.lock_state();
         let Some(owner) = state.live_owners.get(&owner_id) else {
             Self::mark_incomplete(&mut state, ReceiptCompletenessReason::InvalidLifecycle);
             return None;
@@ -603,9 +674,13 @@ impl RuntimeReceiptCollector {
             );
             return None;
         }
+        let Some(ordinal) = Self::allocate_ordinal(&state.next_resource_ordinal) else {
+            Self::mark_identity_exhausted(&mut state);
+            return None;
+        };
         let resource_id = RuntimeResourceId {
             scope_id: self.scope_id,
-            ordinal: state.next_resource_ordinal.fetch_add(1, Ordering::Relaxed),
+            ordinal,
         };
         state
             .live_owners
@@ -642,10 +717,10 @@ impl RuntimeReceiptCollector {
         resource_id: RuntimeResourceId,
         descriptor: RuntimeResourceDescriptor,
     ) -> bool {
-        if !self.is_available() {
+        let mut state = self.lock_state();
+        if !self.state_is_available(&state) {
             return false;
         }
-        let mut state = self.lock_state();
         let Some(owner) = state.live_owners.get_mut(&owner_id) else {
             Self::mark_incomplete(&mut state, ReceiptCompletenessReason::InvalidLifecycle);
             return false;
@@ -664,10 +739,10 @@ impl RuntimeReceiptCollector {
         resource_id: RuntimeResourceId,
         next_state: RuntimeResourceState,
     ) -> bool {
-        if !self.is_available() {
+        let mut state = self.lock_state();
+        if !self.state_is_available(&state) {
             return false;
         }
-        let mut state = self.lock_state();
         let Some(owner) = state.live_owners.get_mut(&owner_id) else {
             Self::mark_incomplete(&mut state, ReceiptCompletenessReason::InvalidLifecycle);
             return false;
@@ -692,10 +767,10 @@ impl RuntimeReceiptCollector {
     }
 
     fn release_resource(&self, owner_id: RuntimeOwnerId, resource_id: RuntimeResourceId) {
-        if !self.is_available() {
+        let mut state = self.lock_state();
+        if !self.state_is_available(&state) {
             return;
         }
-        let mut state = self.lock_state();
         let Some(owner) = state.live_owners.get_mut(&owner_id) else {
             Self::mark_incomplete(&mut state, ReceiptCompletenessReason::InvalidLifecycle);
             return;
@@ -715,10 +790,10 @@ impl RuntimeReceiptCollector {
     }
 
     fn release_owner(&self, owner_id: RuntimeOwnerId, attempt_id: Option<ExecutionCacheAttemptId>) {
-        if !self.is_available() {
+        let mut state = self.lock_state();
+        if !self.state_is_available(&state) {
             return;
         }
-        let mut state = self.lock_state();
         let Some(owner) = state.live_owners.remove(&owner_id) else {
             Self::mark_incomplete(&mut state, ReceiptCompletenessReason::InvalidLifecycle);
             return;
@@ -743,7 +818,7 @@ impl RuntimeReceiptCollector {
         RuntimeReceiptSnapshot {
             schema: RUNTIME_RECEIPT_SCHEMA,
             scope_id: self.scope_id,
-            availability: self.availability,
+            availability: self.availability_for_state(&state),
             live_owners: state.live_owners.values().cloned().collect(),
             events: state.events.iter().cloned().collect(),
             event_capacity: self.event_capacity,
@@ -763,7 +838,7 @@ impl RuntimeReceiptCollector {
         let state = self.lock_state();
         RuntimeReceiptSummary {
             scope_id: self.scope_id,
-            availability: self.availability,
+            availability: self.availability_for_state(&state),
             live_owner_count: state.live_owners.len(),
             live_resource_count: state
                 .live_owners
@@ -883,6 +958,20 @@ mod tests {
 
     fn collector(capacity: usize) -> RuntimeReceiptCollector {
         RuntimeReceiptCollector::new_for_test(scope(), capacity).unwrap()
+    }
+
+    fn collector_with_ordinals(
+        capacity: usize,
+        next_owner_ordinal: u64,
+        next_resource_ordinal: u64,
+    ) -> RuntimeReceiptCollector {
+        RuntimeReceiptCollector::new_for_test_with_ordinals(
+            scope(),
+            capacity,
+            next_owner_ordinal,
+            next_resource_ordinal,
+        )
+        .unwrap()
     }
 
     fn owner(collector: &RuntimeReceiptCollector) -> RuntimeOwnerGuard {
@@ -1011,11 +1100,9 @@ mod tests {
                 reason: RuntimeReceiptUnavailableReason::EntropyUnavailable,
             }
         );
-        assert!(
-            collector
-                .owner_descriptor("/private/path", None, None, None)
-                .is_none()
-        );
+        assert!(collector
+            .owner_descriptor("/private/path", None, None, None)
+            .is_none());
         let snapshot = collector.snapshot();
         assert!(!snapshot.completeness.complete);
         assert_eq!(
@@ -1026,6 +1113,141 @@ mod tests {
         );
         assert_eq!(snapshot.live_owners.len(), 0);
         assert_eq!(collector.summary().availability, snapshot.availability);
+    }
+
+    #[test]
+    fn ordinal_exhaustion_is_fail_closed_and_stops_owner_evidence() {
+        let collector = collector_with_ordinals(8, u64::MAX, 1);
+        let first = owner(&collector);
+        let first_id = first.owner_id().expect("last legal owner ordinal");
+        assert_eq!(first_id.ordinal, u64::MAX);
+        assert_ne!(first_id.ordinal, 0);
+        let before = collector.snapshot();
+
+        let exhausted = owner(&collector);
+        assert!(exhausted.owner_id().is_none());
+        let exhausted_snapshot = collector.snapshot();
+        let live_ordinals = exhausted_snapshot
+            .live_owners
+            .iter()
+            .map(|owner| owner.id.ordinal)
+            .collect::<Vec<_>>();
+        assert_eq!(live_ordinals, vec![u64::MAX]);
+        assert_eq!(
+            exhausted_snapshot.availability,
+            RuntimeReceiptAvailability::Unavailable {
+                reason: RuntimeReceiptUnavailableReason::IdentityExhausted,
+            }
+        );
+        assert_eq!(
+            exhausted_snapshot.completeness.reason,
+            Some(ReceiptCompletenessReason::IdentityExhausted)
+        );
+        assert_eq!(exhausted_snapshot.events, before.events);
+        assert!(collector
+            .owner_descriptor("/private/path", None, None, None)
+            .is_none());
+
+        first.record_reuse(None);
+        collector.record_notification_coalesced();
+        drop(first);
+        assert_eq!(collector.snapshot().events, before.events);
+    }
+
+    #[test]
+    fn ordinal_exhaustion_is_fail_closed_and_stops_resource_evidence() {
+        let collector = collector_with_ordinals(8, 1, u64::MAX);
+        let owner_guard = owner(&collector);
+        let owner_id = owner_guard.owner_id().unwrap();
+        let descriptor = collector
+            .unpriced_resource_descriptor("pack-weight-buffer")
+            .expect("entropy-backed resource descriptor");
+        let first = collector
+            .acquire_resource(owner_id, descriptor.clone())
+            .expect("last legal resource ordinal is allocated once");
+        let first_snapshot = collector.snapshot();
+        let resource_ordinals = first_snapshot.live_owners[0]
+            .resources
+            .keys()
+            .map(|resource_id| resource_id.ordinal)
+            .collect::<Vec<_>>();
+        assert_eq!(resource_ordinals, vec![u64::MAX]);
+        assert!(!resource_ordinals.contains(&0));
+
+        assert!(collector.acquire_resource(owner_id, descriptor).is_none());
+        let exhausted_snapshot = collector.snapshot();
+        assert_eq!(
+            exhausted_snapshot.availability,
+            RuntimeReceiptAvailability::Unavailable {
+                reason: RuntimeReceiptUnavailableReason::IdentityExhausted,
+            }
+        );
+        assert_eq!(
+            exhausted_snapshot.completeness.reason,
+            Some(ReceiptCompletenessReason::IdentityExhausted)
+        );
+        assert_eq!(exhausted_snapshot.events.len(), first_snapshot.events.len());
+        assert!(collector
+            .unpriced_resource_descriptor("another-resource")
+            .is_none());
+
+        drop(first);
+        drop(owner_guard);
+        assert_eq!(
+            collector.snapshot().events.len(),
+            first_snapshot.events.len()
+        );
+    }
+
+    #[test]
+    fn last_two_owner_ordinals_are_unique_then_identity_exhausts() {
+        let collector = collector_with_ordinals(8, u64::MAX - 1, 1);
+        let first = owner(&collector);
+        let second = owner(&collector);
+        let third = owner(&collector);
+        let first_id = first.owner_id().expect("penultimate owner ordinal");
+        let second_id = second.owner_id().expect("last legal owner ordinal");
+        assert_eq!(first_id.ordinal, u64::MAX - 1);
+        assert_eq!(second_id.ordinal, u64::MAX);
+        assert_ne!(first_id, second_id);
+        assert_ne!(first_id.ordinal, 0);
+        assert_ne!(second_id.ordinal, 0);
+        assert!(third.owner_id().is_none());
+        let live_ordinals = collector
+            .snapshot()
+            .live_owners
+            .iter()
+            .map(|owner| owner.id.ordinal)
+            .collect::<Vec<_>>();
+        assert_eq!(live_ordinals.len(), 2);
+        assert!(!live_ordinals.contains(&0));
+        assert_ne!(live_ordinals[0], live_ordinals[1]);
+        assert_eq!(
+            collector.snapshot().availability,
+            RuntimeReceiptAvailability::Unavailable {
+                reason: RuntimeReceiptUnavailableReason::IdentityExhausted,
+            }
+        );
+    }
+
+    #[test]
+    fn zero_ordinal_is_never_allocated_as_a_known_identity() {
+        let collector = collector_with_ordinals(8, 0, 0);
+        let owner_guard = owner(&collector);
+        assert!(owner_guard.owner_id().is_none());
+        let snapshot = collector.snapshot();
+        assert!(snapshot.live_owners.is_empty());
+        assert!(snapshot.events.is_empty());
+        assert_eq!(
+            snapshot.availability,
+            RuntimeReceiptAvailability::Unavailable {
+                reason: RuntimeReceiptUnavailableReason::IdentityExhausted,
+            }
+        );
+        assert_eq!(
+            snapshot.completeness.reason,
+            Some(ReceiptCompletenessReason::IdentityExhausted)
+        );
     }
 
     #[test]
