@@ -21,7 +21,6 @@ use std::{
 
 use thiserror::Error;
 
-use crate::models::native_execution_services::current_runtime_receipts;
 use crate::models::runtime_receipts::{
     RuntimeBackendOwnedReliability, RuntimeNativeMemoryEvidence, RuntimeReceiptMetric,
 };
