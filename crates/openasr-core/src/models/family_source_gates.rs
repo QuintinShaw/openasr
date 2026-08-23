@@ -801,6 +801,67 @@ fn resident_model_actor_keys_exclude_request_capacity() {
 }
 
 #[test]
+fn families_without_output_plan_keys_keep_plan_invariant_topology() {
+    let root = models_root();
+    // Whisper retained decoder/unified graphs always emit complete logits.
+    // Compact vs full-logits is not a topology split, so the owner key must
+    // not grow a mechanical GgmlDecodeOutputPlan component.
+    assert_tuple_alias_components(
+        &root.join("whisper/ggml_executor.rs"),
+        "WhisperDecoderPersistentSessionKey",
+        &[
+            "PackContentKey",
+            "ExecutionLaneKey",
+            "Seq2SeqResidentCapacity",
+            "WhisperGpuLoadedF16WeightMode",
+        ],
+    );
+    assert_tuple_alias_components(
+        &root.join("whisper/ggml_executor.rs"),
+        "WhisperUnifiedPersistentSessionKey",
+        &[
+            "PackContentKey",
+            "ExecutionLaneKey",
+            "Seq2SeqResidentCapacity",
+            "WhisperGpuLoadedF16WeightMode",
+        ],
+    );
+    assert_tuple_alias_components(
+        &root.join("dolphin/executor.rs"),
+        "DolphinPreparedRuntimeCacheKey",
+        &["PackContentKey", "ExecutionLaneKey"],
+    );
+    assert_tuple_alias_components(
+        &root.join("wav2vec2_ctc/executor.rs"),
+        "Wav2Vec2RuntimeCacheKey",
+        &["PackContentKey", "ExecutionLaneKey"],
+    );
+
+    let forbidden = [
+        "GgmlDecodeOutputPlan",
+        "DeviceGreedyStepOutputMode",
+        "NativeFirstMaxToken",
+        "DeviceTop1",
+    ];
+    for relative in [
+        "whisper/ggml_executor.rs",
+        "whisper/ggml_decoder_graph.rs",
+        "whisper/batched_decode.rs",
+        "dolphin/executor.rs",
+        "wav2vec2_ctc/executor.rs",
+        "parakeet_tdt/executor.rs",
+    ] {
+        let syntax = ProductionSyntax::collect(&root.join(relative));
+        for ident in forbidden {
+            assert!(
+                !syntax.references_identifier(ident),
+                "{relative} topology is plan-invariant and must not reference {ident}"
+            );
+        }
+    }
+}
+
+#[test]
 fn sensevoice_production_uses_complete_frame_logits_and_resolved_cache_identity() {
     let root = models_root().join("sensevoice");
     let encoder = std::fs::read_to_string(root.join("encoder_graph.rs"))

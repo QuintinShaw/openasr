@@ -1036,6 +1036,52 @@ mod tests {
         );
         assert_ne!(direct, scheduled);
     }
+
+    #[test]
+    fn serve_batch_engine_key_is_shared_across_output_plans() {
+        use crate::ggml_runtime::{
+            AutoGpuPolicy, GgmlDecodeOutputContract, GgmlDecodeOutputPlan,
+            RequestBackendPreference, ResolvedFamilyRuntimeInput,
+        };
+
+        let full = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+            Some(RequestBackendPreference::CpuOnly),
+            AutoGpuPolicy::AllBackends,
+            GgmlDecodeOutputContract::FullLogits,
+        );
+        let compact = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+            Some(RequestBackendPreference::CpuOnly),
+            AutoGpuPolicy::AllBackends,
+            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+        );
+        assert_eq!(full.output_plan(), GgmlDecodeOutputPlan::FullLogits);
+        assert_eq!(
+            compact.output_plan(),
+            GgmlDecodeOutputPlan::NativeFirstMaxToken
+        );
+
+        let lane = crate::models::native_execution_services::current_execution_lane_key(
+            GgmlCpuGraphBackend::Cpu,
+        );
+        let engine_key = |_plan: GgmlDecodeOutputPlan| WhisperServeBatchEngineKey {
+            build_identity: crate::RuntimeBuildIdentity::new(
+                "test-pack",
+                "whisper:test",
+                "adapter=none",
+            ),
+            lane: lane.clone(),
+            resident_self_positions: 448,
+            resident_cross_positions: 1500,
+            hidden_size: 512,
+            uses_scheduler: false,
+            max_batch: 2,
+        };
+        assert_eq!(
+            engine_key(full.output_plan()),
+            engine_key(compact.output_plan()),
+            "whisper serve-batch engine must serve both plans with one retained graph"
+        );
+    }
     use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
     use crate::models::serve_batch_env::OPENASR_SERVE_BATCH_ENV;
     use crate::models::whisper::runtime_contract::validate_whisper_execution_metadata;
