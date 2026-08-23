@@ -192,9 +192,12 @@ pub use metrics::{
 };
 pub use models::pack_verifier::{PackCandidate, PackVerificationError, PackVerifier, VerifiedPack};
 pub use short_audio_receipt::{
-    SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE, SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK,
-    SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioReceipt, ShortAudioReceiptAudio, ShortAudioReceiptError,
-    ShortAudioReceiptLoadError, ShortAudioReceiptMetrics, ShortAudioReceiptPack,
+    DecodeFirstDivergenceClass, EncoderDecoderSplitLane, EncoderDecoderSplitProbeRecord,
+    SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE, SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS,
+    SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK, SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioReceipt,
+    ShortAudioReceiptAudio, ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptDecodeStep,
+    ShortAudioReceiptError, ShortAudioReceiptLoadError, ShortAudioReceiptMetrics,
+    ShortAudioReceiptOutputPlan, ShortAudioReceiptPack, ShortAudioReceiptReuseMode,
     ShortAudioReceiptRun, ShortAudioReceiptTranscript, median_f64, receipt_os_id,
     resolve_core_commit, sha256_file, sha256_hex_bytes, validate_core_commit,
 };

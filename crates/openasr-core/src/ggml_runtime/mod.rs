@@ -3,6 +3,7 @@ mod backend;
 pub(crate) mod backend_memory;
 pub(crate) mod backend_memory_admission;
 mod cpu_graph;
+mod decode_conformance;
 mod env_flags;
 mod execution_telemetry;
 mod ffi;
@@ -70,6 +71,17 @@ pub(crate) use cpu_graph::{
     GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext,
     GgmlMatmulPrecision, GgmlNativeGqaCapability, GgmlPersistentGraphSession, GgmlRopeExtParams,
     GgmlStaticTensor, GgmlStaticTensorArena,
+};
+pub use decode_conformance::{
+    DecodeFirstDivergenceClass, EncoderDecoderSplitLane, EncoderDecoderSplitProbeRecord,
+    SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS, ShortAudioReceiptDecodeDiagnostics,
+    ShortAudioReceiptDecodeStep, ShortAudioReceiptOutputPlan, ShortAudioReceiptReuseMode,
+};
+#[allow(unused_imports)]
+pub(crate) use decode_conformance::{
+    DiagnosticFamilyCompactPolicy, classify_four_quadrant_first_divergence,
+    run_diagnostic_dual_output_conformance, run_diagnostic_four_quadrant_cpu_probe,
+    synthetic_cpu_encoder_decoder_split_record,
 };
 pub(crate) use env_flags::{env_toggle_with_raw, env_var_truthy};
 pub use execution_telemetry::{

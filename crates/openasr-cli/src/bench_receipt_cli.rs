@@ -320,6 +320,7 @@ pub(crate) fn bench_receipt_short_audio(
         observed_placement: (!observed_placement.is_empty()).then_some(observed_placement),
         scope: options.scope.to_string(),
         notes,
+        decode_diagnostics: None,
     })
     .context("Constructed short-audio receipt failed validation")?;
 

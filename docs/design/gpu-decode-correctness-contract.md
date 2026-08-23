@@ -917,6 +917,10 @@ publication.
 
 ### Phase 0: evidence without semantic claims
 
+Probe entry (diagnostic only):
+`crates/openasr-core/src/ggml_runtime/decode_conformance.rs`. Dual-output
+success does not authorize a production compact path.
+
 1. Add same-graph dual-output support for diagnostic conformance builds only;
    never use that graph as production authorization evidence.
 2. Add fresh/reuse four-quadrant probes using independent runtimes.

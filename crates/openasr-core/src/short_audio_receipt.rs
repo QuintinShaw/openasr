@@ -16,6 +16,12 @@ use thiserror::Error;
 
 use crate::ggml_runtime::GgmlExecutionPlacementSummary;
 
+pub use crate::ggml_runtime::{
+    DecodeFirstDivergenceClass, EncoderDecoderSplitLane, EncoderDecoderSplitProbeRecord,
+    SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS, ShortAudioReceiptDecodeDiagnostics,
+    ShortAudioReceiptDecodeStep, ShortAudioReceiptOutputPlan, ShortAudioReceiptReuseMode,
+};
+
 /// Stable schema id for the short-audio receipt MVP.
 pub const SHORT_AUDIO_RECEIPT_SCHEMA: &str = "openasr.short-audio-receipt.v0";
 
@@ -53,6 +59,16 @@ pub enum ShortAudioReceiptError {
     MedianMismatch { median: String, expected: String },
     #[error("could not hash path {path}: {reason}")]
     HashIo { path: String, reason: String },
+    #[error("short-audio receipt decode diagnostics exceed {max} steps, got {actual}")]
+    DecodeStepsUnbounded { max: usize, actual: usize },
+    #[error(
+        "short-audio receipt decode diagnostics exceed {max} encoder/decoder splits, got {actual}"
+    )]
+    EncoderDecoderSplitsUnbounded { max: usize, actual: usize },
+    #[error(
+        "short-audio receipt decode diagnostics field `{field}` must be 64 lowercase hex chars, got {actual:?}"
+    )]
+    InvalidDiagnosticSha256 { field: &'static str, actual: String },
 }
 
 /// Top-level short-audio receipt document.
@@ -77,6 +93,11 @@ pub struct ShortAudioReceipt {
     pub scope: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// Optional decode-correctness diagnostics. Absent on older v0 receipts.
+    /// Dual-output or four-quadrant agreement recorded here is not production
+    /// compact-path authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_diagnostics: Option<ShortAudioReceiptDecodeDiagnostics>,
 }
 
 /// Pack identity bound into the receipt.
@@ -238,6 +259,9 @@ impl ShortAudioReceipt {
                 }
             }
             (None, _) => {}
+        }
+        if let Some(diagnostics) = &self.decode_diagnostics {
+            validate_decode_diagnostics(diagnostics)?;
         }
         Ok(())
     }
@@ -405,6 +429,76 @@ fn require_non_empty(field: &'static str, value: &str) -> Result<(), ShortAudioR
     }
 }
 
+const MAX_ENCODER_DECODER_SPLITS: usize = 8;
+
+fn validate_decode_diagnostics(
+    diagnostics: &ShortAudioReceiptDecodeDiagnostics,
+) -> Result<(), ShortAudioReceiptError> {
+    if diagnostics.steps.len() > SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS {
+        return Err(ShortAudioReceiptError::DecodeStepsUnbounded {
+            max: SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS,
+            actual: diagnostics.steps.len(),
+        });
+    }
+    if diagnostics.encoder_decoder_splits.len() > MAX_ENCODER_DECODER_SPLITS {
+        return Err(ShortAudioReceiptError::EncoderDecoderSplitsUnbounded {
+            max: MAX_ENCODER_DECODER_SPLITS,
+            actual: diagnostics.encoder_decoder_splits.len(),
+        });
+    }
+    for step in &diagnostics.steps {
+        if let Some(hash) = &step.logits_sha256 {
+            validate_sha256_hex("decode_diagnostics.steps.logits_sha256", hash).map_err(
+                |actual| ShortAudioReceiptError::InvalidDiagnosticSha256 {
+                    field: "decode_diagnostics.steps.logits_sha256",
+                    actual,
+                },
+            )?;
+        }
+    }
+    for split in &diagnostics.encoder_decoder_splits {
+        if split.step_logits_hashes.len() > SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS {
+            return Err(ShortAudioReceiptError::DecodeStepsUnbounded {
+                max: SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS,
+                actual: split.step_logits_hashes.len(),
+            });
+        }
+        if let Some(hash) = &split.encoder_checksum {
+            validate_sha256_hex("decode_diagnostics.encoder_checksum", hash).map_err(|actual| {
+                ShortAudioReceiptError::InvalidDiagnosticSha256 {
+                    field: "decode_diagnostics.encoder_checksum",
+                    actual,
+                }
+            })?;
+        }
+        if let Some(hash) = &split.cross_kv_checksum {
+            validate_sha256_hex("decode_diagnostics.cross_kv_checksum", hash).map_err(
+                |actual| ShortAudioReceiptError::InvalidDiagnosticSha256 {
+                    field: "decode_diagnostics.cross_kv_checksum",
+                    actual,
+                },
+            )?;
+        }
+        for hash in &split.step_logits_hashes {
+            validate_sha256_hex("decode_diagnostics.step_logits_hashes", hash).map_err(
+                |actual| ShortAudioReceiptError::InvalidDiagnosticSha256 {
+                    field: "decode_diagnostics.step_logits_hashes",
+                    actual,
+                },
+            )?;
+        }
+        for hash in &split.mask_hashes {
+            validate_sha256_hex("decode_diagnostics.mask_hashes", hash).map_err(|actual| {
+                ShortAudioReceiptError::InvalidDiagnosticSha256 {
+                    field: "decode_diagnostics.mask_hashes",
+                    actual,
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_sha256_hex(_field: &str, value: &str) -> Result<(), String> {
     let ok = value.len() == 64
         && value
@@ -496,6 +590,7 @@ mod tests {
             }),
             scope: SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE.to_string(),
             notes: vec!["unit-test fixture".to_string()],
+            decode_diagnostics: None,
         }
     }
 
@@ -607,5 +702,26 @@ mod tests {
             built.metrics.measurement_method.as_deref(),
             Some(SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK)
         );
+    }
+
+    #[test]
+    fn older_v0_receipt_without_decode_diagnostics_still_deserializes() {
+        let mut receipt = sample_receipt();
+        receipt.decode_diagnostics = None;
+        let json = ShortAudioReceipt::try_new(receipt)
+            .unwrap()
+            .to_pretty_json()
+            .unwrap();
+        assert!(
+            !json.contains("decode_diagnostics"),
+            "empty diagnostics must stay omitted for older readers"
+        );
+        let stripped = json
+            .lines()
+            .filter(|line| !line.contains("decode_diagnostics"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let loaded = ShortAudioReceipt::from_json_str(&stripped).unwrap();
+        assert!(loaded.decode_diagnostics.is_none());
     }
 }
