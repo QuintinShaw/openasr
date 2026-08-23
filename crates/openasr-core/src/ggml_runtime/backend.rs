@@ -207,6 +207,12 @@ impl GgmlBackendDevice {
         device_supports_argmax_first(self.raw)
     }
 
+    /// Whether this device reports support for parameterized `GGML_UNARY_OP_SWOOSH`.
+    #[cfg(test)]
+    pub(crate) fn supports_swoosh(&self) -> bool {
+        device_supports_swoosh(self.raw)
+    }
+
     /// Probe the representative weight types and report which the device can run
     /// `mul_mat` for. Surface for `doctor` diagnostics and load-time weight
     /// placement; on a discrete GPU with narrow quant coverage (e.g. Vulkan)
@@ -353,6 +359,33 @@ pub(crate) fn device_supports_argmax_first(device: NonNull<c_void>) -> bool {
             false
         } else {
             let op = ffi::ggml_argmax_first(ctx, logits);
+            !op.is_null() && ffi::ggml_backend_dev_supports_op(device.as_ptr(), op)
+        };
+        ffi::ggml_free(ctx);
+        supported
+    }
+}
+
+/// Load-time `GGML_UNARY_OP_SWOOSH` probe. Builds a throwaway contiguous F32
+/// vector through `ggml_swoosh` and asks `ggml_backend_dev_supports_op`.
+#[cfg(test)]
+pub(crate) fn device_supports_swoosh(device: NonNull<c_void>) -> bool {
+    const N: i64 = 8;
+    let params = ffi::GgmlInitParams {
+        mem_size: 16 * 1024,
+        mem_buffer: ptr::null_mut(),
+        no_alloc: true,
+    };
+    unsafe {
+        let ctx = ffi::ggml_init(params);
+        if ctx.is_null() {
+            return false;
+        }
+        let input = ffi::ggml_new_tensor_1d(ctx, ffi::GGML_TYPE_F32, N);
+        let supported = if input.is_null() {
+            false
+        } else {
+            let op = ffi::ggml_swoosh(ctx, input, 1.0, -0.08, 0.08);
             !op.is_null() && ffi::ggml_backend_dev_supports_op(device.as_ptr(), op)
         };
         ffi::ggml_free(ctx);
@@ -2355,6 +2388,21 @@ mod tests {
     }
 
     #[test]
+    fn cpu_device_supports_swoosh() {
+        let devices = ggml_available_devices();
+        let Some(cpu) = devices
+            .iter()
+            .find(|device| device.kind == GgmlBackendKind::Cpu)
+        else {
+            return;
+        };
+        assert!(
+            cpu.supports_swoosh(),
+            "CPU must declare GGML_UNARY_OP_SWOOSH through supports_op"
+        );
+    }
+
+    #[test]
     fn metal_device_does_not_support_argmax_first_when_present() {
         let devices = ggml_available_devices();
         let Some(metal) = devices.iter().find(|device| {
@@ -2365,6 +2413,20 @@ mod tests {
         assert!(
             !metal.supports_argmax_first(),
             "Metal must not declare GGML_OP_ARGMAX_FIRST"
+        );
+    }
+
+    #[test]
+    fn metal_device_supports_swoosh_when_present() {
+        let devices = ggml_available_devices();
+        let Some(metal) = devices.iter().find(|device| {
+            ExecutionProvider::from_backend_name(&device.name) == ExecutionProvider::Metal
+        }) else {
+            return;
+        };
+        assert!(
+            metal.supports_swoosh(),
+            "Metal must declare GGML_UNARY_OP_SWOOSH through supports_op"
         );
     }
 

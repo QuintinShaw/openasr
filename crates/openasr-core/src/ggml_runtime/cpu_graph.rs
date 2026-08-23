@@ -12720,6 +12720,80 @@ mod tests {
         ));
     }
 
+    /// Metal `supports_op` must declare parameterized SWOOSH for contiguous f32
+    /// rows. Without this, XASR encoder graphs fail at
+    /// `ggml_metal_op_encode_impl` with `unsupported op 'SWOOSH'`.
+    #[test]
+    fn metal_device_declares_swoosh_support_when_present() {
+        use crate::device::execution_route::ExecutionProvider;
+        use crate::ggml_runtime::ggml_available_devices;
+
+        let Some(metal) = ggml_available_devices().into_iter().find(|device| {
+            ExecutionProvider::from_backend_name(&device.name) == ExecutionProvider::Metal
+        }) else {
+            eprintln!(
+                "metal_device_declares_swoosh_support_when_present: Metal device absent - skipping"
+            );
+            return;
+        };
+        assert!(
+            metal.supports_swoosh(),
+            "Metal must declare GGML_UNARY_OP_SWOOSH for contiguous f32 rows"
+        );
+    }
+
+    /// Same `graph.swoosh` values as the CPU reference, executed on a live
+    /// Metal runner. Covers both the scalar unary kernel (7 elems) and the
+    /// vectorized c4 kernel (8 elems). Skips on hosts without Metal.
+    #[test]
+    fn parameterized_swoosh_matches_cpu_reference_on_metal() {
+        const OFFSET: f32 = 1.0;
+        const SHIFT: f32 = -0.08;
+        const LINEAR_SCALE: f32 = 0.08;
+
+        let mut config = GgmlCpuGraphConfig::conservative_default();
+        config.backend = GgmlCpuGraphBackend::Metal;
+        let mut runner = match GgmlCpuGraphRunner::new(config) {
+            Ok(runner) => runner,
+            Err(error) => {
+                eprintln!(
+                    "parameterized_swoosh_matches_cpu_reference_on_metal: Metal unavailable ({error}) - skipping"
+                );
+                return;
+            }
+        };
+
+        for values in [
+            [-40.0_f32, -8.0, -1.0, 0.0, 1.0, 8.0, 40.0].as_slice(),
+            [-40.0, -8.0, -1.0, 0.0, 1.0, 8.0, 21.0, 40.0].as_slice(),
+        ] {
+            let mut graph = runner.start_graph();
+            let input = graph
+                .new_tensor_1d_f32(values.len(), "swoosh_input")
+                .expect("input allocation should succeed");
+            graph
+                .set_input(input)
+                .expect("input set_input should succeed");
+            let output = graph
+                .swoosh(input, OFFSET, SHIFT, LINEAR_SCALE)
+                .expect("swoosh should build");
+            graph
+                .set_output(output)
+                .expect("set_output should succeed before allocation");
+            graph
+                .set_f32_slice(input, values, "swoosh_input")
+                .expect("input upload should succeed");
+            let actual = graph
+                .compute_output_f32(output, values.len())
+                .expect("swoosh graph should compute on metal");
+            let expected: Vec<f32> = values
+                .iter()
+                .map(|value| softplus_reference(value - OFFSET) - LINEAR_SCALE * value - SHIFT)
+                .collect();
+            assert_f32_close(&actual, &expected, 1.0e-5);
+        }
+    }
+
     #[test]
     fn extended_reduction_and_binary_ops_compute_expected_values() {
         let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
