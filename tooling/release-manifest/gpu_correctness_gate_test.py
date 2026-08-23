@@ -316,6 +316,66 @@ class GpuCorrectnessGateTests(unittest.TestCase):
                     trace_paths=[trace],
                 )
 
+    def test_cpu_receipt_cannot_close_gpu_cell(self) -> None:
+        matrix = self.project()
+        cuda = next(cell for cell in matrix["cells"] if cell["provider"] == "cuda")
+        cpu = next(cell for cell in matrix["cells"] if cell["provider"] == "cpu")
+        self.assertEqual((cuda["model_id"], cuda["quant"]), (cpu["model_id"], cpu["quant"]))
+        with tempfile.TemporaryDirectory() as temp:
+            receipt = self.receipt(cpu, "token_transcript", "cold")
+            path = Path(temp) / "cpu-as-gpu.json"
+            path.write_text(json.dumps(receipt))
+            token_label = receipt["evidence"]["trace"]["token_trace"]["label"]
+            token_content = (
+                json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "header", "mode": "cold", "provider": "cpu", "device": "test-cpu"})
+                + "\n"
+                + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "token", "step_index": 0, "token_id": 7, "is_eot": 0})
+                + "\n"
+                + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "top_k", "step_index": 0, "items": [{"token_id": 7, "value": 1.25}, {"token_id": 8, "value": 0.75}]})
+                + "\n"
+            )
+            token_trace = Path(temp) / token_label
+            token_trace.write_text(token_content)
+            logits_label = receipt["evidence"]["trace"]["logits"]["label"]
+            logits_trace = Path(temp) / logits_label
+            logits_trace.write_text(token_content)
+            with self.assertRaisesRegex(GATE.MatrixError, "incomplete|missing receipts"):
+                GATE.validate_matrix(
+                    matrix,
+                    [path],
+                    inventory=self.inventory,
+                    catalog=self.catalog,
+                    backend_catalog=self.backends,
+                    source_digests=self.source_digests,
+                    trace_paths=[token_trace, logits_trace],
+                )
+
+    def test_placement_receipt_cannot_close_token_cell(self) -> None:
+        matrix = self.project()
+        cell = next(item for item in matrix["cells"] if item["provider"] == "cuda")
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "placement-only.json"
+            path.write_text(json.dumps(self.receipt(cell, "placement_resource", "cold")))
+            trace = Path(temp) / "trace.jsonl"
+            trace.write_text(
+                json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "header", "mode": "cold", "provider": "cuda", "device": "test-cuda"})
+                + "\n"
+                + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "token", "step_index": 0, "token_id": 1})
+                + "\n"
+                + json.dumps({"schema": "openasr.gpu-correctness-trace.v1", "event": "top_k", "step_index": 0, "items": [{"token_id": 1, "value": 1.0}]})
+                + "\n"
+            )
+            with self.assertRaisesRegex(GATE.MatrixError, "incomplete|missing receipts"):
+                GATE.validate_matrix(
+                    matrix,
+                    [path],
+                    inventory=self.inventory,
+                    catalog=self.catalog,
+                    backend_catalog=self.backends,
+                    source_digests=self.source_digests,
+                    trace_paths=[trace],
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

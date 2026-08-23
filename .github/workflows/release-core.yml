@@ -232,7 +232,7 @@ jobs:
       release_tag: ${{ needs.resolve.outputs.tag }}
     secrets: inherit
 
-
+  finalize-notes:
     name: Finalize Install & Verify with real assets
     needs: [resolve, release, binaries, prepublication-family, deploy-catalog]
     if: needs.resolve.outputs.should_release == 'true' && success() && github.event_name == 'workflow_dispatch'

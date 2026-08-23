@@ -18,10 +18,11 @@ use openasr_core::{
     BackendKind, ExecutionTarget, GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector,
     InstalledPack, NativeExecutionServices, ResolvedOutputTarget,
     SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK, SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioReceipt,
-    ShortAudioReceiptAudio, ShortAudioReceiptMetrics, ShortAudioReceiptPack, ShortAudioReceiptRun,
-    ShortAudioReceiptTranscript, TranscriptionRequest, atomic_write_text, list_installed_packs,
-    load_config, openasr_home, parse_model_ref, prepare_audio_input, process_memory_snapshot,
-    receipt_os_id, resolve_core_commit, resolve_installed_pack_reference,
+    ShortAudioReceiptAudio, ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptMetrics,
+    ShortAudioReceiptOutputPlan, ShortAudioReceiptPack, ShortAudioReceiptReuseMode,
+    ShortAudioReceiptRun, ShortAudioReceiptTranscript, TranscriptionRequest, atomic_write_text,
+    list_installed_packs, load_config, openasr_home, parse_model_ref, prepare_audio_input,
+    process_memory_snapshot, receipt_os_id, resolve_core_commit, resolve_installed_pack_reference,
     resolve_output_target_handle, sha256_file, validate_local_native_model_pack_path,
 };
 
@@ -324,7 +325,17 @@ pub(crate) fn bench_receipt_short_audio(
         evidence: receipt_evidence,
         scope: options.scope.to_string(),
         notes,
-        decode_diagnostics: None,
+        decode_diagnostics: Some(ShortAudioReceiptDecodeDiagnostics {
+            output_plan: ShortAudioReceiptOutputPlan::FullLogits,
+            reuse_mode: if options.warmup_runs > 0 {
+                ShortAudioReceiptReuseMode::ReusableGraph
+            } else {
+                ShortAudioReceiptReuseMode::FreshGraph
+            },
+            steps: Vec::new(),
+            first_divergence: None,
+            encoder_decoder_splits: Vec::new(),
+        }),
     })
     .context("Constructed short-audio receipt failed validation")?;
 
@@ -798,6 +809,18 @@ mod tests {
         assert_eq!(receipt.run.backend, "mock");
         assert_eq!(receipt.run.device, "cpu");
         assert_eq!(receipt.placement, "cpu");
+        let diagnostics = receipt
+            .decode_diagnostics
+            .as_ref()
+            .expect("decode diagnostics are required");
+        assert_eq!(
+            diagnostics.output_plan,
+            openasr_core::ShortAudioReceiptOutputPlan::FullLogits
+        );
+        assert_eq!(
+            diagnostics.reuse_mode,
+            openasr_core::ShortAudioReceiptReuseMode::FreshGraph
+        );
         assert!(!receipt.transcript.text.is_empty());
         assert_eq!(receipt.audio.sha256.len(), 64);
         assert!(receipt.metrics.rtf_samples.len() <= 1);

@@ -16,13 +16,17 @@ use sha2::{Digest, Sha256};
 
 use super::{
     GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlPersistentGraphSession,
+    GgmlDecodeOutputPlan, GgmlDecodeReuseMode, GgmlPersistentGraphSession,
 };
 
 /// Bounded per-step diagnostic records on a short-audio receipt.
 pub const SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS: usize = 64;
 
 /// Receipt-facing copy of the resolved output plan. Diagnostic only.
+///
+/// This is a serialization projection of [`GgmlDecodeOutputPlan`]. The runtime
+/// type remains the planner authority; unknown compact capability still falls
+/// back uniquely to [`GgmlDecodeOutputPlan::FullLogits`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShortAudioReceiptOutputPlan {
@@ -31,12 +35,31 @@ pub enum ShortAudioReceiptOutputPlan {
     NativeFirstMaxToken,
 }
 
+impl From<GgmlDecodeOutputPlan> for ShortAudioReceiptOutputPlan {
+    fn from(plan: GgmlDecodeOutputPlan) -> Self {
+        match plan {
+            GgmlDecodeOutputPlan::FullLogits => Self::FullLogits,
+            GgmlDecodeOutputPlan::CompleteScores => Self::CompleteScores,
+            GgmlDecodeOutputPlan::NativeFirstMaxToken => Self::NativeFirstMaxToken,
+        }
+    }
+}
+
 /// Receipt-facing copy of the resolved reuse mode. Diagnostic only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShortAudioReceiptReuseMode {
     FreshGraph,
     ReusableGraph,
+}
+
+impl From<GgmlDecodeReuseMode> for ShortAudioReceiptReuseMode {
+    fn from(mode: GgmlDecodeReuseMode) -> Self {
+        match mode {
+            GgmlDecodeReuseMode::FreshGraph => Self::FreshGraph,
+            GgmlDecodeReuseMode::ReusableGraph => Self::ReusableGraph,
+        }
+    }
 }
 
 /// Contract interpretation of a four-quadrant first divergence.
@@ -78,13 +101,15 @@ pub struct ShortAudioReceiptDecodeStep {
     pub graph_rebuilt: bool,
 }
 
-/// Optional diagnostic block on `openasr.short-audio-receipt.v0`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+/// Fail-closed diagnostic block on `openasr.short-audio-receipt.v0`.
+///
+/// `output_plan` and `reuse_mode` are required. They record the resolved
+/// [`GgmlDecodeOutputPlan`] / [`GgmlDecodeReuseMode`] projection, including the
+/// unique `full_logits` fallback when compact selection is unproven.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ShortAudioReceiptDecodeDiagnostics {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_plan: Option<ShortAudioReceiptOutputPlan>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reuse_mode: Option<ShortAudioReceiptReuseMode>,
+    pub output_plan: ShortAudioReceiptOutputPlan,
+    pub reuse_mode: ShortAudioReceiptReuseMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<ShortAudioReceiptDecodeStep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -940,8 +965,8 @@ mod tests {
         assert_eq!(split.device_token_ids, split.host_token_ids);
 
         let receipt = sample_receipt_with_diagnostics(ShortAudioReceiptDecodeDiagnostics {
-            output_plan: Some(ShortAudioReceiptOutputPlan::FullLogits),
-            reuse_mode: Some(ShortAudioReceiptReuseMode::FreshGraph),
+            output_plan: ShortAudioReceiptOutputPlan::FullLogits,
+            reuse_mode: ShortAudioReceiptReuseMode::FreshGraph,
             steps: vec![ShortAudioReceiptDecodeStep {
                 step: 0,
                 token_id: Some(2),
@@ -981,6 +1006,30 @@ mod tests {
         assert!(encoded.contains("cpu_encoder_accel_fresh_decoder"));
         assert!(encoded.contains("accel_encoder_accel_fresh_decoder"));
         assert!(encoded.contains("accel_encoder_accel_reusable_decoder"));
+    }
+
+    #[test]
+    fn receipt_output_plan_projects_every_ggml_decode_output_plan() {
+        assert_eq!(
+            ShortAudioReceiptOutputPlan::from(GgmlDecodeOutputPlan::FullLogits),
+            ShortAudioReceiptOutputPlan::FullLogits
+        );
+        assert_eq!(
+            ShortAudioReceiptOutputPlan::from(GgmlDecodeOutputPlan::CompleteScores),
+            ShortAudioReceiptOutputPlan::CompleteScores
+        );
+        assert_eq!(
+            ShortAudioReceiptOutputPlan::from(GgmlDecodeOutputPlan::NativeFirstMaxToken),
+            ShortAudioReceiptOutputPlan::NativeFirstMaxToken
+        );
+        assert_eq!(
+            ShortAudioReceiptReuseMode::from(GgmlDecodeReuseMode::FreshGraph),
+            ShortAudioReceiptReuseMode::FreshGraph
+        );
+        assert_eq!(
+            ShortAudioReceiptReuseMode::from(GgmlDecodeReuseMode::ReusableGraph),
+            ShortAudioReceiptReuseMode::ReusableGraph
+        );
     }
 
     fn sample_receipt_with_diagnostics(

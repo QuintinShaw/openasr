@@ -86,6 +86,10 @@ pub enum ShortAudioReceiptError {
     MedianMismatch { median: String, expected: String },
     #[error("could not hash path {path}: {reason}")]
     HashIo { path: String, reason: String },
+    #[error(
+        "short-audio receipt decode_diagnostics is required and must bind output_plan and reuse_mode"
+    )]
+    DecodeDiagnosticsMissing,
     #[error("short-audio receipt decode diagnostics exceed {max} steps, got {actual}")]
     DecodeStepsUnbounded { max: usize, actual: usize },
     #[error(
@@ -124,9 +128,8 @@ pub struct ShortAudioReceipt {
     pub scope: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
-    /// Optional decode-correctness diagnostics. Absent on older v0 receipts.
-    /// Dual-output or four-quadrant agreement recorded here is not production
-    /// compact-path authorization.
+    /// Fail-closed decode-correctness diagnostics. Dual-output or four-quadrant
+    /// agreement recorded here is not production compact-path authorization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decode_diagnostics: Option<ShortAudioReceiptDecodeDiagnostics>,
 }
@@ -301,9 +304,11 @@ impl ShortAudioReceipt {
             }
             (None, _) => {}
         }
-        if let Some(diagnostics) = &self.decode_diagnostics {
-            validate_decode_diagnostics(diagnostics)?;
-        }
+        let diagnostics = self
+            .decode_diagnostics
+            .as_ref()
+            .ok_or(ShortAudioReceiptError::DecodeDiagnosticsMissing)?;
+        validate_decode_diagnostics(diagnostics)?;
         Ok(())
     }
 
@@ -955,7 +960,17 @@ mod tests {
             evidence: None,
             scope: SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE.to_string(),
             notes: vec!["unit-test fixture".to_string()],
-            decode_diagnostics: None,
+            decode_diagnostics: Some(sample_decode_diagnostics()),
+        }
+    }
+
+    fn sample_decode_diagnostics() -> ShortAudioReceiptDecodeDiagnostics {
+        ShortAudioReceiptDecodeDiagnostics {
+            output_plan: ShortAudioReceiptOutputPlan::FullLogits,
+            reuse_mode: ShortAudioReceiptReuseMode::FreshGraph,
+            steps: Vec::new(),
+            first_divergence: None,
+            encoder_decoder_splits: Vec::new(),
         }
     }
 
@@ -1176,23 +1191,54 @@ mod tests {
     }
 
     #[test]
-    fn older_v0_receipt_without_decode_diagnostics_still_deserializes() {
+    fn decode_diagnostics_are_required_fail_closed() {
         let mut receipt = sample_receipt();
         receipt.decode_diagnostics = None;
-        let json = ShortAudioReceipt::try_new(receipt)
-            .unwrap()
-            .to_pretty_json()
-            .unwrap();
+        assert!(matches!(
+            receipt.validate(),
+            Err(ShortAudioReceiptError::DecodeDiagnosticsMissing)
+        ));
+        let json = serde_json::to_string(&receipt).unwrap();
         assert!(
             !json.contains("decode_diagnostics"),
-            "empty diagnostics must stay omitted for older readers"
+            "absent diagnostics must not serialize as a placeholder"
         );
-        let stripped = json
-            .lines()
-            .filter(|line| !line.contains("decode_diagnostics"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let loaded = ShortAudioReceipt::from_json_str(&stripped).unwrap();
-        assert!(loaded.decode_diagnostics.is_none());
+        assert!(ShortAudioReceipt::from_json_str(&json).is_err());
+    }
+
+    #[test]
+    fn decode_diagnostics_bind_output_plan_and_reuse_mode() {
+        let receipt = ShortAudioReceipt::try_new(sample_receipt()).unwrap();
+        let diagnostics = receipt.decode_diagnostics.as_ref().expect("required");
+        assert_eq!(
+            diagnostics.output_plan,
+            ShortAudioReceiptOutputPlan::FullLogits
+        );
+        assert_eq!(
+            diagnostics.reuse_mode,
+            ShortAudioReceiptReuseMode::FreshGraph
+        );
+        let json = receipt.to_pretty_json().unwrap();
+        assert!(json.contains("\"output_plan\": \"full_logits\""));
+        assert!(json.contains("\"reuse_mode\": \"fresh_graph\""));
+        assert!(!json.contains("raw_audio"));
+        assert!(!json.contains("weights"));
+        assert!(!json.contains("secret"));
+    }
+
+    #[test]
+    fn placement_evidence_is_not_token_transcript_proof() {
+        let mut receipt = sample_receipt();
+        let mut evidence = sample_token_evidence(ShortAudioReuseMode::Cold);
+        evidence.evidence_class = ShortAudioEvidenceClass::PlacementResource;
+        evidence.output_plan = None;
+        evidence.family_oracle = None;
+        evidence.execution = Some(ShortAudioExecutionMode {
+            mode: ShortAudioReuseMode::Cold,
+            graph_rebuild_reason: None,
+        });
+        evidence.trace = None;
+        receipt.evidence = Some(evidence);
+        ShortAudioReceipt::try_new(receipt).expect("placement evidence may omit token fields");
     }
 }

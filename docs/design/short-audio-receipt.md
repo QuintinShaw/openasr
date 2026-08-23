@@ -84,7 +84,8 @@ wrong-artifact, placement-only, CPU-only, or partial matrices.
 | `transcript.text_sha256` | yes | Lowercase hex sha256 of the UTF-8 transcript bytes. |
 | `placement` | yes | Legacy/requested placement label retained for v0 compatibility. It is not proof of where graph compute ran. |
 | `observed_placement` | no | Actual graph-node placement observed during compute: total/compute-node counts by backend, graph compute count, output bytes, and bounded fallback samples. Native Metal acceptance requires selected-device compute and rejects disallowed CPU/alternate-accelerator compute according to the execution placement. |
-| `evidence` | no | Versioned, class-separated build/placement/token evidence; omission preserves legacy readability but is never GPU token approval. |
+| `evidence` | no | Versioned, class-separated build/placement/token evidence nested in this same v0 receipt. Omission is never GPU token approval. This is not a third top-level JSON or policy channel. |
+| `decode_diagnostics` | yes | Fail-closed projection of the runtime `GgmlDecodeOutputPlan` and reuse mode, including the unique `full_logits` fallback when compact selection is unproven. Dual-output agreement here is not compact-path authorization. |
 | `scope` | yes | Default `short-audio-gate`. |
 | `notes` | no | Free-form annotations. |
 
