@@ -48,7 +48,7 @@ use super::runtime_contract::{
 };
 use super::tokenizer::GraniteSpeechTokenizer;
 use crate::api::backend::{Segment, Transcription};
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufRuntimeSourcePreflight};
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlDecodeReuseMode, GgufRuntimeSourcePreflight};
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
     PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
@@ -254,6 +254,7 @@ impl GraniteSpeechPreparedRuntime {
         preflight: &GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        reuse_mode: GgmlDecodeReuseMode,
     ) -> Result<Self, GraniteSpeechGgmlExecutorError> {
         let metadata = &preflight.metadata;
         let encoder_config = parse_encoder_metadata(metadata).map_err(|error| {
@@ -312,6 +313,7 @@ impl GraniteSpeechPreparedRuntime {
             embed_table.device_graph_spec(),
             backend,
             greedy_step_output_mode,
+            reuse_mode,
         )
         .map_err(|error| GraniteSpeechGgmlExecutorError::DecodeFailed {
             reason: error.to_string(),
@@ -489,6 +491,7 @@ impl GraniteSpeechGgmlExecutor {
         preflight: &GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        reuse_mode: GgmlDecodeReuseMode,
     ) -> Result<GraniteSpeechPreparedRuntimeActor, GraniteSpeechGgmlExecutorError> {
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
@@ -519,6 +522,7 @@ impl GraniteSpeechGgmlExecutor {
                     &build_preflight,
                     backend,
                     greedy_step_output_mode,
+                    reuse_mode,
                 )?;
                 let retained = prepared.retained_system_memory_bytes()?;
                 let peak = retained
@@ -590,7 +594,12 @@ impl GraniteSpeechGgmlExecutor {
                 capacity.validate_hard_cap(super::capacity::GRANITE_SPEECH_DECODER_MAX_POSITIONS)
             })
             .map_err(|source| GraniteSpeechGgmlExecutorError::DecoderStateCapacity { source })?;
-        let actor = self.checkout_prepared_runtime(preflight, backend, greedy_step_output_mode)?;
+        let actor = self.checkout_prepared_runtime(
+            preflight,
+            backend,
+            greedy_step_output_mode,
+            request.resolved_runtime.reuse_mode(),
+        )?;
         let control = Arc::clone(&request.execution_context.control);
         let decode_work_progress = request
             .execution_context

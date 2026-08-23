@@ -20,8 +20,9 @@ use std::sync::Arc;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlFlashAttentionPrecision, GgmlKvElementType,
-    GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlDecodeReuseMode, GgmlFlashAttentionPrecision,
+    GgmlKvElementType, GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor,
+    GgmlStaticTensorArena,
 };
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, STANDARD_HEAD_PERMUTE_AXES,
@@ -35,19 +36,12 @@ use crate::nn::norm::{
     AffineLayerNormSteps, RmsNormSteps, apply_affine_layer_norm, apply_rms_norm,
 };
 
-/// Reused decode graphs with in-place resident KV are only correct on the
-/// single-backend GPU path. CPU direct execution mis-recomputes reused graphs
-/// with in-place KV writes, and the multi-backend scheduler drops refreshed
-/// per-token inputs.
-pub(crate) fn reusable_decode_graph_supported(
-    backend: GgmlCpuGraphBackend,
-    uses_scheduler: bool,
-) -> bool {
-    backend.is_gpu_class() && !uses_scheduler
-}
-
-pub(crate) fn reusable_decode_graph_supported_for_runner(runner: &GgmlCpuGraphRunner) -> bool {
-    reusable_decode_graph_supported(runner.backend_kind(), runner.uses_scheduler())
+/// Persistent in-place KV graph reuse is authorized only by the immutable
+/// planner `reuse_mode`. GPU class is a placement category, not proof of
+/// reuse correctness; CPU/scheduler mechanical limits live in planner-internal
+/// evidence. Production reuse evidence is Unknown, so every lane is FreshGraph.
+pub(crate) fn reusable_decode_graph_supported(reuse_mode: GgmlDecodeReuseMode) -> bool {
+    reuse_mode == GgmlDecodeReuseMode::ReusableGraph
 }
 
 /// Return a zero-copy `[hidden_size, 1]` view of the final token in a
@@ -2533,30 +2527,12 @@ mod tests {
     use crate::ggml_runtime::{GgmlCpuGraphConfig, GgmlCpuGraphRunner};
 
     #[test]
-    fn reusable_decode_graph_support_requires_gpu_class_without_scheduler() {
+    fn reusable_decode_graph_support_requires_reusable_mode() {
         assert!(!reusable_decode_graph_supported(
-            GgmlCpuGraphBackend::Cpu,
-            false
-        ));
-        assert!(!reusable_decode_graph_supported(
-            GgmlCpuGraphBackend::Cpu,
-            true
+            GgmlDecodeReuseMode::FreshGraph
         ));
         assert!(reusable_decode_graph_supported(
-            GgmlCpuGraphBackend::Metal,
-            false
-        ));
-        assert!(!reusable_decode_graph_supported(
-            GgmlCpuGraphBackend::Metal,
-            true
-        ));
-        assert!(reusable_decode_graph_supported(
-            GgmlCpuGraphBackend::Gpu,
-            false
-        ));
-        assert!(!reusable_decode_graph_supported(
-            GgmlCpuGraphBackend::Gpu,
-            true
+            GgmlDecodeReuseMode::ReusableGraph
         ));
     }
 

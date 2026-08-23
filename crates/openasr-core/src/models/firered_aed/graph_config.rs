@@ -80,22 +80,20 @@ pub(crate) fn firered_encoder_graph_config(backend: GgmlCpuGraphBackend) -> Ggml
     config
 }
 
-/// Decode-graph reuse (`nn::decoder::reusable_decode_graph_supported`) only
-/// activates when the backend is GPU-class *and* the scheduler is off (a
-/// multi-backend scheduler's `sched_alloc_graph` drops the per-token inputs
-/// a reused, in-place-KV graph depends on). The decoder previously inherited
-/// the encoder's `default_use_scheduler_when_unset: Some(true)`, which would
-/// keep the reusable incremental-step graph in `decoder_graph` permanently
-/// disabled on Metal and force a full graph rebuild every decode token
-/// (measured at ~21% of the per-token decode step on l-v2 q4_k). Leaving
-/// this `None` keeps the base default (scheduler-off on GPU-class backends,
-/// see `configure_model_graph_config`), exactly mirroring moonshine's
-/// decoder-tier fix. This is a pure backend/scheduling choice: output must
-/// stay byte-identical (pinned by the reused-vs-fresh logits test in
-/// `decoder_graph` and the firered golden tests), since it does not change
-/// which arithmetic runs, only whether the graph is rebuilt per token.
-/// `OPENASR_GGML_USE_SCHEDULER=1` remains the explicit escape hatch (it also
-/// disables reuse, restoring the rebuild-per-token path).
+/// Decode-graph reuse is authorized only by the immutable planner
+/// `reuse_mode`. Scheduler-off on GPU-class backends remains a mechanical
+/// default so a future proven ReusableGraph lane can keep per-token inputs
+/// (a multi-backend scheduler's `sched_alloc_graph` drops them). The decoder
+/// previously inherited the encoder's `default_use_scheduler_when_unset:
+/// Some(true)`, which would keep any reusable incremental-step graph in
+/// `decoder_graph` permanently disabled on Metal and force a full graph
+/// rebuild every decode token (measured at ~21% of the per-token decode
+/// step on l-v2 q4_k). Leaving this `None` keeps the base default
+/// (scheduler-off on GPU-class backends, see `configure_model_graph_config`).
+/// This is a pure backend/scheduling choice: output must stay byte-identical
+/// (pinned by the reused-vs-fresh logits test in `decoder_graph` and the
+/// firered golden tests). `OPENASR_GGML_USE_SCHEDULER=1` remains the explicit
+/// escape hatch.
 pub(crate) fn firered_decoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
     // See the matching comment in `firered_encoder_graph_config`: this is a
     // `no_alloc` metadata pool sized from the actual node count, not the real
@@ -150,11 +148,10 @@ mod tests {
         }
     }
 
-    /// Pin the decoder tier's Metal scheduler default to OFF: decode-graph
-    /// reuse (`nn::decoder::reusable_decode_graph_supported`) requires
-    /// `gpu_class && !scheduler`, so a scheduler-on default here would turn
-    /// the reusable incremental decode graph back into dead code (the exact
-    /// regression moonshine had before commit 879677ac).
+    /// Pin the decoder tier's Metal scheduler default to OFF: a future
+    /// proven reusable graph still needs scheduler-off so per-token inputs
+    /// survive. A scheduler-on default here would turn that path into dead
+    /// code (the exact regression moonshine had before commit 879677ac).
     #[test]
     fn decoder_metal_scheduler_default_stays_off_for_decode_graph_reuse() {
         let config = firered_runtime_graph_config_with_explicit_overrides(

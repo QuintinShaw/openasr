@@ -27,7 +27,9 @@ use crate::PhraseBiasConfig;
 use crate::Segment;
 use crate::capacity::topology::StateKind;
 use crate::ggml_runtime::GgufRuntimeSourcePreflight;
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphRunner};
+use crate::ggml_runtime::{
+    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphRunner, GgmlDecodeReuseMode,
+};
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, BuiltinSeq2SeqDecodePolicyConfigInput,
     build_builtin_seq2seq_decode_policy_config, resolve_builtin_decode_policy,
@@ -77,6 +79,7 @@ pub(crate) struct WhisperServeBatchJob {
     pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,
     pub uses_scheduler: bool,
+    pub reuse_mode: GgmlDecodeReuseMode,
     pub execution: WhisperGgmlExecutionMetadata,
     pub decoder_weights: WhisperDecoderWeightSeam,
     pub tokenizer: WhisperTokenizer,
@@ -542,6 +545,10 @@ impl Seq2SeqServeBatchFamily for WhisperFamily {
         job.uses_scheduler
     }
 
+    fn reuse_mode(job: &Self::Job) -> GgmlDecodeReuseMode {
+        job.reuse_mode
+    }
+
     fn effective_max_batch_after_vram_cap(
         capped_max_batch: usize,
         job: &Self::Job,
@@ -724,6 +731,7 @@ impl WhisperServeBatchJob {
             && self.runtime_cache_path == other.runtime_cache_path
             && self.backend == other.backend
             && self.uses_scheduler == other.uses_scheduler
+            && self.reuse_mode == other.reuse_mode
             && whisper_serve_decode_configs_can_share_fixed_bucket(
                 &self.decode_config,
                 &other.decode_config,
@@ -1264,6 +1272,7 @@ mod tests {
             runtime_preflight,
             backend,
             uses_scheduler,
+            reuse_mode: GgmlDecodeReuseMode::FreshGraph,
             execution,
             decoder_weights,
             tokenizer,

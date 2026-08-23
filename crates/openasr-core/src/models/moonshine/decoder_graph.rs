@@ -27,7 +27,7 @@ use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generat
 use crate::nn::decoder::{
     LlmResidentKvArena, Seq2SeqReusableDecodeGraph, allocate_zeroed_llm_resident_kv_arena,
     build_fixed_kv_attention_mask_bits, build_fixed_kv_attention_mask_bits_for_sequences,
-    reusable_decode_graph_supported_for_runner as shared_reusable_decode_graph_supported_for_runner,
+    reusable_decode_graph_supported,
 };
 use crate::nn::half::f32_to_f16_bits;
 use crate::{Segment, Transcription};
@@ -429,19 +429,13 @@ impl Seq2SeqGreedyDecodeStepExecutor for MoonshineDecoderStepExecutor<'_> {
     }
 }
 
-fn reuse_mode_allows_persistent_graph(
-    reuse_mode: GgmlDecodeReuseMode,
-    runner_supports_reuse: bool,
-) -> bool {
-    reuse_mode == GgmlDecodeReuseMode::ReusableGraph && runner_supports_reuse
+fn reuse_mode_allows_persistent_graph(reuse_mode: GgmlDecodeReuseMode) -> bool {
+    reusable_decode_graph_supported(reuse_mode)
 }
 
 impl MoonshineDecoderGraphRuntime {
     fn supports_reusable_decode_graph(&self) -> bool {
-        reuse_mode_allows_persistent_graph(
-            self.reuse_mode,
-            reusable_decode_graph_supported_for_runner(&self.runner),
-        )
+        reuse_mode_allows_persistent_graph(self.reuse_mode)
     }
 
     fn ensure_resident_self_kv_arena(&mut self) -> Result<(), MoonshineDecoderGraphError> {
@@ -1806,10 +1800,6 @@ fn map_device_top1_token(
     })
 }
 
-fn reusable_decode_graph_supported_for_runner(runner: &GgmlCpuGraphRunner) -> bool {
-    shared_reusable_decode_graph_supported_for_runner(runner)
-}
-
 impl MoonshineDecoderLayerRuntime {
     fn cross_k_proj(&self) -> WeightSlot {
         self.cross_k
@@ -3074,25 +3064,18 @@ fn build_err(step: &'static str) -> impl Fn(GgmlCpuGraphError) -> MoonshineDecod
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig};
     use crate::{
         GgufRuntimeSourcePreflight, read_gguf_metadata_from_runtime_source,
         read_gguf_tensor_index_from_runtime_source, validate_ggml_runtime_source_path,
     };
 
     #[test]
-    fn fresh_graph_never_allows_persistent_reuse_even_when_runner_supports_it() {
+    fn fresh_graph_never_allows_persistent_reuse() {
         assert!(!reuse_mode_allows_persistent_graph(
             GgmlDecodeReuseMode::FreshGraph,
-            true,
         ));
         assert!(reuse_mode_allows_persistent_graph(
             GgmlDecodeReuseMode::ReusableGraph,
-            true,
-        ));
-        assert!(!reuse_mode_allows_persistent_graph(
-            GgmlDecodeReuseMode::ReusableGraph,
-            false,
         ));
     }
 
@@ -3102,7 +3085,6 @@ mod tests {
     fn fresh_graph_rejects_batch_prefill_before_resident_state_allocation() {
         assert!(!reuse_mode_allows_persistent_graph(
             GgmlDecodeReuseMode::FreshGraph,
-            true,
         ));
     }
 
@@ -3179,23 +3161,13 @@ mod tests {
     }
 
     #[test]
-    fn reusable_decode_graph_is_disabled_on_cpu_direct_runner() {
-        let mut config = GgmlCpuGraphConfig::conservative_default();
-        config.backend = GgmlCpuGraphBackend::Cpu;
-        config.use_scheduler = false;
-        let runner = GgmlCpuGraphRunner::new(config).expect("direct runner should initialize");
-
-        assert!(!reusable_decode_graph_supported_for_runner(&runner));
-    }
-
-    #[test]
-    fn reusable_decode_graph_is_disabled_on_scheduler_runner() {
-        let mut config = GgmlCpuGraphConfig::conservative_default();
-        config.backend = GgmlCpuGraphBackend::Cpu;
-        config.use_scheduler = true;
-        let runner = GgmlCpuGraphRunner::new(config).expect("scheduler runner should initialize");
-
-        assert!(!reusable_decode_graph_supported_for_runner(&runner));
+    fn reusable_decode_graph_is_disabled_until_planner_authorizes_reuse() {
+        assert!(!reusable_decode_graph_supported(
+            GgmlDecodeReuseMode::FreshGraph
+        ));
+        assert!(reusable_decode_graph_supported(
+            GgmlDecodeReuseMode::ReusableGraph
+        ));
     }
 
     #[test]

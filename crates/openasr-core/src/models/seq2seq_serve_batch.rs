@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlDecodeReuseMode};
 use crate::models::native_execution_services::{
     NativeExecutionContext, current_native_execution_context, install_native_execution_context,
 };
@@ -112,6 +112,7 @@ pub(crate) trait Seq2SeqServeBatchFamily: Sized + 'static {
     fn vram_slot_bytes(job: &Self::Job) -> usize;
     fn backend(job: &Self::Job) -> GgmlCpuGraphBackend;
     fn uses_scheduler(job: &Self::Job) -> bool;
+    fn reuse_mode(job: &Self::Job) -> GgmlDecodeReuseMode;
     /// Applied AFTER the VRAM cap in `validate_for_job`. The default is the
     /// identity (cohere / moonshine never resolve a backend name); whisper
     /// overrides this to resolve typed backend capabilities at the shared
@@ -1253,11 +1254,12 @@ impl ServeBatchConfig {
     }
 
     /// Validates the config against a concrete job and resolves the effective
-    /// max-batch: `max_batch >= 2` (else `F::invalid_enabled_batch`); gpu-class
-    /// backend && !scheduler (else `F::unsupported_backend`); the VRAM cap
-    /// (`F::vram_slot_bytes`); THEN `F::effective_max_batch_after_vram_cap`
-    /// (whisper Vulkan->serial). The VRAM-cap-then-backend-name-cap ORDER is
-    /// load-bearing -- it affects the engine key -- and is preserved exactly.
+    /// max-batch: `max_batch >= 2` (else `F::invalid_enabled_batch`); the
+    /// immutable planner must have authorized a reusable graph (else
+    /// `F::unsupported_backend`); the VRAM cap (`F::vram_slot_bytes`); THEN
+    /// `F::effective_max_batch_after_vram_cap` (whisper Vulkan->serial). The
+    /// VRAM-cap-then-backend-name-cap ORDER is load-bearing -- it affects the
+    /// engine key -- and is preserved exactly.
     pub(crate) fn validate_for_job<F: Seq2SeqServeBatchFamily>(
         self,
         job: &F::Job,
@@ -1266,7 +1268,7 @@ impl ServeBatchConfig {
             return Err(F::invalid_enabled_batch(self.max_batch));
         }
         let backend = F::backend(job);
-        if !reusable_decode_graph_supported(backend, F::uses_scheduler(job)) {
+        if !reusable_decode_graph_supported(F::reuse_mode(job)) || F::uses_scheduler(job) {
             return Err(F::unsupported_backend(backend));
         }
         let max_batch =
@@ -1756,6 +1758,10 @@ mod slot_isolation_tests {
 
         fn uses_scheduler(_job: &Self::Job) -> bool {
             false
+        }
+
+        fn reuse_mode(_job: &Self::Job) -> GgmlDecodeReuseMode {
+            GgmlDecodeReuseMode::FreshGraph
         }
 
         fn initial_prompt_tokens(_job: &Self::Job) -> &[u32] {

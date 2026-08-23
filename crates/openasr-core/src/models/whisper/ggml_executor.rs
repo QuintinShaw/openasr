@@ -29,9 +29,10 @@ use crate::device::execution_policy::ExecutionPlacement;
 use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity,
-    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
-    RequestBackendPreference, request_backend_override,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlDecodeReuseMode, GgmlLoadedTensor,
+    GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext, GgmlStaticTensor,
+    GgmlStaticTensorArena, GgufRuntimeSourcePreflight, RequestBackendPreference,
+    request_backend_override,
 };
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
@@ -64,7 +65,7 @@ use crate::nn::attn::{
 use crate::nn::conv::{
     Conv1dParams, ConvActivation, ConvBlockSteps, apply_conv_1d_bias_activation,
 };
-use crate::nn::decoder::{Seq2SeqReusableDecodeGraph, reusable_decode_graph_supported_for_runner};
+use crate::nn::decoder::{Seq2SeqReusableDecodeGraph, reusable_decode_graph_supported};
 use crate::nn::half::{f16_bits_to_f32, f32_to_f16_bits};
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 use crate::{
@@ -187,11 +188,11 @@ const OPENASR_WHISPER_DISABLE_GPU_LOADED_F16_WEIGHTS: &str =
 const WHISPER_ENCODER_LAYER_NORM_EPSILON: f32 = 1.0e-5;
 
 fn whisper_can_use_serve_batch(
-    graph_config: GgmlCpuGraphConfig,
+    reuse_mode: GgmlDecodeReuseMode,
     _request_options: &GgmlAsrExecutionOptions,
     _allow_persistent_session_reuse: bool,
 ) -> bool {
-    graph_config.backend.is_gpu_class() && !graph_config.use_scheduler
+    reusable_decode_graph_supported(reuse_mode)
 }
 
 #[derive(Debug, Error)]
@@ -806,6 +807,7 @@ struct WhisperDecoderActorJob {
     audio_duration: f32,
     allow_persistent_session_reuse: bool,
     backend: GgmlCpuGraphBackend,
+    reuse_mode: GgmlDecodeReuseMode,
     decoder_placement_policy: WhisperDecoderPlacementPolicy,
     loaded_f16_weight_mode: WhisperGpuLoadedF16WeightMode,
     control: Arc<crate::api::backend::TranscriptionControl>,
@@ -949,6 +951,7 @@ impl WhisperDecoderActorJob {
                 &self.control,
                 self.decode_work_progress.as_ref(),
                 self.unstable_decode_text.as_ref(),
+                self.reuse_mode,
             )
         })();
         if !self.allow_persistent_session_reuse {
@@ -4258,6 +4261,7 @@ impl WhisperGgmlExecutor {
             skip_serve_batch,
             &request.execution_context,
             request.resolved_runtime.backend(),
+            request.resolved_runtime.reuse_mode(),
         )
         .map_err(|error| match error {
             WhisperGgmlExecutorError::ServeBatchUnavailable { reason, retryable } => {
@@ -4676,6 +4680,7 @@ fn execute_whisper_with_prepared_runtime(
     skip_serve_batch: bool,
     execution_context: &std::sync::Arc<crate::RequestExecutionContext>,
     resolved_backend: GgmlCpuGraphBackend,
+    reuse_mode: GgmlDecodeReuseMode,
 ) -> Result<WhisperExecutionOutput, WhisperGgmlExecutorError> {
     let runtime_source = &preflight.runtime_source;
     let runtime = prepared_owner.as_ref();
@@ -4804,11 +4809,7 @@ fn execute_whisper_with_prepared_runtime(
     let decoder_graph_config =
         whisper_decoder_graph_config(resolved_backend, decoder_placement_policy);
     let can_use_serve_batch = !skip_serve_batch
-        && whisper_can_use_serve_batch(
-            decoder_graph_config,
-            request_options,
-            allow_persistent_session_reuse,
-        );
+        && whisper_can_use_serve_batch(reuse_mode, request_options, allow_persistent_session_reuse);
     if let Some(serve_batch_config) = serve_batch_config.filter(|_| can_use_serve_batch) {
         let encoder_result = run_whisper_encoder_actor(
             encoder_actor,
@@ -4871,6 +4872,7 @@ fn execute_whisper_with_prepared_runtime(
                     ),
                 backend: decoder_graph_config.backend,
                 uses_scheduler: decoder_graph_config.use_scheduler,
+                reuse_mode,
                 execution: runtime.execution.clone(),
                 decoder_weights: runtime.decoder_weights.clone(),
                 tokenizer: runtime.tokenizer.clone(),
@@ -4933,6 +4935,7 @@ fn execute_whisper_with_prepared_runtime(
             audio_duration,
             allow_persistent_session_reuse,
             backend: resolved_backend,
+            reuse_mode,
             decoder_placement_policy,
             loaded_f16_weight_mode: gpu_loaded_f16_weight_mode,
             control: Arc::clone(&execution_context.control),
@@ -5000,6 +5003,7 @@ fn execute_whisper_with_prepared_runtime(
         audio_duration,
         allow_persistent_session_reuse,
         backend: resolved_backend,
+        reuse_mode,
         decoder_placement_policy,
         loaded_f16_weight_mode: gpu_loaded_f16_weight_mode,
         control: Arc::clone(&execution_context.control),
@@ -5113,6 +5117,7 @@ fn execute_whisper_ggml_non_streaming_cpu(
             "test-only non-streaming CPU decode helper",
         )),
         GgmlCpuGraphBackend::Cpu,
+        GgmlDecodeReuseMode::FreshGraph,
     )
     .map(|output| output.text)
 }
@@ -5892,6 +5897,7 @@ struct WhisperGreedyDecodeStepRunnerAdapter<'a> {
     decoder_self_kv_state: WhisperDecoderSelfKvCacheState,
     decoder_reuse: &'a mut Option<Seq2SeqReusableDecodeGraph>,
     decoder_graph_runner: &'a mut GgmlCpuGraphRunner,
+    reuse_mode: GgmlDecodeReuseMode,
     decoder_graph_input: WhisperDecoderGraphExecutionInput,
     decoder_step_input: WhisperDecoderStepSeamInput,
     decoder_tensor_cache: WhisperDecoderExecutionTensorCache,
@@ -6016,7 +6022,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for WhisperGreedyDecodeStepRunnerAdapter<'_
         let logits_start = Instant::now();
         let use_reusable_graph = !input.generated_tokens.is_empty()
             && !self.decoder_graph_config.collect_cross_attention
-            && reusable_decode_graph_supported_for_runner(self.decoder_graph_runner);
+            && reusable_decode_graph_supported(self.reuse_mode);
         let step_logits = if use_reusable_graph {
             let token_id = *self
                 .decoder_graph_input
@@ -6162,6 +6168,7 @@ fn run_whisper_decode_loop(
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
     unstable_decode_text: Option<&crate::api::backend::UnstableDecodeTextObserver>,
+    reuse_mode: GgmlDecodeReuseMode,
 ) -> Result<WhisperExecutionOutput, WhisperGgmlExecutorError> {
     let prelude_summary = match prelude_result {
         WhisperEncoderPreludeSeamResult::GraphExecuted {
@@ -6329,6 +6336,7 @@ fn run_whisper_decode_loop(
         decoder_self_kv_state: WhisperDecoderSelfKvCacheState::new(),
         decoder_reuse: &mut decoder_persistent_static.reuse,
         decoder_graph_runner: &mut decoder_persistent_static.runner,
+        reuse_mode,
         decoder_graph_input: WhisperDecoderGraphExecutionInput {
             decoder_prefix_tokens: Vec::with_capacity(
                 initial_prompt_tokens

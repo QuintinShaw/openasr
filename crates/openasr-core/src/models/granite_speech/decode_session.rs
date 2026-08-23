@@ -48,10 +48,10 @@
 //!
 //! The description above is the CPU / scheduler-on path: it keeps the K/V in
 //! host `Vec<f32>` buffers and rebuilds the 40-layer step graph every token,
-//! re-uploading the whole history each step. On the single-backend GPU path
-//! (`reusable_decode_graph_supported_for_runner`: gpu-class backend + scheduler
-//! off) that host round-trip is the dominant decode cost, so this module also
-//! provides the resident path taken there:
+//! re-uploading the whole history each step. When the immutable planner
+//! authorizes `GgmlDecodeReuseMode::ReusableGraph`, that host round-trip is
+//! the dominant decode cost, so this module also provides the resident path
+//! taken there:
 //!
 //! - The K/V lives in a device-resident fixed-span arena (`resident_kv`,
 //!   `[head_dim, resident_capacity, kv_heads]` f32 per layer). `prefill` seeds
@@ -76,8 +76,8 @@ use std::collections::HashMap;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlKvElementType, GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlPersistentGraphSession,
-    GgmlRopeExtParams,
+    GgmlDecodeReuseMode, GgmlKvElementType, GgmlLoadedTensor, GgmlLoadedWeightContext,
+    GgmlPersistentGraphSession, GgmlRopeExtParams,
 };
 use crate::models::device_greedy_token::{DeviceGreedyStepOutputMode, device_top1_token_id};
 use crate::models::mapped_token_embedding::MappedTokenEmbeddingDeviceSpec;
@@ -88,7 +88,7 @@ use crate::models::system_memory_owner::{
 use crate::nn::decoder::{
     LlmKvCacheSpec, LlmResidentKvArena, allocate_zeroed_llm_resident_kv_arena,
     build_causal_mask_f16_bits, build_fixed_kv_attention_mask_bits, last_token_hidden_view,
-    reusable_decode_graph_supported_for_runner,
+    reusable_decode_graph_supported,
 };
 
 /// Exact per-invocation KV bound plus the stable session-envelope reservation
@@ -421,6 +421,7 @@ pub(crate) struct GraniteSpeechDecodeSession {
     /// below and therefore dropped after it.
     reuse: Option<GraniteReusableDecodeGraph>,
     greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    reuse_mode: GgmlDecodeReuseMode,
     config: GraniteSpeechDecoderConfig,
     runner: GgmlCpuGraphRunner,
     weights: GraniteDecoderWeights,
@@ -569,6 +570,7 @@ impl GraniteSpeechDecodeSession {
             None,
             None,
             DeviceGreedyStepOutputMode::FullLogits,
+            GgmlDecodeReuseMode::FreshGraph,
         )
     }
 
@@ -585,6 +587,7 @@ impl GraniteSpeechDecodeSession {
         token_embedding: Option<MappedTokenEmbeddingDeviceSpec<'_>>,
         backend: GgmlCpuGraphBackend,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        reuse_mode: GgmlDecodeReuseMode,
     ) -> Result<Self, GraniteSpeechDecoderError> {
         let graph_config = decoder_graph_config(backend);
         let runner =
@@ -613,11 +616,10 @@ impl GraniteSpeechDecodeSession {
                 })
             })
             .transpose()?;
-        if reusable_decode_graph_supported_for_runner(&runner) && device_token_embedding.is_none() {
+        if reusable_decode_graph_supported(reuse_mode) && device_token_embedding.is_none() {
             return Err(GraniteSpeechDecoderError::Shape {
-                reason:
-                    "direct GPU Granite decode requires a canonical token-major embedding tensor"
-                        .to_string(),
+                reason: "reusable Granite decode requires a canonical token-major embedding tensor"
+                    .to_string(),
             });
         }
         Self::assemble(
@@ -627,6 +629,7 @@ impl GraniteSpeechDecodeSession {
             device_token_embedding,
             Some(loaded),
             greedy_step_output_mode,
+            reuse_mode,
         )
     }
 
@@ -637,10 +640,12 @@ impl GraniteSpeechDecodeSession {
         device_token_embedding: Option<GraniteDeviceTokenEmbedding>,
         loaded: Option<GgmlLoadedWeightContext>,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        reuse_mode: GgmlDecodeReuseMode,
     ) -> Result<Self, GraniteSpeechDecoderError> {
         Ok(Self {
             reuse: None,
             greedy_step_output_mode,
+            reuse_mode,
             config,
             runner,
             weights,
@@ -655,11 +660,10 @@ impl GraniteSpeechDecodeSession {
         })
     }
 
-    /// Whether this session's runner can run the in-place resident-KV reuse path
-    /// (single-backend GPU, scheduler off). CPU / scheduler-on runners fall back
-    /// to the growing-KV host path, which the bit-exact gate covers.
+    /// Whether the immutable planner authorized in-place resident-KV reuse.
+    /// Unproven lanes, including GPU FullDevice, stay on the growing-KV host path.
     fn reuse_supported(&self) -> bool {
-        reusable_decode_graph_supported_for_runner(&self.runner)
+        reusable_decode_graph_supported(self.reuse_mode)
     }
 
     /// Reset this decode's request-visible state before the prepared runtime

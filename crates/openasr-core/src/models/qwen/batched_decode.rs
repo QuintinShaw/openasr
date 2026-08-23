@@ -22,7 +22,7 @@ use super::prompt_embedding::Qwen3AsrPromptTokenInput;
 use super::runtime_contract::Qwen3AsrExecutionMetadata;
 use super::tokenizer::Qwen3AsrTokenizer;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlNativeGqaCapability, ResolvedFamilyRuntimeInput,
+    GgmlCpuGraphBackend, GgmlDecodeReuseMode, GgmlNativeGqaCapability, ResolvedFamilyRuntimeInput,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, apply_seq2seq_text_postprocess,
@@ -43,7 +43,6 @@ use crate::models::serve_batch_env::{
     serve_batch_select_and_apply_greedy_step, serve_batch_submit_with_timeout,
     serve_batch_trace_enabled, serve_batch_vram_capped_max_batch,
 };
-use crate::nn::decoder::reusable_decode_graph_supported;
 use crate::{GgmlAsrExecutionResult, Segment, Transcription};
 
 const QWEN_SERVE_BATCH_MAX_BATCH_LIMIT: usize = 8;
@@ -398,10 +397,7 @@ impl Qwen3AsrServeBatchConfig {
         if !job.native_gqa.is_validated() {
             return Err(Qwen3AsrServeBatchError::UnsupportedBackend { backend });
         }
-        if !reusable_decode_graph_supported(
-            backend,
-            qwen_runtime_graph_config(backend).use_scheduler,
-        ) {
+        if job.resolved_runtime.reuse_mode() != GgmlDecodeReuseMode::ReusableGraph {
             return Err(Qwen3AsrServeBatchError::UnsupportedBackend { backend });
         }
         let max_batch = serve_batch_vram_capped_max_batch(

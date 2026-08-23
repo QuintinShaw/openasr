@@ -440,7 +440,11 @@ impl GgmlLaneDecodeEvidence {
     }
 
     /// CPU is the only production lane with proven native `ARGMAX_FIRST`.
-    /// Reuse stays unknown, so the planner still emits FreshGraph.
+    /// This is planner-internal evidence in the same style as
+    /// [`GgmlNativeGqaCapability`]: not a `GgmlBackendCapabilities` field and
+    /// not a family-composed registry. Metal/CUDA/Vulkan/HIP stay Unknown, so
+    /// compact output cannot be authorized by GPU class. Reuse stays unknown,
+    /// so the planner still emits FreshGraph.
     const fn cpu_native_first_max_token() -> Self {
         Self {
             compact_selector: GgmlLaneCompactSelectorEvidence {
@@ -12062,6 +12066,69 @@ mod tests {
     }
 
     #[test]
+    fn unproven_reuse_gpu_full_device_stays_full_logits_and_fresh_graph() {
+        use super::{
+            GgmlDecodeLogitsConsumers, GgmlDecodeOutputContract, GgmlDecodeOutputPlan,
+            GgmlDecodeReuseMode, RequestBackendPreference, ResolvedFamilyRuntimeInput,
+            backend_satisfies_execution_placement, lane_decode_evidence_for_backend,
+            plan_decode_output,
+        };
+        use crate::device::execution_policy::ExecutionPlacement;
+        use crate::device::execution_route::{
+            DeviceAddressability, ExecutionProvider, ResolvedExecutionRoute, RouteDeviceKind,
+        };
+
+        let exact = |provider| {
+            RequestBackendPreference::Exact(ResolvedExecutionRoute {
+                provider,
+                stable_id: format!("{}0", provider.as_str()),
+                registry_ordinal: 0,
+                kind: RouteDeviceKind::Accelerated,
+                addressability: DeviceAddressability::NotExactlyAddressable {
+                    reason: "unproven reuse FullDevice fixture",
+                },
+            })
+        };
+
+        for provider in [
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Vulkan,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Metal,
+        ] {
+            let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+                Some(exact(provider)),
+                super::AutoGpuPolicy::AllBackends,
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+            );
+            assert!(
+                resolved.backend().is_gpu_class(),
+                "unproven {provider:?} must keep the selected GPU lane"
+            );
+            assert!(backend_satisfies_execution_placement(
+                resolved.backend(),
+                Some(ExecutionPlacement::FullDevice),
+            ));
+            assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
+            assert_eq!(resolved.reuse_mode(), GgmlDecodeReuseMode::FreshGraph);
+            assert!(
+                !lane_decode_evidence_for_backend(resolved.backend())
+                    .reuse
+                    .is_validated()
+            );
+            assert_eq!(
+                plan_decode_output(
+                    GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+                    lane_decode_evidence_for_backend(resolved.backend()),
+                    GgmlDecodeLogitsConsumers::none().with_phrase_bias(true),
+                ),
+                GgmlDecodeOutputPlan::FullLogits,
+                "complete-logits consumers must not compact on unproven {provider:?}"
+            );
+        }
+    }
+
+    #[test]
     fn resolved_family_runtime_native_gqa_capability_is_typed_and_fail_closed() {
         use super::{
             GgmlNativeGqaCapability, RequestBackendPreference, ResolvedFamilyRuntimeInput,
@@ -15427,6 +15494,9 @@ mod tests {
 
     #[test]
     fn layer2_reusable_native_graph_stays_active_and_rebuilds_on_topology_change() {
+        // Drive the shipped persistent-session and native first-max ops, not a
+        // test-only graph clone. Same topology stays prepared; a new shape
+        // requires a new session.
         let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
             .expect("cpu graph runner should initialize");
         let mut session = runner

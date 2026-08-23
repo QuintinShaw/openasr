@@ -328,6 +328,10 @@ impl Seq2SeqServeBatchFamily for MoonshineFamily {
         job.uses_scheduler
     }
 
+    fn reuse_mode(job: &Self::Job) -> GgmlDecodeReuseMode {
+        job.reuse_mode
+    }
+
     fn initial_prompt_tokens(job: &Self::Job) -> &[u32] {
         &job.decode_config.initial_prompt_tokens
     }
