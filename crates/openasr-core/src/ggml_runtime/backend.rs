@@ -198,6 +198,15 @@ impl GgmlBackendDevice {
         device_supports_matmul_for_type(self.raw, weight_ggml_type)
     }
 
+    /// Whether this device reports support for native `GGML_OP_ARGMAX_FIRST`.
+    ///
+    /// This is the `ggml_backend_dev_supports_op` declaration only. It is not
+    /// production compact-output authorization; the shared planner still
+    /// requires the proven evidence dimensions / three-layer receipts.
+    pub(crate) fn supports_argmax_first(&self) -> bool {
+        device_supports_argmax_first(self.raw)
+    }
+
     /// Probe the representative weight types and report which the device can run
     /// `mul_mat` for. Surface for `doctor` diagnostics and load-time weight
     /// placement; on a discrete GPU with narrow quant coverage (e.g. Vulkan)
@@ -315,6 +324,35 @@ pub(crate) fn device_supports_matmul_for_type(
             false
         } else {
             let op = ffi::ggml_mul_mat(ctx, weight, activation);
+            !op.is_null() && ffi::ggml_backend_dev_supports_op(device.as_ptr(), op)
+        };
+        ffi::ggml_free(ctx);
+        supported
+    }
+}
+
+/// Load-time `GGML_OP_ARGMAX_FIRST` probe. Builds a throwaway contiguous F32
+/// row matrix through the existing `ggml_argmax_first` FFI symbol and asks
+/// `ggml_backend_dev_supports_op`. This is the native-operator declaration
+/// seam; it cannot authorize compact token output by itself.
+pub(crate) fn device_supports_argmax_first(device: NonNull<c_void>) -> bool {
+    const COLS: i64 = 4;
+    const ROWS: i64 = 1;
+    let params = ffi::GgmlInitParams {
+        mem_size: 16 * 1024,
+        mem_buffer: ptr::null_mut(),
+        no_alloc: true,
+    };
+    unsafe {
+        let ctx = ffi::ggml_init(params);
+        if ctx.is_null() {
+            return false;
+        }
+        let logits = ffi::ggml_new_tensor_2d(ctx, ffi::GGML_TYPE_F32, COLS, ROWS);
+        let supported = if logits.is_null() {
+            false
+        } else {
+            let op = ffi::ggml_argmax_first(ctx, logits);
             !op.is_null() && ffi::ggml_backend_dev_supports_op(device.as_ptr(), op)
         };
         ffi::ggml_free(ctx);
@@ -2299,6 +2337,35 @@ mod tests {
             .map(|(name, _)| name)
             .collect::<Vec<_>>();
         assert!(names.contains(&"q5_k"));
+    }
+
+    #[test]
+    fn cpu_device_supports_argmax_first() {
+        let devices = ggml_available_devices();
+        let Some(cpu) = devices
+            .iter()
+            .find(|device| device.kind == GgmlBackendKind::Cpu)
+        else {
+            return;
+        };
+        assert!(
+            cpu.supports_argmax_first(),
+            "CPU must declare GGML_OP_ARGMAX_FIRST through supports_op"
+        );
+    }
+
+    #[test]
+    fn metal_device_does_not_support_argmax_first_when_present() {
+        let devices = ggml_available_devices();
+        let Some(metal) = devices.iter().find(|device| {
+            ExecutionProvider::from_backend_name(&device.name) == ExecutionProvider::Metal
+        }) else {
+            return;
+        };
+        assert!(
+            !metal.supports_argmax_first(),
+            "Metal must not declare GGML_OP_ARGMAX_FIRST"
+        );
     }
 
     #[test]

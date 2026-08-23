@@ -12,7 +12,7 @@ use std::{
     ptr::{self, NonNull},
     rc::{Rc, Weak},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -196,6 +196,11 @@ pub(crate) struct GgmlBackendCapabilities {
     vulkan: bool,
     f16_lhs_f32_rhs_mul_mat_requires_f32_precision: bool,
     multi_query_prefill_width_multiple: usize,
+    /// Native `GGML_OP_ARGMAX_FIRST` declaration from
+    /// `ggml_backend_dev_supports_op`. This is not compact-output
+    /// authorization: production `NativeFirstMaxToken` still requires the
+    /// proven evidence dimensions / three-layer receipts.
+    native_argmax_first_op: bool,
 }
 
 impl GgmlBackendCapabilities {
@@ -206,6 +211,7 @@ impl GgmlBackendCapabilities {
                 vulkan: false,
                 f16_lhs_f32_rhs_mul_mat_requires_f32_precision: false,
                 multi_query_prefill_width_multiple: 1,
+                native_argmax_first_op: false,
             };
         }
         let name = backend_name.to_ascii_lowercase();
@@ -228,6 +234,11 @@ impl GgmlBackendCapabilities {
             // unknown provider remains conservative through
             // `known_discrete_gpu == false` at the family policy layer.
             multi_query_prefill_width_multiple: if is_hip { 2 } else { 1 },
+            // Provider spelling never declares ARGMAX_FIRST. Live
+            // `supports_op` is applied through
+            // [`Self::with_native_argmax_first_op`] at the shared runtime
+            // boundary.
+            native_argmax_first_op: false,
         }
     }
 
@@ -245,6 +256,17 @@ impl GgmlBackendCapabilities {
 
     pub(crate) const fn multi_query_prefill_width_multiple(self) -> usize {
         self.multi_query_prefill_width_multiple
+    }
+
+    pub(crate) const fn supports_native_argmax_first_op(self) -> bool {
+        self.native_argmax_first_op
+    }
+
+    /// Attach the live `ggml_backend_dev_supports_op` declaration. This does
+    /// not authorize compact output by itself.
+    pub(crate) const fn with_native_argmax_first_op(mut self, supported: bool) -> Self {
+        self.native_argmax_first_op = supported;
+        self
     }
 
     #[cfg(test)]
@@ -451,12 +473,8 @@ impl GgmlLaneDecodeEvidence {
         }
     }
 
-    /// CPU is the only production lane with proven native `ARGMAX_FIRST`.
-    /// This is planner-internal evidence in the same style as
-    /// [`GgmlNativeGqaCapability`]: not a `GgmlBackendCapabilities` field and
-    /// not a family-composed registry. Metal/CUDA/Vulkan/HIP stay Unknown, so
-    /// compact output cannot be authorized by GPU class. Reuse stays unknown,
-    /// so the planner still emits FreshGraph.
+    /// Proven CPU compact evidence. Reuse stays unknown, so the planner still
+    /// emits FreshGraph even when native first-max is authorized.
     const fn cpu_native_first_max_token() -> Self {
         Self {
             compact_selector: GgmlLaneCompactSelectorEvidence {
@@ -512,10 +530,71 @@ impl GgmlLaneDecodeEvidence {
 }
 
 fn lane_decode_evidence_for_backend(backend: GgmlCpuGraphBackend) -> GgmlLaneDecodeEvidence {
-    match backend {
-        GgmlCpuGraphBackend::Cpu => GgmlLaneDecodeEvidence::cpu_native_first_max_token(),
-        GgmlCpuGraphBackend::Metal | GgmlCpuGraphBackend::Gpu => GgmlLaneDecodeEvidence::unknown(),
+    let capabilities = GgmlBackendCapabilities::resolve(backend, "")
+        .with_native_argmax_first_op(native_argmax_first_op_supported(backend));
+    lane_decode_evidence_for_backend_capabilities(backend, capabilities)
+}
+
+fn lane_decode_evidence_for_backend_capabilities(
+    backend: GgmlCpuGraphBackend,
+    capabilities: GgmlBackendCapabilities,
+) -> GgmlLaneDecodeEvidence {
+    // `supports_op` is only the native operator declaration. Compact
+    // authorization also requires the proven evidence dimensions. Unknown
+    // stays FullLogits.
+    if capabilities.supports_native_argmax_first_op() && native_first_max_compact_is_proven(backend)
+    {
+        GgmlLaneDecodeEvidence::cpu_native_first_max_token()
+    } else {
+        GgmlLaneDecodeEvidence::unknown()
     }
+}
+
+const fn native_first_max_compact_is_proven(backend: GgmlCpuGraphBackend) -> bool {
+    // CPU is the only lane with three-layer compact receipts. CUDA/Vulkan/HIP
+    // may declare GGML_OP_ARGMAX_FIRST through supports_op, but that is not
+    // production compact authorization. Metal does not implement the op.
+    matches!(backend, GgmlCpuGraphBackend::Cpu)
+}
+
+fn native_argmax_first_op_supported(backend: GgmlCpuGraphBackend) -> bool {
+    static CPU: OnceLock<bool> = OnceLock::new();
+    static METAL: OnceLock<bool> = OnceLock::new();
+    static GPU: OnceLock<bool> = OnceLock::new();
+    let cell = match backend {
+        GgmlCpuGraphBackend::Cpu => &CPU,
+        GgmlCpuGraphBackend::Metal => &METAL,
+        GgmlCpuGraphBackend::Gpu => &GPU,
+    };
+    *cell.get_or_init(|| probe_native_argmax_first_op(backend))
+}
+
+fn probe_native_argmax_first_op(backend: GgmlCpuGraphBackend) -> bool {
+    ggml_available_devices().iter().any(|device| {
+        graph_backend_matches_device(backend, device) && device.supports_argmax_first()
+    })
+}
+
+fn graph_backend_matches_device(
+    backend: GgmlCpuGraphBackend,
+    device: &super::GgmlBackendDevice,
+) -> bool {
+    let provider = ExecutionProvider::from_backend_name(&device.name);
+    match backend {
+        GgmlCpuGraphBackend::Cpu => {
+            matches!(provider, ExecutionProvider::Cpu) || device.kind == super::GgmlBackendKind::Cpu
+        }
+        GgmlCpuGraphBackend::Metal => matches!(provider, ExecutionProvider::Metal),
+        GgmlCpuGraphBackend::Gpu => {
+            device.kind.is_gpu()
+                && !matches!(provider, ExecutionProvider::Metal | ExecutionProvider::Cpu)
+        }
+    }
+}
+
+fn native_argmax_first_op_supported_by_guard(backend: &GgmlBackendGuard) -> bool {
+    let device = unsafe { ffi::ggml_backend_get_device(backend.raw.as_ptr()) };
+    NonNull::new(device).is_some_and(super::backend::device_supports_argmax_first)
 }
 
 fn plan_decode_output(
@@ -956,7 +1035,8 @@ impl GgmlCpuGraphConfig {
         backend: GgmlCpuGraphBackend,
     ) -> Result<GgmlBackendCapabilities, GgmlCpuGraphError> {
         let name = Self::resolve_backend_name_for(backend)?;
-        Ok(GgmlBackendCapabilities::resolve(backend, &name))
+        Ok(GgmlBackendCapabilities::resolve(backend, &name)
+            .with_native_argmax_first_op(native_argmax_first_op_supported(backend)))
     }
 }
 
@@ -1043,13 +1123,16 @@ impl ResolvedFamilyRuntimeInput {
     ) -> Self {
         let backend =
             GgmlCpuGraphConfig::resolve_family_backend_for_preference(preference.clone(), policy);
-        // Compact native first-max is authorized only for the proven CPU lane.
-        // Metal/CUDA/Vulkan/HIP stay Unknown and therefore FullLogits. Generic
-        // first/last-max semantics never authorize the compact result. Reuse
-        // evidence stays Unknown in production, so every lane is FreshGraph.
-        // Phrase bias, timestamps, suppression, debug logits, and host-visible
-        // adapter consumers independently force the complete-output plan
-        // without changing placement.
+        // Compact native first-max requires both a live `supports_op`
+        // declaration for GGML_OP_ARGMAX_FIRST and proven evidence
+        // dimensions. Metal stays FullLogits because it does not support the
+        // op. CUDA/Vulkan/HIP may declare the op and still stay Unknown until
+        // three-layer receipts land. Generic first/last-max semantics never
+        // authorize the compact result. Reuse evidence stays Unknown in
+        // production, so every lane is FreshGraph. Phrase bias, timestamps,
+        // suppression, debug logits, and host-visible adapter consumers
+        // independently force the complete-output plan without changing
+        // placement.
         let evidence = lane_decode_evidence_for_backend(backend);
         Self {
             backend,
@@ -2215,7 +2298,8 @@ impl GgmlCpuGraphRunner {
                 );
             }
         }
-        let backend_capabilities = GgmlBackendCapabilities::resolve(config.backend, &backend_name);
+        let backend_capabilities = GgmlBackendCapabilities::resolve(config.backend, &backend_name)
+            .with_native_argmax_first_op(native_argmax_first_op_supported_by_guard(&backend));
         Ok(Self {
             context,
             backend,
@@ -10555,6 +10639,7 @@ mod tests {
             assert!(capabilities.is_known_discrete_gpu());
             assert!(capabilities.f16_lhs_f32_rhs_mul_mat_requires_f32_precision());
             assert_eq!(capabilities.multi_query_prefill_width_multiple(), 2);
+            assert!(!capabilities.supports_native_argmax_first_op());
         }
         for name in ["CUDA0", "NVIDIA"] {
             let capabilities =
@@ -10562,12 +10647,14 @@ mod tests {
             assert!(capabilities.is_known_discrete_gpu());
             assert!(capabilities.f16_lhs_f32_rhs_mul_mat_requires_f32_precision());
             assert_eq!(capabilities.multi_query_prefill_width_multiple(), 1);
+            assert!(!capabilities.supports_native_argmax_first_op());
         }
         let vulkan =
             GgmlBackendCapabilities::from_backend_for_test(GgmlCpuGraphBackend::Gpu, "Vulkan0");
         assert!(vulkan.is_known_discrete_gpu());
         assert!(!vulkan.f16_lhs_f32_rhs_mul_mat_requires_f32_precision());
         assert_eq!(vulkan.multi_query_prefill_width_multiple(), 1);
+        assert!(!vulkan.supports_native_argmax_first_op());
         let unknown = GgmlBackendCapabilities::from_backend_for_test(
             GgmlCpuGraphBackend::Gpu,
             "future-provider",
@@ -10575,11 +10662,13 @@ mod tests {
         assert!(!unknown.is_known_discrete_gpu());
         assert!(unknown.f16_lhs_f32_rhs_mul_mat_requires_f32_precision());
         assert_eq!(unknown.multi_query_prefill_width_multiple(), 1);
+        assert!(!unknown.supports_native_argmax_first_op());
         for backend in [GgmlCpuGraphBackend::Cpu, GgmlCpuGraphBackend::Metal] {
             let capabilities = GgmlBackendCapabilities::from_backend_for_test(backend, "HIP0");
             assert!(!capabilities.is_known_discrete_gpu());
             assert!(!capabilities.f16_lhs_f32_rhs_mul_mat_requires_f32_precision());
             assert_eq!(capabilities.multi_query_prefill_width_multiple(), 1);
+            assert!(!capabilities.supports_native_argmax_first_op());
         }
     }
 
@@ -12090,6 +12179,115 @@ mod tests {
         assert_eq!(cpu.backend(), super::GgmlCpuGraphBackend::Cpu);
         assert_eq!(cpu.output_plan(), GgmlDecodeOutputPlan::NativeFirstMaxToken);
         assert_eq!(cpu.reuse_mode(), super::GgmlDecodeReuseMode::FreshGraph);
+    }
+
+    #[test]
+    fn shipped_planner_cpu_supports_op_selects_native_first_max() {
+        use super::{
+            GgmlDecodeOutputContract, GgmlDecodeOutputPlan, RequestBackendPreference,
+            ResolvedFamilyRuntimeInput, native_argmax_first_op_supported,
+            native_first_max_compact_is_proven,
+        };
+        use crate::ggml_runtime::{GgmlBackendKind, ggml_available_devices};
+
+        let cpu_device = ggml_available_devices()
+            .into_iter()
+            .find(|device| device.kind == GgmlBackendKind::Cpu)
+            .expect("CPU device");
+        assert!(
+            cpu_device.supports_argmax_first(),
+            "CPU must declare GGML_OP_ARGMAX_FIRST"
+        );
+        assert!(native_argmax_first_op_supported(GgmlCpuGraphBackend::Cpu));
+        assert!(native_first_max_compact_is_proven(GgmlCpuGraphBackend::Cpu));
+
+        let cpu = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+            Some(RequestBackendPreference::CpuOnly),
+            super::AutoGpuPolicy::AllBackends,
+            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+        );
+        assert_eq!(cpu.backend(), GgmlCpuGraphBackend::Cpu);
+        assert_eq!(cpu.output_plan(), GgmlDecodeOutputPlan::NativeFirstMaxToken);
+    }
+
+    #[test]
+    fn shipped_planner_metal_stays_full_logits_without_argmax_first() {
+        use super::{
+            GgmlDecodeOutputContract, GgmlDecodeOutputPlan, RequestBackendPreference,
+            ResolvedFamilyRuntimeInput, native_argmax_first_op_supported,
+            native_first_max_compact_is_proven,
+        };
+        use crate::device::execution_route::{
+            DeviceAddressability, ExecutionProvider, ResolvedExecutionRoute, RouteDeviceKind,
+        };
+        use crate::ggml_runtime::ggml_available_devices;
+
+        for device in ggml_available_devices() {
+            if ExecutionProvider::from_backend_name(&device.name) == ExecutionProvider::Metal {
+                assert!(
+                    !device.supports_argmax_first(),
+                    "Metal must not declare GGML_OP_ARGMAX_FIRST"
+                );
+            }
+        }
+        assert!(!native_argmax_first_op_supported(
+            GgmlCpuGraphBackend::Metal
+        ));
+        assert!(!native_first_max_compact_is_proven(
+            GgmlCpuGraphBackend::Metal
+        ));
+
+        let metal = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+            Some(RequestBackendPreference::Exact(ResolvedExecutionRoute {
+                provider: ExecutionProvider::Metal,
+                stable_id: "Metal".to_string(),
+                registry_ordinal: 0,
+                kind: RouteDeviceKind::Accelerated,
+                addressability: DeviceAddressability::NotExactlyAddressable {
+                    reason: "shipped Metal first-max fixture",
+                },
+            })),
+            super::AutoGpuPolicy::AllBackends,
+            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+        );
+        assert_eq!(metal.backend(), GgmlCpuGraphBackend::Metal);
+        assert_eq!(metal.output_plan(), GgmlDecodeOutputPlan::FullLogits);
+        assert_eq!(metal.reuse_mode(), super::GgmlDecodeReuseMode::FreshGraph);
+    }
+
+    #[test]
+    fn shipped_planner_fake_gpu_supports_op_stays_full_logits_until_proven() {
+        use super::{
+            GgmlBackendCapabilities, GgmlDecodeLogitsConsumers, GgmlDecodeOutputContract,
+            GgmlDecodeOutputPlan, lane_decode_evidence_for_backend_capabilities,
+            native_first_max_compact_is_proven, plan_decode_output,
+        };
+
+        for name in ["CUDA0", "Vulkan0", "HIP0"] {
+            let capabilities =
+                GgmlBackendCapabilities::from_backend_for_test(GgmlCpuGraphBackend::Gpu, name)
+                    .with_native_argmax_first_op(true);
+            assert!(
+                capabilities.supports_native_argmax_first_op(),
+                "{name} fixture must inject a fake supports_op declaration"
+            );
+            assert!(!native_first_max_compact_is_proven(
+                GgmlCpuGraphBackend::Gpu
+            ));
+            let evidence = lane_decode_evidence_for_backend_capabilities(
+                GgmlCpuGraphBackend::Gpu,
+                capabilities,
+            );
+            assert_eq!(
+                plan_decode_output(
+                    GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+                    evidence,
+                    GgmlDecodeLogitsConsumers::none(),
+                ),
+                GgmlDecodeOutputPlan::FullLogits,
+                "fake {name} supports_op must not authorize compact until evidence is validated"
+            );
+        }
     }
 
     #[test]
