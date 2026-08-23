@@ -427,25 +427,51 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
     // next-strongest frame (its real region) surface, which restores a
     // monotone peak order on clips where every non-artifact row already
     // pointed the right way. Rejected after both tests -> uniform fallback.
-    let dtw_window: Option<Vec<Vec<f32>>> =
-        if cross_attention_peaks_order_aligned(&full_window, &is_content) {
-            None
-        } else {
-            match mask_dominant_early_sinks(&full_window) {
-                Some(window) if cross_attention_peaks_order_aligned(&window, &is_content) => {
-                    if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
-                        eprintln!("cohere cross gate: order restored after sink strip, using DTW");
-                    }
-                    Some(window)
+    let dtw_window: Option<Vec<Vec<f32>>> = if cross_attention_peaks_order_aligned(
+        &full_window,
+        &is_content,
+    ) {
+        None
+    } else {
+        match mask_dominant_early_sinks(&full_window, &is_content) {
+            Some(window) if cross_attention_peaks_order_aligned(&window, &is_content) => {
+                if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
+                    eprintln!("cohere cross gate: order restored after sink strip, using DTW");
                 }
-                _ => {
-                    if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
-                        eprintln!("cohere cross gate: peaks not order-aligned, using uniform");
-                    }
-                    return Ok(Vec::new());
-                }
+                Some(window)
             }
-        };
+            Some(window)
+                if content_backward_fraction(&window, &is_content)
+                    <= COHERE_DTW_MAX_BACKWARD_PAIR_FRACTION
+                    && band_duration_seconds(&full_window, seconds_per_frame)
+                        >= COHERE_DTW_TOLERANT_MIN_BAND_SECONDS =>
+            {
+                // Not perfectly monotone, but the backward jumps are a
+                // tiny minority of content pairs: the strip exposed a
+                // mostly-clean left-to-right signal and the DTW path can be
+                // trusted for it. This tier is strictly more permissive than
+                // the strict re-test  above, applies only after the sink strip,
+                // and is scoped to long windows (cohere's 30s long-form chunks)
+                // where the pauses are actually measurable. Windows shorter than
+                // the threshold follow the current strict path and fall
+                // back to the provably-uniform baseline when they don't
+                // reach the strict re-test, keeping short-clip behavior
+                // unchanged.
+                if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
+                    eprintln!(
+                        "cohere cross gate: order restored after sink strip (tolerant), using DTW"
+                    );
+                }
+                Some(window)
+            }
+            _ => {
+                if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
+                    eprintln!("cohere cross gate: peaks not order-aligned, using uniform");
+                }
+                return Ok(Vec::new());
+            }
+        }
+    };
     // The band is always derived from the unmasked raw attention: masking
     // zeroed frames would corrupt the earliest-peak bound, and the DTW cost
     // normalizes each row anyway, so the slice only needs the right range.
@@ -3021,42 +3047,125 @@ fn cross_attention_peaks_order_aligned(attention: &[Vec<f32>], is_content: &[boo
 /// masked because they may carry the one token's real speech location.
 const SINK_STRIP_SEARCH_FRAMES: usize = 10;
 
+/// Fraction of forward-vs-backward content-token pairs tolerated in the
+/// post-sink-strip "mostly-monotone" tier of the order gate. The strict
+/// re-test rejects any backward jump of 2+ frames. The tolerant tier admits
+/// windows where such jumps affect at most this fraction of content pairs.
+/// Windows that fall short of the tolerant tier fall back to the uniform baseline.
+const COHERE_DTW_MAX_BACKWARD_PAIR_FRACTION: f32 = 0.10;
+
+/// Minimum DTW band duration, in seconds, before the post-sink-strip
+/// "mostly-monotone" tier of the order gate is allowed to admit a window.
+/// The tolerant tier exists to catch long, pause-heavy windows (like
+/// cohere's 30s long-form chunks) where the raw peak order zig-zags from the
+/// shared early sink but the post-strip signal is still mostly left-to-right.
+/// On shorter windows (clips of 15-25s), the same post-strip profile can
+/// still carry enough accumulated drift for the DTW to land worse than the
+/// uniform fallback; the guard keeps the short-window behavior unchanged and
+/// restricts the newly-admitted region to where the pauses are actually measurable.
+const COHERE_DTW_TOLERANT_MIN_BAND_SECONDS: f32 = 20.0;
+
+/// The wall-clock length of the window, given the per-row frame count and the
+/// family's seconds-per-frame.
+fn band_duration_seconds(window: &[Vec<f32>], seconds_per_frame: f32) -> f32 {
+    let frame_count = window.first().map_or(0, |row| row.len());
+    frame_count as f32 * seconds_per_frame
+}
+
+/// Returns the fraction of adjacent content-token peak pairs that backward-jump
+/// by 2+ frames, in `[0.0, 1.0]`; `0.0` when there are no such pairs (fully
+/// monotone after sinks). Non-content tokens are skipped.
+fn content_backward_fraction(attention: &[Vec<f32>], is_content: &[bool]) -> f32 {
+    let mut previous_peak: Option<usize> = None;
+    let mut total_pairs = 0usize;
+    let mut backward_pairs = 0usize;
+    for (index, row) in attention.iter().enumerate() {
+        if !is_content.get(index).copied().unwrap_or(false) || row.is_empty() {
+            continue;
+        }
+        let peak = row
+            .iter()
+            .enumerate()
+            .filter(|&(_, &value)| value.is_finite())
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(frame, _)| frame);
+        let Some(peak) = peak else {
+            continue;
+        };
+        if let Some(previous) = previous_peak {
+            total_pairs += 1;
+            if peak
+                .checked_add(1)
+                .is_some_and(|shifted| shifted < previous)
+            {
+                backward_pairs += 1;
+            }
+        }
+        previous_peak = Some(peak);
+    }
+    if total_pairs == 0 {
+        return 0.0;
+    }
+    backward_pairs as f32 / total_pairs as f32
+}
+
 /// Returns a copy of `window` with each dominant early sink frame zeroed in
 /// every row, or `None` when no frame qualifies.
 ///
 /// A dominant early sink is a frame within [`SINK_STRIP_SEARCH_FRAMES`] that
-/// is the strict-majority global max of the rows. On diffuse, front-loaded
-/// decodes one such shared priming frame steals the argmax from most tokens,
-/// and its removal is what exposes each row's next-strongest frame (the
-/// token's real region) so the order gate can re-test. The caller must still
-/// re-run `cross_attention_peaks_order_aligned` on the result: this function
-/// only removes the artifact, the gate decides whether the cleaned signal is
-/// trustworthy. A row whose only finite mass sat on a masked frame has no
-/// valid peak after the strip, which the order gate reads as a missing peak
-/// and ignores; when enough rows lose their peak the order collapses and the
-/// gate rejects (the safe outcome).
-fn mask_dominant_early_sinks(window: &[Vec<f32>]) -> Option<Vec<Vec<f32>>> {
+/// is the strict-majority global max of at least one of:
+/// - all rows in the window (the strict, conservative reading), or
+/// - the content rows only (the rows whose decodings actually carry speech;
+///   the gate's order test ignores the non-content rows, so the sink check
+///   matches the rows the gate cares about).
+///
+/// The two readings are a superset of each other in practice: a frame that is
+/// a majority of all rows is almost always a majority of the (smaller) content
+/// row set too, but the content reading can detect a shared early sink that
+/// only dominates the meaningful rows. The union of the two is what this
+/// function reports.
+///
+/// On diffuse, front-loaded decodes one such shared priming frame steals the
+/// argmax from most tokens, and its removal is what exposes each row's
+/// next-strongest frame (the token's real region) so the order gate can
+/// re-test. The caller must still re-run `cross_attention_peaks_order_aligned`
+/// on the result: this function only removes the artifact, the gate decides
+/// whether the cleaned signal is trustworthy. A row whose only finite mass sat
+/// on a masked frame has no valid peak after the strip, which the order gate
+/// reads as a missing peak and ignores; when enough rows lose their peak the
+/// order collapses and the gate rejects (the safe outcome).
+fn mask_dominant_early_sinks(window: &[Vec<f32>], is_content: &[bool]) -> Option<Vec<Vec<f32>>> {
     let row_count = window.len();
     let frame_count = window.first()?.len();
     if frame_count == 0 {
         return None;
     }
     let search = SINK_STRIP_SEARCH_FRAMES.min(frame_count);
-    let mut peak_counts = vec![0usize; search];
-    for row in window {
+    let mut all_peak_counts = vec![0usize; search];
+    let mut content_peak_counts = vec![0usize; search];
+    let mut content_row_count = 0usize;
+    for (index, row) in window.iter().enumerate() {
         let (peak, &value) = row
             .iter()
             .enumerate()
             .filter(|&(_, &value)| value.is_finite())
             .max_by(|(_, a), (_, b)| a.total_cmp(b))?;
-        if value > 0.0 && peak < search {
-            peak_counts[peak] += 1;
+        if value <= 0.0 || peak >= search {
+            continue;
+        }
+        all_peak_counts[peak] += 1;
+        if is_content.get(index).copied().unwrap_or(false) {
+            content_peak_counts[peak] += 1;
+            content_row_count += 1;
         }
     }
     let mut masked = vec![false; search];
     let mut sinks = Vec::new();
     for frame in 0..search {
-        if peak_counts[frame].saturating_mul(2) > row_count {
+        let is_all_majority = all_peak_counts[frame].saturating_mul(2) > row_count;
+        let is_content_majority = content_row_count > 0
+            && content_peak_counts[frame].saturating_mul(2) > content_row_count;
+        if is_all_majority || is_content_majority {
             masked[frame] = true;
             sinks.push(frame);
         }
@@ -4794,7 +4903,8 @@ mod tests {
             sink_row(frames, 2, 7),
             right_row(frames, 9),
         ];
-        let striped = mask_dominant_early_sinks(&raw).expect("a sink must be found");
+        let all_content = vec![true; raw.len()];
+        let striped = mask_dominant_early_sinks(&raw, &all_content).expect("a sink must be found");
         assert_eq!(striped.len(), raw.len());
         for (raw_row, striped_row) in raw.iter().zip(&striped) {
             assert_eq!(
@@ -4810,21 +4920,25 @@ mod tests {
         // Frame 2 is the argmax of only 2 of 4 rows: not a strict majority
         // (2*2 > 4 is false), so no sink qualifies.
         assert!(
-            mask_dominant_early_sinks(&[
-                sink_row(frames, 2, 4),
-                sink_row(frames, 2, 5),
-                right_row(frames, 8),
-                right_row(frames, 9),
-            ])
+            mask_dominant_early_sinks(
+                &[
+                    sink_row(frames, 2, 4),
+                    sink_row(frames, 2, 5),
+                    right_row(frames, 8),
+                    right_row(frames, 9),
+                ],
+                &[true; 4],
+            )
             .is_none()
         );
         // A shared peak beyond the 10-frame search horizon is out of scope
         // (late peaks carry a token's real region and must never be masked).
         assert!(
-            mask_dominant_early_sinks(&[right_row(frames, 11), right_row(frames, 11),]).is_none()
+            mask_dominant_early_sinks(&[right_row(frames, 11), right_row(frames, 11),], &[true; 2])
+                .is_none()
         );
         // Empty first row -> no frame count -> nothing to strip.
-        assert!(mask_dominant_early_sinks(&[Vec::new(), vec![0.01; frames]]).is_none());
+        assert!(mask_dominant_early_sinks(&[Vec::new(), vec![0.01; frames]], &[true; 2]).is_none());
     }
 
     #[test]
@@ -4850,11 +4964,118 @@ mod tests {
             !cross_attention_peaks_order_aligned(&rows, &is_content),
             "raw zig-zag must be rejected before stripping"
         );
-        let striped = mask_dominant_early_sinks(&rows).expect("sink frame 3 must be found");
+        let striped =
+            mask_dominant_early_sinks(&rows, &is_content).expect("sink frame 3 must be found");
         assert!(
             cross_attention_peaks_order_aligned(&striped, &is_content),
             "stripping the dominant sink must restore a monotone peak order"
         );
+    }
+
+    #[test]
+    fn content_backward_fraction_counts_zigzag_pairs() {
+        let frames = 20;
+        // Fully monotone: no backward pairs -> fraction 0.0.
+        let monotone = vec![
+            right_row(frames, 4),
+            right_row(frames, 8),
+            right_row(frames, 12),
+            right_row(frames, 16),
+        ];
+        assert_eq!(content_backward_fraction(&monotone, &[true; 4]), 0.0);
+        // One backward jump of 8+ frames out of 3 pairs: 1/3.
+        let zigzag = vec![
+            right_row(frames, 4),
+            right_row(frames, 12),
+            right_row(frames, 5),
+            right_row(frames, 16),
+        ];
+        assert!((content_backward_fraction(&zigzag, &[true; 4]) - 1.0 / 3.0).abs() < 1e-6);
+        // Non-content rows are skipped entirely.
+        assert_eq!(
+            content_backward_fraction(
+                &[
+                    right_row(frames, 4),
+                    right_row(frames, 0),
+                    right_row(frames, 16)
+                ],
+                &[true, false, true],
+            ),
+            0.0
+        );
+        // No content pairs at all -> vacuously 0.0 (the caller still has the
+        // strict re-test to fall through to).
+        assert_eq!(
+            content_backward_fraction(&[right_row(frames, 4)], &[true]),
+            0.0
+        );
+    }
+
+    #[test]
+    fn band_duration_seconds_scales_with_row_length() {
+        let window = vec![vec![0.0; 375], vec![0.0; 375]];
+        assert!((band_duration_seconds(&window, 0.08) - 30.0).abs() < 1e-5);
+        let short = vec![vec![0.0; 208], vec![0.0; 208]];
+        assert!((band_duration_seconds(&short, 0.08) - 16.64).abs() < 1e-5);
+        assert_eq!(band_duration_seconds(&[], 0.08), 0.0);
+    }
+
+    #[test]
+    fn mask_dominant_early_sinks_strips_frame_dominating_content_rows_only() {
+        let frames = 12;
+        // 51 content rows peak at the early sink (frame 2); 105 non-content
+        // rows peak at later distinct frames. Frame 2 is not a majority of
+        // all rows (51*2=102 is not greater than 156) but is a strict
+        // majority of the content rows (51*2=102 > 51). The gate only tests
+        // content rows, so the sink must still be stripped.
+        let mut rows: Vec<Vec<f32>> = Vec::with_capacity(156);
+        let mut is_content: Vec<bool> = Vec::with_capacity(156);
+        for _ in 0..51 {
+            rows.push(sink_row(frames, 2, 9));
+            is_content.push(true);
+        }
+        for i in 0..105 {
+            let mut row = vec![0.01f32; frames];
+            row[(i + 4) % (frames - 4) + 4] = 0.3;
+            rows.push(row);
+            is_content.push(false);
+        }
+        let stripped = mask_dominant_early_sinks(&rows, &is_content)
+            .expect("sink must be found vs content rows");
+        assert_eq!(
+            stripped[0][2], 0.0,
+            "sink frame must be zeroed in every row"
+        );
+        assert_eq!(
+            stripped[100][2], 0.0,
+            "sink strip applies to all rows, not just content"
+        );
+    }
+
+    /// 20 content rows with the diffuse front-loaded artifact and a single
+    /// residual dip: 18 rows share the early sink (frame 3) with their real
+    /// region walking left to right around a gap at frame 20 (a right-pointing
+    /// row), so the raw peak order zig-zags. After the sink is stripped the
+    /// effective peaks are `10..15, 20, 15'..` with exactly one backward pair
+    /// (~5% of content pairs): just under the tolerant 10% threshold but above
+    /// the strict re-test (which allows zero).
+    fn zigzag_after_strip_rows(frames: usize) -> (Vec<Vec<f32>>, Vec<bool>) {
+        let reals: [usize; 20] = [
+            10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+        ];
+        let mut rows = Vec::with_capacity(20);
+        // Row 5 is the right-pointing escapee at frame 20; everything before it
+        // climbs 10..14, then row 5 jumps to 20, then the sink rows resume at
+        // 15 and climb to 29. The single 20 -> 15 step is the lone dip.
+        for (index, &real) in reals.iter().enumerate() {
+            if index == 5 {
+                rows.push(right_row(frames, 20));
+            } else {
+                rows.push(sink_row(frames, 3, real));
+            }
+        }
+        let is_content = vec![true; rows.len()];
+        (rows, is_content)
     }
 
     #[test]
@@ -4980,6 +5201,122 @@ mod tests {
         assert!(
             words.is_empty(),
             "zig-zag surviving the sink strip must fall back (empty), got {words:?}"
+        );
+    }
+
+    fn tolerant_tier_window(
+        frames: usize,
+    ) -> (Vec<(u32, Vec<f32>)>, Vec<Vec<f32>>, Vec<bool>, f32) {
+        let (rows, is_content) = zigzag_after_strip_rows(frames);
+        let duration = (frames as f32) * (8.0 * 320.0 / 16000.0);
+        let token_ids: Vec<u32> = (20..20 + rows.len() as u32).collect();
+        let alignments = rows
+            .iter()
+            .zip(&token_ids)
+            .map(|(row, &token_id)| (token_id, row.clone()))
+            .collect();
+        (alignments, rows, is_content, duration)
+    }
+
+    #[test]
+    fn cohere_dtw_word_timestamps_uses_tolerant_dtw_when_strip_leaves_minor_zigzag_on_long_window()
+    {
+        let (_runtime_path, preflight) = write_runtime_ready_preflight();
+        let metadata = super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
+            &preflight.metadata,
+        )
+        .expect("parse metadata");
+        // 260 frames * 0.08s = 20.8s, above the 20s threshold.
+        let (alignments, rows, is_content, duration) = tolerant_tier_window(260);
+        assert!(duration >= COHERE_DTW_TOLERANT_MIN_BAND_SECONDS);
+        // Sanity-check the helper's contract: raw zig-zags (strict re-test fails),
+        // but the fractional backward count is exactly 1/19 which is below the
+        // 10% tolerant threshold.
+        assert!(
+            !cross_attention_peaks_order_aligned(&rows, &is_content),
+            "the raw peak order must fail the strict monotone re-test"
+        );
+        let fraction = content_backward_fraction(&rows, &is_content);
+        assert!(
+            (fraction - 1.0 / 19.0).abs() < 1e-6,
+            "expected exactly one backward pair out of 19, got {fraction}"
+        );
+        let token_ids: Vec<u32> = (20..20 + alignments.len() as u32).collect();
+        let decode_text = |token_ids: &[u32]| {
+            let mut s = String::new();
+            for &token_id in token_ids {
+                use std::fmt::Write;
+                let _ = write!(s, "w{token_id} ");
+            }
+            Ok(s.trim_end().to_string())
+        };
+        let words = cohere_dtw_word_timestamps::<()>(
+            &alignments,
+            metadata,
+            &vec![0.99; token_ids.len()],
+            duration,
+            &decode_text,
+        )
+        .expect("dtw words");
+        assert!(
+            !words.is_empty(),
+            "tolerant-tier long window must emit DTW word spans, got empty"
+        );
+        for (index, word) in words.iter().enumerate() {
+            assert_eq!(word.word, format!("w{}", token_ids[index]));
+        }
+        for pair in words.windows(2) {
+            assert!(pair[0].start <= pair[1].start, "timeline must be monotone");
+            assert!(pair[0].end - 1e-6 <= pair[1].start, "no overlaps");
+        }
+        assert!(words.last().is_some_and(|last| last.end <= duration + 1e-3));
+    }
+
+    #[test]
+    fn cohere_dtw_word_timestamps_falls_back_when_strip_zigzag_fits_short_window() {
+        let (_runtime_path, preflight) = write_runtime_ready_preflight();
+        let metadata = super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
+            &preflight.metadata,
+        )
+        .expect("parse metadata");
+        // 44 frames * 0.08s = 3.52s, below the 20s threshold. Even though the
+        // post-strip backward fraction would clear the tolerant tier, the
+        // band-length guard must reject this short window so it falls back to
+        // uniform baseline.
+        let (alignments, rows, is_content, duration) = tolerant_tier_window(44);
+        assert!(
+            duration < COHERE_DTW_TOLERANT_MIN_BAND_SECONDS,
+            "short-window test must stay below the tolerant band threshold"
+        );
+        assert!(
+            !cross_attention_peaks_order_aligned(&rows, &is_content),
+            "raw zig-zag must fail the strict re-test"
+        );
+        let fraction = content_backward_fraction(&rows, &is_content);
+        assert!(
+            fraction <= COHERE_DTW_MAX_BACKWARD_PAIR_FRACTION,
+            "fraction must be under the tolerant threshold so the only failing check is band length"
+        );
+        let token_ids: Vec<u32> = (20..20 + alignments.len() as u32).collect();
+        let decode_text = |token_ids: &[u32]| {
+            let mut s = String::new();
+            for &token_id in token_ids {
+                use std::fmt::Write;
+                let _ = write!(s, "w{token_id} ");
+            }
+            Ok(s.trim_end().to_string())
+        };
+        let words = cohere_dtw_word_timestamps::<()>(
+            &alignments,
+            metadata,
+            &vec![0.99; token_ids.len()],
+            duration,
+            &decode_text,
+        )
+        .expect("dtw words");
+        assert!(
+            words.is_empty(),
+            "short window below the tolerant band threshold must still fall back, got {words:?}"
         );
     }
 
