@@ -648,6 +648,7 @@ mod tests {
             configured_diarize: false,
             backend_preference: crate::GgmlAsrBackendPreference::CpuOnly,
             resolved_runtime,
+            execution_lane: None,
             final_text_processor: None,
             session_context: crate::NativeAsrSessionContext::new("rt_xasr_streaming_match"),
             session_config: crate::NativeAsrStreamingSessionConfig::new()
@@ -803,6 +804,7 @@ mod tests {
                 (crate::GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
                 crate::ggml_runtime::AutoGpuPolicy::AllBackends,
             ),
+            execution_lane: None,
             final_text_processor: None,
             session_context: crate::NativeAsrSessionContext::new("rt_xasr_streaming_warmup"),
             session_config: crate::NativeAsrStreamingSessionConfig::new()

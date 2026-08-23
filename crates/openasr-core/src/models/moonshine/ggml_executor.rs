@@ -24,8 +24,8 @@ use crate::MOONSHINE_GGML_ADAPTER_ID;
 use crate::NativeAsrSession;
 use crate::device::execution_policy::ExecutionPlacement;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlDecodeOutputContract, GgmlDecodeOutputPlan, GgmlDecodeReuseMode,
-    GgufRuntimeSourcePreflight, ResolvedFamilyRuntimeInput,
+    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlDecodeOutputContract, GgmlDecodeOutputPlan,
+    GgmlDecodeReuseMode, GgufRuntimeSourcePreflight, ResolvedFamilyRuntimeInput,
 };
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
@@ -66,6 +66,31 @@ const MOONSHINE_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
 /// would be a correctness bug. The output topology fields keep an owner
 /// built for one request proof from being reused for another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct MoonshineGraphConfigKey {
+    context_bytes: usize,
+    graph_size: usize,
+    n_threads: Option<usize>,
+    backend: GgmlCpuGraphBackend,
+    use_scheduler: bool,
+}
+
+impl From<GgmlCpuGraphConfig> for MoonshineGraphConfigKey {
+    fn from(config: GgmlCpuGraphConfig) -> Self {
+        let graph_size = config.graph_size.max(16_384);
+        let context_bytes = config
+            .context_bytes
+            .max(GgmlCpuGraphConfig::metadata_context_bytes(graph_size));
+        Self {
+            context_bytes,
+            graph_size,
+            n_threads: config.n_threads,
+            backend: config.backend,
+            use_scheduler: config.use_scheduler,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct MoonshineDecodeFeatureKey {
     output_mode: DeviceGreedyStepOutputMode,
     adapter_active: bool,
@@ -75,10 +100,16 @@ struct MoonshineDecodeFeatureKey {
     serve_batch: bool,
 }
 
-type MoonshineEncoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, String);
+type MoonshineEncoderRuntimeCacheKey = (
+    PackContentKey,
+    ExecutionLaneKey,
+    MoonshineGraphConfigKey,
+    String,
+);
 type MoonshineDecoderRuntimeCacheKey = (
     PackContentKey,
     ExecutionLaneKey,
+    MoonshineGraphConfigKey,
     crate::models::seq2seq_decoder_state::Seq2SeqResidentCapacity,
     String,
     GgmlDecodeOutputContract,
@@ -249,8 +280,14 @@ impl MoonshineGgmlExecutor {
             .unwrap_or_else(|| ExecutionLaneKey::unscoped_for_backend(backend));
         let encoder_config = moonshine_encoder_graph_config(backend);
         let decoder_config = moonshine_decoder_graph_config(backend, Some(request_lane.provider()));
-        let encoder_execution_lane =
-            request_lane.for_stage(encoder_config.backend, ExecutionPlacement::FullDevice);
+        let encoder_execution_lane = request_lane.for_stage(
+            encoder_config.backend,
+            if encoder_config.backend == GgmlCpuGraphBackend::Cpu {
+                ExecutionPlacement::CpuOnly
+            } else {
+                ExecutionPlacement::FullDevice
+            },
+        );
         let decoder_execution_lane = request_lane.for_stage(
             decoder_config.backend,
             if decoder_config.backend == GgmlCpuGraphBackend::Cpu {
@@ -272,6 +309,7 @@ impl MoonshineGgmlExecutor {
             features,
             adapter.clone(),
             backend,
+            encoder_config,
             encoder_execution_lane.clone(),
         )?;
 
@@ -454,11 +492,13 @@ impl MoonshineGgmlExecutor {
         prepared: PreparedRuntimeHandle<MoonshinePreparedRuntime>,
         adapter: Option<ResolvedLoraAdapterHandle>,
         backend: GgmlCpuGraphBackend,
+        graph_config: GgmlCpuGraphConfig,
         lane: ExecutionLaneKey,
     ) -> Result<MoonshineEncoderRuntimeActor, MoonshineGgmlExecutorError> {
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             lane,
+            MoonshineGraphConfigKey::from(graph_config),
             moonshine_adapter_cache_fingerprint(adapter.as_ref().map(resolved_lora_adapter)),
         );
         let preflight = preflight.clone();
@@ -466,12 +506,13 @@ impl MoonshineGgmlExecutor {
             key,
             move || Ok((0, (preflight, prepared, adapter))),
             move |(preflight, prepared, adapter)| {
-                let runtime = MoonshineEncoderGraphRuntime::new(
+                let runtime = MoonshineEncoderGraphRuntime::new_with_graph_config(
                     &prepared.encoder_weights,
                     prepared.metadata,
                     &preflight,
                     adapter.as_ref().map(resolved_lora_adapter),
                     backend,
+                    graph_config,
                 )
                 .map_err(|error| MoonshineGgmlExecutorError::EncoderFailed {
                     reason: error.to_string(),
@@ -506,6 +547,7 @@ impl MoonshineGgmlExecutor {
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             lane,
+            MoonshineGraphConfigKey::from(decoder_config),
             decoder_state.resident_capacity(),
             moonshine_adapter_cache_fingerprint(adapter.as_ref().map(resolved_lora_adapter)),
             output_contract,
@@ -552,9 +594,17 @@ impl MoonshineGgmlExecutor {
         features: super::frontend::MoonshineWaveformFeatures,
         adapter: Option<ResolvedLoraAdapterHandle>,
         backend: GgmlCpuGraphBackend,
+        graph_config: GgmlCpuGraphConfig,
         lane: ExecutionLaneKey,
     ) -> Result<MoonshineEncoderOutput, MoonshineGgmlExecutorError> {
-        let runtime = self.checkout_encoder_runtime(preflight, prepared, adapter, backend, lane)?;
+        let runtime = self.checkout_encoder_runtime(
+            preflight,
+            prepared,
+            adapter,
+            backend,
+            graph_config,
+            lane,
+        )?;
         runtime
             .call_mut(move |state| {
                 let encode_result = state.runtime.encode(&features);
@@ -805,8 +855,8 @@ fn map_decoder_error(error: MoonshineDecoderGraphError) -> MoonshineGgmlExecutor
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecutionLaneKey, MoonshineDecodeFeatureKey, can_use_moonshine_serve_batch,
-        moonshine_greedy_step_output_mode,
+        ExecutionLaneKey, MoonshineDecodeFeatureKey, MoonshineGraphConfigKey,
+        can_use_moonshine_serve_batch, moonshine_greedy_step_output_mode,
     };
     use crate::device::execution_policy::ExecutionPlacement;
     use crate::device::execution_route::{
@@ -814,8 +864,9 @@ mod tests {
         RouteDeviceKind,
     };
     use crate::ggml_runtime::{
-        AutoGpuPolicy, GgmlCpuGraphBackend, GgmlDecodeOutputContract, GgmlDecodeOutputPlan,
-        GgmlDecodeReuseMode, RequestBackendPreference, ResolvedFamilyRuntimeInput,
+        AutoGpuPolicy, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlDecodeOutputContract,
+        GgmlDecodeOutputPlan, GgmlDecodeReuseMode, RequestBackendPreference,
+        ResolvedFamilyRuntimeInput,
     };
     use crate::models::device_greedy_token::DeviceGreedyStepOutputMode;
 
@@ -862,11 +913,33 @@ mod tests {
         let candidate = ExecutionLaneKey::unscoped_for_backend(GgmlCpuGraphBackend::Gpu);
         let encoder = candidate.for_stage(GgmlCpuGraphBackend::Gpu, ExecutionPlacement::FullDevice);
         let decoder = candidate.for_stage(GgmlCpuGraphBackend::Cpu, ExecutionPlacement::CpuOnly);
+        let cpu_encoder =
+            candidate.for_stage(GgmlCpuGraphBackend::Cpu, ExecutionPlacement::CpuOnly);
         assert_eq!(encoder.provider(), candidate.provider());
         assert_eq!(decoder.provider(), candidate.provider());
         assert_eq!(encoder.backend(), GgmlCpuGraphBackend::Gpu);
         assert_eq!(decoder.backend(), GgmlCpuGraphBackend::Cpu);
+        assert_eq!(cpu_encoder.placement(), ExecutionPlacement::CpuOnly);
         assert_ne!(encoder, decoder);
+    }
+    #[test]
+    fn streaming_context_carries_candidate_lane_without_reresolution() {
+        let candidate = ExecutionLaneKey::unscoped_for_backend(GgmlCpuGraphBackend::Gpu);
+        let context = crate::RequestExecutionContext::uncancellable("lane test")
+            .with_native_execution_lane(candidate.clone());
+        assert_eq!(context.native_execution_lane(), Some(&candidate));
+    }
+    #[test]
+    fn graph_config_key_isolates_effective_thread_topology() {
+        let mut one =
+            GgmlCpuGraphConfig::runtime_default_for_resolved_backend(GgmlCpuGraphBackend::Cpu);
+        one.n_threads = Some(1);
+        let mut four = one;
+        four.n_threads = Some(4);
+        assert_ne!(
+            MoonshineGraphConfigKey::from(one),
+            MoonshineGraphConfigKey::from(four)
+        );
     }
     #[test]
     fn feature_bits_isolate_owner_cache_topology() {

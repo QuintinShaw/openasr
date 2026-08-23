@@ -14,6 +14,7 @@ use crate::ggml_runtime::{
     request_backend_override,
 };
 use crate::models::ggml_family_adapter::GgmlAdapterBindingStrategy;
+use crate::models::native_execution_services::ExecutionLaneKey;
 use crate::{
     GgmlExecutionCapability, GgmlFamilyAdapterDescriptor, GgmlRuntimeSource, LongFormOptions,
     NativeAsrBackpressurePolicy, NativeAsrSession, PcmSlice, PhraseBiasConfig, RealtimeAudioFormat,
@@ -962,6 +963,8 @@ pub struct GgmlAsrStreamingSessionRequest {
     /// The shared streaming drivers copy it into every per-frame
     /// `GgmlAsrExecutionRequest` they build for the life of the session.
     pub resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput,
+    /// Candidate-resolved exact lane copied into every streaming frame context.
+    pub(crate) execution_lane: Option<ExecutionLaneKey>,
     /// Optional session-stable auxiliary FINAL-text processor. It has its own
     /// execution plan/lane and is never derived from `resolved_runtime`.
     pub(crate) final_text_processor: Option<GgmlAsrStreamingFinalTextProcessorSlot>,
@@ -2442,6 +2445,7 @@ mod tests {
                 backend_preference.request_backend_override(),
                 crate::ggml_runtime::AutoGpuPolicy::AllBackends,
             ),
+            execution_lane: None,
             final_text_processor: None,
             session_context: crate::NativeAsrSessionContext::new("rt_ggml_streaming"),
             session_config: crate::NativeAsrStreamingSessionConfig::new().into(),

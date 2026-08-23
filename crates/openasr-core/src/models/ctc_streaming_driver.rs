@@ -504,6 +504,7 @@ mod tests {
                 configured_diarize: false,
                 backend_preference,
                 resolved_runtime,
+                execution_lane: None,
                 final_text_processor: None,
                 session_context: crate::NativeAsrSessionContext::new(
                     "rt_ctc_backend_override_test",

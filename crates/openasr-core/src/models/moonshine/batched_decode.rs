@@ -128,9 +128,35 @@ impl MoonshineServeBatchError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct MoonshineServeBatchGraphConfigKey {
+    context_bytes: usize,
+    graph_size: usize,
+    n_threads: Option<usize>,
+    backend: GgmlCpuGraphBackend,
+    use_scheduler: bool,
+}
+
+impl From<GgmlCpuGraphConfig> for MoonshineServeBatchGraphConfigKey {
+    fn from(config: GgmlCpuGraphConfig) -> Self {
+        let graph_size = config.graph_size.max(16_384);
+        let context_bytes = config
+            .context_bytes
+            .max(GgmlCpuGraphConfig::metadata_context_bytes(graph_size));
+        Self {
+            context_bytes,
+            graph_size,
+            n_threads: config.n_threads,
+            backend: config.backend,
+            use_scheduler: config.use_scheduler,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct MoonshineServeBatchEngineKey {
     build_identity: crate::RuntimeBuildIdentity,
     lane: crate::models::native_execution_services::ExecutionLaneKey,
+    graph_config: MoonshineServeBatchGraphConfigKey,
     output_plan: GgmlDecodeOutputPlan,
     output_mode: DeviceGreedyStepOutputMode,
     reuse_mode: GgmlDecodeReuseMode,
@@ -293,6 +319,7 @@ impl Seq2SeqServeBatchFamily for MoonshineFamily {
         MoonshineServeBatchEngineKey {
             build_identity: job.build_identity.clone(),
             lane: job.lane.clone(),
+            graph_config: MoonshineServeBatchGraphConfigKey::from(job.graph_config),
             output_plan: job.output_plan,
             output_mode: job.output_mode,
             reuse_mode: job.reuse_mode,

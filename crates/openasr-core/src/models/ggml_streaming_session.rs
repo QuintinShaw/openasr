@@ -708,6 +708,7 @@ mod tests {
                 (GgmlAsrBackendPreference::Auto).request_backend_override(),
                 crate::ggml_runtime::AutoGpuPolicy::AllBackends,
             ),
+            execution_lane: None,
             final_text_processor: None,
             session_context: crate::NativeAsrSessionContext::new("rt_ggml_transcript_session"),
             session_config: crate::NativeAsrStreamingSessionConfig::new()

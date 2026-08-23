@@ -124,6 +124,7 @@ fn build_request(pack: &Path) -> GgmlAsrStreamingSessionRequest {
             (GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
             crate::ggml_runtime::AutoGpuPolicy::AllBackends,
         ),
+        execution_lane: None,
         final_text_processor: None,
         session_context: NativeAsrSessionContext::new("rt_finalize_bench"),
         session_config: NativeAsrStreamingSessionConfig::new()

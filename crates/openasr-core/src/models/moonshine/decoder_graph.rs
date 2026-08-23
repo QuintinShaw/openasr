@@ -1350,6 +1350,11 @@ impl MoonshineDecoderGraphRuntime {
         &mut self,
         prompt_tokens: &[u32],
     ) -> Result<Vec<f32>, MoonshineDecoderGraphError> {
+        if !self.supports_reusable_decode_graph() {
+            return Err(MoonshineDecoderGraphError::InvalidInput {
+                reason: "moonshine batched prefill requires ReusableGraph evidence".to_string(),
+            });
+        }
         if self.n_seq == 1 {
             return Err(MoonshineDecoderGraphError::InvalidInput {
                 reason: "batched moonshine prefill requires n_seq > 1".to_string(),
@@ -3142,6 +3147,14 @@ mod tests {
     }
 
     const MOONSHINE_BATCH_REAL_PACK_ENV: &str = "OPENASR_MOONSHINE_BATCH_REAL_PACK";
+
+    #[test]
+    fn fresh_graph_rejects_batch_prefill_before_resident_state_allocation() {
+        assert!(!reuse_mode_allows_persistent_graph(
+            GgmlDecodeReuseMode::FreshGraph,
+            true,
+        ));
+    }
 
     fn read_runtime_source_preflight(runtime_path: &Path) -> GgufRuntimeSourcePreflight {
         let runtime_source =

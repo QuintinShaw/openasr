@@ -644,6 +644,11 @@ impl NativeStreamingSessionCandidateBuilder for NativeStreamingSessionCandidateF
                     configured_diarize: self.configured_diarize,
                     backend_preference: coarse_backend_preference_for_candidate(candidate),
                     resolved_runtime,
+                    execution_lane: Some(
+                        crate::models::native_execution_services::current_execution_lane_key(
+                            resolved_runtime.backend(),
+                        ),
+                    ),
                     final_text_processor: self
                         .streaming_punctuator
                         .as_ref()

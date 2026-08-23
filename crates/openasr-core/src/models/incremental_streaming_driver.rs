@@ -27,7 +27,7 @@ use crate::models::ggml_streaming_session::{
     GgmlAsrStreamingTranscriptUpdate,
 };
 use crate::models::graph_runtime_config::install_request_inference_threads_override;
-use crate::models::native_execution_services::current_execution_lane_key;
+use crate::models::native_execution_services::ExecutionLaneKey;
 use crate::models::streaming_partial_cadence::PartialDecodeCadence;
 use crate::{
     NativeAsrSession, RealtimeAudioFrame, StreamingPartialGranularity, TranscriptUpdate,
@@ -202,7 +202,10 @@ where
     // the session request, not a thread-local): every per-frame request this
     // driver builds for the life of the session copies it in directly.
     let resolved_runtime = request.resolved_runtime;
-    let execution_lane = current_execution_lane_key(resolved_runtime.backend());
+    let execution_lane = request
+        .execution_lane
+        .clone()
+        .unwrap_or_else(|| ExecutionLaneKey::unscoped_for_backend(resolved_runtime.backend()));
     let partial_granularity = crate::arch::streaming_partial_granularity_for_model_architecture(
         request.selected_family.model_architecture,
     );
@@ -1814,6 +1817,7 @@ mod tests {
                 configured_diarize: false,
                 backend_preference,
                 resolved_runtime,
+                execution_lane: None,
                 final_text_processor: None,
                 session_context: crate::NativeAsrSessionContext::new("rt_backend_override_test"),
                 session_config: crate::NativeAsrStreamingSessionConfig::new()
