@@ -540,6 +540,83 @@ def require_activation(
         )
 
 
+_UNAVAILABLE_HOST_ALIASES = {
+    "cuda": ("windows_cuda", "cuda"),
+    "vulkan": ("vulkan",),
+    "hip": ("hip",),
+}
+
+
+def parse_hardware_unavailable(path: Path) -> dict[str, str]:
+    """Record missing CUDA/Vulkan/HIP hosts. Unavailable is not a pass."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise MatrixError(f"cannot read hardware-unavailable record {path}: {error}") from error
+    lowered = text.lower()
+    if "not a pass" not in lowered:
+        raise MatrixError(f"{path} does not record that missing hosts are not passes")
+    statuses: dict[str, str] = {}
+    for provider, aliases in _UNAVAILABLE_HOST_ALIASES.items():
+        matched = False
+        for line in text.splitlines():
+            stripped = line.strip().lower()
+            if any(stripped.startswith(f"{alias}:") for alias in aliases):
+                if "pass" in stripped.split(":", 1)[-1] or "proven" in stripped.split(":", 1)[-1]:
+                    raise MatrixError(
+                        f"{path} records {provider} as a pass without receipts"
+                    )
+                if "unavailable" not in stripped:
+                    raise MatrixError(f"{path} does not record {provider} as unavailable")
+                statuses[provider] = "unavailable"
+                matched = True
+                break
+        if not matched:
+            raise MatrixError(f"{path} does not record {provider} as unavailable")
+    return statuses
+
+
+def require_desktop_plugin_switch(path: Path) -> None:
+    """Fail closed unless a desktop plugin-switch log records an actual PASS.
+
+    `skipped=true` and `result=FAIL` are not passes. A missing host is not
+    selectable.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise MatrixError(f"cannot read desktop plugin-switch log {path}: {error}") from error
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        if line.startswith(" ") or line.startswith("\t") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key in {"result", "skipped", "reason", "host_mode"}:
+            fields[key] = value.strip()
+    if fields.get("skipped", "").lower() == "true":
+        raise MatrixError("desktop plugin-switch skip is not a pass")
+    if fields.get("result") != "PASS":
+        raise MatrixError(
+            "desktop plugin-switch is not selectable: "
+            f"result={fields.get('result')!r} reason={fields.get('reason')!r}"
+        )
+
+
+def require_untested_hosts_not_activatable(
+    matrix: dict[str, Any],
+    closed_keys: set[tuple[str, str, str, str, str, str]],
+    hardware_unavailable: Path,
+) -> None:
+    """CUDA/Vulkan/HIP stay projected and unselectable without receipts."""
+    statuses = parse_hardware_unavailable(hardware_unavailable)
+    for provider, status in statuses.items():
+        if status != "unavailable":
+            raise MatrixError(f"{provider} missing-host record is not fail-closed")
+        require_activation(matrix, closed_keys, provider=provider, mode="auto")
+        require_activation(matrix, closed_keys, provider=provider, mode="explicit")
+
+
 def validate_matrix(
     matrix: dict[str, Any],
     receipt_paths: list[Path],

@@ -1,0 +1,18 @@
+# GPU decode correctness — missing-host record
+# Missing hosts are not passes. CUDA / physical Vulkan / HIP compact and
+# token-correctness cells stay non-activatable until receipts exist.
+
+host: Apple M1 (arm64, darwin), Metal 4
+windows_cuda: unavailable
+  reason: no NVIDIA GPU, no Windows CUDA plugin, CUDA Cargo features not activated
+vulkan: unavailable
+  reason: no physical Vulkan device; CUDA/Vulkan/HIP Cargo features not enabled
+hip: unavailable
+  reason: no AMD ROCm/HIP toolkit or plugin; HIP Cargo features not activated
+note: absence is not a pass. CUDA/Vulkan/HIP compact quadrants C/D were not executed.
+
+metal_policy: FullLogits only; native compact DeviceTop1 was not used on Metal
+cpu_policy: native ARGMAX_FIRST is typed for this lane; reusable-KV is not supported on CPU direct execution
+fp16_pack: not installed locally; Layer-3 used installed quants (q4_k / q8_0)
+
+desktop_plugin_switch: FAIL (see desktop-plugin-switch.log); skipped=false; host_mode=legacy_static
