@@ -1964,6 +1964,9 @@ async fn set_default_rebinds_native_bound_pack_without_restart() {
         TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed("whisper-tiny"),
     );
     let runtime = native_runtime_with_pack(Some(moonshine.clone()));
+    runtime
+        .model_pack_path
+        .set_activation_probe_override(Some(|| Ok(())));
     let app = openasr_server::app_with_runtime_and_distribution(
         runtime.clone(),
         openasr_server::DistributionRuntime {
@@ -2017,6 +2020,9 @@ async fn set_default_binds_unbound_native_runtime_without_restart() {
         TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready("moonshine-tiny"),
     );
     let runtime = native_runtime_with_pack(None);
+    runtime
+        .model_pack_path
+        .set_activation_probe_override(Some(|| Ok(())));
     let app = openasr_server::app_with_runtime_and_distribution(
         runtime.clone(),
         openasr_server::DistributionRuntime {

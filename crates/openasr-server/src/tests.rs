@@ -1330,10 +1330,21 @@ async fn delete_model_allows_current_default_and_clears_default_selection() {
     let pack = write_valid_installed_pack_for_test(temp.path(), "moonshine-tiny", "q8_0", "q8");
     persist_default_pack(temp.path(), &pack, QuantPreference::pinned(&pack.quant)).unwrap();
     let distribution = distribution_context_for_test(temp.path());
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack.path.clone()).into(),
+    };
 
-    let response = delete_model(AxumPath(pack.pull.clone()), Extension(distribution.clone()))
-        .await
-        .unwrap();
+    let response = delete_model(
+        State(runtime.clone()),
+        AxumPath(pack.pull.clone()),
+        Extension(distribution.clone()),
+    )
+    .await
+    .unwrap();
     let response = response.0;
 
     assert!(response.deleted);
@@ -1347,6 +1358,16 @@ async fn delete_model_allows_current_default_and_clears_default_selection() {
     assert!(default.default_pull.is_none());
     assert!(default.pack.is_none());
     assert_eq!(default.default_model_status, "unset");
+    assert!(runtime.model_pack_path.current().is_none());
+    let cleared =
+        openasr_core::default_selection::read_active_model_selection_v2(temp.path()).unwrap();
+    assert!(
+        cleared.as_ref().is_none_or(|record| {
+            record.status == openasr_core::default_selection::ActiveModelSelectionStatus::Unset
+                && record.pull.is_none()
+        }),
+        "deleting the current default must clear durable V2: {cleared:?}"
+    );
 }
 
 #[tokio::test]
@@ -1702,6 +1723,15 @@ async fn set_default_model_http_returns_conflict_when_native_session_is_busy() {
         "q4",
         "whisper-base",
     );
+    let pack_a_installed = installed_pack_by_pull(&home, "whisper-tiny:q4");
+    persist_default_pack(
+        &home,
+        &pack_a_installed,
+        QuantPreference::pinned(&pack_a_installed.quant),
+    )
+    .unwrap();
+    let previous_v2 =
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap();
 
     let runtime = ServerRuntime {
         backend: BackendKind::Native,
@@ -1716,7 +1746,7 @@ async fn set_default_model_http_returns_conflict_when_native_session_is_busy() {
     let app = app_with_runtime_and_distribution(
         runtime.clone(),
         DistributionRuntime {
-            openasr_home: Some(home),
+            openasr_home: Some(home.clone()),
             catalog_url: None,
             catalog_local_override: None,
         },
@@ -1747,6 +1777,194 @@ async fn set_default_model_http_returns_conflict_when_native_session_is_busy() {
     assert_eq!(
         runtime.model_pack_path.current().as_deref(),
         Some(pack_a.as_path())
+    );
+    assert_eq!(
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap(),
+        previous_v2
+    );
+}
+
+fn activation_probe_ok() -> Result<(), String> {
+    Ok(())
+}
+
+fn activation_probe_fail() -> Result<(), String> {
+    Err("injected activation probe failure".to_string())
+}
+
+fn installed_pack_by_pull(home: &std::path::Path, pull: &str) -> InstalledPack {
+    list_installed_packs(home)
+        .unwrap()
+        .into_iter()
+        .find(|pack| pack.pull == pull)
+        .unwrap_or_else(|| panic!("installed pack {pull} must exist"))
+}
+
+#[tokio::test]
+async fn set_default_model_http_keeps_previous_selection_when_activation_probe_fails() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let pack_a = write_installed_pack_ref(
+        &home,
+        "whisper-tiny",
+        "whisper-tiny:q4",
+        "q4_0",
+        "q4",
+        "whisper-tiny",
+    );
+    let _pack_b = write_installed_pack_ref(
+        &home,
+        "whisper-base",
+        "whisper-base:q4",
+        "q4_0",
+        "q4",
+        "whisper-base",
+    );
+    let pack_a_installed = installed_pack_by_pull(&home, "whisper-tiny:q4");
+    persist_default_pack(
+        &home,
+        &pack_a_installed,
+        QuantPreference::pinned(&pack_a_installed.quant),
+    )
+    .unwrap();
+    let previous_v2 =
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap();
+
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_a.clone()).into(),
+    };
+    runtime
+        .model_pack_path
+        .set_activation_probe_override(Some(activation_probe_fail));
+    let app = app_with_runtime_and_distribution(
+        runtime.clone(),
+        DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/default")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "pull": "whisper-base:q4" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        parsed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("injected activation probe failure"),
+        "{parsed}"
+    );
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(pack_a.as_path())
+    );
+    assert_eq!(
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap(),
+        previous_v2
+    );
+}
+
+#[tokio::test]
+async fn set_default_model_http_persists_only_after_activation_probe_succeeds() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let pack_a = write_installed_pack_ref(
+        &home,
+        "whisper-tiny",
+        "whisper-tiny:q4",
+        "q4_0",
+        "q4",
+        "whisper-tiny",
+    );
+    let pack_b = write_installed_pack_ref(
+        &home,
+        "whisper-base",
+        "whisper-base:q4",
+        "q4_0",
+        "q4",
+        "whisper-base",
+    );
+    let pack_a_installed = installed_pack_by_pull(&home, "whisper-tiny:q4");
+    persist_default_pack(
+        &home,
+        &pack_a_installed,
+        QuantPreference::pinned(&pack_a_installed.quant),
+    )
+    .unwrap();
+
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_a).into(),
+    };
+    runtime
+        .model_pack_path
+        .set_activation_probe_override(Some(activation_probe_ok));
+    let app = app_with_runtime_and_distribution(
+        runtime.clone(),
+        DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/default")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "pull": "whisper-base:q4" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(parsed["default_model"], "whisper-base");
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(pack_b.as_path())
+    );
+    let persisted = openasr_core::default_selection::read_active_model_selection_v2(&home)
+        .unwrap()
+        .expect("successful activation must persist V2");
+    assert_eq!(persisted.pull.as_deref(), Some("whisper-base:q4"));
+    assert_eq!(
+        persisted.status,
+        openasr_core::default_selection::ActiveModelSelectionStatus::Installed
     );
 }
 

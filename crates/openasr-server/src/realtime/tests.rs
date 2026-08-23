@@ -2686,7 +2686,7 @@ async fn boot_native_warmup_skips_when_the_runtime_slot_is_occupied() {
         .acquire_native_execution("test-content", None)
         .expect("fixture runtime must admit the active native session");
 
-    tokio::time::timeout(
+    let _ = tokio::time::timeout(
         Duration::from_millis(100),
         warm_up_default_native_streaming_worker(runtime.clone()),
     )

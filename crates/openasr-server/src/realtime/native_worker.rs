@@ -1114,28 +1114,43 @@ pub(crate) fn wait_while_native_warmup_in_flight_blocking() {
 
 pub(crate) fn spawn_boot_native_warmup(runtime: ServerRuntime) {
     tokio::spawn(async move {
-        warm_up_default_native_streaming_worker(runtime).await;
+        let _ = warm_up_default_native_streaming_worker(runtime).await;
     });
 }
 
-pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime: ServerRuntime) {
+pub(crate) async fn probe_native_activation(runtime: ServerRuntime) -> Result<(), ApiError> {
+    if let Some(probe) = runtime.model_pack_path.activation_probe_override() {
+        return probe().map_err(ApiError::BadRequest);
+    }
+    warm_up_default_native_streaming_worker(runtime)
+        .await
+        .map_err(|reason| {
+            ApiError::BadRequest(format!("default model activation probe failed: {reason}"))
+        })
+}
+
+pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(
+    runtime: ServerRuntime,
+) -> Result<(), String> {
     if runtime.backend != openasr_core::BackendKind::Native {
-        return;
+        return Ok(());
     }
     let Some(model_pack_path) = runtime.model_pack_path.current() else {
         // Fresh install / no model installed yet: nothing to warm. The daemon
         // still serves `/health`; a later default-model rebind binds a pack
         // in-process without restart, and the next request path loads it.
-        return;
+        return Ok(());
     };
-    // Opportunistic: a live user session already owns the slot and will Warm
-    // itself. Never take `max-native-sessions-per-model`; that slot is only
-    // for transcription/realtime. Coalesce overlapping boot/rebind spawns.
+    // Opportunistic for boot: a live user session already owns the slot and
+    // will Warm itself. Set-default treats this as probe failure so it cannot
+    // persist a pack that never activated. Never take
+    // `max-native-sessions-per-model`; that slot is only for
+    // transcription/realtime. Coalesce overlapping boot/rebind spawns.
     if runtime.native_execution.has_active_sessions() {
-        return;
+        return Err("native session is already active".to_string());
     }
     let Some(_lease) = try_begin_native_warmup() else {
-        return;
+        return Err("native warmup already in flight".to_string());
     };
     let preferences_home = openasr_core::openasr_home().ok();
     let inference_threads = preferences_home
@@ -1151,11 +1166,17 @@ pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime
     .flatten();
     let Some(adapter) = openasr_core::native_runtime_model_adapter_for_path(&model_pack_path)
     else {
-        return;
+        return Err(format!(
+            "no native runtime adapter for {}",
+            model_pack_path.display()
+        ));
     };
-    let Ok(model_pack) = adapter.model_pack_ref("native-default") else {
-        return;
-    };
+    let model_pack = adapter.model_pack_ref("native-default").map_err(|error| {
+        format!(
+            "could not open native default pack {}: {error}",
+            model_pack_path.display()
+        )
+    })?;
     let context = NativeAsrSessionContext::new("boot-warmup");
     // Same saved-preferences fallback a real WS attach applies when a session
     // does not set an explicit `execution_target`/`inference_threads`
@@ -1192,7 +1213,7 @@ pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime
                     single_line_log_value(&error.to_string()),
                 ),
             );
-            return;
+            return Err(error.to_string());
         }
     };
     let key = NativeStreamingWorkerKey::with_route(
@@ -1213,7 +1234,9 @@ pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime
                 single_line_log_value(&error),
             ),
         );
+        return Err(error);
     }
+    Ok(())
 }
 
 pub(crate) fn single_line_log_value(value: &str) -> String {

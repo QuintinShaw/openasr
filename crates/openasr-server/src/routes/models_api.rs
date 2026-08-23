@@ -46,10 +46,44 @@ pub(crate) async fn set_default_model(
                 .to_string(),
         ));
     }
-    let commit = persist_default_pack(&home, &pack, preference)?;
+    let previous_path = runtime.model_pack_path.current();
+    let _previous_v2 = openasr_core::default_selection::read_active_model_selection_v2(&home)?;
+    let restore_previous_runtime = |runtime: &ServerRuntime| {
+        if runtime.backend != BackendKind::Native {
+            return;
+        }
+        if runtime.model_pack_path.current() == previous_path {
+            return;
+        }
+        if let Err(error) = runtime.rebind_native_model_pack(previous_path.clone()) {
+            eprintln!(
+                "openasr-server: failed to restore previous native model pack after activation failure: {error}"
+            );
+        }
+    };
+
+    if runtime.backend == BackendKind::Native {
+        if let Err(error) = runtime.rebind_native_model_pack(Some(pack.path.clone())) {
+            restore_previous_runtime(&runtime);
+            return Err(error);
+        }
+        if let Err(error) = crate::realtime::probe_native_activation(runtime.clone()).await {
+            restore_previous_runtime(&runtime);
+            return Err(error);
+        }
+    }
+
+    let commit = match persist_default_pack(&home, &pack, preference) {
+        Ok(commit) => commit,
+        Err(error) => {
+            restore_previous_runtime(&runtime);
+            return Err(error);
+        }
+    };
     if let openasr_core::default_selection::DefaultSelectionCommitOutcome::NotCommitted { reason } =
         &commit
     {
+        restore_previous_runtime(&runtime);
         return Err(ApiError::BadRequest(format!(
             "default model was not committed: {reason}"
         )));
@@ -62,10 +96,6 @@ pub(crate) async fn set_default_model(
             "openasr-server: default V2 committed but legacy projection repair is pending: {reason}"
         );
     }
-    if runtime.backend == BackendKind::Native {
-        runtime.rebind_native_model_pack(Some(pack.path.clone()))?;
-        crate::realtime::spawn_boot_native_warmup(runtime.clone());
-    }
     Ok(Json(default_model_response(
         &home,
         distribution.catalog_source(),
@@ -73,6 +103,7 @@ pub(crate) async fn set_default_model(
 }
 
 pub(crate) async fn delete_model(
+    State(runtime): State<ServerRuntime>,
     AxumPath(id): AxumPath<String>,
     Extension(distribution): Extension<DistributionContext>,
 ) -> Result<Json<DeleteModelResponse>, ApiError> {
@@ -105,6 +136,7 @@ pub(crate) async fn delete_model(
                 "openasr-server: default V2 clear committed; legacy projection repair is pending: {reason}"
             ),
         }
+        runtime.rebind_native_model_pack(None)?;
     }
     Ok(Json(DeleteModelResponse {
         deleted: removed.is_some(),

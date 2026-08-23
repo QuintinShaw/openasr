@@ -1298,6 +1298,10 @@ fn resolve_instance_token(launch_option: Option<String>) -> Option<String> {
 #[derive(Clone)]
 pub struct BoundModelPackPath {
     inner: Arc<RwLock<Option<PathBuf>>>,
+    /// Test-only override for the set-default activation probe. Production
+    /// leaves this unset so the live warmup is awaited. Shared across runtime
+    /// clones because bind state itself is shared.
+    activation_probe: Arc<RwLock<Option<fn() -> Result<(), String>>>>,
 }
 
 impl std::fmt::Debug for BoundModelPackPath {
@@ -1326,6 +1330,7 @@ impl From<Option<PathBuf>> for BoundModelPackPath {
     fn from(path: Option<PathBuf>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(path)),
+            activation_probe: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -1357,6 +1362,23 @@ impl BoundModelPackPath {
 
     fn set(&self, path: Option<PathBuf>) {
         *self.lock_write() = path;
+    }
+
+    /// Override the native activation probe. Production leaves this unset so
+    /// set-default awaits the live warmup. Tests inject success or failure
+    /// without loading a real model.
+    pub fn set_activation_probe_override(&self, probe: Option<fn() -> Result<(), String>>) {
+        *self
+            .activation_probe
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = probe;
+    }
+
+    pub(crate) fn activation_probe_override(&self) -> Option<fn() -> Result<(), String>> {
+        *self
+            .activation_probe
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
