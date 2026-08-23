@@ -769,6 +769,17 @@ fn resident_model_actor_keys_exclude_request_capacity() {
             ][..],
         ),
         (
+            "sensevoice/executor.rs",
+            "SenseVoiceRuntimeCacheKey",
+            &[
+                "PackContentKey",
+                "ExecutionLaneKey",
+                "GgmlDecodeOutputContract",
+                "GgmlDecodeOutputPlan",
+                "GgmlDecodeReuseMode",
+            ][..],
+        ),
+        (
             "qwen/ggml_executor.rs",
             "Qwen3AsrDecoderRuntimeCacheKey",
             &[
@@ -781,6 +792,49 @@ fn resident_model_actor_keys_exclude_request_capacity() {
         ),
     ] {
         assert_tuple_alias_components(&root.join(relative), alias, expected);
+    }
+}
+
+#[test]
+fn sensevoice_production_uses_complete_frame_logits_and_resolved_cache_identity() {
+    let root = models_root().join("sensevoice");
+    let encoder = std::fs::read_to_string(root.join("encoder_graph.rs"))
+        .expect("read SenseVoice encoder graph");
+    assert!(
+        encoder.contains("compute_output_f32(logits, want)"),
+        "SenseVoice production must read back complete frame logits",
+    );
+    for forbidden in ["FrameTokenIds", "top1_argmax_first_max", "device_greedy"] {
+        assert!(
+            !encoder.contains(forbidden),
+            "SenseVoice encoder must not authorize compact output through '{forbidden}'",
+        );
+    }
+
+    let executor =
+        std::fs::read_to_string(root.join("executor.rs")).expect("read SenseVoice executor");
+    for required in [
+        "resolved_runtime.output_contract()",
+        "resolved_runtime.output_plan()",
+        "resolved_runtime.reuse_mode()",
+        "GgmlDecodeOutputPlan",
+        "GgmlDecodeReuseMode",
+    ] {
+        assert!(
+            executor.contains(required),
+            "SenseVoice runtime must consume immutable resolved {required}",
+        );
+    }
+    for forbidden in [
+        "FrameTokenIds",
+        "encode_lfr_with_prompt_frame_token_ids",
+        "device_greedy_step_output_mode",
+        "DeviceGreedyStepOutputMode",
+    ] {
+        assert!(
+            !executor.contains(forbidden),
+            "SenseVoice executor must not restore compact output path '{forbidden}'",
+        );
     }
 }
 
