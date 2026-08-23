@@ -44,6 +44,7 @@ pub(crate) struct Qwen3AsrLlmLogitsHead {
     vocab_size: usize,
     rms_norm_epsilon: f32,
     output_norm_weight: Vec<f32>,
+    #[cfg(test)]
     output_weight_tensor_name: &'static str,
     output_weight_values: Option<Vec<f32>>,
     output_weight_layout: OutputWeightLayout,
@@ -161,6 +162,7 @@ impl LogitsWeightPayload {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct Qwen3AsrLlmFusedLogitsHeadSpec<'a> {
     pub(crate) d_model: usize,
     pub(crate) vocab_size: usize,
@@ -170,6 +172,11 @@ pub(crate) struct Qwen3AsrLlmFusedLogitsHeadSpec<'a> {
     pub(crate) output_weight_ggml_type: i32,
     pub(crate) output_weight_dims: &'a [usize],
     pub(crate) output_weight_bytes: &'a [u8],
+}
+
+#[cfg(not(test))]
+pub(crate) struct Qwen3AsrLlmFusedLogitsHeadSpec<'a> {
+    _marker: std::marker::PhantomData<&'a ()>,
 }
 
 impl Qwen3AsrLlmLogitsHead {
@@ -277,6 +284,7 @@ impl Qwen3AsrLlmLogitsHead {
         Ok(bytes.finish())
     }
 
+    #[cfg(test)]
     pub(crate) fn fused_top1_spec(&self) -> Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>> {
         let output_weight = self.ggml_output_weight.as_ref()?;
         Some(Qwen3AsrLlmFusedLogitsHeadSpec {
@@ -289,6 +297,13 @@ impl Qwen3AsrLlmLogitsHead {
             output_weight_dims: &output_weight.dims,
             output_weight_bytes: output_weight.payload.bytes(),
         })
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn fused_top1_spec(&self) -> Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>> {
+        // Native compact output is a test-only seam until the shared planner
+        // receives device-specific evidence for this exact graph.
+        None
     }
 
     #[cfg(test)]
@@ -715,6 +730,7 @@ pub(crate) fn load_llm_logits_head_from_reader_with_tensor_names(
         vocab_size,
         rms_norm_epsilon,
         output_norm_weight,
+        #[cfg(test)]
         output_weight_tensor_name,
         output_weight_values,
         output_weight_layout,

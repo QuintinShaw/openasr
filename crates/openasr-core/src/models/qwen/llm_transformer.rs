@@ -16,14 +16,16 @@ use thiserror::Error;
 use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
+    GgmlDecodeOutputContract, GgmlDecodeOutputPlan, GgmlDecodeReuseMode,
     GgmlFlashAttentionPrecision, GgmlKvElementType, GgmlLoadedTensor, GgmlNativeGqaCapability,
     GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReadError,
-    GgufTensorDataReader, env_toggle_with_raw, env_var_truthy,
+    GgufTensorDataReader, ResolvedFamilyRuntimeInput, env_toggle_with_raw, env_var_truthy,
 };
 
 use super::decoder_contract::{QwenDecoderContract, QwenDecoderContractGeometry};
 use super::graph_config::qwen_decoder_graph_config;
 use super::kv_cache::{Qwen3AsrKvCacheCapacity, Qwen3AsrLayerKvCacheState};
+#[cfg(test)]
 use crate::models::device_greedy_token::{
     first_max_argmax_reverse_indices, first_max_token_id_from_reversed_argmax,
 };
@@ -1093,6 +1095,7 @@ struct Qwen3AsrLlmLayerWeightHandles {
     lora: QwenLayerLoraSlots,
 }
 
+#[cfg(test)]
 struct Qwen3AsrLlmFusedLogitsHeadHandles {
     vocab_size: usize,
     rms_norm_epsilon: f32,
@@ -2017,6 +2020,7 @@ fn upload_layer_lora_slots(
     Ok(())
 }
 
+#[cfg(test)]
 fn allocate_fused_logits_head_tensors(
     arena: &mut GgmlStaticTensorArena,
     loaded: Option<&crate::ggml_runtime::GgmlLoadedWeightContext>,
@@ -2068,6 +2072,7 @@ fn allocate_fused_logits_head_tensors(
     })
 }
 
+#[cfg(test)]
 fn upload_fused_logits_head_weights(
     arena: &mut GgmlStaticTensorArena,
     handles: &Qwen3AsrLlmFusedLogitsHeadHandles,
@@ -2093,6 +2098,7 @@ fn upload_fused_logits_head_weights(
     Ok(())
 }
 
+#[cfg(test)]
 fn build_fused_logits_top1<'a>(
     arena: &GgmlStaticTensorArena,
     logits_head: &Qwen3AsrLlmFusedLogitsHeadHandles,
@@ -2114,6 +2120,7 @@ fn build_fused_logits_top1<'a>(
     )
 }
 
+#[cfg(test)]
 fn validate_fused_top1_token_id(
     reversed_token_id: i32,
     vocab_size: usize,
@@ -2360,12 +2367,16 @@ pub(crate) struct Qwen3AsrLlmWholeDecoderGraphExecutor {
     runner: GgmlCpuGraphRunner,
     arena: GgmlStaticTensorArena,
     layers: Vec<Qwen3AsrLlmLayerWeightHandles>,
+    #[cfg(test)]
     fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadHandles>,
+    resolved_runtime: ResolvedFamilyRuntimeInput,
     dims: Qwen3AsrLlmDecodeDims,
     use_native_gqa: bool,
     rms_norm_epsilon: f32,
     kv_cache_spec: LlmKvCacheSpec,
     flash_attention_precision: GgmlFlashAttentionPrecision,
+    #[cfg(test)]
+    test_native_output_enabled: bool,
     #[cfg(test)]
     materialization_peak_staging_bytes: usize,
 }
@@ -2666,7 +2677,15 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             layers.push(handles);
         }
         let dims = dims.expect("non-empty whole-decoder plan sets dimensions");
+        #[cfg(not(test))]
+        let _ = fused_logits_head;
+        let resolved_runtime = ResolvedFamilyRuntimeInput::resolve_for_backend_with_output_contract(
+            graph_config.backend,
+            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+        );
+        #[cfg(test)]
         let fused_logits_head = fused_logits_head
+            .filter(|_| resolved_runtime.output_plan() == GgmlDecodeOutputPlan::NativeFirstMaxToken)
             .map(|spec| {
                 let handles =
                     allocate_fused_logits_head_tensors(&mut arena, loaded.as_ref(), dims, &spec)?;
@@ -2740,12 +2759,16 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             runner,
             arena,
             layers,
+            #[cfg(test)]
             fused_logits_head,
+            resolved_runtime,
             dims,
             use_native_gqa,
             rms_norm_epsilon,
             kv_cache_spec: LlmKvCacheSpec::DEFAULT,
             flash_attention_precision: GgmlFlashAttentionPrecision::Default,
+            #[cfg(test)]
+            test_native_output_enabled: false,
             #[cfg(test)]
             materialization_peak_staging_bytes,
         };
@@ -2940,6 +2963,10 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             fused_qkvs.push(fused_qkv);
         }
         let dims = dims.expect("non-empty projections set dims");
+        let resolved_runtime = ResolvedFamilyRuntimeInput::resolve_for_backend_with_output_contract(
+            backend,
+            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+        );
         let fused_logits_head = match fused_logits_head {
             Some(spec) => {
                 let handles =
@@ -2992,12 +3019,14 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             arena,
             layers,
             fused_logits_head,
+            resolved_runtime,
             dims,
             use_native_gqa,
             rms_norm_epsilon,
             kv_cache_spec: LlmKvCacheSpec::DEFAULT,
             flash_attention_precision: GgmlFlashAttentionPrecision::Default,
             #[cfg(test)]
+            test_native_output_enabled: true,
             materialization_peak_staging_bytes: 0,
         };
         // Shared production policy for every family that builds this executor
@@ -3088,11 +3117,23 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
     /// compute mis-recomputes a reused graph that writes its KV in place, while
     /// the multi-backend scheduler drops refreshed per-token inputs.
     pub(crate) fn supports_graph_reuse(&self) -> bool {
-        reusable_decode_graph_supported_for_runner(&self.runner)
+        self.resolved_runtime.output_plan() == GgmlDecodeOutputPlan::FullLogits
+            && self.resolved_runtime.reuse_mode() == GgmlDecodeReuseMode::ReusableGraph
+            && reusable_decode_graph_supported_for_runner(&self.runner)
     }
 
     pub(crate) fn supports_fused_top1(&self) -> bool {
-        self.fused_logits_head.is_some()
+        #[cfg(test)]
+        {
+            return (self.test_native_output_enabled
+                || self.resolved_runtime.output_plan()
+                    == GgmlDecodeOutputPlan::NativeFirstMaxToken)
+                && self.fused_logits_head.is_some();
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
     }
 
     pub(crate) fn supports_device_token_embedding(&self) -> bool {
@@ -3814,6 +3855,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
     /// Compute a fused device-side top-1 token from an already-materialized
     /// decoder hidden row. This avoids allocating a separate full-vocabulary
     /// logits executor after a resident prefill graph has populated its KV.
+    #[cfg(test)]
     pub(crate) fn fused_logits_top1_from_hidden(
         &mut self,
         hidden: &[f32],
@@ -3846,6 +3888,16 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 validate_fused_top1_token_id(token_id, fused_logits_head.vocab_size)
             })?;
         Ok(Some(token_id))
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn fused_logits_top1_from_hidden(
+        &mut self,
+        _hidden: &[f32],
+    ) -> Result<Option<u32>, GgmlCpuGraphError> {
+        // Native compact output has no production implementation until the
+        // selected device contributes explicit evidence to the shared planner.
+        Ok(None)
     }
 
     /// Run an entire prompt prefix as one causal multi-query LLM graph. This is
@@ -4870,21 +4922,24 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 |_step, source| source,
             )?;
             let state = stack.state;
+            #[cfg(test)]
             let top1 = self
                 .fused_logits_head
                 .as_ref()
+                .filter(|_| self.supports_fused_top1())
                 .map(|logits_head| {
                     build_fused_logits_top1(&self.arena, logits_head, graph, state, n_seq)
                 })
                 .transpose()?;
+            #[cfg(not(test))]
+            let top1: Option<GgmlCpuTensor<'_>> = None;
             graph.set_output(state)?;
             if let Some(top1) = top1 {
                 graph.set_output(top1)?;
             }
-            // Load-bearing: reusable fused decode must prepare both roots. The
-            // state root keeps host-hidden callers valid, and the top1 root keeps
-            // later fused-token calls from reusing a graph allocated for state
-            // only (round-4 regression).
+            // The production output contract has no native compact result. The
+            // optional top1 root is retained only for the test-only numerical
+            // oracle and is never allocated in a production graph.
             let mut prepared_outputs = vec![state];
             if let Some(top1) = top1 {
                 prepared_outputs.push(top1);
@@ -4906,6 +4961,9 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         }
 
         let reuse = self.reuse.as_mut().expect("reuse graph built above");
+        // Keep the shared optional compact-output slot structurally observed;
+        // production never populates it because the resolved plan is FullLogits.
+        let _compact_output = reuse.top1;
         let hidden_tensor = reuse
             .hidden_tensor
             .expect("serial hidden-input reuse graph built above");
@@ -5047,6 +5105,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn run_token_step_reused_batched_top1(
         &mut self,
         token_ids: &[u32],
@@ -5061,6 +5120,19 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             max_positions,
             None,
         )
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn run_token_step_reused_batched_top1(
+        &mut self,
+        _token_ids: &[u32],
+        _cache_positions: &[usize],
+        _rope_theta: f32,
+        _max_positions: usize,
+    ) -> Result<Qwen3AsrLlmWholeStepTop1Output, GgmlCpuGraphError> {
+        Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "whole-decoder native top1 is test-only until device evidence is validated",
+        })
     }
 
     /// Rebuild the reusable batched graph and seed resident KV without executing
@@ -5283,21 +5355,24 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             |_step, source| source,
         )?;
         let state = stack.state;
+        #[cfg(test)]
         let top1 = self
             .fused_logits_head
             .as_ref()
+            .filter(|_| self.supports_fused_top1())
             .map(|logits_head| {
                 build_fused_logits_top1(&self.arena, logits_head, graph, state, n_seq)
             })
             .transpose()?;
+        #[cfg(not(test))]
+        let top1: Option<GgmlCpuTensor<'_>> = None;
         graph.set_output(state)?;
         if let Some(top1) = top1 {
             graph.set_output(top1)?;
         }
-        // Load-bearing: reusable fused decode must prepare both roots. The state
-        // root keeps host-hidden callers valid, and the top1 root keeps later
-        // fused-token calls from reusing a graph allocated for state only
-        // (round-4 regression).
+        // The production output contract has no native compact result. The
+        // optional top1 root is retained only for the test-only numerical
+        // oracle and is never allocated in a production graph.
         let mut prepared_outputs = vec![state];
         if let Some(top1) = top1 {
             prepared_outputs.push(top1);
@@ -5475,6 +5550,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         })
     }
 
+    #[cfg(test)]
     fn run_step_reused_batched_top1_inner(
         &mut self,
         input: QwenReusableDecodeInput<'_>,
@@ -7924,6 +8000,23 @@ mod tests {
     const QWEN_PREFILL_REAL_PACK_ENV: &str = "OPENASR_QWEN_PREFILL_REAL_PACK";
     const QWEN_PREFILL_TOKENS_ENV: &str = "OPENASR_QWEN_PREFILL_TOKENS";
     const QWEN_PREFILL_CHUNK_TOKENS_ENV: &str = "OPENASR_QWEN_PREFILL_CHUNK_TOKENS";
+
+    #[test]
+    fn qwen_production_output_plan_is_full_logits_and_fresh_graph_without_evidence() {
+        for backend in [
+            GgmlCpuGraphBackend::Cpu,
+            GgmlCpuGraphBackend::Metal,
+            GgmlCpuGraphBackend::Gpu,
+        ] {
+            let resolved = ResolvedFamilyRuntimeInput::resolve_for_backend_with_output_contract(
+                backend,
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+            );
+            assert_eq!(resolved.backend(), backend);
+            assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
+            assert_eq!(resolved.reuse_mode(), GgmlDecodeReuseMode::FreshGraph);
+        }
+    }
 
     fn quote_test_layer_names(layer: usize) -> QwenFamilyLlmLayerTensorNames {
         let prefix = format!("quote.blk.{layer}");
