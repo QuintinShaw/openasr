@@ -3307,6 +3307,19 @@ async fn runtime_receipts_require_operator_auth_and_bound_query() {
         .unwrap();
     assert_eq!(device.status(), StatusCode::FORBIDDEN);
 
+    let device_runtime = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/runtime/receipts")
+                .header(header::AUTHORIZATION, format!("Bearer {device_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(device_runtime.status(), StatusCode::FORBIDDEN);
+
     let authorized = app
         .clone()
         .oneshot(
@@ -3324,7 +3337,7 @@ async fn runtime_receipts_require_operator_auth_and_bound_query() {
     assert!(!body_text.contains("admin-secret"));
     assert!(!body_text.contains(device_token));
     let json: Value = serde_json::from_str(&body_text).unwrap();
-    assert_eq!(json["schema"], "openasr.runtime-ownership-receipt.v0");
+    assert_eq!(json["schema"], "openasr.runtime-ownership-receipt.v1");
     assert_eq!(json["availability"], "available");
     assert!(json["snapshot_completeness"]["complete"].as_bool().unwrap());
     assert_eq!(json["event_limit"], 128);
