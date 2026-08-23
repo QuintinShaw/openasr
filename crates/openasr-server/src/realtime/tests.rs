@@ -5900,6 +5900,39 @@ fn validate_snapshot_identity_invariants(
     Ok(())
 }
 
+fn is_valid_resource_state_transition(
+    current: openasr_core::runtime_receipts::RuntimeResourceState,
+    next: openasr_core::runtime_receipts::RuntimeResourceState,
+) -> bool {
+    use openasr_core::runtime_receipts::RuntimeResourceState;
+
+    matches!(
+        (current, next),
+        (
+            RuntimeResourceState::Reserved,
+            RuntimeResourceState::Reconciled
+        ) | (
+            RuntimeResourceState::Reserved,
+            RuntimeResourceState::Committed
+        ) | (
+            RuntimeResourceState::Reserved,
+            RuntimeResourceState::Quarantined
+        ) | (
+            RuntimeResourceState::Reserved,
+            RuntimeResourceState::Released
+        ) | (
+            RuntimeResourceState::Reconciled,
+            RuntimeResourceState::Committed
+        ) | (
+            RuntimeResourceState::Committed,
+            RuntimeResourceState::Quarantined
+        ) | (
+            RuntimeResourceState::Committed,
+            RuntimeResourceState::Released
+        )
+    )
+}
+
 fn receipt_identity_sets(
     snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
 ) -> Result<
@@ -6038,6 +6071,7 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HistoricalWeight {
     owner_id: openasr_core::runtime_receipts::RuntimeOwnerId,
+    resource_id: openasr_core::runtime_receipts::RuntimeResourceId,
     key: (
         openasr_core::runtime_receipts::RedactedIdentity,
         openasr_core::runtime_receipts::RedactedIdentity,
@@ -6201,7 +6235,7 @@ fn replay_receipt_lifecycle(
                 let Some(resource) = replay.resources.get_mut(&(owner_id, resource_id)) else {
                     return Err(());
                 };
-                if resource.released {
+                if resource.released || !is_valid_resource_state_transition(resource.state, state) {
                     return Err(());
                 }
                 resource.descriptor = descriptor;
@@ -6385,6 +6419,7 @@ fn historical_weights(
             };
             result.push(HistoricalWeight {
                 owner_id: owner.id,
+                resource_id: resource.id,
                 key: (
                     replayed_owner.descriptor.as_ref().ok_or(())?.component,
                     content,
@@ -6402,6 +6437,91 @@ fn historical_weights(
     Ok(result)
 }
 
+fn validated_delta_membership(
+    snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+    delta: &RuntimeReceiptIdentityDelta,
+) -> Result<
+    (
+        Vec<openasr_core::runtime_receipts::RuntimeOwnerId>,
+        Vec<openasr_core::runtime_receipts::RuntimeResourceId>,
+    ),
+    (),
+> {
+    let (live_owner_ids, active_resource_ids) = receipt_identity_sets(snapshot)?;
+    let retained_by_resource = live_retained_resource_metrics(snapshot)?;
+    if !delta
+        .owner_ids_added
+        .iter()
+        .all(|owner_id| live_owner_ids.contains(owner_id))
+        || !delta
+            .resource_ids_added
+            .iter()
+            .all(|resource_id| active_resource_ids.contains(resource_id))
+        || !delta
+            .offline_owned_retained_resource_ids
+            .iter()
+            .all(|resource_id| matches!(retained_by_resource.get(resource_id), Some(Some(_))))
+    {
+        return Err(());
+    }
+    let owner_ids = delta.owner_ids_added.clone();
+    let resource_ids = delta
+        .resource_ids_added
+        .iter()
+        .chain(delta.offline_owned_retained_resource_ids.iter())
+        .copied()
+        .collect();
+    Ok((owner_ids, resource_ids))
+}
+
+#[derive(Debug, Clone)]
+struct DeltaBoundWeightObservation<Owner, Resource, Key> {
+    owner_id: Owner,
+    resource_id: Resource,
+    key: Key,
+    retained_bytes: u64,
+}
+
+fn classify_delta_bound_weight_resources<Owner, Resource, Key>(
+    resources: Vec<DeltaBoundWeightObservation<Owner, Resource, Key>>,
+    delta_owner_ids: &[Owner],
+    delta_resource_ids: &[Resource],
+) -> HostOwnerAttribution
+where
+    Owner: Clone + PartialEq,
+    Resource: PartialEq,
+    Key: Clone + PartialEq,
+{
+    let total_resources = resources.len();
+    let candidates = resources
+        .into_iter()
+        .filter(|resource| {
+            delta_owner_ids.contains(&resource.owner_id)
+                || delta_resource_ids.contains(&resource.resource_id)
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return HostOwnerAttribution::AttributionIncomplete;
+    }
+    let observations = candidates
+        .iter()
+        .map(|resource| WeightObservation {
+            owner_id: resource.owner_id.clone(),
+            key: resource.key.clone(),
+            retained_bytes: resource.retained_bytes,
+        })
+        .collect::<Vec<_>>();
+    let attribution =
+        classify_equivalent_weight_resources(&observations, 5_090_000_000, 512 * 1024 * 1024);
+    if attribution == HostOwnerAttribution::SupportedEquivalentDuplicatedWeights
+        || candidates.len() == total_resources
+    {
+        attribution
+    } else {
+        HostOwnerAttribution::AttributionIncomplete
+    }
+}
+
 fn evaluate_host_owner_attribution(
     snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
     warmup_to_offline_delta: &RuntimeReceiptIdentityDelta,
@@ -6417,15 +6537,21 @@ fn evaluate_host_owner_attribution(
     let Ok(resources) = historical_weights(snapshot) else {
         return HostOwnerAttribution::AttributionIncomplete;
     };
-    let observations = resources
+    let Ok((delta_owner_ids, delta_resource_ids)) =
+        validated_delta_membership(snapshot, warmup_to_offline_delta)
+    else {
+        return HostOwnerAttribution::AttributionIncomplete;
+    };
+    let causal_resources = resources
         .into_iter()
-        .map(|resource| WeightObservation {
+        .map(|resource| DeltaBoundWeightObservation {
             owner_id: resource.owner_id,
+            resource_id: resource.resource_id,
             key: resource.key,
             retained_bytes: resource.retained_bytes,
         })
-        .collect::<Vec<_>>();
-    classify_equivalent_weight_resources(&observations, 5_090_000_000, 512 * 1024 * 1024)
+        .collect();
+    classify_delta_bound_weight_resources(causal_resources, &delta_owner_ids, &delta_resource_ids)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6706,6 +6832,42 @@ fn event_count_without_active_or_retained_evidence_is_inconclusive() {
         ..delta
     };
     assert!(with_retained_evidence.has_observable_change());
+    assert_eq!(
+        evaluate_host_owner_attribution(&empty, &with_retained_evidence),
+        HostOwnerAttribution::AttributionIncomplete
+    );
+}
+
+#[test]
+fn unrelated_retained_delta_cannot_promote_old_equivalent_pair() {
+    let resources = vec![
+        DeltaBoundWeightObservation {
+            owner_id: 1_u8,
+            resource_id: 11_u8,
+            key: "same",
+            retained_bytes: 5_090_000_000,
+        },
+        DeltaBoundWeightObservation {
+            owner_id: 2_u8,
+            resource_id: 22_u8,
+            key: "same",
+            retained_bytes: 5_090_000_001,
+        },
+        DeltaBoundWeightObservation {
+            owner_id: 3_u8,
+            resource_id: 33_u8,
+            key: "unrelated",
+            retained_bytes: 5_090_000_002,
+        },
+    ];
+    assert_eq!(
+        classify_delta_bound_weight_resources(resources.clone(), &[], &[33_u8]),
+        HostOwnerAttribution::AttributionIncomplete
+    );
+    assert_eq!(
+        classify_delta_bound_weight_resources(resources, &[], &[11_u8, 22_u8]),
+        HostOwnerAttribution::SupportedEquivalentDuplicatedWeights
+    );
 }
 
 #[test]
@@ -6738,6 +6900,101 @@ fn lifecycle_replay_rejects_unknown_and_tracks_release_coverage() {
         .is_err()
     );
 
+    let assert_inconclusive = |result: Result<ReplayedReceiptLifecycle, ()>| {
+        assert_eq!(
+            result.map_or(HostOwnerAttribution::AttributionIncomplete, |_| {
+                HostOwnerAttribution::SupportedEquivalentDuplicatedWeights
+            },),
+            HostOwnerAttribution::AttributionIncomplete
+        );
+    };
+    assert_inconclusive(replay_receipt_lifecycle([
+        ReceiptLifecycleEvent::OwnerCreated {
+            owner_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceAcquired {
+            owner_id,
+            resource_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state: RuntimeResourceState::Reconciled,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state: RuntimeResourceState::Reserved,
+            descriptor: None,
+        },
+    ]));
+    assert_inconclusive(replay_receipt_lifecycle([
+        ReceiptLifecycleEvent::OwnerCreated {
+            owner_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceAcquired {
+            owner_id,
+            resource_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state: RuntimeResourceState::Quarantined,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state: RuntimeResourceState::Committed,
+            descriptor: None,
+        },
+    ]));
+    assert_inconclusive(replay_receipt_lifecycle([
+        ReceiptLifecycleEvent::OwnerCreated {
+            owner_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceAcquired {
+            owner_id,
+            resource_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state: RuntimeResourceState::Reserved,
+            descriptor: None,
+        },
+    ]));
+    assert_inconclusive(replay_receipt_lifecycle([
+        ReceiptLifecycleEvent::OwnerCreated {
+            owner_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceAcquired {
+            owner_id,
+            resource_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state: RuntimeResourceState::Released,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state: RuntimeResourceState::Committed,
+            descriptor: None,
+        },
+    ]));
+
     let replay = replay_receipt_lifecycle([
         ReceiptLifecycleEvent::OwnerCreated {
             owner_id,
@@ -6746,6 +7003,12 @@ fn lifecycle_replay_rejects_unknown_and_tracks_release_coverage() {
         ReceiptLifecycleEvent::ResourceAcquired {
             owner_id,
             resource_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state: RuntimeResourceState::Reconciled,
             descriptor: None,
         },
         ReceiptLifecycleEvent::ResourceStateChanged {
