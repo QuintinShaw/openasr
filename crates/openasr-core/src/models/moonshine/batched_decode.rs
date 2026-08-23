@@ -7,6 +7,7 @@ use super::decoder_graph::{
     MoonshineDecodeOutput, MoonshineDecoderGraphRuntime, MoonshineDecoderRuntimeInput,
 };
 use super::encoder_graph::MoonshineEncoderOutput;
+use super::graph_config::{MoonshineGraphConfigIdentity, moonshine_graph_config_identity};
 use super::prepared_runtime::MoonshinePreparedRuntime;
 use super::runtime_contract::MoonshineExecutionMetadata;
 use super::tokenizer::MoonshineTokenizer;
@@ -128,35 +129,10 @@ impl MoonshineServeBatchError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct MoonshineServeBatchGraphConfigKey {
-    context_bytes: usize,
-    graph_size: usize,
-    n_threads: Option<usize>,
-    backend: GgmlCpuGraphBackend,
-    use_scheduler: bool,
-}
-
-impl From<GgmlCpuGraphConfig> for MoonshineServeBatchGraphConfigKey {
-    fn from(config: GgmlCpuGraphConfig) -> Self {
-        let graph_size = config.graph_size.max(16_384);
-        let context_bytes = config
-            .context_bytes
-            .max(GgmlCpuGraphConfig::metadata_context_bytes(graph_size));
-        Self {
-            context_bytes,
-            graph_size,
-            n_threads: config.n_threads,
-            backend: config.backend,
-            use_scheduler: config.use_scheduler,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct MoonshineServeBatchEngineKey {
     build_identity: crate::RuntimeBuildIdentity,
     lane: crate::models::native_execution_services::ExecutionLaneKey,
-    graph_config: MoonshineServeBatchGraphConfigKey,
+    graph_config: MoonshineGraphConfigIdentity,
     output_plan: GgmlDecodeOutputPlan,
     output_mode: DeviceGreedyStepOutputMode,
     reuse_mode: GgmlDecodeReuseMode,
@@ -319,7 +295,7 @@ impl Seq2SeqServeBatchFamily for MoonshineFamily {
         MoonshineServeBatchEngineKey {
             build_identity: job.build_identity.clone(),
             lane: job.lane.clone(),
-            graph_config: MoonshineServeBatchGraphConfigKey::from(job.graph_config),
+            graph_config: moonshine_graph_config_identity(job.graph_config),
             output_plan: job.output_plan,
             output_mode: job.output_mode,
             reuse_mode: job.reuse_mode,

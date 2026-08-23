@@ -13,7 +13,10 @@ use super::decoder_graph::{
 };
 use super::encoder_graph::{MoonshineEncoderGraphRuntime, MoonshineEncoderOutput};
 use super::frontend::{MoonshineFrontendError, moonshine_waveform_from_prepared_audio};
-use super::graph_config::{moonshine_decoder_graph_config, moonshine_encoder_graph_config};
+use super::graph_config::{
+    MoonshineGraphConfigIdentity, moonshine_decoder_graph_config, moonshine_encoder_graph_config,
+    moonshine_graph_config_identity,
+};
 use super::lora::{
     MoonshineLoraError, moonshine_adapter_cache_fingerprint, resolve_moonshine_lora_adapter,
 };
@@ -66,31 +69,6 @@ const MOONSHINE_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
 /// would be a correctness bug. The output topology fields keep an owner
 /// built for one request proof from being reused for another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct MoonshineGraphConfigKey {
-    context_bytes: usize,
-    graph_size: usize,
-    n_threads: Option<usize>,
-    backend: GgmlCpuGraphBackend,
-    use_scheduler: bool,
-}
-
-impl From<GgmlCpuGraphConfig> for MoonshineGraphConfigKey {
-    fn from(config: GgmlCpuGraphConfig) -> Self {
-        let graph_size = config.graph_size.max(16_384);
-        let context_bytes = config
-            .context_bytes
-            .max(GgmlCpuGraphConfig::metadata_context_bytes(graph_size));
-        Self {
-            context_bytes,
-            graph_size,
-            n_threads: config.n_threads,
-            backend: config.backend,
-            use_scheduler: config.use_scheduler,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct MoonshineDecodeFeatureKey {
     output_mode: DeviceGreedyStepOutputMode,
     adapter_active: bool,
@@ -103,13 +81,13 @@ struct MoonshineDecodeFeatureKey {
 type MoonshineEncoderRuntimeCacheKey = (
     PackContentKey,
     ExecutionLaneKey,
-    MoonshineGraphConfigKey,
+    MoonshineGraphConfigIdentity,
     String,
 );
 type MoonshineDecoderRuntimeCacheKey = (
     PackContentKey,
     ExecutionLaneKey,
-    MoonshineGraphConfigKey,
+    MoonshineGraphConfigIdentity,
     crate::models::seq2seq_decoder_state::Seq2SeqResidentCapacity,
     String,
     GgmlDecodeOutputContract,
@@ -401,6 +379,7 @@ impl MoonshineGgmlExecutor {
                     encoder_output,
                     request.request_options.phrase_bias.clone(),
                     resolved_runtime,
+                    decoder_config,
                     request.request_options.word_timestamps,
                     audio_duration,
                     adapter.clone(),
@@ -498,7 +477,7 @@ impl MoonshineGgmlExecutor {
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             lane,
-            MoonshineGraphConfigKey::from(graph_config),
+            moonshine_graph_config_identity(graph_config),
             moonshine_adapter_cache_fingerprint(adapter.as_ref().map(resolved_lora_adapter)),
         );
         let preflight = preflight.clone();
@@ -535,19 +514,19 @@ impl MoonshineGgmlExecutor {
         adapter: Option<ResolvedLoraAdapterHandle>,
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
         resolved_runtime: ResolvedFamilyRuntimeInput,
+        decoder_config: GgmlCpuGraphConfig,
         lane: ExecutionLaneKey,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
         feature_key: MoonshineDecodeFeatureKey,
     ) -> Result<MoonshineDecoderRuntimeActor, MoonshineGgmlExecutorError> {
         let backend = resolved_runtime.backend();
-        let decoder_config = moonshine_decoder_graph_config(backend, Some(lane.provider()));
         let output_contract = resolved_runtime.output_contract();
         let output_plan = resolved_runtime.output_plan();
         let reuse_mode = resolved_runtime.reuse_mode();
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             lane,
-            MoonshineGraphConfigKey::from(decoder_config),
+            moonshine_graph_config_identity(decoder_config),
             decoder_state.resident_capacity(),
             moonshine_adapter_cache_fingerprint(adapter.as_ref().map(resolved_lora_adapter)),
             output_contract,
@@ -629,6 +608,7 @@ impl MoonshineGgmlExecutor {
         encoder_output: MoonshineEncoderOutput,
         phrase_bias: Option<crate::PhraseBiasConfig>,
         resolved_runtime: ResolvedFamilyRuntimeInput,
+        decoder_config: GgmlCpuGraphConfig,
         word_timestamps: bool,
         audio_duration_seconds: f32,
         adapter: Option<ResolvedLoraAdapterHandle>,
@@ -648,6 +628,7 @@ impl MoonshineGgmlExecutor {
             adapter,
             decoder_state,
             resolved_runtime,
+            decoder_config,
             lane,
             greedy_step_output_mode,
             feature_key,
@@ -854,9 +835,10 @@ fn map_decoder_error(error: MoonshineDecoderGraphError) -> MoonshineGgmlExecutor
 
 #[cfg(test)]
 mod tests {
+    use super::super::graph_config::moonshine_graph_config_identity;
     use super::{
-        ExecutionLaneKey, MoonshineDecodeFeatureKey, MoonshineGraphConfigKey,
-        can_use_moonshine_serve_batch, moonshine_greedy_step_output_mode,
+        ExecutionLaneKey, MoonshineDecodeFeatureKey, can_use_moonshine_serve_batch,
+        moonshine_greedy_step_output_mode,
     };
     use crate::device::execution_policy::ExecutionPlacement;
     use crate::device::execution_route::{
@@ -937,8 +919,8 @@ mod tests {
         let mut four = one;
         four.n_threads = Some(4);
         assert_ne!(
-            MoonshineGraphConfigKey::from(one),
-            MoonshineGraphConfigKey::from(four)
+            moonshine_graph_config_identity(one),
+            moonshine_graph_config_identity(four)
         );
     }
     #[test]

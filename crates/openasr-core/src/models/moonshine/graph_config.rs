@@ -8,6 +8,31 @@ use crate::models::graph_runtime_config::{
 
 const OPENASR_MOONSHINE_ENABLE_DECODER_GPU: &str = "OPENASR_MOONSHINE_ENABLE_DECODER_GPU";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct MoonshineGraphConfigIdentity {
+    pub(crate) context_bytes: usize,
+    pub(crate) graph_size: usize,
+    pub(crate) n_threads: Option<usize>,
+    pub(crate) backend: GgmlCpuGraphBackend,
+    pub(crate) use_scheduler: bool,
+}
+
+pub(crate) fn moonshine_graph_config_identity(
+    config: GgmlCpuGraphConfig,
+) -> MoonshineGraphConfigIdentity {
+    let graph_size = config.graph_size.max(16_384);
+    let context_bytes = config
+        .context_bytes
+        .max(GgmlCpuGraphConfig::metadata_context_bytes(graph_size));
+    MoonshineGraphConfigIdentity {
+        context_bytes,
+        graph_size,
+        n_threads: config.n_threads,
+        backend: config.backend,
+        use_scheduler: config.use_scheduler,
+    }
+}
+
 /// Shared base for both stages: everything except the scheduler default,
 /// which the encoder and decoder now set independently (see
 /// [`moonshine_encoder_graph_config`] / [`moonshine_decoder_graph_config`]).
