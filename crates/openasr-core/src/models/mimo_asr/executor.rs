@@ -127,23 +127,24 @@ enum MimoAsrExecutorError {
 /// input-local transformer, 36L Qwen2 backbone decoder), their
 /// device-uploaded / arena-resident weights, plus the immutable derived data
 /// read once from the pack. CPU lanes retain scalar-oracle RVQ codebooks and
-/// speech-embedding tables; accelerated lanes bind those native tensors in
-/// the encoder/input-local graphs and deliberately retain no host-f32 copy.
-/// Both retain the mel front-end plan, tokenizer, and the two metadata groups
-/// the per-request path still consults. Before this cache, mimo-asr was the only
-/// family that rebuilt this ENTIRE set on every `execute()` -- three
-/// `Runtime::new()` calls plus a full re-read of the pack's codebooks/tables
-/// -- purely to re-derive state that never changes between requests against
-/// the same pack. Mirrors `firered_llm`'s resident-decoder cache (`FireRedLlm
-/// DecoderRuntime` there is one stage; here the whole prepared pipeline is
-/// resident because all three mimo stages are equally per-request-invariant).
+/// speech-embedding tables; accelerated lanes keep the encoder graph on the
+/// selected backend, read its hidden rows once, and use the same host RVQ
+/// score oracle. Both retain the mel front-end plan, tokenizer, and the two
+/// metadata groups the per-request path still consults. Before this cache,
+/// mimo-asr was the only family that rebuilt this ENTIRE set on every
+/// `execute()` -- three `Runtime::new()` calls plus a full re-read of the pack's
+/// codebooks/tables -- purely to re-derive state that never changes between
+/// requests against the same pack. Mirrors `firered_llm`'s resident-decoder
+/// cache (`FireRedLlm DecoderRuntime` there is one stage; here the whole
+/// prepared pipeline is resident because all three mimo stages are equally
+/// per-request-invariant).
 struct MimoAsrPreparedRuntime {
     encoder_runtime: MimoAudiotokEncoderRuntime,
     inlocal_runtime: MimoInputLocalRuntime,
     decoder: MimoLlmDecoderRuntime,
     tokenizer: MimoAsrTokenizer,
-    /// CPU exact-oracle RVQ tables. Accelerated lanes bind the native GGUF
-    /// tensors in `encoder_runtime` and deliberately retain no host f32 copy.
+    /// CPU exact-oracle RVQ tables. Accelerated lanes retain their host copy
+    /// inside `encoder_runtime` for the same strict-first score oracle.
     codebooks: Option<MimoRvqCodebooks>,
     /// CPU exact-oracle speech tables. Accelerated lanes gather their native
     /// f16 tensors inside `inlocal_runtime` and retain no host f32 copy.
@@ -328,14 +329,7 @@ impl MimoAsrPreparedRuntime {
         let (codebook_peak, codebook_retained, speech_embedding_retained) = if backend
             .is_gpu_class()
         {
-            (
-                MimoRvqCodebooks::quoted_device_construction_peak_system_memory_bytes(
-                    &audiotok_metadata,
-                )
-                .map_err(capacity_error)?,
-                0,
-                0,
-            )
+            (0, 0, 0)
         } else {
             let codebooks =
                 MimoRvqCodebooks::quoted_retained_system_memory_bytes(&audiotok_metadata)
@@ -822,7 +816,7 @@ impl MimoAsrGgmlExecutor {
                         }
                     })?
                 }
-                MimoAudiotokEncoderOutput::DeviceCodes(codes) => codes,
+                MimoAudiotokEncoderOutput::HostCodes(codes) => codes,
             };
 
         // Truncate to the nearest group_size multiple (drop up to
@@ -1357,15 +1351,13 @@ mod tests {
     }
 
     /// Exact bridge gate for the accelerated rewrite: a diagnostic Metal
-    /// encoder emits hidden rows and the original scalar RVQ oracle quantizes
-    /// them; production Metal fuses that same sequential residual quantizer
-    /// into the encoder graph and returns only compact codes. Holding the
-    /// encoder backend fixed isolates the new RVQ math from normal CPU/Metal
-    /// reduction-order drift.
+    /// The encoder graph remains on Metal, but RVQ selection is deliberately
+    /// host-oracle based: compare its compact output with the diagnostic
+    /// hidden-row path while also checking graph placement.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     #[ignore = "host-local: needs OPENASR_MIMO_ASR_PACK and Metal"]
-    fn metal_rvq_fusion_matches_scalar_oracle_on_same_metal_hidden_rows() {
+    fn metal_rvq_host_oracle_matches_scalar_oracle_on_same_metal_hidden_rows() {
         let Some(pack_path) = dev_pack_path() else {
             return;
         };
@@ -1428,8 +1420,8 @@ mod tests {
         metal
             .release_transient_compute_memory()
             .expect("release Metal transient memory");
-        let MimoAudiotokEncoderOutput::DeviceCodes(actual) = output else {
-            panic!("Metal encoder must fuse RVQ and return device codes");
+        let MimoAudiotokEncoderOutput::HostCodes(actual) = output else {
+            panic!("Metal encoder must return host RVQ codes");
         };
         let observed = placement.snapshot();
         let mismatches = actual
