@@ -43,7 +43,9 @@ use crate::ggml_runtime::{
     GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity,
     GgmlLoadedWeightContext,
 };
+use crate::models::firered_aed::encoder_graph::start_firered_component_receipt;
 use crate::models::firered_aed::graph_config::firered_encoder_graph_config;
+use crate::models::runtime_receipts::RuntimeOwnerGuard;
 
 use super::tensor_names::{
     ADAPTER_LINEAR1_BIAS, ADAPTER_LINEAR1_WEIGHT, ADAPTER_LINEAR2_BIAS, ADAPTER_LINEAR2_WEIGHT,
@@ -108,6 +110,8 @@ pub(crate) struct FireRedLlmAdapterGraphRuntime {
     linear1_bias: GgmlLoadedTensor,
     linear2_weight: GgmlLoadedTensor,
     linear2_bias: GgmlLoadedTensor,
+    /// Dropped after the native runner and loaded binding.
+    _receipt_owner: Option<RuntimeOwnerGuard>,
 }
 
 impl FireRedLlmAdapterGraphRuntime {
@@ -146,6 +150,11 @@ impl FireRedLlmAdapterGraphRuntime {
         let linear1_bias = tensor(&loaded, ADAPTER_LINEAR1_BIAS)?;
         let linear2_weight = tensor(&loaded, ADAPTER_LINEAR2_WEIGHT)?;
         let linear2_bias = tensor(&loaded, ADAPTER_LINEAR2_BIAS)?;
+        let receipt_owner = start_firered_component_receipt(
+            "firered-llm-adapter",
+            preflight.runtime_source.content_id(),
+            backend,
+        );
         Ok(Self {
             runner,
             _loaded: loaded,
@@ -153,6 +162,7 @@ impl FireRedLlmAdapterGraphRuntime {
             linear1_bias,
             linear2_weight,
             linear2_bias,
+            _receipt_owner: receipt_owner,
         })
     }
 

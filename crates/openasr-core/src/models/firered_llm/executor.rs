@@ -43,7 +43,9 @@ use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyComponentRegistryError, BuiltinSeq2SeqDecodePolicyConfigInput,
     run_builtin_seq2seq_decode_policy,
 };
-use crate::models::firered_aed::encoder_graph::FireRedEncoderGraphRuntime;
+use crate::models::firered_aed::encoder_graph::{
+    FireRedEncoderGraphRuntime, start_firered_component_receipt,
+};
 use crate::models::firered_aed::frontend::{FireRedFbankFrontend, apply_cmvn};
 use crate::models::firered_aed::runtime_contract::FireRedAedExecutionMetadata;
 use crate::models::ggml_asr_executor::{
@@ -119,6 +121,27 @@ struct FireRedLlmUnifiedRuntimeState {
     encoder: FireRedEncoderGraphRuntime,
     adapter: FireRedLlmAdapterGraphRuntime,
     decoder: FireRedLlmDecoderRuntime,
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+enum FireRedLlmUnifiedBindingError {
+    #[error("encoder and adapter resolved different pack-wide weight bindings")]
+    EncoderAdapterMismatch,
+    #[error("encoder and decoder resolved different pack-wide weight bindings")]
+    EncoderDecoderMismatch,
+}
+
+fn validate_firered_llm_unified_binding(
+    encoder_adapter_coalesced: bool,
+    encoder_decoder_coalesced: bool,
+) -> Result<(), FireRedLlmUnifiedBindingError> {
+    if !encoder_adapter_coalesced {
+        return Err(FireRedLlmUnifiedBindingError::EncoderAdapterMismatch);
+    }
+    if !encoder_decoder_coalesced {
+        return Err(FireRedLlmUnifiedBindingError::EncoderDecoderMismatch);
+    }
+    Ok(())
 }
 
 fn firered_llm_unified_runtime_system_memory_shape(
@@ -232,6 +255,14 @@ pub(crate) const FIRERED_LLM_MAX_INPUT_SECONDS: f32 = 40.0;
 /// fail-closed backstop against a runaway (non-terminating) decode.
 pub(crate) const FIRERED_LLM_MAX_GENERATED_TOKENS: usize = 512;
 
+fn start_firered_llm_request_receipt(
+    component: &'static str,
+    content_id: &str,
+    backend: GgmlCpuGraphBackend,
+) -> Option<crate::models::runtime_receipts::RuntimeOwnerGuard> {
+    start_firered_component_receipt(component, content_id, backend)
+}
+
 #[derive(Debug, Error)]
 enum FireRedLlmExecutorError {
     #[error("firered-llm executor requires adapter '{expected}', got '{found}'")]
@@ -266,6 +297,11 @@ enum FireRedLlmExecutorError {
     DecoderFailed { reason: String },
     #[error("firered-llm {stage} runtime ownership failed: {reason}")]
     RuntimeOwnershipFailed { stage: &'static str, reason: String },
+    #[error("firered-llm unified weight-binding coalescing failed: {source}")]
+    UnifiedBindingCoalescing {
+        #[source]
+        source: FireRedLlmUnifiedBindingError,
+    },
     #[error("firered-llm greedy decode failed: {reason}")]
     GreedyDecodeFailed { reason: String },
 }
@@ -300,12 +336,11 @@ fn validate_firered_llm_unified_runtime(
             reason: "unified FireRed-LLM decoder did not retain a loaded weight binding"
                 .to_string(),
         })?;
-    if encoder_binding != adapter_binding || encoder_binding != decoder_binding {
-        return Err(FireRedLlmExecutorError::RuntimeContractViolation {
-            reason: "unified FireRed-LLM runtime did not coalesce its pack-wide weight binding"
-                .to_string(),
-        });
-    }
+    validate_firered_llm_unified_binding(
+        encoder_binding == adapter_binding,
+        encoder_binding == decoder_binding,
+    )
+    .map_err(|source| FireRedLlmExecutorError::UnifiedBindingCoalescing { source })?;
     Ok(())
 }
 
@@ -795,6 +830,7 @@ impl FireRedLlmGgmlExecutor {
             });
         }
         let preflight = request.runtime_source_preflight();
+        let content_id = preflight.runtime_source.content_id().to_string();
 
         let encoder_metadata =
             parse_firered_llm_encoder_metadata(&*preflight.metadata).map_err(|error| {
@@ -887,21 +923,33 @@ impl FireRedLlmGgmlExecutor {
 
         let feature_frames = features.n_frames;
         let encoder_output = match unified_gpu_runtime.as_ref() {
-            Some(runtime) => runtime
-                .call_mut_fallible(move |state| {
-                    let encode_result = state.encoder.encode(&features.data, feature_frames);
-                    let release_result = state.encoder.release_transient_compute_memory();
-                    match (encode_result, release_result) {
-                        (Ok(output), Ok(())) => Ok(output),
-                        (Err(error), _) => Err(error),
-                        (Ok(_), Err(error)) => Err(error),
-                    }
-                })
-                .map_err(|error| Self::map_actor_error("unified-encoder", error))?
-                .map_err(|error| FireRedLlmExecutorError::EncoderFailed {
-                    reason: error.to_string(),
-                })?,
+            Some(runtime) => {
+                let _request_owner = start_firered_llm_request_receipt(
+                    "firered-llm-unified-request-encoder",
+                    &content_id,
+                    backend,
+                );
+                runtime
+                    .call_mut_fallible(move |state| {
+                        let encode_result = state.encoder.encode(&features.data, feature_frames);
+                        let release_result = state.encoder.release_transient_compute_memory();
+                        match (encode_result, release_result) {
+                            (Ok(output), Ok(())) => Ok(output),
+                            (Err(error), _) => Err(error),
+                            (Ok(_), Err(error)) => Err(error),
+                        }
+                    })
+                    .map_err(|error| Self::map_actor_error("unified-encoder", error))?
+                    .map_err(|error| FireRedLlmExecutorError::EncoderFailed {
+                        reason: error.to_string(),
+                    })?
+            }
             None => {
+                let _request_owner = start_firered_llm_request_receipt(
+                    "firered-llm-split-request-encoder",
+                    &content_id,
+                    backend,
+                );
                 let mut encoder_runtime = FireRedEncoderGraphRuntime::new_from_preflight(
                     preflight,
                     encoder_metadata,
@@ -922,27 +970,39 @@ impl FireRedLlmGgmlExecutor {
 
         let adapter_profile_started_at = std::time::Instant::now();
         let (speech_rows, speech_frame_count) = match unified_gpu_runtime.as_ref() {
-            Some(runtime) => runtime
-                .call_mut_fallible(move |state| {
-                    let adapter_result = state.adapter.run(
-                        &encoder_output.rows,
-                        encoder_output.frame_count,
-                        encoder_metadata.d_model,
-                        adapter_metadata.downsample_rate,
-                        adapter_metadata.llm_dim,
-                    );
-                    let release_result = state.adapter.release_transient_compute_memory();
-                    match (adapter_result, release_result) {
-                        (Ok(output), Ok(())) => Ok(output),
-                        (Err(error), _) => Err(error),
-                        (Ok(_), Err(error)) => Err(error),
-                    }
-                })
-                .map_err(|error| Self::map_actor_error("unified-adapter", error))?
-                .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
-                    reason: error.to_string(),
-                })?,
+            Some(runtime) => {
+                let _request_owner = start_firered_llm_request_receipt(
+                    "firered-llm-unified-request-adapter",
+                    &content_id,
+                    backend,
+                );
+                runtime
+                    .call_mut_fallible(move |state| {
+                        let adapter_result = state.adapter.run(
+                            &encoder_output.rows,
+                            encoder_output.frame_count,
+                            encoder_metadata.d_model,
+                            adapter_metadata.downsample_rate,
+                            adapter_metadata.llm_dim,
+                        );
+                        let release_result = state.adapter.release_transient_compute_memory();
+                        match (adapter_result, release_result) {
+                            (Ok(output), Ok(())) => Ok(output),
+                            (Err(error), _) => Err(error),
+                            (Ok(_), Err(error)) => Err(error),
+                        }
+                    })
+                    .map_err(|error| Self::map_actor_error("unified-adapter", error))?
+                    .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
+                        reason: error.to_string(),
+                    })?
+            }
             None => {
+                let _request_owner = start_firered_llm_request_receipt(
+                    "firered-llm-split-request-adapter",
+                    &content_id,
+                    backend,
+                );
                 let mut adapter_runtime = FireRedLlmAdapterGraphRuntime::new_from_preflight(
                     preflight, backend,
                 )
@@ -1026,6 +1086,11 @@ impl FireRedLlmGgmlExecutor {
             .is_some_and(|chunk_count| chunk_count > 1);
         let result = match unified_gpu_runtime.as_ref() {
             Some(runtime) => {
+                let _request_owner = start_firered_llm_request_receipt(
+                    "firered-llm-unified-request-decoder",
+                    &content_id,
+                    decoder_backend,
+                );
                 let decode = move |state: &mut FireRedLlmUnifiedRuntimeState| {
                     run_firered_llm_decode_with_runtime(
                         &mut state.decoder,
@@ -1048,6 +1113,11 @@ impl FireRedLlmGgmlExecutor {
                 decoded.map_err(|error| Self::map_actor_error("unified-decoder", error))??
             }
             None => {
+                let _request_owner = start_firered_llm_request_receipt(
+                    "firered-llm-split-request-decoder",
+                    &content_id,
+                    decoder_backend,
+                );
                 let decoder_actor = self.checkout_decoder_runtime(
                     preflight,
                     decoder_metadata,
@@ -1297,6 +1367,32 @@ mod tests {
                 GgmlNativeGqaCapability::Unsupported,
             ),
             GgmlNativeGqaCapability::Unsupported,
+        );
+    }
+
+    #[test]
+    fn firered_llm_receipts_cover_request_drop_and_typed_binding_coalescing() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _scope =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+        let receipt = start_firered_llm_request_receipt(
+            "firered-llm-split-request-encoder",
+            "test-content",
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("test service has available receipts");
+        assert_eq!(services.runtime_receipts().summary().live_owner_count, 1);
+        drop(receipt);
+        assert_eq!(services.runtime_receipts().summary().live_owner_count, 0);
+
+        assert_eq!(validate_firered_llm_unified_binding(true, true), Ok(()));
+        assert_eq!(
+            validate_firered_llm_unified_binding(false, true),
+            Err(FireRedLlmUnifiedBindingError::EncoderAdapterMismatch)
+        );
+        assert_eq!(
+            validate_firered_llm_unified_binding(true, false),
+            Err(FireRedLlmUnifiedBindingError::EncoderDecoderMismatch)
         );
     }
 
