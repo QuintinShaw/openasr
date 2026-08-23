@@ -11,7 +11,7 @@
 
 use thiserror::Error;
 
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReader};
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReader, ResolvedFamilyRuntimeInput};
 use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
@@ -103,8 +103,9 @@ impl FunasrNanoDecoderRuntime {
     pub(crate) fn new_from_preflight(
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         metadata: FunasrNanoDecoderMetadata,
-        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<Self, FunasrNanoDecoderError> {
+        let backend = resolved_runtime.backend();
         let reader =
             crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(preflight)
                 .map_err(|error| FunasrNanoDecoderError::TensorReadFailed {
@@ -152,7 +153,7 @@ impl FunasrNanoDecoderRuntime {
                 rms_norm_epsilon: FUNASR_NANO_RMS_NORM_EPSILON,
                 fused_logits_head: logits_head.fused_top1_spec(),
                 token_embedding: token_embedding.device_graph_spec(),
-                backend,
+                resolved_runtime,
             },
         )
         .map_err(|error| FunasrNanoDecoderError::GraphFailed {
@@ -641,7 +642,11 @@ mod trace_tests {
             .expect("combo pack preflight");
         let decoder = parse_funasr_nano_decoder_metadata(preflight.metadata())
             .expect("parse decoder metadata from combo pack");
-        FunasrNanoDecoderRuntime::new_from_preflight(&preflight, decoder, GgmlCpuGraphBackend::Cpu)
+        let resolved_runtime = ResolvedFamilyRuntimeInput::resolve(
+            Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        );
+        FunasrNanoDecoderRuntime::new_from_preflight(&preflight, decoder, resolved_runtime)
             .expect("combo pack must load through whole-decoder weight context");
     }
 
@@ -668,11 +673,12 @@ mod trace_tests {
 
         let preflight = crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index(&path)
             .expect("preflight");
-        let result = FunasrNanoDecoderRuntime::new_from_preflight(
-            &preflight,
-            metadata,
-            GgmlCpuGraphBackend::Cpu,
+        let resolved_runtime = ResolvedFamilyRuntimeInput::resolve(
+            Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
         );
+        let result =
+            FunasrNanoDecoderRuntime::new_from_preflight(&preflight, metadata, resolved_runtime);
         let error = match result {
             Ok(_) => panic!("missing attn_q must fail closed"),
             Err(error) => error,

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::ggml_runtime::GgmlNativeGqaCapability;
+use crate::ggml_runtime::ResolvedFamilyRuntimeInput;
 use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
@@ -115,7 +115,7 @@ impl MossTdDecoderRuntime {
         logits_head: Arc<Qwen3AsrLlmLogitsHead>,
         token_embedding: Arc<MappedTokenEmbeddingTable>,
         graph_config: crate::ggml_runtime::GgmlCpuGraphConfig,
-        native_gqa: GgmlNativeGqaCapability,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<Self, MossTdDecoderError> {
         // Structural Prepared Graph Plan adoption: host prepare already owns
         // the typed plan and compiles through the shared seam (same entry
@@ -128,10 +128,9 @@ impl MossTdDecoderRuntime {
                     rms_norm_epsilon: MOSS_TD_RMS_NORM_EPSILON,
                     fused_logits_head: logits_head.fused_top1_spec(),
                     token_embedding: token_embedding.device_graph_spec(),
-                    backend: graph_config.backend,
+                    resolved_runtime,
                 },
                 graph_config,
-                native_gqa,
             )
             .map_err(|error| MossTdDecoderError::GraphFailed {
                 reason: error.to_string(),

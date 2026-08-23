@@ -1732,8 +1732,7 @@ impl Qwen3AsrOwnerThreadState {
                 prepared_runtime.decoder_plan.as_ref(),
                 &slot.job.runtime_source_preflight,
                 token_embedding,
-                slot.job.backend(),
-                slot.job.native_gqa,
+                slot.job.resolved_runtime,
                 QwenQkvExecutionMode::FusedArena,
             )
             .map_err(|error| Qwen3AsrServeBatchError::OwnerFailed {
@@ -2726,7 +2725,10 @@ mod tests {
             &fixture.decoder_plan,
             &fixture.runtime_source_preflight,
             token_embedding,
-            GgmlCpuGraphBackend::Metal,
+            crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                Some(crate::ggml_runtime::RequestBackendPreference::Accelerated),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
         )
         .expect("tiny qwen Metal decoder should compile")
     }

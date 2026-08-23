@@ -18,7 +18,7 @@ use thiserror::Error;
 use crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index_from_source;
 use crate::ggml_runtime::{
     GgmlFlashAttentionPrecision, GgufMetadata, GgufRuntimeSourcePreflight, GgufTensorDataReadError,
-    build_runtime_tensor_reader_from_preflight,
+    ResolvedFamilyRuntimeInput, build_runtime_tensor_reader_from_preflight,
 };
 use crate::models::gpt2_bpe::{build_merge_rank, build_token_to_id, encode_prompt_text};
 use crate::models::{
@@ -602,13 +602,19 @@ fn align_forced_with_stage_backends(
             &assets.decoder_plan,
             preflight,
             device_embedding,
-            backends.decoder,
+            ResolvedFamilyRuntimeInput::resolve(
+                None,
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
         )
     } else {
         Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight(
             &assets.decoder_plan,
             preflight,
-            backends.decoder,
+            ResolvedFamilyRuntimeInput::resolve(
+                None,
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
         )
     }
     .map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {

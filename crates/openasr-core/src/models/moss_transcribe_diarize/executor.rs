@@ -28,7 +28,7 @@ use crate::device::execution_policy::ExecutionPlacement;
 use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlNativeGqaCapability, RequestBackendPreference,
-    request_backend_override,
+    ResolvedFamilyRuntimeInput, request_backend_override,
 };
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
@@ -52,7 +52,7 @@ use crate::models::prepared_runtime_cache::{
 };
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity, Qwen3AsrKvCacheCapacityError,
-    Qwen3AsrPromptTokenInput, qwen_llm_effective_native_gqa_capability,
+    Qwen3AsrPromptTokenInput,
 };
 use crate::models::runtime_cache_coordinator::PackContentKey;
 use crate::models::seq2seq_greedy_decode::{
@@ -1133,9 +1133,10 @@ impl MossTdGgmlExecutor {
         &self,
         preflight: &crate::GgufRuntimeSourcePreflight,
         prepared: PreparedRuntimeHandle<MossTdPreparedRuntime>,
-        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-        native_gqa: GgmlNativeGqaCapability,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<MossTdDecoderRuntimeActor, MossTdExecutorError> {
+        let backend = resolved_runtime.backend();
+        let native_gqa = resolved_runtime.native_gqa_capability();
         let graph_config = moss_td_runtime_graph_config(backend);
         let effective_backend = graph_config.backend;
         let key = (
@@ -1177,7 +1178,7 @@ impl MossTdGgmlExecutor {
                         Arc::clone(&prepared.logits_head),
                         Arc::clone(&prepared.token_embedding),
                         graph_config,
-                        native_gqa,
+                        resolved_runtime,
                     )
                     .map_err(|error| MossTdExecutorError::DecoderFailed {
                         reason: error.to_string(),
@@ -1215,11 +1216,12 @@ impl MossTdGgmlExecutor {
         &self,
         preflight: &crate::GgufRuntimeSourcePreflight,
         prepared: PreparedRuntimeHandle<MossTdPreparedRuntime>,
-        backend: GgmlCpuGraphBackend,
         encoder_config: GgmlCpuGraphConfig,
         decoder_config: GgmlCpuGraphConfig,
-        native_gqa: GgmlNativeGqaCapability,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<MossTdUnifiedRuntimeActor, MossTdExecutorError> {
+        let backend = resolved_runtime.backend();
+        let native_gqa = resolved_runtime.native_gqa_capability();
         let key = MossTdUnifiedRuntimeCacheKey {
             content: PackContentKey::for_runtime_source(&preflight.runtime_source),
             lane: current_execution_lane_key(backend),
@@ -1270,7 +1272,7 @@ impl MossTdGgmlExecutor {
                         Arc::clone(&prepared.logits_head),
                         Arc::clone(&prepared.token_embedding),
                         decoder_config,
-                        native_gqa,
+                        resolved_runtime,
                     )
                     .map_err(|error| MossTdExecutorError::DecoderFailed {
                         reason: error.to_string(),
@@ -1368,11 +1370,6 @@ impl MossTdGgmlExecutor {
         let decoder_metadata = prepared.decoder_metadata;
         let tokenizer = prepared.tokenizer.clone();
         let backend_preference = request_backend_override();
-        let native_gqa = qwen_llm_effective_native_gqa_capability(moss_td_native_gqa_candidate(
-            backend,
-            backend_preference.as_ref(),
-            request.resolved_runtime.native_gqa_capability(),
-        ));
         let unified_configs = moss_td_unified_runtime_configs(
             allow_unified_runtime,
             backend,
@@ -1384,10 +1381,9 @@ impl MossTdGgmlExecutor {
                 self.checkout_unified_runtime(
                     preflight,
                     Arc::clone(&prepared),
-                    backend,
                     encoder_config,
                     decoder_config,
-                    native_gqa,
+                    request.resolved_runtime,
                 )
             })
             .transpose()?;
@@ -1563,7 +1559,7 @@ impl MossTdGgmlExecutor {
             }
             None => {
                 let decoder_actor =
-                    self.checkout_decoder_runtime(preflight, prepared, backend, native_gqa)?;
+                    self.checkout_decoder_runtime(preflight, prepared, request.resolved_runtime)?;
                 run_moss_td_decoder_with_cached_runtime(
                     &decoder_actor,
                     decoder_metadata,

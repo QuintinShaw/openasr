@@ -11,7 +11,7 @@
 
 use thiserror::Error;
 
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlNativeGqaCapability, GgufTensorDataReader};
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReader, ResolvedFamilyRuntimeInput};
 
 use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
 use crate::models::qwen::{
@@ -87,9 +87,9 @@ impl MimoLlmDecoderRuntime {
     pub(crate) fn new_from_preflight(
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         metadata: MimoLlmMetadata,
-        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-        native_gqa: GgmlNativeGqaCapability,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<Self, MimoLlmDecoderError> {
+        let backend = resolved_runtime.backend();
         let reader =
             crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(preflight)
                 .map_err(|error| MimoLlmDecoderError::TensorReadFailed {
@@ -131,9 +131,8 @@ impl MimoLlmDecoderRuntime {
                 rms_norm_epsilon: metadata.rms_norm_epsilon,
                 fused_logits_head: logits_head.fused_top1_spec(),
                 token_embedding: token_embedding.device_graph_spec(),
-                backend,
+                resolved_runtime,
             },
-            native_gqa,
         )
         .map_err(|error| MimoLlmDecoderError::GraphFailed {
             reason: error.to_string(),

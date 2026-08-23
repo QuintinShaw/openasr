@@ -598,8 +598,7 @@ impl Qwen3AsrGgmlExecutor {
                         prepared_runtime.logits_head.fused_top1_spec(),
                         prepared_runtime.token_embedding_table.device_graph_spec(),
                         adapter.as_ref().map(resolved_lora_adapter),
-                        backend,
-                        native_gqa,
+                        resolved_runtime,
                         qkv_execution_mode,
                     )
                     .map_err(|error| {
@@ -699,8 +698,7 @@ impl Qwen3AsrGgmlExecutor {
                         prepared_runtime.logits_head.fused_top1_spec(),
                         prepared_runtime.token_embedding_table.device_graph_spec(),
                         None,
-                        backend,
-                        native_gqa,
+                        resolved_runtime,
                         qkv_execution_mode,
                     )
                     .map_err(|error| Qwen3AsrGgmlExecutorError::RuntimeContractViolation {

@@ -33,7 +33,7 @@ use crate::device::execution_policy::ExecutionPlacement;
 use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlNativeGqaCapability, RequestBackendPreference,
-    request_backend_override,
+    ResolvedFamilyRuntimeInput, request_backend_override,
 };
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
@@ -345,10 +345,10 @@ fn allocate_firered_llm_unified_runtime(
     preflight: crate::GgufRuntimeSourcePreflight,
     encoder_metadata: FireRedAedExecutionMetadata,
     decoder_metadata: FireRedLlmDecoderMetadata,
-    backend: GgmlCpuGraphBackend,
-    native_gqa: GgmlNativeGqaCapability,
+    resolved_runtime: ResolvedFamilyRuntimeInput,
     quote: SystemMemoryAllocationQuote,
 ) -> Result<SystemMemoryOwner<FireRedLlmUnifiedRuntimeState>, FireRedLlmExecutorError> {
+    let backend = resolved_runtime.backend();
     let construction_transient = quote
         .peak_bytes
         .checked_sub(quote.retained_bytes)
@@ -373,8 +373,7 @@ fn allocate_firered_llm_unified_runtime(
         let decoder = FireRedLlmDecoderRuntime::new_from_preflight_with_native_gqa(
             &preflight,
             decoder_metadata,
-            backend,
-            native_gqa,
+            resolved_runtime,
         )
         .map_err(|error| FireRedLlmExecutorError::DecoderFailed {
             reason: error.to_string(),
@@ -621,9 +620,10 @@ impl FireRedLlmGgmlExecutor {
         &self,
         preflight: &crate::GgufRuntimeSourcePreflight,
         metadata: super::runtime_contract::FireRedLlmDecoderMetadata,
-        backend: GgmlCpuGraphBackend,
-        native_gqa: GgmlNativeGqaCapability,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<FireRedLlmDecoderRuntimeActor, FireRedLlmExecutorError> {
+        let backend = resolved_runtime.backend();
+        let native_gqa = resolved_runtime.native_gqa_capability();
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
@@ -668,13 +668,15 @@ impl FireRedLlmGgmlExecutor {
                 })?;
                 Ok((
                     retained_bytes,
-                    (build_preflight, metadata, backend, native_gqa, quote),
+                    (build_preflight, metadata, resolved_runtime, quote),
                 ))
             },
-            move |(preflight, metadata, backend, native_gqa, quote)| {
+            move |(preflight, metadata, resolved_runtime, quote)| {
                 match SystemMemoryOwner::try_allocate_transaction(quote, || {
                     let runtime = FireRedLlmDecoderRuntime::new_from_preflight_with_native_gqa(
-                        &preflight, metadata, backend, native_gqa,
+                        &preflight,
+                        metadata,
+                        resolved_runtime,
                     )
                     .map_err(|error| {
                         FireRedLlmExecutorError::DecoderFailed {
@@ -710,9 +712,10 @@ impl FireRedLlmGgmlExecutor {
         preflight: &crate::GgufRuntimeSourcePreflight,
         encoder_metadata: FireRedAedExecutionMetadata,
         decoder_metadata: FireRedLlmDecoderMetadata,
-        backend: GgmlCpuGraphBackend,
-        native_gqa: GgmlNativeGqaCapability,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<FireRedLlmUnifiedRuntimeActor, FireRedLlmExecutorError> {
+        let backend = resolved_runtime.backend();
+        let native_gqa = resolved_runtime.native_gqa_capability();
         let key = FireRedLlmUnifiedRuntimeCacheKey {
             content: PackContentKey::for_runtime_source(&preflight.runtime_source),
             lane: current_execution_lane_key(backend),
@@ -742,8 +745,7 @@ impl FireRedLlmGgmlExecutor {
                     preflight,
                     encoder_metadata,
                     decoder_metadata,
-                    backend,
-                    native_gqa,
+                    resolved_runtime,
                     quote,
                 )
             },
@@ -862,11 +864,6 @@ impl FireRedLlmGgmlExecutor {
 
         let backend = request.resolved_runtime.backend();
         let backend_preference = request_backend_override();
-        let native_gqa = firered_llm_native_gqa_capability(
-            backend,
-            backend_preference.as_ref(),
-            request.resolved_runtime.native_gqa_capability(),
-        );
         let placement = current_execution_placement();
         let unified_gpu_runtime = if firered_llm_unified_runtime_enabled(
             allow_unified_runtime,
@@ -878,8 +875,7 @@ impl FireRedLlmGgmlExecutor {
                 preflight,
                 encoder_metadata,
                 decoder_metadata,
-                backend,
-                native_gqa,
+                request.resolved_runtime,
             )?)
         } else {
             None
@@ -986,7 +982,6 @@ impl FireRedLlmGgmlExecutor {
         // this candidate. Family executors must not invent a second heuristic
         // fallback: doing so would make allocation ownership and the reported
         // execution route disagree.
-        let decoder_backend = backend;
         let measured_positions =
             crate::capacity::topology::causal_prefix_positions_with_context_cap(
                 super::capacity::FIRERED_LLM_SELF_KV_STATE_ID,
@@ -1051,8 +1046,7 @@ impl FireRedLlmGgmlExecutor {
                 let decoder_actor = self.checkout_decoder_runtime(
                     preflight,
                     decoder_metadata,
-                    decoder_backend,
-                    native_gqa,
+                    request.resolved_runtime,
                 )?;
                 decoder_actor
                     .call_mut(move |decoder| {

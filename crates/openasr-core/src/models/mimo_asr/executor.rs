@@ -23,7 +23,7 @@ use crate::arch::MIMO_ASR_DECODE_POLICY_ID;
 use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlNativeGqaCapability, RequestBackendPreference,
-    request_backend_override,
+    ResolvedFamilyRuntimeInput,
 };
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
@@ -43,7 +43,7 @@ use crate::models::incremental_streaming_driver::{
 use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity, Qwen3AsrKvCacheCapacityError,
-    Qwen3AsrPromptTokenInput, qwen_llm_effective_native_gqa_capability,
+    Qwen3AsrPromptTokenInput,
 };
 use crate::models::runtime_cache_coordinator::PackContentKey;
 use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
@@ -404,9 +404,9 @@ impl MimoAsrPreparedRuntime {
     /// exists to pay exactly once per (pack, execution lane).
     fn build(
         preflight: &crate::GgufRuntimeSourcePreflight,
-        backend: GgmlCpuGraphBackend,
-        native_gqa: GgmlNativeGqaCapability,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<Self, MimoAsrExecutorError> {
+        let backend = resolved_runtime.backend();
         let llm_metadata = parse_mimo_llm_metadata(&preflight.metadata).map_err(|error| {
             MimoAsrExecutorError::RuntimeContractViolation {
                 reason: error.to_string(),
@@ -516,7 +516,7 @@ impl MimoAsrPreparedRuntime {
         })?;
 
         let decoder =
-            MimoLlmDecoderRuntime::new_from_preflight(preflight, llm_metadata, backend, native_gqa)
+            MimoLlmDecoderRuntime::new_from_preflight(preflight, llm_metadata, resolved_runtime)
                 .map_err(|error| MimoAsrExecutorError::DecoderFailed {
                     reason: error.to_string(),
                 })?;
@@ -612,9 +612,10 @@ impl MimoAsrGgmlExecutor {
     fn checkout_prepared_runtime(
         &self,
         preflight: &crate::GgufRuntimeSourcePreflight,
-        backend: GgmlCpuGraphBackend,
-        native_gqa: GgmlNativeGqaCapability,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<MimoAsrPreparedRuntimeActor, MimoAsrExecutorError> {
+        let backend = resolved_runtime.backend();
+        let native_gqa = resolved_runtime.native_gqa_capability();
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
@@ -637,7 +638,7 @@ impl MimoAsrGgmlExecutor {
                 Ok((retained_bytes, quote))
             },
             move |quote| match SystemMemoryOwner::try_allocate_transaction(quote, || {
-                let runtime = MimoAsrPreparedRuntime::build(&build_preflight, backend, native_gqa)?;
+                let runtime = MimoAsrPreparedRuntime::build(&build_preflight, resolved_runtime)?;
                 let retained = runtime.retained_system_memory_bytes()?;
                 Ok(SystemMemoryAllocationOutcome::new(
                     runtime, retained, retained,
@@ -685,18 +686,12 @@ impl MimoAsrGgmlExecutor {
             });
         }
 
-        let backend = request.resolved_runtime.backend();
-        let native_gqa = qwen_llm_effective_native_gqa_capability(mimo_native_gqa_candidate(
-            backend,
-            request_backend_override().as_ref(),
-            request.resolved_runtime.native_gqa_capability(),
-        ));
         let kv_capacity = Qwen3AsrKvCacheCapacity::from_decoder_state(
             &request.decoder_state,
             super::capacity::MIMO_ASR_SELF_KV_STATE_ID,
         )
         .map_err(|source| MimoAsrExecutorError::DecoderStateCapacity { source })?;
-        let actor = self.checkout_prepared_runtime(preflight, backend, native_gqa)?;
+        let actor = self.checkout_prepared_runtime(preflight, request.resolved_runtime)?;
         let samples = samples.to_vec();
         let input_rate = request.prepared_audio.sample_rate_hz;
         let control = Arc::clone(&request.execution_context.control);

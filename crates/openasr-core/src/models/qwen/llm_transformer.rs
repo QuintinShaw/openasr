@@ -16,10 +16,10 @@ use thiserror::Error;
 use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlDecodeOutputContract, GgmlDecodeOutputPlan, GgmlDecodeReuseMode,
-    GgmlFlashAttentionPrecision, GgmlKvElementType, GgmlLoadedTensor, GgmlNativeGqaCapability,
-    GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReadError,
-    GgufTensorDataReader, ResolvedFamilyRuntimeInput, env_toggle_with_raw, env_var_truthy,
+    GgmlDecodeOutputPlan, GgmlDecodeReuseMode, GgmlFlashAttentionPrecision, GgmlKvElementType,
+    GgmlLoadedTensor, GgmlNativeGqaCapability, GgmlRopeExtParams, GgmlStaticTensor,
+    GgmlStaticTensorArena, GgufTensorDataReadError, GgufTensorDataReader,
+    ResolvedFamilyRuntimeInput, env_toggle_with_raw, env_var_truthy,
 };
 
 use super::decoder_contract::{QwenDecoderContract, QwenDecoderContractGeometry};
@@ -2257,7 +2257,7 @@ pub(crate) struct QwenPreparedDecoderGraphCompileRequest<'a> {
     pub rms_norm_epsilon: f32,
     pub fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'a>>,
     pub token_embedding: Option<MappedTokenEmbeddingDeviceSpec<'a>>,
-    pub backend: GgmlCpuGraphBackend,
+    pub resolved_runtime: ResolvedFamilyRuntimeInput,
 }
 
 /// Compile a prepared [`QwenWholeDecoderPlan`] into a monomorphic whole-decoder
@@ -2273,7 +2273,7 @@ pub(crate) struct QwenPreparedDecoderGraphCompileRequest<'a> {
 pub(crate) fn compile_qwen_whole_decoder_graph_from_prepared_plan(
     request: QwenPreparedDecoderGraphCompileRequest<'_>,
 ) -> Result<Qwen3AsrLlmWholeDecoderGraphExecutor, GgmlCpuGraphError> {
-    let graph_config = qwen_decoder_graph_config(request.backend);
+    let graph_config = qwen_decoder_graph_config(request.resolved_runtime.backend());
     compile_qwen_whole_decoder_graph_from_prepared_plan_with_config(request, graph_config)
 }
 
@@ -2283,13 +2283,11 @@ pub(crate) fn compile_qwen_whole_decoder_graph_from_prepared_plan(
 /// infer a provider from a coarse `Gpu` backend or a backend name.
 pub(crate) fn compile_qwen_whole_decoder_graph_from_prepared_plan_with_native_gqa(
     request: QwenPreparedDecoderGraphCompileRequest<'_>,
-    native_gqa: GgmlNativeGqaCapability,
 ) -> Result<Qwen3AsrLlmWholeDecoderGraphExecutor, GgmlCpuGraphError> {
-    let graph_config = qwen_decoder_graph_config(request.backend);
+    let graph_config = qwen_decoder_graph_config(request.resolved_runtime.backend());
     compile_qwen_whole_decoder_graph_from_prepared_plan_with_config_and_native_gqa(
         request,
         graph_config,
-        native_gqa,
     )
 }
 
@@ -2305,7 +2303,6 @@ pub(crate) fn compile_qwen_whole_decoder_graph_from_prepared_plan_with_config(
     compile_qwen_whole_decoder_graph_from_prepared_plan_with_config_and_native_gqa_impl(
         request,
         graph_config,
-        None,
     )
 }
 
@@ -2315,23 +2312,20 @@ pub(crate) fn compile_qwen_whole_decoder_graph_from_prepared_plan_with_config(
 pub(crate) fn compile_qwen_whole_decoder_graph_from_prepared_plan_with_config_and_native_gqa(
     request: QwenPreparedDecoderGraphCompileRequest<'_>,
     graph_config: GgmlCpuGraphConfig,
-    native_gqa: GgmlNativeGqaCapability,
 ) -> Result<Qwen3AsrLlmWholeDecoderGraphExecutor, GgmlCpuGraphError> {
     compile_qwen_whole_decoder_graph_from_prepared_plan_with_config_and_native_gqa_impl(
         request,
         graph_config,
-        Some(native_gqa),
     )
 }
 
 fn compile_qwen_whole_decoder_graph_from_prepared_plan_with_config_and_native_gqa_impl(
     request: QwenPreparedDecoderGraphCompileRequest<'_>,
     graph_config: GgmlCpuGraphConfig,
-    native_gqa: Option<GgmlNativeGqaCapability>,
 ) -> Result<Qwen3AsrLlmWholeDecoderGraphExecutor, GgmlCpuGraphError> {
-    if graph_config.backend != request.backend {
+    if graph_config.backend != request.resolved_runtime.backend() {
         return Err(GgmlCpuGraphError::UnsupportedInputs {
-            reason: "prepared decoder graph config backend does not match compile request",
+            reason: "prepared decoder graph config backend does not match resolved runtime",
         });
     }
     Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_adapter_and_native_gqa(
@@ -2342,7 +2336,7 @@ fn compile_qwen_whole_decoder_graph_from_prepared_plan_with_config_and_native_gq
         None,
         request.preflight,
         graph_config,
-        native_gqa,
+        request.resolved_runtime,
         QwenQkvExecutionMode::FusedArena,
     )
 }
@@ -2473,6 +2467,11 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         self.use_native_gqa
     }
 
+    #[cfg(test)]
+    pub(crate) fn resolved_runtime(&self) -> ResolvedFamilyRuntimeInput {
+        self.resolved_runtime
+    }
+
     #[allow(dead_code)] // Conservative shared-family entry point; Qwen uses the typed variant.
     pub(crate) fn new_from_plan_with_preflight_and_lora(
         plan: &QwenWholeDecoderPlan,
@@ -2480,7 +2479,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
         token_embedding: Option<MappedTokenEmbeddingDeviceSpec<'_>>,
         adapter: Option<&QwenLoraAdapter>,
-        backend: GgmlCpuGraphBackend,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<Self, GgmlCpuGraphError> {
         Self::new_from_plan_with_adapter(
             plan,
@@ -2489,7 +2488,8 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             token_embedding,
             adapter,
             preflight,
-            qwen_decoder_graph_config(backend),
+            qwen_decoder_graph_config(resolved_runtime.backend()),
+            resolved_runtime,
         )
     }
 
@@ -2500,8 +2500,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>>,
         token_embedding: Option<MappedTokenEmbeddingDeviceSpec<'_>>,
         adapter: Option<&QwenLoraAdapter>,
-        backend: GgmlCpuGraphBackend,
-        native_gqa: GgmlNativeGqaCapability,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
         qkv_execution_mode: QwenQkvExecutionMode,
     ) -> Result<Self, GgmlCpuGraphError> {
         Self::new_from_plan_with_adapter_and_native_gqa(
@@ -2511,8 +2510,8 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             token_embedding,
             adapter,
             preflight,
-            qwen_decoder_graph_config(backend),
-            Some(native_gqa),
+            qwen_decoder_graph_config(resolved_runtime.backend()),
+            resolved_runtime,
             qkv_execution_mode,
         )
     }
@@ -2520,7 +2519,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
     pub(crate) fn new_from_plan_with_preflight(
         plan: &QwenWholeDecoderPlan,
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
-        backend: GgmlCpuGraphBackend,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<Self, GgmlCpuGraphError> {
         compile_qwen_whole_decoder_graph_from_prepared_plan(
             QwenPreparedDecoderGraphCompileRequest {
@@ -2529,7 +2528,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
                 fused_logits_head: None,
                 token_embedding: None,
-                backend,
+                resolved_runtime,
             },
         )
     }
@@ -2538,7 +2537,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         plan: &QwenWholeDecoderPlan,
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         token_embedding: MappedTokenEmbeddingDeviceSpec<'_>,
-        backend: GgmlCpuGraphBackend,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<Self, GgmlCpuGraphError> {
         compile_qwen_whole_decoder_graph_from_prepared_plan(
             QwenPreparedDecoderGraphCompileRequest {
@@ -2547,7 +2546,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
                 fused_logits_head: None,
                 token_embedding: Some(token_embedding),
-                backend,
+                resolved_runtime,
             },
         )
     }
@@ -2564,6 +2563,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         adapter: Option<&QwenLoraAdapter>,
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         graph_config: GgmlCpuGraphConfig,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<Self, GgmlCpuGraphError> {
         Self::new_from_plan_with_adapter_and_native_gqa(
             plan,
@@ -2573,7 +2573,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             adapter,
             preflight,
             graph_config,
-            None,
+            resolved_runtime,
             QwenQkvExecutionMode::FusedArena,
         )
     }
@@ -2582,8 +2582,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         plan: &QwenWholeDecoderPlan,
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         token_embedding: MappedTokenEmbeddingDeviceSpec<'_>,
-        backend: GgmlCpuGraphBackend,
-        native_gqa: GgmlNativeGqaCapability,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
         qkv_execution_mode: QwenQkvExecutionMode,
     ) -> Result<Self, GgmlCpuGraphError> {
         Self::new_from_plan_with_adapter_and_native_gqa(
@@ -2593,8 +2592,8 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             Some(token_embedding),
             None,
             preflight,
-            qwen_decoder_graph_config(backend),
-            Some(native_gqa),
+            qwen_decoder_graph_config(resolved_runtime.backend()),
+            resolved_runtime,
             qkv_execution_mode,
         )
     }
@@ -2608,7 +2607,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         adapter: Option<&QwenLoraAdapter>,
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         graph_config: GgmlCpuGraphConfig,
-        native_gqa: Option<GgmlNativeGqaCapability>,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
         qkv_execution_mode: QwenQkvExecutionMode,
     ) -> Result<Self, GgmlCpuGraphError> {
         if plan.layers.is_empty() {
@@ -2629,9 +2628,8 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         let mut config = graph_config;
         config.graph_size = QWEN3_LLM_WHOLE_DECODE_GRAPH_SIZE;
         config.context_bytes = qwen_llm_graph_context_bytes();
-        let use_native_gqa = native_gqa.map_or_else(
-            || qwen_llm_resolve_use_native_gqa(config.backend),
-            qwen_llm_resolve_use_native_gqa_for_capability,
+        let use_native_gqa = qwen_llm_resolve_use_native_gqa_for_capability(
+            resolved_runtime.native_gqa_capability(),
         );
         let runner = GgmlCpuGraphRunner::new(config)?;
         let loaded = Some(runner.load_gguf_weight_context_from_preflight(preflight)?);
@@ -2679,10 +2677,6 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         let dims = dims.expect("non-empty whole-decoder plan sets dimensions");
         #[cfg(not(test))]
         let _ = fused_logits_head;
-        let resolved_runtime = ResolvedFamilyRuntimeInput::resolve_for_backend_with_output_contract(
-            graph_config.backend,
-            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
-        );
         #[cfg(test)]
         let fused_logits_head = fused_logits_head
             .filter(|_| resolved_runtime.output_plan() == GgmlDecodeOutputPlan::NativeFirstMaxToken)
@@ -2963,9 +2957,9 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             fused_qkvs.push(fused_qkv);
         }
         let dims = dims.expect("non-empty projections set dims");
-        let resolved_runtime = ResolvedFamilyRuntimeInput::resolve_for_backend_with_output_contract(
-            backend,
-            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+        let resolved_runtime = ResolvedFamilyRuntimeInput::resolve(
+            None,
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
         );
         let fused_logits_head = match fused_logits_head {
             Some(spec) => {
@@ -8003,18 +7997,38 @@ mod tests {
 
     #[test]
     fn qwen_production_output_plan_is_full_logits_and_fresh_graph_without_evidence() {
-        for backend in [
-            GgmlCpuGraphBackend::Cpu,
-            GgmlCpuGraphBackend::Metal,
-            GgmlCpuGraphBackend::Gpu,
+        use crate::device::execution_route::{
+            DeviceAddressability, ExecutionProvider, ResolvedExecutionRoute, RouteDeviceKind,
+        };
+        use crate::ggml_runtime::RequestBackendPreference;
+
+        let exact = |provider| {
+            RequestBackendPreference::Exact(ResolvedExecutionRoute {
+                provider,
+                stable_id: format!("{}0", provider.as_str()),
+                registry_ordinal: 0,
+                kind: RouteDeviceKind::Accelerated,
+                addressability: DeviceAddressability::NotExactlyAddressable {
+                    reason: "qwen output-plan propagation fixture",
+                },
+            })
+        };
+        for provider in [
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Vulkan,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Metal,
         ] {
-            let resolved = ResolvedFamilyRuntimeInput::resolve_for_backend_with_output_contract(
-                backend,
-                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+            let resolved = ResolvedFamilyRuntimeInput::resolve(
+                Some(exact(provider)),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
             );
-            assert_eq!(resolved.backend(), backend);
             assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
             assert_eq!(resolved.reuse_mode(), GgmlDecodeReuseMode::FreshGraph);
+            assert_eq!(
+                resolved.output_contract(),
+                crate::ggml_runtime::GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits
+            );
         }
     }
 
@@ -8099,6 +8113,10 @@ mod tests {
             GgmlCpuGraphBackend::Cpu,
         )
         .expect("load tail");
+        let resolved_runtime = ResolvedFamilyRuntimeInput::resolve(
+            Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        );
         let graph = compile_qwen_whole_decoder_graph_from_prepared_plan(
             QwenPreparedDecoderGraphCompileRequest {
                 plan: &plan,
@@ -8106,10 +8124,11 @@ mod tests {
                 rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
                 fused_logits_head: tail.logits_head.fused_top1_spec(),
                 token_embedding: None,
-                backend: GgmlCpuGraphBackend::Cpu,
+                resolved_runtime,
             },
         )
         .expect("compile graph");
+        assert_eq!(graph.resolved_runtime(), resolved_runtime);
         let actual_retained = graph
             .retained_system_memory_bytes()
             .and_then(|bytes| {
@@ -8232,7 +8251,10 @@ mod tests {
                         rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
                         fused_logits_head: None,
                         token_embedding: None,
-                        backend: GgmlCpuGraphBackend::Cpu,
+                        resolved_runtime: ResolvedFamilyRuntimeInput::resolve(
+                            Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+                            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+                        ),
                     },
                 )
                 .expect("qwen2 parity executor");
@@ -8297,7 +8319,10 @@ mod tests {
         let executor = Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight(
             &plan,
             &preflight,
-            GgmlCpuGraphBackend::Cpu,
+            ResolvedFamilyRuntimeInput::resolve(
+                Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
         )
         .expect("materialize planned decoder");
         let one_layer_payload = [
@@ -8341,6 +8366,10 @@ mod tests {
             )
             .expect("decoder fixture preflight");
 
+        let resolved_runtime = ResolvedFamilyRuntimeInput::resolve(
+            Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        );
         let mut fused =
             Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight_and_lora_for_qwen(
                 &plan,
@@ -8348,8 +8377,7 @@ mod tests {
                 None,
                 None,
                 None,
-                GgmlCpuGraphBackend::Cpu,
-                GgmlNativeGqaCapability::Validated,
+                resolved_runtime,
                 QwenQkvExecutionMode::FusedArena,
             )
             .expect("fused decoder");
@@ -8360,8 +8388,7 @@ mod tests {
                 None,
                 None,
                 None,
-                GgmlCpuGraphBackend::Cpu,
-                GgmlNativeGqaCapability::Validated,
+                resolved_runtime,
                 QwenQkvExecutionMode::SplitLoaded,
             )
             .expect("split-loaded decoder");
@@ -8534,7 +8561,10 @@ mod tests {
                 rms_norm_epsilon: DEFAULT_RMS_NORM_EPSILON,
                 fused_logits_head: None,
                 token_embedding: None,
-                backend: GgmlCpuGraphBackend::Cpu,
+                resolved_runtime: ResolvedFamilyRuntimeInput::resolve(
+                    Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+                    crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+                ),
             },
         )
         .expect("prepare-time compile from owned plan");

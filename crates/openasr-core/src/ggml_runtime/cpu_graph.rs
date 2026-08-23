@@ -956,33 +956,6 @@ impl ResolvedFamilyRuntimeInput {
         Self::resolve_with_output_contract(preference, policy, output_requirement)
     }
 
-    /// Resolves a runtime input for a backend that has already been selected by
-    /// the family materializer. This keeps output and reuse policy on the same
-    /// typed contract even when backend selection happened at an outer seam.
-    /// Device evidence is intentionally absent here, so compact output and
-    /// persistent-graph reuse fail closed.
-    pub fn resolve_for_backend_with_output_contract(
-        backend: GgmlCpuGraphBackend,
-        output_contract: GgmlDecodeOutputContract,
-    ) -> Self {
-        let evidence = GgmlLaneDecodeEvidence::unknown();
-        Self {
-            backend,
-            native_gqa: resolve_native_gqa_capability(None, backend),
-            output_contract,
-            output_plan: plan_decode_output(output_contract, evidence),
-            reuse_mode: GgmlDecodeReuseMode::FreshGraph,
-        }
-    }
-
-    /// Backend-only compatibility spelling for token families.
-    pub fn resolve_for_backend(backend: GgmlCpuGraphBackend) -> Self {
-        Self::resolve_for_backend_with_output_contract(
-            backend,
-            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
-        )
-    }
-
     /// The backend resolved for this request, already passed through the
     /// family's own [`AutoGpuPolicy`] gate.
     pub fn backend(self) -> GgmlCpuGraphBackend {
