@@ -59,9 +59,10 @@ use super::{
     },
     candidate_activation_transaction::{
         ActivationReservation, ActivationStage, AttestationFailure, AttestationOutcome,
-        ExecutionCandidateAttemptEvidence, ExecutionCandidateAttemptJournalFactory,
-        ExecutionCandidateAttemptOwner, NativeCandidateAttemptFacts, ResolvedExecutionFacts,
-        TypedAttestation,
+        DefaultModelActivationFacts, DefaultModelActivationIdentity, DefaultModelActivationLane,
+        DefaultModelActivationPlan, ExecutionCandidateAttemptEvidence,
+        ExecutionCandidateAttemptJournalFactory, ExecutionCandidateAttemptOwner,
+        NativeCandidateAttemptFacts, ResolvedExecutionFacts, TypedAttestation,
     },
     executor_component_registry::BuiltinStatefulExecutorScope,
     ggml_asr_executor::GgmlAsrExecutionDispatch,
@@ -135,6 +136,12 @@ thread_local! {
     /// it to expose staged values to their own attempt without leaking them to
     /// concurrent candidates before the outermost journal commits.
     static CURRENT_EXECUTION_CACHE_ATTEMPT_ID: Cell<Option<ExecutionCacheAttemptId>> = const {
+        Cell::new(None)
+    };
+    /// Explicit outer activation cohort shared by every nested reservation
+    /// during staged materialization. It takes precedence over the inner cache
+    /// journal attempt id and propagates through worker contexts.
+    static CURRENT_ACTIVATION_RESERVATION_COHORT: Cell<Option<MemoryReservationCohortId>> = const {
         Cell::new(None)
     };
     /// Strict receipt collection is opt-in and follows the concrete request
@@ -569,6 +576,7 @@ pub(crate) struct NativeExecutionContext {
     observation_sink: Option<ExecutionObservationSink>,
     failure_sink: Option<ExecutionCandidateFailureSink>,
     cache_attempt_id: Option<ExecutionCacheAttemptId>,
+    activation_reservation_cohort: Option<MemoryReservationCohortId>,
     execution_telemetry: Option<GgmlExecutionTelemetryCollector>,
     receipt: Option<NativeExecutionReceiptCollector>,
 }
@@ -585,6 +593,7 @@ impl NativeExecutionContext {
             && Arc::ptr_eq(&self.memory_broker, &other.memory_broker)
             && self.backend_preference == other.backend_preference
             && self.placement == other.placement
+            && self.activation_reservation_cohort == other.activation_reservation_cohort
             && match (&self.observation_sink, &other.observation_sink) {
                 (Some(left), Some(right)) => Arc::ptr_eq(&left.observations, &right.observations),
                 (None, None) => true,
@@ -643,6 +652,7 @@ impl NativeExecutionContext {
             observation_sink: first.observation_sink.clone(),
             failure_sink,
             cache_attempt_id,
+            activation_reservation_cohort: first.activation_reservation_cohort,
             execution_telemetry,
             receipt: first.receipt.clone(),
         }))
@@ -668,6 +678,7 @@ pub(crate) struct NativeExecutionContextGuard {
     previous_observation_sink: Option<ExecutionObservationSink>,
     previous_failure_sink: Option<ExecutionCandidateFailureSink>,
     previous_cache_attempt_id: Option<ExecutionCacheAttemptId>,
+    previous_activation_reservation_cohort: Option<MemoryReservationCohortId>,
     execution_telemetry: GgmlExecutionTelemetryGuard,
     previous_receipt: Option<NativeExecutionReceiptCollector>,
     backend: RequestBackendOverrideGuard,
@@ -696,6 +707,8 @@ impl Drop for NativeExecutionContextGuard {
         });
         CURRENT_EXECUTION_CACHE_ATTEMPT_ID
             .with(|current| current.set(self.previous_cache_attempt_id.take()));
+        CURRENT_ACTIVATION_RESERVATION_COHORT
+            .with(|current| current.set(self.previous_activation_reservation_cohort.take()));
         CURRENT_EXECUTION_RECEIPT.with(|current| {
             *current.borrow_mut() = self.previous_receipt.take();
         });
@@ -812,6 +825,7 @@ pub(crate) fn current_native_execution_context() -> Option<NativeExecutionContex
         observation_sink: current_execution_observation_sink(),
         failure_sink: current_execution_candidate_failure_sink(),
         cache_attempt_id: current_execution_cache_attempt_id(),
+        activation_reservation_cohort: current_activation_reservation_cohort_id(),
         execution_telemetry: current_execution_telemetry_collector(),
         receipt: current_execution_receipt_collector(),
     })
@@ -1023,7 +1037,32 @@ pub(crate) fn current_execution_cache_attempt_id() -> Option<ExecutionCacheAttem
 /// enter the provisional domain gate held by their own candidate without
 /// weakening exclusion between independent candidates.
 pub(crate) fn current_memory_reservation_cohort_id() -> Option<MemoryReservationCohortId> {
-    current_execution_cache_attempt_id().map(|attempt| MemoryReservationCohortId::new(attempt.0))
+    current_activation_reservation_cohort_id().or_else(|| {
+        current_execution_cache_attempt_id()
+            .map(|attempt| MemoryReservationCohortId::new(attempt.0))
+    })
+}
+
+fn current_activation_reservation_cohort_id() -> Option<MemoryReservationCohortId> {
+    CURRENT_ACTIVATION_RESERVATION_COHORT.with(Cell::get)
+}
+
+pub(crate) struct ActivationReservationContextGuard {
+    previous: Option<MemoryReservationCohortId>,
+}
+
+impl Drop for ActivationReservationContextGuard {
+    fn drop(&mut self) {
+        CURRENT_ACTIVATION_RESERVATION_COHORT.with(|current| current.set(self.previous.take()));
+    }
+}
+
+pub(crate) fn install_activation_reservation_context(
+    context: Option<ActivationReservationContext>,
+) -> ActivationReservationContextGuard {
+    let previous = CURRENT_ACTIVATION_RESERVATION_COHORT
+        .with(|current| current.replace(context.map(|context| context.cohort_id)));
+    ActivationReservationContextGuard { previous }
 }
 
 /// Resolves the complete resident-owner cache lane for the active request.
@@ -1161,6 +1200,8 @@ pub(crate) fn install_native_execution_context(
         .with(|current| current.replace(context.failure_sink));
     let previous_cache_attempt_id = CURRENT_EXECUTION_CACHE_ATTEMPT_ID
         .with(|current| current.replace(context.cache_attempt_id));
+    let previous_activation_reservation_cohort = CURRENT_ACTIVATION_RESERVATION_COHORT
+        .with(|current| current.replace(context.activation_reservation_cohort));
     let execution_telemetry = install_execution_telemetry_collector(context.execution_telemetry);
     let previous_receipt =
         CURRENT_EXECUTION_RECEIPT.with(|current| current.replace(context.receipt));
@@ -1175,6 +1216,7 @@ pub(crate) fn install_native_execution_context(
         previous_observation_sink,
         previous_failure_sink,
         previous_cache_attempt_id,
+        previous_activation_reservation_cohort,
         execution_telemetry,
         previous_receipt,
         backend,
@@ -1198,6 +1240,7 @@ pub(crate) fn install_native_execution_services(
         observation_sink: current_execution_observation_sink(),
         failure_sink: current_execution_candidate_failure_sink(),
         cache_attempt_id: current_execution_cache_attempt_id(),
+        activation_reservation_cohort: current_activation_reservation_cohort_id(),
         execution_telemetry: current_execution_telemetry_collector(),
         receipt: current_execution_receipt_collector(),
     })
@@ -1230,6 +1273,7 @@ pub(crate) fn install_execution_candidate_attempt(
         observation_sink: current_execution_observation_sink(),
         failure_sink: Some(failure_sink),
         cache_attempt_id: current_execution_cache_attempt_id(),
+        activation_reservation_cohort: current_activation_reservation_cohort_id(),
         execution_telemetry: current_execution_telemetry_collector(),
         receipt: current_execution_receipt_collector(),
     })
@@ -1410,18 +1454,36 @@ fn observed_placement_violation(
 
 /// Broker-backed reservation for one candidate activation. Quote is obtained
 /// separately; this token is the atomic `try_reserve*` result.
+/// Opaque identity shared by an outer activation reservation and every
+/// nested owner allocation performed while materializing that candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivationReservationContext {
+    cohort_id: MemoryReservationCohortId,
+}
+
 pub struct BrokerActivationReservation {
     batch: Option<DeviceMemoryReservationBatch>,
+    context: ActivationReservationContext,
 }
 
 impl BrokerActivationReservation {
-    fn from_batch(batch: DeviceMemoryReservationBatch) -> Result<Self, String> {
+    fn from_batch(
+        batch: DeviceMemoryReservationBatch,
+        cohort_id: MemoryReservationCohortId,
+    ) -> Result<Self, String> {
         if batch.is_empty() {
             return Err(
                 "candidate activation quote produced no physical-domain reservation".to_string(),
             );
         }
-        Ok(Self { batch: Some(batch) })
+        Ok(Self {
+            batch: Some(batch),
+            context: ActivationReservationContext { cohort_id },
+        })
+    }
+
+    pub const fn context(&self) -> ActivationReservationContext {
+        self.context
     }
 }
 
@@ -1530,6 +1592,78 @@ pub fn resolve_candidate_activation_lane(
         .first()
         .cloned()
         .ok_or_else(|| format!("execution policy produced no candidate lane for {architecture_id}"))
+}
+
+/// Fully resolved default-model activation facts. The server consumes this
+/// value but cannot independently recombine family policy, provider identity,
+/// output-plan evidence, or reuse evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDefaultModelActivation {
+    candidate: ExecutionCandidate,
+    facts: DefaultModelActivationFacts,
+}
+
+impl ResolvedDefaultModelActivation {
+    pub const fn candidate(&self) -> &ExecutionCandidate {
+        &self.candidate
+    }
+
+    pub const fn facts(&self) -> &DefaultModelActivationFacts {
+        &self.facts
+    }
+
+    pub fn into_facts(self) -> DefaultModelActivationFacts {
+        self.facts
+    }
+}
+
+/// Resolve the verified pack, exact candidate lane, output plan, reuse mode,
+/// and activation identity exactly once before owner acquisition.
+pub fn resolve_default_model_activation(
+    services: &NativeExecutionServices,
+    pack: &VerifiedPack,
+    intent: ExecutionIntent,
+    pull: String,
+    path: std::path::PathBuf,
+) -> Result<ResolvedDefaultModelActivation, String> {
+    if pack.preflight().runtime_source().path() != path {
+        return Err("default-model activation path does not match the verified source".to_string());
+    }
+    let architecture_id = architecture_id_from_pack(pack)?;
+    let descriptor = crate::arch::OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(architecture_id)
+        .ok_or_else(|| {
+            format!("candidate activation has no architecture descriptor for {architecture_id}")
+        })?;
+    let candidate = resolve_candidate_activation_lane(services, pack, intent)?;
+    let logits_consumers = super::device_greedy_token::decode_logits_consumers_for_request(
+        descriptor.identity.adapter_id,
+        false,
+        false,
+        false,
+    );
+    let resolved_runtime = super::device_greedy_token::resolved_runtime_for_family_candidate(
+        &candidate,
+        crate::arch::family_auto_gpu_policy_for_model_architecture(architecture_id),
+        descriptor.identity.adapter_id,
+        logits_consumers,
+    );
+    let pack_content_id = pack.content_id().to_string();
+    let plan =
+        DefaultModelActivationPlan::new(path.clone(), pack_content_id.clone(), resolved_runtime);
+    let lane = DefaultModelActivationLane::new(candidate.clone());
+    let identity = DefaultModelActivationIdentity::new(
+        pull,
+        path,
+        pack_content_id,
+        candidate.clone(),
+        plan.output_plan(),
+        plan.reuse_mode(),
+    );
+    Ok(ResolvedDefaultModelActivation {
+        candidate,
+        facts: ResolvedExecutionFacts::new(plan, lane, identity),
+    })
 }
 
 fn require_prepare_or_load_components(
@@ -1811,15 +1945,16 @@ fn reserve_activation_plan(
     plan: &NativeMemoryAdmissionPlan,
 ) -> Result<BrokerActivationReservation, String> {
     let mut requests = plan.reservation_requests().to_vec();
-    let cohort_id = current_memory_reservation_cohort_id();
+    let cohort_id = current_memory_reservation_cohort_id()
+        .unwrap_or_else(|| MemoryReservationCohortId::new(ExecutionCacheAttemptId::next().0));
     for request in &mut requests {
-        request.cohort_id = cohort_id;
+        request.cohort_id = Some(cohort_id);
     }
     let batch = services
         .memory_broker()
         .try_reserve_batch(requests)
         .map_err(|error| format!("candidate activation reserve: {error}"))?;
-    BrokerActivationReservation::from_batch(batch)
+    BrokerActivationReservation::from_batch(batch, cohort_id)
 }
 
 fn quote_and_reserve_declared_host_resident(

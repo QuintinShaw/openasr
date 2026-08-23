@@ -11,6 +11,7 @@
 use std::marker::PhantomData;
 
 use crate::device::execution_policy::ExecutionCandidate;
+use crate::ggml_runtime::{GgmlDecodeOutputPlan, GgmlDecodeReuseMode, ResolvedFamilyRuntimeInput};
 
 /// The externally visible lifecycle of one candidate activation attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1329,20 +1330,120 @@ pub type NativeCandidatePreparedActivation = CandidateActivationTransaction<
 pub struct DefaultModelActivationCandidate {
     pub pull: String,
     pub path: std::path::PathBuf,
+    pub pack_content_id: String,
 }
 
+/// Immutable semantic execution plan resolved from the verified pack and the
+/// exact policy candidate before any owner is materialized.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefaultModelActivationPlan {
-    pub path: std::path::PathBuf,
+    path: std::path::PathBuf,
+    pack_content_id: String,
+    resolved_runtime: ResolvedFamilyRuntimeInput,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct DefaultModelActivationLane;
+impl DefaultModelActivationPlan {
+    pub fn new(
+        path: std::path::PathBuf,
+        pack_content_id: String,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
+    ) -> Self {
+        Self {
+            path,
+            pack_content_id,
+            resolved_runtime,
+        }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub fn pack_content_id(&self) -> &str {
+        &self.pack_content_id
+    }
+
+    pub fn resolved_runtime(&self) -> ResolvedFamilyRuntimeInput {
+        self.resolved_runtime
+    }
+
+    pub fn output_plan(&self) -> GgmlDecodeOutputPlan {
+        self.resolved_runtime.output_plan()
+    }
+
+    pub fn reuse_mode(&self) -> GgmlDecodeReuseMode {
+        self.resolved_runtime.reuse_mode()
+    }
+}
+
+/// Exact physical execution candidate selected for this activation attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultModelActivationLane {
+    candidate: ExecutionCandidate,
+}
+
+impl DefaultModelActivationLane {
+    pub fn new(candidate: ExecutionCandidate) -> Self {
+        Self { candidate }
+    }
+
+    pub const fn candidate(&self) -> &ExecutionCandidate {
+        &self.candidate
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefaultModelActivationIdentity {
-    pub pull: String,
-    pub path: std::path::PathBuf,
+    pull: String,
+    path: std::path::PathBuf,
+    pack_content_id: String,
+    candidate: ExecutionCandidate,
+    output_plan: GgmlDecodeOutputPlan,
+    reuse_mode: GgmlDecodeReuseMode,
+}
+
+impl DefaultModelActivationIdentity {
+    pub fn new(
+        pull: String,
+        path: std::path::PathBuf,
+        pack_content_id: String,
+        candidate: ExecutionCandidate,
+        output_plan: GgmlDecodeOutputPlan,
+        reuse_mode: GgmlDecodeReuseMode,
+    ) -> Self {
+        Self {
+            pull,
+            path,
+            pack_content_id,
+            candidate,
+            output_plan,
+            reuse_mode,
+        }
+    }
+
+    pub fn pull(&self) -> &str {
+        &self.pull
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub fn pack_content_id(&self) -> &str {
+        &self.pack_content_id
+    }
+
+    pub const fn candidate(&self) -> &ExecutionCandidate {
+        &self.candidate
+    }
+
+    pub const fn output_plan(&self) -> GgmlDecodeOutputPlan {
+        self.output_plan
+    }
+
+    pub const fn reuse_mode(&self) -> GgmlDecodeReuseMode {
+        self.reuse_mode
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1496,6 +1597,12 @@ pub type DefaultModelPreparedActivation = CandidateActivationTransaction<
     DefaultModelActivationLane,
     DefaultModelActivationIdentity,
     DefaultModelActivationJournal,
+>;
+
+pub type DefaultModelActivationFacts = ResolvedExecutionFacts<
+    DefaultModelActivationPlan,
+    DefaultModelActivationLane,
+    DefaultModelActivationIdentity,
 >;
 
 fn format_cleanup<ReservationError, OwnerError, JournalError>(

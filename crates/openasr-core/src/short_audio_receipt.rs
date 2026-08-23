@@ -314,6 +314,12 @@ impl ShortAudioReceipt {
             .as_ref()
             .ok_or(ShortAudioReceiptError::DecodeDiagnosticsMissing)?;
         validate_decode_diagnostics(diagnostics)?;
+        if self.evidence.is_some() && diagnostics.capability_evidence_revision.is_none() {
+            return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                field: "decode_diagnostics.capability_evidence_revision",
+                actual: "missing from release-bound evidence".to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -847,6 +853,7 @@ pub fn decode_diagnostics_from_shipped_runtime(
     Ok(ShortAudioReceiptDecodeDiagnostics {
         output_plan: ShortAudioReceiptOutputPlan::from(resolved.output_plan()),
         reuse_mode: ShortAudioReceiptReuseMode::from(resolved.reuse_mode()),
+        capability_evidence_revision: Some(resolved.evidence_revision()),
         steps,
         first_divergence: None,
         encoder_decoder_splits: Vec::new(),
@@ -880,6 +887,12 @@ fn decode_step_from_native_token(
 fn validate_decode_diagnostics(
     diagnostics: &ShortAudioReceiptDecodeDiagnostics,
 ) -> Result<(), ShortAudioReceiptError> {
+    if diagnostics.capability_evidence_revision == Some(0) {
+        return Err(ShortAudioReceiptError::InvalidEvidenceField {
+            field: "decode_diagnostics.capability_evidence_revision",
+            actual: "0".to_string(),
+        });
+    }
     if diagnostics.steps.len() > SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS {
         return Err(ShortAudioReceiptError::DecodeStepsUnbounded {
             max: SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS,
@@ -1045,6 +1058,7 @@ mod tests {
         ShortAudioReceiptDecodeDiagnostics {
             output_plan: ShortAudioReceiptOutputPlan::FullLogits,
             reuse_mode: ShortAudioReceiptReuseMode::FreshGraph,
+            capability_evidence_revision: Some(1),
             steps: Vec::new(),
             first_divergence: None,
             encoder_decoder_splits: Vec::new(),

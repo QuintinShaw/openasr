@@ -526,6 +526,8 @@ pub struct NativeAsrSessionContext {
     pub session_id: RealtimeSessionId,
     pub trace_id: Option<String>,
     pub request_id: Option<String>,
+    native_execution_receipt: Option<crate::NativeExecutionReceiptCollector>,
+    activation_reservation_context: Option<crate::ActivationReservationContext>,
 }
 
 impl NativeAsrSessionContext {
@@ -534,6 +536,8 @@ impl NativeAsrSessionContext {
             session_id: RealtimeSessionId(session_id.into()),
             trace_id: None,
             request_id: None,
+            native_execution_receipt: None,
+            activation_reservation_context: None,
         }
     }
 
@@ -542,6 +546,8 @@ impl NativeAsrSessionContext {
             session_id,
             trace_id: None,
             request_id: None,
+            native_execution_receipt: None,
+            activation_reservation_context: None,
         }
     }
 
@@ -553,6 +559,36 @@ impl NativeAsrSessionContext {
     pub fn with_request_id(mut self, request_id: Option<String>) -> Self {
         self.request_id = request_id;
         self
+    }
+
+    /// Attach the explicit request-local receipt authority used by strict
+    /// warm-up and activation evidence. Ordinary sessions leave this absent.
+    pub fn with_native_execution_receipt(
+        mut self,
+        receipt: crate::NativeExecutionReceiptCollector,
+    ) -> Self {
+        self.native_execution_receipt = Some(receipt);
+        self
+    }
+
+    pub(crate) fn native_execution_receipt(
+        &self,
+    ) -> Option<crate::NativeExecutionReceiptCollector> {
+        self.native_execution_receipt.clone()
+    }
+
+    pub fn with_activation_reservation_context(
+        mut self,
+        context: crate::ActivationReservationContext,
+    ) -> Self {
+        self.activation_reservation_context = Some(context);
+        self
+    }
+
+    pub(crate) const fn activation_reservation_context(
+        &self,
+    ) -> Option<crate::ActivationReservationContext> {
+        self.activation_reservation_context
     }
 }
 

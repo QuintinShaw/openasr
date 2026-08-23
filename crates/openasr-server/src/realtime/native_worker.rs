@@ -1118,7 +1118,7 @@ pub(crate) fn spawn_boot_native_warmup(runtime: ServerRuntime) {
     // V2 or publish an unattested runtime as the live default; errors stay
     // local to this background task.
     tokio::spawn(async move {
-        let _ = probe_native_activation(runtime, None).await;
+        let _ = probe_native_activation(runtime, None, None, None).await;
     });
 }
 
@@ -1128,15 +1128,23 @@ pub(crate) fn spawn_boot_native_warmup(runtime: ServerRuntime) {
 pub(crate) async fn probe_native_activation(
     runtime: ServerRuntime,
     candidate_pack: Option<PathBuf>,
-) -> Result<(), ApiError> {
+    preferences_home: Option<PathBuf>,
+    reservation_context: Option<openasr_core::ActivationReservationContext>,
+) -> Result<Option<openasr_core::NativeExecutionReceiptSnapshot>, ApiError> {
     if let Some(failpoint) = runtime.model_pack_path.activation_probe_failpoint() {
-        return failpoint.map_err(ApiError::BadRequest);
+        return failpoint.map(|()| None).map_err(ApiError::BadRequest);
     }
-    warm_up_native_pack(runtime, candidate_pack)
-        .await
-        .map_err(|reason| {
-            ApiError::BadRequest(format!("default model activation probe failed: {reason}"))
-        })
+    warm_up_native_pack(
+        runtime,
+        candidate_pack,
+        preferences_home,
+        reservation_context,
+    )
+    .await
+    .map(Some)
+    .map_err(|reason| {
+        ApiError::BadRequest(format!("default model activation probe failed: {reason}"))
+    })
 }
 
 /// Sync entry for the typestate attestation contract. Injection failpoints
@@ -1146,8 +1154,15 @@ pub(crate) async fn probe_native_activation(
 pub(crate) fn probe_native_activation_blocking(
     runtime: ServerRuntime,
     candidate_pack: Option<PathBuf>,
-) -> Result<(), ApiError> {
-    let future = probe_native_activation(runtime, candidate_pack);
+    preferences_home: Option<PathBuf>,
+    reservation_context: Option<openasr_core::ActivationReservationContext>,
+) -> Result<Option<openasr_core::NativeExecutionReceiptSnapshot>, ApiError> {
+    let future = probe_native_activation(
+        runtime,
+        candidate_pack,
+        preferences_home,
+        reservation_context,
+    );
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread => {
             futures_util::FutureExt::now_or_never(future).ok_or_else(|| {
@@ -1166,24 +1181,30 @@ pub(crate) fn probe_native_activation_blocking(
     }
 }
 
+#[cfg(test)]
 pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(
     runtime: ServerRuntime,
 ) -> Result<(), String> {
-    warm_up_native_pack(runtime, None).await
+    warm_up_native_pack(runtime, None, None, None)
+        .await
+        .map(|_| ())
 }
 
 async fn warm_up_native_pack(
     runtime: ServerRuntime,
     candidate_pack: Option<PathBuf>,
-) -> Result<(), String> {
+    preferences_home: Option<PathBuf>,
+    reservation_context: Option<openasr_core::ActivationReservationContext>,
+) -> Result<openasr_core::NativeExecutionReceiptSnapshot, String> {
+    let receipt = openasr_core::NativeExecutionReceiptCollector::new();
     if runtime.backend != openasr_core::BackendKind::Native {
-        return Ok(());
+        return Ok(receipt.snapshot());
     }
     let Some(model_pack_path) = candidate_pack.or_else(|| runtime.model_pack_path.current()) else {
         // Fresh install / no model installed yet: nothing to warm. The daemon
         // still serves `/health`; a later default-model rebind binds a pack
         // in-process without restart, and the next request path loads it.
-        return Ok(());
+        return Ok(receipt.snapshot());
     };
     // Opportunistic for boot: a live user session already owns the slot and
     // will Warm itself. Set-default treats this as probe failure so it cannot
@@ -1196,7 +1217,7 @@ async fn warm_up_native_pack(
     let Some(_lease) = try_begin_native_warmup() else {
         return Err("native warmup already in flight".to_string());
     };
-    let preferences_home = openasr_core::openasr_home().ok();
+    let preferences_home = preferences_home.or_else(|| openasr_core::openasr_home().ok());
     let inference_threads = preferences_home
         .as_deref()
         .and_then(realtime_inference_threads_preference);
@@ -1221,7 +1242,14 @@ async fn warm_up_native_pack(
             model_pack_path.display()
         )
     })?;
-    let context = NativeAsrSessionContext::new("boot-warmup");
+    let context =
+        NativeAsrSessionContext::new("boot-warmup").with_native_execution_receipt(receipt.clone());
+    let context = match reservation_context {
+        Some(reservation_context) => {
+            context.with_activation_reservation_context(reservation_context)
+        }
+        None => context,
+    };
     // Same saved-preferences fallback a real WS attach applies when a session
     // does not set an explicit `execution_target`/`inference_threads`
     // override (`realtime_execution_target_preference` /
@@ -1280,7 +1308,7 @@ async fn warm_up_native_pack(
         );
         return Err(error);
     }
-    Ok(())
+    Ok(receipt.snapshot())
 }
 
 pub(crate) fn single_line_log_value(value: &str) -> String {

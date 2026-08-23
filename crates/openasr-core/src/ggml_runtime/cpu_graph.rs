@@ -12,7 +12,7 @@ use std::{
     ptr::{self, NonNull},
     rc::{Rc, Weak},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -388,7 +388,7 @@ pub enum GgmlDecodeReuseMode {
     ReusableGraph,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum GgmlLaneEvidence {
     Unknown,
     Validated,
@@ -403,7 +403,7 @@ impl GgmlLaneEvidence {
 /// Internal evidence for a native compact token result. Generic first/last
 /// maximum semantics are deliberately not capabilities: they cannot authorize
 /// the native result contract without the selected device's complete proof.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct GgmlLaneCompactSelectorEvidence {
     first_max: GgmlLaneEvidence,
     last_max: GgmlLaneEvidence,
@@ -427,7 +427,7 @@ impl GgmlLaneCompactSelectorEvidence {
 /// The five persistent-graph dimensions remain planner-internal evidence. A
 /// lane cannot expose reusable execution to a family until every dimension is
 /// validated for that lane and graph contract.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct GgmlLaneReuseEvidence {
     persistent_input_refresh: GgmlLaneEvidence,
     persistent_output_refresh: GgmlLaneEvidence,
@@ -458,7 +458,7 @@ impl GgmlLaneReuseEvidence {
 
 /// Backend-neutral lane evidence. The six dimensions are deliberately kept
 /// behind the shared planner rather than becoming family-composed capabilities.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct GgmlLaneDecodeEvidence {
     compact_selector: GgmlLaneCompactSelectorEvidence,
     reuse: GgmlLaneReuseEvidence,
@@ -528,10 +528,40 @@ impl GgmlLaneDecodeEvidence {
     }
 }
 
-fn lane_decode_evidence_for_backend(backend: GgmlCpuGraphBackend) -> GgmlLaneDecodeEvidence {
-    let capabilities = GgmlBackendCapabilities::resolve(backend, "")
-        .with_native_argmax_first_op(native_argmax_first_op_supported(backend));
+const GGML_DECODE_LANE_EVIDENCE_REVISION: u64 = 1;
+
+fn lane_decode_evidence_for_preference(
+    preference: Option<&RequestBackendPreference>,
+    backend: GgmlCpuGraphBackend,
+) -> GgmlLaneDecodeEvidence {
+    let Some(device) = selected_backend_device(preference, backend) else {
+        return GgmlLaneDecodeEvidence::unknown();
+    };
+    let capabilities = GgmlBackendCapabilities::resolve(backend, &device.name)
+        .with_native_argmax_first_op(device.supports_argmax_first());
     lane_decode_evidence_for_backend_capabilities(backend, capabilities)
+}
+
+fn selected_backend_device(
+    preference: Option<&RequestBackendPreference>,
+    backend: GgmlCpuGraphBackend,
+) -> Option<super::GgmlBackendDevice> {
+    let devices = ggml_available_devices();
+    match preference {
+        Some(RequestBackendPreference::Exact(route)) => devices.into_iter().find(|device| {
+            device.name == route.stable_id
+                && ExecutionProvider::from_backend_name(&device.name) == route.provider
+                && graph_backend_matches_device(backend, device)
+        }),
+        Some(RequestBackendPreference::CpuOnly) | None if backend == GgmlCpuGraphBackend::Cpu => {
+            devices
+                .into_iter()
+                .find(|device| graph_backend_matches_device(backend, device))
+        }
+        Some(RequestBackendPreference::Accelerated)
+        | Some(RequestBackendPreference::CpuOnly)
+        | None => None,
+    }
 }
 
 fn lane_decode_evidence_for_backend_capabilities(
@@ -556,24 +586,6 @@ const fn native_first_max_compact_is_proven(backend: GgmlCpuGraphBackend) -> boo
     matches!(backend, GgmlCpuGraphBackend::Cpu)
 }
 
-fn native_argmax_first_op_supported(backend: GgmlCpuGraphBackend) -> bool {
-    static CPU: OnceLock<bool> = OnceLock::new();
-    static METAL: OnceLock<bool> = OnceLock::new();
-    static GPU: OnceLock<bool> = OnceLock::new();
-    let cell = match backend {
-        GgmlCpuGraphBackend::Cpu => &CPU,
-        GgmlCpuGraphBackend::Metal => &METAL,
-        GgmlCpuGraphBackend::Gpu => &GPU,
-    };
-    *cell.get_or_init(|| probe_native_argmax_first_op(backend))
-}
-
-fn probe_native_argmax_first_op(backend: GgmlCpuGraphBackend) -> bool {
-    ggml_available_devices().iter().any(|device| {
-        graph_backend_matches_device(backend, device) && device.supports_argmax_first()
-    })
-}
-
 fn graph_backend_matches_device(
     backend: GgmlCpuGraphBackend,
     device: &super::GgmlBackendDevice,
@@ -589,6 +601,17 @@ fn graph_backend_matches_device(
                 && !matches!(provider, ExecutionProvider::Metal | ExecutionProvider::Cpu)
         }
     }
+}
+
+fn native_argmax_first_op_supported_for_name(
+    backend: GgmlCpuGraphBackend,
+    backend_name: &str,
+) -> bool {
+    ggml_available_devices().into_iter().any(|device| {
+        device.name == backend_name
+            && graph_backend_matches_device(backend, &device)
+            && device.supports_argmax_first()
+    })
 }
 
 fn native_argmax_first_op_supported_by_guard(backend: &GgmlBackendGuard) -> bool {
@@ -1035,7 +1058,7 @@ impl GgmlCpuGraphConfig {
     ) -> Result<GgmlBackendCapabilities, GgmlCpuGraphError> {
         let name = Self::resolve_backend_name_for(backend)?;
         Ok(GgmlBackendCapabilities::resolve(backend, &name)
-            .with_native_argmax_first_op(native_argmax_first_op_supported(backend)))
+            .with_native_argmax_first_op(native_argmax_first_op_supported_for_name(backend, &name)))
     }
 }
 
@@ -1072,6 +1095,8 @@ pub struct ResolvedFamilyRuntimeInput {
     backend: GgmlCpuGraphBackend,
     native_gqa: GgmlNativeGqaCapability,
     output_contract: GgmlDecodeOutputContract,
+    decode_evidence: GgmlLaneDecodeEvidence,
+    evidence_revision: u64,
     output_plan: GgmlDecodeOutputPlan,
     reuse_mode: GgmlDecodeReuseMode,
 }
@@ -1132,11 +1157,13 @@ impl ResolvedFamilyRuntimeInput {
         // suppression, debug logits, and host-visible adapter consumers
         // independently force the complete-output plan without changing
         // placement.
-        let evidence = lane_decode_evidence_for_backend(backend);
+        let evidence = lane_decode_evidence_for_preference(preference.as_ref(), backend);
         Self {
             backend,
             native_gqa: resolve_native_gqa_capability(preference.as_ref(), backend),
             output_contract,
+            decode_evidence: evidence,
+            evidence_revision: GGML_DECODE_LANE_EVIDENCE_REVISION,
             output_plan: plan_decode_output(output_contract, evidence, logits_consumers),
             reuse_mode: if evidence.reuse.is_validated() {
                 GgmlDecodeReuseMode::ReusableGraph
@@ -1160,9 +1187,12 @@ impl ResolvedFamilyRuntimeInput {
     /// Re-combine the already-resolved lane with extra request logits
     /// consumers. Placement and reuse evidence are unchanged.
     pub fn with_logits_consumers(self, logits_consumers: GgmlDecodeLogitsConsumers) -> Self {
-        let evidence = lane_decode_evidence_for_backend(self.backend);
         Self {
-            output_plan: plan_decode_output(self.output_contract, evidence, logits_consumers),
+            output_plan: plan_decode_output(
+                self.output_contract,
+                self.decode_evidence,
+                logits_consumers,
+            ),
             ..self
         }
     }
@@ -1200,6 +1230,13 @@ impl ResolvedFamilyRuntimeInput {
     /// Reuse mode is resolved independently from compact-output selection.
     pub fn reuse_mode(self) -> GgmlDecodeReuseMode {
         self.reuse_mode
+    }
+
+    /// Version of the planner-internal lane evidence used to freeze this
+    /// output/reuse decision. Receipts bind to the revision, never to parsed
+    /// diagnostic text.
+    pub const fn evidence_revision(self) -> u64 {
+        self.evidence_revision
     }
 }
 
@@ -12501,7 +12538,7 @@ mod tests {
     fn shipped_planner_cpu_supports_op_selects_native_first_max() {
         use super::{
             GgmlDecodeOutputContract, GgmlDecodeOutputPlan, RequestBackendPreference,
-            ResolvedFamilyRuntimeInput, native_argmax_first_op_supported,
+            ResolvedFamilyRuntimeInput, native_argmax_first_op_supported_for_name,
             native_first_max_compact_is_proven,
         };
         use crate::ggml_runtime::{GgmlBackendKind, ggml_available_devices};
@@ -12514,7 +12551,10 @@ mod tests {
             cpu_device.supports_argmax_first(),
             "CPU must declare GGML_OP_ARGMAX_FIRST"
         );
-        assert!(native_argmax_first_op_supported(GgmlCpuGraphBackend::Cpu));
+        assert!(native_argmax_first_op_supported_for_name(
+            GgmlCpuGraphBackend::Cpu,
+            &cpu_device.name,
+        ));
         assert!(native_first_max_compact_is_proven(GgmlCpuGraphBackend::Cpu));
 
         let cpu = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
@@ -12530,8 +12570,7 @@ mod tests {
     fn shipped_planner_metal_stays_full_logits_without_argmax_first() {
         use super::{
             GgmlDecodeOutputContract, GgmlDecodeOutputPlan, RequestBackendPreference,
-            ResolvedFamilyRuntimeInput, native_argmax_first_op_supported,
-            native_first_max_compact_is_proven,
+            ResolvedFamilyRuntimeInput, native_first_max_compact_is_proven,
         };
         use crate::device::execution_route::{
             DeviceAddressability, ExecutionProvider, ResolvedExecutionRoute, RouteDeviceKind,
@@ -12546,9 +12585,6 @@ mod tests {
                 );
             }
         }
-        assert!(!native_argmax_first_op_supported(
-            GgmlCpuGraphBackend::Metal
-        ));
         assert!(!native_first_max_compact_is_proven(
             GgmlCpuGraphBackend::Metal
         ));
@@ -12611,8 +12647,7 @@ mod tests {
         use super::{
             GgmlDecodeLogitsConsumers, GgmlDecodeOutputContract, GgmlDecodeOutputPlan,
             GgmlDecodeReuseMode, RequestBackendPreference, ResolvedFamilyRuntimeInput,
-            backend_satisfies_execution_placement, lane_decode_evidence_for_backend,
-            plan_decode_output,
+            backend_satisfies_execution_placement, plan_decode_output,
         };
         use crate::device::execution_policy::ExecutionPlacement;
         use crate::device::execution_route::{
@@ -12652,15 +12687,11 @@ mod tests {
             ));
             assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
             assert_eq!(resolved.reuse_mode(), GgmlDecodeReuseMode::FreshGraph);
-            assert!(
-                !lane_decode_evidence_for_backend(resolved.backend())
-                    .reuse
-                    .is_validated()
-            );
+            assert!(!resolved.decode_evidence.reuse.is_validated());
             assert_eq!(
                 plan_decode_output(
                     GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
-                    lane_decode_evidence_for_backend(resolved.backend()),
+                    resolved.decode_evidence,
                     GgmlDecodeLogitsConsumers::none().with_phrase_bias(true),
                 ),
                 GgmlDecodeOutputPlan::FullLogits,

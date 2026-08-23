@@ -14,6 +14,7 @@ use crate::routes::transcription::{
     resolve_execution_route_for_target, validate_native_runtime_pack,
 };
 use crate::{NativeExecutionSupervisor, PairingCredentialState};
+use std::path::PathBuf;
 
 fn test_distribution() -> DistributionContext {
     let temp = tempfile::tempdir().unwrap();
@@ -7209,7 +7210,9 @@ async fn firered_llm_owner_attribution_host_local_phase0() {
     ));
     assert!(baseline.completeness.complete);
 
-    warm_up_default_native_streaming_worker(runtime.clone()).await;
+    warm_up_default_native_streaming_worker(runtime.clone())
+        .await
+        .expect("startup warm-up must complete");
     let after_startup_warmup = services.runtime_receipts().snapshot();
     assert!(after_startup_warmup.completeness.complete);
     let startup_lanes = receipt_lanes(&after_startup_warmup);

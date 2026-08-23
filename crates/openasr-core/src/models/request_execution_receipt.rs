@@ -8,6 +8,7 @@ use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
 };
+use thiserror::Error;
 
 use crate::{
     device::{execution_policy::ExecutionPlacement, execution_route::ExecutionProvider},
@@ -73,6 +74,63 @@ pub struct NativeExecutionReceiptSnapshot {
     pub trace: NativeExecutionTraceSnapshot,
     pub token_steps: Vec<NativeExecutionTokenStep>,
     pub completed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum NativeExecutionAttestationError {
+    #[error("candidate attempt did not complete")]
+    Incomplete,
+    #[error("candidate attempt produced no immutable request facts")]
+    MissingFacts,
+    #[error("candidate attempt used a different pack content identity")]
+    PackContentMismatch,
+    #[error("candidate attempt used a different output or reuse plan")]
+    RuntimePlanMismatch,
+    #[error("candidate attempt selected a different execution lane")]
+    LaneMismatch,
+    #[error("candidate attempt lacks matching live backend attestation")]
+    LiveBackendMismatch,
+}
+
+impl NativeExecutionReceiptSnapshot {
+    /// Attest that the completed request used the exact immutable activation
+    /// plan and physical lane selected before owner acquisition.
+    pub fn attest_activation(
+        &self,
+        expected_pack_content_id: &str,
+        expected_runtime: ResolvedFamilyRuntimeInput,
+        expected_provider: ExecutionProvider,
+        expected_stable_device_id: &str,
+        expected_placement: ExecutionPlacement,
+    ) -> Result<(), NativeExecutionAttestationError> {
+        if !self.completed {
+            return Err(NativeExecutionAttestationError::Incomplete);
+        }
+        let facts = self
+            .facts
+            .as_ref()
+            .ok_or(NativeExecutionAttestationError::MissingFacts)?;
+        if facts.pack_content_id != expected_pack_content_id {
+            return Err(NativeExecutionAttestationError::PackContentMismatch);
+        }
+        if facts.resolved_runtime != expected_runtime {
+            return Err(NativeExecutionAttestationError::RuntimePlanMismatch);
+        }
+        if facts.selected_provider != expected_provider
+            || facts.stable_device_id != expected_stable_device_id
+            || facts.placement != expected_placement
+            || facts.backend != expected_runtime.backend()
+        {
+            return Err(NativeExecutionAttestationError::LaneMismatch);
+        }
+        if facts.actual_provider != Some(expected_provider)
+            || facts.actual_stable_device_id.as_deref() != Some(expected_stable_device_id)
+            || facts.scheduler_enabled.is_none()
+        {
+            return Err(NativeExecutionAttestationError::LiveBackendMismatch);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -314,6 +372,81 @@ impl NativeExecutionReceiptCollector {
     }
 }
 
+impl PartialEq for NativeExecutionReceiptCollector {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+}
+
+impl Eq for NativeExecutionReceiptCollector {}
+
+/// Record the immutable family, pack, lane, and output-plan facts selected by
+/// the successful candidate attempt. Offline, streaming, warm-up, and model
+/// activation all call this one interface; a path that has no explicit
+/// collector remains uninstrumented rather than reconstructing facts later.
+pub(crate) fn record_request_execution_facts(
+    receipt: Option<&NativeExecutionReceiptCollector>,
+    verified_pack: &crate::models::pack_verifier::VerifiedPack,
+    selected_family: &crate::GgmlFamilyAdapterDescriptor,
+    resolved_runtime: ResolvedFamilyRuntimeInput,
+    execution_lane: &ExecutionLaneKey,
+) -> Result<(), String> {
+    let Some(receipt) = receipt else {
+        return Ok(());
+    };
+    let descriptor = crate::arch::OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(selected_family.model_architecture)
+        .ok_or_else(|| {
+            "selected native family is absent from the architecture inventory".to_string()
+        })?;
+    let decode_driver = match descriptor.topology_contract.decode_driver {
+        crate::arch::OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy { .. } => {
+            "shared-seq2seq-greedy"
+        }
+        crate::arch::OpenAsrDecodeDriverStrategy::SharedCtcGreedy { .. } => "shared-ctc-greedy",
+        crate::arch::OpenAsrDecodeDriverStrategy::Dedicated { .. } => "dedicated",
+    };
+    let decoder_state = match descriptor.topology_contract.decoder_state_topology {
+        crate::arch::OpenAsrDecoderStateTopology::None => "none",
+        crate::arch::OpenAsrDecoderStateTopology::CausalSelfAttentionKv => {
+            "causal-self-attention-kv"
+        }
+        crate::arch::OpenAsrDecoderStateTopology::EncoderDecoderSelfAndCrossAttentionKv => {
+            "encoder-decoder-self-and-cross-attention-kv"
+        }
+        crate::arch::OpenAsrDecoderStateTopology::FamilyDefinedTokenScaledPersistent => {
+            "family-defined-token-scaled-persistent"
+        }
+    };
+    let block_stack = match descriptor.topology_contract.block_stack {
+        crate::arch::OpenAsrBlockStackStrategy::Shared(_) => "shared",
+        crate::arch::OpenAsrBlockStackStrategy::ArchitectureGraph { .. } => "architecture-graph",
+    };
+    receipt.record_facts(NativeExecutionRequestFacts {
+        resolved_runtime,
+        execution_lane: execution_lane.clone(),
+        selected_provider: execution_lane.provider(),
+        stable_device_id: execution_lane.stable_device_id().to_string(),
+        placement: execution_lane.placement(),
+        backend: execution_lane.backend(),
+        topology: NativeExecutionTopologyFacts {
+            family: selected_family.model_family.to_string(),
+            model_architecture: selected_family.model_architecture.to_string(),
+            adapter_id: selected_family.adapter_id.to_string(),
+            decode_policy_id: selected_family.decode_policy_id.to_string(),
+            decode_driver: decode_driver.to_string(),
+            decoder_state: decoder_state.to_string(),
+            block_stack: block_stack.to_string(),
+        },
+        pack_content_id: verified_pack.content_id().to_string(),
+        pack_size_bytes: verified_pack.preflight().runtime_source().byte_len(),
+        actual_provider: None,
+        actual_stable_device_id: None,
+        scheduler_enabled: None,
+    });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +564,53 @@ mod tests {
             actual_stable_device_id: None,
             scheduler_enabled: None,
         }
+    }
+
+    #[test]
+    fn activation_attestation_requires_exact_plan_lane_and_live_backend() {
+        let receipt = NativeExecutionReceiptCollector::new();
+        let facts = seq2seq_facts();
+        let expected_runtime = facts.resolved_runtime;
+        receipt.begin_candidate_attempt();
+        receipt.record_facts(facts);
+        receipt.record_backend_observation(ExecutionProvider::Cpu, "CPU", false);
+        receipt.finish_candidate_attempt(true);
+        let snapshot = receipt.snapshot();
+
+        snapshot
+            .attest_activation(
+                "test-pack",
+                expected_runtime,
+                ExecutionProvider::Cpu,
+                "CPU",
+                ExecutionPlacement::CpuOnly,
+            )
+            .expect("matching activation receipt must attest");
+        assert_eq!(
+            snapshot.attest_activation(
+                "test-pack",
+                expected_runtime,
+                ExecutionProvider::Cpu,
+                "CPU-other",
+                ExecutionPlacement::CpuOnly,
+            ),
+            Err(NativeExecutionAttestationError::LaneMismatch)
+        );
+
+        let missing_live = NativeExecutionReceiptCollector::new();
+        missing_live.begin_candidate_attempt();
+        missing_live.record_facts(seq2seq_facts());
+        missing_live.finish_candidate_attempt(true);
+        assert_eq!(
+            missing_live.snapshot().attest_activation(
+                "test-pack",
+                expected_runtime,
+                ExecutionProvider::Cpu,
+                "CPU",
+                ExecutionPlacement::CpuOnly,
+            ),
+            Err(NativeExecutionAttestationError::LiveBackendMismatch)
+        );
     }
 
     #[test]

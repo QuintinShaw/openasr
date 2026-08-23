@@ -499,6 +499,9 @@ fn write_mock_gguf_runtime_source(path: &std::path::Path, metadata_model_id: Opt
         Some(model_id) if model_id.starts_with("moonshine") => {
             TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready(model_id)
         }
+        Some(model_id) if model_id.starts_with("cohere") => {
+            TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready(model_id)
+        }
         Some(model_id) if model_id.starts_with("qwen") => {
             TinyGgufFixtureSpec::qwen3_asr_oasr_v1_runtime_ready(model_id)
         }
@@ -1353,11 +1356,18 @@ async fn delete_model_allows_current_default_and_clears_default_selection() {
         Some("moonshine-tiny:q8")
     );
     assert!(list_installed_packs(temp.path()).unwrap().is_empty());
-    let default = default_model_response(temp.path(), distribution.catalog_source()).unwrap();
+    let active = runtime.model_pack_path.current();
+    let default = default_model_response(
+        temp.path(),
+        distribution.catalog_source(),
+        active.as_deref(),
+    )
+    .unwrap();
     assert!(default.default_model.is_none());
     assert!(default.default_pull.is_none());
     assert!(default.pack.is_none());
     assert_eq!(default.default_model_status, "unset");
+    assert_eq!(default.activation, DefaultModelActivationState::Unavailable);
     assert!(runtime.model_pack_path.current().is_none());
     let cleared =
         openasr_core::default_selection::read_active_model_selection_v2(temp.path()).unwrap();
@@ -1375,29 +1385,41 @@ async fn default_model_response_reports_installed_not_installed_and_unset() {
     let temp = tempfile::tempdir().unwrap();
     let distribution = distribution_context_for_test(temp.path());
 
-    let unset = default_model_response(temp.path(), distribution.catalog_source()).unwrap();
+    let unset = default_model_response(temp.path(), distribution.catalog_source(), None).unwrap();
     assert_eq!(unset.default_model_status, "unset");
     assert!(unset.pack.is_none());
+    assert_eq!(unset.activation, DefaultModelActivationState::Unavailable);
 
     let mut document = openasr_core::load_config_document(temp.path()).unwrap();
     document.config.default_model = Some("whisper-small".to_string());
     openasr_core::save_config_document(temp.path(), &document).unwrap();
-    let not_installed = default_model_response(temp.path(), distribution.catalog_source()).unwrap();
+    let not_installed =
+        default_model_response(temp.path(), distribution.catalog_source(), None).unwrap();
     assert_eq!(not_installed.default_model_status, "not_installed");
     assert_eq!(
         not_installed.default_model.as_deref(),
         Some("whisper-small")
     );
     assert!(not_installed.pack.is_none());
+    assert_eq!(
+        not_installed.activation,
+        DefaultModelActivationState::Unavailable
+    );
 
     let pack = write_valid_installed_pack_for_test(temp.path(), "whisper-small", "q8_0", "q8");
     persist_default_pack(temp.path(), &pack, QuantPreference::pinned(&pack.quant)).unwrap();
-    let installed = default_model_response(temp.path(), distribution.catalog_source()).unwrap();
+    let installed = default_model_response(
+        temp.path(),
+        distribution.catalog_source(),
+        Some(pack.path.as_path()),
+    )
+    .unwrap();
     assert_eq!(installed.default_model_status, "installed");
     assert_eq!(
         installed.pack.as_ref().map(|pack| pack.pull.as_str()),
         Some("whisper-small:q8")
     );
+    assert_eq!(installed.activation, DefaultModelActivationState::Committed);
 }
 
 #[test]
@@ -2056,6 +2078,81 @@ async fn set_default_model_http_persists_only_after_activation_probe_succeeds() 
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_default_model_http_real_probe_attests_plan_lane_and_live_backend() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut config = openasr_core::load_config_document(&home).unwrap();
+    config.preferences.execution_target = openasr_core::ExecutionTarget::Cpu;
+    openasr_core::save_config_document(&home, &config).unwrap();
+    let previous_path = write_installed_pack_ref(
+        &home,
+        "cohere-transcribe-a",
+        "cohere-transcribe-a:q4",
+        "q4_0",
+        "q4",
+        "cohere-transcribe-a",
+    );
+    let next_path = write_installed_pack_ref(
+        &home,
+        "cohere-transcribe-b",
+        "cohere-transcribe-b:q4",
+        "q4_0",
+        "q4",
+        "cohere-transcribe-b",
+    );
+    let previous = installed_pack_by_pull(&home, "cohere-transcribe-a:q4");
+    persist_default_pack(&home, &previous, QuantPreference::pinned(&previous.quant)).unwrap();
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(previous_path).into(),
+    };
+    let app = app_with_runtime_and_distribution(
+        runtime.clone(),
+        DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/default")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "pull": "cohere-transcribe-b:q4" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(parsed["activation"], "committed");
+    assert_eq!(parsed["default_pull"], "cohere-transcribe-b:q4");
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(next_path.as_path())
+    );
+}
+
 #[test]
 fn set_default_model_http_stage_does_not_publish_live() {
     let source = include_str!("routes/models_api.rs");
@@ -2096,7 +2193,7 @@ fn set_default_model_http_stage_does_not_publish_live() {
     );
     assert!(
         set_default.contains("PackVerifier")
-            && set_default.contains("resolve_candidate_activation_lane"),
+            && set_default.contains("resolve_default_model_activation"),
         "set_default_model must quote the pack being activated on its real lane: {set_default}"
     );
     let persist_idx = set_default

@@ -127,6 +127,11 @@ const BACKEND_STORE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_BACKEND_GC_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "ts-export"), derive(ts_rs::TS))]
+#[cfg_attr(
+    any(test, feature = "ts-export"),
+    ts(export_to = "generated/http-wire/")
+)]
 pub struct InstalledPack {
     pub model_id: String,
     pub display_name: String,

@@ -36,9 +36,6 @@ use crate::models::decode_policy_component_registry::{
 };
 use crate::models::ggml_family_adapter::GgmlFamilyAdapterSelectionError;
 use crate::models::graph_runtime_config::install_request_inference_threads_override;
-use crate::models::request_execution_receipt::{
-    NativeExecutionRequestFacts, NativeExecutionTopologyFacts,
-};
 #[cfg(test)]
 use crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index_from_source;
 use crate::models::runtime_selection_metadata::selection_metadata_from_gguf;
@@ -400,7 +397,9 @@ fn run_dispatch_once_with_progress_and_policy(
                     chunk.clone(),
                     request_options.clone(),
                     backend_preference,
-                    request_backend_preference_for_candidate(candidate),
+                    crate::models::device_greedy_token::request_backend_preference_for_candidate(
+                        candidate,
+                    ),
                     auto_gpu_policy,
                     execution_context,
                     decode_progress,
@@ -2417,12 +2416,13 @@ fn run_native_transcription_impl(
         .candidates()
         .first()
         .expect("execution policy plans are non-empty");
-    let resolved_runtime_for_request = resolved_runtime_for_family_candidate(
-        primary_candidate,
-        auto_gpu_policy,
-        &selected_family,
-        decode_logits_consumers_for_options(selected_family.adapter_id, &request_options),
-    );
+    let resolved_runtime_for_request =
+        crate::models::device_greedy_token::resolved_runtime_for_family_candidate(
+            primary_candidate,
+            auto_gpu_policy,
+            selected_family.adapter_id,
+            decode_logits_consumers_for_options(selected_family.adapter_id, &request_options),
+        );
     // Actual device class after candidate selection: Auto may land on Metal/GPU
     // even though the intent-only provisional plan used AutoOrCpu weights.
     let resolved_backend_class =
@@ -4111,76 +4111,21 @@ fn is_cooperative_cancel_reason(reason: &str) -> bool {
         || reason.contains("aborted by cancel request")
 }
 
-/// Builds the request's resolved runtime from the exact candidate route passed
-/// by the policy loop. Recomputing it per attempt is required because a retry
-/// can change both provider and placement.
-fn receipt_topology_for_family(
-    selected_family: &GgmlFamilyAdapterDescriptor,
-) -> Result<NativeExecutionTopologyFacts, BackendError> {
-    let descriptor = OpenAsrArchitectureRegistry::with_builtins()
-        .find_by_model_architecture(selected_family.model_architecture)
-        .ok_or_else(|| BackendError::NativeFailClosed {
-            reason: "selected native family is absent from the architecture inventory".to_string(),
-        })?;
-    let decode_driver = match descriptor.topology_contract.decode_driver {
-        crate::arch::OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy { .. } => {
-            "shared-seq2seq-greedy"
-        }
-        crate::arch::OpenAsrDecodeDriverStrategy::SharedCtcGreedy { .. } => "shared-ctc-greedy",
-        crate::arch::OpenAsrDecodeDriverStrategy::Dedicated { .. } => "dedicated",
-    };
-    let decoder_state = match descriptor.topology_contract.decoder_state_topology {
-        crate::arch::OpenAsrDecoderStateTopology::None => "none",
-        crate::arch::OpenAsrDecoderStateTopology::CausalSelfAttentionKv => {
-            "causal-self-attention-kv"
-        }
-        crate::arch::OpenAsrDecoderStateTopology::EncoderDecoderSelfAndCrossAttentionKv => {
-            "encoder-decoder-self-and-cross-attention-kv"
-        }
-        crate::arch::OpenAsrDecoderStateTopology::FamilyDefinedTokenScaledPersistent => {
-            "family-defined-token-scaled-persistent"
-        }
-    };
-    let block_stack = match descriptor.topology_contract.block_stack {
-        crate::arch::OpenAsrBlockStackStrategy::Shared(_) => "shared",
-        crate::arch::OpenAsrBlockStackStrategy::ArchitectureGraph { .. } => "architecture-graph",
-    };
-    Ok(NativeExecutionTopologyFacts {
-        family: selected_family.model_family.to_string(),
-        model_architecture: selected_family.model_architecture.to_string(),
-        adapter_id: selected_family.adapter_id.to_string(),
-        decode_policy_id: selected_family.decode_policy_id.to_string(),
-        decode_driver: decode_driver.to_string(),
-        decoder_state: decoder_state.to_string(),
-        block_stack: block_stack.to_string(),
-    })
-}
-
 fn capture_request_execution_facts(
     verified_pack: &VerifiedPack,
     selected_family: &GgmlFamilyAdapterDescriptor,
     resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput,
     execution_lane: crate::models::native_execution_services::ExecutionLaneKey,
 ) -> Result<crate::models::native_execution_services::ExecutionLaneKey, BackendError> {
-    let Some(receipt) =
-        crate::models::native_execution_services::current_execution_receipt_collector()
-    else {
-        return Ok(execution_lane);
-    };
-    receipt.record_facts(NativeExecutionRequestFacts {
+    let receipt = crate::models::native_execution_services::current_execution_receipt_collector();
+    crate::models::request_execution_receipt::record_request_execution_facts(
+        receipt.as_ref(),
+        verified_pack,
+        selected_family,
         resolved_runtime,
-        selected_provider: execution_lane.provider(),
-        stable_device_id: execution_lane.stable_device_id().to_string(),
-        placement: execution_lane.placement(),
-        backend: execution_lane.backend(),
-        execution_lane: execution_lane.clone(),
-        topology: receipt_topology_for_family(selected_family)?,
-        pack_content_id: verified_pack.content_id().to_string(),
-        pack_size_bytes: verified_pack.preflight().runtime_source().byte_len(),
-        actual_provider: None,
-        actual_stable_device_id: None,
-        scheduler_enabled: None,
-    });
+        &execution_lane,
+    )
+    .map_err(|reason| BackendError::NativeFailClosed { reason })?;
     Ok(execution_lane)
 }
 
@@ -4417,39 +4362,14 @@ fn resolved_runtime_for_family_preference(
     )
 }
 
-fn resolved_runtime_for_family_candidate(
-    candidate: &ExecutionCandidate,
-    auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
-    selected_family: &GgmlFamilyAdapterDescriptor,
-    logits_consumers: crate::ggml_runtime::GgmlDecodeLogitsConsumers,
-) -> crate::ggml_runtime::ResolvedFamilyRuntimeInput {
-    resolved_runtime_for_family_preference(
-        request_backend_preference_for_candidate(candidate),
-        auto_gpu_policy,
-        selected_family,
-        logits_consumers,
-    )
-}
-
 fn resolved_runtime_for_candidate(
     candidate: &ExecutionCandidate,
     auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
 ) -> crate::ggml_runtime::ResolvedFamilyRuntimeInput {
     crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
-        request_backend_preference_for_candidate(candidate),
+        crate::models::device_greedy_token::request_backend_preference_for_candidate(candidate),
         auto_gpu_policy,
     )
-}
-
-fn request_backend_preference_for_candidate(
-    candidate: &ExecutionCandidate,
-) -> Option<RequestBackendPreference> {
-    match candidate.placement {
-        ExecutionPlacement::CpuOnly => Some(RequestBackendPreference::CpuOnly),
-        ExecutionPlacement::FullDevice | ExecutionPlacement::Hybrid => Some(
-            RequestBackendPreference::Exact(candidate.device.route.clone()),
-        ),
-    }
 }
 
 /// Whole-slice RMS against an absolute dBFS line. The one caller is the

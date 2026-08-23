@@ -107,7 +107,10 @@ use std::path::{Path, PathBuf};
 
 use ts_rs::{Config, TS};
 
-use crate::{CapabilitiesResponse, DevicesResponse, HealthResponse, ModelResponse, ModelsResponse};
+use crate::{
+    CapabilitiesResponse, DefaultModelActivationState, DefaultModelResponse, DevicesResponse,
+    HealthResponse, ModelResponse, ModelsResponse,
+};
 
 const COMMITTED_RELATIVE_DIR: &str = "generated";
 const REGENERATE_ENV_VAR: &str = "REGENERATE_HTTP_WIRE_BINDINGS";
@@ -131,6 +134,8 @@ fn export_http_wire_bindings(cfg: &Config) {
         HealthResponse,
         ModelsResponse,
         ModelResponse,
+        DefaultModelActivationState,
+        DefaultModelResponse,
         CapabilitiesResponse,
         DevicesResponse,
     );

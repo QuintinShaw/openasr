@@ -2388,6 +2388,17 @@ fn invalidate_cached_native_realtime_capabilities() {
 // openasr-core capability leaf types are legitimately re-exported here,
 // alongside their already-committed copy under
 // `crates/openasr-core/generated/realtime-wire/`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/http-wire/"))]
+pub(crate) enum DefaultModelActivationState {
+    Committed,
+    RolledBack,
+    Unavailable,
+    Fallback,
+}
+
 #[derive(Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export_to = "generated/http-wire/"))]
@@ -2650,7 +2661,9 @@ impl SetDefaultRequest {
 }
 
 #[derive(Serialize)]
-struct DefaultModelResponse {
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/http-wire/"))]
+pub(crate) struct DefaultModelResponse {
     object: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     default_model: Option<String>,
@@ -2666,6 +2679,10 @@ struct DefaultModelResponse {
     default_pull: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pack: Option<InstalledPack>,
+    /// Live activation projection. `committed` is returned only when the V2
+    /// durable selection resolves to the same pack currently bound by the
+    /// daemon; every other state is fail-closed as `unavailable`.
+    activation: DefaultModelActivationState,
 }
 
 #[derive(Debug)]

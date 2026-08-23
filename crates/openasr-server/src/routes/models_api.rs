@@ -23,12 +23,14 @@ pub(crate) async fn local_models(
 }
 
 pub(crate) async fn default_model(
+    State(runtime): State<ServerRuntime>,
     Extension(distribution): Extension<DistributionContext>,
 ) -> Result<Json<DefaultModelResponse>, ApiError> {
     let home = distribution.openasr_home()?;
     Ok(Json(default_model_response(
         &home,
         distribution.catalog_source(),
+        runtime.model_pack_path.current().as_deref(),
     )?))
 }
 
@@ -47,31 +49,6 @@ pub(crate) async fn set_default_model(
         ));
     }
 
-    let identity = openasr_core::DefaultModelActivationIdentity {
-        pull: pack.pull.clone(),
-        path: pack.path.clone(),
-    };
-    let facts = openasr_core::ResolvedExecutionFacts::new(
-        openasr_core::DefaultModelActivationPlan {
-            path: pack.path.clone(),
-        },
-        openasr_core::DefaultModelActivationLane,
-        identity.clone(),
-    );
-    let prepared = openasr_core::DefaultModelActivationJournalFactory {
-        home: home.clone(),
-        pack: pack.clone(),
-        preference,
-    }
-    .prepare(
-        openasr_core::DefaultModelActivationCandidate {
-            pull: pack.pull.clone(),
-            path: pack.path.clone(),
-        },
-        facts,
-    );
-    debug_assert_eq!(prepared.stage(), openasr_core::ActivationStage::Prepared);
-
     let verified_pack = openasr_core::PackVerifier
         .verify_candidate(openasr_core::PackCandidate::new(pack.path.clone()))
         .map_err(|error| {
@@ -83,11 +60,33 @@ pub(crate) async fn set_default_model(
         .map(openasr_core::device::execution_policy::ExecutionIntent::from)
         .unwrap_or(openasr_core::device::execution_policy::ExecutionIntent::Auto);
     let services = runtime.native_execution.execution_services();
-    let candidate =
-        openasr_core::resolve_candidate_activation_lane(services.as_ref(), &verified_pack, intent)
-            .map_err(|reason| {
-                ApiError::BadRequest(format!("default model activation lane failed: {reason}"))
-            })?;
+    let resolved_activation = openasr_core::resolve_default_model_activation(
+        services.as_ref(),
+        &verified_pack,
+        intent,
+        pack.pull.clone(),
+        pack.path.clone(),
+    )
+    .map_err(|reason| {
+        ApiError::BadRequest(format!("default model activation plan failed: {reason}"))
+    })?;
+    let candidate = resolved_activation.candidate().clone();
+    let facts = resolved_activation.into_facts();
+    let identity = facts.identity().clone();
+    let prepared = openasr_core::DefaultModelActivationJournalFactory {
+        home: home.clone(),
+        pack: pack.clone(),
+        preference,
+    }
+    .prepare(
+        openasr_core::DefaultModelActivationCandidate {
+            pull: pack.pull.clone(),
+            path: pack.path.clone(),
+            pack_content_id: verified_pack.content_id().to_string(),
+        },
+        facts,
+    );
+    debug_assert_eq!(prepared.stage(), openasr_core::ActivationStage::Prepared);
     let reservation = openasr_core::quote_and_reserve_candidate_activation(
         services.as_ref(),
         &candidate,
@@ -96,6 +95,7 @@ pub(crate) async fn set_default_model(
     .map_err(|reason| {
         ApiError::BadRequest(format!("default model activation reserve failed: {reason}"))
     })?;
+    let reservation_context = reservation.context();
     let reserved = prepared.reserve(reservation);
     debug_assert_eq!(reserved.stage(), openasr_core::ActivationStage::Reserved);
 
@@ -109,6 +109,8 @@ pub(crate) async fn set_default_model(
     let pending = materialized.begin_attestation(NativeActivationAttestation {
         identity,
         runtime: runtime.clone(),
+        home: home.clone(),
+        reservation_context,
     });
     debug_assert_eq!(
         pending.stage(),
@@ -148,6 +150,7 @@ pub(crate) async fn set_default_model(
     Ok(Json(default_model_response(
         &home,
         distribution.catalog_source(),
+        runtime.model_pack_path.current().as_deref(),
     )?))
 }
 
@@ -192,6 +195,25 @@ impl openasr_core::StagedOwner for NativePackRebindOwner {
 struct NativeActivationAttestation {
     identity: openasr_core::DefaultModelActivationIdentity,
     runtime: ServerRuntime,
+    home: PathBuf,
+    reservation_context: openasr_core::ActivationReservationContext,
+}
+
+fn validate_native_activation_probe(
+    snapshot: openasr_core::NativeExecutionReceiptSnapshot,
+    plan: &openasr_core::DefaultModelActivationPlan,
+    lane: &openasr_core::DefaultModelActivationLane,
+) -> Result<(), String> {
+    let candidate = lane.candidate();
+    snapshot
+        .attest_activation(
+            plan.pack_content_id(),
+            plan.resolved_runtime(),
+            candidate.device.route.provider,
+            &candidate.device.route.stable_id,
+            candidate.placement,
+        )
+        .map_err(|error| error.to_string())
 }
 
 impl
@@ -210,22 +232,40 @@ impl
 
     fn attest(
         &self,
-        _facts: &openasr_core::ResolvedExecutionFacts<
+        facts: &openasr_core::ResolvedExecutionFacts<
             openasr_core::DefaultModelActivationPlan,
             openasr_core::DefaultModelActivationLane,
             Self::Identity,
         >,
     ) -> Result<Self::Evidence, openasr_core::AttestationFailure<Self::Error>> {
+        let plan = facts.plan();
+        let lane = facts.exact_lane();
+        if plan.path() != self.identity.path()
+            || plan.pack_content_id() != self.identity.pack_content_id()
+            || plan.output_plan() != self.identity.output_plan()
+            || plan.reuse_mode() != self.identity.reuse_mode()
+            || lane.candidate() != self.identity.candidate()
+        {
+            return Err(openasr_core::AttestationFailure::Rejected(
+                "activation facts drifted before native attestation".to_string(),
+            ));
+        }
         if self.runtime.backend != BackendKind::Native {
             return Ok(openasr_core::DefaultModelActivationEvidence::new(
                 self.identity.clone(),
             ));
         }
-        crate::realtime::probe_native_activation_blocking(
+        let probe = crate::realtime::probe_native_activation_blocking(
             self.runtime.clone(),
-            Some(self.identity.path.clone()),
+            Some(self.identity.path().to_path_buf()),
+            Some(self.home.clone()),
+            Some(self.reservation_context),
         )
         .map_err(|error| openasr_core::AttestationFailure::Rejected(error.to_string()))?;
+        if let Some(snapshot) = probe {
+            validate_native_activation_probe(snapshot, plan, lane)
+                .map_err(openasr_core::AttestationFailure::Rejected)?;
+        }
         Ok(openasr_core::DefaultModelActivationEvidence::new(
             self.identity.clone(),
         ))
@@ -350,6 +390,7 @@ pub(crate) fn resolve_default_pack(
 pub(crate) fn default_model_response(
     home: &Path,
     catalog_source: Option<CatalogSource<'_>>,
+    active_pack_path: Option<&Path>,
 ) -> Result<DefaultModelResponse, ApiError> {
     let catalog = catalog_source
         .map(|source| load_catalog_for_source(source, home))
@@ -374,6 +415,14 @@ pub(crate) fn default_model_response(
         openasr_core::default_selection::DefaultModelResolution::Unset => None,
     };
     let pack = resolution.into_installed_pack();
+    let activation = if pack
+        .as_ref()
+        .is_some_and(|pack| active_pack_path == Some(pack.path.as_path()))
+    {
+        DefaultModelActivationState::Committed
+    } else {
+        DefaultModelActivationState::Unavailable
+    };
 
     Ok(DefaultModelResponse {
         object: "model.default",
@@ -381,6 +430,7 @@ pub(crate) fn default_model_response(
         default_model_status: status,
         default_pull: pack.as_ref().map(|pack| pack.pull.clone()),
         pack,
+        activation,
     })
 }
 
@@ -445,6 +495,7 @@ pub(crate) fn find_installed_pack_reference(
         .map_err(ApiError::Pull)
 }
 
+#[cfg(test)]
 pub(crate) fn persist_default_pack(
     home: &Path,
     pack: &InstalledPack,

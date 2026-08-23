@@ -110,6 +110,11 @@ pub struct ShortAudioReceiptDecodeStep {
 pub struct ShortAudioReceiptDecodeDiagnostics {
     pub output_plan: ShortAudioReceiptOutputPlan,
     pub reuse_mode: ShortAudioReceiptReuseMode,
+    /// Planner-internal typed evidence revision that produced the immutable
+    /// output/reuse decision. Legacy diagnostics may omit it; new release
+    /// evidence binds it explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_evidence_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<ShortAudioReceiptDecodeStep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1429,6 +1434,7 @@ mod tests {
         let receipt = sample_receipt_with_diagnostics(ShortAudioReceiptDecodeDiagnostics {
             output_plan: ShortAudioReceiptOutputPlan::FullLogits,
             reuse_mode: ShortAudioReceiptReuseMode::FreshGraph,
+            capability_evidence_revision: Some(1),
             steps: vec![ShortAudioReceiptDecodeStep {
                 step: 0,
                 token_id: Some(2),

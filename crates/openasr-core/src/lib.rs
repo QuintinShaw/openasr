@@ -135,8 +135,9 @@ pub use api::backend::{
     verify_native_runtime_model_pack_path,
 };
 pub use models::request_execution_receipt::{
-    NativeExecutionReceiptCollector, NativeExecutionReceiptSnapshot, NativeExecutionRequestFacts,
-    NativeExecutionTokenStep, NativeExecutionTopologyFacts, NativeExecutionTraceSnapshot,
+    NativeExecutionAttestationError, NativeExecutionReceiptCollector,
+    NativeExecutionReceiptSnapshot, NativeExecutionRequestFacts, NativeExecutionTokenStep,
+    NativeExecutionTopologyFacts, NativeExecutionTraceSnapshot,
 };
 
 pub use api::native::{
@@ -282,7 +283,7 @@ pub use model_store_gc::{
 pub use models::candidate_activation_transaction::{
     ActivationReservation, ActivationStage, AttestationError, AttestationEvidence,
     AttestationFailure, AttestationOutcome, CandidateActivationTransaction, CommitError,
-    DefaultModelActivationCandidate, DefaultModelActivationEvidence,
+    DefaultModelActivationCandidate, DefaultModelActivationEvidence, DefaultModelActivationFacts,
     DefaultModelActivationIdentity, DefaultModelActivationJournalFactory,
     DefaultModelActivationLane, DefaultModelActivationPlan, DefaultModelPreparedActivation,
     PublicationFailure, PublicationJournalFactory, ResolvedExecutionFacts, StagedOwner,
@@ -292,9 +293,10 @@ pub(crate) use models::ggml_asr_executor::{
     GgmlAsrExecutionViewRequest, GgmlAsrPreparedAudioView, GgmlAsrViewExecutor,
 };
 pub use models::native_execution_services::{
-    BrokerActivationReservation, NativeExecutionScopeId, NativeExecutionServices,
-    NativeExecutionServicesError, quote_and_reserve_candidate_activation,
-    resolve_candidate_activation_lane,
+    ActivationReservationContext, BrokerActivationReservation, NativeExecutionScopeId,
+    NativeExecutionServices, NativeExecutionServicesError, ResolvedDefaultModelActivation,
+    quote_and_reserve_candidate_activation, resolve_candidate_activation_lane,
+    resolve_default_model_activation,
 };
 pub use models::runtime_receipts;
 pub use models::{

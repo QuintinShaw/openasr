@@ -5,9 +5,10 @@
 //! decision is resolved once by [`ResolvedFamilyRuntimeInput`]; this module
 //! only translates that immutable output plan into the graph-facing mode.
 
+use crate::device::execution_policy::{ExecutionCandidate, ExecutionPlacement};
 use crate::ggml_runtime::{
-    GgmlCpuGraphError, GgmlDecodeLogitsConsumers, GgmlDecodeOutputContract, GgmlDecodeOutputPlan,
-    ResolvedFamilyRuntimeInput,
+    AutoGpuPolicy, GgmlCpuGraphError, GgmlDecodeLogitsConsumers, GgmlDecodeOutputContract,
+    GgmlDecodeOutputPlan, RequestBackendPreference, ResolvedFamilyRuntimeInput,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -55,6 +56,36 @@ pub(crate) fn decode_logits_consumers_for_request(
         debug_logits,
     )
     .with_host_visible(adapter_active)
+}
+
+/// Convert one immutable policy candidate into the exact request preference
+/// consumed by the shared runtime planner. Offline, streaming, warm-up, and
+/// activation must not grow independent provider/placement tables.
+pub(crate) fn request_backend_preference_for_candidate(
+    candidate: &ExecutionCandidate,
+) -> Option<RequestBackendPreference> {
+    match candidate.placement {
+        ExecutionPlacement::CpuOnly => Some(RequestBackendPreference::CpuOnly),
+        ExecutionPlacement::FullDevice | ExecutionPlacement::Hybrid => Some(
+            RequestBackendPreference::Exact(candidate.device.route.clone()),
+        ),
+    }
+}
+
+/// Resolve one immutable family runtime input from a concrete candidate.
+/// This is the shared output-plan/reuse combiner for every execution surface.
+pub(crate) fn resolved_runtime_for_family_candidate(
+    candidate: &ExecutionCandidate,
+    auto_gpu_policy: AutoGpuPolicy,
+    adapter_id: &str,
+    logits_consumers: GgmlDecodeLogitsConsumers,
+) -> ResolvedFamilyRuntimeInput {
+    ResolvedFamilyRuntimeInput::resolve_with_output_contract_and_consumers(
+        request_backend_preference_for_candidate(candidate),
+        auto_gpu_policy,
+        decode_output_contract_for_adapter(adapter_id),
+        logits_consumers,
+    )
 }
 
 fn suppression_active_for_adapter(adapter_id: &str) -> bool {
