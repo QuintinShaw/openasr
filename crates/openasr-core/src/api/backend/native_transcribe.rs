@@ -4183,7 +4183,7 @@ fn run_dispatch_once(
     );
     let execution_lane =
         capture_request_execution_facts(verified_pack, selected_family, resolved_runtime)?;
-    let execution_context = Arc::new(
+    let request_execution_context = Arc::new(
         (**execution_context)
             .clone()
             .with_native_execution_lane(execution_lane),
@@ -4197,7 +4197,7 @@ fn run_dispatch_once(
         request_options,
         backend_preference,
         resolved_runtime,
-        execution_context: Arc::clone(execution_context),
+        execution_context: Arc::clone(&request_execution_context),
     };
     let planning_input =
         crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput::for_offline_view_request(

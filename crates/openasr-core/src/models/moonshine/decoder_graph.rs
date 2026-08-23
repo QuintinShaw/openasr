@@ -602,7 +602,7 @@ impl MoonshineDecoderGraphRuntime {
         decoder_weights: &MoonshineDecoderWeights,
         metadata: MoonshineExecutionMetadata,
         decoder_state: Seq2SeqDecoderState,
-        backend: GgmlCpuGraphBackend,
+        _backend: GgmlCpuGraphBackend,
         graph_config: GgmlCpuGraphConfig,
         reuse_mode: GgmlDecodeReuseMode,
         runtime_source: RuntimeWeightSource<'_>,
