@@ -16,11 +16,15 @@ use std::{fs, io::Write};
 use anyhow::{Context, Result, bail};
 use openasr_core::{
     BackendKind, ExecutionTarget, GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector,
-    InstalledPack, NativeExecutionServices, ResolvedOutputTarget,
+    InstalledPack, NativeExecutionReceiptCollector, NativeExecutionServices, ResolvedOutputTarget,
     SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK, SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioReceipt,
     ShortAudioReceiptAudio, ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptMetrics,
     ShortAudioReceiptOutputPlan, ShortAudioReceiptPack, ShortAudioReceiptReuseMode,
     ShortAudioReceiptRun, ShortAudioReceiptTranscript, TranscriptionRequest, atomic_write_text,
+    ggml_runtime::{
+        AutoGpuPolicy, GgmlDecodeLogitsConsumers, GgmlDecodeOutputContract,
+        RequestBackendPreference, ResolvedFamilyRuntimeInput,
+    },
     list_installed_packs, load_config, openasr_home, parse_model_ref, prepare_audio_input,
     process_memory_snapshot, receipt_os_id, resolve_core_commit, resolve_installed_pack_reference,
     resolve_output_target_handle, sha256_file, validate_local_native_model_pack_path,
@@ -138,9 +142,11 @@ pub(crate) fn bench_receipt_short_audio(
     let total_passes = options.warmup_runs.saturating_add(options.runs);
     let execution_telemetry = GgmlExecutionTelemetryCollector::new();
     let _execution_telemetry_guard = execution_telemetry.install();
-    let request_receipt = options
-        .trace_out
-        .map(|_| openasr_core::NativeExecutionReceiptCollector::new());
+    // Native receipts must project decode_diagnostics from the runtime that
+    // actually ran. Reconstructing output_plan/reuse_mode from --device or
+    // --warmup-runs is forbidden.
+    let request_receipt =
+        (options.backend_kind == BackendKind::Native).then(NativeExecutionReceiptCollector::new);
     let mut rtf_samples = Vec::with_capacity(options.runs);
     let mut last_text = String::new();
     let mut notes = Vec::new();
@@ -180,7 +186,7 @@ pub(crate) fn bench_receipt_short_audio(
         if let Some(receipt) = &request_receipt {
             request = request.with_execution_context(Arc::new(
                 openasr_core::RequestExecutionContext::uncancellable(
-                    "strict short-audio trace command has no cancel surface",
+                    "short-audio receipt command has no cancel surface",
                 )
                 .with_native_execution_receipt(receipt.clone()),
             ));
@@ -247,6 +253,15 @@ pub(crate) fn bench_receipt_short_audio(
     if options.backend_kind == BackendKind::Native {
         validate_observed_accelerator_placement(&device_label, &observed_placement)?;
     }
+    let decode_diagnostics = decode_diagnostics_from_shipped_runtime(match options.backend_kind {
+        BackendKind::Native => request_receipt.as_ref().and_then(|collector| {
+            collector
+                .snapshot()
+                .facts
+                .map(|facts| facts.resolved_runtime)
+        }),
+        BackendKind::Mock => Some(resolved_runtime_for_mock_receipt(options.device)?),
+    })?;
     if let (Some((_, trace_target)), Some(request_receipt)) =
         (fixed_output_targets.as_ref(), request_receipt.as_ref())
     {
@@ -325,17 +340,7 @@ pub(crate) fn bench_receipt_short_audio(
         evidence: receipt_evidence,
         scope: options.scope.to_string(),
         notes,
-        decode_diagnostics: Some(ShortAudioReceiptDecodeDiagnostics {
-            output_plan: ShortAudioReceiptOutputPlan::FullLogits,
-            reuse_mode: if options.warmup_runs > 0 {
-                ShortAudioReceiptReuseMode::ReusableGraph
-            } else {
-                ShortAudioReceiptReuseMode::FreshGraph
-            },
-            steps: Vec::new(),
-            first_divergence: None,
-            encoder_decoder_splits: Vec::new(),
-        }),
+        decode_diagnostics: Some(decode_diagnostics),
     })
     .context("Constructed short-audio receipt failed validation")?;
 
@@ -505,6 +510,41 @@ fn quant_from_model_ref(model_arg: Option<&str>) -> Option<String> {
     parsed
         .tag
         .map(|tag| openasr_core::canonical_quant_tag(&tag).to_string())
+}
+
+fn decode_diagnostics_from_shipped_runtime(
+    resolved: Option<ResolvedFamilyRuntimeInput>,
+) -> Result<ShortAudioReceiptDecodeDiagnostics> {
+    let Some(resolved) = resolved else {
+        bail!(
+            "short-audio receipt is missing shipped output_plan/reuse_mode; refusing to emit a receipt"
+        );
+    };
+    Ok(ShortAudioReceiptDecodeDiagnostics {
+        output_plan: ShortAudioReceiptOutputPlan::from(resolved.output_plan()),
+        reuse_mode: ShortAudioReceiptReuseMode::from(resolved.reuse_mode()),
+        steps: Vec::new(),
+        first_divergence: None,
+        encoder_decoder_splits: Vec::new(),
+    })
+}
+
+/// Mock transcription never records native execution facts. Plumbing receipts
+/// still project through the same planner, with no logits consumers.
+fn resolved_runtime_for_mock_receipt(device: &str) -> Result<ResolvedFamilyRuntimeInput> {
+    let preference = match parse_receipt_device(device)? {
+        ExecutionTarget::Cpu => Some(RequestBackendPreference::CpuOnly),
+        ExecutionTarget::Accelerated => Some(RequestBackendPreference::Accelerated),
+        ExecutionTarget::Auto => None,
+    };
+    Ok(
+        ResolvedFamilyRuntimeInput::resolve_with_output_contract_and_consumers(
+            preference,
+            AutoGpuPolicy::AllBackends,
+            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+            GgmlDecodeLogitsConsumers::none(),
+        ),
+    )
 }
 
 fn parse_receipt_device(raw: &str) -> Result<ExecutionTarget> {
@@ -751,6 +791,109 @@ mod tests {
         assert!(parse_receipt_device("tpu").is_err());
     }
 
+    fn exact_accelerated_preference(
+        provider: openasr_core::ExecutionProvider,
+    ) -> RequestBackendPreference {
+        RequestBackendPreference::Exact(openasr_core::ResolvedExecutionRoute {
+            provider,
+            stable_id: format!("{}0", provider.as_str()),
+            registry_ordinal: 0,
+            kind: openasr_core::RouteDeviceKind::Accelerated,
+            addressability: openasr_core::DeviceAddressability::NotExactlyAddressable {
+                reason: "receipt output-plan fixture",
+            },
+        })
+    }
+
+    fn resolved_runtime(
+        preference: Option<RequestBackendPreference>,
+        consumers: GgmlDecodeLogitsConsumers,
+    ) -> ResolvedFamilyRuntimeInput {
+        ResolvedFamilyRuntimeInput::resolve_with_output_contract_and_consumers(
+            preference,
+            AutoGpuPolicy::AllBackends,
+            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+            consumers,
+        )
+    }
+
+    #[test]
+    fn shipped_emitter_projects_cpu_native_first_max_without_logits_consumers() {
+        let resolved = resolved_runtime(
+            Some(RequestBackendPreference::CpuOnly),
+            GgmlDecodeLogitsConsumers::none(),
+        );
+        let diagnostics = decode_diagnostics_from_shipped_runtime(Some(resolved))
+            .expect("CPU compact runtime must project");
+        assert_eq!(
+            diagnostics.output_plan,
+            ShortAudioReceiptOutputPlan::from(resolved.output_plan())
+        );
+        assert_eq!(
+            diagnostics.reuse_mode,
+            ShortAudioReceiptReuseMode::from(resolved.reuse_mode())
+        );
+        assert_eq!(
+            diagnostics.output_plan,
+            ShortAudioReceiptOutputPlan::NativeFirstMaxToken
+        );
+        assert_eq!(
+            diagnostics.reuse_mode,
+            ShortAudioReceiptReuseMode::FreshGraph
+        );
+    }
+
+    #[test]
+    fn shipped_emitter_projects_unproven_metal_and_gpu_full_logits() {
+        for provider in [
+            openasr_core::ExecutionProvider::Metal,
+            openasr_core::ExecutionProvider::Cuda,
+            openasr_core::ExecutionProvider::Vulkan,
+            openasr_core::ExecutionProvider::Hip,
+        ] {
+            let resolved = resolved_runtime(
+                Some(exact_accelerated_preference(provider)),
+                GgmlDecodeLogitsConsumers::none(),
+            );
+            let diagnostics = decode_diagnostics_from_shipped_runtime(Some(resolved))
+                .expect("unproven accelerator runtime must project");
+            assert_eq!(
+                diagnostics.output_plan,
+                ShortAudioReceiptOutputPlan::from(resolved.output_plan())
+            );
+            assert_eq!(
+                diagnostics.output_plan,
+                ShortAudioReceiptOutputPlan::FullLogits,
+                "unproven {provider:?} must not claim compact output"
+            );
+            assert_eq!(
+                diagnostics.reuse_mode,
+                ShortAudioReceiptReuseMode::FreshGraph
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_emitter_cpu_logits_consumers_force_full_logits() {
+        let resolved = resolved_runtime(
+            Some(RequestBackendPreference::CpuOnly),
+            GgmlDecodeLogitsConsumers::none().with_phrase_bias(true),
+        );
+        let diagnostics = decode_diagnostics_from_shipped_runtime(Some(resolved))
+            .expect("CPU complete-logits runtime must project");
+        assert_eq!(
+            diagnostics.output_plan,
+            ShortAudioReceiptOutputPlan::FullLogits
+        );
+    }
+
+    #[test]
+    fn shipped_emitter_fail_closed_without_resolved_runtime() {
+        let error = decode_diagnostics_from_shipped_runtime(None)
+            .expect_err("missing shipped plan/reuse must not emit");
+        assert!(error.to_string().contains("output_plan/reuse_mode"));
+    }
+
     #[test]
     fn mock_short_audio_receipt_roundtrip_on_fixture_audio() {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav");
@@ -813,13 +956,19 @@ mod tests {
             .decode_diagnostics
             .as_ref()
             .expect("decode diagnostics are required");
+        let expected = decode_diagnostics_from_shipped_runtime(Some(
+            resolved_runtime_for_mock_receipt("cpu").expect("cpu mock runtime"),
+        ))
+        .expect("mock CPU path must project a shipped runtime");
+        assert_eq!(diagnostics.output_plan, expected.output_plan);
+        assert_eq!(diagnostics.reuse_mode, expected.reuse_mode);
         assert_eq!(
             diagnostics.output_plan,
-            openasr_core::ShortAudioReceiptOutputPlan::FullLogits
+            ShortAudioReceiptOutputPlan::NativeFirstMaxToken
         );
         assert_eq!(
             diagnostics.reuse_mode,
-            openasr_core::ShortAudioReceiptReuseMode::FreshGraph
+            ShortAudioReceiptReuseMode::FreshGraph
         );
         assert!(!receipt.transcript.text.is_empty());
         assert_eq!(receipt.audio.sha256.len(), 64);
