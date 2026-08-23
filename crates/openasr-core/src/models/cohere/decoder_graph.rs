@@ -4,8 +4,8 @@ use thiserror::Error;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext, GgmlStaticTensor,
-    GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
+    GgmlDecodeReuseMode, GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity,
+    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
 };
 use crate::{Segment, Transcription};
 
@@ -479,6 +479,7 @@ pub(crate) struct CohereDecoderGraphRuntime {
     reuse: Option<Seq2SeqReusableDecodeGraph>,
     argmax_reverse_indices: Option<GgmlStaticTensor>,
     greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    reuse_mode: GgmlDecodeReuseMode,
     metadata: CohereTranscribeExecutionMetadata,
     token_embedding: CohereDecoderWeightTensor,
     positional_embedding: CohereDecoderWeightTensor,
@@ -688,7 +689,7 @@ impl CohereDecoderGraphRuntime {
         backend: GgmlCpuGraphBackend,
         prefer_cpu_backend: bool,
         preflight: &GgufRuntimeSourcePreflight,
-        greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        reuse_mode: GgmlDecodeReuseMode,
     ) -> Result<Self, CohereDecoderGraphError> {
         Self::new_with_n_seq_impl(
             decoder_weights,
@@ -699,7 +700,8 @@ impl CohereDecoderGraphRuntime {
             prefer_cpu_backend,
             1,
             Some(preflight),
-            greedy_step_output_mode,
+            DeviceGreedyStepOutputMode::FullLogits,
+            reuse_mode,
         )
     }
 
@@ -722,6 +724,29 @@ impl CohereDecoderGraphRuntime {
         )
     }
 
+    pub(crate) fn new_with_reuse_mode(
+        decoder_weights: &CohereTranscribeDecoderWeights,
+        metadata: CohereTranscribeExecutionMetadata,
+        decoder_state: Seq2SeqDecoderState,
+        cross_hidden_size: usize,
+        backend: GgmlCpuGraphBackend,
+        prefer_cpu_backend: bool,
+        reuse_mode: GgmlDecodeReuseMode,
+    ) -> Result<Self, CohereDecoderGraphError> {
+        Self::new_with_n_seq_impl(
+            decoder_weights,
+            metadata,
+            decoder_state,
+            cross_hidden_size,
+            backend,
+            prefer_cpu_backend,
+            1,
+            None,
+            DeviceGreedyStepOutputMode::FullLogits,
+            reuse_mode,
+        )
+    }
+
     pub(crate) fn new_with_n_seq(
         decoder_weights: &CohereTranscribeDecoderWeights,
         metadata: CohereTranscribeExecutionMetadata,
@@ -741,6 +766,7 @@ impl CohereDecoderGraphRuntime {
             n_seq,
             None,
             DeviceGreedyStepOutputMode::FullLogits,
+            GgmlDecodeReuseMode::FreshGraph,
         )
     }
 
@@ -755,6 +781,7 @@ impl CohereDecoderGraphRuntime {
         n_seq: usize,
         runtime_preflight: Option<&GgufRuntimeSourcePreflight>,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        reuse_mode: GgmlDecodeReuseMode,
     ) -> Result<Self, CohereDecoderGraphError> {
         decoder_state
             .validate()
@@ -829,6 +856,7 @@ impl CohereDecoderGraphRuntime {
             reuse: None,
             argmax_reverse_indices: arena_state.argmax_reverse_indices,
             greedy_step_output_mode,
+            reuse_mode,
             loaded_weights,
             metadata,
             runner,
@@ -1921,7 +1949,8 @@ impl CohereDecoderGraphRuntime {
     }
 
     fn supports_reusable_decode_graph(&self) -> bool {
-        reusable_decode_graph_supported_for_runner(&self.runner)
+        self.reuse_mode == GgmlDecodeReuseMode::ReusableGraph
+            && reusable_decode_graph_supported_for_runner(&self.runner)
     }
 
     fn compute_reused_incremental_step_output(
@@ -4155,6 +4184,7 @@ mod tests {
                 1,
                 None,
                 DeviceGreedyStepOutputMode::DeviceTop1,
+                GgmlDecodeReuseMode::FreshGraph,
             )
             .expect("device-top1 runtime");
             full.populate_cross_attention_cache(&encoder_output)
