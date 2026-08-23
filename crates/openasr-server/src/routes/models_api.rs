@@ -257,6 +257,18 @@ impl
             validate_native_activation_probe(snapshot, plan, lane)
                 .map_err(openasr_core::AttestationFailure::Rejected)?;
         }
+        let services = self.runtime.native_execution.execution_services();
+        let reconciliation = services
+            .runtime_receipts()
+            .reconcile_live_leases_quiescent(services.memory_broker());
+        if !matches!(
+            reconciliation,
+            openasr_core::runtime_receipts::LeaseReceiptShadow::Matched
+        ) {
+            return Err(openasr_core::AttestationFailure::Rejected(format!(
+                "default model activation owner reconciliation failed: {reconciliation:?}"
+            )));
+        }
         Ok(openasr_core::DefaultModelActivationEvidence::new(
             self.identity.clone(),
         ))

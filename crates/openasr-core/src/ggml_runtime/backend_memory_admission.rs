@@ -32,10 +32,7 @@ use crate::device::execution_memory::{
     PhaseSet, PhysicalDeviceKey, QuoteConfidence,
 };
 
-use crate::models::native_execution_services::{
-    current_execution_cache_attempt_id, current_execution_lane, current_runtime_receipts,
-};
-use crate::models::runtime_receipts::{RuntimeOwnerGuard, RuntimeResourceGuard};
+use crate::models::native_execution_services::{current_execution_lane, current_runtime_receipts};
 
 use super::{
     backend_memory::{
@@ -195,6 +192,10 @@ impl NativeMemoryAdmissionPlan {
         &self.evidence
     }
 
+    pub(crate) fn quote_confidence_for_domain(&self, domain: &MemoryDomainKey) -> QuoteConfidence {
+        quote_confidence_for_domain(&self.claims, domain)
+    }
+
     /// The single quote-to-broker admission edge. Every native backend/group
     /// has already been merged by physical domain before this one atomic call.
     pub(crate) fn try_reserve(
@@ -349,6 +350,30 @@ impl NativeMemoryAdmissionPlan {
     }
 }
 
+fn quote_confidence_for_domain(
+    claims: &[MemoryClaim],
+    domain: &MemoryDomainKey,
+) -> QuoteConfidence {
+    let mut confidence = None;
+    for claim in claims {
+        if &claim.domain != domain {
+            continue;
+        }
+        confidence = Some(match (confidence, claim.confidence) {
+            (Some(QuoteConfidence::Provisional), _) | (_, QuoteConfidence::Provisional) => {
+                QuoteConfidence::Provisional
+            }
+            (Some(QuoteConfidence::Unknown), _) | (_, QuoteConfidence::Unknown) => {
+                QuoteConfidence::Unknown
+            }
+            (Some(QuoteConfidence::CommittedUpperBound), _)
+            | (_, QuoteConfidence::CommittedUpperBound) => QuoteConfidence::CommittedUpperBound,
+            _ => QuoteConfidence::ExactCommitted,
+        });
+    }
+    confidence.unwrap_or(QuoteConfidence::Provisional)
+}
+
 /// Pending broker ownership plus the native quote tokens and pre-allocation
 /// observations required by the allocation transaction.
 pub(crate) struct NativeMemoryAllocationTransaction {
@@ -424,7 +449,7 @@ impl NativeMemoryAllocationTransaction {
         };
         let lane = current_execution_lane().and_then(|lane| lane.receipt_projection(&collector));
         let Some(owner_descriptor) = collector.owner_descriptor(
-            "native-memory-reservation",
+            "native-memory-owner",
             None,
             Some(first_group.group_id()),
             lane,
@@ -452,7 +477,7 @@ impl NativeMemoryAllocationTransaction {
                     request.peak_bytes,
                     request.peak_bytes,
                     request.retained_bytes,
-                    self.quote_confidence_for_domain(&request.domain),
+                    quote_confidence_for_domain(&self.claims, &request.domain),
                     Some(request.snapshot.confidence),
                 )?;
                 let mut native = self
@@ -475,26 +500,6 @@ impl NativeMemoryAllocationTransaction {
             .collect()
     }
 
-    fn quote_confidence_for_domain(&self, domain: &MemoryDomainKey) -> QuoteConfidence {
-        let mut confidence = None;
-        for claim in &self.claims {
-            if &claim.domain != domain {
-                continue;
-            }
-            confidence = Some(match (confidence, claim.confidence) {
-                (Some(QuoteConfidence::Provisional), _) | (_, QuoteConfidence::Provisional) => {
-                    QuoteConfidence::Provisional
-                }
-                (Some(QuoteConfidence::Unknown), _) | (_, QuoteConfidence::Unknown) => {
-                    QuoteConfidence::Unknown
-                }
-                (Some(QuoteConfidence::CommittedUpperBound), _)
-                | (_, QuoteConfidence::CommittedUpperBound) => QuoteConfidence::CommittedUpperBound,
-                _ => QuoteConfidence::ExactCommitted,
-            });
-        }
-        confidence.unwrap_or(QuoteConfidence::Provisional)
-    }
     pub(crate) fn reservation(&self) -> &DeviceMemoryReservationBatch {
         &self.reservation
     }
@@ -656,11 +661,8 @@ impl NativeMemoryAllocationTransaction {
             }
         }
 
-        let (receipt_owner, receipt_resources) = runtime_receipt_parts(&self.claims);
         Ok(NativeMemoryAllocation {
             owner: Some(owner),
-            receipt_owner,
-            receipt_resources,
             reservation: Some(self.reservation),
         })
     }
@@ -724,10 +726,7 @@ impl NativeMemoryAllocationTransaction {
             }
         }
 
-        let (receipt_owner, receipt_resources) = runtime_receipt_parts(&self.claims);
         Ok(NativeOwnerAttachedMemoryLease {
-            receipt_owner,
-            receipt_resources,
             reservation: Some(self.reservation),
         })
     }
@@ -769,15 +768,12 @@ impl NativeMemoryAllocationTransaction {
             }
             any_reserved = true;
         }
-        let (receipt_owner, receipt_resources) = runtime_receipt_parts(&self.claims);
         Ok(NativeBackendPrivateMemoryLease {
             inner: Rc::new(RefCell::new(NativeBackendPrivateMemoryLeaseInner {
                 transaction: Some(self),
                 committed_reservation: None,
                 committed: false,
                 quarantined: false,
-                receipt_owner,
-                receipt_resources,
             })),
         })
     }
@@ -924,68 +920,14 @@ pub(crate) enum NativeMemoryRequestKindError {
     },
 }
 
-/// Builds bounded, redacted receipt guards for one committed native
-/// allocation. Receipt construction is deliberately after native commit and
-/// never participates in admission; unavailable entropy simply yields no-op
-/// guards.
-fn runtime_receipt_parts(
-    claims: &[MemoryClaim],
-) -> (Option<RuntimeOwnerGuard>, Vec<RuntimeResourceGuard>) {
-    let Some(collector) = current_runtime_receipts().filter(|collector| collector.is_available())
-    else {
-        return (None, Vec::new());
-    };
-    let source = claims.first().map(|claim| claim.resource_id.as_str());
-    let lane = current_execution_lane().and_then(|lane| lane.receipt_projection(&collector));
-    let Some(descriptor) =
-        collector.owner_descriptor("native-memory-allocation", None, source, lane)
-    else {
-        return (None, Vec::new());
-    };
-    let owner = collector.start_owner(descriptor, current_execution_cache_attempt_id());
-    let Some(owner_id) = owner.owner_id() else {
-        return (Some(owner), Vec::new());
-    };
-    let resources = claims
-        .iter()
-        .filter_map(|claim| {
-            let descriptor = collector.resource_descriptor(
-                &claim.resource_id,
-                &claim.domain,
-                claim.requested_bytes,
-                claim.incremental_peak_bytes.unwrap_or(0),
-                claim.incremental_retained_bytes.unwrap_or(0),
-                claim.confidence,
-                None,
-            )?;
-            collector
-                .acquire_resource(owner_id, descriptor)
-                .map(|resource| {
-                    // Receipts are attached after the broker lease has already
-                    // committed. Leaving them Reserved would make shadow comparison
-                    // charge them as pending.
-                    resource.set_state(
-                        crate::models::runtime_receipts::RuntimeResourceState::Committed,
-                    );
-                    resource
-                })
-        })
-        .collect();
-    (Some(owner), resources)
-}
-
 /// The true native owner and its committed process-wide memory lease. This
 /// wrapper intentionally has an explicit `Drop`: native buffers disappear
 /// before the reservation can refund committed bytes.
 pub(crate) struct NativeMemoryAllocation<T> {
     owner: Option<T>,
-    /// Diagnostic-only owner/resource guards. They are deliberately kept
-    /// beside the native owner so receipt teardown cannot affect admission or
-    /// native lifetime.
-    // Resource guards precede the owner guard so drop emits ResourceReleased
-    // before OwnerReleased.
-    receipt_resources: Vec<RuntimeResourceGuard>,
-    receipt_owner: Option<RuntimeOwnerGuard>,
+    /// The broker batch owns the one receipt row for this physical owner. Its
+    /// state moves Reserved -> Committed/Reconciled -> Released together with
+    /// the ledger; a second committed receipt would double-count one lease.
     reservation: Option<DeviceMemoryReservationBatch>,
 }
 
@@ -1004,12 +946,6 @@ pub(crate) struct NativeBackendPrivateMemoryLease {
 }
 
 struct NativeBackendPrivateMemoryLeaseInner {
-    /// Diagnostic-only receipt guards share the same Rc lifetime as the native
-    /// private owner and are never consulted by admission or quarantine.
-    // Resource guards precede the owner guard so drop emits ResourceReleased
-    // before OwnerReleased.
-    receipt_resources: Vec<RuntimeResourceGuard>,
-    receipt_owner: Option<RuntimeOwnerGuard>,
     /// Kept after commit so its broker batch follows the backend owner's true
     /// lifetime. Quote groups are also retained; they are small and preserve
     /// the evidence required when finalization is intentionally deferred.
@@ -1027,10 +963,6 @@ struct NativeBackendPrivateMemoryLeaseInner {
 /// responsible for dropping native state before this lease collection.
 #[must_use = "owner-attached memory leases must be stored inside their native owner"]
 pub(crate) struct NativeOwnerAttachedMemoryLease {
-    // Resource guards precede the owner guard so drop emits ResourceReleased
-    // before OwnerReleased.
-    receipt_resources: Vec<RuntimeResourceGuard>,
-    receipt_owner: Option<RuntimeOwnerGuard>,
     reservation: Option<DeviceMemoryReservationBatch>,
 }
 
@@ -1142,9 +1074,7 @@ impl NativeBackendPrivateMemoryLease {
 
 impl<T> NativeMemoryAllocation<T> {
     pub(crate) fn record_receipt_reuse(&self) {
-        if let Some(owner) = self.receipt_owner.as_ref() {
-            owner.record_reuse(current_execution_cache_attempt_id());
-        }
+        self.reservation().record_receipt_reuse();
     }
 
     pub(crate) fn owner(&self) -> &T {
@@ -3251,8 +3181,6 @@ mod tests {
                 broker: Arc::clone(&broker),
                 observed_committed: Arc::clone(&observed_committed),
             }),
-            receipt_owner: None,
-            receipt_resources: Vec::new(),
             reservation: Some(lease),
         };
 
@@ -3293,8 +3221,6 @@ mod tests {
                 committed_reservation: Some(reservation),
                 committed: true,
                 quarantined: false,
-                receipt_owner: None,
-                receipt_resources: Vec::new(),
             })),
         };
         let second_owner = first_owner.clone();

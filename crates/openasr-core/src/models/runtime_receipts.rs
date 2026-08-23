@@ -1074,6 +1074,40 @@ impl RuntimeReceiptCollector {
         }
         LeaseReceiptShadow::Matched
     }
+
+    /// Waits for the short broker/receipt publication window to quiesce, then
+    /// returns the same fail-closed comparison as [`Self::reconcile_live_leases`].
+    ///
+    /// Broker accounting and diagnostic receipt guards intentionally use
+    /// separate locks so diagnostics can never participate in admission. A
+    /// reservation therefore has a tiny transition window while its receipt
+    /// is attached or released. Activation is the only path that needs a
+    /// stable pre-publication verdict; it may retry transient `Mismatch` or
+    /// `SnapshotChanged`, but never retries an unavailable, incomplete,
+    /// unknown-placement, or unpriced state.
+    pub fn reconcile_live_leases_quiescent(
+        &self,
+        broker: &DeviceMemoryBrokerSet,
+    ) -> LeaseReceiptShadow {
+        const QUIESCENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
+
+        let deadline = std::time::Instant::now() + QUIESCENCE_TIMEOUT;
+        loop {
+            let reconciliation = self.reconcile_live_leases(broker);
+            let retryable = matches!(
+                reconciliation,
+                LeaseReceiptShadow::Mismatch(_)
+                    | LeaseReceiptShadow::Incomparable {
+                        reason: LeaseReceiptShadowIncomparable::SnapshotChanged,
+                    }
+            );
+            if !retryable || std::time::Instant::now() >= deadline {
+                return reconciliation;
+            }
+            std::thread::sleep(RETRY_DELAY);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

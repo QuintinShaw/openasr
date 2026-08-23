@@ -1656,7 +1656,12 @@ impl ResolvedDefaultModelActivation {
             &self.candidate,
             self.facts.plan().resident_topology(),
         )?;
-        reserve_activation_plan(services, &native_plan)
+        reserve_activation_plan(
+            services,
+            &native_plan,
+            &self.candidate,
+            Some(self.verified_pack.content_id()),
+        )
     }
 }
 
@@ -2014,6 +2019,8 @@ fn quote_cpu_buffer_plan(
 fn reserve_activation_plan(
     services: &NativeExecutionServices,
     plan: &NativeMemoryAdmissionPlan,
+    candidate: &ExecutionCandidate,
+    content_id: Option<&str>,
 ) -> Result<BrokerActivationReservation, String> {
     let mut requests = plan.reservation_requests().to_vec();
     let cohort_id = current_memory_reservation_cohort_id()
@@ -2021,22 +2028,65 @@ fn reserve_activation_plan(
     for request in &mut requests {
         request.cohort_id = Some(cohort_id);
     }
-    let batch = services
+    let mut batch = services
         .memory_broker()
         .try_reserve_batch_for_scope(requests, Some(services.scope_id))
         .map_err(|error| format!("candidate activation reserve: {error}"))?;
+    let collector = services.runtime_receipts();
+    let backend = match candidate.device.route.provider {
+        ExecutionProvider::Cpu => GgmlCpuGraphBackend::Cpu,
+        ExecutionProvider::Metal => GgmlCpuGraphBackend::Metal,
+        ExecutionProvider::Cuda
+        | ExecutionProvider::Hip
+        | ExecutionProvider::Vulkan
+        | ExecutionProvider::Accelerator
+        | ExecutionProvider::Unknown => GgmlCpuGraphBackend::Gpu,
+    };
+    if let Some(lane) = collector.lane_projection(
+        candidate.device.route.provider,
+        &candidate.device.route.stable_id,
+        candidate.placement,
+        backend,
+    ) && let Some(owner) = collector.owner_descriptor(
+        "candidate-activation-reservation",
+        content_id,
+        plan.reservation_requests()
+            .first()
+            .map(|request| request.resource_id.as_str()),
+        Some(lane),
+    ) {
+        let resources = plan
+            .reservation_requests()
+            .iter()
+            .filter_map(|request| {
+                collector
+                    .resource_descriptor(
+                        &request.resource_id,
+                        &request.domain,
+                        request.peak_bytes,
+                        request.peak_bytes,
+                        request.retained_bytes,
+                        plan.quote_confidence_for_domain(&request.domain),
+                        Some(request.snapshot.confidence),
+                    )
+                    .map(|descriptor| (request.domain.clone(), descriptor))
+            })
+            .collect();
+        batch.attach_receipt(collector.clone(), owner, resources);
+    }
     BrokerActivationReservation::from_batch(batch, cohort_id)
 }
 
 fn quote_and_reserve_declared_host_resident(
     services: &NativeExecutionServices,
+    candidate: &ExecutionCandidate,
     quote: &SystemMemoryAllocationQuote,
 ) -> Result<BrokerActivationReservation, String> {
     let (_backend, plan) = quote_cpu_buffer_plan(
         &quote.resource_id,
         quote.peak_bytes.max(quote.retained_bytes),
     )?;
-    reserve_activation_plan(services, &plan)
+    reserve_activation_plan(services, &plan, candidate, None)
 }
 
 fn quote_and_reserve_current_candidate_activation(
@@ -2048,7 +2098,7 @@ fn quote_and_reserve_current_candidate_activation(
             quote_and_reserve_candidate_activation(services, candidate, &pack)
         }
         Some(CandidateActivationQuoteSource::Declared(quote)) => {
-            quote_and_reserve_declared_host_resident(services, &quote)
+            quote_and_reserve_declared_host_resident(services, candidate, &quote)
         }
         None => Err(
             "candidate activation cannot quote without a verified pack or the current owner's declared resident bytes"
@@ -2079,7 +2129,7 @@ pub(crate) fn quote_and_reserve_candidate_activation(
     );
     let topology = resolve_resident_topology_plan(descriptor, pack, candidate, &intent, true)?;
     let (_backends, _mapping, plan) = quote_candidate_activation_plan(pack, candidate, &topology)?;
-    reserve_activation_plan(services, &plan)
+    reserve_activation_plan(services, &plan, candidate, Some(pack.content_id()))
 }
 
 /// Runs a complete allocation/execution operation inside one candidate's

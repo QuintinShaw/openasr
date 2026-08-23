@@ -1058,6 +1058,14 @@ impl DeviceMemoryReservationBatch {
         self.receipt_owner = Some(owner);
     }
 
+    pub(crate) fn record_receipt_reuse(&self) {
+        if let Some(owner) = self.receipt_owner.as_ref() {
+            owner.record_reuse(
+                crate::models::native_execution_services::current_execution_cache_attempt_id(),
+            );
+        }
+    }
+
     pub(crate) fn update_receipt_descriptors(
         &mut self,
         resources: Vec<(MemoryDomainKey, RuntimeResourceDescriptor)>,
