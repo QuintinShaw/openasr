@@ -329,27 +329,59 @@ pub(crate) enum ForcedAlignerProgressEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ForcedAlignerStageBackends {
-    audio: crate::ggml_runtime::GgmlCpuGraphBackend,
-    decoder: crate::ggml_runtime::GgmlCpuGraphBackend,
-    logits: crate::ggml_runtime::GgmlCpuGraphBackend,
+    audio: ResolvedFamilyRuntimeInput,
+    decoder: ResolvedFamilyRuntimeInput,
+    logits: ResolvedFamilyRuntimeInput,
 }
 
 impl ForcedAlignerStageBackends {
-    const fn uniform(backend: crate::ggml_runtime::GgmlCpuGraphBackend) -> Self {
+    const fn uniform(runtime: ResolvedFamilyRuntimeInput) -> Self {
         Self {
-            audio: backend,
-            decoder: backend,
-            logits: backend,
+            audio: runtime,
+            decoder: runtime,
+            logits: runtime,
         }
     }
 
-    const fn gpu_audio_hybrid() -> Self {
+    fn gpu_audio_hybrid(audio_runtime: ResolvedFamilyRuntimeInput) -> Self {
+        let cpu_runtime = ResolvedFamilyRuntimeInput::resolve(
+            Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        );
         Self {
-            audio: crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
-            decoder: crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
-            logits: crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            audio: audio_runtime,
+            decoder: cpu_runtime,
+            logits: cpu_runtime,
         }
     }
+
+    fn audio_backend(self) -> crate::ggml_runtime::GgmlCpuGraphBackend {
+        self.audio.backend()
+    }
+
+    fn decoder_backend(self) -> crate::ggml_runtime::GgmlCpuGraphBackend {
+        self.decoder.backend()
+    }
+
+    fn logits_backend(self) -> crate::ggml_runtime::GgmlCpuGraphBackend {
+        self.logits.backend()
+    }
+}
+
+#[cfg(test)]
+fn resolved_runtime_for_backend(
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+) -> ResolvedFamilyRuntimeInput {
+    ResolvedFamilyRuntimeInput::resolve(
+        Some(
+            if matches!(backend, crate::ggml_runtime::GgmlCpuGraphBackend::Cpu) {
+                crate::ggml_runtime::RequestBackendPreference::CpuOnly
+            } else {
+                crate::ggml_runtime::RequestBackendPreference::Accelerated
+            },
+        ),
+        crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+    )
 }
 
 /// Assembles the aligner's decode prompt directly from BPE-encoded pieces
@@ -424,8 +456,9 @@ pub(crate) struct Qwen3ForcedAlignerPreparedAssets {
 
 pub(crate) fn load_forced_aligner_prepared_assets(
     preflight: &GgufRuntimeSourcePreflight,
-    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+    runtime: ResolvedFamilyRuntimeInput,
 ) -> Result<Qwen3ForcedAlignerPreparedAssets, Qwen3ForcedAlignerRuntimeError> {
+    let backend = runtime.backend();
     let runtime_source = &preflight.runtime_source;
     let gguf_metadata = preflight.metadata.as_ref();
     let metadata = parse_forced_aligner_runtime_metadata(gguf_metadata)?;
@@ -520,7 +553,7 @@ pub(crate) fn align_forced_with_progress(
         audio_samples_16khz_mono,
         text,
         language,
-        ForcedAlignerStageBackends::uniform(backend),
+        ForcedAlignerStageBackends::uniform(resolved_runtime_for_backend(backend)),
         observer,
     )
 }
@@ -549,16 +582,16 @@ fn align_forced_with_stage_backends(
 
     report(ForcedAlignerProgressEvent::AudioEncodingStarted);
     let audio_runtime_result = if matches!(
-        backends.audio,
+        backends.audio_backend(),
         crate::ggml_runtime::GgmlCpuGraphBackend::Gpu
     ) {
         Qwen3AsrAudioEncoderRuntime::new_from_preflight_with_flash_attention(
             preflight,
-            backends.audio,
+            backends.audio_backend(),
             false,
         )
     } else {
-        Qwen3AsrAudioEncoderRuntime::new_from_preflight(preflight, backends.audio)
+        Qwen3AsrAudioEncoderRuntime::new_from_preflight(preflight, backends.audio_backend())
     };
     let mut audio_runtime =
         audio_runtime_result.map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
@@ -590,7 +623,7 @@ fn align_forced_with_stage_backends(
     )?;
 
     report(ForcedAlignerProgressEvent::DecoderPrefillStarted);
-    let mut whole_decoder = if backends.decoder.is_gpu_class() {
+    let mut whole_decoder = if backends.decoder_backend().is_gpu_class() {
         let device_embedding = assets
             .token_embedding_table
             .device_graph_spec()
@@ -602,25 +635,19 @@ fn align_forced_with_stage_backends(
             &assets.decoder_plan,
             preflight,
             device_embedding,
-            ResolvedFamilyRuntimeInput::resolve(
-                None,
-                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
-            ),
+            backends.decoder,
         )
     } else {
         Qwen3AsrLlmWholeDecoderGraphExecutor::new_from_plan_with_preflight(
             &assets.decoder_plan,
             preflight,
-            ResolvedFamilyRuntimeInput::resolve(
-                None,
-                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
-            ),
+            backends.decoder,
         )
     }
     .map_err(|error| Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
         reason: error.to_string(),
     })?;
-    if backends.decoder.is_gpu_class() {
+    if backends.decoder_backend().is_gpu_class() {
         // Forced alignment turns a single near-tie attention argmax into an
         // absolute timestamp choice. Request ggml's precise attention contract
         // for this transient decoder on every GPU; ordinary Qwen-family decode
@@ -635,7 +662,7 @@ fn align_forced_with_stage_backends(
             reason: "forced aligner audio pad position overflowed".to_string(),
         })?;
     let audio_positions = (decode_prompt.audio_pad_start_index..audio_pad_end).collect::<Vec<_>>();
-    let prefill_input = if backends.decoder.is_gpu_class() {
+    let prefill_input = if backends.decoder_backend().is_gpu_class() {
         let token_major_embeddings = whole_decoder
             .materialize_token_prompt_on_device(
                 &decode_prompt.token_ids,
@@ -684,7 +711,7 @@ fn align_forced_with_stage_backends(
     // runtime so their transient GPU allocations never overlap.
     drop(whole_decoder);
     drop(prefill_input);
-    let mut logits_runtime = assets.logits_head.new_runtime(backends.logits)?;
+    let mut logits_runtime = assets.logits_head.new_runtime(backends.logits_backend())?;
     let expected_timestamp_positions = word_list.len() * 2;
     if timestamp_positions.len() != expected_timestamp_positions {
         return Err(
@@ -961,25 +988,36 @@ impl Qwen3ForcedAlignerSession {
         pack_path: &std::path::Path,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<Self, Qwen3ForcedAlignerRuntimeError> {
-        Self::load_verified(verify_forced_aligner_pack(pack_path)?, backend)
+        let runtime = ResolvedFamilyRuntimeInput::resolve(
+            Some(
+                if matches!(backend, crate::ggml_runtime::GgmlCpuGraphBackend::Cpu) {
+                    crate::ggml_runtime::RequestBackendPreference::CpuOnly
+                } else {
+                    crate::ggml_runtime::RequestBackendPreference::Accelerated
+                },
+            ),
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        );
+        Self::load_verified(verify_forced_aligner_pack(pack_path)?, runtime)
     }
 
     pub(crate) fn load_verified(
         verified: VerifiedPack,
-        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<Self, Qwen3ForcedAlignerRuntimeError> {
         Self::load_verified_with_stage_backends(
             verified,
-            ForcedAlignerStageBackends::uniform(backend),
+            ForcedAlignerStageBackends::uniform(runtime),
         )
     }
 
     pub(crate) fn load_verified_gpu_audio_hybrid(
         verified: VerifiedPack,
+        audio_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<Self, Qwen3ForcedAlignerRuntimeError> {
         Self::load_verified_with_stage_backends(
             verified,
-            ForcedAlignerStageBackends::gpu_audio_hybrid(),
+            ForcedAlignerStageBackends::gpu_audio_hybrid(audio_runtime),
         )
     }
 
@@ -1117,12 +1155,20 @@ mod tests {
             pack: &std::path::Path,
         ) -> Result<Qwen3ForcedAlignerSession, Qwen3ForcedAlignerRuntimeError> {
             let verified = verify_forced_aligner_pack(pack)?;
+            let runtime = ResolvedFamilyRuntimeInput::resolve(
+                Some(if matches!(self, Self::Cpu) {
+                    crate::ggml_runtime::RequestBackendPreference::CpuOnly
+                } else {
+                    crate::ggml_runtime::RequestBackendPreference::Accelerated
+                }),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            );
             match self {
                 Self::Cuda | Self::Vulkan => {
-                    Qwen3ForcedAlignerSession::load_verified_gpu_audio_hybrid(verified)
+                    Qwen3ForcedAlignerSession::load_verified_gpu_audio_hybrid(verified, runtime)
                 }
                 Self::Cpu | Self::Metal | Self::GenericGpu => {
-                    Qwen3ForcedAlignerSession::load_verified(verified, self.graph_backend())
+                    Qwen3ForcedAlignerSession::load_verified(verified, runtime)
                 }
             }
         }
@@ -1140,18 +1186,67 @@ mod tests {
 
     #[test]
     fn discrete_gpu_hybrid_accelerates_only_the_audio_encoder() {
-        let backends = ForcedAlignerStageBackends::gpu_audio_hybrid();
+        let runtime = ResolvedFamilyRuntimeInput::resolve(
+            Some(crate::ggml_runtime::RequestBackendPreference::Exact(
+                crate::device::execution_route::ResolvedExecutionRoute {
+                    provider: crate::device::execution_route::ExecutionProvider::Cuda,
+                    stable_id: "cuda0".to_string(),
+                    registry_ordinal: 0,
+                    kind: crate::device::execution_route::RouteDeviceKind::Accelerated,
+                    addressability:
+                        crate::device::execution_route::DeviceAddressability::ExactlyAddressable {
+                            physical_key: crate::device::execution_route::PhysicalResourceKey::new(
+                                "0000:01:00.0",
+                            )
+                            .expect("physical key"),
+                        },
+                },
+            )),
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        );
+        let backends = ForcedAlignerStageBackends::gpu_audio_hybrid(runtime);
         assert_eq!(
-            backends.audio,
+            backends.audio_backend(),
             crate::ggml_runtime::GgmlCpuGraphBackend::Gpu,
         );
         assert_eq!(
-            backends.decoder,
+            backends.decoder_backend(),
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         );
         assert_eq!(
-            backends.logits,
-            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            backends.logits_backend(),
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu
+        );
+
+        let cpu = ForcedAlignerStageBackends::uniform(ResolvedFamilyRuntimeInput::resolve(
+            Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        ));
+        assert_eq!(
+            cpu.audio_backend(),
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu
+        );
+        assert_eq!(
+            cpu.decoder_backend(),
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu
+        );
+        assert_eq!(
+            cpu.logits_backend(),
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu
+        );
+
+        let full_gpu = ForcedAlignerStageBackends::uniform(runtime);
+        assert_eq!(
+            full_gpu.audio_backend(),
+            crate::ggml_runtime::GgmlCpuGraphBackend::Gpu
+        );
+        assert_eq!(
+            full_gpu.decoder_backend(),
+            crate::ggml_runtime::GgmlCpuGraphBackend::Gpu
+        );
+        assert_eq!(
+            full_gpu.logits_backend(),
+            crate::ggml_runtime::GgmlCpuGraphBackend::Gpu
         );
     }
 
@@ -1823,7 +1918,10 @@ mod tests {
             .expect("runtime preflight");
         let assets = load_forced_aligner_prepared_assets(
             &preflight,
-            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            ResolvedFamilyRuntimeInput::resolve(
+                Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            ),
         )
         .expect("prepared assets");
 

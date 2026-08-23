@@ -1719,7 +1719,8 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
             if execution_context.is_canceled() {
                 return Err(BackendError::TranscriptionCanceled);
             }
-            let backend = crate::models::policy_resolved_aux_runtime::resolved_runtime_for_auxiliary_candidate(candidate).backend();
+            let resolved_runtime = crate::models::policy_resolved_aux_runtime::resolved_runtime_for_auxiliary_candidate(candidate);
+            let backend = resolved_runtime.backend();
             let session_load_started = Instant::now();
             let session_plan =
                 forced_aligner_session_plan(candidate.placement, candidate.device.route.provider)
@@ -1732,11 +1733,12 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
             let session = match session_plan {
                 ForcedAlignerSessionPlan::Uniform => Qwen3ForcedAlignerSession::load_verified(
                     verified_forced_aligner.clone(),
-                    backend,
+                    resolved_runtime,
                 ),
                 ForcedAlignerSessionPlan::GpuAudioHybrid => {
                     Qwen3ForcedAlignerSession::load_verified_gpu_audio_hybrid(
                         verified_forced_aligner.clone(),
+                        resolved_runtime,
                     )
                 }
             }
