@@ -15,16 +15,18 @@
 //! route audio through an unexpected model/quant.
 
 use std::{
+    cell::Cell,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard, OnceLock},
 };
 
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
@@ -49,6 +51,20 @@ fn selection_write_lock() -> MutexGuard<'static, ()> {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+thread_local! {
+    static PERSIST_COMMIT_FAILPOINT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Test-only failpoint for activation persist. Production never enables this.
+#[doc(hidden)]
+pub fn set_persist_commit_failpoint_for_test(enabled: bool) {
+    PERSIST_COMMIT_FAILPOINT.with(|flag| flag.set(enabled));
+}
+
+fn persist_commit_failpoint_enabled() -> bool {
+    PERSIST_COMMIT_FAILPOINT.with(Cell::get)
 }
 
 #[cfg(test)]
@@ -635,6 +651,11 @@ pub fn persist_detailed(
 ) -> Result<DefaultSelectionCommitOutcome, DefaultSelectionError> {
     let _lock = selection_write_lock();
     let _file_lock = SelectionFileLock::acquire(home)?;
+    if persist_commit_failpoint_enabled() {
+        return Ok(DefaultSelectionCommitOutcome::NotCommitted {
+            reason: "injected persist failure".to_string(),
+        });
+    }
     let generation = match next_generation(home) {
         Ok(generation) => generation,
         Err(error) => {

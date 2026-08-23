@@ -383,14 +383,20 @@ impl ResidentSessionEnvelope {
         self.serve_batch
     }
 
-    #[cfg(test)]
-    pub(crate) const fn test_default() -> Self {
+    /// Envelope for Prepare/Load quoting. Request/session components are not
+    /// reserved here; they stay JIT behind the prepared topology.
+    pub(crate) const fn activation_prepare() -> Self {
         Self {
             decoder_capacity: ResidentDecoderCapacity::None,
             active_slots: 1,
             max_sessions: 1,
             serve_batch: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn test_default() -> Self {
+        Self::activation_prepare()
     }
 
     #[cfg(test)]
@@ -987,6 +993,63 @@ pub(crate) const MOSS_TD_RESIDENT_FOOTPRINT: ResidentFootprintFacet =
     ResidentFootprintFacet::new(&[MODEL_BINDING, EXECUTION_STATE, DECODER_STATE]);
 pub(crate) const GRANITE_SPEECH_RESIDENT_FOOTPRINT: ResidentFootprintFacet =
     ResidentFootprintFacet::new(&[MODEL_BINDING, EXECUTION_STATE, DECODER_STATE]);
+
+const STREAM_VAD_EMBEDDED: ResidentComponentSpec = ResidentComponentSpec::new(
+    "embedded-model",
+    "v1",
+    ResidentPhase::Load,
+    ResidentLifetime::ExecutionScope,
+    NO_DEPENDENCIES,
+    BOTH_BINDINGS,
+    UNIFIED_AND_SPLIT,
+    ResidentCheckout::serialized(),
+    None,
+);
+const STREAM_VAD_EMBEDDED_DEPENDENCY: &[&str] = &["embedded-model"];
+const STREAM_VAD_HOST_SESSION: ResidentComponentSpec = ResidentComponentSpec::new(
+    "host-session",
+    "v1",
+    ResidentPhase::Stream,
+    ResidentLifetime::Session,
+    STREAM_VAD_EMBEDDED_DEPENDENCY,
+    BOTH_BINDINGS,
+    UNIFIED_AND_SPLIT,
+    ResidentCheckout::serialized(),
+    Some(STREAM_SESSION),
+);
+const STREAM_VAD_ACCELERATED_ACTOR: ResidentComponentSpec = ResidentComponentSpec::new(
+    "accelerated-actor",
+    "v1",
+    ResidentPhase::Stream,
+    ResidentLifetime::ExecutionScope,
+    STREAM_VAD_EMBEDDED_DEPENDENCY,
+    BOTH_BINDINGS,
+    UNIFIED_AND_SPLIT,
+    ResidentCheckout::bounded(2),
+    None,
+);
+pub(crate) const FIRERED_STREAM_VAD_RESIDENT_FOOTPRINT: ResidentFootprintFacet =
+    ResidentFootprintFacet::new(&[
+        STREAM_VAD_EMBEDDED,
+        STREAM_VAD_HOST_SESSION,
+        STREAM_VAD_ACCELERATED_ACTOR,
+    ]);
+pub(crate) const REDIMNET_RESIDENT_FOOTPRINT: ResidentFootprintFacet =
+    ResidentFootprintFacet::new(&[MODEL_BINDING, EXECUTION_STATE]);
+pub(crate) const PYANNOTE_SEGMENT_RESIDENT_FOOTPRINT: ResidentFootprintFacet =
+    ResidentFootprintFacet::new(&[MODEL_BINDING, EXECUTION_STATE]);
+pub(crate) const DIARIZEN_SEGMENT_RESIDENT_FOOTPRINT: ResidentFootprintFacet =
+    ResidentFootprintFacet::new(&[MODEL_BINDING, EXECUTION_STATE]);
+pub(crate) const FIRERED_PUNC_RESIDENT_FOOTPRINT: ResidentFootprintFacet =
+    ResidentFootprintFacet::new(&[MODEL_BINDING, EXECUTION_STATE]);
+
+pub(crate) const AUXILIARY_RESIDENT_FOOTPRINTS: &[(&str, ResidentFootprintFacet)] = &[
+    ("firered-stream-vad", FIRERED_STREAM_VAD_RESIDENT_FOOTPRINT),
+    ("redimnet2", REDIMNET_RESIDENT_FOOTPRINT),
+    ("pyannote-segmentation", PYANNOTE_SEGMENT_RESIDENT_FOOTPRINT),
+    ("diarizen-segmentation", DIARIZEN_SEGMENT_RESIDENT_FOOTPRINT),
+    ("firered-punc", FIRERED_PUNC_RESIDENT_FOOTPRINT),
+];
 
 #[cfg(test)]
 pub(crate) const TEST_RESIDENT_FOOTPRINT: ResidentFootprintFacet =

@@ -4,13 +4,17 @@
 //! backend, infer a device class, attach to an execution context, or publish
 //! through an existing runtime service. Callers supply already-resolved facts,
 //! reservations, staged owners, attestation contracts, and a journal factory.
+//! Production NES attempts and default-model activation both enter here;
+//! family modules must not construct a second transaction.
 #![allow(dead_code, private_bounds, private_interfaces)]
 
 use std::marker::PhantomData;
 
+use crate::device::execution_policy::ExecutionCandidate;
+
 /// The externally visible lifecycle of one candidate activation attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ActivationStage {
+pub enum ActivationStage {
     Prepared,
     Reserved,
     Materialized,
@@ -22,15 +26,15 @@ pub(crate) enum ActivationStage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct InvalidTransition {
-    pub(crate) from: ActivationStage,
-    pub(crate) to: ActivationStage,
+pub struct InvalidTransition {
+    pub from: ActivationStage,
+    pub to: ActivationStage,
 }
 
 impl ActivationStage {
     /// Check an edge independently of a transaction. The typestate wrappers
     /// make the same invalid edges unrepresentable at call sites.
-    pub(crate) const fn transition(self, to: Self) -> Result<(), InvalidTransition> {
+    pub const fn transition(self, to: Self) -> Result<(), InvalidTransition> {
         let valid = match (self, to) {
             (Self::Prepared, Self::Reserved | Self::RolledBack)
             | (Self::Reserved, Self::Materialized | Self::RolledBack | Self::Quarantined)
@@ -57,14 +61,14 @@ impl ActivationStage {
 /// `is_gpu_class`, `Auto`, or output-plan conversion is inspected here. The
 /// exact values supplied by the caller are retained and returned unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ResolvedExecutionFacts<Plan, Lane, Identity> {
+pub struct ResolvedExecutionFacts<Plan, Lane, Identity> {
     plan: Plan,
     exact_lane: Lane,
     identity: Identity,
 }
 
 impl<Plan, Lane, Identity> ResolvedExecutionFacts<Plan, Lane, Identity> {
-    pub(crate) const fn new(plan: Plan, exact_lane: Lane, identity: Identity) -> Self {
+    pub const fn new(plan: Plan, exact_lane: Lane, identity: Identity) -> Self {
         Self {
             plan,
             exact_lane,
@@ -72,26 +76,26 @@ impl<Plan, Lane, Identity> ResolvedExecutionFacts<Plan, Lane, Identity> {
         }
     }
 
-    pub(crate) const fn plan(&self) -> &Plan {
+    pub const fn plan(&self) -> &Plan {
         &self.plan
     }
 
-    pub(crate) const fn exact_lane(&self) -> &Lane {
+    pub const fn exact_lane(&self) -> &Lane {
         &self.exact_lane
     }
 
-    pub(crate) const fn identity(&self) -> &Identity {
+    pub const fn identity(&self) -> &Identity {
         &self.identity
     }
 
-    pub(crate) fn into_parts(self) -> (Plan, Lane, Identity) {
+    pub fn into_parts(self) -> (Plan, Lane, Identity) {
         (self.plan, self.exact_lane, self.identity)
     }
 }
 
 /// A staged owner that has not yet been published to a shared registry.
 /// Transactions invoke the operations in reverse construction order.
-pub(crate) trait StagedOwner {
+pub trait StagedOwner {
     type Error;
 
     fn teardown(&mut self) -> Result<(), Self::Error>;
@@ -99,7 +103,7 @@ pub(crate) trait StagedOwner {
 }
 
 /// The reservation token supplied by the admission layer.
-pub(crate) trait ActivationReservation {
+pub trait ActivationReservation {
     type Error;
 
     fn release(&mut self) -> Result<(), Self::Error>;
@@ -122,13 +126,13 @@ impl StagedOwner for EmptyOwner {
 
 /// A typed result from an attestation contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AttestationFailure<Error> {
+pub enum AttestationFailure<Error> {
     Rejected(Error),
     MustQuarantine(Error),
 }
 
 /// Evidence must carry the same opaque identity as the resolved facts.
-pub(crate) trait AttestationEvidence<Identity> {
+pub trait AttestationEvidence<Identity> {
     fn identity(&self) -> &Identity;
 }
 
@@ -137,7 +141,7 @@ pub(crate) trait AttestationEvidence<Identity> {
 /// There is deliberately no default implementation. A contract declares its
 /// identity, and the transaction checks both that identity and the evidence
 /// identity against the immutable resolved facts before producing Attested.
-pub(crate) trait TypedAttestation<Plan, Lane> {
+pub trait TypedAttestation<Plan, Lane> {
     type Identity: Eq;
     type Evidence: AttestationEvidence<Self::Identity>;
     type Error;
@@ -173,7 +177,7 @@ trait PublicationJournal<Candidate, Plan, Lane, Identity> {
 
 /// The only journal surface visible outside this module is construction. Its
 /// associated journal type has no externally callable publication methods.
-pub(crate) trait PublicationJournalFactory<Candidate, Plan, Lane, Identity> {
+pub trait PublicationJournalFactory<Candidate, Plan, Lane, Identity> {
     type Journal;
 
     fn build(
@@ -184,27 +188,28 @@ pub(crate) trait PublicationJournalFactory<Candidate, Plan, Lane, Identity> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PublicationFailure<Error> {
+pub enum PublicationFailure<Error> {
     Rejected(Error),
     MustQuarantine(Error),
 }
 
 /// A read-only observer seam for a future GPU/runtime adapter. It has no
 /// transaction handle and no mutating method, and is not wired to context.
-pub(crate) trait ReadOnlyActivationObserver<Plan, Lane, Identity> {
+pub trait ReadOnlyActivationObserver<Plan, Lane, Identity> {
     fn observe(&self, stage: ActivationStage, facts: &ResolvedExecutionFacts<Plan, Lane, Identity>);
 }
 
-pub(crate) struct ReadOnlyObserverAdapter<'a, Observer> {
+#[allow(dead_code)]
+pub struct ReadOnlyObserverAdapter<'a, Observer> {
     observer: &'a Observer,
 }
 
 impl<'a, Observer> ReadOnlyObserverAdapter<'a, Observer> {
-    pub(crate) const fn new(observer: &'a Observer) -> Self {
+    pub const fn new(observer: &'a Observer) -> Self {
         Self { observer }
     }
 
-    pub(crate) fn notify<Plan, Lane, Identity>(
+    pub fn notify<Plan, Lane, Identity>(
         &self,
         stage: ActivationStage,
         facts: &ResolvedExecutionFacts<Plan, Lane, Identity>,
@@ -216,9 +221,9 @@ impl<'a, Observer> ReadOnlyObserverAdapter<'a, Observer> {
 }
 
 #[derive(Debug)]
-pub(crate) struct OwnerSetError<Error> {
-    pub(crate) first: Error,
-    pub(crate) failures: usize,
+pub struct OwnerSetError<Error> {
+    pub first: Error,
+    pub failures: usize,
 }
 
 struct StagedOwnerSet<Owner> {
@@ -270,10 +275,10 @@ impl<Owner> StagedOwnerSet<Owner> {
 }
 
 #[derive(Debug)]
-pub(crate) struct CleanupError<ReservationError, OwnerError, JournalError> {
-    pub(crate) reservation: Option<ReservationError>,
-    pub(crate) owners: Option<OwnerSetError<OwnerError>>,
-    pub(crate) journal: Option<JournalError>,
+pub struct CleanupError<ReservationError, OwnerError, JournalError> {
+    pub reservation: Option<ReservationError>,
+    pub owners: Option<OwnerSetError<OwnerError>>,
+    pub journal: Option<JournalError>,
 }
 
 impl<ReservationError, OwnerError, JournalError>
@@ -487,7 +492,7 @@ where
 }
 
 /// The prepared transaction entry point.
-pub(crate) struct PreparedTransaction<Candidate, Plan, Lane, Identity, Journal>
+pub struct PreparedTransaction<Candidate, Plan, Lane, Identity, Journal>
 where
     Journal: PublicationJournal<Candidate, Plan, Lane, Identity>,
 {
@@ -495,7 +500,7 @@ where
 }
 
 /// The canonical name for the prepared transaction entry point.
-pub(crate) type CandidateActivationTransaction<Candidate, Plan, Lane, Identity, Journal> =
+pub type CandidateActivationTransaction<Candidate, Plan, Lane, Identity, Journal> =
     PreparedTransaction<Candidate, Plan, Lane, Identity, Journal>;
 
 impl<Candidate, Plan, Lane, Identity, Journal>
@@ -503,7 +508,7 @@ impl<Candidate, Plan, Lane, Identity, Journal>
 where
     Journal: PublicationJournal<Candidate, Plan, Lane, Identity>,
 {
-    pub(crate) fn prepare(
+    pub fn prepare(
         candidate: Candidate,
         facts: ResolvedExecutionFacts<Plan, Lane, Identity>,
         journal: Journal,
@@ -517,15 +522,15 @@ where
         }
     }
 
-    pub(crate) const fn stage(&self) -> ActivationStage {
+    pub const fn stage(&self) -> ActivationStage {
         ActivationStage::Prepared
     }
 
-    pub(crate) fn facts(&self) -> &ResolvedExecutionFacts<Plan, Lane, Identity> {
+    pub fn facts(&self) -> &ResolvedExecutionFacts<Plan, Lane, Identity> {
         self.guard.facts()
     }
 
-    pub(crate) fn reserve<Reservation>(
+    pub fn reserve<Reservation>(
         mut self,
         reservation: Reservation,
     ) -> ReservedTransaction<Candidate, Plan, Lane, Identity, Journal, Reservation>
@@ -546,7 +551,7 @@ where
 
     /// Factory construction is the only public(crate) family seam. The
     /// resulting journal still has a private mutation capability.
-    pub(crate) fn prepare_from_factory<Factory>(
+    pub fn prepare_from_factory<Factory>(
         candidate: Candidate,
         facts: ResolvedExecutionFacts<Plan, Lane, Identity>,
         factory: Factory,
@@ -565,9 +570,7 @@ impl<Candidate, Plan, Lane, Identity, Journal>
 where
     Journal: PublicationJournal<Candidate, Plan, Lane, Identity>,
 {
-    pub(crate) fn rollback(
-        mut self,
-    ) -> Result<PreparedRollback, CleanupError<(), (), Journal::Error>> {
+    pub fn rollback(mut self) -> Result<PreparedRollback, CleanupError<(), (), Journal::Error>> {
         let result = self.guard.rollback();
         if let Err(journal) = result {
             // Keep the guard armed. Its Drop path performs quarantine, so a
@@ -587,7 +590,7 @@ where
 }
 
 /// Transaction with an active reservation but no staged owners yet.
-pub(crate) struct ReservedTransaction<Candidate, Plan, Lane, Identity, Journal, Reservation>
+pub struct ReservedTransaction<Candidate, Plan, Lane, Identity, Journal, Reservation>
 where
     Journal: PublicationJournal<Candidate, Plan, Lane, Identity>,
     Reservation: ActivationReservation,
@@ -601,11 +604,11 @@ where
     Journal: PublicationJournal<Candidate, Plan, Lane, Identity>,
     Reservation: ActivationReservation,
 {
-    pub(crate) const fn stage(&self) -> ActivationStage {
+    pub const fn stage(&self) -> ActivationStage {
         ActivationStage::Reserved
     }
 
-    pub(crate) fn materialize<Owner>(
+    pub fn materialize<Owner>(
         mut self,
         owners: impl IntoIterator<Item = Owner>,
     ) -> MaterializedTransaction<Candidate, Plan, Lane, Identity, Journal, Reservation, Owner>
@@ -624,7 +627,7 @@ where
         }
     }
 
-    pub(crate) fn rollback(
+    pub fn rollback(
         mut self,
     ) -> Result<
         RollbackTerminal,
@@ -641,7 +644,7 @@ where
         }
     }
 
-    pub(crate) fn quarantine(
+    pub fn quarantine(
         mut self,
     ) -> Result<
         QuarantineTerminal,
@@ -661,15 +664,8 @@ where
 
 /// Transaction after all candidate owners have been staged, but before
 /// attestation.
-pub(crate) struct MaterializedTransaction<
-    Candidate,
-    Plan,
-    Lane,
-    Identity,
-    Journal,
-    Reservation,
-    Owner,
-> where
+pub struct MaterializedTransaction<Candidate, Plan, Lane, Identity, Journal, Reservation, Owner>
+where
     Journal: PublicationJournal<Candidate, Plan, Lane, Identity>,
     Reservation: ActivationReservation,
     Owner: StagedOwner,
@@ -684,11 +680,11 @@ where
     Reservation: ActivationReservation,
     Owner: StagedOwner,
 {
-    pub(crate) const fn stage(&self) -> ActivationStage {
+    pub const fn stage(&self) -> ActivationStage {
         ActivationStage::Materialized
     }
 
-    pub(crate) fn begin_attestation<Contract>(
+    pub fn begin_attestation<Contract>(
         mut self,
         contract: Contract,
     ) -> AttestationPendingTransaction<
@@ -707,7 +703,7 @@ where
         }
     }
 
-    pub(crate) fn rollback(
+    pub fn rollback(
         mut self,
     ) -> Result<RollbackTerminal, CleanupError<Reservation::Error, Owner::Error, Journal::Error>>
     {
@@ -722,7 +718,7 @@ where
         }
     }
 
-    pub(crate) fn quarantine(
+    pub fn quarantine(
         mut self,
     ) -> Result<QuarantineTerminal, CleanupError<Reservation::Error, Owner::Error, Journal::Error>>
     {
@@ -740,7 +736,7 @@ where
 
 /// A pending attestation retains the explicit contract. There is no operation
 /// that can construct `AttestedTransaction` without invoking that contract.
-pub(crate) struct AttestationPendingTransaction<
+pub struct AttestationPendingTransaction<
     Candidate,
     Plan,
     Lane,
@@ -759,14 +755,14 @@ pub(crate) struct AttestationPendingTransaction<
 }
 
 #[derive(Debug)]
-pub(crate) enum AttestationError<Error> {
+pub enum AttestationError<Error> {
     Contract(AttestationFailure<Error>),
     ContractIdentityMismatch,
     EvidenceIdentityMismatch,
 }
 
 #[derive(Debug)]
-pub(crate) enum AttestationOutcome<Pending, Attested, Quarantine, Error> {
+pub enum AttestationOutcome<Pending, Attested, Quarantine, Error> {
     Attested(Attested),
     Rejected {
         source: AttestationError<Error>,
@@ -794,11 +790,11 @@ where
     Reservation: ActivationReservation,
     Owner: StagedOwner,
 {
-    pub(crate) const fn stage(&self) -> ActivationStage {
+    pub const fn stage(&self) -> ActivationStage {
         ActivationStage::AttestationPending
     }
 
-    pub(crate) fn rollback(
+    pub fn rollback(
         mut self,
     ) -> Result<RollbackTerminal, CleanupError<Reservation::Error, Owner::Error, Journal::Error>>
     {
@@ -813,7 +809,7 @@ where
         }
     }
 
-    pub(crate) fn quarantine(
+    pub fn quarantine(
         mut self,
     ) -> Result<QuarantineTerminal, CleanupError<Reservation::Error, Owner::Error, Journal::Error>>
     {
@@ -847,7 +843,7 @@ where
     Identity: Eq,
     Contract: TypedAttestation<Plan, Lane, Identity = Identity>,
 {
-    pub(crate) fn attest(
+    pub fn attest(
         mut self,
     ) -> AttestationOutcome<
         Self,
@@ -904,7 +900,7 @@ where
 /// A MustQuarantine result has a narrower capability than a rejected pending
 /// transaction. It exposes only quarantine, and its guard drops into
 /// quarantine; rollback is not a method on this type.
-pub(crate) struct QuarantineRequired<
+pub struct QuarantineRequired<
     Candidate,
     Plan,
     Lane,
@@ -929,7 +925,7 @@ where
     Reservation: ActivationReservation,
     Owner: StagedOwner,
 {
-    pub(crate) fn quarantine(
+    pub fn quarantine(
         mut self,
     ) -> Result<QuarantineTerminal, CleanupError<Reservation::Error, Owner::Error, Journal::Error>>
     {
@@ -953,7 +949,7 @@ struct AttestationProof<Contract, Evidence> {
 }
 
 /// Transaction with a contract-backed attestation proof.
-pub(crate) struct AttestedTransaction<
+pub struct AttestedTransaction<
     Candidate,
     Plan,
     Lane,
@@ -989,11 +985,11 @@ where
     Reservation: ActivationReservation,
     Owner: StagedOwner,
 {
-    pub(crate) const fn stage(&self) -> ActivationStage {
+    pub const fn stage(&self) -> ActivationStage {
         ActivationStage::Attested
     }
 
-    pub(crate) fn commit(
+    pub fn commit(
         mut self,
     ) -> Result<
         CommittedTransaction<
@@ -1037,7 +1033,7 @@ where
         }
     }
 
-    pub(crate) fn rollback(
+    pub fn rollback(
         mut self,
     ) -> Result<RollbackTerminal, CleanupError<Reservation::Error, Owner::Error, Journal::Error>>
     {
@@ -1052,7 +1048,7 @@ where
         }
     }
 
-    pub(crate) fn quarantine(
+    pub fn quarantine(
         mut self,
     ) -> Result<QuarantineTerminal, CleanupError<Reservation::Error, Owner::Error, Journal::Error>>
     {
@@ -1069,7 +1065,7 @@ where
 }
 
 #[derive(Debug)]
-pub(crate) enum CommitError<ReservationError, OwnerError, JournalError> {
+pub enum CommitError<ReservationError, OwnerError, JournalError> {
     Rejected {
         source: JournalError,
         cleanup: Option<CleanupError<ReservationError, OwnerError, JournalError>>,
@@ -1081,30 +1077,30 @@ pub(crate) enum CommitError<ReservationError, OwnerError, JournalError> {
 }
 
 /// The only successful pre-publication rollback terminal.
-pub(crate) struct RollbackTerminal {
+pub struct RollbackTerminal {
     _private: PhantomData<()>,
 }
 
 impl RollbackTerminal {
-    pub(crate) const fn stage(&self) -> ActivationStage {
+    pub const fn stage(&self) -> ActivationStage {
         ActivationStage::RolledBack
     }
 }
 
 /// The terminal returned by explicit or contract-required quarantine.
-pub(crate) struct QuarantineTerminal {
+pub struct QuarantineTerminal {
     _private: PhantomData<()>,
 }
 
 impl QuarantineTerminal {
-    pub(crate) const fn stage(&self) -> ActivationStage {
+    pub const fn stage(&self) -> ActivationStage {
         ActivationStage::Quarantined
     }
 }
 
 /// A committed transaction has no rollback operation. Releasing the old
 /// publication is a later transaction, not an authority retained by this one.
-pub(crate) struct CommittedTransaction<
+pub struct CommittedTransaction<
     Candidate,
     Plan,
     Lane,
@@ -1140,19 +1136,538 @@ where
     Reservation: ActivationReservation,
     Owner: StagedOwner,
 {
-    pub(crate) const fn stage(&self) -> ActivationStage {
+    pub const fn stage(&self) -> ActivationStage {
         ActivationStage::Committed
     }
 }
 
 /// A prepared transaction has no reservation or staged owner to compensate.
-pub(crate) struct PreparedRollback {
+pub struct PreparedRollback {
     _private: PhantomData<()>,
 }
 
 impl PreparedRollback {
-    pub(crate) const fn stage(&self) -> ActivationStage {
+    pub const fn stage(&self) -> ActivationStage {
         ActivationStage::RolledBack
+    }
+}
+
+/// Opaque identity for one NES candidate attempt. The selected candidate is
+/// retained as facts; this module does not inspect provider or placement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeCandidateAttemptFacts {
+    candidate: ExecutionCandidate,
+}
+
+impl NativeCandidateAttemptFacts {
+    pub fn new(candidate: ExecutionCandidate) -> Self {
+        Self { candidate }
+    }
+
+    #[allow(dead_code)]
+    pub fn candidate(&self) -> &ExecutionCandidate {
+        &self.candidate
+    }
+}
+
+/// Evidence that one NES candidate attempt completed its attestation contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionCandidateAttemptEvidence {
+    identity: NativeCandidateAttemptFacts,
+}
+
+impl ExecutionCandidateAttemptEvidence {
+    pub fn new(identity: NativeCandidateAttemptFacts) -> Self {
+        Self { identity }
+    }
+}
+
+impl AttestationEvidence<NativeCandidateAttemptFacts> for ExecutionCandidateAttemptEvidence {
+    fn identity(&self) -> &NativeCandidateAttemptFacts {
+        &self.identity
+    }
+}
+
+/// Token owner for an NES attempt. Resident owners are staged through the
+/// bound cache journal during attestation, not as a second publication path.
+#[derive(Debug, Default)]
+pub struct ExecutionCandidateAttemptOwner;
+
+impl StagedOwner for ExecutionCandidateAttemptOwner {
+    type Error = std::convert::Infallible;
+
+    fn teardown(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn quarantine(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// Binds the NES cache-journal finish callback. Publish commits staged owners;
+/// rollback and quarantine destroy them. Quote is not a reservation: NES does
+/// not treat a forecast as this journal's reservation token.
+pub struct ExecutionCandidateAttemptJournalFactory {
+    finish: Option<Box<dyn FnOnce(bool) + 'static>>,
+}
+
+pub struct ExecutionCandidateAttemptJournal {
+    finish: Option<Box<dyn FnOnce(bool) + 'static>>,
+}
+
+impl ExecutionCandidateAttemptJournalFactory {
+    pub fn bind(finish: impl FnOnce(bool) + 'static) -> Self {
+        Self {
+            finish: Some(Box::new(finish)),
+        }
+    }
+
+    pub fn prepare(
+        self,
+        candidate: NativeCandidateAttemptFacts,
+        facts: ResolvedExecutionFacts<
+            NativeCandidateAttemptFacts,
+            NativeCandidateAttemptFacts,
+            NativeCandidateAttemptFacts,
+        >,
+    ) -> NativeCandidatePreparedActivation {
+        CandidateActivationTransaction::<
+            NativeCandidateAttemptFacts,
+            NativeCandidateAttemptFacts,
+            NativeCandidateAttemptFacts,
+            NativeCandidateAttemptFacts,
+            ExecutionCandidateAttemptJournal,
+        >::prepare_from_factory(candidate, facts, self)
+    }
+}
+
+impl
+    PublicationJournalFactory<
+        NativeCandidateAttemptFacts,
+        NativeCandidateAttemptFacts,
+        NativeCandidateAttemptFacts,
+        NativeCandidateAttemptFacts,
+    > for ExecutionCandidateAttemptJournalFactory
+{
+    type Journal = ExecutionCandidateAttemptJournal;
+
+    fn build(
+        self,
+        _candidate: &NativeCandidateAttemptFacts,
+        _facts: &ResolvedExecutionFacts<
+            NativeCandidateAttemptFacts,
+            NativeCandidateAttemptFacts,
+            NativeCandidateAttemptFacts,
+        >,
+    ) -> Self::Journal {
+        ExecutionCandidateAttemptJournal {
+            finish: self.finish,
+        }
+    }
+}
+
+impl ExecutionCandidateAttemptJournal {
+    fn finish(&mut self, commit: bool) -> Result<(), String> {
+        if let Some(finish) = self.finish.take() {
+            finish(commit);
+        }
+        Ok(())
+    }
+}
+
+impl
+    PublicationJournal<
+        NativeCandidateAttemptFacts,
+        NativeCandidateAttemptFacts,
+        NativeCandidateAttemptFacts,
+        NativeCandidateAttemptFacts,
+    > for ExecutionCandidateAttemptJournal
+{
+    type Error = String;
+
+    fn publish(
+        &mut self,
+        _candidate: &NativeCandidateAttemptFacts,
+        _facts: &ResolvedExecutionFacts<
+            NativeCandidateAttemptFacts,
+            NativeCandidateAttemptFacts,
+            NativeCandidateAttemptFacts,
+        >,
+    ) -> Result<(), PublicationFailure<Self::Error>> {
+        self.finish(true).map_err(PublicationFailure::Rejected)
+    }
+
+    fn rollback(
+        &mut self,
+        _candidate: &NativeCandidateAttemptFacts,
+        _facts: &ResolvedExecutionFacts<
+            NativeCandidateAttemptFacts,
+            NativeCandidateAttemptFacts,
+            NativeCandidateAttemptFacts,
+        >,
+    ) -> Result<(), Self::Error> {
+        self.finish(false)
+    }
+
+    fn quarantine(&mut self) -> Result<(), Self::Error> {
+        self.finish(false)
+    }
+}
+
+pub type NativeCandidatePreparedActivation = CandidateActivationTransaction<
+    NativeCandidateAttemptFacts,
+    NativeCandidateAttemptFacts,
+    NativeCandidateAttemptFacts,
+    NativeCandidateAttemptFacts,
+    ExecutionCandidateAttemptJournal,
+>;
+
+/// Default-model activation candidate identity. The path is the installed pack
+/// the host intends to publish after attestation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultModelActivationCandidate {
+    pub pull: String,
+    pub path: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultModelActivationPlan {
+    pub path: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DefaultModelActivationLane;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultModelActivationIdentity {
+    pub pull: String,
+    pub path: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultModelActivationEvidence {
+    identity: DefaultModelActivationIdentity,
+}
+
+impl DefaultModelActivationEvidence {
+    pub fn new(identity: DefaultModelActivationIdentity) -> Self {
+        Self { identity }
+    }
+}
+
+impl AttestationEvidence<DefaultModelActivationIdentity> for DefaultModelActivationEvidence {
+    fn identity(&self) -> &DefaultModelActivationIdentity {
+        &self.identity
+    }
+}
+
+/// Reservation used when set-default does not hold a broker batch of its own.
+/// Native warmup/probe admits its owners through the existing NES path.
+#[derive(Debug, Default)]
+pub struct NoopActivationReservation;
+
+impl ActivationReservation for NoopActivationReservation {
+    type Error = std::convert::Infallible;
+
+    fn release(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn quarantine(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// Factory for the production default-model publication journal. Persist of
+/// V2 happens only when an attested transaction commits.
+pub struct DefaultModelActivationJournalFactory {
+    pub home: std::path::PathBuf,
+    pub pack: crate::InstalledPack,
+    pub preference: crate::QuantPreference,
+}
+
+/// Opaque production journal. Families and the server cannot call publish.
+pub struct DefaultModelActivationJournal {
+    home: std::path::PathBuf,
+    pack: crate::InstalledPack,
+    preference: crate::QuantPreference,
+}
+
+impl DefaultModelActivationJournalFactory {
+    pub fn prepare(
+        self,
+        candidate: DefaultModelActivationCandidate,
+        facts: ResolvedExecutionFacts<
+            DefaultModelActivationPlan,
+            DefaultModelActivationLane,
+            DefaultModelActivationIdentity,
+        >,
+    ) -> DefaultModelPreparedActivation {
+        CandidateActivationTransaction::<
+            DefaultModelActivationCandidate,
+            DefaultModelActivationPlan,
+            DefaultModelActivationLane,
+            DefaultModelActivationIdentity,
+            DefaultModelActivationJournal,
+        >::prepare_from_factory(candidate, facts, self)
+    }
+}
+
+impl
+    PublicationJournalFactory<
+        DefaultModelActivationCandidate,
+        DefaultModelActivationPlan,
+        DefaultModelActivationLane,
+        DefaultModelActivationIdentity,
+    > for DefaultModelActivationJournalFactory
+{
+    type Journal = DefaultModelActivationJournal;
+
+    fn build(
+        self,
+        _candidate: &DefaultModelActivationCandidate,
+        _facts: &ResolvedExecutionFacts<
+            DefaultModelActivationPlan,
+            DefaultModelActivationLane,
+            DefaultModelActivationIdentity,
+        >,
+    ) -> Self::Journal {
+        DefaultModelActivationJournal {
+            home: self.home,
+            pack: self.pack,
+            preference: self.preference,
+        }
+    }
+}
+
+impl
+    PublicationJournal<
+        DefaultModelActivationCandidate,
+        DefaultModelActivationPlan,
+        DefaultModelActivationLane,
+        DefaultModelActivationIdentity,
+    > for DefaultModelActivationJournal
+{
+    type Error = String;
+
+    fn publish(
+        &mut self,
+        _candidate: &DefaultModelActivationCandidate,
+        _facts: &ResolvedExecutionFacts<
+            DefaultModelActivationPlan,
+            DefaultModelActivationLane,
+            DefaultModelActivationIdentity,
+        >,
+    ) -> Result<(), PublicationFailure<Self::Error>> {
+        match crate::default_selection::persist_detailed(
+            &self.home,
+            &self.pack,
+            self.preference.clone(),
+        ) {
+            Ok(crate::default_selection::DefaultSelectionCommitOutcome::NotCommitted {
+                reason,
+            }) => Err(PublicationFailure::Rejected(reason)),
+            Ok(_) => Ok(()),
+            Err(error) => Err(PublicationFailure::Rejected(error.to_string())),
+        }
+    }
+
+    fn rollback(
+        &mut self,
+        _candidate: &DefaultModelActivationCandidate,
+        _facts: &ResolvedExecutionFacts<
+            DefaultModelActivationPlan,
+            DefaultModelActivationLane,
+            DefaultModelActivationIdentity,
+        >,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn quarantine(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+pub type DefaultModelPreparedActivation = CandidateActivationTransaction<
+    DefaultModelActivationCandidate,
+    DefaultModelActivationPlan,
+    DefaultModelActivationLane,
+    DefaultModelActivationIdentity,
+    DefaultModelActivationJournal,
+>;
+
+fn format_cleanup<ReservationError, OwnerError, JournalError>(
+    error: CleanupError<ReservationError, OwnerError, JournalError>,
+) -> String
+where
+    ReservationError: std::fmt::Debug,
+    OwnerError: std::fmt::Debug,
+    JournalError: std::fmt::Debug,
+{
+    format!("{error:?}")
+}
+
+impl<Reservation, Owner, Contract>
+    AttestationPendingTransaction<
+        DefaultModelActivationCandidate,
+        DefaultModelActivationPlan,
+        DefaultModelActivationLane,
+        DefaultModelActivationIdentity,
+        DefaultModelActivationJournal,
+        Reservation,
+        Owner,
+        Contract,
+    >
+where
+    Reservation: ActivationReservation,
+    Owner: StagedOwner,
+    Reservation::Error: std::fmt::Debug,
+    Owner::Error: std::fmt::Debug,
+{
+    pub fn rollback_activation(self) -> Result<RollbackTerminal, String> {
+        self.rollback().map_err(format_cleanup)
+    }
+
+    pub fn quarantine_activation(self) -> Result<QuarantineTerminal, String> {
+        self.quarantine().map_err(format_cleanup)
+    }
+}
+
+impl<Reservation, Owner, Contract>
+    QuarantineRequired<
+        DefaultModelActivationCandidate,
+        DefaultModelActivationPlan,
+        DefaultModelActivationLane,
+        DefaultModelActivationIdentity,
+        DefaultModelActivationJournal,
+        Reservation,
+        Owner,
+        Contract,
+    >
+where
+    Reservation: ActivationReservation,
+    Owner: StagedOwner,
+    Reservation::Error: std::fmt::Debug,
+    Owner::Error: std::fmt::Debug,
+{
+    pub fn quarantine_activation(self) -> Result<QuarantineTerminal, String> {
+        self.quarantine().map_err(format_cleanup)
+    }
+}
+
+impl<Reservation, Owner, Contract, Evidence>
+    AttestedTransaction<
+        DefaultModelActivationCandidate,
+        DefaultModelActivationPlan,
+        DefaultModelActivationLane,
+        DefaultModelActivationIdentity,
+        DefaultModelActivationJournal,
+        Reservation,
+        Owner,
+        Contract,
+        Evidence,
+    >
+where
+    Reservation: ActivationReservation,
+    Owner: StagedOwner,
+    Reservation::Error: std::fmt::Debug,
+    Owner::Error: std::fmt::Debug,
+{
+    pub fn commit_activation(self) -> Result<(), String> {
+        match self.commit() {
+            Ok(_) => Ok(()),
+            Err(CommitError::Rejected { source, cleanup }) => Err(match cleanup {
+                Some(cleanup) => format!("{source}; cleanup={cleanup:?}"),
+                None => source,
+            }),
+            Err(CommitError::MustQuarantine { source, cleanup }) => Err(match cleanup {
+                Some(cleanup) => format!("{source}; cleanup={cleanup:?}"),
+                None => source,
+            }),
+        }
+    }
+}
+
+impl<Reservation, Owner, Contract>
+    AttestationPendingTransaction<
+        NativeCandidateAttemptFacts,
+        NativeCandidateAttemptFacts,
+        NativeCandidateAttemptFacts,
+        NativeCandidateAttemptFacts,
+        ExecutionCandidateAttemptJournal,
+        Reservation,
+        Owner,
+        Contract,
+    >
+where
+    Reservation: ActivationReservation,
+    Owner: StagedOwner,
+    Reservation::Error: std::fmt::Debug,
+    Owner::Error: std::fmt::Debug,
+{
+    pub fn rollback_attempt(self) -> Result<RollbackTerminal, String> {
+        self.rollback().map_err(format_cleanup)
+    }
+
+    pub fn quarantine_attempt(self) -> Result<QuarantineTerminal, String> {
+        self.quarantine().map_err(format_cleanup)
+    }
+}
+
+impl<Reservation, Owner, Contract>
+    QuarantineRequired<
+        NativeCandidateAttemptFacts,
+        NativeCandidateAttemptFacts,
+        NativeCandidateAttemptFacts,
+        NativeCandidateAttemptFacts,
+        ExecutionCandidateAttemptJournal,
+        Reservation,
+        Owner,
+        Contract,
+    >
+where
+    Reservation: ActivationReservation,
+    Owner: StagedOwner,
+    Reservation::Error: std::fmt::Debug,
+    Owner::Error: std::fmt::Debug,
+{
+    pub fn quarantine_attempt(self) -> Result<QuarantineTerminal, String> {
+        self.quarantine().map_err(format_cleanup)
+    }
+}
+
+impl<Reservation, Owner, Contract, Evidence>
+    AttestedTransaction<
+        NativeCandidateAttemptFacts,
+        NativeCandidateAttemptFacts,
+        NativeCandidateAttemptFacts,
+        NativeCandidateAttemptFacts,
+        ExecutionCandidateAttemptJournal,
+        Reservation,
+        Owner,
+        Contract,
+        Evidence,
+    >
+where
+    Reservation: ActivationReservation,
+    Owner: StagedOwner,
+    Reservation::Error: std::fmt::Debug,
+    Owner::Error: std::fmt::Debug,
+{
+    pub fn commit_attempt(self) -> Result<(), String> {
+        match self.commit() {
+            Ok(_) => Ok(()),
+            Err(CommitError::Rejected { source, cleanup }) => Err(match cleanup {
+                Some(cleanup) => format!("{source}; cleanup={cleanup:?}"),
+                None => source,
+            }),
+            Err(CommitError::MustQuarantine { source, cleanup }) => Err(match cleanup {
+                Some(cleanup) => format!("{source}; cleanup={cleanup:?}"),
+                None => source,
+            }),
+        }
     }
 }
 
@@ -1567,6 +2082,7 @@ mod tests {
                 .join("src/models/candidate_activation_transaction.rs"),
         )
         .expect("module source should be readable");
+        assert!(!source.contains(&["pub trait ", "PublicationJournal<"].concat()));
         assert!(!source.contains(&["pub(crate) trait ", "PublicationJournal<"].concat()));
         let capability_start = source
             .find("trait PublicationJournal<")
@@ -1577,5 +2093,48 @@ mod tests {
         let capability = &source[capability_start..capability_start + capability_end];
         assert!(capability.contains("fn publish"));
         assert!(!capability.contains("pub(crate)"));
+        let pending_impl = source
+            .split("AttestationPendingTransaction<")
+            .nth(2)
+            .expect("AttestationPendingTransaction impl should exist");
+        let pending_methods = pending_impl
+            .split("pub struct QuarantineRequired")
+            .next()
+            .expect("pending impl should end before QuarantineRequired");
+        assert!(
+            !pending_methods.contains("fn commit("),
+            "AttestationPending must not expose commit; persist is only after attest"
+        );
+    }
+
+    fn native_attempt_facts() -> NativeCandidateAttemptFacts {
+        NativeCandidateAttemptFacts::new(ExecutionCandidate {
+            device: crate::device::execution_policy::ExecutionDeviceSnapshot {
+                route: crate::device::execution_route::ResolvedExecutionRoute::cpu(),
+                ggml_kind: crate::ggml_runtime::GgmlBackendKind::Cpu,
+                memory: None,
+                buffer_alignment: None,
+            },
+            placement: crate::device::execution_policy::ExecutionPlacement::CpuOnly,
+        })
+    }
+
+    #[test]
+    fn execution_attempt_journal_publish_and_rollback_invoke_the_bound_finish() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let publish_events = Arc::clone(&events);
+        let facts = native_attempt_facts();
+        let prepared = ExecutionCandidateAttemptJournalFactory::bind(move |commit| {
+            publish_events
+                .lock()
+                .unwrap()
+                .push(if commit { "publish" } else { "rollback" });
+        })
+        .prepare(
+            facts.clone(),
+            ResolvedExecutionFacts::new(facts.clone(), facts.clone(), facts),
+        );
+        drop(prepared);
+        assert_eq!(*events.lock().unwrap(), vec!["rollback"]);
     }
 }

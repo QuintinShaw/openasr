@@ -33,9 +33,11 @@ use super::{
         AuxiliaryExecutionPolicy, auxiliary_execution_policy, auxiliary_runtime_ownership,
     },
     native_execution_services::{
-        ExecutionLaneKey, NativeExecutionServices, current_execution_cache_attempt_id,
-        current_execution_lane_key, drop_execution_candidate_value_without_cache_publication,
-        run_execution_candidate_attempt, stage_execution_cache_commit,
+        CandidateActivationQuoteSource, ExecutionLaneKey, NativeExecutionServices,
+        current_execution_cache_attempt_id, current_execution_lane_key,
+        drop_execution_candidate_value_without_cache_publication,
+        install_candidate_activation_quote, run_execution_candidate_attempt,
+        stage_execution_cache_commit,
     },
     system_memory_owner::{AdmittedHostObject, SystemMemoryOwner},
 };
@@ -200,6 +202,7 @@ pub(crate) struct PolicyResolvedAuxRuntime<R, E> {
     runtime: Option<R>,
     builder: AuxiliaryRuntimeBuilder<R, E>,
     stage: &'static str,
+    activation_quote: CandidateActivationQuoteSource,
 }
 
 impl<R, E> PolicyResolvedAuxRuntime<R, E> {
@@ -208,12 +211,14 @@ impl<R, E> PolicyResolvedAuxRuntime<R, E> {
         execution_plan: ExecutionPlan,
         stage: &'static str,
         builder: AuxiliaryRuntimeBuilder<R, E>,
+        activation_quote: CandidateActivationQuoteSource,
     ) -> Result<Self, PolicyResolvedAuxRuntimeError<E>> {
         let (candidate_index, runtime) = Self::construct_from(
             execution_services.as_ref(),
             &execution_plan,
             stage,
             builder.as_ref(),
+            &activation_quote,
             0,
         )?;
         Ok(Self {
@@ -223,6 +228,7 @@ impl<R, E> PolicyResolvedAuxRuntime<R, E> {
             runtime: Some(runtime),
             builder,
             stage,
+            activation_quote,
         })
     }
 
@@ -231,10 +237,12 @@ impl<R, E> PolicyResolvedAuxRuntime<R, E> {
         execution_plan: &ExecutionPlan,
         stage: &'static str,
         builder: &(dyn Fn(&ExecutionCandidate) -> Result<R, E> + Send + Sync),
+        activation_quote: &CandidateActivationQuoteSource,
         start_index: usize,
     ) -> Result<(usize, R), PolicyResolvedAuxRuntimeError<E>> {
         let candidates = execution_plan.candidates();
         for (candidate_index, candidate) in candidates.iter().enumerate().skip(start_index) {
+            let _quote = install_candidate_activation_quote(activation_quote.clone());
             let attempt = run_execution_candidate_attempt(execution_services, candidate, || {
                 builder(candidate)
             });
@@ -279,6 +287,7 @@ impl<R, E> PolicyResolvedAuxRuntime<R, E> {
         }
         loop {
             let candidate = self.execution_plan.candidates()[self.candidate_index].clone();
+            let _quote = install_candidate_activation_quote(self.activation_quote.clone());
             let attempt = run_execution_candidate_attempt(
                 self.execution_services.as_ref(),
                 &candidate,
@@ -324,6 +333,7 @@ impl<R, E> PolicyResolvedAuxRuntime<R, E> {
                         &self.execution_plan,
                         self.stage,
                         self.builder.as_ref(),
+                        &self.activation_quote,
                         next_index,
                     )?;
                     self.candidate_index = candidate_index;
@@ -346,6 +356,7 @@ impl<R, E> PolicyResolvedAuxRuntime<R, E> {
             return Err(PolicyResolvedAuxRuntimeError::EmptyPlan { stage: self.stage });
         }
         let candidate = self.execution_plan.candidates()[self.candidate_index].clone();
+        let _quote = install_candidate_activation_quote(self.activation_quote.clone());
         let attempt =
             run_execution_candidate_attempt(self.execution_services.as_ref(), &candidate, || {
                 operation(
@@ -765,7 +776,22 @@ mod tests {
     use crate::ggml_runtime::GgmlBackendKind;
 
     use super::*;
-    use crate::models::native_execution_services::record_current_execution_candidate_failure;
+    use crate::models::native_execution_services::{
+        CandidateActivationQuoteSource, install_candidate_activation_quote,
+        record_current_execution_candidate_failure,
+    };
+    use crate::models::system_memory_owner::SystemMemoryAllocationQuote;
+
+    fn test_aux_activation_quote(stage: &str) -> CandidateActivationQuoteSource {
+        CandidateActivationQuoteSource::Declared(
+            SystemMemoryAllocationQuote::new(
+                format!("test-aux.{stage}.declared-resident"),
+                64 * 1024,
+                64 * 1024,
+            )
+            .expect("test aux declared resident"),
+        )
+    }
 
     fn candidate(provider: ExecutionProvider, stable_id: &str) -> ExecutionCandidate {
         ExecutionCandidate {
@@ -825,8 +851,14 @@ mod tests {
             builds_for_closure.fetch_add(1, Ordering::SeqCst);
             Ok::<_, &'static str>(candidate.device.route.provider)
         });
-        let mut runtime =
-            PolicyResolvedAuxRuntime::try_new(services, plan, "test-aux", builder).unwrap();
+        let mut runtime = PolicyResolvedAuxRuntime::try_new(
+            services,
+            plan,
+            "test-aux",
+            builder,
+            test_aux_activation_quote("test-aux"),
+        )
+        .unwrap();
 
         let value = runtime
             .invoke_replay_safe(|provider| {
@@ -915,8 +947,14 @@ mod tests {
                 track_drop: candidate.device.route.provider == ExecutionProvider::Vulkan,
             })
         });
-        let mut runtime =
-            PolicyResolvedAuxRuntime::try_new(services, plan, "test-drop-order", builder).unwrap();
+        let mut runtime = PolicyResolvedAuxRuntime::try_new(
+            services,
+            plan,
+            "test-drop-order",
+            builder,
+            test_aux_activation_quote("test-drop-order"),
+        )
+        .unwrap();
 
         let output = runtime
             .invoke_replay_safe(|runtime| {
@@ -957,6 +995,7 @@ mod tests {
             Arc::new(|candidate: &ExecutionCandidate| {
                 Ok::<_, &'static str>(candidate.device.route.provider)
             }),
+            test_aux_activation_quote("test-aux"),
         )
         .unwrap();
 
@@ -987,6 +1026,7 @@ mod tests {
                 builds_for_closure.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, &'static str>(candidate.device.route.provider)
             }),
+            test_aux_activation_quote("test-pinned-aux"),
         )
         .unwrap();
 
@@ -1030,6 +1070,7 @@ mod tests {
                 builds_for_closure.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, &'static str>(candidate.device.route.provider)
             }),
+            test_aux_activation_quote("test-stateful-aux"),
         )
         .unwrap();
         let mut runtime = PolicyResolvedStatefulAuxRuntime::new(runtime);
@@ -1085,6 +1126,7 @@ mod tests {
             Arc::new(|candidate: &ExecutionCandidate| {
                 Ok::<_, &'static str>(candidate.device.route.provider)
             }),
+            test_aux_activation_quote("test-buffered-stateful-aux"),
         )
         .unwrap();
         let mut runtime = PolicyResolvedStatefulAuxRuntime::new(runtime);
@@ -1252,6 +1294,7 @@ mod tests {
         let cache = services.auxiliary_runtime_owners();
         let cpu = candidate(ExecutionProvider::Cpu, "cpu");
         let builds = AtomicUsize::new(0);
+        let _quote = install_candidate_activation_quote(test_aux_activation_quote("staged-hit"));
         let outcome = run_execution_candidate_attempt(services.as_ref(), &cpu, || {
             let key = AuxiliaryRuntimeCacheKey::for_current_lane::<usize>(
                 "test",
@@ -1315,6 +1358,7 @@ mod tests {
         let failed_builds = Arc::clone(&builds);
         let failed_candidate = candidate(ExecutionProvider::Cpu, "cpu");
         let failed = std::thread::spawn(move || {
+            let _quote = install_candidate_activation_quote(test_aux_activation_quote("rollback"));
             run_execution_candidate_attempt(failed_services.as_ref(), &failed_candidate, || {
                 let key = AuxiliaryRuntimeCacheKey::for_current_lane::<usize>(
                     "test",
@@ -1350,6 +1394,7 @@ mod tests {
         let waiter_builds = Arc::clone(&builds);
         let waiter_candidate = candidate(ExecutionProvider::Cpu, "cpu");
         let waiter = std::thread::spawn(move || {
+            let _quote = install_candidate_activation_quote(test_aux_activation_quote("waiter"));
             run_execution_candidate_attempt(waiter_services.as_ref(), &waiter_candidate, || {
                 let key = AuxiliaryRuntimeCacheKey::for_current_lane::<usize>(
                     "test",

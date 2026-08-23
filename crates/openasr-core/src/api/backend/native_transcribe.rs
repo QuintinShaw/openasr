@@ -374,6 +374,10 @@ fn run_dispatch_once_with_progress_and_policy(
                 GgmlAsrBackendPreference::Accelerated
             }
         };
+        let _activation_pack =
+            crate::models::native_execution_services::install_candidate_activation_pack(
+                verified_pack.clone(),
+            );
         let attempt = crate::models::native_execution_services::run_execution_candidate_attempt(
             execution_services.as_ref(),
             candidate,
@@ -1387,6 +1391,9 @@ fn apply_punctuation_stage_with_policy(
         execution_services,
         &execution_plan,
         "firered-punctuation",
+        crate::models::native_execution_services::CandidateActivationQuoteSource::Pack(
+            verified_pack.clone(),
+        ),
         |candidate| {
             // Punctuation is an optional accuracy stage: malformed/missing
             // runtime errors keep the ASR output unchanged. Candidate-local
@@ -1715,6 +1722,9 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
         execution_services,
         &execution_plan,
         "qwen3-forced-aligner",
+        crate::models::native_execution_services::CandidateActivationQuoteSource::Pack(
+            verified_forced_aligner.clone(),
+        ),
         |candidate| {
             if execution_context.is_canceled() {
                 return Err(BackendError::TranscriptionCanceled);
@@ -2442,10 +2452,19 @@ fn run_native_transcription_impl(
             execution_services.as_ref(),
             &request_execution_intent,
         )?;
+        let vad_activation_quote =
+            crate::models::native_execution_services::CandidateActivationQuoteSource::Declared(
+                crate::diarize::vad::FireRedStreamVadModel::system_memory_quote().map_err(
+                    |reason| BackendError::NativeFailClosed {
+                        reason: format!("longform Stream-VAD resident quote failed: {reason}"),
+                    },
+                )?,
+            );
         let (mut plan, vad_engine_label) = run_auxiliary_stage_with_policy(
             execution_services.as_ref(),
             &vad_execution_plan,
             "longform-vad",
+            vad_activation_quote,
             |candidate| {
                 let (vad_provider, vad_engine_label) =
                     resolve_longform_vad_provider(
@@ -4191,10 +4210,14 @@ fn run_auxiliary_stage_with_policy<T>(
     execution_services: &NativeExecutionServices,
     execution_plan: &ExecutionPlan,
     stage: &'static str,
+    activation_quote: crate::models::native_execution_services::CandidateActivationQuoteSource,
     mut operation: impl FnMut(&ExecutionCandidate) -> Result<T, BackendError>,
 ) -> Result<T, PolicyResolvedAuxRuntimeError<BackendError>> {
     let candidates = execution_plan.candidates();
     for (candidate_index, candidate) in candidates.iter().enumerate() {
+        let _quote = crate::models::native_execution_services::install_candidate_activation_quote(
+            activation_quote.clone(),
+        );
         let attempt = crate::models::native_execution_services::run_execution_candidate_attempt(
             execution_services,
             candidate,
@@ -4924,15 +4947,46 @@ mod tests {
         let services = native_execution_services_for_test();
         let plan = resolve_longform_vad_execution_plan(services.as_ref(), &ExecutionIntent::Auto)
             .expect("Auto VAD plan");
-        let error =
-            run_auxiliary_stage_with_policy(services.as_ref(), &plan, "longform-vad", |_| {
-                Err::<(), BackendError>(BackendError::TranscriptionCanceled)
-            })
-            .expect_err("canceled long-form VAD must fail the auxiliary stage");
+        let error = run_auxiliary_stage_with_policy(
+            services.as_ref(),
+            &plan,
+            "longform-vad",
+            longform_vad_activation_quote_for_test(),
+            |_| Err::<(), BackendError>(BackendError::TranscriptionCanceled),
+        )
+        .expect_err("canceled long-form VAD must fail the auxiliary stage");
         assert!(matches!(
             required_auxiliary_stage_error(error),
             BackendError::TranscriptionCanceled
         ));
+    }
+
+    #[test]
+    fn run_auxiliary_stage_with_policy_installs_quote_and_does_not_capacity_exhaust() {
+        let services = native_execution_services_for_test();
+        let plan = resolve_longform_vad_execution_plan(services.as_ref(), &ExecutionIntent::Auto)
+            .expect("Auto VAD plan");
+        let installed = std::sync::atomic::AtomicBool::new(false);
+        let value = run_auxiliary_stage_with_policy(
+            services.as_ref(),
+            &plan,
+            "longform-vad",
+            longform_vad_activation_quote_for_test(),
+            |_| {
+                installed.store(
+                    crate::models::native_execution_services::current_candidate_activation_quote()
+                        .is_some(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                Ok::<_, BackendError>(())
+            },
+        )
+        .expect("shipped auxiliary stage must install its quote source");
+        assert!(
+            installed.load(std::sync::atomic::Ordering::SeqCst),
+            "run_auxiliary_stage_with_policy must install CandidateActivationQuoteSource before the attempt"
+        );
+        let _ = value;
     }
 
     #[test]
@@ -5005,6 +5059,30 @@ mod tests {
 
     fn native_execution_services_for_test() -> Arc<NativeExecutionServices> {
         crate::models::native_execution_services::test_native_execution_services()
+    }
+
+    fn longform_vad_activation_quote_for_test()
+    -> crate::models::native_execution_services::CandidateActivationQuoteSource {
+        crate::models::native_execution_services::CandidateActivationQuoteSource::Declared(
+            crate::diarize::vad::FireRedStreamVadModel::system_memory_quote()
+                .expect("Stream-VAD declared resident quote"),
+        )
+    }
+
+    fn auxiliary_stage_activation_quote_for_test(
+        stage: &str,
+    ) -> crate::models::native_execution_services::CandidateActivationQuoteSource {
+        if stage == "longform-vad" {
+            return longform_vad_activation_quote_for_test();
+        }
+        crate::models::native_execution_services::CandidateActivationQuoteSource::Declared(
+            crate::models::system_memory_owner::SystemMemoryAllocationQuote::new(
+                format!("aux.{stage}.test.declared-resident"),
+                128 * 1024,
+                96 * 1024,
+            )
+            .expect("test auxiliary declared resident"),
+        )
     }
 
     const ASR_EXACT_SMOKE_PACK_ENV: &str = "OPENASR_ASR_SMOKE_PACK";
@@ -8858,6 +8936,7 @@ mod tests {
                 native_execution_services_for_test().as_ref(),
                 &typed_fallback_test_plan(),
                 stage,
+                auxiliary_stage_activation_quote_for_test(stage),
                 |_| {
                     calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     crate::models::native_execution_services::record_current_execution_candidate_failure(

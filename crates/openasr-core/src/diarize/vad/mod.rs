@@ -3,9 +3,10 @@
 //! OpenASR ships exactly one VAD engine: FireRedVAD's **Stream-VAD**
 //! checkpoint ([`firered_stream`], causal DFSMN, Apache-2.0). It is vendored
 //! (~2.3 MB, baked in via `include_bytes!`, no ggml/.oasr/catalog
-//! involvement), so it is always available, and loaded once into a
-//! process-wide [`shared_model`] shared by the batch provider and the
-//! streaming detector. Because the checkpoint is strictly causal (no
+//! involvement), so it is always available. Parsed weights are admitted to
+//! the installed [`crate::NativeExecutionServices`] root via [`shared_model`]
+//! and shared by the batch provider and the streaming detector. Because the
+//! checkpoint is strictly causal (no
 //! lookahead), the same weights back:
 //!
 //! - realtime endpointing ([`crate::realtime::VadMode::ExternalProbability`],
@@ -37,15 +38,20 @@ mod firered_stream;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use firered_stream::StreamVadEmbeddedSlot;
 pub(crate) use firered_stream::{
     FireRedRealtimeVadRuntime, FireRedRealtimeVadSession, PolicyResolvedFireRedStreamVadProvider,
 };
-pub use firered_stream::{FireRedStreamVadError, FireRedStreamVadProvider, FireRedStreamingVad};
+pub use firered_stream::{
+    FireRedStreamVadError, FireRedStreamVadModel, FireRedStreamVadProvider, FireRedStreamingVad,
+    SharedFireRedStreamVadModel,
+};
 
-/// The process-wide Stream-VAD model, loaded once (~2.3 MB). Returns `None`
-/// only if the vendored weights blob fails to parse (a build-integrity
-/// problem, since the blob is a fixed, committed asset).
-pub fn shared_model() -> Option<&'static firered_stream::FireRedStreamVadModel> {
+/// The Stream-VAD model admitted to the current native execution scope
+/// (~2.3 MB). Returns `None` only if the vendored weights blob fails to parse
+/// (a build-integrity problem, since the blob is a fixed, committed asset)
+/// or system-memory admission fails.
+pub fn shared_model() -> Option<SharedFireRedStreamVadModel> {
     firered_stream::shared_model()
 }
 

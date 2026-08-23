@@ -513,6 +513,9 @@ impl PolicyResolvedSpeakerRuntime {
             execution_plan,
             STREAMING_SPEAKER_STAGE,
             builder,
+            crate::models::native_execution_services::CandidateActivationQuoteSource::Pack(
+                verified_pack,
+            ),
         )
         .map_err(policy_runtime_error)?;
         let identity = SpeakerEmbedderIdentity {

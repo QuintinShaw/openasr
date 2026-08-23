@@ -870,6 +870,27 @@ impl DeviceMemoryBrokerSet {
         }
     }
 
+    /// Diagnostic snapshot of every physical-domain ledger row. Receipts
+    /// compare against this map; admission never reads it.
+    #[allow(dead_code)]
+    pub(crate) fn ledger_snapshot(&self) -> BTreeMap<MemoryDomainKey, DeviceMemoryUsage> {
+        self.lock_accounts()
+            .iter()
+            .map(|(domain, account)| {
+                (
+                    domain.clone(),
+                    DeviceMemoryUsage {
+                        pending_bytes: account.pending_bytes,
+                        committed_bytes: account.committed_bytes,
+                        unreclaimable_bytes: account.unreclaimable_bytes,
+                        exclusive_pending: account.exclusive_pending_children != 0,
+                        quarantined: account.quarantined,
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn lock_accounts(&self) -> MutexGuard<'_, HashMap<MemoryDomainKey, DomainAccount>> {
         self.accounts
             .lock()
@@ -2448,6 +2469,124 @@ mod tests {
         assert_eq!(broker.usage(&domain()).pending_bytes, 1);
         drop(lease);
         assert_eq!(broker.usage(&domain()), DeviceMemoryUsage::default());
+    }
+
+    #[test]
+    fn committed_lease_receipts_cover_the_broker_ledger_including_incident_totals() {
+        const INCIDENT_COMMITTED: u64 = 11_488_973_972;
+        const INCIDENT_REQUESTED: u64 = 5_092_073_216;
+        const INCIDENT_TOTAL: u64 = 15_406_611_046;
+        const INCIDENT_OBSERVED_FREE: u64 = 4_461_342_720;
+        const INCIDENT_POLICY_REMAINDER: u64 = 3_917_637_074;
+
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let collector = RuntimeReceiptCollector::new_for_test(
+            crate::models::native_execution_services::NativeExecutionScopeId::next(),
+            64,
+        )
+        .unwrap();
+        let system = MemoryDomainKey::SystemMemory;
+        let mut lease = broker
+            .try_reserve_batch(vec![DomainReservationRequest {
+                domain: system.clone(),
+                snapshot: DeviceMemorySnapshot {
+                    free_bytes: INCIDENT_TOTAL,
+                    total_bytes: INCIDENT_TOTAL,
+                    confidence: MemoryObservationConfidence::DeviceSnapshot,
+                },
+                peak_bytes: INCIDENT_COMMITTED,
+                retained_bytes: INCIDENT_COMMITTED,
+                observed_peak_bytes: None,
+                requires_reconciliation: false,
+                resource_id: "incident-committed-owners".to_string(),
+                cohort_id: None,
+            }])
+            .unwrap();
+        let owner = collector
+            .owner_descriptor(
+                "firered-llm-encoder",
+                Some("sha256:incident-pack"),
+                Some("pack-weight-buffer"),
+                collector.lane_projection(
+                    crate::device::execution_route::ExecutionProvider::Cpu,
+                    "cpu0",
+                    crate::device::execution_policy::ExecutionPlacement::CpuOnly,
+                    crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+                ),
+            )
+            .unwrap();
+        let resource = collector
+            .resource_descriptor(
+                "pack-weight-buffer",
+                &system,
+                INCIDENT_COMMITTED,
+                INCIDENT_COMMITTED,
+                INCIDENT_COMMITTED,
+                QuoteConfidence::CommittedUpperBound,
+                Some(MemoryObservationConfidence::DeviceSnapshot),
+            )
+            .unwrap();
+        lease.attach_receipt(collector.clone(), owner, vec![(system.clone(), resource)]);
+        lease.commit_quoted().unwrap();
+
+        let snapshot = collector.snapshot();
+        assert_eq!(snapshot.live_owners.len(), 1);
+        let live = &snapshot.live_owners[0];
+        assert!(live.descriptor.content.is_some());
+        assert!(live.descriptor.lane.is_some());
+        let resource = live.resources.values().next().unwrap();
+        assert_eq!(resource.state, RuntimeResourceState::Committed);
+        assert_eq!(
+            resource.descriptor.retained,
+            RuntimeReceiptMetric::Known(INCIDENT_COMMITTED)
+        );
+        assert_eq!(broker.usage(&system).committed_bytes, INCIDENT_COMMITTED);
+        assert_eq!(
+            collector.shadow_compare_leases(&broker),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
+
+        let rejected = broker.try_reserve_batch(vec![DomainReservationRequest {
+            domain: system.clone(),
+            snapshot: DeviceMemorySnapshot {
+                free_bytes: INCIDENT_OBSERVED_FREE,
+                total_bytes: INCIDENT_TOTAL,
+                confidence: MemoryObservationConfidence::DeviceSnapshot,
+            },
+            peak_bytes: INCIDENT_REQUESTED,
+            retained_bytes: INCIDENT_REQUESTED,
+            observed_peak_bytes: None,
+            requires_reconciliation: false,
+            resource_id: "pack-weight-buffer-chunk-0".to_string(),
+            cohort_id: None,
+        }]);
+        match rejected {
+            Err(MemoryPlanningError::DeviceBudgetExceeded {
+                requested_bytes,
+                committed_bytes,
+                available_bytes,
+                ..
+            }) => {
+                assert_eq!(requested_bytes, INCIDENT_REQUESTED);
+                assert_eq!(committed_bytes, INCIDENT_COMMITTED);
+                assert_eq!(available_bytes, INCIDENT_POLICY_REMAINDER);
+                assert!(INCIDENT_REQUESTED > INCIDENT_POLICY_REMAINDER);
+                assert!(INCIDENT_REQUESTED > INCIDENT_OBSERVED_FREE);
+            }
+            other => panic!("incident arithmetic must fail closed, got {other:?}"),
+        }
+        assert_eq!(
+            collector.shadow_compare_leases(&broker),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
+        drop(lease);
+        assert_eq!(
+            collector.shadow_compare_leases(&broker),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
     }
     #[test]
     fn impossible_free_snapshot_is_clamped_to_total() {

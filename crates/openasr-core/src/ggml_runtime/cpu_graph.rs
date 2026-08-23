@@ -1721,7 +1721,7 @@ enum GgmlWeightMaterialization {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum GgmlWeightMaterializationKind {
     HostImported,
     DeviceCopied,
@@ -1854,19 +1854,118 @@ pub(crate) struct GgmlLoadedWeightBindingIdentity {
     context_address: usize,
 }
 
+/// NES-scoped coalescing key for one pack-wide loaded-weight owner.
+///
+/// Content and already-open mapping identity are required. Lane is always
+/// present so CPU and accelerator (or distinct cards/placements) never share.
+/// Host-import versus copied-buffer is part of the key: a failed host-import
+/// that materializes a copy is a second physical owner and must not hit the
+/// host-import slot.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct LoadedWeightContextCacheKey {
-    execution_scope_id: Option<crate::models::native_execution_services::NativeExecutionScopeId>,
-    runtime_mapping_address: usize,
-    backend_address: usize,
+struct LoadedWeightOwnerKey {
+    content_id: String,
+    source_identity: super::StrongFileIdentity,
+    mapping_identity: usize,
+    kind: GgmlWeightMaterializationKind,
+    lane: crate::models::native_execution_services::ExecutionLaneKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct LoadedWeightOwnerSlot {
+    scope: crate::models::native_execution_services::NativeExecutionScopeId,
+    key: LoadedWeightOwnerKey,
+}
+
+/// Handle to the NES-owned loaded-weight owner table. ggml contexts are
+/// thread-affine and `!Send`, so they cannot enter
+/// [`crate::models::admitted_host_object_cache::AdmittedHostObjectCache`] or a
+/// second pinned actor (family graph construction still consumes raw tensor
+/// pointers on the construction thread). This handle is the canonical
+/// publication API: production loaders never write a process-global TLS owner
+/// map. The thread-local slot table below is only the `!Send` payload storage
+/// for one NES identity on the current owner thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LoadedWeightOwnerCache {
+    scope: crate::models::native_execution_services::NativeExecutionScopeId,
 }
 
 thread_local! {
-    /// Weak-only by design: this table coalesces concurrently resident stage
-    /// runtimes but never extends a pack's lifetime or defeats idle unloading.
-    static LOADED_WEIGHT_CONTEXT_BY_KEY: RefCell<
-        HashMap<LoadedWeightContextCacheKey, Weak<GgmlLoadedWeightContextInner>>,
+    /// CompatibilitySeam: Weak payload slots for NES-scoped loaded-weight
+    /// owners. Not an independent authority -- insert/get happen only through
+    /// [`LoadedWeightOwnerCache`]. ggml contexts remain `!Send`, so this knife
+    /// cannot move them into the process-wide admitted-host or pinned-actor
+    /// maps without relocating every family graph constructor onto a second
+    /// actor thread.
+    static LOADED_WEIGHT_OWNER_SLOTS: RefCell<
+        HashMap<LoadedWeightOwnerSlot, Weak<GgmlLoadedWeightContextInner>>,
     > = RefCell::new(HashMap::new());
+}
+
+impl LoadedWeightOwnerCache {
+    pub(crate) fn new(
+        scope: crate::models::native_execution_services::NativeExecutionScopeId,
+    ) -> Self {
+        Self { scope }
+    }
+
+    fn key(
+        source: &GgmlRuntimeSource,
+        kind: GgmlWeightMaterializationKind,
+        backend_kind: GgmlCpuGraphBackend,
+    ) -> LoadedWeightOwnerKey {
+        LoadedWeightOwnerKey {
+            content_id: source.content_id().to_string(),
+            source_identity: source.strong_file_identity(),
+            mapping_identity: source.backing_mmap_identity(),
+            kind,
+            lane: crate::models::native_execution_services::current_execution_lane_key(
+                backend_kind,
+            ),
+        }
+    }
+
+    fn lookup(&self, key: &LoadedWeightOwnerKey) -> Option<Rc<GgmlLoadedWeightContextInner>> {
+        LOADED_WEIGHT_OWNER_SLOTS.with(|slots| {
+            let mut slots = slots.borrow_mut();
+            slots.retain(|_, weak| weak.strong_count() > 0);
+            slots
+                .get(&LoadedWeightOwnerSlot {
+                    scope: self.scope,
+                    key: key.clone(),
+                })
+                .and_then(std::rc::Weak::upgrade)
+        })
+    }
+
+    fn publish(&self, key: LoadedWeightOwnerKey, inner: &Rc<GgmlLoadedWeightContextInner>) {
+        LOADED_WEIGHT_OWNER_SLOTS.with(|slots| {
+            let mut slots = slots.borrow_mut();
+            slots.retain(|_, weak| weak.strong_count() > 0);
+            slots.insert(
+                LoadedWeightOwnerSlot {
+                    scope: self.scope,
+                    key,
+                },
+                Rc::downgrade(inner),
+            );
+        });
+    }
+
+    pub(crate) fn clear(&self) {
+        LOADED_WEIGHT_OWNER_SLOTS.with(|slots| {
+            slots
+                .borrow_mut()
+                .retain(|slot, _| slot.scope != self.scope);
+        });
+    }
+
+    pub(crate) fn evict_content_id(&self, pack_content_id: &str) {
+        LOADED_WEIGHT_OWNER_SLOTS.with(|slots| {
+            slots.borrow_mut().retain(|slot, _| {
+                slot.scope != self.scope || slot.key.content_id != pack_content_id
+            });
+        });
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2304,28 +2403,26 @@ impl GgmlCpuGraphRunner {
     ) -> Result<GgmlLoadedWeightContext, GgmlCpuGraphError> {
         let require_direct_backend_matmul_support =
             self.backend_kind.is_gpu_class() && self.scheduler.is_none();
-        let cache_key = LoadedWeightContextCacheKey {
-            execution_scope_id:
-                crate::models::native_execution_services::current_native_execution_scope_id(),
-            runtime_mapping_address: source.backing_mmap_identity(),
-            backend_address: self.backend.raw.as_ptr() as usize,
+        let preferred_kind = if backend_supports_host_import_weight_buffer(self.backend.raw) {
+            GgmlWeightMaterializationKind::HostImported
+        } else {
+            GgmlWeightMaterializationKind::DeviceCopied
         };
-        if let Some(inner) = LOADED_WEIGHT_CONTEXT_BY_KEY.with(|cache| {
-            cache
-                .borrow()
-                .get(&cache_key)
-                .and_then(std::rc::Weak::upgrade)
-        }) {
-            if require_direct_backend_matmul_support {
-                validate_direct_backend_matmul_weight_support(
-                    inner._context.raw,
-                    self.backend.raw,
-                    source.path(),
-                )?;
+        let owners = crate::models::native_execution_services::current_loaded_weight_owners();
+        if let Some(owners) = owners.as_ref() {
+            let key = LoadedWeightOwnerCache::key(source, preferred_kind, self.backend_kind);
+            if let Some(inner) = owners.lookup(&key) {
+                if require_direct_backend_matmul_support {
+                    validate_direct_backend_matmul_weight_support(
+                        inner._context.raw,
+                        self.backend.raw,
+                        source.path(),
+                    )?;
+                }
+                let loaded = GgmlLoadedWeightContext { inner };
+                loaded.record_receipt_reuse();
+                return Ok(loaded);
             }
-            let loaded = GgmlLoadedWeightContext { inner };
-            loaded.record_receipt_reuse();
-            return Ok(loaded);
         }
 
         let reader = build_reader()?;
@@ -2336,11 +2433,14 @@ impl GgmlCpuGraphRunner {
             self.backend_kind,
             require_direct_backend_matmul_support,
         )?;
-        LOADED_WEIGHT_CONTEXT_BY_KEY.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            cache.retain(|_, weak| weak.strong_count() > 0);
-            cache.insert(cache_key, Rc::downgrade(&loaded.inner));
-        });
+        if let Some(owners) = owners {
+            let key = LoadedWeightOwnerCache::key(
+                source,
+                loaded.inner.materialization.kind(),
+                self.backend_kind,
+            );
+            owners.publish(key, &loaded.inner);
+        }
         Ok(loaded)
     }
 
@@ -8474,6 +8574,12 @@ impl GgmlSchedulerMemoryOwner {
 /// so they are cached per-thread per resolved route and handed out with
 /// `free_on_drop=false` (the cached entry owns the single instance).
 ///
+/// CompatibilitySeam: this table cannot move to the NES loaded-weight owner
+/// cache in this knife. Backend handles are created before a pack content id
+/// exists, are shared by graphs that never load weights, and are poisoned or
+/// leaked on device-lost. Weight owners consume a resolved backend; they do
+/// not own its lifetime.
+///
 /// Invariant: a cache entry's [`CachedBackendKey`] is always the route of the
 /// device that was actually initialized. Preferred/Auto may Optimus-fall
 /// through discrete -> iGPU, but each successful init is inserted under that
@@ -8544,6 +8650,10 @@ fn is_backend_poisoned(raw: NonNull<c_void>) -> bool {
 
 #[cfg(test)]
 thread_local! {
+    /// Test-only seam: force the copied-weight fallback even when the backend
+    /// can host-import the mapping. Used to prove host-import and copied
+    /// bindings are distinct physical owners under the same publication API.
+    static TEST_FORCE_COPIED_WEIGHT_BINDING: Cell<bool> = const { Cell::new(false) };
     /// Test-only seam: when set, the next `compute_graph_with_current_job_cancel`
     /// call returns this status instead of calling the real ggml FFI, so tests
     /// can inject a terminal completion status (e.g. `DeviceLost`) without a
@@ -8565,6 +8675,22 @@ thread_local! {
     /// Test-only seam: substitutes the next tensor-get completion status after
     /// a graph has computed successfully. Cleared after one use.
     static TEST_TENSOR_READBACK_STATUS_OVERRIDE: RefCell<Option<c_int>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct ForceCopiedWeightBindingGuard;
+
+#[cfg(test)]
+impl Drop for ForceCopiedWeightBindingGuard {
+    fn drop(&mut self) {
+        TEST_FORCE_COPIED_WEIGHT_BINDING.with(|flag| flag.set(false));
+    }
+}
+
+#[cfg(test)]
+fn force_copied_weight_binding() -> ForceCopiedWeightBindingGuard {
+    TEST_FORCE_COPIED_WEIGHT_BINDING.with(|flag| flag.set(true));
+    ForceCopiedWeightBindingGuard
 }
 
 #[cfg(test)]
@@ -10191,20 +10317,14 @@ fn allocate_native_buffers_with_admission(
     })
 }
 
-fn maybe_allocate_weight_buffer_from_host_ptr(
-    backend: NonNull<c_void>,
-    reader: &GgufTensorDataReader,
-) -> Result<
-    Option<(
-        GgmlBackendBufferGuard,
-        std::sync::Arc<Mmap>,
-        Option<PackWeightResidencyHandle>,
-    )>,
-    GgmlCpuGraphError,
-> {
+fn backend_supports_host_import_weight_buffer(backend: NonNull<c_void>) -> bool {
+    #[cfg(test)]
+    if TEST_FORCE_COPIED_WEIGHT_BINDING.with(Cell::get) {
+        return false;
+    }
     let device_raw = unsafe { ffi::ggml_backend_get_device(backend.as_ptr()) };
     let Some(device_raw) = NonNull::new(device_raw) else {
-        return Ok(None);
+        return false;
     };
     let mut props = ffi::GgmlBackendDevProps {
         name: ptr::null(),
@@ -10216,9 +10336,27 @@ fn maybe_allocate_weight_buffer_from_host_ptr(
         caps: ffi::GgmlBackendDevCaps::default(),
     };
     unsafe { ffi::ggml_backend_dev_get_props(device_raw.as_ptr(), &mut props) };
-    if !props.caps.buffer_from_host_ptr {
+    props.caps.buffer_from_host_ptr
+}
+
+fn maybe_allocate_weight_buffer_from_host_ptr(
+    backend: NonNull<c_void>,
+    reader: &GgufTensorDataReader,
+) -> Result<
+    Option<(
+        GgmlBackendBufferGuard,
+        std::sync::Arc<Mmap>,
+        Option<PackWeightResidencyHandle>,
+    )>,
+    GgmlCpuGraphError,
+> {
+    if !backend_supports_host_import_weight_buffer(backend) {
         return Ok(None);
     }
+    let device_raw = unsafe { ffi::ggml_backend_get_device(backend.as_ptr()) };
+    let Some(device_raw) = NonNull::new(device_raw) else {
+        return Ok(None);
+    };
     let mmap = reader.backing_mmap();
     let host_ptr = mmap.as_ptr().cast::<c_void>();
     let native_allocate = || {
@@ -12966,6 +13104,9 @@ mod tests {
         ];
         write_gguf_file_v0(&pack, &BTreeMap::new(), &tensors).expect("write tiny gguf");
 
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _nes =
+            crate::models::native_execution_services::install_native_execution_services(&services);
         let runtime_source =
             crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
         let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
@@ -13097,6 +13238,240 @@ mod tests {
                 scheduled_loaded.shares_storage_with(&direct_loaded),
                 "same runtime mapping across cached Metal runners must share one binding"
             );
+        }
+    }
+
+    fn tiny_loaded_weight_pack() -> (tempfile::TempDir, crate::ggml_runtime::GgmlRuntimeSource) {
+        use crate::ggml_runtime::gguf_write::{
+            GgufWriteTensor, GgufWriteTensorType, write_gguf_file_v0,
+        };
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pack = dir.path().join("loaded_owner.gguf");
+        let w: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let data: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+        write_gguf_file_v0(
+            &pack,
+            &BTreeMap::new(),
+            &[GgufWriteTensor {
+                name: "loaded.weight".to_string(),
+                dims: vec![3, 2],
+                tensor_type: GgufWriteTensorType::F32,
+                data,
+            }],
+        )
+        .expect("write tiny gguf");
+        let runtime_source =
+            crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
+        (dir, runtime_source)
+    }
+
+    fn system_memory_committed(
+        services: &crate::models::native_execution_services::NativeExecutionServices,
+    ) -> u64 {
+        services
+            .memory_broker()
+            .usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory)
+            .committed_bytes
+    }
+
+    #[test]
+    fn shipped_load_gguf_weight_context_reuses_same_lane_owner_then_retires() {
+        use crate::models::runtime_receipts::LeaseReceiptShadow;
+
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _nes =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+        let (_dir, runtime_source) = tiny_loaded_weight_pack();
+        let preflight =
+            crate::ggml_runtime::GgufRuntimeSourcePreflight::from_runtime_source(&runtime_source)
+                .expect("preflight");
+        let runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let after_runner = system_memory_committed(&services);
+
+        let first = runner
+            .load_gguf_weight_context_from_preflight(&preflight)
+            .expect("shipped preflight load");
+        assert!(
+            first.resident_host_import_capability().is_some(),
+            "CPU host-import is the shipped owner for this fixture"
+        );
+        let after_first = system_memory_committed(&services);
+        assert!(
+            after_first > after_runner,
+            "first load must charge the NES broker"
+        );
+
+        let second = runner
+            .load_gguf_weight_context_from_preflight(&preflight)
+            .expect("second shipped preflight load");
+        let via_test_helper = runner
+            .load_gguf_weight_context(&runtime_source)
+            .expect("test helper shares the shipped owner path");
+        assert!(
+            first.shares_storage_with(&second),
+            "same content and lane must reuse one owner"
+        );
+        assert!(
+            first.shares_storage_with(&via_test_helper),
+            "load_gguf_weight_context* must share the NES owner"
+        );
+        assert_eq!(
+            system_memory_committed(&services),
+            after_first,
+            "same-lane reuse must not admit a second physical owner"
+        );
+        assert_eq!(
+            services
+                .runtime_receipts()
+                .shadow_compare_leases(services.memory_broker()),
+            LeaseReceiptShadow::Matched,
+            "broker and receipt shadow must stay aligned on reuse"
+        );
+
+        drop(first);
+        drop(second);
+        drop(via_test_helper);
+        assert_eq!(
+            system_memory_committed(&services),
+            after_runner,
+            "dropping the last loaded-weight handle must retire the owner"
+        );
+        assert_eq!(
+            services
+                .runtime_receipts()
+                .shadow_compare_leases(services.memory_broker()),
+            LeaseReceiptShadow::Matched,
+            "broker and receipt shadow must stay aligned after retirement"
+        );
+
+        drop(runner);
+        assert_eq!(system_memory_committed(&services), 0);
+        assert_eq!(
+            services
+                .runtime_receipts()
+                .shadow_compare_leases(services.memory_broker()),
+            LeaseReceiptShadow::Matched
+        );
+    }
+
+    #[test]
+    fn shipped_load_gguf_weight_context_host_import_and_copy_are_distinct_owners() {
+        use crate::models::runtime_receipts::LeaseReceiptShadow;
+
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _nes =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+        let (_dir, runtime_source) = tiny_loaded_weight_pack();
+        let preflight =
+            crate::ggml_runtime::GgufRuntimeSourcePreflight::from_runtime_source(&runtime_source)
+                .expect("preflight");
+        let runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+
+        let host = runner
+            .load_gguf_weight_context_from_preflight(&preflight)
+            .expect("host-import owner");
+        assert!(host.resident_host_import_capability().is_some());
+        assert!(host.resident_device_copy_capability().is_none());
+        let after_host = system_memory_committed(&services);
+        let host_receipts = services.runtime_receipts().summary();
+
+        let _force = super::force_copied_weight_binding();
+        let copied = runner
+            .load_gguf_weight_context_from_preflight(&preflight)
+            .expect("copied-weight owner");
+        assert!(copied.resident_device_copy_capability().is_some());
+        assert!(copied.resident_host_import_capability().is_none());
+        assert!(
+            !host.shares_storage_with(&copied),
+            "host-import failure/copy fallback is a second physical owner"
+        );
+        assert!(
+            system_memory_committed(&services) > after_host,
+            "copied-weight owner must admit its own broker charge"
+        );
+        let both_receipts = services.runtime_receipts().summary();
+        assert!(
+            both_receipts.live_owner_count > host_receipts.live_owner_count,
+            "two physical owners must publish two receipt owners, host={host_receipts:?}, both={both_receipts:?}"
+        );
+        assert!(
+            both_receipts.live_resource_count > host_receipts.live_resource_count,
+            "two physical owners must publish two receipt resources, host={host_receipts:?}, both={both_receipts:?}"
+        );
+
+        let copied_again = runner
+            .load_gguf_weight_context_from_preflight(&preflight)
+            .expect("same-lane copied reuse");
+        assert!(copied.shares_storage_with(&copied_again));
+
+        drop(host);
+        drop(copied);
+        drop(copied_again);
+        drop(runner);
+        assert_eq!(system_memory_committed(&services), 0);
+        assert_eq!(
+            services
+                .runtime_receipts()
+                .shadow_compare_leases(services.memory_broker()),
+            LeaseReceiptShadow::Matched
+        );
+    }
+
+    #[test]
+    fn shipped_load_gguf_weight_context_does_not_share_across_nes_or_lanes() {
+        let first_services =
+            crate::models::native_execution_services::test_native_execution_services();
+        let second_services =
+            crate::models::native_execution_services::test_native_execution_services();
+        let (_dir, runtime_source) = tiny_loaded_weight_pack();
+        let preflight =
+            crate::ggml_runtime::GgufRuntimeSourcePreflight::from_runtime_source(&runtime_source)
+                .expect("preflight");
+
+        let _first_nes =
+            crate::models::native_execution_services::install_native_execution_services(
+                &first_services,
+            );
+        let first_runner =
+            GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default()).expect("first NES runner");
+        let first = first_runner
+            .load_gguf_weight_context_from_preflight(&preflight)
+            .expect("first NES owner");
+
+        let _second_nes =
+            crate::models::native_execution_services::install_native_execution_services(
+                &second_services,
+            );
+        let second_runner =
+            GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default()).expect("second NES runner");
+        let second = second_runner
+            .load_gguf_weight_context_from_preflight(&preflight)
+            .expect("second NES owner");
+        assert!(
+            !first.shares_storage_with(&second),
+            "distinct NES roots must not share loaded-weight owners"
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            let metal = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig {
+                backend: GgmlCpuGraphBackend::Metal,
+                use_scheduler: true,
+                ..GgmlCpuGraphConfig::default()
+            });
+            if let Ok(metal_runner) = metal {
+                let metal_loaded = metal_runner
+                    .load_gguf_weight_context_from_preflight(&preflight)
+                    .expect("Metal lane owner");
+                assert!(
+                    !second.shares_storage_with(&metal_loaded),
+                    "CPU and Metal lanes must not share a loaded-weight owner"
+                );
+            }
         }
     }
 

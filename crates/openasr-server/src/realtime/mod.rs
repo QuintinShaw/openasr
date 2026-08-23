@@ -655,7 +655,9 @@ fn realtime_inference_threads_preference(home: &Path) -> Option<u16> {
 /// Reads the user's saved `execution_target` preference from `home`'s config
 /// document. See [`realtime_inference_threads_preference`] for why this takes
 /// a resolved home directory instead of a [`DistributionContext`].
-fn realtime_execution_target_preference(home: &Path) -> Option<openasr_core::ExecutionTarget> {
+pub(crate) fn realtime_execution_target_preference(
+    home: &Path,
+) -> Option<openasr_core::ExecutionTarget> {
     openasr_core::config::load_config_document(home)
         .ok()
         .map(|document| document.preferences.execution_target)

@@ -1843,7 +1843,7 @@ async fn set_default_model_http_keeps_previous_selection_when_activation_probe_f
     };
     runtime
         .model_pack_path
-        .set_activation_probe_override(Some(activation_probe_fail));
+        .set_activation_probe_failpoint(Some(activation_probe_fail()));
     let app = app_with_runtime_and_distribution(
         runtime.clone(),
         DistributionRuntime {
@@ -1874,6 +1874,94 @@ async fn set_default_model_http_keeps_previous_selection_when_activation_probe_f
             .as_str()
             .unwrap()
             .contains("injected activation probe failure"),
+        "{parsed}"
+    );
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(pack_a.as_path())
+    );
+    assert_eq!(
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap(),
+        previous_v2
+    );
+}
+
+#[tokio::test]
+async fn set_default_model_http_keeps_previous_selection_when_persist_fails() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let pack_a = write_installed_pack_ref(
+        &home,
+        "whisper-tiny",
+        "whisper-tiny:q4",
+        "q4_0",
+        "q4",
+        "whisper-tiny",
+    );
+    let _pack_b = write_installed_pack_ref(
+        &home,
+        "whisper-base",
+        "whisper-base:q4",
+        "q4_0",
+        "q4",
+        "whisper-base",
+    );
+    let pack_a_installed = installed_pack_by_pull(&home, "whisper-tiny:q4");
+    persist_default_pack(
+        &home,
+        &pack_a_installed,
+        QuantPreference::pinned(&pack_a_installed.quant),
+    )
+    .unwrap();
+    let previous_v2 =
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap();
+
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_a.clone()).into(),
+    };
+    runtime
+        .model_pack_path
+        .set_activation_probe_failpoint(Some(activation_probe_ok()));
+    let app = app_with_runtime_and_distribution(
+        runtime.clone(),
+        DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    openasr_core::default_selection::set_persist_commit_failpoint_for_test(true);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/default")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "pull": "whisper-base:q4" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    openasr_core::default_selection::set_persist_commit_failpoint_for_test(false);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        parsed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("injected persist failure"),
         "{parsed}"
     );
     assert_eq!(
@@ -1927,7 +2015,7 @@ async fn set_default_model_http_persists_only_after_activation_probe_succeeds() 
     };
     runtime
         .model_pack_path
-        .set_activation_probe_override(Some(activation_probe_ok));
+        .set_activation_probe_failpoint(Some(activation_probe_ok()));
     let app = app_with_runtime_and_distribution(
         runtime.clone(),
         DistributionRuntime {
@@ -1965,6 +2053,88 @@ async fn set_default_model_http_persists_only_after_activation_probe_succeeds() 
     assert_eq!(
         persisted.status,
         openasr_core::default_selection::ActiveModelSelectionStatus::Installed
+    );
+}
+
+#[test]
+fn set_default_model_http_stage_does_not_publish_live() {
+    let source = include_str!("routes/models_api.rs");
+    let owner_impl = source
+        .split("impl NativePackRebindOwner")
+        .nth(1)
+        .expect("NativePackRebindOwner impl");
+    let stage = owner_impl
+        .split("fn restore")
+        .next()
+        .expect("stage precedes restore");
+    assert!(
+        stage.contains("fn stage("),
+        "expected NativePackRebindOwner::stage in source audit window"
+    );
+    assert!(
+        !stage.contains("rebind_native_model_pack"),
+        "materialize/stage must not publish live: {stage}"
+    );
+    let set_default = source
+        .split("pub(crate) async fn set_default_model")
+        .nth(1)
+        .expect("set_default_model")
+        .split("pub(crate) async fn delete_model")
+        .next()
+        .expect("set_default_model body");
+    assert!(
+        !set_default.contains("NoopActivationReservation"),
+        "set_default_model must not reserve with NoopActivationReservation"
+    );
+    assert!(
+        set_default.contains("quote_and_reserve_candidate_activation"),
+        "set_default_model must quote and reserve known physical domains"
+    );
+    assert!(
+        !set_default.contains("ResolvedExecutionRoute::cpu()"),
+        "set_default_model must not quote a dummy CPU candidate: {set_default}"
+    );
+    assert!(
+        set_default.contains("PackVerifier")
+            && set_default.contains("resolve_candidate_activation_lane"),
+        "set_default_model must quote the pack being activated on its real lane: {set_default}"
+    );
+    let persist_idx = set_default
+        .find("commit_activation")
+        .expect("persist/commit must exist");
+    let publish_idx = set_default
+        .find("rebind_native_model_pack")
+        .expect("live publication must exist after persist");
+    assert!(
+        persist_idx < publish_idx,
+        "live publication must follow V2 commit, got persist@{persist_idx} publish@{publish_idx}"
+    );
+}
+
+#[test]
+fn spawn_boot_native_warmup_uses_set_default_attestation_entry() {
+    let source = include_str!("realtime/native_worker.rs");
+    let spawn = source
+        .split("pub(crate) fn spawn_boot_native_warmup")
+        .nth(1)
+        .expect("spawn_boot_native_warmup")
+        .split("pub(crate) async fn probe_native_activation")
+        .next()
+        .expect("spawn_boot_native_warmup body");
+    assert!(
+        spawn.contains("probe_native_activation("),
+        "boot warmup must use the same shipped attestation entry as set-default: {spawn}"
+    );
+    assert!(
+        !spawn.contains("warm_up_default_native_streaming_worker"),
+        "boot warmup must not bypass probe_native_activation: {spawn}"
+    );
+    assert!(
+        !spawn.contains("commit_activation")
+            && !spawn.contains("rebind_native_model_pack")
+            && !spawn.contains("persist_detailed")
+            && !spawn.contains("persist_default"),
+        "failed boot warmup must not persist V2 or publish live: {spawn}"
     );
 }
 

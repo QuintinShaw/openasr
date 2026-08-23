@@ -114,6 +114,15 @@ impl PolicyResolvedPyannoteSegmenterRuntime {
         let source = prepared.source;
         let content_id = source.content_id().to_string();
         let (retained_quote, peak_quote) = pyannote_source_quote(&source)?;
+        let activation_quote =
+            crate::models::native_execution_services::CandidateActivationQuoteSource::Declared(
+                SystemMemoryAllocationQuote::new(
+                    format!("aux.{PYANNOTE_GGML_ARCHITECTURE_ID}.{content_id}.source"),
+                    peak_quote,
+                    retained_quote,
+                )
+                .map_err(|error| SegmentError::LoadFailed(error.to_string()))?,
+            );
         let execution_plan = resolve_auxiliary_execution_plan(
             execution_services.as_ref(),
             PYANNOTE_GGML_ARCHITECTURE_ID,
@@ -173,6 +182,7 @@ impl PolicyResolvedPyannoteSegmenterRuntime {
             execution_plan,
             PYANNOTE_STAGE,
             builder,
+            activation_quote,
         )
         .map_err(policy_error)?;
         Ok(Self {
@@ -403,6 +413,11 @@ impl PolicyResolvedDiariZenSegmenterRuntime {
         .map_err(|error| SegmentError::LoadFailed(error.to_string()))?;
         let services_for_builder = Arc::clone(&execution_services);
         let (preflight, content_id) = prepared.source.into_parts();
+        let activation_quote =
+            crate::models::native_execution_services::CandidateActivationQuoteSource::Declared(
+                diarizen::DiariZenRuntime::quote_candidate_system_memory(&preflight)
+                    .map_err(diarizen_error)?,
+            );
         let builder = Arc::new(move |candidate: &ExecutionCandidate| {
             load_diarizen_actor(
                 services_for_builder.as_ref(),
@@ -416,6 +431,7 @@ impl PolicyResolvedDiariZenSegmenterRuntime {
             execution_plan,
             DIARIZEN_STAGE,
             builder,
+            activation_quote,
         )
         .map_err(policy_error)?;
         Ok(Self {

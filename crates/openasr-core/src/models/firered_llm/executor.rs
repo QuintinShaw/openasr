@@ -429,6 +429,64 @@ fn allocate_firered_llm_unified_runtime(
     }
 }
 
+fn allocate_split_encoder_runtime_owner(
+    preflight: crate::GgufRuntimeSourcePreflight,
+    metadata: FireRedAedExecutionMetadata,
+    backend: GgmlCpuGraphBackend,
+    quote: SystemMemoryAllocationQuote,
+) -> Result<SystemMemoryOwner<FireRedEncoderGraphRuntime>, FireRedLlmExecutorError> {
+    match SystemMemoryOwner::try_allocate_transaction(quote, || {
+        let runtime = FireRedEncoderGraphRuntime::new_from_preflight(&preflight, metadata, backend)
+            .map_err(|error| FireRedLlmExecutorError::EncoderFailed {
+                reason: error.to_string(),
+            })?;
+        let retained = runtime.retained_system_memory_bytes().map_err(|reason| {
+            FireRedLlmExecutorError::RuntimeOwnershipFailed {
+                stage: "split-encoder",
+                reason,
+            }
+        })?;
+        Ok(SystemMemoryAllocationOutcome::new(
+            runtime, retained, retained,
+        ))
+    }) {
+        Ok(owner) => Ok(owner),
+        Err(SystemMemoryAllocationTransactionError::Allocation(error)) => Err(error),
+        Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+            Err(FireRedLlmExecutorError::RuntimeOwnershipFailed {
+                stage: "split-encoder",
+                reason: error.to_string(),
+            })
+        }
+    }
+}
+
+fn allocate_split_adapter_runtime_owner(
+    preflight: crate::GgufRuntimeSourcePreflight,
+    backend: GgmlCpuGraphBackend,
+    quote: SystemMemoryAllocationQuote,
+) -> Result<SystemMemoryOwner<FireRedLlmAdapterGraphRuntime>, FireRedLlmExecutorError> {
+    match SystemMemoryOwner::try_allocate_transaction(quote, || {
+        let runtime = FireRedLlmAdapterGraphRuntime::new_from_preflight(&preflight, backend)
+            .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
+                reason: error.to_string(),
+            })?;
+        let retained = runtime.retained_system_memory_bytes();
+        Ok(SystemMemoryAllocationOutcome::new(
+            runtime, retained, retained,
+        ))
+    }) {
+        Ok(owner) => Ok(owner),
+        Err(SystemMemoryAllocationTransactionError::Allocation(error)) => Err(error),
+        Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+            Err(FireRedLlmExecutorError::RuntimeOwnershipFailed {
+                stage: "split-adapter",
+                reason: error.to_string(),
+            })
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct FireRedLlmGgmlExecutor {
     decoder_runtimes: Arc<FireRedLlmDecoderRuntimePool>,
@@ -934,14 +992,18 @@ impl FireRedLlmGgmlExecutor {
                     &content_id,
                     backend,
                 );
-                let mut encoder_runtime = FireRedEncoderGraphRuntime::new_from_preflight(
-                    preflight,
+                let quote =
+                    FireRedEncoderGraphRuntime::system_memory_quote(encoder_metadata, &content_id)
+                        .map_err(|reason| FireRedLlmExecutorError::RuntimeOwnershipFailed {
+                            stage: "split-encoder",
+                            reason,
+                        })?;
+                let mut encoder_runtime = allocate_split_encoder_runtime_owner(
+                    preflight.clone(),
                     encoder_metadata,
                     backend,
-                )
-                .map_err(|error| FireRedLlmExecutorError::EncoderFailed {
-                    reason: error.to_string(),
-                })?;
+                    quote,
+                )?;
                 let output = encoder_runtime
                     .encode(&features.data, feature_frames)
                     .map_err(|error| FireRedLlmExecutorError::EncoderFailed {
@@ -987,12 +1049,19 @@ impl FireRedLlmGgmlExecutor {
                     &content_id,
                     backend,
                 );
-                let mut adapter_runtime = FireRedLlmAdapterGraphRuntime::new_from_preflight(
-                    preflight, backend,
+                let quote = SystemMemoryAllocationQuote::new(
+                    format!("firered-llm-split-adapter:{content_id}"),
+                    0,
+                    0,
                 )
-                .map_err(|error| FireRedLlmExecutorError::AdapterGraphFailed {
-                    reason: error.to_string(),
+                .map_err(|error| {
+                    FireRedLlmExecutorError::RuntimeOwnershipFailed {
+                        stage: "split-adapter",
+                        reason: error.to_string(),
+                    }
                 })?;
+                let mut adapter_runtime =
+                    allocate_split_adapter_runtime_owner(preflight.clone(), backend, quote)?;
                 let output = adapter_runtime
                     .run(
                         &encoder_output.rows,

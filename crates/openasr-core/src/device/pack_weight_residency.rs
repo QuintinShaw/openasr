@@ -40,7 +40,9 @@ use super::execution_memory::{
 use crate::models::native_execution_services::{
     current_execution_cache_attempt_id, current_runtime_receipts,
 };
-use crate::models::runtime_receipts::{RuntimeOwnerGuard, RuntimeResourceGuard};
+use crate::models::runtime_receipts::{
+    RuntimeOwnerGuard, RuntimeResourceGuard, RuntimeResourceState,
+};
 
 /// Process-local identity of one already-open pack weight mapping.
 ///
@@ -178,6 +180,8 @@ impl PackWeightResidencyInner {
         let Some(resource) = collector.acquire_resource(owner_id, descriptor) else {
             return;
         };
+        // Receipts are attached after the broker lease has already committed.
+        resource.set_state(RuntimeResourceState::Committed);
         *receipt = Some((resource, owner));
     }
 

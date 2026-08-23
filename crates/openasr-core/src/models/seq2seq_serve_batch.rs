@@ -20,6 +20,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::ggml_runtime::GgmlCpuGraphBackend;
+#[cfg(not(test))]
+use crate::models::native_execution_services::current_execution_cache_attempt_id;
 use crate::models::native_execution_services::{
     NativeExecutionContext, current_native_execution_context, current_runtime_receipts,
     install_native_execution_context,
@@ -169,6 +171,12 @@ pub(crate) trait Seq2SeqServeBatchFamily: Sized + 'static {
     fn unsupported_backend(backend: GgmlCpuGraphBackend) -> Self::Error;
     fn registry_poisoned() -> Self::Error;
     fn thread_spawn_failed(reason: String) -> Self::Error;
+    #[cfg_attr(test, allow(dead_code))]
+    fn candidate_attempt_required() -> Self::Error {
+        Self::thread_spawn_failed(
+            "serve-batch publication requires an active candidate activation attempt".to_string(),
+        )
+    }
     fn queue_full() -> Self::Error;
     fn owner_disconnected() -> Self::Error;
     fn reply_timed_out() -> Self::Error;
@@ -1807,6 +1815,10 @@ where
         Shutdown: Fn(&E) + Copy + Send + Sync + 'static,
         ErrorFactory: Fn() -> Err + Copy,
     {
+        #[cfg(not(test))]
+        if current_execution_cache_attempt_id().is_none() {
+            return Err(registry_error());
+        }
         loop {
             let pending = {
                 let mut engines = self.engines.lock().map_err(|_| registry_error())?;
@@ -2080,6 +2092,10 @@ where
         key: F::EngineKey,
         config: ServeBatchConfig,
     ) -> Result<Arc<ServeBatchEngine<F>>, F::Error> {
+        #[cfg(not(test))]
+        if current_execution_cache_attempt_id().is_none() {
+            return Err(F::candidate_attempt_required());
+        }
         loop {
             let pending = {
                 let mut engines = self.engines.lock().map_err(|_| F::registry_poisoned())?;

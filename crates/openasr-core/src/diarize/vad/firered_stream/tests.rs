@@ -125,7 +125,7 @@ fn benchmark_backend() -> BenchmarkBackend {
 }
 
 fn streaming_probabilities_for_backend(
-    model: &'static FireRedStreamVadModel,
+    model: super::SharedFireRedStreamVadModel,
     samples: &[f32],
     backend: crate::ggml_runtime::GgmlCpuGraphBackend,
 ) -> Result<Vec<f32>, String> {
@@ -140,14 +140,15 @@ fn streaming_probabilities_for_backend(
         .unwrap_or_else(|| default_chunk_samples / super::frontend::SAMPLE_RATE_HZ as usize)
         .max(1);
     let chunk_samples = chunk_seconds.saturating_mul(super::frontend::SAMPLE_RATE_HZ as usize);
-    let mut streaming = super::streaming::FireRedStreamingVad::from_model(model);
+    let mut streaming = super::streaming::FireRedStreamingVad::from_model(model.clone())
+        .map_err(|error| error.to_string())?;
     let placement = if backend == crate::ggml_runtime::GgmlCpuGraphBackend::Cpu {
         crate::device::execution_policy::ExecutionPlacement::CpuOnly
     } else {
         crate::device::execution_policy::ExecutionPlacement::FullDevice
     };
     let mut runtime = (backend != crate::ggml_runtime::GgmlCpuGraphBackend::Cpu)
-        .then(|| super::ggml_runtime::FireRedStreamVadGgmlRuntime::new(model, backend, placement))
+        .then(|| super::ggml_runtime::FireRedStreamVadGgmlRuntime::new(&model, backend, placement))
         .transpose()
         .map_err(|error| error.to_string())?;
     let mut probabilities = Vec::with_capacity(samples.len().div_ceil(160));
@@ -266,13 +267,13 @@ fn exact_gpu_graph_matches_cpu_probabilities_and_product_spans() {
     let (samples, _) = golden();
     let model = super::shared_model().expect("vendored FireRedVAD weights");
     let cpu = streaming_probabilities_for_backend(
-        model,
+        model.clone(),
         &samples,
         crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
     )
     .expect("run FireRedVAD CPU reference");
     let accelerated =
-        streaming_probabilities_for_backend(model, &samples, benchmark_backend.backend)
+        streaming_probabilities_for_backend(model.clone(), &samples, benchmark_backend.backend)
             .expect("run FireRedVAD exact GPU route");
     let (max_abs, worst_frame) = max_abs_diff_with_location(&accelerated, &cpu);
     let mean_abs = mean_abs_diff(&accelerated, &cpu);
@@ -344,7 +345,7 @@ fn firered_stream_vad_matches_official_reference_on_aux_audio() {
     let backend = benchmark_backend.backend;
     let execution_placement = crate::GgmlExecutionTelemetryCollector::new();
     let _execution_placement_guard = execution_placement.install();
-    let probabilities = streaming_probabilities_for_backend(model, &samples, backend)
+    let probabilities = streaming_probabilities_for_backend(model.clone(), &samples, backend)
         .expect("run policy-equivalent FireRedVAD");
     let observed = execution_placement.snapshot();
     let (max_abs, worst_frame) = max_abs_diff_with_location(&probabilities, &reference_probs);
@@ -444,14 +445,19 @@ fn firered_stream_vad_cpu_metal_aux_benchmark() {
         crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
         crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
     ] {
-        streaming_probabilities_for_backend(model, &samples[..samples.len().min(16_000)], backend)
-            .expect("warm FireRedVAD backend");
+        streaming_probabilities_for_backend(
+            model.clone(),
+            &samples[..samples.len().min(16_000)],
+            backend,
+        )
+        .expect("warm FireRedVAD backend");
         let mut probabilities = Vec::new();
         let seconds = (0..5)
             .map(|_| {
                 let started = std::time::Instant::now();
-                probabilities = streaming_probabilities_for_backend(model, &samples, backend)
-                    .expect("run FireRedVAD backend");
+                probabilities =
+                    streaming_probabilities_for_backend(model.clone(), &samples, backend)
+                        .expect("run FireRedVAD backend");
                 started.elapsed().as_secs_f64()
             })
             .collect::<Vec<_>>();
@@ -553,6 +559,108 @@ fn shared_model_loads() {
 }
 
 #[test]
+fn shared_model_admits_to_installed_nes_and_refunds_on_drop() {
+    use crate::device::execution_memory::{
+        DeviceMemoryBrokerSet, DeviceMemoryPolicy, DeviceMemoryUsage, MemoryDomainKey,
+    };
+    use crate::models::native_execution_services::{
+        NativeExecutionServices, install_native_execution_services,
+    };
+    use crate::models::runtime_receipts::LeaseReceiptShadow;
+    use std::sync::Arc;
+
+    let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+        maximum_owned_basis_points: 10_000,
+        minimum_headroom_bytes: 0,
+    }));
+    let services = NativeExecutionServices::new_with_broker(
+        Arc::new(crate::device::execution_policy::DefaultExecutionPolicyResolver),
+        Arc::clone(&broker),
+    )
+    .expect("native execution services must construct");
+    {
+        let _guard = install_native_execution_services(&services);
+        let model = super::shared_model().expect("shared_model must drive try_allocate");
+        assert!(
+            model.committed_requested_bytes() > 2_000_000,
+            "parsed Stream-VAD weights must be billed, got {}",
+            model.committed_requested_bytes()
+        );
+        assert_eq!(
+            services
+                .runtime_receipts()
+                .shadow_compare_leases(services.memory_broker()),
+            LeaseReceiptShadow::Matched
+        );
+        let snapshot = services.runtime_receipts().snapshot();
+        assert_eq!(snapshot.live_owners.len(), 1);
+        let resource = snapshot.live_owners[0]
+            .resources
+            .values()
+            .next()
+            .expect("embedded Stream-VAD must publish a resource receipt");
+        assert!(matches!(
+            resource.descriptor.retained,
+            crate::models::runtime_receipts::RuntimeReceiptMetric::Known(bytes) if bytes > 2_000_000
+        ));
+        drop(model);
+        let _session = super::FireRedStreamingVad::shared().expect("host session must admit");
+        assert_eq!(
+            services
+                .runtime_receipts()
+                .shadow_compare_leases(services.memory_broker()),
+            LeaseReceiptShadow::Matched
+        );
+        let session_snapshot = services.runtime_receipts().snapshot();
+        assert!(
+            session_snapshot.live_owners.len() >= 2,
+            "host session must add a priced owner beside the embedded model, got {session_snapshot:?}"
+        );
+        assert!(session_snapshot.live_owners.iter().all(|owner| {
+            owner.resources.values().all(|resource| {
+                resource.descriptor.domain.is_some()
+                    && matches!(
+                        resource.state,
+                        crate::models::runtime_receipts::RuntimeResourceState::Committed
+                            | crate::models::runtime_receipts::RuntimeResourceState::Reconciled
+                    )
+            })
+        }));
+    }
+    drop(services);
+    assert_eq!(
+        broker.usage(&MemoryDomainKey::SystemMemory),
+        DeviceMemoryUsage::default()
+    );
+}
+
+#[test]
+fn stream_vad_has_no_process_global_shared_model() {
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/diarize/vad/firered_stream");
+    for name in [
+        "mod.rs",
+        "streaming.rs",
+        "realtime_runtime.rs",
+        "provider.rs",
+    ] {
+        let source = std::fs::read_to_string(root.join(name)).expect("read stream-vad source");
+        assert!(
+            !source.contains("static SHARED_MODEL"),
+            "{name} must not keep a process-global SHARED_MODEL"
+        );
+        assert!(
+            !source.contains("NotPricedLegacy"),
+            "{name} must not write NotPricedLegacy compatibility receipts"
+        );
+        assert!(
+            !source.contains("OnceLock<Option<FireRedStreamVadModel>>"),
+            "{name} must not cache parsed weights in a process OnceLock"
+        );
+    }
+}
+
+#[test]
 fn provider_shared_computes_speech_slices_on_golden_clip() {
     use crate::longform::{LongFormOptions, LongFormVadProvider};
 
@@ -649,15 +757,18 @@ fn firered_stream_vad_fifteen_minute_endurance() {
     let benchmark_backend = benchmark_backend();
     let backend = benchmark_backend.backend;
     // Warm up (page-in, allocator warm) before timing.
-    let _ =
-        streaming_probabilities_for_backend(model, &samples[..samples.len().min(16_000)], backend)
-            .expect("warm FireRedVAD backend");
+    let _ = streaming_probabilities_for_backend(
+        model.clone(),
+        &samples[..samples.len().min(16_000)],
+        backend,
+    )
+    .expect("warm FireRedVAD backend");
 
     let mut probs = Vec::new();
     let seconds = (0..5)
         .map(|_| {
             let started = std::time::Instant::now();
-            probs = streaming_probabilities_for_backend(model, &samples, backend)
+            probs = streaming_probabilities_for_backend(model.clone(), &samples, backend)
                 .expect("run FireRedVAD endurance backend");
             started.elapsed().as_secs_f64()
         })

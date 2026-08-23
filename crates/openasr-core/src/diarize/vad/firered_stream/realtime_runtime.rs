@@ -107,7 +107,6 @@ pub(crate) struct FireRedRealtimeVadSession {
     expected_frame_samples: usize,
     precommit_frames: Vec<Vec<i16>>,
     _request_receipt_owner: Option<super::RuntimeOwnerGuard>,
-    _session_receipt_owner: Option<super::RuntimeOwnerGuard>,
 }
 
 impl fmt::Debug for FireRedRealtimeVadSession {
@@ -164,10 +163,6 @@ impl FireRedRealtimeVadSession {
                 Some("request"),
                 None,
             ),
-            _session_receipt_owner: super::embedded_receipt_owner(
-                "firered-stream-vad.realtime.host-session",
-                cpu_receipt_lane(),
-            ),
         })
     }
 
@@ -206,11 +201,17 @@ impl FireRedRealtimeVadSession {
         let builder = Arc::new(move |candidate: &ExecutionCandidate| {
             build_candidate(Arc::clone(&services_for_builder), candidate, frame_samples)
         });
+        let activation_quote =
+            crate::models::native_execution_services::CandidateActivationQuoteSource::Declared(
+                super::FireRedStreamVadModel::system_memory_quote()
+                    .map_err(|reason| FireRedStreamVadError::ExecutionPolicy { reason })?,
+            );
         let runtime = PolicyResolvedAuxRuntime::try_new(
             execution_services,
             execution_plan,
             REALTIME_VAD_STAGE,
             builder,
+            activation_quote,
         )
         .map_err(map_policy_error)?;
         Ok(Self {
@@ -223,10 +224,6 @@ impl FireRedRealtimeVadSession {
                 "firered-stream-vad.realtime.request",
                 Some(&format!("frame-samples={frame_samples}")),
                 Some("request"),
-                None,
-            ),
-            _session_receipt_owner: super::embedded_receipt_owner(
-                "firered-stream-vad.realtime.session",
                 None,
             ),
         })
@@ -328,16 +325,6 @@ fn invoke_frame_with_precommit_replay<R, E>(
         precommit_frames.clear();
     }
     result
-}
-
-fn cpu_receipt_lane() -> Option<super::SafeExecutionLaneProjection> {
-    let collector = crate::models::native_execution_services::current_runtime_receipts()?;
-    collector.lane_projection(
-        ExecutionProvider::Cpu,
-        "CPU",
-        ExecutionPlacement::CpuOnly,
-        GgmlCpuGraphBackend::Cpu,
-    )
 }
 
 fn validate_frame_samples(frame_samples: usize) -> Result<(), FireRedStreamVadError> {
@@ -488,7 +475,7 @@ impl FireRedRealtimeVadRuntime {
             reason: "vendored Stream-VAD weights failed to parse".to_string(),
         })?;
         let device =
-            FireRedStreamVadGgmlRuntime::new(model, backend, placement).map_err(|error| {
+            FireRedStreamVadGgmlRuntime::new(&model, backend, placement).map_err(|error| {
                 FireRedStreamVadError::Graph {
                     reason: error.to_string(),
                 }
@@ -511,7 +498,11 @@ impl FireRedRealtimeVadRuntime {
                 ))
             });
         Ok(Self {
-            streaming: FireRedStreamingVad::from_model(model),
+            streaming: FireRedStreamingVad::from_model(model).map_err(|error| {
+                FireRedStreamVadError::RealtimeRuntime {
+                    reason: error.to_string(),
+                }
+            })?,
             device,
             _receipt_owner: receipt_owner,
         })
@@ -768,6 +759,9 @@ mod tests {
                     samples: Mutex::new(Vec::new()),
                 })
             }),
+            crate::models::native_execution_services::CandidateActivationQuoteSource::Declared(
+                crate::diarize::vad::FireRedStreamVadModel::system_memory_quote().unwrap(),
+            ),
         )
         .unwrap();
         let mut runtime = PolicyResolvedStatefulAuxRuntime::new(runtime);

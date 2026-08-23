@@ -502,6 +502,14 @@ impl NativeMemoryAllocationTransaction {
         &mut self.reservation
     }
 
+    /// Detaches the broker batch so a candidate-activation reservation can
+    /// hold known-domain peak/retained without immediately allocating native
+    /// owners. Quote tokens are dropped; later declared components still JIT
+    /// against this pending batch's cohort.
+    pub(crate) fn into_reservation(self) -> DeviceMemoryReservationBatch {
+        self.reservation
+    }
+
     pub(crate) fn requires_reconciliation(&self) -> bool {
         self.reservation.requires_reconciliation()
     }
@@ -948,7 +956,17 @@ fn runtime_receipt_parts(
                 claim.confidence,
                 None,
             )?;
-            collector.acquire_resource(owner_id, descriptor)
+            collector
+                .acquire_resource(owner_id, descriptor)
+                .map(|resource| {
+                    // Receipts are attached after the broker lease has already
+                    // committed. Leaving them Reserved would make shadow comparison
+                    // charge them as pending.
+                    resource.set_state(
+                        crate::models::runtime_receipts::RuntimeResourceState::Committed,
+                    );
+                    resource
+                })
         })
         .collect();
     (Some(owner), resources)

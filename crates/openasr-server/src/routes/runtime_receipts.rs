@@ -5,7 +5,7 @@
 //! deliberately serializes only keyed/redacted identifiers.
 
 use crate::*;
-use axum::{extract::Query, Json};
+use axum::{Json, extract::Query};
 use openasr_core::runtime_receipts::{
     LiveRuntimeOwner, RuntimeOwnerId, RuntimeReceiptAvailability, RuntimeReceiptEvent,
     RuntimeReceiptMetric, RuntimeReceiptSnapshot, RuntimeResourceId, RuntimeResourceState,

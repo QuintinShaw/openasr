@@ -4,6 +4,7 @@
 
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -1113,29 +1114,72 @@ pub(crate) fn wait_while_native_warmup_in_flight_blocking() {
 }
 
 pub(crate) fn spawn_boot_native_warmup(runtime: ServerRuntime) {
+    // Same shipped attestation entry as set-default. Failure must not persist
+    // V2 or publish an unattested runtime as the live default; errors stay
+    // local to this background task.
     tokio::spawn(async move {
-        let _ = warm_up_default_native_streaming_worker(runtime).await;
+        let _ = probe_native_activation(runtime, None).await;
     });
 }
 
-pub(crate) async fn probe_native_activation(runtime: ServerRuntime) -> Result<(), ApiError> {
-    if let Some(probe) = runtime.model_pack_path.activation_probe_override() {
-        return probe().map_err(ApiError::BadRequest);
+/// Attest a candidate pack without publishing it as the live default.
+/// `candidate_pack` is loaded for warmup/probe only; live `model_pack_path`
+/// is left unchanged. `None` probes the currently bound pack (boot warmup).
+pub(crate) async fn probe_native_activation(
+    runtime: ServerRuntime,
+    candidate_pack: Option<PathBuf>,
+) -> Result<(), ApiError> {
+    if let Some(failpoint) = runtime.model_pack_path.activation_probe_failpoint() {
+        return failpoint.map_err(ApiError::BadRequest);
     }
-    warm_up_default_native_streaming_worker(runtime)
+    warm_up_native_pack(runtime, candidate_pack)
         .await
         .map_err(|reason| {
             ApiError::BadRequest(format!("default model activation probe failed: {reason}"))
         })
 }
 
+/// Sync entry for the typestate attestation contract. Injection failpoints
+/// complete without awaiting warmup, so current-thread tests still enter this
+/// shipped function. Real warmup uses `block_in_place` on a multi-thread
+/// runtime.
+pub(crate) fn probe_native_activation_blocking(
+    runtime: ServerRuntime,
+    candidate_pack: Option<PathBuf>,
+) -> Result<(), ApiError> {
+    let future = probe_native_activation(runtime, candidate_pack);
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread => {
+            futures_util::FutureExt::now_or_never(future).ok_or_else(|| {
+                ApiError::BadRequest(
+                    "activation probe required async warmup on the current-thread runtime"
+                        .to_string(),
+                )
+            })?
+        }
+        Ok(_) => tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future)),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| ApiError::BadRequest(error.to_string()))?
+            .block_on(future),
+    }
+}
+
 pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(
     runtime: ServerRuntime,
+) -> Result<(), String> {
+    warm_up_native_pack(runtime, None).await
+}
+
+async fn warm_up_native_pack(
+    runtime: ServerRuntime,
+    candidate_pack: Option<PathBuf>,
 ) -> Result<(), String> {
     if runtime.backend != openasr_core::BackendKind::Native {
         return Ok(());
     }
-    let Some(model_pack_path) = runtime.model_pack_path.current() else {
+    let Some(model_pack_path) = candidate_pack.or_else(|| runtime.model_pack_path.current()) else {
         // Fresh install / no model installed yet: nothing to warm. The daemon
         // still serves `/health`; a later default-model rebind binds a pack
         // in-process without restart, and the next request path loads it.

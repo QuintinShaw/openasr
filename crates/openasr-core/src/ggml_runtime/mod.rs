@@ -5,7 +5,7 @@ pub(crate) mod backend_memory_admission;
 mod cpu_graph;
 mod env_flags;
 mod execution_telemetry;
-mod ffi;
+pub(crate) mod ffi;
 mod gguf_c_parser_sandbox;
 pub mod gguf_header;
 mod gguf_metadata;
@@ -69,7 +69,7 @@ pub(crate) use cpu_graph::{
     GgmlBackendCapabilities, GgmlCpuGraphBuilder, GgmlCpuTensor, GgmlFlashAttentionPrecision,
     GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext,
     GgmlMatmulPrecision, GgmlNativeGqaCapability, GgmlPersistentGraphSession, GgmlRopeExtParams,
-    GgmlStaticTensor, GgmlStaticTensorArena, ResidentDeviceCopyCapability,
+    GgmlStaticTensor, GgmlStaticTensorArena, LoadedWeightOwnerCache, ResidentDeviceCopyCapability,
     ResidentHostImportCapability,
 };
 pub(crate) use env_flags::{env_toggle_with_raw, env_var_truthy};

@@ -76,6 +76,15 @@ impl FireRedStreamVadCache {
             self.blocks[index - 1] = values;
         }
     }
+
+    pub(super) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.fsmn1, "firered-stream-vad.session.fsmn1")?;
+        for (index, layer) in self.blocks.iter().enumerate() {
+            bytes.add_vec(layer, &format!("firered-stream-vad.session.block{index}"))?;
+        }
+        Ok(bytes.finish())
+    }
 }
 
 impl Default for FireRedStreamVadCache {
@@ -96,6 +105,22 @@ impl FireRedStreamVadModel {
             weights: FireRedStreamVadWeights::embedded()?,
             frontend: FireRedVadFbankFrontend::new(),
         })
+    }
+
+    pub(crate) fn system_memory_quote()
+    -> Result<crate::models::system_memory_owner::SystemMemoryAllocationQuote, String> {
+        let blob = FireRedStreamVadWeights::embedded_blob_bytes();
+        let peak = blob.saturating_mul(2);
+        crate::models::system_memory_owner::SystemMemoryAllocationQuote::new(
+            "firered-stream-vad.embedded-model",
+            peak,
+            blob,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        self.weights.retained_system_memory_bytes()
     }
 
     /// Compute one speech probability per 10 ms frame over the whole

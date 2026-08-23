@@ -388,6 +388,15 @@ impl<T> SystemMemoryOwner<T> {
                             Some(observation_confidence),
                         )
                         .and_then(|descriptor| collector.acquire_resource(owner_id, descriptor))
+                        .map(|resource| {
+                            // Receipts are attached after the broker lease has
+                            // already committed. Leaving them Reserved would
+                            // make shadow comparison charge them as pending.
+                            resource.set_state(
+                                crate::models::runtime_receipts::RuntimeResourceState::Committed,
+                            );
+                            resource
+                        })
                 });
                 Some((Some(owner), resource))
             })
@@ -566,6 +575,62 @@ mod tests {
         assert_eq!(
             broker.usage(&MemoryDomainKey::SystemMemory),
             DeviceMemoryUsage::default()
+        );
+    }
+
+    #[test]
+    fn shipped_allocate_commits_receipts_that_cover_the_broker_lease() {
+        let services =
+            crate::models::native_execution_services::NativeExecutionServices::new_with_broker(
+                Arc::new(crate::device::execution_policy::DefaultExecutionPolicyResolver),
+                test_broker(),
+            )
+            .expect("native execution services must construct for receipt shadow tests");
+        let _guard =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+        let quote = SystemMemoryAllocationQuote::new("test.shadow-owner", 96, 96).unwrap();
+        let owner = SystemMemoryOwner::try_allocate_with(
+            quote,
+            Some(Arc::clone(services.memory_broker())),
+            true,
+            || Ok(snapshot(200)),
+            || Ok(SystemMemoryAllocationOutcome::new(vec![0_u8; 96], 96, 96)),
+        )
+        .unwrap();
+        let snapshot = services.runtime_receipts().snapshot();
+        assert_eq!(snapshot.live_owners.len(), 1);
+        let resource = snapshot.live_owners[0]
+            .resources
+            .values()
+            .next()
+            .expect("system-memory owner must publish a resource receipt");
+        assert_eq!(
+            resource.state,
+            crate::models::runtime_receipts::RuntimeResourceState::Committed
+        );
+        assert_eq!(
+            resource.descriptor.retained,
+            crate::models::runtime_receipts::RuntimeReceiptMetric::Known(96)
+        );
+        assert_eq!(
+            services
+                .runtime_receipts()
+                .shadow_compare_leases(services.memory_broker()),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
+        drop(owner);
+        assert_eq!(
+            services
+                .runtime_receipts()
+                .shadow_compare_leases(services.memory_broker()),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
+        assert!(
+            services
+                .runtime_receipts()
+                .snapshot()
+                .live_owners
+                .is_empty()
         );
     }
 

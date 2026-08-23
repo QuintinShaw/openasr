@@ -4,7 +4,7 @@
 //! fallback never read this module's event stream or snapshot.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt::{self, Write as _},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::device::execution_memory::{
-    MemoryDomainKey, MemoryObservationConfidence, QuoteConfidence,
+    DeviceMemoryBrokerSet, MemoryDomainKey, MemoryObservationConfidence, QuoteConfidence,
 };
 use crate::device::execution_policy::ExecutionPlacement;
 use crate::device::execution_route::ExecutionProvider;
@@ -857,6 +857,173 @@ impl RuntimeReceiptCollector {
             },
         }
     }
+
+    /// Receipt-only comparison against the process-wide broker ledger.
+    ///
+    /// This never mutates admission. Incomplete or unavailable receipts cannot
+    /// prove coverage and return [`LeaseReceiptShadow::Incomparable`].
+    #[allow(dead_code)]
+    pub(crate) fn shadow_compare_leases(
+        &self,
+        broker: &DeviceMemoryBrokerSet,
+    ) -> LeaseReceiptShadow {
+        let snapshot = self.snapshot();
+        if !matches!(snapshot.availability, RuntimeReceiptAvailability::Available) {
+            return LeaseReceiptShadow::Incomparable {
+                reason: LeaseReceiptShadowIncomparable::ReceiptsUnavailable,
+            };
+        }
+        if !snapshot.completeness.complete {
+            return LeaseReceiptShadow::Incomparable {
+                reason: LeaseReceiptShadowIncomparable::ReceiptsIncomplete(
+                    snapshot
+                        .completeness
+                        .reason
+                        .unwrap_or(ReceiptCompletenessReason::InvalidLifecycle),
+                ),
+            };
+        }
+
+        let mut receipt_bytes = HashMap::<SafeMemoryDomainProjection, ReceiptDomainBytes>::new();
+        for owner in &snapshot.live_owners {
+            for resource in owner.resources.values() {
+                let Some(domain) = resource.descriptor.domain else {
+                    // Unpriced diagnostic rows do not represent broker leases.
+                    continue;
+                };
+                let slot = receipt_bytes.entry(domain).or_default();
+                match resource.state {
+                    RuntimeResourceState::Reserved => {
+                        match known_metric(resource.descriptor.peak) {
+                            Ok(bytes) => {
+                                slot.reserved_peak = slot.reserved_peak.saturating_add(bytes)
+                            }
+                            Err(reason) => {
+                                return LeaseReceiptShadow::Incomparable { reason };
+                            }
+                        }
+                    }
+                    RuntimeResourceState::Committed | RuntimeResourceState::Reconciled => {
+                        match known_metric(resource.descriptor.retained) {
+                            Ok(bytes) => {
+                                slot.committed_retained =
+                                    slot.committed_retained.saturating_add(bytes)
+                            }
+                            Err(reason) => {
+                                return LeaseReceiptShadow::Incomparable { reason };
+                            }
+                        }
+                    }
+                    RuntimeResourceState::Quarantined => {
+                        match known_metric(resource.descriptor.retained) {
+                            Ok(bytes) => {
+                                slot.quarantined_retained =
+                                    slot.quarantined_retained.saturating_add(bytes)
+                            }
+                            Err(reason) => {
+                                return LeaseReceiptShadow::Incomparable { reason };
+                            }
+                        }
+                    }
+                    RuntimeResourceState::Released => {}
+                }
+            }
+        }
+
+        let ledger = broker.ledger_snapshot();
+        let mut seen = HashMap::<SafeMemoryDomainProjection, ()>::new();
+        for (domain, usage) in &ledger {
+            let Some(projection) = self.domain_projection(domain) else {
+                return LeaseReceiptShadow::Incomparable {
+                    reason: LeaseReceiptShadowIncomparable::ReceiptsUnavailable,
+                };
+            };
+            seen.insert(projection, ());
+            let receipts = receipt_bytes.get(&projection).copied().unwrap_or_default();
+            if receipts.reserved_peak != usage.pending_bytes
+                || receipts.committed_retained != usage.committed_bytes
+                || receipts.quarantined_retained != usage.unreclaimable_bytes
+            {
+                return LeaseReceiptShadow::Mismatch(LeaseReceiptShadowMismatch {
+                    domain: projection,
+                    broker_pending: usage.pending_bytes,
+                    broker_committed: usage.committed_bytes,
+                    broker_unreclaimable: usage.unreclaimable_bytes,
+                    receipt_reserved: receipts.reserved_peak,
+                    receipt_committed: receipts.committed_retained,
+                    receipt_quarantined: receipts.quarantined_retained,
+                });
+            }
+        }
+        for (projection, receipts) in &receipt_bytes {
+            if seen.contains_key(projection) {
+                continue;
+            }
+            if receipts.reserved_peak != 0
+                || receipts.committed_retained != 0
+                || receipts.quarantined_retained != 0
+            {
+                return LeaseReceiptShadow::Mismatch(LeaseReceiptShadowMismatch {
+                    domain: *projection,
+                    broker_pending: 0,
+                    broker_committed: 0,
+                    broker_unreclaimable: 0,
+                    receipt_reserved: receipts.reserved_peak,
+                    receipt_committed: receipts.committed_retained,
+                    receipt_quarantined: receipts.quarantined_retained,
+                });
+            }
+        }
+        LeaseReceiptShadow::Matched
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReceiptDomainBytes {
+    reserved_peak: u64,
+    committed_retained: u64,
+    quarantined_retained: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LeaseReceiptShadow {
+    Matched,
+    Incomparable {
+        reason: LeaseReceiptShadowIncomparable,
+    },
+    Mismatch(LeaseReceiptShadowMismatch),
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeaseReceiptShadowIncomparable {
+    ReceiptsUnavailable,
+    ReceiptsIncomplete(ReceiptCompletenessReason),
+    UnpricedLiveResource,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LeaseReceiptShadowMismatch {
+    pub domain: SafeMemoryDomainProjection,
+    pub broker_pending: u64,
+    pub broker_committed: u64,
+    pub broker_unreclaimable: u64,
+    pub receipt_reserved: u64,
+    pub receipt_committed: u64,
+    pub receipt_quarantined: u64,
+}
+
+#[allow(dead_code)]
+fn known_metric(metric: RuntimeReceiptMetric) -> Result<u64, LeaseReceiptShadowIncomparable> {
+    match metric {
+        RuntimeReceiptMetric::Known(bytes) => Ok(bytes),
+        RuntimeReceiptMetric::Unavailable | RuntimeReceiptMetric::Unknown => {
+            Err(LeaseReceiptShadowIncomparable::UnpricedLiveResource)
+        }
+    }
 }
 
 /// Drop guard for one live owner. It is diagnostic-only and never owns the
@@ -1100,9 +1267,11 @@ mod tests {
                 reason: RuntimeReceiptUnavailableReason::EntropyUnavailable,
             }
         );
-        assert!(collector
-            .owner_descriptor("/private/path", None, None, None)
-            .is_none());
+        assert!(
+            collector
+                .owner_descriptor("/private/path", None, None, None)
+                .is_none()
+        );
         let snapshot = collector.snapshot();
         assert!(!snapshot.completeness.complete);
         assert_eq!(
@@ -1144,9 +1313,11 @@ mod tests {
             Some(ReceiptCompletenessReason::IdentityExhausted)
         );
         assert_eq!(exhausted_snapshot.events, before.events);
-        assert!(collector
-            .owner_descriptor("/private/path", None, None, None)
-            .is_none());
+        assert!(
+            collector
+                .owner_descriptor("/private/path", None, None, None)
+                .is_none()
+        );
 
         first.record_reuse(None);
         collector.record_notification_coalesced();
@@ -1187,9 +1358,11 @@ mod tests {
             Some(ReceiptCompletenessReason::IdentityExhausted)
         );
         assert_eq!(exhausted_snapshot.events.len(), first_snapshot.events.len());
-        assert!(collector
-            .unpriced_resource_descriptor("another-resource")
-            .is_none());
+        assert!(
+            collector
+                .unpriced_resource_descriptor("another-resource")
+                .is_none()
+        );
 
         drop(first);
         drop(owner_guard);
@@ -1262,5 +1435,35 @@ mod tests {
         );
         assert_eq!(first.snapshot().live_owners.len(), 1);
         assert_eq!(second.snapshot().live_owners.len(), 1);
+    }
+
+    #[test]
+    fn empty_collector_matches_an_empty_broker_ledger() {
+        let collector = collector(8);
+        let broker =
+            DeviceMemoryBrokerSet::new(crate::device::execution_memory::DeviceMemoryPolicy {
+                maximum_owned_basis_points: 10_000,
+                minimum_headroom_bytes: 0,
+            });
+        assert_eq!(
+            collector.shadow_compare_leases(&broker),
+            LeaseReceiptShadow::Matched
+        );
+    }
+
+    #[test]
+    fn unavailable_receipts_cannot_claim_lease_coverage() {
+        let collector = RuntimeReceiptCollector::new_with_entropy_failure_for_test(scope());
+        let broker =
+            DeviceMemoryBrokerSet::new(crate::device::execution_memory::DeviceMemoryPolicy {
+                maximum_owned_basis_points: 10_000,
+                minimum_headroom_bytes: 0,
+            });
+        assert_eq!(
+            collector.shadow_compare_leases(&broker),
+            LeaseReceiptShadow::Incomparable {
+                reason: LeaseReceiptShadowIncomparable::ReceiptsUnavailable,
+            }
+        );
     }
 }
