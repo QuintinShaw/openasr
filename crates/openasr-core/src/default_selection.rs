@@ -28,11 +28,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 use crate::{
-    CatalogError, ConfigError, InstalledPack, LaunchPackRequest, ModelCatalog, PullError,
-    QuantPreference, default_pack_pointer_path, host_quant_recommendation_profile,
-    list_installed_packs, load_config_document, load_model_catalog, persist_default_pack_pointer,
-    read_default_pack_pointer, resolve_launch_pack, save_config_document,
-    save_default_model_selection,
+    CatalogError, CatalogPullRequest, ConfigError, InstalledPack, LaunchPackRequest, ModelCatalog,
+    PullError, QuantPreference, canonical_quant_tag, default_pack_pointer_path,
+    host_quant_recommendation_profile, list_installed_packs, load_config_document,
+    load_embedded_signed_catalog, load_model_catalog, parse_model_ref,
+    persist_default_pack_pointer, read_default_pack_pointer, resolve_catalog_pull_with_profile,
+    resolve_launch_pack,
 };
 
 /// The schema version for the durable active-model selection record.
@@ -552,6 +553,18 @@ fn resolve_v2(
     }
     let packs = list_installed_packs(home)?;
     let model_id = record.model_id.as_deref().expect("validated V2 model id");
+    if record.status == ActiveModelSelectionStatus::NotInstalled && record.expected_pack.is_none() {
+        let reference = record.pull.as_deref().unwrap_or(model_id);
+        let request = LaunchPackRequest {
+            model_ref: reference,
+            preference: &record.quant_preference,
+            catalog,
+            host_profile: host_quant_recommendation_profile(),
+        };
+        if let Ok(selection) = resolve_launch_pack(&packs, &request) {
+            return Ok(DefaultModelResolution::Installed(selection.pack));
+        }
+    }
     let Some(quant) = record.quant.as_deref() else {
         return Ok(DefaultModelResolution::NotInstalled(model_id.to_string()));
     };
@@ -667,8 +680,17 @@ pub fn persist_detailed(
     }
     // Compatibility projections are deliberately after the authoritative V2
     // commit. A crash here leaves a complete V2 record for the next reader.
-    if let Err(error) = save_default_model_selection(home, pack.model_id.clone(), quant_preference)
-    {
+    let mut projection = match load_config_document(home) {
+        Ok(document) => document,
+        Err(error) => {
+            return Ok(DefaultSelectionCommitOutcome::V2CommittedProjectionFailed {
+                reason: error.to_string(),
+            });
+        }
+    };
+    projection.config.default_model = Some(pack.model_id.clone());
+    projection.preferences.quant_preference = quant_preference;
+    if let Err(error) = crate::config::save_config_document_unlocked(home, &projection) {
         return Ok(DefaultSelectionCommitOutcome::V2CommittedProjectionFailed {
             reason: error.to_string(),
         });
@@ -823,7 +845,8 @@ fn repair_compat_projection_unlocked(
             let mut document = load_config_document(home).map_err(|error| error.to_string())?;
             document.config.default_model = None;
             document.preferences.quant_preference = QuantPreference::Auto;
-            save_config_document(home, &document).map_err(|error| error.to_string())?;
+            crate::config::save_config_document_unlocked(home, &document)
+                .map_err(|error| error.to_string())?;
             remove_legacy_pointer(home).map_err(|error| error.to_string())?;
         }
         ActiveModelSelectionStatus::Installed | ActiveModelSelectionStatus::NotInstalled => {
@@ -831,7 +854,8 @@ fn repair_compat_projection_unlocked(
             let mut document = load_config_document(home).map_err(|error| error.to_string())?;
             document.config.default_model = Some(model_id.to_string());
             document.preferences.quant_preference = record.quant_preference.clone();
-            save_config_document(home, &document).map_err(|error| error.to_string())?;
+            crate::config::save_config_document_unlocked(home, &document)
+                .map_err(|error| error.to_string())?;
             let packs = list_installed_packs(home).map_err(|error| error.to_string())?;
             if let Some(expected) = record.expected_pack.as_ref()
                 && let Some(pack) = packs.iter().find(|pack| {
@@ -856,6 +880,25 @@ fn remove_legacy_pointer(home: &Path) -> Result<(), DefaultSelectionError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(DefaultSelectionError::Pull(PullError::Io { path, source })),
     }
+}
+
+/// Save a generic config update without allowing it to overwrite the V2
+/// selection projection observed before the write. The process mutex and
+/// cross-process lock cover the final read/modify/write boundary; when V2 is
+/// present its model and quant preference remain authoritative.
+pub fn save_config_document_preserving_v2_selection(
+    home: &Path,
+    document: &crate::OpenAsrConfigDocument,
+) -> Result<(), DefaultSelectionError> {
+    let _lock = selection_write_lock();
+    let _file_lock = SelectionFileLock::acquire(home)?;
+    let mut document = document.clone();
+    if let Some(record) = read_v2(home)? {
+        document.config.default_model = record.model_id;
+        document.preferences.quant_preference = record.quant_preference;
+    }
+    crate::config::save_config_document_unlocked(home, &document)
+        .map_err(DefaultSelectionError::Config)
 }
 
 /// The supplied generation is ignored: writers cannot move the generation
@@ -903,8 +946,20 @@ fn persist_v2_record_without_generation(
             path: path.clone(),
             reason: format!("cannot serialize selection: {source}"),
         })?;
-    crate::atomic_file::write_file_atomically(&path, &contents)
-        .map_err(|source| DefaultSelectionError::Pull(PullError::Io { path, source }))
+    match crate::atomic_file::write_file_atomically_detailed(
+        &path,
+        &contents,
+        crate::atomic_file::AtomicFileMode::Default,
+    ) {
+        Ok(crate::atomic_file::AtomicWriteOutcome::Written) => Ok(()),
+        Ok(crate::atomic_file::AtomicWriteOutcome::CommittedWithSyncWarning { source }) => {
+            eprintln!("openasr-core: default V2 record committed but parent sync failed: {source}");
+            Ok(())
+        }
+        Err(crate::atomic_file::AtomicWriteError::NotCommitted(source)) => {
+            Err(DefaultSelectionError::Pull(PullError::Io { path, source }))
+        }
+    }
 }
 
 fn next_generation(home: &Path) -> Result<u64, DefaultSelectionError> {
@@ -974,7 +1029,7 @@ pub fn clear_detailed(home: &Path) -> Result<DefaultSelectionCommitOutcome, Defa
     };
     document.config.default_model = None;
     document.preferences.quant_preference = QuantPreference::Auto;
-    if let Err(error) = save_config_document(home, &document) {
+    if let Err(error) = crate::config::save_config_document_unlocked(home, &document) {
         return Ok(DefaultSelectionCommitOutcome::V2CommittedProjectionFailed {
             reason: error.to_string(),
         });
@@ -988,11 +1043,59 @@ pub fn clear_detailed(home: &Path) -> Result<DefaultSelectionCommitOutcome, Defa
     Ok(DefaultSelectionCommitOutcome::V2Committed)
 }
 
+fn canonicalize_legacy_reference(
+    reference: &str,
+    catalog: Option<&ModelCatalog>,
+) -> (String, String, Option<String>) {
+    let parsed = parse_model_ref(reference).ok();
+    let bare = parsed
+        .as_ref()
+        .map(|parsed| parsed.family.as_str())
+        .unwrap_or(reference.trim());
+    let explicit_quant = parsed
+        .as_ref()
+        .and_then(|parsed| parsed.tag.as_deref())
+        .map(canonical_quant_tag)
+        .map(str::to_string);
+    let canonical_model_id = catalog
+        .and_then(|catalog| {
+            resolve_catalog_pull_with_profile(
+                catalog,
+                &CatalogPullRequest {
+                    reference: reference.to_string(),
+                    quant: None,
+                    size: None,
+                },
+                None,
+            )
+            .ok()
+        })
+        .map(|resolved| resolved.model_id)
+        .unwrap_or_else(|| bare.to_string());
+    let canonical_reference = explicit_quant
+        .as_ref()
+        .map(|quant| format!("{canonical_model_id}:{quant}"))
+        .unwrap_or_else(|| canonical_model_id.clone());
+    (canonical_model_id, canonical_reference, explicit_quant)
+}
+
 /// Explicitly migrate the legacy two-file state into one V2 record. Reading a
 /// legacy state never writes as a side effect; callers choose when migration is
 /// appropriate.
 pub fn migrate_legacy_to_v2(
     home: &Path,
+) -> Result<Option<ActiveModelSelectionV2>, DefaultSelectionError> {
+    let catalog = load_embedded_signed_catalog(home)?;
+    migrate_legacy_to_v2_with_catalog(home, Some(&catalog))
+}
+
+/// Migrate legacy selection state using the same catalog-aware model-reference
+/// and quant-selection path as runtime resolution. Callers that already own a
+/// verified catalog should pass it here; `None` retains the legacy no-catalog
+/// behavior for offline callers.
+pub fn migrate_legacy_to_v2_with_catalog(
+    home: &Path,
+    catalog: Option<&ModelCatalog>,
 ) -> Result<Option<ActiveModelSelectionV2>, DefaultSelectionError> {
     let _lock = selection_write_lock();
     let _file_lock = SelectionFileLock::acquire(home)?;
@@ -1002,7 +1105,7 @@ pub fn migrate_legacy_to_v2(
     let packs = list_installed_packs(home)?;
     let document = load_config_document(home)?;
     let pointer = read_default_pack_pointer(home)?;
-    let Some(model_id) = document
+    let Some(model_ref) = document
         .config
         .default_model
         .clone()
@@ -1023,7 +1126,9 @@ pub fn migrate_legacy_to_v2(
         };
         return persist_v2_record_unlocked(home, record).map(Some);
     };
-    let pointer = pointer.filter(|value| value.model_id == model_id);
+    let (canonical_model_id, canonical_reference, explicit_quant) =
+        canonicalize_legacy_reference(&model_ref, catalog);
+    let pointer = pointer.filter(|value| value.model_id == canonical_model_id);
     let preference = if matches!(
         document.preferences.quant_preference,
         QuantPreference::Pinned { .. }
@@ -1036,14 +1141,19 @@ pub fn migrate_legacy_to_v2(
         document.preferences.quant_preference.clone()
     };
     let request = LaunchPackRequest {
-        model_ref: &model_id,
+        model_ref: &canonical_reference,
         preference: &preference,
-        catalog: None,
+        catalog,
         host_profile: host_quant_recommendation_profile(),
     };
     let selected = resolve_launch_pack(&packs, &request)
         .ok()
         .map(|selection| selection.pack);
+    let selected_model_id = selected
+        .as_ref()
+        .map(|pack| pack.model_id.clone())
+        .or_else(|| pointer.as_ref().map(|value| value.model_id.clone()))
+        .unwrap_or_else(|| canonical_model_id.clone());
     let (pull, quant, expected, status) = if let Some(pack) = selected {
         (
             Some(pack.pull.clone()),
@@ -1066,8 +1176,8 @@ pub fn migrate_legacy_to_v2(
         )
     } else {
         (
-            Some(model_id.to_string()),
-            None,
+            Some(canonical_reference),
+            explicit_quant,
             None,
             ActiveModelSelectionStatus::NotInstalled,
         )
@@ -1077,7 +1187,7 @@ pub fn migrate_legacy_to_v2(
         selection_generation: 0,
         status,
         pull,
-        model_id: Some(model_id.to_string()),
+        model_id: Some(selected_model_id),
         quant,
         architecture_id: None,
         expected_pack: expected,

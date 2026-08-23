@@ -15,6 +15,64 @@ fn expected_default_dictation_shortcut() -> &'static str {
     "Alt"
 }
 
+#[test]
+fn concurrent_generic_config_save_preserves_v2_default_projection() {
+    let temp = tempfile::tempdir().unwrap();
+    let initial = crate::default_selection::ActiveModelSelectionV2 {
+        schema_version: crate::default_selection::ACTIVE_MODEL_SELECTION_V2_SCHEMA_VERSION,
+        selection_generation: 0,
+        status: crate::default_selection::ActiveModelSelectionStatus::NotInstalled,
+        pull: Some("initial-model".to_string()),
+        model_id: Some("initial-model".to_string()),
+        quant: None,
+        architecture_id: None,
+        expected_pack: None,
+        quant_preference: QuantPreference::Auto,
+        execution_intent: "auto".to_string(),
+        checksum: String::new(),
+    };
+    crate::default_selection::persist_v2_record(temp.path(), initial).unwrap();
+
+    let stale = OpenAsrConfig {
+        default_model: Some("stale-model".to_string()),
+        ..OpenAsrConfig::default()
+    };
+    let updated = crate::default_selection::ActiveModelSelectionV2 {
+        schema_version: crate::default_selection::ACTIVE_MODEL_SELECTION_V2_SCHEMA_VERSION,
+        selection_generation: 0,
+        status: crate::default_selection::ActiveModelSelectionStatus::NotInstalled,
+        pull: Some("updated-model".to_string()),
+        model_id: Some("updated-model".to_string()),
+        quant: None,
+        architecture_id: None,
+        expected_pack: None,
+        quant_preference: QuantPreference::Auto,
+        execution_intent: "auto".to_string(),
+        checksum: String::new(),
+    };
+    let home = temp.path().to_path_buf();
+    let (ready, proceed) = std::sync::mpsc::sync_channel(0);
+    let selection_home = home.clone();
+    let selection = std::thread::spawn(move || {
+        crate::default_selection::persist_v2_record(&selection_home, updated).unwrap();
+        ready.send(()).unwrap();
+    });
+    let writer_home = home.clone();
+    let writer = std::thread::spawn(move || {
+        proceed.recv().unwrap();
+        save_config(&writer_home, &stale).unwrap();
+    });
+    selection.join().unwrap();
+    writer.join().unwrap();
+
+    let record = crate::default_selection::read_active_model_selection_v2(&home)
+        .unwrap()
+        .unwrap();
+    let saved = load_config(&home).unwrap();
+    assert_eq!(record.model_id.as_deref(), Some("updated-model"));
+    assert_eq!(saved.default_model.as_deref(), Some("updated-model"));
+}
+
 fn registry() -> Vec<ModelCard> {
     vec![
         crate::registry::test_model_card("qwen3-asr-0.6b"),

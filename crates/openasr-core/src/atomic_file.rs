@@ -54,46 +54,46 @@ fn failpoint_after_replace() -> io::Result<()> {
 }
 
 pub(crate) fn write_file_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
-    write_file_atomically_with(
-        &RealAtomicFileSystem,
-        path,
-        contents,
-        AtomicFileMode::Default,
-    )
+    write_file_atomically_detailed(path, contents, AtomicFileMode::Default)
+        .map(|_| ())
+        .map_err(|AtomicWriteError::NotCommitted(source)| source)
 }
 
-/// Result of replacing a staged file. Replacement errors distinguish a rename
-/// that did not commit from a committed rename whose parent sync failed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) fn write_file_atomically_detailed(
+    path: &Path,
+    contents: &[u8],
+    mode: AtomicFileMode,
+) -> Result<AtomicWriteOutcome, AtomicWriteError> {
+    write_file_atomically_detailed_with(&RealAtomicFileSystem, path, contents, mode)
+}
+
+/// Result of replacing a staged file. A committed replacement whose parent
+/// directory could not be synced is still a successful commit; callers may
+/// surface the durability warning without treating the target as absent.
+#[derive(Debug)]
 pub(crate) enum AtomicReplaceOutcome {
     Replaced,
+    CommittedWithSyncWarning { source: io::Error },
 }
 
 #[derive(Debug)]
 pub(crate) enum AtomicReplaceError {
     NotReplaced(io::Error),
-    ReplacedButParentSync(io::Error),
 }
 
 impl std::fmt::Display for AtomicReplaceError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotReplaced(error) => write!(formatter, "atomic replacement failed: {error}"),
-            Self::ReplacedButParentSync(error) => {
-                write!(
-                    formatter,
-                    "atomic replacement committed but parent sync failed: {error}"
-                )
-            }
         }
     }
 }
 
 impl std::error::Error for AtomicReplaceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(match self {
-            Self::NotReplaced(error) | Self::ReplacedButParentSync(error) => error,
-        })
+        match self {
+            Self::NotReplaced(error) => Some(error),
+        }
     }
 }
 
@@ -116,17 +116,51 @@ fn replace_file_atomically_detailed_with(
         .map_err(AtomicReplaceError::NotReplaced)?;
     match filesystem.sync_parent_dir(path) {
         Ok(()) => Ok(AtomicReplaceOutcome::Replaced),
-        Err(source) => Err(AtomicReplaceError::ReplacedButParentSync(source)),
+        Err(source) => Ok(AtomicReplaceOutcome::CommittedWithSyncWarning { source }),
     }
 }
 
 pub(crate) fn replace_file_atomically(from: &Path, path: &Path) -> io::Result<()> {
-    replace_file_atomically_detailed(from, path)
-        .map(|_| ())
-        .map_err(|error| match error {
-            AtomicReplaceError::NotReplaced(source)
-            | AtomicReplaceError::ReplacedButParentSync(source) => source,
-        })
+    match replace_file_atomically_detailed(from, path) {
+        Ok(AtomicReplaceOutcome::Replaced) => Ok(()),
+        Ok(AtomicReplaceOutcome::CommittedWithSyncWarning { source }) => {
+            eprintln!(
+                "openasr-core: atomic replacement committed but parent sync failed: {source}"
+            );
+            Ok(())
+        }
+        Err(AtomicReplaceError::NotReplaced(source)) => Err(source),
+    }
+}
+
+/// A detailed result for the temporary-file writer. The target is authoritative
+/// after `rename` succeeds, even when the post-rename durability step reports
+/// an error (including Windows `MoveFileExW` callers).
+#[derive(Debug)]
+pub(crate) enum AtomicWriteOutcome {
+    Written,
+    CommittedWithSyncWarning { source: io::Error },
+}
+
+#[derive(Debug)]
+pub(crate) enum AtomicWriteError {
+    NotCommitted(io::Error),
+}
+
+impl std::fmt::Display for AtomicWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotCommitted(error) => write!(formatter, "atomic write failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for AtomicWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotCommitted(error) => Some(error),
+        }
+    }
 }
 
 /// Atomically writes `contents` to `path`, creating the temporary file with
@@ -147,33 +181,58 @@ fn write_owner_only_file_atomically_with(
     path: &Path,
     contents: &[u8],
 ) -> io::Result<()> {
-    write_file_atomically_with(fs, path, contents, AtomicFileMode::OwnerOnly)
+    write_file_atomically_detailed_with(fs, path, contents, AtomicFileMode::OwnerOnly)
+        .map(|_| ())
+        .map_err(|AtomicWriteError::NotCommitted(source)| source)
 }
 
+#[cfg(test)]
 fn write_file_atomically_with(
     fs: &impl AtomicFileSystem,
     path: &Path,
     contents: &[u8],
     mode: AtomicFileMode,
 ) -> io::Result<()> {
+    write_file_atomically_detailed_with(fs, path, contents, mode)
+        .map(|_| ())
+        .map_err(|AtomicWriteError::NotCommitted(source)| source)
+}
+
+fn write_file_atomically_detailed_with(
+    fs: &impl AtomicFileSystem,
+    path: &Path,
+    contents: &[u8],
+    mode: AtomicFileMode,
+) -> Result<AtomicWriteOutcome, AtomicWriteError> {
     let temp_path = atomic_temp_path(path);
     let result = (|| {
-        let mut file = fs.create_new(&temp_path, mode)?;
+        let mut file = fs
+            .create_new(&temp_path, mode)
+            .map_err(AtomicWriteError::NotCommitted)?;
         if mode == AtomicFileMode::OwnerOnly {
-            fs.set_owner_only_permissions(&temp_path)?;
+            fs.set_owner_only_permissions(&temp_path)
+                .map_err(AtomicWriteError::NotCommitted)?;
         }
-        file.write_all(contents)?;
-        file.flush()?;
-        file.sync_all()?;
+        file.write_all(contents)
+            .map_err(AtomicWriteError::NotCommitted)?;
+        file.flush().map_err(AtomicWriteError::NotCommitted)?;
+        file.sync_all().map_err(AtomicWriteError::NotCommitted)?;
         drop(file);
-        failpoint_before_replace()?;
-        fs.rename(&temp_path, path)?;
-        failpoint_after_replace()?;
-        if mode == AtomicFileMode::OwnerOnly {
-            fs.set_owner_only_permissions(path)?;
+        failpoint_before_replace().map_err(AtomicWriteError::NotCommitted)?;
+        fs.rename(&temp_path, path)
+            .map_err(AtomicWriteError::NotCommitted)?;
+
+        let mut warning = failpoint_after_replace().err();
+        if warning.is_none() && mode == AtomicFileMode::OwnerOnly {
+            warning = fs.set_owner_only_permissions(path).err();
         }
-        fs.sync_parent_dir_best_effort(path);
-        Ok(())
+        if warning.is_none() {
+            warning = fs.sync_parent_dir(path).err();
+        }
+        Ok(match warning {
+            Some(source) => AtomicWriteOutcome::CommittedWithSyncWarning { source },
+            None => AtomicWriteOutcome::Written,
+        })
     })();
 
     if result.is_err() {
@@ -183,7 +242,7 @@ fn write_file_atomically_with(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AtomicFileMode {
+pub(crate) enum AtomicFileMode {
     Default,
     OwnerOnly,
 }
@@ -200,7 +259,6 @@ trait AtomicFileSystem {
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     fn sync_parent_dir(&self, path: &Path) -> io::Result<()>;
-    fn sync_parent_dir_best_effort(&self, path: &Path);
 }
 
 struct RealAtomicFileSystem;
@@ -291,10 +349,6 @@ impl AtomicFileSystem for RealAtomicFileSystem {
             return Ok(());
         };
         fs::File::open(parent).and_then(|file| file.sync_all())
-    }
-
-    fn sync_parent_dir_best_effort(&self, path: &Path) {
-        sync_parent_dir_best_effort(path);
     }
 }
 
@@ -516,10 +570,6 @@ mod tests {
             self.state.synced_parent.set(true);
             Ok(())
         }
-
-        fn sync_parent_dir_best_effort(&self, _path: &Path) {
-            self.state.synced_parent.set(true);
-        }
     }
 
     fn assert_failure_cleans_temp_and_preserves_target(failure_point: FailurePoint) {
@@ -648,14 +698,19 @@ mod tests {
     }
 
     #[test]
-    fn failpoint_after_replace_exposes_committed_new_record() {
+    fn failpoint_after_replace_reports_committed_new_record() {
         let target = Path::new("/tmp/openasr/config.json");
         let fs = FakeAtomicFileSystem::with_target(target, b"old");
         set_atomic_file_failpoint(Some(AtomicFileFailpoint::AfterReplace));
-        let error = write_file_atomically_with(&fs, target, b"new", AtomicFileMode::Default);
+        let outcome =
+            write_file_atomically_detailed_with(&fs, target, b"new", AtomicFileMode::Default)
+                .unwrap();
         set_atomic_file_failpoint(None);
 
-        assert!(error.is_err());
+        assert!(matches!(
+            outcome,
+            AtomicWriteOutcome::CommittedWithSyncWarning { .. }
+        ));
         assert_eq!(fs.target_contents(target), Some(b"new".to_vec()));
     }
 
@@ -686,10 +741,26 @@ mod tests {
             .insert(staged.to_path_buf(), b"new".to_vec());
         fs.fail_at(FailurePoint::ParentSync);
 
-        let error = replace_file_atomically_detailed_with(&fs, staged, target).unwrap_err();
+        let outcome = replace_file_atomically_detailed_with(&fs, staged, target).unwrap();
         assert!(matches!(
-            error,
-            AtomicReplaceError::ReplacedButParentSync(_)
+            outcome,
+            AtomicReplaceOutcome::CommittedWithSyncWarning { .. }
+        ));
+        assert_eq!(fs.target_contents(target), Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn detailed_write_reports_committed_target_when_parent_sync_fails() {
+        let target = Path::new("/tmp/openasr/config.json");
+        let fs = FakeAtomicFileSystem::with_target(target, b"old");
+        fs.fail_at(FailurePoint::ParentSync);
+
+        let outcome =
+            write_file_atomically_detailed_with(&fs, target, b"new", AtomicFileMode::Default)
+                .unwrap();
+        assert!(matches!(
+            outcome,
+            AtomicWriteOutcome::CommittedWithSyncWarning { .. }
         ));
         assert_eq!(fs.target_contents(target), Some(b"new".to_vec()));
     }

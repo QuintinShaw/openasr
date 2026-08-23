@@ -619,6 +619,22 @@ pub fn save_config_document(
     document: &OpenAsrConfigDocument,
 ) -> Result<(), ConfigError> {
     let home = openasr_home.as_ref();
+    crate::default_selection::save_config_document_preserving_v2_selection(home, document).map_err(
+        |error| match error {
+            crate::default_selection::DefaultSelectionError::Config(error) => error,
+            other => ConfigError::WriteConfig {
+                path: config_path(home),
+                source: std::io::Error::other(other.to_string()),
+            },
+        },
+    )
+}
+
+pub(crate) fn save_config_document_unlocked(
+    openasr_home: impl AsRef<Path>,
+    document: &OpenAsrConfigDocument,
+) -> Result<(), ConfigError> {
+    let home = openasr_home.as_ref();
     fs::create_dir_all(home).map_err(|source| ConfigError::CreateHome {
         path: home.to_path_buf(),
         source,

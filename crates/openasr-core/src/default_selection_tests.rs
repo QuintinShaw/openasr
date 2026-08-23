@@ -3,7 +3,7 @@ use std::path::Path;
 
 use super::*;
 use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
-use crate::{OpenAsrConfigDocument, config_path};
+use crate::{OpenAsrConfigDocument, config_path, save_config_document};
 use sha2::Digest;
 
 /// Installs `model_id`/`quant` the way the store actually holds it: an immutable
@@ -396,6 +396,95 @@ fn legacy_migration_reuses_pointer_quant_policy_and_writes_v2() {
     assert_eq!(
         resolve(temp.path(), None).unwrap(),
         DefaultModelResolution::Installed(pinned_pack)
+    );
+}
+
+#[test]
+fn legacy_migration_uses_catalog_alias_and_explicit_quant_tag() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack = write_installed_pack(temp.path(), "whisper-small", "q8_0", "q8");
+    let mut document = OpenAsrConfigDocument::default();
+    document.config.default_model = Some("legacy-whisper:q8".to_string());
+    save_config_document(temp.path(), &document).unwrap();
+
+    let mut catalog = crate::load_embedded_signed_catalog(temp.path()).unwrap();
+    catalog
+        .models
+        .iter_mut()
+        .find(|model| model.id == "whisper-small")
+        .expect("embedded catalog contains whisper-small")
+        .aliases
+        .push("legacy-whisper".to_string());
+
+    let migrated = migrate_legacy_to_v2_with_catalog(temp.path(), Some(&catalog))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(migrated.status, ActiveModelSelectionStatus::Installed);
+    assert_eq!(migrated.model_id.as_deref(), Some("whisper-small"));
+    assert_eq!(migrated.quant.as_deref(), Some("q8_0"));
+    assert_eq!(migrated.pull.as_deref(), Some(pack.pull.as_str()));
+}
+
+#[test]
+fn legacy_alias_without_pack_migrates_to_canonical_and_resolves_after_install() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut document = OpenAsrConfigDocument::default();
+    document.config.default_model = Some("legacy-whisper".to_string());
+    crate::config::save_config_document_unlocked(temp.path(), &document).unwrap();
+
+    let mut catalog = crate::load_embedded_signed_catalog(temp.path()).unwrap();
+    catalog
+        .models
+        .iter_mut()
+        .find(|model| model.id == "whisper-small")
+        .expect("embedded catalog contains whisper-small")
+        .aliases
+        .push("legacy-whisper".to_string());
+
+    let migrated = migrate_legacy_to_v2_with_catalog(temp.path(), Some(&catalog))
+        .unwrap()
+        .unwrap();
+    assert_eq!(migrated.status, ActiveModelSelectionStatus::NotInstalled);
+    assert_eq!(migrated.model_id.as_deref(), Some("whisper-small"));
+    assert_eq!(migrated.pull.as_deref(), Some("whisper-small"));
+    assert_eq!(migrated.quant, None);
+
+    let pack = write_installed_pack(temp.path(), "whisper-small", "q8_0", "q8");
+    assert_eq!(
+        resolve_with_catalog(temp.path(), Some(&catalog)).unwrap(),
+        DefaultModelResolution::Installed(pack)
+    );
+}
+
+#[test]
+fn legacy_alias_with_quant_without_pack_keeps_canonical_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut document = OpenAsrConfigDocument::default();
+    document.config.default_model = Some("legacy-whisper:q8".to_string());
+    crate::config::save_config_document_unlocked(temp.path(), &document).unwrap();
+
+    let mut catalog = crate::load_embedded_signed_catalog(temp.path()).unwrap();
+    catalog
+        .models
+        .iter_mut()
+        .find(|model| model.id == "whisper-small")
+        .expect("embedded catalog contains whisper-small")
+        .aliases
+        .push("legacy-whisper".to_string());
+
+    let migrated = migrate_legacy_to_v2_with_catalog(temp.path(), Some(&catalog))
+        .unwrap()
+        .unwrap();
+    assert_eq!(migrated.status, ActiveModelSelectionStatus::NotInstalled);
+    assert_eq!(migrated.model_id.as_deref(), Some("whisper-small"));
+    assert_eq!(migrated.pull.as_deref(), Some("whisper-small:q8_0"));
+    assert_eq!(migrated.quant.as_deref(), Some("q8_0"));
+
+    let pack = write_installed_pack(temp.path(), "whisper-small", "q8_0", "q8");
+    assert_eq!(
+        resolve_with_catalog(temp.path(), Some(&catalog)).unwrap(),
+        DefaultModelResolution::Installed(pack)
     );
 }
 

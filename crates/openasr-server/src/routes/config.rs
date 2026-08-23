@@ -4,9 +4,7 @@
 //! `openasr_core::config`.
 
 use axum::{Extension, Json};
-use openasr_core::config::{
-    OpenAsrConfigDocument, Preferences, load_config_document, save_config_document,
-};
+use openasr_core::config::{OpenAsrConfigDocument, Preferences, load_config_document};
 
 use crate::*;
 
@@ -27,7 +25,9 @@ pub(crate) async fn put_config(
     let home = distribution.openasr_home()?;
     let document = config_document_from_update_payload(&home, payload)?;
     validate_config_document(&document, &distribution)?;
-    save_config_document(&home, &document).map_err(ApiError::Config)?;
+    openasr_core::default_selection::save_config_document_preserving_v2_selection(
+        &home, &document,
+    )?;
     let mut saved = load_config_document(&home).map_err(ApiError::Config)?;
     saved.config.default_model = openasr_core::default_selection::current_default_model(&home)?;
     validate_config_document(&saved, &distribution)?;
@@ -158,6 +158,45 @@ mod tests {
         .unwrap();
 
         assert_eq!(saved.config.default_model.as_deref(), Some("active-model"));
+    }
+
+    #[test]
+    fn generic_config_write_preserves_authoritative_v2_default_after_stale_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let record = openasr_core::default_selection::ActiveModelSelectionV2 {
+            schema_version:
+                openasr_core::default_selection::ACTIVE_MODEL_SELECTION_V2_SCHEMA_VERSION,
+            selection_generation: 0,
+            status: openasr_core::default_selection::ActiveModelSelectionStatus::NotInstalled,
+            pull: Some("authoritative-model:q8".to_string()),
+            model_id: Some("authoritative-model".to_string()),
+            quant: Some("q8_0".to_string()),
+            architecture_id: None,
+            expected_pack: None,
+            quant_preference: openasr_core::QuantPreference::pinned("q8_0"),
+            execution_intent: "auto".to_string(),
+            checksum: String::new(),
+        };
+        openasr_core::default_selection::persist_v2_record(temp.path(), record).unwrap();
+
+        let mut stale = OpenAsrConfigDocument::default();
+        stale.config.default_model = Some("stale-model".to_string());
+        stale.preferences.quant_preference = openasr_core::QuantPreference::Auto;
+        openasr_core::default_selection::save_config_document_preserving_v2_selection(
+            temp.path(),
+            &stale,
+        )
+        .unwrap();
+
+        let saved = load_config_document(temp.path()).unwrap();
+        assert_eq!(
+            saved.config.default_model.as_deref(),
+            Some("authoritative-model")
+        );
+        assert_eq!(
+            saved.preferences.quant_preference,
+            openasr_core::QuantPreference::pinned("q8_0")
+        );
     }
 
     #[test]
