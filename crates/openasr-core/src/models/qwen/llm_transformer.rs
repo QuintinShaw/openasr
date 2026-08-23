@@ -16,15 +16,15 @@ use thiserror::Error;
 use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlDecodeOutputPlan, GgmlDecodeReuseMode, GgmlFlashAttentionPrecision, GgmlKvElementType,
-    GgmlLoadedTensor, GgmlNativeGqaCapability, GgmlRopeExtParams, GgmlStaticTensor,
-    GgmlStaticTensorArena, GgufTensorDataReadError, GgufTensorDataReader,
-    ResolvedFamilyRuntimeInput, env_toggle_with_raw, env_var_truthy,
+    GgmlDecodeOutputPlan, GgmlFlashAttentionPrecision, GgmlKvElementType, GgmlLoadedTensor,
+    GgmlNativeGqaCapability, GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgufTensorDataReadError, GgufTensorDataReader, ResolvedFamilyRuntimeInput, env_toggle_with_raw,
+    env_var_truthy,
 };
 
 use super::decoder_contract::{QwenDecoderContract, QwenDecoderContractGeometry};
 use super::graph_config::qwen_decoder_graph_config;
-use super::kv_cache::{Qwen3AsrKvCacheCapacity, Qwen3AsrLayerKvCacheState};
+use super::kv_cache::{Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity, Qwen3AsrLayerKvCacheState};
 #[cfg(test)]
 use crate::models::device_greedy_token::device_top1_token_id;
 
@@ -1023,6 +1023,28 @@ pub(crate) fn resolve_qwen_family_production_kv_cache_policy(
 ) -> LlmKvCachePolicy {
     let use_native_gqa = qwen_llm_resolve_use_native_gqa(backend);
     resolve_production_llm_kv_cache_policy_from_env(backend, head_dim, use_native_gqa, true)
+}
+
+/// Resident K/V graphs are authorized only by the immutable planner result.
+/// GPU class and scheduler-off are placement, not proof: production reuse
+/// evidence is Unknown, so every lane is FreshGraph and must materialize
+/// host KV. Compact first-max is a separate output_plan and cannot keep an
+/// empty ResidentOnly owner while the decode path rebuilds a growing graph.
+pub(crate) fn qwen_llm_uses_resident_kv_graph(
+    resolved_runtime: ResolvedFamilyRuntimeInput,
+) -> bool {
+    resolved_runtime.output_plan() == GgmlDecodeOutputPlan::FullLogits
+        && reusable_decode_graph_supported(resolved_runtime.reuse_mode())
+}
+
+pub(crate) fn qwen_host_kv_mode_for_resolved_runtime(
+    resolved_runtime: ResolvedFamilyRuntimeInput,
+) -> Qwen3AsrHostKvMode {
+    if qwen_llm_uses_resident_kv_graph(resolved_runtime) {
+        Qwen3AsrHostKvMode::ResidentOnly
+    } else {
+        Qwen3AsrHostKvMode::Materialized
+    }
 }
 
 /// A decode-layer 2D projection weight: either an arena tensor (f32-uploaded) or
@@ -3088,8 +3110,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
     /// GPU class is placement, not proof; production evidence is Unknown so
     /// this stays FreshGraph. Compact first-max is a separate output_plan.
     pub(crate) fn supports_graph_reuse(&self) -> bool {
-        self.resolved_runtime.output_plan() == GgmlDecodeOutputPlan::FullLogits
-            && reusable_decode_graph_supported(self.resolved_runtime.reuse_mode())
+        qwen_llm_uses_resident_kv_graph(self.resolved_runtime)
     }
 
     pub(crate) fn supports_fused_top1(&self) -> bool {
@@ -7960,7 +7981,9 @@ mod tests {
     use super::*;
     use std::{collections::BTreeMap, path::PathBuf};
 
-    use crate::ggml_runtime::{GGML_TYPE_F32, GgmlCpuGraphConfig, GgmlCpuGraphRunner};
+    use crate::ggml_runtime::{
+        GGML_TYPE_F32, GgmlCpuGraphConfig, GgmlCpuGraphRunner, GgmlDecodeReuseMode,
+    };
     use crate::models::qwen::runtime_contract::parse_qwen3_execution_metadata;
     use crate::testing::{
         TinyGgufFixtureSpec, with_forced_cpu_backend_for_test, write_tiny_gguf_runtime_source,
@@ -8005,7 +8028,25 @@ mod tests {
                 resolved.output_contract(),
                 crate::ggml_runtime::GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits
             );
+            assert!(
+                !qwen_llm_uses_resident_kv_graph(resolved),
+                "{provider:?} scheduler-off is placement, not resident-KV proof"
+            );
+            assert_eq!(
+                qwen_host_kv_mode_for_resolved_runtime(resolved),
+                Qwen3AsrHostKvMode::Materialized,
+                "{provider:?} FreshGraph must materialize host KV; empty ResidentOnly owners fail on the growing-graph write path"
+            );
         }
+        let cpu = ResolvedFamilyRuntimeInput::resolve(
+            Some(RequestBackendPreference::CpuOnly),
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        );
+        assert_eq!(cpu.reuse_mode(), GgmlDecodeReuseMode::FreshGraph);
+        assert_eq!(
+            qwen_host_kv_mode_for_resolved_runtime(cpu),
+            Qwen3AsrHostKvMode::Materialized
+        );
     }
 
     fn quote_test_layer_names(layer: usize) -> QwenFamilyLlmLayerTensorNames {

@@ -24,13 +24,12 @@ use super::graph_config::{
 };
 use super::greedy_decode::{Qwen3AsrGreedyDecodeError, run_qwen3_greedy_decode_loop};
 use super::kv_cache::{
-    Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
-    Qwen3AsrKvCacheCapacityError,
+    Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity, Qwen3AsrKvCacheCapacityError,
 };
 use super::llm_prefill::build_qwen3_llm_prefill_input;
 use super::llm_transformer::{
     Qwen3AsrLlmWholeDecoderGraphExecutor, QwenQkvExecutionMode, QwenWholeDecoderPlan,
-    qwen_llm_effective_native_gqa_capability,
+    qwen_host_kv_mode_for_resolved_runtime, qwen_llm_effective_native_gqa_capability,
 };
 use super::logits_head::{Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime};
 use super::lora::{qwen_adapter_cache_fingerprint, resolve_qwen_lora_adapter};
@@ -1113,18 +1112,12 @@ impl Qwen3AsrGgmlExecutor {
         qwen_decode_profile_log_opt("decoder_actor_checkout", whole_decoder_started_at);
 
         // The host KV owner is request-scoped, while the whole decoder and its
-        // logits runtime stay resident in the pinned owner actor. This mode is
-        // derived from the same resolved lane policy used by the decoder
-        // constructor, so a resident graph never aliases a materialized host
-        // path (and vice versa).
+        // logits runtime stay resident in the pinned owner actor. Mode must
+        // match `supports_graph_reuse`: ResidentOnly is legal only when the
+        // decoder will actually seed a resident graph. A GPU-class Metal lane
+        // that the planner still marks FreshGraph must materialize host KV.
         let kv_cache_started_at = qwen_decode_profile_start();
-        let host_mode = if request.resolved_runtime.reuse_mode()
-            == crate::ggml_runtime::GgmlDecodeReuseMode::ReusableGraph
-        {
-            Qwen3AsrHostKvMode::ResidentOnly
-        } else {
-            Qwen3AsrHostKvMode::Materialized
-        };
+        let host_mode = qwen_host_kv_mode_for_resolved_runtime(request.resolved_runtime);
         let kv_cache_spec = super::llm_transformer::resolve_qwen_family_production_kv_cache_policy(
             decoder_backend,
             metadata.llm_head_dim,
