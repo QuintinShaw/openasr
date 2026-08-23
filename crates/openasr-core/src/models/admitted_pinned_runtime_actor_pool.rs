@@ -45,9 +45,9 @@ use super::admitted_host_object_cache::{
     AdmittedHostObjectCacheLimits, SingleFlightWeightedCache, SingleFlightWeightedLookup,
 };
 use super::native_execution_services::{
-    ExecutionCacheAttemptId, current_execution_cache_attempt_id, current_native_execution_context,
-    current_runtime_receipts, install_native_execution_context, stage_execution_cache_commit,
-    stage_execution_cache_rollback,
+    ExecutionCacheAttemptId, current_execution_cache_attempt_id, current_execution_lane,
+    current_native_execution_context, current_runtime_receipts, install_native_execution_context,
+    stage_execution_cache_commit, stage_execution_cache_rollback,
 };
 use super::runtime_receipts::RuntimeOwnerDescriptor;
 use super::system_memory_owner::SystemMemoryOwner;
@@ -602,11 +602,12 @@ fn safe_pool_key_token<K: Hash>(key: &K) -> String {
 fn actor_receipt_descriptor<K: Hash>(worker_name: &str, key: &K) -> Option<RuntimeOwnerDescriptor> {
     let collector = current_runtime_receipts()?;
     let key_token = safe_pool_key_token(key);
+    let lane = current_execution_lane().and_then(|lane| lane.receipt_projection(&collector));
     collector.owner_descriptor(
         "pinned-runtime-actor",
         Some(&key_token),
         Some(worker_name),
-        None,
+        lane,
     )
 }
 

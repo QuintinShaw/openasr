@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::models::{
     native_execution_services::{current_execution_cache_attempt_id, current_runtime_receipts},
-    runtime_receipts::{RuntimeOwnerGuard, SafeExecutionLaneProjection},
+    runtime_receipts::RuntimeOwnerGuard,
     system_memory_owner::{
         AdmittedHostObject, SystemMemoryAllocationOutcome, SystemMemoryOwner,
         SystemMemoryOwnerError,
@@ -105,13 +105,12 @@ pub(super) fn receipt_owner(
     component: &str,
     content: Option<&str>,
     source: Option<&str>,
-    lane: Option<SafeExecutionLaneProjection>,
 ) -> Option<RuntimeOwnerGuard> {
     let collector = current_runtime_receipts()?;
     if !collector.is_available() {
         return None;
     }
-    let descriptor = collector.owner_descriptor(component, content, source, lane)?;
+    let descriptor = collector.host_neutral_owner_descriptor(component, content, source)?;
     Some(collector.start_owner(descriptor, current_execution_cache_attempt_id()))
 }
 

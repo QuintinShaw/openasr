@@ -150,11 +150,10 @@ fn redimnet_actor_receipt_descriptor(
 
 fn redimnet_parsed_host_receipt_owner(content_id: &str) -> Option<RuntimeOwnerGuard> {
     let collector = crate::models::native_execution_services::current_runtime_receipts()?;
-    let descriptor = collector.owner_descriptor(
+    let descriptor = collector.host_neutral_owner_descriptor(
         "redimnet2.parsed-host-state",
         Some(content_id),
         Some(REDIMNET_PARSED_HOST_REPRESENTATION),
-        None,
     )?;
     Some(collector.start_owner(
         descriptor,

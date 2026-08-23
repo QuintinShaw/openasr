@@ -33,7 +33,7 @@ use crate::device::execution_memory::{
 };
 
 use crate::models::native_execution_services::{
-    current_execution_cache_attempt_id, current_runtime_receipts,
+    current_execution_cache_attempt_id, current_execution_lane, current_runtime_receipts,
 };
 use crate::models::runtime_receipts::{RuntimeOwnerGuard, RuntimeResourceGuard};
 
@@ -422,11 +422,12 @@ impl NativeMemoryAllocationTransaction {
         let Some(first_group) = self.groups.first() else {
             return;
         };
+        let lane = current_execution_lane().and_then(|lane| lane.receipt_projection(&collector));
         let Some(owner_descriptor) = collector.owner_descriptor(
             "native-memory-reservation",
             None,
             Some(first_group.group_id()),
-            None,
+            lane,
         ) else {
             return;
         };
@@ -935,8 +936,9 @@ fn runtime_receipt_parts(
         return (None, Vec::new());
     };
     let source = claims.first().map(|claim| claim.resource_id.as_str());
+    let lane = current_execution_lane().and_then(|lane| lane.receipt_projection(&collector));
     let Some(descriptor) =
-        collector.owner_descriptor("native-memory-allocation", None, source, None)
+        collector.owner_descriptor("native-memory-allocation", None, source, lane)
     else {
         return (None, Vec::new());
     };

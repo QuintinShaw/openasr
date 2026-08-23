@@ -295,8 +295,7 @@ pub(crate) use models::ggml_asr_executor::{
 pub use models::native_execution_services::{
     ActivationReservationContext, BrokerActivationReservation, NativeExecutionScopeId,
     NativeExecutionServices, NativeExecutionServicesError, ResolvedDefaultModelActivation,
-    quote_and_reserve_candidate_activation, resolve_candidate_activation_lane,
-    resolve_default_model_activation,
+    resolve_candidate_activation_lane, resolve_default_model_activation,
 };
 pub use models::runtime_receipts;
 pub use models::{

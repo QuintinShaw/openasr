@@ -70,8 +70,7 @@ pub(crate) async fn set_default_model(
     .map_err(|reason| {
         ApiError::BadRequest(format!("default model activation plan failed: {reason}"))
     })?;
-    let candidate = resolved_activation.candidate().clone();
-    let facts = resolved_activation.into_facts();
+    let facts = resolved_activation.facts().clone();
     let identity = facts.identity().clone();
     let prepared = openasr_core::DefaultModelActivationJournalFactory {
         home: home.clone(),
@@ -87,14 +86,11 @@ pub(crate) async fn set_default_model(
         facts,
     );
     debug_assert_eq!(prepared.stage(), openasr_core::ActivationStage::Prepared);
-    let reservation = openasr_core::quote_and_reserve_candidate_activation(
-        services.as_ref(),
-        &candidate,
-        &verified_pack,
-    )
-    .map_err(|reason| {
-        ApiError::BadRequest(format!("default model activation reserve failed: {reason}"))
-    })?;
+    let reservation = resolved_activation
+        .quote_and_reserve(services.as_ref())
+        .map_err(|reason| {
+            ApiError::BadRequest(format!("default model activation reserve failed: {reason}"))
+        })?;
     let reservation_context = reservation.context();
     let reserved = prepared.reserve(reservation);
     debug_assert_eq!(reserved.stage(), openasr_core::ActivationStage::Reserved);
@@ -240,12 +236,7 @@ impl
     ) -> Result<Self::Evidence, openasr_core::AttestationFailure<Self::Error>> {
         let plan = facts.plan();
         let lane = facts.exact_lane();
-        if plan.path() != self.identity.path()
-            || plan.pack_content_id() != self.identity.pack_content_id()
-            || plan.output_plan() != self.identity.output_plan()
-            || plan.reuse_mode() != self.identity.reuse_mode()
-            || lane.candidate() != self.identity.candidate()
-        {
+        if !plan.matches_identity(&self.identity) || lane.candidate() != self.identity.candidate() {
             return Err(openasr_core::AttestationFailure::Rejected(
                 "activation facts drifted before native attestation".to_string(),
             ));

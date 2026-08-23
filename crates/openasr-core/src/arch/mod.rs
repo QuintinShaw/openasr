@@ -893,8 +893,6 @@ pub(crate) struct OpenAsrArchitectureDescriptor {
 
 impl OpenAsrArchitectureDescriptor {
     /// Build the resident topology through this descriptor's sole facet.
-    /// The runtime migration consumes this seam in a later integration change.
-    #[allow(dead_code)]
     pub(crate) fn build_resident_topology<'a>(
         self,
         verified_pack: &'a crate::models::pack_verifier::VerifiedPack,

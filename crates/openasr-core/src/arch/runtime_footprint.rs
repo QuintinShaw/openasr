@@ -350,6 +350,7 @@ pub(crate) struct ResidentSessionEnvelope {
     active_slots: u16,
     max_sessions: u16,
     serve_batch: Option<ServeBatchSpec>,
+    deferred_dynamic_session: bool,
 }
 
 impl ResidentSessionEnvelope {
@@ -364,6 +365,7 @@ impl ResidentSessionEnvelope {
             active_slots,
             max_sessions,
             serve_batch,
+            deferred_dynamic_session: false,
         }
     }
 
@@ -391,6 +393,7 @@ impl ResidentSessionEnvelope {
             active_slots: 1,
             max_sessions: 1,
             serve_batch: None,
+            deferred_dynamic_session: true,
         }
     }
 
@@ -409,6 +412,7 @@ impl ResidentSessionEnvelope {
             active_slots: 1,
             max_sessions: 4,
             serve_batch: Some(SERVE_BATCH),
+            deferred_dynamic_session: false,
         }
     }
 
@@ -746,7 +750,9 @@ impl ResidentFootprintFacet {
         let dependency_order = resolve_dependency_order(&active_specs)?;
         let mut components = Vec::with_capacity(active_specs.len());
         for spec in active_specs {
-            if let Some(component_session) = spec.session {
+            if let Some(component_session) = spec.session
+                && !inputs.session.deferred_dynamic_session
+            {
                 validate_session_envelope_for_component(inputs.session, component_session)?;
             }
             components.push(ResidentTopologyComponent {

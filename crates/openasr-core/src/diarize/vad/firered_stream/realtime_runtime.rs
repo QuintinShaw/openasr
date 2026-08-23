@@ -161,7 +161,6 @@ impl FireRedRealtimeVadSession {
                 "firered-stream-vad.realtime.request",
                 Some(&format!("frame-samples={frame_samples}")),
                 Some("request"),
-                None,
             ),
         })
     }
@@ -224,7 +223,6 @@ impl FireRedRealtimeVadSession {
                 "firered-stream-vad.realtime.request",
                 Some(&format!("frame-samples={frame_samples}")),
                 Some("request"),
-                None,
             ),
         })
     }
@@ -544,7 +542,6 @@ impl FireRedRealtimeVadRuntime {
             "firered-stream-vad.realtime.warmup",
             Some(&format!("frame-samples={frame_samples}")),
             Some("pre-output candidate validation"),
-            None,
         );
         let silent = vec![0_i16; frame_samples];
         for _ in 0..=frames_until_first_compute {

@@ -1060,12 +1060,15 @@ fn k3_registered_families_reference_physical_execution_lane_identity() {
             .iter()
             .any(|file| ProductionSyntax::collect(file).references_identifier("ExecutionLaneKey"));
         let derives_lane_key = rs_files.iter().any(|file| {
-            ProductionSyntax::collect(file).calls_or_invokes_method("current_execution_lane_key")
+            let syntax = ProductionSyntax::collect(file);
+            syntax.calls_or_invokes_method("current_execution_lane_key")
+                || syntax.calls_or_invokes_method("native_execution_lane")
         });
         assert!(
             references_lane_key && derives_lane_key,
             "K3 execution-lane gate: resident family '{family}' does not derive its \
-             backend-owner cache identity through ExecutionLaneKey/current_execution_lane_key. \
+             backend-owner cache identity through ExecutionLaneKey and the explicit request lane \
+             (or the shared current_execution_lane_key adapter). \
              A coarse GgmlCpuGraphBackend key aliases providers and physical cards."
         );
     }

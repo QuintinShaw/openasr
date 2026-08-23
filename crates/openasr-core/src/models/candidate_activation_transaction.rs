@@ -13,6 +13,25 @@ use std::marker::PhantomData;
 use crate::device::execution_policy::ExecutionCandidate;
 use crate::ggml_runtime::{GgmlDecodeOutputPlan, GgmlDecodeReuseMode, ResolvedFamilyRuntimeInput};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DefaultModelResidentComponentPlan {
+    pub(crate) component: &'static str,
+    pub(crate) variant: &'static str,
+    pub(crate) phase: crate::arch::runtime_footprint::ResidentPhase,
+    pub(crate) lifetime: crate::arch::runtime_footprint::ResidentLifetime,
+    pub(crate) dependencies: Vec<&'static str>,
+    pub(crate) representations: Vec<crate::arch::runtime_footprint::ResidentRepresentation>,
+    pub(crate) checkout: crate::arch::runtime_footprint::ResidentCheckout,
+    pub(crate) placement: crate::arch::runtime_footprint::ResidentPlacementVariant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DefaultModelResidentTopologyPlan {
+    pub(crate) architecture: &'static str,
+    pub(crate) components: Vec<DefaultModelResidentComponentPlan>,
+    pub(crate) dependency_order: Vec<&'static str>,
+}
+
 /// The externally visible lifecycle of one candidate activation attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivationStage {
@@ -1340,18 +1359,21 @@ pub struct DefaultModelActivationPlan {
     path: std::path::PathBuf,
     pack_content_id: String,
     resolved_runtime: ResolvedFamilyRuntimeInput,
+    resident_topology: DefaultModelResidentTopologyPlan,
 }
 
 impl DefaultModelActivationPlan {
-    pub fn new(
+    pub(crate) fn new(
         path: std::path::PathBuf,
         pack_content_id: String,
         resolved_runtime: ResolvedFamilyRuntimeInput,
+        resident_topology: DefaultModelResidentTopologyPlan,
     ) -> Self {
         Self {
             path,
             pack_content_id,
             resolved_runtime,
+            resident_topology,
         }
     }
 
@@ -1373,6 +1395,18 @@ impl DefaultModelActivationPlan {
 
     pub fn reuse_mode(&self) -> GgmlDecodeReuseMode {
         self.resolved_runtime.reuse_mode()
+    }
+
+    pub fn matches_identity(&self, identity: &DefaultModelActivationIdentity) -> bool {
+        self.path == identity.path
+            && self.pack_content_id == identity.pack_content_id
+            && self.output_plan() == identity.output_plan
+            && self.reuse_mode() == identity.reuse_mode
+            && self.resident_topology == identity.resident_topology
+    }
+
+    pub(crate) fn resident_topology(&self) -> &DefaultModelResidentTopologyPlan {
+        &self.resident_topology
     }
 }
 
@@ -1400,16 +1434,18 @@ pub struct DefaultModelActivationIdentity {
     candidate: ExecutionCandidate,
     output_plan: GgmlDecodeOutputPlan,
     reuse_mode: GgmlDecodeReuseMode,
+    resident_topology: DefaultModelResidentTopologyPlan,
 }
 
 impl DefaultModelActivationIdentity {
-    pub fn new(
+    pub(crate) fn new(
         pull: String,
         path: std::path::PathBuf,
         pack_content_id: String,
         candidate: ExecutionCandidate,
         output_plan: GgmlDecodeOutputPlan,
         reuse_mode: GgmlDecodeReuseMode,
+        resident_topology: DefaultModelResidentTopologyPlan,
     ) -> Self {
         Self {
             pull,
@@ -1418,6 +1454,7 @@ impl DefaultModelActivationIdentity {
             candidate,
             output_plan,
             reuse_mode,
+            resident_topology,
         }
     }
 

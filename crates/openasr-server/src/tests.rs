@@ -2292,7 +2292,7 @@ fn set_default_model_http_stage_does_not_publish_live() {
         "set_default_model must not reserve with NoopActivationReservation"
     );
     assert!(
-        set_default.contains("quote_and_reserve_candidate_activation"),
+        set_default.contains(".quote_and_reserve("),
         "set_default_model must quote and reserve known physical domains"
     );
     assert!(
