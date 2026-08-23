@@ -5955,6 +5955,9 @@ fn receipt_identity_delta(
     before: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
     after: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
 ) -> Result<RuntimeReceiptIdentityDelta, ()> {
+    if before.scope_id != after.scope_id {
+        return Err(());
+    }
     let (before_owners, before_resources) = receipt_identity_sets(before)?;
     let (after_owners, after_resources) = receipt_identity_sets(after)?;
     let before_retained = live_retained_resource_metrics(before)?;
@@ -6669,6 +6672,10 @@ fn resource_identity_collisions_and_scope_mismatches_are_inconclusive() {
         },
     ];
     assert_inconclusive(receipt_identity_sets(&event_scope_snapshot).map(|_| ()));
+
+    let before = empty_runtime_receipt_snapshot();
+    let after = empty_runtime_receipt_snapshot();
+    assert!(receipt_identity_delta(&before, &after).is_err());
 }
 
 #[test]
