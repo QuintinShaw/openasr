@@ -24,6 +24,8 @@ pub struct FireRedStreamingVad {
     cache: FireRedStreamVadCache,
     raw_buffer: Vec<f32>,
     last_prob: f32,
+    _frontend_receipt_owner: Option<super::RuntimeOwnerGuard>,
+    _cache_receipt_owner: Option<super::RuntimeOwnerGuard>,
 }
 
 impl fmt::Debug for FireRedStreamingVad {
@@ -48,6 +50,18 @@ impl FireRedStreamingVad {
             cache: FireRedStreamVadCache::new(),
             raw_buffer: Vec::with_capacity(FRAME_LENGTH * 2),
             last_prob: 0.0,
+            _frontend_receipt_owner: super::receipt_owner(
+                "firered-stream-vad.frontend",
+                Some("kaldi-fbank-cmvn"),
+                Some("session"),
+                None,
+            ),
+            _cache_receipt_owner: super::receipt_owner(
+                "firered-stream-vad.cache",
+                Some("causal-dfsmn-lookback"),
+                Some("session"),
+                None,
+            ),
         }
     }
 

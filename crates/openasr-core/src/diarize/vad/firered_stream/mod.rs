@@ -26,6 +26,11 @@ mod tests;
 
 use std::sync::OnceLock;
 
+use crate::models::{
+    native_execution_services::{current_execution_cache_attempt_id, current_runtime_receipts},
+    runtime_receipts::{RuntimeOwnerGuard, SafeExecutionLaneProjection},
+};
+
 pub use model::FireRedStreamVadModel;
 pub(crate) use provider::PolicyResolvedFireRedStreamVadProvider;
 pub use provider::{FireRedStreamVadError, FireRedStreamVadProvider};
@@ -64,6 +69,36 @@ pub(crate) const AUTO_GPU_POLICY: crate::ggml_runtime::AutoGpuPolicy =
 /// explicit opt-in until its product-level latency evidence is promoted.
 pub(crate) const OFFLINE_AUTO_GPU_POLICY: crate::ggml_runtime::AutoGpuPolicy =
     crate::ggml_runtime::AutoGpuPolicy::ExceptMetal;
+
+const EMBEDDED_CONTENT_ID: &str = "firered-stream-vad-embedded-v1";
+const PROCESS_GLOBAL_COMPATIBILITY_SOURCE: &str =
+    "process-global compatibility owner/NotPricedLegacy";
+
+pub(super) fn receipt_owner(
+    component: &str,
+    content: Option<&str>,
+    source: Option<&str>,
+    lane: Option<SafeExecutionLaneProjection>,
+) -> Option<RuntimeOwnerGuard> {
+    let collector = current_runtime_receipts()?;
+    if !collector.is_available() {
+        return None;
+    }
+    let descriptor = collector.owner_descriptor(component, content, source, lane)?;
+    Some(collector.start_owner(descriptor, current_execution_cache_attempt_id()))
+}
+
+pub(super) fn embedded_receipt_owner(
+    component: &str,
+    lane: Option<SafeExecutionLaneProjection>,
+) -> Option<RuntimeOwnerGuard> {
+    receipt_owner(
+        component,
+        Some(EMBEDDED_CONTENT_ID),
+        Some(PROCESS_GLOBAL_COMPATIBILITY_SOURCE),
+        lane,
+    )
+}
 
 static SHARED_MODEL: OnceLock<Option<FireRedStreamVadModel>> = OnceLock::new();
 
