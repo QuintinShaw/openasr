@@ -4,6 +4,7 @@ pub(crate) mod admitted_pinned_runtime_actor_pool;
 pub(crate) mod audio_frontend;
 pub(crate) mod aux_pack_registry;
 pub(crate) mod builtin_execution_dispatch;
+pub(crate) mod candidate_activation_transaction;
 pub mod cohere;
 pub(crate) mod ctc_greedy_decode;
 pub(crate) mod ctc_prefix_beam;
