@@ -136,7 +136,7 @@ pub use api::backend::{
 };
 pub use models::request_execution_receipt::{
     NativeExecutionReceiptCollector, NativeExecutionReceiptSnapshot, NativeExecutionRequestFacts,
-    NativeExecutionTopologyFacts, NativeExecutionTraceSnapshot,
+    NativeExecutionTokenStep, NativeExecutionTopologyFacts, NativeExecutionTraceSnapshot,
 };
 
 pub use api::native::{
@@ -204,8 +204,8 @@ pub use short_audio_receipt::{
     ShortAudioReceiptMetrics, ShortAudioReceiptOutputPlan, ShortAudioReceiptPack,
     ShortAudioReceiptReuseMode, ShortAudioReceiptRun, ShortAudioReceiptTranscript,
     ShortAudioReuseMode, ShortAudioSchedulerMode, ShortAudioTiePolicy, ShortAudioTopKSummary,
-    median_f64, receipt_os_id, resolve_core_commit, sha256_file, sha256_hex_bytes,
-    validate_core_commit,
+    decode_diagnostics_from_shipped_runtime, median_f64, receipt_os_id, resolve_core_commit,
+    sha256_file, sha256_hex_bytes, validate_core_commit,
 };
 pub use subtitle::{
     TimelinePrecisionPolicy, TimelineQuality, WordAnchorQuality, WordAnchorValidation,

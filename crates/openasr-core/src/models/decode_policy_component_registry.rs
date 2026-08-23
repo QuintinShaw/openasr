@@ -133,7 +133,7 @@ pub(crate) const COHERE_TRANSCRIBE_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyC
         decode_policy_id: crate::COHERE_TRANSCRIBE_DECODE_POLICY_ID,
         execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
         seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
-        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
         seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
         seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
         longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
@@ -146,7 +146,7 @@ pub(crate) const WHISPER_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponentDe
         decode_policy_id: crate::WHISPER_DECODE_POLICY_ID,
         execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
         seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
-        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::WhisperEnvV0,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
         seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
         seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::WhisperDefaultV0,
         longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::TokenHistory,
@@ -173,7 +173,7 @@ pub(crate) const MOONSHINE_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponent
         decode_policy_id: crate::MOONSHINE_DECODE_POLICY_ID,
         execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
         seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
-        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
         seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
         seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
         // The executor has no carry_context producer; the conservative profile
@@ -190,7 +190,7 @@ pub(crate) const FIRERED_AED_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyCompone
         decode_policy_id: crate::arch::FIRERED_AED_DECODE_POLICY_ID,
         execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
         seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
-        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
         seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
         seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
         // Plain `<sos>` AED with no carry_context producer; conservative
@@ -207,7 +207,7 @@ pub(crate) const FIRERED_LLM_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyCompone
         decode_policy_id: crate::arch::FIRERED_LLM_DECODE_POLICY_ID,
         execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
         seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
-        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
         // The eot token (ChatML `<|im_end|>`) is supplied per-request via
         // `BuiltinSeq2SeqDecodePolicyConfigInput.eot_token_id`; unlike qwen3-asr's
         // audio-boundary marker, firered-llm's prompt has no extra stop token
@@ -235,7 +235,7 @@ pub(crate) const FUNASR_NANO_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyCompone
         execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
         seq2seq_text_postprocess_kind:
             BuiltinDecodePolicySeq2SeqTextPostprocessKind::FunAsrNanoStripControlMarkersV0,
-        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
         seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
         seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
         // Every chunk is a fresh ChatML turn and the executor emits no carry.
@@ -257,7 +257,7 @@ pub(crate) const MIMO_ASR_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponentD
         // eot token is supplied per-request via `eot_token_id`, not a
         // registry-level stop-token-kind).
         seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
-        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
         seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
         seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
         // Every chunk is a fresh ChatML turn and the executor emits no carry.
@@ -280,7 +280,7 @@ pub(crate) const MOSS_TD_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponentDe
         // there is nothing else to strip -- Identity postprocess, same shape
         // as firered-llm/mimo-asr.
         seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
-        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
         seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
         seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
         // This family's executor concatenates its own 30s encoder chunks into
@@ -310,7 +310,7 @@ pub(crate) const GRANITE_SPEECH_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComp
         // starts), so there is nothing else to strip -- Identity postprocess,
         // same shape as firered-llm/mimo-asr/moss-transcribe-diarize.
         seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
-        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
         seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
         seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
         // This family's executor assembles the audio splice ONCE (the whole
@@ -938,7 +938,7 @@ mod tests {
         );
         assert_eq!(
             whisper.seq2seq_trace_kind,
-            BuiltinDecodePolicySeq2SeqTraceKind::WhisperEnvV0
+            BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1
         );
         assert_eq!(
             qwen.seq2seq_text_postprocess_kind,
@@ -1004,6 +1004,12 @@ mod tests {
                         policy.execution_kind,
                         BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
                         "family '{}'",
+                        descriptor.identity.model_family
+                    );
+                    assert_eq!(
+                        policy.seq2seq_trace_kind,
+                        BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
+                        "family '{}' must emit runtime token traces into the native receipt collector",
                         descriptor.identity.model_family
                     );
                 }
@@ -1565,10 +1571,93 @@ mod tests {
             0,
             &[1.0, 0.5],
         );
-        let text = receipt.snapshot().trace.jsonl;
+        let snapshot = receipt.snapshot();
+        let text = snapshot.trace.jsonl;
         assert!(text.contains("\"schema\":\"openasr.gpu-correctness-trace.v1\""));
         assert!(text.contains("\"event\":\"token\""));
         assert!(text.contains("\"event\":\"top_k\""));
+        assert_eq!(snapshot.token_steps.len(), 1);
+        assert_eq!(snapshot.token_steps[0].token_id, 7);
+        assert_eq!(snapshot.token_steps[0].top2_margin, Some(0.5));
+    }
+
+    #[test]
+    fn seq2seq_greedy_policies_record_token_steps_through_shipped_emitter() {
+        let policies = [
+            crate::COHERE_TRANSCRIBE_DECODE_POLICY_ID,
+            crate::WHISPER_DECODE_POLICY_ID,
+            crate::MOONSHINE_DECODE_POLICY_ID,
+            crate::arch::FIRERED_AED_DECODE_POLICY_ID,
+            crate::arch::FIRERED_LLM_DECODE_POLICY_ID,
+            crate::arch::FUNASR_NANO_DECODE_POLICY_ID,
+            crate::arch::MIMO_ASR_DECODE_POLICY_ID,
+            crate::arch::MOSS_TD_DECODE_POLICY_ID,
+            crate::arch::GRANITE_SPEECH_DECODE_POLICY_ID,
+            crate::QWEN3_ASR_DECODE_POLICY_ID,
+        ];
+        let token_table = BTreeMap::from([(1_u32, "he"), (2_u32, "llo")]);
+        let decode_text_token_ids = |token_ids: &[u32]| {
+            let mut out = String::new();
+            for token_id in token_ids {
+                out.push_str(token_table.get(token_id).copied().unwrap_or("?"));
+            }
+            Ok::<String, String>(out)
+        };
+        let config = BuiltinSeq2SeqDecodePolicyConfigInput {
+            initial_prompt_tokens: vec![42],
+            eot_token_id: 7,
+            vocab_size: 16,
+            max_generated_tokens: 8,
+        };
+        for decode_policy_id in policies {
+            let receipt =
+                crate::models::request_execution_receipt::NativeExecutionReceiptCollector::new();
+            let _guard =
+                crate::models::native_execution_services::install_execution_receipt_collector(
+                    Some(receipt.clone()),
+                );
+            let mut step_executor = SyntheticStepExecutor {
+                vocab_size: 16,
+                sequence: vec![1, 2, 7],
+            };
+            let qwen = decode_policy_id == crate::QWEN3_ASR_DECODE_POLICY_ID;
+            run_builtin_seq2seq_decode_policy(
+                decode_policy_id,
+                &config,
+                &SyntheticTokenSource {
+                    audio_end_token_id: qwen.then_some(9),
+                    audio_pad_token_id: qwen.then_some(8),
+                    start_of_transcript_token_id: None,
+                    transcribe_token_id: None,
+                    no_timestamps_token_id: None,
+                    token_ids_by_content: BTreeMap::new(),
+                },
+                None,
+                &mut step_executor,
+                &decode_text_token_ids,
+                |error| Seq2SeqGreedyDecodeError::TokenizerDecodeFailed { reason: error },
+                |error| error.to_string(),
+                |error| error.to_string(),
+                &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+                None,
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{decode_policy_id}: {error}"));
+            let snapshot = receipt.snapshot();
+            assert!(
+                snapshot.token_steps.len() >= 3,
+                "{decode_policy_id} must record each greedy step including EOT"
+            );
+            assert_eq!(snapshot.token_steps[0].token_id, 1, "{decode_policy_id}");
+            assert!(
+                snapshot.token_steps[0].top2_margin.is_some(),
+                "{decode_policy_id} host logits must record top-k margin"
+            );
+            assert!(
+                snapshot.trace.event_count > 0,
+                "{decode_policy_id} must emit receipt trace events"
+            );
+        }
     }
 
     #[test]
