@@ -52,7 +52,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -602,6 +602,64 @@ impl DaemonHistoryStore {
         tx.commit().map_err(DaemonHistoryStoreError::Query)?;
         self.get(id)?
             .ok_or_else(|| DaemonHistoryStoreError::NotFound(id.to_string()))
+    }
+
+    /// Deletes one entry only when its optimistic-concurrency revision still
+    /// equals `expected_revision`.
+    ///
+    /// The conditional `DELETE` is the first row operation in the transaction,
+    /// so a caller cannot delete a newer revision after reading an older one.
+    /// `Ok(true)` means the row was deleted, `Ok(false)` means the id did not
+    /// exist, and an existing row with another revision returns
+    /// [`DaemonHistoryStoreError::RevisionConflict`].
+    pub fn delete_if_revision(
+        &self,
+        id: &str,
+        expected_revision: u64,
+    ) -> Result<bool, DaemonHistoryStoreError> {
+        validate_history_id(id)?;
+        let mut conn = self.connection()?;
+        // Take the writer lock before classifying a failed conditional delete.
+        // Otherwise another writer could change the row between the DELETE and
+        // the diagnostic SELECT, reintroducing the very TOCTOU this primitive
+        // is intended to remove.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DaemonHistoryStoreError::Query)?;
+        let expected_revision_u64 = expected_revision;
+        let expected_revision = i64::try_from(expected_revision).unwrap_or(i64::MAX);
+        let removed = tx
+            .execute(
+                "DELETE FROM history_entries WHERE id = ?1 AND revision = ?2",
+                params![id, expected_revision],
+            )
+            .map_err(DaemonHistoryStoreError::Query)?;
+
+        if removed > 0 {
+            tx.execute("DELETE FROM history_entries_fts WHERE id = ?1", params![id])
+                .map_err(DaemonHistoryStoreError::Query)?;
+            tx.commit().map_err(DaemonHistoryStoreError::Query)?;
+            return Ok(true);
+        }
+
+        let current_revision = tx
+            .query_row(
+                "SELECT revision FROM history_entries WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(DaemonHistoryStoreError::Query)?;
+        match current_revision {
+            None => {
+                tx.commit().map_err(DaemonHistoryStoreError::Query)?;
+                Ok(false)
+            }
+            Some(actual_revision) => Err(DaemonHistoryStoreError::RevisionConflict {
+                expected: expected_revision_u64,
+                actual: actual_revision.max(0) as u64,
+            }),
+        }
     }
 
     pub fn delete(&self, id: &str) -> Result<bool, DaemonHistoryStoreError> {
@@ -1173,6 +1231,55 @@ mod tests {
         assert!(store.delete(&entry.id).unwrap());
         assert!(store.list().unwrap().is_empty());
         assert!(store.get(&entry.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn daemon_history_store_conditional_delete_rejects_stale_revision_and_deletes_current() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DaemonHistoryStore::open(temp.path());
+        let concurrent_store = DaemonHistoryStore::open(temp.path());
+        let entry = record_history_for_test(&store, "original transcript");
+
+        // Simulate another request committing a newer revision between the
+        // caller's read and its delete request.
+        let updated = concurrent_store
+            .replace_transcript(
+                &entry.id,
+                entry.revision,
+                &crate::api::backend::Transcription {
+                    text: "newer transcript".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.entry.revision, entry.revision + 1);
+
+        let error = store
+            .delete_if_revision(&entry.id, entry.revision)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DaemonHistoryStoreError::RevisionConflict {
+                expected: 0,
+                actual: 1
+            }
+        ));
+        let retained = store.get(&entry.id).unwrap().unwrap();
+        assert_eq!(retained.text, "newer transcript");
+        assert_eq!(retained.entry.revision, updated.entry.revision);
+
+        assert!(
+            store
+                .delete_if_revision(&entry.id, updated.entry.revision)
+                .unwrap()
+        );
+        assert!(store.get(&entry.id).unwrap().is_none());
+        assert!(
+            !store
+                .delete_if_revision(&entry.id, updated.entry.revision)
+                .unwrap()
+        );
+        assert!(!store.delete_if_revision("hist-missing", 0).unwrap());
     }
 
     #[test]
