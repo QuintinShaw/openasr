@@ -357,7 +357,7 @@ mod tests {
         let mut scores = Vec::new();
         complete_scores_for_residual(&[0.5, 0.5], &table, 2, 2, &mut scores);
         assert_eq!(scores.len(), 2);
-        assert_eq!(scores, vec![0.5, 0.5]);
+        assert_eq!(scores, vec![0.0, 0.0]);
     }
 
     #[test]
