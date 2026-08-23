@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use super::OutputWriteError;
@@ -11,7 +11,9 @@ pub(super) fn resolve_output_path(path: &Path) -> Result<PathBuf, OutputWriteErr
     for _ in 0..40 {
         let metadata = match fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(current),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return canonicalized_final_target(&current, &original);
+            }
             Err(source) => {
                 return Err(OutputWriteError::ResolveSymlink {
                     path: original,
@@ -21,7 +23,7 @@ pub(super) fn resolve_output_path(path: &Path) -> Result<PathBuf, OutputWriteErr
         };
 
         if !metadata.file_type().is_symlink() {
-            return Ok(current);
+            return canonicalized_final_target(&current, &original);
         }
 
         let target =
@@ -40,6 +42,56 @@ pub(super) fn resolve_output_path(path: &Path) -> Result<PathBuf, OutputWriteErr
         path: original,
         source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "too many symlink levels"),
     })
+}
+
+fn lexically_normalized_absolute(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            Component::Normal(name) => normalized.push(name),
+        }
+    }
+    normalized
+}
+
+fn canonicalized_final_target(path: &Path, original: &Path) -> Result<PathBuf, OutputWriteError> {
+    let normalized = lexically_normalized_absolute(path);
+    let parent = output_parent(&normalized);
+    let canonical_parent = fs::canonicalize(parent).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            OutputWriteError::ParentNotFound {
+                parent: parent.to_path_buf(),
+            }
+        } else {
+            OutputWriteError::ResolveSymlink {
+                path: original.to_path_buf(),
+                source,
+            }
+        }
+    })?;
+    let basename = normalized
+        .file_name()
+        .ok_or_else(|| OutputWriteError::ResolveSymlink {
+            path: original.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "output path has no file name",
+            ),
+        })?;
+    Ok(canonical_parent.join(basename))
 }
 
 pub(super) fn output_parent(path: &Path) -> &Path {

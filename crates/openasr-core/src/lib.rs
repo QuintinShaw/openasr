@@ -134,6 +134,11 @@ pub use api::backend::{
     resolve_local_native_runtime_model_identity, validate_local_native_model_pack_path,
     verify_native_runtime_model_pack_path,
 };
+pub use models::request_execution_receipt::{
+    NativeExecutionReceiptCollector, NativeExecutionReceiptSnapshot, NativeExecutionRequestFacts,
+    NativeExecutionTopologyFacts, NativeExecutionTraceSnapshot,
+};
+
 pub use api::native::{
     NativeAsrBackpressurePolicy, NativeAsrBenchmarkStatus, NativeAsrCapabilities,
     NativeAsrCapabilityClass, NativeAsrError, NativeAsrExecutor, NativeAsrHardwareTarget,
@@ -356,7 +361,10 @@ pub use models::{
         convert_local_xasr_zipformer_source_to_runtime_pack,
     },
 };
-pub use output::{OutputWriteError, atomic_write_text};
+pub use output::{
+    OutputWriteError, ResolvedOutputTarget, atomic_write_text,
+    atomic_write_text_to_resolved_target, resolve_output_target, resolve_output_target_handle,
+};
 pub use pull::{
     BackendFileFormat, BackendPackDownloadPlan, BackendStoreGcReport, DefaultPackPointer,
     InstalledBackend, InstalledPack, LegacyMigrationFailure, LegacyMigrationReport,

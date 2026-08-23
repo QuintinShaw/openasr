@@ -69,6 +69,7 @@ Optional flags:
 - `--warmup-runs N` - untimed passes before sampling (marks warm/populated)
 - `--core-commit <40-hex>` - otherwise `OPENASR_BUILD_COMMIT` or `git rev-parse HEAD`
 - `--scope <label>` - default `short-audio-gate`
+- `--trace-out <path>` - native-only strict token trace. It is create-new (never replaces an existing path), rejects any final-path alias with `--out` including dangling symlink chains and symlinked parent directories, and fails closed if the trace directory metadata cannot be synced. Both targets pin canonical parent directories before trace publication, so later caller-path symlink swaps cannot redirect the receipt write. A trace artifact retained after that sync failure is not release-valid.
 - `--backend mock` - plumbing only; not a quality/perf claim
 
 The command is an **explicit tooling surface**. It does not change the default

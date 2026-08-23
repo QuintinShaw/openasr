@@ -5,22 +5,24 @@
 //! Reuses the same transcription ingress as `transcribe --benchmark`.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
 };
+#[cfg(test)]
+use std::{fs, io::Write};
 
 use anyhow::{Context, Result, bail};
 use openasr_core::{
     BackendKind, ExecutionTarget, GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector,
-    InstalledPack, NativeExecutionServices, SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK,
-    SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioReceipt, ShortAudioReceiptAudio,
-    ShortAudioReceiptMetrics, ShortAudioReceiptPack, ShortAudioReceiptRun,
+    InstalledPack, NativeExecutionServices, ResolvedOutputTarget,
+    SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK, SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioReceipt,
+    ShortAudioReceiptAudio, ShortAudioReceiptMetrics, ShortAudioReceiptPack, ShortAudioReceiptRun,
     ShortAudioReceiptTranscript, TranscriptionRequest, atomic_write_text, list_installed_packs,
     load_config, openasr_home, parse_model_ref, prepare_audio_input, process_memory_snapshot,
-    receipt_os_id, resolve_core_commit, resolve_installed_pack_reference, sha256_file,
-    validate_local_native_model_pack_path,
+    receipt_os_id, resolve_core_commit, resolve_installed_pack_reference,
+    resolve_output_target_handle, sha256_file, validate_local_native_model_pack_path,
 };
 
 use crate::cli_args::RuntimePathOverrides;
@@ -41,6 +43,7 @@ pub(crate) struct ShortAudioReceiptOptions<'a> {
     pub(crate) scope: &'a str,
     pub(crate) ffmpeg_bin: Option<PathBuf>,
     pub(crate) git_cwd: Option<&'a Path>,
+    pub(crate) trace_out: Option<&'a Path>,
 }
 
 pub(crate) fn bench_receipt_short_audio(
@@ -55,6 +58,29 @@ pub(crate) fn bench_receipt_short_audio(
             "Audio file not found: {}\nPass an existing WAV/audio path via --audio.",
             options.audio.display()
         );
+    }
+    if options.trace_out.is_some() && options.backend_kind != BackendKind::Native {
+        bail!("--trace-out requires --backend native; mock cannot produce a native trace");
+    }
+    if options.trace_out.is_some()
+        && let Some(parent) = options.out.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Could not create receipt output directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let fixed_output_targets = options
+        .trace_out
+        .map(|trace_out| fixed_receipt_and_trace_targets(options.out, trace_out))
+        .transpose()?;
+    if let Some((_, trace_target)) = &fixed_output_targets {
+        if trace_target.path().exists() {
+            bail!("refusing to overwrite runtime trace output");
+        }
     }
 
     let home = openasr_home()?;
@@ -111,6 +137,9 @@ pub(crate) fn bench_receipt_short_audio(
     let total_passes = options.warmup_runs.saturating_add(options.runs);
     let execution_telemetry = GgmlExecutionTelemetryCollector::new();
     let _execution_telemetry_guard = execution_telemetry.install();
+    let request_receipt = options
+        .trace_out
+        .map(|_| openasr_core::NativeExecutionReceiptCollector::new());
     let mut rtf_samples = Vec::with_capacity(options.runs);
     let mut last_text = String::new();
     let mut notes = Vec::new();
@@ -131,7 +160,7 @@ pub(crate) fn bench_receipt_short_audio(
 
     for pass in 0..total_passes {
         let is_warmup = pass < options.warmup_runs;
-        let request = TranscriptionRequest::new(
+        let mut request = TranscriptionRequest::new(
             prepared_audio.path(),
             prepared_run.model_source.model_id.clone(),
         )
@@ -147,6 +176,14 @@ pub(crate) fn bench_receipt_short_audio(
                 .and_then(|name| name.to_str())
                 .map(str::to_string),
         );
+        if let Some(receipt) = &request_receipt {
+            request = request.with_execution_context(Arc::new(
+                openasr_core::RequestExecutionContext::uncancellable(
+                    "strict short-audio trace command has no cancel surface",
+                )
+                .with_native_execution_receipt(receipt.clone()),
+            ));
+        }
 
         let started = Instant::now();
         let transcription = transcribe_with_backend(
@@ -162,6 +199,16 @@ pub(crate) fn bench_receipt_short_audio(
             )
         })?;
         let elapsed = started.elapsed();
+        if options.trace_out.is_some()
+            && transcription
+                .longform
+                .as_ref()
+                .is_some_and(|longform| longform.chunk_count > 1)
+        {
+            bail!(
+                "--trace-out rejects multi-slice native requests; trace schema has no slice identity"
+            );
+        }
         last_text = transcription.text;
 
         if is_warmup {
@@ -199,6 +246,36 @@ pub(crate) fn bench_receipt_short_audio(
     if options.backend_kind == BackendKind::Native {
         validate_observed_accelerator_placement(&device_label, &observed_placement)?;
     }
+    if let (Some((_, trace_target)), Some(request_receipt)) =
+        (fixed_output_targets.as_ref(), request_receipt.as_ref())
+    {
+        let snapshot = request_receipt.snapshot();
+        let facts = snapshot.facts.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("native trace is missing request-scoped execution facts")
+        })?;
+        if !snapshot.completed
+            || snapshot.trace.overflowed
+            || snapshot.trace.event_count == 0
+            || snapshot.trace.jsonl.is_empty()
+            || facts.actual_provider != Some(facts.selected_provider)
+            || facts.actual_stable_device_id.as_deref() != Some(facts.stable_device_id.as_str())
+            || facts.scheduler_enabled.is_none()
+        {
+            bail!("native trace is incomplete; refusing to emit an approval trace");
+        }
+        validate_release_trace(&snapshot.trace.jsonl)?;
+        trace_target
+            .create_new_text_and_sync_parent(&snapshot.trace.jsonl)
+            .with_context(|| {
+                format!(
+                    "Could not write runtime trace to {}",
+                    trace_target.path().display()
+                )
+            })?;
+    }
+    // A generic native receipt records only typed placement telemetry produced
+    // by the runtime. It is not a release correctness approval; strict trace
+    // publication above remains the only approval-producing path.
     let receipt = ShortAudioReceipt::try_new(ShortAudioReceipt {
         schema: SHORT_AUDIO_RECEIPT_SCHEMA.to_string(),
         core_commit,
@@ -259,12 +336,23 @@ pub(crate) fn bench_receipt_short_audio(
             )
         })?;
     }
-    atomic_write_text(options.out, &format!("{json}\n")).with_context(|| {
-        format!(
-            "Could not write short-audio receipt to {}",
-            options.out.display()
-        )
-    })?;
+    if let Some((receipt_target, _)) = fixed_output_targets.as_ref() {
+        receipt_target
+            .atomic_write_text(&format!("{json}\n"))
+            .with_context(|| {
+                format!(
+                    "Could not write short-audio receipt to fixed target {}",
+                    receipt_target.path().display()
+                )
+            })?;
+    } else {
+        atomic_write_text(options.out, &format!("{json}\n")).with_context(|| {
+            format!(
+                "Could not write short-audio receipt to {}",
+                options.out.display()
+            )
+        })?;
+    }
     eprintln!(
         "Wrote {} short-audio receipt to {}",
         SHORT_AUDIO_RECEIPT_SCHEMA,
@@ -459,6 +547,10 @@ fn build_command_argv(
         command.push("--core-commit".to_string());
         command.push(core_commit.to_string());
     }
+    if let Some(trace_out) = options.trace_out {
+        command.push("--trace-out".to_string());
+        command.push(trace_out.display().to_string());
+    }
     command
 }
 
@@ -478,6 +570,120 @@ fn capture_env_allowlist() -> BTreeMap<String, String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+fn resolved_output_target(path: &Path) -> Result<PathBuf> {
+    openasr_core::resolve_output_target(path)
+        .with_context(|| format!("Could not resolve output target {}", path.display()))
+}
+
+fn fixed_receipt_and_trace_targets(
+    receipt: &Path,
+    trace: &Path,
+) -> Result<(ResolvedOutputTarget, ResolvedOutputTarget)> {
+    let receipt = resolve_output_target_handle(receipt)?;
+    let trace = resolve_output_target_handle(trace)?;
+    if receipt.path() == trace.path() {
+        bail!("--out and --trace-out must name different output targets");
+    }
+    Ok((receipt, trace))
+}
+
+/// Write a complete trace through a same-directory temporary file, then publish
+/// it with a hard link. `hard_link` is create-new: an attacker or concurrent
+/// producer that creates the destination after validation wins safely and we
+/// fail rather than replacing their file.
+#[cfg(test)]
+fn atomic_create_new_trace_at_target(target: &Path, contents: &str) -> Result<()> {
+    atomic_create_new_trace_at_target_with(target, contents, |parent| {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(anyhow::Error::from)
+    })
+}
+
+#[cfg(test)]
+fn atomic_create_new_trace_at_target_with(
+    target: &Path,
+    contents: &str,
+    sync_parent: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    let parent = target.parent().expect("fixed target has a parent");
+    let mut temp = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "Could not create trace temporary file in {}",
+            parent.display()
+        )
+    })?;
+    temp.write_all(contents.as_bytes())
+        .context("Could not write runtime trace temporary file")?;
+    temp.as_file()
+        .sync_all()
+        .context("Could not sync runtime trace temporary file")?;
+    if let Err(error) = fs::hard_link(temp.path(), &target) {
+        let _ = temp.close();
+        return Err(anyhow::anyhow!(
+            "Could not create runtime trace {} without replacing an existing file: {error}",
+            target.display()
+        ));
+    }
+    if let Err(error) = sync_parent(parent) {
+        // The create-new artifact remains intact: unlinking by path after a
+        // metadata failure could race a replacement and delete another writer's
+        // file. It is not release-valid because this call fails closed.
+        let _ = temp.close();
+        return Err(anyhow::anyhow!(
+            "Could not persist runtime trace directory metadata for {}: {error}; artifact retained and unusable",
+            target.display(),
+        ));
+    }
+    temp.close()
+        .context("Could not remove runtime trace temporary file")?;
+    Ok(())
+}
+
+fn validate_release_trace(jsonl: &str) -> Result<()> {
+    let mut token_steps = BTreeSet::new();
+    let mut top_k_steps = BTreeSet::new();
+    for line in jsonl.lines() {
+        let event: serde_json::Value =
+            serde_json::from_str(line).context("runtime trace contains invalid JSON")?;
+        let step = event.get("step_index").and_then(serde_json::Value::as_u64);
+        match event.get("event").and_then(serde_json::Value::as_str) {
+            Some("token") => {
+                let step =
+                    step.ok_or_else(|| anyhow::anyhow!("runtime token trace has no step_index"))?;
+                if !token_steps.insert(step) {
+                    bail!("runtime token trace has duplicate step_index {step}");
+                }
+            }
+            Some("top_k") => {
+                let step =
+                    step.ok_or_else(|| anyhow::anyhow!("runtime top-k trace has no step_index"))?;
+                let items = event
+                    .get("items")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| anyhow::anyhow!("runtime top-k trace has no items"))?;
+                if items.len() < 2
+                    || event
+                        .get("top1_top2_margin")
+                        .and_then(serde_json::Value::as_f64)
+                        .is_none()
+                {
+                    bail!("runtime top-k trace lacks a real top1/top2 margin at step {step}");
+                }
+                if !top_k_steps.insert(step) {
+                    bail!("runtime top-k trace has duplicate step_index {step}");
+                }
+            }
+            _ => {}
+        }
+    }
+    if token_steps.is_empty() || token_steps != top_k_steps {
+        bail!("every runtime token trace step must have exactly one same-step top-k/margin record");
+    }
+    Ok(())
 }
 
 fn validate_observed_accelerator_placement(
@@ -567,6 +773,7 @@ mod tests {
                 scope: SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE,
                 ffmpeg_bin: None,
                 git_cwd: None,
+                trace_out: None,
             },
         );
         match previous_home {
@@ -589,6 +796,137 @@ mod tests {
         assert!(!receipt.transcript.text.is_empty());
         assert_eq!(receipt.audio.sha256.len(), 64);
         assert!(receipt.metrics.rtf_samples.len() <= 1);
+    }
+
+    #[test]
+    fn fixed_targets_collapse_lexical_trace_aliases() {
+        let dir = TempDir::new().unwrap();
+        let trace = dir.path().join("trace.jsonl");
+        std::fs::write(&trace, "existing").unwrap();
+        let dot_trace = dir.path().join(".").join("trace.jsonl");
+        let parent_trace = dir.path().join("missing").join("..").join("trace.jsonl");
+        assert!(fixed_receipt_and_trace_targets(&dot_trace, &trace).is_err());
+        assert!(fixed_receipt_and_trace_targets(&parent_trace, &trace).is_err());
+        assert_eq!(
+            resolved_output_target(&trace).unwrap(),
+            resolved_output_target(&dot_trace).unwrap()
+        );
+        assert_eq!(
+            resolved_output_target(&trace).unwrap(),
+            resolved_output_target(&parent_trace).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixed_targets_reject_parent_directory_symlink_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir(&real).unwrap();
+        symlink("real", &alias).unwrap();
+        let via_alias = alias.join("trace.jsonl");
+        let direct = real.join("trace.jsonl");
+        assert_eq!(
+            resolved_output_target(&via_alias).unwrap(),
+            resolved_output_target(&direct).unwrap()
+        );
+        assert!(fixed_receipt_and_trace_targets(&via_alias, &direct).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixed_receipt_target_survives_post_resolution_parent_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        let other = dir.path().join("other");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        symlink("real", &alias).unwrap();
+        let requested = alias.join("receipt.json");
+        let fixed = resolve_output_target_handle(&requested).unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        symlink("other", &alias).unwrap();
+        fixed.atomic_write_text("receipt").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(real.join("receipt.json")).unwrap(),
+            "receipt"
+        );
+        assert!(!other.join("receipt.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixed_receipt_target_safely_replaces_post_resolution_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let receipt = dir.path().join("receipt.json");
+        let victim = dir.path().join("victim.json");
+        std::fs::write(&victim, "victim").unwrap();
+        let fixed = resolve_output_target_handle(&receipt).unwrap();
+        symlink("victim.json", &receipt).unwrap();
+        fixed.atomic_write_text("receipt").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "victim");
+        assert_eq!(std::fs::read_to_string(&receipt).unwrap(), "receipt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_alias_rejects_dangling_receipt_symlink_to_trace() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let receipt = dir.path().join("receipt.json");
+        let trace = dir.path().join("trace.jsonl");
+        symlink("trace.jsonl", &receipt).unwrap();
+        // The link remains dangling until trace publication, but it already
+        // resolves to the same final write target.
+        assert!(fixed_receipt_and_trace_targets(&receipt, &trace).is_err());
+        assert!(!trace.exists());
+    }
+
+    #[test]
+    fn strict_trace_requires_same_step_top_k_and_margin() {
+        let valid = concat!(
+            "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"header\"}\n",
+            "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"token\",\"step_index\":0}\n",
+            "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"top_k\",\"step_index\":0,\"items\":[{\"token_id\":1,\"value\":2.0},{\"token_id\":2,\"value\":1.0}],\"top1_top2_margin\":1.0}\n"
+        );
+        validate_release_trace(valid).expect("complete trace accepted");
+        assert!(validate_release_trace("{\"event\":\"token\",\"step_index\":0}\n").is_err());
+    }
+
+    #[test]
+    fn trace_create_new_refuses_racing_existing_target() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("trace.jsonl");
+        std::fs::write(&path, "other producer").unwrap();
+        assert!(atomic_create_new_trace_at_target(&path, "trace\n").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "other producer");
+    }
+
+    #[test]
+    fn trace_directory_sync_failure_retains_unapproved_artifact() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("trace.jsonl");
+        let error = atomic_create_new_trace_at_target_with(&path, "trace\n", |parent| {
+            assert!(path.exists(), "link occurs before parent directory sync");
+            assert_eq!(parent, dir.path());
+            Err(anyhow::anyhow!("directory sync unavailable"))
+        })
+        .expect_err("directory sync failure must fail closed");
+        assert!(error.to_string().contains("directory metadata"));
+        assert!(
+            path.exists(),
+            "conservative failure retains create-new artifact"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "trace\n");
     }
 
     #[test]

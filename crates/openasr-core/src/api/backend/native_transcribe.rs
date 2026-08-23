@@ -36,6 +36,9 @@ use crate::models::decode_policy_component_registry::{
 };
 use crate::models::ggml_family_adapter::GgmlFamilyAdapterSelectionError;
 use crate::models::graph_runtime_config::install_request_inference_threads_override;
+use crate::models::request_execution_receipt::{
+    NativeExecutionRequestFacts, NativeExecutionTopologyFacts,
+};
 #[cfg(test)]
 use crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index_from_source;
 use crate::models::runtime_selection_metadata::selection_metadata_from_gguf;
@@ -367,6 +370,10 @@ fn run_dispatch_once_with_progress_and_policy(
 ) -> Result<(GgmlAsrExecutionResult, Option<SliceExecutionFallback>), BackendError> {
     let mut failures = Vec::new();
     let candidates = execution_plan.candidates();
+    let _receipt_guard =
+        crate::models::native_execution_services::install_execution_receipt_collector(
+            execution_context.native_execution_receipt(),
+        );
     for (candidate_index, candidate) in candidates.iter().enumerate() {
         let backend_preference = match candidate.placement {
             ExecutionPlacement::CpuOnly => GgmlAsrBackendPreference::CpuOnly,
@@ -4081,6 +4088,81 @@ fn is_cooperative_cancel_reason(reason: &str) -> bool {
 /// Builds the request's resolved runtime from the exact candidate route passed
 /// by the policy loop. Recomputing it per attempt is required because a retry
 /// can change both provider and placement.
+fn receipt_topology_for_family(
+    selected_family: &GgmlFamilyAdapterDescriptor,
+) -> Result<NativeExecutionTopologyFacts, BackendError> {
+    let descriptor = OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(selected_family.model_architecture)
+        .ok_or_else(|| BackendError::NativeFailClosed {
+            reason: "selected native family is absent from the architecture inventory".to_string(),
+        })?;
+    let decode_driver = match descriptor.topology_contract.decode_driver {
+        crate::arch::OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy { .. } => {
+            "shared-seq2seq-greedy"
+        }
+        crate::arch::OpenAsrDecodeDriverStrategy::SharedCtcGreedy { .. } => "shared-ctc-greedy",
+        crate::arch::OpenAsrDecodeDriverStrategy::Dedicated { .. } => "dedicated",
+    };
+    let decoder_state = match descriptor.topology_contract.decoder_state_topology {
+        crate::arch::OpenAsrDecoderStateTopology::None => "none",
+        crate::arch::OpenAsrDecoderStateTopology::CausalSelfAttentionKv => {
+            "causal-self-attention-kv"
+        }
+        crate::arch::OpenAsrDecoderStateTopology::EncoderDecoderSelfAndCrossAttentionKv => {
+            "encoder-decoder-self-and-cross-attention-kv"
+        }
+        crate::arch::OpenAsrDecoderStateTopology::FamilyDefinedTokenScaledPersistent => {
+            "family-defined-token-scaled-persistent"
+        }
+    };
+    let block_stack = match descriptor.topology_contract.block_stack {
+        crate::arch::OpenAsrBlockStackStrategy::Shared(_) => "shared",
+        crate::arch::OpenAsrBlockStackStrategy::ArchitectureGraph { .. } => "architecture-graph",
+    };
+    Ok(NativeExecutionTopologyFacts {
+        family: selected_family.model_family.to_string(),
+        model_architecture: selected_family.model_architecture.to_string(),
+        adapter_id: selected_family.adapter_id.to_string(),
+        decode_policy_id: selected_family.decode_policy_id.to_string(),
+        decode_driver: decode_driver.to_string(),
+        decoder_state: decoder_state.to_string(),
+        block_stack: block_stack.to_string(),
+    })
+}
+
+fn capture_request_execution_facts(
+    verified_pack: &VerifiedPack,
+    selected_family: &GgmlFamilyAdapterDescriptor,
+    resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput,
+) -> Result<(), BackendError> {
+    let Some(receipt) =
+        crate::models::native_execution_services::current_execution_receipt_collector()
+    else {
+        return Ok(());
+    };
+    let execution_lane = crate::models::native_execution_services::current_execution_lane_key(
+        resolved_runtime.backend(),
+    );
+    receipt.record_facts(NativeExecutionRequestFacts {
+        resolved_runtime,
+        selected_provider: execution_lane.provider(),
+        stable_device_id: execution_lane.stable_device_id().to_string(),
+        placement: execution_lane.placement(),
+        backend: execution_lane.backend(),
+        execution_lane,
+        topology: receipt_topology_for_family(selected_family)?,
+        pack_content_id: verified_pack.content_id().to_string(),
+        pack_size_bytes: verified_pack.preflight().runtime_source().byte_len(),
+        actual_provider: None,
+        actual_stable_device_id: None,
+        scheduler_enabled: None,
+    });
+    Ok(())
+}
+
+/// Builds the request's resolved runtime from the exact candidate route passed
+/// by the policy loop. Recomputing it per attempt is required because a retry
+/// can change both provider and placement.
 fn run_dispatch_once(
     dispatch: &GgmlAsrExecutionDispatch,
     execution_services: &Arc<NativeExecutionServices>,
@@ -4099,6 +4181,7 @@ fn run_dispatch_once(
         auto_gpu_policy,
         selected_family,
     );
+    capture_request_execution_facts(verified_pack, selected_family, resolved_runtime)?;
     let execution_request = GgmlAsrExecutionViewRequest {
         execution_services: Arc::clone(execution_services),
         decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,

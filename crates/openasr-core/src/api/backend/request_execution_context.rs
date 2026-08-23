@@ -29,6 +29,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use super::TranscriptionControl;
+use crate::models::request_execution_receipt::NativeExecutionReceiptCollector;
 
 /// Cloneable request-local completed-work observer.
 ///
@@ -102,6 +103,10 @@ pub struct RequestExecutionContext {
     /// so the shared decode driver can emit revisable prefixes before EOT;
     /// FINAL / offline paths leave it unset.
     unstable_decode_text: Option<UnstableDecodeTextObserver>,
+    /// Explicit opt-in native receipt authority. It is propagated with this
+    /// context into candidate attempts and worker-owned decode loops; normal
+    /// product requests leave it absent.
+    native_execution_receipt: Option<NativeExecutionReceiptCollector>,
 }
 
 // Manual, not derived: `TranscriptionControl` holds a `Mutex`/`Condvar` and
@@ -126,6 +131,7 @@ impl RequestExecutionContext {
             control,
             decode_work_progress: None,
             unstable_decode_text: None,
+            native_execution_receipt: None,
         }
     }
 
@@ -141,6 +147,7 @@ impl RequestExecutionContext {
             control: Arc::clone(&self.control),
             decode_work_progress: Some(observer),
             unstable_decode_text: self.unstable_decode_text.clone(),
+            native_execution_receipt: self.native_execution_receipt.clone(),
         }
     }
 
@@ -158,11 +165,27 @@ impl RequestExecutionContext {
             control: Arc::clone(&self.control),
             decode_work_progress: self.decode_work_progress.clone(),
             unstable_decode_text: Some(observer),
+            native_execution_receipt: self.native_execution_receipt.clone(),
         }
     }
 
     pub(crate) fn unstable_decode_text_observer(&self) -> Option<&UnstableDecodeTextObserver> {
         self.unstable_decode_text.as_ref()
+    }
+
+    /// Attach the one explicit request-scoped authority that can receive native
+    /// execution facts and decode trace events. Receipt consumers must use this
+    /// value rather than re-resolving backend policy after the request returns.
+    pub fn with_native_execution_receipt(
+        mut self,
+        receipt: NativeExecutionReceiptCollector,
+    ) -> Self {
+        self.native_execution_receipt = Some(receipt);
+        self
+    }
+
+    pub(crate) fn native_execution_receipt(&self) -> Option<NativeExecutionReceiptCollector> {
+        self.native_execution_receipt.clone()
     }
 
     /// A context with no external owner: nothing can ever cancel or pause
@@ -223,6 +246,7 @@ impl RequestExecutionContext {
             control: Arc::new(TranscriptionControl::detached()),
             decode_work_progress: None,
             unstable_decode_text: None,
+            native_execution_receipt: None,
         }
     }
 
@@ -252,6 +276,19 @@ mod tests {
         assert_eq!(context.request_id.as_deref(), Some("job-1"));
         control.request_cancel();
         assert!(context.is_canceled());
+    }
+
+    #[test]
+    fn native_receipt_authority_propagates_through_slice_contexts() {
+        let receipt = NativeExecutionReceiptCollector::new();
+        let context = RequestExecutionContext::uncancellable("receipt propagation test")
+            .with_native_execution_receipt(receipt.clone())
+            .with_decode_work_progress_observer(WorkProgressObserver::new(|_, _| {}));
+        let propagated = context
+            .native_execution_receipt()
+            .expect("slice context retains receipt authority");
+        propagated.record_token(0, 7, false);
+        assert_eq!(receipt.snapshot().trace.event_count, 1);
     }
 
     #[test]

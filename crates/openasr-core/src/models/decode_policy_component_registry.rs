@@ -46,6 +46,7 @@ pub(crate) enum BuiltinDecodePolicySeq2SeqTextPostprocessKind {
 pub(crate) enum BuiltinDecodePolicySeq2SeqTraceKind {
     None,
     WhisperEnvV0,
+    RuntimeJsonlV1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,7 +158,7 @@ pub(crate) const QWEN3_ASR_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponent
         execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
         seq2seq_text_postprocess_kind:
             BuiltinDecodePolicySeq2SeqTextPostprocessKind::Qwen3AsrStripControlPrefixV0,
-        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::None,
+        seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
         seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::Qwen3AsrAudioBoundaryV0,
         seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
         longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Text,
@@ -768,6 +769,14 @@ fn emit_seq2seq_token_trace(
     token_id: u32,
     is_eot: bool,
 ) {
+    if kind == BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1 {
+        if let Some(receipt) =
+            crate::models::native_execution_services::current_execution_receipt_collector()
+        {
+            receipt.record_token(step_index, token_id, is_eot);
+        }
+        return;
+    }
     if kind != BuiltinDecodePolicySeq2SeqTraceKind::WhisperEnvV0
         || std::env::var_os("OPENASR_WHISPER_GGML_TRACE").is_none()
     {
@@ -784,6 +793,14 @@ fn emit_seq2seq_topk_trace(
     step_index: usize,
     logits: &[f32],
 ) {
+    if kind == BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1 {
+        if let Some(receipt) =
+            crate::models::native_execution_services::current_execution_receipt_collector()
+        {
+            receipt.record_top_k(step_index, logits);
+        }
+        return;
+    }
     if kind != BuiltinDecodePolicySeq2SeqTraceKind::WhisperEnvV0
         || std::env::var_os("OPENASR_WHISPER_GGML_TRACE_TOPK").is_none()
     {
@@ -1465,6 +1482,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn qwen_runtime_trace_producer_binds_to_request_receipt() {
+        let receipt =
+            crate::models::request_execution_receipt::NativeExecutionReceiptCollector::new();
+        let _guard = crate::models::native_execution_services::install_execution_receipt_collector(
+            Some(receipt.clone()),
+        );
+        emit_seq2seq_token_trace(
+            BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
+            0,
+            7,
+            false,
+        );
+        emit_seq2seq_topk_trace(
+            BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
+            0,
+            &[1.0, 0.5],
+        );
+        let text = receipt.snapshot().trace.jsonl;
+        assert!(text.contains("\"schema\":\"openasr.gpu-correctness-trace.v1\""));
+        assert!(text.contains("\"event\":\"token\""));
+        assert!(text.contains("\"event\":\"top_k\""));
+    }
     #[test]
     fn parakeet_decode_policy_is_ctc_greedy_with_blank() {
         let parakeet = resolve_builtin_decode_policy(crate::PARAKEET_CTC_DECODE_POLICY_ID)

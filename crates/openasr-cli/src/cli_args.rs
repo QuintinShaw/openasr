@@ -708,6 +708,11 @@ pub(crate) enum BenchReceiptCommand {
         /// Optional ffmpeg binary for non-WAV preparation.
         #[arg(long)]
         ffmpeg_bin: Option<PathBuf>,
+        /// Write the request-scoped native token trace. This strict output is
+        /// unavailable to mock runs and is produced only after a complete
+        /// native candidate records execution facts.
+        #[arg(long)]
+        trace_out: Option<PathBuf>,
     },
 }
 

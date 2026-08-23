@@ -43,6 +43,7 @@ use super::{
     },
     executor_component_registry::BuiltinStatefulExecutorScope,
     ggml_asr_executor::GgmlAsrExecutionDispatch,
+    request_execution_receipt::NativeExecutionReceiptCollector,
 };
 
 static NEXT_EXECUTION_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
@@ -107,6 +108,11 @@ thread_local! {
     static CURRENT_EXECUTION_CACHE_ATTEMPT_ID: Cell<Option<ExecutionCacheAttemptId>> = const {
         Cell::new(None)
     };
+    /// Strict receipt collection is opt-in and follows the concrete request
+    /// context through policy candidates and worker contexts. It is never
+    /// reconstructed from process state after native execution.
+    static CURRENT_EXECUTION_RECEIPT:
+        RefCell<Option<NativeExecutionReceiptCollector>> = const { RefCell::new(None) };
 }
 
 /// A backend that was actually constructed for one policy-scoped graph.
@@ -380,8 +386,15 @@ impl ExecutionLaneKey {
         self.backend
     }
 
-    #[cfg(test)]
-    fn placement(&self) -> ExecutionPlacement {
+    pub(crate) fn provider(&self) -> ExecutionProvider {
+        self.device.route.provider
+    }
+
+    pub(crate) fn stable_device_id(&self) -> &str {
+        &self.device.route.stable_id
+    }
+
+    pub(crate) fn placement(&self) -> ExecutionPlacement {
         self.placement
     }
 }
@@ -432,6 +445,7 @@ pub(crate) struct NativeExecutionContext {
     failure_sink: Option<ExecutionCandidateFailureSink>,
     cache_attempt_id: Option<ExecutionCacheAttemptId>,
     execution_telemetry: Option<GgmlExecutionTelemetryCollector>,
+    receipt: Option<NativeExecutionReceiptCollector>,
 }
 
 impl NativeExecutionContext {
@@ -448,6 +462,11 @@ impl NativeExecutionContext {
             && self.placement == other.placement
             && match (&self.observation_sink, &other.observation_sink) {
                 (Some(left), Some(right)) => Arc::ptr_eq(&left.observations, &right.observations),
+                (None, None) => true,
+                _ => false,
+            }
+            && match (&self.receipt, &other.receipt) {
+                (Some(_), Some(_)) => false,
                 (None, None) => true,
                 _ => false,
             }
@@ -497,6 +516,7 @@ impl NativeExecutionContext {
             failure_sink,
             cache_attempt_id,
             execution_telemetry,
+            receipt: first.receipt.clone(),
         }))
     }
 }
@@ -518,6 +538,7 @@ pub(crate) struct NativeExecutionContextGuard {
     previous_failure_sink: Option<ExecutionCandidateFailureSink>,
     previous_cache_attempt_id: Option<ExecutionCacheAttemptId>,
     execution_telemetry: GgmlExecutionTelemetryGuard,
+    previous_receipt: Option<NativeExecutionReceiptCollector>,
     backend: RequestBackendOverrideGuard,
 }
 
@@ -535,6 +556,9 @@ impl Drop for NativeExecutionContextGuard {
         });
         CURRENT_EXECUTION_CACHE_ATTEMPT_ID
             .with(|current| current.set(self.previous_cache_attempt_id.take()));
+        CURRENT_EXECUTION_RECEIPT.with(|current| {
+            *current.borrow_mut() = self.previous_receipt.take();
+        });
         // `scope` restores itself after this `Drop` returns.
         let _ = &self.scope;
         // `backend` restores itself after this `Drop` returns.
@@ -645,6 +669,7 @@ pub(crate) fn current_native_execution_context() -> Option<NativeExecutionContex
         failure_sink: current_execution_candidate_failure_sink(),
         cache_attempt_id: current_execution_cache_attempt_id(),
         execution_telemetry: current_execution_telemetry_collector(),
+        receipt: current_execution_receipt_collector(),
     })
 }
 
@@ -663,6 +688,34 @@ pub(crate) fn current_execution_observation_sink() -> Option<ExecutionObservatio
     CURRENT_EXECUTION_OBSERVATION_SINK.with(|current| current.borrow().clone())
 }
 
+/// Returns the explicit request-local receipt collector, when a strict native
+/// evidence producer installed one. Normal inference never creates it.
+pub(crate) fn current_execution_receipt_collector() -> Option<NativeExecutionReceiptCollector> {
+    CURRENT_EXECUTION_RECEIPT.with(|current| current.borrow().clone())
+}
+
+pub(crate) struct ExecutionReceiptCollectorGuard {
+    previous: Option<NativeExecutionReceiptCollector>,
+}
+
+impl Drop for ExecutionReceiptCollectorGuard {
+    fn drop(&mut self) {
+        CURRENT_EXECUTION_RECEIPT.with(|current| {
+            *current.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+/// Install the receipt authority carried by a concrete request context before
+/// candidate selection. Candidate/worker propagation then uses the existing
+/// `NativeExecutionContext` path.
+pub(crate) fn install_execution_receipt_collector(
+    collector: Option<NativeExecutionReceiptCollector>,
+) -> ExecutionReceiptCollectorGuard {
+    let previous = CURRENT_EXECUTION_RECEIPT.with(|current| current.replace(collector));
+    ExecutionReceiptCollectorGuard { previous }
+}
+
 /// Records a runner-backed observation only while an explicitly instrumented
 /// policy request is active. The route is recovered from the same Exact
 /// backend preference that the runner receives, never from an environment
@@ -675,6 +728,9 @@ pub(crate) fn record_current_execution_backend_observation(
     actual_stable_id: &str,
     use_scheduler: bool,
 ) {
+    if let Some(receipt) = current_execution_receipt_collector() {
+        receipt.record_backend_observation(actual_provider, actual_stable_id, use_scheduler);
+    }
     let Some(sink) = current_execution_observation_sink() else {
         return;
     };
@@ -937,6 +993,8 @@ pub(crate) fn install_native_execution_context(
     let previous_cache_attempt_id = CURRENT_EXECUTION_CACHE_ATTEMPT_ID
         .with(|current| current.replace(context.cache_attempt_id));
     let execution_telemetry = install_execution_telemetry_collector(context.execution_telemetry);
+    let previous_receipt =
+        CURRENT_EXECUTION_RECEIPT.with(|current| current.replace(context.receipt));
     let backend = install_request_backend_override(context.backend_preference);
     NativeExecutionContextGuard {
         scope,
@@ -946,6 +1004,7 @@ pub(crate) fn install_native_execution_context(
         previous_failure_sink,
         previous_cache_attempt_id,
         execution_telemetry,
+        previous_receipt,
         backend,
     }
 }
@@ -965,6 +1024,7 @@ pub(crate) fn install_native_execution_services(
         failure_sink: current_execution_candidate_failure_sink(),
         cache_attempt_id: current_execution_cache_attempt_id(),
         execution_telemetry: current_execution_telemetry_collector(),
+        receipt: current_execution_receipt_collector(),
     })
 }
 
@@ -993,6 +1053,7 @@ pub(crate) fn install_execution_candidate_attempt(
         failure_sink: Some(failure_sink),
         cache_attempt_id: current_execution_cache_attempt_id(),
         execution_telemetry: current_execution_telemetry_collector(),
+        receipt: current_execution_receipt_collector(),
     })
 }
 
@@ -1119,16 +1180,28 @@ pub(crate) fn run_execution_candidate_attempt<T, E>(
     let failure_sink = ExecutionCandidateFailureSink::new();
     let placement_collector = (candidate.placement != ExecutionPlacement::CpuOnly)
         .then(GgmlExecutionTelemetryCollector::new);
+    let receipt = current_execution_receipt_collector();
+    // This collector belongs to precisely one candidate attempt. It never
+    // consults the caller's cumulative telemetry when publishing receipt facts.
+    let receipt_collector = receipt
+        .as_ref()
+        .map(|_| GgmlExecutionTelemetryCollector::new());
     let outer_collector = current_execution_telemetry_collector();
     let combined_collector = GgmlExecutionTelemetryCollector::fanout(
-        outer_collector.iter().chain(placement_collector.iter()),
+        outer_collector
+            .iter()
+            .chain(placement_collector.iter())
+            .chain(receipt_collector.iter()),
     );
     // Audit observations follow the same candidate transaction as resident
     // cache publication. A failed FullDevice attempt must not contaminate the
     // evidence for a succeeding Hybrid attempt on the same Exact device.
     let observation_transaction = current_execution_observation_sink()
         .map(|parent| (parent, ExecutionObservationSink::new()));
-    let (result, candidate_failure, committed) = {
+    if let Some(receipt) = &receipt {
+        receipt.begin_candidate_attempt();
+    }
+    let (result, candidate_failure, committed, receipt_placement) = {
         let _observation_guard = observation_transaction
             .as_ref()
             .map(|(_, attempt)| install_execution_observation_sink(attempt.clone()));
@@ -1144,11 +1217,20 @@ pub(crate) fn run_execution_candidate_attempt<T, E>(
             });
         }
         let committed = result.is_ok() && candidate_failure.is_none();
+        let receipt_placement = receipt_collector
+            .as_ref()
+            .map(GgmlExecutionTelemetryCollector::snapshot);
         journal_scope.finish(committed);
-        (result, candidate_failure, committed)
+        (result, candidate_failure, committed, receipt_placement)
     };
     if committed && let Some((parent, attempt)) = observation_transaction {
         parent.append(attempt.observations());
+    }
+    if let Some(receipt) = receipt {
+        receipt.finish_candidate_attempt(committed);
+        if committed {
+            receipt.record_placement(receipt_placement.unwrap_or_default());
+        }
     }
     ExecutionCandidateAttemptOutcome {
         result,

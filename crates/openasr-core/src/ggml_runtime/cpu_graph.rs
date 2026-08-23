@@ -2021,6 +2021,8 @@ impl GgmlCpuGraphRunner {
         if exact_request
             || crate::models::native_execution_services::current_execution_observation_sink()
                 .is_some()
+            || crate::models::native_execution_services::current_execution_receipt_collector()
+                .is_some()
         {
             let (actual_provider, actual_stable_id) = backend_provider_and_stable_id(backend.raw)?;
             crate::models::native_execution_services::attest_current_exact_accelerated_backend(

@@ -393,6 +393,7 @@ async fn run() -> Result<()> {
                 core_commit,
                 scope,
                 ffmpeg_bin,
+                trace_out,
             } => {
                 let git_cwd = env::current_dir().ok();
                 bench_receipt_cli::bench_receipt_short_audio(
@@ -410,6 +411,7 @@ async fn run() -> Result<()> {
                         scope: &scope,
                         ffmpeg_bin,
                         git_cwd: git_cwd.as_deref(),
+                        trace_out: trace_out.as_deref(),
                     },
                 )
             }

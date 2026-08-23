@@ -57,6 +57,7 @@ pub(crate) mod policy_resolved_aux_runtime;
 pub(crate) mod prepared_runtime_cache;
 pub(crate) mod pyannote;
 pub mod qwen;
+pub mod request_execution_receipt;
 #[cfg(test)]
 mod resident_runtime_audit;
 pub(crate) mod runtime_asset_bootstrap;
