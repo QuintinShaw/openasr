@@ -13,8 +13,9 @@ use crate::ggml_runtime::{
     DecodeFirstDivergenceClass, DiagnosticFamilyCompactPolicy,
     DiagnosticFourQuadrantClassificationInput, EncoderKernelStageChecksumPair,
     EncoderKernelStageClass, EncoderKernelStageClassification,
-    EncoderKernelStageClassificationInput, EncoderKernelStageLayerChecksums, GgmlCpuGraphBackend,
-    GgmlDecodeReuseMode, SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS, classify_encoder_kernel_stage,
+    EncoderKernelStageClassificationInput, EncoderKernelStageLayerChecksums,
+    EncoderKernelStageStemChecksums, GgmlCpuGraphBackend, GgmlDecodeReuseMode,
+    SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS, classify_encoder_kernel_stage,
     classify_four_quadrant_first_divergence, diagnostic_host_first_max_token,
     diagnostic_logits_sha256, diagnostic_top2, run_diagnostic_dual_output_conformance,
     run_diagnostic_four_quadrant_cpu_probe,
@@ -81,6 +82,12 @@ fn class_name(class: DecodeFirstDivergenceClass) -> &'static str {
 
 fn kernel_stage_class_name(class: EncoderKernelStageClass) -> &'static str {
     match class {
+        EncoderKernelStageClass::SubsampleInput => "subsample_input",
+        EncoderKernelStageClass::SubsampleConvolution => "subsample_convolution",
+        EncoderKernelStageClass::SubsampleBias => "subsample_bias",
+        EncoderKernelStageClass::SubsampleRelu => "subsample_relu",
+        EncoderKernelStageClass::SubsampleLayout => "subsample_layout",
+        EncoderKernelStageClass::SubsampleOutputProjection => "subsample_output_projection",
         EncoderKernelStageClass::RelativePositionAttention => "relative_position_attention",
         EncoderKernelStageClass::DepthwiseConvolution => "depthwise_convolution",
         EncoderKernelStageClass::EncoderReadback => "encoder_readback",
@@ -456,8 +463,87 @@ impl OwnedTapPair {
     }
 }
 
+struct OwnedStemTapPairs {
+    mel_4d: OwnedTapPair,
+    conv1_raw: OwnedTapPair,
+    conv1_bias: OwnedTapPair,
+    conv1_relu: OwnedTapPair,
+    conv2_raw: OwnedTapPair,
+    conv2_bias: OwnedTapPair,
+    conv2_relu: OwnedTapPair,
+    after_permute: OwnedTapPair,
+    after_cont: OwnedTapPair,
+    flat_2d: OwnedTapPair,
+    out_matmul: OwnedTapPair,
+    subsample_out: OwnedTapPair,
+}
+
+impl OwnedStemTapPairs {
+    fn from_dumps(cpu: &FireRedEncoderTapDump, accel: &FireRedEncoderTapDump) -> Self {
+        let pair = |cpu: &[f32], accel: &[f32]| OwnedTapPair {
+            cpu: diagnostic_logits_sha256(cpu),
+            accel: diagnostic_logits_sha256(accel),
+        };
+        Self {
+            mel_4d: pair(&cpu.stem.mel_4d, &accel.stem.mel_4d),
+            conv1_raw: pair(&cpu.stem.conv1_raw, &accel.stem.conv1_raw),
+            conv1_bias: pair(&cpu.stem.conv1_bias, &accel.stem.conv1_bias),
+            conv1_relu: pair(&cpu.stem.conv1_relu, &accel.stem.conv1_relu),
+            conv2_raw: pair(&cpu.stem.conv2_raw, &accel.stem.conv2_raw),
+            conv2_bias: pair(&cpu.stem.conv2_bias, &accel.stem.conv2_bias),
+            conv2_relu: pair(&cpu.stem.conv2_relu, &accel.stem.conv2_relu),
+            after_permute: pair(&cpu.stem.after_permute, &accel.stem.after_permute),
+            after_cont: pair(&cpu.stem.after_cont, &accel.stem.after_cont),
+            flat_2d: pair(&cpu.stem.flat_2d, &accel.stem.flat_2d),
+            out_matmul: pair(&cpu.stem.out_matmul, &accel.stem.out_matmul),
+            subsample_out: pair(&cpu.stem.subsample_out, &accel.stem.subsample_out),
+        }
+    }
+
+    fn checksums(&self) -> EncoderKernelStageStemChecksums<'_> {
+        EncoderKernelStageStemChecksums {
+            mel_4d: Some(self.mel_4d.pair()),
+            conv1_raw: Some(self.conv1_raw.pair()),
+            conv1_bias: Some(self.conv1_bias.pair()),
+            conv1_relu: Some(self.conv1_relu.pair()),
+            conv2_raw: Some(self.conv2_raw.pair()),
+            conv2_bias: Some(self.conv2_bias.pair()),
+            conv2_relu: Some(self.conv2_relu.pair()),
+            after_permute: Some(self.after_permute.pair()),
+            after_cont: Some(self.after_cont.pair()),
+            flat_2d: Some(self.flat_2d.pair()),
+            out_matmul: Some(self.out_matmul.pair()),
+            subsample_out: Some(self.subsample_out.pair()),
+        }
+    }
+
+    fn json(&self) -> Value {
+        let pair = |pair: &OwnedTapPair| {
+            json!({
+                "cpu": &pair.cpu,
+                "metal": &pair.accel,
+                "matches": pair.cpu == pair.accel,
+            })
+        };
+        json!({
+            "mel_4d": pair(&self.mel_4d),
+            "conv1_raw": pair(&self.conv1_raw),
+            "conv1_bias": pair(&self.conv1_bias),
+            "conv1_relu": pair(&self.conv1_relu),
+            "conv2_raw": pair(&self.conv2_raw),
+            "conv2_bias": pair(&self.conv2_bias),
+            "conv2_relu": pair(&self.conv2_relu),
+            "after_permute": pair(&self.after_permute),
+            "after_cont": pair(&self.after_cont),
+            "flat_2d": pair(&self.flat_2d),
+            "out_matmul": pair(&self.out_matmul),
+            "subsample_out": pair(&self.subsample_out),
+        })
+    }
+}
+
 fn classify_owned(
-    subsample: &OwnedTapPair,
+    stem: &OwnedStemTapPairs,
     layers: &[(usize, OwnedTapPair, Option<[OwnedTapPair; 4]>)],
     encoder_output: &OwnedTapPair,
 ) -> EncoderKernelStageClassification {
@@ -484,7 +570,8 @@ fn classify_owned(
         })
         .collect();
     classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
-        subsample: Some(subsample.pair()),
+        stem: Some(stem.checksums()),
+        subsample: Some(stem.subsample_out.pair()),
         layers: &layer_views,
         encoder_output: Some(encoder_output.pair()),
     })
@@ -577,10 +664,7 @@ fn firered_cpu_metal_encoder_kernel_stage_and_four_quadrant() {
     )
     .expect("metal block taps");
 
-    let subsample = OwnedTapPair {
-        cpu: diagnostic_logits_sha256(&cpu_blocks.subsample_rows),
-        accel: diagnostic_logits_sha256(&metal_blocks.subsample_rows),
-    };
+    let stem = OwnedStemTapPairs::from_dumps(&cpu_blocks, &metal_blocks);
     let encoder_output = OwnedTapPair {
         cpu: diagnostic_logits_sha256(&cpu_encoder.rows),
         accel: diagnostic_logits_sha256(&metal_encoder.rows),
@@ -659,7 +743,7 @@ fn firered_cpu_metal_encoder_kernel_stage_and_four_quadrant() {
         };
         layers_owned.push((index, block, intra));
     }
-    let classification = classify_owned(&subsample, &layers_owned, &encoder_output);
+    let classification = classify_owned(&stem, &layers_owned, &encoder_output);
 
     eprintln!(
         "encoder_kernel_stage class={} layer={:?} tap={:?}",
@@ -917,10 +1001,11 @@ fn firered_cpu_metal_encoder_kernel_stage_and_four_quadrant() {
                 "matches_cpu": encoder_match,
             },
             "subsample": {
-                "cpu": subsample.cpu,
-                "metal": subsample.accel,
-                "matches": subsample.cpu == subsample.accel,
+                "cpu": &stem.subsample_out.cpu,
+                "metal": &stem.subsample_out.accel,
+                "matches": stem.subsample_out.cpu == stem.subsample_out.accel,
             },
+            "stem_taps": stem.json(),
         },
         "encoder_layer_taps": {
             "first_divergent_block_layer": first_block_layer,

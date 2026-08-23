@@ -1457,7 +1457,9 @@ pub(crate) fn encode_with_layer_taps(
         dilation_x: 1,
         dilation_y: 1,
     };
-    let mut state_4d = graph
+    // This diagnostic twin exposes every bounded stem seam as a graph output;
+    // the production encoder remains on the shared helper path.
+    let mel_4d = graph
         .reshape_4d(mel, feature_dim, padded_frames, 1, 1)
         .map_err(|source| map_err("ggml_reshape_4d(mel)", source))?;
     let conv1_bias_4d = reshape_bias_4d(
@@ -1467,20 +1469,24 @@ pub(crate) fn encode_with_layer_taps(
         "ggml_reshape_4d(subsample_conv1_bias)",
         map_err,
     )?;
-    state_4d = apply_conv_2d_bias_activation(
-        &graph,
-        weights.subsample_conv1_weight.as_graph_tensor(),
-        state_4d,
-        conv1_bias_4d,
-        subsample_params,
-        ConvActivation::Relu,
-        ConvBlockSteps {
-            conv: "ggml_conv_2d(subsample_conv1)",
-            bias: "ggml_add(subsample_conv1_bias)",
-            activation: "ggml_relu(subsample_conv1)",
-        },
-        map_err,
-    )?;
+    let conv1_raw = graph
+        .conv_2d(
+            weights.subsample_conv1_weight.as_graph_tensor(),
+            mel_4d,
+            subsample_params.stride_x,
+            subsample_params.stride_y,
+            subsample_params.padding_x,
+            subsample_params.padding_y,
+            subsample_params.dilation_x,
+            subsample_params.dilation_y,
+        )
+        .map_err(|source| map_err("ggml_conv_2d(subsample_conv1)", source))?;
+    let conv1_bias = graph
+        .add(conv1_raw, conv1_bias_4d)
+        .map_err(|source| map_err("ggml_add(subsample_conv1_bias)", source))?;
+    let conv1_relu = graph
+        .relu(conv1_bias)
+        .map_err(|source| map_err("ggml_relu(subsample_conv1)", source))?;
     let conv2_bias_4d = reshape_bias_4d(
         &graph,
         weights.subsample_conv2_bias.as_graph_tensor(),
@@ -1488,34 +1494,38 @@ pub(crate) fn encode_with_layer_taps(
         "ggml_reshape_4d(subsample_conv2_bias)",
         map_err,
     )?;
-    state_4d = apply_conv_2d_bias_activation(
-        &graph,
-        weights.subsample_conv2_weight.as_graph_tensor(),
-        state_4d,
-        conv2_bias_4d,
-        subsample_params,
-        ConvActivation::Relu,
-        ConvBlockSteps {
-            conv: "ggml_conv_2d(subsample_conv2)",
-            bias: "ggml_add(subsample_conv2_bias)",
-            activation: "ggml_relu(subsample_conv2)",
-        },
-        map_err,
-    )?;
-    let mut state = graph
-        .permute(state_4d, 0, 2, 1, 3)
+    let conv2_raw = graph
+        .conv_2d(
+            weights.subsample_conv2_weight.as_graph_tensor(),
+            conv1_relu,
+            subsample_params.stride_x,
+            subsample_params.stride_y,
+            subsample_params.padding_x,
+            subsample_params.padding_y,
+            subsample_params.dilation_x,
+            subsample_params.dilation_y,
+        )
+        .map_err(|source| map_err("ggml_conv_2d(subsample_conv2)", source))?;
+    let conv2_bias = graph
+        .add(conv2_raw, conv2_bias_4d)
+        .map_err(|source| map_err("ggml_add(subsample_conv2_bias)", source))?;
+    let conv2_relu = graph
+        .relu(conv2_bias)
+        .map_err(|source| map_err("ggml_relu(subsample_conv2)", source))?;
+    let after_permute = graph
+        .permute(conv2_relu, 0, 2, 1, 3)
         .map_err(|source| map_err("ggml_permute(subsample_flatten)", source))?;
-    state = graph
-        .cont(state)
+    let after_cont = graph
+        .cont(after_permute)
         .map_err(|source| map_err("ggml_cont(subsample_flatten)", source))?;
-    state = graph
-        .reshape_2d(state, metadata.subsample_out_dim, frame_count)
+    let flat_2d = graph
+        .reshape_2d(after_cont, metadata.subsample_out_dim, frame_count)
         .map_err(|source| map_err("ggml_reshape_2d(subsample_flatten)", source))?;
-    state = graph
-        .mul_mat(weights.subsample_out_weight.as_graph_tensor(), state)
+    let out_matmul = graph
+        .mul_mat(weights.subsample_out_weight.as_graph_tensor(), flat_2d)
         .map_err(|source| map_err("ggml_mul_mat(subsample_out)", source))?;
-    state = graph
-        .add(state, weights.subsample_out_bias.as_graph_tensor())
+    let mut state = graph
+        .add(out_matmul, weights.subsample_out_bias.as_graph_tensor())
         .map_err(|source| map_err("ggml_add(subsample_out_bias)", source))?;
 
     let subsample_out = state;
@@ -1549,7 +1559,21 @@ pub(crate) fn encode_with_layer_taps(
         block_outputs.push(state);
     }
 
-    let mut all_outputs = vec![subsample_out];
+    let stem_tensors = [
+        mel_4d,
+        conv1_raw,
+        conv1_bias,
+        conv1_relu,
+        conv2_raw,
+        conv2_bias,
+        conv2_relu,
+        after_permute,
+        after_cont,
+        flat_2d,
+        out_matmul,
+        subsample_out,
+    ];
+    let mut all_outputs = stem_tensors.to_vec();
     all_outputs.extend(block_outputs.iter().copied());
     if let Some(taps) = &intra_block_taps {
         all_outputs.extend([
@@ -1588,13 +1612,33 @@ pub(crate) fn encode_with_layer_taps(
     let expected_len = frame_count
         .checked_mul(metadata.d_model)
         .ok_or(FireRedEncoderError::ShapeOverflow)?;
-    // `subsample_out` is `state` AFTER the subsample stem's `self.out` Linear
-    // projection (matches Python's `embed_output`, already d_model-wide, not
-    // the raw pre-projection `subsample_out_dim`-wide conv output).
-    let subsample_len = expected_len;
+    let mel_4d_len = padded_frames
+        .checked_mul(feature_dim)
+        .ok_or(FireRedEncoderError::ShapeOverflow)?;
+    let conv1_time = conv_out_dim(padded_frames, 3, 2)?;
+    let conv1_len = conv1_freq
+        .checked_mul(conv1_time)
+        .and_then(|value| value.checked_mul(metadata.subsample_channels))
+        .ok_or(FireRedEncoderError::ShapeOverflow)?;
+    let conv2_len = metadata
+        .subsample_out_dim
+        .checked_mul(frame_count)
+        .ok_or(FireRedEncoderError::ShapeOverflow)?;
 
-    let mut requests: Vec<(crate::ggml_runtime::GgmlCpuTensor<'_>, usize)> =
-        vec![(subsample_out, subsample_len)];
+    let mut requests: Vec<(crate::ggml_runtime::GgmlCpuTensor<'_>, usize)> = vec![
+        (mel_4d, mel_4d_len),
+        (conv1_raw, conv1_len),
+        (conv1_bias, conv1_len),
+        (conv1_relu, conv1_len),
+        (conv2_raw, conv2_len),
+        (conv2_bias, conv2_len),
+        (conv2_relu, conv2_len),
+        (after_permute, conv2_len),
+        (after_cont, conv2_len),
+        (flat_2d, conv2_len),
+        (out_matmul, expected_len),
+        (subsample_out, expected_len),
+    ];
     requests.extend(block_outputs.iter().map(|&t| (t, expected_len)));
     if let Some(taps) = &intra_block_taps {
         requests.extend([
@@ -1613,7 +1657,20 @@ pub(crate) fn encode_with_layer_taps(
     })?;
 
     let mut iter = computed.drain(..);
-    let subsample_rows = iter.next().expect("subsample_out present");
+    let stem = FireRedEncoderStemTapDump {
+        mel_4d: iter.next().expect("mel_4d present"),
+        conv1_raw: iter.next().expect("conv1_raw present"),
+        conv1_bias: iter.next().expect("conv1_bias present"),
+        conv1_relu: iter.next().expect("conv1_relu present"),
+        conv2_raw: iter.next().expect("conv2_raw present"),
+        conv2_bias: iter.next().expect("conv2_bias present"),
+        conv2_relu: iter.next().expect("conv2_relu present"),
+        after_permute: iter.next().expect("after_permute present"),
+        after_cont: iter.next().expect("after_cont present"),
+        flat_2d: iter.next().expect("flat_2d present"),
+        out_matmul: iter.next().expect("out_matmul present"),
+        subsample_out: iter.next().expect("subsample_out present"),
+    };
     let block_rows: Vec<Vec<f32>> = (0..block_outputs.len())
         .map(|_| iter.next().expect("block output present"))
         .collect();
@@ -1633,24 +1690,45 @@ pub(crate) fn encode_with_layer_taps(
         frame_count,
         hidden_size: metadata.d_model,
         subsample_out_dim: metadata.subsample_out_dim,
-        subsample_rows,
+        stem,
         block_rows,
         intra_taps,
     })
 }
 
-/// Owned bisection dump: every block's final output plus, if requested, the
-/// intra-block taps of one layer -- all as row-major `[frame][hidden]` f32.
+/// Owned bisection dump: bounded subsample-stem checkpoints, every block's
+/// final output and, if requested, intra-block taps -- all read back as f32.
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct FireRedEncoderTapDump {
     pub frame_count: usize,
     pub hidden_size: usize,
     pub subsample_out_dim: usize,
-    pub subsample_rows: Vec<f32>,
+    pub stem: FireRedEncoderStemTapDump,
     /// `block_rows[i]` is Conformer block `i`'s final output (0-indexed).
     pub block_rows: Vec<Vec<f32>>,
     pub intra_taps: Option<FireRedEncoderIntraBlockDump>,
+}
+
+/// Every checkpoint in the test-only Conv2d subsampling diagnostic twin.
+///
+/// `subsample_out` is after the `self.out` Linear projection and its bias;
+/// `flat_2d` remains the raw flattened Conv2d output before that projection.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct FireRedEncoderStemTapDump {
+    pub mel_4d: Vec<f32>,
+    pub conv1_raw: Vec<f32>,
+    pub conv1_bias: Vec<f32>,
+    pub conv1_relu: Vec<f32>,
+    pub conv2_raw: Vec<f32>,
+    pub conv2_bias: Vec<f32>,
+    pub conv2_relu: Vec<f32>,
+    pub after_permute: Vec<f32>,
+    pub after_cont: Vec<f32>,
+    pub flat_2d: Vec<f32>,
+    pub out_matmul: Vec<f32>,
+    pub subsample_out: Vec<f32>,
 }
 
 #[cfg(test)]
@@ -2014,7 +2092,7 @@ mod parity_tests {
             std::fs::write(out_dir.join(name), bytes).expect("write dump file");
         };
 
-        write_f32("subsample_out.f32", &dump.subsample_rows);
+        write_f32("subsample_out.f32", &dump.stem.subsample_out);
         for (idx, rows) in dump.block_rows.iter().enumerate() {
             write_f32(&format!("block_{idx:02}.f32"), rows);
         }

@@ -252,11 +252,18 @@ pub struct DiagnosticFourQuadrantClassificationInput<'a> {
 ///
 /// Intra-block order is `ffn1_out` -> `attn_out` (relative-position attention)
 /// -> `conv_out` (depthwise) -> `ffn2_out` -> `block_out`. This enum is the
-/// contract three-way split; macaron FFN, subsample stem, and "no fork" all
-/// collapse to [`Self::InsufficientEvidence`].
+/// contract split. A fully bounded subsample-stem tap sequence names the first
+/// graph seam before the Conformer blocks; incomplete evidence still collapses
+/// to [`Self::InsufficientEvidence`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EncoderKernelStageClass {
+    SubsampleInput,
+    SubsampleConvolution,
+    SubsampleBias,
+    SubsampleRelu,
+    SubsampleLayout,
+    SubsampleOutputProjection,
     RelativePositionAttention,
     DepthwiseConvolution,
     EncoderReadback,
@@ -290,9 +297,31 @@ pub struct EncoderKernelStageLayerChecksums<'a> {
     pub block_out: Option<EncoderKernelStageChecksumPair<'a>>,
 }
 
+/// Ordered test-only FireRed Conv2d-subsampling checkpoints.
+///
+/// A classifier may name a subsample seam only when every checkpoint through
+/// that seam is present. This prevents a partial diagnostic dump from being
+/// promoted to an operator-level conclusion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncoderKernelStageStemChecksums<'a> {
+    pub mel_4d: Option<EncoderKernelStageChecksumPair<'a>>,
+    pub conv1_raw: Option<EncoderKernelStageChecksumPair<'a>>,
+    pub conv1_bias: Option<EncoderKernelStageChecksumPair<'a>>,
+    pub conv1_relu: Option<EncoderKernelStageChecksumPair<'a>>,
+    pub conv2_raw: Option<EncoderKernelStageChecksumPair<'a>>,
+    pub conv2_bias: Option<EncoderKernelStageChecksumPair<'a>>,
+    pub conv2_relu: Option<EncoderKernelStageChecksumPair<'a>>,
+    pub after_permute: Option<EncoderKernelStageChecksumPair<'a>>,
+    pub after_cont: Option<EncoderKernelStageChecksumPair<'a>>,
+    pub flat_2d: Option<EncoderKernelStageChecksumPair<'a>>,
+    pub out_matmul: Option<EncoderKernelStageChecksumPair<'a>>,
+    pub subsample_out: Option<EncoderKernelStageChecksumPair<'a>>,
+}
+
 /// Checksum-string input for [`classify_encoder_kernel_stage`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EncoderKernelStageClassificationInput<'a> {
+    pub stem: Option<EncoderKernelStageStemChecksums<'a>>,
     pub subsample: Option<EncoderKernelStageChecksumPair<'a>>,
     pub layers: &'a [EncoderKernelStageLayerChecksums<'a>],
     pub encoder_output: Option<EncoderKernelStageChecksumPair<'a>>,
@@ -328,6 +357,83 @@ fn encoder_kernel_stage_result(
 pub fn classify_encoder_kernel_stage(
     input: EncoderKernelStageClassificationInput<'_>,
 ) -> EncoderKernelStageClassification {
+    if let Some(stem) = input.stem {
+        let ordered = [
+            (
+                stem.mel_4d,
+                EncoderKernelStageClass::SubsampleInput,
+                "mel_4d",
+            ),
+            (
+                stem.conv1_raw,
+                EncoderKernelStageClass::SubsampleConvolution,
+                "conv1_raw",
+            ),
+            (
+                stem.conv1_bias,
+                EncoderKernelStageClass::SubsampleBias,
+                "conv1_bias",
+            ),
+            (
+                stem.conv1_relu,
+                EncoderKernelStageClass::SubsampleRelu,
+                "conv1_relu",
+            ),
+            (
+                stem.conv2_raw,
+                EncoderKernelStageClass::SubsampleConvolution,
+                "conv2_raw",
+            ),
+            (
+                stem.conv2_bias,
+                EncoderKernelStageClass::SubsampleBias,
+                "conv2_bias",
+            ),
+            (
+                stem.conv2_relu,
+                EncoderKernelStageClass::SubsampleRelu,
+                "conv2_relu",
+            ),
+            (
+                stem.after_permute,
+                EncoderKernelStageClass::SubsampleLayout,
+                "after_permute",
+            ),
+            (
+                stem.after_cont,
+                EncoderKernelStageClass::SubsampleLayout,
+                "after_cont",
+            ),
+            (
+                stem.flat_2d,
+                EncoderKernelStageClass::SubsampleLayout,
+                "flat_2d",
+            ),
+            (
+                stem.out_matmul,
+                EncoderKernelStageClass::SubsampleOutputProjection,
+                "out_matmul",
+            ),
+            (
+                stem.subsample_out,
+                EncoderKernelStageClass::SubsampleOutputProjection,
+                "subsample_out",
+            ),
+        ];
+        for (tap, class, name) in ordered {
+            let Some(tap) = tap else {
+                return encoder_kernel_stage_result(
+                    EncoderKernelStageClass::InsufficientEvidence,
+                    None,
+                    Some(name),
+                );
+            };
+            if tap.differs() {
+                return encoder_kernel_stage_result(class, None, Some(name));
+            }
+        }
+    }
+
     if input
         .subsample
         .is_some_and(EncoderKernelStageChecksumPair::differs)
@@ -1121,10 +1227,85 @@ mod tests {
         }
     }
 
+    fn stem_checksums(
+        first_difference: Option<&'static str>,
+    ) -> EncoderKernelStageStemChecksums<'static> {
+        let pair = |name| {
+            if first_difference == Some(name) {
+                Some(DIFF)
+            } else {
+                Some(SAME)
+            }
+        };
+        EncoderKernelStageStemChecksums {
+            mel_4d: pair("mel_4d"),
+            conv1_raw: pair("conv1_raw"),
+            conv1_bias: pair("conv1_bias"),
+            conv1_relu: pair("conv1_relu"),
+            conv2_raw: pair("conv2_raw"),
+            conv2_bias: pair("conv2_bias"),
+            conv2_relu: pair("conv2_relu"),
+            after_permute: pair("after_permute"),
+            after_cont: pair("after_cont"),
+            flat_2d: pair("flat_2d"),
+            out_matmul: pair("out_matmul"),
+            subsample_out: pair("subsample_out"),
+        }
+    }
+
+    #[test]
+    fn classify_encoder_kernel_stage_names_first_bounded_stem_seam() {
+        for (tap, class) in [
+            ("mel_4d", EncoderKernelStageClass::SubsampleInput),
+            ("conv1_raw", EncoderKernelStageClass::SubsampleConvolution),
+            ("conv1_bias", EncoderKernelStageClass::SubsampleBias),
+            ("conv1_relu", EncoderKernelStageClass::SubsampleRelu),
+            ("conv2_raw", EncoderKernelStageClass::SubsampleConvolution),
+            ("conv2_bias", EncoderKernelStageClass::SubsampleBias),
+            ("conv2_relu", EncoderKernelStageClass::SubsampleRelu),
+            ("after_permute", EncoderKernelStageClass::SubsampleLayout),
+            ("after_cont", EncoderKernelStageClass::SubsampleLayout),
+            ("flat_2d", EncoderKernelStageClass::SubsampleLayout),
+            (
+                "out_matmul",
+                EncoderKernelStageClass::SubsampleOutputProjection,
+            ),
+            (
+                "subsample_out",
+                EncoderKernelStageClass::SubsampleOutputProjection,
+            ),
+        ] {
+            let result = classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+                stem: Some(stem_checksums(Some(tap))),
+                subsample: Some(DIFF),
+                layers: &[],
+                encoder_output: Some(DIFF),
+            });
+            assert_eq!(result.class, class, "tap={tap}");
+            assert_eq!(result.first_divergent_tap.as_deref(), Some(tap));
+            assert_eq!(result.first_divergent_layer, None);
+        }
+    }
+
+    #[test]
+    fn classify_encoder_kernel_stage_rejects_incomplete_stem_evidence() {
+        let mut stem = stem_checksums(None);
+        stem.conv2_bias = None;
+        let result = classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+            stem: Some(stem),
+            subsample: Some(DIFF),
+            layers: &[],
+            encoder_output: Some(DIFF),
+        });
+        assert_eq!(result.class, EncoderKernelStageClass::InsufficientEvidence);
+        assert_eq!(result.first_divergent_tap.as_deref(), Some("conv2_bias"));
+    }
+
     #[test]
     fn classify_encoder_kernel_stage_contract_cases() {
         let missing_intra = [kernel_stage_layer(0, None, DIFF)];
         let missing = classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+            stem: None,
             subsample: Some(SAME),
             layers: &missing_intra,
             encoder_output: Some(DIFF),
@@ -1134,6 +1315,7 @@ mod tests {
 
         let subsample_layers = [kernel_stage_layer(0, Some((SAME, DIFF, SAME, SAME)), DIFF)];
         let subsample = classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+            stem: None,
             subsample: Some(DIFF),
             layers: &subsample_layers,
             encoder_output: Some(DIFF),
@@ -1153,6 +1335,7 @@ mod tests {
             kernel_stage_layer(1, Some((SAME, DIFF, SAME, SAME)), DIFF),
         ];
         let attn = classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+            stem: None,
             subsample: Some(SAME),
             layers: &attn_layers,
             encoder_output: Some(DIFF),
@@ -1166,6 +1349,7 @@ mod tests {
 
         let conv_layers = [kernel_stage_layer(0, Some((SAME, SAME, DIFF, SAME)), DIFF)];
         let conv = classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+            stem: None,
             subsample: Some(SAME),
             layers: &conv_layers,
             encoder_output: Some(DIFF),
@@ -1175,6 +1359,7 @@ mod tests {
 
         let ffn1_layers = [kernel_stage_layer(0, Some((DIFF, DIFF, SAME, SAME)), DIFF)];
         let ffn1 = classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+            stem: None,
             subsample: Some(SAME),
             layers: &ffn1_layers,
             encoder_output: Some(DIFF),
@@ -1184,6 +1369,7 @@ mod tests {
 
         let ffn2_layers = [kernel_stage_layer(0, Some((SAME, SAME, SAME, DIFF)), DIFF)];
         let ffn2 = classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+            stem: None,
             subsample: Some(SAME),
             layers: &ffn2_layers,
             encoder_output: Some(DIFF),
@@ -1193,6 +1379,7 @@ mod tests {
 
         let readback_block_layers = [kernel_stage_layer(0, Some((SAME, SAME, SAME, SAME)), DIFF)];
         let readback_block = classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+            stem: None,
             subsample: Some(SAME),
             layers: &readback_block_layers,
             encoder_output: Some(DIFF),
@@ -1209,6 +1396,7 @@ mod tests {
         let matching_layers = [kernel_stage_layer(0, Some((SAME, SAME, SAME, SAME)), SAME)];
         let readback_output =
             classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+                stem: None,
                 subsample: Some(SAME),
                 layers: &matching_layers,
                 encoder_output: Some(DIFF),
@@ -1224,6 +1412,7 @@ mod tests {
         );
 
         let all_same = classify_encoder_kernel_stage(EncoderKernelStageClassificationInput {
+            stem: None,
             subsample: Some(SAME),
             layers: &matching_layers,
             encoder_output: Some(SAME),
@@ -1238,6 +1427,11 @@ mod tests {
 
     #[test]
     fn classify_encoder_kernel_stage_serde_is_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&EncoderKernelStageClass::SubsampleConvolution)
+                .expect("serialize class"),
+            "\"subsample_convolution\""
+        );
         let encoded = serde_json::to_string(&EncoderKernelStageClass::RelativePositionAttention)
             .expect("serialize class");
         assert_eq!(encoded, "\"relative_position_attention\"");
