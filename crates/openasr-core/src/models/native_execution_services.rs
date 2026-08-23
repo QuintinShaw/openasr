@@ -1647,20 +1647,46 @@ impl ResolvedDefaultModelActivation {
         &self.facts
     }
 
-    pub fn quote_and_reserve(
-        &self,
-        services: &NativeExecutionServices,
-    ) -> Result<BrokerActivationReservation, String> {
-        let (_backends, _mapping, native_plan) = quote_candidate_activation_plan(
+    pub fn quote(&self) -> Result<DefaultModelActivationQuote, String> {
+        let (_backends, _mapping, plan) = quote_candidate_activation_plan(
             &self.verified_pack,
             &self.candidate,
             self.facts.plan().resident_topology(),
         )?;
+        Ok(DefaultModelActivationQuote {
+            plan,
+            candidate: self.candidate.clone(),
+            content_id: self.verified_pack.content_id().to_string(),
+        })
+    }
+
+    pub fn quote_and_reserve(
+        &self,
+        services: &NativeExecutionServices,
+    ) -> Result<BrokerActivationReservation, String> {
+        self.quote()?.reserve(services)
+    }
+}
+
+/// Opaque, observation-bound activation quote. The server can place a fault
+/// or audit checkpoint between quote/stat observation and broker mutation, but
+/// cannot inspect or rewrite physical-domain rows.
+pub struct DefaultModelActivationQuote {
+    plan: NativeMemoryAdmissionPlan,
+    candidate: ExecutionCandidate,
+    content_id: String,
+}
+
+impl DefaultModelActivationQuote {
+    pub fn reserve(
+        self,
+        services: &NativeExecutionServices,
+    ) -> Result<BrokerActivationReservation, String> {
         reserve_activation_plan(
             services,
-            &native_plan,
+            &self.plan,
             &self.candidate,
-            Some(self.verified_pack.content_id()),
+            Some(&self.content_id),
         )
     }
 }

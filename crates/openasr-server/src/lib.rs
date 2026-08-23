@@ -1309,6 +1309,43 @@ pub struct ActiveRuntimeSlot {
     /// [`crate::realtime::probe_native_activation`]. Production leaves this
     /// unset so live warmup runs.
     activation_probe_failpoint: Arc<RwLock<Option<Result<(), String>>>>,
+    activation_failpoint: Arc<RwLock<Option<ModelActivationFailpoint>>>,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelActivationFailpoint {
+    PackVerification,
+    CandidateResolution,
+    QuoteObservation,
+    BrokerReservation,
+    NativeMaterialization,
+    FirstComputeAttestation,
+    Reconciliation,
+    V2StagingWrite,
+    V2StagingSync,
+    AtomicBeforeReplace,
+    AtomicAfterReplace,
+    DurableCommitBeforeLivePublish,
+}
+
+impl ModelActivationFailpoint {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::PackVerification => "pack-verification",
+            Self::CandidateResolution => "candidate-resolution",
+            Self::QuoteObservation => "quote-observation",
+            Self::BrokerReservation => "broker-reservation",
+            Self::NativeMaterialization => "native-materialization",
+            Self::FirstComputeAttestation => "first-compute-attestation",
+            Self::Reconciliation => "reconciliation",
+            Self::V2StagingWrite => "v2-staging-write",
+            Self::V2StagingSync => "v2-staging-sync",
+            Self::AtomicBeforeReplace => "atomic-before-replace",
+            Self::AtomicAfterReplace => "atomic-after-replace",
+            Self::DurableCommitBeforeLivePublish => "durable-commit-before-live-publish",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1366,6 +1403,7 @@ impl From<Option<PathBuf>> for ActiveRuntimeSlot {
             })),
             activation_barrier: Arc::new(Mutex::new(())),
             activation_probe_failpoint: Arc::new(RwLock::new(None)),
+            activation_failpoint: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -1381,6 +1419,7 @@ impl ActiveRuntimeSlot {
             })),
             activation_barrier: Arc::new(Mutex::new(())),
             activation_probe_failpoint: Arc::new(RwLock::new(None)),
+            activation_failpoint: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -1456,6 +1495,57 @@ impl ActiveRuntimeSlot {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    #[doc(hidden)]
+    pub fn set_activation_failpoint_for_test(&self, failpoint: Option<ModelActivationFailpoint>) {
+        *self
+            .activation_failpoint
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = failpoint;
+    }
+
+    pub(crate) fn inject_activation_failure(
+        &self,
+        stage: ModelActivationFailpoint,
+    ) -> Result<(), ApiError> {
+        let configured = *self
+            .activation_failpoint
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if configured == Some(stage) {
+            Err(ApiError::BadRequest(format!(
+                "injected default model activation failure at {}",
+                stage.label()
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn selection_write_fault(
+        &self,
+    ) -> Option<openasr_core::default_selection::DefaultSelectionWriteFault> {
+        use openasr_core::default_selection::DefaultSelectionWriteFault;
+        match *self
+            .activation_failpoint
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            Some(ModelActivationFailpoint::V2StagingWrite) => {
+                Some(DefaultSelectionWriteFault::BeforeStagingWrite)
+            }
+            Some(ModelActivationFailpoint::V2StagingSync) => {
+                Some(DefaultSelectionWriteFault::BeforeStagingSync)
+            }
+            Some(ModelActivationFailpoint::AtomicBeforeReplace) => {
+                Some(DefaultSelectionWriteFault::BeforeAtomicReplace)
+            }
+            Some(ModelActivationFailpoint::AtomicAfterReplace) => {
+                Some(DefaultSelectionWriteFault::AfterAtomicReplace)
+            }
+            _ => None,
+        }
     }
 }
 

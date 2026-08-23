@@ -11,9 +11,9 @@ use std::cell::Cell;
 
 static ATOMIC_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AtomicFileFailpoint {
+    BeforeSync,
     BeforeReplace,
     AfterReplace,
 }
@@ -27,15 +27,32 @@ thread_local! {
 pub(crate) fn set_atomic_file_failpoint(failpoint: Option<AtomicFileFailpoint>) {
     let value = match failpoint {
         None => 0,
-        Some(AtomicFileFailpoint::BeforeReplace) => 1,
-        Some(AtomicFileFailpoint::AfterReplace) => 2,
+        Some(AtomicFileFailpoint::BeforeSync) => 1,
+        Some(AtomicFileFailpoint::BeforeReplace) => 2,
+        Some(AtomicFileFailpoint::AfterReplace) => 3,
     };
     ATOMIC_FILE_FAILPOINT.with(|current| current.set(value));
 }
 
-fn failpoint_before_replace() -> io::Result<()> {
+fn failpoint_before_sync(explicit: Option<AtomicFileFailpoint>) -> io::Result<()> {
+    if explicit == Some(AtomicFileFailpoint::BeforeSync) {
+        return Err(io::Error::other("injected failure before staging sync"));
+    }
     #[cfg(test)]
     if ATOMIC_FILE_FAILPOINT.with(Cell::get) == 1 {
+        return Err(io::Error::other("injected failure before staging sync"));
+    }
+    Ok(())
+}
+
+fn failpoint_before_replace(explicit: Option<AtomicFileFailpoint>) -> io::Result<()> {
+    if explicit == Some(AtomicFileFailpoint::BeforeReplace) {
+        return Err(io::Error::other(
+            "injected failure before atomic replacement",
+        ));
+    }
+    #[cfg(test)]
+    if ATOMIC_FILE_FAILPOINT.with(Cell::get) == 2 {
         return Err(io::Error::other(
             "injected failure before atomic replacement",
         ));
@@ -43,9 +60,14 @@ fn failpoint_before_replace() -> io::Result<()> {
     Ok(())
 }
 
-fn failpoint_after_replace() -> io::Result<()> {
+fn failpoint_after_replace(explicit: Option<AtomicFileFailpoint>) -> io::Result<()> {
+    if explicit == Some(AtomicFileFailpoint::AfterReplace) {
+        return Err(io::Error::other(
+            "injected failure after atomic replacement",
+        ));
+    }
     #[cfg(test)]
-    if ATOMIC_FILE_FAILPOINT.with(Cell::get) == 2 {
+    if ATOMIC_FILE_FAILPOINT.with(Cell::get) == 3 {
         return Err(io::Error::other(
             "injected failure after atomic replacement",
         ));
@@ -65,6 +87,21 @@ pub(crate) fn write_file_atomically_detailed(
     mode: AtomicFileMode,
 ) -> Result<AtomicWriteOutcome, AtomicWriteError> {
     write_file_atomically_detailed_with(&RealAtomicFileSystem, path, contents, mode)
+}
+
+pub(crate) fn write_file_atomically_detailed_with_failpoint(
+    path: &Path,
+    contents: &[u8],
+    mode: AtomicFileMode,
+    failpoint: AtomicFileFailpoint,
+) -> Result<AtomicWriteOutcome, AtomicWriteError> {
+    write_file_atomically_detailed_with_injected(
+        &RealAtomicFileSystem,
+        path,
+        contents,
+        mode,
+        Some(failpoint),
+    )
 }
 
 /// Result of replacing a staged file. A committed replacement whose parent
@@ -204,6 +241,16 @@ fn write_file_atomically_detailed_with(
     contents: &[u8],
     mode: AtomicFileMode,
 ) -> Result<AtomicWriteOutcome, AtomicWriteError> {
+    write_file_atomically_detailed_with_injected(fs, path, contents, mode, None)
+}
+
+fn write_file_atomically_detailed_with_injected(
+    fs: &impl AtomicFileSystem,
+    path: &Path,
+    contents: &[u8],
+    mode: AtomicFileMode,
+    failpoint: Option<AtomicFileFailpoint>,
+) -> Result<AtomicWriteOutcome, AtomicWriteError> {
     let temp_path = atomic_temp_path(path);
     let result = (|| {
         let mut file = fs
@@ -216,13 +263,14 @@ fn write_file_atomically_detailed_with(
         file.write_all(contents)
             .map_err(AtomicWriteError::NotCommitted)?;
         file.flush().map_err(AtomicWriteError::NotCommitted)?;
+        failpoint_before_sync(failpoint).map_err(AtomicWriteError::NotCommitted)?;
         file.sync_all().map_err(AtomicWriteError::NotCommitted)?;
         drop(file);
-        failpoint_before_replace().map_err(AtomicWriteError::NotCommitted)?;
+        failpoint_before_replace(failpoint).map_err(AtomicWriteError::NotCommitted)?;
         fs.rename(&temp_path, path)
             .map_err(AtomicWriteError::NotCommitted)?;
 
-        let mut warning = failpoint_after_replace().err();
+        let mut warning = failpoint_after_replace(failpoint).err();
         if warning.is_none() && mode == AtomicFileMode::OwnerOnly {
             warning = fs.set_owner_only_permissions(path).err();
         }

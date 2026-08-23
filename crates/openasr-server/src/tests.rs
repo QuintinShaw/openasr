@@ -2105,6 +2105,294 @@ async fn set_default_model_http_keeps_previous_selection_when_persist_fails() {
 }
 
 #[tokio::test]
+async fn set_default_model_failure_matrix_preserves_precommit_state() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let previous_path = write_installed_pack_ref(
+        &home,
+        "whisper-failure-a",
+        "whisper-failure-a:q4",
+        "q4_0",
+        "q4",
+        "whisper-failure-a",
+    );
+    let _next_path = write_installed_pack_ref(
+        &home,
+        "whisper-failure-b",
+        "whisper-failure-b:q4",
+        "q4_0",
+        "q4",
+        "whisper-failure-b",
+    );
+    let previous = installed_pack_by_pull(&home, "whisper-failure-a:q4");
+    persist_default_pack(&home, &previous, QuantPreference::pinned(&previous.quant)).unwrap();
+    let durable_before =
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap();
+
+    for failpoint in [
+        ModelActivationFailpoint::PackVerification,
+        ModelActivationFailpoint::CandidateResolution,
+        ModelActivationFailpoint::QuoteObservation,
+        ModelActivationFailpoint::BrokerReservation,
+        ModelActivationFailpoint::NativeMaterialization,
+        ModelActivationFailpoint::FirstComputeAttestation,
+        ModelActivationFailpoint::Reconciliation,
+        ModelActivationFailpoint::V2StagingWrite,
+        ModelActivationFailpoint::V2StagingSync,
+        ModelActivationFailpoint::AtomicBeforeReplace,
+    ] {
+        let runtime = ServerRuntime {
+            backend: BackendKind::Native,
+            native_execution: NativeExecutionSupervisor::default(),
+            ffmpeg_bin: None,
+            ffmpeg_bin_explicit: false,
+            model_pack_path: Some(previous_path.clone()).into(),
+        };
+        runtime
+            .model_pack_path
+            .set_activation_probe_failpoint(Some(activation_probe_ok()));
+        runtime
+            .model_pack_path
+            .set_activation_failpoint_for_test(Some(failpoint));
+        let app = app_with_runtime_and_distribution(
+            runtime.clone(),
+            DistributionRuntime {
+                openasr_home: Some(home.clone()),
+                catalog_url: None,
+                catalog_local_override: None,
+            },
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/models/default")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "pull": "whisper-failure-b:q4" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{failpoint:?}");
+        assert_eq!(
+            runtime.model_pack_path.current().as_deref(),
+            Some(previous_path.as_path()),
+            "live state changed at {failpoint:?}"
+        );
+        assert_eq!(
+            openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap(),
+            durable_before,
+            "durable state changed at {failpoint:?}"
+        );
+        let services = runtime.native_execution.execution_services();
+        assert_eq!(
+            services
+                .runtime_receipts()
+                .reconcile_live_leases_quiescent(services.memory_broker()),
+            openasr_core::runtime_receipts::LeaseReceiptShadow::Matched,
+            "owner ledger leaked at {failpoint:?}"
+        );
+        assert!(
+            std::fs::read_dir(&home)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    !(name.starts_with(".openasr-") && name.ends_with(".tmp"))
+                }),
+            "orphan staging file after {failpoint:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn atomic_after_replace_commits_and_publishes_instead_of_rolling_back() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let previous_path = write_installed_pack_ref(
+        &home,
+        "whisper-after-replace-a",
+        "whisper-after-replace-a:q4",
+        "q4_0",
+        "q4",
+        "whisper-after-replace-a",
+    );
+    let next_path = write_installed_pack_ref(
+        &home,
+        "whisper-after-replace-b",
+        "whisper-after-replace-b:q4",
+        "q4_0",
+        "q4",
+        "whisper-after-replace-b",
+    );
+    let previous = installed_pack_by_pull(&home, "whisper-after-replace-a:q4");
+    persist_default_pack(&home, &previous, QuantPreference::pinned(&previous.quant)).unwrap();
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(previous_path).into(),
+    };
+    runtime
+        .model_pack_path
+        .set_activation_probe_failpoint(Some(activation_probe_ok()));
+    runtime
+        .model_pack_path
+        .set_activation_failpoint_for_test(Some(ModelActivationFailpoint::AtomicAfterReplace));
+    let app = app_with_runtime_and_distribution(
+        runtime.clone(),
+        DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/default")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "pull": "whisper-after-replace-b:q4" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(next_path.as_path())
+    );
+    let durable = openasr_core::default_selection::read_active_model_selection_v2(&home)
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.pull.as_deref(), Some("whisper-after-replace-b:q4"));
+}
+
+#[tokio::test]
+async fn restart_reactivates_commit_that_preceded_live_pointer_exchange() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let previous_path = write_installed_pack_ref(
+        &home,
+        "whisper-restart-a",
+        "whisper-restart-a:q4",
+        "q4_0",
+        "q4",
+        "whisper-restart-a",
+    );
+    let next_path = write_installed_pack_ref(
+        &home,
+        "whisper-restart-b",
+        "whisper-restart-b:q4",
+        "q4_0",
+        "q4",
+        "whisper-restart-b",
+    );
+    let previous = installed_pack_by_pull(&home, "whisper-restart-a:q4");
+    persist_default_pack(&home, &previous, QuantPreference::pinned(&previous.quant)).unwrap();
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(previous_path.clone()).into(),
+    };
+    runtime
+        .model_pack_path
+        .set_activation_probe_failpoint(Some(activation_probe_ok()));
+    runtime
+        .model_pack_path
+        .set_activation_failpoint_for_test(Some(
+            ModelActivationFailpoint::DurableCommitBeforeLivePublish,
+        ));
+    let app = app_with_runtime_and_distribution(
+        runtime.clone(),
+        DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/default")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "pull": "whisper-restart-b:q4" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(previous_path.as_path()),
+        "the killed process never exchanged its live pointer"
+    );
+    let durable = openasr_core::default_selection::read_active_model_selection_v2(&home)
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.pull.as_deref(), Some("whisper-restart-b:q4"));
+
+    let restarted = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: ActiveRuntimeSlot::requested(Some(next_path.clone())),
+    };
+    restarted
+        .model_pack_path
+        .set_activation_probe_failpoint(Some(activation_probe_ok()));
+    let next = installed_pack_by_pull(&home, "whisper-restart-b:q4");
+    let intent =
+        openasr_core::default_selection::execution_intent_from_v2_wire(&durable.execution_intent)
+            .unwrap();
+    activate_default_model_blocking(
+        &restarted,
+        &home,
+        &next,
+        durable.quant_preference.clone(),
+        intent,
+        DefaultModelActivationMode::ReactivateDurableSelection,
+    )
+    .unwrap();
+    assert_eq!(
+        restarted.model_pack_path.current().as_deref(),
+        Some(next_path.as_path())
+    );
+    assert_eq!(
+        openasr_core::default_selection::read_active_model_selection_v2(&home)
+            .unwrap()
+            .unwrap(),
+        durable,
+        "restart reactivation must not mint another durable generation"
+    );
+}
+
+#[tokio::test]
 async fn set_default_model_http_persists_only_after_activation_probe_succeeds() {
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
@@ -2391,8 +2679,8 @@ fn set_default_model_http_stage_does_not_publish_live() {
         "set_default_model must not reserve with NoopActivationReservation"
     );
     assert!(
-        set_default.contains(".quote_and_reserve("),
-        "set_default_model must quote and reserve known physical domains"
+        set_default.contains(".quote()") && set_default.contains(".reserve(services.as_ref())"),
+        "set_default_model must separate quote observation from broker reservation"
     );
     assert!(
         !set_default.contains("ResolvedExecutionRoute::cpu()"),

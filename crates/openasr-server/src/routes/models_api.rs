@@ -83,6 +83,9 @@ pub(crate) fn activate_default_model_blocking(
         ));
     }
 
+    runtime
+        .model_pack_path
+        .inject_activation_failure(ModelActivationFailpoint::PackVerification)?;
     let verified_pack = openasr_core::PackVerifier
         .verify_candidate(openasr_core::PackCandidate::new(pack.path.clone()))
         .map_err(|error| {
@@ -90,6 +93,9 @@ pub(crate) fn activate_default_model_blocking(
                 "default model pack is not a verified activation pack: {error}"
             ))
         })?;
+    runtime
+        .model_pack_path
+        .inject_activation_failure(ModelActivationFailpoint::CandidateResolution)?;
     let services = runtime.native_execution.execution_services();
     let resolved_activation = openasr_core::resolve_default_model_activation(
         services.as_ref(),
@@ -119,6 +125,12 @@ pub(crate) fn activate_default_model_blocking(
             )
         }
     };
+    let journal = match runtime.model_pack_path.selection_write_fault() {
+        Some(fault) if mode == DefaultModelActivationMode::PersistSelection => {
+            journal.with_selection_write_fault_for_test(fault)
+        }
+        _ => journal,
+    };
     let prepared = journal.prepare(
         openasr_core::DefaultModelActivationCandidate {
             pull: pack.pull.clone(),
@@ -128,14 +140,29 @@ pub(crate) fn activate_default_model_blocking(
         facts,
     );
     debug_assert_eq!(prepared.stage(), openasr_core::ActivationStage::Prepared);
-    let reservation = resolved_activation
-        .quote_and_reserve(services.as_ref())
-        .map_err(|reason| {
-            ApiError::BadRequest(format!("default model activation reserve failed: {reason}"))
-        })?;
+    runtime
+        .model_pack_path
+        .inject_activation_failure(ModelActivationFailpoint::QuoteObservation)?;
+    let quote = resolved_activation.quote().map_err(|reason| {
+        ApiError::BadRequest(format!("default model activation quote failed: {reason}"))
+    })?;
+    runtime
+        .model_pack_path
+        .inject_activation_failure(ModelActivationFailpoint::BrokerReservation)?;
+    let reservation = quote.reserve(services.as_ref()).map_err(|reason| {
+        ApiError::BadRequest(format!("default model activation reserve failed: {reason}"))
+    })?;
     let reservation_context = reservation.context();
     let reserved = prepared.reserve(reservation);
     debug_assert_eq!(reserved.stage(), openasr_core::ActivationStage::Reserved);
+
+    if let Err(error) = runtime
+        .model_pack_path
+        .inject_activation_failure(ModelActivationFailpoint::NativeMaterialization)
+    {
+        let _ = reserved.rollback_activation();
+        return Err(error);
+    }
 
     let staged = NativeActivationStagedOwner::stage(
         &runtime,
@@ -181,6 +208,10 @@ pub(crate) fn activate_default_model_blocking(
     attested.commit_activation().map_err(|source| {
         ApiError::BadRequest(format!("default model was not committed: {source}"))
     })?;
+
+    runtime
+        .model_pack_path
+        .inject_activation_failure(ModelActivationFailpoint::DurableCommitBeforeLivePublish)?;
 
     // Durable V2 is the commit frontier. Live publication is the non-fallible
     // follow-up: it must not run before persist, and a failed persist must
@@ -296,6 +327,10 @@ impl
                 self.identity.clone(),
             ));
         }
+        self.runtime
+            .model_pack_path
+            .inject_activation_failure(ModelActivationFailpoint::FirstComputeAttestation)
+            .map_err(|error| openasr_core::AttestationFailure::Rejected(error.to_string()))?;
         let probe = crate::realtime::probe_native_activation_blocking(
             self.runtime.clone(),
             Some(self.identity.path().to_path_buf()),
@@ -307,6 +342,10 @@ impl
             validate_native_activation_probe(snapshot, plan, lane)
                 .map_err(openasr_core::AttestationFailure::Rejected)?;
         }
+        self.runtime
+            .model_pack_path
+            .inject_activation_failure(ModelActivationFailpoint::Reconciliation)
+            .map_err(|error| openasr_core::AttestationFailure::Rejected(error.to_string()))?;
         let services = self.runtime.native_execution.execution_services();
         let reconciliation = services
             .runtime_receipts()

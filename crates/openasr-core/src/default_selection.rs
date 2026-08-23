@@ -67,6 +67,15 @@ fn persist_commit_failpoint_enabled() -> bool {
     PERSIST_COMMIT_FAILPOINT.with(Cell::get)
 }
 
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultSelectionWriteFault {
+    BeforeStagingWrite,
+    BeforeStagingSync,
+    BeforeAtomicReplace,
+    AfterAtomicReplace,
+}
+
 #[cfg(test)]
 static RECOVERY_FAIL_AFTER_EVIDENCE: AtomicBool = AtomicBool::new(false);
 
@@ -789,7 +798,7 @@ pub fn persist_detailed(
     pack: &InstalledPack,
     quant_preference: QuantPreference,
 ) -> Result<DefaultSelectionCommitOutcome, DefaultSelectionError> {
-    persist_detailed_with_activation_metadata(home, pack, quant_preference, None, "auto")
+    persist_detailed_with_activation_metadata(home, pack, quant_preference, None, "auto", None)
 }
 
 /// Activation-only writer. The ordinary legacy projection API above keeps its
@@ -803,6 +812,25 @@ pub fn persist_activation_detailed(
     architecture_id: &str,
     execution_intent: &crate::device::execution_policy::ExecutionIntent,
 ) -> Result<DefaultSelectionCommitOutcome, DefaultSelectionError> {
+    persist_activation_detailed_with_fault(
+        home,
+        pack,
+        quant_preference,
+        architecture_id,
+        execution_intent,
+        None,
+    )
+}
+
+#[doc(hidden)]
+pub fn persist_activation_detailed_with_fault(
+    home: &Path,
+    pack: &InstalledPack,
+    quant_preference: QuantPreference,
+    architecture_id: &str,
+    execution_intent: &crate::device::execution_policy::ExecutionIntent,
+    fault: Option<DefaultSelectionWriteFault>,
+) -> Result<DefaultSelectionCommitOutcome, DefaultSelectionError> {
     let execution_intent = execution_intent_to_v2_wire(execution_intent);
     persist_detailed_with_activation_metadata(
         home,
@@ -810,6 +838,7 @@ pub fn persist_activation_detailed(
         quant_preference,
         Some(architecture_id),
         &execution_intent,
+        fault,
     )
 }
 
@@ -819,6 +848,7 @@ fn persist_detailed_with_activation_metadata(
     quant_preference: QuantPreference,
     architecture_id: Option<&str>,
     execution_intent: &str,
+    fault: Option<DefaultSelectionWriteFault>,
 ) -> Result<DefaultSelectionCommitOutcome, DefaultSelectionError> {
     let _lock = selection_write_lock();
     let _file_lock = SelectionFileLock::acquire(home)?;
@@ -859,7 +889,12 @@ fn persist_detailed_with_activation_metadata(
             });
         }
     };
-    match persist_v2_record_unlocked(home, record) {
+    if fault == Some(DefaultSelectionWriteFault::BeforeStagingWrite) {
+        return Ok(DefaultSelectionCommitOutcome::NotCommitted {
+            reason: "injected failure before V2 staging write".to_string(),
+        });
+    }
+    match persist_v2_record_unlocked_with_fault(home, record, fault) {
         Ok(_) => {}
         Err(error) => {
             return Ok(DefaultSelectionCommitOutcome::NotCommitted {
@@ -1103,7 +1138,15 @@ pub fn persist_v2_record(
 
 fn persist_v2_record_unlocked(
     home: &Path,
+    record: ActiveModelSelectionV2,
+) -> Result<ActiveModelSelectionV2, DefaultSelectionError> {
+    persist_v2_record_unlocked_with_fault(home, record, None)
+}
+
+fn persist_v2_record_unlocked_with_fault(
+    home: &Path,
     mut record: ActiveModelSelectionV2,
+    fault: Option<DefaultSelectionWriteFault>,
 ) -> Result<ActiveModelSelectionV2, DefaultSelectionError> {
     record.schema_version = ACTIVE_MODEL_SELECTION_V2_SCHEMA_VERSION;
     record.selection_generation = next_generation(home)?;
@@ -1115,13 +1158,21 @@ fn persist_v2_record_unlocked(
             reason: format!("cannot serialize selection: {source}"),
         })?;
     record.validate(&active_model_selection_v2_path(home))?;
-    persist_v2_record_without_generation(home, &record)?;
+    persist_v2_record_without_generation_with_fault(home, &record, fault)?;
     Ok(record)
 }
 
 fn persist_v2_record_without_generation(
     home: &Path,
     record: &ActiveModelSelectionV2,
+) -> Result<(), DefaultSelectionError> {
+    persist_v2_record_without_generation_with_fault(home, record, None)
+}
+
+fn persist_v2_record_without_generation_with_fault(
+    home: &Path,
+    record: &ActiveModelSelectionV2,
+    fault: Option<DefaultSelectionWriteFault>,
 ) -> Result<(), DefaultSelectionError> {
     std::fs::create_dir_all(home).map_err(|source| {
         DefaultSelectionError::Pull(PullError::Io {
@@ -1135,11 +1186,40 @@ fn persist_v2_record_without_generation(
             path: path.clone(),
             reason: format!("cannot serialize selection: {source}"),
         })?;
-    match crate::atomic_file::write_file_atomically_detailed(
-        &path,
-        &contents,
-        crate::atomic_file::AtomicFileMode::Default,
-    ) {
+    let write = match fault {
+        Some(DefaultSelectionWriteFault::BeforeStagingSync) => {
+            crate::atomic_file::write_file_atomically_detailed_with_failpoint(
+                &path,
+                &contents,
+                crate::atomic_file::AtomicFileMode::Default,
+                crate::atomic_file::AtomicFileFailpoint::BeforeSync,
+            )
+        }
+        Some(DefaultSelectionWriteFault::BeforeAtomicReplace) => {
+            crate::atomic_file::write_file_atomically_detailed_with_failpoint(
+                &path,
+                &contents,
+                crate::atomic_file::AtomicFileMode::Default,
+                crate::atomic_file::AtomicFileFailpoint::BeforeReplace,
+            )
+        }
+        Some(DefaultSelectionWriteFault::AfterAtomicReplace) => {
+            crate::atomic_file::write_file_atomically_detailed_with_failpoint(
+                &path,
+                &contents,
+                crate::atomic_file::AtomicFileMode::Default,
+                crate::atomic_file::AtomicFileFailpoint::AfterReplace,
+            )
+        }
+        Some(DefaultSelectionWriteFault::BeforeStagingWrite) | None => {
+            crate::atomic_file::write_file_atomically_detailed(
+                &path,
+                &contents,
+                crate::atomic_file::AtomicFileMode::Default,
+            )
+        }
+    };
+    match write {
         Ok(crate::atomic_file::AtomicWriteOutcome::Written) => Ok(()),
         Ok(crate::atomic_file::AtomicWriteOutcome::CommittedWithSyncWarning { source }) => {
             eprintln!("openasr-core: default V2 record committed but parent sync failed: {source}");

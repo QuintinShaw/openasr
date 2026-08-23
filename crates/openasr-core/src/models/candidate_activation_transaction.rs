@@ -1037,7 +1037,7 @@ where
                 proof: self.proof,
             }),
             Err(PublicationFailure::Rejected(source)) => {
-                let cleanup = self.guard.cleanup(true).err();
+                let cleanup = self.guard.cleanup(false).err();
                 if cleanup.is_none() {
                     self.guard.disarm();
                 }
@@ -1554,6 +1554,7 @@ pub struct DefaultModelActivationJournalFactory {
     pack: crate::InstalledPack,
     preference: crate::QuantPreference,
     publication: DefaultModelActivationPublication,
+    write_fault: Option<crate::default_selection::DefaultSelectionWriteFault>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1570,6 +1571,7 @@ pub struct DefaultModelActivationJournal {
     architecture_id: String,
     execution_intent: crate::device::execution_policy::ExecutionIntent,
     publication: DefaultModelActivationPublication,
+    write_fault: Option<crate::default_selection::DefaultSelectionWriteFault>,
 }
 
 impl DefaultModelActivationJournalFactory {
@@ -1583,6 +1585,7 @@ impl DefaultModelActivationJournalFactory {
             pack,
             preference,
             publication: DefaultModelActivationPublication::PersistSelection,
+            write_fault: None,
         }
     }
 
@@ -1596,7 +1599,17 @@ impl DefaultModelActivationJournalFactory {
             pack,
             preference,
             publication: DefaultModelActivationPublication::ReactivateDurableSelection,
+            write_fault: None,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn with_selection_write_fault_for_test(
+        mut self,
+        fault: crate::default_selection::DefaultSelectionWriteFault,
+    ) -> Self {
+        self.write_fault = Some(fault);
+        self
     }
 
     pub fn prepare(
@@ -1644,6 +1657,7 @@ impl
             architecture_id: facts.plan().architecture_id().to_string(),
             execution_intent: facts.plan().execution_intent().clone(),
             publication: self.publication,
+            write_fault: self.write_fault,
         }
     }
 }
@@ -1669,12 +1683,13 @@ impl
     ) -> Result<(), PublicationFailure<Self::Error>> {
         match self.publication {
             DefaultModelActivationPublication::PersistSelection => {
-                match crate::default_selection::persist_activation_detailed(
+                match crate::default_selection::persist_activation_detailed_with_fault(
                     &self.home,
                     &self.pack,
                     self.preference.clone(),
                     &self.architecture_id,
                     &self.execution_intent,
+                    self.write_fault,
                 ) {
                     Ok(crate::default_selection::DefaultSelectionCommitOutcome::NotCommitted {
                         reason,
@@ -1754,6 +1769,24 @@ where
     JournalError: std::fmt::Debug,
 {
     format!("{error:?}")
+}
+
+impl<Reservation>
+    ReservedTransaction<
+        DefaultModelActivationCandidate,
+        DefaultModelActivationPlan,
+        DefaultModelActivationLane,
+        DefaultModelActivationIdentity,
+        DefaultModelActivationJournal,
+        Reservation,
+    >
+where
+    Reservation: ActivationReservation,
+    Reservation::Error: std::fmt::Debug,
+{
+    pub fn rollback_activation(self) -> Result<RollbackTerminal, String> {
+        self.rollback().map_err(format_cleanup)
+    }
 }
 
 impl<Reservation, Owner, Contract>
@@ -2165,6 +2198,58 @@ mod tests {
         };
         let committed = attested.commit().expect("publication should succeed");
         assert_eq!(committed.stage(), ActivationStage::Committed);
+    }
+
+    #[test]
+    fn rejected_publication_rolls_back_while_must_quarantine_stays_distinct() {
+        for (publication, expected) in [
+            (
+                PublicationFailure::Rejected(MockError("durable write rejected")),
+                vec![
+                    "publish",
+                    "journal-rollback",
+                    "teardown-2",
+                    "teardown-1",
+                    "release",
+                ],
+            ),
+            (
+                PublicationFailure::MustQuarantine(MockError("publication may have mutated")),
+                vec![
+                    "publish",
+                    "journal-quarantine",
+                    "quarantine-2",
+                    "quarantine-1",
+                    "reservation-quarantine",
+                ],
+            ),
+        ] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut failing = journal(events.clone());
+            failing.publication = Err(publication);
+            let materialized =
+                PreparedTransaction::prepare(1, ResolvedExecutionFacts::new(7, 9, 3), failing)
+                    .reserve(MockReservation {
+                        events: events.clone(),
+                    })
+                    .materialize([
+                        MockOwner {
+                            id: 1,
+                            events: events.clone(),
+                        },
+                        MockOwner {
+                            id: 2,
+                            events: events.clone(),
+                        },
+                    ]);
+            let AttestationOutcome::Attested(attested) =
+                materialized.begin_attestation(contract()).attest()
+            else {
+                panic!("contract should attest before publication failure");
+            };
+            assert!(attested.commit().is_err());
+            assert_eq!(*events.lock().unwrap(), expected);
+        }
     }
 
     #[test]
