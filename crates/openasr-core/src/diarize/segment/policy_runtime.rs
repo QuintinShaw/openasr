@@ -20,6 +20,7 @@ use crate::{
             PolicyResolvedAuxRuntimeError, resolve_auxiliary_execution_plan,
             resolved_runtime_for_auxiliary_candidate,
         },
+        runtime_receipts::RuntimeOwnerDescriptor,
         system_memory_owner::{
             AdmittedHostObject, SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
             SystemMemoryAllocationTransactionError, SystemMemoryOwner,
@@ -40,6 +41,28 @@ const PYANNOTE_STAGE: &str = "pyannote-segmentation-stage-v1";
 const DIARIZEN_STAGE: &str = "diarizen-segmentation-stage-v1";
 const PYANNOTE_HOST_REPRESENTATION: &str = "pyannote-segmentation.f32-pure-rust.v1";
 const DIARIZEN_RUNTIME_REPRESENTATION: &str = "diarizen-large-s80-v2.ggml.v1";
+
+fn actor_receipt_descriptor(
+    component: &str,
+    content_id: &str,
+    representation: &str,
+    candidate: &ExecutionCandidate,
+    backend: GgmlCpuGraphBackend,
+) -> Option<RuntimeOwnerDescriptor> {
+    let collector = crate::models::native_execution_services::current_runtime_receipts()?;
+    let lane = collector.lane_projection(
+        candidate.device.route.provider,
+        &candidate.device.route.stable_id,
+        candidate.placement,
+        backend,
+    )?;
+    collector.owner_descriptor(
+        component,
+        Some(content_id),
+        Some(representation),
+        Some(lane),
+    )
+}
 
 type SharedPyannote = AdmittedHostObject<PyannoteSegmenter>;
 type PyannoteActor = PinnedRuntimeActor<PyannetGgmlRuntime>;
@@ -116,6 +139,7 @@ impl PolicyResolvedPyannoteSegmenterRuntime {
                         &content_id,
                         backend,
                         candidate.placement,
+                        candidate,
                         peak_quote,
                     )
                     .map(PyannoteRuntimeOwner::FullDevice)
@@ -134,6 +158,7 @@ impl PolicyResolvedPyannoteSegmenterRuntime {
                         &content_id,
                         backend,
                         candidate.placement,
+                        candidate,
                         peak_quote,
                     )?;
                     Ok(PyannoteRuntimeOwner::Hybrid {
@@ -275,6 +300,7 @@ fn load_pyannote_actor(
     expected_content_id: &str,
     backend: GgmlCpuGraphBackend,
     placement: crate::device::execution_policy::ExecutionPlacement,
+    candidate: &ExecutionCandidate,
     peak_quote: u64,
 ) -> Result<PyannoteActor, SegmentError> {
     if source.preflight().runtime_source.content_id() != expected_content_id {
@@ -306,11 +332,19 @@ fn load_pyannote_actor(
     );
     let preflight = source.preflight().clone();
     let content_id = expected_content_id.to_string();
+    let owner_descriptor = actor_receipt_descriptor(
+        "pyannote-segmentation.actor-runtime",
+        expected_content_id,
+        representation,
+        candidate,
+        backend,
+    );
     let quote_content_id = content_id.clone();
     execution_services
         .pyannote_segmenter_actors()
-        .get_or_try_insert_with(
+        .get_or_try_insert_with_owner_receipt(
             key,
+            owner_descriptor,
             move || {
                 let quote = SystemMemoryAllocationQuote::new(
                     format!(
@@ -498,10 +532,18 @@ fn load_diarizen_actor(
     let retained_bytes = quote.retained_bytes;
     let preflight = preflight.clone();
     let content_id = expected_content_id.to_string();
+    let owner_descriptor = actor_receipt_descriptor(
+        "diarizen-segmentation.actor-runtime",
+        expected_content_id,
+        DIARIZEN_RUNTIME_REPRESENTATION,
+        candidate,
+        backend,
+    );
     execution_services
         .diarizen_segmenter_actors()
-        .get_or_try_insert_with(
+        .get_or_try_insert_with_owner_receipt(
             key,
+            owner_descriptor,
             || Ok((retained_bytes, quote)),
             move |quote| {
                 let snapshot = preflight

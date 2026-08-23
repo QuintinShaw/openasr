@@ -7,6 +7,7 @@ use crate::models::admitted_pinned_runtime_actor_pool::PinnedRuntimeActor;
 use crate::models::policy_resolved_aux_runtime::{
     AuxiliaryPinnedRuntimeCacheKey, resolved_runtime_for_auxiliary_candidate,
 };
+use crate::models::runtime_receipts::RuntimeOwnerDescriptor;
 use crate::{NativeExecutionServices, punctuation::PunctuationError};
 
 use super::config::FIRERED_PUNC_ARCHITECTURE_VALUE;
@@ -25,6 +26,26 @@ pub(crate) enum PolicyOwnedFireRedPuncError {
     Actor(String),
     #[error("FireRedPunc pack identity changed: expected {expected}, got {actual}")]
     ContentChanged { expected: String, actual: String },
+}
+
+fn actor_receipt_descriptor(
+    content_id: &str,
+    candidate: &ExecutionCandidate,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+) -> Option<RuntimeOwnerDescriptor> {
+    let collector = crate::models::native_execution_services::current_runtime_receipts()?;
+    let lane = collector.lane_projection(
+        candidate.device.route.provider,
+        &candidate.device.route.stable_id,
+        candidate.placement,
+        backend,
+    )?;
+    collector.owner_descriptor(
+        "firered-punc.actor-runtime",
+        Some(content_id),
+        Some("firered-punc.runtime.v1"),
+        Some(lane),
+    )
 }
 
 pub(crate) fn load_actor(
@@ -48,10 +69,12 @@ pub(crate) fn load_actor(
     );
     let build_preflight = preflight.clone();
     let build_content_id = expected_content_id.to_string();
+    let owner_descriptor = actor_receipt_descriptor(expected_content_id, candidate, backend);
     execution_services
         .firered_punc_actors()
-        .get_or_try_insert_with(
+        .get_or_try_insert_with_owner_receipt(
             key,
+            owner_descriptor,
             || {
                 let quote = FireRedPuncRuntime::quote_candidate_system_memory(preflight)?;
                 Ok((quote.retained_bytes, quote))

@@ -714,9 +714,37 @@ where
         F: FnOnce(A) -> Result<SystemMemoryOwner<R>, E> + Send + 'static,
         M: Fn(PinnedRuntimeActorError) -> E,
     {
+        self.checkout_or_try_build_with_owner_receipt(key, None, quote, build, map_actor_error)
+    }
+
+    /// Builds a pinned actor with a caller-provided family owner receipt.
+    ///
+    /// Auxiliary policy runtimes know the semantic component, content, and
+    /// execution lane that the generic actor pool cannot infer. Supplying that
+    /// descriptor replaces the pool's generic `pinned-runtime-actor` owner;
+    /// the nested SystemMemory/native receipts remain unchanged.
+    pub(crate) fn checkout_or_try_build_with_owner_receipt<E, A, Q, F, M>(
+        &self,
+        key: K,
+        owner_descriptor: Option<RuntimeOwnerDescriptor>,
+        quote: Q,
+        build: F,
+        map_actor_error: M,
+    ) -> Result<PinnedRuntimeActorCheckout<K, R>, E>
+    where
+        E: Send + 'static,
+        A: Send + 'static,
+        Q: FnOnce() -> Result<(u64, A), E>,
+        F: FnOnce(A) -> Result<SystemMemoryOwner<R>, E> + Send + 'static,
+        M: Fn(PinnedRuntimeActorError) -> E,
+    {
         let worker_name = self.worker_name;
-        let receipt = actor_receipt_descriptor(worker_name, &key)
-            .map(|descriptor| (descriptor, current_execution_cache_attempt_id()));
+        let receipt = owner_descriptor
+            .map(|descriptor| (descriptor, current_execution_cache_attempt_id()))
+            .or_else(|| {
+                actor_receipt_descriptor(worker_name, &key)
+                    .map(|descriptor| (descriptor, current_execution_cache_attempt_id()))
+            });
         let mapper = &map_actor_error;
         self.pool.checkout_or_try_build(
             key,
@@ -798,6 +826,7 @@ where
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn get_or_try_insert_with<E, A, Q, F, M>(
         &self,
         key: K,
@@ -812,9 +841,33 @@ where
         F: FnOnce(A) -> Result<SystemMemoryOwner<R>, E> + Send + 'static,
         M: Fn(PinnedRuntimeActorError) -> E,
     {
+        self.get_or_try_insert_with_owner_receipt(key, None, quote, build, map_actor_error)
+    }
+
+    /// Shared-actor counterpart to the checkout pool's caller-provided family
+    /// owner descriptor capability.
+    pub(crate) fn get_or_try_insert_with_owner_receipt<E, A, Q, F, M>(
+        &self,
+        key: K,
+        owner_descriptor: Option<RuntimeOwnerDescriptor>,
+        quote: Q,
+        build: F,
+        map_actor_error: M,
+    ) -> Result<PinnedRuntimeActor<R>, E>
+    where
+        E: Send + 'static,
+        A: Send + 'static,
+        Q: FnOnce() -> Result<(u64, A), E>,
+        F: FnOnce(A) -> Result<SystemMemoryOwner<R>, E> + Send + 'static,
+        M: Fn(PinnedRuntimeActorError) -> E,
+    {
         let attempt_id = current_execution_cache_attempt_id();
-        let receipt = actor_receipt_descriptor(self.worker_name, &key)
-            .map(|descriptor| (descriptor, attempt_id));
+        let receipt = owner_descriptor
+            .map(|descriptor| (descriptor, attempt_id))
+            .or_else(|| {
+                actor_receipt_descriptor(self.worker_name, &key)
+                    .map(|descriptor| (descriptor, attempt_id))
+            });
         let mut quote = Some(quote);
         let mut build = Some(build);
         loop {
@@ -1680,6 +1733,42 @@ mod tests {
         assert_eq!(services.runtime_receipts().summary().live_owner_count, 0);
     }
 
+    #[test]
+    fn family_owner_descriptor_replaces_generic_actor_label_and_releases_on_clear() {
+        let services = test_native_execution_services();
+        let _context = install_native_execution_services(services.as_ref());
+        let collector = services.runtime_receipts();
+        let descriptor = collector
+            .owner_descriptor(
+                "redimnet2.resident-runtime",
+                Some("redimnet-content"),
+                Some("redimnet2.ggml-resident.v1"),
+                None,
+            )
+            .expect("family receipt descriptor");
+        let pool = AdmittedPinnedRuntimeActorPool::new(
+            "redimnet-runtime-actors",
+            AdmittedPinnedRuntimeActorPoolLimits::new(1, 32),
+        );
+        let actor = pool
+            .get_or_try_insert_with_owner_receipt(
+                "redimnet-key",
+                Some(descriptor),
+                || Ok::<_, String>((16, ())),
+                move |()| Ok(owner(1, 16, Arc::new(AtomicUsize::new(0)))),
+                |error| error.to_string(),
+            )
+            .expect("family actor");
+        let snapshot = collector.snapshot();
+        assert_eq!(snapshot.live_owners.len(), 1);
+        assert_eq!(
+            snapshot.live_owners[0].descriptor.component,
+            descriptor.component
+        );
+        drop(actor);
+        pool.clear();
+        assert_eq!(collector.summary().live_owner_count, 0);
+    }
     #[test]
     fn candidate_failure_drops_checkout_without_repopulating_idle_pool() {
         let services = test_native_execution_services();
