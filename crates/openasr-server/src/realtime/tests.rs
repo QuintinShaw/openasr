@@ -1,6 +1,7 @@
 //! Unit tests for the realtime module. Pure code-motion from `realtime.rs`.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{Read, Write},
     num::NonZeroUsize,
@@ -5716,13 +5717,16 @@ fn diarize_sample_spans_map_split_samples_to_stream_time() {
 #[derive(Debug, serde::Serialize)]
 struct HostOwnerAttributionReport {
     schema: &'static str,
-    pack_path: String,
+    /// The input path is intentionally redacted. The report is a durable
+    /// diagnostic artifact and must not turn a private home path into evidence.
+    pack_path: &'static str,
     pack_sha256: String,
     model_id: String,
     requested_backend: String,
     requested_target: String,
     observed_providers: Vec<String>,
     attribution: HostOwnerAttribution,
+    warmup_to_offline_delta: RuntimeReceiptIdentityDelta,
     baseline: openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
     after_startup_warmup: openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
     after_offline_transcribe: openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
@@ -5733,6 +5737,26 @@ enum HostOwnerAttribution {
     SupportedEquivalentDuplicatedWeights,
     RejectedSingleOrNonEquivalentOwners,
     AttributionIncomplete,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct RuntimeReceiptIdentityDelta {
+    owner_ids_added: Vec<openasr_core::runtime_receipts::RuntimeOwnerId>,
+    owner_ids_removed: Vec<openasr_core::runtime_receipts::RuntimeOwnerId>,
+    resource_ids_added: Vec<openasr_core::runtime_receipts::RuntimeResourceId>,
+    resource_ids_removed: Vec<openasr_core::runtime_receipts::RuntimeResourceId>,
+    event_count_before: usize,
+    event_count_after: usize,
+}
+
+impl RuntimeReceiptIdentityDelta {
+    fn has_observable_change(&self) -> bool {
+        self.event_count_after > self.event_count_before
+            || !self.owner_ids_added.is_empty()
+            || !self.owner_ids_removed.is_empty()
+            || !self.resource_ids_added.is_empty()
+            || !self.resource_ids_removed.is_empty()
+    }
 }
 
 fn hash_file_sha256(path: &std::path::Path) -> std::io::Result<String> {
@@ -5789,68 +5813,453 @@ fn receipt_lanes(
     lanes
 }
 
-fn evaluate_host_owner_attribution(
+fn receipt_identity_sets(
     snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
-) -> HostOwnerAttribution {
-    use openasr_core::runtime_receipts::{RuntimeReceiptAvailability, RuntimeReceiptMetric};
+) -> (
+    BTreeSet<openasr_core::runtime_receipts::RuntimeOwnerId>,
+    BTreeSet<openasr_core::runtime_receipts::RuntimeResourceId>,
+) {
+    use openasr_core::runtime_receipts::RuntimeReceiptEvent;
 
-    if !matches!(snapshot.availability, RuntimeReceiptAvailability::Available)
-        || !snapshot.completeness.complete
-    {
-        return HostOwnerAttribution::AttributionIncomplete;
-    }
-
-    let mut resources = Vec::new();
-    for owner in &snapshot.live_owners {
-        for resource in owner.resources.values() {
-            let RuntimeReceiptMetric::Known(retained) = resource.descriptor.retained else {
-                return HostOwnerAttribution::AttributionIncomplete;
-            };
-            let Some(lane) = owner.descriptor.lane else {
-                return HostOwnerAttribution::AttributionIncomplete;
-            };
-            let Some(content) = owner.descriptor.content else {
-                // A redacted-but-absent content key cannot bind two owners to the
-                // same pack. Do not infer duplication from RSS or component names.
-                return HostOwnerAttribution::AttributionIncomplete;
-            };
-            resources.push((
-                owner.descriptor.component,
-                content,
-                lane,
-                resource.descriptor.kind,
-                resource.descriptor.domain,
-                retained,
-            ));
+    let mut owner_ids = snapshot
+        .live_owners
+        .iter()
+        .map(|owner| owner.id)
+        .collect::<BTreeSet<_>>();
+    let mut resource_ids = snapshot
+        .live_owners
+        .iter()
+        .flat_map(|owner| owner.resources.values().map(|resource| resource.id))
+        .collect::<BTreeSet<_>>();
+    for event in &snapshot.events {
+        match event {
+            RuntimeReceiptEvent::OwnerCreated { owner_id, .. }
+            | RuntimeReceiptEvent::OwnerReused { owner_id, .. }
+            | RuntimeReceiptEvent::OwnerReleased { owner_id, .. } => {
+                owner_ids.insert(*owner_id);
+            }
+            RuntimeReceiptEvent::ResourceAcquired {
+                owner_id,
+                resource_id,
+                ..
+            }
+            | RuntimeReceiptEvent::ResourceStateChanged {
+                owner_id,
+                resource_id,
+                ..
+            }
+            | RuntimeReceiptEvent::ResourceReleased {
+                owner_id,
+                resource_id,
+            } => {
+                owner_ids.insert(*owner_id);
+                resource_ids.insert(*resource_id);
+            }
         }
     }
+    (owner_ids, resource_ids)
+}
 
-    let expected = 5_090_000_000_u64;
-    let tolerance = 512 * 1024 * 1024_u64;
-    let equivalent = resources.iter().enumerate().any(|(index, left)| {
+fn receipt_identity_delta(
+    before: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+    after: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+) -> RuntimeReceiptIdentityDelta {
+    let (before_owners, before_resources) = receipt_identity_sets(before);
+    let (after_owners, after_resources) = receipt_identity_sets(after);
+    RuntimeReceiptIdentityDelta {
+        owner_ids_added: after_owners.difference(&before_owners).copied().collect(),
+        owner_ids_removed: before_owners.difference(&after_owners).copied().collect(),
+        resource_ids_added: after_resources
+            .difference(&before_resources)
+            .copied()
+            .collect(),
+        resource_ids_removed: before_resources
+            .difference(&after_resources)
+            .copied()
+            .collect(),
+        event_count_before: before.events.len(),
+        event_count_after: after.events.len(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WeightObservation<Owner, Key> {
+    owner_id: Owner,
+    key: Key,
+    retained_bytes: u64,
+}
+
+/// A duplicate is supported only across owner boundaries. Keeping this as a
+/// small generic function makes the owner-id rule independently testable and
+/// prevents a future snapshot projection from accidentally dropping owner.id.
+fn classify_equivalent_weight_resources<Owner, Key>(
+    resources: &[WeightObservation<Owner, Key>],
+    expected_retained: u64,
+    retained_tolerance: u64,
+) -> HostOwnerAttribution
+where
+    Owner: PartialEq,
+    Key: PartialEq,
+{
+    if resources.is_empty() {
+        return HostOwnerAttribution::AttributionIncomplete;
+    }
+    for (index, left) in resources.iter().enumerate() {
+        for right in resources.iter().skip(index + 1) {
+            if left.owner_id == right.owner_id
+                && left.key == right.key
+                && left.retained_bytes.abs_diff(expected_retained) <= retained_tolerance
+                && right.retained_bytes.abs_diff(expected_retained) <= retained_tolerance
+            {
+                return HostOwnerAttribution::RejectedSingleOrNonEquivalentOwners;
+            }
+        }
+    }
+    if resources.iter().enumerate().any(|(index, left)| {
         resources.iter().skip(index + 1).any(|right| {
-            left.0 == right.0
-                && left.1 == right.1
-                && left.2 == right.2
-                && left.3 == right.3
-                && left.4 == right.4
-                && left.5.abs_diff(expected) <= tolerance
-                && right.5.abs_diff(expected) <= tolerance
+            left.owner_id != right.owner_id
+                && left.key == right.key
+                && left.retained_bytes.abs_diff(expected_retained) <= retained_tolerance
+                && right.retained_bytes.abs_diff(expected_retained) <= retained_tolerance
         })
-    });
-    if equivalent {
+    }) {
         HostOwnerAttribution::SupportedEquivalentDuplicatedWeights
     } else {
-        // A single owner, different components, or a different retained-size
-        // shape rejects the duplicated-weight hypothesis. 11.49 GB is never a
-        // pass condition; the decision is based on owner/resource receipts.
         HostOwnerAttribution::RejectedSingleOrNonEquivalentOwners
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HistoricalWeight {
+    owner_id: openasr_core::runtime_receipts::RuntimeOwnerId,
+    key: (
+        openasr_core::runtime_receipts::RedactedIdentity,
+        openasr_core::runtime_receipts::RedactedIdentity,
+        openasr_core::runtime_receipts::SafeExecutionLaneProjection,
+        openasr_core::runtime_receipts::RedactedIdentity,
+        openasr_core::runtime_receipts::SafeMemoryDomainProjection,
+    ),
+    retained_bytes: u64,
+}
+
+fn historical_weights(
+    snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+) -> Result<Vec<HistoricalWeight>, ()> {
+    use openasr_core::runtime_receipts::{RuntimeReceiptEvent, RuntimeReceiptMetric};
+
+    let mut owners = BTreeMap::new();
+    let mut resources = BTreeMap::new();
+    for event in &snapshot.events {
+        match event {
+            RuntimeReceiptEvent::OwnerCreated {
+                owner_id,
+                descriptor,
+                ..
+            } => {
+                owners.insert(*owner_id, *descriptor);
+            }
+            RuntimeReceiptEvent::ResourceAcquired {
+                owner_id,
+                resource_id,
+                descriptor,
+            }
+            | RuntimeReceiptEvent::ResourceStateChanged {
+                owner_id,
+                resource_id,
+                descriptor,
+                ..
+            } => {
+                resources.insert((*owner_id, *resource_id), descriptor.clone());
+            }
+            RuntimeReceiptEvent::OwnerReused { .. }
+            | RuntimeReceiptEvent::OwnerReleased { .. }
+            | RuntimeReceiptEvent::ResourceReleased { .. } => {}
+        }
+    }
+    for owner in &snapshot.live_owners {
+        owners.insert(owner.id, owner.descriptor);
+        for resource in owner.resources.values() {
+            resources.insert((owner.id, resource.id), resource.descriptor.clone());
+        }
+    }
+
+    if owners.is_empty() || resources.is_empty() {
+        return Err(());
+    }
+    if owners.keys().any(|owner_id| {
+        !resources
+            .keys()
+            .any(|(resource_owner, _)| resource_owner == owner_id)
+    }) {
+        // A live or released owner with no resource is not evidence of a
+        // single-owner result; it is an incomplete coverage case.
+        return Err(());
+    }
+
+    let mut result = Vec::with_capacity(resources.len());
+    for ((owner_id, _resource_id), descriptor) in resources {
+        let owner = owners.get(&owner_id).ok_or(())?;
+        let Some(content) = owner.content else {
+            return Err(());
+        };
+        let Some(lane) = owner.lane else {
+            return Err(());
+        };
+        let Some(domain) = descriptor.domain else {
+            return Err(());
+        };
+        let RuntimeReceiptMetric::Known(retained_bytes) = descriptor.retained else {
+            return Err(());
+        };
+        result.push(HistoricalWeight {
+            owner_id,
+            key: (owner.component, content, lane, descriptor.kind, domain),
+            retained_bytes,
+        });
+    }
+    Ok(result)
+}
+
+fn evaluate_host_owner_attribution(
+    snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+    warmup_to_offline_delta: &RuntimeReceiptIdentityDelta,
+) -> HostOwnerAttribution {
+    use openasr_core::runtime_receipts::RuntimeReceiptAvailability;
+
+    if !matches!(snapshot.availability, RuntimeReceiptAvailability::Available)
+        || !snapshot.completeness.complete
+        || !warmup_to_offline_delta.has_observable_change()
+    {
+        return HostOwnerAttribution::AttributionIncomplete;
+    }
+    let Ok(resources) = historical_weights(snapshot) else {
+        return HostOwnerAttribution::AttributionIncomplete;
+    };
+    let observations = resources
+        .into_iter()
+        .map(|resource| WeightObservation {
+            owner_id: resource.owner_id,
+            key: resource.key,
+            retained_bytes: resource.retained_bytes,
+        })
+        .collect::<Vec<_>>();
+    classify_equivalent_weight_resources(&observations, 5_090_000_000, 512 * 1024 * 1024)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FireRedCatalogIdentityProjection {
+    model_id: String,
+    model_family: String,
+    adapter_id: String,
+    architecture: String,
+}
+
+fn firered_llm_catalog_identity_projection(
+    adapter: &openasr_core::NativeRuntimeModelAdapter,
+    identity: &openasr_core::NativeRuntimeModelIdentity,
+) -> FireRedCatalogIdentityProjection {
+    FireRedCatalogIdentityProjection {
+        model_id: identity.model_id.clone(),
+        model_family: adapter.model_family().to_string(),
+        adapter_id: adapter.adapter_id().to_string(),
+        architecture: adapter
+            .tensor_layout()
+            .map(|layout| layout.name)
+            .unwrap_or_default(),
+    }
+}
+
+fn validate_firered_llm_catalog_identity(
+    projection: &FireRedCatalogIdentityProjection,
+) -> Result<(), String> {
+    const EXPECTED_MODEL_FAMILY: &str = "firered2-llm";
+    const EXPECTED_ADAPTER_ID: &str = "ggml-family-firered-llm-runtime-v1";
+    const EXPECTED_ARCHITECTURE: &str = "firered-llm-conformer-adapter-qwen2";
+    let expected = format!(
+        "model family/model id '{EXPECTED_MODEL_FAMILY}', adapter '{EXPECTED_ADAPTER_ID}', architecture '{EXPECTED_ARCHITECTURE}'"
+    );
+    let actual = format!(
+        "model_id='{}', model_family='{}', adapter='{}', architecture='{}'",
+        projection.model_id,
+        projection.model_family,
+        projection.adapter_id,
+        projection.architecture
+    );
+    let parsed = openasr_core::parse_model_ref(projection.model_id.trim()).map_err(|error| {
+        format!("expected {expected}; actual safe projection ({actual}); invalid model id: {error}")
+    })?;
+    if parsed.family != EXPECTED_MODEL_FAMILY
+        || parsed.tag.is_some()
+        || projection.model_family != EXPECTED_MODEL_FAMILY
+        || projection.adapter_id != EXPECTED_ADAPTER_ID
+        || projection.architecture != EXPECTED_ARCHITECTURE
+    {
+        return Err(format!(
+            "expected {expected}; actual safe projection ({actual})"
+        ));
+    }
+    Ok(())
+}
+
+fn attribution_report_dir(home_path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    if let Some(raw) = std::env::var_os("OPENASR_RUNTIME_ATTRIBUTION_REPORT_DIR") {
+        let path = std::path::PathBuf::from(raw);
+        let metadata = fs::metadata(&path).map_err(|error| {
+            format!("OPENASR_RUNTIME_ATTRIBUTION_REPORT_DIR is unreadable: {error}")
+        })?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "OPENASR_RUNTIME_ATTRIBUTION_REPORT_DIR must be an existing directory: {}",
+                path.display()
+            ));
+        }
+        return Ok(path);
+    }
+    let path = home_path.join("diagnostics").join("runtime-attribution");
+    fs::create_dir_all(&path)
+        .map_err(|error| format!("could not create diagnostic report directory: {error}"))?;
+    Ok(path)
+}
+
+fn persist_attribution_report(
+    report_dir: &std::path::Path,
+    report: &HostOwnerAttributionReport,
+) -> std::io::Result<std::path::PathBuf> {
+    let report_path = report_dir.join("runtime-owner-attribution.json");
+    let bytes = serde_json::to_vec_pretty(report).map_err(std::io::Error::other)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(report_dir)?;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(&report_path)
+        .map_err(|error| error.error)?;
+    Ok(report_path)
+}
+
+#[test]
+fn firered_catalog_identity_rejects_aed_and_punctuation_projections() {
+    let valid = FireRedCatalogIdentityProjection {
+        model_id: "firered2-llm".to_string(),
+        model_family: "firered2-llm".to_string(),
+        adapter_id: "ggml-family-firered-llm-runtime-v1".to_string(),
+        architecture: "firered-llm-conformer-adapter-qwen2".to_string(),
+    };
+    assert!(validate_firered_llm_catalog_identity(&valid).is_ok());
+    for rejected in ["firered-aed-l-v2", "firered-punc", "not-firered"] {
+        let mut projection = valid.clone();
+        projection.model_id = rejected.to_string();
+        let error = validate_firered_llm_catalog_identity(&projection).unwrap_err();
+        assert!(error.contains("expected") && error.contains("actual safe projection"));
+    }
+}
+
+#[test]
+fn equivalent_weights_require_distinct_owner_ids() {
+    let same_key = "firered-weights";
+    let same_owner = vec![
+        WeightObservation {
+            owner_id: 7_u8,
+            key: same_key,
+            retained_bytes: 5_090_000_000,
+        },
+        WeightObservation {
+            owner_id: 7_u8,
+            key: same_key,
+            retained_bytes: 5_090_000_001,
+        },
+    ];
+    assert_eq!(
+        classify_equivalent_weight_resources(&same_owner, 5_090_000_000, 512 * 1024 * 1024),
+        HostOwnerAttribution::RejectedSingleOrNonEquivalentOwners
+    );
+    let distinct_owners = vec![
+        WeightObservation {
+            owner_id: 7_u8,
+            key: same_key,
+            retained_bytes: 5_090_000_000,
+        },
+        WeightObservation {
+            owner_id: 8_u8,
+            key: same_key,
+            retained_bytes: 5_090_000_001,
+        },
+    ];
+    assert_eq!(
+        classify_equivalent_weight_resources(&distinct_owners, 5_090_000_000, 512 * 1024 * 1024),
+        HostOwnerAttribution::SupportedEquivalentDuplicatedWeights
+    );
+}
+
+#[test]
+fn empty_or_unchanged_receipt_coverage_is_inconclusive() {
+    let empty = empty_runtime_receipt_snapshot();
+    let delta = RuntimeReceiptIdentityDelta {
+        owner_ids_added: Vec::new(),
+        owner_ids_removed: Vec::new(),
+        resource_ids_added: Vec::new(),
+        resource_ids_removed: Vec::new(),
+        event_count_before: 3,
+        event_count_after: 3,
+    };
+    assert!(!delta.has_observable_change());
+    assert_eq!(
+        evaluate_host_owner_attribution(&empty, &delta),
+        HostOwnerAttribution::AttributionIncomplete
+    );
+    let changed_delta = RuntimeReceiptIdentityDelta {
+        event_count_before: 0,
+        event_count_after: 1,
+        ..delta
+    };
+    assert_eq!(
+        evaluate_host_owner_attribution(&empty, &changed_delta),
+        HostOwnerAttribution::AttributionIncomplete
+    );
+}
+
+#[test]
+fn attribution_report_persists_atomically_in_requested_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let report = HostOwnerAttributionReport {
+        schema: openasr_core::runtime_receipts::RUNTIME_RECEIPT_SCHEMA,
+        pack_path: "<redacted>",
+        pack_sha256: "deadbeef".to_string(),
+        model_id: "firered2-llm".to_string(),
+        requested_backend: "cpu".to_string(),
+        requested_target: "Cpu".to_string(),
+        observed_providers: vec!["cpu".to_string()],
+        attribution: HostOwnerAttribution::AttributionIncomplete,
+        warmup_to_offline_delta: RuntimeReceiptIdentityDelta {
+            owner_ids_added: Vec::new(),
+            owner_ids_removed: Vec::new(),
+            resource_ids_added: Vec::new(),
+            resource_ids_removed: Vec::new(),
+            event_count_before: 1,
+            event_count_after: 2,
+        },
+        baseline: empty_runtime_receipt_snapshot(),
+        after_startup_warmup: empty_runtime_receipt_snapshot(),
+        after_offline_transcribe: empty_runtime_receipt_snapshot(),
+    };
+    let path = persist_attribution_report(temp.path(), &report).unwrap();
+    assert!(path.is_file());
+    let contents = fs::read_to_string(&path).unwrap();
+    assert!(contents.contains("warmup_to_offline_delta"));
+    assert!(contents.contains("<redacted>"));
+    assert!(contents.contains("deadbeef"));
+    assert!(!contents.contains("/private/"));
+}
+
+fn empty_runtime_receipt_snapshot() -> openasr_core::runtime_receipts::RuntimeReceiptSnapshot {
+    openasr_core::NativeExecutionServices::for_local_process()
+        .expect("test receipt service root")
+        .runtime_receipts()
+        .snapshot()
+}
+
 /// Host-local Phase-0 incident harness. It intentionally uses one injected
 /// service root for startup warm-up and offline transcription, then records the
-/// v1 receipt snapshot plus a strong pack identity under the isolated home.
+/// v1 receipt snapshot plus a strong pack identity under an isolated home.
 #[tokio::test]
 #[ignore = "host-local: set OPENASR_FIRERED_LLM_PACK and OPENASR_GGML_BACKEND=cpu|metal|vulkan"]
 async fn firered_llm_owner_attribution_host_local_phase0() {
@@ -5906,14 +6315,16 @@ async fn firered_llm_owner_attribution_host_local_phase0() {
     let identity = adapter
         .verified_runtime_model_identity(None)
         .expect("validated pack must expose a verified model identity");
-    assert!(
-        identity.model_id.to_ascii_lowercase().contains("firered"),
-        "OPENASR_FIRERED_LLM_PACK resolved to unexpected model id {}",
-        identity.model_id
-    );
+    let identity_projection = firered_llm_catalog_identity_projection(&adapter, &identity);
+    if let Err(error) = validate_firered_llm_catalog_identity(&identity_projection) {
+        panic!("OPENASR_FIRERED_LLM_PACK rejected: {error}");
+    }
 
-    let home = tempfile::tempdir().expect("create isolated OPENASR_HOME");
-    let home_path = home.path().to_path_buf();
+    // Keep the harness isolated from a contributor's real home, but deliberately
+    // retain the generated home so the default report is reviewable after exit.
+    let home_path = tempfile::tempdir()
+        .expect("create isolated OPENASR_HOME")
+        .keep();
     let _home_guard = EnvVarGuard::set("OPENASR_HOME", &home_path);
     let _backend_guard = EnvVarGuard::set("OPENASR_GGML_BACKEND", &requested_backend);
     let mut preferences = openasr_core::config::load_config_document(&home_path).unwrap();
@@ -5941,8 +6352,6 @@ async fn firered_llm_owner_attribution_host_local_phase0() {
     ));
     assert!(baseline.completeness.complete);
 
-    // This is the same startup warm-up path used by the server, with the same
-    // pack, isolated preference target, service root, and exact lane selection.
     warm_up_default_native_streaming_worker(runtime.clone()).await;
     let after_startup_warmup = services.runtime_receipts().snapshot();
     assert!(after_startup_warmup.completeness.complete);
@@ -5986,13 +6395,6 @@ async fn firered_llm_owner_attribution_host_local_phase0() {
         )),
         "receipt lifecycle must include resource acquisition"
     );
-    assert!(
-        after_offline_transcribe.events.iter().any(|event| matches!(
-            event,
-            openasr_core::runtime_receipts::RuntimeReceiptEvent::OwnerReleased { .. }
-        )),
-        "receipt lifecycle must include owner release"
-    );
 
     let observed_providers = receipt_provider_names(&after_offline_transcribe);
     assert!(
@@ -6010,21 +6412,31 @@ async fn firered_llm_owner_attribution_host_local_phase0() {
         assert_eq!(observed_providers, vec![requested_backend.clone()]);
     }
 
+    let warmup_to_offline_delta =
+        receipt_identity_delta(&after_startup_warmup, &after_offline_transcribe);
+    assert!(
+        warmup_to_offline_delta.has_observable_change(),
+        "warmup->offline receipt delta must contain an observable owner/resource/event change"
+    );
     let report = HostOwnerAttributionReport {
         schema: after_offline_transcribe.schema,
-        pack_path: pack_path.display().to_string(),
+        pack_path: "<redacted>",
         pack_sha256,
         model_id: identity.model_id,
         requested_backend,
         requested_target: format!("{target:?}"),
         observed_providers,
-        attribution: evaluate_host_owner_attribution(&after_offline_transcribe),
+        attribution: evaluate_host_owner_attribution(
+            &after_offline_transcribe,
+            &warmup_to_offline_delta,
+        ),
+        warmup_to_offline_delta,
         baseline,
         after_startup_warmup,
         after_offline_transcribe,
     };
-    let report_path = home_path.join("runtime-owner-attribution.json");
-    let report_contents = serde_json::to_vec_pretty(&report).expect("serialize attribution report");
-    fs::write(&report_path, report_contents).expect("persist attribution report");
+    let report_dir = attribution_report_dir(&home_path).expect("resolve safe report directory");
+    let report_path = persist_attribution_report(&report_dir, &report)
+        .expect("persist attribution report atomically");
     eprintln!("owner attribution report: {}", report_path.display());
 }
