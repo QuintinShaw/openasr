@@ -14,13 +14,22 @@ fn moonshine_runtime_graph_config_with_scheduler_default(
     backend: GgmlCpuGraphBackend,
     default_use_scheduler_when_unset: Option<bool>,
 ) -> GgmlCpuGraphConfig {
-    configure_model_runtime_graph_config_from_env(
+    let mut config = configure_model_runtime_graph_config_from_env(
         GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend),
         ModelMetalRuntimeOverrides {
             default_use_scheduler_when_unset,
             default_n_threads_when_unset: Some(1),
         },
-    )
+    );
+    // The request-resolved backend is authoritative for this family. An
+    // ambient placement override may not silently turn an already-selected
+    // accelerator into a CPU graph; the decoder's explicit Vulkan hybrid
+    // policy below is the only intentional stage-local downgrade.
+    if backend.is_gpu_class() && config.backend == GgmlCpuGraphBackend::Cpu {
+        config.backend = backend;
+        config.use_scheduler = false;
+    }
+    config
 }
 
 /// Moonshine's waveform preparation and token handling stay on the host, while
@@ -52,26 +61,12 @@ pub(crate) fn moonshine_encoder_graph_config(backend: GgmlCpuGraphBackend) -> Gg
     apply_moonshine_neural_graph_placement(config)
 }
 
-/// Decode-graph reuse (`nn::decoder::reusable_decode_graph_supported`) only
-/// activates when the backend is GPU-class *and* the scheduler is off (a
-/// multi-backend scheduler's `sched_alloc_graph` drops the per-token inputs
-/// a reused, in-place-KV graph depends on). The decoder previously inherited
-/// a cross-backend scheduler, which meant Metal decode never got the
-/// persistent incremental-step graph
-/// (`compute_incremental_step_logits`) and always fell back to rebuilding a
-/// full-prefix graph every token (`compute_full_prefix_step_logits`) -- an
-/// O(n^2) cost with no large encoder to amortize it against, measured 1.67x
-/// slower than CPU. Leaving this `None` keeps the base (scheduler-off on
-/// GPU-class backends, see `configure_model_graph_config`) so Metal decode
-/// now gets the same persistent reused graph qwen's decoder already uses.
-/// This is a pure backend/scheduling choice: output must stay byte-identical
-/// (verified via the moonshine golden test), since it does not change which
-/// arithmetic runs, only whether the graph is rebuilt per token. The encoder
-/// and decoder are complete neural subgraphs. Metal, CUDA, and HIP run both as
-/// exact FullDevice graphs. On the validated Vulkan route the encoder remains
-/// a direct device graph while the dispatch-bound decoder defaults to CPU, so
-/// policy truthfully advertises that provider as Hybrid. The stage env can
-/// force Vulkan decode back to the GPU for diagnostics.
+/// Keep decoder placement separate from encoder placement. Vulkan is the
+/// validated hybrid route: the encoder remains accelerated while the decoder
+/// defaults to CPU, unless the diagnostic stage override explicitly enables
+/// GPU decode. The request output/reuse contract is resolved at the dispatch
+/// boundary and consumed by the executor; this graph config only determines
+/// the stage backend and scheduler settings.
 pub(crate) fn moonshine_decoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
     let mut config = moonshine_runtime_graph_config_with_scheduler_default(backend, None);
     if config.backend.is_gpu_class() && !decoder_gpu_enabled(config.backend) {
