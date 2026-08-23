@@ -3,7 +3,7 @@ use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphThreadingWorkload};
 use crate::models::graph_runtime_config::{
     ModelMetalRuntimeOverrides, configure_model_runtime_graph_config_from_env,
-    has_explicit_thread_override, install_request_inference_threads_override,
+    has_explicit_thread_override,
 };
 
 const OPENASR_MOONSHINE_ENABLE_DECODER_GPU: &str = "OPENASR_MOONSHINE_ENABLE_DECODER_GPU";
@@ -135,6 +135,7 @@ fn decoder_gpu_enabled_with_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::graph_runtime_config::install_request_inference_threads_override;
 
     fn with_decoder_env<T>(gpu: Option<&str>, run: impl FnOnce() -> T) -> T {
         crate::test_process_env::with_test_process_env(
