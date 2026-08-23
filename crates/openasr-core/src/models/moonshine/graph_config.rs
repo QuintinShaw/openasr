@@ -3,7 +3,7 @@ use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphThreadingWorkload};
 use crate::models::graph_runtime_config::{
     ModelMetalRuntimeOverrides, configure_model_runtime_graph_config_from_env,
-    has_explicit_thread_override,
+    has_explicit_thread_override, install_request_inference_threads_override,
 };
 
 const OPENASR_MOONSHINE_ENABLE_DECODER_GPU: &str = "OPENASR_MOONSHINE_ENABLE_DECODER_GPU";
@@ -227,5 +227,32 @@ mod tests {
                 None,
             ));
         });
+    }
+
+    #[test]
+    fn captured_graph_config_and_identity_survive_late_request_overrides() {
+        let captured = {
+            let _request_threads = install_request_inference_threads_override(Some(2));
+            moonshine_decoder_graph_config(GgmlCpuGraphBackend::Cpu, None)
+        };
+        let captured_identity = moonshine_graph_config_identity(captured);
+
+        let _late_request_threads = install_request_inference_threads_override(Some(8));
+        crate::test_process_env::with_test_process_env(
+            [(
+                GgmlCpuGraphConfig::THREADS_ENV,
+                Some(std::ffi::OsString::from("8")),
+            )],
+            || {
+                let late_config = moonshine_decoder_graph_config(GgmlCpuGraphBackend::Cpu, None);
+                assert_eq!(captured.n_threads, Some(2));
+                assert_eq!(moonshine_graph_config_identity(captured), captured_identity);
+                assert_eq!(late_config.n_threads, Some(8));
+                assert_ne!(
+                    moonshine_graph_config_identity(late_config),
+                    captured_identity
+                );
+            },
+        );
     }
 }
