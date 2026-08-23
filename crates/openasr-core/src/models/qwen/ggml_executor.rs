@@ -52,8 +52,9 @@ use crate::arch::{
 use crate::device::execution_policy::ExecutionPlacement;
 use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphError, GgmlNativeGqaCapability, RequestBackendPreference,
-    ResolvedFamilyRuntimeInput, env_toggle_with_raw, env_var_truthy, request_backend_override,
+    GgmlCpuGraphBackend, GgmlCpuGraphError, GgmlDecodeOutputPlan, GgmlNativeGqaCapability,
+    RequestBackendPreference, ResolvedFamilyRuntimeInput, env_toggle_with_raw, env_var_truthy,
+    request_backend_override,
 };
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
@@ -113,17 +114,20 @@ type Qwen3AsrDecoderRuntimeCacheKey = (
     String,
     GgmlNativeGqaCapability,
     QwenQkvExecutionMode,
+    GgmlDecodeOutputPlan,
 );
 
 /// Immutable identity of one ordinary Qwen model owner. Request-sized KV is
 /// deliberately absent: it is created inside one actor call and dropped before
-/// checkout return, while the pack, physical lane and adapter stay resident.
+/// checkout return, while the pack, physical lane, adapter, and output plan
+/// stay resident.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Qwen3AsrRuntimeOwnerCacheKey {
     content: PackContentKey,
     lane: ExecutionLaneKey,
     native_gqa: GgmlNativeGqaCapability,
     qkv_execution_mode: QwenQkvExecutionMode,
+    output_plan: GgmlDecodeOutputPlan,
 }
 
 struct Qwen3AsrAudioEncoderRuntimeActorState {
@@ -578,6 +582,7 @@ impl Qwen3AsrGgmlExecutor {
             qwen_adapter_cache_fingerprint(adapter.as_ref().map(resolved_lora_adapter)),
             native_gqa,
             qkv_execution_mode,
+            resolved_runtime.output_plan(),
         );
         let preflight = preflight.clone();
         self.decoder_runtimes.checkout_or_try_build_with(
@@ -641,6 +646,7 @@ impl Qwen3AsrGgmlExecutor {
             lane: current_execution_lane_key(decoder_backend),
             native_gqa,
             qkv_execution_mode,
+            output_plan: resolved_runtime.output_plan(),
         };
         let preflight = preflight.clone();
         let content_id = preflight.runtime_source.content_id().to_string();
@@ -2705,14 +2711,37 @@ mod tests {
             lane: lane.clone(),
             native_gqa: GgmlNativeGqaCapability::Validated,
             qkv_execution_mode: QwenQkvExecutionMode::FusedArena,
+            output_plan: GgmlDecodeOutputPlan::FullLogits,
         };
         let split = Qwen3AsrRuntimeOwnerCacheKey {
             content,
             lane,
             native_gqa: GgmlNativeGqaCapability::Validated,
             qkv_execution_mode: QwenQkvExecutionMode::SplitLoaded,
+            output_plan: GgmlDecodeOutputPlan::FullLogits,
         };
         assert_ne!(fused, split);
+    }
+
+    #[test]
+    fn output_plan_partitions_unified_runtime_cache_identity() {
+        let content = PackContentKey::new("sha256:qwen-output-plan-fixture");
+        let lane = current_execution_lane_key(GgmlCpuGraphBackend::Cpu);
+        let full_logits = Qwen3AsrRuntimeOwnerCacheKey {
+            content: content.clone(),
+            lane: lane.clone(),
+            native_gqa: GgmlNativeGqaCapability::Validated,
+            qkv_execution_mode: QwenQkvExecutionMode::FusedArena,
+            output_plan: GgmlDecodeOutputPlan::FullLogits,
+        };
+        let compact = Qwen3AsrRuntimeOwnerCacheKey {
+            content,
+            lane,
+            native_gqa: GgmlNativeGqaCapability::Validated,
+            qkv_execution_mode: QwenQkvExecutionMode::FusedArena,
+            output_plan: GgmlDecodeOutputPlan::NativeFirstMaxToken,
+        };
+        assert_ne!(full_logits, compact);
     }
 
     #[test]

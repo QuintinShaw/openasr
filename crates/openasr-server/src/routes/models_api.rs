@@ -46,15 +46,73 @@ pub(crate) async fn set_default_model(
                 .to_string(),
         ));
     }
-    persist_default_pack(&home, &pack, preference)?;
+    let previous_runtime = runtime.model_pack_path.current();
+    let previous_durable = resolve_default_pack(&home, distribution.catalog_source())?;
+    let previous_preference = openasr_core::load_config_document(&home)
+        .map(|document| document.preferences.quant_preference)
+        .unwrap_or(QuantPreference::Auto);
+    let selected_output_plan = openasr_core::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+        None,
+        openasr_core::ggml_runtime::AutoGpuPolicy::AllBackends,
+    )
+    .output_plan();
+    // Production owners are materialized for this same resolved plan. The
+    // shipped activation entry attests that identity before durable commit.
+    let staged_owner = openasr_core::StagedActivationOwner::new(selected_output_plan);
+    openasr_core::activate_runtime_with_output_plan(
+        openasr_core::PreviousActivationState {
+            durable_selection: previous_durable.clone(),
+            active_runtime: previous_runtime.clone(),
+        },
+        openasr_core::ActivationFacts {
+            selected_output_plan,
+        },
+        staged_owner,
+        Some(pack.clone()),
+        Some(pack.path.clone()),
+        |next| {
+            let pack = next.as_ref().ok_or_else(|| {
+                ApiError::BadRequest("activation candidate is missing a pack".to_string())
+            })?;
+            persist_default_pack(&home, pack, preference)
+        },
+        |next_path| {
+            if runtime.backend != BackendKind::Native {
+                return Ok(());
+            }
+            runtime.rebind_native_model_pack(next_path.clone())
+        },
+        |previous| match previous {
+            Some(previous_pack) => {
+                persist_default_pack(&home, previous_pack, previous_preference.clone())
+            }
+            None => clear_default_model_selection(&home),
+        },
+    )
+    .map_err(map_activation_error)?;
     if runtime.backend == BackendKind::Native {
-        runtime.rebind_native_model_pack(Some(pack.path.clone()))?;
         crate::realtime::spawn_boot_native_warmup(runtime.clone());
     }
     Ok(Json(default_model_response(
         &home,
         distribution.catalog_source(),
     )?))
+}
+
+fn map_activation_error(
+    failed: openasr_core::FailedActivation<
+        Option<openasr_core::InstalledPack>,
+        Option<std::path::PathBuf>,
+    >,
+) -> ApiError {
+    match failed.error {
+        openasr_core::ActivationError::OutputPlanMismatch { selected, staged } => {
+            ApiError::BadRequest(format!(
+                "default model activation failed output-plan attestation: selected={selected:?} staged={staged:?}"
+            ))
+        }
+        openasr_core::ActivationError::Commit(reason) => ApiError::BadRequest(reason),
+    }
 }
 
 pub(crate) async fn delete_model(

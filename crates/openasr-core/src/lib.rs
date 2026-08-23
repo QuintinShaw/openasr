@@ -279,6 +279,10 @@ pub use model_store_gc::{
     ModelStoreEntry, ModelStoreGcReport, ModelStoreRefVerification, ModelStoreUsage,
     ModelStoreVerification, collect_model_store_garbage, model_store_usage, verify_model_store,
 };
+pub use models::candidate_activation_transaction::{
+    ActivationError, ActivationFacts, CommittedActivation, FailedActivation,
+    PreviousActivationState, StagedActivationOwner, activate_runtime_with_output_plan,
+};
 pub(crate) use models::ggml_asr_executor::{
     GgmlAsrExecutionViewRequest, GgmlAsrPreparedAudioView, GgmlAsrViewExecutor,
 };
