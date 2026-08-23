@@ -11,6 +11,7 @@ pub(crate) use routes::history::*;
 pub(crate) use routes::models_api::*;
 pub(crate) use routes::pairing::*;
 pub(crate) use routes::pull_jobs::*;
+pub(crate) use routes::runtime_receipts::*;
 pub(crate) use routes::transcription::*;
 pub(crate) use routes::voice_id::*;
 
@@ -137,13 +138,16 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
     distribution.log_restart_pending_pull_jobs();
     let auth = launch_options.auth.clone();
     let health_identity = ServerHealthIdentity::from_launch_options(launch_options);
+    let start_identity = ServerStartIdentity::new();
     Router::new()
         .route("/health", get(health))
+        .route("/v1/debug/runtime-receipts", get(runtime_receipts))
         .route("/v1/models", get(models))
         .route("/v1/catalog", get(catalog))
         .route("/v1/config", get(get_config).put(put_config))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/devices", get(devices))
+        .route("/v1/runtime/receipts", get(runtime_receipts))
         .route("/v1/history", get(history_list))
         .route("/v1/history/{id}", get(history_get).delete(history_delete))
         .route(
@@ -247,6 +251,7 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
         ))
         .layer(Extension(auth))
         .layer(Extension(health_identity))
+        .layer(Extension(start_identity))
         .layer(Extension(distribution))
         .layer(DefaultBodyLimit::max(MAX_TRANSCRIPTION_UPLOAD_BYTES))
         .with_state(runtime)
@@ -300,6 +305,30 @@ pub async fn serve_with_launch_options(
     openasr_core::stage_timing::log_stage(
         "server_boot",
         "runtime_validate",
+        stage_started.elapsed(),
+    );
+    let stage_started = Instant::now();
+    let home = openasr_home()?;
+    let migration = openasr_core::default_selection::migrate_legacy_to_v2(&home)?;
+    let projection = openasr_core::default_selection::repair_compat_projection(&home)?;
+    if let openasr_core::default_selection::DefaultSelectionCommitOutcome::V2CommittedProjectionFailed {
+        reason,
+    } = &projection
+    {
+        eprintln!(
+            "openasr-server: default V2 is valid but compatibility projection repair is pending: {reason}"
+        );
+    }
+    openasr_core::stage_timing::log_event(
+        "server_boot",
+        format_args!(
+            "stage=default_selection_migration migrated={}",
+            migration.is_some()
+        ),
+    );
+    openasr_core::stage_timing::log_stage(
+        "server_boot",
+        "default_selection_migration",
         stage_started.elapsed(),
     );
     let stage_started = Instant::now();
@@ -775,15 +804,29 @@ fn validate_listen_security(
     addr: SocketAddr,
     launch_options: &ServerLaunchOptions,
 ) -> anyhow::Result<()> {
+    validate_listen_security_with_escape(addr, launch_options, insecure_non_loopback_bind_allowed())
+}
+
+fn validate_listen_security_with_escape(
+    addr: SocketAddr,
+    launch_options: &ServerLaunchOptions,
+    allow_insecure_non_loopback: bool,
+) -> anyhow::Result<()> {
     if addr.ip().is_loopback() {
         return Ok(());
+    }
+    if !launch_options.auth.is_enabled() {
+        anyhow::bail!(
+            "OpenASR remote serve requires device authentication before binding a non-loopback address such as {addr}"
+        );
     }
     if !launch_options.tls.is_enabled() {
         // Opt-in escape hatch for container / trusted-network deployments where an
         // OUTER boundary controls exposure (a Docker port-publish, a reverse proxy
         // terminating TLS, etc.). The default stays fail-closed; the desktop
-        // pairing flow never sets this and always serves TLS.
-        if insecure_non_loopback_bind_allowed() {
+        // pairing flow never sets this and always serves TLS. This escape hatch
+        // only waives TLS; device authentication remains mandatory above.
+        if allow_insecure_non_loopback {
             eprintln!(
                 "openasr-server: WARNING — binding non-loopback {addr} WITHOUT TLS because OPENASR_ALLOW_INSECURE_NON_LOOPBACK is set. Traffic is UNENCRYPTED; only do this behind a trusted boundary (container / reverse proxy)."
             );
@@ -791,11 +834,6 @@ fn validate_listen_security(
         }
         anyhow::bail!(
             "OpenASR HTTP serve is local-only until TLS/WSS remote serving is enabled; bind a loopback address such as 127.0.0.1 instead of {addr} (or, only for a trusted/container deployment, set OPENASR_ALLOW_INSECURE_NON_LOOPBACK=1)"
-        );
-    }
-    if !launch_options.auth.is_enabled() {
-        anyhow::bail!(
-            "OpenASR remote serve requires device authentication before binding a non-loopback address such as {addr}"
         );
     }
     Ok(())
@@ -1222,6 +1260,29 @@ impl ServerHealthIdentity {
     }
 }
 
+/// Non-secret identity for one router/daemon start. This is intentionally
+/// separate from the legacy supervised-daemon instance token: the token is a
+/// readiness-control secret and must never be copied into diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServerStartIdentity {
+    pub(crate) pid: u32,
+    pub(crate) nonce: Option<String>,
+    pub(crate) started_at_unix_secs: Option<u64>,
+}
+
+impl ServerStartIdentity {
+    fn new() -> Self {
+        Self {
+            pid: std::process::id(),
+            nonce: random_hex(16).ok(),
+            started_at_unix_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_secs()),
+        }
+    }
+}
+
 fn resolve_instance_token(launch_option: Option<String>) -> Option<String> {
     env::var(SERVER_INSTANCE_TOKEN_ENV)
         .ok()
@@ -1237,6 +1298,10 @@ fn resolve_instance_token(launch_option: Option<String>) -> Option<String> {
 #[derive(Clone)]
 pub struct BoundModelPackPath {
     inner: Arc<RwLock<Option<PathBuf>>>,
+    /// Test-only failpoint honored inside the shipped
+    /// [`crate::realtime::probe_native_activation`]. Production leaves this
+    /// unset so live warmup runs.
+    activation_probe_failpoint: Arc<RwLock<Option<Result<(), String>>>>,
 }
 
 impl std::fmt::Debug for BoundModelPackPath {
@@ -1265,6 +1330,7 @@ impl From<Option<PathBuf>> for BoundModelPackPath {
     fn from(path: Option<PathBuf>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(path)),
+            activation_probe_failpoint: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -1296,6 +1362,23 @@ impl BoundModelPackPath {
 
     fn set(&self, path: Option<PathBuf>) {
         *self.lock_write() = path;
+    }
+
+    /// Inject a result into the shipped activation probe. Production leaves
+    /// this unset. Tests use it so set-default still enters
+    /// `probe_native_activation` instead of short-circuiting in the caller.
+    pub fn set_activation_probe_failpoint(&self, result: Option<Result<(), String>>) {
+        *self
+            .activation_probe_failpoint
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = result;
+    }
+
+    pub(crate) fn activation_probe_failpoint(&self) -> Option<Result<(), String>> {
+        self.activation_probe_failpoint
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
@@ -1426,6 +1509,15 @@ impl ServerRuntime {
     /// only after a successful load/decode, and flips back to `false` the
     /// moment the `idle_unload` reaper evicts the cached runtime, without
     /// this method reaching into any per-thread cache itself.
+    pub(crate) fn runtime_receipt_snapshot(
+        &self,
+    ) -> openasr_core::runtime_receipts::RuntimeReceiptSnapshot {
+        self.native_execution
+            .execution_services()
+            .runtime_receipts()
+            .snapshot()
+    }
+
     fn model_is_resident(&self) -> bool {
         match self.backend {
             BackendKind::Mock => true,
@@ -2623,6 +2715,15 @@ impl From<openasr_core::default_selection::DefaultSelectionError> for ApiError {
             }
             openasr_core::default_selection::DefaultSelectionError::Catalog(error) => {
                 Self::Catalog(error)
+            }
+            openasr_core::default_selection::DefaultSelectionError::NotCommitted { reason } => {
+                Self::BadRequest(format!("default selection was not committed: {reason}"))
+            }
+            openasr_core::default_selection::DefaultSelectionError::Corrupt { path, reason } => {
+                Self::BadRequest(format!(
+                    "active default selection is corrupt at {}: {reason}",
+                    path.display()
+                ))
             }
         }
     }

@@ -39,7 +39,7 @@ enum PredictorState {
         pred_proj: Vec<f32>,
     },
     Resident {
-        arena: GgmlStaticTensorArena,
+        arena: Box<GgmlStaticTensorArena>,
         h: Vec<GgmlStaticTensor>,
         c: Vec<GgmlStaticTensor>,
         reset_zeros: Vec<f32>,
@@ -186,7 +186,7 @@ impl ParakeetTdtDeviceDecoder {
                 predictor,
                 joint,
                 PredictorState::Resident {
-                    arena,
+                    arena: Box::new(arena),
                     h,
                     c,
                     reset_zeros,

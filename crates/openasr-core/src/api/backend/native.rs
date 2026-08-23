@@ -577,6 +577,10 @@ struct NativeStreamingSessionCandidateFactory {
 trait NativeStreamingSessionCandidateBuilder: Send + Sync {
     fn execution_services(&self) -> Arc<NativeExecutionServices>;
 
+    fn activation_pack(&self) -> Option<crate::models::pack_verifier::VerifiedPack> {
+        None
+    }
+
     fn initialize_auxiliary_runtimes(&self) -> Result<(), NativeAsrError> {
         Ok(())
     }
@@ -595,6 +599,10 @@ impl NativeStreamingSessionCandidateBuilder for NativeStreamingSessionCandidateF
         Arc::clone(&self.execution_services)
     }
 
+    fn activation_pack(&self) -> Option<crate::models::pack_verifier::VerifiedPack> {
+        Some(self.verified_pack.as_ref().clone())
+    }
+
     fn initialize_auxiliary_runtimes(&self) -> Result<(), NativeAsrError> {
         if let Some(punctuator) = self.streaming_punctuator.as_ref() {
             punctuator.initialize().map_err(|error| {
@@ -611,6 +619,10 @@ impl NativeStreamingSessionCandidateBuilder for NativeStreamingSessionCandidateF
         Box<dyn NativeAsrSession>,
         NativeAsrError,
     > {
+        let _activation_pack =
+            crate::models::native_execution_services::install_candidate_activation_pack(
+                self.verified_pack.as_ref().clone(),
+            );
         crate::models::native_execution_services::run_execution_candidate_attempt(
             self.execution_services.as_ref(),
             candidate,
@@ -760,6 +772,10 @@ impl PolicyResolvedNativeStreamingSession {
         }
         let candidate = self.candidate().clone();
         let services = self.factory.execution_services();
+        let _activation_pack = self
+            .factory
+            .activation_pack()
+            .map(crate::models::native_execution_services::install_candidate_activation_pack);
         crate::models::native_execution_services::run_execution_candidate_attempt(
             services.as_ref(),
             &candidate,

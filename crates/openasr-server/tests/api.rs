@@ -643,6 +643,78 @@ async fn config_endpoint_roundtrips_versioned_preferences() {
 }
 
 #[tokio::test]
+async fn config_endpoint_honors_v2_unset_over_stale_legacy_config_on_get_put() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let mut legacy = openasr_core::OpenAsrConfigDocument::default();
+    legacy.config.default_model = Some("stale-model".to_string());
+    openasr_core::save_config_document(&home, &legacy).unwrap();
+    openasr_core::default_selection::persist_v2_record(
+        &home,
+        openasr_core::default_selection::ActiveModelSelectionV2 {
+            schema_version:
+                openasr_core::default_selection::ACTIVE_MODEL_SELECTION_V2_SCHEMA_VERSION,
+            selection_generation: 0,
+            status: openasr_core::default_selection::ActiveModelSelectionStatus::Unset,
+            pull: None,
+            model_id: None,
+            quant: None,
+            architecture_id: None,
+            expected_pack: None,
+            quant_preference: openasr_core::QuantPreference::Auto,
+            execution_intent: "auto".to_string(),
+            checksum: String::new(),
+        },
+    )
+    .unwrap();
+
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/config")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let mut document: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(document["default_model"].is_null());
+    document["preferences"]["language"] = serde_json::json!("en");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/config")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(document.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let saved: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(saved["default_model"].is_null());
+    assert_eq!(saved["preferences"]["language"], "en");
+
+    let persisted: Value =
+        serde_json::from_slice(&std::fs::read(home.join("config.json")).unwrap()).unwrap();
+    assert!(persisted["default_model"].is_null());
+}
+
+#[tokio::test]
 async fn config_endpoint_rejects_invalid_whole_object_update() {
     let temp = tempfile::tempdir().unwrap();
     let distribution = openasr_server::DistributionRuntime {
@@ -656,7 +728,7 @@ async fn config_endpoint_rejects_invalid_whole_object_update() {
     );
 
     let mut document = serde_json::json!({
-        "default_model": "whisper-large-v3-turbo",
+        "default_model": null,
         "default_backend": "bogus-xyz",
         "media": {},
         "preferences": {
@@ -770,7 +842,7 @@ async fn preferences_only_put_merges_partial_preferences() {
     );
 
     let initial = serde_json::json!({
-        "default_model": "whisper-large-v3-turbo",
+        "default_model": null,
         "default_backend": "mock",
         "media": { "ffmpeg_bin": null },
         "preferences": {
@@ -1892,6 +1964,9 @@ async fn set_default_rebinds_native_bound_pack_without_restart() {
         TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed("whisper-tiny"),
     );
     let runtime = native_runtime_with_pack(Some(moonshine.clone()));
+    runtime
+        .model_pack_path
+        .set_activation_probe_failpoint(Some(Ok(())));
     let app = openasr_server::app_with_runtime_and_distribution(
         runtime.clone(),
         openasr_server::DistributionRuntime {
@@ -1945,6 +2020,9 @@ async fn set_default_binds_unbound_native_runtime_without_restart() {
         TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready("moonshine-tiny"),
     );
     let runtime = native_runtime_with_pack(None);
+    runtime
+        .model_pack_path
+        .set_activation_probe_failpoint(Some(Ok(())));
     let app = openasr_server::app_with_runtime_and_distribution(
         runtime.clone(),
         openasr_server::DistributionRuntime {
@@ -3152,6 +3230,144 @@ async fn bearer_auth_protects_v1_routes_when_enabled() {
 }
 
 #[tokio::test]
+async fn runtime_receipts_require_operator_auth_and_bound_query() {
+    let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime::default(),
+        openasr_server::ServerLaunchOptions {
+            auth: openasr_server::ServerAuth::pairing("admin-secret"),
+            ..Default::default()
+        },
+    );
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/debug/runtime-receipts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/pairing/requests")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"device_name":"Receipt Reader"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::ACCEPTED);
+    let create_body = to_bytes(create.into_body(), 1024 * 64).await.unwrap();
+    let request_id = serde_json::from_slice::<Value>(&create_body).unwrap()["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let approve = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/pairing/requests/{request_id}/approve"))
+                .header(header::AUTHORIZATION, "Bearer admin-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(approve.status(), StatusCode::OK);
+
+    let credential = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/pairing/requests/{request_id}/credential"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(credential.status(), StatusCode::OK);
+    let credential_body = to_bytes(credential.into_body(), 1024 * 64).await.unwrap();
+    let credential_json: Value = serde_json::from_slice(&credential_body).unwrap();
+    let device_token = credential_json["bearer_token"].as_str().unwrap();
+
+    let device = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/debug/runtime-receipts")
+                .header(header::AUTHORIZATION, format!("Bearer {device_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(device.status(), StatusCode::FORBIDDEN);
+
+    let device_runtime = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/runtime/receipts")
+                .header(header::AUTHORIZATION, format!("Bearer {device_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(device_runtime.status(), StatusCode::FORBIDDEN);
+
+    let authorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/debug/runtime-receipts?event_limit=999999")
+                .header(header::AUTHORIZATION, "Bearer admin-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+    let body = to_bytes(authorized.into_body(), 1024 * 64).await.unwrap();
+    let body_text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(!body_text.contains("admin-secret"));
+    assert!(!body_text.contains(device_token));
+    let json: Value = serde_json::from_str(&body_text).unwrap();
+    assert_eq!(json["schema"], "openasr.runtime-ownership-receipt.v1");
+    assert_eq!(json["availability"], "available");
+    assert!(json["snapshot_completeness"]["complete"].as_bool().unwrap());
+    assert_eq!(json["event_limit"], 128);
+    assert!(json["live_owners"].as_array().unwrap().is_empty());
+    assert!(json["recent_events"].as_array().unwrap().is_empty());
+    let daemon_nonce = json["daemon_start_identity"]["nonce"].as_str().unwrap();
+    assert_eq!(daemon_nonce.len(), 32);
+    assert!(daemon_nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert!(json.get("instance_token").is_none());
+
+    let invalid_domain = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/debug/runtime-receipts?domain=physical-device")
+                .header(header::AUTHORIZATION, "Bearer admin-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_domain.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn pairing_auth_issues_and_revokes_device_bearer_credentials() {
     let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
         openasr_server::ServerRuntime::default(),
@@ -3566,7 +3782,10 @@ async fn serve_rejects_non_loopback_http_bind_until_tls_is_available() {
     let err = openasr_server::serve_with_launch_options(
         "0.0.0.0:0".parse().unwrap(),
         openasr_server::ServerRuntime::default(),
-        openasr_server::ServerLaunchOptions::default(),
+        openasr_server::ServerLaunchOptions {
+            auth: openasr_server::ServerAuth::bearer("test-token"),
+            ..Default::default()
+        },
     )
     .await
     .unwrap_err();

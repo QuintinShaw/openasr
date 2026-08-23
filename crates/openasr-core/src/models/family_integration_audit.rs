@@ -538,6 +538,7 @@ pub(crate) mod source_tree_audit {
                 ..base.optimization_contract
             },
             quantization_contract: base.quantization_contract,
+            resident_footprint: base.resident_footprint,
             conformance_contract: base.conformance_contract,
         };
     }

@@ -32,6 +32,10 @@ use crate::ggml_runtime::{
     GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlLoadedWeightBindingIdentity,
     GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
 };
+use crate::models::native_execution_services::{
+    current_execution_cache_attempt_id, current_execution_lane_key, current_runtime_receipts,
+};
+use crate::models::runtime_receipts::RuntimeOwnerGuard;
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, AttentionValueMergeSteps,
     RelativePositionAttentionInputs, RelativePositionAttentionSteps, STANDARD_HEAD_PERMUTE_AXES,
@@ -62,6 +66,29 @@ const FIRERED_ENCODER_LAYER_NORM_EPSILON: f32 = 1.0e-5;
 /// encoder pads the time axis by `context - 1` zero frames before the stem
 /// (`fireredasr` `ConformerEncoder.forward(..., pad=True)`).
 const SUBSAMPLE_CONTEXT_PAD_FRAMES: usize = 6;
+
+/// Starts a diagnostic component owner for a FireRed graph runtime. The receipt
+/// is deliberately independent of admission and carries only the keyed content
+/// and exact execution-lane projections; native ownership remains with the
+/// runtime's ordinary drop order.
+pub(crate) fn start_firered_component_receipt(
+    component: &'static str,
+    content_id: &str,
+    backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+) -> Option<RuntimeOwnerGuard> {
+    let collector = current_runtime_receipts()?;
+    if !collector.is_available() {
+        return None;
+    }
+    let lane = current_execution_lane_key(backend).receipt_projection(&collector);
+    let descriptor = collector.owner_descriptor(
+        component,
+        Some(content_id),
+        Some("firered-runtime-component"),
+        lane,
+    )?;
+    Some(collector.start_owner(descriptor, current_execution_cache_attempt_id()))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FireRedEncoderOutput {
@@ -114,6 +141,8 @@ pub(crate) struct FireRedEncoderGraphRuntime {
     relative_position_inverse_timescales: GgmlStaticTensor,
     weights: FireRedEncoderWeights,
     metadata: FireRedAedExecutionMetadata,
+    /// Dropped after the native runner, loaded binding, and weight descriptors.
+    _receipt_owner: Option<RuntimeOwnerGuard>,
 }
 
 impl FireRedEncoderGraphRuntime {
@@ -183,6 +212,11 @@ impl FireRedEncoderGraphRuntime {
                 "firered_relative_position_inverse_timescales",
             )
             .map_err(|source| map_err("upload_relative_position_inverse_timescales", source))?;
+        let receipt_owner = start_firered_component_receipt(
+            "firered-conformer-encoder",
+            preflight.runtime_source.content_id(),
+            backend,
+        );
         Ok(Self {
             runner,
             _loaded: loaded,
@@ -190,6 +224,7 @@ impl FireRedEncoderGraphRuntime {
             relative_position_inverse_timescales: relative_position_inv,
             weights,
             metadata,
+            _receipt_owner: receipt_owner,
         })
     }
 

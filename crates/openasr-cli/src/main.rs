@@ -613,31 +613,73 @@ fn show_model(target: &str) -> Result<()> {
 
 fn config_command(command: ConfigCommand) -> Result<()> {
     let home = openasr_home()?;
+    if matches!(&command, ConfigCommand::RecoverDefault) {
+        let outcome = openasr_core::default_selection::recover_corrupt_v2_detailed(&home)
+            .context("Could not recover the corrupt V2 default selection")?;
+        match outcome {
+            openasr_core::default_selection::DefaultSelectionRecoveryOutcome::Committed {
+                record,
+                ..
+            } => println!(
+                "Recovered default selection to {:?} (generation {}).",
+                record.status, record.selection_generation
+            ),
+            openasr_core::default_selection::DefaultSelectionRecoveryOutcome::ProjectionFailed {
+                record,
+                reason,
+                ..
+            } => {
+                eprintln!(
+                    "Warning: V2 default selection was recovered to {:?} (generation {}), but compatibility projection repair is pending: {reason}",
+                    record.status, record.selection_generation
+                );
+                println!(
+                    "Recovered default selection to {:?} (generation {}).",
+                    record.status, record.selection_generation
+                );
+            }
+        }
+        return Ok(());
+    }
     let mut config = load_config(&home)?;
 
     match command {
-        ConfigCommand::List => print_config(&config),
+        ConfigCommand::List => print_config(&home, &config)?,
         ConfigCommand::Get { key } => {
             let key = ConfigKey::from_str(&key)?;
-            println!(
-                "{}",
-                config.get(key).unwrap_or_else(|| UNSET_VALUE.to_string())
-            );
+            let value = if key == ConfigKey::DefaultModel {
+                openasr_core::default_selection::current_default_model(&home)?
+            } else {
+                config.get(key)
+            };
+            println!("{}", value.unwrap_or_else(|| UNSET_VALUE.to_string()));
         }
         ConfigCommand::Set { key, value } => {
             let key = ConfigKey::from_str(&key)?;
+            reject_legacy_default_model_mutation(key)?;
             set_config_value(&mut config, key, value)?;
             save_config(&home, &config)?;
             println!("Set {}.", key.as_str());
         }
         ConfigCommand::Unset { key } => {
             let key = ConfigKey::from_str(&key)?;
+            reject_legacy_default_model_mutation(key)?;
             config.unset(key);
             save_config(&home, &config)?;
             println!("Unset {}.", key.as_str());
         }
+        ConfigCommand::RecoverDefault => unreachable!("handled before loading config"),
     }
 
+    Ok(())
+}
+
+fn reject_legacy_default_model_mutation(key: ConfigKey) -> Result<()> {
+    if key == ConfigKey::DefaultModel {
+        bail!(
+            "default_model is managed by the default-selection authority; use the daemon's /v1/models/default endpoint or the desktop default-model activation surface instead."
+        );
+    }
     Ok(())
 }
 
@@ -842,19 +884,26 @@ fn catalog_fingerprint_command() -> Result<()> {
     Ok(())
 }
 
-fn print_config(config: &OpenAsrConfig) {
+fn print_config(home: &Path, config: &OpenAsrConfig) -> Result<()> {
+    let current_default = openasr_core::default_selection::current_default_model(home)?;
     for key in [
         ConfigKey::DefaultModel,
         ConfigKey::DefaultBackend,
         ConfigKey::MediaFfmpegBin,
         ConfigKey::DownloadSource,
     ] {
+        let value = if key == ConfigKey::DefaultModel {
+            current_default.clone()
+        } else {
+            config.get(key)
+        };
         println!(
             "{}={}",
             key.as_str(),
-            config.get(key).unwrap_or_else(|| UNSET_VALUE.to_string())
+            value.unwrap_or_else(|| UNSET_VALUE.to_string())
         );
     }
+    Ok(())
 }
 
 fn doctor() -> Result<()> {
@@ -863,7 +912,8 @@ fn doctor() -> Result<()> {
     let config = load_config(&home)?;
     let catalog = load_cli_model_catalog(&home)?;
     let cards = runtime_registry(catalog.as_ref()).context("Could not load model registry")?;
-    let default_model = config.default_model.as_deref().unwrap_or(DEFAULT_MODEL_ID);
+    let current_default = openasr_core::default_selection::current_default_model(&home)?;
+    let default_model = current_default.as_deref().unwrap_or(DEFAULT_MODEL_ID);
     let default_backend = config
         .default_backend
         .as_deref()
@@ -1196,11 +1246,7 @@ fn transcribe(
         && options.model_pack.is_none()
         && let Some(catalog) = offline_language_catalog(&home)
     {
-        let model_ref = options
-            .model
-            .map(str::to_string)
-            .or_else(|| config.default_model.clone())
-            .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
+        let model_ref = selected_model_ref(options.model, &home)?;
         validate_requested_language(&catalog, &model_ref, language)?;
     }
 
@@ -1490,7 +1536,9 @@ mod tests {
             ..OpenAsrConfig::default()
         };
 
-        let card = resolve_transcribe_model(&cards, None, &config).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        save_config(home.path(), &config).unwrap();
+        let card = resolve_transcribe_model(&cards, None, home.path()).unwrap();
 
         assert_eq!(card.id, "whisper-small");
     }
@@ -1506,8 +1554,10 @@ mod tests {
             ..OpenAsrConfig::default()
         };
 
+        let home = tempfile::tempdir().unwrap();
+        save_config(home.path(), &config).unwrap();
         let card =
-            resolve_transcribe_model(&cards, Some("whisper-large-v3-turbo"), &config).unwrap();
+            resolve_transcribe_model(&cards, Some("whisper-large-v3-turbo"), home.path()).unwrap();
 
         assert_eq!(card.id, "whisper-large-v3-turbo");
     }
@@ -1523,7 +1573,9 @@ mod tests {
             ..OpenAsrConfig::default()
         };
 
-        let error = resolve_transcribe_model(&cards, None, &config).unwrap_err();
+        let home = tempfile::tempdir().unwrap();
+        save_config(home.path(), &config).unwrap();
+        let error = resolve_transcribe_model(&cards, None, home.path()).unwrap_err();
         assert!(error.to_string().contains("Unknown model: whisper-tiny"));
     }
 
@@ -1538,7 +1590,9 @@ mod tests {
             ..OpenAsrConfig::default()
         };
 
-        let error = resolve_transcribe_model(&cards, None, &config).unwrap_err();
+        let home = tempfile::tempdir().unwrap();
+        save_config(home.path(), &config).unwrap();
+        let error = resolve_transcribe_model(&cards, None, home.path()).unwrap_err();
         assert!(error.to_string().contains("Unknown model: whisper-tiny.en"));
     }
 
@@ -1557,7 +1611,9 @@ mod tests {
                 default_model: Some(alias.to_string()),
                 ..OpenAsrConfig::default()
             };
-            let error = resolve_transcribe_model(&cards, None, &config).unwrap_err();
+            let home = tempfile::tempdir().unwrap();
+            save_config(home.path(), &config).unwrap();
+            let error = resolve_transcribe_model(&cards, None, home.path()).unwrap_err();
             assert!(error.to_string().contains("Unknown model"), "{alias}");
         }
     }
@@ -1573,7 +1629,9 @@ mod tests {
             ..OpenAsrConfig::default()
         };
 
-        let error = resolve_transcribe_model(&cards, None, &config).unwrap_err();
+        let home = tempfile::tempdir().unwrap();
+        save_config(home.path(), &config).unwrap();
+        let error = resolve_transcribe_model(&cards, None, home.path()).unwrap_err();
         assert!(error.to_string().contains("Unknown model: not-a-model"));
     }
 
@@ -1628,8 +1686,8 @@ mod tests {
 
     #[test]
     fn rejects_unknown_transcribe_model_with_friendly_message() {
-        let error = resolve_transcribe_model(&[], Some("not-a-model"), &OpenAsrConfig::default())
-            .unwrap_err();
+        let home = tempfile::tempdir().unwrap();
+        let error = resolve_transcribe_model(&[], Some("not-a-model"), home.path()).unwrap_err();
         let message = error.to_string();
 
         assert!(message.contains("Unknown model: not-a-model"));
@@ -1901,8 +1959,9 @@ mod tests {
     fn default_model_ref_matches_documented_constant() {
         // No --model and no saved default resolves to the built-in default,
         // which must stay the documented qwen3-asr-0.6b (guards code/doc drift).
+        let home = tempfile::tempdir().unwrap();
         assert_eq!(
-            selected_model_ref(None, &OpenAsrConfig::default(), &[]),
+            selected_model_ref(None, home.path()).unwrap(),
             "qwen3-asr-0.6b"
         );
         assert_eq!(DEFAULT_MODEL_ID, "qwen3-asr-0.6b");

@@ -67,7 +67,7 @@ impl From<crate::ExecutionTarget> for ExecutionIntent {
 }
 
 /// Placement shapes implemented by a family/runtime pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum ExecutionPlacement {
     CpuOnly,
     FullDevice,

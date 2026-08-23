@@ -46,76 +46,209 @@ pub(crate) async fn set_default_model(
                 .to_string(),
         ));
     }
-    let previous_runtime = runtime.model_pack_path.current();
-    let previous_durable = resolve_default_pack(&home, distribution.catalog_source())?;
-    let previous_preference = openasr_core::load_config_document(&home)
-        .map(|document| document.preferences.quant_preference)
-        .unwrap_or(QuantPreference::Auto);
-    let selected_output_plan = openasr_core::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
-        None,
-        openasr_core::ggml_runtime::AutoGpuPolicy::AllBackends,
-    )
-    .output_plan();
-    // Production owners are materialized for this same resolved plan. The
-    // shipped activation entry attests that identity before durable commit.
-    let staged_owner = openasr_core::StagedActivationOwner::new(selected_output_plan);
-    openasr_core::activate_runtime_with_output_plan(
-        openasr_core::PreviousActivationState {
-            durable_selection: previous_durable.clone(),
-            active_runtime: previous_runtime.clone(),
+
+    let identity = openasr_core::DefaultModelActivationIdentity {
+        pull: pack.pull.clone(),
+        path: pack.path.clone(),
+    };
+    let facts = openasr_core::ResolvedExecutionFacts::new(
+        openasr_core::DefaultModelActivationPlan {
+            path: pack.path.clone(),
         },
-        openasr_core::ActivationFacts {
-            selected_output_plan,
-        },
-        staged_owner,
-        Some(pack.clone()),
-        Some(pack.path.clone()),
-        |next| {
-            let pack = next.as_ref().ok_or_else(|| {
-                ApiError::BadRequest("activation candidate is missing a pack".to_string())
-            })?;
-            persist_default_pack(&home, pack, preference)
-        },
-        |next_path| {
-            if runtime.backend != BackendKind::Native {
-                return Ok(());
-            }
-            runtime.rebind_native_model_pack(next_path.clone())
-        },
-        |previous| match previous {
-            Some(previous_pack) => {
-                persist_default_pack(&home, previous_pack, previous_preference.clone())
-            }
-            None => clear_default_model_selection(&home),
-        },
-    )
-    .map_err(map_activation_error)?;
-    if runtime.backend == BackendKind::Native {
-        crate::realtime::spawn_boot_native_warmup(runtime.clone());
+        openasr_core::DefaultModelActivationLane,
+        identity.clone(),
+    );
+    let prepared = openasr_core::DefaultModelActivationJournalFactory {
+        home: home.clone(),
+        pack: pack.clone(),
+        preference,
     }
+    .prepare(
+        openasr_core::DefaultModelActivationCandidate {
+            pull: pack.pull.clone(),
+            path: pack.path.clone(),
+        },
+        facts,
+    );
+    debug_assert_eq!(prepared.stage(), openasr_core::ActivationStage::Prepared);
+
+    let verified_pack = openasr_core::PackVerifier
+        .verify_candidate(openasr_core::PackCandidate::new(pack.path.clone()))
+        .map_err(|error| {
+            ApiError::BadRequest(format!(
+                "default model pack is not a verified activation pack: {error}"
+            ))
+        })?;
+    let intent = crate::realtime::realtime_execution_target_preference(&home)
+        .map(openasr_core::device::execution_policy::ExecutionIntent::from)
+        .unwrap_or(openasr_core::device::execution_policy::ExecutionIntent::Auto);
+    let services = runtime.native_execution.execution_services();
+    let candidate =
+        openasr_core::resolve_candidate_activation_lane(services.as_ref(), &verified_pack, intent)
+            .map_err(|reason| {
+                ApiError::BadRequest(format!("default model activation lane failed: {reason}"))
+            })?;
+    let reservation = openasr_core::quote_and_reserve_candidate_activation(
+        services.as_ref(),
+        &candidate,
+        &verified_pack,
+    )
+    .map_err(|reason| {
+        ApiError::BadRequest(format!("default model activation reserve failed: {reason}"))
+    })?;
+    let reserved = prepared.reserve(reservation);
+    debug_assert_eq!(reserved.stage(), openasr_core::ActivationStage::Reserved);
+
+    let staged = NativePackRebindOwner::stage(&runtime, Some(pack.path.clone()))?;
+    let materialized = reserved.materialize(std::iter::once(staged));
+    debug_assert_eq!(
+        materialized.stage(),
+        openasr_core::ActivationStage::Materialized
+    );
+
+    let pending = materialized.begin_attestation(NativeActivationAttestation {
+        identity,
+        runtime: runtime.clone(),
+    });
+    debug_assert_eq!(
+        pending.stage(),
+        openasr_core::ActivationStage::AttestationPending
+    );
+
+    let attested = match pending.attest() {
+        openasr_core::AttestationOutcome::Attested(attested) => attested,
+        openasr_core::AttestationOutcome::Rejected {
+            transaction,
+            source,
+        } => {
+            let _ = transaction.rollback_activation();
+            return Err(map_attestation_error(source));
+        }
+        openasr_core::AttestationOutcome::MustQuarantine {
+            transaction,
+            source,
+        } => {
+            let _ = transaction.quarantine_activation();
+            return Err(map_attestation_error(source));
+        }
+    };
+    debug_assert_eq!(attested.stage(), openasr_core::ActivationStage::Attested);
+
+    attested.commit_activation().map_err(|source| {
+        ApiError::BadRequest(format!("default model was not committed: {source}"))
+    })?;
+
+    // Durable V2 is the commit frontier. Live publication is the non-fallible
+    // follow-up: it must not run before persist, and a failed persist must
+    // leave the previous live path in place.
+    if runtime.backend == BackendKind::Native {
+        runtime.rebind_native_model_pack(Some(pack.path.clone()))?;
+    }
+
     Ok(Json(default_model_response(
         &home,
         distribution.catalog_source(),
     )?))
 }
 
-fn map_activation_error(
-    failed: openasr_core::FailedActivation<
-        Option<openasr_core::InstalledPack>,
-        Option<std::path::PathBuf>,
-    >,
-) -> ApiError {
-    match failed.error {
-        openasr_core::ActivationError::OutputPlanMismatch { selected, staged } => {
-            ApiError::BadRequest(format!(
-                "default model activation failed output-plan attestation: selected={selected:?} staged={staged:?}"
-            ))
+struct NativePackRebindOwner {
+    runtime: ServerRuntime,
+    previous: Option<PathBuf>,
+}
+
+impl NativePackRebindOwner {
+    fn stage(runtime: &ServerRuntime, _new_path: Option<PathBuf>) -> Result<Self, ApiError> {
+        Ok(Self {
+            runtime: runtime.clone(),
+            previous: runtime.model_pack_path.current(),
+        })
+    }
+
+    fn restore(&mut self) -> Result<(), String> {
+        if self.runtime.backend != BackendKind::Native {
+            return Ok(());
         }
-        openasr_core::ActivationError::Commit(reason) => ApiError::BadRequest(reason),
+        if self.runtime.model_pack_path.current() == self.previous {
+            return Ok(());
+        }
+        self.runtime
+            .rebind_native_model_pack(self.previous.clone())
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl openasr_core::StagedOwner for NativePackRebindOwner {
+    type Error = String;
+
+    fn teardown(&mut self) -> Result<(), Self::Error> {
+        self.restore()
+    }
+
+    fn quarantine(&mut self) -> Result<(), Self::Error> {
+        self.restore()
+    }
+}
+
+struct NativeActivationAttestation {
+    identity: openasr_core::DefaultModelActivationIdentity,
+    runtime: ServerRuntime,
+}
+
+impl
+    openasr_core::TypedAttestation<
+        openasr_core::DefaultModelActivationPlan,
+        openasr_core::DefaultModelActivationLane,
+    > for NativeActivationAttestation
+{
+    type Identity = openasr_core::DefaultModelActivationIdentity;
+    type Evidence = openasr_core::DefaultModelActivationEvidence;
+    type Error = String;
+
+    fn identity(&self) -> &Self::Identity {
+        &self.identity
+    }
+
+    fn attest(
+        &self,
+        _facts: &openasr_core::ResolvedExecutionFacts<
+            openasr_core::DefaultModelActivationPlan,
+            openasr_core::DefaultModelActivationLane,
+            Self::Identity,
+        >,
+    ) -> Result<Self::Evidence, openasr_core::AttestationFailure<Self::Error>> {
+        if self.runtime.backend != BackendKind::Native {
+            return Ok(openasr_core::DefaultModelActivationEvidence::new(
+                self.identity.clone(),
+            ));
+        }
+        crate::realtime::probe_native_activation_blocking(
+            self.runtime.clone(),
+            Some(self.identity.path.clone()),
+        )
+        .map_err(|error| openasr_core::AttestationFailure::Rejected(error.to_string()))?;
+        Ok(openasr_core::DefaultModelActivationEvidence::new(
+            self.identity.clone(),
+        ))
+    }
+}
+
+fn map_attestation_error(source: openasr_core::AttestationError<String>) -> ApiError {
+    match source {
+        openasr_core::AttestationError::Contract(
+            openasr_core::AttestationFailure::Rejected(reason)
+            | openasr_core::AttestationFailure::MustQuarantine(reason),
+        ) => ApiError::BadRequest(reason),
+        openasr_core::AttestationError::ContractIdentityMismatch => {
+            ApiError::BadRequest("activation attestation contract identity mismatch".to_string())
+        }
+        openasr_core::AttestationError::EvidenceIdentityMismatch => {
+            ApiError::BadRequest("activation attestation evidence identity mismatch".to_string())
+        }
     }
 }
 
 pub(crate) async fn delete_model(
+    State(runtime): State<ServerRuntime>,
     AxumPath(id): AxumPath<String>,
     Extension(distribution): Extension<DistributionContext>,
 ) -> Result<Json<DeleteModelResponse>, ApiError> {
@@ -132,7 +265,23 @@ pub(crate) async fn delete_model(
         .as_ref()
         .is_some_and(|pack| default_pull.as_deref() == Some(pack.pull.as_str()))
     {
-        clear_default_model_selection(&home)?;
+        let clear_outcome = clear_default_model_selection(&home)?;
+        match &clear_outcome {
+            openasr_core::default_selection::DefaultSelectionCommitOutcome::NotCommitted {
+                reason,
+            } => {
+                return Err(ApiError::BadRequest(format!(
+                    "default clear was not committed: {reason}"
+                )));
+            }
+            openasr_core::default_selection::DefaultSelectionCommitOutcome::V2Committed => {}
+            openasr_core::default_selection::DefaultSelectionCommitOutcome::V2CommittedProjectionFailed {
+                reason,
+            } => eprintln!(
+                "openasr-server: default V2 clear committed; legacy projection repair is pending: {reason}"
+            ),
+        }
+        runtime.rebind_native_model_pack(None)?;
     }
     Ok(Json(DeleteModelResponse {
         deleted: removed.is_some(),
@@ -300,14 +449,16 @@ pub(crate) fn persist_default_pack(
     home: &Path,
     pack: &InstalledPack,
     quant_preference: QuantPreference,
-) -> Result<(), ApiError> {
-    Ok(openasr_core::default_selection::persist(
+) -> Result<openasr_core::default_selection::DefaultSelectionCommitOutcome, ApiError> {
+    Ok(openasr_core::default_selection::persist_detailed(
         home,
         pack,
         quant_preference,
     )?)
 }
 
-pub(crate) fn clear_default_model_selection(home: &Path) -> Result<(), ApiError> {
-    Ok(openasr_core::default_selection::clear(home)?)
+pub(crate) fn clear_default_model_selection(
+    home: &Path,
+) -> Result<openasr_core::default_selection::DefaultSelectionCommitOutcome, ApiError> {
+    Ok(openasr_core::default_selection::clear_detailed(home)?)
 }

@@ -316,8 +316,10 @@ next candidate. Model, input, format, cancellation, and decoding failures do
 not. String matching is not a fallback protocol.
 
 Offline dispatch may retry the complete transaction. Streaming construction
-and warm-up may retry before any audio is accepted. After the first sample is
-accepted, automatic replay on another candidate is forbidden.
+and warm-up may retry before any externally visible semantic output or decision
+has committed the lane; raw PCM arrival is not itself that frontier. After the
+first such output or decision reaches the client/session observer, automatic
+replay or fallback on another candidate is forbidden.
 
 Window reduction, model switching, and state quantization are separate product
 choices and are not hidden inside the planner or fallback resolver.

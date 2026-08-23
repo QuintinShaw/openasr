@@ -15,40 +15,89 @@
 
 use std::fmt;
 
+use super::SharedFireRedStreamVadModel;
 use super::frontend::FRAME_LENGTH;
-use super::model::{FRAME_SHIFT_MS, FireRedStreamVadCache, FireRedStreamVadModel};
+use super::model::{CACHE_FRAMES, FRAME_SHIFT_MS, FireRedStreamVadCache, NUM_BLOCKS, PROJ};
+use crate::models::system_memory_owner::{
+    SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote, SystemMemoryCapacity,
+    SystemMemoryOwner,
+};
 
-/// Buffered, stateful Stream-VAD detector for one realtime session.
-pub struct FireRedStreamingVad {
-    model: &'static FireRedStreamVadModel,
+struct FireRedStreamingVadState {
+    model: SharedFireRedStreamVadModel,
     cache: FireRedStreamVadCache,
     raw_buffer: Vec<f32>,
     last_prob: f32,
 }
 
+impl FireRedStreamingVadState {
+    fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = SystemMemoryCapacity::default();
+        bytes.add_vec(&self.raw_buffer, "firered-stream-vad.session.raw-buffer")?;
+        bytes.add(
+            self.cache.retained_system_memory_bytes()?,
+            "firered-stream-vad.session.cache",
+        )?;
+        Ok(bytes.finish())
+    }
+}
+
+/// Buffered, stateful Stream-VAD detector for one realtime session.
+pub struct FireRedStreamingVad {
+    inner: SystemMemoryOwner<FireRedStreamingVadState>,
+}
+
 impl fmt::Debug for FireRedStreamingVad {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FireRedStreamingVad")
-            .field("buffered_samples", &self.raw_buffer.len())
-            .field("last_prob", &self.last_prob)
+            .field("buffered_samples", &self.inner.raw_buffer.len())
+            .field("last_prob", &self.inner.last_prob)
             .finish_non_exhaustive()
     }
 }
 
+fn host_session_quote() -> Result<SystemMemoryAllocationQuote, String> {
+    let raw_buffer = (FRAME_LENGTH as u64)
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<f32>() as u64);
+    let cache = ((NUM_BLOCKS + 1) as u64)
+        .saturating_mul(CACHE_FRAMES as u64)
+        .saturating_mul(PROJ as u64)
+        .saturating_mul(std::mem::size_of::<f32>() as u64);
+    let retained = raw_buffer.saturating_add(cache);
+    SystemMemoryAllocationQuote::new("firered-stream-vad.host-session", retained, retained)
+        .map_err(|error| error.to_string())
+}
+
 impl FireRedStreamingVad {
     /// Build a streaming detector over the shared model, or `None` if the
-    /// vendored weights are unavailable.
+    /// vendored weights are unavailable or the session cannot be admitted.
     pub fn shared() -> Option<Self> {
-        super::shared_model().map(Self::from_model)
+        super::shared_model().and_then(|model| Self::from_model(model).ok())
     }
 
-    pub(super) fn from_model(model: &'static FireRedStreamVadModel) -> Self {
-        Self {
-            model,
-            cache: FireRedStreamVadCache::new(),
-            raw_buffer: Vec::with_capacity(FRAME_LENGTH * 2),
-            last_prob: 0.0,
-        }
+    pub(super) fn from_model(
+        model: SharedFireRedStreamVadModel,
+    ) -> Result<Self, crate::models::system_memory_owner::SystemMemoryOwnerError> {
+        let quote = host_session_quote().map_err(|reason| {
+            crate::models::system_memory_owner::SystemMemoryOwnerError::capacity_failure(
+                "host_state_quote",
+                reason,
+            )
+        })?;
+        SystemMemoryOwner::try_allocate(quote, || {
+            let state = FireRedStreamingVadState {
+                model,
+                cache: FireRedStreamVadCache::new(),
+                raw_buffer: Vec::with_capacity(FRAME_LENGTH * 2),
+                last_prob: 0.0,
+            };
+            let retained = state.retained_system_memory_bytes()?;
+            Ok(SystemMemoryAllocationOutcome::new(
+                state, retained, retained,
+            ))
+        })
+        .map(|inner| Self { inner })
     }
 
     /// Feed one frame of 16 kHz mono 16-bit PCM and return the current speech
@@ -67,7 +116,7 @@ impl FireRedStreamingVad {
             .map(|sample| *sample as f32 / 32_768.0)
             .collect::<Vec<_>>();
         let produced_decision = !self.accept_f32_chunk(&float_samples).is_empty();
-        (self.last_prob, produced_decision)
+        (self.inner.last_prob, produced_decision)
     }
 
     /// Feed an offline/native f32 chunk and return every newly completed
@@ -77,7 +126,7 @@ impl FireRedStreamingVad {
     /// checkpoints between them instead of one uninterruptible whole-file
     /// fbank/DFSMN call.
     pub(super) fn accept_f32_chunk(&mut self, samples: &[f32]) -> Vec<f32> {
-        let model = self.model;
+        let model = self.inner.model.clone();
         match self.accept_f32_chunk_with(samples, |features, frames, cache| {
             Ok::<_, std::convert::Infallible>(model.forward_chunk(features, frames, cache))
         }) {
@@ -91,16 +140,16 @@ impl FireRedStreamingVad {
         samples: &[f32],
         forward: impl FnOnce(&[f32], usize, &mut FireRedStreamVadCache) -> Result<Vec<f32>, E>,
     ) -> Result<Vec<f32>, E> {
-        self.raw_buffer.extend_from_slice(samples);
-        if self.raw_buffer.len() < FRAME_LENGTH {
+        self.inner.raw_buffer.extend_from_slice(samples);
+        if self.inner.raw_buffer.len() < FRAME_LENGTH {
             return Ok(Vec::new());
         }
-        let (features, n_frames) = self.model.cmvn_features(&self.raw_buffer);
+        let (features, n_frames) = self.inner.model.cmvn_features(&self.inner.raw_buffer);
         if n_frames == 0 {
             return Ok(Vec::new());
         }
-        let probs = forward(&features, n_frames, &mut self.cache)?;
-        self.last_prob = *probs.last().expect("n_frames > 0 implies non-empty probs");
+        let probs = forward(&features, n_frames, &mut self.inner.cache)?;
+        self.inner.last_prob = *probs.last().expect("n_frames > 0 implies non-empty probs");
 
         // `frontend.compute` uses snip_edges framing: frame i spans
         // `[i*FRAME_SHIFT, i*FRAME_SHIFT+FRAME_LENGTH)`. Once `n_frames` have
@@ -109,20 +158,20 @@ impl FireRedStreamingVad {
         // complete the next frame once more audio arrives.
         let frame_shift_samples = (16_000u64 * FRAME_SHIFT_MS as u64 / 1000) as usize;
         let consumed = n_frames * frame_shift_samples;
-        self.raw_buffer.drain(..consumed);
+        self.inner.raw_buffer.drain(..consumed);
         Ok(probs)
     }
 
     /// Most recent probability without feeding new audio.
     pub fn last_probability(&self) -> f32 {
-        self.last_prob
+        self.inner.last_prob
     }
 
     /// Clear all state for a new utterance/session.
     pub fn reset(&mut self) {
-        self.cache.reset();
-        self.raw_buffer.clear();
-        self.last_prob = 0.0;
+        self.inner.cache.reset();
+        self.inner.raw_buffer.clear();
+        self.inner.last_prob = 0.0;
     }
 }
 

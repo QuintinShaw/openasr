@@ -91,6 +91,41 @@ pub(crate) struct FireRedStreamVadWeights {
 }
 
 impl FireRedStreamVadWeights {
+    pub(crate) fn embedded_blob_bytes() -> u64 {
+        u64::try_from(WEIGHTS_BYTES.len()).unwrap_or(u64::MAX)
+    }
+
+    pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_vec(&self.fc1_w, "firered-stream-vad.fc1_w")?;
+        bytes.add_vec(&self.fc1_b, "firered-stream-vad.fc1_b")?;
+        bytes.add_vec(&self.fc2_w, "firered-stream-vad.fc2_w")?;
+        bytes.add_vec(&self.fc2_b, "firered-stream-vad.fc2_b")?;
+        bytes.add_vec(&self.fsmn1_lookback, "firered-stream-vad.fsmn1_lookback")?;
+        for (index, block) in self.blocks.iter().enumerate() {
+            bytes.add_vec(
+                &block.fc1_w,
+                &format!("firered-stream-vad.block{index}.fc1_w"),
+            )?;
+            bytes.add_vec(
+                &block.fc1_b,
+                &format!("firered-stream-vad.block{index}.fc1_b"),
+            )?;
+            bytes.add_vec(
+                &block.fc2_w,
+                &format!("firered-stream-vad.block{index}.fc2_w"),
+            )?;
+            bytes.add_vec(
+                &block.lookback,
+                &format!("firered-stream-vad.block{index}.lookback"),
+            )?;
+        }
+        bytes.add_vec(&self.dnn_w, "firered-stream-vad.dnn_w")?;
+        bytes.add_vec(&self.dnn_b, "firered-stream-vad.dnn_b")?;
+        bytes.add_vec(&self.out_w, "firered-stream-vad.out_w")?;
+        Ok(bytes.finish())
+    }
+
     /// Load the vendored, validated weights. Infallible in practice (the
     /// blob is committed), but returns a typed error rather than panicking so
     /// callers can decline to register the engine.

@@ -336,6 +336,9 @@ pub(crate) fn is_operator_only_path(method: &axum::http::Method, path: &str) -> 
     if path == "/v1/voice-id" || path.starts_with("/v1/voice-id/") {
         return true; // operator-local Voice ID v2
     }
+    if path == "/v1/debug/runtime-receipts" || path == "/v1/runtime/receipts" {
+        return true; // bounded runtime ownership diagnostics are operator-local
+    }
     if path == "/v1/models/default" {
         return method != Method::GET; // set-default (POST/PUT); GET is informational
     }

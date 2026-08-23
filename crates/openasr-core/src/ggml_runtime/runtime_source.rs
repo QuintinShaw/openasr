@@ -55,6 +55,23 @@ pub(crate) struct StrongFileIdentity {
 }
 
 impl StrongFileIdentity {
+    #[cfg(test)]
+    pub(crate) const fn test_fixture(seed: u64) -> Self {
+        Self {
+            #[cfg(unix)]
+            dev: 1,
+            #[cfg(unix)]
+            ino: seed,
+            #[cfg(windows)]
+            volume_serial_number: 1,
+            #[cfg(windows)]
+            file_index: seed,
+            len: 4096,
+            mtime_secs: 1,
+            mtime_nanos: 1,
+        }
+    }
+
     /// `None` when any needed metadata field cannot be read (including a
     /// pre-1970 mtime, which cannot be represented here) -- callers must fail
     /// closed rather than trust a partial identity.

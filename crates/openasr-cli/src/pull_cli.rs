@@ -15,6 +15,12 @@ use openasr_core::{
 use crate::PullCommandOptions;
 use crate::consent::{self, CliExit, ExitCode, PullConsent};
 
+fn install_without_selection(
+    installer: impl FnOnce() -> Result<InstalledPack>,
+) -> Result<InstalledPack> {
+    installer()
+}
+
 pub(crate) fn pull(
     native_execution_services: &Arc<NativeExecutionServices>,
     options: PullCommandOptions<'_>,
@@ -51,34 +57,25 @@ pub(crate) fn pull(
     };
     let source_chain = resolve_chain(&source_pref);
 
-    let installed = if let Some(path) = options.from {
-        install_model_pack_from_path_with_execution_services(
-            &resolved,
-            path,
-            &home,
-            Some(native_execution_services.as_ref()),
-            progress,
-        )?
-    } else {
-        PullModelPackRequest::new(&resolved, &home)
-            .execution_services(native_execution_services.as_ref())
-            .sources(&source_chain)
-            .execute(progress)?
-    };
+    let installed = install_without_selection(|| {
+        if let Some(path) = options.from {
+            Ok(install_model_pack_from_path_with_execution_services(
+                &resolved,
+                path,
+                &home,
+                Some(native_execution_services.as_ref()),
+                progress,
+            )?)
+        } else {
+            Ok(PullModelPackRequest::new(&resolved, &home)
+                .execution_services(native_execution_services.as_ref())
+                .sources(&source_chain)
+                .execute(progress)?)
+        }
+    })?;
 
-    let preference = if options.quant.is_some() || options.reference.contains(':') {
-        QuantPreference::pinned(&installed.quant)
-    } else {
-        QuantPreference::Auto
-    };
-    if should_update_default_asr_model(&catalog, &installed.model_id) {
-        openasr_core::default_selection::persist(&home, &installed, preference)?;
-    } else {
-        eprintln!(
-            "{}",
-            non_default_asr_install_status(&catalog, &installed.model_id, &installed.pull)
-        );
-    }
+    let status = install_status(&catalog, &installed.model_id, &installed.pull);
+    eprintln!("{status}");
     println!(
         "{}\t{}\t{}\t{}",
         installed.pull,
@@ -89,8 +86,9 @@ pub(crate) fn pull(
     Ok(())
 }
 
-fn non_default_asr_install_status(catalog: &ModelCatalog, model_id: &str, pull: &str) -> String {
+fn install_status(catalog: &ModelCatalog, model_id: &str, pull: &str) -> String {
     let pack_kind = match catalog_model_kind(catalog, model_id) {
+        Some(openasr_core::CatalogModelKind::AsrModel) => "ASR model",
         Some(openasr_core::CatalogModelKind::TranslationModel) => "translation model",
         _ => "capability pack",
     };
@@ -106,14 +104,6 @@ fn catalog_model_kind(
         .iter()
         .find(|model| model.id == model_id)
         .map(|model| model.kind)
-}
-
-fn should_update_default_asr_model(catalog: &ModelCatalog, model_id: &str) -> bool {
-    catalog
-        .models
-        .iter()
-        .find(|model| model.id == model_id)
-        .is_some_and(|model| model.public && model.kind == openasr_core::CatalogModelKind::AsrModel)
 }
 
 fn ensure_explicit_pull_license_acceptance(
@@ -214,6 +204,14 @@ pub(crate) fn remove_installed(
 /// explicit `openasr pull --accept-license` path so download consent cannot
 /// become license acceptance. When the model is already installed this answers
 /// from on-disk packs with no network access.
+fn resolve_persisted_default(
+    home: &Path,
+) -> Result<openasr_core::default_selection::DefaultModelResolution> {
+    Ok(openasr_core::default_selection::resolve_with_catalog(
+        home, None,
+    )?)
+}
+
 pub(crate) fn ensure_asr_model_installed(
     native_execution_services: &Arc<NativeExecutionServices>,
     model: Option<&str>,
@@ -221,10 +219,22 @@ pub(crate) fn ensure_asr_model_installed(
     consent: &PullConsent,
 ) -> Result<()> {
     let home = openasr_home()?;
-    let model_ref = model
-        .map(str::to_string)
-        .or_else(|| config.default_model.clone())
-        .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
+    let model_ref = match model {
+        Some(model_ref) => model_ref.to_string(),
+        None => match resolve_persisted_default(&home)? {
+            openasr_core::default_selection::DefaultModelResolution::Installed(_) => return Ok(()),
+            openasr_core::default_selection::DefaultModelResolution::NotInstalled(model_ref) => {
+                return Err(CliExit::new(
+                    ExitCode::ModelNotInstalled,
+                    format!("Model '{model_ref}' is not installed.\nRun: openasr pull {model_ref}"),
+                )
+                .into());
+            }
+            openasr_core::default_selection::DefaultModelResolution::Unset => {
+                DEFAULT_MODEL_ID.to_string()
+            }
+        },
+    };
     let packs = list_installed_packs(&home)?;
 
     // Fast path: installed under its canonical id, answerable with zero network.
@@ -323,18 +333,19 @@ pub(crate) fn ensure_asr_model_installed(
         }
     }
 
-    let installed = perform_consent_pull(native_execution_services, &resolved, &home, config)
-        .map_err(|error| {
-            CliExit::new(
-                ExitCode::DownloadFailed,
-                format!("Download failed: {error}"),
-            )
-        })?;
-    if should_update_default_asr_model(&catalog, &installed.model_id) {
-        let preference = QuantPreference::pinned(&installed.quant);
-        openasr_core::default_selection::persist(&home, &installed, preference)?;
-    }
+    perform_consent_pull(native_execution_services, &resolved, &home, config).map_err(|error| {
+        CliExit::new(
+            ExitCode::DownloadFailed,
+            format!("Download failed: {error}"),
+        )
+    })?;
     Ok(())
+}
+
+fn perform_consent_pull_with_installer(
+    installer: impl FnOnce() -> Result<InstalledPack>,
+) -> Result<InstalledPack> {
+    install_without_selection(installer)
 }
 
 fn perform_consent_pull(
@@ -346,10 +357,12 @@ fn perform_consent_pull(
     let mut reporter = crate::progress::PullReporter::new(&resolved.pull);
     let progress = |event| reporter.on(event);
     let source_chain = resolve_chain(&config.download_source);
-    Ok(PullModelPackRequest::new(resolved, home)
-        .execution_services(native_execution_services.as_ref())
-        .sources(&source_chain)
-        .execute(progress)?)
+    perform_consent_pull_with_installer(|| {
+        Ok(PullModelPackRequest::new(resolved, home)
+            .execution_services(native_execution_services.as_ref())
+            .sources(&source_chain)
+            .execute(progress)?)
+    })
 }
 
 #[cfg(test)]
@@ -422,6 +435,131 @@ mod tests {
     }
 
     #[test]
+    fn persisted_default_resolution_keeps_unset_and_not_installed_distinct() {
+        let home = tempfile::tempdir().expect("temporary OPENASR_HOME");
+
+        assert_eq!(
+            resolve_persisted_default(home.path()).expect("resolve unset default"),
+            openasr_core::default_selection::DefaultModelResolution::Unset
+        );
+
+        openasr_core::save_config(
+            home.path(),
+            &OpenAsrConfig {
+                default_model: Some("moonshine-tiny".to_string()),
+                ..OpenAsrConfig::default()
+            },
+        )
+        .expect("persist configured default fixture");
+        assert_eq!(
+            resolve_persisted_default(home.path()).expect("resolve missing default"),
+            openasr_core::default_selection::DefaultModelResolution::NotInstalled(
+                "moonshine-tiny".to_string()
+            )
+        );
+        assert_eq!(
+            openasr_core::load_config(home.path())
+                .expect("reload configured default fixture")
+                .default_model
+                .as_deref(),
+            Some("moonshine-tiny")
+        );
+    }
+
+    #[test]
+    fn consent_pull_local_install_seam_preserves_default_selection() {
+        use sha2::Digest as _;
+
+        let home = tempfile::tempdir().expect("temporary OPENASR_HOME");
+        let pack_path = home.path().join("moonshine-tiny-q8_0.oasr");
+        let spec = openasr_core::testing::TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready(
+            "moonshine-tiny",
+        );
+        openasr_core::testing::write_tiny_gguf_runtime_source(&pack_path, &spec)
+            .expect("write real local OASR fixture");
+        let bytes = std::fs::read(&pack_path).expect("read local OASR fixture");
+        let mut resolved = resolved_pull(LicenseClass::Permissive);
+        resolved.requested = "moonshine-tiny:q8".to_string();
+        resolved.model_id = "moonshine-tiny".to_string();
+        resolved.catalog_family_id = "moonshine".to_string();
+        resolved.display_name = "Moonshine Tiny".to_string();
+        resolved.quant = "q8_0".to_string();
+        resolved.suffix = "q8".to_string();
+        resolved.pull = "moonshine-tiny:q8".to_string();
+        resolved.filename = "moonshine-tiny-q8_0.oasr".to_string();
+        resolved.sha256 = format!("{:x}", sha2::Sha256::digest(&bytes));
+        resolved.size_bytes = bytes.len() as u64;
+        let services = NativeExecutionServices::for_local_process()
+            .expect("construct local execution services");
+        let seeded = install_model_pack_from_path_with_execution_services(
+            &resolved,
+            &pack_path,
+            home.path(),
+            Some(&services),
+            |_| {},
+        )
+        .expect("install and verify real OASR fixture");
+        openasr_core::save_default_model_selection(
+            home.path(),
+            seeded.model_id.clone(),
+            QuantPreference::pinned(&seeded.quant),
+        )
+        .expect("write explicit default config fixture");
+        openasr_core::persist_default_pack_pointer(home.path(), &seeded)
+            .expect("write valid default pointer fixture");
+        let config_before = std::fs::read(home.path().join("config.json"))
+            .expect("read configured default before consent seam");
+        let pointer_before = std::fs::read(home.path().join("default.json"))
+            .expect("read default pointer before consent seam");
+
+        let installed = perform_consent_pull_with_installer(|| {
+            Ok(install_model_pack_from_path_with_execution_services(
+                &resolved,
+                &pack_path,
+                home.path(),
+                Some(&services),
+                |_| {},
+            )?)
+        })
+        .expect("injected local consent installer must verify and install");
+        assert_eq!(installed.model_id, "moonshine-tiny");
+        assert_eq!(
+            std::fs::read(home.path().join("config.json"))
+                .expect("read configured default after consent seam"),
+            config_before,
+            "consent pull installation seam must not rewrite config default selection"
+        );
+        assert_eq!(
+            std::fs::read(home.path().join("default.json"))
+                .expect("read default pointer after consent seam"),
+            pointer_before,
+            "consent pull installation seam must not rewrite default pointer"
+        );
+    }
+
+    #[test]
+    fn pull_cli_is_selection_writer_free() {
+        let source = include_str!("pull_cli.rs");
+        let source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("pull_cli.rs must contain a test module boundary");
+        for forbidden in [
+            concat!("default_selection", "::", "persist"),
+            concat!("default_selection", "::", "clear"),
+            concat!("save_default_", "model_selection"),
+            concat!("persist_default_", "pack_pointer"),
+            concat!("save_config", "_document"),
+            concat!("save", "_config"),
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "pull_cli.rs must not call selection writer {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn restricted_pull_requires_explicit_acceptance_even_for_local_import() {
         let mut resolved = resolved_pull(LicenseClass::Noncommercial);
         let download_error = ensure_explicit_pull_license_acceptance(&resolved, false)
@@ -459,39 +597,27 @@ mod tests {
     }
 
     #[test]
-    fn capability_pack_pull_does_not_update_default_asr_model() {
+    fn asr_install_status_reports_that_default_was_not_changed() {
         let catalog = ModelCatalog {
             schema_version: 1,
             generated_at: "2026-06-11T00:00:00Z".to_string(),
             catalog_url: "fixture".to_string(),
             backends: Vec::new(),
             language_labels: std::collections::BTreeMap::new(),
-            models: vec![
-                catalog_model("moonshine-tiny", openasr_core::CatalogModelKind::AsrModel),
-                catalog_model(
-                    "redimnet2-b6-cn",
-                    openasr_core::CatalogModelKind::CapabilityPack,
-                ),
-                catalog_model(
-                    "translator-test",
-                    openasr_core::CatalogModelKind::TranslationModel,
-                ),
-            ],
+            models: vec![catalog_model(
+                "moonshine-tiny",
+                openasr_core::CatalogModelKind::AsrModel,
+            )],
         };
 
-        assert!(should_update_default_asr_model(&catalog, "moonshine-tiny"));
-        assert!(!should_update_default_asr_model(
-            &catalog,
-            "redimnet2-b6-cn"
-        ));
-        assert!(!should_update_default_asr_model(
-            &catalog,
-            "translator-test"
-        ));
+        assert_eq!(
+            install_status(&catalog, "moonshine-tiny", "moonshine-tiny:q8"),
+            "Installed ASR model moonshine-tiny:q8; default ASR model was not changed."
+        );
     }
 
     #[test]
-    fn non_default_asr_install_status_names_catalog_kind() {
+    fn install_status_names_catalog_kind() {
         let catalog = ModelCatalog {
             schema_version: 1,
             generated_at: "2026-06-11T00:00:00Z".to_string(),
@@ -511,11 +637,11 @@ mod tests {
         };
 
         assert_eq!(
-            non_default_asr_install_status(&catalog, "redimnet2-b6-cn", "redimnet2-b6-cn:fp16"),
+            install_status(&catalog, "redimnet2-b6-cn", "redimnet2-b6-cn:fp16"),
             "Installed capability pack redimnet2-b6-cn:fp16; default ASR model was not changed."
         );
         assert_eq!(
-            non_default_asr_install_status(&catalog, "translator-test", "translator-test:q4km"),
+            install_status(&catalog, "translator-test", "translator-test:q4km"),
             "Installed translation model translator-test:q4km; default ASR model was not changed."
         );
     }

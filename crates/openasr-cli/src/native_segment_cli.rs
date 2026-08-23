@@ -329,7 +329,8 @@ pub(super) fn resolve_model_source_for_backend(
     model_pack: Option<&Path>,
     config: &OpenAsrConfig,
 ) -> Result<ResolvedModelSource> {
-    let catalog = load_cli_model_catalog(&openasr_home()?)?;
+    let home = openasr_home()?;
+    let catalog = load_cli_model_catalog(&home)?;
 
     if backend_kind != BackendKind::Native {
         if model_pack.is_some() {
@@ -338,7 +339,7 @@ pub(super) fn resolve_model_source_for_backend(
             );
         }
         let cards = runtime_registry(catalog.as_ref()).context("Could not load model registry")?;
-        let model_ref = selected_model_ref(model, config, &cards);
+        let model_ref = selected_model_ref(model, &home)?;
         let model_id = find_runtime_model_id(&cards, catalog.as_ref(), &model_ref)?;
         return Ok(ResolvedModelSource {
             model_id,
@@ -382,26 +383,16 @@ pub(super) fn resolve_model_source_for_backend(
     })
 }
 
-/// Resolves the installed `.oasr` pack for a model id (the resolved default when
-/// `model` is `None`), or `Ok(None)` when no matching pack is installed yet (a
-/// normal state right after a fresh install, before the user has pulled any
-/// model). Genuine environment/registry errors (unreadable `OPENASR_HOME`,
-/// corrupt registry, ...) still return `Err`. Never pulls either way.
-///
-/// An explicit `model` reference is a CLI-local concern (not "the default") and
-/// is matched directly against installed packs with `QuantPreference::Auto`.
-/// With no explicit reference, resolving `config.default_model` against
-/// installed packs -- including the `default.json` pointer fallback and
-/// `Pinned` quant recovery -- is delegated to `openasr_core::default_selection`,
-/// the single authority also used by the server; only the
-/// no-persisted-default-at-all fallback to `DEFAULT_MODEL_ID` stays here, since
-/// that bare-invocation convention is CLI-specific, not part of "the default".
+/// With no explicit reference, resolving the persisted default against installed
+/// packs is delegated to `openasr_core::default_selection`, the single authority
+/// also used by the server. The V2 record wins over compatibility projections;
+/// only a missing V2 file falls back to legacy state. The no-persisted-default-at-
+/// all fallback to `DEFAULT_MODEL_ID` stays here, since that bare-invocation
+/// convention is CLI-specific, not part of "the default".
 fn resolve_installed_native_pack_opt(
     model: Option<&str>,
-    // `default_selection::resolve_with_catalog` reads `config.default_model`
-    // straight off disk (the single-authority contract requires re-reading, not
-    // trusting a possibly-stale in-memory copy); kept for signature parity with
-    // `resolve_installed_native_pack`, whose error message still needs it.
+    // Kept for signature parity with `resolve_installed_native_pack`, whose error
+    // message still needs the config-derived runtime settings.
     _config: &OpenAsrConfig,
     catalog: Option<&openasr_core::ModelCatalog>,
 ) -> Result<Option<PathBuf>> {
@@ -445,7 +436,8 @@ pub(super) fn resolve_installed_native_pack(
     config: &OpenAsrConfig,
     catalog: Option<&openasr_core::ModelCatalog>,
 ) -> Result<PathBuf> {
-    let model_ref = selected_model_ref(model, config, &[]);
+    let home = openasr_home()?;
+    let model_ref = selected_model_ref(model, &home)?;
     resolve_installed_native_pack_opt(model, config, catalog)?.ok_or_else(|| {
         anyhow!(
             "Model '{model_ref}' is not installed.\nRun: openasr pull {model_ref}\n(Or pass --model-pack <local.oasr> to run a specific local pack file.)"
@@ -856,25 +848,20 @@ fn runtime_resolution_unknown_model(error: &openasr_core::RuntimeModelResolution
 pub(super) fn resolve_transcribe_model<'a>(
     cards: &'a [ModelCard],
     model: Option<&str>,
-    config: &OpenAsrConfig,
+    home: &Path,
 ) -> Result<&'a ModelCard> {
-    Ok(find_model(cards, &selected_model_ref(model, config, cards))?.card)
+    Ok(find_model(cards, &selected_model_ref(model, home)?)?.card)
 }
 
-pub(super) fn selected_model_ref(
-    model: Option<&str>,
-    config: &OpenAsrConfig,
-    _cards: &[ModelCard],
-) -> String {
+pub(super) fn selected_model_ref(model: Option<&str>, home: &Path) -> Result<String> {
     if let Some(model) = model {
-        return model.to_string();
+        return Ok(model.to_string());
     }
 
-    if let Some(config_default) = config.default_model.as_deref() {
-        return config_default.to_string();
-    }
-
-    DEFAULT_MODEL_ID.to_string()
+    Ok(
+        openasr_core::default_selection::current_default_model(home)?
+            .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string()),
+    )
 }
 
 pub(super) fn resolve_backend(
@@ -1641,41 +1628,58 @@ mod tests {
         });
     }
 
-    // Locks the three-tier priority `selected_model_ref` must keep: an explicit
-    // `--model` always wins, then the persisted `config.default_model`, and only
-    // with neither does the CLI fall back to `DEFAULT_MODEL_ID` -- the
-    // bare-invocation convention that (post-refactor) is no longer implicitly
-    // written into `config.json` (see `openasr_core::config::DEFAULT_MODEL_ID`
-    // and `default_selection`).
     #[test]
-    fn selected_model_ref_explicit_wins_over_config_default() {
-        let config = OpenAsrConfig {
-            default_model: Some("whisper-small".to_string()),
-            ..OpenAsrConfig::default()
-        };
+    fn selected_model_ref_explicit_wins_over_persisted_default() {
+        let home = tempfile::tempdir().unwrap();
         assert_eq!(
-            selected_model_ref(Some("whisper-large-v3-turbo"), &config, &[]),
+            selected_model_ref(Some("whisper-large-v3-turbo"), home.path()).unwrap(),
             "whisper-large-v3-turbo"
         );
     }
 
     #[test]
-    fn selected_model_ref_falls_back_to_config_default_when_no_explicit_model() {
-        let config = OpenAsrConfig {
-            default_model: Some("whisper-small".to_string()),
-            ..OpenAsrConfig::default()
-        };
-        assert_eq!(selected_model_ref(None, &config, &[]), "whisper-small");
+    fn selected_model_ref_reads_v2_before_stale_legacy_projection() {
+        let home = tempfile::tempdir().unwrap();
+        openasr_core::save_config(
+            home.path(),
+            &OpenAsrConfig {
+                default_model: Some("stale-model".to_string()),
+                ..OpenAsrConfig::default()
+            },
+        )
+        .unwrap();
+        openasr_core::default_selection::persist_v2_record(
+            home.path(),
+            openasr_core::default_selection::ActiveModelSelectionV2 {
+                schema_version:
+                    openasr_core::default_selection::ACTIVE_MODEL_SELECTION_V2_SCHEMA_VERSION,
+                selection_generation: 0,
+                status: openasr_core::default_selection::ActiveModelSelectionStatus::Unset,
+                pull: None,
+                model_id: None,
+                quant: None,
+                architecture_id: None,
+                expected_pack: None,
+                quant_preference: openasr_core::QuantPreference::Auto,
+                execution_intent: "auto".to_string(),
+                checksum: String::new(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            selected_model_ref(None, home.path()).unwrap(),
+            DEFAULT_MODEL_ID
+        );
     }
 
     #[test]
-    fn selected_model_ref_falls_back_to_default_model_id_when_config_default_is_unset() {
-        // A fresh config (or one built by `OpenAsrConfig::default()`) has
-        // `default_model: None` -- the CLI convention fallback, not a config value,
-        // must still resolve to something usable.
-        let config = OpenAsrConfig::default();
-        assert_eq!(config.default_model, None);
-        assert_eq!(selected_model_ref(None, &config, &[]), DEFAULT_MODEL_ID);
+    fn selected_model_ref_falls_back_to_default_model_id_when_unset() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            selected_model_ref(None, home.path()).unwrap(),
+            DEFAULT_MODEL_ID
+        );
     }
 
     #[test]

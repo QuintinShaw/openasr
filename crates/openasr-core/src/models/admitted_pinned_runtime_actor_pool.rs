@@ -25,8 +25,9 @@
 //! cached runtime never retains a job's callback data across jobs.
 
 use std::any::Any;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{
@@ -44,9 +45,11 @@ use super::admitted_host_object_cache::{
     AdmittedHostObjectCacheLimits, SingleFlightWeightedCache, SingleFlightWeightedLookup,
 };
 use super::native_execution_services::{
-    current_execution_cache_attempt_id, current_native_execution_context,
-    install_native_execution_context, stage_execution_cache_commit, stage_execution_cache_rollback,
+    ExecutionCacheAttemptId, current_execution_cache_attempt_id, current_native_execution_context,
+    current_runtime_receipts, install_native_execution_context, stage_execution_cache_commit,
+    stage_execution_cache_rollback,
 };
+use super::runtime_receipts::RuntimeOwnerDescriptor;
 use super::system_memory_owner::SystemMemoryOwner;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +109,7 @@ type ActorJob<R> = Box<dyn FnOnce(&mut R) -> bool + Send + 'static>;
 
 enum ActorCommand<R> {
     Run(ActorJob<R>),
+    RecordReuse(Option<ExecutionCacheAttemptId>),
     Shutdown,
 }
 
@@ -180,7 +184,20 @@ impl<R: 'static> fmt::Debug for PinnedRuntimeActor<R> {
 }
 
 impl<R: 'static> PinnedRuntimeActor<R> {
+    #[cfg(test)]
     fn spawn<E, F>(worker_name: &str, build: F) -> Result<Self, ActorBuildError<E>>
+    where
+        E: Send + 'static,
+        F: FnOnce() -> Result<SystemMemoryOwner<R>, E> + Send + 'static,
+    {
+        Self::spawn_with_receipt(worker_name, None, build)
+    }
+
+    fn spawn_with_receipt<E, F>(
+        worker_name: &str,
+        receipt: Option<(RuntimeOwnerDescriptor, Option<ExecutionCacheAttemptId>)>,
+        build: F,
+    ) -> Result<Self, ActorBuildError<E>>
     where
         E: Send + 'static,
         F: FnOnce() -> Result<SystemMemoryOwner<R>, E> + Send + 'static,
@@ -190,6 +207,7 @@ impl<R: 'static> PinnedRuntimeActor<R> {
         let alive = Arc::new(AtomicBool::new(true));
         let worker_alive = Arc::clone(&alive);
         let build_context = current_native_execution_context();
+        let receipt_context = build_context.clone();
         // The request's compute-scoped cancel flag is thread-local; capture it
         // on the admitting caller and republish it on the owner thread for the
         // build's duration, so a canceled request also aborts the runtime
@@ -223,10 +241,23 @@ impl<R: 'static> PinnedRuntimeActor<R> {
                         return;
                     }
                 };
+                // Keep the diagnostic owner guard on this thread. It is dropped
+                // only after `owner`, so a receipt never claims destruction
+                // before the native runtime and its memory lease are gone.
+                let receipt_owner = receipt.and_then(|(descriptor, attempt_id)| {
+                    receipt_context.map(|context| {
+                        let _context = install_native_execution_context(context);
+                        current_runtime_receipts()
+                            .map(|collector| collector.start_owner(descriptor, attempt_id))
+                    })
+                });
+                let receipt_owner = receipt_owner.flatten();
                 if ready_tx
                     .send(Ok(owner.committed_requested_bytes()))
                     .is_err()
                 {
+                    drop(owner);
+                    drop(receipt_owner);
                     worker_alive.store(false, Ordering::Release);
                     return;
                 }
@@ -238,12 +269,19 @@ impl<R: 'static> PinnedRuntimeActor<R> {
                                 break;
                             }
                         }
+                        ActorCommand::RecordReuse(attempt_id) => {
+                            if let Some(receipt_owner) = receipt_owner.as_ref() {
+                                receipt_owner.record_reuse(attempt_id);
+                            }
+                        }
                         ActorCommand::Shutdown => break,
                     }
                 }
                 // `owner` (R first, lease second) is dropped right here, on
                 // the same thread that constructed every backend context.
                 drop(owner);
+                // Release the owner receipt after native destruction completes.
+                drop(receipt_owner);
                 worker_alive.store(false, Ordering::Release);
             })
             .map_err(|error| {
@@ -287,6 +325,12 @@ impl<R: 'static> PinnedRuntimeActor<R> {
 
     fn is_alive(&self) -> bool {
         self.inner.alive.load(Ordering::Acquire)
+    }
+
+    fn record_receipt_reuse(&self) {
+        let _ = self.inner.sender.send(ActorCommand::RecordReuse(
+            current_execution_cache_attempt_id(),
+        ));
     }
 
     fn cache_value_clone(&self) -> Self {
@@ -501,6 +545,10 @@ impl<R: 'static> AdmittedExclusivePoolOwner for PinnedRuntimeActor<R> {
     fn is_reusable(&self) -> bool {
         self.inner.alive.load(Ordering::Acquire)
     }
+
+    fn record_receipt_reuse(&self) {
+        PinnedRuntimeActor::record_receipt_reuse(self);
+    }
 }
 
 #[derive(Debug)]
@@ -537,6 +585,30 @@ impl AdmittedPinnedRuntimeActorCheckoutPoolLimits {
 
 pub(crate) type PinnedRuntimeActorCheckout<K, R> =
     AdmittedExclusiveObjectCheckout<K, PinnedRuntimeActor<R>>;
+
+fn safe_pool_key_token<K: Hash>(key: &K) -> String {
+    // Hash the generic key before it reaches the receipt collector. The
+    // collector applies its service-root keyed digest to this token, while no
+    // Debug representation or caller-owned identifier enters receipt state.
+    let mut first = DefaultHasher::new();
+    0_u8.hash(&mut first);
+    key.hash(&mut first);
+    let mut second = DefaultHasher::new();
+    1_u8.hash(&mut second);
+    key.hash(&mut second);
+    format!("{:016x}{:016x}", first.finish(), second.finish())
+}
+
+fn actor_receipt_descriptor<K: Hash>(worker_name: &str, key: &K) -> Option<RuntimeOwnerDescriptor> {
+    let collector = current_runtime_receipts()?;
+    let key_token = safe_pool_key_token(key);
+    collector.owner_descriptor(
+        "pinned-runtime-actor",
+        Some(&key_token),
+        Some(worker_name),
+        None,
+    )
+}
 
 /// Pending operation that retains the exclusive checkout until completion, so
 /// the pool cannot hand the same actor to another caller while work is queued.
@@ -642,18 +714,49 @@ where
         F: FnOnce(A) -> Result<SystemMemoryOwner<R>, E> + Send + 'static,
         M: Fn(PinnedRuntimeActorError) -> E,
     {
+        self.checkout_or_try_build_with_owner_receipt(key, None, quote, build, map_actor_error)
+    }
+
+    /// Builds a pinned actor with a caller-provided family owner receipt.
+    ///
+    /// Auxiliary policy runtimes know the semantic component, content, and
+    /// execution lane that the generic actor pool cannot infer. Supplying that
+    /// descriptor replaces the pool's generic `pinned-runtime-actor` owner;
+    /// the nested SystemMemory/native receipts remain unchanged.
+    pub(crate) fn checkout_or_try_build_with_owner_receipt<E, A, Q, F, M>(
+        &self,
+        key: K,
+        owner_descriptor: Option<RuntimeOwnerDescriptor>,
+        quote: Q,
+        build: F,
+        map_actor_error: M,
+    ) -> Result<PinnedRuntimeActorCheckout<K, R>, E>
+    where
+        E: Send + 'static,
+        A: Send + 'static,
+        Q: FnOnce() -> Result<(u64, A), E>,
+        F: FnOnce(A) -> Result<SystemMemoryOwner<R>, E> + Send + 'static,
+        M: Fn(PinnedRuntimeActorError) -> E,
+    {
         let worker_name = self.worker_name;
+        let receipt = owner_descriptor
+            .map(|descriptor| (descriptor, current_execution_cache_attempt_id()))
+            .or_else(|| {
+                actor_receipt_descriptor(worker_name, &key)
+                    .map(|descriptor| (descriptor, current_execution_cache_attempt_id()))
+            });
         let mapper = &map_actor_error;
         self.pool.checkout_or_try_build(
             key,
             quote,
             move |allocation_quote| {
-                PinnedRuntimeActor::spawn(worker_name, move || build(allocation_quote)).map_err(
-                    |error| match error {
-                        ActorBuildError::Build(error) => error,
-                        ActorBuildError::Actor(error) => mapper(error),
-                    },
-                )
+                PinnedRuntimeActor::spawn_with_receipt(worker_name, receipt, move || {
+                    build(allocation_quote)
+                })
+                .map_err(|error| match error {
+                    ActorBuildError::Build(error) => error,
+                    ActorBuildError::Actor(error) => mapper(error),
+                })
             },
             |reason| mapper(PinnedRuntimeActorError::PoolFailure { reason }),
         )
@@ -723,6 +826,7 @@ where
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn get_or_try_insert_with<E, A, Q, F, M>(
         &self,
         key: K,
@@ -737,7 +841,33 @@ where
         F: FnOnce(A) -> Result<SystemMemoryOwner<R>, E> + Send + 'static,
         M: Fn(PinnedRuntimeActorError) -> E,
     {
+        self.get_or_try_insert_with_owner_receipt(key, None, quote, build, map_actor_error)
+    }
+
+    /// Shared-actor counterpart to the checkout pool's caller-provided family
+    /// owner descriptor capability.
+    pub(crate) fn get_or_try_insert_with_owner_receipt<E, A, Q, F, M>(
+        &self,
+        key: K,
+        owner_descriptor: Option<RuntimeOwnerDescriptor>,
+        quote: Q,
+        build: F,
+        map_actor_error: M,
+    ) -> Result<PinnedRuntimeActor<R>, E>
+    where
+        E: Send + 'static,
+        A: Send + 'static,
+        Q: FnOnce() -> Result<(u64, A), E>,
+        F: FnOnce(A) -> Result<SystemMemoryOwner<R>, E> + Send + 'static,
+        M: Fn(PinnedRuntimeActorError) -> E,
+    {
         let attempt_id = current_execution_cache_attempt_id();
+        let receipt = owner_descriptor
+            .map(|descriptor| (descriptor, attempt_id))
+            .or_else(|| {
+                actor_receipt_descriptor(self.worker_name, &key)
+                    .map(|descriptor| (descriptor, attempt_id))
+            });
         let mut quote = Some(quote);
         let mut build = Some(build);
         loop {
@@ -747,6 +877,7 @@ where
                 .map_err(|_| map_actor_error(PinnedRuntimeActorError::CachePoisoned))?
             {
                 SingleFlightWeightedLookup::Ready(actor) if actor.is_alive() => {
+                    actor.record_receipt_reuse();
                     return Ok(actor.with_candidate_cache_binding(self.cache.clone(), key));
                 }
                 SingleFlightWeightedLookup::Ready(_) => {
@@ -762,13 +893,17 @@ where
                     let retain = permit
                         .make_room_for(quoted_weight)
                         .map_err(|_| map_actor_error(PinnedRuntimeActorError::CachePoisoned))?;
-                    let actor = PinnedRuntimeActor::spawn(self.worker_name, move || {
-                        build
-                            .take()
-                            .expect("actor build is consumed by one acquired build slot")(
-                            allocation_quote,
-                        )
-                    })
+                    let actor = PinnedRuntimeActor::spawn_with_receipt(
+                        self.worker_name,
+                        receipt,
+                        move || {
+                            build
+                                .take()
+                                .expect("actor build is consumed by one acquired build slot")(
+                                allocation_quote,
+                            )
+                        },
+                    )
                     .map_err(|error| match error {
                         ActorBuildError::Build(error) => error,
                         ActorBuildError::Actor(error) => map_actor_error(error),
@@ -821,8 +956,8 @@ mod tests {
     use crate::device::execution_route::ResolvedExecutionRoute;
     use crate::ggml_runtime::GgmlBackendKind;
     use crate::models::native_execution_services::{
-        record_current_execution_candidate_failure, run_execution_candidate_attempt,
-        test_native_execution_services,
+        install_native_execution_services, record_current_execution_candidate_failure,
+        run_execution_candidate_attempt, test_native_execution_services,
     };
     use std::cell::Cell;
     use std::rc::Rc;
@@ -1522,6 +1657,235 @@ mod tests {
         assert_eq!(
             observed_in_operation, 0,
             "the build's cancel publication must not leak into subsequent jobs"
+        );
+    }
+
+    #[test]
+    fn pool_receipts_are_opaque_and_release_after_owner_thread_destruction() {
+        let services = test_native_execution_services();
+        let _context = install_native_execution_services(services.as_ref());
+        let pool = AdmittedPinnedRuntimeActorCheckoutPool::new(
+            "receipt-owner-test",
+            AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(2, 64, 2),
+        );
+        let builds = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let first = checkout_actor(
+            &pool,
+            "secret-model-path-that-must-not-escape",
+            Arc::clone(&builds),
+            Arc::clone(&drops),
+        )
+        .expect("first actor");
+        let second = checkout_actor(
+            &pool,
+            "secret-model-path-that-must-not-escape",
+            Arc::clone(&builds),
+            Arc::clone(&drops),
+        )
+        .expect("second actor");
+        assert_eq!(
+            first
+                .call_mut(
+                    |_| current_runtime_receipts().map(|collector| collector.snapshot().scope_id)
+                )
+                .unwrap(),
+            Some(services.scope_id())
+        );
+        assert_eq!(services.runtime_receipts().summary().live_owner_count, 2);
+        assert!(
+            !format!("{:?}", services.runtime_receipts().snapshot())
+                .contains("secret-model-path-that-must-not-escape")
+        );
+
+        drop(first);
+        let reused = checkout_actor(
+            &pool,
+            "secret-model-path-that-must-not-escape",
+            Arc::clone(&builds),
+            Arc::clone(&drops),
+        )
+        .expect("idle actor reuse");
+        reused
+            .call_mut(|_| ())
+            .expect("reuse marker must precede the next operation");
+        drop(reused);
+        drop(second);
+        assert_eq!(
+            services.runtime_receipts().summary().live_owner_count,
+            2,
+            "idle actors remain live until eviction"
+        );
+        assert!(
+            services
+                .runtime_receipts()
+                .snapshot()
+                .events
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    super::super::runtime_receipts::RuntimeReceiptEvent::OwnerReused { .. }
+                ))
+        );
+
+        pool.clear();
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        assert_eq!(services.runtime_receipts().summary().live_owner_count, 0);
+    }
+
+    #[test]
+    fn family_owner_descriptor_replaces_generic_actor_label_and_releases_on_clear() {
+        let services = test_native_execution_services();
+        let _context = install_native_execution_services(services.as_ref());
+        let collector = services.runtime_receipts();
+        let descriptor = collector
+            .owner_descriptor(
+                "redimnet2.resident-runtime",
+                Some("redimnet-content"),
+                Some("redimnet2.ggml-resident.v1"),
+                None,
+            )
+            .expect("family receipt descriptor");
+        let pool = AdmittedPinnedRuntimeActorPool::new(
+            "redimnet-runtime-actors",
+            AdmittedPinnedRuntimeActorPoolLimits::new(1, 32),
+        );
+        let actor = pool
+            .get_or_try_insert_with_owner_receipt(
+                "redimnet-key",
+                Some(descriptor),
+                || Ok::<_, String>((16, ())),
+                move |()| Ok(owner(1, 16, Arc::new(AtomicUsize::new(0)))),
+                |error| error.to_string(),
+            )
+            .expect("family actor");
+        let snapshot = collector.snapshot();
+        assert_eq!(snapshot.live_owners.len(), 1);
+        assert_eq!(
+            snapshot.live_owners[0].descriptor.component,
+            descriptor.component
+        );
+        drop(actor);
+        pool.clear();
+        assert_eq!(collector.summary().live_owner_count, 0);
+    }
+    #[test]
+    fn candidate_failure_drops_checkout_without_repopulating_idle_pool() {
+        let services = test_native_execution_services();
+        let _context = install_native_execution_services(services.as_ref());
+        let pool = AdmittedPinnedRuntimeActorCheckoutPool::new(
+            "receipt-candidate-failure-test",
+            AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(1, 32, 1),
+        );
+        let builds = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let candidate = ExecutionCandidate {
+            device: ExecutionDeviceSnapshot {
+                route: ResolvedExecutionRoute::cpu(),
+                ggml_kind: GgmlBackendKind::Cpu,
+                memory: None,
+                buffer_alignment: None,
+            },
+            placement: ExecutionPlacement::CpuOnly,
+        };
+        let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            let actor = checkout_actor(
+                &pool,
+                "candidate-secret",
+                Arc::clone(&builds),
+                Arc::clone(&drops),
+            )?;
+            drop(actor);
+            record_current_execution_candidate_failure(ExecutionCandidateFailure::capacity(
+                "receipt-candidate",
+                "synthetic rejection",
+            ));
+            Ok::<_, String>(())
+        });
+        assert!(outcome.candidate_failure.is_some());
+        assert_eq!(pool.usage_for_test(), (0, 0));
+        assert_eq!(services.runtime_receipts().summary().live_owner_count, 0);
+
+        let rebuilt = checkout_actor(
+            &pool,
+            "candidate-secret",
+            Arc::clone(&builds),
+            Arc::clone(&drops),
+        )
+        .expect("candidate failure must leave the key retryable");
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        drop(rebuilt);
+        pool.clear();
+    }
+
+    #[test]
+    fn receipt_scope_stays_root_local_across_worker_context_propagation() {
+        let first_services = test_native_execution_services();
+        let second_services = test_native_execution_services();
+        let first_pool = AdmittedPinnedRuntimeActorCheckoutPool::new(
+            "receipt-root-one",
+            AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(1, 32, 1),
+        );
+        let second_pool = AdmittedPinnedRuntimeActorCheckoutPool::new(
+            "receipt-root-two",
+            AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(1, 32, 1),
+        );
+        let builds = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let first = {
+            let _context = install_native_execution_services(first_services.as_ref());
+            checkout_actor(
+                &first_pool,
+                "same-key",
+                Arc::clone(&builds),
+                Arc::clone(&drops),
+            )
+            .expect("first root actor")
+        };
+        let second = {
+            let _context = install_native_execution_services(second_services.as_ref());
+            checkout_actor(
+                &second_pool,
+                "same-key",
+                Arc::clone(&builds),
+                Arc::clone(&drops),
+            )
+            .expect("second root actor")
+        };
+        {
+            let _context = install_native_execution_services(first_services.as_ref());
+            assert_eq!(
+                first
+                    .call_mut(|_| current_runtime_receipts()
+                        .map(|collector| collector.snapshot().scope_id))
+                    .unwrap(),
+                Some(first_services.scope_id())
+            );
+        }
+        {
+            let _context = install_native_execution_services(second_services.as_ref());
+            assert_eq!(
+                second
+                    .call_mut(|_| current_runtime_receipts()
+                        .map(|collector| collector.snapshot().scope_id))
+                    .unwrap(),
+                Some(second_services.scope_id())
+            );
+        }
+        drop(first);
+        drop(second);
+        first_pool.clear();
+        second_pool.clear();
+        assert_eq!(
+            first_services.runtime_receipts().summary().live_owner_count,
+            0
+        );
+        assert_eq!(
+            second_services
+                .runtime_receipts()
+                .summary()
+                .live_owner_count,
+            0
         );
     }
 }

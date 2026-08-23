@@ -566,7 +566,7 @@ impl GraniteSpeechDecodeSession {
         Self::assemble(
             config,
             runner,
-            GraniteDecoderWeights::Arena(weights),
+            GraniteDecoderWeights::Arena(Box::new(weights)),
             None,
             None,
             DeviceGreedyStepOutputMode::FullLogits,

@@ -280,15 +280,23 @@ pub use model_store_gc::{
     ModelStoreVerification, collect_model_store_garbage, model_store_usage, verify_model_store,
 };
 pub use models::candidate_activation_transaction::{
-    ActivationError, ActivationFacts, CommittedActivation, FailedActivation,
-    PreviousActivationState, StagedActivationOwner, activate_runtime_with_output_plan,
+    ActivationReservation, ActivationStage, AttestationError, AttestationEvidence,
+    AttestationFailure, AttestationOutcome, CandidateActivationTransaction, CommitError,
+    DefaultModelActivationCandidate, DefaultModelActivationEvidence,
+    DefaultModelActivationIdentity, DefaultModelActivationJournalFactory,
+    DefaultModelActivationLane, DefaultModelActivationPlan, DefaultModelPreparedActivation,
+    PublicationFailure, PublicationJournalFactory, ResolvedExecutionFacts, StagedOwner,
+    TypedAttestation,
 };
 pub(crate) use models::ggml_asr_executor::{
     GgmlAsrExecutionViewRequest, GgmlAsrPreparedAudioView, GgmlAsrViewExecutor,
 };
 pub use models::native_execution_services::{
-    NativeExecutionScopeId, NativeExecutionServices, NativeExecutionServicesError,
+    BrokerActivationReservation, NativeExecutionScopeId, NativeExecutionServices,
+    NativeExecutionServicesError, quote_and_reserve_candidate_activation,
+    resolve_candidate_activation_lane,
 };
+pub use models::runtime_receipts;
 pub use models::{
     cohere::COHERE_TRANSCRIBE_MODEL_FAMILY,
     cohere::{

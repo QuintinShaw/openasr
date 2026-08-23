@@ -1569,6 +1569,10 @@ impl GgmlBackend {
         unsafe { cstr_lossy(ffi::ggml_backend_name(self.raw.as_ptr())) }
     }
 
+    pub(crate) fn as_ptr(&self) -> ffi::GgmlBackendRaw {
+        self.raw.as_ptr()
+    }
+
     pub(crate) fn into_raw(self) -> NonNull<c_void> {
         let raw = self.raw;
         std::mem::forget(self);

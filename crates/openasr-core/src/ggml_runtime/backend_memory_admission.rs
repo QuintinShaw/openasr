@@ -21,6 +21,10 @@ use std::{
 
 use thiserror::Error;
 
+use crate::models::runtime_receipts::{
+    RuntimeBackendOwnedReliability, RuntimeNativeMemoryEvidence, RuntimeReceiptMetric,
+};
+
 use crate::device::execution_memory::{
     AllocationFootprint, AllocationLifetime, DeviceMemoryBrokerSet, DeviceMemoryReservationBatch,
     DeviceMemorySnapshot, DomainMemoryReconciliation, DomainReservationRequest, MemoryClaim,
@@ -28,10 +32,16 @@ use crate::device::execution_memory::{
     PhaseSet, PhysicalDeviceKey, QuoteConfidence,
 };
 
+use crate::models::native_execution_services::{
+    current_execution_cache_attempt_id, current_runtime_receipts,
+};
+use crate::models::runtime_receipts::{RuntimeOwnerGuard, RuntimeResourceGuard};
+
 use super::{
     backend_memory::{
-        BackendMemoryAbi, BackendMemoryAbiError, BackendMemoryLifecyclePoint, BackendMemoryQuote,
-        BackendMemoryStatsSnapshot,
+        BackendMemoryAbi, BackendMemoryAbiError, BackendMemoryDomainKind,
+        BackendMemoryLifecyclePoint, BackendMemoryQuote, BackendMemoryStatsSnapshot,
+        backend_owned_unknown_reason,
     },
     ffi,
 };
@@ -53,6 +63,7 @@ pub(crate) struct NativeQuotedBackendGroup {
     group_id: String,
     backend_device_identity: PhysicalDeviceKey,
     abi: BackendMemoryAbi,
+    provider: crate::device::execution_route::ExecutionProvider,
     requests: Vec<ffi::GgmlBackendMemoryRequestV1>,
     quote: BackendMemoryQuote,
     fresh_stats: BackendMemoryStatsSnapshot,
@@ -76,11 +87,13 @@ impl NativeQuotedBackendGroup {
             return Err(NativeMemoryAdmissionError::EmptyGroupId);
         }
         let quote = abi.quote(&requests)?;
+        let provider = abi.provider();
         let fresh_stats = abi.stats_at(BackendMemoryLifecyclePoint::AdmissionQuote)?;
         Ok(Self {
             group_id,
             backend_device_identity,
             abi,
+            provider,
             requests,
             quote,
             fresh_stats,
@@ -199,14 +212,16 @@ impl NativeMemoryAdmissionPlan {
             }
             match broker.try_reserve_batch(self.requests.clone()) {
                 Ok(reservation) => {
-                    return Ok(NativeMemoryAllocationTransaction {
+                    let mut transaction = NativeMemoryAllocationTransaction {
                         groups: self.groups,
                         claims: self.claims,
                         requests: self.requests,
                         evidence: self.evidence,
                         reconciliation_baseline: self.reconciliation_baseline,
                         reservation,
-                    });
+                    };
+                    transaction.attach_runtime_receipt();
+                    return Ok(transaction);
                 }
                 Err(error @ MemoryPlanningError::DeviceDomainBusy { .. }) => {
                     if !Self::wait_for_domain_busy_retry(deadline, &mut retry_delay)? {
@@ -265,13 +280,17 @@ impl NativeMemoryAdmissionPlan {
             return Ok(plans
                 .into_iter()
                 .zip(reservations)
-                .map(|(plan, reservation)| NativeMemoryAllocationTransaction {
-                    groups: plan.groups,
-                    claims: plan.claims,
-                    requests: plan.requests,
-                    evidence: plan.evidence,
-                    reconciliation_baseline: plan.reconciliation_baseline,
-                    reservation,
+                .map(|(plan, reservation)| {
+                    let mut transaction = NativeMemoryAllocationTransaction {
+                        groups: plan.groups,
+                        claims: plan.claims,
+                        requests: plan.requests,
+                        evidence: plan.evidence,
+                        reconciliation_baseline: plan.reconciliation_baseline,
+                        reservation,
+                    };
+                    transaction.attach_runtime_receipt();
+                    transaction
                 })
                 .collect());
         }
@@ -394,16 +413,101 @@ impl NativeMemoryAllocationTransaction {
         &self.requests
     }
 
-    pub(crate) fn evidence(&self) -> &[NativeMemoryQuoteEvidence] {
-        &self.evidence
+    fn attach_runtime_receipt(&mut self) {
+        let Some(collector) =
+            current_runtime_receipts().filter(|collector| collector.is_available())
+        else {
+            return;
+        };
+        let Some(first_group) = self.groups.first() else {
+            return;
+        };
+        let Some(owner_descriptor) = collector.owner_descriptor(
+            "native-memory-reservation",
+            None,
+            Some(first_group.group_id()),
+            None,
+        ) else {
+            return;
+        };
+        let resources = self.runtime_receipt_descriptors(&collector);
+        self.reservation
+            .attach_receipt(collector, owner_descriptor, resources);
     }
 
+    fn runtime_receipt_descriptors(
+        &self,
+        collector: &crate::models::runtime_receipts::RuntimeReceiptCollector,
+    ) -> Vec<(
+        MemoryDomainKey,
+        crate::models::runtime_receipts::RuntimeResourceDescriptor,
+    )> {
+        self.requests
+            .iter()
+            .filter_map(|request| {
+                let descriptor = collector.resource_descriptor(
+                    "native-memory-domain",
+                    &request.domain,
+                    request.peak_bytes,
+                    request.peak_bytes,
+                    request.retained_bytes,
+                    self.quote_confidence_for_domain(&request.domain),
+                    Some(request.snapshot.confidence),
+                )?;
+                let mut native = self
+                    .reconciliation_baseline
+                    .observations
+                    .get(&request.domain)
+                    .map(runtime_native_evidence)?;
+                let usage = self.reservation.domain_usage(&request.domain);
+                native.broker_pending_bytes = RuntimeReceiptMetric::Known(usage.pending_bytes);
+                native.broker_committed_bytes = RuntimeReceiptMetric::Known(usage.committed_bytes);
+                native.broker_unreclaimable_bytes =
+                    RuntimeReceiptMetric::Known(usage.unreclaimable_bytes);
+                Some((
+                    request.domain.clone(),
+                    crate::models::runtime_receipts::RuntimeReceiptCollector::with_native_evidence(
+                        descriptor, native,
+                    ),
+                ))
+            })
+            .collect()
+    }
+
+    fn quote_confidence_for_domain(&self, domain: &MemoryDomainKey) -> QuoteConfidence {
+        let mut confidence = None;
+        for claim in &self.claims {
+            if &claim.domain != domain {
+                continue;
+            }
+            confidence = Some(match (confidence, claim.confidence) {
+                (Some(QuoteConfidence::Provisional), _) | (_, QuoteConfidence::Provisional) => {
+                    QuoteConfidence::Provisional
+                }
+                (Some(QuoteConfidence::Unknown), _) | (_, QuoteConfidence::Unknown) => {
+                    QuoteConfidence::Unknown
+                }
+                (Some(QuoteConfidence::CommittedUpperBound), _)
+                | (_, QuoteConfidence::CommittedUpperBound) => QuoteConfidence::CommittedUpperBound,
+                _ => QuoteConfidence::ExactCommitted,
+            });
+        }
+        confidence.unwrap_or(QuoteConfidence::Provisional)
+    }
     pub(crate) fn reservation(&self) -> &DeviceMemoryReservationBatch {
         &self.reservation
     }
 
     pub(crate) fn reservation_mut(&mut self) -> &mut DeviceMemoryReservationBatch {
         &mut self.reservation
+    }
+
+    /// Detaches the broker batch so a candidate-activation reservation can
+    /// hold known-domain peak/retained without immediately allocating native
+    /// owners. Quote tokens are dropped; later declared components still JIT
+    /// against this pending batch's cohort.
+    pub(crate) fn into_reservation(self) -> DeviceMemoryReservationBatch {
+        self.reservation
     }
 
     pub(crate) fn requires_reconciliation(&self) -> bool {
@@ -431,6 +535,12 @@ impl NativeMemoryAllocationTransaction {
         self.requests = fresh.requests;
         self.evidence = fresh.evidence;
         self.reconciliation_baseline = fresh.reconciliation_baseline;
+        if let Some(collector) =
+            current_runtime_receipts().filter(|collector| collector.is_available())
+        {
+            self.reservation
+                .update_receipt_descriptors(self.runtime_receipt_descriptors(&collector));
+        }
         Ok(self)
     }
 
@@ -545,8 +655,11 @@ impl NativeMemoryAllocationTransaction {
             }
         }
 
+        let (receipt_owner, receipt_resources) = runtime_receipt_parts(&self.claims);
         Ok(NativeMemoryAllocation {
             owner: Some(owner),
+            receipt_owner,
+            receipt_resources,
             reservation: Some(self.reservation),
         })
     }
@@ -610,7 +723,10 @@ impl NativeMemoryAllocationTransaction {
             }
         }
 
+        let (receipt_owner, receipt_resources) = runtime_receipt_parts(&self.claims);
         Ok(NativeOwnerAttachedMemoryLease {
+            receipt_owner,
+            receipt_resources,
             reservation: Some(self.reservation),
         })
     }
@@ -652,12 +768,15 @@ impl NativeMemoryAllocationTransaction {
             }
             any_reserved = true;
         }
+        let (receipt_owner, receipt_resources) = runtime_receipt_parts(&self.claims);
         Ok(NativeBackendPrivateMemoryLease {
             inner: Rc::new(RefCell::new(NativeBackendPrivateMemoryLeaseInner {
                 transaction: Some(self),
                 committed_reservation: None,
                 committed: false,
                 quarantined: false,
+                receipt_owner,
+                receipt_resources,
             })),
         })
     }
@@ -714,6 +833,7 @@ fn fetch_live_observations(
         let mapped = map_group_stats(
             &group.group_id,
             &group.backend_device_identity,
+            group.provider,
             stats.domains(),
             None,
         )?;
@@ -803,11 +923,67 @@ pub(crate) enum NativeMemoryRequestKindError {
     },
 }
 
+/// Builds bounded, redacted receipt guards for one committed native
+/// allocation. Receipt construction is deliberately after native commit and
+/// never participates in admission; unavailable entropy simply yields no-op
+/// guards.
+fn runtime_receipt_parts(
+    claims: &[MemoryClaim],
+) -> (Option<RuntimeOwnerGuard>, Vec<RuntimeResourceGuard>) {
+    let Some(collector) = current_runtime_receipts().filter(|collector| collector.is_available())
+    else {
+        return (None, Vec::new());
+    };
+    let source = claims.first().map(|claim| claim.resource_id.as_str());
+    let Some(descriptor) =
+        collector.owner_descriptor("native-memory-allocation", None, source, None)
+    else {
+        return (None, Vec::new());
+    };
+    let owner = collector.start_owner(descriptor, current_execution_cache_attempt_id());
+    let Some(owner_id) = owner.owner_id() else {
+        return (Some(owner), Vec::new());
+    };
+    let resources = claims
+        .iter()
+        .filter_map(|claim| {
+            let descriptor = collector.resource_descriptor(
+                &claim.resource_id,
+                &claim.domain,
+                claim.requested_bytes,
+                claim.incremental_peak_bytes.unwrap_or(0),
+                claim.incremental_retained_bytes.unwrap_or(0),
+                claim.confidence,
+                None,
+            )?;
+            collector
+                .acquire_resource(owner_id, descriptor)
+                .map(|resource| {
+                    // Receipts are attached after the broker lease has already
+                    // committed. Leaving them Reserved would make shadow comparison
+                    // charge them as pending.
+                    resource.set_state(
+                        crate::models::runtime_receipts::RuntimeResourceState::Committed,
+                    );
+                    resource
+                })
+        })
+        .collect();
+    (Some(owner), resources)
+}
+
 /// The true native owner and its committed process-wide memory lease. This
 /// wrapper intentionally has an explicit `Drop`: native buffers disappear
 /// before the reservation can refund committed bytes.
 pub(crate) struct NativeMemoryAllocation<T> {
     owner: Option<T>,
+    /// Diagnostic-only owner/resource guards. They are deliberately kept
+    /// beside the native owner so receipt teardown cannot affect admission or
+    /// native lifetime.
+    // Resource guards precede the owner guard so drop emits ResourceReleased
+    // before OwnerReleased.
+    receipt_resources: Vec<RuntimeResourceGuard>,
+    receipt_owner: Option<RuntimeOwnerGuard>,
     reservation: Option<DeviceMemoryReservationBatch>,
 }
 
@@ -826,6 +1002,12 @@ pub(crate) struct NativeBackendPrivateMemoryLease {
 }
 
 struct NativeBackendPrivateMemoryLeaseInner {
+    /// Diagnostic-only receipt guards share the same Rc lifetime as the native
+    /// private owner and are never consulted by admission or quarantine.
+    // Resource guards precede the owner guard so drop emits ResourceReleased
+    // before OwnerReleased.
+    receipt_resources: Vec<RuntimeResourceGuard>,
+    receipt_owner: Option<RuntimeOwnerGuard>,
     /// Kept after commit so its broker batch follows the backend owner's true
     /// lifetime. Quote groups are also retained; they are small and preserve
     /// the evidence required when finalization is intentionally deferred.
@@ -843,6 +1025,10 @@ struct NativeBackendPrivateMemoryLeaseInner {
 /// responsible for dropping native state before this lease collection.
 #[must_use = "owner-attached memory leases must be stored inside their native owner"]
 pub(crate) struct NativeOwnerAttachedMemoryLease {
+    // Resource guards precede the owner guard so drop emits ResourceReleased
+    // before OwnerReleased.
+    receipt_resources: Vec<RuntimeResourceGuard>,
+    receipt_owner: Option<RuntimeOwnerGuard>,
     reservation: Option<DeviceMemoryReservationBatch>,
 }
 
@@ -953,6 +1139,12 @@ impl NativeBackendPrivateMemoryLease {
 }
 
 impl<T> NativeMemoryAllocation<T> {
+    pub(crate) fn record_receipt_reuse(&self) {
+        if let Some(owner) = self.receipt_owner.as_ref() {
+            owner.record_reuse(current_execution_cache_attempt_id());
+        }
+    }
+
     pub(crate) fn owner(&self) -> &T {
         self.owner
             .as_ref()
@@ -1120,6 +1312,7 @@ impl<E> std::error::Error for NativeMemoryAllocationError<E> where E: std::error
 struct NativeGroupView<'a> {
     group_id: &'a str,
     backend_device_identity: &'a PhysicalDeviceKey,
+    provider: crate::device::execution_route::ExecutionProvider,
     quote: &'a ffi::GgmlBackendMemoryQuoteV1,
     claims: &'a [ffi::GgmlBackendMemoryClaimV1],
     stats: &'a [ffi::GgmlBackendMemoryStatsV1],
@@ -1132,6 +1325,7 @@ impl<'a> From<&'a NativeQuotedBackendGroup> for NativeGroupView<'a> {
         Self {
             group_id: &group.group_id,
             backend_device_identity: &group.backend_device_identity,
+            provider: group.provider,
             quote: group.quote.raw(),
             claims: group.quote.claims(),
             stats: group.fresh_stats.domains(),
@@ -1172,6 +1366,7 @@ fn build_from_views(
         let mapped = map_group_stats(
             group.group_id,
             group.backend_device_identity,
+            group.provider,
             group.stats,
             Some(group.quote.stats_generation),
         )?;
@@ -1195,6 +1390,9 @@ fn build_from_views(
                 });
             }
             let domain = map_native_domain(&native.domain, group.backend_device_identity)?;
+            if let Some(observation) = observations.get_mut(&domain) {
+                observation.claim_flags |= native.flags;
+            }
             if !observations.contains_key(&domain) {
                 return Err(NativeMemoryAdmissionError::MissingClaimStats {
                     group_id: group.group_id.to_owned(),
@@ -1425,16 +1623,41 @@ fn map_native_domain(
 #[derive(Debug, Clone)]
 struct DomainObservation {
     snapshot: DeviceMemorySnapshot,
+    domain_kind: BackendMemoryDomainKind,
+    provider: Option<crate::device::execution_route::ExecutionProvider>,
+    backend_owned_reliability: RuntimeBackendOwnedReliability,
+    heap_index: u32,
+    total_bytes: u64,
+    budget_bytes: Option<u64>,
+    stats_generation: u64,
     device_used_bytes: u64,
     /// Current provider-owned physical commitment. CUDA scratch is normally
     /// cached after an op, so `live_bytes` alone would incorrectly return to
     /// zero; workspace/live+cached expose the retained pool high-water.
     backend_owned_committed_bytes: u64,
+    backend_owned_live_bytes: u64,
+    backend_owned_cached_bytes: u64,
+    backend_owned_workspace_bytes: u64,
+    backend_owned_high_water_bytes: u64,
+    claim_flags: u32,
+    quote_generation: Option<u64>,
+}
+
+fn backend_domain_kind(kind: u32) -> BackendMemoryDomainKind {
+    match kind {
+        ffi::GGML_BACKEND_MEMORY_DOMAIN_HOST_PAGEABLE => BackendMemoryDomainKind::HostPageable,
+        ffi::GGML_BACKEND_MEMORY_DOMAIN_HOST_PINNED => BackendMemoryDomainKind::HostPinned,
+        ffi::GGML_BACKEND_MEMORY_DOMAIN_UNIFIED => BackendMemoryDomainKind::Unified,
+        ffi::GGML_BACKEND_MEMORY_DOMAIN_DEVICE_LOCAL => BackendMemoryDomainKind::DeviceLocal,
+        ffi::GGML_BACKEND_MEMORY_DOMAIN_FILE_BACKED => BackendMemoryDomainKind::FileBacked,
+        kind => BackendMemoryDomainKind::Unknown(kind),
+    }
 }
 
 fn map_group_stats(
     group_id: &str,
     backend_device_identity: &PhysicalDeviceKey,
+    provider: crate::device::execution_route::ExecutionProvider,
     stats: &[ffi::GgmlBackendMemoryStatsV1],
     expected_generation: Option<u64>,
 ) -> Result<BTreeMap<MemoryDomainKey, DomainObservation>, NativeMemoryAdmissionError> {
@@ -1505,11 +1728,28 @@ fn map_group_stats(
                 total_bytes,
                 confidence,
             },
+            domain_kind: backend_domain_kind(raw.domain.kind),
+            provider: Some(provider),
+            backend_owned_reliability: if backend_owned_unknown_reason(provider).is_some() {
+                RuntimeBackendOwnedReliability::Incomplete
+            } else {
+                RuntimeBackendOwnedReliability::Complete
+            },
+            heap_index: raw.domain.heap_index,
+            total_bytes: raw.total_bytes,
+            budget_bytes: (raw.budget_bytes != 0).then_some(raw.budget_bytes),
+            stats_generation: raw.generation,
             device_used_bytes: raw.device_used_bytes,
             backend_owned_committed_bytes: raw
                 .backend_owned_workspace_bytes
                 .max(backend_owned_live_and_cached)
                 .max(raw.backend_owned_live_bytes),
+            backend_owned_live_bytes: raw.backend_owned_live_bytes,
+            backend_owned_cached_bytes: raw.backend_owned_cached_bytes,
+            backend_owned_workspace_bytes: raw.backend_owned_workspace_bytes,
+            backend_owned_high_water_bytes: raw.backend_owned_high_water_bytes,
+            claim_flags: 0,
+            quote_generation: expected_generation,
         };
         merge_observation_within_group(&mut mapped, domain, observation);
     }
@@ -1533,6 +1773,31 @@ fn merge_observation_within_group(
             existing.backend_owned_committed_bytes = existing
                 .backend_owned_committed_bytes
                 .max(observation.backend_owned_committed_bytes);
+            existing.backend_owned_live_bytes = existing
+                .backend_owned_live_bytes
+                .max(observation.backend_owned_live_bytes);
+            existing.backend_owned_cached_bytes = existing
+                .backend_owned_cached_bytes
+                .max(observation.backend_owned_cached_bytes);
+            existing.backend_owned_workspace_bytes = existing
+                .backend_owned_workspace_bytes
+                .max(observation.backend_owned_workspace_bytes);
+            existing.backend_owned_high_water_bytes = existing
+                .backend_owned_high_water_bytes
+                .max(observation.backend_owned_high_water_bytes);
+            existing.provider = match (existing.provider, observation.provider) {
+                (Some(left), Some(right)) if left == right => Some(left),
+                _ => None,
+            };
+            if observation.backend_owned_reliability == RuntimeBackendOwnedReliability::Incomplete {
+                existing.backend_owned_reliability = RuntimeBackendOwnedReliability::Incomplete;
+            }
+            existing.claim_flags |= observation.claim_flags;
+            existing.quote_generation =
+                match (existing.quote_generation, observation.quote_generation) {
+                    (Some(left), Some(right)) if left == right => Some(left),
+                    _ => None,
+                };
         })
         .or_insert(observation);
 }
@@ -1556,6 +1821,43 @@ fn merge_group_observations(
                 .ok_or(NativeMemoryAdmissionError::ArithmeticOverflow {
                     operation: "backend-owned live-byte merge",
                 })?;
+            existing.backend_owned_live_bytes = existing
+                .backend_owned_live_bytes
+                .checked_add(observation.backend_owned_live_bytes)
+                .ok_or(NativeMemoryAdmissionError::ArithmeticOverflow {
+                    operation: "backend-owned live-byte merge",
+                })?;
+            existing.backend_owned_cached_bytes = existing
+                .backend_owned_cached_bytes
+                .checked_add(observation.backend_owned_cached_bytes)
+                .ok_or(NativeMemoryAdmissionError::ArithmeticOverflow {
+                    operation: "backend-owned cached-byte merge",
+                })?;
+            existing.backend_owned_workspace_bytes = existing
+                .backend_owned_workspace_bytes
+                .checked_add(observation.backend_owned_workspace_bytes)
+                .ok_or(NativeMemoryAdmissionError::ArithmeticOverflow {
+                    operation: "backend-owned workspace-byte merge",
+                })?;
+            existing.backend_owned_high_water_bytes = existing
+                .backend_owned_high_water_bytes
+                .checked_add(observation.backend_owned_high_water_bytes)
+                .ok_or(NativeMemoryAdmissionError::ArithmeticOverflow {
+                    operation: "backend-owned high-water merge",
+                })?;
+            existing.provider = match (existing.provider, observation.provider) {
+                (Some(left), Some(right)) if left == right => Some(left),
+                _ => None,
+            };
+            if observation.backend_owned_reliability == RuntimeBackendOwnedReliability::Incomplete {
+                existing.backend_owned_reliability = RuntimeBackendOwnedReliability::Incomplete;
+            }
+            existing.claim_flags |= observation.claim_flags;
+            existing.quote_generation =
+                match (existing.quote_generation, observation.quote_generation) {
+                    (Some(left), Some(right)) if left == right => Some(left),
+                    _ => None,
+                };
         } else {
             merged.insert(domain, observation);
         }
@@ -1604,6 +1906,7 @@ struct ReconciliationBaseline {
 struct PostStatsView<'a> {
     group_id: &'a str,
     backend_device_identity: &'a PhysicalDeviceKey,
+    provider: crate::device::execution_route::ExecutionProvider,
     stats: &'a [ffi::GgmlBackendMemoryStatsV1],
 }
 
@@ -1623,6 +1926,7 @@ fn build_reconciliations(
         let mapped = map_group_stats(
             group.group_id,
             group.backend_device_identity,
+            group.provider,
             group.stats,
             None,
         )?;
@@ -1675,6 +1979,57 @@ fn build_reconciliations_from_observations(
     Ok(reconciliations)
 }
 
+fn runtime_native_evidence(observation: &DomainObservation) -> RuntimeNativeMemoryEvidence {
+    let domain_kind = Some(match observation.domain_kind {
+        BackendMemoryDomainKind::HostPageable
+        | BackendMemoryDomainKind::HostPinned
+        | BackendMemoryDomainKind::Unified
+        | BackendMemoryDomainKind::FileBacked => {
+            crate::models::runtime_receipts::SafeMemoryDomainKind::SystemMemory
+        }
+        BackendMemoryDomainKind::DeviceLocal | BackendMemoryDomainKind::Unknown(_) => {
+            crate::models::runtime_receipts::SafeMemoryDomainKind::DedicatedDevice
+        }
+    });
+    let metric = |value: u64| {
+        if value != 0 {
+            RuntimeReceiptMetric::Known(value)
+        } else {
+            RuntimeReceiptMetric::Unavailable
+        }
+    };
+    let backend_owned = |value| match observation.backend_owned_reliability {
+        RuntimeBackendOwnedReliability::Complete => RuntimeReceiptMetric::Known(value),
+        RuntimeBackendOwnedReliability::Incomplete => RuntimeReceiptMetric::Unavailable,
+    };
+    RuntimeNativeMemoryEvidence {
+        domain_kind,
+        provider: observation.provider,
+        backend_owned_reliability: observation.backend_owned_reliability,
+        heap_index: Some(observation.heap_index),
+        total_bytes: metric(observation.total_bytes),
+        budget_bytes: observation
+            .budget_bytes
+            .map(RuntimeReceiptMetric::Known)
+            .unwrap_or(RuntimeReceiptMetric::Unavailable),
+        free_bytes: RuntimeReceiptMetric::Known(observation.snapshot.free_bytes),
+        used_bytes: RuntimeReceiptMetric::Known(observation.device_used_bytes),
+        backend_owned_live_bytes: backend_owned(observation.backend_owned_live_bytes),
+        backend_owned_cached_bytes: backend_owned(observation.backend_owned_cached_bytes),
+        backend_owned_workspace_bytes: backend_owned(observation.backend_owned_workspace_bytes),
+        backend_owned_high_water_bytes: backend_owned(observation.backend_owned_high_water_bytes),
+        stats_generation: metric(observation.stats_generation),
+        quote_generation: observation
+            .quote_generation
+            .map(RuntimeReceiptMetric::Known)
+            .unwrap_or(RuntimeReceiptMetric::Unavailable),
+        claim_flags: observation.claim_flags,
+        observation_confidence: Some(observation.snapshot.confidence),
+        broker_pending_bytes: RuntimeReceiptMetric::Unavailable,
+        broker_committed_bytes: RuntimeReceiptMetric::Unavailable,
+        broker_unreclaimable_bytes: RuntimeReceiptMetric::Unavailable,
+    }
+}
 fn observation_growth(before: &DomainObservation, after: &DomainObservation) -> u64 {
     let physical_used_delta = after
         .device_used_bytes
@@ -2055,9 +2410,32 @@ mod tests {
         request_semantics: &'a BTreeMap<u64, NativeMemoryClaimSemantics>,
         shared_semantics: &'a NativeMemoryClaimSemantics,
     ) -> NativeGroupView<'a> {
+        view_with_provider(
+            group_id,
+            identity,
+            quote,
+            claims,
+            stats,
+            request_semantics,
+            shared_semantics,
+            crate::device::execution_route::ExecutionProvider::Cpu,
+        )
+    }
+
+    fn view_with_provider<'a>(
+        group_id: &'a str,
+        identity: &'a PhysicalDeviceKey,
+        quote: &'a ffi::GgmlBackendMemoryQuoteV1,
+        claims: &'a [ffi::GgmlBackendMemoryClaimV1],
+        stats: &'a [ffi::GgmlBackendMemoryStatsV1],
+        request_semantics: &'a BTreeMap<u64, NativeMemoryClaimSemantics>,
+        shared_semantics: &'a NativeMemoryClaimSemantics,
+        provider: crate::device::execution_route::ExecutionProvider,
+    ) -> NativeGroupView<'a> {
         NativeGroupView {
             group_id,
             backend_device_identity: identity,
+            provider,
             quote,
             claims,
             stats,
@@ -2066,6 +2444,181 @@ mod tests {
         }
     }
 
+    #[test]
+    fn same_group_repeated_domain_observations_use_max_high_water() {
+        let identity = identity("cpu:repeat");
+        let native_domain = domain(ffi::GGML_BACKEND_MEMORY_DOMAIN_HOST_PAGEABLE, 0, [0; 16]);
+        let mut first = stats(native_domain, 1, 8 * GIB, 16 * GIB);
+        first.backend_owned_high_water_bytes = GIB;
+        let mut second = first;
+        second.backend_owned_high_water_bytes = 2 * GIB;
+        let claims = [claim(
+            1,
+            native_domain,
+            ffi::GGML_BACKEND_MEMORY_CLAIM_EXACT,
+            1,
+            0,
+            1,
+            1,
+        )];
+        let quote = ffi::GgmlBackendMemoryQuoteV1 {
+            struct_size: mem::size_of::<ffi::GgmlBackendMemoryQuoteV1>() as u32,
+            stats_generation: 1,
+            ..Default::default()
+        };
+        let metadata = BTreeMap::from([(1, semantics("repeat", PhaseSet::ALL))]);
+        let shared = semantics("shared", PhaseSet::ALL);
+        let built = build_from_views(&[view(
+            "repeat",
+            &identity,
+            &quote,
+            &claims,
+            &[first, second],
+            &metadata,
+            &shared,
+        )])
+        .unwrap();
+        assert_eq!(
+            built
+                .reconciliation_baseline
+                .observations
+                .get(&MemoryDomainKey::SystemMemory)
+                .unwrap()
+                .backend_owned_high_water_bytes,
+            2 * GIB
+        );
+    }
+
+    #[test]
+    fn cross_backend_domain_high_water_is_checked_additive() {
+        let first_identity = identity("cpu:first");
+        let second_identity = identity("cpu:second");
+        let native_domain = domain(ffi::GGML_BACKEND_MEMORY_DOMAIN_HOST_PAGEABLE, 0, [0; 16]);
+        let mut first_stats = stats(native_domain, 1, 8 * GIB, 16 * GIB);
+        first_stats.backend_owned_high_water_bytes = GIB;
+        let mut second_stats = first_stats;
+        second_stats.backend_owned_high_water_bytes = 2 * GIB;
+        let first_claim = [claim(
+            1,
+            native_domain,
+            ffi::GGML_BACKEND_MEMORY_CLAIM_EXACT,
+            1,
+            0,
+            1,
+            1,
+        )];
+        let second_claim = [claim(
+            2,
+            native_domain,
+            ffi::GGML_BACKEND_MEMORY_CLAIM_EXACT,
+            2,
+            0,
+            2,
+            2,
+        )];
+        let first_quote = ffi::GgmlBackendMemoryQuoteV1 {
+            struct_size: mem::size_of::<ffi::GgmlBackendMemoryQuoteV1>() as u32,
+            stats_generation: 1,
+            ..Default::default()
+        };
+        let second_quote = first_quote;
+        let first_metadata = BTreeMap::from([(1, semantics("first", PhaseSet::ALL))]);
+        let second_metadata = BTreeMap::from([(2, semantics("second", PhaseSet::ALL))]);
+        let first_shared = semantics("first-shared", PhaseSet::ALL);
+        let second_shared = semantics("second-shared", PhaseSet::ALL);
+        let built = build_from_views(&[
+            view(
+                "first",
+                &first_identity,
+                &first_quote,
+                &first_claim,
+                &[first_stats],
+                &first_metadata,
+                &first_shared,
+            ),
+            view(
+                "second",
+                &second_identity,
+                &second_quote,
+                &second_claim,
+                &[second_stats],
+                &second_metadata,
+                &second_shared,
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            built
+                .reconciliation_baseline
+                .observations
+                .get(&MemoryDomainKey::SystemMemory)
+                .unwrap()
+                .backend_owned_high_water_bytes,
+            3 * GIB
+        );
+    }
+
+    #[test]
+    fn incomplete_provider_accounting_never_projects_partial_backend_owned_counters() {
+        let identity = identity("cuda:incomplete");
+        let native_domain = domain(ffi::GGML_BACKEND_MEMORY_DOMAIN_DEVICE_LOCAL, 0, [0x44; 16]);
+        let mut native_stats = stats(native_domain, 1, 8 * GIB, 16 * GIB);
+        native_stats.backend_owned_live_bytes = GIB;
+        native_stats.backend_owned_cached_bytes = GIB;
+        native_stats.backend_owned_workspace_bytes = GIB;
+        native_stats.backend_owned_high_water_bytes = 3 * GIB;
+        let claims = [claim(
+            1,
+            native_domain,
+            ffi::GGML_BACKEND_MEMORY_CLAIM_EXACT,
+            1,
+            0,
+            1,
+            1,
+        )];
+        let quote = ffi::GgmlBackendMemoryQuoteV1 {
+            struct_size: mem::size_of::<ffi::GgmlBackendMemoryQuoteV1>() as u32,
+            stats_generation: 1,
+            ..Default::default()
+        };
+        let metadata = BTreeMap::from([(1, semantics("cuda", PhaseSet::ALL))]);
+        let shared = semantics("cuda-shared", PhaseSet::ALL);
+        let built = build_from_views(&[view_with_provider(
+            "cuda",
+            &identity,
+            &quote,
+            &claims,
+            &[native_stats],
+            &metadata,
+            &shared,
+            crate::device::execution_route::ExecutionProvider::Cuda,
+        )])
+        .unwrap();
+        let evidence = runtime_native_evidence(
+            built
+                .reconciliation_baseline
+                .observations
+                .values()
+                .next()
+                .unwrap(),
+        );
+        assert_eq!(
+            evidence.provider,
+            Some(crate::device::execution_route::ExecutionProvider::Cuda)
+        );
+        assert_eq!(
+            evidence.backend_owned_reliability,
+            RuntimeBackendOwnedReliability::Incomplete
+        );
+        assert_eq!(
+            evidence.backend_owned_high_water_bytes,
+            RuntimeReceiptMetric::Unavailable
+        );
+        assert_eq!(
+            evidence.backend_owned_live_bytes,
+            RuntimeReceiptMetric::Unavailable
+        );
+    }
     #[test]
     fn discrete_and_host_claims_merge_into_one_atomic_two_domain_batch() {
         let uuid = [0xabu8; 16];
@@ -2541,6 +3094,7 @@ mod tests {
         let post = [PostStatsView {
             group_id: "cuda",
             backend_device_identity: &identity,
+            provider: crate::device::execution_route::ExecutionProvider::Cuda,
             stats: &after_stats,
         }];
         let reconciled =
@@ -2565,6 +3119,13 @@ mod tests {
             observations: BTreeMap::from([(
                 domain.clone(),
                 DomainObservation {
+                    domain_kind: BackendMemoryDomainKind::DeviceLocal,
+                    provider: Some(crate::device::execution_route::ExecutionProvider::Cuda),
+                    backend_owned_reliability: RuntimeBackendOwnedReliability::Incomplete,
+                    heap_index: 0,
+                    total_bytes: 8 * GIB,
+                    budget_bytes: Some(8 * GIB),
+                    stats_generation: 1,
                     snapshot: DeviceMemorySnapshot {
                         free_bytes: 19 * GIB / 4,
                         total_bytes: 8 * GIB,
@@ -2572,6 +3133,12 @@ mod tests {
                     },
                     device_used_bytes: 13 * GIB / 4,
                     backend_owned_committed_bytes: GIB / 4,
+                    backend_owned_live_bytes: GIB / 4,
+                    backend_owned_cached_bytes: 0,
+                    backend_owned_workspace_bytes: 0,
+                    backend_owned_high_water_bytes: GIB / 4,
+                    claim_flags: 0,
+                    quote_generation: None,
                 },
             )]),
             carried_private_bytes: BTreeMap::from([(domain.clone(), GIB / 4)]),
@@ -2579,6 +3146,13 @@ mod tests {
         let after = BTreeMap::from([(
             domain.clone(),
             DomainObservation {
+                domain_kind: BackendMemoryDomainKind::DeviceLocal,
+                provider: Some(crate::device::execution_route::ExecutionProvider::Cuda),
+                backend_owned_reliability: RuntimeBackendOwnedReliability::Incomplete,
+                heap_index: 0,
+                total_bytes: 8 * GIB,
+                budget_bytes: Some(8 * GIB),
+                stats_generation: 1,
                 snapshot: DeviceMemorySnapshot {
                     free_bytes: 17 * GIB / 4,
                     total_bytes: 8 * GIB,
@@ -2586,6 +3160,12 @@ mod tests {
                 },
                 device_used_bytes: 15 * GIB / 4,
                 backend_owned_committed_bytes: 3 * GIB / 4,
+                backend_owned_live_bytes: 3 * GIB / 4,
+                backend_owned_cached_bytes: 0,
+                backend_owned_workspace_bytes: 0,
+                backend_owned_high_water_bytes: 3 * GIB / 4,
+                claim_flags: 0,
+                quote_generation: None,
             },
         )]);
         let request = DomainReservationRequest {
@@ -2669,6 +3249,8 @@ mod tests {
                 broker: Arc::clone(&broker),
                 observed_committed: Arc::clone(&observed_committed),
             }),
+            receipt_owner: None,
+            receipt_resources: Vec::new(),
             reservation: Some(lease),
         };
 
@@ -2709,6 +3291,8 @@ mod tests {
                 committed_reservation: Some(reservation),
                 committed: true,
                 quarantined: false,
+                receipt_owner: None,
+                receipt_resources: Vec::new(),
             })),
         };
         let second_owner = first_owner.clone();

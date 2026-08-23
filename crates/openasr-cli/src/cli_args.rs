@@ -746,6 +746,9 @@ pub(crate) enum ConfigCommand {
     Set { key: String, value: String },
     /// Remove one saved config value.
     Unset { key: String },
+    /// Preserve a corrupt V2 default record and reset it to a checksummed Unset.
+    #[command(name = "recover-default")]
+    RecoverDefault,
 }
 
 #[derive(Debug, Subcommand)]

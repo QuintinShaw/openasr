@@ -41,6 +41,11 @@ pub(crate) trait AdmittedExclusivePoolOwner: Send + 'static {
     fn is_reusable(&self) -> bool {
         true
     }
+
+    /// Records a diagnostic reuse event without changing admission semantics.
+    /// Owners that carry a receipt hook override this; the default keeps the
+    /// pool usable for receipt-free test and legacy owners.
+    fn record_receipt_reuse(&self) {}
 }
 
 impl<T> AdmittedExclusivePoolOwner for SystemMemoryOwner<T>
@@ -49,6 +54,10 @@ where
 {
     fn committed_requested_bytes(&self) -> u64 {
         SystemMemoryOwner::committed_requested_bytes(self)
+    }
+
+    fn record_receipt_reuse(&self) {
+        SystemMemoryOwner::record_receipt_reuse(self);
     }
 }
 
@@ -204,13 +213,15 @@ where
                 state.idle_committed_requested_bytes = state
                     .idle_committed_requested_bytes
                     .saturating_sub(idle.owner.committed_requested_bytes());
+                let owner = idle.owner;
                 drop(state);
+                owner.record_receipt_reuse();
                 return Ok(AdmittedExclusiveObjectCheckout {
                     inner: Arc::clone(&self.inner),
                     key,
                     epoch,
                     cacheable: true,
-                    owner: Some(idle.owner),
+                    owner: Some(owner),
                 });
             }
 

@@ -53,6 +53,7 @@ use super::tensor_names::OUTPUT_WEIGHT;
 use super::token_embedding::load_qwen3_token_embedding_table_from_reader;
 use crate::models::ggml_asr_executor::GgmlAsrPreparedAudioView;
 use crate::models::mapped_token_embedding::{MappedTokenEmbeddingError, MappedTokenEmbeddingTable};
+use crate::models::runtime_receipts::{RuntimeOwnerGuard, RuntimeResourceGuard};
 
 /// Same rope theta as the shared qwen3-asr LLM stack (`QWEN_ROPE_THETA` in
 /// `batched_decode.rs`); the forced aligner's LM shares that architecture
@@ -334,6 +335,46 @@ struct ForcedAlignerStageBackends {
     logits: ResolvedFamilyRuntimeInput,
 }
 
+const FORCED_ALIGNER_REQUEST_COMPONENT: &str = "qwen3-forced-aligner.request";
+const FORCED_ALIGNER_ASSETS_RESOURCE: &str = "qwen3-forced-aligner.prepared-assets";
+
+fn request_receipts(content_id: &str) -> (Option<RuntimeOwnerGuard>, Option<RuntimeResourceGuard>) {
+    let Some(collector) = crate::models::native_execution_services::current_runtime_receipts()
+        .filter(|collector| collector.is_available())
+    else {
+        return (None, None);
+    };
+    let Some(descriptor) = collector.owner_descriptor(
+        FORCED_ALIGNER_REQUEST_COMPONENT,
+        Some(content_id),
+        Some("request"),
+        None,
+    ) else {
+        return (None, None);
+    };
+    let owner = collector.start_owner(
+        descriptor,
+        crate::models::native_execution_services::current_execution_cache_attempt_id(),
+    );
+    let resource = owner.owner_id().and_then(|owner_id| {
+        collector
+            .unpriced_resource_descriptor(FORCED_ALIGNER_ASSETS_RESOURCE)
+            .and_then(|descriptor| collector.acquire_resource(owner_id, descriptor))
+    });
+    (Some(owner), resource)
+}
+
+fn transient_receipt_owner(component: &str, content_id: &str) -> Option<RuntimeOwnerGuard> {
+    let collector = crate::models::native_execution_services::current_runtime_receipts()
+        .filter(|collector| collector.is_available())?;
+    let descriptor =
+        collector.owner_descriptor(component, Some(content_id), Some("request-transient"), None)?;
+    Some(collector.start_owner(
+        descriptor,
+        crate::models::native_execution_services::current_execution_cache_attempt_id(),
+    ))
+}
+
 impl ForcedAlignerStageBackends {
     const fn uniform(runtime: ResolvedFamilyRuntimeInput) -> Self {
         Self {
@@ -581,6 +622,10 @@ fn align_forced_with_stage_backends(
     report(ForcedAlignerProgressEvent::MelReady);
 
     report(ForcedAlignerProgressEvent::AudioEncodingStarted);
+    let audio_receipt_owner = transient_receipt_owner(
+        "qwen3-forced-aligner.audio-runtime",
+        preflight.runtime_source.content_id(),
+    );
     let audio_runtime_result = if matches!(
         backends.audio_backend(),
         crate::ggml_runtime::GgmlCpuGraphBackend::Gpu
@@ -612,6 +657,7 @@ fn align_forced_with_stage_backends(
         .release_transient_compute_memory()
         .map_err(Qwen3ForcedAlignerRuntimeError::AudioEncoderFailed)?;
     drop(audio_runtime);
+    drop(audio_receipt_owner);
     drop(mel_features);
 
     let (decode_prompt, timestamp_positions) = build_forced_aligner_decode_prompt(
@@ -623,6 +669,10 @@ fn align_forced_with_stage_backends(
     )?;
 
     report(ForcedAlignerProgressEvent::DecoderPrefillStarted);
+    let decoder_receipt_owner = transient_receipt_owner(
+        "qwen3-forced-aligner.decoder-runtime",
+        preflight.runtime_source.content_id(),
+    );
     let mut whole_decoder = if backends.decoder_backend().is_gpu_class() {
         let device_embedding = assets
             .token_embedding_table
@@ -710,7 +760,12 @@ fn align_forced_with_stage_backends(
     // larger decoder graph/weight runtime before materializing the logits-head
     // runtime so their transient GPU allocations never overlap.
     drop(whole_decoder);
+    drop(decoder_receipt_owner);
     drop(prefill_input);
+    let logits_receipt_owner = transient_receipt_owner(
+        "qwen3-forced-aligner.logits-runtime",
+        preflight.runtime_source.content_id(),
+    );
     let mut logits_runtime = assets.logits_head.new_runtime(backends.logits_backend())?;
     let expected_timestamp_positions = word_list.len() * 2;
     if timestamp_positions.len() != expected_timestamp_positions {
@@ -777,6 +832,8 @@ fn align_forced_with_stage_backends(
         });
     }
 
+    drop(logits_runtime);
+    drop(logits_receipt_owner);
     let fixed_ms = fix_timestamp(&raw_timestamps_ms)?;
     let mut items = Vec::with_capacity(word_list.len());
     for (index, word) in word_list.into_iter().enumerate() {
@@ -814,6 +871,8 @@ pub(crate) struct Qwen3ForcedAlignerSession {
     verified: VerifiedPack,
     assets: Qwen3ForcedAlignerPreparedAssets,
     backends: ForcedAlignerStageBackends,
+    _receipt_prepared_assets: Option<RuntimeResourceGuard>,
+    _receipt_owner: Option<RuntimeOwnerGuard>,
 }
 
 pub(crate) fn validate_forced_aligner_quantization_contract(
@@ -1026,10 +1085,14 @@ impl Qwen3ForcedAlignerSession {
         backends: ForcedAlignerStageBackends,
     ) -> Result<Self, Qwen3ForcedAlignerRuntimeError> {
         let assets = load_forced_aligner_prepared_assets(verified.preflight(), backends.logits)?;
+        let (receipt_owner, receipt_prepared_assets) =
+            request_receipts(verified.preflight().runtime_source.content_id());
         Ok(Self {
             verified,
             assets,
             backends,
+            _receipt_prepared_assets: receipt_prepared_assets,
+            _receipt_owner: receipt_owner,
         })
     }
 
@@ -1071,6 +1134,8 @@ impl Qwen3ForcedAlignerSession {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1172,6 +1237,101 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn forced_aligner_request_receipts_release_assets_on_success_and_error() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _context = crate::models::native_execution_services::install_native_execution_services(
+            services.as_ref(),
+        );
+        for success in [true, false] {
+            let (owner, assets) = request_receipts("forced-aligner-test-content");
+            assert!(owner.is_some(), "request owner must be recorded");
+            assert!(
+                assets.is_some(),
+                "prepared assets must have an Unknown receipt"
+            );
+            assert_eq!(services.runtime_receipts().summary().live_owner_count, 1);
+            assert_eq!(services.runtime_receipts().summary().live_resource_count, 1);
+            let result: Result<(), &str> = if success { Ok(()) } else { Err("align failed") };
+            drop(assets);
+            drop(owner);
+            if success {
+                assert!(result.is_ok());
+            } else {
+                assert!(result.is_err());
+            }
+            assert_eq!(services.runtime_receipts().summary().live_owner_count, 0);
+            assert_eq!(services.runtime_receipts().summary().live_resource_count, 0);
+        }
+    }
+    #[test]
+    fn forced_aligner_logits_receipts_release_after_runtime_drop() {
+        struct RuntimeDropProbe(Arc<Mutex<Vec<&'static str>>>);
+
+        impl Drop for RuntimeDropProbe {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().push("runtime-dropped");
+            }
+        }
+
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _context = crate::models::native_execution_services::install_native_execution_services(
+            services.as_ref(),
+        );
+        let collector = services.runtime_receipts();
+        let descriptor = collector
+            .owner_descriptor(
+                "qwen3-forced-aligner.logits-runtime",
+                Some("forced-aligner-test-content"),
+                Some("request-transient"),
+                None,
+            )
+            .expect("logits owner descriptor");
+        let owner = collector.start_owner(descriptor, None);
+        let resource = owner
+            .owner_id()
+            .and_then(|owner_id| {
+                collector
+                    .unpriced_resource_descriptor("qwen3-forced-aligner.logits-resource")
+                    .and_then(|descriptor| collector.acquire_resource(owner_id, descriptor))
+            })
+            .expect("logits resource receipt");
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let runtime = RuntimeDropProbe(Arc::clone(&order));
+
+        drop(runtime);
+        assert_eq!(order.lock().unwrap().as_slice(), ["runtime-dropped"]);
+        drop(resource);
+        order.lock().unwrap().push("resource-released");
+        drop(owner);
+        order.lock().unwrap().push("owner-released");
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            ["runtime-dropped", "resource-released", "owner-released"]
+        );
+
+        let events = collector.snapshot().events;
+        let resource_release = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    crate::models::runtime_receipts::RuntimeReceiptEvent::ResourceReleased { .. }
+                )
+            })
+            .expect("resource release receipt");
+        let owner_release = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    crate::models::runtime_receipts::RuntimeReceiptEvent::OwnerReleased { .. }
+                )
+            })
+            .expect("owner release receipt");
+        assert!(resource_release < owner_release);
     }
 
     #[test]

@@ -24,7 +24,7 @@ use crate::ggml_runtime::{GgmlBackendDevice, GgmlBackendKind};
 
 /// Backend provider family for route identity. Distinct from the public coarse
 /// [`crate::ExecutionTarget`] surface (`auto` / `cpu` / `accelerated`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum ExecutionProvider {
     Cpu,
     Metal,

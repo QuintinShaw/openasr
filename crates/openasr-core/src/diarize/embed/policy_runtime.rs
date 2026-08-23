@@ -7,6 +7,7 @@
 //! no process-global or thread-local owner exists outside the injected service
 //! root.
 
+use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rayon::prelude::*;
@@ -14,6 +15,7 @@ use rayon::prelude::*;
 use crate::{
     NativeExecutionServices,
     device::execution_policy::ExecutionIntent,
+    device::execution_route::ExecutionProvider,
     ggml_runtime::GgmlCpuGraphBackend,
     models::{
         admitted_pinned_runtime_actor_pool::{
@@ -29,6 +31,7 @@ use crate::{
             PolicyResolvedAuxRuntimeError, resolve_auxiliary_execution_plan,
             resolved_runtime_for_auxiliary_candidate,
         },
+        runtime_receipts::{RuntimeOwnerDescriptor, RuntimeOwnerGuard},
         system_memory_owner::{
             AdmittedHostObject, SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
             SystemMemoryOwner,
@@ -86,12 +89,25 @@ fn redimnet_resident_worker_limit(backend: GgmlCpuGraphBackend, pool_threads: us
     }
 }
 
-type SharedAdmittedEmbedder = AdmittedHostObject<RedimNet2Embedder>;
+type SharedAdmittedEmbedder = AdmittedHostObject<RedimNetParsedHost>;
 type PendingActorBatch = CheckedOutPinnedRuntimeActorCall<
     AuxiliaryPinnedRuntimeCacheKey,
     RedimNetResidentRuntime,
     Result<Vec<(usize, Result<SpeakerEmbedding, EmbedError>)>, EmbedError>,
 >;
+
+struct RedimNetParsedHost {
+    embedder: RedimNet2Embedder,
+    _receipt_owner: Option<RuntimeOwnerGuard>,
+}
+
+impl Deref for RedimNetParsedHost {
+    type Target = RedimNet2Embedder;
+
+    fn deref(&self) -> &Self::Target {
+        &self.embedder
+    }
+}
 
 struct PolicySpeakerCandidate {
     parsed: SharedAdmittedEmbedder,
@@ -99,6 +115,8 @@ struct PolicySpeakerCandidate {
     content_id: String,
     backend: GgmlCpuGraphBackend,
     placement: crate::device::execution_policy::ExecutionPlacement,
+    provider: ExecutionProvider,
+    stable_device_id: String,
 }
 
 fn redimnet_actor_key(
@@ -111,6 +129,37 @@ fn redimnet_actor_key(
         REDIMNET_RESIDENT_REPRESENTATION,
         backend,
     )
+}
+
+fn redimnet_actor_receipt_descriptor(
+    content_id: &str,
+    backend: GgmlCpuGraphBackend,
+    placement: crate::device::execution_policy::ExecutionPlacement,
+    provider: ExecutionProvider,
+    stable_device_id: &str,
+) -> Option<RuntimeOwnerDescriptor> {
+    let collector = crate::models::native_execution_services::current_runtime_receipts()?;
+    let lane = collector.lane_projection(provider, stable_device_id, placement, backend)?;
+    collector.owner_descriptor(
+        "redimnet2.resident-runtime",
+        Some(content_id),
+        Some(REDIMNET_RESIDENT_REPRESENTATION),
+        Some(lane),
+    )
+}
+
+fn redimnet_parsed_host_receipt_owner(content_id: &str) -> Option<RuntimeOwnerGuard> {
+    let collector = crate::models::native_execution_services::current_runtime_receipts()?;
+    let descriptor = collector.owner_descriptor(
+        "redimnet2.parsed-host-state",
+        Some(content_id),
+        Some(REDIMNET_PARSED_HOST_REPRESENTATION),
+        None,
+    )?;
+    Some(collector.start_owner(
+        descriptor,
+        crate::models::native_execution_services::current_execution_cache_attempt_id(),
+    ))
 }
 
 impl PolicySpeakerCandidate {
@@ -132,10 +181,18 @@ impl PolicySpeakerCandidate {
         let weights = self.parsed.shared_weights();
         let backend = self.backend;
         let placement = self.placement;
+        let owner_descriptor = redimnet_actor_receipt_descriptor(
+            &self.content_id,
+            backend,
+            placement,
+            self.provider,
+            &self.stable_device_id,
+        );
         self.services
             .redimnet_runtime_actors()
-            .checkout_or_try_build_with(
+            .checkout_or_try_build_with_owner_receipt(
                 self.actor_key(),
+                owner_descriptor,
                 || Ok((0, (weights, threads, warmup))),
                 move |(weights, threads, warmup)| {
                     let mut runtime =
@@ -408,7 +465,7 @@ impl PolicyResolvedSpeakerRuntime {
             move |execution_candidate: &crate::device::execution_policy::ExecutionCandidate| {
                 let backend =
                     resolved_runtime_for_auxiliary_candidate(execution_candidate).backend();
-                let key = AuxiliaryRuntimeCacheKey::host_neutral::<RedimNet2Embedder>(
+                let key = AuxiliaryRuntimeCacheKey::host_neutral::<RedimNetParsedHost>(
                     REDIMNET2_GGML_ARCHITECTURE_ID,
                     content_for_builder.clone(),
                     REDIMNET_PARSED_HOST_REPRESENTATION,
@@ -434,6 +491,8 @@ impl PolicyResolvedSpeakerRuntime {
                     content_id: content_for_builder.clone(),
                     backend,
                     placement: execution_candidate.placement,
+                    provider: execution_candidate.device.route.provider,
+                    stable_device_id: execution_candidate.device.route.stable_id.clone(),
                 };
                 let warmup = deterministic_warmup_audio();
                 let warmup = candidate
@@ -454,6 +513,9 @@ impl PolicyResolvedSpeakerRuntime {
             execution_plan,
             STREAMING_SPEAKER_STAGE,
             builder,
+            crate::models::native_execution_services::CandidateActivationQuoteSource::Pack(
+                verified_pack,
+            ),
         )
         .map_err(policy_runtime_error)?;
         let identity = SpeakerEmbedderIdentity {
@@ -504,7 +566,7 @@ fn build_admitted_embedder(
     expected_content_id: &str,
     peak_quote: u64,
     retained_quote: u64,
-) -> Result<AdmittedHostObject<RedimNet2Embedder>, EmbedError> {
+) -> Result<AdmittedHostObject<RedimNetParsedHost>, EmbedError> {
     let quote = SystemMemoryAllocationQuote::new(
         format!("aux.{REDIMNET2_GGML_ARCHITECTURE_ID}.{expected_content_id}.parsed-host-state"),
         peak_quote,
@@ -525,7 +587,10 @@ fn build_admitted_embedder(
             .immutable_snapshot_construction_peak_bytes(actual_retained)
             .map_err(|error| error.to_string())?;
         Ok(SystemMemoryAllocationOutcome::new(
-            embedder,
+            RedimNetParsedHost {
+                embedder,
+                _receipt_owner: redimnet_parsed_host_receipt_owner(expected_content_id),
+            },
             actual_peak,
             actual_retained,
         ))
@@ -594,6 +659,20 @@ fn policy_runtime_error(error: PolicyResolvedAuxRuntimeError<EmbedError>) -> Emb
 mod tests {
     use super::*;
 
+    #[test]
+    fn redimnet_host_receipt_releases_without_leaking_across_cache_lifecycle() {
+        let services = Arc::new(
+            NativeExecutionServices::for_local_process()
+                .expect("construct native execution services"),
+        );
+        let _context =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+        let owner = redimnet_parsed_host_receipt_owner("redimnet-test-content")
+            .expect("host receipt owner");
+        assert_eq!(services.runtime_receipts().summary().live_owner_count, 1);
+        drop(owner);
+        assert_eq!(services.runtime_receipts().summary().live_owner_count, 0);
+    }
     #[test]
     fn redimnet_actor_key_separates_cpu_and_gpu_residents() {
         let cpu = redimnet_actor_key("same-pack", GgmlCpuGraphBackend::Cpu);

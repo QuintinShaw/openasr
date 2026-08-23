@@ -10,6 +10,7 @@ use std::{ffi::c_void, marker::PhantomData, mem, ptr};
 
 use thiserror::Error;
 
+use crate::device::execution_memory::MemoryObservationConfidence;
 use crate::device::execution_route::ExecutionProvider;
 
 use super::ffi;
@@ -41,6 +42,20 @@ pub(crate) enum BackendMemoryBytes {
     Unknown(BackendMemoryUnknownReason),
 }
 
+pub(crate) fn backend_owned_unknown_reason(
+    provider: ExecutionProvider,
+) -> Option<BackendMemoryUnknownReason> {
+    match provider {
+        ExecutionProvider::Vulkan => {
+            Some(BackendMemoryUnknownReason::ProviderDoesNotReportBackendOwned)
+        }
+        ExecutionProvider::Cpu => None,
+        ExecutionProvider::Cuda => {
+            Some(BackendMemoryUnknownReason::ProviderOwnedAccountingIncomplete)
+        }
+        _ => Some(BackendMemoryUnknownReason::ProviderReliabilityUnspecified),
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackendMemoryDomainKind {
     HostPageable,
@@ -58,6 +73,12 @@ pub(crate) struct SafeBackendMemoryReceipt {
     pub(crate) lifecycle: BackendMemoryLifecyclePoint,
     pub(crate) domain_kind: Option<BackendMemoryDomainKind>,
     pub(crate) heap_index: Option<u32>,
+    pub(crate) total_bytes: BackendMemoryBytes,
+    pub(crate) budget_bytes: BackendMemoryBytes,
+    pub(crate) stats_generation: BackendMemoryBytes,
+    pub(crate) quote_generation: BackendMemoryBytes,
+    pub(crate) claim_flags: u32,
+    pub(crate) observation_confidence: MemoryObservationConfidence,
     pub(crate) device_used_bytes: BackendMemoryBytes,
     pub(crate) device_free_bytes: BackendMemoryBytes,
     pub(crate) backend_owned_live_bytes: BackendMemoryBytes,
@@ -78,6 +99,12 @@ impl SafeBackendMemoryReceipt {
             lifecycle,
             domain_kind: None,
             heap_index: None,
+            total_bytes: value,
+            budget_bytes: value,
+            stats_generation: value,
+            quote_generation: BackendMemoryBytes::Unknown(reason),
+            claim_flags: 0,
+            observation_confidence: MemoryObservationConfidence::Unknown,
             device_used_bytes: value,
             device_free_bytes: value,
             backend_owned_live_bytes: value,
@@ -371,6 +398,15 @@ impl BackendMemoryAbi {
         self.backend
     }
 
+    pub(crate) fn provider(&self) -> ExecutionProvider {
+        let name = unsafe { ffi::ggml_backend_name(self.backend) };
+        if name.is_null() {
+            return ExecutionProvider::Unknown;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
+        ExecutionProvider::from_backend_name(name.as_ref())
+    }
+
     pub(crate) fn trim(&self, flags: u64) -> Result<(), BackendMemoryAbiError> {
         let trim = self.raw.trim.ok_or(BackendMemoryAbiError::Incompatible)?;
         status("trim", unsafe { trim(self.backend, flags) })
@@ -480,6 +516,30 @@ fn safe_receipt(
         ffi::GGML_BACKEND_MEMORY_DOMAIN_FILE_BACKED => BackendMemoryDomainKind::FileBacked,
         kind => BackendMemoryDomainKind::Unknown(kind),
     };
+    let observation_confidence = if raw.domain.kind == ffi::GGML_BACKEND_MEMORY_DOMAIN_UNIFIED {
+        MemoryObservationConfidence::WorkingSetBudget
+    } else {
+        MemoryObservationConfidence::DeviceSnapshot
+    };
+    let total_bytes = if raw.total_bytes == 0 {
+        BackendMemoryBytes::Unknown(BackendMemoryUnknownReason::IncompatibleStats)
+    } else {
+        BackendMemoryBytes::Known(raw.total_bytes)
+    };
+    let budget_bytes = if raw.flags & ffi::GGML_BACKEND_MEMORY_STATS_BUDGET_UNAVAILABLE != 0
+        || raw.budget_bytes == 0
+    {
+        BackendMemoryBytes::Unknown(BackendMemoryUnknownReason::DeviceBudgetUnavailable)
+    } else {
+        BackendMemoryBytes::Known(raw.budget_bytes)
+    };
+    let stats_generation = if raw.generation == 0 {
+        BackendMemoryBytes::Unknown(BackendMemoryUnknownReason::IncompatibleStats)
+    } else {
+        BackendMemoryBytes::Known(raw.generation)
+    };
+    let quote_generation =
+        BackendMemoryBytes::Unknown(BackendMemoryUnknownReason::StatsUnavailable);
     let device = if raw.flags & ffi::GGML_BACKEND_MEMORY_STATS_BUDGET_UNAVAILABLE != 0 {
         BackendMemoryBytes::Unknown(BackendMemoryUnknownReason::DeviceBudgetUnavailable)
     } else {
@@ -494,19 +554,7 @@ fn safe_receipt(
         .backend_owned_live_bytes
         .saturating_add(raw.backend_owned_cached_bytes)
         .max(raw.backend_owned_workspace_bytes);
-    let owned_unknown = match provider {
-        ExecutionProvider::Vulkan => {
-            Some(BackendMemoryUnknownReason::ProviderDoesNotReportBackendOwned)
-        }
-        ExecutionProvider::Cpu => None,
-        // CUDA v1 currently accounts the temporary pool only; direct backend
-        // buffers holding model weights are outside these counters. Presenting
-        // the pool as total model ownership would under-report dedicated VRAM.
-        ExecutionProvider::Cuda => {
-            Some(BackendMemoryUnknownReason::ProviderOwnedAccountingIncomplete)
-        }
-        _ => Some(BackendMemoryUnknownReason::ProviderReliabilityUnspecified),
-    };
+    let owned_unknown = backend_owned_unknown_reason(provider);
     let owned = |value| {
         owned_unknown.map_or(
             BackendMemoryBytes::Known(value),
@@ -517,6 +565,12 @@ fn safe_receipt(
         lifecycle,
         domain_kind: Some(domain_kind),
         heap_index: Some(raw.domain.heap_index),
+        total_bytes,
+        budget_bytes,
+        stats_generation,
+        quote_generation,
+        claim_flags: 0,
+        observation_confidence,
         device_used_bytes: device,
         device_free_bytes: device_free,
         backend_owned_live_bytes: owned(raw.backend_owned_live_bytes),

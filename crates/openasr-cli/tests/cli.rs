@@ -64,6 +64,48 @@ fn temp_home() -> TempDir {
     tempfile::tempdir().expect("temporary OPENASR_HOME")
 }
 
+fn persist_v2_unset(home: &Path) {
+    openasr_core::default_selection::persist_v2_record(
+        home,
+        openasr_core::default_selection::ActiveModelSelectionV2 {
+            schema_version:
+                openasr_core::default_selection::ACTIVE_MODEL_SELECTION_V2_SCHEMA_VERSION,
+            selection_generation: 0,
+            status: openasr_core::default_selection::ActiveModelSelectionStatus::Unset,
+            pull: None,
+            model_id: None,
+            quant: None,
+            architecture_id: None,
+            expected_pack: None,
+            quant_preference: openasr_core::QuantPreference::Auto,
+            execution_intent: "auto".to_string(),
+            checksum: String::new(),
+        },
+    )
+    .expect("persist V2 unset selection");
+}
+
+fn persist_v2_not_installed(home: &Path, model_id: &str) {
+    openasr_core::default_selection::persist_v2_record(
+        home,
+        openasr_core::default_selection::ActiveModelSelectionV2 {
+            schema_version:
+                openasr_core::default_selection::ACTIVE_MODEL_SELECTION_V2_SCHEMA_VERSION,
+            selection_generation: 0,
+            status: openasr_core::default_selection::ActiveModelSelectionStatus::NotInstalled,
+            pull: Some(model_id.to_string()),
+            model_id: Some(model_id.to_string()),
+            quant: None,
+            architecture_id: None,
+            expected_pack: None,
+            quant_preference: openasr_core::QuantPreference::Auto,
+            execution_intent: "auto".to_string(),
+            checksum: String::new(),
+        },
+    )
+    .expect("persist V2 selected model");
+}
+
 fn temp_input_wav() -> tempfile::NamedTempFile {
     let file = tempfile::Builder::new()
         .prefix("openasr-test-")
@@ -1916,6 +1958,170 @@ fn hidden_gguf_c_parser_probe_emits_metadata_and_tensor_index_json() {
 }
 
 #[test]
+fn config_default_model_is_v2_first_and_rejects_legacy_mutation() {
+    let home = temp_home();
+    openasr_core::save_config(
+        home.path(),
+        &openasr_core::OpenAsrConfig {
+            default_model: Some("stale-model".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("persist stale legacy default fixture");
+    openasr_core::default_selection::persist_v2_record(
+        home.path(),
+        openasr_core::default_selection::ActiveModelSelectionV2 {
+            schema_version:
+                openasr_core::default_selection::ACTIVE_MODEL_SELECTION_V2_SCHEMA_VERSION,
+            selection_generation: 0,
+            status: openasr_core::default_selection::ActiveModelSelectionStatus::Unset,
+            pull: None,
+            model_id: None,
+            quant: None,
+            architecture_id: None,
+            expected_pack: None,
+            quant_preference: openasr_core::QuantPreference::Auto,
+            execution_intent: "auto".to_string(),
+            checksum: String::new(),
+        },
+    )
+    .expect("persist V2 Unset fixture");
+
+    openasr_with_home(home.path())
+        .args(["config", "get", "default_model"])
+        .assert()
+        .success()
+        .stdout("<unset>\n");
+
+    openasr_with_home(home.path())
+        .args(["config", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default_model=<unset>"))
+        .stdout(predicate::str::contains("default_model=stale-model").not());
+
+    openasr_with_home(home.path())
+        .args(["config", "set", "default_model", "new-model"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("/v1/models/default"))
+        .stderr(predicate::str::contains(
+            "desktop default-model activation surface",
+        ))
+        .stderr(predicate::str::contains("pull").not());
+
+    openasr_with_home(home.path())
+        .args(["config", "unset", "default_model"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("/v1/models/default"))
+        .stderr(predicate::str::contains(
+            "desktop default-model activation surface",
+        ))
+        .stderr(predicate::str::contains("pull").not());
+}
+
+#[test]
+fn native_segment_and_live_ignore_stale_legacy_default_when_v2_is_unset() {
+    let home = temp_home();
+    openasr_core::save_config(
+        home.path(),
+        &openasr_core::OpenAsrConfig {
+            default_model: Some("stale-model".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("persist stale legacy default fixture");
+    persist_v2_unset(home.path());
+
+    let input = temp_input_wav();
+    openasr_with_home(home.path())
+        .args([
+            "transcribe",
+            "--backend",
+            "mock",
+            input.path().to_str().expect("input path"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("using qwen3-asr-0.6b"))
+        .stderr(predicate::str::contains("stale-model").not());
+
+    openasr_with_home(home.path())
+        .args([
+            "live",
+            "--backend",
+            "mock",
+            "--input-file",
+            input.path().to_str().expect("input path"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("stale-model").not());
+}
+
+#[test]
+fn transcribe_language_prevalidation_uses_v2_selected_model() {
+    let home = temp_home();
+    openasr_core::save_config(
+        home.path(),
+        &openasr_core::OpenAsrConfig {
+            default_model: Some("whisper-large-v3".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("persist stale legacy default fixture");
+    persist_v2_not_installed(home.path(), "moonshine-tiny");
+
+    let input = valid_temp_input_wav();
+    openasr_with_home(home.path())
+        .args([
+            "transcribe",
+            "--backend",
+            "mock",
+            "--language",
+            "fr",
+            input.path().to_str().expect("input path"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("moonshine-tiny"))
+        .stderr(predicate::str::contains("whisper-large-v3").not());
+}
+
+#[test]
+fn doctor_and_config_report_v2_selected_model_over_legacy_projection() {
+    let home = temp_home();
+    openasr_core::save_config(
+        home.path(),
+        &openasr_core::OpenAsrConfig {
+            default_model: Some("stale-model".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("persist stale legacy default fixture");
+    persist_v2_not_installed(home.path(), "moonshine-tiny");
+
+    openasr_with_home(home.path())
+        .args(["config", "get", "default_model"])
+        .assert()
+        .success()
+        .stdout("moonshine-tiny\n");
+    openasr_with_home(home.path())
+        .args(["config", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default_model=moonshine-tiny"))
+        .stdout(predicate::str::contains("default_model=stale-model").not());
+    openasr_with_home(home.path())
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Default model: moonshine-tiny"))
+        .stdout(predicate::str::contains("stale-model").not());
+}
+
+#[test]
 fn pull_installs_local_pack_from_catalog_reference() {
     let home = temp_home();
     let temp = tempfile::tempdir().expect("tempdir");
@@ -1941,11 +2147,74 @@ fn pull_installs_local_pack_from_catalog_reference() {
         .stdout(predicate::str::contains("moonshine-tiny:q8"))
         .stdout(predicate::str::contains(&sha256));
 
+    let config = openasr_core::load_config(home.path()).expect("load config after pull");
+    assert_eq!(
+        config.default_model, None,
+        "pull must not choose an ASR default"
+    );
+    assert!(
+        !home.path().join("default.json").exists(),
+        "pull must not create the default-pack pointer"
+    );
     openasr_with_home(home.path())
         .args(["list"])
         .assert()
         .success()
         .stdout(predicate::str::contains("moonshine-tiny:q8"));
+}
+
+#[test]
+fn pull_preserves_existing_default_selection() {
+    let home = temp_home();
+    let temp = tempfile::tempdir().expect("pull fixture tempdir");
+    let pack = temp.path().join("moonshine-tiny-q8_0.oasr");
+    write_moonshine_oasr_v1_fixture(&pack, "moonshine-tiny");
+    let bytes = std::fs::read(&pack).expect("read pack fixture");
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let catalog = temp.path().join("catalog.json");
+    write_catalog_fixture(&catalog, &sha256, bytes.len() as u64);
+    let catalog_url = format!("file://{}", catalog.display());
+    let args = [
+        "pull",
+        "moonshine-tiny:q8",
+        "--catalog-url",
+        catalog_url.as_str(),
+        "--from",
+        pack.to_str().expect("pack path"),
+    ];
+
+    openasr_with_home(home.path()).args(args).assert().success();
+    let installed = openasr_core::list_installed_packs(home.path())
+        .expect("load installed pack after local pull")
+        .into_iter()
+        .next()
+        .expect("local pull must install a pack");
+    openasr_core::save_default_model_selection(
+        home.path(),
+        installed.model_id.clone(),
+        openasr_core::QuantPreference::pinned(&installed.quant),
+    )
+    .expect("write explicit default config fixture");
+    openasr_core::persist_default_pack_pointer(home.path(), &installed)
+        .expect("write valid default pointer fixture");
+
+    let config_before = std::fs::read(home.path().join("config.json"))
+        .expect("read configured default before pull");
+    let pointer_before =
+        std::fs::read(home.path().join("default.json")).expect("read default pointer before pull");
+
+    openasr_with_home(home.path()).args(args).assert().success();
+
+    assert_eq!(
+        std::fs::read(home.path().join("config.json")).expect("read configured default after pull"),
+        config_before,
+        "ordinary pull must not rewrite config default selection"
+    );
+    assert_eq!(
+        std::fs::read(home.path().join("default.json")).expect("read default pointer after pull"),
+        pointer_before,
+        "ordinary pull must not rewrite default pointer"
+    );
 }
 
 #[test]

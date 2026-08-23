@@ -4,6 +4,7 @@
 
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -1113,29 +1114,87 @@ pub(crate) fn wait_while_native_warmup_in_flight_blocking() {
 }
 
 pub(crate) fn spawn_boot_native_warmup(runtime: ServerRuntime) {
+    // Same shipped attestation entry as set-default. Failure must not persist
+    // V2 or publish an unattested runtime as the live default; errors stay
+    // local to this background task.
     tokio::spawn(async move {
-        warm_up_default_native_streaming_worker(runtime).await;
+        let _ = probe_native_activation(runtime, None).await;
     });
 }
 
-pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime: ServerRuntime) {
-    if runtime.backend != openasr_core::BackendKind::Native {
-        return;
+/// Attest a candidate pack without publishing it as the live default.
+/// `candidate_pack` is loaded for warmup/probe only; live `model_pack_path`
+/// is left unchanged. `None` probes the currently bound pack (boot warmup).
+pub(crate) async fn probe_native_activation(
+    runtime: ServerRuntime,
+    candidate_pack: Option<PathBuf>,
+) -> Result<(), ApiError> {
+    if let Some(failpoint) = runtime.model_pack_path.activation_probe_failpoint() {
+        return failpoint.map_err(ApiError::BadRequest);
     }
-    let Some(model_pack_path) = runtime.model_pack_path.current() else {
+    warm_up_native_pack(runtime, candidate_pack)
+        .await
+        .map_err(|reason| {
+            ApiError::BadRequest(format!("default model activation probe failed: {reason}"))
+        })
+}
+
+/// Sync entry for the typestate attestation contract. Injection failpoints
+/// complete without awaiting warmup, so current-thread tests still enter this
+/// shipped function. Real warmup uses `block_in_place` on a multi-thread
+/// runtime.
+pub(crate) fn probe_native_activation_blocking(
+    runtime: ServerRuntime,
+    candidate_pack: Option<PathBuf>,
+) -> Result<(), ApiError> {
+    let future = probe_native_activation(runtime, candidate_pack);
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread => {
+            futures_util::FutureExt::now_or_never(future).ok_or_else(|| {
+                ApiError::BadRequest(
+                    "activation probe required async warmup on the current-thread runtime"
+                        .to_string(),
+                )
+            })?
+        }
+        Ok(_) => tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future)),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| ApiError::BadRequest(error.to_string()))?
+            .block_on(future),
+    }
+}
+
+pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(
+    runtime: ServerRuntime,
+) -> Result<(), String> {
+    warm_up_native_pack(runtime, None).await
+}
+
+async fn warm_up_native_pack(
+    runtime: ServerRuntime,
+    candidate_pack: Option<PathBuf>,
+) -> Result<(), String> {
+    if runtime.backend != openasr_core::BackendKind::Native {
+        return Ok(());
+    }
+    let Some(model_pack_path) = candidate_pack.or_else(|| runtime.model_pack_path.current()) else {
         // Fresh install / no model installed yet: nothing to warm. The daemon
         // still serves `/health`; a later default-model rebind binds a pack
         // in-process without restart, and the next request path loads it.
-        return;
+        return Ok(());
     };
-    // Opportunistic: a live user session already owns the slot and will Warm
-    // itself. Never take `max-native-sessions-per-model`; that slot is only
-    // for transcription/realtime. Coalesce overlapping boot/rebind spawns.
+    // Opportunistic for boot: a live user session already owns the slot and
+    // will Warm itself. Set-default treats this as probe failure so it cannot
+    // persist a pack that never activated. Never take
+    // `max-native-sessions-per-model`; that slot is only for
+    // transcription/realtime. Coalesce overlapping boot/rebind spawns.
     if runtime.native_execution.has_active_sessions() {
-        return;
+        return Err("native session is already active".to_string());
     }
     let Some(_lease) = try_begin_native_warmup() else {
-        return;
+        return Err("native warmup already in flight".to_string());
     };
     let preferences_home = openasr_core::openasr_home().ok();
     let inference_threads = preferences_home
@@ -1151,11 +1210,17 @@ pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime
     .flatten();
     let Some(adapter) = openasr_core::native_runtime_model_adapter_for_path(&model_pack_path)
     else {
-        return;
+        return Err(format!(
+            "no native runtime adapter for {}",
+            model_pack_path.display()
+        ));
     };
-    let Ok(model_pack) = adapter.model_pack_ref("native-default") else {
-        return;
-    };
+    let model_pack = adapter.model_pack_ref("native-default").map_err(|error| {
+        format!(
+            "could not open native default pack {}: {error}",
+            model_pack_path.display()
+        )
+    })?;
     let context = NativeAsrSessionContext::new("boot-warmup");
     // Same saved-preferences fallback a real WS attach applies when a session
     // does not set an explicit `execution_target`/`inference_threads`
@@ -1192,7 +1257,7 @@ pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime
                     single_line_log_value(&error.to_string()),
                 ),
             );
-            return;
+            return Err(error.to_string());
         }
     };
     let key = NativeStreamingWorkerKey::with_route(
@@ -1213,7 +1278,9 @@ pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(runtime
                 single_line_log_value(&error),
             ),
         );
+        return Err(error);
     }
+    Ok(())
 }
 
 pub(crate) fn single_line_log_value(value: &str) -> String {

@@ -45,6 +45,7 @@ struct StreamingPunctuationInitializer {
             + Sync,
     >,
     adapter_id: &'static str,
+    verified_pack: crate::models::pack_verifier::VerifiedPack,
 }
 
 /// Session-stable punctuation owner. Preparation is read-only; initialization
@@ -127,6 +128,7 @@ impl PolicyResolvedStreamingPunctuator {
                 execution_plan,
                 builder,
                 adapter_id,
+                verified_pack,
             })),
         })))
     }
@@ -156,6 +158,9 @@ impl PolicyResolvedStreamingPunctuator {
             inputs.execution_plan.clone(),
             STREAMING_PUNCTUATION_STAGE,
             Arc::clone(&inputs.builder),
+            crate::models::native_execution_services::CandidateActivationQuoteSource::Pack(
+                inputs.verified_pack.clone(),
+            ),
         ) {
             Ok(runtime) => runtime,
             Err(error) if optional_punctuation_failure_disables_stage(&error) => {

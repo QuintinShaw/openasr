@@ -6,7 +6,7 @@ mod cpu_graph;
 mod decode_conformance;
 mod env_flags;
 mod execution_telemetry;
-mod ffi;
+pub(crate) mod ffi;
 mod gguf_c_parser_sandbox;
 pub mod gguf_header;
 mod gguf_metadata;
@@ -71,7 +71,8 @@ pub(crate) use cpu_graph::{
     GgmlBackendCapabilities, GgmlCpuGraphBuilder, GgmlCpuTensor, GgmlFlashAttentionPrecision,
     GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext,
     GgmlMatmulPrecision, GgmlNativeGqaCapability, GgmlPersistentGraphSession, GgmlRopeExtParams,
-    GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlStaticTensor, GgmlStaticTensorArena, LoadedWeightOwnerCache, ResidentDeviceCopyCapability,
+    ResidentHostImportCapability,
 };
 pub use decode_conformance::{
     DecodeFirstDivergenceClass, EncoderDecoderSplitLane, EncoderDecoderSplitProbeRecord,
