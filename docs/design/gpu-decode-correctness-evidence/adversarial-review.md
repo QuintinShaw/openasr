@@ -4,7 +4,7 @@
 代码权威：`docs/gpu-top1-correctness-design` @ `90aceda2f`（含 Metal SWOOSH pin、Qwen FreshGraph host KV、seq2seq token steps）。
 口径：对问题中的肯定命题作答。缺主机不是通过。
 
-证据文件（同目录）：`hardware-unavailable.txt`、`desktop-plugin-switch.log`。
+证据文件（同目录）：`hardware-unavailable.txt`、`desktop-plugin-switch.fail.txt`。
 门测试：`tooling/release-manifest/gpu_correctness_gate_test.py`、`gpu_decode_fail_closed_evidence_test.py`。
 
 ---
@@ -63,7 +63,7 @@
 
 ## 14. 桌面插件能否在 daemon 转录前报成功
 
-**结论：本机产品 E2E 未跑通，记 FAIL 不是 skip。** `desktop-plugin-switch.log`：`result=FAIL` `skipped=false` `host_mode=legacy_static`。shipped `require_desktop_plugin_switch` 将 FAIL 视为不可选。
+**结论：本机产品 E2E 未跑通，记 FAIL 不是 skip。** `desktop-plugin-switch.fail.txt`：`result=FAIL` `skipped=false` `host_mode=legacy_static`。shipped `require_desktop_plugin_switch` 将 FAIL 视为不可选。
 
 ## 15. 删 reverse 是否让无 native first-max 的后端回归
 

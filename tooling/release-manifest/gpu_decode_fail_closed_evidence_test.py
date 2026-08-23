@@ -20,7 +20,7 @@ SPEC.loader.exec_module(GATE)
 REPO = Path(__file__).resolve().parents[2]
 EVIDENCE = REPO / "docs/design/gpu-decode-correctness-evidence"
 HARDWARE = EVIDENCE / "hardware-unavailable.txt"
-DESKTOP = EVIDENCE / "desktop-plugin-switch.log"
+DESKTOP = EVIDENCE / "desktop-plugin-switch.fail.txt"
 
 
 class FailClosedEvidenceTests(unittest.TestCase):

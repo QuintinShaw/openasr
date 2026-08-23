@@ -15,4 +15,4 @@ metal_policy: FullLogits only; native compact DeviceTop1 was not used on Metal
 cpu_policy: native ARGMAX_FIRST is typed for this lane; reusable-KV is not supported on CPU direct execution
 fp16_pack: not installed locally; Layer-3 used installed quants (q4_k / q8_0)
 
-desktop_plugin_switch: FAIL (see desktop-plugin-switch.log); skipped=false; host_mode=legacy_static
+desktop_plugin_switch: FAIL (see desktop-plugin-switch.fail.txt); skipped=false; host_mode=legacy_static

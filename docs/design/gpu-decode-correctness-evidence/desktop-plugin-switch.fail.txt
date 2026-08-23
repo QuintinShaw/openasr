@@ -1,0 +1,11 @@
+result=FAIL
+skipped=false
+reason=plugin host is not the shipped neutral_dynamic host (host_mode=legacy_static)
+started=2026-08-23T17:44:39.641Z
+finished=2026-08-23T17:44:39.793Z
+sidecar=openasr (OPENASR_E2E_BIN)
+host_mode=legacy_static
+provider=
+steps:
+  ok static-shipped-symbols: test file and shipped functions present
+  FAIL plugin-host-start: plugin host is not the shipped neutral_dynamic host (host_mode=legacy_static)
