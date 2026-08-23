@@ -2626,7 +2626,7 @@ fn compute_greedy_step_output_for_graph<'a>(
 ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, CohereDecoderGraphError> {
     match top1 {
         Some(top1) => {
-            let reversed_token_id = graph
+            let token_id = graph
                 .compute_output_i32(top1, 1)
                 .map_err(|error| CohereDecoderGraphError::GraphExecutionFailed {
                     reason: error.to_string(),
@@ -2638,7 +2638,7 @@ fn compute_greedy_step_output_for_graph<'a>(
                 })?;
             Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
                 logits: Vec::new(),
-                greedy_token_hint: Some(map_device_top1_token(reversed_token_id, vocab_size)?),
+                greedy_token_hint: Some(map_device_top1_token(token_id, vocab_size)?),
             })
         }
         None => Ok(Seq2SeqGreedyDecodeStepLogitsOutput {

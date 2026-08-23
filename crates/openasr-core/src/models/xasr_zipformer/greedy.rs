@@ -283,6 +283,11 @@ mod tests {
     fn argmax_uses_last_index_on_exact_ties() {
         assert_eq!(argmax(&[3.0, 7.0, 7.0, 2.0]), Some(2));
         assert_eq!(argmax(&[f32::NAN, 7.0, 7.0]), Some(2));
+        assert_eq!(
+            argmax(&[2.0, 1.0, 5.0, 5.0]),
+            Some(3),
+            "XASR host last-max must keep the last equal maximum"
+        );
     }
 
     #[test]

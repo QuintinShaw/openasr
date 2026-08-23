@@ -657,6 +657,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cache_identity_distinguishes_full_logits_from_compact() {
+        use crate::ggml_runtime::{AutoGpuPolicy, RequestBackendPreference};
+        use crate::models::runtime_cache_coordinator::PackContentKey;
+
+        let full = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+            Some(RequestBackendPreference::CpuOnly),
+            AutoGpuPolicy::AllBackends,
+            GgmlDecodeOutputContract::FullLogits,
+        );
+        let compact = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+            Some(RequestBackendPreference::CpuOnly),
+            AutoGpuPolicy::AllBackends,
+            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+        );
+        assert_eq!(full.output_plan(), GgmlDecodeOutputPlan::FullLogits);
+        assert_eq!(
+            compact.output_plan(),
+            GgmlDecodeOutputPlan::NativeFirstMaxToken
+        );
+        let pack = PackContentKey::new("sha256:sensevoice-cache-identity-fixture");
+        let lane = current_execution_lane_key(full.backend());
+        let full_key: SenseVoiceRuntimeCacheKey = (
+            pack.clone(),
+            lane.clone(),
+            full.output_contract(),
+            full.output_plan(),
+            full.reuse_mode(),
+        );
+        let compact_key: SenseVoiceRuntimeCacheKey = (
+            pack,
+            lane,
+            compact.output_contract(),
+            compact.output_plan(),
+            compact.reuse_mode(),
+        );
+        assert_ne!(
+            full_key, compact_key,
+            "SenseVoice must not share a runtime owner across full-logits and compact plans"
+        );
+    }
+
+    #[test]
     fn transcription_surfaces_requested_language_and_strips_tags() {
         let out = sensevoice_result_to_transcription(
             "<|zh|><|NEUTRAL|><|Speech|><|woitn|>\u{5f00}\u{996d}",

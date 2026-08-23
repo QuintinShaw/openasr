@@ -854,6 +854,14 @@ fn granite_token_embeddings_stay_mapped_and_family_local() {
             && executor.contains("MappedTokenEmbeddingTable"),
         "Granite production must own the shared mmap-backed token-row gatherer",
     );
+    assert!(
+        executor.contains("device_greedy_step_output_mode_for_resolved_runtime"),
+        "Granite must consume the shared planner instead of a provider compact allowlist",
+    );
+    assert!(
+        !executor.contains("device_greedy_step_output_mode("),
+        "Granite must not restore the pre-planner Cuda/Vulkan compact shim",
+    );
     for forbidden in [
         "GraniteSpeechDecoderWeightProvider",
         "load_tensors_from_preflight",
