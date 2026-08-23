@@ -10,16 +10,22 @@
 //! All four families (cohere / moonshine / whisper / qwen) are wired onto this
 //! generic owner.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::AtomicBool;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 
 use crate::ggml_runtime::GgmlCpuGraphBackend;
 use crate::models::native_execution_services::{
-    NativeExecutionContext, current_native_execution_context, install_native_execution_context,
+    NativeExecutionContext, current_native_execution_context, current_runtime_receipts,
+    install_native_execution_context,
+};
+use crate::models::runtime_receipts::{
+    RuntimeOwnerGuard, RuntimeReceiptCollector, RuntimeResourceGuard,
 };
 use crate::models::serve_batch_env::{
     OwnerAliveGuard, SERVE_BATCH_COLLECT_WINDOW, ServeBatchPolicy, serve_batch_bucket_width,
@@ -208,17 +214,75 @@ struct PendingRefillSlot<F: Seq2SeqServeBatchFamily> {
 
 /// The owner-thread decode state: a lazily-built serial runtime and a cache of
 /// per-width batched runtimes keyed by `n_seq`.
+///
+/// Runtime receipt guards intentionally live after the native runtimes in field
+/// order. Rust therefore destroys each runtime before releasing its independent
+/// component/resource receipt, while the enclosing owner receipt is released
+/// only after this state has been dropped.
 pub(crate) struct OwnerThreadState<F: Seq2SeqServeBatchFamily> {
     serial_runtime: Option<F::Runtime>,
     pub(crate) batched_runtimes: HashMap<usize, F::Runtime>,
+    serial_runtime_receipt: Option<RuntimeResourceGuard>,
+    batched_runtime_receipts: HashMap<usize, RuntimeResourceGuard>,
+    receipt_context: Option<ServeBatchReceiptContext>,
+}
+
+#[derive(Clone)]
+struct ServeBatchReceiptContext {
+    collector: RuntimeReceiptCollector,
+    owner_id: crate::models::runtime_receipts::RuntimeOwnerId,
 }
 
 impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_receipt_context(None)
+    }
+
+    fn with_receipt_context(receipt_context: Option<ServeBatchReceiptContext>) -> Self {
         Self {
             serial_runtime: None,
             batched_runtimes: HashMap::new(),
+            serial_runtime_receipt: None,
+            batched_runtime_receipts: HashMap::new(),
+            receipt_context,
         }
+    }
+
+    fn acquire_not_priced_legacy_resource(&self, kind: String) -> Option<RuntimeResourceGuard> {
+        let receipt = self.receipt_context.as_ref()?;
+        let descriptor = receipt.collector.unpriced_resource_descriptor(&kind)?;
+        receipt
+            .collector
+            .acquire_resource(receipt.owner_id, descriptor)
+    }
+
+    fn record_serial_runtime_receipt(&mut self) {
+        if self.serial_runtime.is_some() && self.serial_runtime_receipt.is_none() {
+            self.serial_runtime_receipt = self.acquire_not_priced_legacy_resource(
+                "serve-batch.serial-runtime:NotPricedLegacy".to_string(),
+            );
+        }
+    }
+
+    fn record_batched_runtime_receipt(&mut self, width: usize) {
+        if !self.batched_runtime_receipts.contains_key(&width) {
+            if let Some(resource) = self.acquire_not_priced_legacy_resource(format!(
+                "serve-batch.batch-runtime-width={width}:NotPricedLegacy"
+            )) {
+                self.batched_runtime_receipts.insert(width, resource);
+            }
+        }
+    }
+
+    fn record_session_receipt(
+        &self,
+        active_slots: usize,
+        max_batch: usize,
+    ) -> Option<RuntimeResourceGuard> {
+        self.acquire_not_priced_legacy_resource(format!(
+            "serve-batch.session-state:active-slots={active_slots}:current-width=NotPricedLegacy:max-batch={max_batch}"
+        ))
     }
 
     pub(crate) fn run_batch(
@@ -228,6 +292,7 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
         max_batch: usize,
         trace_batches: bool,
     ) -> VecDeque<Envelope<F>> {
+        let _session_receipt = self.record_session_receipt(batch.len(), max_batch);
         if batch.len() <= 1 {
             for envelope in batch {
                 let Envelope {
@@ -1150,7 +1215,9 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
     }
 
     fn decode_serial_job(&mut self, job: F::Job) -> Result<F::Output, F::Error> {
-        F::decode_serial(&mut self.serial_runtime, job)
+        let result = F::decode_serial(&mut self.serial_runtime, job);
+        self.record_serial_runtime_receipt();
+        result
     }
 
     pub(crate) fn batched_runtime_for(
@@ -1161,6 +1228,7 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
         if let std::collections::hash_map::Entry::Vacant(e) = self.batched_runtimes.entry(n_seq) {
             let runtime = F::Runtime::build_batched(job, n_seq)?;
             e.insert(runtime);
+            self.record_batched_runtime_receipt(n_seq);
         }
         let runtime = self.batched_runtimes.get_mut(&n_seq).ok_or_else(|| {
             F::owner_failed("seq2seq serve batch runtime cache is unexpectedly empty".to_string())
@@ -1276,12 +1344,146 @@ impl ServeBatchConfig {
     }
 }
 
-/// A serve-batch engine: the owner-thread send channel, the resolved config,
-/// and the owner liveness flag (used to respawn after a dead/panicked owner).
+/// Derive an opaque owner descriptor from the family key without putting any
+/// caller-owned path or model identifier into the receipt stream. The owner
+/// component is the single serialized actor; retained runtimes and transient
+/// session state are separate resources under it.
+fn serve_batch_receipt_descriptor<F: Seq2SeqServeBatchFamily>(
+    key: &F::EngineKey,
+) -> Option<crate::models::runtime_receipts::RuntimeOwnerDescriptor> {
+    let collector = current_runtime_receipts()?;
+    let mut first = DefaultHasher::new();
+    0_u8.hash(&mut first);
+    key.hash(&mut first);
+    let mut second = DefaultHasher::new();
+    1_u8.hash(&mut second);
+    key.hash(&mut second);
+    let key_token = format!("{:016x}{:016x}", first.finish(), second.finish());
+    let lane = crate::models::native_execution_services::current_execution_lane_key(
+        F::engine_key_backend(key),
+    )
+    .receipt_projection(&collector);
+    collector.owner_descriptor(
+        "serve-batch.serialized-actor",
+        Some(F::THREAD_NAME_PREFIX),
+        Some(&key_token),
+        lane,
+    )
+}
+
+struct ServeBatchOwner<F: Seq2SeqServeBatchFamily> {
+    // Field order is load-bearing: native runtimes and their resource guards
+    // drop before the owner guard emits OwnerReleased.
+    state: OwnerThreadState<F>,
+    _receipt_owner: Option<RuntimeOwnerGuard>,
+}
+
+/// A single FIFO serialized actor for one serve-batch engine. The bounded
+/// request channel is unchanged; the actor wrapper makes owner-thread lifetime
+/// and deterministic shutdown explicit.
+struct ServeBatchReuseState {
+    latest_attempt: Option<crate::models::native_execution_services::ExecutionCacheAttemptId>,
+    pending: bool,
+    closed: bool,
+}
+
+struct ServeBatchReuseSignal {
+    state: Mutex<ServeBatchReuseState>,
+    collector: Option<RuntimeReceiptCollector>,
+}
+
+impl ServeBatchReuseSignal {
+    fn record(
+        &self,
+        attempt: Option<crate::models::native_execution_services::ExecutionCacheAttemptId>,
+    ) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.closed {
+            if let Some(collector) = self.collector.as_ref() {
+                collector.record_notification_coalesced();
+            }
+            return;
+        }
+        if state.pending {
+            if let Some(collector) = self.collector.as_ref() {
+                collector.record_notification_coalesced();
+            }
+        }
+        state.latest_attempt = attempt;
+        state.pending = true;
+    }
+
+    fn consume(
+        &self,
+    ) -> Option<Option<crate::models::native_execution_services::ExecutionCacheAttemptId>> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        if !state.pending {
+            return None;
+        }
+        state.pending = false;
+        Some(state.latest_attempt.take())
+    }
+
+    fn close_and_drop(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.closed = true;
+        if state.pending {
+            state.pending = false;
+            state.latest_attempt.take();
+            if let Some(collector) = self.collector.as_ref() {
+                collector.record_notification_coalesced();
+            }
+        }
+    }
+}
+
 pub(crate) struct ServeBatchEngine<F: Seq2SeqServeBatchFamily> {
-    sender: SyncSender<Envelope<F>>,
+    sender: Mutex<Option<SyncSender<Envelope<F>>>>,
+    reuse: Arc<ServeBatchReuseSignal>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
+    worker_thread_id: thread::ThreadId,
     config: ServeBatchConfig,
     is_alive: Arc<AtomicBool>,
+    #[cfg(test)]
+    owner_ready: Arc<AtomicBool>,
+}
+
+impl<F: Seq2SeqServeBatchFamily> ServeBatchEngine<F> {
+    fn shutdown_owner(&self) {
+        // Closing the only request sender lets the owner drain accepted
+        // requests and then leave its loop. Joining makes runtime/resource
+        // release deterministic before a failed build wakes waiters.
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(sender);
+        let worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(worker) = worker {
+            if thread::current().id() == self.worker_thread_id {
+                drop(worker);
+            } else {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
+impl<F: Seq2SeqServeBatchFamily> Drop for ServeBatchEngine<F> {
+    fn drop(&mut self) {
+        self.shutdown_owner();
+    }
 }
 
 impl<F: Seq2SeqServeBatchFamily> ServeBatchEngine<F> {
@@ -1289,7 +1491,7 @@ impl<F: Seq2SeqServeBatchFamily> ServeBatchEngine<F> {
     where
         // The `Envelope<F>` (job + reply sender for `Result<Output, Error>`) is
         // moved into the spawned owner thread, so each crossing type must be
-        // `Send`. All three concrete families satisfy this.
+        // `Send`. All concrete families satisfy this.
         F::Job: Send,
         F::Output: Send,
         F::Error: Send,
@@ -1302,26 +1504,77 @@ impl<F: Seq2SeqServeBatchFamily> ServeBatchEngine<F> {
             F::engine_key_backend(&key),
             config.max_batch
         );
-        thread::Builder::new()
+        let owner_context = current_native_execution_context();
+        let receipt_collector = current_runtime_receipts();
+        let receipt_descriptor = serve_batch_receipt_descriptor::<F>(&key);
+        let receipt_attempt_id =
+            crate::models::native_execution_services::current_execution_cache_attempt_id();
+        let reuse = Arc::new(ServeBatchReuseSignal {
+            state: Mutex::new(ServeBatchReuseState {
+                latest_attempt: None,
+                pending: false,
+                closed: false,
+            }),
+            collector: receipt_collector.clone(),
+        });
+        let worker_reuse = Arc::clone(&reuse);
+        let owner_ready = Arc::new(AtomicBool::new(false));
+        let worker_ready = Arc::clone(&owner_ready);
+        let worker = thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
                 let _alive_guard = alive_guard;
-                owner_thread_loop::<F>(receiver, config)
+                let _context = owner_context.map(install_native_execution_context);
+                let receipt_owner = receipt_descriptor.and_then(|descriptor| {
+                    current_runtime_receipts()
+                        .map(|collector| collector.start_owner(descriptor, receipt_attempt_id))
+                });
+                let receipt_context = receipt_owner.as_ref().and_then(|owner| {
+                    owner.owner_id().and_then(|owner_id| {
+                        current_runtime_receipts().map(|collector| ServeBatchReceiptContext {
+                            collector,
+                            owner_id,
+                        })
+                    })
+                });
+                let owner = ServeBatchOwner {
+                    state: OwnerThreadState::with_receipt_context(receipt_context),
+                    _receipt_owner: receipt_owner,
+                };
+                owner_thread_loop::<F>(receiver, config, worker_reuse, worker_ready, owner)
             })
             .map_err(|error| F::thread_spawn_failed(error.to_string()))?;
+        let worker_thread_id = worker.thread().id();
         Ok(Self {
-            sender,
+            sender: Mutex::new(Some(sender)),
+            reuse,
+            worker: Mutex::new(Some(worker)),
+            worker_thread_id,
             config,
             is_alive,
+            #[cfg(test)]
+            owner_ready,
         })
+    }
+
+    fn record_receipt_reuse(&self) {
+        self.reuse
+            .record(crate::models::native_execution_services::current_execution_cache_attempt_id());
     }
 
     pub(crate) fn submit(&self, job: F::Job) -> Result<F::Output, F::Error> {
         let context = Arc::clone(F::job_execution_context(&job));
         let native_execution_context = current_native_execution_context();
         let (reply, reply_rx) = mpsc::channel();
+        let sender = self
+            .sender
+            .lock()
+            .map_err(|_| F::owner_disconnected())?
+            .as_ref()
+            .cloned()
+            .ok_or_else(F::owner_disconnected)?;
         serve_batch_submit_with_timeout(
-            &self.sender,
+            &sender,
             Envelope {
                 job,
                 context,
@@ -1338,13 +1591,29 @@ impl<F: Seq2SeqServeBatchFamily> ServeBatchEngine<F> {
     }
 }
 
+impl<F: Seq2SeqServeBatchFamily> ServeBatchOwner<F> {
+    fn consume_receipt_reuse(&self, reuse: &ServeBatchReuseSignal) {
+        let Some(attempt) = reuse.consume() else {
+            return;
+        };
+        if let Some(receipt_owner) = self._receipt_owner.as_ref() {
+            receipt_owner.record_reuse(attempt);
+        }
+    }
+}
+
 fn owner_thread_loop<F: Seq2SeqServeBatchFamily>(
     receiver: Receiver<Envelope<F>>,
     config: ServeBatchConfig,
+    reuse: Arc<ServeBatchReuseSignal>,
+    ready: Arc<AtomicBool>,
+    owner: ServeBatchOwner<F>,
 ) {
-    let mut state = OwnerThreadState::<F>::new();
+    ready.store(true, Ordering::Release);
+    let mut owner = owner;
     let mut deferred = VecDeque::new();
     loop {
+        owner.consume_receipt_reuse(&reuse);
         let Some(batch) = serve_batch_drain_compatible_batch(
             &mut deferred,
             &receiver,
@@ -1352,6 +1621,7 @@ fn owner_thread_loop<F: Seq2SeqServeBatchFamily>(
             config.collect_window,
             |first, next| F::can_batch_with(&first.job, &next.job),
         ) else {
+            reuse.close_and_drop();
             break;
         };
         if config.trace_batches {
@@ -1361,7 +1631,12 @@ fn owner_thread_loop<F: Seq2SeqServeBatchFamily>(
                 batch.len()
             );
         }
-        deferred.extend(state.run_batch(batch, &receiver, config.max_batch, config.trace_batches));
+        deferred.extend(owner.state.run_batch(
+            batch,
+            &receiver,
+            config.max_batch,
+            config.trace_batches,
+        ));
     }
 }
 
@@ -1376,6 +1651,45 @@ fn owner_thread_loop<F: Seq2SeqServeBatchFamily>(
 /// another's engines and therefore need no scope component in their keys.
 pub(crate) struct ServeBatchEngineRegistry<F: Seq2SeqServeBatchFamily> {
     engines: Arc<Mutex<BoundedServeBatchEngineCache<F::EngineKey, ServeBatchEngine<F>>>>,
+    active: Arc<Mutex<HashMap<F::EngineKey, Weak<ServeBatchEngine<F>>>>>,
+    pending: Arc<Mutex<HashMap<F::EngineKey, Arc<PendingServeBatchEngine<F>>>>>,
+}
+
+struct PendingServeBatchEngine<F: Seq2SeqServeBatchFamily> {
+    result: Mutex<Option<Result<Arc<ServeBatchEngine<F>>, ()>>>,
+    wake: Condvar,
+}
+
+impl<F: Seq2SeqServeBatchFamily> PendingServeBatchEngine<F> {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn complete(&self, result: Result<Arc<ServeBatchEngine<F>>, ()>) {
+        let mut state = self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = Some(result);
+        self.wake.notify_all();
+    }
+
+    fn wait(&self) -> Result<Arc<ServeBatchEngine<F>>, ()> {
+        let mut state = self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.is_none() {
+            state = self
+                .wake
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.as_ref().expect("pending result was set").clone()
+    }
 }
 
 /// A small executor-local LRU for heavyweight serve-batch owner threads.
@@ -1400,6 +1714,259 @@ impl<K, E> Default for BoundedServeBatchEngineCache<K, E> {
             entries: HashMap::new(),
             recency: VecDeque::new(),
             generation: 0,
+        }
+    }
+}
+
+/// Shared bounded single-flight/active-owner registry used by all serve-batch
+/// family implementations, including Qwen's family-specific decode loop.
+pub(crate) struct ServeBatchActiveRegistry<K, E> {
+    pub(crate) engines: Arc<Mutex<BoundedServeBatchEngineCache<K, E>>>,
+    active: Arc<Mutex<HashMap<K, Weak<E>>>>,
+    pending: Arc<Mutex<HashMap<K, Arc<PendingSingleFlight<E>>>>>,
+}
+
+struct PendingSingleFlight<E> {
+    result: Mutex<Option<Result<Arc<E>, ()>>>,
+    wake: Condvar,
+}
+
+impl<E> PendingSingleFlight<E> {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn complete(&self, result: Result<Arc<E>, ()>) {
+        let mut state = self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = Some(result);
+        self.wake.notify_all();
+    }
+
+    fn wait(&self) -> Result<Arc<E>, ()> {
+        let mut state = self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.is_none() {
+            state = self
+                .wake
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state
+            .as_ref()
+            .expect("single-flight result was set")
+            .clone()
+    }
+}
+
+impl<K, E> Clone for ServeBatchActiveRegistry<K, E> {
+    fn clone(&self) -> Self {
+        Self {
+            engines: Arc::clone(&self.engines),
+            active: Arc::clone(&self.active),
+            pending: Arc::clone(&self.pending),
+        }
+    }
+}
+
+impl<K, E> Default for ServeBatchActiveRegistry<K, E> {
+    fn default() -> Self {
+        Self {
+            engines: Arc::new(Mutex::new(BoundedServeBatchEngineCache::default())),
+            active: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl<K, E> ServeBatchActiveRegistry<K, E>
+where
+    K: Clone + Eq + std::hash::Hash + Send + 'static,
+    E: Send + Sync + 'static,
+{
+    pub(crate) fn lookup_or_build<Err, Build, Alive, Reuse, Shutdown, ErrorFactory>(
+        &self,
+        key: K,
+        build: Build,
+        is_alive: Alive,
+        on_reuse: Reuse,
+        shutdown: Shutdown,
+        registry_error: ErrorFactory,
+    ) -> Result<Arc<E>, Err>
+    where
+        Build: Fn() -> Result<Arc<E>, Err> + Clone,
+        Alive: Fn(&E) -> bool + Copy + Send + Sync + 'static,
+        Reuse: Fn(&E) + Copy + Send + Sync + 'static,
+        Shutdown: Fn(&E) + Copy + Send + Sync + 'static,
+        ErrorFactory: Fn() -> Err + Copy,
+    {
+        loop {
+            let pending = {
+                let mut engines = self.engines.lock().map_err(|_| registry_error())?;
+                if let Some(engine) = engines.get(&key) {
+                    if is_alive(&engine) {
+                        on_reuse(&engine);
+                        return Ok(engine);
+                    }
+                    engines.remove(&key);
+                }
+                let mut pending_map = self.pending.lock().map_err(|_| registry_error())?;
+                if let Some(pending) = pending_map.get(&key) {
+                    Arc::clone(pending)
+                } else {
+                    let mut active = self.active.lock().map_err(|_| registry_error())?;
+                    active.retain(|_, weak| weak.strong_count() > 0);
+                    if let Some(weak) = active.get(&key) {
+                        if let Some(engine) = weak.upgrade() {
+                            if is_alive(&engine) {
+                                on_reuse(&engine);
+                                return Ok(engine);
+                            }
+                        }
+                        active.remove(&key);
+                    }
+                    let generation = engines.generation();
+                    let pending = Arc::new(PendingSingleFlight::new());
+                    pending_map.insert(key.clone(), Arc::clone(&pending));
+                    drop(active);
+                    drop(pending_map);
+                    drop(engines);
+
+                    let engine = match build() {
+                        Ok(engine) => engine,
+                        Err(error) => {
+                            pending.complete(Err(()));
+                            self.remove_pending_if(&key, &pending);
+                            return Err(error);
+                        }
+                    };
+                    let mut active = match self.active.lock() {
+                        Ok(active) => active,
+                        Err(_) => {
+                            shutdown(&engine);
+                            drop(engine);
+                            pending.complete(Err(()));
+                            self.remove_pending_if(&key, &pending);
+                            return Err(registry_error());
+                        }
+                    };
+                    active.retain(|_, weak| weak.strong_count() > 0);
+                    active.insert(key.clone(), Arc::downgrade(&engine));
+                    drop(active);
+
+                    let rollback_registry = self.clone();
+                    let rollback_key = key.clone();
+                    let rollback_engine = Arc::clone(&engine);
+                    let rollback_pending = Arc::clone(&pending);
+                    crate::models::native_execution_services::stage_execution_cache_rollback(
+                        move || {
+                            rollback_registry.evict_exact(&rollback_key, &rollback_engine);
+                            shutdown(&rollback_engine);
+                            drop(rollback_engine);
+                            rollback_pending.complete(Err(()));
+                            rollback_registry.remove_pending_if(&rollback_key, &rollback_pending);
+                        },
+                    );
+                    let commit_registry = self.clone();
+                    let commit_key = key.clone();
+                    let commit_engine = Arc::clone(&engine);
+                    let commit_pending = Arc::clone(&pending);
+                    crate::models::native_execution_services::stage_execution_cache_commit(
+                        move || {
+                            let Ok(mut engines) = commit_registry.engines.lock() else {
+                                commit_registry.evict_active_exact(&commit_key, &commit_engine);
+                                shutdown(&commit_engine);
+                                drop(commit_engine);
+                                commit_pending.complete(Err(()));
+                                commit_registry.remove_pending_if(&commit_key, &commit_pending);
+                                return;
+                            };
+                            if engines.generation() != generation {
+                                commit_registry.evict_active_exact(&commit_key, &commit_engine);
+                                shutdown(&commit_engine);
+                                drop(commit_engine);
+                                commit_pending.complete(Err(()));
+                                commit_registry.remove_pending_if(&commit_key, &commit_pending);
+                                return;
+                            }
+                            let _ = engines.insert_if_idle_capacity(
+                                commit_key.clone(),
+                                Arc::clone(&commit_engine),
+                            );
+                            if let Ok(mut active) = commit_registry.active.lock() {
+                                active.retain(|_, weak| weak.strong_count() > 0);
+                            }
+                            commit_pending.complete(Ok(commit_engine));
+                            commit_registry.remove_pending_if(&commit_key, &commit_pending);
+                        },
+                    );
+                    return Ok(engine);
+                }
+            };
+            match pending.wait() {
+                Ok(engine) if is_alive(&engine) => {
+                    on_reuse(&engine);
+                    return Ok(engine);
+                }
+                Ok(_) | Err(()) => {
+                    self.remove_pending_if(&key, &pending);
+                }
+            }
+        }
+    }
+
+    fn remove_pending_if(&self, key: &K, expected: &Arc<PendingSingleFlight<E>>) {
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        if pending
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            pending.remove(key);
+        }
+    }
+
+    fn evict_active_exact(&self, key: &K, engine: &Arc<E>) {
+        let Ok(mut active) = self.active.lock() else {
+            return;
+        };
+        if active.get(key).is_some_and(|weak| {
+            weak.upgrade()
+                .is_some_and(|current| Arc::ptr_eq(&current, engine))
+        }) {
+            active.remove(key);
+        }
+    }
+
+    pub(crate) fn evict_exact(&self, key: &K, engine: &Arc<E>) {
+        if let Ok(mut engines) = self.engines.lock()
+            && engines.contains_ptr(key, engine)
+        {
+            engines.remove(key);
+        }
+        self.evict_active_exact(key, engine);
+    }
+
+    pub(crate) fn shutdown(&self) {
+        if let Ok(mut engines) = self.engines.lock() {
+            engines.clear();
+        }
+        if let Ok(mut active) = self.active.lock() {
+            active.clear();
+        }
+        if let Ok(mut pending) = self.pending.lock() {
+            for build in pending.values() {
+                build.complete(Err(()));
+            }
+            pending.clear();
         }
     }
 }
@@ -1475,6 +2042,8 @@ impl<F: Seq2SeqServeBatchFamily> Clone for ServeBatchEngineRegistry<F> {
     fn clone(&self) -> Self {
         Self {
             engines: Arc::clone(&self.engines),
+            active: Arc::clone(&self.active),
+            pending: Arc::clone(&self.pending),
         }
     }
 }
@@ -1491,6 +2060,8 @@ impl<F: Seq2SeqServeBatchFamily> Default for ServeBatchEngineRegistry<F> {
     fn default() -> Self {
         Self {
             engines: Arc::new(Mutex::new(BoundedServeBatchEngineCache::default())),
+            active: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -1509,57 +2080,189 @@ where
         key: F::EngineKey,
         config: ServeBatchConfig,
     ) -> Result<Arc<ServeBatchEngine<F>>, F::Error> {
-        let mut engines = self.engines.lock().map_err(|_| F::registry_poisoned())?;
-        if let Some(engine) = engines.get(&key) {
-            if serve_batch_owner_alive(&engine.is_alive) {
-                let registry = self.clone();
-                let failed_key = key.clone();
-                let failed_engine = Arc::clone(&engine);
-                crate::models::native_execution_services::stage_execution_cache_rollback(
-                    move || registry.evict_exact(&failed_key, &failed_engine),
-                );
-                return Ok(engine);
+        loop {
+            let pending = {
+                let mut engines = self.engines.lock().map_err(|_| F::registry_poisoned())?;
+                if let Some(engine) = engines.get(&key) {
+                    if serve_batch_owner_alive(&engine.is_alive) {
+                        engine.record_receipt_reuse();
+                        let registry = self.clone();
+                        let failed_key = key.clone();
+                        let failed_engine = Arc::clone(&engine);
+                        crate::models::native_execution_services::stage_execution_cache_rollback(
+                            move || registry.evict_exact(&failed_key, &failed_engine),
+                        );
+                        return Ok(engine);
+                    }
+                    engines.remove(&key);
+                }
+                let mut pending_map = self.pending.lock().map_err(|_| F::registry_poisoned())?;
+                if let Some(pending) = pending_map.get(&key) {
+                    Arc::clone(pending)
+                } else {
+                    let mut active = self.active.lock().map_err(|_| F::registry_poisoned())?;
+                    active.retain(|_, weak| weak.strong_count() > 0);
+                    if let Some(weak) = active.get(&key) {
+                        if let Some(engine) = weak.upgrade() {
+                            if serve_batch_owner_alive(&engine.is_alive) {
+                                engine.record_receipt_reuse();
+                                let registry = self.clone();
+                                let failed_key = key.clone();
+                                let failed_engine = Arc::clone(&engine);
+                                crate::models::native_execution_services::
+                                    stage_execution_cache_rollback(move || {
+                                        registry.evict_exact(&failed_key, &failed_engine)
+                                    });
+                                return Ok(engine);
+                            }
+                        }
+                        active.remove(&key);
+                    }
+                    let generation = engines.generation();
+                    let pending = Arc::new(PendingServeBatchEngine::new());
+                    pending_map.insert(key.clone(), Arc::clone(&pending));
+                    drop(pending_map);
+                    drop(active);
+                    drop(engines);
+                    return self.build_and_publish_pending(key, config, generation, pending);
+                }
+            };
+
+            match pending.wait() {
+                Ok(engine) if serve_batch_owner_alive(&engine.is_alive) => {
+                    engine.record_receipt_reuse();
+                    return Ok(engine);
+                }
+                Ok(_) | Err(()) => {
+                    self.remove_pending_if(&key, &pending);
+                    continue;
+                }
             }
-            engines.remove(&key);
         }
-        let generation = engines.generation();
-        let engine = Arc::new(ServeBatchEngine::<F>::spawn(key.clone(), config)?);
-        drop(engines);
+    }
+
+    fn build_and_publish_pending(
+        &self,
+        key: F::EngineKey,
+        config: ServeBatchConfig,
+        generation: u64,
+        pending: Arc<PendingServeBatchEngine<F>>,
+    ) -> Result<Arc<ServeBatchEngine<F>>, F::Error> {
+        let engine = match ServeBatchEngine::<F>::spawn(key.clone(), config) {
+            Ok(engine) => Arc::new(engine),
+            Err(error) => {
+                pending.complete(Err(()));
+                self.remove_pending_if(&key, &pending);
+                return Err(error);
+            }
+        };
+        let mut active = match self.active.lock() {
+            Ok(active) => active,
+            Err(_) => {
+                engine.shutdown_owner();
+                drop(engine);
+                pending.complete(Err(()));
+                self.remove_pending_if(&key, &pending);
+                return Err(F::registry_poisoned());
+            }
+        };
+        active.retain(|_, weak| weak.strong_count() > 0);
+        active.insert(key.clone(), Arc::downgrade(&engine));
+        drop(active);
 
         let failed_registry = self.clone();
         let failed_key = key.clone();
         let failed_engine = Arc::clone(&engine);
+        let failed_pending = Arc::clone(&pending);
         crate::models::native_execution_services::stage_execution_cache_rollback(move || {
             failed_registry.evict_exact(&failed_key, &failed_engine);
+            failed_registry.remove_active_exact(&failed_key, &failed_engine);
+            failed_engine.shutdown_owner();
+            drop(failed_engine);
+            failed_registry.complete_pending_failure(&failed_key, &failed_pending);
         });
+
         let registry = self.clone();
         let staged_engine = Arc::clone(&engine);
+        let staged_pending = Arc::clone(&pending);
         crate::models::native_execution_services::stage_execution_cache_commit(move || {
             let Ok(mut engines) = registry.engines.lock() else {
+                registry.remove_active_exact(&key, &staged_engine);
+                staged_engine.shutdown_owner();
+                drop(staged_engine);
+                registry.complete_pending_failure(&key, &staged_pending);
                 return;
             };
             if engines.generation() != generation {
+                registry.remove_active_exact(&key, &staged_engine);
+                staged_engine.shutdown_owner();
+                drop(staged_engine);
+                registry.complete_pending_failure(&key, &staged_pending);
                 return;
             }
-            if engines
-                .get(&key)
-                .is_some_and(|existing| serve_batch_owner_alive(&existing.is_alive))
-            {
-                return;
+            if let Some(existing) = engines.get(&key) {
+                if serve_batch_owner_alive(&existing.is_alive) {
+                    if let Ok(mut active) = registry.active.lock() {
+                        active.insert(key.clone(), Arc::downgrade(&existing));
+                    }
+                    staged_pending.complete(Ok(existing));
+                    registry.remove_pending_if(&key, &staged_pending);
+                    return;
+                }
             }
             engines.remove(&key);
-            let _ = engines.insert_if_idle_capacity(key, staged_engine);
+            let _ = engines.insert_if_idle_capacity(key.clone(), Arc::clone(&staged_engine));
+            if let Ok(mut active) = registry.active.lock() {
+                active.retain(|_, weak| weak.strong_count() > 0);
+            }
+            // The new owner still serves its admitting request even when an
+            // all-borrowed LRU deliberately does not retain it.
+            staged_pending.complete(Ok(staged_engine));
+            registry.remove_pending_if(&key, &staged_pending);
         });
         Ok(engine)
     }
 
-    fn evict_exact(&self, key: &F::EngineKey, engine: &Arc<ServeBatchEngine<F>>) {
-        let Ok(mut engines) = self.engines.lock() else {
+    fn remove_pending_if(&self, key: &F::EngineKey, expected: &Arc<PendingServeBatchEngine<F>>) {
+        let Ok(mut pending) = self.pending.lock() else {
             return;
         };
-        if engines.contains_ptr(key, engine) {
+        if pending
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            pending.remove(key);
+        }
+    }
+
+    fn complete_pending_failure(
+        &self,
+        key: &F::EngineKey,
+        pending: &Arc<PendingServeBatchEngine<F>>,
+    ) {
+        pending.complete(Err(()));
+        self.remove_pending_if(key, pending);
+    }
+
+    fn remove_active_exact(&self, key: &F::EngineKey, engine: &Arc<ServeBatchEngine<F>>) {
+        let Ok(mut active) = self.active.lock() else {
+            return;
+        };
+        if active.get(key).is_some_and(|weak| {
+            weak.upgrade()
+                .is_some_and(|current| Arc::ptr_eq(&current, engine))
+        }) {
+            active.remove(key);
+        }
+    }
+
+    fn evict_exact(&self, key: &F::EngineKey, engine: &Arc<ServeBatchEngine<F>>) {
+        if let Ok(mut engines) = self.engines.lock()
+            && engines.contains_ptr(key, engine)
+        {
             engines.remove(key);
         }
+        self.remove_active_exact(key, engine);
     }
 
     /// Removes the exact owner that participated in a typed candidate failure.
@@ -1583,6 +2286,15 @@ where
     pub(crate) fn shutdown(&self) {
         if let Ok(mut engines) = self.engines.lock() {
             engines.clear();
+            if let Ok(mut active) = self.active.lock() {
+                active.clear();
+            }
+            if let Ok(mut pending) = self.pending.lock() {
+                for build in pending.values() {
+                    build.complete(Err(()));
+                }
+                pending.clear();
+            }
         }
     }
 }
@@ -2015,6 +2727,418 @@ mod slot_isolation_tests {
             state.batched_runtimes.is_empty(),
             "an incompatible lane must be rejected before resident runtime allocation"
         );
+    }
+
+    #[test]
+    fn serve_batch_receipts_trace_serialized_owner_runtime_width_and_release() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let services_guard =
+            crate::models::native_execution_services::install_native_execution_services(
+                services.as_ref(),
+            );
+        let config = ServeBatchConfig {
+            max_batch: 2,
+            queue_capacity: 2,
+            // Keep the first request open until the synchronized sibling arrives.
+            collect_window: Duration::from_secs(30),
+            send_timeout: Duration::from_secs(1),
+            reply_timeout: Duration::from_secs(5),
+            trace_batches: false,
+        };
+        let registry = ServeBatchEngineRegistry::<FakeFamily>::default();
+        let engine = registry
+            .engine_for_key(7, config)
+            .expect("serve-batch actor");
+        let reused_engine = registry
+            .engine_for_key(7, config)
+            .expect("reused serve-batch actor");
+        assert!(Arc::ptr_eq(&engine, &reused_engine));
+        drop(reused_engine);
+        drop(services_guard);
+
+        fn receipt_job(id: u32) -> FakeJob {
+            FakeJob {
+                id,
+                max_tokens: 2,
+                execution_context: Arc::new(RequestExecutionContext::new(
+                    Some(format!("receipt-job-{id}")),
+                    Arc::new(crate::TranscriptionControl::new()),
+                )),
+                self_cancel_after_step: None,
+            }
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let first_engine = Arc::clone(&engine);
+        let first_barrier = Arc::clone(&barrier);
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_engine.submit(receipt_job(1))
+        });
+        let second_engine = Arc::clone(&engine);
+        let second_barrier = Arc::clone(&barrier);
+        let second = std::thread::spawn(move || {
+            second_barrier.wait();
+            second_engine.submit(receipt_job(2))
+        });
+        barrier.wait();
+
+        assert_eq!(first.join().expect("first submitter"), Ok(1));
+        assert_eq!(second.join().expect("second submitter"), Ok(2));
+
+        let live = services.runtime_receipts().snapshot();
+        assert_eq!(live.live_owners.len(), 1);
+        assert_eq!(live.live_owners[0].resources.len(), 1);
+        let resource = live.live_owners[0]
+            .resources
+            .values()
+            .next()
+            .expect("retained batch resource");
+        assert!(resource.descriptor.domain.is_none());
+        assert_eq!(
+            resource.descriptor.requested,
+            crate::models::runtime_receipts::RuntimeReceiptMetric::Unknown
+        );
+        let wire = serde_json::to_value(resource).expect("unpriced receipt serializes");
+        assert_eq!(
+            wire["descriptor"]["requested"],
+            serde_json::json!("Unknown")
+        );
+        assert_eq!(wire["descriptor"]["domain"], serde_json::Value::Null);
+        assert!(live.events.iter().any(|event| matches!(
+            event,
+            crate::models::runtime_receipts::RuntimeReceiptEvent::OwnerCreated { .. }
+        )));
+        assert!(live.events.iter().any(|event| matches!(
+            event,
+            crate::models::runtime_receipts::RuntimeReceiptEvent::ResourceAcquired { .. }
+        )));
+
+        registry.shutdown();
+        drop(engine);
+        let released = services.runtime_receipts().snapshot();
+        assert!(released.live_owners.is_empty());
+        let resource_released = released
+            .events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    crate::models::runtime_receipts::RuntimeReceiptEvent::ResourceReleased { .. }
+                )
+            })
+            .expect("resource release event");
+        let owner_released = released
+            .events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    crate::models::runtime_receipts::RuntimeReceiptEvent::OwnerReleased { .. }
+                )
+            })
+            .expect("owner release event");
+        assert!(resource_released < owner_released);
+        assert!(released.events.iter().any(|event| matches!(
+            event,
+            crate::models::runtime_receipts::RuntimeReceiptEvent::OwnerReleased { .. }
+        )));
+    }
+
+    #[test]
+    fn generic_pending_reuse_shutdown_marks_dropped_and_incomplete() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _guard = crate::models::native_execution_services::install_native_execution_services(
+            services.as_ref(),
+        );
+        let config = ServeBatchConfig {
+            max_batch: 2,
+            queue_capacity: 2,
+            collect_window: Duration::ZERO,
+            send_timeout: Duration::from_secs(1),
+            reply_timeout: Duration::from_secs(1),
+            trace_batches: false,
+        };
+        let engine = ServeBatchEngine::<FakeFamily>::spawn(777, config).expect("generic owner");
+        while !engine.owner_ready.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        engine.record_receipt_reuse();
+        engine.record_receipt_reuse();
+        engine.shutdown_owner();
+        let completeness = services.runtime_receipts().summary().completeness;
+        assert!(completeness.dropped_notifications > 0);
+        assert!(!completeness.complete);
+    }
+
+    #[test]
+    fn same_key_concurrent_lookup_builds_one_owner_and_one_engine() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let registry = Arc::new(ServeBatchEngineRegistry::<FakeFamily>::default());
+        let config = ServeBatchConfig {
+            max_batch: 2,
+            queue_capacity: 2,
+            collect_window: Duration::ZERO,
+            send_timeout: Duration::from_secs(1),
+            reply_timeout: Duration::from_secs(1),
+            trace_batches: false,
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let first_registry = Arc::clone(&registry);
+        let first_services = Arc::clone(&services);
+        let first_barrier = Arc::clone(&barrier);
+        let first = std::thread::spawn(move || {
+            let _guard =
+                crate::models::native_execution_services::install_native_execution_services(
+                    first_services.as_ref(),
+                );
+            first_barrier.wait();
+            first_registry.engine_for_key(99, config)
+        });
+        let second_registry = Arc::clone(&registry);
+        let second_services = Arc::clone(&services);
+        let second_barrier = Arc::clone(&barrier);
+        let second = std::thread::spawn(move || {
+            let _guard =
+                crate::models::native_execution_services::install_native_execution_services(
+                    second_services.as_ref(),
+                );
+            second_barrier.wait();
+            second_registry.engine_for_key(99, config)
+        });
+        barrier.wait();
+
+        let first_engine = first.join().expect("first lookup").expect("first engine");
+        let second_engine = second
+            .join()
+            .expect("second lookup")
+            .expect("second engine");
+        assert!(Arc::ptr_eq(&first_engine, &second_engine));
+        let job = FakeJob {
+            id: 1,
+            max_tokens: 1,
+            execution_context: Arc::new(RequestExecutionContext::new(
+                Some("single-flight-job".to_string()),
+                Arc::new(crate::TranscriptionControl::new()),
+            )),
+            self_cancel_after_step: None,
+        };
+        assert_eq!(first_engine.submit(job).expect("single-flight decode"), 1);
+        let snapshot = services.runtime_receipts().snapshot();
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        crate::models::runtime_receipts::RuntimeReceiptEvent::OwnerCreated { .. }
+                    )
+                })
+                .count(),
+            1
+        );
+        drop(first_engine);
+        drop(second_engine);
+        registry.shutdown();
+        let released = services.runtime_receipts().snapshot();
+        let resource_released = released
+            .events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    crate::models::runtime_receipts::RuntimeReceiptEvent::ResourceReleased { .. }
+                )
+            })
+            .expect("owner resource teardown");
+        let owner_released = released
+            .events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    crate::models::runtime_receipts::RuntimeReceiptEvent::OwnerReleased { .. }
+                )
+            })
+            .expect("owner teardown");
+        assert!(resource_released < owner_released);
+
+        let rollback_registry = Arc::new(ServeBatchEngineRegistry::<FakeFamily>::default());
+        let rollback_barrier = Arc::new(std::sync::Barrier::new(2));
+        let baseline_events = services.runtime_receipts().snapshot().events.len();
+        let rollback_registry_first = Arc::clone(&rollback_registry);
+        let rollback_services_first = Arc::clone(&services);
+        let rollback_barrier_first = Arc::clone(&rollback_barrier);
+        let rollback_first = std::thread::spawn(move || {
+            let _guard =
+                crate::models::native_execution_services::install_native_execution_services(
+                    rollback_services_first.as_ref(),
+                );
+            let candidate = crate::device::execution_policy::ExecutionCandidate {
+                device: crate::device::execution_policy::ExecutionDeviceSnapshot {
+                    route: crate::device::execution_route::ResolvedExecutionRoute::cpu(),
+                    ggml_kind: crate::ggml_runtime::GgmlBackendKind::Cpu,
+                    memory: None,
+                    buffer_alignment: None,
+                },
+                placement: crate::device::execution_policy::ExecutionPlacement::CpuOnly,
+            };
+            let outcome = crate::models::native_execution_services::run_execution_candidate_attempt(
+                rollback_services_first.as_ref(),
+                &candidate,
+                || {
+                    let engine = rollback_registry_first.engine_for_key(123, config)?;
+                    rollback_barrier_first.wait();
+                    crate::models::native_execution_services::record_current_execution_candidate_failure(
+                        crate::device::execution_policy::ExecutionCandidateFailure::capacity(
+                            "serve-batch-test",
+                            "forced rollback",
+                        ),
+                    );
+                    Ok::<_, FakeError>(engine)
+                },
+            );
+            drop(outcome.result);
+        });
+        let rollback_registry_second = Arc::clone(&rollback_registry);
+        let rollback_services_second = Arc::clone(&services);
+        let rollback_barrier_second = Arc::clone(&rollback_barrier);
+        let rollback_second = std::thread::spawn(move || {
+            let _guard =
+                crate::models::native_execution_services::install_native_execution_services(
+                    rollback_services_second.as_ref(),
+                );
+            rollback_barrier_second.wait();
+            let engine = rollback_registry_second
+                .engine_for_key(123, config)
+                .expect("retry after rollback");
+            assert_eq!(
+                engine
+                    .submit(FakeJob {
+                        id: 123,
+                        max_tokens: 1,
+                        execution_context: Arc::new(RequestExecutionContext::new(
+                            Some("rollback-retry".to_string()),
+                            Arc::new(crate::TranscriptionControl::new()),
+                        )),
+                        self_cancel_after_step: None,
+                    })
+                    .expect("rollback retry decode"),
+                123
+            );
+        });
+        rollback_first.join().expect("rollback builder");
+        rollback_second.join().expect("rollback waiter");
+        let rollback_events = services.runtime_receipts().snapshot().events;
+        let rollback_events = &rollback_events[baseline_events..];
+        let first_created = rollback_events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    crate::models::runtime_receipts::RuntimeReceiptEvent::OwnerCreated { .. }
+                )
+            })
+            .expect("rollback owner created");
+        let released = rollback_events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    crate::models::runtime_receipts::RuntimeReceiptEvent::OwnerReleased { .. }
+                )
+            })
+            .expect("rollback owner released");
+        let second_created = rollback_events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| {
+                (index > released
+                    && matches!(
+                        event,
+                        crate::models::runtime_receipts::RuntimeReceiptEvent::OwnerCreated { .. }
+                    ))
+                .then_some(index)
+            })
+            .unwrap_or_else(|| panic!("retry owner created; events={rollback_events:?}"));
+        assert!(first_created < released && released < second_created);
+        rollback_registry.shutdown();
+    }
+
+    #[test]
+    fn active_owner_survives_full_borrowed_lru_and_reuses_same_key() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _guard = crate::models::native_execution_services::install_native_execution_services(
+            services.as_ref(),
+        );
+        let registry = ServeBatchEngineRegistry::<FakeFamily>::default();
+        let config = ServeBatchConfig {
+            max_batch: 2,
+            queue_capacity: 2,
+            collect_window: Duration::ZERO,
+            send_timeout: Duration::from_secs(1),
+            reply_timeout: Duration::from_secs(1),
+            trace_batches: false,
+        };
+        fn job(id: usize) -> FakeJob {
+            FakeJob {
+                id: id as u32,
+                max_tokens: 1,
+                execution_context: Arc::new(RequestExecutionContext::new(
+                    Some(format!("lru-job-{id}")),
+                    Arc::new(crate::TranscriptionControl::new()),
+                )),
+                self_cancel_after_step: None,
+            }
+        }
+        let mut borrowed = Vec::new();
+        for key in 0..SERVE_BATCH_ENGINE_REGISTRY_MAX_ENTRIES {
+            borrowed.push(
+                registry
+                    .engine_for_key(key as u32, config)
+                    .expect("borrowed LRU owner"),
+            );
+        }
+        let first = registry
+            .engine_for_key(100, config)
+            .expect("active overflow owner");
+        assert_eq!(
+            registry.engines.lock().unwrap().len(),
+            SERVE_BATCH_ENGINE_REGISTRY_MAX_ENTRIES
+        );
+        let second = registry
+            .engine_for_key(100, config)
+            .expect("active overflow reuse");
+        assert!(Arc::ptr_eq(&first, &second));
+        for _ in 0..10_000 {
+            first.record_receipt_reuse();
+        }
+        let notification_summary = services.runtime_receipts().summary();
+        assert!(notification_summary.completeness.dropped_notifications > 0);
+        assert!(!notification_summary.completeness.complete);
+        for (id, engine) in borrowed.iter().enumerate() {
+            assert_eq!(
+                engine.submit(job(id)).expect("borrowed owner decode"),
+                id as u32
+            );
+        }
+        assert_eq!(first.submit(job(100)).expect("active owner decode"), 100);
+        assert_eq!(services.runtime_receipts().summary().live_owner_count, 5);
+
+        drop(second);
+        drop(first);
+        drop(borrowed);
+        for key in 200..1200_u32 {
+            let engine = registry
+                .engine_for_key(key, config)
+                .expect("bounded churn owner");
+            drop(engine);
+        }
+        assert!(
+            registry.active.lock().unwrap().len() <= SERVE_BATCH_ENGINE_REGISTRY_MAX_ENTRIES,
+            "active weak registry exceeded its bounded LRU owner footprint"
+        );
+        registry.shutdown();
     }
 
     #[test]

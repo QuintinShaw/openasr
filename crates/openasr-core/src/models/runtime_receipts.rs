@@ -10,6 +10,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -23,18 +24,18 @@ use crate::ggml_runtime::GgmlCpuGraphBackend;
 use super::native_execution_services::{ExecutionCacheAttemptId, NativeExecutionScopeId};
 
 /// Schema marker for the phase-0 in-process ownership evidence.
-pub const RUNTIME_RECEIPT_SCHEMA: &str = "openasr.runtime-ownership-receipt.v0";
+pub const RUNTIME_RECEIPT_SCHEMA: &str = "openasr.runtime-ownership-receipt.v1";
 const DEFAULT_EVENT_CAPACITY: usize = 256;
 const MAX_EVENT_CAPACITY: usize = 4096;
 const MAX_LIVE_OWNERS: usize = 1024;
 const MAX_RESOURCES_PER_OWNER: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RuntimeReceiptUnavailableReason {
     EntropyUnavailable,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RuntimeReceiptAvailability {
     Available,
     Unavailable {
@@ -42,18 +43,21 @@ pub enum RuntimeReceiptAvailability {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RuntimeReceiptMetric {
     Known(u64),
+    /// The provider cannot supply this metric.
     Unavailable,
+    /// The component has not been physically priced yet.
+    Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RuntimeBackendOwnedReliability {
     Complete,
     Incomplete,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RuntimeResourceState {
     Reserved,
     Reconciled,
@@ -65,7 +69,7 @@ pub enum RuntimeResourceState {
 /// Safe native evidence attached to a reservation resource. Values are
 /// projections only: unavailable fields remain typed unavailable and no raw
 /// backend identity, pointer, or path reaches this type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeNativeMemoryEvidence {
     pub domain_kind: Option<SafeMemoryDomainKind>,
     pub provider: Option<ExecutionProvider>,
@@ -94,12 +98,13 @@ impl RuntimeReceiptAvailability {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ReceiptCompletenessReason {
     Unavailable(RuntimeReceiptUnavailableReason),
     EventCapacityExceeded,
     OwnerCapacityExceeded,
     ResourceCapacityExceeded,
+    NotificationCapacityExceeded,
     InvalidLifecycle,
 }
 
@@ -113,7 +118,7 @@ pub enum RuntimeReceiptError {
 
 /// A keyed, 128-bit projection of an identity. The key is random per service
 /// root and is never retained in a snapshot or exported through this type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct RedactedIdentity([u8; 16]);
 
 impl RedactedIdentity {
@@ -129,13 +134,13 @@ impl RedactedIdentity {
 /// The safe domain vocabulary used by receipt snapshots. The physical device
 /// identity is represented only by `join_id`; the original domain is never
 /// stored in a receipt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum SafeMemoryDomainKind {
     SystemMemory,
     DedicatedDevice,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct SafeMemoryDomainProjection {
     pub kind: SafeMemoryDomainKind,
     pub heap: Option<u32>,
@@ -144,7 +149,7 @@ pub struct SafeMemoryDomainProjection {
 
 /// Redacted execution-lane identity. Provider, placement, and backend reuse
 /// the runtime's typed vocabulary; the provider-local device name is keyed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct SafeExecutionLaneProjection {
     pub provider: ExecutionProvider,
     pub placement: ExecutionPlacement,
@@ -153,14 +158,14 @@ pub struct SafeExecutionLaneProjection {
 }
 
 /// Stable owner identity within one service root.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct RuntimeOwnerId {
     pub scope_id: NativeExecutionScopeId,
     pub ordinal: u64,
 }
 
 /// Stable resource identity within one service root.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct RuntimeResourceId {
     pub scope_id: NativeExecutionScopeId,
     pub ordinal: u64,
@@ -168,7 +173,7 @@ pub struct RuntimeResourceId {
 
 /// Safe owner metadata. All free-form identifiers are projected with the
 /// service root's keyed digest before they reach this type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RuntimeOwnerDescriptor {
     pub component: RedactedIdentity,
     pub content: Option<RedactedIdentity>,
@@ -179,19 +184,19 @@ pub struct RuntimeOwnerDescriptor {
 /// Safe resource metadata. Domain and confidence use the existing admission
 /// vocabulary where those values are meaningful; the domain identity itself is
 /// projected into [`SafeMemoryDomainProjection`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeResourceDescriptor {
     pub kind: RedactedIdentity,
-    pub domain: SafeMemoryDomainProjection,
-    pub requested_bytes: u64,
-    pub peak_bytes: u64,
-    pub retained_bytes: u64,
+    pub domain: Option<SafeMemoryDomainProjection>,
+    pub requested: RuntimeReceiptMetric,
+    pub peak: RuntimeReceiptMetric,
+    pub retained: RuntimeReceiptMetric,
     pub quote_confidence: QuoteConfidence,
     pub observation_confidence: Option<MemoryObservationConfidence>,
     pub native: Option<RuntimeNativeMemoryEvidence>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum RuntimeReceiptEvent {
     OwnerCreated {
         owner_id: RuntimeOwnerId,
@@ -223,30 +228,31 @@ pub enum RuntimeReceiptEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LiveRuntimeResource {
     pub id: RuntimeResourceId,
     pub descriptor: RuntimeResourceDescriptor,
     pub state: RuntimeResourceState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LiveRuntimeOwner {
     pub id: RuntimeOwnerId,
     pub descriptor: RuntimeOwnerDescriptor,
     pub resources: BTreeMap<RuntimeResourceId, LiveRuntimeResource>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ReceiptCompleteness {
     pub complete: bool,
     pub reason: Option<ReceiptCompletenessReason>,
     pub dropped_events: u64,
     pub dropped_owners: u64,
     pub rejected_resources: u64,
+    pub dropped_notifications: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RuntimeReceiptSummary {
     pub scope_id: NativeExecutionScopeId,
     pub availability: RuntimeReceiptAvailability,
@@ -257,7 +263,7 @@ pub struct RuntimeReceiptSummary {
     pub completeness: ReceiptCompleteness,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeReceiptSnapshot {
     pub schema: &'static str,
     pub scope_id: NativeExecutionScopeId,
@@ -276,6 +282,7 @@ struct RuntimeReceiptState {
     dropped_events: u64,
     dropped_owners: u64,
     rejected_resources: u64,
+    dropped_notifications: u64,
     complete: bool,
     completeness_reason: Option<ReceiptCompletenessReason>,
 }
@@ -352,6 +359,7 @@ impl RuntimeReceiptCollector {
                 dropped_events: 0,
                 dropped_owners: 0,
                 rejected_resources: 0,
+                dropped_notifications: 0,
                 complete: availability.is_available(),
                 completeness_reason,
             })),
@@ -406,10 +414,10 @@ impl RuntimeReceiptCollector {
     ) -> Option<RuntimeResourceDescriptor> {
         Some(RuntimeResourceDescriptor {
             kind: self.digest(b"resource-kind", kind)?,
-            domain: self.domain_projection(domain)?,
-            requested_bytes,
-            peak_bytes,
-            retained_bytes,
+            domain: Some(self.domain_projection(domain)?),
+            requested: RuntimeReceiptMetric::Known(requested_bytes),
+            peak: RuntimeReceiptMetric::Known(peak_bytes),
+            retained: RuntimeReceiptMetric::Known(retained_bytes),
             quote_confidence,
             observation_confidence,
             native: None,
@@ -422,6 +430,24 @@ impl RuntimeReceiptCollector {
     ) -> RuntimeResourceDescriptor {
         descriptor.native = Some(native);
         descriptor
+    }
+
+    /// Serve-batch and other legacy components whose memory footprint is not
+    /// priced yet use typed Unknown metrics and no fabricated memory domain.
+    pub(crate) fn unpriced_resource_descriptor(
+        &self,
+        kind: &str,
+    ) -> Option<RuntimeResourceDescriptor> {
+        Some(RuntimeResourceDescriptor {
+            kind: self.digest(b"resource-kind", kind)?,
+            domain: None,
+            requested: RuntimeReceiptMetric::Unknown,
+            peak: RuntimeReceiptMetric::Unknown,
+            retained: RuntimeReceiptMetric::Unknown,
+            quote_confidence: QuoteConfidence::Unknown,
+            observation_confidence: None,
+            native: None,
+        })
     }
 
     pub(crate) fn lane_projection(
@@ -542,6 +568,18 @@ impl RuntimeReceiptCollector {
             },
         );
         true
+    }
+
+    pub(crate) fn record_notification_coalesced(&self) {
+        if !self.is_available() {
+            return;
+        }
+        let mut state = self.lock_state();
+        state.dropped_notifications = state.dropped_notifications.saturating_add(1);
+        Self::mark_incomplete(
+            &mut state,
+            ReceiptCompletenessReason::NotificationCapacityExceeded,
+        );
     }
 
     pub(crate) fn acquire_resource(
@@ -715,6 +753,7 @@ impl RuntimeReceiptCollector {
                 dropped_events: state.dropped_events,
                 dropped_owners: state.dropped_owners,
                 rejected_resources: state.rejected_resources,
+                dropped_notifications: state.dropped_notifications,
             },
         }
     }
@@ -739,6 +778,7 @@ impl RuntimeReceiptCollector {
                 dropped_events: state.dropped_events,
                 dropped_owners: state.dropped_owners,
                 rejected_resources: state.rejected_resources,
+                dropped_notifications: state.dropped_notifications,
             },
         }
     }

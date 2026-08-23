@@ -147,6 +147,7 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
         .route("/v1/config", get(get_config).put(put_config))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/devices", get(devices))
+        .route("/v1/runtime/receipts", get(runtime_receipts))
         .route("/v1/history", get(history_list))
         .route("/v1/history/{id}", get(history_get).delete(history_delete))
         .route(

@@ -406,7 +406,7 @@ impl ExecutionLaneKey {
 }
 
 /// Stable identity of one explicitly constructed execution-service root.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct NativeExecutionScopeId(u64);
 
 impl NativeExecutionScopeId {
@@ -417,7 +417,7 @@ impl NativeExecutionScopeId {
 
 /// Identity of the outermost transactional cache-publication attempt. Nested
 /// auxiliary candidates inherit it and merge their journals into the parent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct ExecutionCacheAttemptId(u64);
 
 impl ExecutionCacheAttemptId {

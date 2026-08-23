@@ -111,7 +111,7 @@ pub struct GgmlCpuGraphConfig {
     pub use_scheduler: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum GgmlCpuGraphBackend {
     Cpu,
     Metal,

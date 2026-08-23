@@ -28,13 +28,19 @@ use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, apply_seq2seq_text_postprocess,
 };
 use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
+use crate::models::native_execution_services::{
+    current_native_execution_context, current_runtime_receipts, install_native_execution_context,
+};
 use crate::models::prepared_runtime_cache::PreparedRuntimeHandle;
 use crate::models::runtime_prepared_registry::BuiltinPreparedRuntime;
+use crate::models::runtime_receipts::{
+    RuntimeOwnerGuard, RuntimeReceiptCollector, RuntimeResourceGuard,
+};
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStopReason,
     build_seq2seq_greedy_stop_token_ids,
 };
-use crate::models::seq2seq_serve_batch::BoundedServeBatchEngineCache;
+use crate::models::seq2seq_serve_batch::ServeBatchActiveRegistry;
 use crate::models::seq2seq_word_timestamps::seq2seq_word_timestamps_from_generated_tokens;
 use crate::models::serve_batch_env::{
     OwnerAliveGuard, SERVE_BATCH_COLLECT_WINDOW, ServeBatchPolicy, serve_batch_bucket_width,
@@ -282,9 +288,7 @@ struct Qwen3AsrServeBatchEngineKey {
 /// process singleton partitioned by ambient scope ids.
 #[derive(Clone, Default)]
 pub(super) struct Qwen3AsrServeBatchEngineRegistry {
-    engines: Arc<
-        Mutex<BoundedServeBatchEngineCache<Qwen3AsrServeBatchEngineKey, Qwen3AsrServeBatchEngine>>,
-    >,
+    engines: Arc<ServeBatchActiveRegistry<Qwen3AsrServeBatchEngineKey, Qwen3AsrServeBatchEngine>>,
 }
 
 impl std::fmt::Debug for Qwen3AsrServeBatchEngineRegistry {
@@ -295,10 +299,77 @@ impl std::fmt::Debug for Qwen3AsrServeBatchEngineRegistry {
     }
 }
 
+struct QwenReuseState {
+    latest_attempt: Option<crate::models::native_execution_services::ExecutionCacheAttemptId>,
+    pending: bool,
+    closed: bool,
+}
+
+struct QwenReuseSignal {
+    state: Mutex<QwenReuseState>,
+    collector: Option<RuntimeReceiptCollector>,
+}
+
+impl QwenReuseSignal {
+    fn record(
+        &self,
+        attempt: Option<crate::models::native_execution_services::ExecutionCacheAttemptId>,
+    ) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.closed {
+            if let Some(collector) = self.collector.as_ref() {
+                collector.record_notification_coalesced();
+            }
+            return;
+        }
+        if state.pending {
+            if let Some(collector) = self.collector.as_ref() {
+                collector.record_notification_coalesced();
+            }
+        }
+        state.latest_attempt = attempt;
+        state.pending = true;
+    }
+
+    fn consume(
+        &self,
+    ) -> Option<Option<crate::models::native_execution_services::ExecutionCacheAttemptId>> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        if !state.pending {
+            return None;
+        }
+        state.pending = false;
+        Some(state.latest_attempt.take())
+    }
+
+    fn close_and_drop(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.closed = true;
+        if state.pending {
+            state.pending = false;
+            state.latest_attempt.take();
+            if let Some(collector) = self.collector.as_ref() {
+                collector.record_notification_coalesced();
+            }
+        }
+    }
+}
+
 struct Qwen3AsrServeBatchEngine {
-    sender: SyncSender<Qwen3AsrServeBatchEnvelope>,
+    sender: Mutex<Option<SyncSender<Qwen3AsrServeBatchEnvelope>>>,
+    reuse: Arc<QwenReuseSignal>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
+    worker_thread_id: thread::ThreadId,
     config: Qwen3AsrServeBatchConfig,
     is_alive: Arc<AtomicBool>,
+    #[cfg(test)]
+    owner_ready: Arc<AtomicBool>,
 }
 
 struct Qwen3AsrServeBatchEnvelope {
@@ -311,6 +382,14 @@ struct Qwen3AsrServeBatchEnvelope {
 struct Qwen3AsrOwnerThreadState {
     decoder: Option<Qwen3AsrLlmWholeDecoderGraphExecutor>,
     logits_runtime: Option<Qwen3AsrLlmLogitsHeadRuntime>,
+    runtime_receipts: Vec<RuntimeResourceGuard>,
+    receipt_context: Option<ServeBatchReceiptContext>,
+}
+
+#[derive(Clone)]
+struct ServeBatchReceiptContext {
+    collector: RuntimeReceiptCollector,
+    owner_id: crate::models::runtime_receipts::RuntimeOwnerId,
 }
 
 struct Qwen3AsrActiveBatchSlot {
@@ -414,9 +493,7 @@ impl Qwen3AsrServeBatchConfig {
 }
 
 pub(super) fn shutdown_qwen_serve_batch_engines(registry: &Qwen3AsrServeBatchEngineRegistry) {
-    if let Ok(mut engines) = registry.engines.lock() {
-        engines.clear();
-    }
+    registry.engines.shutdown();
 }
 
 pub(super) fn submit_qwen_serve_batch_job(
@@ -455,52 +532,16 @@ fn qwen_serve_batch_engine_for_key(
     key: Qwen3AsrServeBatchEngineKey,
     config: Qwen3AsrServeBatchConfig,
 ) -> Result<Arc<Qwen3AsrServeBatchEngine>, Qwen3AsrServeBatchError> {
-    let mut engines = registry
-        .engines
-        .lock()
-        .map_err(|_| Qwen3AsrServeBatchError::RegistryPoisoned)?;
-    if let Some(engine) = engines.get(&key) {
-        if serve_batch_owner_alive(&engine.is_alive) {
-            let failed_registry = registry.clone();
-            let failed_key = key.clone();
-            let failed_engine = Arc::clone(&engine);
-            crate::models::native_execution_services::stage_execution_cache_rollback(move || {
-                evict_qwen_serve_batch_engine(&failed_registry, &failed_key, &failed_engine);
-            });
-            return Ok(engine);
-        }
-        // The cached owner thread exited (normal or panic); drop the stale
-        // engine and respawn a fresh one with clean ggml state.
-        engines.remove(&key);
-    }
-    let generation = engines.generation();
-    let engine = Arc::new(Qwen3AsrServeBatchEngine::spawn(key.clone(), config)?);
-    drop(engines);
-    let failed_registry = registry.clone();
-    let failed_key = key.clone();
-    let failed_engine = Arc::clone(&engine);
-    crate::models::native_execution_services::stage_execution_cache_rollback(move || {
-        evict_qwen_serve_batch_engine(&failed_registry, &failed_key, &failed_engine);
-    });
-    let registry = registry.clone();
-    let staged_engine = Arc::clone(&engine);
-    crate::models::native_execution_services::stage_execution_cache_commit(move || {
-        let Ok(mut engines) = registry.engines.lock() else {
-            return;
-        };
-        if engines.generation() != generation {
-            return;
-        }
-        if engines
-            .get(&key)
-            .is_some_and(|existing| serve_batch_owner_alive(&existing.is_alive))
-        {
-            return;
-        }
-        engines.remove(&key);
-        let _ = engines.insert_if_idle_capacity(key, staged_engine);
-    });
-    Ok(engine)
+    let build_key = key.clone();
+    let build = move || Qwen3AsrServeBatchEngine::spawn(build_key.clone(), config).map(Arc::new);
+    registry.engines.lookup_or_build(
+        key,
+        build,
+        |engine| serve_batch_owner_alive(&engine.is_alive),
+        |engine| engine.record_receipt_reuse(),
+        |engine| engine.shutdown_owner(),
+        || Qwen3AsrServeBatchError::RegistryPoisoned,
+    )
 }
 
 fn evict_qwen_serve_batch_engine(
@@ -508,37 +549,113 @@ fn evict_qwen_serve_batch_engine(
     key: &Qwen3AsrServeBatchEngineKey,
     engine: &Arc<Qwen3AsrServeBatchEngine>,
 ) {
-    let Ok(mut engines) = registry.engines.lock() else {
-        return;
-    };
-    if engines.contains_ptr(key, engine) {
-        engines.remove(key);
-    }
+    registry.engines.evict_exact(key, engine);
+}
+
+fn qwen_receipt_descriptor(
+    key: &Qwen3AsrServeBatchEngineKey,
+) -> Option<crate::models::runtime_receipts::RuntimeOwnerDescriptor> {
+    let collector = current_runtime_receipts()?;
+    let lane = key.lane.receipt_projection(&collector);
+    collector.owner_descriptor(
+        "serve-batch.qwen.serialized-actor",
+        Some("qwen"),
+        Some(&format!("{key:?}")),
+        lane,
+    )
 }
 
 impl Qwen3AsrServeBatchEngine {
+    fn shutdown_owner(&self) {
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(sender);
+        let worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(worker) = worker {
+            if thread::current().id() == self.worker_thread_id {
+                drop(worker);
+            } else {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    fn record_receipt_reuse(&self) {
+        self.reuse
+            .record(crate::models::native_execution_services::current_execution_cache_attempt_id());
+    }
+
     fn spawn(
         key: Qwen3AsrServeBatchEngineKey,
         config: Qwen3AsrServeBatchConfig,
     ) -> Result<Self, Qwen3AsrServeBatchError> {
         let (sender, receiver) = mpsc::sync_channel(config.queue_capacity);
+        let receipt_collector = current_runtime_receipts();
+        let reuse = Arc::new(QwenReuseSignal {
+            state: Mutex::new(QwenReuseState {
+                latest_attempt: None,
+                pending: false,
+                closed: false,
+            }),
+            collector: receipt_collector.clone(),
+        });
+        let worker_reuse = Arc::clone(&reuse);
+        let owner_ready = Arc::new(AtomicBool::new(false));
+        let worker_ready = Arc::clone(&owner_ready);
         let (is_alive, alive_guard) = OwnerAliveGuard::new();
-        thread::Builder::new()
+        let owner_context = current_native_execution_context();
+        let receipt_descriptor = qwen_receipt_descriptor(&key);
+        let receipt_attempt_id =
+            crate::models::native_execution_services::current_execution_cache_attempt_id();
+        let worker = thread::Builder::new()
             .name(format!(
                 "openasr-qwen-serve-batch-{:?}-{}",
                 key.lane, key.max_batch
             ))
             .spawn(move || {
                 let _alive_guard = alive_guard;
-                qwen_owner_thread_loop(receiver, config)
+                let _context = owner_context.map(install_native_execution_context);
+                let receipt_owner = receipt_descriptor.and_then(|descriptor| {
+                    current_runtime_receipts()
+                        .map(|collector| collector.start_owner(descriptor, receipt_attempt_id))
+                });
+                let receipt_context = receipt_owner.as_ref().and_then(|owner| {
+                    owner.owner_id().and_then(|owner_id| {
+                        current_runtime_receipts().map(|collector| ServeBatchReceiptContext {
+                            collector,
+                            owner_id,
+                        })
+                    })
+                });
+                qwen_owner_thread_loop(
+                    receiver,
+                    config,
+                    worker_reuse,
+                    worker_ready,
+                    receipt_context,
+                    receipt_owner,
+                )
             })
             .map_err(|error| Qwen3AsrServeBatchError::ThreadSpawnFailed {
                 reason: error.to_string(),
             })?;
+        let worker_thread_id = worker.thread().id();
         Ok(Self {
-            sender,
+            sender: Mutex::new(Some(sender)),
+            reuse,
+            worker: Mutex::new(Some(worker)),
+            worker_thread_id,
             config,
             is_alive,
+            #[cfg(test)]
+            owner_ready,
         })
     }
 
@@ -547,12 +664,18 @@ impl Qwen3AsrServeBatchEngine {
         job: Qwen3AsrServeBatchJob,
     ) -> Result<GgmlAsrExecutionResult, Qwen3AsrServeBatchError> {
         let (reply, reply_rx) = mpsc::channel();
+        let sender = self
+            .sender
+            .lock()
+            .map_err(|_| Qwen3AsrServeBatchError::OwnerDisconnected)?
+            .as_ref()
+            .cloned()
+            .ok_or(Qwen3AsrServeBatchError::OwnerDisconnected)?;
         serve_batch_submit_with_timeout(
-            &self.sender,
+            &sender,
             Qwen3AsrServeBatchEnvelope {
                 job,
-                native_execution_context:
-                    crate::models::native_execution_services::current_native_execution_context(),
+                native_execution_context: current_native_execution_context(),
                 reply,
             },
             reply_rx,
@@ -565,16 +688,35 @@ impl Qwen3AsrServeBatchEngine {
     }
 }
 
+impl Drop for Qwen3AsrServeBatchEngine {
+    fn drop(&mut self) {
+        self.shutdown_owner();
+    }
+}
+
 fn qwen_owner_thread_loop(
     receiver: Receiver<Qwen3AsrServeBatchEnvelope>,
     config: Qwen3AsrServeBatchConfig,
+    reuse: Arc<QwenReuseSignal>,
+    ready: Arc<AtomicBool>,
+    receipt_context: Option<ServeBatchReceiptContext>,
+    receipt_owner: Option<RuntimeOwnerGuard>,
 ) {
+    ready.store(true, std::sync::atomic::Ordering::Release);
+    let receipt_owner = receipt_owner;
     let mut state = Qwen3AsrOwnerThreadState {
         decoder: None,
         logits_runtime: None,
+        runtime_receipts: Vec::new(),
+        receipt_context,
     };
     let mut deferred = VecDeque::new();
     loop {
+        if let Some(attempt) = reuse.consume() {
+            if let Some(owner) = receipt_owner.as_ref() {
+                owner.record_reuse(attempt);
+            }
+        }
         let Some(batch) = serve_batch_drain_compatible_batch(
             &mut deferred,
             &receiver,
@@ -585,6 +727,7 @@ fn qwen_owner_thread_loop(
                     && first.job.runtime_cache_path == next.job.runtime_cache_path
             },
         ) else {
+            reuse.close_and_drop();
             break;
         };
         if config.trace_batches {
@@ -1709,6 +1852,27 @@ impl Qwen3AsrOwnerThreadState {
         }
     }
 
+    fn record_runtime_receipts(&mut self) {
+        if !self.runtime_receipts.is_empty() {
+            return;
+        }
+        let Some(receipt) = self.receipt_context.as_ref() else {
+            return;
+        };
+        for kind in [
+            "serve-batch.qwen.decoder-runtime:NotPricedLegacy",
+            "serve-batch.qwen.logits-runtime:NotPricedLegacy",
+        ] {
+            if let Some(descriptor) = receipt.collector.unpriced_resource_descriptor(kind)
+                && let Some(resource) = receipt
+                    .collector
+                    .acquire_resource(receipt.owner_id, descriptor)
+            {
+                self.runtime_receipts.push(resource);
+            }
+        }
+    }
+
     fn decoder_for(
         &mut self,
         slot: &Qwen3AsrBatchSlot,
@@ -1747,6 +1911,7 @@ impl Qwen3AsrOwnerThreadState {
                 })?;
             self.decoder = Some(decoder);
             self.logits_runtime = Some(logits_runtime);
+            self.record_runtime_receipts();
         } else if self.decoder.is_none() || self.logits_runtime.is_none() {
             return Err(Qwen3AsrServeBatchError::OwnerFailed {
                 reason: "qwen serve batch decoder/logits runtime cache is inconsistent".to_string(),
@@ -2485,6 +2650,126 @@ mod tests {
     use std::{collections::BTreeMap, ffi::OsString};
 
     const QWEN_SERVE_BATCH_REAL_PACK_ENV: &str = "OPENASR_QWEN_SERVE_BATCH_REAL_PACK";
+
+    #[test]
+    fn qwen_pending_reuse_shutdown_marks_dropped_and_incomplete() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _guard = crate::models::native_execution_services::install_native_execution_services(
+            services.as_ref(),
+        );
+        let key = Qwen3AsrServeBatchEngineKey {
+            build_identity: crate::RuntimeBuildIdentity::resolve_for_request(
+                None,
+                "qwen:test-shutdown",
+                "adapter=none",
+                "qwen-shutdown-receipt-test",
+            ),
+            lane: crate::models::native_execution_services::current_execution_lane_key(
+                GgmlCpuGraphBackend::Cpu,
+            ),
+            resident_positions: 8,
+            max_batch: 2,
+            native_gqa: GgmlNativeGqaCapability::Validated,
+        };
+        let config = Qwen3AsrServeBatchConfig {
+            max_batch: 2,
+            queue_capacity: 2,
+            collect_window: Duration::ZERO,
+            send_timeout: Duration::from_secs(1),
+            reply_timeout: Duration::from_secs(1),
+            trace_batches: false,
+        };
+        let engine = Qwen3AsrServeBatchEngine::spawn(key, config).expect("qwen owner");
+        while !engine
+            .owner_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            std::thread::yield_now();
+        }
+        engine.record_receipt_reuse();
+        engine.record_receipt_reuse();
+        engine.shutdown_owner();
+        let completeness = services.runtime_receipts().summary().completeness;
+        assert!(completeness.dropped_notifications > 0);
+        assert!(!completeness.complete);
+    }
+
+    #[test]
+    fn qwen_serve_batch_concurrent_same_key_has_one_owner_receipt() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let registry = Arc::new(Qwen3AsrServeBatchEngineRegistry::default());
+        let key = Qwen3AsrServeBatchEngineKey {
+            build_identity: crate::RuntimeBuildIdentity::resolve_for_request(
+                None,
+                "qwen:test",
+                "adapter=none",
+                "qwen-receipt-test",
+            ),
+            lane: crate::models::native_execution_services::current_execution_lane_key(
+                GgmlCpuGraphBackend::Cpu,
+            ),
+            resident_positions: 8,
+            max_batch: 2,
+            native_gqa: GgmlNativeGqaCapability::Validated,
+        };
+        let config = Qwen3AsrServeBatchConfig {
+            max_batch: 2,
+            queue_capacity: 2,
+            collect_window: Duration::ZERO,
+            send_timeout: Duration::from_secs(1),
+            reply_timeout: Duration::from_secs(1),
+            trace_batches: false,
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let first_registry = Arc::clone(&registry);
+        let first_services = Arc::clone(&services);
+        let first_barrier = Arc::clone(&barrier);
+        let first_key = key.clone();
+        let first = std::thread::spawn(move || {
+            let _guard =
+                crate::models::native_execution_services::install_native_execution_services(
+                    first_services.as_ref(),
+                );
+            first_barrier.wait();
+            qwen_serve_batch_engine_for_key(&first_registry, first_key, config)
+                .expect("qwen first owner")
+        });
+        let second_registry = Arc::clone(&registry);
+        let second_services = Arc::clone(&services);
+        let second_barrier = Arc::clone(&barrier);
+        let second_key = key;
+        let second = std::thread::spawn(move || {
+            let _guard =
+                crate::models::native_execution_services::install_native_execution_services(
+                    second_services.as_ref(),
+                );
+            second_barrier.wait();
+            qwen_serve_batch_engine_for_key(&second_registry, second_key, config)
+                .expect("qwen second owner")
+        });
+        barrier.wait();
+        let first_engine = first.join().expect("qwen first lookup");
+        let second_engine = second.join().expect("qwen second lookup");
+        assert!(Arc::ptr_eq(&first_engine, &second_engine));
+        first_engine.shutdown_owner();
+        drop(second_engine);
+        drop(first_engine);
+        registry.engines.shutdown();
+        let snapshot = services.runtime_receipts().snapshot();
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        crate::models::runtime_receipts::RuntimeReceiptEvent::OwnerCreated { .. }
+                    )
+                })
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn serve_batch_error_classifies_transient_failures() {

@@ -8,7 +8,8 @@ use crate::*;
 use axum::{Json, extract::Query};
 use openasr_core::runtime_receipts::{
     LiveRuntimeOwner, RuntimeOwnerId, RuntimeReceiptAvailability, RuntimeReceiptEvent,
-    RuntimeReceiptSnapshot, RuntimeResourceId, RuntimeResourceState, SafeMemoryDomainKind,
+    RuntimeReceiptMetric, RuntimeReceiptSnapshot, RuntimeResourceId, RuntimeResourceState,
+    SafeMemoryDomainKind,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -137,13 +138,22 @@ struct RuntimeLaneView {
 struct RuntimeResourceView {
     id: String,
     kind: String,
-    domain: RuntimeDomainView,
-    requested_bytes: u64,
-    peak_bytes: u64,
-    retained_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    domain: Option<RuntimeDomainView>,
+    requested: RuntimeMetricView,
+    peak: RuntimeMetricView,
+    retained: RuntimeMetricView,
     quote_confidence: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     observation_confidence: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", content = "bytes", rename_all = "kebab-case")]
+enum RuntimeMetricView {
+    Known(u64),
+    Unknown,
+    Unavailable,
 }
 
 #[derive(Debug, Serialize)]
@@ -216,14 +226,16 @@ impl DomainAttribution {
                 descriptor,
             } = event
             {
-                attribution
-                    .owner_domains
-                    .entry(*owner_id)
-                    .or_default()
-                    .insert(descriptor.domain.kind);
-                attribution
-                    .resource_domains
-                    .insert(*resource_id, (*owner_id, descriptor.domain.kind));
+                if let Some(domain) = descriptor.domain {
+                    attribution
+                        .owner_domains
+                        .entry(*owner_id)
+                        .or_default()
+                        .insert(domain.kind);
+                    attribution
+                        .resource_domains
+                        .insert(*resource_id, (*owner_id, domain.kind));
+                }
             }
         }
         attribution
@@ -301,10 +313,13 @@ fn filter_live_owners<'a>(
                 };
                 return domains.contains(&domain.kind());
             }
-            owner
-                .resources
-                .values()
-                .any(|resource| domain.matches(resource.descriptor.domain.kind))
+            owner.resources.values().any(|resource| {
+                let Some(resource_domain) = resource.descriptor.domain else {
+                    complete = false;
+                    return false;
+                };
+                domain.matches(resource_domain.kind)
+            })
         })
         .collect();
     (filtered, complete)
@@ -324,7 +339,11 @@ fn filter_events<'a>(
         .filter(|event| match event {
             RuntimeReceiptEvent::ResourceAcquired { descriptor, .. }
             | RuntimeReceiptEvent::ResourceStateChanged { descriptor, .. } => {
-                domain.matches(descriptor.domain.kind)
+                let Some(resource_domain) = descriptor.domain else {
+                    complete = false;
+                    return false;
+                };
+                domain.matches(resource_domain.kind)
             }
             RuntimeReceiptEvent::ResourceReleased {
                 owner_id,
@@ -378,7 +397,10 @@ impl RuntimeOwnerView {
                 .resources
                 .values()
                 .filter(|resource| {
-                    domain.is_none_or(|domain| domain.matches(resource.descriptor.domain.kind))
+                    let Some(resource_domain) = resource.descriptor.domain else {
+                        return false;
+                    };
+                    domain.is_none_or(|domain| domain.matches(resource_domain.kind))
                 })
                 .map(RuntimeResourceView::from_resource)
                 .collect(),
@@ -401,18 +423,34 @@ impl RuntimeOwnerDescriptorView {
 
 impl RuntimeResourceView {
     fn from_resource(resource: &openasr_core::runtime_receipts::LiveRuntimeResource) -> Self {
+        Self::from_descriptor(resource_view_id(resource.id.ordinal), &resource.descriptor)
+    }
+
+    fn from_descriptor(
+        id: String,
+        descriptor: &openasr_core::runtime_receipts::RuntimeResourceDescriptor,
+    ) -> Self {
         Self {
-            id: resource_view_id(resource.id.ordinal),
-            kind: resource.descriptor.kind.to_hex(),
-            domain: RuntimeDomainView::from(resource.descriptor.domain),
-            requested_bytes: resource.descriptor.requested_bytes,
-            peak_bytes: resource.descriptor.peak_bytes,
-            retained_bytes: resource.descriptor.retained_bytes,
-            quote_confidence: format!("{:?}", resource.descriptor.quote_confidence),
-            observation_confidence: resource
-                .descriptor
+            id,
+            kind: descriptor.kind.to_hex(),
+            domain: descriptor.domain.map(RuntimeDomainView::from),
+            requested: RuntimeMetricView::from(descriptor.requested),
+            peak: RuntimeMetricView::from(descriptor.peak),
+            retained: RuntimeMetricView::from(descriptor.retained),
+            quote_confidence: format!("{:?}", descriptor.quote_confidence),
+            observation_confidence: descriptor
                 .observation_confidence
-                .map(|value| format!("{:?}", value)),
+                .map(|value| format!("{value:?}")),
+        }
+    }
+}
+
+impl From<RuntimeReceiptMetric> for RuntimeMetricView {
+    fn from(metric: RuntimeReceiptMetric) -> Self {
+        match metric {
+            RuntimeReceiptMetric::Known(bytes) => Self::Known(bytes),
+            RuntimeReceiptMetric::Unknown => Self::Unknown,
+            RuntimeReceiptMetric::Unavailable => Self::Unavailable,
         }
     }
 }
@@ -482,18 +520,10 @@ impl RuntimeEventView {
                 owner_id: owner_view_id(owner_id.ordinal),
                 resource_id: Some(resource_view_id(resource_id.ordinal)),
                 owner: None,
-                resource: Some(RuntimeResourceView {
-                    id: resource_view_id(resource_id.ordinal),
-                    kind: descriptor.kind.to_hex(),
-                    domain: RuntimeDomainView::from(descriptor.domain),
-                    requested_bytes: descriptor.requested_bytes,
-                    peak_bytes: descriptor.peak_bytes,
-                    retained_bytes: descriptor.retained_bytes,
-                    quote_confidence: format!("{:?}", descriptor.quote_confidence),
-                    observation_confidence: descriptor
-                        .observation_confidence
-                        .map(|value| format!("{value:?}")),
-                }),
+                resource: Some(RuntimeResourceView::from_descriptor(
+                    resource_view_id(resource_id.ordinal),
+                    descriptor,
+                )),
             },
             RuntimeReceiptEvent::ResourceStateChanged {
                 owner_id,
@@ -511,18 +541,10 @@ impl RuntimeEventView {
                 owner_id: owner_view_id(owner_id.ordinal),
                 resource_id: Some(resource_view_id(resource_id.ordinal)),
                 owner: None,
-                resource: Some(RuntimeResourceView {
-                    id: resource_view_id(resource_id.ordinal),
-                    kind: descriptor.kind.to_hex(),
-                    domain: RuntimeDomainView::from(descriptor.domain),
-                    requested_bytes: descriptor.requested_bytes,
-                    peak_bytes: descriptor.peak_bytes,
-                    retained_bytes: descriptor.retained_bytes,
-                    quote_confidence: format!("{:?}", descriptor.quote_confidence),
-                    observation_confidence: descriptor
-                        .observation_confidence
-                        .map(|value| format!("{value:?}")),
-                }),
+                resource: Some(RuntimeResourceView::from_descriptor(
+                    resource_view_id(resource_id.ordinal),
+                    descriptor,
+                )),
             },
             RuntimeReceiptEvent::ResourceReleased {
                 owner_id,

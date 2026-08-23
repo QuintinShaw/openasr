@@ -93,7 +93,7 @@ impl fmt::Display for PhysicalDeviceKey {
 }
 
 /// Quality of a live memory observation supplied by a backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum MemoryObservationConfidence {
     /// Backend/driver reports current free and total bytes for the target heap.
     DeviceSnapshot,
@@ -132,7 +132,7 @@ impl DeviceMemorySnapshot {
 /// Whether a quote describes backend-requested bytes or a physical commitment
 /// upper bound.  The distinction is part of the type so diagnostics and tests
 /// cannot accidentally relabel requested Vulkan/CUDA bytes as exact VRAM.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum QuoteConfidence {
     ExactCommitted,
     CommittedUpperBound,
@@ -1015,8 +1015,14 @@ impl DeviceMemoryReservationBatch {
         retained_bytes: u64,
     ) {
         if let Some(mut descriptor) = entry.receipt_descriptor.clone() {
-            descriptor.peak_bytes = descriptor.peak_bytes.max(peak_bytes);
-            descriptor.retained_bytes = descriptor.retained_bytes.max(retained_bytes);
+            descriptor.peak = RuntimeReceiptMetric::Known(match descriptor.peak {
+                RuntimeReceiptMetric::Known(previous) => previous.max(peak_bytes),
+                RuntimeReceiptMetric::Unavailable | RuntimeReceiptMetric::Unknown => peak_bytes,
+            });
+            descriptor.retained = RuntimeReceiptMetric::Known(match descriptor.retained {
+                RuntimeReceiptMetric::Known(previous) => previous.max(retained_bytes),
+                RuntimeReceiptMetric::Unavailable | RuntimeReceiptMetric::Unknown => retained_bytes,
+            });
             entry.receipt_descriptor = Some(descriptor);
         }
     }
