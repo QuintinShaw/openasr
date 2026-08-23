@@ -90,7 +90,13 @@ enum TestHistoryBusyState {
 }
 
 #[cfg(test)]
-const TEST_HISTORY_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
+// Coordinator wait fails fast if BEGIN IMMEDIATE never hits the writer lock.
+// The callback watchdog starts at the first SQLITE_BUSY and must outlast that
+// wait plus the writer's later commit/fsync; a matching 2s pair races the
+// remaining window and can Cancel after wait already succeeded.
+const TEST_HISTORY_BUSY_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const TEST_HISTORY_BUSY_HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[cfg(test)]
 static TEST_HISTORY_BUSY_WAITER: OnceLock<(Mutex<TestHistoryBusyState>, Condvar)> = OnceLock::new();
@@ -144,7 +150,7 @@ fn test_history_busy_handler(_count: i32) -> bool {
     }
     *state = TestHistoryBusyState::Waiting;
     waiter.notify_all();
-    let deadline = Instant::now() + TEST_HISTORY_BUSY_TIMEOUT;
+    let deadline = Instant::now() + TEST_HISTORY_BUSY_HANDLER_TIMEOUT;
     while *state == TestHistoryBusyState::Waiting {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -1489,7 +1495,7 @@ mod tests {
             result
         });
         start.wait();
-        if let Err(error) = wait_for_test_history_busy_handler(Duration::from_secs(2)) {
+        if let Err(error) = wait_for_test_history_busy_handler(TEST_HISTORY_BUSY_WAIT_TIMEOUT) {
             cancel_test_history_busy_handler();
             drop(tx);
             let worker_result = handle.join().unwrap();
