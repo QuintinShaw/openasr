@@ -33,6 +33,7 @@ use crate::nn::half::f32_to_f16_bits;
 use crate::{Segment, Transcription};
 
 use super::encoder_graph::MoonshineEncoderOutput;
+#[cfg(test)]
 use super::graph_config::moonshine_decoder_graph_config;
 use super::lora::{LoraSlot, MoonshineLoraAdapter, new_lora_slot_tensors};
 use super::runtime_contract::MoonshineExecutionMetadata;
@@ -512,6 +513,7 @@ impl MoonshineDecoderGraphRuntime {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn new_with_n_seq(
         decoder_weights: &MoonshineDecoderWeights,
         metadata: MoonshineExecutionMetadata,

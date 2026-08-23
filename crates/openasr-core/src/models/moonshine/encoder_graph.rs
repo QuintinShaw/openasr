@@ -8,6 +8,7 @@ use crate::ggml_runtime::{
 use crate::nn::half::f32_to_f16_bits;
 
 use super::frontend::MoonshineWaveformFeatures;
+#[cfg(test)]
 use super::graph_config::moonshine_encoder_graph_config;
 use super::lora::{LoraSlot, MoonshineLoraAdapter, new_lora_slot_tensors};
 use super::runtime_contract::MoonshineExecutionMetadata;
@@ -173,6 +174,7 @@ pub(crate) struct MoonshineEncoderGraphRuntime {
 }
 
 impl MoonshineEncoderGraphRuntime {
+    #[cfg(test)]
     pub(crate) fn new(
         weights: &MoonshineEncoderWeights,
         metadata: MoonshineExecutionMetadata,

@@ -6,11 +6,9 @@
 //! strings, slots, and generations cannot create an owner identity.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
-
 use crate::arch::runtime_footprint::{
-    ResidentCheckout, ResidentDecoderCapacity, ResidentPartition, ResidentRepresentation,
-    ResidentSessionEnvelope, SessionFootprintSpec, VerifiedResidentComponent,
+    ResidentDecoderCapacity, ResidentPartition, ResidentRepresentation, ResidentSessionEnvelope,
+    SessionFootprintSpec, VerifiedResidentComponent,
 };
 use crate::ggml_runtime::{
     ResidentDeviceCopyCapability, ResidentHostImportCapability, StrongFileIdentity,
@@ -202,8 +200,6 @@ pub(crate) enum ResidentKeyError {
     HostForbidsLane,
     ContractMismatch,
     GenerationMismatch,
-    CheckoutExhausted,
-    GenerationExhausted,
 }
 
 /// An actual materialization binding. The only production constructor accepts
@@ -236,126 +232,6 @@ impl ResidentBinding {
         match self {
             Self::HostImportedBinding { key } | Self::DeviceCopiedBinding { key } => key,
         }
-    }
-}
-
-/// Identity of one independently live checkout. Slot and generation are private
-/// and can be issued only by `ResidentCheckoutPool`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct OwnerInstanceKey {
-    resident: ResidentKey,
-    slot: u16,
-    generation: u64,
-}
-
-/// A bounded checkout issuer. It enforces `slot < max_instances` and owns
-/// generation allocation; callers cannot forge either value. The contract
-/// identity is retained so a binding from a different descriptor component or
-/// session envelope cannot enter this pool.
-#[derive(Debug)]
-pub(crate) struct ResidentCheckoutPool {
-    max_instances: u16,
-    contract: Option<(
-        &'static str,
-        &'static str,
-        &'static str,
-        crate::arch::runtime_footprint::ResidentPlacementVariant,
-        ResidentSessionEnvelope,
-        Option<SessionFootprintSpec>,
-    )>,
-    next_generation: u64,
-    occupied: BTreeMap<u16, u64>,
-}
-
-impl ResidentCheckoutPool {
-    pub(crate) fn from_verified_component(
-        component: &VerifiedResidentComponent<'_>,
-    ) -> Result<Self, ResidentKeyError> {
-        let checkout = component.spec().checkout();
-        let mut pool = Self::from_checkout(checkout)?;
-        pool.contract = Some((
-            component.architecture(),
-            component.spec().component(),
-            component.spec().variant(),
-            component.resolved_variant().placement(),
-            component.session(),
-            component.component_session(),
-        ));
-        Ok(pool)
-    }
-
-    fn from_checkout(checkout: ResidentCheckout) -> Result<Self, ResidentKeyError> {
-        let max_instances = checkout.max_instances();
-        if max_instances == 0 {
-            return Err(ResidentKeyError::CheckoutExhausted);
-        }
-        Ok(Self {
-            max_instances,
-            contract: None,
-            next_generation: 0,
-            occupied: BTreeMap::new(),
-        })
-    }
-
-    pub(crate) fn checkout(
-        &mut self,
-        binding: ResidentBinding,
-    ) -> Result<OwnerInstanceKey, ResidentKeyError> {
-        let resident = binding.key();
-        if let Some((
-            architecture,
-            component,
-            variant,
-            placement_variant,
-            session,
-            component_session,
-        )) = self.contract
-            && (
-                resident.architecture,
-                resident.component,
-                resident.variant,
-                resident.placement_variant,
-                resident.session,
-                resident.component_session,
-            ) != (
-                architecture,
-                component,
-                variant,
-                placement_variant,
-                session,
-                component_session,
-            )
-        {
-            return Err(ResidentKeyError::ContractMismatch);
-        }
-        resident.validate_partition_lane()?;
-        let slot = (0..self.max_instances)
-            .find(|slot| !self.occupied.contains_key(slot))
-            .ok_or(ResidentKeyError::CheckoutExhausted)?;
-        let generation = self
-            .next_generation
-            .checked_add(1)
-            .ok_or(ResidentKeyError::GenerationExhausted)?;
-        self.next_generation = generation;
-        self.occupied.insert(slot, generation);
-        Ok(OwnerInstanceKey {
-            resident: resident.clone(),
-            slot,
-            generation,
-        })
-    }
-
-    pub(crate) fn release(&mut self, owner: &OwnerInstanceKey) -> bool {
-        if self.occupied.get(&owner.slot) == Some(&owner.generation) {
-            self.occupied.remove(&owner.slot).is_some()
-        } else {
-            false
-        }
-    }
-
-    #[cfg(test)]
-    fn for_test(checkout: ResidentCheckout) -> Self {
-        Self::from_checkout(checkout).expect("test checkout policy")
     }
 }
 
@@ -438,38 +314,6 @@ mod tests {
             invalid_host.validate_partition_lane(),
             Err(ResidentKeyError::HostForbidsLane)
         );
-    }
-
-    #[test]
-    fn checkout_pool_owns_slots_and_generations() {
-        let scope = test_scope_id();
-        let resident = ResidentKey::test_key(ResidentPartition::HostNeutral, None, scope);
-        let mut pool = ResidentCheckoutPool::for_test(ResidentCheckout::bounded(2));
-        let first = pool
-            .checkout(ResidentBinding::HostImportedBinding {
-                key: resident.clone(),
-            })
-            .expect("first slot");
-        let second = pool
-            .checkout(ResidentBinding::HostImportedBinding {
-                key: resident.clone(),
-            })
-            .expect("second slot");
-        assert!(first.slot < 2 && second.slot < 2);
-        assert_ne!(first, second);
-        assert_eq!(
-            pool.checkout(ResidentBinding::HostImportedBinding {
-                key: resident.clone()
-            }),
-            Err(ResidentKeyError::CheckoutExhausted)
-        );
-        assert!(pool.release(&first));
-        let third = pool
-            .checkout(ResidentBinding::HostImportedBinding { key: resident })
-            .expect("reused slot");
-        assert!(third.slot < 2);
-        assert!(third.generation > second.generation);
-        assert!(!pool.release(&first));
     }
 
     #[test]

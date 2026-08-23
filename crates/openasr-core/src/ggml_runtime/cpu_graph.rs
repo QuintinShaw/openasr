@@ -2169,12 +2169,10 @@ pub(crate) struct LoadedWeightOwnerCache {
 }
 
 thread_local! {
-    /// CompatibilitySeam: Weak payload slots for NES-scoped loaded-weight
-    /// owners. Not an independent authority -- insert/get happen only through
-    /// [`LoadedWeightOwnerCache`]. ggml contexts remain `!Send`, so this knife
-    /// cannot move them into the process-wide admitted-host or pinned-actor
-    /// maps without relocating every family graph constructor onto a second
-    /// actor thread.
+    /// Weak payload storage behind the NES-scoped [`LoadedWeightOwnerCache`]
+    /// interface. This is not an owner/publication authority: keys include the
+    /// service scope, values cannot extend native lifetime, and all access is
+    /// mediated by the cache handle carried in `NativeExecutionContext`.
     static LOADED_WEIGHT_OWNER_SLOTS: RefCell<
         HashMap<LoadedWeightOwnerSlot, Weak<GgmlLoadedWeightContextInner>>,
     > = RefCell::new(HashMap::new());
@@ -8753,6 +8751,7 @@ struct GgmlBackendGuard {
 struct GgmlCachedBackendGuard {
     raw: NonNull<c_void>,
     private_memory_leases: Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>>,
+    _receipt_owner: Option<crate::models::runtime_receipts::RuntimeOwnerGuard>,
 }
 
 struct GgmlBackendSchedulerGuard {
@@ -8832,11 +8831,10 @@ impl GgmlSchedulerMemoryOwner {
 /// so they are cached per-thread per resolved route and handed out with
 /// `free_on_drop=false` (the cached entry owns the single instance).
 ///
-/// CompatibilitySeam: this table cannot move to the NES loaded-weight owner
-/// cache in this knife. Backend handles are created before a pack content id
-/// exists, are shared by graphs that never load weights, and are poisoned or
-/// leaked on device-lost. Weight owners consume a resolved backend; they do
-/// not own its lifetime.
+/// The table is a thread-affine implementation detail, not a process-global
+/// owner: every cached key includes the current NES scope and exact route, and
+/// an unscoped low-level caller receives an ordinary drop-owned backend rather
+/// than publishing into this cache.
 ///
 /// Invariant: a cache entry's [`CachedBackendKey`] is always the route of the
 /// device that was actually initialized. Preferred/Auto may Optimus-fall
@@ -8844,11 +8842,27 @@ impl GgmlSchedulerMemoryOwner {
 /// device's own key -- never under a preferred route key while holding a
 /// different card. Exact never falls through.
 #[derive(Clone, PartialEq, Eq, Hash)]
-enum CachedBackendKey {
+enum CachedBackendDeviceKey {
     /// System-default Metal device (not exactly addressable).
     Metal,
     /// Discrete / Vulkan / CUDA / HIP device keyed by resolved route identity.
     Route(ExecutionRouteCacheKey),
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CachedBackendKey {
+    scope_id: crate::models::native_execution_services::NativeExecutionScopeId,
+    device: CachedBackendDeviceKey,
+}
+
+impl CachedBackendKey {
+    fn for_current_scope(device: CachedBackendDeviceKey) -> Option<Self> {
+        Some(Self {
+            scope_id: crate::models::native_execution_services::current_native_execution_scope_id(
+            )?,
+            device,
+        })
+    }
 }
 
 thread_local! {
@@ -9143,7 +9157,7 @@ impl GgmlBackendGuard {
     }
 
     fn metal() -> Result<Self, GgmlCpuGraphError> {
-        Self::cached_backend(CachedBackendKey::Metal, Self::init_metal_backend)
+        Self::cached_backend(CachedBackendDeviceKey::Metal, Self::init_metal_backend)
     }
 
     fn gpu() -> Result<Self, GgmlCpuGraphError> {
@@ -9159,9 +9173,10 @@ impl GgmlBackendGuard {
                 }
                 // Exact: pin one device, fail closed on miss/init failure, key
                 // is exactly that route (no fallthrough, no key drift).
-                Self::cached_backend(CachedBackendKey::Route(route.cache_key()), move || {
-                    Self::init_exact_gpu_backend(&route)
-                })
+                Self::cached_backend(
+                    CachedBackendDeviceKey::Route(route.cache_key()),
+                    move || Self::init_exact_gpu_backend(&route),
+                )
             }
             Some(RequestBackendPreference::Accelerated) | None => {
                 // Preferred/Auto GPU lane: ranked Optimus fallthrough with
@@ -9184,10 +9199,13 @@ impl GgmlBackendGuard {
     /// compute-scoped cancellation API carries the current job's flag on the
     /// call stack, so reuse cannot inherit another job's cancellation.
     fn cached_backend(
-        key: CachedBackendKey,
+        device_key: CachedBackendDeviceKey,
         init: impl FnOnce() -> Result<NonNull<c_void>, GgmlCpuGraphError>,
     ) -> Result<Self, GgmlCpuGraphError> {
-        if let Some((raw, private_memory_leases)) = Self::cached_backend_lookup(&key) {
+        let key = CachedBackendKey::for_current_scope(device_key.clone());
+        if let Some(key) = key.as_ref()
+            && let Some((raw, private_memory_leases)) = Self::cached_backend_lookup(key)
+        {
             return Ok(Self {
                 raw,
                 free_on_drop: false,
@@ -9195,6 +9213,13 @@ impl GgmlBackendGuard {
             });
         }
         let raw = init()?;
+        let Some(key) = key else {
+            return Ok(Self {
+                raw,
+                free_on_drop: true,
+                private_memory_leases: Rc::new(RefCell::new(Vec::new())),
+            });
+        };
         let private_memory_leases = Self::cached_backend_insert(key, raw);
         Ok(Self {
             raw,
@@ -9230,12 +9255,33 @@ impl GgmlBackendGuard {
         raw: NonNull<c_void>,
     ) -> Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>> {
         let private_memory_leases = Rc::new(RefCell::new(Vec::new()));
+        let backend = match &key.device {
+            CachedBackendDeviceKey::Metal => GgmlCpuGraphBackend::Metal,
+            CachedBackendDeviceKey::Route(_) => GgmlCpuGraphBackend::Gpu,
+        };
+        let receipt_owner = crate::models::native_execution_services::current_runtime_receipts()
+            .and_then(|collector| {
+                let lane =
+                    crate::models::native_execution_services::current_execution_lane_key(backend)
+                        .receipt_projection(&collector)?;
+                let descriptor = collector.owner_descriptor(
+                    "ggml-backend-cache",
+                    None,
+                    Some("thread-affine-backend"),
+                    Some(lane),
+                )?;
+                Some(collector.start_owner(
+                    descriptor,
+                    crate::models::native_execution_services::current_execution_cache_attempt_id(),
+                ))
+            });
         THREAD_BACKEND_CACHE_BY_KIND.with(|cache| {
             cache.borrow_mut().insert(
                 key,
                 GgmlCachedBackendGuard {
                     raw,
                     private_memory_leases: Rc::clone(&private_memory_leases),
+                    _receipt_owner: receipt_owner,
                 },
             )
         });
@@ -9264,8 +9310,12 @@ impl GgmlBackendGuard {
         let mut last_init_error: Option<GgmlCpuGraphError> = None;
         for candidate in ranked {
             let route = candidate.to_resolved_route();
-            let key = CachedBackendKey::Route(route.cache_key());
-            if let Some((raw, private_memory_leases)) = Self::cached_backend_lookup(&key) {
+            let key = CachedBackendKey::for_current_scope(CachedBackendDeviceKey::Route(
+                route.cache_key(),
+            ));
+            if let Some(key) = key.as_ref()
+                && let Some((raw, private_memory_leases)) = Self::cached_backend_lookup(key)
+            {
                 return Ok(Self {
                     raw,
                     free_on_drop: false,
@@ -9274,6 +9324,13 @@ impl GgmlBackendGuard {
             }
             match Self::init_route_gpu_device(&devices, &route) {
                 Ok(raw) => {
+                    let Some(key) = key else {
+                        return Ok(Self {
+                            raw,
+                            free_on_drop: true,
+                            private_memory_leases: Rc::new(RefCell::new(Vec::new())),
+                        });
+                    };
                     let private_memory_leases = Self::cached_backend_insert(key, raw);
                     return Ok(Self {
                         raw,
@@ -11336,10 +11393,13 @@ mod tests {
     fn sticky_backend_poison_evicts_cached_entry_and_blocks_future_lookup() {
         let sentinel = std::ptr::NonNull::new(0x10 as *mut std::ffi::c_void)
             .expect("non-null sentinel address");
-        super::GgmlBackendGuard::cached_backend_insert(super::CachedBackendKey::Metal, sentinel);
+        let key = super::CachedBackendKey {
+            scope_id: crate::models::native_execution_services::NativeExecutionScopeId::next(),
+            device: super::CachedBackendDeviceKey::Metal,
+        };
+        super::GgmlBackendGuard::cached_backend_insert(key.clone(), sentinel);
         assert!(
-            super::GgmlBackendGuard::cached_backend_lookup(&super::CachedBackendKey::Metal)
-                .is_some(),
+            super::GgmlBackendGuard::cached_backend_lookup(&key).is_some(),
             "precondition: cache must contain the seeded entry before poisoning"
         );
 
@@ -11347,10 +11407,40 @@ mod tests {
 
         assert!(super::is_backend_poisoned(sentinel));
         assert!(
-            super::GgmlBackendGuard::cached_backend_lookup(&super::CachedBackendKey::Metal)
-                .is_none(),
+            super::GgmlBackendGuard::cached_backend_lookup(&key).is_none(),
             "a poisoned address must never be handed out again"
         );
+    }
+
+    #[test]
+    fn backend_cache_key_requires_and_separates_nes_scopes() {
+        assert!(
+            super::CachedBackendKey::for_current_scope(super::CachedBackendDeviceKey::Metal)
+                .is_none(),
+            "unscoped low-level callers must not publish into the TLS backend cache"
+        );
+        let first =
+            crate::models::native_execution_services::NativeExecutionServices::for_local_process()
+                .unwrap();
+        let second =
+            crate::models::native_execution_services::NativeExecutionServices::for_local_process()
+                .unwrap();
+        let first_key = {
+            let _scope =
+                crate::models::native_execution_services::install_native_execution_services(&first);
+            super::CachedBackendKey::for_current_scope(super::CachedBackendDeviceKey::Metal)
+                .unwrap()
+        };
+        let second_key = {
+            let _scope =
+                crate::models::native_execution_services::install_native_execution_services(
+                    &second,
+                );
+            super::CachedBackendKey::for_current_scope(super::CachedBackendDeviceKey::Metal)
+                .unwrap()
+        };
+        assert_ne!(first_key.scope_id, second_key.scope_id);
+        assert!(first_key != second_key);
     }
 
     #[test]

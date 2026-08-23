@@ -104,7 +104,6 @@ enum ResidentSurface {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResidentSiteStatus {
     Active,
-    CompatibilitySeam,
 }
 
 const RESIDENT_CONSTRUCTION_PUBLICATION_INVENTORY: &[(
@@ -156,12 +155,6 @@ const RESIDENT_CONSTRUCTION_PUBLICATION_INVENTORY: &[(
         ResidentSiteStatus::Active,
     ),
     (
-        ResidentSurface::Models,
-        "models/resident_owner.rs",
-        "ResidentCheckoutPool",
-        ResidentSiteStatus::CompatibilitySeam,
-    ),
-    (
         ResidentSurface::GgmlRuntime,
         "ggml_runtime/backend_memory.rs",
         "BackendMemoryAbi",
@@ -189,13 +182,13 @@ const RESIDENT_CONSTRUCTION_PUBLICATION_INVENTORY: &[(
         ResidentSurface::GgmlRuntime,
         "ggml_runtime/cpu_graph.rs",
         "LOADED_WEIGHT_OWNER_SLOTS",
-        ResidentSiteStatus::CompatibilitySeam,
+        ResidentSiteStatus::Active,
     ),
     (
         ResidentSurface::GgmlRuntime,
         "ggml_runtime/cpu_graph.rs",
         "THREAD_BACKEND_CACHE_BY_KIND",
-        ResidentSiteStatus::CompatibilitySeam,
+        ResidentSiteStatus::Active,
     ),
     (
         ResidentSurface::GgmlRuntime,
@@ -946,16 +939,29 @@ fn k5_machine_discovery_matches_resident_construction_inventory_both_directions(
 }
 
 #[test]
-fn compatibility_seams_are_explicitly_inventoried() {
-    let seams: BTreeSet<_> = RESIDENT_CONSTRUCTION_PUBLICATION_INVENTORY
-        .iter()
-        .filter_map(|(_, path, symbol, status)| {
-            (*status == ResidentSiteStatus::CompatibilitySeam).then_some((*path, *symbol))
-        })
-        .collect();
-    assert!(seams.contains(&("ggml_runtime/cpu_graph.rs", "LOADED_WEIGHT_OWNER_SLOTS")));
-    assert!(seams.contains(&("ggml_runtime/cpu_graph.rs", "THREAD_BACKEND_CACHE_BY_KIND")));
-    assert!(seams.contains(&("models/resident_owner.rs", "ResidentCheckoutPool")));
+fn no_resident_owner_compatibility_seams_remain() {
+    assert!(
+        RESIDENT_CONSTRUCTION_PUBLICATION_INVENTORY
+            .iter()
+            .all(|(_, _, _, status)| *status == ResidentSiteStatus::Active)
+    );
+}
+
+#[test]
+fn thread_affine_backend_cache_is_scoped_and_receipted() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ggml_runtime/cpu_graph.rs");
+    let source = std::fs::read_to_string(path).expect("read cpu graph source");
+    assert!(source.contains("struct CachedBackendKey"));
+    assert!(
+        source
+            .contains("scope_id: crate::models::native_execution_services::NativeExecutionScopeId")
+    );
+    assert!(source.contains("current_native_execution_scope_id"));
+    assert!(
+        source
+            .contains("_receipt_owner: Option<crate::models::runtime_receipts::RuntimeOwnerGuard>")
+    );
+    assert!(source.contains("free_on_drop: true"));
 }
 
 #[test]

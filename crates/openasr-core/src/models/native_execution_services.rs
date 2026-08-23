@@ -1097,9 +1097,7 @@ pub(crate) fn install_activation_reservation_context(
 pub(crate) fn current_execution_lane_key(backend: GgmlCpuGraphBackend) -> ExecutionLaneKey {
     if let Some(lane) = current_execution_lane() {
         let placement = match (lane.placement(), backend) {
-            (ExecutionPlacement::Hybrid, GgmlCpuGraphBackend::Cpu) => {
-                ExecutionPlacement::CpuOnly
-            }
+            (ExecutionPlacement::Hybrid, GgmlCpuGraphBackend::Cpu) => ExecutionPlacement::CpuOnly,
             (ExecutionPlacement::Hybrid, GgmlCpuGraphBackend::Metal | GgmlCpuGraphBackend::Gpu) => {
                 ExecutionPlacement::FullDevice
             }
@@ -1580,12 +1578,6 @@ pub(crate) fn install_candidate_activation_pack(
     pack: VerifiedPack,
 ) -> CandidateActivationQuoteGuard {
     install_candidate_activation_quote(CandidateActivationQuoteSource::Pack(pack))
-}
-
-pub(crate) fn install_candidate_activation_declared_resident(
-    quote: SystemMemoryAllocationQuote,
-) -> CandidateActivationQuoteGuard {
-    install_candidate_activation_quote(CandidateActivationQuoteSource::Declared(quote))
 }
 
 pub(crate) fn current_candidate_activation_quote() -> Option<CandidateActivationQuoteSource> {
@@ -2565,7 +2557,9 @@ mod tests {
         operation: impl FnOnce() -> Result<T, E>,
     ) -> ExecutionCandidateAttemptOutcome<T, E> {
         let _guard = current_candidate_activation_quote().is_none().then(|| {
-            install_candidate_activation_declared_resident(nes_unit_test_declared_resident())
+            install_candidate_activation_quote(CandidateActivationQuoteSource::Declared(
+                nes_unit_test_declared_resident(),
+            ))
         });
         super::run_execution_candidate_attempt(services, candidate, operation)
     }
@@ -3544,7 +3538,9 @@ mod tests {
             );
             peak
         };
-        let _quote = install_candidate_activation_declared_resident(declared.clone());
+        let _quote = install_candidate_activation_quote(CandidateActivationQuoteSource::Declared(
+            declared.clone(),
+        ));
         let broker = Arc::clone(services.memory_broker());
         let before = broker.usage(&MemoryDomainKey::SystemMemory);
         let outcome = super::run_execution_candidate_attempt(services.as_ref(), &candidate, || {
@@ -3602,7 +3598,8 @@ mod tests {
                 .sum::<u64>()
         };
         assert_ne!(punc_quoted, vad_quoted);
-        let _quote = install_candidate_activation_declared_resident(punc);
+        let _quote =
+            install_candidate_activation_quote(CandidateActivationQuoteSource::Declared(punc));
         let broker = Arc::clone(services.memory_broker());
         let before = broker.usage(&MemoryDomainKey::SystemMemory);
         let outcome = super::run_execution_candidate_attempt(services.as_ref(), &candidate, || {

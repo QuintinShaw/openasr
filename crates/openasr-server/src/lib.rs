@@ -2401,6 +2401,7 @@ fn invalidate_cached_native_realtime_capabilities() {
 #[serde(rename_all = "kebab-case")]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export_to = "generated/http-wire/"))]
+#[allow(dead_code)] // rolled-back/fallback are transaction outcomes, not steady-state GET values
 pub(crate) enum DefaultModelActivationState {
     Committed,
     RolledBack,
