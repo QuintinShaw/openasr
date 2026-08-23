@@ -306,6 +306,7 @@ fn run_dispatch_once_with_progress(
     execution_services: &Arc<NativeExecutionServices>,
     verified_pack: &VerifiedPack,
     selected_family: &GgmlFamilyAdapterDescriptor,
+    candidate: &ExecutionCandidate,
     chunk: PcmSlice,
     request_options: GgmlAsrExecutionOptions,
     backend_preference: GgmlAsrBackendPreference,
@@ -330,6 +331,7 @@ fn run_dispatch_once_with_progress(
         execution_services,
         verified_pack,
         selected_family,
+        candidate,
         chunk,
         request_options,
         backend_preference,
@@ -390,6 +392,7 @@ fn run_dispatch_once_with_progress_and_policy(
                     execution_services,
                     verified_pack,
                     selected_family,
+                    candidate,
                     chunk.clone(),
                     request_options.clone(),
                     backend_preference,
@@ -4134,10 +4137,8 @@ fn capture_request_execution_facts(
     verified_pack: &VerifiedPack,
     selected_family: &GgmlFamilyAdapterDescriptor,
     resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput,
+    execution_lane: crate::models::native_execution_services::ExecutionLaneKey,
 ) -> Result<crate::models::native_execution_services::ExecutionLaneKey, BackendError> {
-    let execution_lane = crate::models::native_execution_services::current_execution_lane_key(
-        resolved_runtime.backend(),
-    );
     let Some(receipt) =
         crate::models::native_execution_services::current_execution_receipt_collector()
     else {
@@ -4168,6 +4169,7 @@ fn run_dispatch_once(
     execution_services: &Arc<NativeExecutionServices>,
     verified_pack: &VerifiedPack,
     selected_family: &GgmlFamilyAdapterDescriptor,
+    candidate: &ExecutionCandidate,
     samples: PcmSlice,
     request_options: GgmlAsrExecutionOptions,
     backend_preference: GgmlAsrBackendPreference,
@@ -4182,7 +4184,19 @@ fn run_dispatch_once(
         selected_family,
     );
     let execution_lane =
-        capture_request_execution_facts(verified_pack, selected_family, resolved_runtime)?;
+        crate::models::native_execution_services::ExecutionLaneKey::from_candidate(
+            candidate,
+            resolved_runtime.backend(),
+        )
+        .map_err(|reason| BackendError::NativeFailClosed {
+            reason: reason.to_string(),
+        })?;
+    let execution_lane = capture_request_execution_facts(
+        verified_pack,
+        selected_family,
+        resolved_runtime,
+        execution_lane,
+    )?;
     let request_execution_context = Arc::new(
         (**execution_context)
             .clone()

@@ -620,6 +620,14 @@ impl NativeStreamingSessionCandidateBuilder for NativeStreamingSessionCandidateF
                     self.auto_gpu_policy,
                     &self.selected_family,
                 );
+                let execution_lane =
+                    crate::models::native_execution_services::ExecutionLaneKey::from_candidate(
+                        candidate,
+                        resolved_runtime.backend(),
+                    )
+                    .map_err(|reason| NativeAsrError::SessionFailed {
+                        message: reason.to_string(),
+                    })?;
                 let planning_input = crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput::for_streaming_session(
                     self.verified_pack.preflight(),
                     &self.request_options,
@@ -644,11 +652,7 @@ impl NativeStreamingSessionCandidateBuilder for NativeStreamingSessionCandidateF
                     configured_diarize: self.configured_diarize,
                     backend_preference: coarse_backend_preference_for_candidate(candidate),
                     resolved_runtime,
-                    execution_lane: Some(
-                        crate::models::native_execution_services::current_execution_lane_key(
-                            resolved_runtime.backend(),
-                        ),
-                    ),
+                    execution_lane: Some(execution_lane),
                     final_text_processor: self
                         .streaming_punctuator
                         .as_ref()

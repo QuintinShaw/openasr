@@ -412,6 +412,39 @@ impl ExecutionLaneKey {
         }
     }
 
+    /// Construct an exact resident-owner lane from the immutable policy candidate.
+    /// Backend/provider and placement mismatches fail closed; no ambient request
+    /// override or device discovery is consulted.
+    pub(crate) fn from_candidate(
+        candidate: &ExecutionCandidate,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, &'static str> {
+        let provider = candidate.device.route.provider;
+        let backend_matches = match backend {
+            GgmlCpuGraphBackend::Cpu => provider == ExecutionProvider::Cpu,
+            GgmlCpuGraphBackend::Metal => provider == ExecutionProvider::Metal,
+            GgmlCpuGraphBackend::Gpu => matches!(
+                provider,
+                ExecutionProvider::Cuda | ExecutionProvider::Hip | ExecutionProvider::Vulkan
+            ),
+        };
+        let placement_matches = match candidate.placement {
+            ExecutionPlacement::CpuOnly => provider == ExecutionProvider::Cpu,
+            ExecutionPlacement::FullDevice | ExecutionPlacement::Hybrid => {
+                provider != ExecutionProvider::Cpu
+            }
+        };
+        if !backend_matches || !placement_matches {
+            return Err("execution candidate lane is incompatible with resolved backend/placement");
+        }
+        Ok(Self {
+            device: ResolvedDeviceKey {
+                route: candidate.device.route.cache_key(),
+            },
+            placement: candidate.placement,
+            backend,
+        })
+    }
     /// Test/internal fallback for callers outside a request candidate. Native
     /// production dispatch attaches an exact lane to its request context.
     pub(crate) fn unscoped_for_backend(backend: GgmlCpuGraphBackend) -> Self {
@@ -1602,6 +1635,38 @@ mod tests {
             },
             placement,
         }
+    }
+
+    #[test]
+    fn candidate_lane_ignores_ambient_override_and_rejects_backend_drift() {
+        let candidate = gpu_candidate(
+            ExecutionProvider::Cuda,
+            "CUDA0",
+            "0000:00:02.0",
+            ExecutionPlacement::FullDevice,
+        );
+        let ambient = gpu_candidate(
+            ExecutionProvider::Vulkan,
+            "Vulkan0",
+            "0000:00:03.0",
+            ExecutionPlacement::Hybrid,
+        );
+        let _backend_guard = install_request_backend_override(Some(
+            RequestBackendPreference::Exact(ambient.device.route.clone()),
+        ));
+
+        let lane = ExecutionLaneKey::from_candidate(&candidate, GgmlCpuGraphBackend::Gpu)
+            .expect("candidate route must construct the lane");
+        let context = crate::RequestExecutionContext::uncancellable("candidate lane test")
+            .with_native_execution_lane(lane.clone());
+        assert_eq!(lane.provider(), ExecutionProvider::Cuda);
+        assert_eq!(lane.stable_device_id(), "CUDA0");
+        assert_eq!(lane.placement(), ExecutionPlacement::FullDevice);
+        assert_eq!(context.native_execution_lane(), Some(&lane));
+        assert!(
+            ExecutionLaneKey::from_candidate(&candidate, GgmlCpuGraphBackend::Metal).is_err(),
+            "a CUDA candidate must not be relabeled as Metal"
+        );
     }
 
     fn record_test_graph_placements(backends: &[&str]) {
