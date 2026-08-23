@@ -159,6 +159,22 @@ pub struct SafeExecutionLaneProjection {
     pub device: RedactedIdentity,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "lane", rename_all = "kebab-case")]
+pub enum RuntimeOwnerPlacement {
+    HostNeutral,
+    LaneBound(SafeExecutionLaneProjection),
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "domain", rename_all = "kebab-case")]
+pub enum RuntimeResourceLedgerBinding {
+    Brokered(SafeMemoryDomainProjection),
+    NoBrokerLease,
+    Unknown,
+}
+
 /// Stable owner identity within one service root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct RuntimeOwnerId {
@@ -180,7 +196,7 @@ pub struct RuntimeOwnerDescriptor {
     pub component: RedactedIdentity,
     pub content: Option<RedactedIdentity>,
     pub source: Option<RedactedIdentity>,
-    pub lane: Option<SafeExecutionLaneProjection>,
+    pub placement: RuntimeOwnerPlacement,
 }
 
 /// Safe resource metadata. Domain and confidence use the existing admission
@@ -190,6 +206,7 @@ pub struct RuntimeOwnerDescriptor {
 pub struct RuntimeResourceDescriptor {
     pub kind: RedactedIdentity,
     pub domain: Option<SafeMemoryDomainProjection>,
+    pub ledger_binding: RuntimeResourceLedgerBinding,
     pub requested: RuntimeReceiptMetric,
     pub peak: RuntimeReceiptMetric,
     pub retained: RuntimeReceiptMetric,
@@ -248,6 +265,10 @@ pub struct LiveRuntimeOwner {
 pub struct ReceiptCompleteness {
     pub complete: bool,
     pub reason: Option<ReceiptCompletenessReason>,
+    pub live_state_complete: bool,
+    pub live_state_reason: Option<ReceiptCompletenessReason>,
+    pub event_history_complete: bool,
+    pub event_history_reason: Option<ReceiptCompletenessReason>,
     pub dropped_events: u64,
     pub dropped_owners: u64,
     pub rejected_resources: u64,
@@ -286,8 +307,10 @@ struct RuntimeReceiptState {
     dropped_owners: u64,
     rejected_resources: u64,
     dropped_notifications: u64,
-    complete: bool,
-    completeness_reason: Option<ReceiptCompletenessReason>,
+    live_state_complete: bool,
+    live_state_reason: Option<ReceiptCompletenessReason>,
+    event_history_complete: bool,
+    event_history_reason: Option<ReceiptCompletenessReason>,
 }
 
 /// Bounded collector owned by one [`NativeExecutionServices`] root.
@@ -371,7 +394,7 @@ impl RuntimeReceiptCollector {
                 reason: RuntimeReceiptUnavailableReason::EntropyUnavailable,
             },
         };
-        let completeness_reason =
+        let live_state_reason =
             (!availability.is_available()).then_some(ReceiptCompletenessReason::Unavailable(
                 RuntimeReceiptUnavailableReason::EntropyUnavailable,
             ));
@@ -390,8 +413,10 @@ impl RuntimeReceiptCollector {
                 dropped_owners: 0,
                 rejected_resources: 0,
                 dropped_notifications: 0,
-                complete: availability.is_available(),
-                completeness_reason,
+                live_state_complete: availability.is_available(),
+                live_state_reason,
+                event_history_complete: true,
+                event_history_reason: None,
             })),
         })
     }
@@ -431,7 +456,24 @@ impl RuntimeReceiptCollector {
             component: self.digest(b"component", component)?,
             content: content.and_then(|value| self.digest(b"content", value)),
             source: source.and_then(|value| self.digest(b"source", value)),
-            lane,
+            placement: lane.map_or(
+                RuntimeOwnerPlacement::Unknown,
+                RuntimeOwnerPlacement::LaneBound,
+            ),
+        })
+    }
+
+    pub(crate) fn host_neutral_owner_descriptor(
+        &self,
+        component: &str,
+        content: Option<&str>,
+        source: Option<&str>,
+    ) -> Option<RuntimeOwnerDescriptor> {
+        Some(RuntimeOwnerDescriptor {
+            component: self.digest(b"component", component)?,
+            content: content.and_then(|value| self.digest(b"content", value)),
+            source: source.and_then(|value| self.digest(b"source", value)),
+            placement: RuntimeOwnerPlacement::HostNeutral,
         })
     }
 
@@ -445,9 +487,11 @@ impl RuntimeReceiptCollector {
         quote_confidence: QuoteConfidence,
         observation_confidence: Option<MemoryObservationConfidence>,
     ) -> Option<RuntimeResourceDescriptor> {
+        let domain = self.domain_projection(domain)?;
         Some(RuntimeResourceDescriptor {
             kind: self.digest(b"resource-kind", kind)?,
-            domain: Some(self.domain_projection(domain)?),
+            domain: Some(domain),
+            ledger_binding: RuntimeResourceLedgerBinding::Brokered(domain),
             requested: RuntimeReceiptMetric::Known(requested_bytes),
             peak: RuntimeReceiptMetric::Known(peak_bytes),
             retained: RuntimeReceiptMetric::Known(retained_bytes),
@@ -474,6 +518,7 @@ impl RuntimeReceiptCollector {
         Some(RuntimeResourceDescriptor {
             kind: self.digest(b"resource-kind", kind)?,
             domain: None,
+            ledger_binding: RuntimeResourceLedgerBinding::Unknown,
             requested: RuntimeReceiptMetric::Unknown,
             peak: RuntimeReceiptMetric::Unknown,
             retained: RuntimeReceiptMetric::Unknown,
@@ -517,9 +562,39 @@ impl RuntimeReceiptCollector {
     }
 
     fn mark_incomplete(state: &mut RuntimeReceiptState, reason: ReceiptCompletenessReason) {
-        state.complete = false;
-        if state.completeness_reason.is_none() {
-            state.completeness_reason = Some(reason);
+        match reason {
+            ReceiptCompletenessReason::EventCapacityExceeded
+            | ReceiptCompletenessReason::NotificationCapacityExceeded => {
+                state.event_history_complete = false;
+                if state.event_history_reason.is_none() {
+                    state.event_history_reason = Some(reason);
+                }
+            }
+            ReceiptCompletenessReason::Unavailable(_)
+            | ReceiptCompletenessReason::IdentityExhausted
+            | ReceiptCompletenessReason::OwnerCapacityExceeded
+            | ReceiptCompletenessReason::ResourceCapacityExceeded
+            | ReceiptCompletenessReason::InvalidLifecycle => {
+                state.live_state_complete = false;
+                if state.live_state_reason.is_none() {
+                    state.live_state_reason = Some(reason);
+                }
+            }
+        }
+    }
+
+    fn completeness_for_state(state: &RuntimeReceiptState) -> ReceiptCompleteness {
+        ReceiptCompleteness {
+            complete: state.live_state_complete && state.event_history_complete,
+            reason: state.live_state_reason.or(state.event_history_reason),
+            live_state_complete: state.live_state_complete,
+            live_state_reason: state.live_state_reason,
+            event_history_complete: state.event_history_complete,
+            event_history_reason: state.event_history_reason,
+            dropped_events: state.dropped_events,
+            dropped_owners: state.dropped_owners,
+            rejected_resources: state.rejected_resources,
+            dropped_notifications: state.dropped_notifications,
         }
     }
 
@@ -822,14 +897,7 @@ impl RuntimeReceiptCollector {
             live_owners: state.live_owners.values().cloned().collect(),
             events: state.events.iter().cloned().collect(),
             event_capacity: self.event_capacity,
-            completeness: ReceiptCompleteness {
-                complete: state.complete,
-                reason: state.completeness_reason,
-                dropped_events: state.dropped_events,
-                dropped_owners: state.dropped_owners,
-                rejected_resources: state.rejected_resources,
-                dropped_notifications: state.dropped_notifications,
-            },
+            completeness: Self::completeness_for_state(&state),
         }
     }
 
@@ -847,38 +915,41 @@ impl RuntimeReceiptCollector {
                 .sum(),
             event_count: state.events.len(),
             event_capacity: self.event_capacity,
-            completeness: ReceiptCompleteness {
-                complete: state.complete,
-                reason: state.completeness_reason,
-                dropped_events: state.dropped_events,
-                dropped_owners: state.dropped_owners,
-                rejected_resources: state.rejected_resources,
-                dropped_notifications: state.dropped_notifications,
-            },
+            completeness: Self::completeness_for_state(&state),
         }
     }
 
-    /// Receipt-only comparison against the process-wide broker ledger.
+    /// Live-owner comparison against the process-wide broker ledger.
     ///
     /// This never mutates admission. Incomplete or unavailable receipts cannot
-    /// prove coverage and return [`LeaseReceiptShadow::Incomparable`].
-    #[allow(dead_code)]
-    pub(crate) fn shadow_compare_leases(
-        &self,
-        broker: &DeviceMemoryBrokerSet,
-    ) -> LeaseReceiptShadow {
+    /// prove coverage and return [`LeaseReceiptShadow::Incomparable`]. Event
+    /// ring truncation does not invalidate the live owner table.
+    pub fn reconcile_live_leases(&self, broker: &DeviceMemoryBrokerSet) -> LeaseReceiptShadow {
+        let before = self.snapshot();
+        let ledger_before = broker.ledger_snapshot_for_scope(self.scope_id);
         let snapshot = self.snapshot();
+        let ledger = broker.ledger_snapshot_for_scope(self.scope_id);
+        if before.availability != snapshot.availability
+            || before.live_owners != snapshot.live_owners
+            || before.completeness.live_state_complete != snapshot.completeness.live_state_complete
+            || before.completeness.live_state_reason != snapshot.completeness.live_state_reason
+            || ledger_before != ledger
+        {
+            return LeaseReceiptShadow::Incomparable {
+                reason: LeaseReceiptShadowIncomparable::SnapshotChanged,
+            };
+        }
         if !matches!(snapshot.availability, RuntimeReceiptAvailability::Available) {
             return LeaseReceiptShadow::Incomparable {
                 reason: LeaseReceiptShadowIncomparable::ReceiptsUnavailable,
             };
         }
-        if !snapshot.completeness.complete {
+        if !snapshot.completeness.live_state_complete {
             return LeaseReceiptShadow::Incomparable {
                 reason: LeaseReceiptShadowIncomparable::ReceiptsIncomplete(
                     snapshot
                         .completeness
-                        .reason
+                        .live_state_reason
                         .unwrap_or(ReceiptCompletenessReason::InvalidLifecycle),
                 ),
             };
@@ -886,10 +957,34 @@ impl RuntimeReceiptCollector {
 
         let mut receipt_bytes = HashMap::<SafeMemoryDomainProjection, ReceiptDomainBytes>::new();
         for owner in &snapshot.live_owners {
+            if matches!(owner.descriptor.placement, RuntimeOwnerPlacement::Unknown) {
+                return LeaseReceiptShadow::Incomparable {
+                    reason: LeaseReceiptShadowIncomparable::OwnerPlacementUnknown,
+                };
+            }
             for resource in owner.resources.values() {
-                let Some(domain) = resource.descriptor.domain else {
-                    // Unpriced diagnostic rows do not represent broker leases.
-                    continue;
+                let domain = match resource.descriptor.ledger_binding {
+                    RuntimeResourceLedgerBinding::Brokered(domain)
+                        if resource.descriptor.domain == Some(domain) =>
+                    {
+                        domain
+                    }
+                    RuntimeResourceLedgerBinding::NoBrokerLease
+                        if resource.descriptor.domain.is_none() =>
+                    {
+                        continue;
+                    }
+                    RuntimeResourceLedgerBinding::Unknown => {
+                        return LeaseReceiptShadow::Incomparable {
+                            reason: LeaseReceiptShadowIncomparable::UnpricedLiveResource,
+                        };
+                    }
+                    RuntimeResourceLedgerBinding::Brokered(_)
+                    | RuntimeResourceLedgerBinding::NoBrokerLease => {
+                        return LeaseReceiptShadow::Incomparable {
+                            reason: LeaseReceiptShadowIncomparable::InvalidLiveLifecycle,
+                        };
+                    }
                 };
                 let slot = receipt_bytes.entry(domain).or_default();
                 match resource.state {
@@ -925,12 +1020,15 @@ impl RuntimeReceiptCollector {
                             }
                         }
                     }
-                    RuntimeResourceState::Released => {}
+                    RuntimeResourceState::Released => {
+                        return LeaseReceiptShadow::Incomparable {
+                            reason: LeaseReceiptShadowIncomparable::InvalidLiveLifecycle,
+                        };
+                    }
                 }
             }
         }
 
-        let ledger = broker.ledger_snapshot();
         let mut seen = HashMap::<SafeMemoryDomainProjection, ()>::new();
         for (domain, usage) in &ledger {
             let Some(projection) = self.domain_projection(domain) else {
@@ -978,7 +1076,6 @@ impl RuntimeReceiptCollector {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ReceiptDomainBytes {
     reserved_peak: u64,
@@ -986,9 +1083,9 @@ struct ReceiptDomainBytes {
     quarantined_retained: u64,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LeaseReceiptShadow {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", content = "detail", rename_all = "kebab-case")]
+pub enum LeaseReceiptShadow {
     Matched,
     Incomparable {
         reason: LeaseReceiptShadowIncomparable,
@@ -996,17 +1093,19 @@ pub(crate) enum LeaseReceiptShadow {
     Mismatch(LeaseReceiptShadowMismatch),
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LeaseReceiptShadowIncomparable {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LeaseReceiptShadowIncomparable {
     ReceiptsUnavailable,
     ReceiptsIncomplete(ReceiptCompletenessReason),
     UnpricedLiveResource,
+    OwnerPlacementUnknown,
+    InvalidLiveLifecycle,
+    SnapshotChanged,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LeaseReceiptShadowMismatch {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LeaseReceiptShadowMismatch {
     pub domain: SafeMemoryDomainProjection,
     pub broker_pending: u64,
     pub broker_committed: u64,
@@ -1016,7 +1115,6 @@ pub(crate) struct LeaseReceiptShadowMismatch {
     pub receipt_quarantined: u64,
 }
 
-#[allow(dead_code)]
 fn known_metric(metric: RuntimeReceiptMetric) -> Result<u64, LeaseReceiptShadowIncomparable> {
     match metric {
         RuntimeReceiptMetric::Known(bytes) => Ok(bytes),
@@ -1240,8 +1338,20 @@ mod tests {
         assert_eq!(snapshot.events.len(), 2);
         assert_eq!(snapshot.event_capacity, 2);
         assert!(!snapshot.completeness.complete);
+        assert!(snapshot.completeness.live_state_complete);
+        assert!(!snapshot.completeness.event_history_complete);
         assert!(snapshot.completeness.dropped_events > 0);
         assert_eq!(second_id.scope_id, snapshot.scope_id);
+        let broker =
+            DeviceMemoryBrokerSet::new(crate::device::execution_memory::DeviceMemoryPolicy {
+                maximum_owned_basis_points: 10_000,
+                minimum_headroom_bytes: 0,
+            });
+        assert_eq!(
+            collector.reconcile_live_leases(&broker),
+            LeaseReceiptShadow::Matched,
+            "bounded event history must not invalidate the authoritative live owner table"
+        );
     }
 
     #[test]
@@ -1446,9 +1556,36 @@ mod tests {
                 minimum_headroom_bytes: 0,
             });
         assert_eq!(
-            collector.shadow_compare_leases(&broker),
+            collector.reconcile_live_leases(&broker),
             LeaseReceiptShadow::Matched
         );
+    }
+
+    #[test]
+    fn unpriced_live_resource_is_incomparable_not_silent_zero() {
+        let collector = collector(8);
+        let owner = owner(&collector);
+        let resource = collector
+            .acquire_resource(
+                owner.owner_id().unwrap(),
+                collector
+                    .unpriced_resource_descriptor("legacy-unpriced")
+                    .unwrap(),
+            )
+            .expect("unpriced row is retained for diagnosis");
+        let broker =
+            DeviceMemoryBrokerSet::new(crate::device::execution_memory::DeviceMemoryPolicy {
+                maximum_owned_basis_points: 10_000,
+                minimum_headroom_bytes: 0,
+            });
+        assert_eq!(
+            collector.reconcile_live_leases(&broker),
+            LeaseReceiptShadow::Incomparable {
+                reason: LeaseReceiptShadowIncomparable::UnpricedLiveResource,
+            }
+        );
+        drop(resource);
+        drop(owner);
     }
 
     #[test]
@@ -1460,7 +1597,7 @@ mod tests {
                 minimum_headroom_bytes: 0,
             });
         assert_eq!(
-            collector.shadow_compare_leases(&broker),
+            collector.reconcile_live_leases(&broker),
             LeaseReceiptShadow::Incomparable {
                 reason: LeaseReceiptShadowIncomparable::ReceiptsUnavailable,
             }

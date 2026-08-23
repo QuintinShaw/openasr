@@ -13925,7 +13925,7 @@ mod tests {
         assert_eq!(
             services
                 .runtime_receipts()
-                .shadow_compare_leases(services.memory_broker()),
+                .reconcile_live_leases(services.memory_broker()),
             LeaseReceiptShadow::Matched,
             "broker and receipt shadow must stay aligned on reuse"
         );
@@ -13941,7 +13941,7 @@ mod tests {
         assert_eq!(
             services
                 .runtime_receipts()
-                .shadow_compare_leases(services.memory_broker()),
+                .reconcile_live_leases(services.memory_broker()),
             LeaseReceiptShadow::Matched,
             "broker and receipt shadow must stay aligned after retirement"
         );
@@ -13951,7 +13951,7 @@ mod tests {
         assert_eq!(
             services
                 .runtime_receipts()
-                .shadow_compare_leases(services.memory_broker()),
+                .reconcile_live_leases(services.memory_broker()),
             LeaseReceiptShadow::Matched
         );
     }
@@ -14015,7 +14015,7 @@ mod tests {
         assert_eq!(
             services
                 .runtime_receipts()
-                .shadow_compare_leases(services.memory_broker()),
+                .reconcile_live_leases(services.memory_broker()),
             LeaseReceiptShadow::Matched
         );
     }

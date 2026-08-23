@@ -158,7 +158,7 @@ impl PackWeightResidencyInner {
             return;
         }
         let Some(descriptor) =
-            collector.owner_descriptor("pack-weight-residency", None, None, None)
+            collector.host_neutral_owner_descriptor("pack-weight-residency", None, None)
         else {
             return;
         };

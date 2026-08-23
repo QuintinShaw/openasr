@@ -1952,7 +1952,7 @@ fn reserve_activation_plan(
     }
     let batch = services
         .memory_broker()
-        .try_reserve_batch(requests)
+        .try_reserve_batch_for_scope(requests, Some(services.scope_id))
         .map_err(|error| format!("candidate activation reserve: {error}"))?;
     BrokerActivationReservation::from_batch(batch, cohort_id)
 }

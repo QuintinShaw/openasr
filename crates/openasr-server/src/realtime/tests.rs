@@ -5786,9 +5786,7 @@ fn receipt_provider_names(
             openasr_core::runtime_receipts::RuntimeReceiptEvent::OwnerCreated {
                 descriptor,
                 ..
-            } => descriptor
-                .lane
-                .map(|lane| lane.provider.as_str().to_string()),
+            } => receipt_descriptor_lane(descriptor).map(|lane| lane.provider.as_str().to_string()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -5807,13 +5805,23 @@ fn receipt_lanes(
             openasr_core::runtime_receipts::RuntimeReceiptEvent::OwnerCreated {
                 descriptor,
                 ..
-            } => descriptor.lane,
+            } => receipt_descriptor_lane(descriptor),
             _ => None,
         })
         .collect::<Vec<_>>();
     lanes.sort_by_key(|lane| format!("{lane:?}"));
     lanes.dedup();
     lanes
+}
+
+fn receipt_descriptor_lane(
+    descriptor: &openasr_core::runtime_receipts::RuntimeOwnerDescriptor,
+) -> Option<openasr_core::runtime_receipts::SafeExecutionLaneProjection> {
+    match descriptor.placement {
+        openasr_core::runtime_receipts::RuntimeOwnerPlacement::LaneBound(lane) => Some(lane),
+        openasr_core::runtime_receipts::RuntimeOwnerPlacement::HostNeutral
+        | openasr_core::runtime_receipts::RuntimeOwnerPlacement::Unknown => None,
+    }
 }
 
 fn is_active_resource_state(state: openasr_core::runtime_receipts::RuntimeResourceState) -> bool {
@@ -6400,7 +6408,7 @@ fn historical_weights(
         let Some(lane) = replayed_owner
             .descriptor
             .as_ref()
-            .and_then(|descriptor| descriptor.lane)
+            .and_then(receipt_descriptor_lane)
         else {
             return Err(());
         };

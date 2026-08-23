@@ -7,9 +7,9 @@
 use crate::*;
 use axum::{Json, extract::Query};
 use openasr_core::runtime_receipts::{
-    LiveRuntimeOwner, RuntimeOwnerId, RuntimeReceiptAvailability, RuntimeReceiptEvent,
-    RuntimeReceiptMetric, RuntimeReceiptSnapshot, RuntimeResourceId, RuntimeResourceState,
-    SafeMemoryDomainKind,
+    LeaseReceiptShadow, LiveRuntimeOwner, RuntimeOwnerId, RuntimeOwnerPlacement,
+    RuntimeReceiptAvailability, RuntimeReceiptEvent, RuntimeReceiptMetric, RuntimeReceiptSnapshot,
+    RuntimeResourceId, RuntimeResourceState, SafeMemoryDomainKind,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -89,6 +89,7 @@ pub(crate) struct RuntimeReceiptResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     unavailable_reason: Option<&'static str>,
     snapshot_completeness: ReceiptCompletenessView,
+    lease_reconciliation: LeaseReceiptShadow,
     live_owners: Vec<RuntimeOwnerView>,
     recent_events: Vec<RuntimeEventView>,
     event_limit: usize,
@@ -108,9 +109,16 @@ struct ReceiptCompletenessView {
     complete: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    live_state_complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    live_state_reason: Option<String>,
+    event_history_complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_history_reason: Option<String>,
     dropped_events: u64,
     dropped_owners: u64,
     rejected_resources: u64,
+    dropped_notifications: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -121,6 +129,7 @@ struct RuntimeOwnerView {
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<String>,
+    placement: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     lane: Option<RuntimeLaneView>,
     resources: Vec<RuntimeResourceView>,
@@ -140,6 +149,7 @@ struct RuntimeResourceView {
     kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     domain: Option<RuntimeDomainView>,
+    ledger_binding: &'static str,
     requested: RuntimeMetricView,
     peak: RuntimeMetricView,
     retained: RuntimeMetricView,
@@ -183,6 +193,7 @@ struct RuntimeOwnerDescriptorView {
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<String>,
+    placement: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     lane: Option<RuntimeLaneView>,
 }
@@ -202,8 +213,10 @@ pub(crate) async fn runtime_receipts(
         .unwrap_or(DEFAULT_EVENT_LIMIT)
         .min(MAX_EVENT_LIMIT);
     let snapshot = runtime.runtime_receipt_snapshot();
+    let reconciliation = runtime.runtime_receipt_reconciliation();
     Ok(Json(RuntimeReceiptResponse::from_snapshot(
         snapshot,
+        reconciliation,
         identity,
         domain,
         event_limit,
@@ -245,6 +258,7 @@ impl DomainAttribution {
 impl RuntimeReceiptResponse {
     fn from_snapshot(
         snapshot: RuntimeReceiptSnapshot,
+        lease_reconciliation: LeaseReceiptShadow,
         identity: ServerStartIdentity,
         domain: Option<DomainFilter>,
         event_limit: usize,
@@ -284,6 +298,7 @@ impl RuntimeReceiptResponse {
             availability,
             unavailable_reason,
             snapshot_completeness,
+            lease_reconciliation,
             live_owners: live_owners
                 .into_iter()
                 .map(|owner| RuntimeOwnerView::from_owner(owner, domain))
@@ -387,20 +402,21 @@ impl From<ServerStartIdentity> for SafeDaemonStartIdentityView {
 
 impl RuntimeOwnerView {
     fn from_owner(owner: &LiveRuntimeOwner, domain: Option<DomainFilter>) -> Self {
+        let (placement, lane) = runtime_owner_placement(owner.descriptor.placement);
         Self {
             id: owner_view_id(owner.id.ordinal),
             component: owner.descriptor.component.to_hex(),
             content: owner.descriptor.content.map(|value| value.to_hex()),
             source: owner.descriptor.source.map(|value| value.to_hex()),
-            lane: owner.descriptor.lane.map(RuntimeLaneView::from),
+            placement,
+            lane,
             resources: owner
                 .resources
                 .values()
-                .filter(|resource| {
-                    let Some(resource_domain) = resource.descriptor.domain else {
-                        return false;
-                    };
-                    domain.is_none_or(|domain| domain.matches(resource_domain.kind))
+                .filter(|resource| match (domain, resource.descriptor.domain) {
+                    (None, _) => true,
+                    (Some(domain), Some(resource_domain)) => domain.matches(resource_domain.kind),
+                    (Some(_), None) => false,
                 })
                 .map(RuntimeResourceView::from_resource)
                 .collect(),
@@ -412,12 +428,24 @@ impl RuntimeOwnerDescriptorView {
     fn from_descriptor(
         descriptor: &openasr_core::runtime_receipts::RuntimeOwnerDescriptor,
     ) -> Self {
+        let (placement, lane) = runtime_owner_placement(descriptor.placement);
         Self {
             component: descriptor.component.to_hex(),
             content: descriptor.content.map(|value| value.to_hex()),
             source: descriptor.source.map(|value| value.to_hex()),
-            lane: descriptor.lane.map(RuntimeLaneView::from),
+            placement,
+            lane,
         }
+    }
+}
+
+fn runtime_owner_placement(
+    placement: RuntimeOwnerPlacement,
+) -> (&'static str, Option<RuntimeLaneView>) {
+    match placement {
+        RuntimeOwnerPlacement::HostNeutral => ("host-neutral", None),
+        RuntimeOwnerPlacement::LaneBound(lane) => ("lane-bound", Some(RuntimeLaneView::from(lane))),
+        RuntimeOwnerPlacement::Unknown => ("unknown", None),
     }
 }
 
@@ -434,6 +462,15 @@ impl RuntimeResourceView {
             id,
             kind: descriptor.kind.to_hex(),
             domain: descriptor.domain.map(RuntimeDomainView::from),
+            ledger_binding: match descriptor.ledger_binding {
+                openasr_core::runtime_receipts::RuntimeResourceLedgerBinding::Brokered(_) => {
+                    "brokered"
+                }
+                openasr_core::runtime_receipts::RuntimeResourceLedgerBinding::NoBrokerLease => {
+                    "no-broker-lease"
+                }
+                openasr_core::runtime_receipts::RuntimeResourceLedgerBinding::Unknown => "unknown",
+            },
             requested: RuntimeMetricView::from(descriptor.requested),
             peak: RuntimeMetricView::from(descriptor.peak),
             retained: RuntimeMetricView::from(descriptor.retained),
@@ -565,9 +602,18 @@ impl From<openasr_core::runtime_receipts::ReceiptCompleteness> for ReceiptComple
         Self {
             complete: completeness.complete,
             reason: completeness.reason.map(|value| format!("{:?}", value)),
+            live_state_complete: completeness.live_state_complete,
+            live_state_reason: completeness
+                .live_state_reason
+                .map(|value| format!("{:?}", value)),
+            event_history_complete: completeness.event_history_complete,
+            event_history_reason: completeness
+                .event_history_reason
+                .map(|value| format!("{:?}", value)),
             dropped_events: completeness.dropped_events,
             dropped_owners: completeness.dropped_owners,
             rejected_resources: completeness.rejected_resources,
+            dropped_notifications: completeness.dropped_notifications,
         }
     }
 }
@@ -626,6 +672,15 @@ mod tests {
                             EntropyUnavailable,
                     ),
                 ),
+                live_state_complete: false,
+                live_state_reason: Some(
+                    openasr_core::runtime_receipts::ReceiptCompletenessReason::Unavailable(
+                        openasr_core::runtime_receipts::RuntimeReceiptUnavailableReason::
+                            EntropyUnavailable,
+                    ),
+                ),
+                event_history_complete: true,
+                event_history_reason: None,
                 dropped_events: 0,
                 dropped_owners: 0,
                 rejected_resources: 0,
@@ -635,6 +690,10 @@ mod tests {
         };
         let response = RuntimeReceiptResponse::from_snapshot(
             snapshot,
+            LeaseReceiptShadow::Incomparable {
+                reason: openasr_core::runtime_receipts::LeaseReceiptShadowIncomparable::
+                    ReceiptsUnavailable,
+            },
             ServerStartIdentity {
                 pid: 42,
                 nonce: None,
@@ -663,6 +722,12 @@ mod tests {
                 reason: Some(
                     openasr_core::runtime_receipts::ReceiptCompletenessReason::IdentityExhausted,
                 ),
+                live_state_complete: false,
+                live_state_reason: Some(
+                    openasr_core::runtime_receipts::ReceiptCompletenessReason::IdentityExhausted,
+                ),
+                event_history_complete: true,
+                event_history_reason: None,
                 dropped_events: 0,
                 dropped_owners: 0,
                 rejected_resources: 0,
@@ -672,6 +737,10 @@ mod tests {
         };
         let response = RuntimeReceiptResponse::from_snapshot(
             snapshot,
+            LeaseReceiptShadow::Incomparable {
+                reason: openasr_core::runtime_receipts::LeaseReceiptShadowIncomparable::
+                    ReceiptsUnavailable,
+            },
             ServerStartIdentity {
                 pid: 42,
                 nonce: None,

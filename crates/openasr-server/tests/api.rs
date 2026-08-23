@@ -3346,6 +3346,17 @@ async fn runtime_receipts_require_operator_auth_and_bound_query() {
     assert_eq!(json["schema"], "openasr.runtime-ownership-receipt.v1");
     assert_eq!(json["availability"], "available");
     assert!(json["snapshot_completeness"]["complete"].as_bool().unwrap());
+    assert!(
+        json["snapshot_completeness"]["live_state_complete"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(
+        json["snapshot_completeness"]["event_history_complete"]
+            .as_bool()
+            .unwrap()
+    );
+    assert_eq!(json["lease_reconciliation"]["status"], "matched");
     assert_eq!(json["event_limit"], 128);
     assert!(json["live_owners"].as_array().unwrap().is_empty());
     assert!(json["recent_events"].as_array().unwrap().is_empty());

@@ -369,11 +369,10 @@ impl<T> SystemMemoryOwner<T> {
         let (receipt_owner, receipt_resource) = current_runtime_receipts()
             .filter(|collector| collector.is_available())
             .and_then(|collector| {
-                let descriptor = collector.owner_descriptor(
+                let descriptor = collector.host_neutral_owner_descriptor(
                     "system-memory-owner",
                     None,
                     Some(&resource_id),
-                    None,
                 )?;
                 let owner = collector.start_owner(descriptor, current_execution_cache_attempt_id());
                 let resource = owner.owner_id().and_then(|owner_id| {
@@ -615,14 +614,14 @@ mod tests {
         assert_eq!(
             services
                 .runtime_receipts()
-                .shadow_compare_leases(services.memory_broker()),
+                .reconcile_live_leases(services.memory_broker()),
             crate::models::runtime_receipts::LeaseReceiptShadow::Matched
         );
         drop(owner);
         assert_eq!(
             services
                 .runtime_receipts()
-                .shadow_compare_leases(services.memory_broker()),
+                .reconcile_live_leases(services.memory_broker()),
             crate::models::runtime_receipts::LeaseReceiptShadow::Matched
         );
         assert!(
@@ -632,6 +631,73 @@ mod tests {
                 .live_owners
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn independent_service_roots_reconcile_only_their_scoped_broker_leases() {
+        let broker = test_broker();
+        let first =
+            crate::models::native_execution_services::NativeExecutionServices::new_with_broker(
+                Arc::new(crate::device::execution_policy::DefaultExecutionPolicyResolver),
+                Arc::clone(&broker),
+            )
+            .unwrap();
+        let second =
+            crate::models::native_execution_services::NativeExecutionServices::new_with_broker(
+                Arc::new(crate::device::execution_policy::DefaultExecutionPolicyResolver),
+                Arc::clone(&broker),
+            )
+            .unwrap();
+        let first_owner = {
+            let _guard =
+                crate::models::native_execution_services::install_native_execution_services(&first);
+            SystemMemoryOwner::try_allocate_with(
+                SystemMemoryAllocationQuote::new("test.scope-first", 96, 96).unwrap(),
+                Some(Arc::clone(&broker)),
+                true,
+                || Ok(snapshot(220)),
+                || Ok(SystemMemoryAllocationOutcome::new(vec![0_u8; 96], 96, 96)),
+            )
+            .unwrap()
+        };
+        let second_owner = {
+            let _guard =
+                crate::models::native_execution_services::install_native_execution_services(
+                    &second,
+                );
+            SystemMemoryOwner::try_allocate_with(
+                SystemMemoryAllocationQuote::new("test.scope-second", 64, 64).unwrap(),
+                Some(Arc::clone(&broker)),
+                true,
+                || Ok(snapshot(180)),
+                || Ok(SystemMemoryAllocationOutcome::new(vec![0_u8; 64], 64, 64)),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            first.runtime_receipts().reconcile_live_leases(&broker),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
+        assert_eq!(
+            second.runtime_receipts().reconcile_live_leases(&broker),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).committed_bytes,
+            160
+        );
+
+        drop(first_owner);
+        assert_eq!(
+            first.runtime_receipts().reconcile_live_leases(&broker),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
+        assert_eq!(
+            second.runtime_receipts().reconcile_live_leases(&broker),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
+        drop(second_owner);
     }
 
     #[test]

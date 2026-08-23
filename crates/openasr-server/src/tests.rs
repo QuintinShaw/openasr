@@ -1909,6 +1909,114 @@ async fn set_default_model_http_keeps_previous_selection_when_activation_probe_f
 }
 
 #[tokio::test]
+async fn set_default_model_http_host_pressure_rejects_before_publication_and_preserves_old_state() {
+    use axum::body::{Body, to_bytes};
+    use openasr_core::device::execution_memory::{
+        DeviceMemorySnapshot, DomainFootprint, DomainReservationRequest, MemoryDomainKey,
+        MemoryObservationConfidence,
+    };
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let previous_path = write_installed_pack_ref(
+        &home,
+        "whisper-tiny",
+        "whisper-tiny:q4",
+        "q4_0",
+        "q4",
+        "whisper-tiny",
+    );
+    let _next_path = write_installed_pack_ref(
+        &home,
+        "whisper-base",
+        "whisper-base:q4",
+        "q4_0",
+        "q4",
+        "whisper-base",
+    );
+    let previous = installed_pack_by_pull(&home, "whisper-tiny:q4");
+    persist_default_pack(&home, &previous, QuantPreference::pinned(&previous.quant)).unwrap();
+    let previous_v2 =
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap();
+
+    let native_execution = NativeExecutionSupervisor::default();
+    let services = Arc::clone(native_execution.execution_services());
+    let broker = Arc::clone(services.memory_broker());
+    let pressure_bytes = 1_u64 << 60;
+    let mut pressure = broker
+        .try_reserve_batch(vec![DomainReservationRequest::from_footprint(
+            DomainFootprint {
+                domain: MemoryDomainKey::SystemMemory,
+                peak_bytes: pressure_bytes,
+                retained_bytes: pressure_bytes,
+                requires_reconciliation: false,
+                resource_ids: vec!["external-host-pressure".to_string()],
+            },
+            DeviceMemorySnapshot {
+                free_bytes: u64::MAX,
+                total_bytes: u64::MAX,
+                confidence: MemoryObservationConfidence::DeviceSnapshot,
+            },
+        )])
+        .unwrap();
+    pressure.commit_quoted().unwrap();
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution,
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(previous_path.clone()).into(),
+    };
+    let app = app_with_runtime_and_distribution(
+        runtime.clone(),
+        DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/default")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "pull": "whisper-base:q4" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        parsed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("activation reserve failed"),
+        "{parsed}"
+    );
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(previous_path.as_path())
+    );
+    assert_eq!(
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap(),
+        previous_v2
+    );
+    assert_eq!(
+        services.runtime_receipts().reconcile_live_leases(&broker),
+        openasr_core::runtime_receipts::LeaseReceiptShadow::Matched
+    );
+    drop(pressure);
+}
+
+#[tokio::test]
 async fn set_default_model_http_keeps_previous_selection_when_persist_fails() {
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;

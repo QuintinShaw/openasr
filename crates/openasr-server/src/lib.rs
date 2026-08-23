@@ -1518,6 +1518,15 @@ impl ServerRuntime {
             .snapshot()
     }
 
+    pub(crate) fn runtime_receipt_reconciliation(
+        &self,
+    ) -> openasr_core::runtime_receipts::LeaseReceiptShadow {
+        let services = self.native_execution.execution_services();
+        services
+            .runtime_receipts()
+            .reconcile_live_leases(services.memory_broker())
+    }
+
     fn model_is_resident(&self) -> bool {
         match self.backend {
             BackendKind::Mock => true,

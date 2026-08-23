@@ -23,6 +23,7 @@ use std::{
 
 use thiserror::Error;
 
+use crate::models::native_execution_services::NativeExecutionScopeId;
 use crate::models::runtime_receipts::{
     RuntimeOwnerDescriptor, RuntimeReceiptCollector, RuntimeReceiptMetric,
     RuntimeResourceDescriptor, RuntimeResourceGuard, RuntimeResourceState,
@@ -457,6 +458,14 @@ struct DomainAccount {
     exclusive_pending_children: u32,
     exclusive_pending_cohort: Option<ReservationCohortKey>,
     quarantined: bool,
+    by_scope: HashMap<NativeExecutionScopeId, ScopedDomainAccount>,
+}
+
+#[derive(Debug, Default)]
+struct ScopedDomainAccount {
+    pending_bytes: u64,
+    committed_bytes: u64,
+    unreclaimable_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -572,11 +581,22 @@ impl DeviceMemoryBrokerSet {
         self: &Arc<Self>,
         requests: Vec<DomainReservationRequest>,
     ) -> Result<DeviceMemoryReservationBatch, MemoryPlanningError> {
-        self.try_reserve_partitioned(vec![requests])?.pop().ok_or(
-            MemoryPlanningError::ReservationLedgerCorrupted {
-                domain: MemoryDomainKey::SystemMemory,
-            },
+        self.try_reserve_batch_for_scope(
+            requests,
+            crate::models::native_execution_services::current_native_execution_scope_id(),
         )
+    }
+
+    pub(crate) fn try_reserve_batch_for_scope(
+        self: &Arc<Self>,
+        requests: Vec<DomainReservationRequest>,
+        owner_scope_id: Option<NativeExecutionScopeId>,
+    ) -> Result<DeviceMemoryReservationBatch, MemoryPlanningError> {
+        self.try_reserve_partitioned_for_scope(vec![requests], owner_scope_id)?
+            .pop()
+            .ok_or(MemoryPlanningError::ReservationLedgerCorrupted {
+                domain: MemoryDomainKey::SystemMemory,
+            })
     }
 
     /// Atomically admits one candidate while preserving separate native-owner
@@ -591,6 +611,17 @@ impl DeviceMemoryBrokerSet {
     pub fn try_reserve_partitioned(
         self: &Arc<Self>,
         partitions: Vec<Vec<DomainReservationRequest>>,
+    ) -> Result<Vec<DeviceMemoryReservationBatch>, MemoryPlanningError> {
+        self.try_reserve_partitioned_for_scope(
+            partitions,
+            crate::models::native_execution_services::current_native_execution_scope_id(),
+        )
+    }
+
+    pub(crate) fn try_reserve_partitioned_for_scope(
+        self: &Arc<Self>,
+        partitions: Vec<Vec<DomainReservationRequest>>,
+        owner_scope_id: Option<NativeExecutionScopeId>,
     ) -> Result<Vec<DeviceMemoryReservationBatch>, MemoryPlanningError> {
         #[derive(Clone)]
         struct Aggregate {
@@ -793,6 +824,17 @@ impl DeviceMemoryBrokerSet {
                 .ok_or(MemoryPlanningError::ArithmeticOverflow {
                     operation: "pending reservation sum",
                 })?;
+            if let Some(owner_scope_id) = owner_scope_id {
+                account
+                    .by_scope
+                    .get(&owner_scope_id)
+                    .map(|scoped| scoped.pending_bytes)
+                    .unwrap_or(0)
+                    .checked_add(aggregate.peak_bytes)
+                    .ok_or(MemoryPlanningError::ArithmeticOverflow {
+                        operation: "scoped pending reservation sum",
+                    })?;
+            }
             if aggregate.requires_reconciliation {
                 account
                     .exclusive_pending_children
@@ -806,6 +848,13 @@ impl DeviceMemoryBrokerSet {
         for (domain, aggregate) in &aggregates {
             let account = accounts.entry(domain.clone()).or_default();
             account.pending_bytes += aggregate.peak_bytes;
+            if let Some(owner_scope_id) = owner_scope_id {
+                account
+                    .by_scope
+                    .entry(owner_scope_id)
+                    .or_default()
+                    .pending_bytes += aggregate.peak_bytes;
+            }
             *account.pending_bytes_by_cohort.entry(cohort).or_default() += aggregate.peak_bytes;
             if aggregate.requires_reconciliation {
                 debug_assert!(
@@ -835,6 +884,7 @@ impl DeviceMemoryBrokerSet {
                     requires_reconciliation: request.requires_reconciliation,
                     holds_exclusive_gate,
                     cohort,
+                    owner_scope_id,
                     quarantine_bytes: request.peak_bytes,
                     receipt_resource: None,
                     receipt_descriptor: None,
@@ -891,6 +941,31 @@ impl DeviceMemoryBrokerSet {
             .collect()
     }
 
+    /// Diagnostic ledger rows owned by one execution-service root. Admission
+    /// remains process-wide; this projection exists only so a scope-local
+    /// owner receipt can be reconciled without charging unrelated roots.
+    pub(crate) fn ledger_snapshot_for_scope(
+        &self,
+        scope_id: NativeExecutionScopeId,
+    ) -> BTreeMap<MemoryDomainKey, DeviceMemoryUsage> {
+        self.lock_accounts()
+            .iter()
+            .filter_map(|(domain, account)| {
+                let scoped = account.by_scope.get(&scope_id)?;
+                Some((
+                    domain.clone(),
+                    DeviceMemoryUsage {
+                        pending_bytes: scoped.pending_bytes,
+                        committed_bytes: scoped.committed_bytes,
+                        unreclaimable_bytes: scoped.unreclaimable_bytes,
+                        exclusive_pending: account.exclusive_pending_children != 0,
+                        quarantined: account.quarantined,
+                    },
+                ))
+            })
+            .collect()
+    }
+
     fn lock_accounts(&self) -> MutexGuard<'_, HashMap<MemoryDomainKey, DomainAccount>> {
         self.accounts
             .lock()
@@ -929,6 +1004,7 @@ struct ReservationEntry {
     requires_reconciliation: bool,
     holds_exclusive_gate: bool,
     cohort: ReservationCohortKey,
+    owner_scope_id: Option<NativeExecutionScopeId>,
     /// Conservative charge if native state becomes unreclaimable before the
     /// transaction can commit. Reconciliation evidence may raise this above
     /// the provider's provisional estimate.
@@ -1236,6 +1312,7 @@ impl DeviceMemoryReservationBatch {
                 .expect("reservation ledger validated above");
             release_pending_bytes(account, entry);
             account.committed_bytes += *committed_bytes;
+            add_scoped_committed_bytes(account, entry, *committed_bytes);
             release_exclusive_child(account, entry);
             entry.committed_bytes = *committed_bytes;
             let reconciliation = by_domain
@@ -1291,6 +1368,7 @@ impl DeviceMemoryReservationBatch {
             };
             if bytes > 0 {
                 account.unreclaimable_bytes = account.unreclaimable_bytes.saturating_add(bytes);
+                add_scoped_unreclaimable_bytes(account, entry, bytes);
             }
             if matches!(entry.domain, MemoryDomainKey::DedicatedDevice { .. }) {
                 account.quarantined = true;
@@ -1435,6 +1513,7 @@ impl DeviceMemoryReservationBatch {
             let account = accounts.get_mut(&entry.domain).expect("validated above");
             release_pending_bytes(account, entry);
             account.committed_bytes += *committed_bytes;
+            add_scoped_committed_bytes(account, entry, *committed_bytes);
             release_exclusive_child(account, entry);
             entry.committed_bytes = *committed_bytes;
             Self::prepare_receipt_descriptor(entry, *committed_bytes, *committed_bytes);
@@ -1497,6 +1576,23 @@ fn domain_account_is_consistent(account: &DomainAccount) -> bool {
     if cohort_sum != Some(account.pending_bytes) {
         return false;
     }
+    let scoped = account.by_scope.values().try_fold(
+        (0_u64, 0_u64, 0_u64),
+        |(pending, committed, unreclaimable), scope| {
+            Some((
+                pending.checked_add(scope.pending_bytes)?,
+                committed.checked_add(scope.committed_bytes)?,
+                unreclaimable.checked_add(scope.unreclaimable_bytes)?,
+            ))
+        },
+    );
+    if scoped.is_none_or(|(pending, committed, unreclaimable)| {
+        pending > account.pending_bytes
+            || committed > account.committed_bytes
+            || unreclaimable > account.unreclaimable_bytes
+    }) {
+        return false;
+    }
 
     match (
         account.exclusive_pending_children,
@@ -1511,7 +1607,14 @@ fn domain_account_is_consistent(account: &DomainAccount) -> bool {
 }
 
 fn pending_entry_is_consistent(account: &DomainAccount, entry: &ReservationEntry) -> bool {
-    account.pending_bytes >= entry.reserved_peak_bytes
+    let scope_consistent = entry.owner_scope_id.is_none_or(|scope_id| {
+        account
+            .by_scope
+            .get(&scope_id)
+            .is_some_and(|scope| scope.pending_bytes >= entry.reserved_peak_bytes)
+    });
+    scope_consistent
+        && account.pending_bytes >= entry.reserved_peak_bytes
         && account
             .pending_bytes_by_cohort
             .get(&entry.cohort)
@@ -1543,6 +1646,17 @@ fn release_pending_bytes(account: &mut DomainAccount, entry: &ReservationEntry) 
         return;
     };
     account.pending_bytes = next_total;
+    if let Some(scope_id) = entry.owner_scope_id {
+        let Some(scoped) = account.by_scope.get_mut(&scope_id) else {
+            account.quarantined = true;
+            return;
+        };
+        let Some(next_scoped) = scoped.pending_bytes.checked_sub(entry.reserved_peak_bytes) else {
+            account.quarantined = true;
+            return;
+        };
+        scoped.pending_bytes = next_scoped;
+    }
     *cohort_bytes = next_cohort;
     if next_cohort == 0 {
         account.pending_bytes_by_cohort.remove(&entry.cohort);
@@ -1555,6 +1669,35 @@ fn release_committed_bytes(account: &mut DomainAccount, entry: &ReservationEntry
         return;
     };
     account.committed_bytes = next;
+    if let Some(scope_id) = entry.owner_scope_id {
+        let Some(scoped) = account.by_scope.get_mut(&scope_id) else {
+            account.quarantined = true;
+            return;
+        };
+        let Some(next_scoped) = scoped.committed_bytes.checked_sub(entry.committed_bytes) else {
+            account.quarantined = true;
+            return;
+        };
+        scoped.committed_bytes = next_scoped;
+    }
+}
+
+fn add_scoped_committed_bytes(account: &mut DomainAccount, entry: &ReservationEntry, bytes: u64) {
+    if let Some(scope_id) = entry.owner_scope_id {
+        let scoped = account.by_scope.entry(scope_id).or_default();
+        scoped.committed_bytes = scoped.committed_bytes.saturating_add(bytes);
+    }
+}
+
+fn add_scoped_unreclaimable_bytes(
+    account: &mut DomainAccount,
+    entry: &ReservationEntry,
+    bytes: u64,
+) {
+    if let Some(scope_id) = entry.owner_scope_id {
+        let scoped = account.by_scope.entry(scope_id).or_default();
+        scoped.unreclaimable_bytes = scoped.unreclaimable_bytes.saturating_add(bytes);
+    }
 }
 
 impl Drop for DeviceMemoryReservationBatch {
@@ -2489,21 +2632,25 @@ mod tests {
         )
         .unwrap();
         let system = MemoryDomainKey::SystemMemory;
+        let scope_id = collector.snapshot().scope_id;
         let mut lease = broker
-            .try_reserve_batch(vec![DomainReservationRequest {
-                domain: system.clone(),
-                snapshot: DeviceMemorySnapshot {
-                    free_bytes: INCIDENT_TOTAL,
-                    total_bytes: INCIDENT_TOTAL,
-                    confidence: MemoryObservationConfidence::DeviceSnapshot,
-                },
-                peak_bytes: INCIDENT_COMMITTED,
-                retained_bytes: INCIDENT_COMMITTED,
-                observed_peak_bytes: None,
-                requires_reconciliation: false,
-                resource_id: "incident-committed-owners".to_string(),
-                cohort_id: None,
-            }])
+            .try_reserve_batch_for_scope(
+                vec![DomainReservationRequest {
+                    domain: system.clone(),
+                    snapshot: DeviceMemorySnapshot {
+                        free_bytes: INCIDENT_TOTAL,
+                        total_bytes: INCIDENT_TOTAL,
+                        confidence: MemoryObservationConfidence::DeviceSnapshot,
+                    },
+                    peak_bytes: INCIDENT_COMMITTED,
+                    retained_bytes: INCIDENT_COMMITTED,
+                    observed_peak_bytes: None,
+                    requires_reconciliation: false,
+                    resource_id: "incident-committed-owners".to_string(),
+                    cohort_id: None,
+                }],
+                Some(scope_id),
+            )
             .unwrap();
         let owner = collector
             .owner_descriptor(
@@ -2536,7 +2683,10 @@ mod tests {
         assert_eq!(snapshot.live_owners.len(), 1);
         let live = &snapshot.live_owners[0];
         assert!(live.descriptor.content.is_some());
-        assert!(live.descriptor.lane.is_some());
+        assert!(matches!(
+            live.descriptor.placement,
+            crate::models::runtime_receipts::RuntimeOwnerPlacement::LaneBound(_)
+        ));
         let resource = live.resources.values().next().unwrap();
         assert_eq!(resource.state, RuntimeResourceState::Committed);
         assert_eq!(
@@ -2545,7 +2695,7 @@ mod tests {
         );
         assert_eq!(broker.usage(&system).committed_bytes, INCIDENT_COMMITTED);
         assert_eq!(
-            collector.shadow_compare_leases(&broker),
+            collector.reconcile_live_leases(&broker),
             crate::models::runtime_receipts::LeaseReceiptShadow::Matched
         );
 
@@ -2579,12 +2729,12 @@ mod tests {
             other => panic!("incident arithmetic must fail closed, got {other:?}"),
         }
         assert_eq!(
-            collector.shadow_compare_leases(&broker),
+            collector.reconcile_live_leases(&broker),
             crate::models::runtime_receipts::LeaseReceiptShadow::Matched
         );
         drop(lease);
         assert_eq!(
-            collector.shadow_compare_leases(&broker),
+            collector.reconcile_live_leases(&broker),
             crate::models::runtime_receipts::LeaseReceiptShadow::Matched
         );
     }
