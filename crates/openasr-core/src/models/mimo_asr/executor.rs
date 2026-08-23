@@ -326,20 +326,17 @@ impl MimoAsrPreparedRuntime {
             backend,
         )
         .map_err(capacity_error)?;
-        let (codebook_peak, codebook_retained, speech_embedding_retained) = if backend
-            .is_gpu_class()
-        {
-            (0, 0, 0)
+        let (codebook_peak, codebook_retained) =
+            MimoRvqCodebooks::quoted_construction_system_memory_bytes(&reader, &audiotok_metadata)
+                .map_err(capacity_error)?;
+        let speech_embedding_retained = if backend.is_gpu_class() {
+            0
         } else {
-            let codebooks =
-                MimoRvqCodebooks::quoted_retained_system_memory_bytes(&audiotok_metadata)
-                    .map_err(capacity_error)?;
-            let speech_embeddings = MimoSpeechEmbeddingTables::quoted_retained_system_memory_bytes(
+            MimoSpeechEmbeddingTables::quoted_retained_system_memory_bytes(
                 inlocal_metadata.d_model,
                 &speech_vocab_sizes,
             )
-            .map_err(capacity_error)?;
-            (codebooks, codebooks, speech_embeddings)
+            .map_err(capacity_error)?
         };
         let inlocal =
             MimoInputLocalRuntime::quoted_retained_system_memory_bytes(&inlocal_metadata, backend)

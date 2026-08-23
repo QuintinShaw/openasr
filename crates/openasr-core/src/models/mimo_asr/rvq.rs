@@ -13,7 +13,9 @@
 
 use thiserror::Error;
 
-use crate::ggml_runtime::{GgufTensorDataReadError, GgufTensorDataReader};
+use crate::ggml_runtime::{
+    GGML_TYPE_F16, GGML_TYPE_F32, GgufTensorDataReadError, GgufTensorDataReader, ggml_is_quantized,
+};
 
 use super::runtime_contract::MimoAudiotokMetadata;
 use super::tensor_names::audiotok_codebook_name;
@@ -169,6 +171,38 @@ impl MimoRvqCodebooks {
         Ok(bytes.finish())
     }
 
+    pub(crate) fn quoted_construction_system_memory_bytes(
+        reader: &GgufTensorDataReader,
+        metadata: &MimoAudiotokMetadata,
+    ) -> Result<(u64, u64), String> {
+        let retained = Self::quoted_retained_system_memory_bytes(metadata)?;
+        let mut largest_extra = 0_u64;
+        for (level, &vocab_size) in metadata.codebook_sizes.iter().enumerate() {
+            let name = audiotok_codebook_name(level);
+            let tensor = reader
+                .tensor_index()
+                .get(&name)
+                .ok_or_else(|| format!("mimo-asr RVQ codebook '{name}' is missing"))?;
+            let elements = tensor.num_elements().ok_or_else(|| {
+                format!("mimo-asr RVQ codebook '{name}' element count overflowed")
+            })?;
+            let expected_elements = u64::from(vocab_size)
+                .checked_mul(metadata.d_model as u64)
+                .ok_or_else(|| format!("mimo-asr RVQ codebook '{name}' shape overflowed"))?;
+            if elements != expected_elements {
+                return Err(format!(
+                    "mimo-asr RVQ codebook '{name}' element count {elements} does not match expected {expected_elements}"
+                ));
+            }
+            largest_extra =
+                largest_extra.max(materialization_extra_bytes(tensor.ggml_type, elements)?);
+        }
+        let peak = retained
+            .checked_add(largest_extra)
+            .ok_or_else(|| "mimo-asr RVQ construction peak quote overflowed".to_string())?;
+        Ok((peak, retained))
+    }
+
     pub(crate) fn retained_system_memory_bytes(&self) -> Result<u64, String> {
         let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
         bytes.add_vec(&self.levels, "mimo-asr RVQ level tables")?;
@@ -177,6 +211,24 @@ impl MimoRvqCodebooks {
         }
         bytes.add_vec(&self.vocab_sizes, "mimo-asr RVQ vocabulary sizes")?;
         Ok(bytes.finish())
+    }
+}
+
+fn materialization_extra_bytes(ggml_type: i32, elements: u64) -> Result<u64, String> {
+    let elements = usize::try_from(elements)
+        .map_err(|_| "mimo-asr RVQ materialization element count exceeds usize".to_string())?;
+    match ggml_type {
+        GGML_TYPE_F32 => Ok(0),
+        GGML_TYPE_F16 => u64::try_from(
+            elements
+                .checked_mul(std::mem::size_of::<u16>())
+                .ok_or_else(|| "mimo-asr RVQ F16 transient quote overflowed".to_string())?,
+        )
+        .map_err(|_| "mimo-asr RVQ F16 transient quote exceeds u64".to_string()),
+        other if unsafe { ggml_is_quantized(other) } => Ok(0),
+        other => Err(format!(
+            "mimo-asr RVQ codebook ggml type {other} is unsupported for host materialization"
+        )),
     }
 }
 
@@ -324,6 +376,7 @@ fn nearest_code<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ggml_runtime::GGML_TYPE_Q4_K;
 
     fn toy_codebooks() -> MimoRvqCodebooks {
         // d_model=2, 2 packed levels, vocab 2 each.
@@ -378,6 +431,20 @@ mod tests {
         let codebooks = toy_codebooks();
         let error = encode_rvq_codes(&codebooks, &[1.0, 2.0, 3.0], 2).expect_err("must fail");
         assert!(matches!(error, MimoRvqError::InvalidHiddenRowsShape { .. }));
+    }
+
+    #[test]
+    fn materialization_peak_quotes_dtype_specific_transient() {
+        assert_eq!(materialization_extra_bytes(GGML_TYPE_F32, 10), Ok(0));
+        assert_eq!(materialization_extra_bytes(GGML_TYPE_F16, 10), Ok(20));
+        assert_eq!(materialization_extra_bytes(GGML_TYPE_Q4_K, 256), Ok(0));
+    }
+
+    #[test]
+    fn materialization_peak_rejects_unsupported_type_and_overflow() {
+        assert!(materialization_extra_bytes(999, 10).is_err());
+        let too_many = (usize::MAX as u64 / 2).saturating_add(1);
+        assert!(materialization_extra_bytes(GGML_TYPE_F16, too_many).is_err());
     }
 
     #[test]

@@ -79,7 +79,9 @@ pub use execution_telemetry::{
 pub(crate) use execution_telemetry::{
     current_execution_telemetry_collector, install_execution_telemetry_collector,
 };
-pub(crate) use ffi::{GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0};
+pub(crate) use ffi::{
+    GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, ggml_is_quantized,
+};
 pub(crate) use gguf_c_parser_sandbox::load_gguf_metadata_and_tensor_index_with_c_parser_sandbox;
 pub use gguf_c_parser_sandbox::{
     GGUF_C_PARSER_SANDBOX_HELPER_ARG, GgufCParserSandboxError,

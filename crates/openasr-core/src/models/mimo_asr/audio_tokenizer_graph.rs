@@ -147,7 +147,7 @@ pub(crate) struct MimoAudiotokEncoderRuntime {
 impl MimoAudiotokEncoderRuntime {
     pub(crate) fn quoted_retained_system_memory_bytes(
         metadata: &MimoAudiotokMetadata,
-        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        _backend: crate::ggml_runtime::GgmlCpuGraphBackend,
     ) -> Result<u64, String> {
         let metadata_bytes = metadata
             .codebook_sizes
@@ -158,15 +158,9 @@ impl MimoAudiotokEncoderRuntime {
             .n_layers
             .checked_mul(std::mem::size_of::<LayerRuntime>())
             .ok_or_else(|| "mimo-asr audio-tokenizer handle quote overflowed".to_string())?;
-        let host_rvq_bytes = if backend.is_gpu_class() {
-            MimoRvqCodebooks::quoted_retained_system_memory_bytes(metadata)?
-        } else {
-            0
-        };
         let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
         bytes.add_usize(metadata_bytes, "mimo-asr audio-tokenizer metadata quote")?;
         bytes.add_usize(layer_bytes, "mimo-asr audio-tokenizer handle quote")?;
-        bytes.add(host_rvq_bytes, "mimo-asr host RVQ codebook quote")?;
         Ok(bytes.finish())
     }
 
