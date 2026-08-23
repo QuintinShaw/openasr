@@ -261,6 +261,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn warm_and_measured_passes_require_fresh_backend_attestation() {
+        let receipt = NativeExecutionReceiptCollector::new();
+        for (token_id, pass) in [(11, "warmup"), (22, "measured")] {
+            let execution_lane =
+                super::super::native_execution_services::current_execution_lane_key(
+                    GgmlCpuGraphBackend::Cpu,
+                );
+            receipt.begin_candidate_attempt();
+            receipt.record_facts(NativeExecutionRequestFacts {
+                resolved_runtime: ResolvedFamilyRuntimeInput::resolve(
+                    None,
+                    crate::ggml_runtime::AutoGpuPolicy::Never,
+                ),
+                execution_lane: execution_lane.clone(),
+                selected_provider: ExecutionProvider::Cpu,
+                stable_device_id: "CPU".to_string(),
+                placement: ExecutionPlacement::CpuOnly,
+                backend: GgmlCpuGraphBackend::Cpu,
+                topology: NativeExecutionTopologyFacts {
+                    family: "test".to_string(),
+                    model_architecture: "test".to_string(),
+                    adapter_id: "test".to_string(),
+                    decode_policy_id: "test".to_string(),
+                    decode_driver: "test".to_string(),
+                    decoder_state: "none".to_string(),
+                    block_stack: "shared".to_string(),
+                },
+                pack_content_id: "test-pack".to_string(),
+                pack_size_bytes: 1,
+                actual_provider: None,
+                actual_stable_device_id: None,
+                scheduler_enabled: None,
+            });
+            receipt.record_backend_observation(ExecutionProvider::Cpu, "CPU", false);
+            receipt.record_token(0, token_id, true);
+            receipt.record_top_k(0, &[2.0, 1.0]);
+            receipt.finish_candidate_attempt(true);
+
+            let snapshot = receipt.snapshot();
+            let facts = snapshot.facts.expect("pass facts");
+            assert_eq!(
+                facts.actual_provider,
+                Some(ExecutionProvider::Cpu),
+                "{pass}"
+            );
+            assert_eq!(
+                facts.actual_stable_device_id.as_deref(),
+                Some("CPU"),
+                "{pass}"
+            );
+            assert_eq!(facts.scheduler_enabled, Some(false), "{pass}");
+            assert!(
+                snapshot
+                    .trace
+                    .jsonl
+                    .contains(&format!("\"token_id\":{token_id}")),
+                "{pass}"
+            );
+            assert!(snapshot.completed, "{pass}");
+        }
+    }
+
+    #[test]
     fn failed_candidate_discards_its_trace_before_fallback_commits() {
         let receipt = NativeExecutionReceiptCollector::new();
         receipt.begin_candidate_attempt();

@@ -1490,6 +1490,22 @@ pub enum GgmlCpuGraphError {
          backend that owns it); refusing to allocate against a dangling backend"
     )]
     BackendDeviceUnavailable,
+    #[error(
+        "ggml cpu graph runner identity changed: expected provider={expected_provider} stable_id={expected_stable_id} scheduler={expected_scheduler}, actual provider={actual_provider} stable_id={actual_stable_id} scheduler={actual_scheduler}"
+    )]
+    RunnerIdentityChanged {
+        expected_provider: String,
+        expected_stable_id: String,
+        expected_scheduler: bool,
+        actual_provider: String,
+        actual_stable_id: String,
+        actual_scheduler: bool,
+    },
+    #[error("ggml cpu graph runner placement changed: expected={expected:?}, actual={actual:?}")]
+    RunnerPlacementChanged {
+        expected: Option<ExecutionPlacement>,
+        actual: Option<ExecutionPlacement>,
+    },
     #[error("ggml cpu graph could not create loaded weight context: {reason}")]
     LoadedWeightContextFailed { reason: String },
     #[error("ggml cpu graph loaded tensor '{tensor}' is missing from context")]
@@ -1622,6 +1638,11 @@ pub struct GgmlCpuGraphRunner {
     backend_kind: GgmlCpuGraphBackend,
     backend_name: String,
     backend_capabilities: GgmlBackendCapabilities,
+    /// Immutable identity captured from the initialized ggml backend. Request-
+    /// local receipt collectors must re-attest this identity on every compute;
+    /// they cannot inherit an observation from the request that populated a
+    /// cached runner.
+    execution_identity: GgmlRunnerExecutionIdentity,
     graph_size: usize,
     _scheduler_accel_backends: Vec<GgmlBackendGuard>,
     _scheduler_cpu_fallback: Option<GgmlBackendGuard>,
@@ -1631,6 +1652,15 @@ pub struct GgmlCpuGraphRunner {
     /// Session-scoped: callers that cache this runner across decode sessions
     /// MUST call `release_cpu_step_buffer_pool` when a session/slice ends.
     cpu_step_buffer_pool: GgmlCpuStepBufferPool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GgmlRunnerExecutionIdentity {
+    actual_provider: ExecutionProvider,
+    actual_stable_device_id: String,
+    backend_name: String,
+    scheduler_enabled: bool,
+    placement: Option<ExecutionPlacement>,
 }
 
 /// Session-scoped grow-to-fit backend buffer for the CPU per-token decode
@@ -1823,6 +1853,7 @@ pub(crate) struct GgmlCpuGraphBuilder<'a> {
     backend: NonNull<c_void>,
     backend_kind: GgmlCpuGraphBackend,
     backend_capabilities: GgmlBackendCapabilities,
+    runner_identity: GgmlRunnerExecutionIdentity,
     scheduler: Option<NonNull<c_void>>,
     scheduler_memory_owner: Option<GgmlSchedulerMemoryOwner>,
     scheduler_graph_lifetime: Option<GgmlSchedulerGraphLifetime>,
@@ -2018,26 +2049,33 @@ impl GgmlCpuGraphRunner {
             request_backend_override(),
             Some(RequestBackendPreference::Exact(_))
         );
+        let (actual_provider, actual_stable_id) = backend_provider_and_stable_id(backend.raw)?;
+        let execution_identity = GgmlRunnerExecutionIdentity {
+            actual_provider,
+            actual_stable_device_id: actual_stable_id,
+            backend_name: backend_name.clone(),
+            scheduler_enabled: scheduler.is_some(),
+            placement: execution_placement,
+        };
+        crate::models::native_execution_services::attest_current_exact_accelerated_backend(
+            config.backend,
+            execution_identity.actual_provider,
+            &execution_identity.actual_stable_device_id,
+            execution_identity.scheduler_enabled,
+        )?;
         if exact_request
             || crate::models::native_execution_services::current_execution_observation_sink()
                 .is_some()
             || crate::models::native_execution_services::current_execution_receipt_collector()
                 .is_some()
         {
-            let (actual_provider, actual_stable_id) = backend_provider_and_stable_id(backend.raw)?;
-            crate::models::native_execution_services::attest_current_exact_accelerated_backend(
-                config.backend,
-                actual_provider,
-                &actual_stable_id,
-                config.use_scheduler,
-            )?;
             crate::models::native_execution_services::record_current_execution_backend_observation(
                 backend.raw.as_ptr() as usize,
                 config.backend,
                 &backend_name,
-                actual_provider,
-                &actual_stable_id,
-                config.use_scheduler,
+                execution_identity.actual_provider,
+                &execution_identity.actual_stable_device_id,
+                execution_identity.scheduler_enabled,
             );
             if crate::models::native_execution_services::current_execution_observation_sink()
                 .is_some()
@@ -2055,6 +2093,7 @@ impl GgmlCpuGraphRunner {
             backend_kind: config.backend,
             backend_name,
             backend_capabilities,
+            execution_identity,
             graph_size: config.graph_size,
             _scheduler_accel_backends: scheduler_accel_backends,
             _scheduler_cpu_fallback: scheduler_cpu_fallback,
@@ -2259,6 +2298,7 @@ impl GgmlCpuGraphRunner {
             backend: self.backend.raw,
             backend_kind: self.backend_kind,
             backend_capabilities: self.backend_capabilities,
+            runner_identity: self.execution_identity.clone(),
             scheduler,
             scheduler_memory_owner,
             scheduler_graph_lifetime,
@@ -2445,6 +2485,7 @@ impl GgmlCpuGraphRunner {
             backend: self.backend.raw,
             backend_kind: self.backend_kind,
             backend_capabilities: self.backend_capabilities,
+            runner_identity: self.execution_identity.clone(),
             scheduler: self.scheduler.as_ref().map(|scheduler| scheduler.raw),
             scheduler_memory_owner: self
                 .scheduler
@@ -6362,6 +6403,13 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         if super::thread_job_cancel_flag().is_some_and(|flag| flag.load(Ordering::Acquire)) {
             return self.finish_compute_result(Ok(ffi::GGML_STATUS_ABORTED));
         }
+        attest_runner_execution_identity(
+            self.backend,
+            self.backend_kind,
+            &self.runner_identity.backend_name,
+            &self.runner_identity,
+            self.scheduler.is_some(),
+        )?;
         self.ensure_scheduler_graph_active(graph)?;
         self.prepare_direct_graph_private_gate(graph)?;
         self.record_execution_placement(graph);
@@ -9277,6 +9325,57 @@ fn backend_provider_and_stable_id(
     unsafe { ffi::ggml_backend_dev_get_props(device.as_ptr(), &mut props) };
     let name = cstr_lossy(props.name);
     Ok((ExecutionProvider::from_backend_name(&name), name))
+}
+
+fn attest_runner_execution_identity(
+    backend: NonNull<c_void>,
+    backend_kind: GgmlCpuGraphBackend,
+    backend_name: &str,
+    identity: &GgmlRunnerExecutionIdentity,
+    scheduler_enabled: bool,
+) -> Result<(), GgmlCpuGraphError> {
+    let (actual_provider, actual_stable_id) = backend_provider_and_stable_id(backend)?;
+    if actual_provider != identity.actual_provider
+        || actual_stable_id != identity.actual_stable_device_id
+        || scheduler_enabled != identity.scheduler_enabled
+    {
+        return Err(GgmlCpuGraphError::RunnerIdentityChanged {
+            expected_provider: identity.actual_provider.as_str().to_string(),
+            expected_stable_id: identity.actual_stable_device_id.clone(),
+            expected_scheduler: identity.scheduler_enabled,
+            actual_provider: actual_provider.as_str().to_string(),
+            actual_stable_id,
+            actual_scheduler: scheduler_enabled,
+        });
+    }
+    let placement = crate::models::native_execution_services::current_execution_placement();
+    if placement != identity.placement {
+        return Err(GgmlCpuGraphError::RunnerPlacementChanged {
+            expected: identity.placement,
+            actual: placement,
+        });
+    }
+    crate::models::native_execution_services::attest_current_exact_accelerated_backend(
+        backend_kind,
+        actual_provider,
+        &identity.actual_stable_device_id,
+        scheduler_enabled,
+    )?;
+    crate::models::native_execution_services::record_current_execution_backend_observation(
+        backend.as_ptr() as usize,
+        backend_kind,
+        backend_name,
+        actual_provider,
+        &identity.actual_stable_device_id,
+        scheduler_enabled,
+    );
+    if crate::models::native_execution_services::current_execution_observation_sink().is_some() {
+        super::backend_memory::record_backend_memory_probe(
+            backend.as_ptr(),
+            super::backend_memory::BackendMemoryLifecyclePoint::BackendInitialized,
+        );
+    }
+    Ok(())
 }
 
 /// Stable backend identity retained in native quote evidence and diagnostics.

@@ -1434,6 +1434,46 @@ mod tests {
     }
 
     #[test]
+    fn parses_bench_receipt_warmup_and_trace_options() {
+        let cli = Cli::try_parse_from([
+            "openasr",
+            "bench-receipt",
+            "short-audio",
+            "--audio",
+            "fixture.wav",
+            "--backend",
+            "native",
+            "--out",
+            "receipt.json",
+            "--trace-out",
+            "trace.jsonl",
+            "--warmup-runs",
+            "1",
+            "--runs",
+            "1",
+        ])
+        .expect("bench receipt options parse");
+        let Command::BenchReceipt {
+            command:
+                BenchReceiptCommand::ShortAudio {
+                    runs,
+                    warmup_runs,
+                    trace_out,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected bench receipt short-audio command");
+        };
+        assert_eq!(warmup_runs, 1);
+        assert_eq!(runs, 1);
+        assert_eq!(
+            trace_out.as_deref(),
+            Some(std::path::Path::new("trace.jsonl"))
+        );
+    }
+
+    #[test]
     fn rejects_unknown_backend_value() {
         let error = parse_backend_kind("not-a-backend").unwrap_err();
         assert!(error.contains("Unsupported backend 'not-a-backend'"));
