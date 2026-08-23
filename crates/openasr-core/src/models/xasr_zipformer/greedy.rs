@@ -260,7 +260,7 @@ pub(crate) fn greedy_decode_frames_incremental_with_backend<B: XasrGreedyDecodeB
     Ok(emitted.len() - start_len)
 }
 
-fn argmax(values: &[f32]) -> Option<u32> {
+pub(super) fn argmax(values: &[f32]) -> Option<u32> {
     values
         .iter()
         .copied()
@@ -280,8 +280,9 @@ mod tests {
     };
 
     #[test]
-    fn argmax_ignores_nan() {
-        assert_eq!(argmax(&[0.0, f32::NAN, 2.0]), Some(2));
+    fn argmax_uses_last_index_on_exact_ties() {
+        assert_eq!(argmax(&[3.0, 7.0, 7.0, 2.0]), Some(2));
+        assert_eq!(argmax(&[f32::NAN, 7.0, 7.0]), Some(2));
     }
 
     #[test]

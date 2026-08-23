@@ -1,8 +1,10 @@
 //! Device-resident stateless predictor and RNN-T joiner for X-ASR.
 //!
-//! Only token ids, one encoder frame, the selected token id, and its softmax
-//! probability cross the device boundary. Quantized joiner matrices remain in
-//! their stored ggml type instead of acquiring a host-f32 copy.
+//! The encoder frame, decoder context, and complete joiner logits cross the
+//! device boundary. Token selection and probability calculation stay on the
+//! host so every provider shares the XASR last-max oracle. Quantized joiner
+//! matrices remain in their stored ggml type instead of acquiring a host-f32
+//! copy.
 
 use crate::ggml_runtime::{
     GgmlCpuGraphConfig, GgmlCpuGraphRunner, GgmlCpuTensor, GgmlPersistentGraphSession,
@@ -10,7 +12,7 @@ use crate::ggml_runtime::{
 };
 
 use super::graph_config::{DEVICE_HEAD_GRAPH_SIZE, xasr_zipformer_device_head_graph_config};
-use super::greedy::XasrGreedyDecodeBackend;
+use super::greedy::{XasrGreedyDecodeBackend, argmax};
 use super::package_import::compact_xasr_name;
 use super::runtime_contract::{
     XASR_DECODER_CONV_GROUPS, XASR_OUTPUT_DOWNSAMPLING_FACTOR, XasrRuntimeTensorContract,
@@ -26,14 +28,13 @@ struct ProjectionGraph {
 struct JointGraph {
     session: GgmlPersistentGraphSession,
     encoder_frame: GgmlCpuTensor<'static>,
-    selected_probability: GgmlCpuTensor<'static>,
-    top1: GgmlCpuTensor<'static>,
+    logits: GgmlCpuTensor<'static>,
 }
 
 struct SpeculativeBlankGraph {
     session: GgmlPersistentGraphSession,
     encoder_frames: GgmlCpuTensor<'static>,
-    top1: GgmlCpuTensor<'static>,
+    logits: GgmlCpuTensor<'static>,
     frames: usize,
 }
 
@@ -356,27 +357,20 @@ impl XasrDeviceHead {
             .mul_mat(weights.output_weight.as_graph_tensor(), joined)
             .and_then(|value| graph.add(value, weights.output_bias.as_graph_tensor()))
             .map_err(|error| error.to_string())?;
-        let top1 = graph
-            .top1_argmax(logits)
-            .map_err(|error| error.to_string())?;
-        let selected_probability = graph
-            .soft_max(logits)
-            .and_then(|value| graph.transpose(value))
-            .and_then(|value| graph.cont(value))
-            .and_then(|rows| graph.get_rows(rows, top1))
-            .map_err(|error| error.to_string())?;
-        graph.set_output(top1).map_err(|error| error.to_string())?;
+        // Keep token selection on the host until the shared runtime exposes a
+        // named, provider-specific last-max capability. Reading the complete
+        // row preserves the XASR host oracle's exact tie behavior on every
+        // backend while the joiner itself remains device-resident.
         graph
-            .set_output(selected_probability)
+            .set_output(logits)
             .map_err(|error| error.to_string())?;
         graph
-            .prepare_outputs_for_upload(&[selected_probability, top1])
+            .prepare_outputs_for_upload(&[logits])
             .map_err(|error| error.to_string())?;
         Ok(JointGraph {
             session,
             encoder_frame,
-            selected_probability,
-            top1,
+            logits,
         })
     }
 
@@ -419,17 +413,19 @@ impl XasrDeviceHead {
             .mul_mat(weights.output_weight.as_graph_tensor(), joined)
             .and_then(|value| graph.add(value, weights.output_bias.as_graph_tensor()))
             .map_err(|error| error.to_string())?;
-        let top1 = graph
-            .top1_argmax(logits)
-            .map_err(|error| error.to_string())?;
-        graph.set_output(top1).map_err(|error| error.to_string())?;
+        // The speculative path uses the same host last-max oracle as scalar
+        // decode. A compact device top1 would authorize a tie policy that is
+        // not part of the named runtime capability contract.
         graph
-            .prepare_outputs_for_upload(&[top1])
+            .set_output(logits)
+            .map_err(|error| error.to_string())?;
+        graph
+            .prepare_outputs_for_upload(&[logits])
             .map_err(|error| error.to_string())?;
         Ok(SpeculativeBlankGraph {
             session,
             encoder_frames,
-            top1,
+            logits,
             frames,
         })
     }
@@ -484,24 +480,18 @@ impl XasrGreedyDecodeBackend for XasrDeviceHead {
 
     fn next_token(&mut self) -> Result<u32, String> {
         let graph = self.joint.session.builder();
-        let (probabilities, token_ids) = graph
-            .compute_outputs_f32_i32(
-                &[(self.joint.selected_probability, 1)],
-                &[(self.joint.top1, 1)],
-            )
+        let logits = graph
+            .compute_output_f32(self.joint.logits, self.vocab_size)
             .map_err(|error| error.to_string())?;
-        let token = token_ids[0][0];
-        if token < 0 || token as usize >= self.vocab_size {
-            return Err(format!(
-                "xasr device head selected token {token} outside vocab {}",
-                self.vocab_size
-            ));
-        }
-        let probability = probabilities[0][0];
+        let token = argmax(&logits)
+            .ok_or_else(|| "xasr device head produced no finite logits".to_string())?;
+        let probability = crate::models::seq2seq_greedy_decode::token_softmax_probability(
+            &logits,
+            token as usize,
+        );
         if !probability.is_finite() {
             return Err("xasr device head selected a non-finite probability".to_string());
         }
-        let token = token as u32;
         self.last_token = Some(token);
         self.last_probability = probability;
         Ok(token)
@@ -543,6 +533,13 @@ impl XasrGreedyDecodeBackend for XasrDeviceHead {
             .frames
             .checked_mul(encoder_dim)
             .ok_or_else(|| "xasr speculative frame shape overflowed".to_string())?;
+        if self.vocab_size == 0 {
+            return Err("xasr speculative device head requires a non-empty vocabulary".to_string());
+        }
+        let logits_count = speculative
+            .frames
+            .checked_mul(self.vocab_size)
+            .ok_or_else(|| "xasr speculative logits shape overflowed".to_string())?;
         let graph = speculative.session.builder();
         graph
             .set_f32_slice(
@@ -551,20 +548,18 @@ impl XasrGreedyDecodeBackend for XasrDeviceHead {
                 "xasr_head_speculative_encoder_frames",
             )
             .map_err(|error| error.to_string())?;
-        let tokens = graph
-            .compute_output_i32(speculative.top1, speculative.frames)
+        let logits = graph
+            .compute_output_f32(speculative.logits, logits_count)
             .map_err(|error| error.to_string())?;
-        let first_non_blank = tokens
-            .iter()
-            .position(|&token| token < 0 || token as u32 != self.blank_id)
-            .unwrap_or(tokens.len());
-        if let Some(&token) = tokens.get(first_non_blank)
-            && (token < 0 || token as usize >= self.vocab_size)
-        {
-            return Err(format!(
-                "xasr speculative device head selected token {token} outside vocab {}",
-                self.vocab_size
-            ));
+        let mut first_non_blank = speculative.frames;
+        for (frame, frame_logits) in logits.chunks_exact(self.vocab_size).enumerate() {
+            let token = argmax(frame_logits).ok_or_else(|| {
+                format!("xasr speculative device head produced no finite logits for frame {frame}")
+            })?;
+            if token != self.blank_id {
+                first_non_blank = frame;
+                break;
+            }
         }
         Ok(Some(first_non_blank))
     }
