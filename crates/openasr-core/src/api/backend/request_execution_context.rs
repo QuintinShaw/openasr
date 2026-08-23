@@ -29,6 +29,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use super::TranscriptionControl;
+use crate::models::native_execution_services::ExecutionLaneKey;
 use crate::models::request_execution_receipt::NativeExecutionReceiptCollector;
 
 /// Cloneable request-local completed-work observer.
@@ -107,6 +108,9 @@ pub struct RequestExecutionContext {
     /// context into candidate attempts and worker-owned decode loops; normal
     /// product requests leave it absent.
     native_execution_receipt: Option<NativeExecutionReceiptCollector>,
+    /// Exact candidate lane captured at request dispatch and propagated into
+    /// family-owned runtime/cache keys. Absent only for low-level fixtures.
+    native_execution_lane: Option<ExecutionLaneKey>,
 }
 
 // Manual, not derived: `TranscriptionControl` holds a `Mutex`/`Condvar` and
@@ -132,6 +136,7 @@ impl RequestExecutionContext {
             decode_work_progress: None,
             unstable_decode_text: None,
             native_execution_receipt: None,
+            native_execution_lane: None,
         }
     }
 
@@ -148,6 +153,7 @@ impl RequestExecutionContext {
             decode_work_progress: Some(observer),
             unstable_decode_text: self.unstable_decode_text.clone(),
             native_execution_receipt: self.native_execution_receipt.clone(),
+            native_execution_lane: self.native_execution_lane.clone(),
         }
     }
 
@@ -166,6 +172,7 @@ impl RequestExecutionContext {
             decode_work_progress: self.decode_work_progress.clone(),
             unstable_decode_text: Some(observer),
             native_execution_receipt: self.native_execution_receipt.clone(),
+            native_execution_lane: self.native_execution_lane.clone(),
         }
     }
 
@@ -186,6 +193,16 @@ impl RequestExecutionContext {
 
     pub(crate) fn native_execution_receipt(&self) -> Option<NativeExecutionReceiptCollector> {
         self.native_execution_receipt.clone()
+    }
+
+    /// Attach the exact candidate lane selected for this request attempt.
+    pub(crate) fn with_native_execution_lane(mut self, lane: ExecutionLaneKey) -> Self {
+        self.native_execution_lane = Some(lane);
+        self
+    }
+
+    pub(crate) fn native_execution_lane(&self) -> Option<&ExecutionLaneKey> {
+        self.native_execution_lane.as_ref()
     }
 
     /// A context with no external owner: nothing can ever cancel or pause
@@ -247,6 +264,7 @@ impl RequestExecutionContext {
             decode_work_progress: None,
             unstable_decode_text: None,
             native_execution_receipt: None,
+            native_execution_lane: None,
         }
     }
 

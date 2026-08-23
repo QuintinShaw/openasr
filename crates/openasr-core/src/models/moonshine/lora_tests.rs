@@ -166,6 +166,11 @@ fn first_step_logits(
             metadata: prepared.metadata,
             decoder_state: decoder_state(prepared.metadata, encoder_output.frame_count),
             backend: crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            graph_config: super::graph_config::moonshine_decoder_graph_config(
+                crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+                None,
+            ),
+            reuse_mode: crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph,
         },
         preflight,
         adapter,
@@ -259,6 +264,11 @@ fn lora_cross_value_precompute_delta_matches_host_math_and_scales_linearly() {
                 metadata,
                 decoder_state: decoder_state(metadata, encoder_output.frame_count),
                 backend: crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+                graph_config: super::graph_config::moonshine_decoder_graph_config(
+                    crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+                    None,
+                ),
+                reuse_mode: crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph,
             },
             &preflight,
             adapter,

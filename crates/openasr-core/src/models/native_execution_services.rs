@@ -397,6 +397,38 @@ impl ExecutionLaneKey {
     pub(crate) fn placement(&self) -> ExecutionPlacement {
         self.placement
     }
+
+    /// Derive a stage-specific lane from the request's already-resolved exact
+    /// device. This never consults backend preference or route discovery.
+    pub(crate) fn for_stage(
+        &self,
+        backend: GgmlCpuGraphBackend,
+        placement: ExecutionPlacement,
+    ) -> Self {
+        Self {
+            device: self.device.clone(),
+            placement,
+            backend,
+        }
+    }
+
+    /// Test/internal fallback for callers outside a request candidate. Native
+    /// production dispatch attaches an exact lane to its request context.
+    pub(crate) fn unscoped_for_backend(backend: GgmlCpuGraphBackend) -> Self {
+        let route = fallback_route_for_unscoped_backend(backend);
+        Self {
+            device: ResolvedDeviceKey {
+                route: route.cache_key(),
+            },
+            placement: match backend {
+                GgmlCpuGraphBackend::Cpu => ExecutionPlacement::CpuOnly,
+                GgmlCpuGraphBackend::Metal | GgmlCpuGraphBackend::Gpu => {
+                    ExecutionPlacement::FullDevice
+                }
+            },
+            backend,
+        }
+    }
 }
 
 /// Stable identity of one explicitly constructed execution-service root.

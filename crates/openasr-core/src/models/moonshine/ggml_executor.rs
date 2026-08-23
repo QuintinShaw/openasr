@@ -22,6 +22,7 @@ use super::prepared_runtime::{
 };
 use crate::MOONSHINE_GGML_ADAPTER_ID;
 use crate::NativeAsrSession;
+use crate::device::execution_policy::ExecutionPlacement;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlDecodeOutputContract, GgmlDecodeOutputPlan, GgmlDecodeReuseMode,
     GgufRuntimeSourcePreflight, ResolvedFamilyRuntimeInput,
@@ -42,7 +43,7 @@ use crate::models::incremental_streaming_driver::{
 use crate::models::lora_adapter::{
     ResolvedLoraAdapterCache, ResolvedLoraAdapterHandle, resolved_lora_adapter,
 };
-use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
+use crate::models::native_execution_services::ExecutionLaneKey;
 use crate::models::prepared_runtime_cache::{
     HostNeutralPreparedRuntime, PreparedRuntimeCache, PreparedRuntimeHandle,
     PreparedRuntimeQuoteContext, SystemMemoryMaterialization,
@@ -64,6 +65,16 @@ const MOONSHINE_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
 /// graphs embed the adapter tensors, so reuse keyed only on the base pack
 /// would be a correctness bug. The output topology fields keep an owner
 /// built for one request proof from being reused for another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct MoonshineDecodeFeatureKey {
+    output_mode: DeviceGreedyStepOutputMode,
+    adapter_active: bool,
+    phrase_bias_active: bool,
+    word_timestamps: bool,
+    streaming: bool,
+    serve_batch: bool,
+}
+
 type MoonshineEncoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, String);
 type MoonshineDecoderRuntimeCacheKey = (
     PackContentKey,
@@ -73,6 +84,7 @@ type MoonshineDecoderRuntimeCacheKey = (
     GgmlDecodeOutputContract,
     GgmlDecodeOutputPlan,
     GgmlDecodeReuseMode,
+    MoonshineDecodeFeatureKey,
 );
 
 struct MoonshineEncoderActorState {
@@ -230,10 +242,23 @@ impl MoonshineGgmlExecutor {
         // a hybrid topology: the encoder lane stays accelerated while the
         // default decoder lane is CPU. Owners and cache keys receive these
         // identities explicitly instead of consulting ambient TLS later.
+        let request_lane = request
+            .execution_context
+            .native_execution_lane()
+            .cloned()
+            .unwrap_or_else(|| ExecutionLaneKey::unscoped_for_backend(backend));
         let encoder_config = moonshine_encoder_graph_config(backend);
-        let decoder_config = moonshine_decoder_graph_config(backend);
-        let encoder_execution_lane = current_execution_lane_key(encoder_config.backend);
-        let decoder_execution_lane = current_execution_lane_key(decoder_config.backend);
+        let decoder_config = moonshine_decoder_graph_config(backend, Some(request_lane.provider()));
+        let encoder_execution_lane =
+            request_lane.for_stage(encoder_config.backend, ExecutionPlacement::FullDevice);
+        let decoder_execution_lane = request_lane.for_stage(
+            decoder_config.backend,
+            if decoder_config.backend == GgmlCpuGraphBackend::Cpu {
+                ExecutionPlacement::CpuOnly
+            } else {
+                ExecutionPlacement::FullDevice
+            },
+        );
         let prepared_runtime = self.prepared_runtime_for_preflight(preflight, backend)?;
         let features = moonshine_waveform_from_prepared_audio(
             &request.prepared_audio,
@@ -268,6 +293,14 @@ impl MoonshineGgmlExecutor {
             decoder_config.use_scheduler,
             resolved_runtime,
         );
+        let feature_key = MoonshineDecodeFeatureKey {
+            output_mode: greedy_step_output_mode,
+            adapter_active: adapter.is_some(),
+            phrase_bias_active: request.request_options.phrase_bias.is_some(),
+            word_timestamps: request.request_options.word_timestamps,
+            streaming: skip_serve_batch,
+            serve_batch: can_use_serve_batch,
+        };
         let decode =
             if let Some(serve_batch_config) = serve_batch_config.filter(|_| can_use_serve_batch) {
                 let decode_config = moonshine_serve_batch_decode_config(
@@ -295,6 +328,12 @@ impl MoonshineGgmlExecutor {
                             &preflight.runtime_source,
                         ),
                     backend: decoder_config.backend,
+                    graph_config: decoder_config,
+                    lane: decoder_execution_lane.clone(),
+                    output_plan: resolved_runtime.output_plan(),
+                    output_mode: greedy_step_output_mode,
+                    reuse_mode: resolved_runtime.reuse_mode(),
+                    phrase_bias_active: request.request_options.phrase_bias.is_some(),
                     uses_scheduler: decoder_config.use_scheduler,
                     prepared_runtime: Arc::clone(&prepared_runtime),
                     decoder_state,
@@ -330,6 +369,7 @@ impl MoonshineGgmlExecutor {
                     decoder_state,
                     decoder_execution_lane.clone(),
                     greedy_step_output_mode,
+                    feature_key,
                     Arc::clone(&request.execution_context.control),
                     request
                         .execution_context
@@ -456,8 +496,10 @@ impl MoonshineGgmlExecutor {
         resolved_runtime: ResolvedFamilyRuntimeInput,
         lane: ExecutionLaneKey,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        feature_key: MoonshineDecodeFeatureKey,
     ) -> Result<MoonshineDecoderRuntimeActor, MoonshineGgmlExecutorError> {
         let backend = resolved_runtime.backend();
+        let decoder_config = moonshine_decoder_graph_config(backend, Some(lane.provider()));
         let output_contract = resolved_runtime.output_contract();
         let output_plan = resolved_runtime.output_plan();
         let reuse_mode = resolved_runtime.reuse_mode();
@@ -469,6 +511,7 @@ impl MoonshineGgmlExecutor {
             output_contract,
             output_plan,
             reuse_mode,
+            feature_key,
         );
         let preflight = preflight.clone();
         self.decoder_runtimes.checkout_or_try_build_with(
@@ -481,6 +524,8 @@ impl MoonshineGgmlExecutor {
                         metadata: prepared.metadata,
                         decoder_state,
                         backend,
+                        graph_config: decoder_config,
+                        reuse_mode,
                     },
                     &preflight,
                     adapter.as_ref().map(resolved_lora_adapter),
@@ -540,6 +585,7 @@ impl MoonshineGgmlExecutor {
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
         lane: ExecutionLaneKey,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        feature_key: MoonshineDecodeFeatureKey,
         control: Arc<crate::api::backend::TranscriptionControl>,
         decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
         unstable_decode_text: Option<crate::api::backend::UnstableDecodeTextObserver>,
@@ -554,6 +600,7 @@ impl MoonshineGgmlExecutor {
             resolved_runtime,
             lane,
             greedy_step_output_mode,
+            feature_key,
         )?;
         runtime
             .call_mut(move |state| {
@@ -757,7 +804,11 @@ fn map_decoder_error(error: MoonshineDecoderGraphError) -> MoonshineGgmlExecutor
 
 #[cfg(test)]
 mod tests {
-    use super::{can_use_moonshine_serve_batch, moonshine_greedy_step_output_mode};
+    use super::{
+        ExecutionLaneKey, MoonshineDecodeFeatureKey, can_use_moonshine_serve_batch,
+        moonshine_greedy_step_output_mode,
+    };
+    use crate::device::execution_policy::ExecutionPlacement;
     use crate::device::execution_route::{
         DeviceAddressability, ExecutionProvider, PhysicalResourceKey, ResolvedExecutionRoute,
         RouteDeviceKind,
@@ -806,6 +857,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn hybrid_stage_lanes_keep_exact_device_and_split_backend_identity() {
+        let candidate = ExecutionLaneKey::unscoped_for_backend(GgmlCpuGraphBackend::Gpu);
+        let encoder = candidate.for_stage(GgmlCpuGraphBackend::Gpu, ExecutionPlacement::FullDevice);
+        let decoder = candidate.for_stage(GgmlCpuGraphBackend::Cpu, ExecutionPlacement::CpuOnly);
+        assert_eq!(encoder.provider(), candidate.provider());
+        assert_eq!(decoder.provider(), candidate.provider());
+        assert_eq!(encoder.backend(), GgmlCpuGraphBackend::Gpu);
+        assert_eq!(decoder.backend(), GgmlCpuGraphBackend::Cpu);
+        assert_ne!(encoder, decoder);
+    }
+    #[test]
+    fn feature_bits_isolate_owner_cache_topology() {
+        let base = MoonshineDecodeFeatureKey {
+            output_mode: DeviceGreedyStepOutputMode::FullLogits,
+            adapter_active: false,
+            phrase_bias_active: false,
+            word_timestamps: false,
+            streaming: false,
+            serve_batch: false,
+        };
+        let mut phrase = base;
+        phrase.phrase_bias_active = true;
+        let mut streaming = base;
+        streaming.streaming = true;
+        let mut batch = base;
+        batch.serve_batch = true;
+        assert_ne!(base, phrase);
+        assert_ne!(base, streaming);
+        assert_ne!(base, batch);
+    }
     #[test]
     fn fresh_graph_plan_disables_serve_batch_even_on_direct_gpu_path() {
         // The shared worker owns a persistent graph, while an unproven request

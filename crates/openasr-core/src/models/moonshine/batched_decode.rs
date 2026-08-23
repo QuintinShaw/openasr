@@ -12,8 +12,12 @@ use super::runtime_contract::MoonshineExecutionMetadata;
 use super::tokenizer::MoonshineTokenizer;
 use crate::PhraseBiasConfig;
 use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::ggml_runtime::GgmlCpuGraphConfig;
+use crate::ggml_runtime::GgmlDecodeOutputPlan;
+use crate::ggml_runtime::GgmlDecodeReuseMode;
 use crate::ggml_runtime::GgufRuntimeSourcePreflight;
 use crate::models::decode_policy_component_registry::BuiltinDecodePolicySeq2SeqTextPostprocessKind;
+use crate::models::device_greedy_token::DeviceGreedyStepOutputMode;
 use crate::models::phrase_bias_decode::build_token_phrase_biases;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStopReason,
@@ -61,6 +65,12 @@ pub(crate) struct MoonshineServeBatchJob {
     pub runtime_preflight: GgufRuntimeSourcePreflight,
     pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,
+    pub graph_config: GgmlCpuGraphConfig,
+    pub lane: crate::models::native_execution_services::ExecutionLaneKey,
+    pub output_plan: GgmlDecodeOutputPlan,
+    pub output_mode: DeviceGreedyStepOutputMode,
+    pub reuse_mode: GgmlDecodeReuseMode,
+    pub phrase_bias_active: bool,
     pub uses_scheduler: bool,
     pub prepared_runtime:
         crate::models::prepared_runtime_cache::PreparedRuntimeHandle<MoonshinePreparedRuntime>,
@@ -121,6 +131,11 @@ impl MoonshineServeBatchError {
 pub(crate) struct MoonshineServeBatchEngineKey {
     build_identity: crate::RuntimeBuildIdentity,
     lane: crate::models::native_execution_services::ExecutionLaneKey,
+    output_plan: GgmlDecodeOutputPlan,
+    output_mode: DeviceGreedyStepOutputMode,
+    reuse_mode: GgmlDecodeReuseMode,
+    phrase_bias_active: bool,
+    word_timestamps: bool,
     resident_self_positions: usize,
     resident_cross_positions: usize,
     hidden_size: usize,
@@ -191,6 +206,8 @@ impl Seq2SeqServeRuntime for MoonshineDecoderGraphRuntime {
                 metadata: job.prepared_runtime.metadata,
                 decoder_state: job.decoder_state,
                 backend: job.backend,
+                graph_config: job.graph_config,
+                reuse_mode: job.reuse_mode,
             },
             &job.runtime_preflight,
             None,
@@ -199,11 +216,13 @@ impl Seq2SeqServeRuntime for MoonshineDecoderGraphRuntime {
     }
 
     fn build_batched(job: &Self::Job, n_seq: usize) -> Result<Self, Self::Error> {
-        MoonshineDecoderGraphRuntime::new_with_n_seq(
+        MoonshineDecoderGraphRuntime::new_with_n_seq_and_runtime_config(
             &job.prepared_runtime.decoder_weights,
             job.prepared_runtime.metadata,
             job.decoder_state,
             job.backend,
+            job.graph_config,
+            job.reuse_mode,
             &job.runtime_preflight,
             n_seq,
             None,
@@ -273,7 +292,12 @@ impl Seq2SeqServeBatchFamily for MoonshineFamily {
     fn engine_key(job: &Self::Job, max_batch: usize) -> Self::EngineKey {
         MoonshineServeBatchEngineKey {
             build_identity: job.build_identity.clone(),
-            lane: crate::models::native_execution_services::current_execution_lane_key(job.backend),
+            lane: job.lane.clone(),
+            output_plan: job.output_plan,
+            output_mode: job.output_mode,
+            reuse_mode: job.reuse_mode,
+            phrase_bias_active: job.phrase_bias_active,
+            word_timestamps: job.word_timestamps,
             resident_self_positions: job.decoder_state.self_attention.resident_positions,
             resident_cross_positions: job.decoder_state.cross_attention.resident_positions,
             hidden_size: job.encoder_output.hidden_size,
@@ -443,6 +467,13 @@ impl Seq2SeqServeBatchFamily for MoonshineFamily {
 impl MoonshineServeBatchJob {
     fn can_batch_with(&self, other: &Self) -> bool {
         self.build_identity == other.build_identity
+            && self.lane == other.lane
+            && self.graph_config == other.graph_config
+            && self.reuse_mode == other.reuse_mode
+            && self.output_plan == other.output_plan
+            && self.output_mode == other.output_mode
+            && self.phrase_bias_active == other.phrase_bias_active
+            && self.word_timestamps == other.word_timestamps
             && self.runtime_cache_path == other.runtime_cache_path
             && self.decode_config.initial_prompt_tokens == other.decode_config.initial_prompt_tokens
             && self.decode_config.eot_token_id == other.decode_config.eot_token_id
@@ -944,6 +975,14 @@ mod tests {
             ),
             runtime_preflight,
             backend,
+            graph_config: super::super::graph_config::moonshine_decoder_graph_config(backend, None),
+            lane: crate::models::native_execution_services::ExecutionLaneKey::unscoped_for_backend(
+                backend,
+            ),
+            output_plan: GgmlDecodeOutputPlan::FullLogits,
+            output_mode: DeviceGreedyStepOutputMode::FullLogits,
+            reuse_mode: GgmlDecodeReuseMode::ReusableGraph,
+            phrase_bias_active: false,
             uses_scheduler,
             prepared_runtime: Arc::new(
                 crate::models::system_memory_owner::SystemMemoryOwner::without_allocation(
@@ -1023,6 +1062,7 @@ mod tests {
         let encoder_output_1 = sample_encoder_output(metadata, 0.25, 32);
         let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            None,
         );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
@@ -1091,6 +1131,7 @@ mod tests {
         let metadata = prepared_runtime.metadata;
         let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            None,
         );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
@@ -1135,6 +1176,15 @@ mod tests {
                 ),
                 runtime_preflight,
                 backend: runtime_config.backend,
+                graph_config: runtime_config,
+                lane:
+                    crate::models::native_execution_services::ExecutionLaneKey::unscoped_for_backend(
+                        runtime_config.backend,
+                    ),
+                output_plan: GgmlDecodeOutputPlan::FullLogits,
+                output_mode: DeviceGreedyStepOutputMode::FullLogits,
+                reuse_mode: GgmlDecodeReuseMode::ReusableGraph,
+                phrase_bias_active: false,
                 uses_scheduler: runtime_config.use_scheduler,
                 prepared_runtime: Arc::new(
                     crate::models::system_memory_owner::SystemMemoryOwner::without_allocation(
@@ -1239,6 +1289,7 @@ mod tests {
         let metadata = prepared_runtime.metadata;
         let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            None,
         );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
@@ -1329,6 +1380,7 @@ mod tests {
         let metadata = prepared_runtime.metadata;
         let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            None,
         );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,
@@ -1428,6 +1480,7 @@ mod tests {
         let metadata = prepared_runtime.metadata;
         let runtime_config = super::super::graph_config::moonshine_decoder_graph_config(
             crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+            None,
         );
         assert!(
             runtime_config.backend == GgmlCpuGraphBackend::Cpu || !runtime_config.use_scheduler,

@@ -27,6 +27,7 @@ use crate::models::ggml_streaming_session::{
     GgmlAsrStreamingTranscriptUpdate,
 };
 use crate::models::graph_runtime_config::install_request_inference_threads_override;
+use crate::models::native_execution_services::current_execution_lane_key;
 use crate::models::streaming_partial_cadence::PartialDecodeCadence;
 use crate::{
     NativeAsrSession, RealtimeAudioFrame, StreamingPartialGranularity, TranscriptUpdate,
@@ -201,6 +202,7 @@ where
     // the session request, not a thread-local): every per-frame request this
     // driver builds for the life of the session copies it in directly.
     let resolved_runtime = request.resolved_runtime;
+    let execution_lane = current_execution_lane_key(resolved_runtime.backend());
     let partial_granularity = crate::arch::streaming_partial_granularity_for_model_architecture(
         request.selected_family.model_architecture,
     );
@@ -276,11 +278,14 @@ where
                 // one prefix per token and fan them out as transcript.partials, which
                 // trips Native ASR `max_queued_events` (64) and kills the live session.
                 // The completed window text below is the one overlay this driver emits.
-                std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
-                    "per-frame streaming decode: this request type carries no \
-                     execution-context field of its own yet, and a live session ends by \
-                     the caller dropping it rather than canceling a transcription id",
-                ))
+                std::sync::Arc::new(
+                    crate::RequestExecutionContext::uncancellable(
+                        "per-frame streaming decode: this request type carries no \
+                         execution-context field of its own yet, and a live session ends by \
+                         the caller dropping it rather than canceling a transcription id",
+                    )
+                    .with_native_execution_lane(execution_lane.clone()),
+                )
             },
         })
     };

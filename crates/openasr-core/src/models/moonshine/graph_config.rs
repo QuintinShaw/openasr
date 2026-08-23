@@ -1,4 +1,5 @@
 use crate::device::execution_policy::ExecutionPlacement;
+use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphThreadingWorkload};
 use crate::models::graph_runtime_config::{
     ModelMetalRuntimeOverrides, configure_model_runtime_graph_config_from_env,
@@ -67,9 +68,12 @@ pub(crate) fn moonshine_encoder_graph_config(backend: GgmlCpuGraphBackend) -> Gg
 /// GPU decode. The request output/reuse contract is resolved at the dispatch
 /// boundary and consumed by the executor; this graph config only determines
 /// the stage backend and scheduler settings.
-pub(crate) fn moonshine_decoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
+pub(crate) fn moonshine_decoder_graph_config(
+    backend: GgmlCpuGraphBackend,
+    provider: Option<ExecutionProvider>,
+) -> GgmlCpuGraphConfig {
     let mut config = moonshine_runtime_graph_config_with_scheduler_default(backend, None);
-    if config.backend.is_gpu_class() && !decoder_gpu_enabled(config.backend) {
+    if config.backend.is_gpu_class() && !decoder_gpu_enabled(config.backend, provider) {
         config.backend = GgmlCpuGraphBackend::Cpu;
         config.use_scheduler = false;
     }
@@ -82,24 +86,18 @@ pub(crate) fn moonshine_decoder_graph_config(backend: GgmlCpuGraphBackend) -> Gg
     apply_moonshine_neural_graph_placement(config)
 }
 
-fn decoder_gpu_enabled(backend: GgmlCpuGraphBackend) -> bool {
+fn decoder_gpu_enabled(backend: GgmlCpuGraphBackend, provider: Option<ExecutionProvider>) -> bool {
     let gpu_raw = std::env::var(OPENASR_MOONSHINE_ENABLE_DECODER_GPU).ok();
-    let backend_preference = crate::ggml_runtime::request_backend_override();
-    decoder_gpu_enabled_with_inputs(backend, gpu_raw.as_deref(), backend_preference.as_ref())
+    decoder_gpu_enabled_with_inputs(backend, gpu_raw.as_deref(), provider)
 }
 
 fn decoder_gpu_enabled_with_inputs(
     backend: GgmlCpuGraphBackend,
     gpu_raw: Option<&str>,
-    backend_preference: Option<&crate::ggml_runtime::RequestBackendPreference>,
+    provider: Option<ExecutionProvider>,
 ) -> bool {
-    let exact_vulkan = matches!(
-        (backend, backend_preference),
-        (
-            GgmlCpuGraphBackend::Gpu,
-            Some(crate::ggml_runtime::RequestBackendPreference::Exact(route))
-        ) if route.provider == crate::device::execution_route::ExecutionProvider::Vulkan
-    );
+    let exact_vulkan =
+        backend == GgmlCpuGraphBackend::Gpu && provider == Some(ExecutionProvider::Vulkan);
     if exact_vulkan {
         crate::ggml_runtime::env_toggle_with_raw(None, gpu_raw, false)
     } else {
@@ -112,26 +110,6 @@ fn decoder_gpu_enabled_with_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn exact_route(
-        provider: crate::device::execution_route::ExecutionProvider,
-    ) -> crate::ggml_runtime::RequestBackendPreference {
-        crate::ggml_runtime::RequestBackendPreference::Exact(
-            crate::device::execution_route::ResolvedExecutionRoute {
-                provider,
-                stable_id: format!("{provider:?}0"),
-                registry_ordinal: 0,
-                kind: crate::device::execution_route::RouteDeviceKind::Accelerated,
-                addressability:
-                    crate::device::execution_route::DeviceAddressability::ExactlyAddressable {
-                        physical_key: crate::device::execution_route::PhysicalResourceKey::new(
-                            "0000:02:00.0",
-                        )
-                        .expect("synthetic PCI key is valid"),
-                    },
-            },
-        )
-    }
 
     fn with_decoder_env<T>(gpu: Option<&str>, run: impl FnOnce() -> T) -> T {
         crate::test_process_env::with_test_process_env(
@@ -163,17 +141,18 @@ mod tests {
             GgmlCpuGraphBackend::Metal
         );
         assert_eq!(
-            moonshine_decoder_graph_config(GgmlCpuGraphBackend::Metal).backend,
+            moonshine_decoder_graph_config(GgmlCpuGraphBackend::Metal, None).backend,
             GgmlCpuGraphBackend::Metal
         );
     }
 
     #[test]
     fn exact_vulkan_graph_config_defaults_decoder_to_cpu() {
-        let preference = exact_route(crate::device::execution_route::ExecutionProvider::Vulkan);
         with_decoder_env(None, || {
-            let _guard = crate::ggml_runtime::install_request_backend_override(Some(preference));
-            let config = moonshine_decoder_graph_config(GgmlCpuGraphBackend::Gpu);
+            let config = moonshine_decoder_graph_config(
+                GgmlCpuGraphBackend::Gpu,
+                Some(crate::device::execution_route::ExecutionProvider::Vulkan),
+            );
             assert_eq!(config.backend, GgmlCpuGraphBackend::Cpu);
             assert!(!config.use_scheduler);
         });
@@ -186,10 +165,8 @@ mod tests {
                 crate::device::execution_route::ExecutionProvider::Cuda,
                 crate::device::execution_route::ExecutionProvider::Hip,
             ] {
-                let _guard = crate::ggml_runtime::install_request_backend_override(Some(
-                    exact_route(provider),
-                ));
-                let config = moonshine_decoder_graph_config(GgmlCpuGraphBackend::Gpu);
+                let config =
+                    moonshine_decoder_graph_config(GgmlCpuGraphBackend::Gpu, Some(provider));
                 assert_eq!(config.backend, GgmlCpuGraphBackend::Gpu, "{provider:?}");
                 assert!(!config.use_scheduler, "{provider:?} must remain FullDevice");
             }
@@ -198,10 +175,11 @@ mod tests {
 
     #[test]
     fn explicit_gpu_stage_override_can_force_vulkan_decoder() {
-        let preference = exact_route(crate::device::execution_route::ExecutionProvider::Vulkan);
         with_decoder_env(Some("1"), || {
-            let _guard = crate::ggml_runtime::install_request_backend_override(Some(preference));
-            let config = moonshine_decoder_graph_config(GgmlCpuGraphBackend::Gpu);
+            let config = moonshine_decoder_graph_config(
+                GgmlCpuGraphBackend::Gpu,
+                Some(crate::device::execution_route::ExecutionProvider::Vulkan),
+            );
             assert_eq!(config.backend, GgmlCpuGraphBackend::Gpu);
             assert!(!config.use_scheduler);
         });
@@ -210,10 +188,12 @@ mod tests {
     #[test]
     fn non_vulkan_full_device_backends_ignore_cpu_stage_override() {
         with_decoder_env(Some("0"), || {
-            let preference = exact_route(crate::device::execution_route::ExecutionProvider::Cuda);
-            let _guard = crate::ggml_runtime::install_request_backend_override(Some(preference));
             assert_eq!(
-                moonshine_decoder_graph_config(GgmlCpuGraphBackend::Gpu).backend,
+                moonshine_decoder_graph_config(
+                    GgmlCpuGraphBackend::Gpu,
+                    Some(crate::device::execution_route::ExecutionProvider::Cuda),
+                )
+                .backend,
                 GgmlCpuGraphBackend::Gpu
             );
             assert!(decoder_gpu_enabled_with_inputs(

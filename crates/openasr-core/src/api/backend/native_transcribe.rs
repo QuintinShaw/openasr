@@ -4134,22 +4134,22 @@ fn capture_request_execution_facts(
     verified_pack: &VerifiedPack,
     selected_family: &GgmlFamilyAdapterDescriptor,
     resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput,
-) -> Result<(), BackendError> {
-    let Some(receipt) =
-        crate::models::native_execution_services::current_execution_receipt_collector()
-    else {
-        return Ok(());
-    };
+) -> Result<crate::models::native_execution_services::ExecutionLaneKey, BackendError> {
     let execution_lane = crate::models::native_execution_services::current_execution_lane_key(
         resolved_runtime.backend(),
     );
+    let Some(receipt) =
+        crate::models::native_execution_services::current_execution_receipt_collector()
+    else {
+        return Ok(execution_lane);
+    };
     receipt.record_facts(NativeExecutionRequestFacts {
         resolved_runtime,
         selected_provider: execution_lane.provider(),
         stable_device_id: execution_lane.stable_device_id().to_string(),
         placement: execution_lane.placement(),
         backend: execution_lane.backend(),
-        execution_lane,
+        execution_lane: execution_lane.clone(),
         topology: receipt_topology_for_family(selected_family)?,
         pack_content_id: verified_pack.content_id().to_string(),
         pack_size_bytes: verified_pack.preflight().runtime_source().byte_len(),
@@ -4157,7 +4157,7 @@ fn capture_request_execution_facts(
         actual_stable_device_id: None,
         scheduler_enabled: None,
     });
-    Ok(())
+    Ok(execution_lane)
 }
 
 /// Builds the request's resolved runtime from the exact candidate route passed
@@ -4181,7 +4181,13 @@ fn run_dispatch_once(
         auto_gpu_policy,
         selected_family,
     );
-    capture_request_execution_facts(verified_pack, selected_family, resolved_runtime)?;
+    let execution_lane =
+        capture_request_execution_facts(verified_pack, selected_family, resolved_runtime)?;
+    let execution_context = Arc::new(
+        (**execution_context)
+            .clone()
+            .with_native_execution_lane(execution_lane),
+    );
     let execution_request = GgmlAsrExecutionViewRequest {
         execution_services: Arc::clone(execution_services),
         decoder_state: crate::models::ggml_asr_executor::GgmlAsrDecoderState::NoPersistentState,

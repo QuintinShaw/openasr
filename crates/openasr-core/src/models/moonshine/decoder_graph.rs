@@ -8,8 +8,9 @@ use thiserror::Error;
 use crate::PhraseBiasConfig;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext,
-    GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlDecodeReuseMode, GgmlLoadedTensor,
+    GgmlLoadedWeightContext, GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgufRuntimeSourcePreflight,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, BuiltinSeq2SeqDecodePolicyConfigInput,
@@ -379,6 +380,7 @@ pub(crate) struct MoonshineDecoderGraphRuntime {
     cross_frame_count: usize,
     n_seq: usize,
     greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    reuse_mode: GgmlDecodeReuseMode,
 }
 
 /// The resolved-input identity a decoder runtime is built from: the weights
@@ -391,6 +393,8 @@ pub(crate) struct MoonshineDecoderRuntimeInput<'a> {
     pub(crate) metadata: MoonshineExecutionMetadata,
     pub(crate) decoder_state: Seq2SeqDecoderState,
     pub(crate) backend: GgmlCpuGraphBackend,
+    pub(crate) graph_config: GgmlCpuGraphConfig,
+    pub(crate) reuse_mode: GgmlDecodeReuseMode,
 }
 
 struct MoonshineDecoderStepExecutor<'a> {
@@ -429,9 +433,19 @@ impl Seq2SeqGreedyDecodeStepExecutor for MoonshineDecoderStepExecutor<'_> {
     }
 }
 
+fn reuse_mode_allows_persistent_graph(
+    reuse_mode: GgmlDecodeReuseMode,
+    runner_supports_reuse: bool,
+) -> bool {
+    reuse_mode == GgmlDecodeReuseMode::ReusableGraph && runner_supports_reuse
+}
+
 impl MoonshineDecoderGraphRuntime {
     fn supports_reusable_decode_graph(&self) -> bool {
-        reusable_decode_graph_supported_for_runner(&self.runner)
+        reuse_mode_allows_persistent_graph(
+            self.reuse_mode,
+            reusable_decode_graph_supported_for_runner(&self.runner),
+        )
     }
 
     fn ensure_resident_self_kv_arena(&mut self) -> Result<(), MoonshineDecoderGraphError> {
@@ -473,11 +487,13 @@ impl MoonshineDecoderGraphRuntime {
         adapter: Option<&MoonshineLoraAdapter>,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
     ) -> Result<Self, MoonshineDecoderGraphError> {
-        Self::new_with_n_seq(
+        Self::new_with_n_seq_and_runtime_config(
             input.decoder_weights,
             input.metadata,
             input.decoder_state,
             input.backend,
+            input.graph_config,
+            input.reuse_mode,
             runtime_preflight,
             1,
             adapter,
@@ -496,6 +512,8 @@ impl MoonshineDecoderGraphRuntime {
             input.metadata,
             input.decoder_state,
             input.backend,
+            input.graph_config,
+            input.reuse_mode,
             RuntimeWeightSource::Synthetic,
             1,
             adapter,
@@ -514,11 +532,40 @@ impl MoonshineDecoderGraphRuntime {
         adapter: Option<&MoonshineLoraAdapter>,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
     ) -> Result<Self, MoonshineDecoderGraphError> {
+        Self::new_with_n_seq_and_runtime_config(
+            decoder_weights,
+            metadata,
+            decoder_state,
+            backend,
+            moonshine_decoder_graph_config(backend, None),
+            GgmlDecodeReuseMode::ReusableGraph,
+            runtime_preflight,
+            n_seq,
+            adapter,
+            greedy_step_output_mode,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_n_seq_and_runtime_config(
+        decoder_weights: &MoonshineDecoderWeights,
+        metadata: MoonshineExecutionMetadata,
+        decoder_state: Seq2SeqDecoderState,
+        backend: GgmlCpuGraphBackend,
+        graph_config: GgmlCpuGraphConfig,
+        reuse_mode: GgmlDecodeReuseMode,
+        runtime_preflight: &GgufRuntimeSourcePreflight,
+        n_seq: usize,
+        adapter: Option<&MoonshineLoraAdapter>,
+        greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    ) -> Result<Self, MoonshineDecoderGraphError> {
         Self::new_with_n_seq_impl(
             decoder_weights,
             metadata,
             decoder_state,
             backend,
+            graph_config,
+            reuse_mode,
             RuntimeWeightSource::Verified(runtime_preflight),
             n_seq,
             adapter,
@@ -541,6 +588,8 @@ impl MoonshineDecoderGraphRuntime {
             metadata,
             decoder_state,
             backend,
+            moonshine_decoder_graph_config(backend, None),
+            GgmlDecodeReuseMode::ReusableGraph,
             RuntimeWeightSource::Synthetic,
             n_seq,
             adapter,
@@ -554,6 +603,8 @@ impl MoonshineDecoderGraphRuntime {
         metadata: MoonshineExecutionMetadata,
         decoder_state: Seq2SeqDecoderState,
         backend: GgmlCpuGraphBackend,
+        graph_config: GgmlCpuGraphConfig,
+        reuse_mode: GgmlDecodeReuseMode,
         runtime_source: RuntimeWeightSource<'_>,
         n_seq: usize,
         adapter: Option<&MoonshineLoraAdapter>,
@@ -593,7 +644,7 @@ impl MoonshineDecoderGraphRuntime {
             });
         }
 
-        let mut config = moonshine_decoder_graph_config(backend);
+        let mut config = graph_config;
         config.graph_size = config.graph_size.max(MOONSHINE_DECODER_GRAPH_SIZE_FLOOR);
         config.context_bytes =
             config
@@ -824,6 +875,7 @@ impl MoonshineDecoderGraphRuntime {
             cross_frame_count: decoder_state.cross_attention.logical_positions,
             n_seq,
             greedy_step_output_mode,
+            reuse_mode,
         })
     }
 
@@ -1061,6 +1113,11 @@ impl MoonshineDecoderGraphRuntime {
         position: usize,
         output_mode: DeviceGreedyStepOutputMode,
     ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, MoonshineDecoderGraphError> {
+        if !self.supports_reusable_decode_graph() {
+            return Err(MoonshineDecoderGraphError::InvalidInput {
+                reason: "moonshine incremental decode requires ReusableGraph evidence".to_string(),
+            });
+        }
         if self.n_seq != 1 {
             return Err(MoonshineDecoderGraphError::InvalidInput {
                 reason: "single moonshine decode step requires n_seq=1".to_string(),
@@ -1169,6 +1226,11 @@ impl MoonshineDecoderGraphRuntime {
         positions: &[usize],
         total_tokens_by_sequence: &[usize],
     ) -> Result<Vec<f32>, MoonshineDecoderGraphError> {
+        if !self.supports_reusable_decode_graph() {
+            return Err(MoonshineDecoderGraphError::InvalidInput {
+                reason: "moonshine batched decode requires ReusableGraph evidence".to_string(),
+            });
+        }
         if self.n_seq == 1 {
             return Err(MoonshineDecoderGraphError::InvalidInput {
                 reason: "batched moonshine decode step requires n_seq > 1".to_string(),
@@ -3063,6 +3125,22 @@ mod tests {
         read_gguf_tensor_index_from_runtime_source, validate_ggml_runtime_source_path,
     };
 
+    #[test]
+    fn fresh_graph_never_allows_persistent_reuse_even_when_runner_supports_it() {
+        assert!(!reuse_mode_allows_persistent_graph(
+            GgmlDecodeReuseMode::FreshGraph,
+            true,
+        ));
+        assert!(reuse_mode_allows_persistent_graph(
+            GgmlDecodeReuseMode::ReusableGraph,
+            true,
+        ));
+        assert!(!reuse_mode_allows_persistent_graph(
+            GgmlDecodeReuseMode::ReusableGraph,
+            false,
+        ));
+    }
+
     const MOONSHINE_BATCH_REAL_PACK_ENV: &str = "OPENASR_MOONSHINE_BATCH_REAL_PACK";
 
     fn read_runtime_source_preflight(runtime_path: &Path) -> GgufRuntimeSourcePreflight {
@@ -3178,6 +3256,11 @@ mod tests {
                 metadata,
                 decoder_state: decoder_state(metadata, encoder_output_0.frame_count),
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+                graph_config: moonshine_decoder_graph_config(
+                    crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+                    None,
+                ),
+                reuse_mode: GgmlDecodeReuseMode::ReusableGraph,
             },
             &preflight,
             None,
@@ -3196,6 +3279,11 @@ mod tests {
                 metadata,
                 decoder_state: decoder_state(metadata, encoder_output_1.frame_count),
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+                graph_config: moonshine_decoder_graph_config(
+                    crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+                    None,
+                ),
+                reuse_mode: GgmlDecodeReuseMode::ReusableGraph,
             },
             &preflight,
             None,
@@ -3261,6 +3349,11 @@ mod tests {
                 metadata,
                 decoder_state: decoder_state(metadata, encoder_output_0.frame_count),
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+                graph_config: moonshine_decoder_graph_config(
+                    crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+                    None,
+                ),
+                reuse_mode: GgmlDecodeReuseMode::ReusableGraph,
             },
             &preflight,
             None,
@@ -3284,6 +3377,11 @@ mod tests {
                 metadata,
                 decoder_state: decoder_state(metadata, encoder_output_1.frame_count),
                 backend: crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+                graph_config: moonshine_decoder_graph_config(
+                    crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+                    None,
+                ),
+                reuse_mode: GgmlDecodeReuseMode::ReusableGraph,
             },
             &preflight,
             None,
