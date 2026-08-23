@@ -666,6 +666,7 @@ mod tests {
                 dropped_events: 0,
                 dropped_owners: 0,
                 rejected_resources: 0,
+                dropped_notifications: 0,
             },
             ..snapshot
         };
