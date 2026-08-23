@@ -48,7 +48,9 @@ use super::runtime_contract::{
 };
 use super::tokenizer::GraniteSpeechTokenizer;
 use crate::api::backend::{Segment, Transcription};
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlDecodeReuseMode, GgufRuntimeSourcePreflight};
+use crate::ggml_runtime::{
+    GgmlCpuGraphBackend, GgmlDecodeOutputPlan, GgmlDecodeReuseMode, GgufRuntimeSourcePreflight,
+};
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
     PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
@@ -359,8 +361,12 @@ fn checked_sum_u64<const N: usize>(
 /// device-bound weights came from the old bytes. Entries carry their admission
 /// lease. The service root can clear or target-evict these actors directly;
 /// each actor owns its memory lease and destroys the runtime on its owner thread.
-type GraniteSpeechPreparedRuntimeCacheKey =
-    (PackContentKey, ExecutionLaneKey, DeviceGreedyStepOutputMode);
+type GraniteSpeechPreparedRuntimeCacheKey = (
+    PackContentKey,
+    ExecutionLaneKey,
+    DeviceGreedyStepOutputMode,
+    GgmlDecodeOutputPlan,
+);
 type GraniteSpeechPreparedRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
     GraniteSpeechPreparedRuntimeCacheKey,
     GraniteSpeechPreparedRuntime,
@@ -492,11 +498,13 @@ impl GraniteSpeechGgmlExecutor {
         backend: GgmlCpuGraphBackend,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
         reuse_mode: GgmlDecodeReuseMode,
+        output_plan: GgmlDecodeOutputPlan,
     ) -> Result<GraniteSpeechPreparedRuntimeActor, GraniteSpeechGgmlExecutorError> {
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
             greedy_step_output_mode,
+            output_plan,
         );
         let quote_preflight = preflight.clone();
         let build_preflight = preflight.clone();
@@ -599,6 +607,7 @@ impl GraniteSpeechGgmlExecutor {
             backend,
             greedy_step_output_mode,
             request.resolved_runtime.reuse_mode(),
+            request.resolved_runtime.output_plan(),
         )?;
         let control = Arc::clone(&request.execution_context.control);
         let decode_work_progress = request
@@ -878,6 +887,25 @@ mod tests {
     use crate::models::ggml_asr_executor::GgmlAsrBackendPreference;
     use crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeStopReason;
     use crate::{LongFormMode, LongFormOptions};
+
+    #[test]
+    fn output_plan_partitions_unified_runtime_cache_identity() {
+        let content = PackContentKey::new("sha256:granite-speech-output-plan-fixture");
+        let lane = current_execution_lane_key(GgmlCpuGraphBackend::Cpu);
+        let full_logits: GraniteSpeechPreparedRuntimeCacheKey = (
+            content.clone(),
+            lane.clone(),
+            DeviceGreedyStepOutputMode::FullLogits,
+            GgmlDecodeOutputPlan::FullLogits,
+        );
+        let compact: GraniteSpeechPreparedRuntimeCacheKey = (
+            content,
+            lane,
+            DeviceGreedyStepOutputMode::DeviceTop1,
+            GgmlDecodeOutputPlan::NativeFirstMaxToken,
+        );
+        assert_ne!(full_logits, compact);
+    }
 
     /// Points at a real converted granite-speech `.oasr` pack via
     /// `OPENASR_GRANITE_SPEECH_PACK`. Loading it mmaps + touches a multi-GB

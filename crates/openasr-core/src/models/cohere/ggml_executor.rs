@@ -274,23 +274,12 @@ fn cohere_unified_runtime_enabled(
 fn cohere_greedy_step_output_mode(
     resolved_runtime: ResolvedFamilyRuntimeInput,
     force_full_logits: bool,
-    adapter_active: bool,
-    phrase_bias_active: bool,
-    word_timestamps: bool,
-    debug_tokens: bool,
 ) -> DeviceGreedyStepOutputMode {
-    if force_full_logits || adapter_active {
+    if force_full_logits {
         return DeviceGreedyStepOutputMode::FullLogits;
     }
     crate::models::device_greedy_token::device_greedy_step_output_mode_for_resolved_runtime(
-        resolved_runtime.with_logits_consumers(
-            crate::ggml_runtime::GgmlDecodeLogitsConsumers::new(
-                phrase_bias_active,
-                word_timestamps,
-                false,
-                debug_tokens,
-            ),
-        ),
+        resolved_runtime,
     )
 }
 
@@ -561,10 +550,6 @@ impl CohereTranscribeGgmlExecutor {
         let greedy_step_output_mode = cohere_greedy_step_output_mode(
             resolved_runtime,
             skip_serve_batch || !allow_unified_runtime || serve_batch_active,
-            request.request_options.adapter_path.is_some(),
-            request.request_options.phrase_bias.is_some(),
-            request.request_options.word_timestamps,
-            std::env::var_os("OPENASR_COHERE_DEBUG_TOKENS").is_some(),
         );
         let unified_gpu_runtime = if cohere_unified_runtime_enabled(
             allow_unified_runtime,
@@ -1570,7 +1555,7 @@ mod tests {
             assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
             assert_eq!(resolved.reuse_mode(), GgmlDecodeReuseMode::FreshGraph);
             assert_eq!(
-                cohere_greedy_step_output_mode(resolved, false, false, false, false, false),
+                cohere_greedy_step_output_mode(resolved, false),
                 DeviceGreedyStepOutputMode::FullLogits
             );
         }
@@ -1578,20 +1563,48 @@ mod tests {
 
     #[test]
     fn cohere_request_features_cannot_authorize_compact_output() {
-        let resolved = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+        use crate::ggml_runtime::GgmlDecodeLogitsConsumers;
+        use crate::models::device_greedy_token::decode_logits_consumers_for_request;
+
+        let gpu = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
             Some(exact_route(ExecutionProvider::Cuda)),
             crate::ggml_runtime::AutoGpuPolicy::AllBackends,
         );
-        for excluded in 0..5 {
+        assert_eq!(
+            cohere_greedy_step_output_mode(gpu, true),
+            DeviceGreedyStepOutputMode::FullLogits
+        );
+
+        for consumers in [
+            decode_logits_consumers_for_request(
+                COHERE_TRANSCRIBE_GGML_ADAPTER_ID,
+                true,
+                false,
+                false,
+            ),
+            decode_logits_consumers_for_request(
+                COHERE_TRANSCRIBE_GGML_ADAPTER_ID,
+                false,
+                true,
+                false,
+            ),
+            decode_logits_consumers_for_request(
+                COHERE_TRANSCRIBE_GGML_ADAPTER_ID,
+                false,
+                false,
+                true,
+            ),
+            GgmlDecodeLogitsConsumers::none().with_debug_logits(true),
+            GgmlDecodeLogitsConsumers::none().with_suppression(true),
+        ] {
+            let resolved = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve_with_output_contract_and_consumers(
+                Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+                crate::ggml_runtime::GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+                consumers,
+            );
             assert_eq!(
-                cohere_greedy_step_output_mode(
-                    resolved,
-                    excluded == 0,
-                    excluded == 1,
-                    excluded == 2,
-                    excluded == 3,
-                    excluded == 4,
-                ),
+                cohere_greedy_step_output_mode(resolved, false),
                 DeviceGreedyStepOutputMode::FullLogits
             );
         }

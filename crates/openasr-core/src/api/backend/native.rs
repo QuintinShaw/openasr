@@ -1321,6 +1321,7 @@ fn decode_logits_consumers_for_options(
             .as_ref()
             .is_some_and(|bias| !bias.is_empty()),
         options.word_timestamps,
+        crate::adapter_pack::active_adapter_path(options.adapter_path.as_deref()).is_some(),
     )
 }
 

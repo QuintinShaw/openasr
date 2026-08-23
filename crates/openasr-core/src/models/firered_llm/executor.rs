@@ -32,7 +32,7 @@ use crate::arch::FIRERED_LLM_DECODE_POLICY_ID;
 use crate::device::execution_policy::ExecutionPlacement;
 use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlNativeGqaCapability, RequestBackendPreference,
+    GgmlCpuGraphBackend, GgmlDecodeOutputPlan, GgmlNativeGqaCapability, RequestBackendPreference,
     ResolvedFamilyRuntimeInput, request_backend_override,
 };
 use crate::models::admitted_pinned_runtime_actor_pool::{
@@ -101,7 +101,12 @@ use super::tokenizer::FireRedLlmTokenizer;
 /// are thread-affine. The accompanying [`SystemMemoryOwner`] accounts for the
 /// host logits/embedding representation, while native graph construction
 /// accounts backend buffers in their physical memory domain.
-type FireRedLlmDecoderCacheKey = (PackContentKey, ExecutionLaneKey, GgmlNativeGqaCapability);
+type FireRedLlmDecoderCacheKey = (
+    PackContentKey,
+    ExecutionLaneKey,
+    GgmlNativeGqaCapability,
+    GgmlDecodeOutputPlan,
+);
 
 type FireRedLlmDecoderRuntimePool =
     AdmittedPinnedRuntimeActorCheckoutPool<FireRedLlmDecoderCacheKey, FireRedLlmDecoderRuntime>;
@@ -113,6 +118,7 @@ struct FireRedLlmUnifiedRuntimeCacheKey {
     content: PackContentKey,
     lane: ExecutionLaneKey,
     native_gqa: GgmlNativeGqaCapability,
+    output_plan: GgmlDecodeOutputPlan,
 }
 
 struct FireRedLlmUnifiedRuntimeState {
@@ -628,6 +634,7 @@ impl FireRedLlmGgmlExecutor {
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
             native_gqa,
+            resolved_runtime.output_plan(),
         );
         let quote_preflight = preflight.clone();
         let build_preflight = preflight.clone();
@@ -720,6 +727,7 @@ impl FireRedLlmGgmlExecutor {
             content: PackContentKey::for_runtime_source(&preflight.runtime_source),
             lane: current_execution_lane_key(backend),
             native_gqa,
+            output_plan: resolved_runtime.output_plan(),
         };
         let quote_preflight = preflight.clone();
         let build_preflight = preflight.clone();
@@ -1303,6 +1311,40 @@ mod tests {
         assert!(firered_llm_unified_runtime_system_memory_shape(u64::MAX, 1, 0, 0).is_err());
         assert!(firered_llm_unified_runtime_system_memory_shape(1, 0, u64::MAX, 0).is_err());
         assert!(firered_llm_unified_runtime_system_memory_shape(1, 0, 0, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn output_plan_partitions_unified_runtime_cache_identity() {
+        let content = PackContentKey::new("sha256:firered-llm-output-plan-fixture");
+        let lane = current_execution_lane_key(GgmlCpuGraphBackend::Cpu);
+        let native_gqa = GgmlNativeGqaCapability::Validated;
+        let full_logits = FireRedLlmUnifiedRuntimeCacheKey {
+            content: content.clone(),
+            lane: lane.clone(),
+            native_gqa,
+            output_plan: GgmlDecodeOutputPlan::FullLogits,
+        };
+        let compact = FireRedLlmUnifiedRuntimeCacheKey {
+            content: content.clone(),
+            lane: lane.clone(),
+            native_gqa,
+            output_plan: GgmlDecodeOutputPlan::NativeFirstMaxToken,
+        };
+        assert_ne!(full_logits, compact);
+
+        let full_decoder: FireRedLlmDecoderCacheKey = (
+            content.clone(),
+            lane.clone(),
+            native_gqa,
+            GgmlDecodeOutputPlan::FullLogits,
+        );
+        let compact_decoder: FireRedLlmDecoderCacheKey = (
+            content,
+            lane,
+            native_gqa,
+            GgmlDecodeOutputPlan::NativeFirstMaxToken,
+        );
+        assert_ne!(full_decoder, compact_decoder);
     }
 
     /// Points at the real converted pack from T2

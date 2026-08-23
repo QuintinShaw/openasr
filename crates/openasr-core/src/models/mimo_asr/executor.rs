@@ -22,7 +22,7 @@ use crate::api::backend::{Segment, Transcription};
 use crate::arch::MIMO_ASR_DECODE_POLICY_ID;
 use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlNativeGqaCapability, RequestBackendPreference,
+    GgmlCpuGraphBackend, GgmlDecodeOutputPlan, GgmlNativeGqaCapability, RequestBackendPreference,
     ResolvedFamilyRuntimeInput,
 };
 use crate::models::admitted_pinned_runtime_actor_pool::{
@@ -164,7 +164,12 @@ struct MimoAsrPreparedRuntime {
 /// bytes. Entries are tagged with the idle-unload generation they were built
 /// service root can clear or target-evict every actor directly; each runtime is
 /// destroyed on the same owner thread that constructed its native contexts.
-type MimoAsrPreparedRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, GgmlNativeGqaCapability);
+type MimoAsrPreparedRuntimeCacheKey = (
+    PackContentKey,
+    ExecutionLaneKey,
+    GgmlNativeGqaCapability,
+    GgmlDecodeOutputPlan,
+);
 
 type MimoAsrPreparedRuntimePool =
     AdmittedPinnedRuntimeActorCheckoutPool<MimoAsrPreparedRuntimeCacheKey, MimoAsrPreparedRuntime>;
@@ -620,6 +625,7 @@ impl MimoAsrGgmlExecutor {
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
             native_gqa,
+            resolved_runtime.output_plan(),
         );
         let quote_preflight = preflight.clone();
         let build_preflight = preflight.clone();
@@ -1094,6 +1100,26 @@ mod tests {
             mimo_native_gqa_candidate(GgmlCpuGraphBackend::Metal, None, validated),
             validated,
         );
+    }
+
+    #[test]
+    fn output_plan_partitions_unified_runtime_cache_identity() {
+        let content = PackContentKey::new("sha256:mimo-asr-output-plan-fixture");
+        let lane = current_execution_lane_key(GgmlCpuGraphBackend::Cpu);
+        let native_gqa = GgmlNativeGqaCapability::Validated;
+        let full_logits: MimoAsrPreparedRuntimeCacheKey = (
+            content.clone(),
+            lane.clone(),
+            native_gqa,
+            GgmlDecodeOutputPlan::FullLogits,
+        );
+        let compact: MimoAsrPreparedRuntimeCacheKey = (
+            content,
+            lane,
+            native_gqa,
+            GgmlDecodeOutputPlan::NativeFirstMaxToken,
+        );
+        assert_ne!(full_logits, compact);
     }
 
     #[test]

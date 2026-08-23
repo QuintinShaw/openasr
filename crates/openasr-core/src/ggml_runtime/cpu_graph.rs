@@ -262,6 +262,7 @@ pub struct GgmlDecodeLogitsConsumers {
     timestamps: bool,
     suppression: bool,
     debug_logits: bool,
+    host_visible: bool,
 }
 
 impl GgmlDecodeLogitsConsumers {
@@ -271,6 +272,7 @@ impl GgmlDecodeLogitsConsumers {
             timestamps: false,
             suppression: false,
             debug_logits: false,
+            host_visible: false,
         }
     }
 
@@ -285,6 +287,7 @@ impl GgmlDecodeLogitsConsumers {
             timestamps,
             suppression,
             debug_logits,
+            host_visible: false,
         }
     }
 
@@ -308,8 +311,17 @@ impl GgmlDecodeLogitsConsumers {
         self
     }
 
+    pub const fn with_host_visible(mut self, active: bool) -> Self {
+        self.host_visible = active;
+        self
+    }
+
     pub const fn requires_complete_logits(self) -> bool {
-        self.phrase_bias || self.timestamps || self.suppression || self.debug_logits
+        self.phrase_bias
+            || self.timestamps
+            || self.suppression
+            || self.debug_logits
+            || self.host_visible
     }
 }
 
@@ -1035,8 +1047,9 @@ impl ResolvedFamilyRuntimeInput {
         // Metal/CUDA/Vulkan/HIP stay Unknown and therefore FullLogits. Generic
         // first/last-max semantics never authorize the compact result. Reuse
         // evidence stays Unknown in production, so every lane is FreshGraph.
-        // Phrase bias, timestamps, suppression, and debug logits independently
-        // force the complete-output plan without changing placement.
+        // Phrase bias, timestamps, suppression, debug logits, and host-visible
+        // adapter consumers independently force the complete-output plan
+        // without changing placement.
         let evidence = lane_decode_evidence_for_backend(backend);
         Self {
             backend,
@@ -11993,6 +12006,20 @@ mod tests {
             ),
             GgmlDecodeOutputPlan::CompleteScores
         );
+        for consumers in [
+            super::GgmlDecodeLogitsConsumers::none().with_suppression(true),
+            super::GgmlDecodeLogitsConsumers::none().with_debug_logits(true),
+            super::GgmlDecodeLogitsConsumers::none().with_host_visible(true),
+        ] {
+            assert_eq!(
+                plan_decode_output(
+                    GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+                    native,
+                    consumers,
+                ),
+                GgmlDecodeOutputPlan::FullLogits
+            );
+        }
     }
 
     #[test]

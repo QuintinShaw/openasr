@@ -22,7 +22,7 @@ use crate::arch::FUNASR_NANO_DECODE_POLICY_ID;
 use crate::device::execution_policy::ExecutionPlacement;
 use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, RequestBackendPreference, request_backend_override,
+    GgmlCpuGraphBackend, GgmlDecodeOutputPlan, RequestBackendPreference, request_backend_override,
 };
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
@@ -82,7 +82,7 @@ pub(crate) const FUNASR_NANO_MAX_INPUT_SECONDS: f32 = 40.0;
 pub(crate) const FUNASR_NANO_MAX_GENERATED_TOKENS: usize = 512;
 
 type FunasrNanoEncoderAdapterRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
-type FunasrNanoDecoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
+type FunasrNanoDecoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, GgmlDecodeOutputPlan);
 
 /// Resident encoder-side runtime: the SAN-M encoder graph + transformer
 /// adaptor with their weights already uploaded to (or bound zero-copy in)
@@ -113,6 +113,7 @@ type FunasrNanoDecoderRuntimeActor =
 struct FunasrNanoUnifiedRuntimeCacheKey {
     content: PackContentKey,
     lane: ExecutionLaneKey,
+    output_plan: GgmlDecodeOutputPlan,
 }
 
 struct FunasrNanoUnifiedRuntime {
@@ -569,6 +570,7 @@ impl FunasrNanoGgmlExecutor {
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
+            resolved_runtime.output_plan(),
         );
         let quote_preflight = preflight.clone();
         let build_preflight = preflight.clone();
@@ -598,6 +600,7 @@ impl FunasrNanoGgmlExecutor {
         let key = FunasrNanoUnifiedRuntimeCacheKey {
             content: PackContentKey::for_runtime_source(&preflight.runtime_source),
             lane: current_execution_lane_key(backend),
+            output_plan: resolved_runtime.output_plan(),
         };
         let quote_preflight = preflight.clone();
         let build_preflight = preflight.clone();
@@ -1111,6 +1114,32 @@ mod tests {
                 Some(ExecutionPlacement::FullDevice),
             ));
         }
+    }
+
+    #[test]
+    fn output_plan_partitions_unified_runtime_cache_identity() {
+        let content = PackContentKey::new("sha256:funasr-nano-output-plan-fixture");
+        let lane = current_execution_lane_key(GgmlCpuGraphBackend::Cpu);
+        let full_logits = FunasrNanoUnifiedRuntimeCacheKey {
+            content: content.clone(),
+            lane: lane.clone(),
+            output_plan: GgmlDecodeOutputPlan::FullLogits,
+        };
+        let compact = FunasrNanoUnifiedRuntimeCacheKey {
+            content: content.clone(),
+            lane: lane.clone(),
+            output_plan: GgmlDecodeOutputPlan::NativeFirstMaxToken,
+        };
+        assert_ne!(full_logits, compact);
+
+        let full_decoder: FunasrNanoDecoderRuntimeCacheKey = (
+            content.clone(),
+            lane.clone(),
+            GgmlDecodeOutputPlan::FullLogits,
+        );
+        let compact_decoder: FunasrNanoDecoderRuntimeCacheKey =
+            (content, lane, GgmlDecodeOutputPlan::NativeFirstMaxToken);
+        assert_ne!(full_decoder, compact_decoder);
     }
 
     /// Bring-up golden: reads the committed reference LFR features + adaptor

@@ -729,7 +729,7 @@ fn resident_model_actor_keys_exclude_request_capacity() {
         (
             "funasr_nano/executor.rs",
             "FunasrNanoDecoderRuntimeCacheKey",
-            &["PackContentKey", "ExecutionLaneKey"][..],
+            &["PackContentKey", "ExecutionLaneKey", "GgmlDecodeOutputPlan"][..],
         ),
         (
             "mimo_asr/executor.rs",
@@ -738,6 +738,7 @@ fn resident_model_actor_keys_exclude_request_capacity() {
                 "PackContentKey",
                 "ExecutionLaneKey",
                 "GgmlNativeGqaCapability",
+                "GgmlDecodeOutputPlan",
             ][..],
         ),
         (
@@ -747,6 +748,7 @@ fn resident_model_actor_keys_exclude_request_capacity() {
                 "PackContentKey",
                 "ExecutionLaneKey",
                 "GgmlNativeGqaCapability",
+                "GgmlDecodeOutputPlan",
             ][..],
         ),
         (
@@ -757,6 +759,7 @@ fn resident_model_actor_keys_exclude_request_capacity() {
                 "ExecutionLaneKey",
                 "MossTdGraphRuntimeCacheProfile",
                 "GgmlNativeGqaCapability",
+                "GgmlDecodeOutputPlan",
             ][..],
         ),
         (
@@ -766,6 +769,7 @@ fn resident_model_actor_keys_exclude_request_capacity() {
                 "PackContentKey",
                 "ExecutionLaneKey",
                 "DeviceGreedyStepOutputMode",
+                "GgmlDecodeOutputPlan",
             ][..],
         ),
         (

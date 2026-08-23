@@ -311,13 +311,8 @@ impl MoonshineGgmlExecutor {
         let serve_batch_config = MoonshineServeBatchConfig::from_policy::<
             super::batched_decode::MoonshineFamily,
         >(request.request_options.serve_batch);
-        let greedy_step_output_mode = moonshine_greedy_step_output_mode(
-            resolved_runtime,
-            skip_serve_batch,
-            adapter.is_some(),
-            request.request_options.phrase_bias.is_some(),
-            request.request_options.word_timestamps,
-        );
+        let greedy_step_output_mode =
+            moonshine_greedy_step_output_mode(resolved_runtime, skip_serve_batch);
         let can_use_serve_batch = can_use_moonshine_serve_batch(
             skip_serve_batch,
             adapter.is_some(),
@@ -697,28 +692,17 @@ fn can_use_moonshine_serve_batch(
 }
 
 /// Translate the immutable request output plan into the graph-facing mode.
-/// Moonshine's ordinary decode can use compact output only when the shared
-/// planner has proven that exact contract. Request features independently force
-/// complete logits because they need host-visible scores or token history.
+/// Moonshine consumes the shared planner result; request logits consumers are
+/// combined once at the request boundary rather than re-OR'd here.
 fn moonshine_greedy_step_output_mode(
     resolved_runtime: ResolvedFamilyRuntimeInput,
     force_full_logits: bool,
-    adapter_active: bool,
-    phrase_bias_active: bool,
-    word_timestamps: bool,
 ) -> DeviceGreedyStepOutputMode {
-    if force_full_logits || adapter_active {
+    if force_full_logits {
         return DeviceGreedyStepOutputMode::FullLogits;
     }
     crate::models::device_greedy_token::device_greedy_step_output_mode_for_resolved_runtime(
-        resolved_runtime.with_logits_consumers(
-            crate::ggml_runtime::GgmlDecodeLogitsConsumers::new(
-                phrase_bias_active,
-                word_timestamps,
-                false,
-                false,
-            ),
-        ),
+        resolved_runtime,
     )
 }
 
@@ -997,7 +981,7 @@ mod tests {
             assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
             assert_eq!(resolved.reuse_mode(), GgmlDecodeReuseMode::FreshGraph);
             assert_eq!(
-                moonshine_greedy_step_output_mode(resolved, false, false, false, false),
+                moonshine_greedy_step_output_mode(resolved, false),
                 DeviceGreedyStepOutputMode::FullLogits,
                 "provider={provider:?}"
             );
@@ -1211,31 +1195,35 @@ mod tests {
         );
         assert_eq!(resolved.reuse_mode(), GgmlDecodeReuseMode::FreshGraph);
         assert_eq!(
-            moonshine_greedy_step_output_mode(resolved, false, false, false, false),
+            moonshine_greedy_step_output_mode(resolved, false),
             DeviceGreedyStepOutputMode::DeviceTop1
+        );
+        assert_eq!(
+            moonshine_greedy_step_output_mode(resolved, true),
+            DeviceGreedyStepOutputMode::FullLogits
         );
     }
 
     #[test]
-    fn request_features_keep_moonshine_on_full_logits() {
-        let resolved = ResolvedFamilyRuntimeInput::resolve(
-            Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
-            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
-        );
-        for (force_full_logits, adapter, phrase_bias, word_timestamps) in [
-            (true, false, false, false),
-            (false, true, false, false),
-            (false, false, true, false),
-            (false, false, false, true),
+    fn request_features_keep_moonshine_on_full_logits_through_shipped_combiner() {
+        use crate::MOONSHINE_GGML_ADAPTER_ID;
+        use crate::ggml_runtime::GgmlDecodeLogitsConsumers;
+        use crate::models::device_greedy_token::decode_logits_consumers_for_request;
+
+        for consumers in [
+            decode_logits_consumers_for_request(MOONSHINE_GGML_ADAPTER_ID, true, false, false),
+            decode_logits_consumers_for_request(MOONSHINE_GGML_ADAPTER_ID, false, true, false),
+            decode_logits_consumers_for_request(MOONSHINE_GGML_ADAPTER_ID, false, false, true),
+            GgmlDecodeLogitsConsumers::none().with_debug_logits(true),
         ] {
+            let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_contract_and_consumers(
+                Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+                consumers,
+            );
             assert_eq!(
-                moonshine_greedy_step_output_mode(
-                    resolved,
-                    force_full_logits,
-                    adapter,
-                    phrase_bias,
-                    word_timestamps,
-                ),
+                moonshine_greedy_step_output_mode(resolved, false),
                 DeviceGreedyStepOutputMode::FullLogits
             );
         }

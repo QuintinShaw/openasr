@@ -44,10 +44,29 @@ pub(crate) fn decode_logits_consumers_for_request(
     adapter_id: &str,
     phrase_bias_active: bool,
     word_timestamps: bool,
+    adapter_active: bool,
 ) -> GgmlDecodeLogitsConsumers {
     let debug_logits = adapter_id == crate::arch::COHERE_TRANSCRIBE_GGML_ADAPTER_ID
         && std::env::var_os("OPENASR_COHERE_DEBUG_TOKENS").is_some();
-    GgmlDecodeLogitsConsumers::new(phrase_bias_active, word_timestamps, false, debug_logits)
+    GgmlDecodeLogitsConsumers::new(
+        phrase_bias_active,
+        word_timestamps,
+        suppression_active_for_adapter(adapter_id),
+        debug_logits,
+    )
+    .with_host_visible(adapter_active)
+}
+
+fn suppression_active_for_adapter(adapter_id: &str) -> bool {
+    crate::arch::OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_adapter_id(adapter_id)
+        .and_then(|descriptor| descriptor.topology_contract.decode_driver.shared_policy())
+        .is_some_and(|policy| {
+            !matches!(
+                policy.seq2seq_suppression_kind,
+                crate::models::decode_policy_component_registry::BuiltinDecodePolicySeq2SeqSuppressionKind::None
+            )
+        })
 }
 
 pub(crate) fn device_top1_token_id(
@@ -192,6 +211,7 @@ mod tests {
             GgmlDecodeLogitsConsumers::none().with_timestamps(true),
             GgmlDecodeLogitsConsumers::none().with_suppression(true),
             GgmlDecodeLogitsConsumers::none().with_debug_logits(true),
+            GgmlDecodeLogitsConsumers::none().with_host_visible(true),
         ] {
             let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_contract_and_consumers(
                 Some(RequestBackendPreference::CpuOnly),
@@ -257,6 +277,64 @@ mod tests {
             assert_ne!(
                 resolved.output_plan(),
                 GgmlDecodeOutputPlan::NativeFirstMaxToken
+            );
+        }
+    }
+
+    fn resolve_consumers(consumers: GgmlDecodeLogitsConsumers) -> ResolvedFamilyRuntimeInput {
+        ResolvedFamilyRuntimeInput::resolve_with_output_contract_and_consumers(
+            Some(RequestBackendPreference::CpuOnly),
+            AutoGpuPolicy::AllBackends,
+            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+            consumers,
+        )
+    }
+
+    #[test]
+    fn shipped_combiner_wires_whisper_suppression_and_forces_full_logits() {
+        let whisper = decode_logits_consumers_for_request(
+            crate::arch::WHISPER_GGML_ADAPTER_ID,
+            false,
+            false,
+            false,
+        );
+        assert!(whisper.requires_complete_logits());
+        assert_eq!(
+            resolve_consumers(whisper).output_plan(),
+            GgmlDecodeOutputPlan::FullLogits
+        );
+
+        let qwen = decode_logits_consumers_for_request(
+            crate::arch::QWEN3_ASR_GGML_ADAPTER_ID,
+            false,
+            false,
+            false,
+        );
+        assert!(!qwen.requires_complete_logits());
+        assert_eq!(
+            resolve_consumers(qwen).output_plan(),
+            GgmlDecodeOutputPlan::NativeFirstMaxToken
+        );
+    }
+
+    #[test]
+    fn shipped_combiner_forces_full_logits_for_each_request_consumer() {
+        let adapter = crate::arch::QWEN3_ASR_GGML_ADAPTER_ID;
+        for consumers in [
+            decode_logits_consumers_for_request(adapter, true, false, false),
+            decode_logits_consumers_for_request(adapter, false, true, false),
+            decode_logits_consumers_for_request(adapter, false, false, true),
+            decode_logits_consumers_for_request(
+                crate::arch::WHISPER_GGML_ADAPTER_ID,
+                false,
+                false,
+                false,
+            ),
+        ] {
+            assert!(consumers.requires_complete_logits());
+            assert_eq!(
+                resolve_consumers(consumers).output_plan(),
+                GgmlDecodeOutputPlan::FullLogits
             );
         }
     }
