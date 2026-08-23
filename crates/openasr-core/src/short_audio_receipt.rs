@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::ggml_runtime::GgmlExecutionPlacementSummary;
+use crate::ggml_runtime::{GgmlExecutionPlacementSummary, ResolvedFamilyRuntimeInput};
+use crate::models::request_execution_receipt::{
+    NativeExecutionReceiptSnapshot, NativeExecutionTokenStep,
+};
 
 pub use crate::ggml_runtime::{
     DecodeFirstDivergenceClass, EncoderDecoderSplitLane, EncoderDecoderSplitProbeRecord,
@@ -90,6 +93,8 @@ pub enum ShortAudioReceiptError {
         "short-audio receipt decode_diagnostics is required and must bind output_plan and reuse_mode"
     )]
     DecodeDiagnosticsMissing,
+    #[error("short-audio receipt native seq2seq decode produced no token steps")]
+    NativeSeq2SeqTokenStepsMissing,
     #[error("short-audio receipt decode diagnostics exceed {max} steps, got {actual}")]
     DecodeStepsUnbounded { max: usize, actual: usize },
     #[error(
@@ -799,6 +804,78 @@ fn require_non_empty(field: &'static str, value: &str) -> Result<(), ShortAudioR
 }
 
 const MAX_ENCODER_DECODER_SPLITS: usize = 8;
+const NATIVE_RECEIPT_SEQ2SEQ_DECODE_DRIVER: &str = "shared-seq2seq-greedy";
+
+/// Project fail-closed decode diagnostics from the shipped runtime that ran.
+///
+/// `resolved` is the mock-receipt planner input. Native receipts pass the
+/// request-local collector snapshot instead of reconstructing plan/reuse from
+/// CLI flags. Seq2seq native receipts without token steps fail closed.
+pub fn decode_diagnostics_from_shipped_runtime(
+    resolved: Option<&ResolvedFamilyRuntimeInput>,
+    snapshot: Option<&NativeExecutionReceiptSnapshot>,
+) -> Result<ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptError> {
+    let resolved = snapshot
+        .and_then(|snapshot| snapshot.facts.as_ref())
+        .map(|facts| &facts.resolved_runtime)
+        .or(resolved)
+        .ok_or(ShortAudioReceiptError::DecodeDiagnosticsMissing)?;
+    let token_steps = snapshot
+        .map(|snapshot| snapshot.token_steps.as_slice())
+        .unwrap_or(&[]);
+    if snapshot
+        .and_then(|snapshot| snapshot.facts.as_ref())
+        .is_some_and(|facts| facts.topology.decode_driver == NATIVE_RECEIPT_SEQ2SEQ_DECODE_DRIVER)
+        && token_steps.is_empty()
+    {
+        return Err(ShortAudioReceiptError::NativeSeq2SeqTokenStepsMissing);
+    }
+    if token_steps.len() > SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS {
+        return Err(ShortAudioReceiptError::DecodeStepsUnbounded {
+            max: SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS,
+            actual: token_steps.len(),
+        });
+    }
+    let graph_rebuilt = matches!(
+        ShortAudioReceiptReuseMode::from(resolved.reuse_mode()),
+        ShortAudioReceiptReuseMode::FreshGraph
+    );
+    let mut steps = Vec::with_capacity(token_steps.len());
+    for step in token_steps {
+        steps.push(decode_step_from_native_token(step, graph_rebuilt)?);
+    }
+    Ok(ShortAudioReceiptDecodeDiagnostics {
+        output_plan: ShortAudioReceiptOutputPlan::from(resolved.output_plan()),
+        reuse_mode: ShortAudioReceiptReuseMode::from(resolved.reuse_mode()),
+        steps,
+        first_divergence: None,
+        encoder_decoder_splits: Vec::new(),
+    })
+}
+
+fn decode_step_from_native_token(
+    step: &NativeExecutionTokenStep,
+    graph_rebuilt: bool,
+) -> Result<ShortAudioReceiptDecodeStep, ShortAudioReceiptError> {
+    let step_index = u32::try_from(step.step_index).map_err(|_| {
+        ShortAudioReceiptError::DecodeStepsUnbounded {
+            max: SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS,
+            actual: step.step_index,
+        }
+    })?;
+    let token_id =
+        i32::try_from(step.token_id).map_err(|_| ShortAudioReceiptError::InvalidEvidenceField {
+            field: "decode_diagnostics.steps.token_id",
+            actual: step.token_id.to_string(),
+        })?;
+    Ok(ShortAudioReceiptDecodeStep {
+        step: step_index,
+        token_id: Some(token_id),
+        logits_sha256: None,
+        top2_margin: step.top2_margin,
+        graph_rebuilt,
+    })
+}
 
 fn validate_decode_diagnostics(
     diagnostics: &ShortAudioReceiptDecodeDiagnostics,
@@ -1240,5 +1317,46 @@ mod tests {
         evidence.trace = None;
         receipt.evidence = Some(evidence);
         ShortAudioReceipt::try_new(receipt).expect("placement evidence may omit token fields");
+    }
+
+    fn cpu_resolved_runtime() -> ResolvedFamilyRuntimeInput {
+        ResolvedFamilyRuntimeInput::resolve(
+            Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+            crate::ggml_runtime::AutoGpuPolicy::Never,
+        )
+    }
+
+    #[test]
+    fn shipped_emitter_projects_token_steps_from_collector() {
+        let resolved = cpu_resolved_runtime();
+        let collector = crate::NativeExecutionReceiptCollector::new();
+        collector.record_top_k(0, &[2.0, 1.0]);
+        collector.record_token(0, 11, false);
+        collector.record_token(1, 7, true);
+        let snapshot = collector.snapshot();
+        let diagnostics = decode_diagnostics_from_shipped_runtime(Some(&resolved), Some(&snapshot))
+            .expect("collector token steps must project");
+        assert_eq!(
+            diagnostics.output_plan,
+            ShortAudioReceiptOutputPlan::from(resolved.output_plan())
+        );
+        assert_eq!(
+            diagnostics.reuse_mode,
+            ShortAudioReceiptReuseMode::from(resolved.reuse_mode())
+        );
+        assert_eq!(diagnostics.steps.len(), 2);
+        assert_eq!(diagnostics.steps[0].step, 0);
+        assert_eq!(diagnostics.steps[0].token_id, Some(11));
+        assert_eq!(diagnostics.steps[0].top2_margin, Some(1.0));
+        assert!(diagnostics.steps[0].graph_rebuilt);
+        assert_eq!(diagnostics.steps[1].token_id, Some(7));
+        assert_eq!(diagnostics.steps[1].top2_margin, None);
+    }
+
+    #[test]
+    fn shipped_emitter_fail_closed_without_resolved_runtime() {
+        let error = decode_diagnostics_from_shipped_runtime(None, None)
+            .expect_err("missing shipped plan/reuse must not emit");
+        assert_eq!(error, ShortAudioReceiptError::DecodeDiagnosticsMissing);
     }
 }

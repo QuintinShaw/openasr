@@ -16,10 +16,10 @@ use std::{fs, io::Write};
 use anyhow::{Context, Result, bail};
 use openasr_core::{
     BackendKind, ExecutionTarget, GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector,
-    InstalledPack, NativeExecutionReceiptCollector, NativeExecutionServices, ResolvedOutputTarget,
-    SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK, SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioReceipt,
-    ShortAudioReceiptAudio, ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptMetrics,
-    ShortAudioReceiptOutputPlan, ShortAudioReceiptPack, ShortAudioReceiptReuseMode,
+    InstalledPack, NativeExecutionReceiptCollector, NativeExecutionReceiptSnapshot,
+    NativeExecutionServices, ResolvedOutputTarget, SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK,
+    SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioReceipt, ShortAudioReceiptAudio,
+    ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptMetrics, ShortAudioReceiptPack,
     ShortAudioReceiptRun, ShortAudioReceiptTranscript, TranscriptionRequest, atomic_write_text,
     ggml_runtime::{
         AutoGpuPolicy, GgmlDecodeLogitsConsumers, GgmlDecodeOutputContract,
@@ -149,6 +149,7 @@ pub(crate) fn bench_receipt_short_audio(
         (options.backend_kind == BackendKind::Native).then(NativeExecutionReceiptCollector::new);
     let mut rtf_samples = Vec::with_capacity(options.runs);
     let mut last_text = String::new();
+    let mut last_truncated = Vec::new();
     let mut notes = Vec::new();
 
     if options.backend_kind == BackendKind::Mock {
@@ -217,6 +218,7 @@ pub(crate) fn bench_receipt_short_audio(
             );
         }
         last_text = transcription.text;
+        last_truncated = transcription.truncated_decodes;
 
         if is_warmup {
             continue;
@@ -253,19 +255,33 @@ pub(crate) fn bench_receipt_short_audio(
     if options.backend_kind == BackendKind::Native {
         validate_observed_accelerator_placement(&device_label, &observed_placement)?;
     }
-    let decode_diagnostics = decode_diagnostics_from_shipped_runtime(match options.backend_kind {
-        BackendKind::Native => request_receipt.as_ref().and_then(|collector| {
-            collector
-                .snapshot()
-                .facts
-                .map(|facts| facts.resolved_runtime)
-        }),
-        BackendKind::Mock => Some(resolved_runtime_for_mock_receipt(options.device)?),
-    })?;
-    if let (Some((_, trace_target)), Some(request_receipt)) =
-        (fixed_output_targets.as_ref(), request_receipt.as_ref())
+    let native_snapshot = request_receipt
+        .as_ref()
+        .map(NativeExecutionReceiptCollector::snapshot);
+    let decode_diagnostics = project_decode_diagnostics(
+        match options.backend_kind {
+            BackendKind::Native => None,
+            BackendKind::Mock => Some(resolved_runtime_for_mock_receipt(options.device)?),
+        },
+        native_snapshot.as_ref(),
+    )?;
+    if !last_truncated.is_empty() {
+        for truncated in &last_truncated {
+            notes.push(format!(
+                "decode_stop={}",
+                truncated.truncation.reason.as_str()
+            ));
+        }
+    } else if native_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.token_steps.last())
+        .is_some_and(|step| step.is_eot)
     {
-        let snapshot = request_receipt.snapshot();
+        notes.push("decode_stop=stop_token".to_string());
+    }
+    if let (Some((_, trace_target)), Some(snapshot)) =
+        (fixed_output_targets.as_ref(), native_snapshot.as_ref())
+    {
         let facts = snapshot.facts.as_ref().ok_or_else(|| {
             anyhow::anyhow!("native trace is missing request-scoped execution facts")
         })?;
@@ -512,21 +528,18 @@ fn quant_from_model_ref(model_arg: Option<&str>) -> Option<String> {
         .map(|tag| openasr_core::canonical_quant_tag(&tag).to_string())
 }
 
-fn decode_diagnostics_from_shipped_runtime(
+fn project_decode_diagnostics(
     resolved: Option<ResolvedFamilyRuntimeInput>,
+    snapshot: Option<&NativeExecutionReceiptSnapshot>,
 ) -> Result<ShortAudioReceiptDecodeDiagnostics> {
-    let Some(resolved) = resolved else {
-        bail!(
-            "short-audio receipt is missing shipped output_plan/reuse_mode; refusing to emit a receipt"
-        );
-    };
-    Ok(ShortAudioReceiptDecodeDiagnostics {
-        output_plan: ShortAudioReceiptOutputPlan::from(resolved.output_plan()),
-        reuse_mode: ShortAudioReceiptReuseMode::from(resolved.reuse_mode()),
-        steps: Vec::new(),
-        first_divergence: None,
-        encoder_decoder_splits: Vec::new(),
-    })
+    openasr_core::decode_diagnostics_from_shipped_runtime(resolved.as_ref(), snapshot).map_err(
+        |error| match error {
+            openasr_core::ShortAudioReceiptError::DecodeDiagnosticsMissing => anyhow::anyhow!(
+                "short-audio receipt is missing shipped output_plan/reuse_mode; refusing to emit a receipt"
+            ),
+            other => anyhow::anyhow!("{other}"),
+        },
+    )
 }
 
 /// Mock transcription never records native execution facts. Plumbing receipts
@@ -774,7 +787,10 @@ fn validate_observed_accelerator_placement(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openasr_core::{SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE, SHORT_AUDIO_RECEIPT_SCHEMA};
+    use openasr_core::{
+        SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE, SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioReceiptOutputPlan,
+        ShortAudioReceiptReuseMode,
+    };
     use tempfile::TempDir;
 
     #[test]
@@ -823,7 +839,7 @@ mod tests {
             Some(RequestBackendPreference::CpuOnly),
             GgmlDecodeLogitsConsumers::none(),
         );
-        let diagnostics = decode_diagnostics_from_shipped_runtime(Some(resolved))
+        let diagnostics = project_decode_diagnostics(Some(resolved), None)
             .expect("CPU compact runtime must project");
         assert_eq!(
             diagnostics.output_plan,
@@ -855,7 +871,7 @@ mod tests {
                 Some(exact_accelerated_preference(provider)),
                 GgmlDecodeLogitsConsumers::none(),
             );
-            let diagnostics = decode_diagnostics_from_shipped_runtime(Some(resolved))
+            let diagnostics = project_decode_diagnostics(Some(resolved), None)
                 .expect("unproven accelerator runtime must project");
             assert_eq!(
                 diagnostics.output_plan,
@@ -879,7 +895,7 @@ mod tests {
             Some(RequestBackendPreference::CpuOnly),
             GgmlDecodeLogitsConsumers::none().with_phrase_bias(true),
         );
-        let diagnostics = decode_diagnostics_from_shipped_runtime(Some(resolved))
+        let diagnostics = project_decode_diagnostics(Some(resolved), None)
             .expect("CPU complete-logits runtime must project");
         assert_eq!(
             diagnostics.output_plan,
@@ -889,7 +905,7 @@ mod tests {
 
     #[test]
     fn shipped_emitter_fail_closed_without_resolved_runtime() {
-        let error = decode_diagnostics_from_shipped_runtime(None)
+        let error = project_decode_diagnostics(None, None)
             .expect_err("missing shipped plan/reuse must not emit");
         assert!(error.to_string().contains("output_plan/reuse_mode"));
     }
@@ -956,9 +972,10 @@ mod tests {
             .decode_diagnostics
             .as_ref()
             .expect("decode diagnostics are required");
-        let expected = decode_diagnostics_from_shipped_runtime(Some(
-            resolved_runtime_for_mock_receipt("cpu").expect("cpu mock runtime"),
-        ))
+        let expected = project_decode_diagnostics(
+            Some(resolved_runtime_for_mock_receipt("cpu").expect("cpu mock runtime")),
+            None,
+        )
         .expect("mock CPU path must project a shipped runtime");
         assert_eq!(diagnostics.output_plan, expected.output_plan);
         assert_eq!(diagnostics.reuse_mode, expected.reuse_mode);
@@ -1116,6 +1133,29 @@ mod tests {
             display_model_id(Some("funasr-nano"), "funasr-nano", "q4_k"),
             "funasr-nano:q4_k"
         );
+    }
+
+    #[test]
+    fn shipped_emitter_projects_token_steps_from_collector_record_token() {
+        let resolved = resolved_runtime(
+            Some(RequestBackendPreference::CpuOnly),
+            GgmlDecodeLogitsConsumers::none(),
+        );
+        let collector = NativeExecutionReceiptCollector::new();
+        collector.record_top_k(0, &[2.0, 1.0]);
+        collector.record_token(0, 11, false);
+        collector.record_token(1, 7, true);
+        let snapshot = collector.snapshot();
+        let diagnostics = project_decode_diagnostics(Some(resolved), Some(&snapshot))
+            .expect("collector token steps must project");
+        assert_eq!(diagnostics.steps.len(), 2);
+        assert_eq!(diagnostics.steps[0].step, 0);
+        assert_eq!(diagnostics.steps[0].token_id, Some(11));
+        assert_eq!(diagnostics.steps[0].top2_margin, Some(1.0));
+        assert!(diagnostics.steps[0].graph_rebuilt);
+        assert_eq!(diagnostics.steps[1].token_id, Some(7));
+        assert_eq!(diagnostics.steps[1].top2_margin, None);
+        assert!(snapshot.trace.event_count > 0);
     }
 
     #[test]

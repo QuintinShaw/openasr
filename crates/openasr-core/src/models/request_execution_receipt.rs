@@ -4,7 +4,10 @@
 //! owned by `short_audio_receipt`; no caller may reconstruct facts from a
 //! backend label, environment variable, or CLI policy option after execution.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use crate::{
     device::{execution_policy::ExecutionPlacement, execution_route::ExecutionProvider},
@@ -56,10 +59,19 @@ pub struct NativeExecutionTraceSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct NativeExecutionTokenStep {
+    pub step_index: usize,
+    pub token_id: u32,
+    pub is_eot: bool,
+    pub top2_margin: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct NativeExecutionReceiptSnapshot {
     pub facts: Option<NativeExecutionRequestFacts>,
     pub placement: GgmlExecutionPlacementSummary,
     pub trace: NativeExecutionTraceSnapshot,
+    pub token_steps: Vec<NativeExecutionTokenStep>,
     pub completed: bool,
 }
 
@@ -68,6 +80,8 @@ struct ReceiptState {
     facts: Option<NativeExecutionRequestFacts>,
     placement: GgmlExecutionPlacementSummary,
     trace_events: Vec<String>,
+    token_steps: Vec<NativeExecutionTokenStep>,
+    top_k_margins: BTreeMap<usize, f32>,
     trace_overflowed: bool,
     completed: bool,
 }
@@ -94,6 +108,8 @@ impl NativeExecutionReceiptCollector {
         state.facts = None;
         state.placement = GgmlExecutionPlacementSummary::default();
         state.trace_events.clear();
+        state.token_steps.clear();
+        state.top_k_margins.clear();
         state.trace_overflowed = false;
         state.completed = false;
     }
@@ -109,6 +125,8 @@ impl NativeExecutionReceiptCollector {
             state.facts = None;
             state.placement = GgmlExecutionPlacementSummary::default();
             state.trace_events.clear();
+            state.token_steps.clear();
+            state.top_k_margins.clear();
             state.trace_overflowed = false;
             state.completed = false;
         }
@@ -170,14 +188,39 @@ impl NativeExecutionReceiptCollector {
         state.placement = placement;
     }
 
-    pub(crate) fn record_token(&self, step_index: usize, token_id: u32, is_eot: bool) {
+    pub fn record_token(&self, step_index: usize, token_id: u32, is_eot: bool) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let top2_margin = state.top_k_margins.get(&step_index).copied();
+            if let Some(existing) = state
+                .token_steps
+                .iter_mut()
+                .find(|step| step.step_index == step_index)
+            {
+                existing.token_id = token_id;
+                existing.is_eot = is_eot;
+                if existing.top2_margin.is_none() {
+                    existing.top2_margin = top2_margin;
+                }
+            } else {
+                state.token_steps.push(NativeExecutionTokenStep {
+                    step_index,
+                    token_id,
+                    is_eot,
+                    top2_margin,
+                });
+            }
+        }
         self.record_trace_event(format!(
             "{{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"token\",\"step_index\":{step_index},\"token_id\":{token_id},\"is_eot\":{}}}",
             usize::from(is_eot)
         ));
     }
 
-    pub(crate) fn record_top_k(&self, step_index: usize, logits: &[f32]) {
+    pub fn record_top_k(&self, step_index: usize, logits: &[f32]) {
         let mut top = Vec::<(usize, f32)>::new();
         for (token_id, logit) in logits.iter().copied().enumerate() {
             if !logit.is_finite() {
@@ -199,6 +242,20 @@ impl NativeExecutionReceiptCollector {
             .first()
             .zip(top.get(1))
             .map(|((_, first), (_, second))| first - second);
+        if let Some(margin) = margin {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.top_k_margins.insert(step_index, margin);
+            if let Some(existing) = state
+                .token_steps
+                .iter_mut()
+                .find(|step| step.step_index == step_index)
+            {
+                existing.top2_margin = Some(margin);
+            }
+        }
         let items = top
             .iter()
             .map(|(token_id, logit)| format!("{{\"token_id\":{token_id},\"value\":{logit:.6}}}"))
@@ -251,6 +308,7 @@ impl NativeExecutionReceiptCollector {
                 overflowed: state.trace_overflowed,
                 event_count: state.trace_events.len(),
             },
+            token_steps: state.token_steps.clone(),
             completed: state.completed,
         }
     }
@@ -319,6 +377,10 @@ mod tests {
                     .contains(&format!("\"token_id\":{token_id}")),
                 "{pass}"
             );
+            assert!(snapshot.trace.event_count > 0, "{pass}");
+            assert_eq!(snapshot.token_steps.len(), 1, "{pass}");
+            assert_eq!(snapshot.token_steps[0].token_id, token_id, "{pass}");
+            assert_eq!(snapshot.token_steps[0].top2_margin, Some(1.0), "{pass}");
             assert!(snapshot.completed, "{pass}");
         }
     }
@@ -332,8 +394,87 @@ mod tests {
         receipt.begin_candidate_attempt();
         receipt.record_token(0, 22, false);
         receipt.finish_candidate_attempt(true);
-        let trace = receipt.snapshot().trace.jsonl;
+        let snapshot = receipt.snapshot();
+        let trace = snapshot.trace.jsonl;
         assert!(!trace.contains("\"token_id\":11"));
         assert!(trace.contains("\"token_id\":22"));
+        assert_eq!(snapshot.token_steps.len(), 1);
+        assert_eq!(snapshot.token_steps[0].token_id, 22);
+    }
+
+    fn seq2seq_facts() -> NativeExecutionRequestFacts {
+        let execution_lane = super::super::native_execution_services::current_execution_lane_key(
+            GgmlCpuGraphBackend::Cpu,
+        );
+        NativeExecutionRequestFacts {
+            resolved_runtime: ResolvedFamilyRuntimeInput::resolve(
+                None,
+                crate::ggml_runtime::AutoGpuPolicy::Never,
+            ),
+            execution_lane,
+            selected_provider: ExecutionProvider::Cpu,
+            stable_device_id: "CPU".to_string(),
+            placement: ExecutionPlacement::CpuOnly,
+            backend: GgmlCpuGraphBackend::Cpu,
+            topology: NativeExecutionTopologyFacts {
+                family: "test".to_string(),
+                model_architecture: "test".to_string(),
+                adapter_id: "test".to_string(),
+                decode_policy_id: "test".to_string(),
+                decode_driver: "shared-seq2seq-greedy".to_string(),
+                decoder_state: "none".to_string(),
+                block_stack: "shared".to_string(),
+            },
+            pack_content_id: "test-pack".to_string(),
+            pack_size_bytes: 1,
+            actual_provider: None,
+            actual_stable_device_id: None,
+            scheduler_enabled: None,
+        }
+    }
+
+    #[test]
+    fn seq2seq_receipt_fails_closed_without_token_steps() {
+        let receipt = NativeExecutionReceiptCollector::new();
+        receipt.begin_candidate_attempt();
+        receipt.record_facts(seq2seq_facts());
+        receipt.record_backend_observation(ExecutionProvider::Cpu, "CPU", false);
+        receipt.finish_candidate_attempt(true);
+        let snapshot = receipt.snapshot();
+        assert!(snapshot.completed);
+        assert_eq!(
+            snapshot.facts.as_ref().unwrap().scheduler_enabled,
+            Some(false)
+        );
+        assert!(snapshot.token_steps.is_empty());
+        let error = crate::decode_diagnostics_from_shipped_runtime(None, Some(&snapshot))
+            .expect_err("seq2seq native receipt without tokens must fail closed");
+        assert_eq!(
+            error,
+            crate::ShortAudioReceiptError::NativeSeq2SeqTokenStepsMissing
+        );
+    }
+
+    #[test]
+    fn seq2seq_receipt_projects_token_steps_from_record_token() {
+        let receipt = NativeExecutionReceiptCollector::new();
+        receipt.begin_candidate_attempt();
+        receipt.record_facts(seq2seq_facts());
+        receipt.record_backend_observation(ExecutionProvider::Cpu, "CPU", false);
+        receipt.record_token(0, 11, false);
+        receipt.record_top_k(0, &[4.0, 1.5]);
+        receipt.finish_candidate_attempt(true);
+        let snapshot = receipt.snapshot();
+        let diagnostics = crate::decode_diagnostics_from_shipped_runtime(None, Some(&snapshot))
+            .expect("seq2seq token steps must project");
+        assert_eq!(diagnostics.steps.len(), 1);
+        assert_eq!(diagnostics.steps[0].token_id, Some(11));
+        assert_eq!(diagnostics.steps[0].top2_margin, Some(2.5));
+        assert!(snapshot.completed);
+        assert!(snapshot.trace.event_count > 0);
+        assert_eq!(
+            snapshot.facts.as_ref().unwrap().scheduler_enabled,
+            Some(false)
+        );
     }
 }
