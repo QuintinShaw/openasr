@@ -8,5 +8,6 @@ pub(crate) mod history;
 pub(crate) mod models_api;
 pub(crate) mod pairing;
 pub(crate) mod pull_jobs;
+pub(crate) mod runtime_receipts;
 pub(crate) mod transcription;
 pub(crate) mod voice_id;

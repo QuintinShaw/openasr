@@ -11,6 +11,7 @@ pub(crate) use routes::history::*;
 pub(crate) use routes::models_api::*;
 pub(crate) use routes::pairing::*;
 pub(crate) use routes::pull_jobs::*;
+pub(crate) use routes::runtime_receipts::*;
 pub(crate) use routes::transcription::*;
 pub(crate) use routes::voice_id::*;
 
@@ -137,8 +138,10 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
     distribution.log_restart_pending_pull_jobs();
     let auth = launch_options.auth.clone();
     let health_identity = ServerHealthIdentity::from_launch_options(launch_options);
+    let start_identity = ServerStartIdentity::new();
     Router::new()
         .route("/health", get(health))
+        .route("/v1/debug/runtime-receipts", get(runtime_receipts))
         .route("/v1/models", get(models))
         .route("/v1/catalog", get(catalog))
         .route("/v1/config", get(get_config).put(put_config))
@@ -247,6 +250,7 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
         ))
         .layer(Extension(auth))
         .layer(Extension(health_identity))
+        .layer(Extension(start_identity))
         .layer(Extension(distribution))
         .layer(DefaultBodyLimit::max(MAX_TRANSCRIPTION_UPLOAD_BYTES))
         .with_state(runtime)
@@ -799,15 +803,29 @@ fn validate_listen_security(
     addr: SocketAddr,
     launch_options: &ServerLaunchOptions,
 ) -> anyhow::Result<()> {
+    validate_listen_security_with_escape(addr, launch_options, insecure_non_loopback_bind_allowed())
+}
+
+fn validate_listen_security_with_escape(
+    addr: SocketAddr,
+    launch_options: &ServerLaunchOptions,
+    allow_insecure_non_loopback: bool,
+) -> anyhow::Result<()> {
     if addr.ip().is_loopback() {
         return Ok(());
+    }
+    if !launch_options.auth.is_enabled() {
+        anyhow::bail!(
+            "OpenASR remote serve requires device authentication before binding a non-loopback address such as {addr}"
+        );
     }
     if !launch_options.tls.is_enabled() {
         // Opt-in escape hatch for container / trusted-network deployments where an
         // OUTER boundary controls exposure (a Docker port-publish, a reverse proxy
         // terminating TLS, etc.). The default stays fail-closed; the desktop
-        // pairing flow never sets this and always serves TLS.
-        if insecure_non_loopback_bind_allowed() {
+        // pairing flow never sets this and always serves TLS. This escape hatch
+        // only waives TLS; device authentication remains mandatory above.
+        if allow_insecure_non_loopback {
             eprintln!(
                 "openasr-server: WARNING — binding non-loopback {addr} WITHOUT TLS because OPENASR_ALLOW_INSECURE_NON_LOOPBACK is set. Traffic is UNENCRYPTED; only do this behind a trusted boundary (container / reverse proxy)."
             );
@@ -815,11 +833,6 @@ fn validate_listen_security(
         }
         anyhow::bail!(
             "OpenASR HTTP serve is local-only until TLS/WSS remote serving is enabled; bind a loopback address such as 127.0.0.1 instead of {addr} (or, only for a trusted/container deployment, set OPENASR_ALLOW_INSECURE_NON_LOOPBACK=1)"
-        );
-    }
-    if !launch_options.auth.is_enabled() {
-        anyhow::bail!(
-            "OpenASR remote serve requires device authentication before binding a non-loopback address such as {addr}"
         );
     }
     Ok(())
@@ -1246,6 +1259,29 @@ impl ServerHealthIdentity {
     }
 }
 
+/// Non-secret identity for one router/daemon start. This is intentionally
+/// separate from the legacy supervised-daemon instance token: the token is a
+/// readiness-control secret and must never be copied into diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServerStartIdentity {
+    pub(crate) pid: u32,
+    pub(crate) nonce: Option<String>,
+    pub(crate) started_at_unix_secs: Option<u64>,
+}
+
+impl ServerStartIdentity {
+    fn new() -> Self {
+        Self {
+            pid: std::process::id(),
+            nonce: random_hex(16).ok(),
+            started_at_unix_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_secs()),
+        }
+    }
+}
+
 fn resolve_instance_token(launch_option: Option<String>) -> Option<String> {
     env::var(SERVER_INSTANCE_TOKEN_ENV)
         .ok()
@@ -1450,6 +1486,15 @@ impl ServerRuntime {
     /// only after a successful load/decode, and flips back to `false` the
     /// moment the `idle_unload` reaper evicts the cached runtime, without
     /// this method reaching into any per-thread cache itself.
+    pub(crate) fn runtime_receipt_snapshot(
+        &self,
+    ) -> openasr_core::runtime_receipts::RuntimeReceiptSnapshot {
+        self.native_execution
+            .execution_services()
+            .runtime_receipts()
+            .snapshot()
+    }
+
     fn model_is_resident(&self) -> bool {
         match self.backend {
             BackendKind::Mock => true,

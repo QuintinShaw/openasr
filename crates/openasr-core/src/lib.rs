@@ -271,6 +271,7 @@ pub(crate) use models::ggml_asr_executor::{
 pub use models::native_execution_services::{
     NativeExecutionScopeId, NativeExecutionServices, NativeExecutionServicesError,
 };
+pub use models::runtime_receipts;
 pub use models::{
     cohere::COHERE_TRANSCRIBE_MODEL_FAMILY,
     cohere::{

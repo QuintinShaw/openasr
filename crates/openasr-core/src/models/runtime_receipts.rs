@@ -5,7 +5,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    fmt,
+    fmt::{self, Write as _},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
 };
@@ -115,6 +115,16 @@ pub enum RuntimeReceiptError {
 /// root and is never retained in a snapshot or exported through this type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RedactedIdentity([u8; 16]);
+
+impl RedactedIdentity {
+    pub fn to_hex(self) -> String {
+        let mut encoded = String::with_capacity(32);
+        for byte in self.0 {
+            write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        encoded
+    }
+}
 
 /// The safe domain vocabulary used by receipt snapshots. The physical device
 /// identity is represented only by `join_id`; the original domain is never

@@ -3224,6 +3224,131 @@ async fn bearer_auth_protects_v1_routes_when_enabled() {
 }
 
 #[tokio::test]
+async fn runtime_receipts_require_operator_auth_and_bound_query() {
+    let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime::default(),
+        openasr_server::ServerLaunchOptions {
+            auth: openasr_server::ServerAuth::pairing("admin-secret"),
+            ..Default::default()
+        },
+    );
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/debug/runtime-receipts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/pairing/requests")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"device_name":"Receipt Reader"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::ACCEPTED);
+    let create_body = to_bytes(create.into_body(), 1024 * 64).await.unwrap();
+    let request_id = serde_json::from_slice::<Value>(&create_body).unwrap()["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let approve = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/pairing/requests/{request_id}/approve"))
+                .header(header::AUTHORIZATION, "Bearer admin-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(approve.status(), StatusCode::OK);
+
+    let credential = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/pairing/requests/{request_id}/credential"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(credential.status(), StatusCode::OK);
+    let credential_body = to_bytes(credential.into_body(), 1024 * 64).await.unwrap();
+    let credential_json: Value = serde_json::from_slice(&credential_body).unwrap();
+    let device_token = credential_json["bearer_token"].as_str().unwrap();
+
+    let device = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/debug/runtime-receipts")
+                .header(header::AUTHORIZATION, format!("Bearer {device_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(device.status(), StatusCode::FORBIDDEN);
+
+    let authorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/debug/runtime-receipts?event_limit=999999")
+                .header(header::AUTHORIZATION, "Bearer admin-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+    let body = to_bytes(authorized.into_body(), 1024 * 64).await.unwrap();
+    let body_text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(!body_text.contains("admin-secret"));
+    assert!(!body_text.contains(device_token));
+    let json: Value = serde_json::from_str(&body_text).unwrap();
+    assert_eq!(json["schema"], "openasr.runtime-ownership-receipt.v0");
+    assert_eq!(json["availability"], "available");
+    assert!(json["snapshot_completeness"]["complete"].as_bool().unwrap());
+    assert_eq!(json["event_limit"], 128);
+    assert!(json["live_owners"].as_array().unwrap().is_empty());
+    assert!(json["recent_events"].as_array().unwrap().is_empty());
+    let daemon_nonce = json["daemon_start_identity"]["nonce"].as_str().unwrap();
+    assert_eq!(daemon_nonce.len(), 32);
+    assert!(daemon_nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert!(json.get("instance_token").is_none());
+
+    let invalid_domain = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/debug/runtime-receipts?domain=physical-device")
+                .header(header::AUTHORIZATION, "Bearer admin-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_domain.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn pairing_auth_issues_and_revokes_device_bearer_credentials() {
     let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
         openasr_server::ServerRuntime::default(),
@@ -3638,7 +3763,10 @@ async fn serve_rejects_non_loopback_http_bind_until_tls_is_available() {
     let err = openasr_server::serve_with_launch_options(
         "0.0.0.0:0".parse().unwrap(),
         openasr_server::ServerRuntime::default(),
-        openasr_server::ServerLaunchOptions::default(),
+        openasr_server::ServerLaunchOptions {
+            auth: openasr_server::ServerAuth::bearer("test-token"),
+            ..Default::default()
+        },
     )
     .await
     .unwrap_err();

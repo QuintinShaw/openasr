@@ -41,6 +41,20 @@ fn serve_batch_unavailable_non_retryable_maps_to_503() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
+#[test]
+fn non_loopback_tls_escape_still_requires_authentication() {
+    let err = validate_listen_security_with_escape(
+        "0.0.0.0:0".parse().unwrap(),
+        &ServerLaunchOptions::default(),
+        true,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("requires device authentication"),
+        "unexpected error: {err:?}"
+    );
+}
+
 fn header_map_with_bearer(token: &str) -> axum::http::HeaderMap {
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(
