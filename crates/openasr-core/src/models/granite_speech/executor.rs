@@ -38,7 +38,6 @@ use thiserror::Error;
 use super::decode_executor::GraniteSpeechResidentAudioDecodeStepExecutor;
 use super::decode_session::{
     GraniteSpeechDecodeSession, GraniteSpeechKvCacheCapacity, GraniteSpeechKvCacheCapacityError,
-    decoder_graph_config,
 };
 use super::decoder_graph::GraniteSpeechDecoderConfig;
 use super::encoder_graph::{GraniteSpeechEncoderConfig, GraniteSpeechEncoderRuntime};
@@ -49,8 +48,7 @@ use super::runtime_contract::{
 };
 use super::tokenizer::GraniteSpeechTokenizer;
 use crate::api::backend::{Segment, Transcription};
-use crate::ggml_runtime::GgufRuntimeSourcePreflight;
-use crate::ggml_runtime::{GgmlCpuGraphBackend, request_backend_override};
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufRuntimeSourcePreflight};
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
     PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
@@ -60,7 +58,7 @@ use crate::models::decode_policy_component_registry::{
     run_builtin_seq2seq_decode_policy,
 };
 use crate::models::device_greedy_token::{
-    DeviceGreedyStepOutputMode, device_greedy_step_output_mode,
+    DeviceGreedyStepOutputMode, device_greedy_step_output_mode_for_resolved_runtime,
 };
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
@@ -69,9 +67,7 @@ use crate::models::ggml_asr_executor::{
 use crate::models::mapped_token_embedding::{
     MappedTokenEmbeddingTable, load_mapped_token_embedding_table_from_reader,
 };
-use crate::models::native_execution_services::{
-    ExecutionLaneKey, current_execution_lane_key, current_execution_placement,
-};
+use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
 use crate::models::runtime_cache_coordinator::PackContentKey;
 use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
 use crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError;
@@ -580,14 +576,8 @@ impl GraniteSpeechGgmlExecutor {
             }
         })?;
         let backend = request.resolved_runtime.backend();
-        let backend_preference = request_backend_override();
-        let decoder_graph_config = decoder_graph_config(backend);
-        let greedy_step_output_mode = device_greedy_step_output_mode(
-            backend,
-            decoder_graph_config.use_scheduler,
-            backend_preference.as_ref(),
-            current_execution_placement(),
-        );
+        let greedy_step_output_mode =
+            device_greedy_step_output_mode_for_resolved_runtime(request.resolved_runtime);
         // KWB (keyword-list biasing): the model's own documented prompt
         // convention -- "transcribe the speech to text. Keywords: <kw1>,
         // <kw2>, ..." -- not a decode-time logit bias (see the family's

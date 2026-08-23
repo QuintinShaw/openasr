@@ -253,6 +253,66 @@ impl GgmlBackendCapabilities {
     }
 }
 
+/// Request features that need a complete logits or score row. Any one of these
+/// forces the shared planner onto `FullLogits` or `CompleteScores`; they never
+/// authorize compact native selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct GgmlDecodeLogitsConsumers {
+    phrase_bias: bool,
+    timestamps: bool,
+    suppression: bool,
+    debug_logits: bool,
+}
+
+impl GgmlDecodeLogitsConsumers {
+    pub const fn none() -> Self {
+        Self {
+            phrase_bias: false,
+            timestamps: false,
+            suppression: false,
+            debug_logits: false,
+        }
+    }
+
+    pub const fn new(
+        phrase_bias: bool,
+        timestamps: bool,
+        suppression: bool,
+        debug_logits: bool,
+    ) -> Self {
+        Self {
+            phrase_bias,
+            timestamps,
+            suppression,
+            debug_logits,
+        }
+    }
+
+    pub const fn with_phrase_bias(mut self, active: bool) -> Self {
+        self.phrase_bias = active;
+        self
+    }
+
+    pub const fn with_timestamps(mut self, active: bool) -> Self {
+        self.timestamps = active;
+        self
+    }
+
+    pub const fn with_suppression(mut self, active: bool) -> Self {
+        self.suppression = active;
+        self
+    }
+
+    pub const fn with_debug_logits(mut self, active: bool) -> Self {
+        self.debug_logits = active;
+        self
+    }
+
+    pub const fn requires_complete_logits(self) -> bool {
+        self.phrase_bias || self.timestamps || self.suppression || self.debug_logits
+    }
+}
+
 /// Request/result contract consumed by the shared output planner.
 ///
 /// The variants name the result contract, not an optimization hint. Token
@@ -445,7 +505,17 @@ fn lane_decode_evidence_for_backend(backend: GgmlCpuGraphBackend) -> GgmlLaneDec
 fn plan_decode_output(
     contract: GgmlDecodeOutputContract,
     evidence: GgmlLaneDecodeEvidence,
+    consumers: GgmlDecodeLogitsConsumers,
 ) -> GgmlDecodeOutputPlan {
+    if consumers.requires_complete_logits() {
+        return match contract {
+            GgmlDecodeOutputContract::CompleteScores => GgmlDecodeOutputPlan::CompleteScores,
+            GgmlDecodeOutputContract::FullLogits
+            | GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits => {
+                GgmlDecodeOutputPlan::FullLogits
+            }
+        };
+    }
     match contract {
         GgmlDecodeOutputContract::FullLogits => GgmlDecodeOutputPlan::FullLogits,
         GgmlDecodeOutputContract::CompleteScores => GgmlDecodeOutputPlan::CompleteScores,
@@ -939,18 +1009,36 @@ impl ResolvedFamilyRuntimeInput {
         policy: AutoGpuPolicy,
         output_contract: GgmlDecodeOutputContract,
     ) -> Self {
+        Self::resolve_with_output_contract_and_consumers(
+            preference,
+            policy,
+            output_contract,
+            GgmlDecodeLogitsConsumers::none(),
+        )
+    }
+
+    /// Resolves a family request with an explicit output contract and the
+    /// request features that consume complete logits or scores.
+    pub fn resolve_with_output_contract_and_consumers(
+        preference: Option<RequestBackendPreference>,
+        policy: AutoGpuPolicy,
+        output_contract: GgmlDecodeOutputContract,
+        logits_consumers: GgmlDecodeLogitsConsumers,
+    ) -> Self {
         let backend =
             GgmlCpuGraphConfig::resolve_family_backend_for_preference(preference.clone(), policy);
         // Compact native first-max is authorized only for the proven CPU lane.
         // Metal/CUDA/Vulkan/HIP stay Unknown and therefore FullLogits. Generic
         // first/last-max semantics never authorize the compact result. Reuse
         // evidence stays Unknown in production, so every lane is FreshGraph.
+        // Phrase bias, timestamps, suppression, and debug logits independently
+        // force the complete-output plan without changing placement.
         let evidence = lane_decode_evidence_for_backend(backend);
         Self {
             backend,
             native_gqa: resolve_native_gqa_capability(preference.as_ref(), backend),
             output_contract,
-            output_plan: plan_decode_output(output_contract, evidence),
+            output_plan: plan_decode_output(output_contract, evidence, logits_consumers),
             reuse_mode: if evidence.reuse.is_validated() {
                 GgmlDecodeReuseMode::ReusableGraph
             } else {
@@ -968,6 +1056,16 @@ impl ResolvedFamilyRuntimeInput {
         output_requirement: GgmlRequestOutputRequirement,
     ) -> Self {
         Self::resolve_with_output_contract(preference, policy, output_requirement)
+    }
+
+    /// Re-combine the already-resolved lane with extra request logits
+    /// consumers. Placement and reuse evidence are unchanged.
+    pub fn with_logits_consumers(self, logits_consumers: GgmlDecodeLogitsConsumers) -> Self {
+        let evidence = lane_decode_evidence_for_backend(self.backend);
+        Self {
+            output_plan: plan_decode_output(self.output_contract, evidence, logits_consumers),
+            ..self
+        }
     }
 
     /// The backend resolved for this request, already passed through the
@@ -11854,7 +11952,11 @@ mod tests {
 
         for (name, requirement, evidence, expected) in cases {
             assert_eq!(
-                plan_decode_output(requirement, evidence),
+                plan_decode_output(
+                    requirement,
+                    evidence,
+                    super::GgmlDecodeLogitsConsumers::none()
+                ),
                 expected,
                 "planner case: {name}"
             );
@@ -11868,6 +11970,24 @@ mod tests {
                 scheduler_compatibility: super::GgmlLaneEvidence::Validated,
                 capture_compatibility: super::GgmlLaneEvidence::Validated,
             }
+        );
+
+        let phrase_bias = super::GgmlDecodeLogitsConsumers::none().with_phrase_bias(true);
+        assert_eq!(
+            plan_decode_output(
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+                native,
+                phrase_bias,
+            ),
+            GgmlDecodeOutputPlan::FullLogits
+        );
+        assert_eq!(
+            plan_decode_output(
+                GgmlDecodeOutputContract::CompleteScores,
+                native,
+                super::GgmlDecodeLogitsConsumers::none().with_timestamps(true),
+            ),
+            GgmlDecodeOutputPlan::CompleteScores
         );
     }
 
@@ -15194,6 +15314,285 @@ mod tests {
                 .expect("native rowwise argmax should compute"),
             vec![1, 0, 0]
         );
+    }
+
+    fn native_argmax_first_row(row: &[f32]) -> Result<i32, GgmlCpuGraphError> {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())?;
+        let mut graph = runner.start_graph();
+        let logits = graph.new_tensor_2d_f32(row.len(), 1, "layer1_native_logits")?;
+        graph.set_input(logits)?;
+        let token = graph.top1_argmax_first_max(logits)?;
+        graph.set_output(token)?;
+        graph.set_f32_slice(logits, row, "layer1_native_logits")?;
+        Ok(graph.compute_output_i32(token, 1)?[0])
+    }
+
+    #[test]
+    fn layer1_native_argmax_first_cpu_contract_cases() {
+        const FIRERED_VOCAB: usize = 7832;
+        assert_eq!(
+            native_argmax_first_row(&[2.0, 1.0, 5.0, 5.0]).expect("exact tie"),
+            2,
+            "shipped native ARGMAX_FIRST must keep the first maximum"
+        );
+        assert_eq!(
+            native_argmax_first_row(&[1.0, 7.0, 3.0, 0.0]).expect("unique max"),
+            1
+        );
+        assert_eq!(
+            native_argmax_first_row(&[5.0, 5.0, 5.0, 5.0]).expect("all equal"),
+            0
+        );
+        assert_eq!(
+            native_argmax_first_row(&[-4.0, -1.0, -1.0, -8.0]).expect("negatives"),
+            1
+        );
+
+        let mut firered = vec![0.0_f32; FIRERED_VOCAB];
+        firered[100] = 1.0;
+        firered[200] = 1.0;
+        assert_eq!(
+            native_argmax_first_row(&firered).expect("FireRed vocab width"),
+            100
+        );
+
+        // CPU ARGMAX_FIRST uses serial strict `>`; NaN comparisons never
+        // replace, so a leading NaN stays selected and a later NaN cannot
+        // displace a finite maximum.
+        assert_eq!(
+            native_argmax_first_row(&[f32::NAN, 3.0, 3.0, 1.0]).expect("leading NaN"),
+            0
+        );
+        assert_eq!(
+            native_argmax_first_row(&[3.0, f32::NAN, 3.0, 1.0]).expect("interior NaN"),
+            0
+        );
+        assert_eq!(
+            native_argmax_first_row(&[1.0, f32::INFINITY, 1.0, 0.0]).expect("+inf"),
+            1
+        );
+
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let graph = runner.start_graph();
+        let logits = graph
+            .new_tensor_3d_f32(4, 1, 2, "unsupported_rank3")
+            .expect("rank-3 logits");
+        assert!(
+            graph.top1_argmax_first_max(logits).is_err(),
+            "unsupported shape must fail closed"
+        );
+    }
+
+    #[test]
+    fn layer1_native_argmax_first_repeated_refresh_updates_scalar() {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let mut session = runner
+            .start_persistent_graph_session(1024 * 1024)
+            .expect("persistent session");
+        let (logits, token) = {
+            let graph = session.builder();
+            let logits = graph
+                .new_tensor_2d_f32(4, 1, "layer1_refresh_logits")
+                .expect("logits");
+            graph.set_input(logits).expect("set_input");
+            let token = graph
+                .top1_argmax_first_max(logits)
+                .expect("native ARGMAX_FIRST");
+            graph.set_output(token).expect("set_output");
+            graph.prepare_outputs_for_upload(&[token]).expect("prepare");
+            (logits, token)
+        };
+        session
+            .builder()
+            .set_f32_slice(logits, &[2.0, 1.0, 5.0, 5.0], "layer1_refresh_logits")
+            .expect("upload tie");
+        assert_eq!(
+            session.builder().compute_output_i32(token, 1).expect("tie"),
+            vec![2]
+        );
+        session
+            .builder()
+            .set_f32_slice(logits, &[9.0, 1.0, 5.0, 5.0], "layer1_refresh_logits")
+            .expect("upload refresh");
+        assert_eq!(
+            session
+                .builder()
+                .compute_output_i32(token, 1)
+                .expect("refresh"),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn layer2_reusable_native_graph_stays_active_and_rebuilds_on_topology_change() {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let mut session = runner
+            .start_persistent_graph_session(1024 * 1024)
+            .expect("persistent session");
+        let (logits, token) = {
+            let graph = session.builder();
+            let logits = graph
+                .new_tensor_2d_f32(4, 1, "layer2_logits")
+                .expect("logits");
+            graph.set_input(logits).expect("set_input");
+            let token = graph
+                .top1_argmax_first_max(logits)
+                .expect("native ARGMAX_FIRST");
+            graph.set_output(token).expect("set_output");
+            graph.prepare_outputs_for_upload(&[token]).expect("prepare");
+            (logits, token)
+        };
+        let nodes = session
+            .prepared_native_node_count_for_test()
+            .expect("reuse must materialize a prepared graph");
+        assert!(nodes > 0);
+
+        session
+            .builder()
+            .set_f32_slice(logits, &[2.0, 1.0, 5.0, 5.0], "layer2_logits")
+            .expect("upload 1");
+        assert_eq!(
+            session
+                .builder()
+                .compute_output_i32(token, 1)
+                .expect("run 1"),
+            vec![2]
+        );
+        assert_eq!(
+            session.prepared_native_node_count_for_test(),
+            Some(nodes),
+            "reuse must stay active across input refresh"
+        );
+
+        session
+            .builder()
+            .set_f32_slice(logits, &[0.0, 4.0, 1.0, 4.0], "layer2_logits")
+            .expect("upload 2");
+        assert_eq!(
+            session
+                .builder()
+                .compute_output_i32(token, 1)
+                .expect("run 2"),
+            vec![1],
+            "persistent scalar output must observe the refreshed row"
+        );
+        assert_eq!(session.prepared_native_node_count_for_test(), Some(nodes));
+
+        drop(session);
+        let mut rebuilt = runner
+            .start_persistent_graph_session(1024 * 1024)
+            .expect("rebuild session");
+        let (wide, wide_token) = {
+            let graph = rebuilt.builder();
+            let wide = graph
+                .new_tensor_2d_f32(8, 1, "layer2_wide_logits")
+                .expect("wide logits");
+            graph.set_input(wide).expect("set_input wide");
+            let wide_token = graph
+                .top1_argmax_first_max(wide)
+                .expect("native ARGMAX_FIRST wide");
+            graph.set_output(wide_token).expect("set_output wide");
+            graph
+                .prepare_outputs_for_upload(&[wide_token])
+                .expect("prepare wide");
+            (wide, wide_token)
+        };
+        let rebuilt_nodes = rebuilt
+            .prepared_native_node_count_for_test()
+            .expect("topology change must rebuild a prepared graph");
+        assert!(rebuilt_nodes > 0);
+        rebuilt
+            .builder()
+            .set_f32_slice(
+                wide,
+                &[1.0, 1.0, 1.0, 9.0, 9.0, 0.0, 0.0, 0.0],
+                "layer2_wide_logits",
+            )
+            .expect("upload wide");
+        assert_eq!(
+            rebuilt
+                .builder()
+                .compute_output_i32(wide_token, 1)
+                .expect("wide run"),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn layer2_reusable_kv_set_rows_refresh_is_visible() {
+        const HIDDEN: usize = 2;
+        const MAX_POS: usize = 4;
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let mut session = runner
+            .start_persistent_graph_session(1024 * 1024)
+            .expect("persistent session");
+        let (dst, src, rows, output) = {
+            let graph = session.builder();
+            let dst = graph
+                .new_tensor_2d_f32(HIDDEN, MAX_POS, "layer2_kv")
+                .expect("kv dst");
+            let src = graph
+                .new_tensor_2d_f32(HIDDEN, 1, "layer2_kv_src")
+                .expect("kv src");
+            let rows = graph
+                .new_tensor_1d_i32(1, "layer2_kv_rows")
+                .expect("kv rows");
+            graph.set_input(dst).expect("dst input");
+            graph.set_input(src).expect("src input");
+            graph.set_input(rows).expect("rows input");
+            let output = graph.set_rows(dst, src, rows).expect("set_rows");
+            graph.set_output(output).expect("kv output");
+            graph
+                .prepare_outputs_for_upload(&[output])
+                .expect("prepare kv");
+            (dst, src, rows, output)
+        };
+        let nodes = session
+            .prepared_native_node_count_for_test()
+            .expect("kv graph must be reusable");
+
+        session
+            .builder()
+            .set_f32_slice(dst, &[0.0; HIDDEN * MAX_POS], "layer2_kv")
+            .expect("zero kv");
+        session
+            .builder()
+            .set_f32_slice(src, &[1.0, 2.0], "layer2_kv_src")
+            .expect("src0");
+        session
+            .builder()
+            .set_i32_slice(rows, &[0], "layer2_kv_rows")
+            .expect("row0");
+        let after0 = session
+            .builder()
+            .compute_output_f32(output, HIDDEN * MAX_POS)
+            .expect("kv step 0");
+        assert_eq!(&after0[0..2], &[1.0, 2.0]);
+        assert_eq!(session.prepared_native_node_count_for_test(), Some(nodes));
+
+        session
+            .builder()
+            .set_f32_slice(dst, &after0, "layer2_kv")
+            .expect("reload kv");
+        session
+            .builder()
+            .set_f32_slice(src, &[3.0, 4.0], "layer2_kv_src")
+            .expect("src1");
+        session
+            .builder()
+            .set_i32_slice(rows, &[1], "layer2_kv_rows")
+            .expect("row1");
+        let after1 = session
+            .builder()
+            .compute_output_f32(output, HIDDEN * MAX_POS)
+            .expect("kv step 1");
+        assert_eq!(&after1[0..2], &[1.0, 2.0], "row 0 must remain");
+        assert_eq!(&after1[2..4], &[3.0, 4.0], "row 1 must refresh");
+        assert_eq!(session.prepared_native_node_count_for_test(), Some(nodes));
     }
 
     #[test]

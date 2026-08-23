@@ -402,6 +402,11 @@ mod tests {
     fn nearest_code_uses_strict_first_max_on_exact_tie() {
         let scores = [1.0_f32, 1.0, 0.5];
         assert_eq!(nearest_code_from_complete_scores(&scores, 3), 0);
+        assert_eq!(
+            nearest_code_from_complete_scores(&[2.0, 1.0, 5.0, 5.0], 4),
+            2,
+            "MiMo RVQ host first-max must keep the first equal code"
+        );
     }
 
     #[test]

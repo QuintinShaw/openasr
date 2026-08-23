@@ -619,6 +619,10 @@ impl NativeStreamingSessionCandidateBuilder for NativeStreamingSessionCandidateF
                     candidate,
                     self.auto_gpu_policy,
                     &self.selected_family,
+                    decode_logits_consumers_for_options(
+                        self.selected_family.adapter_id,
+                        &self.request_options,
+                    ),
                 );
                 let execution_lane =
                     crate::models::native_execution_services::ExecutionLaneKey::from_candidate(
@@ -1306,10 +1310,25 @@ fn coarse_backend_preference_for_candidate(
     }
 }
 
+fn decode_logits_consumers_for_options(
+    adapter_id: &str,
+    options: &crate::GgmlAsrExecutionOptions,
+) -> crate::ggml_runtime::GgmlDecodeLogitsConsumers {
+    crate::models::device_greedy_token::decode_logits_consumers_for_request(
+        adapter_id,
+        options
+            .phrase_bias
+            .as_ref()
+            .is_some_and(|bias| !bias.is_empty()),
+        options.word_timestamps,
+    )
+}
+
 fn resolved_runtime_for_family_candidate(
     candidate: &ExecutionCandidate,
     auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
     selected_family: &crate::GgmlFamilyAdapterDescriptor,
+    logits_consumers: crate::ggml_runtime::GgmlDecodeLogitsConsumers,
 ) -> crate::ggml_runtime::ResolvedFamilyRuntimeInput {
     let preference = match candidate.placement {
         ExecutionPlacement::CpuOnly => Some(RequestBackendPreference::CpuOnly),
@@ -1317,15 +1336,14 @@ fn resolved_runtime_for_family_candidate(
             RequestBackendPreference::Exact(candidate.device.route.clone()),
         ),
     };
-    if selected_family.adapter_id == crate::arch::FIRERED_AED_GGML_ADAPTER_ID {
-        crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve_with_output_contract(
-            preference,
-            auto_gpu_policy,
-            crate::ggml_runtime::GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
-        )
-    } else {
-        crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(preference, auto_gpu_policy)
-    }
+    crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve_with_output_contract_and_consumers(
+        preference,
+        auto_gpu_policy,
+        crate::models::device_greedy_token::decode_output_contract_for_adapter(
+            selected_family.adapter_id,
+        ),
+        logits_consumers,
+    )
 }
 
 fn native_ggml_streaming_error_to_asr(

@@ -1158,7 +1158,7 @@ impl MoonshineDecoderGraphRuntime {
 
         match top1 {
             Some(top1) => {
-                let reversed_token_id = graph
+                let token_id = graph
                     .compute_output_i32(top1, 1)
                     .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
                         reason: error.to_string(),
@@ -1171,7 +1171,7 @@ impl MoonshineDecoderGraphRuntime {
                 Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
                     logits: Vec::new(),
                     greedy_token_hint: Some(map_device_top1_token(
-                        reversed_token_id,
+                        token_id,
                         self.metadata.vocab_size,
                     )?),
                 })
@@ -1765,7 +1765,7 @@ impl MoonshineDecoderGraphRuntime {
 
         match top1 {
             Some(top1) => {
-                let reversed_token_id = graph
+                let token_id = graph
                     .compute_output_i32(top1, 1)
                     .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
                         reason: error.to_string(),
@@ -1778,7 +1778,7 @@ impl MoonshineDecoderGraphRuntime {
                 Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
                     logits: Vec::new(),
                     greedy_token_hint: Some(map_device_top1_token(
-                        reversed_token_id,
+                        token_id,
                         self.metadata.vocab_size,
                     )?),
                 })

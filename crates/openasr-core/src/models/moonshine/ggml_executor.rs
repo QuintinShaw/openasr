@@ -707,11 +707,18 @@ fn moonshine_greedy_step_output_mode(
     phrase_bias_active: bool,
     word_timestamps: bool,
 ) -> DeviceGreedyStepOutputMode {
-    if force_full_logits || adapter_active || phrase_bias_active || word_timestamps {
+    if force_full_logits || adapter_active {
         return DeviceGreedyStepOutputMode::FullLogits;
     }
     crate::models::device_greedy_token::device_greedy_step_output_mode_for_resolved_runtime(
-        resolved_runtime,
+        resolved_runtime.with_logits_consumers(
+            crate::ggml_runtime::GgmlDecodeLogitsConsumers::new(
+                phrase_bias_active,
+                word_timestamps,
+                false,
+                false,
+            ),
+        ),
     )
 }
 

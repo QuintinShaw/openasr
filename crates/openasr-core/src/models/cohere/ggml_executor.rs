@@ -279,20 +279,19 @@ fn cohere_greedy_step_output_mode(
     word_timestamps: bool,
     debug_tokens: bool,
 ) -> DeviceGreedyStepOutputMode {
-    let output_mode = match resolved_runtime.output_plan() {
-        GgmlDecodeOutputPlan::NativeFirstMaxToken => DeviceGreedyStepOutputMode::DeviceTop1,
-        GgmlDecodeOutputPlan::FullLogits | GgmlDecodeOutputPlan::CompleteScores => {
-            DeviceGreedyStepOutputMode::FullLogits
-        }
-    };
-    let _ = (
-        force_full_logits,
-        adapter_active,
-        phrase_bias_active,
-        word_timestamps,
-        debug_tokens,
-    );
-    output_mode
+    if force_full_logits || adapter_active {
+        return DeviceGreedyStepOutputMode::FullLogits;
+    }
+    crate::models::device_greedy_token::device_greedy_step_output_mode_for_resolved_runtime(
+        resolved_runtime.with_logits_consumers(
+            crate::ggml_runtime::GgmlDecodeLogitsConsumers::new(
+                phrase_bias_active,
+                word_timestamps,
+                false,
+                debug_tokens,
+            ),
+        ),
+    )
 }
 
 #[derive(Debug, Error)]

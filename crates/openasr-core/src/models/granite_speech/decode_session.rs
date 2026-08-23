@@ -1110,7 +1110,7 @@ impl GraniteSpeechDecodeSession {
         }
         let output = match top1 {
             Some(top1) => {
-                let reversed_token_id = graph
+                let token_id = graph
                     .compute_output_i32(top1, 1)
                     .map_err(map_ggml("reuse_compute_top1"))?
                     .into_iter()
@@ -1120,7 +1120,7 @@ impl GraniteSpeechDecodeSession {
                     })?;
                 Seq2SeqGreedyDecodeStepLogitsOutput {
                     logits: Vec::new(),
-                    greedy_token_hint: Some(map_device_top1_token(reversed_token_id, vocab_size)?),
+                    greedy_token_hint: Some(map_device_top1_token(token_id, vocab_size)?),
                 }
             }
             None => Seq2SeqGreedyDecodeStepLogitsOutput {
@@ -1877,7 +1877,7 @@ fn run_prefill_graph_seeding_resident(
         .map_err(map_ggml("seed_prefill_upload_rows"))?;
     match top1 {
         Some(top1) => {
-            let reversed_token_id = graph
+            let token_id = graph
                 .compute_output_i32(top1, 1)
                 .map_err(map_ggml("seed_prefill_compute_top1"))?
                 .into_iter()
@@ -1887,7 +1887,7 @@ fn run_prefill_graph_seeding_resident(
                 })?;
             Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
                 logits: Vec::new(),
-                greedy_token_hint: Some(map_device_top1_token(reversed_token_id, vocab_size)?),
+                greedy_token_hint: Some(map_device_top1_token(token_id, vocab_size)?),
             })
         }
         None => Ok(Seq2SeqGreedyDecodeStepLogitsOutput {

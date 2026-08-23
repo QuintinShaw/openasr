@@ -871,6 +871,106 @@ mod tests {
     }
 
     #[test]
+    fn production_has_no_reverse_gather_or_cuda_vulkan_compact_allowlist() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut hits = Vec::new();
+        visit_production_rs(&root, &mut |path, source| {
+            if source.contains("top1_argmax_first_max_reversed") {
+                hits.push(format!(
+                    "{}: top1_argmax_first_max_reversed",
+                    path.display()
+                ));
+            }
+            if source.contains("reversed_token_id") {
+                hits.push(format!("{}: reversed_token_id", path.display()));
+            }
+            if source.contains("reverse_index")
+                && !source.contains("device_top1_quote_has_no_reverse_index_construction_staging")
+            {
+                hits.push(format!("{}: reverse_index", path.display()));
+            }
+        });
+        assert!(
+            hits.is_empty(),
+            "production reverse-gather leftovers remain:\n{}",
+            hits.join("\n")
+        );
+    }
+
+    fn visit_production_rs(dir: &std::path::Path, visit: &mut dyn FnMut(&std::path::Path, &str)) {
+        let entries = std::fs::read_dir(dir).expect("read src dir");
+        for entry in entries {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                if name == "tests" || name == "third_party" {
+                    continue;
+                }
+                visit_production_rs(&path, visit);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if name == "tests.rs" || name.ends_with("_tests.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read rust source");
+            let production = strip_cfg_test_modules(&source);
+            visit(&path, &production);
+        }
+    }
+
+    fn strip_cfg_test_modules(source: &str) -> String {
+        let mut out = String::with_capacity(source.len());
+        let mut skip_depth = 0usize;
+        let mut saw_cfg_test = false;
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if skip_depth == 0 && trimmed.starts_with("#[cfg(test)]") {
+                saw_cfg_test = true;
+                continue;
+            }
+            if skip_depth == 0 && saw_cfg_test {
+                if trimmed.starts_with("#[") {
+                    continue;
+                }
+                if trimmed.starts_with("mod ") || trimmed.starts_with("fn ") {
+                    skip_depth = line
+                        .chars()
+                        .filter(|ch| *ch == '{')
+                        .count()
+                        .saturating_sub(line.chars().filter(|ch| *ch == '}').count());
+                    if skip_depth == 0 && trimmed.ends_with('{') {
+                        skip_depth = 1;
+                    } else if skip_depth == 0 {
+                        saw_cfg_test = false;
+                    }
+                    continue;
+                }
+                saw_cfg_test = false;
+            }
+            if skip_depth > 0 {
+                skip_depth = skip_depth
+                    .saturating_add(line.chars().filter(|ch| *ch == '{').count())
+                    .saturating_sub(line.chars().filter(|ch| *ch == '}').count());
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
     fn family_inventory_keeps_xasr_mimo_sensevoice_host_oracles() {
         let root = models_src_root();
         let xasr_head = std::fs::read_to_string(root.join("xasr_zipformer/device_head_graph.rs"))
