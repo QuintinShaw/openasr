@@ -12,10 +12,11 @@ use super::encoder_graph::CohereTranscribeEncoderOutput;
 use super::runtime_contract::CohereTranscribeExecutionMetadata;
 use super::tokenizer::CohereTranscribeTokenizer;
 use crate::PhraseBiasConfig;
-use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlDecodeOutputPlan, GgmlDecodeReuseMode};
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, apply_seq2seq_text_postprocess,
 };
+use crate::models::native_execution_services::ExecutionLaneKey;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStopReason,
     build_seq2seq_greedy_stop_token_ids,
@@ -62,6 +63,9 @@ pub(crate) struct CohereServeBatchJob {
     pub runtime_cache_path: PathBuf,
     pub build_identity: crate::RuntimeBuildIdentity,
     pub backend: GgmlCpuGraphBackend,
+    pub lane: ExecutionLaneKey,
+    pub output_plan: GgmlDecodeOutputPlan,
+    pub reuse_mode: GgmlDecodeReuseMode,
     pub uses_scheduler: bool,
     pub decoder_weights: Arc<CohereTranscribeDecoderWeights>,
     pub decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
@@ -91,6 +95,13 @@ pub(crate) enum CohereServeBatchError {
     InvalidEnabledBatch { max_batch: usize },
     #[error("cohere serve batch supports only gpu-class direct ggml backends, got {backend:?}")]
     UnsupportedBackend { backend: GgmlCpuGraphBackend },
+    #[error(
+        "cohere serve batch requires a reusable full-logit topology, got plan={output_plan:?} reuse={reuse_mode:?}"
+    )]
+    UnsupportedDecodeTopology {
+        output_plan: GgmlDecodeOutputPlan,
+        reuse_mode: GgmlDecodeReuseMode,
+    },
     #[error("cohere serve batch engine registry mutex is poisoned")]
     RegistryPoisoned,
     #[error("cohere serve batch owner thread spawn failed: {reason}")]
@@ -128,6 +139,8 @@ pub(crate) struct CohereServeBatchEngineKey {
     resident_self_positions: usize,
     resident_cross_positions: usize,
     max_batch: usize,
+    output_plan: GgmlDecodeOutputPlan,
+    reuse_mode: GgmlDecodeReuseMode,
 }
 
 pub(super) type CohereServeBatchEngineRegistry = ServeBatchEngineRegistry<CohereFamily>;
@@ -136,17 +149,21 @@ pub(super) type CohereServeBatchEngineRegistry = ServeBatchEngineRegistry<Cohere
 /// path as `Seq2SeqServeBatchFamily::engine_key` without building a full job.
 pub(crate) fn cohere_serve_batch_engine_key(
     build_identity: crate::RuntimeBuildIdentity,
-    backend: GgmlCpuGraphBackend,
+    lane: ExecutionLaneKey,
     resident_self_positions: usize,
     resident_cross_positions: usize,
     max_batch: usize,
+    output_plan: GgmlDecodeOutputPlan,
+    reuse_mode: GgmlDecodeReuseMode,
 ) -> CohereServeBatchEngineKey {
     CohereServeBatchEngineKey {
         build_identity,
-        lane: crate::models::native_execution_services::current_execution_lane_key(backend),
+        lane,
         resident_self_positions,
         resident_cross_positions,
         max_batch,
+        output_plan,
+        reuse_mode,
     }
 }
 
@@ -203,19 +220,28 @@ impl Seq2SeqServeRuntime for CohereDecoderGraphRuntime {
     type Error = CohereServeBatchError;
 
     fn build_serial(job: &Self::Job) -> Result<Self, Self::Error> {
-        CohereDecoderGraphRuntime::new(
+        CohereDecoderGraphRuntime::new_with_reuse_mode(
             &job.decoder_weights,
             job.metadata,
             job.decoder_state,
             job.encoder_output.hidden_size,
             job.backend,
             job.prefer_cpu_backend,
+            job.reuse_mode,
         )
         .map_err(map_decoder_error)
     }
 
     fn build_batched(job: &Self::Job, n_seq: usize) -> Result<Self, Self::Error> {
-        CohereDecoderGraphRuntime::new_with_n_seq(
+        if job.output_plan != GgmlDecodeOutputPlan::FullLogits
+            || job.reuse_mode != GgmlDecodeReuseMode::ReusableGraph
+        {
+            return Err(CohereServeBatchError::UnsupportedDecodeTopology {
+                output_plan: job.output_plan,
+                reuse_mode: job.reuse_mode,
+            });
+        }
+        CohereDecoderGraphRuntime::new_with_n_seq_and_reuse_mode(
             &job.decoder_weights,
             job.metadata,
             job.decoder_state,
@@ -223,6 +249,7 @@ impl Seq2SeqServeRuntime for CohereDecoderGraphRuntime {
             job.backend,
             job.prefer_cpu_backend,
             n_seq,
+            job.reuse_mode,
         )
         .map_err(map_decoder_error)
     }
@@ -267,6 +294,8 @@ impl Seq2SeqServeRuntime for CohereDecoderGraphRuntime {
         positions: &[usize],
         totals: &[usize],
     ) -> Result<Vec<f32>, Self::Error> {
+        // The generic owner only calls this after a batched reusable graph was
+        // admitted. FreshGraph has no safe batched implementation.
         CohereDecoderGraphRuntime::compute_reused_batched_step_logits(
             self, token_ids, positions, totals,
         )
@@ -288,10 +317,12 @@ impl Seq2SeqServeBatchFamily for CohereFamily {
     fn engine_key(job: &Self::Job, max_batch: usize) -> Self::EngineKey {
         cohere_serve_batch_engine_key(
             job.build_identity.clone(),
-            job.backend,
+            job.lane.clone(),
             job.decoder_state.self_attention.resident_positions,
             job.decoder_state.cross_attention.resident_positions,
             max_batch,
+            job.output_plan,
+            job.reuse_mode,
         )
     }
 
@@ -459,6 +490,9 @@ impl Seq2SeqServeBatchFamily for CohereFamily {
 impl CohereServeBatchJob {
     fn can_batch_with(&self, other: &Self) -> bool {
         self.build_identity == other.build_identity
+            && self.lane == other.lane
+            && self.output_plan == other.output_plan
+            && self.reuse_mode == other.reuse_mode
             && self.runtime_cache_path == other.runtime_cache_path
             && self.decode_config.initial_prompt_tokens == other.decode_config.initial_prompt_tokens
             && self.decode_config.eot_token_id == other.decode_config.eot_token_id
@@ -660,7 +694,8 @@ fn map_greedy_error(error: Seq2SeqGreedyDecodeError) -> CohereServeBatchError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ggml_runtime::GgmlCpuGraphBackend;
+    use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlDecodeOutputPlan, GgmlDecodeReuseMode};
+    use crate::models::native_execution_services::current_execution_lane_key;
     use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
 
     #[test]
@@ -1006,6 +1041,9 @@ mod tests {
                     .content_id(),
             ),
             backend,
+            lane: current_execution_lane_key(backend),
+            output_plan: GgmlDecodeOutputPlan::FullLogits,
+            reuse_mode: GgmlDecodeReuseMode::ReusableGraph,
             uses_scheduler,
             decoder_weights,
             tokenizer,
@@ -1098,7 +1136,7 @@ mod tests {
             .compute_step_logits(&[0])
             .expect("serial logits 1");
 
-        let mut batched_runtime = CohereDecoderGraphRuntime::new_with_n_seq(
+        let mut batched_runtime = CohereDecoderGraphRuntime::new_with_n_seq_and_reuse_mode(
             &decoder_weights,
             metadata,
             decoder_state(metadata, encoder_output_0.frame_count),
@@ -1106,6 +1144,7 @@ mod tests {
             backend,
             prefer_cpu_backend,
             2,
+            GgmlDecodeReuseMode::ReusableGraph,
         )
         .expect("batched runtime");
         batched_runtime
@@ -1827,7 +1866,15 @@ mod tests {
             GgmlCpuGraphBackend::Gpu,
             &source_for(),
         );
-        let key_a = cohere_serve_batch_engine_key(identity_a, GgmlCpuGraphBackend::Gpu, 16, 64, 4);
+        let key_a = cohere_serve_batch_engine_key(
+            identity_a,
+            current_execution_lane_key(GgmlCpuGraphBackend::Gpu),
+            16,
+            64,
+            4,
+            GgmlDecodeOutputPlan::FullLogits,
+            GgmlDecodeReuseMode::ReusableGraph,
+        );
 
         write(b"cohere-pack-b-different-bytes");
         let identity_b = serve_batch_build_identity_for_request(
@@ -1836,8 +1883,15 @@ mod tests {
             GgmlCpuGraphBackend::Gpu,
             &source_for(),
         );
-        let key_b =
-            cohere_serve_batch_engine_key(identity_b.clone(), GgmlCpuGraphBackend::Gpu, 16, 64, 4);
+        let key_b = cohere_serve_batch_engine_key(
+            identity_b.clone(),
+            current_execution_lane_key(GgmlCpuGraphBackend::Gpu),
+            16,
+            64,
+            4,
+            GgmlDecodeOutputPlan::FullLogits,
+            GgmlDecodeReuseMode::ReusableGraph,
+        );
         assert_ne!(
             key_a, key_b,
             "production resolve+engine_key must miss on same-path content replacement"
@@ -1852,11 +1906,46 @@ mod tests {
             GgmlCpuGraphBackend::Gpu,
             &source_for(),
         );
-        let key_again =
-            cohere_serve_batch_engine_key(identity_again, GgmlCpuGraphBackend::Gpu, 16, 64, 4);
+        let key_again = cohere_serve_batch_engine_key(
+            identity_again.clone(),
+            current_execution_lane_key(GgmlCpuGraphBackend::Gpu),
+            16,
+            64,
+            4,
+            GgmlDecodeOutputPlan::FullLogits,
+            GgmlDecodeReuseMode::ReusableGraph,
+        );
         assert_eq!(
             key_again, key_b,
             "unchanged bytes must resolve to the exact same engine key, not a fresh one"
+        );
+
+        let topology_variant = cohere_serve_batch_engine_key(
+            identity_again.clone(),
+            current_execution_lane_key(GgmlCpuGraphBackend::Gpu),
+            16,
+            64,
+            4,
+            GgmlDecodeOutputPlan::CompleteScores,
+            GgmlDecodeReuseMode::FreshGraph,
+        );
+        assert_ne!(
+            key_b, topology_variant,
+            "output plan and reuse mode must partition the owner key"
+        );
+
+        let cpu_lane_variant = cohere_serve_batch_engine_key(
+            identity_again,
+            current_execution_lane_key(GgmlCpuGraphBackend::Cpu),
+            16,
+            64,
+            4,
+            GgmlDecodeOutputPlan::FullLogits,
+            GgmlDecodeReuseMode::ReusableGraph,
+        );
+        assert_ne!(
+            key_b, cpu_lane_variant,
+            "a resolved GPU lane must not reuse a CPU lane owner"
         );
     }
 

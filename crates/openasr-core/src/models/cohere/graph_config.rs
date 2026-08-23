@@ -7,13 +7,20 @@ use crate::models::graph_runtime_config::{
 };
 
 pub(crate) fn cohere_runtime_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
-    configure_model_runtime_graph_config_from_env(
+    let mut config = configure_model_runtime_graph_config_from_env(
         GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend),
         ModelMetalRuntimeOverrides {
             default_use_scheduler_when_unset: Some(true),
             default_n_threads_when_unset: Some(1),
         },
-    )
+    );
+    // The request's resolved backend is authoritative. An ambient candidate
+    // placement may not turn an already-selected GPU lane into CPU execution.
+    if backend.is_gpu_class() && config.backend == GgmlCpuGraphBackend::Cpu {
+        config.backend = backend;
+        config.use_scheduler = false;
+    }
+    config
 }
 
 pub(crate) fn cohere_decoder_graph_config(

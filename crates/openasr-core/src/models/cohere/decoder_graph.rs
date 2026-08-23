@@ -705,6 +705,7 @@ impl CohereDecoderGraphRuntime {
         )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(
         decoder_weights: &CohereTranscribeDecoderWeights,
         metadata: CohereTranscribeExecutionMetadata,
@@ -747,6 +748,7 @@ impl CohereDecoderGraphRuntime {
         )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new_with_n_seq(
         decoder_weights: &CohereTranscribeDecoderWeights,
         metadata: CohereTranscribeExecutionMetadata,
@@ -767,6 +769,30 @@ impl CohereDecoderGraphRuntime {
             None,
             DeviceGreedyStepOutputMode::FullLogits,
             GgmlDecodeReuseMode::FreshGraph,
+        )
+    }
+
+    pub(crate) fn new_with_n_seq_and_reuse_mode(
+        decoder_weights: &CohereTranscribeDecoderWeights,
+        metadata: CohereTranscribeExecutionMetadata,
+        decoder_state: Seq2SeqDecoderState,
+        cross_hidden_size: usize,
+        backend: GgmlCpuGraphBackend,
+        prefer_cpu_backend: bool,
+        n_seq: usize,
+        reuse_mode: GgmlDecodeReuseMode,
+    ) -> Result<Self, CohereDecoderGraphError> {
+        Self::new_with_n_seq_impl(
+            decoder_weights,
+            metadata,
+            decoder_state,
+            cross_hidden_size,
+            backend,
+            prefer_cpu_backend,
+            n_seq,
+            None,
+            DeviceGreedyStepOutputMode::FullLogits,
+            reuse_mode,
         )
     }
 
@@ -2062,6 +2088,11 @@ impl CohereDecoderGraphRuntime {
         positions: &[usize],
         total_tokens_by_sequence: &[usize],
     ) -> Result<Vec<f32>, CohereDecoderGraphError> {
+        if self.reuse_mode != GgmlDecodeReuseMode::ReusableGraph {
+            return Err(CohereDecoderGraphError::InvalidInput {
+                reason: "cohere batched decode requires ReusableGraph evidence".to_string(),
+            });
+        }
         if self.n_seq == 1 {
             return Err(CohereDecoderGraphError::InvalidInput {
                 reason: "batched cohere decode step requires n_seq > 1".to_string(),
@@ -4348,7 +4379,7 @@ mod tests {
                 )
                 .expect("decoder weights");
             let encoder_output = sample_encoder_output(metadata);
-            let mut runtime = CohereDecoderGraphRuntime::new_with_n_seq(
+            let mut runtime = CohereDecoderGraphRuntime::new_with_n_seq_and_reuse_mode(
                 &decoder_weights,
                 metadata,
                 decoder_state(
@@ -4360,6 +4391,7 @@ mod tests {
                 GgmlCpuGraphBackend::Cpu,
                 false,
                 2,
+                GgmlDecodeReuseMode::ReusableGraph,
             )
             .expect("batched decoder runtime");
 
