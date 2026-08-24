@@ -603,6 +603,7 @@ mod tests {
             generated_at: "2026-06-11T00:00:00Z".to_string(),
             catalog_url: "fixture".to_string(),
             backends: Vec::new(),
+            execution_approvals: None,
             language_labels: std::collections::BTreeMap::new(),
             models: vec![catalog_model(
                 "moonshine-tiny",
@@ -623,6 +624,7 @@ mod tests {
             generated_at: "2026-06-11T00:00:00Z".to_string(),
             catalog_url: "fixture".to_string(),
             backends: Vec::new(),
+            execution_approvals: None,
             language_labels: std::collections::BTreeMap::new(),
             models: vec![
                 catalog_model(

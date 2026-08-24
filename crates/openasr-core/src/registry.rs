@@ -18,8 +18,16 @@ use crate::{
     http,
 };
 
+mod execution_approvals;
 mod resolution;
 mod validation;
+
+pub use execution_approvals::{
+    CATALOG_EXECUTION_APPROVAL_SCHEMA_VERSION, CatalogExecutionActivationMode,
+    CatalogExecutionApprovalCell, CatalogExecutionApprovalDecision, CatalogExecutionApprovalSet,
+    CatalogExecutionCaptureMode, CatalogExecutionOutputPlan, CatalogExecutionPlacement,
+    CatalogExecutionProvider, CatalogExecutionReuseMode, CatalogExecutionSchedulerMode,
+};
 
 const DEFAULT_CATALOG_URL: &str = "https://catalog.openasr.org/v1/catalog.json";
 const SUPPORTED_CATALOG_SCHEMA_VERSION: u32 = 1;
@@ -177,6 +185,10 @@ pub struct ModelCatalog {
     /// drift gates stay green.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backends: Vec<CatalogBackend>,
+    /// Signed exact-cell runtime approvals. Qualification manifests never enter
+    /// this field: absence means no optional provider capability can be minted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_approvals: Option<CatalogExecutionApprovalSet>,
     /// Curated display labels for language/dialect recognition codes, keyed by
     /// the exact code a model advertises in `languages` (e.g. `zh-sichuan`).
     /// Carried as signed catalog DATA so app surfaces -- including the web app,
@@ -2834,6 +2846,9 @@ fn validate_model_catalog(catalog: &ModelCatalog, source: &str) -> Result<(), Ca
     }
     for backend in &catalog.backends {
         validate_catalog_backend(backend, source)?;
+    }
+    if let Some(approvals) = &catalog.execution_approvals {
+        execution_approvals::validate_catalog_execution_approvals(catalog, approvals)?;
     }
     Ok(())
 }

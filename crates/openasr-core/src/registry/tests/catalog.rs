@@ -112,6 +112,7 @@ fn alias_contract_catalog() -> ModelCatalog {
         generated_at: "2026-06-04T00:00:00Z".to_string(),
         catalog_url: "fixture".to_string(),
         backends: Vec::new(),
+        execution_approvals: None,
         language_labels: std::collections::BTreeMap::new(),
         models: vec![
             alias_contract_model(
@@ -2420,6 +2421,7 @@ fn catalog_parser_rejects_drifted_pull_strings() {
 
 const BACKEND_SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BACKEND_SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const BACKEND_SHA_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
 fn catalog_json_with_backends(backends_json: &str) -> String {
     catalog_json().replace(
@@ -2837,6 +2839,162 @@ fn future_backend_min_cli_version_loads_but_cannot_resolve() {
         ),
         Err(BackendResolutionError::BackendRequiresNewerCli { .. })
     ));
+}
+
+fn catalog_with_hip_execution_approval(decision: CatalogExecutionApprovalDecision) -> ModelCatalog {
+    let mut catalog = parse_model_catalog(
+        &catalog_json_with_backends(&valid_hip_backend_json()),
+        "fixture",
+    )
+    .unwrap();
+    let model = catalog
+        .models
+        .iter()
+        .find(|model| model.id == "moonshine-tiny")
+        .unwrap();
+    let quant = model
+        .quants
+        .iter()
+        .find(|quant| quant.quant == "q8_0")
+        .unwrap();
+    let backend = catalog
+        .backends
+        .iter()
+        .find(|backend| backend.id == "hip-radeon")
+        .unwrap();
+    let plugin_sha256 = backend
+        .files
+        .iter()
+        .find(|file| file.role == CatalogBackendFileRole::Plugin)
+        .unwrap()
+        .sha256
+        .clone();
+    catalog.execution_approvals = Some(CatalogExecutionApprovalSet {
+        schema_version: CATALOG_EXECUTION_APPROVAL_SCHEMA_VERSION,
+        release_subject: "openasr-v0.1.36-windows-x86_64.zip".to_string(),
+        core_commit: "1234567890123456789012345678901234567890".to_string(),
+        binary_sha256: BACKEND_SHA_B.to_string(),
+        matrix_sha256: BACKEND_SHA_A.to_string(),
+        capability_epoch: 9,
+        cells: vec![CatalogExecutionApprovalCell {
+            pack_content_sha256: quant.sha256.clone(),
+            family: model.family.clone(),
+            model_id: model.id.clone(),
+            quant: quant.quant.clone(),
+            topology: "moonshine-seq2seq-v1".to_string(),
+            provider: CatalogExecutionProvider::Hip,
+            device_target: "gfx1200".to_string(),
+            approved_target_set_sha256: None,
+            placement: CatalogExecutionPlacement::FullDevice,
+            output_plan: CatalogExecutionOutputPlan::FullLogits,
+            reuse_mode: CatalogExecutionReuseMode::FreshGraph,
+            capture_mode: CatalogExecutionCaptureMode::Enabled,
+            scheduler_mode: CatalogExecutionSchedulerMode::Disabled,
+            evidence_revision: 1,
+            activation_modes: vec![CatalogExecutionActivationMode::Explicit],
+            plugin_sha256,
+            tombstone_sha256: matches!(decision, CatalogExecutionApprovalDecision::Revoked)
+                .then(|| BACKEND_SHA_B.to_string()),
+            decision,
+        }],
+    });
+    let serialized = serde_json::to_string(&catalog).unwrap();
+    parse_model_catalog(&serialized, "fixture").unwrap()
+}
+
+#[test]
+fn signed_catalog_execution_approval_projects_exact_runtime_snapshot() {
+    let catalog =
+        catalog_with_hip_execution_approval(CatalogExecutionApprovalDecision::Activatable);
+    let backend = catalog
+        .backends
+        .iter()
+        .find(|backend| backend.id == "hip-radeon")
+        .unwrap();
+    let plugin_sha256 = backend
+        .files
+        .iter()
+        .find(|file| file.role == CatalogBackendFileRole::Plugin)
+        .unwrap()
+        .sha256
+        .clone();
+    let snapshot = catalog
+        .capability_approval_snapshot_for_backend("hip-radeon")
+        .unwrap()
+        .expect("signed approval snapshot");
+    let approvals = catalog.execution_approvals.as_ref().unwrap();
+    let attested = snapshot
+        .attest_runtime(&crate::RuntimeCapabilityArtifactIdentity {
+            release_subject: approvals.release_subject.clone(),
+            core_commit: approvals.core_commit.clone(),
+            host_abi_fingerprint: backend.host_abi.fingerprint.clone(),
+            binary_sha256: approvals.binary_sha256.clone(),
+            plugin_sha256,
+            matrix_sha256: approvals.matrix_sha256.clone(),
+            capability_epoch: approvals.capability_epoch,
+        })
+        .unwrap();
+    let candidate = crate::device::execution_policy::ExecutionCandidate {
+        device: crate::device::execution_policy::ExecutionDeviceSnapshot {
+            route: crate::ResolvedExecutionRoute {
+                provider: crate::ExecutionProvider::Hip,
+                stable_id: "ROCm0".to_string(),
+                registry_ordinal: 0,
+                kind: crate::RouteDeviceKind::Accelerated,
+                addressability: crate::DeviceAddressability::ExactlyAddressable {
+                    physical_key: crate::PhysicalResourceKey::new("0000:03:00.0").unwrap(),
+                },
+            },
+            ggml_kind: crate::ggml_runtime::GgmlBackendKind::Gpu,
+            memory: None,
+            buffer_alignment: None,
+        },
+        placement: crate::device::execution_policy::ExecutionPlacement::FullDevice,
+    };
+    let cell = &approvals.cells[0];
+    let approved = crate::CapabilityApprovalResolver::new(attested)
+        .approve(
+            candidate,
+            crate::CapabilityCellContext {
+                pack_content_sha256: cell.pack_content_sha256.clone(),
+                family: cell.family.clone(),
+                model_id: cell.model_id.clone(),
+                quant: cell.quant.clone(),
+                topology: cell.topology.clone(),
+                device_target: cell.device_target.clone(),
+                approved_target_set_sha256: None,
+                output_plan: crate::ggml_runtime::GgmlDecodeOutputPlan::FullLogits,
+                reuse_mode: crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph,
+                capture_mode: crate::CapabilityCaptureMode::Enabled,
+                scheduler_mode: crate::CapabilitySchedulerMode::Disabled,
+                evidence_revision: 1,
+                activation_mode: crate::CapabilityActivationMode::Explicit,
+            },
+        )
+        .unwrap();
+    assert_eq!(approved.approval().capability_epoch, 9);
+}
+
+#[test]
+fn qualification_only_cannot_enter_ordinary_signed_catalog_approvals() {
+    let mut catalog =
+        catalog_with_hip_execution_approval(CatalogExecutionApprovalDecision::Activatable);
+    catalog.execution_approvals.as_mut().unwrap().cells[0].decision =
+        CatalogExecutionApprovalDecision::QualificationOnly;
+    let serialized = serde_json::to_string(&catalog).unwrap();
+    let error = parse_model_catalog(&serialized, "fixture").unwrap_err();
+    assert!(error.to_string().contains("qualification-only"));
+}
+
+#[test]
+fn signed_catalog_approval_rejects_pack_digest_drift() {
+    let mut catalog =
+        catalog_with_hip_execution_approval(CatalogExecutionApprovalDecision::Activatable);
+    catalog.execution_approvals.as_mut().unwrap().cells[0].pack_content_sha256 =
+        BACKEND_SHA_C.to_string();
+    let serialized = serde_json::to_string(&catalog).unwrap();
+    let error = parse_model_catalog(&serialized, "fixture").unwrap_err();
+    assert!(error.to_string().contains("pack digest"));
 }
 
 #[test]

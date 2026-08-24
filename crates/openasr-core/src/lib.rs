@@ -70,6 +70,7 @@ pub use file_identity::StrongFileIdentity;
 pub mod backend_distribution;
 pub(crate) mod batch;
 pub(crate) mod benchmark;
+mod capability_approval;
 pub(crate) mod capability_pack;
 pub(crate) mod capacity;
 pub mod config;
@@ -165,6 +166,12 @@ pub use benchmark::{
     SuiteConfig, SuiteEntry, SuiteEntryMetrics, Tolerances, check_quant_ordering, check_vs_cpp,
     compare_to_baseline, probe_audio_duration_seconds, quant_rank, render_benchmark,
     render_suite_json, render_suite_markdown,
+};
+pub use capability_approval::{
+    ApprovedExecutionCandidate, AttestedCapabilityApprovalSnapshot, CapabilityActivationMode,
+    CapabilityApprovalError, CapabilityApprovalIdentity, CapabilityApprovalResolver,
+    CapabilityApprovalSnapshot, CapabilityArtifactBinding, CapabilityCaptureMode,
+    CapabilityCellContext, CapabilitySchedulerMode, RuntimeCapabilityArtifactIdentity,
 };
 pub use catalog_security::{
     CATALOG_DEGRADED_MARKER_FILE_NAME, CATALOG_EPOCH_FILE_NAME, CATALOG_SIGNATURE_ALGORITHM,
@@ -421,10 +428,14 @@ pub use realtime::{
     VadSpeechStoppedEvent, VadState, VadStateMachine,
 };
 pub use registry::{
-    BackendAvailability, BackendResolutionError, CATALOG_FEATURE_SPEAKER_DIARIZATION,
-    CATALOG_FEATURE_WORD_TIMESTAMPS, CatalogBackend, CatalogBackendActivation,
-    CatalogBackendActivationState, CatalogBackendFile, CatalogBackendFileRole,
-    CatalogBackendVendor, CatalogCapability, CatalogCapabilityRole, CatalogError,
+    BackendAvailability, BackendResolutionError, CATALOG_EXECUTION_APPROVAL_SCHEMA_VERSION,
+    CATALOG_FEATURE_SPEAKER_DIARIZATION, CATALOG_FEATURE_WORD_TIMESTAMPS, CatalogBackend,
+    CatalogBackendActivation, CatalogBackendActivationState, CatalogBackendFile,
+    CatalogBackendFileRole, CatalogBackendVendor, CatalogCapability, CatalogCapabilityRole,
+    CatalogError, CatalogExecutionActivationMode,
+    CatalogExecutionApprovalCell, CatalogExecutionApprovalDecision, CatalogExecutionApprovalSet,
+    CatalogExecutionCaptureMode, CatalogExecutionOutputPlan, CatalogExecutionPlacement,
+    CatalogExecutionProvider, CatalogExecutionReuseMode, CatalogExecutionSchedulerMode,
     CatalogLanguageMode, CatalogMirror, CatalogModel, CatalogModelKind, CatalogProse,
     CatalogPullRequest, CatalogQuant, CatalogQuantPerf, CatalogQuantRecommendationProfile,
     CatalogSpeakerSource, CatalogWordTimestampSource, LicenseClass, LocalCatalogEnvOverride,
