@@ -37,8 +37,8 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeStopReason,
 };
 use crate::models::seq2seq_word_timestamps::{
-    Seq2SeqTokenSpan, seq2seq_word_timestamps_from_generated_tokens,
-    seq2seq_word_timestamps_from_token_spans,
+    Seq2SeqTokenSpan, Seq2SeqTokenTime, seq2seq_word_timestamps_from_generated_tokens,
+    seq2seq_word_timestamps_from_token_spans, seq2seq_word_timestamps_from_token_times,
 };
 use crate::nn::decoder::{
     Seq2SeqReusableDecodeGraph, build_causal_mask_f16_bits, build_fixed_kv_attention_mask_bits,
@@ -465,6 +465,32 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
                 Some(window)
             }
             _ => {
+                // The strict and tolerant DTW tests both rejected the window:
+                // on a pause-heavy 30s chunk the per-word peak order zig-zags
+                // too much for the DTW pass, and the monotone tiling the DTW
+                // would emit (or the uniform fallback the caller would use)
+                // would stretch a few seconds of speech across all 30s. On
+                // LONG windows (where that stretch is large and measurable)
+                // place each word at its own strongest attention frame instead:
+                // the windows-are-diffuse-but-real case, where most tokens do
+                // point the right way and only a few back-jump. Short windows
+                // keep the provably-uniform baseline -- the stretch is small
+                // there and the peak signal too noisy to be worth the risk.
+                if band_duration_seconds(&full_window, seconds_per_frame)
+                    >= COHERE_DTW_PEAK_FALLBACK_MIN_SECONDS
+                {
+                    if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
+                        eprintln!("cohere cross gate: peaks not aligned, using peak fallback");
+                    }
+                    return cohere_peak_fallback_word_timestamps(
+                        &full_window,
+                        &is_content,
+                        token_alignments,
+                        generated_probabilities,
+                        seconds_per_frame,
+                        decode_text,
+                    );
+                }
                 if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
                     eprintln!("cohere cross gate: peaks not order-aligned, using uniform");
                 }
@@ -515,6 +541,71 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
         0.0,
         duration,
         seconds_per_frame,
+        BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+        decode_text,
+    )
+}
+
+/// Order-gate fallback for long, pause-heavy windows: place each token at its
+/// own strongest cross-attention frame and fold those into word timestamps.
+///
+/// Called only when the DTW order gate (strict and tolerant) has rejected the
+/// window but the window is long enough that the stretch would hurt (see
+/// [`COHERE_DTW_PEAK_FALLBACK_MIN_SECONDS`]). Unlike the DTW tiling or the
+/// uniform baseline -- both of which tile the window contiguously and cannot
+/// express a gap -- each word lands where its attention is strongest, so the
+/// midpoints between word centers fall where the attention falls and a short
+/// utterance inside a long chunk stays short. The timeline is bounded at the
+/// earliest frame (the clip start) and the latest *content-token* peak: a
+/// trailing punctuation token's diffuse peak (attending into the ignored
+/// padding) must not stretch the final word's end toward the far edge of the
+/// chunk. Returns `Ok(Vec::new())` when no content-token peak exists, so the
+/// caller keeps the uniform baseline rather than emitting a single degenerate
+/// word.
+fn cohere_peak_fallback_word_timestamps<E>(
+    full_window: &[Vec<f32>],
+    is_content: &[bool],
+    token_alignments: &[(u32, Vec<f32>)],
+    generated_probabilities: &[f32],
+    seconds_per_frame: f32,
+    decode_text: &dyn Fn(&[u32]) -> Result<String, E>,
+) -> Result<Vec<WordTimestamp>, E> {
+    let token_count = token_alignments.len();
+    if token_count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut token_times = Vec::with_capacity(token_count);
+    let mut last_content_peak_center: Option<f32> = None;
+    for (index, alignment) in token_alignments.iter().enumerate() {
+        let row = &full_window[index];
+        let Some((peak_frame, &peak_value)) = row
+            .iter()
+            .enumerate()
+            .filter(|&(_, &value)| value.is_finite())
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        else {
+            return Ok(Vec::new());
+        };
+        let center_seconds = (peak_frame as f32) * seconds_per_frame;
+        if is_content.get(index).copied().unwrap_or(false) && peak_value > 0.0 {
+            last_content_peak_center = Some(match last_content_peak_center {
+                Some(existing) => existing.max(center_seconds),
+                None => center_seconds,
+            });
+        }
+        token_times.push(Seq2SeqTokenTime {
+            token_id: alignment.0,
+            center_seconds,
+            probability: generated_probabilities.get(index).copied(),
+        });
+    }
+    let Some(segment_end) = last_content_peak_center else {
+        return Ok(Vec::new());
+    };
+    seq2seq_word_timestamps_from_token_times(
+        &token_times,
+        0.0,
+        segment_end,
         BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
         decode_text,
     )
@@ -3065,6 +3156,21 @@ const COHERE_DTW_MAX_BACKWARD_PAIR_FRACTION: f32 = 0.10;
 /// restricts the newly-admitted region to where the pauses are actually measurable.
 const COHERE_DTW_TOLERANT_MIN_BAND_SECONDS: f32 = 20.0;
 
+/// Minimum window duration, in seconds, before the order-gate fallback switches
+/// from "return empty -> uniform" to "place each word at its strongest
+/// attention peak". On cohere's 30s long-form chunks the attention-peak order
+/// on a pause-heavy decode is too zig-zaggy for the DTW pass, and neither the
+/// DTW tiling nor the uniform fallback can leave a real gap: both stretch the
+/// few seconds of speech across the whole 30s window (measured start-end span
+/// error of up to ~14s on the worst windows). Placing each word at its own
+/// strongest frame keeps the words where the attention is and lets the midpoints
+/// between them fall naturally, so a 1s utterance in a 30s chunk stays 1s wide
+/// instead of stretching to 30s. The threshold matches the tolerant tier's
+/// band-length guard: below it the stretch is small enough that the plain
+/// uniform baseline (which the caller emits on empty return) remains the safer
+/// choice, keeping short-clip behavior unchanged.
+const COHERE_DTW_PEAK_FALLBACK_MIN_SECONDS: f32 = 20.0;
+
 /// The wall-clock length of the window, given the per-row frame count and the
 /// family's seconds-per-frame.
 fn band_duration_seconds(window: &[Vec<f32>], seconds_per_frame: f32) -> f32 {
@@ -5360,7 +5466,150 @@ mod tests {
         .expect("dtw words");
         assert!(
             words.is_empty(),
-            "non-order-aligned peaks must fall back (empty), got {words:?}"
+            "non-order-aligned peaks must fall back (empty), got {words:?}",
+        );
+    }
+
+    /// 30 content rows on `frames` frames arranged so the raw peak order
+    /// zig-zags immediately (row 0 peaks at ~100, row 1 at ~5) and ~50% of
+    /// adjacent pairs are backward pairs (well above the 10% tolerant
+    /// threshold), so BOTH the strict and the tolerant DTW tiers are
+    /// rejected. No frame in [0, 10) is a dominant early sink (only one row
+    /// peaks in that range), so `mask_dominant_early_sinks` returns `None`
+    /// and the gate falls through to the catch-all branch.
+    fn zigzag_no_sink_rows(frames: usize) -> Vec<Vec<f32>> {
+        assert!(
+            frames >= 110,
+            "need at least 110 frames for the test pattern"
+        );
+        let n = 30usize;
+        (0..n)
+            .map(|i| {
+                let step = (i / 2) as usize;
+                let frame: usize = if i % 2 == 0 {
+                    (frames / 2).saturating_sub(step.saturating_mul(3))
+                } else {
+                    (5usize + step.saturating_mul(3)).min(10)
+                };
+                let mut row = vec![0.01_f32; frames];
+                row[frame] = 0.5;
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cohere_dtw_word_timestamps_uses_peak_fallback_on_long_zigzag_window() {
+        let (_runtime_path, preflight) = write_runtime_ready_preflight();
+        let metadata = super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
+            &preflight.metadata,
+        )
+        .expect("parse metadata");
+        let spf = 8.0 * metadata.hop_length as f32 / metadata.sample_rate_hz as f32;
+        let frames = 250; // 20.0s >= PEAK_FALLBACK_MIN_SECONDS
+        let duration = (frames as f32) * spf;
+        assert!(duration >= COHERE_DTW_PEAK_FALLBACK_MIN_SECONDS);
+        let rows = zigzag_no_sink_rows(frames);
+        let token_ids: Vec<u32> = (50..50 + rows.len() as u32).collect();
+        let alignments: Vec<(u32, Vec<f32>)> = rows
+            .iter()
+            .zip(&token_ids)
+            .map(|(row, &id)| (id, row.to_vec()))
+            .collect();
+        let decode_text = |token_ids: &[u32]| {
+            let mut s = String::new();
+            for &id in token_ids {
+                use std::fmt::Write;
+                let _ = write!(s, "w{id} ");
+            }
+            Ok(s.trim_end().to_string())
+        };
+        // Pre-check: raw peaks zigzag (strict fails), and backward fraction is
+        // > 10% (tolerant also fails). No early sink is detected.
+        let is_content = vec![true; rows.len()];
+        assert!(
+            !cross_attention_peaks_order_aligned(&rows, &is_content),
+            "raw peaks must zigzag for the strict test to fail"
+        );
+        assert!(
+            mask_dominant_early_sinks(&rows, &is_content).is_none(),
+            "no dominant early sink is expected in this pattern"
+        );
+        assert!(
+            content_backward_fraction(&rows, &is_content) > COHERE_DTW_MAX_BACKWARD_PAIR_FRACTION,
+            "backward fraction must exceed the tolerant threshold"
+        );
+        let words = cohere_dtw_word_timestamps::<()>(
+            &alignments,
+            metadata,
+            &vec![0.99; token_ids.len()],
+            duration,
+            &decode_text,
+        )
+        .expect("peak fallback words");
+        assert!(
+            !words.is_empty(),
+            "long zigzag window must emit peak-fallback words, got empty"
+        );
+        // Each word must be at a distinct position (not spread uniformly).
+        // The first word starts near the clip start; the last ends at or below
+        // the last content-peak center (NOT at the full duration).
+        assert!(
+            words[0].start >= 0.0,
+            "first word must not start before clip start"
+        );
+        let last_end = words.last().map(|w| w.end).unwrap();
+        assert!(
+            last_end < duration,
+            "last word end ({last_end}) must be bounded by the last content-peak center, not the full duration ({duration})"
+        );
+        // Monotone and non-overlapping.
+        for pair in words.windows(2) {
+            assert!(
+                pair[0].start <= pair[1].start + 1e-6,
+                "timeline must be monotone"
+            );
+            assert!(pair[0].end - 1e-6 <= pair[1].start, "no overlaps");
+        }
+    }
+
+    #[test]
+    fn cohere_dtw_word_timestamps_falls_back_to_uniform_on_short_zigzag_window() {
+        let (_runtime_path, preflight) = write_runtime_ready_preflight();
+        let metadata = super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
+            &preflight.metadata,
+        )
+        .expect("parse metadata");
+        let spf = 8.0 * metadata.hop_length as f32 / metadata.sample_rate_hz as f32;
+        let frames = 110; // 8.8s < PEAK_FALLBACK_MIN_SECONDS
+        let duration = (frames as f32) * spf;
+        assert!(duration < COHERE_DTW_PEAK_FALLBACK_MIN_SECONDS);
+        let rows = zigzag_no_sink_rows(frames);
+        let token_ids: Vec<u32> = (50..50 + rows.len() as u32).collect();
+        let alignments: Vec<(u32, Vec<f32>)> = rows
+            .iter()
+            .zip(&token_ids)
+            .map(|(row, &id)| (id, row.to_vec()))
+            .collect();
+        let decode_text = |token_ids: &[u32]| {
+            let mut s = String::new();
+            for &id in token_ids {
+                use std::fmt::Write;
+                let _ = write!(s, "w{id} ");
+            }
+            Ok(s.trim_end().to_string())
+        };
+        let words = cohere_dtw_word_timestamps::<()>(
+            &alignments,
+            metadata,
+            &vec![0.99; token_ids.len()],
+            duration,
+            &decode_text,
+        )
+        .expect("dtw words");
+        assert!(
+            words.is_empty(),
+            "short window below the peak-fallback threshold must fall back to uniform (empty), got {words:?}"
         );
     }
 
