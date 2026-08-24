@@ -1912,11 +1912,11 @@ mod tests {
             "bench-receipt".to_string(),
             "short-audio".to_string(),
             "--audio".to_string(),
-            "/Users/alice/fixture.wav".to_string(),
+            "/home/alice/fixture.wav".to_string(),
         ];
         legacy.run.env_allowlist = BTreeMap::from([(
             "OPENASR_HOME".to_string(),
-            "/Users/alice/.openasr".to_string(),
+            "/home/alice/.openasr".to_string(),
         )]);
         let raw = serde_json::to_string(&legacy).unwrap();
         let loaded = ShortAudioReceipt::from_json_str(&raw).expect("legacy v0 remains readable");
@@ -1931,7 +1931,7 @@ mod tests {
     #[test]
     fn new_receipts_reject_posix_windows_unc_paths_and_untyped_environment_values() {
         for raw_path in [
-            "/Users/alice/fixture.wav",
+            "/home/alice/fixture.wav",
             "C:\\Users\\alice\\fixture.wav",
             "\\\\server\\share\\fixture.wav",
         ] {
@@ -1969,7 +1969,7 @@ mod tests {
         let mut receipt = sample_receipt();
         receipt.run.env_allowlist.insert(
             "OPENASR_GGML_BACKEND".to_string(),
-            "/Users/alice/private".to_string(),
+            "/home/alice/private".to_string(),
         );
         assert!(matches!(
             receipt.validate(),
@@ -1988,7 +1988,7 @@ mod tests {
 
         for scope in [
             "../0123456789abcdef0123456789abcdef",
-            "/Users/alice",
+            "/home/alice",
             "C:\\Users\\alice",
             "\\\\server\\share",
             "scope/not-a-nonce",

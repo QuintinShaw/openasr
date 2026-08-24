@@ -16,6 +16,10 @@ jobs:
     name: Docker build and mock API smoke
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # Public, job-local fixture credential. Its purpose is to prove that the
+      # container's non-loopback listener stays behind the pairing auth gate.
+      OPENASR_DOCKER_SMOKE_PAIRING_ADMIN_TOKEN: openasr-ci-docker-smoke
     steps:
       - uses: actions/checkout@v7
         with:
@@ -36,11 +40,15 @@ jobs:
         # Mock smoke: the image default CMD is the fail-closed native server,
         # which exits without an installed pack, so pass explicit mock args.
         # No --rm: keep the container around so `docker logs` works on failure.
-        run: docker run -d --name openasr-docker-smoke -p 18080:8080 openasr:ci serve --addr 0.0.0.0:8080 --backend mock
+        run: |
+          docker run -d --name openasr-docker-smoke -p 18080:8080 \
+            -e OPENASR_DOCKER_SMOKE_PAIRING_ADMIN_TOKEN \
+            openasr:ci serve --addr 0.0.0.0:8080 --backend mock \
+            --pairing-admin-token-env OPENASR_DOCKER_SMOKE_PAIRING_ADMIN_TOKEN
 
       - name: Wait for server
         run: |
-          for i in {1..30}; do
+          for _ in {1..30}; do
             if curl -fsS http://127.0.0.1:18080/health; then
               exit 0
             fi
@@ -53,8 +61,11 @@ jobs:
       - name: Smoke endpoints
         run: |
           curl -fsS http://127.0.0.1:18080/health
-          curl -fsS http://127.0.0.1:18080/v1/models
+          curl -fsS \
+            -H "Authorization: Bearer ${OPENASR_DOCKER_SMOKE_PAIRING_ADMIN_TOKEN}" \
+            http://127.0.0.1:18080/v1/models
           curl -fsS http://127.0.0.1:18080/v1/audio/transcriptions \
+            -H "Authorization: Bearer ${OPENASR_DOCKER_SMOKE_PAIRING_ADMIN_TOKEN}" \
             -F "file=@fixtures/jfk.wav" \
             -F "model=whisper-small" \
             -F "response_format=json" \

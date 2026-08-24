@@ -945,7 +945,7 @@ mod tests {
             "a".repeat(32)
         )));
         for scope in [
-            "/Users/alice",
+            "/home/alice",
             "C:\\Users\\alice",
             "\\\\server\\share",
             "../0123456789abcdef0123456789abcdef",
@@ -1167,7 +1167,7 @@ mod tests {
     #[test]
     fn receipt_command_replaces_caller_paths_with_stable_bindings() {
         let audio = PathBuf::from("/private/var/folders/example/alice/recording.wav");
-        let out = PathBuf::from("/Users/alice/Desktop/receipt.json");
+        let out = PathBuf::from("/home/alice/receipt.json");
         let model_pack = PathBuf::from(r"C:\Users\alice\AppData\Local\model.oasr");
         let trace_out = PathBuf::from("/tmp/openasr/trace.jsonl");
         let options = ShortAudioReceiptOptions {
@@ -1200,7 +1200,7 @@ mod tests {
         assert!(command.contains(&"runtime-trace-output".to_string()));
         for forbidden in [
             "/private/var",
-            "/Users/alice",
+            "/home/alice",
             r"C:\Users\alice",
             "/tmp/openasr",
         ] {
@@ -1360,7 +1360,7 @@ mod tests {
         );
         assert_eq!(
             display_model_id(
-                Some("/Users/alice/.openasr/models/funasr-nano.oasr"),
+                Some("/home/alice/.openasr/models/funasr-nano.oasr"),
                 "funasr-nano",
                 "q4_k"
             ),

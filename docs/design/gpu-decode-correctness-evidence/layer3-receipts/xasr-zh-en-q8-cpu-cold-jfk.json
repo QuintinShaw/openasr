@@ -8,7 +8,7 @@
     "quant": "q8_0"
   },
   "audio": {
-    "path_or_label": "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/fixtures/jfk.wav",
+    "path_or_label": "audio-sha256:59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e",
     "sha256": "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e",
     "duration_s": 11.0
   },
@@ -21,13 +21,13 @@
       "bench-receipt",
       "short-audio",
       "--audio",
-      "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/fixtures/jfk.wav",
+      "audio-sha256:59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e",
       "--backend",
       "native",
       "--device",
       "cpu",
       "--out",
-      "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/docs/design/gpu-decode-correctness-evidence/layer3-receipts/xasr-zh-en-q8-cpu-cold-jfk.json",
+      "receipt-output",
       "--runs",
       "1",
       "--warmup-runs",
@@ -40,7 +40,6 @@
       "533bc76971c2b012f2bec8bdc87d709c762e6ba6"
     ],
     "env_allowlist": {
-      "OPENASR_HOME": "/Volumes/QuintinDocument/openasr-dev/.worktrees/gpu-firered-encoder-split/tmp/openasr-home",
       "OPENASR_OFFLINE": "1"
     },
     "warmup": "cold",
@@ -134,7 +133,8 @@
   "scope": "layer3-xasr-zh-en-q8-cpu-cold-jfk",
   "notes": [
     "placement is the requested device; observed_placement reports actual ggml graph-node backends",
-    "measurement_method=wall_clock_process_elapsed"
+    "measurement_method=wall_clock_process_elapsed",
+    "ingress, output, and runtime-home paths were privacy-projected after capture; measurements are unchanged"
   ],
   "decode_diagnostics": {
     "output_plan": "full_logits",
