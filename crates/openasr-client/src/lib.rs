@@ -27,6 +27,7 @@ use rustls::{
 
 mod client;
 mod error;
+mod local_trust;
 mod secret;
 mod tls;
 
@@ -35,6 +36,9 @@ pub use client::{
     TranscriptionResponse, spawn_realtime_worker,
 };
 pub use error::ClientError;
+pub use local_trust::{
+    LocalTrustError, ManagedDaemonEndpoint, SelectedMedia, managed_daemon_http_client,
+};
 pub use secret::{MemorySecretStore, SecretStore, credential_account};
 
 /// Normalize a certificate fingerprint to lowercase hex with all non-hex

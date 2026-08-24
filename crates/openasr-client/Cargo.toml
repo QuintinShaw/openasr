@@ -11,15 +11,23 @@ description = "OpenASR remote compute client: TOFU TLS fingerprint pinning, LAN 
 [dependencies]
 futures-util.workspace = true
 openasr-core.workspace = true
+reqwest.workspace = true
 # Mirror the desktop client's exact rustls config (ring-only, no aws-lc-rs) so
 # feature unification keeps the client dependency graph lean. Do NOT inherit the
 # workspace rustls (its default features pull aws-lc-rs).
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tokio-tungstenite.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 openasr-server = { workspace = true, features = ["test-support"] }

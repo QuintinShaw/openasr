@@ -38,6 +38,7 @@ pub(crate) const fn runtime_gguf_parse_limits() -> ffi::GgufParseLimits {
     }
 }
 
+pub(crate) use crate::StrongFileIdentity;
 pub(crate) use arena_weight_pipeline::{
     ArenaAllocError, WeightSlot, alloc_static_f16, alloc_static_f32, bind_loaded,
     upload_static_f16, upload_static_f32,
@@ -161,4 +162,4 @@ pub(crate) use runtime_preflight::{
 pub use runtime_source::{
     GgmlRuntimeSource, GgmlRuntimeSourcePathError, validate_ggml_runtime_source_path,
 };
-pub(crate) use runtime_source::{StrongFileIdentity, resolve_content_id, unreadable_content_id};
+pub(crate) use runtime_source::{resolve_content_id, unreadable_content_id};

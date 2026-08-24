@@ -10,6 +10,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::StrongFileIdentity;
+
 use super::{
     GgmlRuntimeSource, GgmlRuntimeSourcePathError, GgufMetadata, GgufMetadataReadError,
     GgufTensorIndex, GgufTensorIndexReadError,
@@ -17,7 +19,6 @@ use super::{
         GgufBoundedParseFailure, parse_bounded_gguf_context, read_gguf_metadata_from_context,
     },
     gguf_tensor_index::{GgufTensorIndexSnapshot, read_gguf_tensor_index_from_context},
-    runtime_source::StrongFileIdentity,
     validate_ggml_runtime_source_path,
 };
 

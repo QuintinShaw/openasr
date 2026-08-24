@@ -12,6 +12,7 @@ mod catalog_series;
 // crate's runtime never calls.
 #[cfg(test)]
 mod cuda_targets;
+mod file_identity;
 mod http;
 mod pe_image_identity;
 #[cfg(test)]
@@ -64,6 +65,7 @@ pub use family_inventory::{
     ExecutionCapabilitiesInventoryV1, ExecutionProviderInventoryV1, ModelFamilyInventoryEntryV1,
     ModelFamilyInventoryV1, builtin_model_family_inventory,
 };
+pub use file_identity::StrongFileIdentity;
 // `pub` (not `pub(crate)`): the desktop app reaches this by path
 // (`openasr_core::backend_manifest::verify_and_parse`) to verify the
 // downloaded inference-kernel manifest -- see the module doc comment.

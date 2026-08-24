@@ -1642,16 +1642,20 @@ name = "openasr-client"
 version = "0.1.36"
 dependencies = [
  "futures-util",
+ "libc",
  "openasr-core",
  "openasr-server",
  "rcgen",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

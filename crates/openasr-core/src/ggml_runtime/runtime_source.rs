@@ -7,116 +7,13 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-#[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
-
-#[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-};
-
 use memmap2::Mmap;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::StrongFileIdentity;
+
 use super::{GgmlPackageFormat, GgmlPackageProbe, GgmlPackageProbeError, probe_ggml_package_file};
-
-/// Strong OS file identity: device, inode, length, and the *full*
-/// nanosecond mtime of an already-opened file. Never truncated to whole
-/// seconds -- see `models::runtime_cache_coordinator`'s module doc comment
-/// for the audited bug (a `(len, whole-second mtime)` memo key) this type
-/// replaces.
-///
-/// Always derived from an open file handle's `metadata()` (an `fstat` on the
-/// held fd), never from a fresh `stat` on a path: a path-based stat can
-/// observe a *different* file than the one actually opened if something
-/// replaces the path in between, which is exactly the class of race this
-/// contract exists to close.
-///
-/// Unix uses `(dev, ino)` and Windows uses `(volume serial, file index)` so a
-/// same-length/same-mtime replacement cannot alias the held generation.
-/// Unsupported native targets fail closed instead of weakening the identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) struct StrongFileIdentity {
-    #[cfg(unix)]
-    dev: u64,
-    #[cfg(unix)]
-    ino: u64,
-    #[cfg(windows)]
-    volume_serial_number: u32,
-    #[cfg(windows)]
-    file_index: u64,
-    len: u64,
-    mtime_secs: u64,
-    mtime_nanos: u32,
-}
-
-impl StrongFileIdentity {
-    #[cfg(test)]
-    pub(crate) const fn test_fixture(seed: u64) -> Self {
-        Self {
-            #[cfg(unix)]
-            dev: 1,
-            #[cfg(unix)]
-            ino: seed,
-            #[cfg(windows)]
-            volume_serial_number: 1,
-            #[cfg(windows)]
-            file_index: seed,
-            len: 4096,
-            mtime_secs: 1,
-            mtime_nanos: 1,
-        }
-    }
-
-    /// `None` when any needed metadata field cannot be read (including a
-    /// pre-1970 mtime, which cannot be represented here) -- callers must fail
-    /// closed rather than trust a partial identity.
-    pub(crate) fn of_file(file: &File, metadata: &std::fs::Metadata) -> Option<Self> {
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = (file, metadata);
-            return None;
-        }
-        #[cfg(unix)]
-        let _ = file;
-        #[cfg(windows)]
-        let handle_identity = {
-            let mut information = BY_HANDLE_FILE_INFORMATION::default();
-            // SAFETY: `file` owns a live Windows file handle for the duration
-            // of this call, and `information` points to writable storage of
-            // the exact structure required by GetFileInformationByHandle.
-            let succeeded =
-                unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
-            if succeeded == 0 {
-                return None;
-            }
-            (
-                information.dwVolumeSerialNumber,
-                (u64::from(information.nFileIndexHigh) << 32)
-                    | u64::from(information.nFileIndexLow),
-            )
-        };
-        let modified = metadata.modified().ok()?;
-        let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
-        Some(Self {
-            #[cfg(unix)]
-            dev: metadata.dev(),
-            #[cfg(unix)]
-            ino: metadata.ino(),
-            #[cfg(windows)]
-            volume_serial_number: handle_identity.0,
-            #[cfg(windows)]
-            file_index: handle_identity.1,
-            len: metadata.len(),
-            mtime_secs: since_epoch.as_secs(),
-            mtime_nanos: since_epoch.subsec_nanos(),
-        })
-    }
-}
 
 /// Process-wide memo: canonical path -> (strong identity at last hash,
 /// `sha256:<hex>` digest). Shared by every *hashing* content id resolver in
