@@ -189,12 +189,12 @@ pub use ggml_runtime::{
     DiagnosticDecodeSelection, DiagnosticDecoderGraphMode, DiagnosticFamilyCompactPolicy,
     DiagnosticFourQuadrantReport, DiagnosticLayer1Case, DiagnosticLayer1Report,
     DiagnosticLayer2Report, DiagnosticQuadrantTrace, GGML_GRAPH_LIFECYCLE_SCHEMA,
-    GgmlActualDeviceFacts, GgmlExecutionNodeSample, GgmlExecutionPlacementSummary,
-    GgmlExecutionTelemetryCollector, GgmlExecutionTelemetryGuard, GgmlGraphLifecycleCollector,
-    GgmlGraphLifecycleEvent, GgmlGraphLifecycleEventKind, GgmlGraphLifecycleGuard,
-    GgmlGraphLifecycleSnapshot, GgmlGraphPoisonReason, GgmlGraphRebuildReason,
-    run_diagnostic_four_quadrant_exact_route_probe, run_diagnostic_layer1_exact_route_probe,
-    run_diagnostic_layer2_exact_route_probe,
+    GgmlActualDeviceFacts, GgmlCaptureExecutableChange, GgmlExecutionNodeSample,
+    GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector, GgmlExecutionTelemetryGuard,
+    GgmlGraphLifecycleCollector, GgmlGraphLifecycleEvent, GgmlGraphLifecycleEventKind,
+    GgmlGraphLifecycleGuard, GgmlGraphLifecycleSnapshot, GgmlGraphPoisonReason,
+    GgmlGraphRebuildReason, run_diagnostic_four_quadrant_exact_route_probe,
+    run_diagnostic_layer1_exact_route_probe, run_diagnostic_layer2_exact_route_probe,
 };
 pub use metrics::{
     ProcessMemorySnapshot, WerCounts, cer_counts, current_rss_bytes, normalize_text,

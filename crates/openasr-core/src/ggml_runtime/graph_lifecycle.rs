@@ -68,7 +68,16 @@ pub enum GgmlGraphPoisonReason {
     ComputeFailed,
     ReadbackFailed,
     MemoryCommitFailed,
+    CaptureObservationFailed,
     Explicit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GgmlCaptureExecutableChange {
+    Instantiated,
+    Updated,
+    Replaced,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,11 +135,31 @@ pub enum GgmlGraphLifecycleEventKind {
         reason: GgmlGraphPoisonReason,
     },
     Dropped,
-    /// This event is reserved for a callback from the backend API that creates
-    /// or replaces an executable capture. The Rust graph layer never emits it
-    /// from a HIP/CUDA label or build option.
+    /// Backend-native graph tracking, capture support, and enablement observed
+    /// immediately before or after a real graph compute. This is emitted from
+    /// the optional backend ABI, never inferred from a build option, provider
+    /// label, or planner policy.
+    CaptureStateObserved {
+        capture_supported: bool,
+        graph_tracked: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        capture_enabled: Option<bool>,
+        executable_present: bool,
+    },
+    /// An executable already existed before the measured compute. The event
+    /// binds the upcoming compute to that native generation without claiming
+    /// that the current Rust graph lifecycle created it.
+    CaptureExecutableObserved {
+        capture_executable_generation: u64,
+        last_change: GgmlCaptureExecutableChange,
+    },
+    /// Emitted only when before/after observations from the backend API prove
+    /// that the measured compute advanced the native executable generation.
+    /// The Rust graph layer never emits it from a provider label or build
+    /// option.
     CaptureExecutableCreated {
         capture_executable_generation: u64,
+        change: GgmlCaptureExecutableChange,
     },
 }
 
@@ -313,6 +342,71 @@ mod tests {
         assert_eq!(snapshot.events.len(), 1);
         assert_eq!(snapshot.events[0].sequence, 2);
         assert_eq!(snapshot.events[0].graph_instance, 3);
+    }
+
+    #[test]
+    fn native_capture_events_serialize_observation_phase_without_policy_inference() {
+        let collector = GgmlGraphLifecycleCollector::new();
+        collector.record(
+            "hip",
+            "ROCm0",
+            1,
+            2,
+            GgmlGraphLifecycleEventKind::CaptureStateObserved {
+                capture_supported: true,
+                graph_tracked: false,
+                capture_enabled: None,
+                executable_present: false,
+            },
+        );
+        collector.record(
+            "hip",
+            "ROCm0",
+            1,
+            2,
+            GgmlGraphLifecycleEventKind::CaptureStateObserved {
+                capture_supported: true,
+                graph_tracked: true,
+                capture_enabled: Some(true),
+                executable_present: true,
+            },
+        );
+        collector.record(
+            "hip",
+            "ROCm0",
+            1,
+            2,
+            GgmlGraphLifecycleEventKind::CaptureExecutableObserved {
+                capture_executable_generation: 7,
+                last_change: GgmlCaptureExecutableChange::Instantiated,
+            },
+        );
+        collector.record(
+            "hip",
+            "ROCm0",
+            1,
+            2,
+            GgmlGraphLifecycleEventKind::CaptureExecutableCreated {
+                capture_executable_generation: 8,
+                change: GgmlCaptureExecutableChange::Updated,
+            },
+        );
+
+        let values = collector
+            .snapshot()
+            .events
+            .iter()
+            .map(|event| serde_json::to_value(event).expect("serialize lifecycle event"))
+            .collect::<Vec<_>>();
+        assert_eq!(values[0]["event"], "capture_state_observed");
+        assert_eq!(values[0]["graph_tracked"], false);
+        assert!(values[0].get("capture_enabled").is_none());
+        assert_eq!(values[1]["event"], "capture_state_observed");
+        assert_eq!(values[1]["capture_enabled"], true);
+        assert_eq!(values[2]["event"], "capture_executable_observed");
+        assert_eq!(values[2]["last_change"], "instantiated");
+        assert_eq!(values[3]["event"], "capture_executable_created");
+        assert_eq!(values[3]["change"], "updated");
     }
 
     #[test]

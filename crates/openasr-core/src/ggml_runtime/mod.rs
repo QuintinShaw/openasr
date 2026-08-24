@@ -1,5 +1,6 @@
 mod arena_weight_pipeline;
 mod backend;
+mod backend_graph_lifecycle;
 pub(crate) mod backend_memory;
 pub(crate) mod backend_memory_admission;
 mod cpu_graph;
@@ -144,9 +145,10 @@ pub(crate) use gguf_write::{
 #[cfg(test)]
 pub(crate) use graph_lifecycle::test_opaque_graph_id_mint_count;
 pub use graph_lifecycle::{
-    GGML_GRAPH_LIFECYCLE_SCHEMA, GgmlActualDeviceFacts, GgmlGraphLifecycleCollector,
-    GgmlGraphLifecycleEvent, GgmlGraphLifecycleEventKind, GgmlGraphLifecycleGuard,
-    GgmlGraphLifecycleSnapshot, GgmlGraphPoisonReason, GgmlGraphRebuildReason,
+    GGML_GRAPH_LIFECYCLE_SCHEMA, GgmlActualDeviceFacts, GgmlCaptureExecutableChange,
+    GgmlGraphLifecycleCollector, GgmlGraphLifecycleEvent, GgmlGraphLifecycleEventKind,
+    GgmlGraphLifecycleGuard, GgmlGraphLifecycleSnapshot, GgmlGraphPoisonReason,
+    GgmlGraphRebuildReason,
 };
 pub(crate) use graph_lifecycle::{
     GgmlGraphLifecycleGeneration, current_graph_lifecycle_collector,

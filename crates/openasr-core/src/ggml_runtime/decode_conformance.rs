@@ -1382,7 +1382,9 @@ mod tests {
         }
         assert!(report.graph_lifecycle.events.iter().all(|event| !matches!(
             event.kind,
-            crate::GgmlGraphLifecycleEventKind::CaptureExecutableCreated { .. }
+            crate::GgmlGraphLifecycleEventKind::CaptureStateObserved { .. }
+                | crate::GgmlGraphLifecycleEventKind::CaptureExecutableObserved { .. }
+                | crate::GgmlGraphLifecycleEventKind::CaptureExecutableCreated { .. }
         )));
     }
 
@@ -1398,6 +1400,12 @@ mod tests {
             crate::GgmlGraphLifecycleEventKind::Rebuilt { .. } => "rebuilt",
             crate::GgmlGraphLifecycleEventKind::Poisoned { .. } => "poisoned",
             crate::GgmlGraphLifecycleEventKind::Dropped => "dropped",
+            crate::GgmlGraphLifecycleEventKind::CaptureStateObserved { .. } => {
+                "capture_state_observed"
+            }
+            crate::GgmlGraphLifecycleEventKind::CaptureExecutableObserved { .. } => {
+                "capture_executable_observed"
+            }
             crate::GgmlGraphLifecycleEventKind::CaptureExecutableCreated { .. } => {
                 "capture_executable_created"
             }

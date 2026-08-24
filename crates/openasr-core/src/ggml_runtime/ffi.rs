@@ -331,6 +331,46 @@ pub(crate) struct GgmlBackendMemoryApiV1 {
     pub quarantine: Option<GgmlMemoryQuarantineFn>,
 }
 
+pub(crate) type GgmlBackendMemoryGetApiV1Fn =
+    unsafe extern "C" fn() -> *const GgmlBackendMemoryApiV1;
+
+pub(crate) const GGML_BACKEND_GRAPH_LIFECYCLE_ABI_V1: u32 = 1;
+pub(crate) const GGML_BACKEND_GRAPH_LIFECYCLE_CAPTURE_SUPPORTED_V1: u32 = 1 << 0;
+pub(crate) const GGML_BACKEND_GRAPH_LIFECYCLE_CAPTURE_ENABLED_V1: u32 = 1 << 1;
+pub(crate) const GGML_BACKEND_GRAPH_LIFECYCLE_EXECUTABLE_PRESENT_V1: u32 = 1 << 2;
+pub(crate) const GGML_BACKEND_GRAPH_LIFECYCLE_GRAPH_TRACKED_V1: u32 = 1 << 3;
+pub(crate) const GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_NONE_V1: u32 = 0;
+pub(crate) const GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_INSTANTIATED_V1: u32 = 1;
+pub(crate) const GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_UPDATED_V1: u32 = 2;
+pub(crate) const GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_REPLACED_V1: u32 = 3;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GgmlBackendGraphLifecycleObservationV1 {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub flags: u32,
+    pub last_executable_change: u32,
+    pub executable_generation: u64,
+}
+
+pub(crate) type GgmlBackendGraphLifecycleObserveV1Fn = unsafe extern "C" fn(
+    GgmlBackendRaw,
+    GgmlCgraphRaw,
+    *mut GgmlBackendGraphLifecycleObservationV1,
+) -> c_int;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct GgmlBackendGraphLifecycleApiV1 {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub capabilities: u64,
+    pub observe: Option<GgmlBackendGraphLifecycleObserveV1Fn>,
+}
+
+pub(crate) type GgmlBackendGraphLifecycleGetApiV1Fn =
+    unsafe extern "C" fn() -> *const GgmlBackendGraphLifecycleApiV1;
 /// ggml abort predicate: return true to abort the in-flight graph. Called from
 /// ggml worker threads -- must stay panic-free and lock-light.
 pub(crate) type GgmlAbortCallback = Option<unsafe extern "C" fn(data: *mut c_void) -> bool>;

@@ -624,8 +624,10 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                     "completed": {},
                     "capture": None,
                     "capture_supported": None,
+                    "graph_tracked": None,
                     "capture_enabled": None,
                     "capture_state_observed": False,
+                    "capture_executable_present": False,
                     "capture_present_observed": False,
                     "compute_captures": [],
                     "poisoned": False,
@@ -654,40 +656,67 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                 state["input"] = input_generation
             elif kind == "capture_state_observed":
                 supported = event.get("capture_supported")
+                graph_tracked = event.get("graph_tracked")
                 enabled = event.get("capture_enabled")
                 executable_present = event.get("executable_present")
                 if (
-                    not all(isinstance(value, bool) for value in (supported, enabled, executable_present))
-                    or (enabled and not supported)
-                    or (executable_present and not enabled)
+                    not all(isinstance(value, bool) for value in (supported, graph_tracked, executable_present))
+                    or (graph_tracked and not isinstance(enabled, bool))
+                    or (not graph_tracked and enabled is not None)
+                    or (graph_tracked and not supported)
+                    or (executable_present and (not graph_tracked or enabled is not True))
                     or (
                         state["capture_supported"] is not None
                         and state["capture_supported"] != supported
                     )
                     or (
-                        state["capture_enabled"] is not None
+                        state["graph_tracked"] is True
+                        and not graph_tracked
+                    )
+                    or (
+                        state["graph_tracked"] is True
+                        and graph_tracked
                         and state["capture_enabled"] != enabled
                     )
                     or (
-                        state["capture_present_observed"]
+                        state["capture_executable_present"]
                         and not executable_present
                     )
                 ):
                     raise MatrixError(f"{path} contains an invalid or drifting native capture state")
                 state["capture_supported"] = supported
+                state["graph_tracked"] = graph_tracked
                 state["capture_enabled"] = enabled
                 state["capture_state_observed"] = True
+                state["capture_executable_present"] = executable_present
                 state["capture_present_observed"] |= executable_present
+            elif kind == "capture_executable_observed":
+                capture = event.get("capture_executable_generation")
+                if (
+                    not positive_int(capture)
+                    or state["capture"] is not None
+                    or event.get("last_change") not in {"instantiated", "updated", "replaced"}
+                    or state["active_compute"] is not None
+                    or not state["capture_state_observed"]
+                    or not state["capture_supported"]
+                    or not state["graph_tracked"]
+                    or state["capture_enabled"] is not True
+                    or not state["capture_executable_present"]
+                ):
+                    raise MatrixError(f"{path} contains an invalid pre-compute capture executable observation")
+                state["capture"] = capture
             elif kind == "capture_executable_created":
                 capture = event.get("capture_executable_generation")
                 if (
                     not positive_int(capture)
                     or (state["capture"] is not None and capture <= state["capture"])
                     or event.get("change") not in {"instantiated", "updated", "replaced"}
+                    or state["active_compute"] is None
                     or not state["capture_state_observed"]
                     or not state["capture_supported"]
-                    or not state["capture_enabled"]
-                    or not state["capture_present_observed"]
+                    or not state["graph_tracked"]
+                    or state["capture_enabled"] is not True
+                    or not state["capture_executable_present"]
                 ):
                     raise MatrixError(f"{path} contains an invalid capture executable generation")
                 state["capture"] = capture
@@ -731,7 +760,7 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                 if not positive_int(previous) or previous == generation or previous not in graph_generations or event.get("reason") not in {"fresh_step", "topology_changed", "poison_recovery"}:
                     raise MatrixError(f"{path} contains an unbound graph rebuild")
             elif kind == "poisoned":
-                if event.get("reason") not in {"compute_failed", "readback_failed", "memory_commit_failed", "explicit"}:
+                if event.get("reason") not in {"compute_failed", "readback_failed", "memory_commit_failed", "capture_observation_failed", "explicit"}:
                     raise MatrixError(f"{path} contains an invalid poison reason")
                 state["poisoned"] = True
                 state["active_compute"] = None
@@ -820,7 +849,7 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
         state for state in graph_states.values() if state["last_compute"] > 0
     ]
     capture_state_modes = {
-        (state["capture_supported"], state["capture_enabled"])
+        (state["capture_supported"], state["graph_tracked"], state["capture_enabled"])
         for state in computed_states
         if state["capture_state_observed"]
     }
@@ -926,7 +955,7 @@ def _require_trace_capture_policy(
         if (
             computed_graphs == 0
             or observed_graphs != computed_graphs
-            or observed_modes != {(True, True)}
+            or observed_modes != {(True, True, True)}
             or not executable_present
             or not capture_observed
             or not capture_consumed
@@ -938,7 +967,7 @@ def _require_trace_capture_policy(
         if (
             computed_graphs == 0
             or observed_graphs != computed_graphs
-            or observed_modes != {(True, False)}
+            or observed_modes != {(True, True, False)}
             or executable_present
             or capture_observed
             or capture_consumed
@@ -948,7 +977,7 @@ def _require_trace_capture_policy(
             )
     elif capture_mode == "unsupported":
         if (
-            observed_modes not in (set(), {(False, False)})
+            observed_modes not in (set(), {(False, False, None)})
             or executable_present
             or capture_observed
             or capture_consumed

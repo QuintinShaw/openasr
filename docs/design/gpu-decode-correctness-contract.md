@@ -108,7 +108,11 @@ for:
 - compute sequence;
 - rebuild event and typed reason;
 - input, output, and KV write generations plus the generation actually consumed;
-- HIP capture executable generation;
+- native capture support, exact-graph tracking, and enablement observed both
+  immediately before and after compute;
+- pre-existing capture executable generation and its last native change,
+  separately from an instantiate/update/replace caused by the measured
+  compute;
 - graph poison; and
 - graph drop.
 
@@ -119,7 +123,10 @@ cannot synthesize these events.
 The evidence must prove that fresh steps use distinct graph generations, reuse
 retains the intended graph/capture executable, refreshed input/output/KV state is
 consumed by the correct compute, topology changes rebuild for the declared
-reason, and poisoned graphs cannot execute or re-enter a cache.
+reason, and poisoned graphs cannot execute or re-enter a cache. A first
+post-compute observation cannot be labeled as creation: the producer must use
+the read-only native ABI before and after compute so an executable that already
+existed in the backend context is reported as observed, not newly created.
 
 ### Required shared producers
 
@@ -1202,7 +1209,7 @@ a gross logits divergence.
 |---|---|
 | x86/ARM CPU | native operator and family host-oracle parity |
 | Apple Metal | target state is complete logits until a semantic native selector and all gates pass; migrate the current Qwen-shaped reverse exception |
-| NVIDIA CUDA | semantic operator, persistent graph, real-pack family parity; capture is currently off |
+| NVIDIA CUDA | semantic operator, persistent graph, real-pack family parity; capture is currently compiled out and therefore projects as `unsupported`, not runtime `disabled` |
 | physical Vulkan | semantic operator, persistent graph, real-pack family parity |
 | AMD HIP/ROCm | semantic operator, current capture-on persistent graph, Qwen-shaped and other advertised family parity |
 

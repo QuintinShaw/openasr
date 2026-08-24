@@ -237,6 +237,7 @@ class GpuCorrectnessGateTests(unittest.TestCase):
                     "event": "capture_state_observed",
                     "sequence": 4,
                     "capture_supported": True,
+                    "graph_tracked": True,
                     "capture_enabled": True,
                     "executable_present": True,
                 },
@@ -245,10 +246,10 @@ class GpuCorrectnessGateTests(unittest.TestCase):
                 5,
                 {
                     **route,
-                    "event": "capture_executable_created",
+                    "event": "capture_executable_observed",
                     "sequence": 5,
                     "capture_executable_generation": 10,
-                    "change": "instantiated",
+                    "last_change": "instantiated",
                 },
             )
         return "\n".join(json.dumps(event) for event in events) + "\n"
