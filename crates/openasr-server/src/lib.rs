@@ -1454,6 +1454,7 @@ impl ActiveRuntimeSlot {
         self.lock_read().active.is_none()
     }
 
+    #[cfg(test)]
     fn set_legacy_binding(&self, path: Option<PathBuf>) {
         let mut state = self.lock_write();
         state.requested_path = path.clone();
@@ -1471,6 +1472,12 @@ impl ActiveRuntimeSlot {
             path,
             attested_identity: Some(identity),
         });
+    }
+
+    fn clear_active(&self) {
+        let mut state = self.lock_write();
+        state.requested_path = None;
+        state.active = None;
     }
 
     fn active_identity(&self) -> Option<openasr_core::DefaultModelActivationIdentity> {
@@ -1660,6 +1667,7 @@ impl ServerRuntime {
     /// in-flight work is not torn down. Unloads idle runtime caches so a
     /// same-id reinstall (path unchanged, file replaced) cannot keep serving
     /// the previous bytes. Mock backends never call this.
+    #[cfg(test)]
     pub(crate) fn rebind_native_model_pack(
         &self,
         new_path: Option<PathBuf>,
@@ -1686,6 +1694,23 @@ impl ServerRuntime {
             invalidate_cached_native_realtime_capabilities();
         }
         Ok(())
+    }
+
+    /// Non-fallible live clear after the authoritative V2 `Unset` record has
+    /// committed. The caller holds the activation barrier and completed every
+    /// fallible busy/durable check before entering this pointer exchange.
+    pub(crate) fn clear_active_native_model(&self) {
+        let previous = self.model_pack_path.active_identity();
+        self.model_pack_path.clear_active();
+        if self.backend == BackendKind::Native
+            && let Some(previous) = previous
+        {
+            self.native_execution
+                .execution_services()
+                .evict_prepared_runtime_content_id(previous.pack_content_id());
+        }
+        idle_activity::bump_native_unload_generation();
+        invalidate_cached_native_realtime_capabilities();
     }
 
     /// Publishes one already-attested identity after durable V2 commit. All

@@ -2651,6 +2651,10 @@ async fn boot_reactivation_attests_v2_before_publishing_active_runtime() {
 #[test]
 fn set_default_model_http_stage_does_not_publish_live() {
     let source = include_str!("routes/models_api.rs");
+    assert!(
+        !source.contains("rebind_native_model_pack"),
+        "production model routes must not restore the legacy path-only rebind"
+    );
     let owner_impl = source
         .split("impl NativeActivationStagedOwner")
         .nth(1)

@@ -1,7 +1,7 @@
 # Runtime ownership and atomic model activation
 
-Status: proposed for independent review; no implementation is implied by this
-document.
+Status: software contract implemented on the integration branch; release
+acceptance remains blocked on the real-host provider matrix described below.
 
 This document defines the cross-family contract for resident runtime ownership,
 physical-memory planning, candidate materialization, and durable model
@@ -15,9 +15,38 @@ activation. It complements:
   architecture inventory and shared/family boundary.
 
 The live Rust inventory, backend ABI, and tests remain the implementation
-authority. This proposal exists to close the missing transaction from a verified
-pack and execution intent to one admitted resident owner and one durable active
-model selection.
+authority. This document now serves as both the governing contract and the
+release checklist for the transaction from a verified pack and execution intent
+to one admitted resident owner and one durable active model selection.
+
+## Implementation checkpoint
+
+The software-side migration is complete for the current inventory:
+
+- architecture descriptors build the resident topology consumed by candidate
+  quote/reserve and default activation;
+- broker reservations, native allocations, host allocations, pack residency,
+  thread-affine backend handles, checkout actors, forced-aligner assets, and
+  serve-batch semantic children publish scope-local typed receipts;
+- live lease reconciliation compares the NES scope rather than a process-global
+  event ring, and event-history truncation cannot invalidate a complete live
+  owner table;
+- `CandidateActivationTransaction` is the shared typestate path; ordinary
+  publication rejection rolls back, while only typed may-have-mutated failures
+  quarantine;
+- `ActiveRuntimeSlot` separates durable requested intent from attested process
+  state, serializes activation against new sessions, publishes only after V2,
+  and startup reactivation validates V2 without minting a new generation;
+- `default_selection` V2 stores architecture plus a reversible, path-free
+  execution-intent wire value, uses the existing same-directory atomic writer,
+  and has per-attempt injection at every pre-commit and replace boundary; and
+- Desktop delegates activation to the daemon and vendors the generated HTTP
+  contract. It does not calculate capacity or persist a competing selection.
+
+This does **not** convert missing hardware into success. CUDA, physical Vulkan,
+and HIP/ROCm (including HIP capture-on), plus the Windows neutral-dynamic
+plugin-switch product flow, still require release-bound real-host receipts. The
+gate must remain closed while those cells are missing, stale, or unavailable.
 
 ## Executive decision
 
@@ -26,32 +55,32 @@ bug. The broker correctly rejected a 5,092,073,216-byte system-memory allocation
 when both the policy remainder and the observed budget were smaller. The product
 failure is broader:
 
-1. resident runtime ownership is expressed by several family-specific cache and
-   actor shapes, so the complete number and lifetime of physical owners are not
-   represented by one enforceable contract;
-2. the runtime can quote and admit each native allocation safely, but the model
-   selection path cannot evaluate and stage the complete selected route before
-   changing durable state; and
-3. desktop and server currently persist the requested default model before the
-   new runtime has been successfully admitted, materialized, attested, and
+1. resident runtime ownership was expressed by several family-specific cache
+   and actor shapes, so the complete number and lifetime of physical owners was
+   not represented by one enforceable contract;
+2. the runtime could quote and admit each native allocation safely, but the
+   model selection path could not evaluate and stage the complete selected
+   route before changing durable state; and
+3. desktop and server persisted the requested default model before the new
+   runtime had been successfully admitted, materialized, attested, and
    published.
 
 The remedy is not a FireRed special case, a larger memory margin, a global cache,
-or a static model-size estimate. OpenASR needs one standard owner protocol and
-one activation transaction while preserving model semantics, backend memory
-semantics, thread affinity, and bounded parallelism.
+or a static model-size estimate. OpenASR now uses one standard owner protocol
+and one activation transaction while preserving model semantics, backend
+memory semantics, thread affinity, and bounded parallelism.
 
 This is a deepening of three existing modules plus one schema upgrade, not four
 parallel subsystems:
 
-1. `NativeExecutionServices` and its actor/cache primitives gain one enumerable
+1. `NativeExecutionServices` and its actor/cache primitives expose one enumerable
    resident-owner protocol;
-2. the architecture inventory gains one backend-neutral resident-footprint
+2. the architecture inventory exposes one backend-neutral resident-footprint
    facet, while `NativeMemoryAdmissionPlan` remains the provider-specific
    physical expansion and admission authority;
-3. the existing candidate attempt/journal becomes the one transaction used by
+3. the existing candidate attempt/journal is the one transaction used by
    offline, streaming, warm-up, auxiliary, and activation paths; and
-4. `default_selection` receives a versioned schema and activation commit
+4. `default_selection` owns a versioned schema and activation commit
    protocol instead of gaining another persistence authority.
 
 Every migration must include a deletion test: once a component enters the new
@@ -569,23 +598,18 @@ confirmed or refuted finding.
 
 ## Atomic model activation
 
-### Current defect
+### Resolved baseline defect
 
-Both server and desktop currently persist the requested selection before runtime
-rebind:
+The baseline server and desktop persisted requested selection before a path-only
+runtime rebind. That sequence could leave durable selection, in-memory binding,
+and UI state describing different models.
 
-- `crates/openasr-server/src/routes/models_api.rs:34-56`
-- `../openasr-app/apps/desktop/src-tauri/src/sidecar.rs:889-942`
-
-A failed rebind can therefore leave durable selection, in-memory binding, and UI
-state describing different models. Current `rebind_native_model_pack` is only a
-verified path/binding exchange plus idle-cache invalidation. It does not resolve
-and reserve a candidate, build the native runtime, run first-compute attestation,
-or reconcile physical growth. Materialization is deferred to asynchronous
-warm-up or the next request, so persistence-first plus successful rebind does not
-prove that the model is admitted or active. Startup is worse: persistence can
-succeed and the first materialization failure appears only on boot warm-up or
-transcription.
+Production model routes no longer call the legacy path-only rebind. Set-default
+enters the transaction below; deletion commits V2 `Unset` before a non-fallible
+active-slot clear; Desktop is a daemon delegate. On startup, durable V2 is only
+requested intent: the fresh `ActiveRuntimeSlot` remains unavailable until the
+same transaction reverifies, reserves, warms, attests, reconciles, validates the
+unchanged durable record, and publishes the process-local identity.
 
 ### `ModelActivationTransaction`
 
@@ -809,6 +833,16 @@ Migrate one representative of each owner shape first:
    execution as the required case;
 7. split and unified pools for one family; and
 8. non-ASR-row auxiliary and serve-batch serialized owners.
+
+Implementation note: “bounded checkout pool” means the existing
+`AdmittedPinnedRuntimeActorCheckoutPool`; the short-lived parallel
+`ResidentCheckoutPool` prototype was deleted rather than retained as a second
+authority. Serve-batch runtime/session rows are typed `NoBrokerLease` semantic
+children because their native/system-memory child owners publish the actual
+brokered byte receipts; `Unknown` is reserved for negative tests and cannot
+silently compare as zero. Forced-aligner prepared assets use
+`SystemMemoryOwner`, while its audio/decoder/logits transients carry distinct
+stage lanes.
 
 For each migration, remove its previous direct publication path. Verify
 construction/drop order, content-id eviction, idle unload, poison, quarantine,

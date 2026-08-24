@@ -1049,12 +1049,69 @@ pub(crate) const DIARIZEN_SEGMENT_RESIDENT_FOOTPRINT: ResidentFootprintFacet =
 pub(crate) const FIRERED_PUNC_RESIDENT_FOOTPRINT: ResidentFootprintFacet =
     ResidentFootprintFacet::new(&[MODEL_BINDING, EXECUTION_STATE]);
 
+const FORCED_ALIGNER_PREPARED_ASSETS: ResidentComponentSpec = ResidentComponentSpec::new(
+    "prepared-assets",
+    "v1",
+    ResidentPhase::Prepare,
+    ResidentLifetime::ExecutionScope,
+    NO_DEPENDENCIES,
+    BOTH_BINDINGS,
+    UNIFIED_AND_SPLIT,
+    ResidentCheckout::serialized(),
+    None,
+);
+const FORCED_ALIGNER_ASSETS_DEPENDENCY: &[&str] = &["prepared-assets"];
+const FORCED_ALIGNER_AUDIO_RUNTIME: ResidentComponentSpec = ResidentComponentSpec::new(
+    "audio-runtime",
+    "v1",
+    ResidentPhase::Execute,
+    ResidentLifetime::Request,
+    FORCED_ALIGNER_ASSETS_DEPENDENCY,
+    BOTH_BINDINGS,
+    UNIFIED_AND_SPLIT,
+    ResidentCheckout::bounded(4),
+    None,
+);
+const FORCED_ALIGNER_DECODER_RUNTIME: ResidentComponentSpec = ResidentComponentSpec::new(
+    "decoder-runtime",
+    "v1",
+    ResidentPhase::Execute,
+    ResidentLifetime::Request,
+    FORCED_ALIGNER_ASSETS_DEPENDENCY,
+    BOTH_BINDINGS,
+    UNIFIED_AND_SPLIT,
+    ResidentCheckout::bounded(4),
+    None,
+);
+const FORCED_ALIGNER_LOGITS_RUNTIME: ResidentComponentSpec = ResidentComponentSpec::new(
+    "logits-runtime",
+    "v1",
+    ResidentPhase::Execute,
+    ResidentLifetime::Request,
+    FORCED_ALIGNER_ASSETS_DEPENDENCY,
+    BOTH_BINDINGS,
+    UNIFIED_AND_SPLIT,
+    ResidentCheckout::bounded(4),
+    None,
+);
+pub(crate) const QWEN_FORCED_ALIGNER_RESIDENT_FOOTPRINT: ResidentFootprintFacet =
+    ResidentFootprintFacet::new(&[
+        FORCED_ALIGNER_PREPARED_ASSETS,
+        FORCED_ALIGNER_AUDIO_RUNTIME,
+        FORCED_ALIGNER_DECODER_RUNTIME,
+        FORCED_ALIGNER_LOGITS_RUNTIME,
+    ]);
+
 pub(crate) const AUXILIARY_RESIDENT_FOOTPRINTS: &[(&str, ResidentFootprintFacet)] = &[
     ("firered-stream-vad", FIRERED_STREAM_VAD_RESIDENT_FOOTPRINT),
     ("redimnet2", REDIMNET_RESIDENT_FOOTPRINT),
     ("pyannote-segmentation", PYANNOTE_SEGMENT_RESIDENT_FOOTPRINT),
     ("diarizen-segmentation", DIARIZEN_SEGMENT_RESIDENT_FOOTPRINT),
     ("firered-punc", FIRERED_PUNC_RESIDENT_FOOTPRINT),
+    (
+        "qwen3-forced-aligner",
+        QWEN_FORCED_ALIGNER_RESIDENT_FOOTPRINT,
+    ),
 ];
 
 #[cfg(test)]

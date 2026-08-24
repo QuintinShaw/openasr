@@ -387,6 +387,13 @@ pub(crate) async fn delete_model(
     let home = distribution.openasr_home()?;
     let default_pull =
         resolve_default_pack(&home, distribution.catalog_source())?.map(|pack| pack.pull);
+    let _activation_barrier = runtime.begin_native_activation()?;
+    if runtime.backend == BackendKind::Native && runtime.native_rebind_blocked() {
+        return Err(ApiError::Conflict(
+            "Cannot delete a model while a native transcription or realtime session is running."
+                .to_string(),
+        ));
+    }
     let removed = remove_model_pack_with_execution_services(
         &home,
         &id,
@@ -413,7 +420,7 @@ pub(crate) async fn delete_model(
                 "openasr-server: default V2 clear committed; legacy projection repair is pending: {reason}"
             ),
         }
-        runtime.rebind_native_model_pack(None)?;
+        runtime.clear_active_native_model();
     }
     Ok(Json(DeleteModelResponse {
         deleted: removed.is_some(),

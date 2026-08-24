@@ -1,13 +1,42 @@
 # GPU decode correctness contract
 
-Status: ready for implementation. This document defines the target correctness
-contract and migration plan. It does not claim that the runtime, release gates,
-or affected model families have already been changed or validated.
+Status: fail-closed software contract implemented; release remains blocked on
+missing or stale real-hardware and product evidence.
 
-Evidence baseline:
+Historical evidence baseline (the source snapshot on which the defect was
+first proven, not a claim about the current release candidate):
 
 - OpenASR source: `562f3fa7e498b3cd0e94908b99477351a0aa6ef1`
 - vendored openasr-ggml pin: `0db3a287511085fb1564fea3f86839f9e40ca39e`
+
+## Implementation checkpoint
+
+The shared software migration is in place:
+
+- reverse-gather ordinary `ARGMAX` is no longer a production authorization
+  path; unproved GPU FullDevice lanes use `FullLogits` and `FreshGraph`;
+- native `ARGMAX_FIRST` is capability-gated, and XASR/MiMo/SenseVoice retain
+  their declared family-oracle semantics rather than inheriting a global tie
+  rule;
+- exact selected-device capability evidence, output plan, reuse mode, pack
+  content identity, actual provider/device, scheduler state, and evidence
+  revision are bound into request/activation receipts;
+- same-graph dual output, fresh/reuse four-quadrant, backend-op, Layer-3, and
+  release-matrix gates are separate; missing, stale, deferred, or mismatched
+  cells fail closed;
+- FireRed's test-only encoder twin now taps every bounded subsample seam before
+  relative-position attention/depthwise/readback, so a complete run can name
+  the first input, convolution, bias, ReLU, layout, or projection divergence;
+  incomplete taps remain `insufficient_evidence`; and
+- the Desktop companion contains a shipped plugin-switch runner and keeps a
+  failed activation on the previous selected/LKG backend.
+
+The evidence boundary remains strict. The committed CPU/Metal Layer-3 receipts
+at the earlier checkpoint do not authorize a later release commit. This Apple
+host has no CUDA, physical Vulkan, or HIP/ROCm lane, and its plugin host is
+`legacy_static`, not the shipped Windows `neutral_dynamic` host. Those cells,
+including HIP capture-on and the original Windows CUDA fp16 reproduction, are
+not passes and remain non-activatable until release-bound receipts are returned.
 
 This design complements [GPU weight placement](gpu-weight-placement.md),
 [Decoder state and native memory planning](decoder-state-memory-planning.md),
@@ -570,8 +599,13 @@ After all consumers migrate, delete:
 
 ## Discriminating validation before final attribution
 
-The first implementation batch must add evidence, not assume the confirmed tie
-bug explains every symptom.
+The implementation adds evidence and does not assume the confirmed tie bug
+explains every symptom. The historical M1 q4 run diverged at the aggregate
+`subsample_out` tap and therefore remains insufficient for Windows CUDA fp16
+attribution. The current test-only twin exposes the ordered stem sequence
+`mel_4d -> conv raw -> bias -> ReLU -> layout/cont/flatten -> output matmul ->
+subsample_out`; a concrete seam is emitted only when every prerequisite tap is
+present. A new CPU/Metal result still does not project to CUDA.
 
 ### Same-graph dual output
 

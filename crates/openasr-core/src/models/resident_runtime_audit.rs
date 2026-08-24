@@ -793,6 +793,7 @@ fn auxiliary_resident_footprints_are_complete() {
         "pyannote-segmentation",
         "diarizen-segmentation",
         "firered-punc",
+        "qwen3-forced-aligner",
     ] {
         assert!(
             names.contains(required),
@@ -1142,6 +1143,7 @@ fn k4_persistent_auxiliary_families_reference_their_declared_owner_shape() {
             "models/firered_punc/policy_runtime.rs",
             "PinnedRuntimeActor",
         ),
+        ("models/qwen/forced_aligner_runtime.rs", "SystemMemoryOwner"),
     ] {
         let syntax = ProductionSyntax::collect(&root.join(relative));
         assert!(
