@@ -861,8 +861,25 @@ fn finish_whisper_serve_batch_output(
         .trim()
         .to_string();
     if text.is_empty() {
-        return Err(WhisperServeBatchError::DecodeFailed {
-            reason: "tokenizer decode produced empty text".to_string(),
+        // A window whose decode leaves no text (a no-speech window that emits
+        // only special tokens, or a salvaged prefix the degenerate-repeat guard
+        // reduced to special tokens) is an honest empty result, not a decode
+        // failure. Failing closed here would abort the whole longform request
+        // over one silent slice; the caller treats an empty window as a
+        // suppressed one. Carry no prompt context (the next slice keeps the
+        // previous context, exactly as for a suppressed slice) while keeping the
+        // stop reason so a cut-short window still reports its truncation.
+        eprintln!(
+            "openasr_whisper_serve_batch stage=finish event=empty_text_degraded status=empty-returned generated_tokens={} stop_reason={:?}",
+            generated_tokens.len(),
+            stop_reason
+        );
+        return Ok(WhisperExecutionOutput {
+            text,
+            segments: Vec::new(),
+            carry_prompt_token_ids: None,
+            detected_language: None,
+            stop_reason,
         });
     }
     let words = if word_timestamps {
@@ -1377,6 +1394,71 @@ mod tests {
             validate_whisper_execution_metadata(&metadata).expect("validate whisper metadata");
         let tokenizer = WhisperTokenizer::from_gguf_metadata(&metadata).expect("load tokenizer");
         (execution, tokenizer)
+    }
+
+    #[test]
+    fn serve_batch_empty_text_degrades_to_empty_transcript() {
+        let (_execution, tokenizer) = whisper_execution_and_tokenizer_fixture();
+        // A no-speech window (or a degenerate-run salvage truncated to the
+        // loop's single special-token occurrence) decodes to nothing but
+        // special tokens. That must come back as an honest empty
+        // transcription -- not a decode failure that aborts the whole
+        // longform request over one silent slice -- and must carry no prompt
+        // context while keeping the truncation stop reason.
+        for stop_reason in [
+            Seq2SeqGreedyDecodeStopReason::StopToken,
+            Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard,
+            Seq2SeqGreedyDecodeStopReason::BudgetExhausted,
+        ] {
+            let output = finish_whisper_serve_batch_output(
+                &tokenizer,
+                vec![11, 8],
+                vec![0.5, 0.5],
+                false,
+                10.0,
+                Some(vec![9, 10]),
+                stop_reason,
+            )
+            .expect("empty special-token decode must not fail closed");
+            assert!(output.text.is_empty());
+            assert!(output.segments.is_empty());
+            assert_eq!(
+                output.carry_prompt_token_ids, None,
+                "a no-text window must not carry prompt context into the next slice"
+            );
+            assert_eq!(output.detected_language, None);
+            assert_eq!(
+                output.stop_reason, stop_reason,
+                "a cut-short window must keep reporting its truncation"
+            );
+        }
+    }
+
+    #[test]
+    fn serve_batch_non_empty_text_still_builds_segments() {
+        let (_execution, tokenizer) = whisper_execution_and_tokenizer_fixture();
+        // Tokens 1, 3, 4, 5, 6, 7 are "h", "l", "o", "w", "r", "d"; token 8 is
+        // EOT (special, dropped). A real word must still flow through to a
+        // segment, so the empty-text branch is not over-broad.
+        let output = finish_whisper_serve_batch_output(
+            &tokenizer,
+            vec![1, 3, 4, 5, 6, 7, 8],
+            vec![0.9; 7],
+            true,
+            10.0,
+            Some(vec![9, 10]),
+            Seq2SeqGreedyDecodeStopReason::StopToken,
+        )
+        .expect("non-empty decode must succeed");
+        assert!(!output.text.is_empty());
+        assert_eq!(output.segments.len(), 1);
+        assert_eq!(output.segments[0].text, output.text);
+        assert_eq!(
+            output.carry_prompt_token_ids,
+            Some(vec![9, 10, 1, 3, 4, 5, 6, 7, 8]),
+            "a text-producing window must carry the previous prompt plus its generated tokens"
+        );
+        assert_eq!(output.stop_reason, Seq2SeqGreedyDecodeStopReason::StopToken);
     }
 
     #[test]

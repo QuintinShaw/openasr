@@ -6698,10 +6698,28 @@ fn run_whisper_decode_loop(
         }
     };
     if decode.text.trim().is_empty() {
-        return Err(WhisperGgmlExecutorError::DecoderInvalidTokenDecode {
-            reason: format!(
-                "{prelude_summary}; {encoder_summary}; tokenizer decode produced empty text"
-            ),
+        // A window whose decode leaves no text (a no-speech window that emits
+        // only special tokens, or a salvaged prefix the degenerate-repeat guard
+        // reduced to special tokens) is an honest empty result, not a decode
+        // failure. Failing closed here would abort the whole longform request
+        // over one silent slice; the longform caller treats an empty window as
+        // a suppressed one. Emit no segments and no carried context (the next
+        // slice keeps the previous context, exactly as for a suppressed slice)
+        // while keeping the stop reason so a cut-short window still reports its
+        // truncation instead of laundering it into a normal completion.
+        eprintln!(
+            "openasr_whisper_ggml_executor stage=decode_loop event=empty_text_degraded status=empty-returned generated_tokens={} stop_reason={:?}",
+            decode.generated_tokens.len(),
+            decode.stop_reason
+        );
+        let stop_reason = decode.stop_reason;
+        let detected_language = detected_language.clone();
+        return Ok(WhisperExecutionOutput {
+            text: String::new(),
+            segments: Vec::new(),
+            carry_prompt_token_ids: None,
+            detected_language,
+            stop_reason,
         });
     }
     let text = decode.text.trim().to_string();
