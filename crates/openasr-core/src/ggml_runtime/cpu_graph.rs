@@ -1946,6 +1946,9 @@ enum GgmlNativeGraphObservationPhase {
 
 struct GgmlGraphLifecycleState {
     collector: super::GgmlGraphLifecycleCollector,
+    collector_scope: Option<u64>,
+    recording_enabled: bool,
+    scheduler_enabled: bool,
     provider: String,
     device: String,
     graph_instance: u64,
@@ -1957,6 +1960,8 @@ struct GgmlGraphLifecycleState {
     last_completed_compute: Option<u64>,
     capture_state: Option<GgmlNativeCaptureState>,
     capture_executable_generation: Option<u64>,
+    capture_state_observed_in_scope: bool,
+    capture_executable_observed_in_scope: bool,
     kv_write_tensors: HashSet<usize>,
     poisoned_recorded: bool,
 }
@@ -1966,8 +1971,12 @@ impl GgmlGraphLifecycleState {
         identity: &GgmlRunnerExecutionIdentity,
         collector: super::GgmlGraphLifecycleCollector,
     ) -> Self {
+        let collector_scope = collector.observation_scope();
         let state = Self {
             collector,
+            collector_scope,
+            recording_enabled: collector_scope.is_some(),
+            scheduler_enabled: identity.scheduler_enabled,
             provider: identity.actual_provider.as_str().to_string(),
             device: identity.actual_stable_device_id.clone(),
             graph_instance: super::mint_opaque_graph_id(),
@@ -1979,6 +1988,8 @@ impl GgmlGraphLifecycleState {
             last_completed_compute: None,
             capture_state: None,
             capture_executable_generation: None,
+            capture_state_observed_in_scope: false,
+            capture_executable_observed_in_scope: false,
             kv_write_tensors: HashSet::new(),
             poisoned_recorded: false,
         };
@@ -1989,6 +2000,12 @@ impl GgmlGraphLifecycleState {
     }
 
     fn record(&self, kind: super::GgmlGraphLifecycleEventKind) {
+        if !self.recording_enabled
+            || self.collector_scope.is_none()
+            || self.collector.observation_scope() != self.collector_scope
+        {
+            return;
+        }
         self.collector.record(
             &self.provider,
             &self.device,
@@ -1996,6 +2013,45 @@ impl GgmlGraphLifecycleState {
             self.graph_generation,
             kind,
         );
+    }
+
+    /// Move per-compute evidence to the explicitly installed request
+    /// collector while preserving the process-local graph identity. Reusable
+    /// graphs otherwise keep writing into the cold request that created them,
+    /// making a later warm request impossible to attest independently.
+    fn refresh_request_collector(&mut self) {
+        let Some(current) = super::current_graph_lifecycle_collector() else {
+            self.recording_enabled = false;
+            return;
+        };
+        let Some(current_scope) = current.observation_scope() else {
+            self.recording_enabled = false;
+            return;
+        };
+        if self.collector.ptr_eq(&current) && self.collector_scope == Some(current_scope) {
+            self.recording_enabled = true;
+            return;
+        }
+        self.collector = current;
+        self.collector_scope = Some(current_scope);
+        self.recording_enabled = true;
+        self.capture_state_observed_in_scope = false;
+        self.capture_executable_observed_in_scope = false;
+        self.record(super::GgmlGraphLifecycleEventKind::ExistingGraphObserved {
+            scheduler_enabled: self.scheduler_enabled,
+            prepare_generation: self.prepare_generation,
+        });
+    }
+
+    fn record_drop_for_current_request(&mut self) {
+        let current_matches = super::current_graph_lifecycle_collector().is_some_and(|current| {
+            self.collector.ptr_eq(&current)
+                && self.collector_scope.is_some()
+                && current.observation_scope() == self.collector_scope
+        });
+        if self.recording_enabled && current_matches {
+            self.record(super::GgmlGraphLifecycleEventKind::Dropped);
+        }
     }
 
     fn observed_generation(&self) -> super::GgmlGraphLifecycleGeneration {
@@ -2091,7 +2147,18 @@ impl GgmlGraphLifecycleState {
                     actual,
                 });
             }
-            (Some(previous), Some(actual)) if actual == previous => None,
+            (Some(previous), Some(actual)) if actual == previous => {
+                if !self.capture_executable_observed_in_scope
+                    && phase == GgmlNativeGraphObservationPhase::BeforeCompute
+                {
+                    let change = observation
+                        .last_executable_change
+                        .ok_or(BackendGraphLifecycleError::CaptureGenerationChangedWithoutReason)?;
+                    Some((actual, change, true))
+                } else {
+                    None
+                }
+            }
             (Some(_), Some(_)) if phase == GgmlNativeGraphObservationPhase::BeforeCompute => {
                 return Err(BackendGraphLifecycleError::CaptureGenerationChangedOutsideCompute);
             }
@@ -2111,15 +2178,16 @@ impl GgmlGraphLifecycleState {
             (None, None) => None,
         };
 
-        if self.capture_state != Some(next_state) {
+        if self.capture_state != Some(next_state) || !self.capture_state_observed_in_scope {
             self.record(super::GgmlGraphLifecycleEventKind::CaptureStateObserved {
                 capture_supported: next_state.capture_supported,
                 graph_tracked: next_state.graph_tracked,
                 capture_enabled: next_state.capture_enabled,
                 executable_present: next_state.executable_present,
             });
-            self.capture_state = Some(next_state);
+            self.capture_state_observed_in_scope = true;
         }
+        self.capture_state = Some(next_state);
         if let Some((capture_executable_generation, change, existed_before_compute)) =
             executable_event
         {
@@ -2148,6 +2216,7 @@ impl GgmlGraphLifecycleState {
                 );
             }
             self.capture_executable_generation = Some(capture_executable_generation);
+            self.capture_executable_observed_in_scope = true;
         }
         Ok(())
     }
@@ -2168,17 +2237,23 @@ impl GgmlGraphLifecycleState {
         }
     }
 
-    fn output_read(&self, bytes: usize) {
+    fn output_read(&self, bytes: usize) -> Option<super::GgmlComputeEvidenceRef> {
         let (Some(compute_sequence), Some(output_generation_consumed)) =
             (self.last_completed_compute, self.latest_output_generation)
         else {
-            return;
+            return None;
         };
         self.record(super::GgmlGraphLifecycleEventKind::OutputRead {
             compute_sequence,
             output_generation_consumed,
             bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
         });
+        Some(super::GgmlComputeEvidenceRef::new(
+            self.graph_instance,
+            self.graph_generation,
+            compute_sequence,
+            output_generation_consumed,
+        ))
     }
 
     fn poisoned(&mut self, reason: super::GgmlGraphPoisonReason) {
@@ -2192,7 +2267,7 @@ impl GgmlGraphLifecycleState {
 
 impl Drop for GgmlGraphLifecycleState {
     fn drop(&mut self) {
-        self.record(super::GgmlGraphLifecycleEventKind::Dropped);
+        self.record_drop_for_current_request();
     }
 }
 
@@ -2648,6 +2723,42 @@ pub(crate) struct GgmlCpuGraphBuilder<'a> {
     observed_placement: Option<GgmlObservedGraphPlacement>,
     lifecycle: Option<GgmlGraphLifecycleState>,
     _runner_borrow: PhantomData<&'a mut GgmlCpuGraphRunner>,
+}
+
+/// A graph output paired with proof minted only after the corresponding
+/// native compute completed and its output readback succeeded. Evidence is
+/// absent when no request-local graph lifecycle collector is installed.
+pub(crate) struct GgmlComputeOutput<T> {
+    value: T,
+    evidence: Option<super::GgmlComputeEvidenceRef>,
+}
+
+impl<T> GgmlComputeOutput<T> {
+    fn into_raw_parts(self) -> (T, Option<super::GgmlComputeEvidenceRef>) {
+        (self.value, self.evidence)
+    }
+
+    pub(crate) fn into_parts(self) -> (T, Option<super::GgmlSelectionEvidenceRef>) {
+        let (value, evidence) = self.into_raw_parts();
+        (
+            value,
+            evidence.and_then(|evidence| evidence.selection(0, 1)),
+        )
+    }
+}
+
+/// A row-partitioned native output. Each logical row carries a witness minted
+/// by the readback layer from the actual buffer length; model code cannot
+/// attach an arbitrary row index to a compute after the fact.
+pub(crate) struct GgmlComputeRowsOutput<T> {
+    value: T,
+    evidence: Option<Vec<super::GgmlSelectionEvidenceRef>>,
+}
+
+impl<T> GgmlComputeRowsOutput<T> {
+    pub(crate) fn into_parts(self) -> (T, Option<Vec<super::GgmlSelectionEvidenceRef>>) {
+        (self.value, self.evidence)
+    }
 }
 
 #[derive(Default)]
@@ -7354,6 +7465,9 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             &self.runner_identity,
             self.scheduler.is_some(),
         )?;
+        if let Some(lifecycle) = self.lifecycle.as_mut() {
+            lifecycle.refresh_request_collector();
+        }
         self.ensure_scheduler_graph_active(graph)?;
         self.prepare_direct_graph_private_gate(graph)?;
         if let Some(lifecycle) = self.lifecycle.as_mut() {
@@ -7609,8 +7723,58 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         output: GgmlCpuTensor<'a>,
         expected_len: usize,
     ) -> Result<Vec<f32>, GgmlCpuGraphError> {
-        let mut outputs = self.compute_outputs_f32(&[(output, expected_len)])?;
-        Ok(outputs.remove(0))
+        Ok(self
+            .compute_output_f32_with_evidence(output, expected_len)?
+            .value)
+    }
+
+    pub(crate) fn compute_output_f32_with_evidence(
+        &mut self,
+        output: GgmlCpuTensor<'a>,
+        expected_len: usize,
+    ) -> Result<GgmlComputeOutput<Vec<f32>>, GgmlCpuGraphError> {
+        let output = self.compute_outputs_f32_with_evidence(&[(output, expected_len)])?;
+        let (mut values, evidence) = output.into_raw_parts();
+        Ok(GgmlComputeOutput {
+            value: values.remove(0),
+            evidence,
+        })
+    }
+
+    pub(crate) fn compute_output_f32_rows_with_evidence(
+        &mut self,
+        output: GgmlCpuTensor<'a>,
+        row_width: usize,
+        row_count: usize,
+    ) -> Result<GgmlComputeRowsOutput<Vec<f32>>, GgmlCpuGraphError> {
+        if row_width == 0 || row_count == 0 {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "row-partitioned output dimensions must be positive",
+            });
+        }
+        let expected_len =
+            row_width
+                .checked_mul(row_count)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "row-partitioned output element count overflow",
+                })?;
+        let output = self.compute_output_f32_with_evidence(output, expected_len)?;
+        let (value, compute) = output.into_raw_parts();
+        let evidence = if let Some(compute) = compute {
+            let mut rows = Vec::with_capacity(row_count);
+            for output_index in 0..row_count {
+                let Some(row) = compute.selection(output_index, row_count) else {
+                    return Err(self.fail_output_evidence(
+                        "readback layer could not mint a bounded output-row witness",
+                    ));
+                };
+                rows.push(row);
+            }
+            Some(rows)
+        } else {
+            None
+        };
+        Ok(GgmlComputeRowsOutput { value, evidence })
     }
 
     /// Executes the graph once and reads every declared output in declaration
@@ -7703,6 +7867,13 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         &mut self,
         outputs: &[(GgmlCpuTensor<'a>, usize)],
     ) -> Result<Vec<Vec<f32>>, GgmlCpuGraphError> {
+        Ok(self.compute_outputs_f32_with_evidence(outputs)?.value)
+    }
+
+    pub(crate) fn compute_outputs_f32_with_evidence(
+        &mut self,
+        outputs: &[(GgmlCpuTensor<'a>, usize)],
+    ) -> Result<GgmlComputeOutput<Vec<Vec<f32>>>, GgmlCpuGraphError> {
         self.ensure_not_poisoned()?;
         if outputs.is_empty() {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
@@ -7745,6 +7916,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.compute_graph_with_memory_gate(graph)?;
 
         let mut results = Vec::with_capacity(outputs.len());
+        let mut compute_evidence = None;
         for ((output, expected_len), output_nbytes) in outputs.iter().zip(output_nbytes) {
             let mut values = vec![0.0f32; *expected_len];
             let status = unsafe {
@@ -7755,10 +7927,26 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     output_nbytes,
                 )
             };
-            self.finish_output_read(status, output_nbytes)?;
+            let output_evidence = self.finish_output_read(status, output_nbytes)?;
+            if self.lifecycle.is_some() && output_evidence.is_none() {
+                return Err(self.fail_output_evidence(
+                    "successful output readback did not produce a compute evidence ref",
+                ));
+            }
+            if let (Some(expected), Some(actual)) = (compute_evidence, output_evidence)
+                && expected != actual
+            {
+                return Err(self.fail_output_evidence(
+                    "one graph compute produced inconsistent output evidence refs",
+                ));
+            }
+            compute_evidence = compute_evidence.or(output_evidence);
             results.push(values);
         }
-        Ok(results)
+        Ok(GgmlComputeOutput {
+            value: results,
+            evidence: compute_evidence,
+        })
     }
 
     /// Computes one graph and reads each f32 output directly into storage
@@ -7962,6 +8150,16 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         output: GgmlCpuTensor<'a>,
         expected_len: usize,
     ) -> Result<Vec<i32>, GgmlCpuGraphError> {
+        Ok(self
+            .compute_output_i32_with_evidence(output, expected_len)?
+            .value)
+    }
+
+    pub(crate) fn compute_output_i32_with_evidence(
+        &mut self,
+        output: GgmlCpuTensor<'a>,
+        expected_len: usize,
+    ) -> Result<GgmlComputeOutput<Vec<i32>>, GgmlCpuGraphError> {
         self.ensure_not_poisoned()?;
         self.ensure_tensor_type(output, ffi::GGML_TYPE_I32, "compute_output_i32 output")?;
         let expected_nbytes = expected_len.checked_mul(I32_WIDTH_BYTES).ok_or(
@@ -8004,8 +8202,16 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 output_nbytes,
             )
         };
-        self.finish_output_read(status, output_nbytes)?;
-        Ok(values)
+        let evidence = self.finish_output_read(status, output_nbytes)?;
+        if self.lifecycle.is_some() && evidence.is_none() {
+            return Err(self.fail_output_evidence(
+                "successful i32 output readback did not produce a compute evidence ref",
+            ));
+        }
+        Ok(GgmlComputeOutput {
+            value: values,
+            evidence,
+        })
     }
 
     fn ensure_backend_buffer(&mut self) -> Result<(), GgmlCpuGraphError> {
@@ -8132,12 +8338,29 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         mapped
     }
 
-    fn finish_output_read(&mut self, status: c_int, bytes: usize) -> Result<(), GgmlCpuGraphError> {
+    fn finish_output_read(
+        &mut self,
+        status: c_int,
+        bytes: usize,
+    ) -> Result<Option<super::GgmlComputeEvidenceRef>, GgmlCpuGraphError> {
         self.finish_readback_status(status)?;
-        if let Some(lifecycle) = self.lifecycle.as_ref() {
-            lifecycle.output_read(bytes);
+        Ok(self
+            .lifecycle
+            .as_ref()
+            .and_then(|lifecycle| lifecycle.output_read(bytes)))
+    }
+
+    fn fail_output_evidence(&mut self, reason: &'static str) -> GgmlCpuGraphError {
+        // A successful native compute may already have committed KV writes.
+        // Never allow an evidence-integrity failure to trigger a retry on the
+        // same graph/session.
+        self.poisoned_after_failed_compute = true;
+        if let Some(lifecycle) = self.lifecycle.as_mut() {
+            lifecycle.poisoned(super::GgmlGraphPoisonReason::Explicit);
         }
-        Ok(())
+        GgmlCpuGraphError::GraphLifecycleEvidenceFailed {
+            reason: reason.to_string(),
+        }
     }
 
     fn ensure_not_poisoned(&self) -> Result<(), GgmlCpuGraphError> {
@@ -8344,6 +8567,9 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             });
         }
         self.ensure_tensor_contiguous(tensor, "tensor_upload")?;
+        if let Some(lifecycle) = self.lifecycle.as_mut() {
+            lifecycle.refresh_request_collector();
+        }
         unsafe {
             write_tensor_data(tensor.raw, data_ptr, offset_nbytes, expected_nbytes)?;
         }
@@ -11791,8 +12017,9 @@ unsafe fn write_tensor_data(
 mod tests {
     use crate::ggml_runtime::{
         GgmlActualDeviceFacts, GgmlCaptureExecutableChange, GgmlGraphLifecycleCollector,
-        GgmlGraphLifecycleEventKind, GgufTensorMetadata, GgufWeightTensorElementType,
-        GgufWeightTensorPayload, ffi, test_opaque_graph_id_mint_count,
+        GgmlGraphLifecycleEventKind, GgmlGraphPoisonReason, GgmlSelectionEvidenceRef,
+        GgufTensorMetadata, GgufWeightTensorElementType, GgufWeightTensorPayload, ffi,
+        test_opaque_graph_id_mint_count,
     };
     use crate::nn::half::f32_to_f16_bits as f32_to_f16_bits_for_test;
 
@@ -11949,6 +12176,129 @@ mod tests {
     }
 
     #[test]
+    fn warm_request_reobserves_unchanged_native_capture_in_each_transaction_scope() {
+        let cold_collector = GgmlGraphLifecycleCollector::new();
+        let cold_guard = cold_collector.install();
+        let mut lifecycle = test_graph_lifecycle_state(cold_collector);
+        let existing = native_capture_observation(
+            true,
+            true,
+            true,
+            Some(7),
+            Some(NativeGraphExecutableChange::Instantiated),
+        );
+        lifecycle
+            .observe_native_capture(existing, GgmlNativeGraphObservationPhase::BeforeCompute)
+            .expect("cold native capture observation");
+        drop(cold_guard);
+
+        let warm_collector = GgmlGraphLifecycleCollector::new();
+        warm_collector.begin_observation_scope();
+        let _warm_guard = warm_collector.install();
+        lifecycle.refresh_request_collector();
+        lifecycle
+            .observe_native_capture(existing, GgmlNativeGraphObservationPhase::BeforeCompute)
+            .expect("warm request must re-observe unchanged native capture");
+        lifecycle.compute_started();
+
+        warm_collector.begin_observation_scope();
+        lifecycle.refresh_request_collector();
+        lifecycle
+            .observe_native_capture(existing, GgmlNativeGraphObservationPhase::BeforeCompute)
+            .expect("new candidate scope must re-observe unchanged native capture");
+        lifecycle.compute_started();
+
+        let events = warm_collector.snapshot().events;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    GgmlGraphLifecycleEventKind::ExistingGraphObserved { .. }
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    GgmlGraphLifecycleEventKind::CaptureStateObserved { .. }
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    GgmlGraphLifecycleEventKind::CaptureExecutableObserved {
+                        capture_executable_generation: 7,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    GgmlGraphLifecycleEventKind::ComputeStarted {
+                        capture_executable_generation: Some(7),
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn graph_drop_does_not_leak_into_a_later_observation_scope() {
+        let collector = GgmlGraphLifecycleCollector::new();
+        let _guard = collector.install();
+        let lifecycle = test_graph_lifecycle_state(collector.clone());
+        collector.begin_observation_scope();
+        drop(lifecycle);
+
+        let events = collector.snapshot().events;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, GgmlGraphLifecycleEventKind::Created { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.kind, GgmlGraphLifecycleEventKind::Dropped))
+        );
+    }
+
+    #[test]
+    fn old_graph_poison_does_not_leak_into_a_later_observation_scope() {
+        let collector = GgmlGraphLifecycleCollector::new();
+        let mut lifecycle = test_graph_lifecycle_state(collector.clone());
+        collector.begin_observation_scope();
+        lifecycle.poisoned(GgmlGraphPoisonReason::Explicit);
+
+        let events = collector.snapshot().events;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, GgmlGraphLifecycleEventKind::Created { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.kind, GgmlGraphLifecycleEventKind::Poisoned { .. }))
+        );
+    }
+
+    #[test]
     fn native_capture_state_fails_closed_on_drift_disappearance_and_regression() {
         let mut policy = test_graph_lifecycle_state(GgmlGraphLifecycleCollector::new());
         policy
@@ -12074,7 +12424,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_lifecycle_keeps_the_creation_collector_after_guard_switch() {
+    fn graph_lifecycle_rebinds_existing_graph_to_the_current_request_collector() {
         let creation_collector = GgmlGraphLifecycleCollector::new();
         let replacement_collector = GgmlGraphLifecycleCollector::new();
         let creation_guard = creation_collector.install();
@@ -12088,28 +12438,58 @@ mod tests {
         let output = graph.add(lhs, rhs).expect("output");
         graph.set_output(output).expect("declared output");
 
-        drop(creation_guard);
-        let replacement_guard = replacement_collector.install();
         graph
             .set_f32_slice(lhs, &[1.0, 2.0], "lhs")
-            .expect("lhs upload");
+            .expect("cold lhs upload");
         graph
             .set_f32_slice(rhs, &[3.0, 4.0], "rhs")
-            .expect("rhs upload");
+            .expect("cold rhs upload");
         assert_eq!(
             graph
                 .compute_output_f32(output, 2)
-                .expect("instrumented graph compute"),
+                .expect("cold graph compute"),
             vec![4.0, 6.0]
         );
+
+        drop(creation_guard);
+        let replacement_guard = replacement_collector.install();
+        graph
+            .set_f32_slice(lhs, &[5.0, 6.0], "lhs")
+            .expect("lhs upload");
+        graph
+            .set_f32_slice(rhs, &[7.0, 8.0], "rhs")
+            .expect("rhs upload");
+        let computed = graph
+            .compute_output_f32_rows_with_evidence(output, 1, 2)
+            .expect("instrumented graph compute");
+        let (values, evidence) = computed.into_parts();
+        assert_eq!(values, vec![12.0, 14.0]);
+        let evidence = evidence.expect("successful observed readback mints row evidence");
+        assert_eq!(evidence.len(), 2);
         drop(graph);
         drop(replacement_guard);
 
-        let events = creation_collector.snapshot().events;
+        let creation_events = creation_collector.snapshot().events;
         assert!(matches!(
-            events.first().map(|event| &event.kind),
+            creation_events.first().map(|event| &event.kind),
             Some(GgmlGraphLifecycleEventKind::Created { .. })
         ));
+        let events = replacement_collector.snapshot().events;
+        assert!(matches!(
+            events.first().map(|event| &event.kind),
+            Some(GgmlGraphLifecycleEventKind::ExistingGraphObserved {
+                prepare_generation: Some(_),
+                ..
+            })
+        ));
+        assert_eq!(
+            (
+                creation_events[0].graph_instance,
+                creation_events[0].graph_generation,
+            ),
+            (events[0].graph_instance, events[0].graph_generation),
+            "a request attachment must preserve the real graph identity"
+        );
         assert_eq!(
             events
                 .iter()
@@ -12120,7 +12500,7 @@ mod tests {
             2
         );
         assert!(
-            events
+            creation_events
                 .iter()
                 .any(|event| matches!(&event.kind, GgmlGraphLifecycleEventKind::Prepared { .. }))
         );
@@ -12137,12 +12517,51 @@ mod tests {
                 .iter()
                 .any(|event| matches!(&event.kind, GgmlGraphLifecycleEventKind::OutputRead { .. }))
         );
+        let output_read = events
+            .iter()
+            .find_map(|event| match event.kind {
+                GgmlGraphLifecycleEventKind::OutputRead {
+                    compute_sequence,
+                    output_generation_consumed,
+                    ..
+                } => Some((
+                    event.graph_instance,
+                    event.graph_generation,
+                    compute_sequence,
+                    output_generation_consumed,
+                )),
+                _ => None,
+            })
+            .expect("output read event");
+        assert_eq!(
+            evidence
+                .iter()
+                .map(GgmlSelectionEvidenceRef::identity_tuple)
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    output_read.0,
+                    output_read.1,
+                    output_read.2,
+                    output_read.3,
+                    0,
+                    2,
+                ),
+                (
+                    output_read.0,
+                    output_read.1,
+                    output_read.2,
+                    output_read.3,
+                    1,
+                    2,
+                ),
+            ]
+        );
         assert!(
             events
                 .iter()
                 .any(|event| matches!(&event.kind, GgmlGraphLifecycleEventKind::Dropped))
         );
-        assert!(replacement_collector.snapshot().events.is_empty());
     }
 
     #[test]

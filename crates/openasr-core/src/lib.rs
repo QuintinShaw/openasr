@@ -137,10 +137,11 @@ pub use api::backend::{
     verify_native_runtime_model_pack_path,
 };
 pub use models::request_execution_receipt::{
+    GPU_CORRECTNESS_TRACE_MAX_STEPS, GPU_FULL_LOGITS_MAX_VOCAB, GPU_FULL_LOGITS_TRACE_SCHEMA,
     NativeExecutionAttestationError, NativeExecutionReceiptCollector,
     NativeExecutionReceiptSnapshot, NativeExecutionRequestFacts, NativeExecutionTokenStep,
-    NativeExecutionTopologyFacts, NativeExecutionTraceSnapshot, RequestExecutionPhase,
-    RequestExecutionTerminal,
+    NativeExecutionTopologyFacts, NativeExecutionTraceMode, NativeExecutionTraceSnapshot,
+    RequestExecutionPhase, RequestExecutionTerminal,
 };
 
 pub use api::native::{

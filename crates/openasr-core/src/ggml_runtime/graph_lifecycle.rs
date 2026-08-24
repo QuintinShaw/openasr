@@ -80,6 +80,81 @@ pub enum GgmlCaptureExecutableChange {
     Replaced,
 }
 
+/// Opaque, process-local proof that a concrete graph compute completed and
+/// that one of its outputs was successfully read back. The fields stay
+/// private so model-family code can carry this value but cannot manufacture
+/// one from planner state, a provider label, or a cached graph handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GgmlComputeEvidenceRef {
+    graph_instance: u64,
+    graph_generation: u64,
+    compute_sequence: u64,
+    output_generation: u64,
+}
+
+impl GgmlComputeEvidenceRef {
+    pub(in crate::ggml_runtime) fn new(
+        graph_instance: u64,
+        graph_generation: u64,
+        compute_sequence: u64,
+        output_generation: u64,
+    ) -> Self {
+        Self {
+            graph_instance,
+            graph_generation,
+            compute_sequence,
+            output_generation,
+        }
+    }
+
+    pub(in crate::ggml_runtime) fn selection(
+        self,
+        output_index: usize,
+        output_count: usize,
+    ) -> Option<GgmlSelectionEvidenceRef> {
+        if output_count == 0 || output_index >= output_count {
+            return None;
+        }
+        Some(GgmlSelectionEvidenceRef {
+            graph_instance: self.graph_instance,
+            graph_generation: self.graph_generation,
+            compute_sequence: self.compute_sequence,
+            output_generation: self.output_generation,
+            output_index,
+            output_count,
+        })
+    }
+}
+
+/// Opaque proof for one logical row of a successfully read native output.
+/// Only the ggml readback wrapper can partition a concrete buffer and mint
+/// these values. It is serializable for evidence artifacts but deliberately
+/// not deserializable back into a runtime witness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GgmlSelectionEvidenceRef {
+    graph_instance: u64,
+    graph_generation: u64,
+    compute_sequence: u64,
+    output_generation: u64,
+    output_index: usize,
+    output_count: usize,
+}
+
+impl GgmlSelectionEvidenceRef {
+    #[cfg(test)]
+    pub(crate) fn identity_tuple(&self) -> (u64, u64, u64, u64, usize, usize) {
+        (
+            self.graph_instance,
+            self.graph_generation,
+            self.compute_sequence,
+            self.output_generation,
+            self.output_index,
+            self.output_count,
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GgmlGraphLifecycleEvent {
     pub schema: String,
@@ -97,6 +172,13 @@ pub struct GgmlGraphLifecycleEvent {
 pub enum GgmlGraphLifecycleEventKind {
     Created {
         scheduler_enabled: bool,
+    },
+    /// A request-local collector attached to a persistent graph that was
+    /// created and prepared by an earlier request in the same process.
+    ExistingGraphObserved {
+        scheduler_enabled: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prepare_generation: Option<u64>,
     },
     Prepared {
         prepare_generation: u64,
@@ -174,23 +256,40 @@ struct LifecycleState {
     events: Vec<GgmlGraphLifecycleEvent>,
     overflowed: bool,
     next_sequence: u64,
+    observation_scope: u64,
+    observation_scope_open: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GgmlGraphLifecycleCollector {
     state: Arc<Mutex<LifecycleState>>,
+}
+
+impl Default for GgmlGraphLifecycleCollector {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(LifecycleState {
+                observation_scope_open: true,
+                ..LifecycleState::default()
+            })),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct GgmlGraphLifecycleGeneration {
     collector_state: Weak<Mutex<LifecycleState>>,
+    observation_scope: Option<u64>,
     graph_generation: u64,
 }
 
 impl GgmlGraphLifecycleGeneration {
     pub(crate) fn generation_for(&self, collector: &GgmlGraphLifecycleCollector) -> Option<u64> {
         let current = Arc::downgrade(&collector.state);
-        (self.collector_state.strong_count() > 0 && Weak::ptr_eq(&self.collector_state, &current))
+        (self.collector_state.strong_count() > 0
+            && Weak::ptr_eq(&self.collector_state, &current)
+            && self.observation_scope.is_some()
+            && collector.observation_scope() == self.observation_scope)
             .then_some(self.graph_generation)
     }
 }
@@ -202,6 +301,40 @@ impl GgmlGraphLifecycleCollector {
 
     pub fn install(&self) -> GgmlGraphLifecycleGuard {
         install_graph_lifecycle_collector(Some(self.clone()))
+    }
+
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    /// Start one transactional request/candidate observation scope. A graph
+    /// may survive a failed candidate or a later request while this collector
+    /// remains allocated, so pointer identity alone cannot decide whether its
+    /// attachment and native capture facts have already been emitted.
+    pub(crate) fn begin_observation_scope(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.observation_scope = mint_opaque_graph_id();
+        state.observation_scope_open = true;
+    }
+
+    pub(crate) fn end_observation_scope(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observation_scope_open = false;
+    }
+
+    pub(crate) fn observation_scope(&self) -> Option<u64> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .observation_scope_open
+            .then_some(state.observation_scope)
     }
 
     pub fn snapshot(&self) -> GgmlGraphLifecycleSnapshot {
@@ -221,6 +354,7 @@ impl GgmlGraphLifecycleCollector {
     ) -> GgmlGraphLifecycleGeneration {
         GgmlGraphLifecycleGeneration {
             collector_state: Arc::downgrade(&self.state),
+            observation_scope: self.observation_scope(),
             graph_generation,
         }
     }
@@ -254,6 +388,9 @@ impl GgmlGraphLifecycleCollector {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.observation_scope_open {
+            return;
+        }
         if state.events.len() >= MAX_GRAPH_LIFECYCLE_EVENTS {
             state.overflowed = true;
             return;
@@ -342,6 +479,58 @@ mod tests {
         assert_eq!(snapshot.events.len(), 1);
         assert_eq!(snapshot.events[0].sequence, 2);
         assert_eq!(snapshot.events[0].graph_instance, 3);
+    }
+
+    #[test]
+    fn graph_generation_witness_is_valid_only_inside_its_open_observation_scope() {
+        let collector = GgmlGraphLifecycleCollector::new();
+        let generation = collector.observed_generation(7);
+        assert_eq!(generation.generation_for(&collector), Some(7));
+
+        collector.begin_observation_scope();
+        assert_eq!(generation.generation_for(&collector), None);
+        let next_generation = collector.observed_generation(8);
+        assert_eq!(next_generation.generation_for(&collector), Some(8));
+
+        collector.end_observation_scope();
+        assert_eq!(next_generation.generation_for(&collector), None);
+    }
+
+    #[test]
+    fn closed_observation_scope_discards_late_events_without_consuming_sequence() {
+        let collector = GgmlGraphLifecycleCollector::new();
+        collector.begin_observation_scope();
+        collector.record(
+            "hip",
+            "ROCm0",
+            1,
+            2,
+            GgmlGraphLifecycleEventKind::Created {
+                scheduler_enabled: false,
+            },
+        );
+        collector.end_observation_scope();
+        collector.record("hip", "ROCm0", 1, 2, GgmlGraphLifecycleEventKind::Dropped);
+        collector.begin_observation_scope();
+        collector.record(
+            "hip",
+            "ROCm0",
+            3,
+            4,
+            GgmlGraphLifecycleEventKind::Created {
+                scheduler_enabled: false,
+            },
+        );
+
+        let events = collector.snapshot().events;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[1].sequence, 2);
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event.kind, GgmlGraphLifecycleEventKind::Dropped))
+        );
     }
 
     #[test]

@@ -10,7 +10,6 @@ use thiserror::Error;
 
 use super::ffi;
 
-const GRAPH_LIFECYCLE_API_PROC: &[u8] = b"ggml_backend_graph_lifecycle_get_api_v1\0";
 const KNOWN_FLAGS: u32 = ffi::GGML_BACKEND_GRAPH_LIFECYCLE_CAPTURE_SUPPORTED_V1
     | ffi::GGML_BACKEND_GRAPH_LIFECYCLE_CAPTURE_ENABLED_V1
     | ffi::GGML_BACKEND_GRAPH_LIFECYCLE_EXECUTABLE_PRESENT_V1
@@ -37,7 +36,7 @@ pub(crate) enum BackendGraphLifecycleBinding {
     Unavailable,
     Incompatible,
     Available {
-        observe: ffi::GgmlBackendGraphLifecycleObserveV1Fn,
+        api: NonNull<ffi::GgmlBackendGraphLifecycleApiV1>,
     },
 }
 
@@ -47,42 +46,25 @@ impl BackendGraphLifecycleBinding {
     /// extension. A present but malformed table remains distinguishable so an
     /// evidence run fails closed when it tries to observe it.
     pub(crate) unsafe fn resolve(backend: NonNull<c_void>) -> Self {
-        // SAFETY: caller guarantees the backend remains live.
-        let device = unsafe { ffi::ggml_backend_get_device(backend.as_ptr()) };
-        if device.is_null() {
+        // SAFETY: caller guarantees the backend remains live. The shared ggml
+        // trampoline contains registry lookup and provider exceptions.
+        let Some(api) = NonNull::new(
+            unsafe { ffi::ggml_backend_graph_lifecycle_api_for_backend_v1(backend.as_ptr()) }
+                .cast_mut(),
+        ) else {
             return Self::Unavailable;
-        }
-        // SAFETY: the device belongs to the live backend.
-        let registry = unsafe { ffi::ggml_backend_dev_backend_reg(device) };
-        if registry.is_null() {
-            return Self::Unavailable;
-        }
-        // SAFETY: static NUL-terminated name and live registry.
-        let proc = unsafe {
-            ffi::ggml_backend_reg_get_proc_address(
-                registry,
-                GRAPH_LIFECYCLE_API_PROC.as_ptr().cast(),
-            )
         };
-        if proc.is_null() {
-            return Self::Unavailable;
-        }
-        // SAFETY: the versioned proc name fixes the getter signature.
-        let get_api: ffi::GgmlBackendGraphLifecycleGetApiV1Fn = unsafe { mem::transmute(proc) };
-        // SAFETY: getter was obtained from the live backend registry.
-        let Some(api) = (unsafe { get_api().as_ref() }) else {
-            return Self::Incompatible;
-        };
-        if api.struct_size < mem::size_of::<ffi::GgmlBackendGraphLifecycleApiV1>() as u32
-            || api.abi_version != ffi::GGML_BACKEND_GRAPH_LIFECYCLE_ABI_V1
-            || api.capabilities != 0
+        // SAFETY: the trampoline returned a non-null table owned by the live
+        // backend registry for at least the backend lifetime.
+        let api_ref = unsafe { api.as_ref() };
+        if api_ref.struct_size < mem::size_of::<ffi::GgmlBackendGraphLifecycleApiV1>() as u32
+            || api_ref.abi_version != ffi::GGML_BACKEND_GRAPH_LIFECYCLE_ABI_V1
+            || api_ref.capabilities != 0
+            || api_ref.observe.is_none()
         {
             return Self::Incompatible;
         }
-        match api.observe {
-            Some(observe) => Self::Available { observe },
-            None => Self::Incompatible,
-        }
+        Self::Available { api }
     }
 
     pub(crate) fn observe(
@@ -90,10 +72,10 @@ impl BackendGraphLifecycleBinding {
         backend: NonNull<c_void>,
         graph: NonNull<c_void>,
     ) -> Result<Option<NativeGraphLifecycleObservation>, BackendGraphLifecycleError> {
-        let observe = match self {
+        let api = match self {
             Self::Unavailable => return Ok(None),
             Self::Incompatible => return Err(BackendGraphLifecycleError::Incompatible),
-            Self::Available { observe } => observe,
+            Self::Available { api } => api,
         };
         let mut raw = ffi::GgmlBackendGraphLifecycleObservationV1 {
             struct_size: mem::size_of::<ffi::GgmlBackendGraphLifecycleObservationV1>() as u32,
@@ -101,7 +83,14 @@ impl BackendGraphLifecycleBinding {
         };
         // SAFETY: backend and graph are live for the enclosing compute, and
         // `raw` is a correctly sized writable v1 observation.
-        let status = unsafe { observe(backend.as_ptr(), graph.as_ptr(), &mut raw) };
+        let status = unsafe {
+            ffi::ggml_backend_graph_lifecycle_api_observe_v1(
+                api.as_ptr(),
+                backend.as_ptr(),
+                graph.as_ptr(),
+                &mut raw,
+            )
+        };
         if status != ffi::GGML_STATUS_SUCCESS {
             return Err(BackendGraphLifecycleError::Status { status });
         }

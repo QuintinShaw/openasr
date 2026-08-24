@@ -331,9 +331,6 @@ pub(crate) struct GgmlBackendMemoryApiV1 {
     pub quarantine: Option<GgmlMemoryQuarantineFn>,
 }
 
-pub(crate) type GgmlBackendMemoryGetApiV1Fn =
-    unsafe extern "C" fn() -> *const GgmlBackendMemoryApiV1;
-
 pub(crate) const GGML_BACKEND_GRAPH_LIFECYCLE_ABI_V1: u32 = 1;
 pub(crate) const GGML_BACKEND_GRAPH_LIFECYCLE_CAPTURE_SUPPORTED_V1: u32 = 1 << 0;
 pub(crate) const GGML_BACKEND_GRAPH_LIFECYCLE_CAPTURE_ENABLED_V1: u32 = 1 << 1;
@@ -369,8 +366,6 @@ pub(crate) struct GgmlBackendGraphLifecycleApiV1 {
     pub observe: Option<GgmlBackendGraphLifecycleObserveV1Fn>,
 }
 
-pub(crate) type GgmlBackendGraphLifecycleGetApiV1Fn =
-    unsafe extern "C" fn() -> *const GgmlBackendGraphLifecycleApiV1;
 /// ggml abort predicate: return true to abort the in-flight graph. Called from
 /// ggml worker threads -- must stay panic-free and lock-light.
 pub(crate) type GgmlAbortCallback = Option<unsafe extern "C" fn(data: *mut c_void) -> bool>;
@@ -538,6 +533,15 @@ unsafe extern "C" {
     pub(crate) fn ggml_backend_memory_api_for_backend_v1(
         backend: GgmlBackendRaw,
     ) -> *const GgmlBackendMemoryApiV1;
+    pub(crate) fn ggml_backend_graph_lifecycle_api_for_backend_v1(
+        backend: GgmlBackendRaw,
+    ) -> *const GgmlBackendGraphLifecycleApiV1;
+    pub(crate) fn ggml_backend_graph_lifecycle_api_observe_v1(
+        api: *const GgmlBackendGraphLifecycleApiV1,
+        backend: GgmlBackendRaw,
+        graph: GgmlCgraphRaw,
+        observation: *mut GgmlBackendGraphLifecycleObservationV1,
+    ) -> c_int;
     pub(crate) fn ggml_backend_memory_api_get_domains_v1(
         api: *const GgmlBackendMemoryApiV1,
         dev: GgmlBackendDevRaw,

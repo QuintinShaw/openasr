@@ -109,7 +109,8 @@ Optional flags:
 - `--warmup-runs N` - untimed passes before sampling (marks warm/populated)
 - `--core-commit <40-hex>` - otherwise `OPENASR_BUILD_COMMIT` or `git rev-parse HEAD`
 - `--scope <label>` - default `short-audio-gate`
-- `--trace-out <path>` - native-only strict token trace. It is create-new (never replaces an existing path), rejects any final-path alias with `--out` including dangling symlink chains and symlinked parent directories, and fails closed if the trace directory metadata cannot be synced. Both targets pin canonical parent directories before trace publication, so later caller-path symlink swaps cannot redirect the receipt write. A trace artifact retained after that sync failure is not release-valid.
+- `--trace-out <path>` - native-only strict token/lifecycle diagnostic for one measured request, so it requires `--runs 1`. It is create-new (never replaces an existing path), rejects any final-path alias with `--out` including dangling symlink chains and symlinked parent directories, and fails closed if the trace directory metadata cannot be synced. Both targets pin canonical parent directories before trace publication, so later caller-path symlink swaps cannot redirect the receipt write. A trace artifact retained after that sync failure is not release-valid.
+- `--logits-out <path>` - requires `--trace-out` and writes the complete finite f32 selection row for every measured FullLogits step. Token and logits headers share a cryptographically random request `run_id`, process-random `process_nonce`, and OS `process_id`. Every row carries the runtime-minted graph/compute/output generation plus a bounded `output_index`/`output_count`; the gate verifies that the complete partition matches the actual native readback byte count. Model-family code cannot construct or deserialize this witness.
 - `--backend mock` - plumbing only; not a quality/perf claim
 
 The command is an **explicit tooling surface**. It does not change the default
@@ -137,9 +138,20 @@ The command is an **explicit tooling surface**. It does not change the default
 - `token_transcript` evidence must carry a family oracle, resolved typed output
   plan, cold/reuse mode, non-empty token trace artifact, and bounded logits/top-k/
   margin summary. `placement_resource` requires observed placement. Classes are
-  never interchangeable. The generic bench command refuses native output until
-  the runtime trace producer is connected; it cannot emit a fixed `evidence:null`
-  correctness claim.
+  never interchangeable. The generic bench command may emit strong runtime
+  diagnostics through `--trace-out`/`--logits-out`, but it deliberately leaves
+  `evidence` absent. Only the explicit real-family qualification producer may
+  bind those artifacts to a release subject and matrix as formal evidence.v1.
+- Cold and reuse traces for one exact family/model/quant/provider lane must have
+  different request `run_id` values and the same process-random nonce plus OS
+  process ID. A label supplied by the caller cannot establish same-process
+  execution. Process-local graph IDs are interpreted only after this pairing.
+- Each token/top-k/full-logits step uses the same readback-layer-minted output
+  witness. A scalar output has index 0/count 1. A batched output may reuse one
+  compute only through distinct runtime-minted row witnesses whose count and
+  vocab width exactly reconstruct the native readback byte size. Caller-supplied
+  row numbers, duplicate row witnesses, missing rows, cross-run splicing, or
+  non-contiguous step indexes fail closed.
 - When a native accelerated run executes a ggml graph, `observed_placement` is
   populated from runtime telemetry and the emitter fails closed if observed
   compute violates the resolved FullDevice/Hybrid placement. Older v0 receipts

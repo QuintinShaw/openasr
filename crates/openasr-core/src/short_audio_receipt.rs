@@ -1424,6 +1424,7 @@ fn validate_semantic_command(
         ("--out", None, Some("receipt-output")),
         ("--model-pack", Some("pack-content-sha256:"), None),
         ("--trace-out", None, Some("runtime-trace-output")),
+        ("--logits-out", None, Some("full-logits-output")),
     ] {
         for index in command
             .iter()

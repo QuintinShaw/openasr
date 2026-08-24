@@ -12,7 +12,7 @@ use crate::ggml_runtime::{
 };
 
 use super::graph_config::{DEVICE_HEAD_GRAPH_SIZE, xasr_zipformer_device_head_graph_config};
-use super::greedy::{XasrGreedyDecodeBackend, argmax};
+use super::greedy::{XasrGreedyDecodeBackend, XasrSelectionEvidence, argmax};
 use super::package_import::compact_xasr_name;
 use super::runtime_contract::{
     XASR_DECODER_CONV_GROUPS, XASR_OUTPUT_DOWNSAMPLING_FACTOR, XasrRuntimeTensorContract,
@@ -65,6 +65,7 @@ pub(crate) struct XasrDeviceHead {
     blank_id: u32,
     last_token: Option<u32>,
     last_probability: f32,
+    last_selection_evidence: Option<XasrSelectionEvidence>,
 }
 
 fn checked_payload<'a>(
@@ -263,6 +264,7 @@ impl XasrDeviceHead {
             blank_id: metadata.blank_id,
             last_token: None,
             last_probability: 0.0,
+            last_selection_evidence: None,
         })
     }
 
@@ -479,10 +481,13 @@ impl XasrGreedyDecodeBackend for XasrDeviceHead {
     }
 
     fn next_token(&mut self) -> Result<u32, String> {
+        self.last_token = None;
+        self.last_selection_evidence = None;
         let graph = self.joint.session.builder();
-        let logits = graph
-            .compute_output_f32(self.joint.logits, self.vocab_size)
+        let output = graph
+            .compute_output_f32_rows_with_evidence(self.joint.logits, self.vocab_size, 1)
             .map_err(|error| error.to_string())?;
+        let (logits, evidence) = output.into_parts();
         let token = argmax(&logits)
             .ok_or_else(|| "xasr device head produced no finite logits".to_string())?;
         let probability = crate::models::seq2seq_greedy_decode::token_softmax_probability(
@@ -494,6 +499,12 @@ impl XasrGreedyDecodeBackend for XasrDeviceHead {
         }
         self.last_token = Some(token);
         self.last_probability = probability;
+        if crate::models::native_execution_services::current_execution_receipt_collector().is_some()
+        {
+            self.last_selection_evidence = evidence
+                .map(|rows| XasrSelectionEvidence::new(rows, logits, self.vocab_size, 1))
+                .transpose()?;
+        }
         Ok(token)
     }
 
@@ -513,6 +524,7 @@ impl XasrGreedyDecodeBackend for XasrDeviceHead {
         frame_count: usize,
         encoder_dim: usize,
     ) -> Result<Option<usize>, String> {
+        self.last_selection_evidence = None;
         let Some(speculative_frames) = self
             .speculative_blank
             .as_ref()
@@ -536,10 +548,6 @@ impl XasrGreedyDecodeBackend for XasrDeviceHead {
         if self.vocab_size == 0 {
             return Err("xasr speculative device head requires a non-empty vocabulary".to_string());
         }
-        let logits_count = speculative
-            .frames
-            .checked_mul(self.vocab_size)
-            .ok_or_else(|| "xasr speculative logits shape overflowed".to_string())?;
         let graph = speculative.session.builder();
         graph
             .set_f32_slice(
@@ -548,9 +556,14 @@ impl XasrGreedyDecodeBackend for XasrDeviceHead {
                 "xasr_head_speculative_encoder_frames",
             )
             .map_err(|error| error.to_string())?;
-        let logits = graph
-            .compute_output_f32(speculative.logits, logits_count)
+        let output = graph
+            .compute_output_f32_rows_with_evidence(
+                speculative.logits,
+                self.vocab_size,
+                speculative.frames,
+            )
             .map_err(|error| error.to_string())?;
+        let (logits, evidence) = output.into_parts();
         let mut first_non_blank = speculative.frames;
         for (frame, frame_logits) in logits.chunks_exact(self.vocab_size).enumerate() {
             let token = argmax(frame_logits).ok_or_else(|| {
@@ -561,7 +574,19 @@ impl XasrGreedyDecodeBackend for XasrDeviceHead {
                 break;
             }
         }
+        if crate::models::native_execution_services::current_execution_receipt_collector().is_some()
+        {
+            self.last_selection_evidence = evidence
+                .map(|rows| {
+                    XasrSelectionEvidence::new(rows, logits, self.vocab_size, speculative.frames)
+                })
+                .transpose()?;
+        }
         Ok(Some(first_non_blank))
+    }
+
+    fn take_selection_evidence(&mut self) -> Option<XasrSelectionEvidence> {
+        self.last_selection_evidence.take()
     }
 }
 
@@ -590,5 +615,180 @@ impl XasrDeviceHead {
             counts.push(speculative.session.prepared_native_node_count_for_test());
         }
         counts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ggml_runtime::{
+        GgmlCpuGraphBackend, GgufWriteTensor, GgufWriteTensorType, write_gguf_file_v0,
+    };
+    use crate::models::xasr_zipformer::greedy::greedy_decode_frames_incremental_with_backend;
+
+    fn f32_tensor(name: &str, dims: &[usize], values: Vec<f32>) -> GgufWriteTensor {
+        assert_eq!(dims.iter().product::<usize>(), values.len());
+        GgufWriteTensor {
+            name: compact_xasr_name(name),
+            dims: dims.iter().map(|&dim| dim as u64).collect(),
+            tensor_type: GgufWriteTensorType::F32,
+            data: values.into_iter().flat_map(f32::to_le_bytes).collect(),
+        }
+    }
+
+    fn fixture_metadata() -> XasrZipformerExecutionMetadata {
+        XasrZipformerExecutionMetadata {
+            num_stacks: 1,
+            num_encoder_layers: vec![1],
+            encoder_dims: vec![128],
+            query_head_dims: vec![32],
+            value_head_dims: vec![16],
+            num_heads: vec![4],
+            cnn_module_kernels: vec![3],
+            left_context_len: vec![4],
+            downsampling_factors: vec![1],
+            feature_dim: 80,
+            decode_chunk_len: 12,
+            joiner_dim: 128,
+            decoder_context_size: 2,
+            vocab_size: 3,
+            blank_id: 0,
+        }
+    }
+
+    fn fixture_device_head() -> (tempfile::TempDir, XasrDeviceHead) {
+        let metadata = fixture_metadata();
+        let dim = metadata.joiner_dim;
+        let mut identity = vec![0.0_f32; dim * dim];
+        for index in 0..dim {
+            identity[index * dim + index] = 1.0;
+        }
+        let mut output_weight = vec![0.0_f32; dim * metadata.vocab_size];
+        output_weight[0] = -1.0;
+        output_weight[dim] = 1.0;
+        let tensors = vec![
+            f32_tensor(
+                "decoder.embedding.weight",
+                &[dim, metadata.vocab_size],
+                vec![0.0; dim * metadata.vocab_size],
+            ),
+            f32_tensor(
+                "decoder.conv.weight",
+                &[metadata.decoder_context_size, 1, dim],
+                vec![0.0; metadata.decoder_context_size * dim],
+            ),
+            f32_tensor("joiner.encoder_proj.weight", &[dim, dim], identity),
+            f32_tensor("joiner.encoder_proj.bias", &[dim], vec![0.0; dim]),
+            f32_tensor(
+                "joiner.decoder_proj.weight",
+                &[dim, dim],
+                vec![0.0; dim * dim],
+            ),
+            f32_tensor("joiner.decoder_proj.bias", &[dim], vec![0.0; dim]),
+            f32_tensor(
+                "joiner.output_linear.weight",
+                &[dim, metadata.vocab_size],
+                output_weight,
+            ),
+            f32_tensor(
+                "joiner.output_linear.bias",
+                &[metadata.vocab_size],
+                vec![0.0, 0.0, -10.0],
+            ),
+        ];
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("xasr-device-head.gguf");
+        write_gguf_file_v0(&path, &std::collections::BTreeMap::new(), &tensors)
+            .expect("write device-head fixture");
+        let reader = GgufTensorDataReader::from_path(&path).expect("device-head reader");
+        let head = XasrDeviceHead::new(&reader, &metadata, GgmlCpuGraphBackend::Cpu, true)
+            .expect("device head");
+        (dir, head)
+    }
+
+    #[test]
+    fn real_device_head_binds_speculative_rows_and_scalar_recompute_to_readbacks() {
+        let receipt = crate::NativeExecutionReceiptCollector::new();
+        receipt.set_trace_mode(crate::NativeExecutionTraceMode::Cold);
+        receipt.begin_candidate_attempt();
+        let _receipt_guard =
+            crate::models::native_execution_services::install_execution_receipt_collector(Some(
+                receipt.clone(),
+            ));
+        let (_dir, mut head) = fixture_device_head();
+        let mut frames = vec![0.0_f32; 3 * 128];
+        frames[0] = -2.0;
+        frames[128] = -1.0;
+        frames[256] = 2.0;
+        let mut context = head.initial_context();
+        let mut emitted = Vec::new();
+        let mut emit_frames = Vec::new();
+        let mut probabilities = Vec::new();
+
+        greedy_decode_frames_incremental_with_backend(
+            &frames,
+            3,
+            128,
+            &mut head,
+            0,
+            1,
+            &mut context,
+            &mut emitted,
+            &mut emit_frames,
+            &mut probabilities,
+            0,
+            &|| false,
+        )
+        .expect("real device-head decode");
+        receipt.finish_candidate_attempt(true);
+
+        assert_eq!(emitted, vec![1]);
+        assert_eq!(emit_frames, vec![2]);
+        let snapshot = receipt.snapshot();
+        assert!(!snapshot.trace.invalid_binding);
+        let tokens = snapshot
+            .trace
+            .jsonl
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event.get("event").and_then(serde_json::Value::as_str) == Some("token"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|event| event["token_id"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 0, 1]
+        );
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|event| {
+                    (
+                        event["compute"]["output_index"].as_u64().unwrap(),
+                        event["compute"]["output_count"].as_u64().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![(0, 3), (1, 3), (0, 1)]
+        );
+
+        let output_bytes = snapshot
+            .graph_lifecycle
+            .events
+            .iter()
+            .filter_map(|event| match event.kind {
+                crate::GgmlGraphLifecycleEventKind::OutputRead { bytes, .. } => Some(bytes),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            output_bytes.contains(&36),
+            "batch logits must read 3 x 3 f32"
+        );
+        assert!(
+            output_bytes.contains(&12),
+            "scalar logits must read 1 x 3 f32"
+        );
     }
 }

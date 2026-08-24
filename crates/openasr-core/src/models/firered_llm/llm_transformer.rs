@@ -31,7 +31,9 @@
 
 use thiserror::Error;
 
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReader, ResolvedFamilyRuntimeInput};
+use crate::ggml_runtime::{
+    GgmlCpuGraphBackend, GgmlSelectionEvidenceRef, GgufTensorDataReader, ResolvedFamilyRuntimeInput,
+};
 use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
@@ -228,6 +230,10 @@ impl FireRedLlmDecoderRuntime {
 
     pub(crate) fn graph_lane(&self) -> (GgmlCpuGraphBackend, bool) {
         self.whole_decoder.graph_lane()
+    }
+
+    pub(crate) fn take_compute_evidence(&mut self) -> Option<GgmlSelectionEvidenceRef> {
+        self.logits_runtime.take_compute_evidence()
     }
 
     pub(crate) fn uses_native_gqa(&self) -> bool {

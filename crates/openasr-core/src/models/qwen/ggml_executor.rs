@@ -1711,6 +1711,10 @@ impl Seq2SeqGreedyDecodeStepExecutor for Qwen3AsrPrefillOnlyGreedyStepExecutor<'
             greedy_token_hint: None,
         })
     }
+
+    fn take_compute_evidence(&mut self) -> Option<crate::ggml_runtime::GgmlSelectionEvidenceRef> {
+        self.logits_head_runtime.take_compute_evidence()
+    }
 }
 
 /// Poll the request's explicit control at a host-cache prefill chunk

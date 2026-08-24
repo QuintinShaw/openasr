@@ -1391,6 +1391,9 @@ mod tests {
     fn lifecycle_event_label(kind: &crate::GgmlGraphLifecycleEventKind) -> &'static str {
         match kind {
             crate::GgmlGraphLifecycleEventKind::Created { .. } => "created",
+            crate::GgmlGraphLifecycleEventKind::ExistingGraphObserved { .. } => {
+                "existing_graph_observed"
+            }
             crate::GgmlGraphLifecycleEventKind::Prepared { .. } => "prepared",
             crate::GgmlGraphLifecycleEventKind::InputWrite { .. } => "input_write",
             crate::GgmlGraphLifecycleEventKind::ComputeStarted { .. } => "compute_started",

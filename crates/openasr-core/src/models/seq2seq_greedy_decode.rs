@@ -216,6 +216,13 @@ pub(crate) trait Seq2SeqGreedyDecodeStepExecutor {
         &mut self,
         input: Seq2SeqGreedyDecodeStepInput<'_>,
     ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeError>;
+
+    /// Consume proof for the immediately preceding successful decoder step.
+    /// The default keeps uninstrumented families usable, while formal GPU
+    /// evidence fails closed when no ref minted by a graph output read exists.
+    fn take_compute_evidence(&mut self) -> Option<crate::ggml_runtime::GgmlSelectionEvidenceRef> {
+        None
+    }
 }
 
 pub(crate) trait Seq2SeqGreedyTokenDecoder {
@@ -345,15 +352,32 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
             step_index,
         };
         let step_logits = step_executor.decode_step_logits(step_input)?;
-        let selection = select_seq2seq_greedy_step_token(
+        let compute_evidence = step_executor.take_compute_evidence();
+        let receipt =
+            crate::models::native_execution_services::current_execution_receipt_collector();
+        if let Some(receipt) = &receipt {
+            receipt.begin_decode_step(step_index, compute_evidence);
+        }
+        let selection = match select_seq2seq_greedy_step_token(
             config,
             &generated,
             step_index,
             step_logits,
             stop_token_ids.as_slice(),
             on_topk,
-        )?;
+        ) {
+            Ok(selection) => selection,
+            Err(error) => {
+                if let Some(receipt) = &receipt {
+                    receipt.abort_decode_step(step_index);
+                }
+                return Err(error);
+            }
+        };
         trace_token(step_index, selection.token_id, selection.reached_eot);
+        if let Some(receipt) = &receipt {
+            receipt.finish_decode_step(step_index);
+        }
         if let Some(observer) = decode_work_progress {
             observer.report(step_index + 1, config.max_generated_tokens);
         }

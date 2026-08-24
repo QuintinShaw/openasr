@@ -405,6 +405,7 @@ async fn run() -> Result<()> {
                 scope,
                 ffmpeg_bin,
                 trace_out,
+                logits_out,
             } => {
                 let git_cwd = env::current_dir().ok();
                 bench_receipt_cli::bench_receipt_short_audio(
@@ -423,6 +424,7 @@ async fn run() -> Result<()> {
                         ffmpeg_bin,
                         git_cwd: git_cwd.as_deref(),
                         trace_out: trace_out.as_deref(),
+                        logits_out: logits_out.as_deref(),
                     },
                 )
             }
@@ -1419,6 +1421,7 @@ mod tests {
                     runs,
                     warmup_runs,
                     trace_out,
+                    logits_out,
                     ..
                 },
         } = cli.command
@@ -1431,6 +1434,7 @@ mod tests {
             trace_out.as_deref(),
             Some(std::path::Path::new("trace.jsonl"))
         );
+        assert!(logits_out.is_none());
     }
 
     #[test]

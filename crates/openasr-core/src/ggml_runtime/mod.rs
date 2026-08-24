@@ -72,11 +72,11 @@ pub use cpu_graph::{
     resolve_request_execution_route,
 };
 pub(crate) use cpu_graph::{
-    GgmlBackendCapabilities, GgmlCpuGraphBuilder, GgmlCpuTensor, GgmlFlashAttentionPrecision,
-    GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext,
-    GgmlMatmulPrecision, GgmlNativeGqaCapability, GgmlPersistentGraphSession, GgmlRopeExtParams,
-    GgmlStaticTensor, GgmlStaticTensorArena, LoadedWeightOwnerCache, ResidentDeviceCopyCapability,
-    ResidentHostImportCapability,
+    GgmlBackendCapabilities, GgmlComputeOutput, GgmlCpuGraphBuilder, GgmlCpuTensor,
+    GgmlFlashAttentionPrecision, GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity,
+    GgmlLoadedWeightContext, GgmlMatmulPrecision, GgmlNativeGqaCapability,
+    GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
+    LoadedWeightOwnerCache, ResidentDeviceCopyCapability, ResidentHostImportCapability,
 };
 pub use decode_conformance::{
     DecodeFirstDivergenceClass, DiagnosticDecodeSelection, DiagnosticDecoderGraphMode,
@@ -151,8 +151,8 @@ pub use graph_lifecycle::{
     GgmlGraphRebuildReason,
 };
 pub(crate) use graph_lifecycle::{
-    GgmlGraphLifecycleGeneration, current_graph_lifecycle_collector,
-    install_graph_lifecycle_collector, mint_opaque_graph_id,
+    GgmlComputeEvidenceRef, GgmlGraphLifecycleGeneration, GgmlSelectionEvidenceRef,
+    current_graph_lifecycle_collector, install_graph_lifecycle_collector, mint_opaque_graph_id,
 };
 pub(crate) use job_cancel::{
     InheritedJobCancelGuard, arm_thread_job_cancel_flag, cancel_flag_requested_from_data,

@@ -5,9 +5,10 @@ use thiserror::Error;
 
 use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
-    GgmlStaticTensor, GgmlStaticTensorArena, GgufOwnedWeightTensorPayload, GgufTensorDataReadError,
-    GgufTensorDataReader, env_toggle_with_raw,
+    GgmlComputeOutput, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError,
+    GgmlCpuGraphRunner, GgmlSelectionEvidenceRef, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgufOwnedWeightTensorPayload, GgufTensorDataReadError, GgufTensorDataReader,
+    env_toggle_with_raw,
 };
 #[cfg(test)]
 use crate::models::device_greedy_token::device_top1_token_id;
@@ -56,6 +57,7 @@ pub(crate) struct Qwen3AsrLlmLogitsHead {
 pub(crate) struct Qwen3AsrLlmLogitsHeadRuntime {
     head_runtime_identity: u64,
     executor: Option<Qwen3AsrLlmLogitsHeadGraphExecutor>,
+    last_compute_evidence: Option<GgmlSelectionEvidenceRef>,
 }
 
 impl fmt::Debug for Qwen3AsrLlmLogitsHeadRuntime {
@@ -263,6 +265,7 @@ impl Qwen3AsrLlmLogitsHead {
         Ok(Qwen3AsrLlmLogitsHeadRuntime {
             head_runtime_identity: self.runtime_identity,
             executor,
+            last_compute_evidence: None,
         })
     }
 
@@ -435,6 +438,7 @@ impl Qwen3AsrLlmLogitsHeadRuntime {
         hidden: &[f32],
         row_count: usize,
     ) -> Result<Vec<f32>, Qwen3AsrLlmLogitsHeadError> {
+        self.last_compute_evidence = None;
         self.validate_head(head)?;
         let expected_hidden = head
             .d_model
@@ -451,11 +455,14 @@ impl Qwen3AsrLlmLogitsHeadRuntime {
             return Err(Qwen3AsrLlmLogitsHeadError::NonFiniteInputs);
         }
         let logits = if let Some(executor) = self.executor.as_mut() {
-            executor.compute_rows(hidden, row_count).map_err(|source| {
+            let output = executor.compute_rows(hidden, row_count).map_err(|source| {
                 Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
                     reason: source.to_string(),
                 }
-            })?
+            })?;
+            let (logits, evidence) = output.into_parts();
+            self.last_compute_evidence = evidence;
+            logits
         } else {
             head.compute_logits_for_hidden_rows(hidden, row_count)?
         };
@@ -467,6 +474,7 @@ impl Qwen3AsrLlmLogitsHeadRuntime {
         head: &Qwen3AsrLlmLogitsHead,
         hidden: &[f32],
     ) -> Result<Vec<f32>, Qwen3AsrLlmLogitsHeadError> {
+        self.last_compute_evidence = None;
         self.validate_head(head)?;
         if let Some(executor) = self.executor.as_mut() {
             if hidden.len() != head.d_model {
@@ -478,14 +486,20 @@ impl Qwen3AsrLlmLogitsHeadRuntime {
             if hidden.iter().any(|value| !value.is_finite()) {
                 return Err(Qwen3AsrLlmLogitsHeadError::NonFiniteInputs);
             }
-            let logits = executor.compute(hidden).map_err(|source| {
+            let output = executor.compute(hidden).map_err(|source| {
                 Qwen3AsrLlmLogitsHeadError::GgmlGraphFailed {
                     reason: source.to_string(),
                 }
             })?;
+            let (logits, evidence) = output.into_parts();
+            self.last_compute_evidence = evidence;
             return validate_logits_rows(logits, 1, head.vocab_size);
         }
         head.compute_logits_for_last_hidden(hidden)
+    }
+
+    pub(crate) fn take_compute_evidence(&mut self) -> Option<GgmlSelectionEvidenceRef> {
+        self.last_compute_evidence.take()
     }
 
     #[cfg(test)]
@@ -842,7 +856,10 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
         })
     }
 
-    fn compute(&mut self, hidden: &[f32]) -> Result<Vec<f32>, GgmlCpuGraphError> {
+    fn compute(
+        &mut self,
+        hidden: &[f32],
+    ) -> Result<GgmlComputeOutput<Vec<f32>>, GgmlCpuGraphError> {
         self.compute_rows(hidden, 1)
     }
 
@@ -850,7 +867,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
         &mut self,
         hidden: &[f32],
         row_count: usize,
-    ) -> Result<Vec<f32>, GgmlCpuGraphError> {
+    ) -> Result<GgmlComputeOutput<Vec<f32>>, GgmlCpuGraphError> {
         let expected_hidden =
             self.d_model
                 .checked_mul(row_count)
@@ -878,7 +895,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
         graph.set_output(logits)?;
         graph.prepare_outputs_for_upload(&[logits])?;
         graph.set_f32_slice(hidden_tensor, hidden, "qwen_llm_logits_hidden_rows")?;
-        graph.compute_output_f32(logits, output_len)
+        graph.compute_output_f32_with_evidence(logits, output_len)
     }
 
     #[cfg(test)]

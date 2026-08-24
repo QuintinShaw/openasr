@@ -104,10 +104,16 @@ operation actually occurs. It contains bounded, opaque process-local identities
 for:
 
 - graph instance and generation;
+- an `existing_graph_observed` attachment when a later request starts observing
+  a graph prepared by an earlier request in the same process;
 - prepare generation;
 - compute sequence;
 - rebuild event and typed reason;
 - input, output, and KV write generations plus the generation actually consumed;
+- a readback-layer-minted logical output-row witness containing a bounded row
+  index/count. Family code can carry and serialize this witness but cannot
+  construct or deserialize it; batched selection rows must exactly partition
+  the observed native output byte count;
 - native capture support, exact-graph tracking, and enablement observed both
   immediately before and after compute;
 - pre-existing capture executable generation and its last native change,
@@ -117,8 +123,16 @@ for:
 - graph drop.
 
 Native pointers are never serialized. IDs are never compared across daemon
-starts. Planner state, `Option<prepared_graph>`, provider labels, and reuse mode
-cannot synthesize these events.
+starts. Formal cold/reuse pairs carry distinct random request IDs plus the same
+process-random nonce and OS process ID before any process-local graph identity is
+compared. Planner state, `Option<prepared_graph>`, provider labels, caller-
+supplied trace headers, and reuse mode cannot synthesize these events.
+
+Attachment is scoped to each transactional request/candidate attempt, not only
+to collector pointer identity. A warm scope must repeat the live native capture
+state and any pre-existing executable generation before its first compute; a
+failed attempt may roll back its events but cannot suppress those observations
+from the succeeding scope.
 
 The evidence must prove that fresh steps use distinct graph generations, reuse
 retains the intended graph/capture executable, refreshed input/output/KV state is

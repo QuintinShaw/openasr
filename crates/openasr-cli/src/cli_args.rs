@@ -718,6 +718,10 @@ pub(crate) enum BenchReceiptCommand {
         /// native candidate records execution facts.
         #[arg(long)]
         trace_out: Option<PathBuf>,
+        /// Write the complete per-step f32 logits artifact. Requires
+        /// `--trace-out` and a native FullLogits execution plan.
+        #[arg(long, requires = "trace_out")]
+        logits_out: Option<PathBuf>,
     },
     /// Validate one or more receipts with the core-owned release qualification
     /// predicate. This command does not approve a matrix cell; it only proves

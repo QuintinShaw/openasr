@@ -6,11 +6,68 @@ use super::tokenizer::XasrZipformerTokenizer;
 
 pub(crate) const DEFAULT_MAX_SYMBOLS_PER_FRAME: usize = 8;
 
+/// Runtime-minted proof and the exact host-visible rows consumed by one XASR
+/// selection compute. A speculative blank graph has several rows under one
+/// compute; `output_index` distinguishes the row actually used for each
+/// selection without pretending that the graph ran once per frame.
+pub(crate) struct XasrSelectionEvidence {
+    rows: Vec<crate::ggml_runtime::GgmlSelectionEvidenceRef>,
+    logits: Vec<f32>,
+    vocab_size: usize,
+    row_count: usize,
+}
+
+impl XasrSelectionEvidence {
+    pub(super) fn new(
+        rows: Vec<crate::ggml_runtime::GgmlSelectionEvidenceRef>,
+        logits: Vec<f32>,
+        vocab_size: usize,
+        row_count: usize,
+    ) -> Result<Self, String> {
+        let expected = vocab_size
+            .checked_mul(row_count)
+            .ok_or_else(|| "xasr selection evidence shape overflowed".to_string())?;
+        if vocab_size == 0 || row_count == 0 || logits.len() != expected || rows.len() != row_count
+        {
+            return Err(format!(
+                "xasr selection evidence has {} logits and {} witnesses, expected {row_count} rows of {vocab_size}",
+                logits.len(),
+                rows.len()
+            ));
+        }
+        Ok(Self {
+            rows,
+            logits,
+            vocab_size,
+            row_count,
+        })
+    }
+
+    fn row(
+        &self,
+        output_index: usize,
+    ) -> Option<(&[f32], crate::ggml_runtime::GgmlSelectionEvidenceRef)> {
+        if output_index >= self.row_count {
+            return None;
+        }
+        let start = output_index.checked_mul(self.vocab_size)?;
+        let end = start.checked_add(self.vocab_size)?;
+        Some((self.logits.get(start..end)?, *self.rows.get(output_index)?))
+    }
+}
+
 pub(crate) trait XasrGreedyDecodeBackend {
     fn project_encoder_frame(&mut self, frame: &[f32]) -> Result<(), String>;
     fn project_decoder_context(&mut self, context: &[u32]) -> Result<(), String>;
     fn next_token(&mut self) -> Result<u32, String>;
     fn token_probability(&self, token: u32) -> Result<f32, String>;
+
+    /// Consume proof for the immediately preceding scalar or speculative
+    /// selection compute. Normal inference does not retain rows; an explicit
+    /// request receipt makes the device backend retain them until this call.
+    fn take_selection_evidence(&mut self) -> Option<XasrSelectionEvidence> {
+        None
+    }
 
     fn speculative_blank_prefix_len(
         &mut self,
@@ -21,6 +78,26 @@ pub(crate) trait XasrGreedyDecodeBackend {
     ) -> Result<Option<usize>, String> {
         Ok(None)
     }
+}
+
+fn record_selection_receipt(
+    evidence: Option<&XasrSelectionEvidence>,
+    output_index: usize,
+    token_id: u32,
+) {
+    let Some(receipt) =
+        crate::models::native_execution_services::current_execution_receipt_collector()
+    else {
+        return;
+    };
+    let row = evidence.and_then(|evidence| evidence.row(output_index));
+    let compute = row.map(|(_, compute)| compute);
+    let step_index = receipt.begin_next_decode_step(compute);
+    if let Some((row, _)) = row {
+        receipt.record_top_k_last_max(step_index, row);
+    }
+    receipt.record_token(step_index, token_id, false);
+    receipt.finish_decode_step(step_index);
 }
 
 struct HostXasrGreedyDecodeBackend<'a> {
@@ -220,14 +297,24 @@ pub(crate) fn greedy_decode_frames_incremental_with_backend<B: XasrGreedyDecodeB
         let remaining_frames = frame_count - frame_idx;
         let remaining_values = &encoder_frames[frame_idx * encoder_dim..];
         let speculative_context = (!decoder_projection_valid).then_some(context.as_slice());
-        if let Some(blank_prefix_len) = backend.speculative_blank_prefix_len(
+        let speculative_blank_prefix_len = backend.speculative_blank_prefix_len(
             speculative_context,
             remaining_values,
             remaining_frames,
             encoder_dim,
-        )? {
+        )?;
+        let speculative_evidence = backend.take_selection_evidence();
+        if speculative_blank_prefix_len.is_none() && speculative_evidence.is_some() {
+            return Err(
+                "xasr backend produced selection evidence without a speculative result".to_string(),
+            );
+        }
+        if let Some(blank_prefix_len) = speculative_blank_prefix_len {
             if blank_prefix_len > remaining_frames {
                 return Err("xasr speculative blank prefix exceeds remaining frames".to_string());
+            }
+            for output_index in 0..blank_prefix_len {
+                record_selection_receipt(speculative_evidence.as_ref(), output_index, blank_id);
             }
             if speculative_context.is_some() {
                 decoder_projection_valid = true;
@@ -245,12 +332,16 @@ pub(crate) fn greedy_decode_frames_incremental_with_backend<B: XasrGreedyDecodeB
                 decoder_projection_valid = true;
             }
             let token_id = backend.next_token()?;
+            let selection_evidence = backend.take_selection_evidence();
             if token_id == blank_id {
+                record_selection_receipt(selection_evidence.as_ref(), 0, token_id);
                 break;
             }
+            let probability = backend.token_probability(token_id)?;
+            record_selection_receipt(selection_evidence.as_ref(), 0, token_id);
             emitted.push(token_id);
             emit_frames.push(frame_offset + frame_idx);
-            emit_probabilities.push(backend.token_probability(token_id)?);
+            emit_probabilities.push(probability);
             context.remove(0);
             context.push(token_id);
             decoder_projection_valid = false;
@@ -498,6 +589,161 @@ mod tests {
 
         assert!(error.contains("exceeds remaining frames"), "{error}");
         assert!(emitted.is_empty());
+    }
+
+    struct ReceiptEvidenceBackend {
+        blank_prefix: Option<usize>,
+        speculative_evidence: Option<XasrSelectionEvidence>,
+        scalar: std::collections::VecDeque<(u32, f32, XasrSelectionEvidence)>,
+        last_probability: f32,
+        last_evidence: Option<XasrSelectionEvidence>,
+    }
+
+    impl XasrGreedyDecodeBackend for ReceiptEvidenceBackend {
+        fn project_encoder_frame(&mut self, _frame: &[f32]) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn project_decoder_context(&mut self, _context: &[u32]) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn next_token(&mut self) -> Result<u32, String> {
+            let (token, probability, evidence) = self
+                .scalar
+                .pop_front()
+                .ok_or_else(|| "receipt evidence backend ran out of scalar rows".to_string())?;
+            self.last_probability = probability;
+            self.last_evidence = Some(evidence);
+            Ok(token)
+        }
+
+        fn token_probability(&self, _token: u32) -> Result<f32, String> {
+            Ok(self.last_probability)
+        }
+
+        fn take_selection_evidence(&mut self) -> Option<XasrSelectionEvidence> {
+            self.last_evidence.take()
+        }
+
+        fn speculative_blank_prefix_len(
+            &mut self,
+            _context: Option<&[u32]>,
+            _encoder_frames: &[f32],
+            _frame_count: usize,
+            _encoder_dim: usize,
+        ) -> Result<Option<usize>, String> {
+            self.last_evidence = self.speculative_evidence.take();
+            Ok(self.blank_prefix.take())
+        }
+    }
+
+    fn mint_selection_evidence(rows: &[&[f32]]) -> XasrSelectionEvidence {
+        assert!(!rows.is_empty());
+        let width = rows[0].len();
+        assert!(width > 0 && rows.iter().all(|row| row.len() == width));
+        let values = rows
+            .iter()
+            .flat_map(|row| row.iter().copied())
+            .collect::<Vec<_>>();
+        let mut runner = crate::ggml_runtime::GgmlCpuGraphRunner::new(
+            crate::ggml_runtime::GgmlCpuGraphConfig::conservative_default(),
+        )
+        .expect("CPU graph runner");
+        let mut graph = runner.start_graph();
+        let output = graph
+            .new_tensor_1d_f32(values.len(), "xasr_receipt_rows")
+            .expect("row tensor");
+        graph.set_input(output).expect("row input");
+        graph.set_output(output).expect("row output");
+        graph
+            .set_f32_slice(output, &values, "xasr_receipt_rows")
+            .expect("row upload");
+        let observed = graph
+            .compute_output_f32_rows_with_evidence(output, width, rows.len())
+            .expect("row compute");
+        let (values, evidence) = observed.into_parts();
+        XasrSelectionEvidence::new(
+            evidence.expect("installed receipt must mint row witnesses"),
+            values,
+            width,
+            rows.len(),
+        )
+        .expect("valid row evidence")
+    }
+
+    #[test]
+    fn speculative_and_scalar_selections_bind_distinct_runtime_minted_rows() {
+        let receipt = crate::NativeExecutionReceiptCollector::new();
+        receipt.set_trace_mode(crate::NativeExecutionTraceMode::Cold);
+        receipt.begin_candidate_attempt();
+        let _guard = crate::models::native_execution_services::install_execution_receipt_collector(
+            Some(receipt.clone()),
+        );
+        let speculative =
+            mint_selection_evidence(&[&[4.0, 0.0, 0.0], &[3.0, 1.0, 0.0], &[0.0, 2.0, 1.0]]);
+        let scalar_non_blank = mint_selection_evidence(&[&[0.0, 2.0, 1.0]]);
+        let scalar_blank = mint_selection_evidence(&[&[3.0, 1.0, 0.0]]);
+        let mut backend = ReceiptEvidenceBackend {
+            blank_prefix: Some(2),
+            speculative_evidence: Some(speculative),
+            scalar: [(1, 0.75, scalar_non_blank), (0, 0.75, scalar_blank)]
+                .into_iter()
+                .collect(),
+            last_probability: 0.0,
+            last_evidence: None,
+        };
+        let mut context = vec![0, 0];
+        let mut emitted = Vec::new();
+        let mut frames = Vec::new();
+        let mut probabilities = Vec::new();
+
+        greedy_decode_frames_incremental_with_backend(
+            &[10.0, 11.0, 20.0, 21.0, 30.0, 31.0],
+            3,
+            2,
+            &mut backend,
+            0,
+            2,
+            &mut context,
+            &mut emitted,
+            &mut frames,
+            &mut probabilities,
+            0,
+            &|| false,
+        )
+        .expect("receipt-bound XASR decode");
+        receipt.finish_candidate_attempt(true);
+
+        let snapshot = receipt.snapshot();
+        assert!(!snapshot.trace.invalid_binding);
+        let tokens = snapshot
+            .trace
+            .jsonl
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event.get("event").and_then(serde_json::Value::as_str) == Some("token"))
+            .collect::<Vec<_>>();
+        assert_eq!(tokens.len(), 4);
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|event| event["token_id"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 0, 1, 0]
+        );
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|event| {
+                    (
+                        event["compute"]["output_index"].as_u64().unwrap(),
+                        event["compute"]["output_count"].as_u64().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![(0, 3), (1, 3), (0, 1), (0, 1)]
+        );
     }
 
     fn decoder_weights() -> XasrDecoderWeights {
