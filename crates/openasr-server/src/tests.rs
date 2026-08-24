@@ -2624,11 +2624,11 @@ async fn boot_reactivation_attests_v2_before_publishing_active_runtime() {
         Some(pack_path.as_path())
     );
 
-    realtime::spawn_boot_native_warmup(runtime.clone(), home.clone());
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while runtime.model_pack_path.current().is_none() && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    let reactivation = realtime::spawn_boot_native_warmup(runtime.clone(), home.clone());
+    tokio::time::timeout(std::time::Duration::from_secs(30), reactivation)
+        .await
+        .expect("boot reactivation must finish within the integration-test deadline")
+        .expect("boot reactivation worker must not panic");
 
     assert_eq!(
         runtime.model_pack_path.current().as_deref(),

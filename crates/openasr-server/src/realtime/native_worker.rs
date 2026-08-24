@@ -1113,7 +1113,10 @@ pub(crate) fn wait_while_native_warmup_in_flight_blocking() {
     }
 }
 
-pub(crate) fn spawn_boot_native_warmup(runtime: ServerRuntime, home: PathBuf) {
+pub(crate) fn spawn_boot_native_warmup(
+    runtime: ServerRuntime,
+    home: PathBuf,
+) -> tokio::task::JoinHandle<()> {
     // Reactivation walks the same verify -> resolve -> reserve -> materialize
     // -> attest -> reconcile transaction as set-default. Its journal only
     // validates that the durable V2 request is still current; it never writes
@@ -1146,7 +1149,7 @@ pub(crate) fn spawn_boot_native_warmup(runtime: ServerRuntime, home: PathBuf) {
             intent,
             crate::DefaultModelActivationMode::ReactivateDurableSelection,
         );
-    });
+    })
 }
 
 /// Attest a candidate pack without publishing it as the live default.

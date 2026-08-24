@@ -349,7 +349,10 @@ pub async fn serve_with_launch_options(
     // anything below that could block, so it never gates bind/serve/health.
     // See `spawn_boot_native_warmup`'s doc comment for the dedup story with a
     // concurrent real WS attach.
-    realtime::spawn_boot_native_warmup(runtime.clone(), home.clone());
+    drop(realtime::spawn_boot_native_warmup(
+        runtime.clone(),
+        home.clone(),
+    ));
     // idle_unload: only spawn the reaper when the resolved policy is not
     // `never` (`idle_unload_after` is `None` for `never` and for every
     // existing caller/test that does not set it, so this is a no-op there).
