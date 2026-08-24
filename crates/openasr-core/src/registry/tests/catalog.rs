@@ -2438,7 +2438,7 @@ fn valid_hip_backend_json() -> String {
       "targets": ["gfx1200"],
       "min_cli_version": "0.1.0",
       "host_abi": {{
-        "schema_version": 3,
+        "schema_version": {BACKEND_HOST_ABI_SCHEMA_VERSION},
         "fingerprint": "{BACKEND_SHA_A}",
         "target": "x86_64-pc-windows-msvc",
         "crt": "msvc-md",
@@ -2795,6 +2795,7 @@ fn resolve_catalog_backend_pull_returns_the_matching_pack() {
     assert_eq!(resolved.backend_id, "hip-radeon");
     assert_eq!(resolved.vendor, CatalogBackendVendor::Hip);
     assert_eq!(resolved.version, "0.13.1+643b5659");
+    assert_eq!(resolved.min_cli_version, "0.1.0");
     assert_eq!(resolved.host_abi.fingerprint, BACKEND_SHA_A);
     assert_eq!(resolved.files.len(), 2);
     assert!(
@@ -2803,6 +2804,39 @@ fn resolve_catalog_backend_pull_returns_the_matching_pack() {
             .iter()
             .any(|file| file.role == CatalogBackendFileRole::Plugin)
     );
+}
+
+#[test]
+fn future_backend_min_cli_version_loads_but_cannot_resolve() {
+    let backend = valid_hip_backend_json().replace(
+        r#""min_cli_version": "0.1.0""#,
+        r#""min_cli_version": "999.0.0""#,
+    );
+    let catalog = parse_model_catalog(&catalog_json_with_backends(&backend), "fixture")
+        .expect("future backend entry should remain visible to a capability-aware catalog reader");
+    let backend = catalog
+        .backends
+        .iter()
+        .find(|backend| backend.id == "hip-radeon")
+        .expect("future backend remains in parsed catalog");
+    assert!(matches!(
+        backend.availability(),
+        BackendAvailability::RequiresUpdate { .. }
+    ));
+
+    assert!(matches!(
+        resolve_catalog_backend_pull(&catalog, "hip-radeon"),
+        Err(BackendResolutionError::BackendRequiresNewerCli { .. })
+    ));
+    assert!(matches!(
+        resolve_compatible_catalog_backend_pull(
+            &catalog,
+            CatalogBackendVendor::Hip,
+            &backend.host_abi,
+            Some("gfx1200"),
+        ),
+        Err(BackendResolutionError::BackendRequiresNewerCli { .. })
+    ));
 }
 
 #[test]

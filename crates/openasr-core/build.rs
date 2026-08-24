@@ -1149,6 +1149,7 @@ fn emit_backend_host_abi(
     target: &str,
     backend_dl: bool,
 ) -> (String, serde_json::Value) {
+    const SCHEMA_VERSION: u32 = 3;
     let backend_impl = source_dir.join("src/ggml-backend-impl.h");
     let header_paths = [
         source_dir.join("include/ggml.h"),
@@ -1219,13 +1220,13 @@ fn emit_backend_host_abi(
     // contract.  A schema-2 host ignores the catalog activation field, so it
     // must never consider a newly published-inert optional module compatible.
     let build_contract = format!(
-        "schema=3\nactivation_policy=activated-catalog-v1\ntarget={target}\ncrt={crt}\ntoolchain={toolchain}\ncompile_flags_sha256={compile_flags_sha256}\nbackend_dl={}\nshared={}\nbackend_api_version={backend_api_version}\nggml_revision={ggml_revision}\nggml_headers_sha256={headers_sha256}\nopenasr_ffi_sha256={openasr_ffi_sha256}\nopenasr_extension_sha256={openasr_extension_sha256}\n",
+        "schema={SCHEMA_VERSION}\nactivation_policy=activated-catalog-v1\ntarget={target}\ncrt={crt}\ntoolchain={toolchain}\ncompile_flags_sha256={compile_flags_sha256}\nbackend_dl={}\nshared={}\nbackend_api_version={backend_api_version}\nggml_revision={ggml_revision}\nggml_headers_sha256={headers_sha256}\nopenasr_ffi_sha256={openasr_ffi_sha256}\nopenasr_extension_sha256={openasr_extension_sha256}\n",
         u8::from(backend_dl),
         u8::from(backend_dl),
     );
     let fingerprint = sha256_hex(build_contract.as_bytes());
 
-    println!("cargo:rustc-env=OPENASR_BACKEND_ABI_SCHEMA_VERSION=3");
+    println!("cargo:rustc-env=OPENASR_BACKEND_ABI_SCHEMA_VERSION={SCHEMA_VERSION}");
     println!("cargo:rustc-env=OPENASR_BACKEND_HOST_ABI_FINGERPRINT={fingerprint}");
     println!("cargo:rustc-env=OPENASR_BACKEND_TARGET={target}");
     println!("cargo:rustc-env=OPENASR_BACKEND_CRT={crt}");
@@ -1240,7 +1241,7 @@ fn emit_backend_host_abi(
     println!("cargo:rerun-if-env-changed=OPENASR_GGML_REVISION_OVERRIDE");
     println!("cargo:rerun-if-changed={}", openasr_ffi.display());
     let json = serde_json::json!({
-        "schema_version": 3,
+        "schema_version": SCHEMA_VERSION,
         "fingerprint": fingerprint,
         "target": target,
         "crt": crt,

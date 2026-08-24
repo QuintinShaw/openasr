@@ -2974,6 +2974,7 @@ fn hip_pack_resolved(plugin: &[u8], archive: &[u8]) -> ResolvedCatalogBackendPul
         vendor: CatalogBackendVendor::Hip,
         version: "0.13.1".to_string(),
         display_name: "AMD ROCm".to_string(),
+        min_cli_version: crate::current_cli_version().to_string(),
         host_abi: crate::backend_distribution::BackendHostAbi::current(),
         targets: vec!["gfx1200".to_string()],
         min_driver_api: Some("7.1.0".to_string()),
@@ -3065,6 +3066,23 @@ fn install_backend_pack_downloads_verifies_and_extracts() {
     assert_eq!(plan.required_download_bytes, 0);
     assert_eq!(plan.required_plugin_bytes, 0);
     assert_eq!(plan.required_vendor_bytes, 0);
+}
+
+#[test]
+fn install_backend_pack_rechecks_min_cli_version_before_writing_or_downloading() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let mut resolved = hip_pack_resolved(&plugin, &archive);
+    resolved.min_cli_version = "999.0.0".to_string();
+    let mut client = FakeClient::with_responses(Vec::new());
+
+    let error =
+        install_backend_pack_with_client(&resolved, home.path(), &mut client, |_| {}).unwrap_err();
+
+    assert!(matches!(error, PullError::BackendRequiresNewerCli { .. }));
+    assert!(client.urls().is_empty());
+    assert!(!home.path().join("backends").exists());
 }
 
 #[cfg(target_os = "windows")]

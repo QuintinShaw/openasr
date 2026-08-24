@@ -498,6 +498,21 @@ pub enum ModelAvailability {
     },
 }
 
+/// Whether the running build may resolve and install a catalog backend.
+///
+/// Backend entries are native code, so unlike model listings a future entry is
+/// never returned as an executable candidate. The catalog may still parse for
+/// forward-compatible display and update guidance, but every backend resolver
+/// and the install boundary enforce this floor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendAvailability {
+    Available,
+    RequiresUpdate {
+        min_cli_version: String,
+        current_cli_version: String,
+    },
+}
+
 /// The OpenASR version of the running build (`CARGO_PKG_VERSION`), used to gate
 /// catalog models against their `min_cli_version`.
 pub fn current_cli_version() -> &'static str {
@@ -548,6 +563,35 @@ impl CatalogModel {
             },
             None => ModelAvailability::Available,
         }
+    }
+}
+
+fn backend_availability(min_cli_version: &str) -> BackendAvailability {
+    let (Some(current), Some(minimum)) = (
+        parse_semver_triplet(current_cli_version()),
+        parse_semver_triplet(min_cli_version),
+    ) else {
+        // Catalog validation rejects malformed floors. Preserve a total helper
+        // for already-constructed test values without turning malformed data
+        // into an executable authorization.
+        return BackendAvailability::RequiresUpdate {
+            min_cli_version: min_cli_version.to_string(),
+            current_cli_version: current_cli_version().to_string(),
+        };
+    };
+    if current < minimum {
+        BackendAvailability::RequiresUpdate {
+            min_cli_version: min_cli_version.to_string(),
+            current_cli_version: current_cli_version().to_string(),
+        }
+    } else {
+        BackendAvailability::Available
+    }
+}
+
+impl CatalogBackend {
+    pub fn availability(&self) -> BackendAvailability {
+        backend_availability(&self.min_cli_version)
     }
 }
 
@@ -938,11 +982,18 @@ pub struct ResolvedCatalogBackendPull {
     pub vendor: CatalogBackendVendor,
     pub version: String,
     pub display_name: String,
+    pub min_cli_version: String,
     pub host_abi: BackendHostAbi,
     pub targets: Vec<String>,
     pub min_driver_api: Option<String>,
     pub activation: CatalogBackendActivation,
     pub files: Vec<CatalogBackendFile>,
+}
+
+impl ResolvedCatalogBackendPull {
+    pub fn availability(&self) -> BackendAvailability {
+        backend_availability(&self.min_cli_version)
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -953,6 +1004,14 @@ pub enum BackendResolutionError {
     UnknownBackend {
         reference: String,
         available: String,
+    },
+    #[error(
+        "Backend '{backend_id}' requires OpenASR >= {min_cli_version} (this build is {current_cli_version}). Update OpenASR to use it."
+    )]
+    BackendRequiresNewerCli {
+        backend_id: String,
+        min_cli_version: String,
+        current_cli_version: String,
     },
     #[error(
         "No {vendor} backend pack matches host ABI '{host_fingerprint}' and device target '{device_target}'."
@@ -1855,6 +1914,7 @@ pub fn resolve_catalog_backend_pull(
                 .collect::<Vec<_>>()
                 .join(", "),
         })?;
+    ensure_catalog_backend_available(backend)?;
     Ok(resolved_catalog_backend_pull(backend))
 }
 
@@ -1880,6 +1940,8 @@ pub fn resolve_catalog_backend_pull_for_host(
             device_target: "post-install-live-probe".to_string(),
         });
     }
+    ensure_matching_backends_available(&matches)?;
+    matches.retain(|backend| matches!(backend.availability(), BackendAvailability::Available));
     if matches.len() > 1 {
         matches.sort_by(|left, right| left.id.cmp(&right.id));
         return Err(BackendResolutionError::AmbiguousCompatibleBackend {
@@ -1959,6 +2021,8 @@ pub fn resolve_compatible_catalog_backend_pull_for_driver(
             device_target,
         });
     }
+    ensure_matching_backends_available(&matches)?;
+    matches.retain(|backend| matches!(backend.availability(), BackendAvailability::Available));
     if matches.len() > 1 {
         matches.sort_by(|left, right| left.id.cmp(&right.id));
         return Err(BackendResolutionError::AmbiguousCompatibleBackend {
@@ -2042,12 +2106,45 @@ fn backend_vendor_label(vendor: CatalogBackendVendor) -> &'static str {
     }
 }
 
+fn ensure_catalog_backend_available(
+    backend: &CatalogBackend,
+) -> Result<(), BackendResolutionError> {
+    match backend.availability() {
+        BackendAvailability::Available => Ok(()),
+        BackendAvailability::RequiresUpdate {
+            min_cli_version,
+            current_cli_version,
+        } => Err(BackendResolutionError::BackendRequiresNewerCli {
+            backend_id: backend.id.clone(),
+            min_cli_version,
+            current_cli_version,
+        }),
+    }
+}
+
+fn ensure_matching_backends_available(
+    matches: &[&CatalogBackend],
+) -> Result<(), BackendResolutionError> {
+    if matches
+        .iter()
+        .any(|backend| matches!(backend.availability(), BackendAvailability::Available))
+    {
+        return Ok(());
+    }
+    let backend = matches
+        .iter()
+        .min_by(|left, right| left.id.cmp(&right.id))
+        .expect("caller checked non-empty backend matches");
+    ensure_catalog_backend_available(backend)
+}
+
 fn resolved_catalog_backend_pull(backend: &CatalogBackend) -> ResolvedCatalogBackendPull {
     ResolvedCatalogBackendPull {
         backend_id: backend.id.clone(),
         vendor: backend.vendor,
         version: backend.version.clone(),
         display_name: backend.display_name.clone(),
+        min_cli_version: backend.min_cli_version.clone(),
         host_abi: backend.host_abi.clone(),
         targets: backend.targets.clone(),
         min_driver_api: backend.min_driver_api.clone(),

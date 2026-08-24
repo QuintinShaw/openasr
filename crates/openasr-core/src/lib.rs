@@ -421,10 +421,11 @@ pub use realtime::{
     VadSpeechStoppedEvent, VadState, VadStateMachine,
 };
 pub use registry::{
-    BackendResolutionError, CATALOG_FEATURE_SPEAKER_DIARIZATION, CATALOG_FEATURE_WORD_TIMESTAMPS,
-    CatalogBackend, CatalogBackendActivation, CatalogBackendActivationState, CatalogBackendFile,
-    CatalogBackendFileRole, CatalogBackendVendor, CatalogCapability, CatalogCapabilityRole,
-    CatalogError, CatalogLanguageMode, CatalogMirror, CatalogModel, CatalogModelKind, CatalogProse,
+    BackendAvailability, BackendResolutionError, CATALOG_FEATURE_SPEAKER_DIARIZATION,
+    CATALOG_FEATURE_WORD_TIMESTAMPS, CatalogBackend, CatalogBackendActivation,
+    CatalogBackendActivationState, CatalogBackendFile, CatalogBackendFileRole,
+    CatalogBackendVendor, CatalogCapability, CatalogCapabilityRole, CatalogError,
+    CatalogLanguageMode, CatalogMirror, CatalogModel, CatalogModelKind, CatalogProse,
     CatalogPullRequest, CatalogQuant, CatalogQuantPerf, CatalogQuantRecommendationProfile,
     CatalogSpeakerSource, CatalogWordTimestampSource, LicenseClass, LocalCatalogEnvOverride,
     ModelAvailability, ModelCard, ModelCatalog, ModelInstallLicenseDecision, ModelRef,

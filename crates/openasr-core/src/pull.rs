@@ -19,8 +19,8 @@ use crate::models::pack_verifier::{
     AdmittedPack, PackCandidate, PackRoute, PackVerificationError, PackVerifier,
 };
 use crate::{
-    CatalogBackendFile, CatalogBackendFileRole, CatalogBackendVendor, CatalogModel,
-    CatalogPullRequest, CatalogQuant, ModelCatalog, OPENASR_RUNTIME_PACK_EXTENSION,
+    BackendAvailability, CatalogBackendFile, CatalogBackendFileRole, CatalogBackendVendor,
+    CatalogModel, CatalogPullRequest, CatalogQuant, ModelCatalog, OPENASR_RUNTIME_PACK_EXTENSION,
     ResolvedCatalogBackendPull, ResolvedCatalogPull, atomic_file, canonical_quant_tag,
     catalog_series::family_aliases_match,
     content_store,
@@ -191,6 +191,14 @@ pub enum PullError {
     NonHttpsUrl { url: String },
     #[error("Invalid catalog pull target '{field}': {reason}")]
     InvalidTarget { field: &'static str, reason: String },
+    #[error(
+        "Backend '{backend_id}' requires OpenASR >= {min_cli_version} (this build is {current_cli_version}). Update OpenASR to install it."
+    )]
+    BackendRequiresNewerCli {
+        backend_id: String,
+        min_cli_version: String,
+        current_cli_version: String,
+    },
     #[error("Could not create OpenASR model directory '{path}': {source}")]
     CreateDir {
         path: PathBuf,
@@ -5778,8 +5786,26 @@ fn install_backend_pack_with_client<C: DownloadClient>(
     client: &mut C,
     progress: impl FnMut(PullProgress),
 ) -> Result<InstalledBackend, PullError> {
+    ensure_backend_cli_version_for_install(resolved)?;
     let _store_lock = BackendStoreMutationLock::acquire(home)?;
     install_backend_pack_with_client_locked(resolved, home, client, progress)
+}
+
+fn ensure_backend_cli_version_for_install(
+    resolved: &ResolvedCatalogBackendPull,
+) -> Result<(), PullError> {
+    if let BackendAvailability::RequiresUpdate {
+        min_cli_version,
+        current_cli_version,
+    } = resolved.availability()
+    {
+        return Err(PullError::BackendRequiresNewerCli {
+            backend_id: resolved.backend_id.clone(),
+            min_cli_version,
+            current_cli_version,
+        });
+    }
+    Ok(())
 }
 
 fn install_backend_pack_with_client_locked<C: DownloadClient>(
@@ -5788,6 +5814,7 @@ fn install_backend_pack_with_client_locked<C: DownloadClient>(
     client: &mut C,
     mut progress: impl FnMut(PullProgress),
 ) -> Result<InstalledBackend, PullError> {
+    ensure_backend_cli_version_for_install(resolved)?;
     let vendor = backend_vendor_dirname(resolved.vendor)?;
     validate_backend_pack_version(&resolved.version)?;
     let plugin_filename = resolved
