@@ -591,12 +591,9 @@ pub(crate) fn native_streaming_worker_for_key(
             openasr_core::stage_timing::log_event(
                 "native_streaming_watchdog",
                 format_args!(
-                    "model_pack_path={} hardware_target={} execution_route_key={} inference_threads={:?} \
+                    "model_pack=resident hardware_target={} execution_route_key={} inference_threads={:?} \
                      reason=same_key_preemption_client_disconnected action=abandon_occupant",
-                    key.model_pack_path.display(),
-                    key.hardware_target,
-                    key.execution_route_key,
-                    key.inference_threads,
+                    key.hardware_target, key.execution_route_key, key.inference_threads,
                 ),
             );
         }
@@ -801,12 +798,9 @@ pub(crate) fn abandon_stuck_native_streaming_worker(
     openasr_core::stage_timing::log_event(
         "native_streaming_watchdog",
         format_args!(
-            "model_pack_path={} hardware_target={} execution_route_key={} inference_threads={:?} reason={reason} \
+            "model_pack=resident hardware_target={} execution_route_key={} inference_threads={:?} reason={reason} \
              action=abandon_worker abandoned_workers={abandoned_count}",
-            key.model_pack_path.display(),
-            key.hardware_target,
-            key.execution_route_key,
-            key.inference_threads,
+            key.hardware_target, key.execution_route_key, key.inference_threads,
         ),
     );
     if abandonment_count_requires_fail_loud(abandoned_count) {
@@ -1227,6 +1221,9 @@ async fn warm_up_native_pack(
     reservation_context: Option<openasr_core::ActivationReservationContext>,
 ) -> Result<openasr_core::NativeExecutionReceiptSnapshot, String> {
     let receipt = openasr_core::NativeExecutionReceiptCollector::new();
+    let request_attempt_id = openasr_core::RequestAttemptId::generate()
+        .map_err(|_| "could not allocate warmup request attempt identity".to_string())?;
+    receipt.bind_request_attempt(request_attempt_id);
     if runtime.backend != openasr_core::BackendKind::Native {
         return Ok(receipt.snapshot());
     }
@@ -1261,19 +1258,14 @@ async fn warm_up_native_pack(
     .flatten();
     let Some(adapter) = openasr_core::native_runtime_model_adapter_for_path(&model_pack_path)
     else {
-        return Err(format!(
-            "no native runtime adapter for {}",
-            model_pack_path.display()
-        ));
+        return Err("no native runtime adapter for selected model pack".to_string());
     };
-    let model_pack = adapter.model_pack_ref("native-default").map_err(|error| {
-        format!(
-            "could not open native default pack {}: {error}",
-            model_pack_path.display()
-        )
-    })?;
-    let context =
-        NativeAsrSessionContext::new("boot-warmup").with_native_execution_receipt(receipt.clone());
+    let model_pack = adapter
+        .model_pack_ref("native-default")
+        .map_err(|_| "could not open selected native default pack".to_string())?;
+    let context = NativeAsrSessionContext::new("boot-warmup")
+        .with_request_attempt_id(request_attempt_id)
+        .with_native_execution_receipt(receipt.clone());
     let context = match reservation_context {
         Some(reservation_context) => {
             context.with_activation_reservation_context(reservation_context)
@@ -1306,13 +1298,12 @@ async fn warm_up_native_pack(
     ) {
         Ok(session) => session,
         Err(error) => {
+            receipt.record_terminal(openasr_core::RequestExecutionTerminal::Failed);
             openasr_core::stage_timing::log_event(
                 "realtime_warmup",
                 format_args!(
-                    "stage=session_start_failed model_pack_path={} hardware_target={} error={}",
-                    model_pack.root.display(),
+                    "stage=session_start_failed model_pack=selected hardware_target={} failure=session_start",
                     hardware_target,
-                    single_line_log_value(&error.to_string()),
                 ),
             );
             return Err(error.to_string());
@@ -1326,21 +1317,21 @@ async fn warm_up_native_pack(
     );
     let diagnostic_key = key.clone();
     if let Err(error) = attach_and_run_boot_warmup(key, session, None).await {
+        receipt.record_terminal(openasr_core::RequestExecutionTerminal::Failed);
         openasr_core::stage_timing::log_event(
             "realtime_warmup",
             format_args!(
-                "stage=failed model_pack_path={} hardware_target={} execution_route_key={} error={}",
-                diagnostic_key.model_pack_path.display(),
-                diagnostic_key.hardware_target,
-                diagnostic_key.execution_route_key,
-                single_line_log_value(&error),
+                "stage=failed model_pack=resident hardware_target={} execution_route_key={} failure=worker_attach_or_warmup",
+                diagnostic_key.hardware_target, diagnostic_key.execution_route_key,
             ),
         );
         return Err(error);
     }
+    receipt.record_terminal(openasr_core::RequestExecutionTerminal::Succeeded);
     Ok(receipt.snapshot())
 }
 
+#[cfg(test)]
 pub(crate) fn single_line_log_value(value: &str) -> String {
     value.replace('\r', "\\r").replace('\n', "\\n")
 }

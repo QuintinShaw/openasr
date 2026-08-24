@@ -25,12 +25,98 @@
 //! `uncancellable` takes a `reason` argument (never a no-argument escape
 //! hatch) -- see its doc comment for why.
 
-use std::fmt;
 use std::sync::Arc;
+use std::{fmt, str::FromStr};
+
+use thiserror::Error;
 
 use super::TranscriptionControl;
 use crate::models::native_execution_services::ExecutionLaneKey;
 use crate::models::request_execution_receipt::NativeExecutionReceiptCollector;
+
+/// Non-secret, process-independent identity for one submitted request attempt.
+///
+/// This is deliberately distinct from `request_id` (pause/cancel control) and
+/// `ExecutionCacheAttemptId` (candidate/cache publication). A managed client
+/// may mint it before dispatch; a server mints one when the caller omits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RequestAttemptId([u8; 16]);
+
+impl RequestAttemptId {
+    pub fn generate() -> Result<Self, getrandom::Error> {
+        let mut bytes = [0_u8; 16];
+        getrandom::fill(&mut bytes)?;
+        Ok(Self(bytes))
+    }
+
+    pub fn parse(value: &str) -> Result<Self, RequestAttemptIdError> {
+        value.parse()
+    }
+}
+
+impl fmt::Display for RequestAttemptId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl serde::Serialize for RequestAttemptId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RequestAttemptId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl FromStr for RequestAttemptId {
+    type Err = RequestAttemptIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 32
+            || !value
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (*byte >= b'a' && *byte <= b'f'))
+        {
+            return Err(RequestAttemptIdError::InvalidFormat);
+        }
+        let mut bytes = [0_u8; 16];
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            let high = decode_lower_hex(pair[0]).ok_or(RequestAttemptIdError::InvalidFormat)?;
+            let low = decode_lower_hex(pair[1]).ok_or(RequestAttemptIdError::InvalidFormat)?;
+            bytes[index] = (high << 4) | low;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+fn decode_lower_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum RequestAttemptIdError {
+    #[error("request attempt id must be exactly 32 lowercase hexadecimal characters")]
+    InvalidFormat,
+}
 
 /// Cloneable request-local completed-work observer.
 ///
@@ -94,6 +180,9 @@ pub struct RequestExecutionContext {
     /// `None` for callers that never opted in -- most CLI and realtime
     /// utterance requests.
     pub request_id: Option<String>,
+    /// Correlation identity for this submitted attempt. It never authorizes
+    /// cancellation, replay, daemon access, or cache publication.
+    request_attempt_id: Option<RequestAttemptId>,
     /// Cancel/pause/resume control for this request's decode.
     pub control: Arc<TranscriptionControl>,
     /// Optional per-slice decode-work progress. Private so every producer must
@@ -122,7 +211,9 @@ pub struct RequestExecutionContext {
 // state".
 impl PartialEq for RequestExecutionContext {
     fn eq(&self, other: &Self) -> bool {
-        self.request_id == other.request_id && Arc::ptr_eq(&self.control, &other.control)
+        self.request_id == other.request_id
+            && Arc::ptr_eq(&self.control, &other.control)
+            && self.request_attempt_id == other.request_attempt_id
     }
 }
 
@@ -132,6 +223,7 @@ impl RequestExecutionContext {
     pub fn new(request_id: Option<String>, control: Arc<TranscriptionControl>) -> Self {
         Self {
             request_id,
+            request_attempt_id: None,
             control,
             decode_work_progress: None,
             unstable_decode_text: None,
@@ -149,6 +241,7 @@ impl RequestExecutionContext {
     ) -> Self {
         Self {
             request_id: self.request_id.clone(),
+            request_attempt_id: self.request_attempt_id,
             control: Arc::clone(&self.control),
             decode_work_progress: Some(observer),
             unstable_decode_text: self.unstable_decode_text.clone(),
@@ -168,6 +261,7 @@ impl RequestExecutionContext {
     ) -> Self {
         Self {
             request_id: self.request_id.clone(),
+            request_attempt_id: self.request_attempt_id,
             control: Arc::clone(&self.control),
             decode_work_progress: self.decode_work_progress.clone(),
             unstable_decode_text: Some(observer),
@@ -180,6 +274,18 @@ impl RequestExecutionContext {
         self.unstable_decode_text.as_ref()
     }
 
+    pub fn with_request_attempt_id(mut self, attempt_id: RequestAttemptId) -> Self {
+        self.request_attempt_id = Some(attempt_id);
+        if let Some(receipt) = self.native_execution_receipt.as_ref() {
+            receipt.bind_request_attempt(attempt_id);
+        }
+        self
+    }
+
+    pub fn request_attempt_id(&self) -> Option<RequestAttemptId> {
+        self.request_attempt_id
+    }
+
     /// Attach the one explicit request-scoped authority that can receive native
     /// execution facts and decode trace events. Receipt consumers must use this
     /// value rather than re-resolving backend policy after the request returns.
@@ -187,11 +293,14 @@ impl RequestExecutionContext {
         mut self,
         receipt: NativeExecutionReceiptCollector,
     ) -> Self {
+        if let Some(attempt_id) = self.request_attempt_id {
+            receipt.bind_request_attempt(attempt_id);
+        }
         self.native_execution_receipt = Some(receipt);
         self
     }
 
-    pub(crate) fn native_execution_receipt(&self) -> Option<NativeExecutionReceiptCollector> {
+    pub fn native_execution_receipt(&self) -> Option<NativeExecutionReceiptCollector> {
         self.native_execution_receipt.clone()
     }
 
@@ -260,6 +369,7 @@ impl RequestExecutionContext {
         let _ = reason;
         Self {
             request_id: None,
+            request_attempt_id: None,
             control: Arc::new(TranscriptionControl::detached()),
             decode_work_progress: None,
             unstable_decode_text: None,
@@ -294,6 +404,34 @@ mod tests {
         assert_eq!(context.request_id.as_deref(), Some("job-1"));
         control.request_cancel();
         assert!(context.is_canceled());
+    }
+
+    #[test]
+    fn request_attempt_is_lower_hex_roundtrippable_and_not_a_control_id() {
+        let attempt = RequestAttemptId::parse("00112233445566778899aabbccddeeff").unwrap();
+        assert_eq!(attempt.to_string(), "00112233445566778899aabbccddeeff");
+        assert!(RequestAttemptId::parse("00112233445566778899AABBCCDDEEFF").is_err());
+        assert!(RequestAttemptId::parse("../00112233445566778899aabbccddeeff").is_err());
+        let json = serde_json::to_string(&attempt).unwrap();
+        assert_eq!(json, "\"00112233445566778899aabbccddeeff\"");
+        assert_eq!(
+            serde_json::from_str::<RequestAttemptId>(&json).unwrap(),
+            attempt
+        );
+
+        let context = RequestExecutionContext::uncancellable("request attempt test")
+            .with_request_attempt_id(attempt);
+        assert_eq!(context.request_attempt_id(), Some(attempt));
+        assert!(context.request_id.is_none());
+    }
+
+    #[test]
+    fn slice_context_preserves_request_attempt_identity() {
+        let attempt = RequestAttemptId::parse("ffeeddccbbaa99887766554433221100").unwrap();
+        let context = RequestExecutionContext::uncancellable("request attempt propagation")
+            .with_request_attempt_id(attempt)
+            .with_decode_work_progress_observer(WorkProgressObserver::new(|_, _| {}));
+        assert_eq!(context.request_attempt_id(), Some(attempt));
     }
 
     #[test]

@@ -38,10 +38,10 @@ use super::execution_memory::{
     MemoryPlanningError, MemoryReservationCohortId,
 };
 use crate::models::native_execution_services::{
-    current_execution_cache_attempt_id, current_runtime_receipts,
+    current_execution_cache_attempt_id, current_native_execution_scope_id, current_runtime_receipts,
 };
 use crate::models::runtime_receipts::{
-    RuntimeOwnerGuard, RuntimeResourceGuard, RuntimeResourceState,
+    RuntimeOwnerGuard, RuntimeOwnerPlacement, RuntimeResourceGuard, RuntimeResourceState,
 };
 
 /// Process-local identity of one already-open pack weight mapping.
@@ -319,7 +319,17 @@ impl DeviceMemoryBrokerSet {
             cohort_id: None,
         };
         request.cohort_id = cohort_id;
-        let mut batch = self.try_reserve_batch(vec![request])?;
+        let owner_scope_id = current_native_execution_scope_id();
+        let owner_placement = if owner_scope_id.is_some() {
+            RuntimeOwnerPlacement::HostNeutral
+        } else {
+            RuntimeOwnerPlacement::Unknown
+        };
+        let mut batch = self.try_reserve_batch_for_scope_and_placement(
+            vec![request],
+            owner_scope_id,
+            owner_placement,
+        )?;
         batch.commit_quoted()?;
 
         let generation = self

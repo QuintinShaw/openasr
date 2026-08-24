@@ -22,7 +22,8 @@ use std::{
 use thiserror::Error;
 
 use crate::models::runtime_receipts::{
-    RuntimeBackendOwnedReliability, RuntimeNativeMemoryEvidence, RuntimeReceiptMetric,
+    RuntimeBackendOwnedReliability, RuntimeNativeMemoryEvidence, RuntimeOwnerPlacement,
+    RuntimeReceiptMetric,
 };
 
 use crate::device::execution_memory::{
@@ -33,7 +34,7 @@ use crate::device::execution_memory::{
 };
 
 use crate::models::native_execution_services::{
-    current_execution_lane_key, current_runtime_receipts,
+    current_execution_lane_key, current_native_execution_scope_id, current_runtime_receipts,
 };
 
 use super::{
@@ -165,6 +166,42 @@ pub(crate) struct NativeMemoryAdmissionPlan {
     reconciliation_baseline: ReconciliationBaseline,
 }
 
+fn runtime_receipt_backend(
+    provider: crate::device::execution_route::ExecutionProvider,
+) -> crate::ggml_runtime::GgmlCpuGraphBackend {
+    match provider {
+        crate::device::execution_route::ExecutionProvider::Cpu => {
+            crate::ggml_runtime::GgmlCpuGraphBackend::Cpu
+        }
+        crate::device::execution_route::ExecutionProvider::Metal => {
+            crate::ggml_runtime::GgmlCpuGraphBackend::Metal
+        }
+        crate::device::execution_route::ExecutionProvider::Cuda
+        | crate::device::execution_route::ExecutionProvider::Hip
+        | crate::device::execution_route::ExecutionProvider::Vulkan
+        | crate::device::execution_route::ExecutionProvider::Accelerator
+        | crate::device::execution_route::ExecutionProvider::Unknown => {
+            crate::ggml_runtime::GgmlCpuGraphBackend::Gpu
+        }
+    }
+}
+
+fn runtime_owner_placement(groups: &[NativeQuotedBackendGroup]) -> RuntimeOwnerPlacement {
+    let Some(collector) = current_runtime_receipts().filter(|collector| collector.is_available())
+    else {
+        return RuntimeOwnerPlacement::Unknown;
+    };
+    let Some(first_group) = groups.first() else {
+        return RuntimeOwnerPlacement::Unknown;
+    };
+    current_execution_lane_key(runtime_receipt_backend(first_group.provider))
+        .receipt_projection(&collector)
+        .map_or(
+            RuntimeOwnerPlacement::Unknown,
+            RuntimeOwnerPlacement::LaneBound,
+        )
+}
+
 impl NativeMemoryAdmissionPlan {
     const DOMAIN_BUSY_WAIT: Duration = Duration::from_secs(30);
     const DOMAIN_BUSY_INITIAL_BACKOFF: Duration = Duration::from_millis(1);
@@ -215,7 +252,13 @@ impl NativeMemoryAdmissionPlan {
             for request in &mut self.requests {
                 request.cohort_id = cohort_id;
             }
-            match broker.try_reserve_batch(self.requests.clone()) {
+            let owner_scope_id = current_native_execution_scope_id();
+            let owner_placement = runtime_owner_placement(&self.groups);
+            match broker.try_reserve_batch_for_scope_and_placement(
+                self.requests.clone(),
+                owner_scope_id,
+                owner_placement,
+            ) {
                 Ok(reservation) => {
                     let mut transaction = NativeMemoryAllocationTransaction {
                         groups: self.groups,
@@ -258,9 +301,16 @@ impl NativeMemoryAdmissionPlan {
             for request in plans.iter_mut().flat_map(|plan| &mut plan.requests) {
                 request.cohort_id = cohort_id;
             }
-            let reservations = match broker
-                .try_reserve_partitioned(plans.iter().map(|plan| plan.requests.clone()).collect())
-            {
+            let owner_scope_id = current_native_execution_scope_id();
+            let owner_placements = plans
+                .iter()
+                .map(|plan| runtime_owner_placement(&plan.groups))
+                .collect();
+            let reservations = match broker.try_reserve_partitioned_for_scope_and_placements(
+                plans.iter().map(|plan| plan.requests.clone()).collect(),
+                owner_scope_id,
+                owner_placements,
+            ) {
                 Ok(reservations) => reservations,
                 Err(error @ MemoryPlanningError::DeviceDomainBusy { .. }) => {
                     if !Self::wait_for_domain_busy_retry(deadline, &mut retry_delay)? {
@@ -566,21 +616,7 @@ impl NativeMemoryAllocationTransaction {
         let Some(first_group) = self.groups.first() else {
             return;
         };
-        let backend = match first_group.provider {
-            crate::device::execution_route::ExecutionProvider::Cpu => {
-                crate::ggml_runtime::GgmlCpuGraphBackend::Cpu
-            }
-            crate::device::execution_route::ExecutionProvider::Metal => {
-                crate::ggml_runtime::GgmlCpuGraphBackend::Metal
-            }
-            crate::device::execution_route::ExecutionProvider::Cuda
-            | crate::device::execution_route::ExecutionProvider::Hip
-            | crate::device::execution_route::ExecutionProvider::Vulkan
-            | crate::device::execution_route::ExecutionProvider::Accelerator
-            | crate::device::execution_route::ExecutionProvider::Unknown => {
-                crate::ggml_runtime::GgmlCpuGraphBackend::Gpu
-            }
-        };
+        let backend = runtime_receipt_backend(first_group.provider);
         let lane = current_execution_lane_key(backend).receipt_projection(&collector);
         let Some(owner_descriptor) = collector.owner_descriptor(
             "native-memory-owner",

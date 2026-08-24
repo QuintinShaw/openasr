@@ -6,10 +6,11 @@
 
 use crate::*;
 use axum::{Json, extract::Query};
+use openasr_core::models::native_execution_services::ExecutionCacheAttemptId;
 use openasr_core::runtime_receipts::{
-    LeaseReceiptShadow, LiveRuntimeOwner, RuntimeOwnerId, RuntimeOwnerPlacement,
-    RuntimeReceiptAvailability, RuntimeReceiptEvent, RuntimeReceiptMetric, RuntimeReceiptSnapshot,
-    RuntimeResourceId, RuntimeResourceState, SafeMemoryDomainKind,
+    LeaseReceiptShadow, LiveRuntimeOwner, ReceiptCompletenessReason, RuntimeOwnerId,
+    RuntimeOwnerPlacement, RuntimeReceiptAvailability, RuntimeReceiptEvent, RuntimeReceiptMetric,
+    RuntimeReceiptSnapshot, RuntimeResourceId, RuntimeResourceState, SafeMemoryDomainKind,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -147,6 +148,9 @@ struct RuntimeLaneView {
 struct RuntimeResourceView {
     id: String,
     kind: String,
+    placement: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lane: Option<RuntimeLaneView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     domain: Option<RuntimeDomainView>,
     ledger_binding: &'static str,
@@ -177,6 +181,10 @@ struct RuntimeDomainView {
 #[derive(Debug, Serialize)]
 struct RuntimeEventView {
     kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_attempt_id: Option<String>,
     owner_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     resource_id: Option<String>,
@@ -237,6 +245,7 @@ impl DomainAttribution {
                 owner_id,
                 resource_id,
                 descriptor,
+                ..
             } = event
                 && let Some(domain) = descriptor.domain
             {
@@ -362,6 +371,7 @@ fn filter_events<'a>(
             RuntimeReceiptEvent::ResourceReleased {
                 owner_id,
                 resource_id,
+                ..
             } => {
                 let Some((acquired_owner_id, resource_domain)) =
                     attribution.resource_domains.get(resource_id)
@@ -457,9 +467,12 @@ impl RuntimeResourceView {
         id: String,
         descriptor: &openasr_core::runtime_receipts::RuntimeResourceDescriptor,
     ) -> Self {
+        let (placement, lane) = runtime_owner_placement(descriptor.placement);
         Self {
             id,
             kind: descriptor.kind.to_hex(),
+            placement,
+            lane,
             domain: descriptor.domain.map(RuntimeDomainView::from),
             ledger_binding: match descriptor.ledger_binding {
                 openasr_core::runtime_receipts::RuntimeResourceLedgerBinding::Brokered(_) => {
@@ -473,10 +486,10 @@ impl RuntimeResourceView {
             requested: RuntimeMetricView::from(descriptor.requested),
             peak: RuntimeMetricView::from(descriptor.peak),
             retained: RuntimeMetricView::from(descriptor.retained),
-            quote_confidence: format!("{:?}", descriptor.quote_confidence),
+            quote_confidence: descriptor.quote_confidence.as_str().to_string(),
             observation_confidence: descriptor
                 .observation_confidence
-                .map(|value| format!("{value:?}")),
+                .map(|value| value.as_str().to_string()),
         }
     }
 }
@@ -511,9 +524,9 @@ fn runtime_domain_kind(kind: SafeMemoryDomainKind) -> &'static str {
 impl From<openasr_core::runtime_receipts::SafeExecutionLaneProjection> for RuntimeLaneView {
     fn from(lane: openasr_core::runtime_receipts::SafeExecutionLaneProjection) -> Self {
         Self {
-            provider: format!("{:?}", lane.provider),
-            placement: format!("{:?}", lane.placement),
-            backend: format!("{:?}", lane.backend),
+            provider: lane.provider.as_str().to_string(),
+            placement: lane.placement.as_str().to_string(),
+            backend: lane.backend.as_str().to_string(),
             device: lane.device.to_hex(),
         }
     }
@@ -525,23 +538,38 @@ impl RuntimeEventView {
             RuntimeReceiptEvent::OwnerCreated {
                 owner_id,
                 descriptor,
-                ..
+                attempt_id,
+                request_attempt_id,
             } => Self {
                 kind: "owner-created",
+                attempt_id: (*attempt_id).map(attempt_view_id),
+                request_attempt_id: request_attempt_id.map(|attempt| attempt.to_string()),
                 owner_id: owner_view_id(owner_id.ordinal),
                 resource_id: None,
                 owner: Some(RuntimeOwnerDescriptorView::from_descriptor(descriptor)),
                 resource: None,
             },
-            RuntimeReceiptEvent::OwnerReused { owner_id, .. } => Self {
+            RuntimeReceiptEvent::OwnerReused {
+                owner_id,
+                attempt_id,
+                request_attempt_id,
+            } => Self {
                 kind: "owner-reused",
+                attempt_id: (*attempt_id).map(attempt_view_id),
+                request_attempt_id: request_attempt_id.map(|attempt| attempt.to_string()),
                 owner_id: owner_view_id(owner_id.ordinal),
                 resource_id: None,
                 owner: None,
                 resource: None,
             },
-            RuntimeReceiptEvent::OwnerReleased { owner_id, .. } => Self {
+            RuntimeReceiptEvent::OwnerReleased {
+                owner_id,
+                attempt_id,
+                request_attempt_id,
+            } => Self {
                 kind: "owner-released",
+                attempt_id: (*attempt_id).map(attempt_view_id),
+                request_attempt_id: request_attempt_id.map(|attempt| attempt.to_string()),
                 owner_id: owner_view_id(owner_id.ordinal),
                 resource_id: None,
                 owner: None,
@@ -551,8 +579,12 @@ impl RuntimeEventView {
                 owner_id,
                 resource_id,
                 descriptor,
+                attempt_id,
+                request_attempt_id,
             } => Self {
                 kind: "resource-acquired",
+                attempt_id: (*attempt_id).map(attempt_view_id),
+                request_attempt_id: request_attempt_id.map(|attempt| attempt.to_string()),
                 owner_id: owner_view_id(owner_id.ordinal),
                 resource_id: Some(resource_view_id(resource_id.ordinal)),
                 owner: None,
@@ -566,6 +598,8 @@ impl RuntimeEventView {
                 resource_id,
                 state,
                 descriptor,
+                attempt_id,
+                request_attempt_id,
             } => Self {
                 kind: match state {
                     RuntimeResourceState::Reserved => "resource-reserved",
@@ -574,6 +608,8 @@ impl RuntimeEventView {
                     RuntimeResourceState::Quarantined => "resource-quarantined",
                     RuntimeResourceState::Released => "resource-released",
                 },
+                attempt_id: (*attempt_id).map(attempt_view_id),
+                request_attempt_id: request_attempt_id.map(|attempt| attempt.to_string()),
                 owner_id: owner_view_id(owner_id.ordinal),
                 resource_id: Some(resource_view_id(resource_id.ordinal)),
                 owner: None,
@@ -585,8 +621,12 @@ impl RuntimeEventView {
             RuntimeReceiptEvent::ResourceReleased {
                 owner_id,
                 resource_id,
+                attempt_id,
+                request_attempt_id,
             } => Self {
                 kind: "resource-released",
+                attempt_id: (*attempt_id).map(attempt_view_id),
+                request_attempt_id: request_attempt_id.map(|attempt| attempt.to_string()),
                 owner_id: owner_view_id(owner_id.ordinal),
                 resource_id: Some(resource_view_id(resource_id.ordinal)),
                 owner: None,
@@ -600,21 +640,32 @@ impl From<openasr_core::runtime_receipts::ReceiptCompleteness> for ReceiptComple
     fn from(completeness: openasr_core::runtime_receipts::ReceiptCompleteness) -> Self {
         Self {
             complete: completeness.complete,
-            reason: completeness.reason.map(|value| format!("{:?}", value)),
+            reason: completeness.reason.map(receipt_completeness_reason),
             live_state_complete: completeness.live_state_complete,
             live_state_reason: completeness
                 .live_state_reason
-                .map(|value| format!("{:?}", value)),
+                .map(receipt_completeness_reason),
             event_history_complete: completeness.event_history_complete,
             event_history_reason: completeness
                 .event_history_reason
-                .map(|value| format!("{:?}", value)),
+                .map(receipt_completeness_reason),
             dropped_events: completeness.dropped_events,
             dropped_owners: completeness.dropped_owners,
             rejected_resources: completeness.rejected_resources,
             dropped_notifications: completeness.dropped_notifications,
         }
     }
+}
+
+/// The attempt identifier is process-local and only meaningful alongside the
+/// daemon-start identity. Prefixing its fixed-width ordinal prevents callers
+/// from treating it as a durable cross-daemon numeric value.
+fn attempt_view_id(attempt_id: ExecutionCacheAttemptId) -> String {
+    format!("attempt-{}", attempt_id.ordinal())
+}
+
+fn receipt_completeness_reason(reason: ReceiptCompletenessReason) -> String {
+    reason.as_str().to_string()
 }
 
 fn owner_view_id(ordinal: u64) -> String {
@@ -709,6 +760,114 @@ mod tests {
     }
 
     #[test]
+    fn resource_events_keep_the_optional_attempt_wire_field() {
+        let snapshot = ServerRuntime::default().runtime_receipt_snapshot();
+        let event = RuntimeReceiptEvent::ResourceReleased {
+            owner_id: RuntimeOwnerId {
+                scope_id: snapshot.scope_id,
+                ordinal: 3,
+            },
+            resource_id: RuntimeResourceId {
+                scope_id: snapshot.scope_id,
+                ordinal: 5,
+            },
+            attempt_id: None,
+            request_attempt_id: None,
+        };
+        let json = serde_json::to_value(RuntimeEventView::from_event(&event))
+            .expect("serialize resource event view");
+        assert_eq!(json["kind"], "resource-released");
+        assert_eq!(json["owner_id"], "owner-3");
+        assert_eq!(json["resource_id"], "resource-5");
+        assert!(json.get("attempt_id").is_none());
+
+        let attempted = RuntimeEventView {
+            kind: "resource-released",
+            attempt_id: Some("attempt-41".to_string()),
+            request_attempt_id: Some("00112233445566778899aabbccddeeff".to_string()),
+            owner_id: "owner-3".to_string(),
+            resource_id: Some("resource-5".to_string()),
+            owner: None,
+            resource: None,
+        };
+        let attempted_json =
+            serde_json::to_value(attempted).expect("serialize attempted resource event view");
+        assert_eq!(attempted_json["attempt_id"], "attempt-41");
+        assert_eq!(
+            attempted_json["request_attempt_id"],
+            "00112233445566778899aabbccddeeff"
+        );
+    }
+
+    #[test]
+    fn resource_view_keeps_placement_and_lane_wire_fields() {
+        let resource = RuntimeResourceView {
+            id: "resource-5".to_string(),
+            kind: "aabbccdd".to_string(),
+            placement: "lane-bound",
+            lane: Some(RuntimeLaneView {
+                provider: "cuda".to_string(),
+                placement: "full-device".to_string(),
+                backend: "gpu".to_string(),
+                device: "deadbeef".to_string(),
+            }),
+            domain: None,
+            ledger_binding: "brokered",
+            requested: RuntimeMetricView::Known(1),
+            peak: RuntimeMetricView::Known(2),
+            retained: RuntimeMetricView::Known(0),
+            quote_confidence: "exact-committed".to_string(),
+            observation_confidence: None,
+        };
+        let json = serde_json::to_value(resource).expect("serialize resource view");
+        assert_eq!(json["placement"], "lane-bound");
+        assert_eq!(json["lane"]["provider"], "cuda");
+        assert_eq!(json["lane"]["device"], "deadbeef");
+    }
+
+    #[test]
+    fn completeness_reason_wire_values_are_stable_kebab_case() {
+        use openasr_core::runtime_receipts::RuntimeReceiptUnavailableReason;
+
+        assert_eq!(
+            receipt_completeness_reason(ReceiptCompletenessReason::Unavailable(
+                RuntimeReceiptUnavailableReason::EntropyUnavailable,
+            )),
+            "entropy-unavailable"
+        );
+        assert_eq!(
+            receipt_completeness_reason(ReceiptCompletenessReason::Unavailable(
+                RuntimeReceiptUnavailableReason::IdentityExhausted,
+            )),
+            "identity-exhausted"
+        );
+        assert_eq!(
+            receipt_completeness_reason(ReceiptCompletenessReason::IdentityExhausted),
+            "identity-exhausted"
+        );
+        assert_eq!(
+            receipt_completeness_reason(ReceiptCompletenessReason::EventCapacityExceeded),
+            "event-capacity-exceeded"
+        );
+        assert_eq!(
+            receipt_completeness_reason(ReceiptCompletenessReason::OwnerCapacityExceeded),
+            "owner-capacity-exceeded"
+        );
+        assert_eq!(
+            receipt_completeness_reason(ReceiptCompletenessReason::ResourceCapacityExceeded),
+            "resource-capacity-exceeded"
+        );
+        assert_eq!(
+            receipt_completeness_reason(ReceiptCompletenessReason::NotificationCapacityExceeded),
+            "notification-capacity-exceeded"
+        );
+        assert_eq!(
+            receipt_completeness_reason(ReceiptCompletenessReason::InvalidLifecycle),
+            "invalid-lifecycle"
+        );
+    }
+
+    #[test]
     fn identity_exhausted_is_projected_and_not_folded_to_known_zero() {
         let snapshot = ServerRuntime::default().runtime_receipt_snapshot();
         let snapshot = RuntimeReceiptSnapshot {
@@ -752,7 +911,10 @@ mod tests {
         assert_eq!(json["availability"], "unavailable");
         assert_eq!(json["unavailable_reason"], "identity-exhausted");
         assert_eq!(json["snapshot_completeness"]["complete"], false);
-        assert_eq!(json["snapshot_completeness"]["reason"], "IdentityExhausted");
+        assert_eq!(
+            json["snapshot_completeness"]["reason"],
+            "identity-exhausted"
+        );
         let rendered = json.to_string();
         assert!(!rendered.contains("\"status\":\"known\""));
         assert!(!rendered.contains("owner-0"));

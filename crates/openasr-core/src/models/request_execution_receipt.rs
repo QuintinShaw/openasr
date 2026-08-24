@@ -7,10 +7,12 @@
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use thiserror::Error;
 
 use crate::{
+    RequestAttemptId,
     device::{execution_policy::ExecutionPlacement, execution_route::ExecutionProvider},
     ggml_runtime::{
         GgmlCpuGraphBackend, GgmlExecutionPlacementSummary, ResolvedFamilyRuntimeInput,
@@ -69,11 +71,57 @@ pub struct NativeExecutionTokenStep {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NativeExecutionReceiptSnapshot {
+    pub request_attempt_id: Option<RequestAttemptId>,
+    pub request_attempt_conflicted: bool,
+    pub phase_duration_micros: BTreeMap<RequestExecutionPhase, u64>,
+    pub timing_complete: bool,
+    pub terminal: Option<RequestExecutionTerminal>,
+    pub timeline_conflicted: bool,
     pub facts: Option<NativeExecutionRequestFacts>,
     pub placement: GgmlExecutionPlacementSummary,
     pub trace: NativeExecutionTraceSnapshot,
     pub token_steps: Vec<NativeExecutionTokenStep>,
     pub completed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RequestExecutionPhase {
+    UploadIngest,
+    DecodeNormalize,
+    AdmissionWait,
+    Compute,
+    /// Internal-only attach of already-prepared samples. This is intentionally
+    /// not reported as audio decode/preparation.
+    PreparedSampleAttach,
+}
+
+impl RequestExecutionPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UploadIngest => "upload-ingest",
+            Self::DecodeNormalize => "decode-normalize",
+            Self::AdmissionWait => "admission-wait",
+            Self::Compute => "compute",
+            Self::PreparedSampleAttach => "prepared-sample-attach",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestExecutionTerminal {
+    Succeeded,
+    Canceled,
+    Failed,
+}
+
+impl RequestExecutionTerminal {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Canceled => "canceled",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -135,6 +183,11 @@ impl NativeExecutionReceiptSnapshot {
 
 #[derive(Debug, Default)]
 struct ReceiptState {
+    request_attempt_id: Option<RequestAttemptId>,
+    request_attempt_conflicted: bool,
+    phase_duration_micros: BTreeMap<RequestExecutionPhase, u64>,
+    terminal: Option<RequestExecutionTerminal>,
+    timeline_conflicted: bool,
     facts: Option<NativeExecutionRequestFacts>,
     placement: GgmlExecutionPlacementSummary,
     trace_events: Vec<String>,
@@ -154,6 +207,67 @@ pub struct NativeExecutionReceiptCollector {
 impl NativeExecutionReceiptCollector {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Binds the request-level correlation identity once. Candidate retries
+    /// share it; conflicting rebinding invalidates completion rather than
+    /// choosing either value.
+    pub fn bind_request_attempt(&self, attempt_id: RequestAttemptId) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match state.request_attempt_id {
+            None => state.request_attempt_id = Some(attempt_id),
+            Some(existing) if existing == attempt_id => {}
+            Some(_) => {
+                state.request_attempt_conflicted = true;
+                state.completed = false;
+            }
+        }
+    }
+
+    pub(crate) fn request_attempt_id(&self) -> Option<RequestAttemptId> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (!state.request_attempt_conflicted)
+            .then_some(state.request_attempt_id)
+            .flatten()
+    }
+
+    pub fn record_phase_duration(&self, phase: RequestExecutionPhase, duration: Duration) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Ok(micros) = u64::try_from(duration.as_micros()) else {
+            state.timeline_conflicted = true;
+            return;
+        };
+        let current = state
+            .phase_duration_micros
+            .get(&phase)
+            .copied()
+            .unwrap_or(0);
+        let Some(total) = current.checked_add(micros) else {
+            state.timeline_conflicted = true;
+            return;
+        };
+        state.phase_duration_micros.insert(phase, total);
+    }
+
+    pub fn record_terminal(&self, terminal: RequestExecutionTerminal) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match state.terminal {
+            None => state.terminal = Some(terminal),
+            Some(existing) if existing == terminal => {}
+            Some(_) => state.timeline_conflicted = true,
+        }
     }
 
     /// Candidate attempts are transactional: a failed candidate cannot leave
@@ -177,7 +291,7 @@ impl NativeExecutionReceiptCollector {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if committed {
+        if committed && !state.request_attempt_conflicted {
             state.completed = true;
         } else {
             state.facts = None;
@@ -355,6 +469,20 @@ impl NativeExecutionReceiptCollector {
         }
         lines.extend(state.trace_events.iter().cloned());
         NativeExecutionReceiptSnapshot {
+            request_attempt_id: state.request_attempt_id,
+            request_attempt_conflicted: state.request_attempt_conflicted,
+            phase_duration_micros: state.phase_duration_micros.clone(),
+            timing_complete: !state.timeline_conflicted
+                && [
+                    RequestExecutionPhase::UploadIngest,
+                    RequestExecutionPhase::DecodeNormalize,
+                    RequestExecutionPhase::AdmissionWait,
+                    RequestExecutionPhase::Compute,
+                ]
+                .iter()
+                .all(|phase| state.phase_duration_micros.contains_key(phase)),
+            terminal: state.terminal,
+            timeline_conflicted: state.timeline_conflicted,
             facts: state.facts.clone(),
             placement: state.placement.clone(),
             trace: NativeExecutionTraceSnapshot {
@@ -533,6 +661,24 @@ mod tests {
         assert!(trace.contains("\"token_id\":22"));
         assert_eq!(snapshot.token_steps.len(), 1);
         assert_eq!(snapshot.token_steps[0].token_id, 22);
+    }
+
+    #[test]
+    fn conflicting_request_attempt_binding_is_irreversible_and_cannot_complete() {
+        let receipt = NativeExecutionReceiptCollector::new();
+        let first = crate::RequestAttemptId::parse("00112233445566778899aabbccddeeff").unwrap();
+        let second = crate::RequestAttemptId::parse("ffeeddccbbaa99887766554433221100").unwrap();
+        receipt.bind_request_attempt(first);
+        receipt.bind_request_attempt(second);
+        receipt.bind_request_attempt(first);
+        receipt.begin_candidate_attempt();
+        receipt.finish_candidate_attempt(true);
+
+        let snapshot = receipt.snapshot();
+        assert_eq!(snapshot.request_attempt_id, Some(first));
+        assert!(snapshot.request_attempt_conflicted);
+        assert!(!snapshot.completed);
+        assert_eq!(receipt.request_attempt_id(), None);
     }
 
     fn seq2seq_facts() -> NativeExecutionRequestFacts {

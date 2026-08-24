@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
+    time::Instant,
 };
 
 use axum::http::HeaderValue;
@@ -27,6 +28,120 @@ use openasr_core::{
 };
 
 use crate::*;
+
+const REQUEST_ATTEMPT_HEADER: &str = "x-openasr-request-attempt";
+
+fn request_attempt_from_headers(
+    headers: &HeaderMap,
+) -> Result<openasr_core::RequestAttemptId, ApiError> {
+    match headers.get(REQUEST_ATTEMPT_HEADER) {
+        Some(value) => {
+            let value = value.to_str().map_err(|_| {
+                ApiError::BadRequest(
+                    "x-openasr-request-attempt must be ASCII lowercase hexadecimal".to_string(),
+                )
+            })?;
+            openasr_core::RequestAttemptId::parse(value)
+                .map_err(|error| ApiError::BadRequest(error.to_string()))
+        }
+        None => openasr_core::RequestAttemptId::generate().map_err(|_| {
+            ApiError::RequestAttemptIdentity(
+                "Could not allocate a request attempt identity".to_string(),
+            )
+        }),
+    }
+}
+
+fn request_server_timing_header(
+    snapshot: &openasr_core::NativeExecutionReceiptSnapshot,
+) -> Option<HeaderValue> {
+    let mut entries = Vec::new();
+    for (phase, wire_name) in [
+        (
+            openasr_core::RequestExecutionPhase::UploadIngest,
+            "upload_ingest",
+        ),
+        (
+            openasr_core::RequestExecutionPhase::DecodeNormalize,
+            "decode_normalize",
+        ),
+        (
+            openasr_core::RequestExecutionPhase::AdmissionWait,
+            "admission_wait",
+        ),
+        (openasr_core::RequestExecutionPhase::Compute, "compute"),
+    ] {
+        if let Some(micros) = snapshot.phase_duration_micros.get(&phase) {
+            entries.push(format!("{wire_name};dur={:.3}", *micros as f64 / 1_000.0));
+        }
+    }
+    (!entries.is_empty())
+        .then(|| HeaderValue::from_str(&entries.join(", ")).ok())
+        .flatten()
+}
+
+fn attach_request_attempt_header(
+    response: &mut Response,
+    attempt_id: openasr_core::RequestAttemptId,
+) {
+    response.headers_mut().insert(
+        REQUEST_ATTEMPT_HEADER,
+        HeaderValue::from_str(&attempt_id.to_string())
+            .expect("request attempt id is a valid HTTP header"),
+    );
+}
+
+#[cfg(test)]
+mod request_attempt_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn request_attempt_header_is_exact_or_server_minted() {
+        let mut headers = HeaderMap::new();
+        let minted = request_attempt_from_headers(&headers).unwrap();
+        assert_eq!(minted.to_string().len(), 32);
+        assert_ne!(minted, request_attempt_from_headers(&headers).unwrap());
+
+        headers.insert(
+            REQUEST_ATTEMPT_HEADER,
+            HeaderValue::from_static("00112233445566778899aabbccddeeff"),
+        );
+        assert_eq!(
+            request_attempt_from_headers(&headers).unwrap().to_string(),
+            "00112233445566778899aabbccddeeff"
+        );
+        headers.insert(
+            REQUEST_ATTEMPT_HEADER,
+            HeaderValue::from_static("00112233445566778899AABBCCDDEEFF"),
+        );
+        assert!(request_attempt_from_headers(&headers).is_err());
+    }
+
+    #[test]
+    fn server_timing_uses_the_four_stable_phase_names() {
+        let receipt = openasr_core::NativeExecutionReceiptCollector::new();
+        for (phase, micros) in [
+            (openasr_core::RequestExecutionPhase::UploadIngest, 1_000),
+            (openasr_core::RequestExecutionPhase::DecodeNormalize, 2_000),
+            (openasr_core::RequestExecutionPhase::AdmissionWait, 3_000),
+            (openasr_core::RequestExecutionPhase::Compute, 4_000),
+        ] {
+            receipt.record_phase_duration(phase, Duration::from_micros(micros));
+        }
+        let value = request_server_timing_header(&receipt.snapshot())
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            value,
+            "upload_ingest;dur=1.000, decode_normalize;dur=2.000, admission_wait;dur=3.000, compute;dur=4.000"
+        );
+        assert!(!value.contains("audio_prep"));
+        assert!(!value.contains("prepared_sample_attach"));
+    }
+}
 
 // ── Axum HTTP handlers ────────────────────────────────────────────────────────
 
@@ -50,7 +165,8 @@ pub(crate) async fn transcriptions(
         .await;
     }
 
-    run_offline_transcription(runtime, headers, auth, distribution, multipart, None).await
+    run_offline_transcription_with_attempt(runtime, headers, auth, distribution, multipart, None)
+        .await
 }
 
 /// `POST /v1/audio/precise-timeline`: re-align word timestamps on an existing
@@ -325,7 +441,7 @@ pub(crate) async fn translations(
     Extension(distribution): Extension<DistributionContext>,
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Response, ApiError> {
-    run_offline_transcription(
+    run_offline_transcription_with_attempt(
         runtime,
         headers,
         auth,
@@ -334,6 +450,36 @@ pub(crate) async fn translations(
         Some(TranscriptionTask::Translate),
     )
     .await
+}
+
+/// Mint or accept the request identity before entering the fallible upload and
+/// native pipeline, then echo it on every terminal response. Invalid identity
+/// syntax is the sole exception because no trustworthy value exists to echo.
+async fn run_offline_transcription_with_attempt(
+    runtime: ServerRuntime,
+    headers: HeaderMap,
+    auth: ServerAuth,
+    distribution: DistributionContext,
+    multipart: Result<Multipart, MultipartRejection>,
+    task_override: Option<TranscriptionTask>,
+) -> Result<Response, ApiError> {
+    let request_attempt_id = request_attempt_from_headers(&headers)?;
+    let mut response = match run_offline_transcription(
+        runtime,
+        headers,
+        auth,
+        distribution,
+        multipart,
+        task_override,
+        request_attempt_id,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    };
+    attach_request_attempt_header(&mut response, request_attempt_id);
+    Ok(response)
 }
 
 /// Fixed denominator for the backward-compatible `done`/`total` ratio: `done /
@@ -617,11 +763,27 @@ async fn run_offline_transcription(
     distribution: DistributionContext,
     multipart: Result<Multipart, MultipartRejection>,
     task_override: Option<TranscriptionTask>,
+    request_attempt_id: openasr_core::RequestAttemptId,
 ) -> Result<Response, ApiError> {
     let home = distribution.openasr_home()?;
     let catalog = load_runtime_model_catalog(distribution.catalog_source(), &home)?;
-    let mut parsed =
-        parse_transcription_multipart(multipart, runtime.backend, catalog.as_ref()).await?;
+    let upload_ingest_started = Instant::now();
+    let parsed = parse_transcription_multipart(multipart, runtime.backend, catalog.as_ref()).await;
+    let upload_ingest_duration = upload_ingest_started.elapsed();
+    openasr_core::stage_timing::log_stage(
+        "http_transcription",
+        "upload_ingest",
+        upload_ingest_duration,
+    );
+    let mut parsed = parsed?;
+    let request_receipt = (runtime.backend == BackendKind::Native)
+        .then(openasr_core::NativeExecutionReceiptCollector::new);
+    if let Some(receipt) = request_receipt.as_ref() {
+        receipt.record_phase_duration(
+            openasr_core::RequestExecutionPhase::UploadIngest,
+            upload_ingest_duration,
+        );
+    }
     if is_remote_compute_client_request(&headers, &auth) && parsed.request.voice_id {
         return Err(ApiError::BadRequest(
             "Voice ID is available only for local file transcription; remote-compute requests must omit diarize=true."
@@ -702,14 +864,19 @@ async fn run_offline_transcription(
     // dispatch -- never a thread-local. A client that never registered a
     // transcription id still gets a concrete (uncancellable) context: there
     // is no "no context" code path below this point.
-    let execution_context = Arc::new(match &control {
+    let mut execution_context = match &control {
         Some((id, control)) => {
             openasr_core::RequestExecutionContext::new(Some(id.clone()), Arc::clone(control))
         }
         None => openasr_core::RequestExecutionContext::uncancellable(
             "client never registered a transcription id for this request, so it has no cancel source",
         ),
-    });
+    }
+    .with_request_attempt_id(request_attempt_id);
+    if let Some(receipt) = request_receipt.as_ref() {
+        execution_context = execution_context.with_native_execution_receipt(receipt.clone());
+    }
+    let execution_context = Arc::new(execution_context);
     let transcription = match transcribe_with_runtime(
         runtime,
         parsed.request,
@@ -718,6 +885,9 @@ async fn run_offline_transcription(
     .await
     {
         Ok(transcription) => {
+            if let Some(receipt) = request_receipt.as_ref() {
+                receipt.record_terminal(openasr_core::RequestExecutionTerminal::Succeeded);
+            }
             if let Some(cleanup) = control_cleanup.as_mut() {
                 cleanup.disarm();
             }
@@ -732,9 +902,15 @@ async fn run_offline_transcription(
             // consult the control to report it honestly as a 409 canceled result
             // rather than a 400 fail-closed refusal.
             if execution_context.is_canceled() {
+                if let Some(receipt) = request_receipt.as_ref() {
+                    receipt.record_terminal(openasr_core::RequestExecutionTerminal::Canceled);
+                }
                 return Err(ApiError::Backend(
                     openasr_core::BackendError::TranscriptionCanceled,
                 ));
+            }
+            if let Some(receipt) = request_receipt.as_ref() {
+                receipt.record_terminal(openasr_core::RequestExecutionTerminal::Failed);
             }
             return Err(error);
         }
@@ -774,6 +950,11 @@ async fn run_offline_transcription(
 
     let mut response_headers = HeaderMap::new();
     response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    if let Some(receipt) = request_receipt.as_ref()
+        && let Some(value) = request_server_timing_header(&receipt.snapshot())
+    {
+        response_headers.insert("server-timing", value);
+    }
     if let Some(history_id) = history_id {
         response_headers.insert(
             "x-openasr-history-id",
@@ -1385,10 +1566,9 @@ pub(crate) fn validate_native_runtime_pack(
 ) -> Result<openasr_core::NativeRuntimeModelAdapter, openasr_core::BackendError> {
     native_runtime_model_adapter_for_path(pack_root).ok_or_else(|| {
         openasr_core::BackendError::NativeFailClosed {
-            reason: format!(
-                "could not verify and select a native model adapter from runtime source '{}'",
-                pack_root.display()
-            ),
+            reason:
+                "could not verify and select a native model adapter from the selected runtime source"
+                    .to_string(),
         }
     })
 }
@@ -2003,6 +2183,7 @@ pub(crate) async fn transcribe_with_runtime(
     request: TranscriptionRequest,
     execution_context: Arc<openasr_core::RequestExecutionContext>,
 ) -> Result<openasr_core::Transcription, ApiError> {
+    let execution_receipt = execution_context.native_execution_receipt();
     match runtime.backend {
         BackendKind::Mock => {
             // The mock backend runs a single opaque decode with no slice loop, so
@@ -2037,10 +2218,7 @@ pub(crate) async fn transcribe_with_runtime(
                 })?;
                 let adapter = native_runtime_model_adapter_for_path(&model_pack_path).ok_or_else(|| {
                     ApiError::Backend(openasr_core::BackendError::NativeFailClosed {
-                        reason: format!(
-                            "could not verify and select a native model adapter from runtime source '{}'",
-                            model_pack_path.display()
-                        ),
+                        reason: "could not verify and select a native model adapter from the selected runtime source".to_string(),
                     })
                 })?;
                 validate_native_request_model(&adapter, &request.model_id)
@@ -2050,6 +2228,7 @@ pub(crate) async fn transcribe_with_runtime(
                 // runtime. Keep it outside the per-model admission window so
                 // upload preparation cannot serialize an unrelated native session
                 // for the same model.
+                let decode_normalize_started = Instant::now();
                 let prepared = prepare_audio_input(
                     &request.input_path,
                     &AudioPreparationOptions::new(runtime.backend)
@@ -2057,14 +2236,42 @@ pub(crate) async fn transcribe_with_runtime(
                         .with_ffmpeg_bin_explicit(runtime.ffmpeg_bin_explicit)
                         .with_native_non_wav_conversion(true),
                 )
-                .map_err(ApiError::AudioPreparation)?;
+                .map_err(ApiError::AudioPreparation);
+                let decode_normalize_duration = decode_normalize_started.elapsed();
+                openasr_core::stage_timing::log_stage(
+                    "http_transcription",
+                    "decode_normalize",
+                    decode_normalize_duration,
+                );
+                if let Some(receipt) = execution_receipt.as_ref() {
+                    receipt.record_phase_duration(
+                        openasr_core::RequestExecutionPhase::DecodeNormalize,
+                        decode_normalize_duration,
+                    );
+                }
+                let prepared = prepared?;
                 let resolved_route = resolve_execution_route_for_target(request.execution_target)
                     .map_err(ApiError::Backend)?;
                 let model_session_key = native_model_session_key(&adapter)?;
+                let admission_wait_started = Instant::now();
                 crate::realtime::wait_while_native_warmup_in_flight_blocking();
                 let model_session_permit = runtime
-                    .acquire_native_execution(&model_session_key, resolved_route.as_ref())?;
-                run_admitted_native_transcription(model_session_permit, move || {
+                    .acquire_native_execution(&model_session_key, resolved_route.as_ref());
+                let admission_wait_duration = admission_wait_started.elapsed();
+                openasr_core::stage_timing::log_stage(
+                    "http_transcription",
+                    "admission_wait",
+                    admission_wait_duration,
+                );
+                if let Some(receipt) = execution_receipt.as_ref() {
+                    receipt.record_phase_duration(
+                        openasr_core::RequestExecutionPhase::AdmissionWait,
+                        admission_wait_duration,
+                    );
+                }
+                let model_session_permit = model_session_permit?;
+                let compute_started = Instant::now();
+                let compute_result = run_admitted_native_transcription(model_session_permit, move || {
                     // Marks this offline (file-transcription / realtime-per-utterance
                     // backend-job) decode as active for the whole synchronous run, so
                     // the idle_unload reaper never evicts the model runtime cache out
@@ -2147,8 +2354,20 @@ pub(crate) async fn transcribe_with_runtime(
                     }
                     drop(prepared);
                     Ok::<_, TranscriptionRuntimeError>(transcription)
-                })
-                .map_err(ApiError::from)
+                });
+                let compute_duration = compute_started.elapsed();
+                openasr_core::stage_timing::log_stage(
+                    "http_transcription",
+                    "compute",
+                    compute_duration,
+                );
+                if let Some(receipt) = execution_receipt.as_ref() {
+                    receipt.record_phase_duration(
+                        openasr_core::RequestExecutionPhase::Compute,
+                        compute_duration,
+                    );
+                }
+                compute_result.map_err(ApiError::from)
             })
             .await
             .map_err(ApiError::BackendJoin)?
@@ -2278,20 +2497,19 @@ fn check_temp_dir_headroom(temp_dir: Option<&Path>) -> Result<(), ApiError> {
     let Some(dir) = temp_dir else {
         return Ok(());
     };
-    check_disk_headroom_bytes(openasr_core::available_disk_space_bytes(dir), dir)
+    check_disk_headroom_bytes(openasr_core::available_disk_space_bytes(dir))
 }
 
 /// Pure decision function split out from `check_temp_dir_headroom` so the
 /// insufficient-space branch can be unit tested by injecting an `available_bytes`
 /// value directly, without needing to actually fill a disk.
-fn check_disk_headroom_bytes(available_bytes: Option<u64>, dir: &Path) -> Result<(), ApiError> {
+fn check_disk_headroom_bytes(available_bytes: Option<u64>) -> Result<(), ApiError> {
     match available_bytes {
         Some(available) if available < MIN_FREE_DISK_HEADROOM_BYTES => {
             Err(ApiError::InsufficientDiskSpace(format!(
-                "Not enough free disk space to receive this upload: {} MB free in '{}', \
+                "Not enough free disk space to receive this upload: {} MB free on the upload temporary volume, \
                  need at least {} MB headroom. Free up space on that volume and retry.",
                 available / (1024 * 1024),
-                dir.display(),
                 MIN_FREE_DISK_HEADROOM_BYTES / (1024 * 1024),
             )))
         }
@@ -2604,13 +2822,12 @@ mod native_runtime_tests {
 
     #[test]
     fn disk_headroom_check_fails_closed_when_available_space_is_below_the_floor() {
-        let dir = std::path::Path::new("/tmp/openasr-upload-test");
-        let error = check_disk_headroom_bytes(Some(1024), dir).unwrap_err();
+        let error = check_disk_headroom_bytes(Some(1024)).unwrap_err();
 
         match error {
             super::ApiError::InsufficientDiskSpace(message) => {
                 assert!(message.contains("Not enough free disk space"), "{message}");
-                assert!(message.contains("/tmp/openasr-upload-test"), "{message}");
+                assert!(!message.contains("/tmp/openasr-upload-test"), "{message}");
             }
             other => panic!("expected InsufficientDiskSpace, got {other:?}"),
         }
@@ -2618,16 +2835,14 @@ mod native_runtime_tests {
 
     #[test]
     fn disk_headroom_check_passes_when_available_space_is_ample() {
-        let dir = std::path::Path::new("/tmp/openasr-upload-test");
-        assert!(check_disk_headroom_bytes(Some(64 * 1024 * 1024 * 1024), dir).is_ok());
+        assert!(check_disk_headroom_bytes(Some(64 * 1024 * 1024 * 1024)).is_ok());
     }
 
     #[test]
     fn disk_headroom_check_stays_permissive_when_probe_is_unsupported() {
         // `None` means the platform/probe couldn't tell -- must not block
         // uploads on that basis, matching pull.rs's `ensure_available_space`.
-        let dir = std::path::Path::new("/tmp/openasr-upload-test");
-        assert!(check_disk_headroom_bytes(None, dir).is_ok());
+        assert!(check_disk_headroom_bytes(None).is_ok());
     }
 
     async fn response_json_body(response: Response) -> serde_json::Value {

@@ -21,8 +21,9 @@ receipt may carry an optional, versioned `evidence` object with schema
 receipt without this object is explicitly not GPU token-correctness evidence.
 The extension is privacy-safe and bounded: provider, opaque stable device
 label, and placement are short labels; artifact bindings are labels, SHA-256
-hashes, and optional sizes; no raw audio, weights, secrets, or unnecessary
-local paths are recorded.
+hashes, and optional sizes. New writers never retain raw audio/model/output
+paths or `OPENASR_HOME`. Historical v0 documents containing a path remain
+readable, but those legacy values are not valid new qualification output.
 
 The evidence object has one disjoint `evidence_class`:
 
@@ -61,14 +62,14 @@ wrong-artifact, placement-only, CPU-only, or partial matrices.
 | `pack.content_sha256` | yes | Lowercase hex sha256 of the exact pack bytes (no `sha256:` prefix). |
 | `pack.size_bytes` | yes | Pack byte length. |
 | `pack.quant` | yes | Quant id (for example `q4_k`). |
-| `audio.path_or_label` | yes | Path or stable label of the short clip. |
+| `audio.path_or_label` | yes | New writers emit `audio-sha256:<digest>` or another stable label, never a local path. Raw paths are legacy-read-only. |
 | `audio.sha256` | yes | Lowercase hex sha256 of the audio file bytes. |
 | `audio.duration_s` | no | Duration in seconds when known. |
 | `run.backend` | yes | `native` or `mock`. |
 | `run.device` | yes | Requested device label (`cpu`, `metal`, `cuda`, `auto`, ...). |
 | `run.os` | yes | `darwin`, `linux`, or `windows`. |
-| `run.command` | yes | Effective argv vector for the receipt command. |
-| `run.env_allowlist` | no | Small allowlisted env snapshot (`OPENASR_HOME`, ...). Never a full env dump. |
+| `run.command` | yes | Privacy-safe semantic argv projection. Ingress/output/model-pack paths are replaced by byte-bound or typed labels; it is not a shell replay script. |
+| `run.env_allowlist` | no | Small non-path allowlisted env snapshot. `OPENASR_HOME` is forbidden. Never a full env dump. |
 | `run.warmup` | yes | `cold` or `warm`. |
 | `run.cache_state` | yes | `empty` or `populated`. |
 | `metrics.rtf_samples` | no | Wall-clock RTF samples; may be empty. |
@@ -85,8 +86,9 @@ wrong-artifact, placement-only, CPU-only, or partial matrices.
 | `placement` | yes | Legacy/requested placement label retained for v0 compatibility. It is not proof of where graph compute ran. |
 | `observed_placement` | no | Actual graph-node placement observed during compute: total/compute-node counts by backend, graph compute count, output bytes, and bounded fallback samples. Native Metal acceptance requires selected-device compute and rejects disallowed CPU/alternate-accelerator compute according to the execution placement. |
 | `evidence` | no | Versioned, class-separated build/placement/token evidence nested in this same v0 receipt. Omission is never GPU token approval. This is not a third top-level JSON or policy channel. |
+| `execution` | no | Additive projection of the existing request/runtime receipts: request and candidate attempts, safe exact lanes/domains, live lease reconciliation, independent live/event completeness, four-phase timings, and typed terminal. No new journal/schema authority is created. |
 | `decode_diagnostics` | yes | Fail-closed projection of the runtime `GgmlDecodeOutputPlan` and reuse mode, including the unique `full_logits` fallback when compact selection is unproven. Dual-output agreement here is not compact-path authorization. |
-| `scope` | yes | Default `short-audio-gate`. |
+| `scope` | yes | Default `short-audio-gate`. Hardware runners may append exactly one `/<32-lower-hex nonce>` segment; absolute, UNC, drive and traversal paths are invalid. |
 | `notes` | no | Free-form annotations. |
 
 ## Emitter
@@ -117,6 +119,10 @@ The command is an **explicit tooling surface**. It does not change the default
 
 - Fail closed on schema mismatch, empty required strings, non-40-hex
   `core_commit`, or non-64-lowercase-hex digests.
+- Core structural loading remains legacy-compatible, but new construction,
+  `to_pretty_json`, and qualification validation enforce the privacy-safe
+  audio/command/environment/scope projection. Loading an old path-bearing v0
+  document never authorizes rewriting it as new evidence.
 - `transcript.text_sha256` must match `sha256(text UTF-8 bytes)`.
 - `rtf_median` may be absent when `rtf_samples` is empty; when present it must
   match the median of the samples.
@@ -138,6 +144,16 @@ The command is an **explicit tooling surface**. It does not change the default
   populated from runtime telemetry and the emitter fails closed if observed
   compute violates the resolved FullDevice/Hybrid placement. Older v0 receipts
   remain readable because the evidence field is optional.
+- `execution.live_state_complete` and `execution.event_history_complete` are
+  independent. `event-capacity-exceeded` does not negate a `matched` live
+  owner/broker reconciliation, but it makes the receipt ineligible for every
+  evidence class that requires complete event history. A qualification gate
+  must call the strict qualification-eligibility validator and never
+  reinterpret dropped history as success.
+- The request attempt is distinct from the pause/cancel `transcription_id` and
+  candidate/cache attempt. Warmup and measured passes receive fresh request
+  attempts; they are not reused merely because the process or runtime cache is
+  warm.
 
 ## Relationship to pack preflight
 

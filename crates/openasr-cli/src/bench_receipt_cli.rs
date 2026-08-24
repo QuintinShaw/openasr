@@ -17,8 +17,9 @@ use anyhow::{Context, Result, bail};
 use openasr_core::{
     BackendKind, ExecutionTarget, GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector,
     InstalledPack, NativeExecutionReceiptCollector, NativeExecutionReceiptSnapshot,
-    NativeExecutionServices, ResolvedOutputTarget, SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK,
-    SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioReceipt, ShortAudioReceiptAudio,
+    NativeExecutionServices, RequestAttemptId, RequestExecutionTerminal, ResolvedOutputTarget,
+    SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK, SHORT_AUDIO_RECEIPT_SCHEMA,
+    ShortAudioExecutionProjection, ShortAudioReceipt, ShortAudioReceiptAudio,
     ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptMetrics, ShortAudioReceiptPack,
     ShortAudioReceiptRun, ShortAudioReceiptTranscript, TranscriptionRequest, atomic_write_text,
     ggml_runtime::{
@@ -57,6 +58,11 @@ pub(crate) fn bench_receipt_short_audio(
 ) -> Result<()> {
     if options.runs == 0 {
         bail!("--runs must be >= 1");
+    }
+    if !privacy_safe_scope_label(options.scope) {
+        bail!(
+            "--scope must be a privacy-safe semantic label, optionally followed by one '/<32-lower-hex-nonce>' runner suffix"
+        );
     }
     if !options.audio.is_file() {
         bail!(
@@ -145,8 +151,7 @@ pub(crate) fn bench_receipt_short_audio(
     // Native receipts must project decode_diagnostics from the runtime that
     // actually ran. Reconstructing output_plan/reuse_mode from --device or
     // --warmup-runs is forbidden.
-    let request_receipt =
-        (options.backend_kind == BackendKind::Native).then(NativeExecutionReceiptCollector::new);
+    let mut last_request_receipt = None;
     let mut rtf_samples = Vec::with_capacity(options.runs);
     let mut last_text = String::new();
     let mut last_truncated = Vec::new();
@@ -168,6 +173,14 @@ pub(crate) fn bench_receipt_short_audio(
 
     for pass in 0..total_passes {
         let is_warmup = pass < options.warmup_runs;
+        let pass_receipt = if options.backend_kind == BackendKind::Native {
+            let attempt_id = RequestAttemptId::generate()
+                .map_err(|_| anyhow::anyhow!("could not allocate request attempt identity"))?;
+            let receipt = NativeExecutionReceiptCollector::new();
+            Some((attempt_id, receipt))
+        } else {
+            None
+        };
         let mut request = TranscriptionRequest::new(
             prepared_audio.path(),
             prepared_run.model_source.model_id.clone(),
@@ -184,11 +197,12 @@ pub(crate) fn bench_receipt_short_audio(
                 .and_then(|name| name.to_str())
                 .map(str::to_string),
         );
-        if let Some(receipt) = &request_receipt {
+        if let Some((attempt_id, receipt)) = &pass_receipt {
             request = request.with_execution_context(Arc::new(
                 openasr_core::RequestExecutionContext::uncancellable(
                     "short-audio receipt command has no cancel surface",
                 )
+                .with_request_attempt_id(*attempt_id)
                 .with_native_execution_receipt(receipt.clone()),
             ));
         }
@@ -207,6 +221,10 @@ pub(crate) fn bench_receipt_short_audio(
             )
         })?;
         let elapsed = started.elapsed();
+        if let Some((_, receipt)) = &pass_receipt {
+            receipt.record_terminal(RequestExecutionTerminal::Succeeded);
+            last_request_receipt = Some(receipt.clone());
+        }
         if options.trace_out.is_some()
             && transcription
                 .longform
@@ -247,15 +265,16 @@ pub(crate) fn bench_receipt_short_audio(
         "empty"
     };
 
-    let command = build_command_argv(&options, &pack_binding, &device_label);
-    let env_allowlist = capture_env_allowlist();
+    let audio_label = receipt_audio_label(&audio_sha256);
+    let command = build_command_argv(&options, &pack_binding, &device_label, &audio_label);
+    let env_allowlist = capture_env_allowlist(&core_commit);
 
     let memory_after_model = process_memory_snapshot();
     let observed_placement = execution_telemetry.snapshot();
     if options.backend_kind == BackendKind::Native {
         validate_observed_accelerator_placement(&device_label, &observed_placement)?;
     }
-    let native_snapshot = request_receipt
+    let native_snapshot = last_request_receipt
         .as_ref()
         .map(NativeExecutionReceiptCollector::snapshot);
     let decode_diagnostics = project_decode_diagnostics(
@@ -311,6 +330,17 @@ pub(crate) fn bench_receipt_short_audio(
     // bindings. Strict trace publication above remains the only
     // approval-producing path.
     let receipt_evidence = None;
+    let execution = native_snapshot.as_ref().map(|request_snapshot| {
+        let runtime_snapshot = native_execution_services.runtime_receipts().snapshot();
+        let reconciliation = native_execution_services
+            .runtime_receipts()
+            .reconcile_live_leases_quiescent(native_execution_services.memory_broker());
+        ShortAudioExecutionProjection::from_receipts(
+            request_snapshot,
+            &runtime_snapshot,
+            &reconciliation,
+        )
+    });
     let receipt = ShortAudioReceipt::try_new(ShortAudioReceipt {
         schema: SHORT_AUDIO_RECEIPT_SCHEMA.to_string(),
         core_commit,
@@ -321,7 +351,7 @@ pub(crate) fn bench_receipt_short_audio(
             quant: pack_binding.quant,
         },
         audio: ShortAudioReceiptAudio {
-            path_or_label: options.audio.display().to_string(),
+            path_or_label: audio_label,
             sha256: audio_sha256,
             duration_s: audio_duration_s,
         },
@@ -354,6 +384,7 @@ pub(crate) fn bench_receipt_short_audio(
         placement: device_label,
         observed_placement: (!observed_placement.is_empty()).then_some(observed_placement),
         evidence: receipt_evidence,
+        execution,
         scope: options.scope.to_string(),
         notes,
         decode_diagnostics: Some(decode_diagnostics),
@@ -504,7 +535,10 @@ fn find_installed_pack<'a>(
 }
 
 fn display_model_id(model_arg: Option<&str>, resolved_model_id: &str, quant: &str) -> String {
-    if let Some(model_arg) = model_arg.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(model_arg) = model_arg
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !looks_like_local_path(value))
+    {
         if model_arg.contains(':') {
             return model_arg.to_string();
         }
@@ -518,6 +552,12 @@ fn display_model_id(model_arg: Option<&str>, resolved_model_id: &str, quant: &st
     } else {
         resolved_model_id.to_string()
     }
+}
+
+/// A receipt identifies a pack through its content digest and model identity;
+/// caller-provided path spellings are neither stable nor safe to retain.
+fn looks_like_local_path(value: &str) -> bool {
+    value.contains('/') || value.contains('\\')
 }
 
 fn quant_from_model_ref(model_arg: Option<&str>) -> Option<String> {
@@ -577,23 +617,61 @@ fn normalize_device_label(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
 
+fn privacy_safe_scope_label(value: &str) -> bool {
+    if privacy_safe_scope_segment(value) {
+        return true;
+    }
+    let mut segments = value.split('/');
+    let Some(base) = segments.next() else {
+        return false;
+    };
+    let nonce = segments.next();
+    segments.next().is_none()
+        && privacy_safe_scope_segment(base)
+        && nonce.is_some_and(|nonce| {
+            nonce.len() == 32
+                && nonce
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+fn privacy_safe_scope_segment(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 256
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'_' | b'.' | b':' | b'+' | b'@' | b'=')
+        })
+        && !(bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+}
+
+/// Returns a stable, byte-bound fixture label safe to retain in a receipt.
+/// Local file paths are ingress-only and must never become evidence payload.
+fn receipt_audio_label(audio_sha256: &str) -> String {
+    format!("audio-sha256:{audio_sha256}")
+}
+
 fn build_command_argv(
     options: &ShortAudioReceiptOptions<'_>,
     pack: &PackBinding,
     device_label: &str,
+    audio_label: &str,
 ) -> Vec<String> {
     let mut command = vec![
         "openasr".to_string(),
         "bench-receipt".to_string(),
         "short-audio".to_string(),
         "--audio".to_string(),
-        options.audio.display().to_string(),
+        audio_label.to_string(),
         "--backend".to_string(),
         options.backend_kind.to_string(),
         "--device".to_string(),
         device_label.to_string(),
         "--out".to_string(),
-        options.out.display().to_string(),
+        "receipt-output".to_string(),
         "--runs".to_string(),
         options.runs.to_string(),
         "--warmup-runs".to_string(),
@@ -601,42 +679,47 @@ fn build_command_argv(
         "--scope".to_string(),
         options.scope.to_string(),
     ];
-    if let Some(model) = options.model {
-        command.push("--model".to_string());
-        command.push(model.to_string());
-    } else {
-        command.push("--model".to_string());
-        command.push(pack.model_id.clone());
-    }
-    if let Some(model_pack) = options.model_pack {
+    command.push("--model".to_string());
+    command.push(pack.model_id.clone());
+    if options.model_pack.is_some() {
         command.push("--model-pack".to_string());
-        command.push(model_pack.display().to_string());
+        command.push(format!("pack-content-sha256:{}", pack.content_sha256));
     }
     if let Some(core_commit) = options.core_commit {
         command.push("--core-commit".to_string());
         command.push(core_commit.to_string());
     }
-    if let Some(trace_out) = options.trace_out {
+    if options.trace_out.is_some() {
         command.push("--trace-out".to_string());
-        command.push(trace_out.display().to_string());
+        command.push("runtime-trace-output".to_string());
     }
     command
 }
 
-fn capture_env_allowlist() -> BTreeMap<String, String> {
-    const KEYS: &[&str] = &[
-        "OPENASR_HOME",
-        "OPENASR_GGML_BACKEND",
-        "OPENASR_BUILD_COMMIT",
-        "OPENASR_OFFLINE",
-    ];
+fn capture_env_allowlist(core_commit: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    for key in KEYS {
-        if let Ok(value) = std::env::var(key)
-            && !value.is_empty()
-        {
-            out.insert((*key).to_string(), value);
+    if let Ok(value) = std::env::var("OPENASR_GGML_BACKEND") {
+        let normalized = value.trim().to_ascii_lowercase();
+        if matches!(
+            normalized.as_str(),
+            "cpu" | "metal" | "gpu" | "cuda" | "hip" | "vulkan"
+        ) {
+            out.insert("OPENASR_GGML_BACKEND".to_string(), normalized);
         }
+    }
+    if let Ok(value) = std::env::var("OPENASR_BUILD_COMMIT") {
+        let normalized = value.trim().to_ascii_lowercase();
+        if normalized == core_commit && openasr_core::validate_core_commit(&normalized).is_ok() {
+            out.insert("OPENASR_BUILD_COMMIT".to_string(), normalized);
+        }
+    }
+    if std::env::var("OPENASR_OFFLINE").ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }) {
+        out.insert("OPENASR_OFFLINE".to_string(), "true".to_string());
     }
     out
 }
@@ -805,6 +888,23 @@ mod tests {
             ExecutionTarget::Accelerated
         );
         assert!(parse_receipt_device("tpu").is_err());
+    }
+
+    #[test]
+    fn receipt_scope_accepts_the_runner_nonce_without_accepting_paths() {
+        assert!(privacy_safe_scope_label(&format!(
+            "hardware-evidence/{}",
+            "a".repeat(32)
+        )));
+        for scope in [
+            "/Users/alice",
+            "C:\\Users\\alice",
+            "\\\\server\\share",
+            "../0123456789abcdef0123456789abcdef",
+            "scope/not-a-nonce",
+        ] {
+            assert!(!privacy_safe_scope_label(scope), "{scope}");
+        }
     }
 
     fn exact_accelerated_preference(
@@ -989,7 +1089,83 @@ mod tests {
         );
         assert!(!receipt.transcript.text.is_empty());
         assert_eq!(receipt.audio.sha256.len(), 64);
+        assert_eq!(
+            receipt.audio.path_or_label,
+            receipt_audio_label(&receipt.audio.sha256)
+        );
+        assert!(
+            !raw.contains(fixture.to_string_lossy().as_ref()),
+            "receipt must not retain the caller audio path"
+        );
+        assert!(
+            !raw.contains(home.to_string_lossy().as_ref()),
+            "receipt must not retain OPENASR_HOME"
+        );
+        assert!(
+            !raw.contains(out.to_string_lossy().as_ref()),
+            "receipt command must not retain its output path"
+        );
+        assert!(
+            !receipt
+                .run
+                .command
+                .iter()
+                .any(|part| part.contains('/') || part.contains('\\')),
+            "receipt command must contain only privacy-safe argument labels"
+        );
         assert!(receipt.metrics.rtf_samples.len() <= 1);
+    }
+
+    #[test]
+    fn receipt_command_replaces_caller_paths_with_stable_bindings() {
+        let audio = PathBuf::from("/private/var/folders/example/alice/recording.wav");
+        let out = PathBuf::from("/Users/alice/Desktop/receipt.json");
+        let model_pack = PathBuf::from(r"C:\Users\alice\AppData\Local\model.oasr");
+        let trace_out = PathBuf::from("/tmp/openasr/trace.jsonl");
+        let options = ShortAudioReceiptOptions {
+            model: Some(r"C:\Users\alice\AppData\Local\model.oasr"),
+            audio: &audio,
+            backend_kind: BackendKind::Native,
+            device: "cuda",
+            model_pack: Some(&model_pack),
+            out: &out,
+            runs: 1,
+            warmup_runs: 0,
+            core_commit: Some("0123456789abcdef0123456789abcdef01234567"),
+            scope: "fixture",
+            ffmpeg_bin: None,
+            git_cwd: None,
+            trace_out: Some(&trace_out),
+        };
+        let pack = PackBinding {
+            model_id: "whisper-tiny:q4_k".to_string(),
+            content_sha256: "a".repeat(64),
+            size_bytes: 1,
+            quant: "q4_k".to_string(),
+        };
+        let audio_label = receipt_audio_label(&"b".repeat(64));
+        let command = build_command_argv(&options, &pack, "cuda", &audio_label);
+        let command_text = command.join("\u{0}");
+
+        assert!(command.contains(&audio_label));
+        assert!(command.contains(&"receipt-output".to_string()));
+        assert!(command.contains(&"runtime-trace-output".to_string()));
+        for forbidden in [
+            "/private/var",
+            "/Users/alice",
+            r"C:\Users\alice",
+            "/tmp/openasr",
+        ] {
+            assert!(
+                !command_text.contains(forbidden),
+                "receipt command leaked caller path fragment {forbidden}"
+            );
+        }
+        assert!(
+            command
+                .iter()
+                .any(|part| { part == &format!("pack-content-sha256:{}", pack.content_sha256) })
+        );
     }
 
     #[test]
@@ -1131,6 +1307,22 @@ mod tests {
         );
         assert_eq!(
             display_model_id(Some("funasr-nano"), "funasr-nano", "q4_k"),
+            "funasr-nano:q4_k"
+        );
+        assert_eq!(
+            display_model_id(
+                Some("/Users/alice/.openasr/models/funasr-nano.oasr"),
+                "funasr-nano",
+                "q4_k"
+            ),
+            "funasr-nano:q4_k"
+        );
+        assert_eq!(
+            display_model_id(
+                Some(r"C:\Users\alice\AppData\Local\funasr-nano.oasr"),
+                "funasr-nano",
+                "q4_k"
+            ),
             "funasr-nano:q4_k"
         );
     }

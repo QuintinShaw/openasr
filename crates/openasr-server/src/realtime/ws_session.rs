@@ -1024,10 +1024,7 @@ impl WsSession {
         let Some(adapter) = native_runtime_model_adapter_for_path(&model_pack_path) else {
             self.emit_error(
                 RealtimeErrorCode::StartupConfigError,
-                &format!(
-                    "Could not select a native streaming adapter from runtime source '{}'.",
-                    model_pack_path.display()
-                ),
+                "Could not select a native streaming adapter from the selected runtime source.",
                 false,
             )
             .await?;

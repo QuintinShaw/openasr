@@ -33,7 +33,7 @@ use super::native_execution_services::{
     current_native_execution_memory_broker, current_native_execution_scope_id,
     current_runtime_receipts, record_current_execution_candidate_failure,
 };
-use super::runtime_receipts::{RuntimeOwnerGuard, RuntimeResourceGuard};
+use super::runtime_receipts::{RuntimeOwnerGuard, RuntimeOwnerPlacement, RuntimeResourceGuard};
 
 /// Checked accumulator for post-build engine-requested Rust heap capacity.
 /// `Vec` storage is measured from container capacity and `size_of::<T>()`, never
@@ -295,20 +295,30 @@ impl<T> SystemMemoryOwner<T> {
         let wait_deadline = Instant::now() + Duration::from_secs(30);
         let mut retry_delay = Duration::from_millis(1);
         let mut snapshot_before = snapshot_before;
+        let owner_scope_id = current_native_execution_scope_id();
+        let owner_placement = if owner_scope_id.is_some() {
+            RuntimeOwnerPlacement::HostNeutral
+        } else {
+            RuntimeOwnerPlacement::Unknown
+        };
         let mut reservation = loop {
-            match broker.try_reserve_batch(vec![DomainReservationRequest {
-                domain: MemoryDomainKey::SystemMemory,
-                snapshot: snapshot_before,
-                peak_bytes: quoted_peak_bytes,
-                retained_bytes: quoted_retained_bytes,
-                observed_peak_bytes: None,
-                // Rust allocator capacity is measured only after construction;
-                // the provisional/exclusive path is what makes reconciliation
-                // safe even when `reserve_exact` rounds upward.
-                requires_reconciliation: true,
-                resource_id: resource_id.clone(),
-                cohort_id: reservation_cohort,
-            }]) {
+            match broker.try_reserve_batch_for_scope_and_placement(
+                vec![DomainReservationRequest {
+                    domain: MemoryDomainKey::SystemMemory,
+                    snapshot: snapshot_before,
+                    peak_bytes: quoted_peak_bytes,
+                    retained_bytes: quoted_retained_bytes,
+                    observed_peak_bytes: None,
+                    // Rust allocator capacity is measured only after construction;
+                    // the provisional/exclusive path is what makes reconciliation
+                    // safe even when `reserve_exact` rounds upward.
+                    requires_reconciliation: true,
+                    resource_id: resource_id.clone(),
+                    cohort_id: reservation_cohort,
+                }],
+                owner_scope_id,
+                owner_placement,
+            ) {
                 Ok(reservation) => break reservation,
                 Err(crate::device::execution_memory::MemoryPlanningError::DeviceDomainBusy {
                     ..

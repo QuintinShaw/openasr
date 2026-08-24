@@ -75,6 +75,16 @@ pub enum ExecutionPlacement {
     Hybrid,
 }
 
+impl ExecutionPlacement {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CpuOnly => "cpu-only",
+            Self::FullDevice => "full-device",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
+
 /// Accelerated placement shapes supported by one provider implementation.
 ///
 /// This is deliberately distinct from [`ExecutionCapabilities`]: two ggml

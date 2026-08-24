@@ -4906,6 +4906,83 @@ async fn transcriptions_mock_backend_formats_match_core_renderers() {
 }
 
 #[tokio::test]
+async fn transcription_echoes_the_exact_request_attempt_without_reusing_control_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+    let attempt = "00112233445566778899aabbccddeeff";
+    let mut request = multipart_request_with_options(
+        "/v1/audio/transcriptions",
+        "whisper-large-v3-turbo",
+        "sample.wav",
+        b"not a real wav",
+        false,
+        Some(ResponseFormat::Json.as_str()),
+    );
+    request.headers_mut().insert(
+        "x-openasr-request-attempt",
+        axum::http::HeaderValue::from_static(attempt),
+    );
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-openasr-request-attempt")
+            .and_then(|value| value.to_str().ok()),
+        Some(attempt)
+    );
+}
+
+#[tokio::test]
+async fn transcription_failures_echo_explicit_and_server_minted_request_attempts() {
+    let app = openasr_server::app();
+    let explicit = "ffeeddccbbaa99887766554433221100";
+    let mut explicit_request = multipart_request_with_extra_fields(
+        "/v1/audio/transcriptions",
+        "whisper-large-v3-turbo",
+        "sample.wav",
+        b"not a real wav",
+        &[("hotword", "unsupported")],
+    );
+    explicit_request.headers_mut().insert(
+        "x-openasr-request-attempt",
+        axum::http::HeaderValue::from_static(explicit),
+    );
+    let explicit_response = app.clone().oneshot(explicit_request).await.unwrap();
+    assert_eq!(explicit_response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        explicit_response
+            .headers()
+            .get("x-openasr-request-attempt")
+            .and_then(|value| value.to_str().ok()),
+        Some(explicit)
+    );
+
+    let minted_request = multipart_request_with_extra_fields(
+        "/v1/audio/transcriptions",
+        "whisper-large-v3-turbo",
+        "sample.wav",
+        b"not a real wav",
+        &[("hotword", "unsupported")],
+    );
+    let minted_response = app.oneshot(minted_request).await.unwrap();
+    assert_eq!(minted_response.status(), StatusCode::BAD_REQUEST);
+    let minted = minted_response
+        .headers()
+        .get("x-openasr-request-attempt")
+        .and_then(|value| value.to_str().ok())
+        .expect("server-minted attempt header");
+    assert!(openasr_core::RequestAttemptId::parse(minted).is_ok());
+}
+
+#[tokio::test]
 async fn transcriptions_reject_hotword_fields_for_current_backends_fail_closed() {
     let request = multipart_request_with_extra_fields(
         "/v1/audio/transcriptions",

@@ -526,6 +526,7 @@ pub struct NativeAsrSessionContext {
     pub session_id: RealtimeSessionId,
     pub trace_id: Option<String>,
     pub request_id: Option<String>,
+    request_attempt_id: Option<crate::RequestAttemptId>,
     native_execution_receipt: Option<crate::NativeExecutionReceiptCollector>,
     activation_reservation_context: Option<crate::ActivationReservationContext>,
 }
@@ -536,6 +537,7 @@ impl NativeAsrSessionContext {
             session_id: RealtimeSessionId(session_id.into()),
             trace_id: None,
             request_id: None,
+            request_attempt_id: None,
             native_execution_receipt: None,
             activation_reservation_context: None,
         }
@@ -546,6 +548,7 @@ impl NativeAsrSessionContext {
             session_id,
             trace_id: None,
             request_id: None,
+            request_attempt_id: None,
             native_execution_receipt: None,
             activation_reservation_context: None,
         }
@@ -561,12 +564,27 @@ impl NativeAsrSessionContext {
         self
     }
 
+    pub fn with_request_attempt_id(mut self, attempt_id: crate::RequestAttemptId) -> Self {
+        self.request_attempt_id = Some(attempt_id);
+        if let Some(receipt) = self.native_execution_receipt.as_ref() {
+            receipt.bind_request_attempt(attempt_id);
+        }
+        self
+    }
+
+    pub fn request_attempt_id(&self) -> Option<crate::RequestAttemptId> {
+        self.request_attempt_id
+    }
+
     /// Attach the explicit request-local receipt authority used by strict
     /// warm-up and activation evidence. Ordinary sessions leave this absent.
     pub fn with_native_execution_receipt(
         mut self,
         receipt: crate::NativeExecutionReceiptCollector,
     ) -> Self {
+        if let Some(attempt_id) = self.request_attempt_id {
+            receipt.bind_request_attempt(attempt_id);
+        }
         self.native_execution_receipt = Some(receipt);
         self
     }

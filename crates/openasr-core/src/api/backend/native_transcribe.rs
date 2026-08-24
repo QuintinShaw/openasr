@@ -2206,16 +2206,23 @@ fn run_native_transcription_impl(
     progress.report_fraction(1.0);
     progress.complete_stage();
     progress.enter_stage_indeterminate(TranscriptionStage::Prepare);
-    let audio_prep_started = Instant::now();
+    let prepared_sample_attach_started = Instant::now();
     let prepared_audio = resolve_prepared_audio_samples(&request.input_path, prepared_samples)
         .map_err(|error| BackendError::NativeUnsupportedInputFormat {
             reason: error.to_string(),
         })?;
+    let prepared_sample_attach_duration = prepared_sample_attach_started.elapsed();
     crate::stage_timing::log_stage(
         "native_transcribe",
-        "audio_prep",
-        audio_prep_started.elapsed(),
+        "prepared_sample_attach",
+        prepared_sample_attach_duration,
     );
+    if let Some(receipt) = execution_context.native_execution_receipt() {
+        receipt.record_phase_duration(
+            crate::RequestExecutionPhase::PreparedSampleAttach,
+            prepared_sample_attach_duration,
+        );
+    }
     progress.report_fraction(1.0);
     progress.complete_stage();
     // Empty-but-valid PCM must reach the ASR family's established empty-input

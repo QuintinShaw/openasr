@@ -2944,6 +2944,7 @@ pub(crate) enum ApiError {
     Home(OpenAsrHomeError),
     History(DaemonHistoryStoreError),
     JobStore(String),
+    RequestAttemptIdentity(String),
     MultipartRejection(MultipartRejection),
     Multipart(axum::extract::multipart::MultipartError),
     AudioPreparation(AudioPreparationError),
@@ -3004,7 +3005,7 @@ impl std::fmt::Display for ApiError {
             Self::Config(error) => write!(f, "Could not read or update OpenASR config: {error}"),
             Self::Home(error) => write!(f, "Could not resolve OpenASR home: {error}"),
             Self::History(error) => write!(f, "Could not update transcription history: {error}"),
-            Self::JobStore(message) => f.write_str(message),
+            Self::JobStore(message) | Self::RequestAttemptIdentity(message) => f.write_str(message),
             Self::MultipartRejection(error) => write!(f, "Could not read multipart form: {error}"),
             Self::Multipart(error) => write!(f, "{}", multipart_error_message(error)),
             Self::AudioPreparation(error) => {
@@ -3083,7 +3084,9 @@ impl IntoResponse for ApiError {
                     format!("Could not update transcription history: {error}"),
                 )
             }
-            Self::JobStore(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
+            Self::JobStore(message) | Self::RequestAttemptIdentity(message) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, message)
+            }
             Self::MultipartRejection(error) => (
                 StatusCode::BAD_REQUEST,
                 format!("Could not read multipart form: {error}"),

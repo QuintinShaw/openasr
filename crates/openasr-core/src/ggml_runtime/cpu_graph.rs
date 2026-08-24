@@ -676,6 +676,14 @@ pub enum AutoGpuPolicy {
 }
 
 impl GgmlCpuGraphBackend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Metal => "metal",
+            Self::Gpu => "gpu",
+        }
+    }
+
     /// GPU-class backends (Metal and the generic discrete-GPU lane:
     /// HIP/CUDA/Vulkan), as opposed to the CPU backend.
     ///

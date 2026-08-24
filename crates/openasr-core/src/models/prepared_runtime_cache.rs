@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::Instant;
@@ -385,22 +384,6 @@ fn required_quote_tensor<'a>(
     })
 }
 
-/// Best-effort human-readable panic message for logging. `std::panic` payloads
-/// are `Box<dyn Any + Send>`; the standard library's own default panic hook
-/// only special-cases `&str` and `String`, so that is what is worth matching
-/// here too -- anything else (a custom payload type) just gets a placeholder,
-/// which is fine since this is diagnostic-only and never part of the typed
-/// error returned to callers.
-fn describe_panic_payload(payload: &(dyn Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "<non-string panic payload>".to_string()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedRuntimeCache<T: HostNeutralPreparedRuntime> {
     admitted_by_content_id: AdmittedHostObjectCache<String, T>,
@@ -470,7 +453,6 @@ impl<T: HostNeutralPreparedRuntime> PreparedRuntimeCache<T> {
             // one-shot uncached build so a transient unreadable path does not
             // wedge the request path behind a permanent "unreadable" slot.
             return Self::build_once_uncached(
-                runtime_source.path(),
                 quote_context,
                 pack_content_id,
                 build,
@@ -508,7 +490,7 @@ impl<T: HostNeutralPreparedRuntime> PreparedRuntimeCache<T> {
             },
             |quote| {
                 Self::allocate_once(
-                    runtime_source.path(),
+                    &pack_content_id,
                     quote,
                     build,
                     &map_poisoned_lock,
@@ -521,7 +503,6 @@ impl<T: HostNeutralPreparedRuntime> PreparedRuntimeCache<T> {
     }
 
     fn build_once_uncached<E, F, M, C>(
-        runtime_path: &std::path::Path,
         quote_context: PreparedRuntimeQuoteContext<'_>,
         pack_content_id: &str,
         build: F,
@@ -536,7 +517,7 @@ impl<T: HostNeutralPreparedRuntime> PreparedRuntimeCache<T> {
         let quote =
             T::system_memory_quote(quote_context, pack_content_id).map_err(&map_capacity_error)?;
         Self::allocate_once(
-            runtime_path,
+            pack_content_id,
             quote,
             build,
             &map_poisoned_lock,
@@ -546,7 +527,7 @@ impl<T: HostNeutralPreparedRuntime> PreparedRuntimeCache<T> {
     }
 
     fn allocate_once<E, F, M, C>(
-        runtime_path: &std::path::Path,
+        pack_content_id: &str,
         quote: SystemMemoryAllocationQuote,
         build: F,
         map_poisoned_lock: &M,
@@ -596,8 +577,8 @@ impl<T: HostNeutralPreparedRuntime> PreparedRuntimeCache<T> {
                 stage_timing::log_event(
                     "model_pack_load",
                     format_args!(
-                        "path={} duration_ms={:.3} admitted_requested_bytes={}{}",
-                        runtime_path.display(),
+                        "pack_content_id={} duration_ms={:.3} admitted_requested_bytes={}{}",
+                        pack_content_id,
                         load_started.elapsed().as_secs_f64() * 1000.0,
                         prepared.committed_requested_bytes(),
                         log_suffix,
@@ -606,13 +587,18 @@ impl<T: HostNeutralPreparedRuntime> PreparedRuntimeCache<T> {
                 Ok(prepared)
             }
             Err(panic_payload) => {
+                let payload_kind = if panic_payload.is::<&str>() || panic_payload.is::<String>() {
+                    "string"
+                } else {
+                    "non-string"
+                };
                 stage_timing::log_event(
                     "model_pack_load_panicked",
                     format_args!(
-                        "path={} duration_ms={:.3} message={}{}",
-                        runtime_path.display(),
+                        "pack_content_id={} duration_ms={:.3} panic_payload={}{}",
+                        pack_content_id,
                         load_started.elapsed().as_secs_f64() * 1000.0,
-                        describe_panic_payload(panic_payload.as_ref()),
+                        payload_kind,
                         log_suffix,
                     ),
                 );

@@ -14,6 +14,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::RequestAttemptId;
 use crate::device::execution_memory::{
     DeviceMemoryBrokerSet, MemoryDomainKey, MemoryObservationConfidence, QuoteConfidence,
 };
@@ -21,7 +22,10 @@ use crate::device::execution_policy::ExecutionPlacement;
 use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::GgmlCpuGraphBackend;
 
-use super::native_execution_services::{ExecutionCacheAttemptId, NativeExecutionScopeId};
+use super::native_execution_services::{
+    ExecutionCacheAttemptId, NativeExecutionScopeId, current_execution_cache_attempt_id,
+    current_request_attempt_id,
+};
 
 /// Schema marker for the phase-0 in-process ownership evidence.
 pub const RUNTIME_RECEIPT_SCHEMA: &str = "openasr.runtime-ownership-receipt.v1";
@@ -34,6 +38,15 @@ const MAX_RESOURCES_PER_OWNER: usize = 256;
 pub enum RuntimeReceiptUnavailableReason {
     EntropyUnavailable,
     IdentityExhausted,
+}
+
+impl RuntimeReceiptUnavailableReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EntropyUnavailable => "entropy-unavailable",
+            Self::IdentityExhausted => "identity-exhausted",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -110,6 +123,20 @@ pub enum ReceiptCompletenessReason {
     InvalidLifecycle,
 }
 
+impl ReceiptCompletenessReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable(reason) => reason.as_str(),
+            Self::IdentityExhausted => "identity-exhausted",
+            Self::EventCapacityExceeded => "event-capacity-exceeded",
+            Self::OwnerCapacityExceeded => "owner-capacity-exceeded",
+            Self::ResourceCapacityExceeded => "resource-capacity-exceeded",
+            Self::NotificationCapacityExceeded => "notification-capacity-exceeded",
+            Self::InvalidLifecycle => "invalid-lifecycle",
+        }
+    }
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RuntimeReceiptError {
     #[error("runtime receipt event capacity {requested} exceeds maximum {maximum}")]
@@ -159,7 +186,7 @@ pub struct SafeExecutionLaneProjection {
     pub device: RedactedIdentity,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(tag = "kind", content = "lane", rename_all = "kebab-case")]
 pub enum RuntimeOwnerPlacement {
     HostNeutral,
@@ -205,6 +232,9 @@ pub struct RuntimeOwnerDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeResourceDescriptor {
     pub kind: RedactedIdentity,
+    /// Diagnostic attribution captured on the owner/resource relationship.
+    /// Broker admission never reads this field.
+    pub placement: RuntimeOwnerPlacement,
     pub domain: Option<SafeMemoryDomainProjection>,
     pub ledger_binding: RuntimeResourceLedgerBinding,
     pub requested: RuntimeReceiptMetric,
@@ -221,29 +251,38 @@ pub enum RuntimeReceiptEvent {
         owner_id: RuntimeOwnerId,
         descriptor: RuntimeOwnerDescriptor,
         attempt_id: Option<ExecutionCacheAttemptId>,
+        request_attempt_id: Option<RequestAttemptId>,
     },
     OwnerReused {
         owner_id: RuntimeOwnerId,
         attempt_id: Option<ExecutionCacheAttemptId>,
+        request_attempt_id: Option<RequestAttemptId>,
     },
     OwnerReleased {
         owner_id: RuntimeOwnerId,
         attempt_id: Option<ExecutionCacheAttemptId>,
+        request_attempt_id: Option<RequestAttemptId>,
     },
     ResourceAcquired {
         owner_id: RuntimeOwnerId,
         resource_id: RuntimeResourceId,
         descriptor: RuntimeResourceDescriptor,
+        attempt_id: Option<ExecutionCacheAttemptId>,
+        request_attempt_id: Option<RequestAttemptId>,
     },
     ResourceStateChanged {
         owner_id: RuntimeOwnerId,
         resource_id: RuntimeResourceId,
         state: RuntimeResourceState,
         descriptor: RuntimeResourceDescriptor,
+        attempt_id: Option<ExecutionCacheAttemptId>,
+        request_attempt_id: Option<RequestAttemptId>,
     },
     ResourceReleased {
         owner_id: RuntimeOwnerId,
         resource_id: RuntimeResourceId,
+        attempt_id: Option<ExecutionCacheAttemptId>,
+        request_attempt_id: Option<RequestAttemptId>,
     },
 }
 
@@ -490,6 +529,7 @@ impl RuntimeReceiptCollector {
         let domain = self.domain_projection(domain)?;
         Some(RuntimeResourceDescriptor {
             kind: self.digest(b"resource-kind", kind)?,
+            placement: RuntimeOwnerPlacement::Unknown,
             domain: Some(domain),
             ledger_binding: RuntimeResourceLedgerBinding::Brokered(domain),
             requested: RuntimeReceiptMetric::Known(requested_bytes),
@@ -519,6 +559,7 @@ impl RuntimeReceiptCollector {
     ) -> Option<RuntimeResourceDescriptor> {
         Some(RuntimeResourceDescriptor {
             kind: self.digest(b"resource-kind", kind)?,
+            placement: RuntimeOwnerPlacement::Unknown,
             domain: None,
             ledger_binding: RuntimeResourceLedgerBinding::Unknown,
             requested: RuntimeReceiptMetric::Unknown,
@@ -541,6 +582,7 @@ impl RuntimeReceiptCollector {
     ) -> Option<RuntimeResourceDescriptor> {
         Some(RuntimeResourceDescriptor {
             kind: self.digest(b"resource-kind", kind)?,
+            placement: RuntimeOwnerPlacement::Unknown,
             domain: None,
             ledger_binding: RuntimeResourceLedgerBinding::NoBrokerLease,
             requested: RuntimeReceiptMetric::Known(0),
@@ -674,6 +716,7 @@ impl RuntimeReceiptCollector {
         descriptor: RuntimeOwnerDescriptor,
         attempt_id: Option<ExecutionCacheAttemptId>,
     ) -> RuntimeOwnerGuard {
+        let request_attempt_id = current_request_attempt_id();
         let mut state = self.lock_state();
         if !self.state_is_available(&state) {
             return RuntimeOwnerGuard::empty();
@@ -707,12 +750,14 @@ impl RuntimeReceiptCollector {
                 owner_id,
                 descriptor: owner_descriptor,
                 attempt_id,
+                request_attempt_id,
             },
         );
         RuntimeOwnerGuard {
             collector: Some(self.clone()),
             owner_id: Some(owner_id),
             attempt_id,
+            request_attempt_id,
         }
     }
 
@@ -721,6 +766,7 @@ impl RuntimeReceiptCollector {
         owner_id: RuntimeOwnerId,
         attempt_id: Option<ExecutionCacheAttemptId>,
     ) -> bool {
+        let request_attempt_id = current_request_attempt_id();
         let mut state = self.lock_state();
         if !self.state_is_available(&state) {
             return false;
@@ -735,6 +781,7 @@ impl RuntimeReceiptCollector {
             RuntimeReceiptEvent::OwnerReused {
                 owner_id,
                 attempt_id,
+                request_attempt_id,
             },
         );
         true
@@ -755,8 +802,10 @@ impl RuntimeReceiptCollector {
     pub(crate) fn acquire_resource(
         &self,
         owner_id: RuntimeOwnerId,
-        descriptor: RuntimeResourceDescriptor,
+        mut descriptor: RuntimeResourceDescriptor,
     ) -> Option<RuntimeResourceGuard> {
+        let attempt_id = current_execution_cache_attempt_id();
+        let request_attempt_id = current_request_attempt_id();
         let mut state = self.lock_state();
         if !self.state_is_available(&state) {
             return None;
@@ -765,6 +814,11 @@ impl RuntimeReceiptCollector {
             Self::mark_incomplete(&mut state, ReceiptCompletenessReason::InvalidLifecycle);
             return None;
         };
+        // Resource placement is bound to the already-published owner inside
+        // the collector, rather than trusted from an independently-built
+        // descriptor. Broker reconciliation later compares this placement to
+        // the attribution captured before admission.
+        descriptor.placement = owner.descriptor.placement;
         if owner.resources.len() >= MAX_RESOURCES_PER_OWNER {
             state.rejected_resources = state.rejected_resources.saturating_add(1);
             Self::mark_incomplete(
@@ -801,12 +855,16 @@ impl RuntimeReceiptCollector {
                 owner_id,
                 resource_id,
                 descriptor,
+                attempt_id,
+                request_attempt_id,
             },
         );
         Some(RuntimeResourceGuard {
-            collector: self.clone(),
+            collector: Some(self.clone()),
             owner_id,
             resource_id,
+            attempt_id,
+            request_attempt_id,
         })
     }
 
@@ -814,7 +872,7 @@ impl RuntimeReceiptCollector {
         &self,
         owner_id: RuntimeOwnerId,
         resource_id: RuntimeResourceId,
-        descriptor: RuntimeResourceDescriptor,
+        mut descriptor: RuntimeResourceDescriptor,
     ) -> bool {
         let mut state = self.lock_state();
         if !self.state_is_available(&state) {
@@ -828,6 +886,9 @@ impl RuntimeReceiptCollector {
             Self::mark_incomplete(&mut state, ReceiptCompletenessReason::InvalidLifecycle);
             return false;
         };
+        // Placement is immutable for a live resource. Updates may refresh
+        // byte/native evidence, but cannot silently move ownership lanes.
+        descriptor.placement = resource.descriptor.placement;
         resource.descriptor = descriptor;
         true
     }
@@ -837,6 +898,8 @@ impl RuntimeReceiptCollector {
         owner_id: RuntimeOwnerId,
         resource_id: RuntimeResourceId,
         next_state: RuntimeResourceState,
+        attempt_id: Option<ExecutionCacheAttemptId>,
+        request_attempt_id: Option<RequestAttemptId>,
     ) -> bool {
         let mut state = self.lock_state();
         if !self.state_is_available(&state) {
@@ -860,12 +923,20 @@ impl RuntimeReceiptCollector {
                 resource_id,
                 state: next_state,
                 descriptor,
+                attempt_id,
+                request_attempt_id,
             },
         );
         true
     }
 
-    fn release_resource(&self, owner_id: RuntimeOwnerId, resource_id: RuntimeResourceId) {
+    fn release_resource(
+        &self,
+        owner_id: RuntimeOwnerId,
+        resource_id: RuntimeResourceId,
+        attempt_id: Option<ExecutionCacheAttemptId>,
+        request_attempt_id: Option<RequestAttemptId>,
+    ) {
         let mut state = self.lock_state();
         if !self.state_is_available(&state) {
             return;
@@ -884,11 +955,18 @@ impl RuntimeReceiptCollector {
             RuntimeReceiptEvent::ResourceReleased {
                 owner_id,
                 resource_id,
+                attempt_id,
+                request_attempt_id,
             },
         );
     }
 
-    fn release_owner(&self, owner_id: RuntimeOwnerId, attempt_id: Option<ExecutionCacheAttemptId>) {
+    fn release_owner(
+        &self,
+        owner_id: RuntimeOwnerId,
+        attempt_id: Option<ExecutionCacheAttemptId>,
+        request_attempt_id: Option<RequestAttemptId>,
+    ) {
         let mut state = self.lock_state();
         if !self.state_is_available(&state) {
             return;
@@ -906,6 +984,7 @@ impl RuntimeReceiptCollector {
             RuntimeReceiptEvent::OwnerReleased {
                 owner_id,
                 attempt_id,
+                request_attempt_id,
             },
         );
     }
@@ -950,9 +1029,9 @@ impl RuntimeReceiptCollector {
     /// ring truncation does not invalidate the live owner table.
     pub fn reconcile_live_leases(&self, broker: &DeviceMemoryBrokerSet) -> LeaseReceiptShadow {
         let before = self.snapshot();
-        let ledger_before = broker.ledger_snapshot_for_scope(self.scope_id);
+        let ledger_before = broker.ledger_snapshot_for_scope_by_placement(self.scope_id);
         let snapshot = self.snapshot();
-        let ledger = broker.ledger_snapshot_for_scope(self.scope_id);
+        let ledger = broker.ledger_snapshot_for_scope_by_placement(self.scope_id);
         if before.availability != snapshot.availability
             || before.live_owners != snapshot.live_owners
             || before.completeness.live_state_complete != snapshot.completeness.live_state_complete
@@ -979,7 +1058,10 @@ impl RuntimeReceiptCollector {
             };
         }
 
-        let mut receipt_bytes = HashMap::<SafeMemoryDomainProjection, ReceiptDomainBytes>::new();
+        let mut receipt_bytes = HashMap::<
+            (RuntimeOwnerPlacement, SafeMemoryDomainProjection),
+            ReceiptDomainBytes,
+        >::new();
         for owner in &snapshot.live_owners {
             if matches!(owner.descriptor.placement, RuntimeOwnerPlacement::Unknown) {
                 return LeaseReceiptShadow::Incomparable {
@@ -987,6 +1069,19 @@ impl RuntimeReceiptCollector {
                 };
             }
             for resource in owner.resources.values() {
+                if matches!(
+                    resource.descriptor.placement,
+                    RuntimeOwnerPlacement::Unknown
+                ) {
+                    return LeaseReceiptShadow::Incomparable {
+                        reason: LeaseReceiptShadowIncomparable::ResourcePlacementUnknown,
+                    };
+                }
+                if resource.descriptor.placement != owner.descriptor.placement {
+                    return LeaseReceiptShadow::Incomparable {
+                        reason: LeaseReceiptShadowIncomparable::ResourceOwnerPlacementMismatch,
+                    };
+                }
                 let domain = match resource.descriptor.ledger_binding {
                     RuntimeResourceLedgerBinding::Brokered(domain)
                         if resource.descriptor.domain == Some(domain) =>
@@ -1010,7 +1105,9 @@ impl RuntimeReceiptCollector {
                         };
                     }
                 };
-                let slot = receipt_bytes.entry(domain).or_default();
+                let slot = receipt_bytes
+                    .entry((resource.descriptor.placement, domain))
+                    .or_default();
                 match resource.state {
                     RuntimeResourceState::Reserved => {
                         match known_metric(resource.descriptor.peak) {
@@ -1053,20 +1150,31 @@ impl RuntimeReceiptCollector {
             }
         }
 
-        let mut seen = HashMap::<SafeMemoryDomainProjection, ()>::new();
-        for (domain, usage) in &ledger {
+        let mut seen = HashMap::<(RuntimeOwnerPlacement, SafeMemoryDomainProjection), ()>::new();
+        for ((domain, placement), usage) in &ledger {
+            if matches!(placement, RuntimeOwnerPlacement::Unknown)
+                && (usage.pending_bytes != 0
+                    || usage.committed_bytes != 0
+                    || usage.unreclaimable_bytes != 0)
+            {
+                return LeaseReceiptShadow::Incomparable {
+                    reason: LeaseReceiptShadowIncomparable::LedgerPlacementUnknown,
+                };
+            }
             let Some(projection) = self.domain_projection(domain) else {
                 return LeaseReceiptShadow::Incomparable {
                     reason: LeaseReceiptShadowIncomparable::ReceiptsUnavailable,
                 };
             };
-            seen.insert(projection, ());
-            let receipts = receipt_bytes.get(&projection).copied().unwrap_or_default();
+            let key = (*placement, projection);
+            seen.insert(key, ());
+            let receipts = receipt_bytes.get(&key).copied().unwrap_or_default();
             if receipts.reserved_peak != usage.pending_bytes
                 || receipts.committed_retained != usage.committed_bytes
                 || receipts.quarantined_retained != usage.unreclaimable_bytes
             {
                 return LeaseReceiptShadow::Mismatch(LeaseReceiptShadowMismatch {
+                    placement: *placement,
                     domain: projection,
                     broker_pending: usage.pending_bytes,
                     broker_committed: usage.committed_bytes,
@@ -1077,8 +1185,8 @@ impl RuntimeReceiptCollector {
                 });
             }
         }
-        for (projection, receipts) in &receipt_bytes {
-            if seen.contains_key(projection) {
+        for ((placement, projection), receipts) in &receipt_bytes {
+            if seen.contains_key(&(*placement, *projection)) {
                 continue;
             }
             if receipts.reserved_peak != 0
@@ -1086,6 +1194,7 @@ impl RuntimeReceiptCollector {
                 || receipts.quarantined_retained != 0
             {
                 return LeaseReceiptShadow::Mismatch(LeaseReceiptShadowMismatch {
+                    placement: *placement,
                     domain: *projection,
                     broker_pending: 0,
                     broker_committed: 0,
@@ -1158,12 +1267,16 @@ pub enum LeaseReceiptShadowIncomparable {
     ReceiptsIncomplete(ReceiptCompletenessReason),
     UnpricedLiveResource,
     OwnerPlacementUnknown,
+    ResourcePlacementUnknown,
+    ResourceOwnerPlacementMismatch,
+    LedgerPlacementUnknown,
     InvalidLiveLifecycle,
     SnapshotChanged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct LeaseReceiptShadowMismatch {
+    pub placement: RuntimeOwnerPlacement,
     pub domain: SafeMemoryDomainProjection,
     pub broker_pending: u64,
     pub broker_committed: u64,
@@ -1188,6 +1301,7 @@ pub(crate) struct RuntimeOwnerGuard {
     collector: Option<RuntimeReceiptCollector>,
     owner_id: Option<RuntimeOwnerId>,
     attempt_id: Option<ExecutionCacheAttemptId>,
+    request_attempt_id: Option<RequestAttemptId>,
 }
 
 impl RuntimeOwnerGuard {
@@ -1196,6 +1310,7 @@ impl RuntimeOwnerGuard {
             collector: None,
             owner_id: None,
             attempt_id: None,
+            request_attempt_id: None,
         }
     }
 
@@ -1209,12 +1324,20 @@ impl RuntimeOwnerGuard {
         }
     }
 
+    /// Leave the live owner row in the collector after this guard is dropped.
+    /// This is reserved for a broker quarantine: the underlying native owner
+    /// and its physical charge are intentionally unreclaimable, so deleting
+    /// the diagnostic row would make the live receipt contradict the ledger.
+    pub(crate) fn persist_for_quarantine(mut self) {
+        self.collector = None;
+    }
+
     fn release_inner(&mut self) {
         let Some(owner_id) = self.owner_id.take() else {
             return;
         };
         if let Some(collector) = self.collector.as_ref() {
-            collector.release_owner(owner_id, self.attempt_id);
+            collector.release_owner(owner_id, self.attempt_id, self.request_attempt_id);
         }
         self.collector = None;
     }
@@ -1236,9 +1359,11 @@ impl Drop for RuntimeOwnerGuard {
 }
 
 pub(crate) struct RuntimeResourceGuard {
-    collector: RuntimeReceiptCollector,
+    collector: Option<RuntimeReceiptCollector>,
     owner_id: RuntimeOwnerId,
     resource_id: RuntimeResourceId,
+    attempt_id: Option<ExecutionCacheAttemptId>,
+    request_attempt_id: Option<RequestAttemptId>,
 }
 
 impl fmt::Debug for RuntimeResourceGuard {
@@ -1253,27 +1378,50 @@ impl fmt::Debug for RuntimeResourceGuard {
 
 impl RuntimeResourceGuard {
     pub(crate) fn set_state(&self, state: RuntimeResourceState) {
-        self.collector
-            .transition_resource(self.owner_id, self.resource_id, state);
+        if let Some(collector) = self.collector.as_ref() {
+            collector.transition_resource(
+                self.owner_id,
+                self.resource_id,
+                state,
+                self.attempt_id,
+                self.request_attempt_id,
+            );
+        }
     }
 
     pub(crate) fn update_descriptor(&self, descriptor: RuntimeResourceDescriptor) {
-        self.collector
-            .update_resource(self.owner_id, self.resource_id, descriptor);
+        if let Some(collector) = self.collector.as_ref() {
+            collector.update_resource(self.owner_id, self.resource_id, descriptor);
+        }
+    }
+
+    /// Preserve the live resource row after the guard is dropped. See
+    /// [`RuntimeOwnerGuard::persist_for_quarantine`].
+    pub(crate) fn persist_for_quarantine(mut self) {
+        self.collector = None;
     }
 }
 
 impl Drop for RuntimeResourceGuard {
     fn drop(&mut self) {
-        self.collector
-            .release_resource(self.owner_id, self.resource_id);
+        if let Some(collector) = self.collector.as_ref() {
+            collector.release_resource(
+                self.owner_id,
+                self.resource_id,
+                self.attempt_id,
+                self.request_attempt_id,
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::execution_memory::{MemoryDomainKey, PhysicalDeviceKey};
+    use crate::device::execution_memory::{
+        DeviceMemoryBrokerSet, DeviceMemoryPolicy, DeviceMemorySnapshot, DomainReservationRequest,
+        MemoryDomainKey, MemoryObservationConfidence, PhysicalDeviceKey, QuoteConfidence,
+    };
 
     fn scope() -> NativeExecutionScopeId {
         NativeExecutionScopeId::next()
@@ -1324,6 +1472,56 @@ mod tests {
         let snapshot = collector.snapshot();
         assert!(snapshot.live_owners.is_empty());
         assert_eq!(snapshot.events.len(), 3);
+    }
+
+    #[test]
+    fn owner_and_resource_events_keep_the_request_attempt_join() {
+        let runtime = collector(16);
+        let request_receipt =
+            crate::models::request_execution_receipt::NativeExecutionReceiptCollector::new();
+        let request_attempt =
+            crate::RequestAttemptId::parse("00112233445566778899aabbccddeeff").unwrap();
+        request_receipt.bind_request_attempt(request_attempt);
+        let _request =
+            crate::models::native_execution_services::install_execution_receipt_collector(Some(
+                request_receipt,
+            ));
+        let owner = owner(&runtime);
+        let resource = runtime
+            .acquire_resource(
+                owner.owner_id().unwrap(),
+                runtime
+                    .no_broker_resource_descriptor("request-attempt-marker")
+                    .unwrap(),
+            )
+            .unwrap();
+        resource.set_state(RuntimeResourceState::Committed);
+        drop(resource);
+        drop(owner);
+
+        for event in runtime.snapshot().events {
+            let observed = match event {
+                RuntimeReceiptEvent::OwnerCreated {
+                    request_attempt_id, ..
+                }
+                | RuntimeReceiptEvent::OwnerReused {
+                    request_attempt_id, ..
+                }
+                | RuntimeReceiptEvent::OwnerReleased {
+                    request_attempt_id, ..
+                }
+                | RuntimeReceiptEvent::ResourceAcquired {
+                    request_attempt_id, ..
+                }
+                | RuntimeReceiptEvent::ResourceStateChanged {
+                    request_attempt_id, ..
+                }
+                | RuntimeReceiptEvent::ResourceReleased {
+                    request_attempt_id, ..
+                } => request_attempt_id,
+            };
+            assert_eq!(observed, Some(request_attempt));
+        }
     }
 
     #[test]
@@ -1617,6 +1815,100 @@ mod tests {
             collector.reconcile_live_leases(&broker),
             LeaseReceiptShadow::Matched
         );
+    }
+
+    #[test]
+    fn equal_domain_totals_cannot_hide_cross_lane_receipt_misattribution() {
+        let collector = collector(64);
+        let scope_id = collector.scope_id;
+        let domain = MemoryDomainKey::DedicatedDevice {
+            physical_device: PhysicalDeviceKey::new("0000:01:00.0").unwrap(),
+            heap_index: 0,
+        };
+        let lane_a = collector
+            .lane_projection(
+                ExecutionProvider::Cuda,
+                "cuda:0",
+                ExecutionPlacement::FullDevice,
+                GgmlCpuGraphBackend::Gpu,
+            )
+            .unwrap();
+        let lane_b = collector
+            .lane_projection(
+                ExecutionProvider::Vulkan,
+                "vulkan:0",
+                ExecutionPlacement::FullDevice,
+                GgmlCpuGraphBackend::Gpu,
+            )
+            .unwrap();
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let request = |resource_id: &str| DomainReservationRequest {
+            domain: domain.clone(),
+            snapshot: DeviceMemorySnapshot {
+                free_bytes: 100,
+                total_bytes: 100,
+                confidence: MemoryObservationConfidence::DeviceSnapshot,
+            },
+            peak_bytes: 10,
+            retained_bytes: 10,
+            observed_peak_bytes: None,
+            requires_reconciliation: false,
+            resource_id: resource_id.to_string(),
+            cohort_id: None,
+        };
+        let mut leases = broker
+            .try_reserve_partitioned_for_scope_and_placements(
+                vec![vec![request("lane-a")], vec![request("lane-b")]],
+                Some(scope_id),
+                vec![
+                    RuntimeOwnerPlacement::LaneBound(lane_a),
+                    RuntimeOwnerPlacement::LaneBound(lane_b),
+                ],
+            )
+            .unwrap();
+        for lease in &mut leases {
+            lease.commit_quoted().unwrap();
+        }
+
+        // Deliberately attribute both receipt resources to lane A. A legacy
+        // domain-only comparison sees 20 == 20; the exact-lane comparison must
+        // reject it because lane B has no receipt coverage.
+        let owner_descriptor = collector
+            .owner_descriptor("misattributed-owner", None, None, Some(lane_a))
+            .unwrap();
+        let owner = collector.start_owner(owner_descriptor, None);
+        let owner_id = owner.owner_id().unwrap();
+        let mut resources = Vec::new();
+        for label in ["first", "second"] {
+            let descriptor = collector
+                .resource_descriptor(
+                    label,
+                    &domain,
+                    10,
+                    10,
+                    10,
+                    QuoteConfidence::CommittedUpperBound,
+                    Some(MemoryObservationConfidence::DeviceSnapshot),
+                )
+                .unwrap();
+            let resource = collector.acquire_resource(owner_id, descriptor).unwrap();
+            resource.set_state(RuntimeResourceState::Committed);
+            resources.push(resource);
+        }
+
+        assert!(matches!(
+            collector.reconcile_live_leases(&broker),
+            LeaseReceiptShadow::Mismatch(LeaseReceiptShadowMismatch {
+                placement: RuntimeOwnerPlacement::LaneBound(lane),
+                ..
+            }) if lane == lane_a || lane == lane_b
+        ));
+        drop(resources);
+        drop(owner);
+        drop(leases);
     }
 
     #[test]

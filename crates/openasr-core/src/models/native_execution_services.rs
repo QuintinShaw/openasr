@@ -68,7 +68,9 @@ use super::{
     executor_component_registry::BuiltinStatefulExecutorScope,
     ggml_asr_executor::GgmlAsrExecutionDispatch,
     request_execution_receipt::NativeExecutionReceiptCollector,
-    runtime_receipts::{RuntimeReceiptCollector, SafeExecutionLaneProjection},
+    runtime_receipts::{
+        RuntimeOwnerPlacement, RuntimeReceiptCollector, SafeExecutionLaneProjection,
+    },
     system_memory_owner::SystemMemoryAllocationQuote,
 };
 
@@ -602,6 +604,10 @@ impl ExecutionCacheAttemptId {
     fn next() -> Self {
         Self(NEXT_EXECUTION_CACHE_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed))
     }
+
+    pub const fn ordinal(self) -> u64 {
+        self.0
+    }
 }
 
 /// Restores the prior dynamically scoped execution identity on drop.
@@ -936,6 +942,10 @@ pub(crate) fn current_execution_observation_sink() -> Option<ExecutionObservatio
 /// evidence producer installed one. Normal inference never creates it.
 pub(crate) fn current_execution_receipt_collector() -> Option<NativeExecutionReceiptCollector> {
     CURRENT_EXECUTION_RECEIPT.with(|current| current.borrow().clone())
+}
+
+pub(crate) fn current_request_attempt_id() -> Option<crate::RequestAttemptId> {
+    current_execution_receipt_collector()?.request_attempt_id()
 }
 
 pub(crate) struct ExecutionReceiptCollectorGuard {
@@ -2108,10 +2118,6 @@ fn reserve_activation_plan(
     for request in &mut requests {
         request.cohort_id = Some(cohort_id);
     }
-    let mut batch = services
-        .memory_broker()
-        .try_reserve_batch_for_scope(requests, Some(services.scope_id))
-        .map_err(|error| format!("candidate activation reserve: {error}"))?;
     let collector = services.runtime_receipts();
     let backend = match candidate.device.route.provider {
         ExecutionProvider::Cpu => GgmlCpuGraphBackend::Cpu,
@@ -2122,19 +2128,34 @@ fn reserve_activation_plan(
         | ExecutionProvider::Accelerator
         | ExecutionProvider::Unknown => GgmlCpuGraphBackend::Gpu,
     };
-    if let Some(lane) = collector.lane_projection(
+    let lane = collector.lane_projection(
         candidate.device.route.provider,
         &candidate.device.route.stable_id,
         candidate.placement,
         backend,
-    ) && let Some(owner) = collector.owner_descriptor(
-        "candidate-activation-reservation",
-        content_id,
-        plan.reservation_requests()
-            .first()
-            .map(|request| request.resource_id.as_str()),
-        Some(lane),
-    ) {
+    );
+    let owner_placement = lane.map_or(
+        RuntimeOwnerPlacement::Unknown,
+        RuntimeOwnerPlacement::LaneBound,
+    );
+    let mut batch = services
+        .memory_broker()
+        .try_reserve_batch_for_scope_and_placement(
+            requests,
+            Some(services.scope_id),
+            owner_placement,
+        )
+        .map_err(|error| format!("candidate activation reserve: {error}"))?;
+    if let Some(lane) = lane
+        && let Some(owner) = collector.owner_descriptor(
+            "candidate-activation-reservation",
+            content_id,
+            plan.reservation_requests()
+                .first()
+                .map(|request| request.resource_id.as_str()),
+            Some(lane),
+        )
+    {
         let resources = plan
             .reservation_requests()
             .iter()

@@ -5898,6 +5898,7 @@ fn validate_snapshot_identity_invariants(
             | RuntimeReceiptEvent::ResourceReleased {
                 owner_id,
                 resource_id,
+                ..
             } => (*owner_id, Some(*resource_id)),
         };
         if owner_id.scope_id != snapshot.scope_id
@@ -6301,6 +6302,7 @@ fn historical_weights(
             owner_id,
             resource_id,
             descriptor,
+            ..
         } => ReceiptLifecycleEvent::ResourceAcquired {
             owner_id: *owner_id,
             resource_id: *resource_id,
@@ -6311,6 +6313,7 @@ fn historical_weights(
             resource_id,
             state,
             descriptor,
+            ..
         } => ReceiptLifecycleEvent::ResourceStateChanged {
             owner_id: *owner_id,
             resource_id: *resource_id,
@@ -6320,6 +6323,7 @@ fn historical_weights(
         RuntimeReceiptEvent::ResourceReleased {
             owner_id,
             resource_id,
+            ..
         } => ReceiptLifecycleEvent::ResourceReleased {
             owner_id: *owner_id,
             resource_id: *resource_id,
@@ -6798,6 +6802,7 @@ fn resource_identity_collisions_and_scope_mismatches_are_inconclusive() {
         openasr_core::runtime_receipts::RuntimeReceiptEvent::OwnerReleased {
             owner_id: owner_one,
             attempt_id: None,
+            request_attempt_id: None,
         },
     ];
     assert_inconclusive(receipt_identity_sets(&event_scope_snapshot).map(|_| ()));
@@ -7044,10 +7049,13 @@ fn lifecycle_replay_rejects_unknown_and_tracks_release_coverage() {
         openasr_core::runtime_receipts::RuntimeReceiptEvent::OwnerReleased {
             owner_id: released_owner_id,
             attempt_id: None,
+            request_attempt_id: None,
         },
         openasr_core::runtime_receipts::RuntimeReceiptEvent::ResourceReleased {
             owner_id: released_owner_id,
             resource_id: released_resource_id,
+            attempt_id: None,
+            request_attempt_id: None,
         },
     ];
     let released_identity_sets = receipt_identity_sets(&released_snapshot).unwrap();
