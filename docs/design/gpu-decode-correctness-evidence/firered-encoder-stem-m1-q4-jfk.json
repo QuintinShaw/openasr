@@ -6,6 +6,14 @@
   },
   "authorizes_production_compact": false,
   "core_commit": "8958bde66",
+  "environment": {
+    "architecture": "arm64",
+    "gpu": "Apple M1 (8 cores, built-in)",
+    "metal_device": "MTL0 (Apple M1)",
+    "metal_support": "Metal 4",
+    "os": "macOS 26.6.1 (25G76)",
+    "scope": "local CPU/Metal diagnostic only; not release authorization"
+  },
   "dual_output": {
     "all_tokens_match": true,
     "authorizes_production_compact": false,

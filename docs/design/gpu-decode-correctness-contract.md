@@ -605,7 +605,13 @@ explains every symptom. The historical M1 q4 run diverged at the aggregate
 attribution. The current test-only twin exposes the ordered stem sequence
 `mel_4d -> conv raw -> bias -> ReLU -> layout/cont/flatten -> output matmul ->
 subsample_out`; a concrete seam is emitted only when every prerequisite tap is
-present. A new CPU/Metal result still does not project to CUDA.
+present. The M1 q4/JFK rerun in
+`gpu-decode-correctness-evidence/firered-encoder-stem-m1-q4-jfk.json` recorded all
+12 taps and classifies the first CPU/Metal checksum difference as
+`subsample_input` at `mel_4d`. That moves the investigation before the first
+convolution; it does not prove whether input upload, view/readback, or another
+backend boundary produced the checksum difference, and it still does not
+project to CUDA.
 
 ### Same-graph dual output
 

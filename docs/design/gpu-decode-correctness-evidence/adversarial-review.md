@@ -23,7 +23,7 @@
 
 ## 4. 无 tie 时现场重复能否发生；四象限是否定位现场 CUDA 第一分叉
 
-**结论：前半成立；后半证据不足。** encoder/KV/kernel 可在无并列最大值时产生重复。`firered-four-quadrant.json` 分类为 encoder/cross-KV/kernel，且是 M1 q4_k，不是 Windows CUDA fp16。`hardware-unavailable.txt` 记录 CUDA 不可用。不得把 Metal/CPU 当 CUDA 通过。
+**结论：前半成立；Windows CUDA 仍证据不足。** encoder/KV/kernel 可在无并列最大值时产生重复。旧 `firered-four-quadrant.json` 只能定位到 aggregate `subsample_out`；完整 12-tap 的 `firered-encoder-stem-m1-q4-jfk.json` 已把本机 CPU/Metal 第一 checksum 分叉收窄到 `subsample_input` / `mel_4d`，即第一层 convolution 之前。它仍是 M1 q4_k，不是 Windows CUDA fp16，也不能单凭 checksum 区分输入上传与读回边界。`hardware-unavailable.txt` 记录 CUDA 不可用。不得把 Metal/CPU 当 CUDA 通过。
 
 ## 5. dual-output 会不会掩盖缺陷
 
