@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use thiserror::Error;
 
 use crate::PhraseBiasConfig;
@@ -13,6 +15,8 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult,
     Seq2SeqGreedyDecodeStepExecutor, run_seq2seq_greedy_decode_loop_with_adapter_v0,
 };
+
+const SEQ2SEQ_DEBUG_TRACE_SCHEMA: &str = "openasr.seq2seq-debug-trace.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BuiltinDecodePolicyLongformPromptCarryMode {
@@ -775,6 +779,10 @@ fn emit_seq2seq_token_trace(
         {
             receipt.record_token(step_index, token_id, is_eot);
         }
+        append_seq2seq_debug_jsonl_trace(&format!(
+            "{{\"schema\":\"{SEQ2SEQ_DEBUG_TRACE_SCHEMA}\",\"event\":\"token\",\"step_index\":{step_index},\"token_id\":{token_id},\"is_eot\":{}}}",
+            usize::from(is_eot)
+        ));
         return;
     }
     if kind != BuiltinDecodePolicySeq2SeqTraceKind::WhisperEnvV0
@@ -799,6 +807,31 @@ fn emit_seq2seq_topk_trace(
         {
             receipt.record_top_k(step_index, logits);
         }
+        let mut top = Vec::<(usize, f32)>::new();
+        for (token_id, logit) in logits.iter().copied().enumerate() {
+            if !logit.is_finite() {
+                continue;
+            }
+            let insert_at = top
+                .iter()
+                .position(|(_, existing)| logit.total_cmp(existing).is_gt());
+            if let Some(insert_at) = insert_at {
+                top.insert(insert_at, (token_id, logit));
+            } else if top.len() < 8 {
+                top.push((token_id, logit));
+            }
+            if top.len() > 8 {
+                top.truncate(8);
+            }
+        }
+        let items = top
+            .iter()
+            .map(|(token_id, logit)| format!("{{\"token_id\":{token_id},\"value\":{logit:.6}}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        append_seq2seq_debug_jsonl_trace(&format!(
+            "{{\"schema\":\"{SEQ2SEQ_DEBUG_TRACE_SCHEMA}\",\"event\":\"top_k\",\"step_index\":{step_index},\"items\":[{items}]}}"
+        ));
         return;
     }
     if kind != BuiltinDecodePolicySeq2SeqTraceKind::WhisperEnvV0
@@ -831,6 +864,40 @@ fn emit_seq2seq_topk_trace(
     eprintln!(
         "openasr_whisper_ggml_trace stage=greedy_decode event=topk status=ok step_index={step_index} topk={items}"
     );
+}
+
+fn append_seq2seq_debug_jsonl_trace(line: &str) {
+    let Some(path) = std::env::var_os("OPENASR_SEQ2SEQ_TRACE_FILE") else {
+        return;
+    };
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    if file
+        .metadata()
+        .map(|metadata| metadata.len() == 0)
+        .unwrap_or(false)
+    {
+        let (Some(mode), Some(provider), Some(device)) = (
+            std::env::var_os("OPENASR_SEQ2SEQ_TRACE_MODE"),
+            std::env::var_os("OPENASR_SEQ2SEQ_TRACE_PROVIDER"),
+            std::env::var_os("OPENASR_SEQ2SEQ_TRACE_DEVICE"),
+        ) else {
+            return;
+        };
+        let header = format!(
+            "{{\"schema\":\"{SEQ2SEQ_DEBUG_TRACE_SCHEMA}\",\"event\":\"header\",\"mode\":\"{}\",\"provider\":\"{}\",\"device\":\"{}\"}}",
+            mode.to_string_lossy(),
+            provider.to_string_lossy(),
+            device.to_string_lossy()
+        );
+        let _ = writeln!(file, "{header}");
+    }
+    let _ = writeln!(file, "{line}");
 }
 
 #[cfg(test)]
@@ -1595,6 +1662,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn qwen_env_trace_is_namespaced_as_non_authoritative_debug_jsonl() {
+        let trace = tempfile::NamedTempFile::new().expect("trace file");
+        let path = trace.path().to_string_lossy().into_owned();
+        unsafe {
+            std::env::set_var("OPENASR_SEQ2SEQ_TRACE_FILE", &path);
+            std::env::set_var("OPENASR_SEQ2SEQ_TRACE_MODE", "cold");
+            std::env::set_var("OPENASR_SEQ2SEQ_TRACE_PROVIDER", "cuda");
+            std::env::set_var("OPENASR_SEQ2SEQ_TRACE_DEVICE", "cuda0");
+        }
+        emit_seq2seq_token_trace(
+            BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
+            0,
+            7,
+            false,
+        );
+        emit_seq2seq_topk_trace(
+            BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
+            0,
+            &[1.0, 0.5],
+        );
+        let text = std::fs::read_to_string(&path).expect("read trace");
+        assert!(text.contains("\"schema\":\"openasr.seq2seq-debug-trace.v1\""));
+        assert!(!text.contains("\"schema\":\"openasr.gpu-correctness-trace.v1\""));
+        assert!(text.contains("\"event\":\"token\""));
+        assert!(text.contains("\"event\":\"top_k\""));
+        unsafe {
+            std::env::remove_var("OPENASR_SEQ2SEQ_TRACE_FILE");
+            std::env::remove_var("OPENASR_SEQ2SEQ_TRACE_MODE");
+            std::env::remove_var("OPENASR_SEQ2SEQ_TRACE_PROVIDER");
+            std::env::remove_var("OPENASR_SEQ2SEQ_TRACE_DEVICE");
+        }
+    }
     #[test]
     fn parakeet_decode_policy_is_ctc_greedy_with_blank() {
         let parakeet = resolve_builtin_decode_policy(crate::PARAKEET_CTC_DECODE_POLICY_ID)

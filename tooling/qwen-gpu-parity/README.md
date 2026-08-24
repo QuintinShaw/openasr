@@ -1,4 +1,4 @@
-# qwen GPU parity diagnostic
+# Qwen GPU parity diagnostic
 
 A raw troubleshooting diagnostic for the qwen3-asr decoder on discrete GPUs.
 
@@ -20,20 +20,27 @@ The runtime guard for this is a conservative default: native GQA is **off** on
 the discrete-GPU lane and **on** for CPU/Metal (see
 `qwen_llm_native_gqa_default_for_backend` in
 `crates/openasr-core/src/models/qwen/llm_transformer.rs`). This diagnostic helps
-reproduce that failure class; it cannot prove a target safe to activate.
+reproduce that failure class; it cannot prove a target safe to activate. Only
+the artifact-bound correctness
+producer and final gate may prove a concrete execution cell safe to activate.
 
 > A synthetic in-process numeric self-check was tried and **rejected**: a probe
 > that exercises one op/shape can *false-pass* when the real decoder mis-computes
 > a different op (e.g. the masked prefill `mul_mat` broadcast vs. an unmasked
-> single-query flash). End-to-end comparison is necessary, but release
-> correctness is gated by the common matrix rather than this convenience script.
+> single-query flash). End-to-end transcript comparison is necessary, but it is
+> not sufficient without runtime and artifact identity evidence.
 
 ## What it does
 
-For each configured audio path the script compares CPU reference output with
-an explicitly selected GPU provider/device and requires cold and same-process
-reuse per-step diagnostic traces. Missing GPU, fixture, pack, or trace is a hard
-failure; there is no CPU-only success path.
+For each configured audio path the script compares CPU reference output with an
+explicitly selected GPU provider/device. Its cold/reuse labels are separate
+`openasr.exe` processes, and its `openasr.seq2seq-debug-trace.v1` header uses
+caller-supplied provider/device labels. Missing GPU, fixture, pack, or debug
+trace is a hard diagnostic failure; there is no CPU-only success path.
+
+Consequently, this script does not prove same-process graph reuse, native
+provider placement, runtime graph lifecycle, complete logits, or artifact
+identity. Do not pass its JSONL files to `gpu_correctness_gate.py`.
 
 ## Run it locally
 
@@ -56,9 +63,15 @@ Overrides (env):
 | `OPENASR_QWEN_PARITY_EXPECTED_DEVICE` | required operator assertion |
 | `OPENASR_QWEN_PARITY_TRACE_DIR` | required output directory |
 
-## CI
+## Release evidence boundary
 
 The workflow attests one CLI, binds one exact `.oasr` input, and records cold and
 reuse output from the provider already active on the self-hosted runner. It
 rejects missing or ambiguous files and CPU/other-device selection. The output is
 intentionally diagnostic and is never consumed by release finalization.
+
+Release qualification requires immutable candidate artifacts, an exact verified
+`.oasr` pack and fixture, runtime-observed provider/device placement, same-
+process cold/reuse requests, complete logits, graph lifecycle events, and
+`openasr.short-audio-receipt.evidence.v1` bound to the projected matrix. This
+diagnostic intentionally supplies none of those release-authorizing claims.
