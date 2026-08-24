@@ -316,6 +316,40 @@ pub(crate) enum Command {
     /// embedded catalog matches a copied catalog resource.
     #[command(name = "catalog-fingerprint", hide = true)]
     CatalogFingerprint,
+    /// Internal helper: sign an inert qualification-manifest.json with the
+    /// production catalog key under the qualification-specific signature
+    /// domain. This command never signs a capability or activation policy.
+    #[command(name = "__openasr-sign-qualification-manifest", hide = true)]
+    SignQualificationManifest {
+        /// qualification-manifest.json file to sign.
+        manifest: PathBuf,
+        /// Output qualification-manifest.signature.json path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Canonical immutable release URL bound into the signature.
+        #[arg(long)]
+        manifest_url: String,
+        /// Production catalog key id. Qualification has no local-dev key.
+        #[arg(long, default_value = "openasr-catalog-v1")]
+        key_id: String,
+        /// Print the derived public key for the env signing seed and exit.
+        #[arg(long)]
+        print_public_key: bool,
+    },
+    /// Internal read-only verifier for a signed qualification manifest. It
+    /// validates the signature and the inert schema but does not download or
+    /// load any artifact.
+    #[command(name = "__openasr-verify-qualification-manifest", hide = true)]
+    VerifyQualificationManifest {
+        /// qualification-manifest.json file to verify.
+        manifest: PathBuf,
+        /// qualification-manifest.signature.json sidecar.
+        #[arg(long)]
+        signature: PathBuf,
+        /// Canonical immutable release URL the signature must bind.
+        #[arg(long)]
+        manifest_url: String,
+    },
     /// Transcribe one or more audio files (or directories of audio).
     #[command(visible_alias = "t")]
     Transcribe {

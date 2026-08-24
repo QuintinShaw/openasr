@@ -14,6 +14,7 @@ mod cuda_targets;
 mod file_identity;
 mod http;
 mod pe_image_identity;
+mod qualification_manifest_security;
 #[cfg(test)]
 mod windows_cmake_cache;
 
@@ -95,6 +96,7 @@ pub(crate) mod output;
 mod ownership_evidence;
 pub(crate) mod pull;
 pub(crate) mod punctuation;
+mod qualification_manifest;
 pub mod realtime;
 pub(crate) mod registry;
 pub(crate) mod remote_compute;
@@ -202,6 +204,18 @@ pub use metrics::{
     peak_rss_bytes, process_memory_snapshot, wer, wer_counts, word_prefix_error_rate,
 };
 pub use models::pack_verifier::{PackCandidate, PackVerificationError, PackVerifier, VerifiedPack};
+pub use qualification_manifest::{
+    QUALIFICATION_MANIFEST_FILE_NAME, QUALIFICATION_MANIFEST_SCHEMA_VERSION, QualificationArtifact,
+    QualificationArtifacts, QualificationAttestation, QualificationHostAbi, QualificationManifest,
+    QualificationManifestError, QualificationManifestSigningError, QualificationProvider,
+    QualificationProviderTarget, VerifiedQualificationManifest,
+    render_validated_qualification_manifest_signature, verify_and_parse_qualification_manifest,
+};
+pub use qualification_manifest_security::{
+    QUALIFICATION_MANIFEST_PRODUCTION_KEY_ID, QUALIFICATION_MANIFEST_SIGNATURE_ALGORITHM,
+    QUALIFICATION_MANIFEST_SIGNATURE_FILE_NAME, QUALIFICATION_MANIFEST_SIGNATURE_SCHEMA_VERSION,
+    QualificationManifestSecurityError,
+};
 pub use short_audio_receipt::{
     DecodeFirstDivergenceClass, EncoderDecoderSplitLane, EncoderDecoderSplitProbeRecord,
     SHORT_AUDIO_RECEIPT_ARTIFACT_CONTRACT, SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE,

@@ -25,9 +25,10 @@ use openasr_core::{
     derive_catalog_public_key_hex, discover_batch_inputs, embedded_catalog_fingerprint,
     load_config, models_dir, openasr_home, parse_model_catalog, parse_model_ref,
     render_batch_summary, render_benchmark, render_catalog_signature_manifest,
-    resolve_registry_model_ref, resolve_runtime_model_ref, runtime_registry, save_config,
-    validate_local_native_model_pack_path, verify_catalog_signature_manifest,
-    verify_local_catalog_signature_manifest,
+    render_validated_qualification_manifest_signature, resolve_registry_model_ref,
+    resolve_runtime_model_ref, runtime_registry, save_config,
+    validate_local_native_model_pack_path, verify_and_parse_qualification_manifest,
+    verify_catalog_signature_manifest, verify_local_catalog_signature_manifest,
 };
 
 mod backend_plugin_cli;
@@ -224,6 +225,28 @@ async fn run() -> Result<()> {
         } => {
             return ownership_evidence_cli::validate_bundle(&artifact_dir, &envelopes);
         }
+        Command::SignQualificationManifest {
+            manifest,
+            out,
+            manifest_url,
+            key_id,
+            print_public_key,
+        } => {
+            return sign_qualification_manifest_command(
+                &manifest,
+                &out,
+                &manifest_url,
+                &key_id,
+                print_public_key,
+            );
+        }
+        Command::VerifyQualificationManifest {
+            manifest,
+            signature,
+            manifest_url,
+        } => {
+            return verify_qualification_manifest_command(&manifest, &signature, &manifest_url);
+        }
         Command::BackendPlugin { command } => {
             // Backend-pack installation uses the blocking catalog/download
             // client by design: the same implementation is shared with the
@@ -320,6 +343,9 @@ async fn run() -> Result<()> {
             print_public_key,
         ),
         Command::CatalogFingerprint => catalog_fingerprint_command(),
+        Command::SignQualificationManifest { .. } | Command::VerifyQualificationManifest { .. } => {
+            unreachable!("handled before runtime initialization")
+        }
         Command::Transcribe {
             inputs,
             formats,
@@ -779,6 +805,98 @@ fn sign_catalog_manifest_command(
         )
     })?;
     println!("Wrote catalog signature manifest: {}", out.display());
+    Ok(())
+}
+
+fn sign_qualification_manifest_command(
+    manifest: &Path,
+    out: &Path,
+    manifest_url: &str,
+    key_id: &str,
+    print_public_key: bool,
+) -> Result<()> {
+    let signing_key_seed_hex =
+        env::var(OPENASR_CATALOG_SIGNING_KEY_SEED_HEX).with_context(|| {
+            format!(
+                "{OPENASR_CATALOG_SIGNING_KEY_SEED_HEX} must be set to a 32-byte hex Ed25519 seed"
+            )
+        })?;
+    if print_public_key {
+        let public_key = derive_catalog_public_key_hex(&signing_key_seed_hex)
+            .context("Could not derive qualification-manifest signature public key")?;
+        println!("{public_key}");
+        return Ok(());
+    }
+
+    let manifest_contents = fs::read_to_string(manifest).with_context(|| {
+        format!(
+            "Could not read qualification-manifest JSON '{}'",
+            manifest.display()
+        )
+    })?;
+    let signature = render_validated_qualification_manifest_signature(
+        &manifest_contents,
+        manifest_url,
+        key_id,
+        &signing_key_seed_hex,
+    )
+    .context("Could not render qualification-manifest signature")?;
+
+    if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Could not create output directory '{}'", parent.display()))?;
+    }
+    atomic_write_text(out, &signature).with_context(|| {
+        format!(
+            "Could not write qualification-manifest signature '{}'",
+            out.display()
+        )
+    })?;
+    println!("Wrote qualification-manifest signature: {}", out.display());
+    Ok(())
+}
+
+fn verify_qualification_manifest_command(
+    manifest: &Path,
+    signature: &Path,
+    manifest_url: &str,
+) -> Result<()> {
+    let manifest_contents = fs::read(manifest).with_context(|| {
+        format!(
+            "Could not read qualification-manifest JSON '{}'",
+            manifest.display()
+        )
+    })?;
+    let signature_contents = fs::read(signature).with_context(|| {
+        format!(
+            "Could not read qualification-manifest signature '{}'",
+            signature.display()
+        )
+    })?;
+    let verified = verify_and_parse_qualification_manifest(
+        &manifest_contents,
+        &signature_contents,
+        manifest_url,
+    )
+    .context("qualification manifest did not verify against the production trust root")?;
+    let body = verified.manifest();
+    println!(
+        "{}",
+        serde_json::json!({
+            "verified": true,
+            "manifest_url": manifest_url,
+            "manifest_sha256": verified.manifest_sha256(),
+            "key_id": verified.signature_key_id(),
+            "release_subject": body.release_subject,
+            "provider": body.provider_target.provider.as_str(),
+            "target": body.provider_target.target,
+            "host_abi_fingerprint": body.host_abi.fingerprint,
+            "binary_sha256": body.artifacts.binary.sha256,
+            "plugin_sha256": body.artifacts.plugin.as_ref().map(|artifact| artifact.sha256.as_str()),
+            "vendor_sha256": body.artifacts.vendor.iter().map(|artifact| artifact.sha256.as_str()).collect::<Vec<_>>(),
+            "attestation_sha256": body.attestation.bundle.sha256,
+        })
+    );
     Ok(())
 }
 

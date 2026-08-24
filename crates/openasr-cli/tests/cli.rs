@@ -2718,6 +2718,67 @@ fn doctor_marks_unknown_saved_default_backend_as_unknown() {
         .stdout(predicate::str::contains("Default backend: mokk (unknown)"));
 }
 
+fn write_probe_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, contents).expect("write probe fixture file");
+    path
+}
+
+#[test]
+fn verify_qualification_manifest_rejects_a_missing_signature_before_runtime_init() {
+    let home = temp_home();
+    let manifest = write_probe_file(
+        home.path(),
+        "qualification-manifest.json",
+        r#"{"schema_version":1}"#,
+    );
+
+    openasr()
+        .arg("__openasr-verify-qualification-manifest")
+        .arg(&manifest)
+        .arg("--signature")
+        .arg(home.path().join("qualification-manifest.signature.json"))
+        .arg("--manifest-url")
+        .arg("https://dl.openasr.org/core/v0.1.37/qualification/cuda-sm_89/qualification-manifest.json")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Could not read qualification-manifest signature",
+        ));
+}
+
+#[test]
+fn sign_qualification_manifest_rejects_activation_policy_before_writing() {
+    let home = temp_home();
+    let manifest = write_probe_file(
+        home.path(),
+        "qualification-manifest.json",
+        r#"{"schema_version":1,"activation_modes":["explicit"]}"#,
+    );
+    let output = home.path().join("qualification-manifest.signature.json");
+
+    openasr()
+        .env(
+            "OPENASR_CATALOG_SIGNING_KEY_SEED_HEX",
+            "0101010101010101010101010101010101010101010101010101010101010101",
+        )
+        .arg("__openasr-sign-qualification-manifest")
+        .arg(&manifest)
+        .arg("--out")
+        .arg(&output)
+        .arg("--manifest-url")
+        .arg("https://dl.openasr.org/core/v0.1.37/qualification/cuda-sm_89/qualification-manifest.json")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Could not render qualification-manifest signature",
+        ));
+    assert!(
+        !output.exists(),
+        "unsafe manifest must not receive a signature"
+    );
+}
+
 // --- model-pack audit-quant (quantization-strategy self-check) -------------
 
 #[test]
