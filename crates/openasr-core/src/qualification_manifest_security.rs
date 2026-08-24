@@ -238,20 +238,24 @@ fn validate_manifest_url(value: &str) -> Result<(), QualificationManifestSecurit
             message: format!("invalid URL: {error}"),
         }
     })?;
+    let file_name = parsed
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .unwrap_or_default();
     if parsed.scheme() != "https"
         || parsed.host_str().is_none()
         || !parsed.username().is_empty()
         || parsed.password().is_some()
         || parsed.query().is_some()
         || parsed.fragment().is_some()
-        || parsed
-            .path_segments()
-            .and_then(|mut segments| segments.next_back())
-            != Some(crate::QUALIFICATION_MANIFEST_FILE_NAME)
+        || !file_name.starts_with("openasr-")
+        || !file_name.contains("-qualification-")
+        || !file_name.ends_with(".json")
+        || crate::safety::validate_safe_relative_path("manifest_url", file_name).is_err()
     {
         return Err(QualificationManifestSecurityError::InvalidField {
             field: "manifest_url",
-            message: "must be a credential-free immutable HTTPS URL ending in qualification-manifest.json without query or fragment"
+            message: "must be a credential-free immutable HTTPS URL ending in a safe exact-cell qualification JSON basename without query or fragment"
                 .to_string(),
         });
     }
@@ -350,7 +354,7 @@ mod tests {
     const TEST_SEED: &str = "0101010101010101010101010101010101010101010101010101010101010101";
     const TEST_KEY_ID: &str = "test-qualification-key";
     const URL: &str =
-        "https://dl.openasr.org/core/v0.1.37/qualification/cuda-sm_89/qualification-manifest.json";
+        "https://dl.openasr.org/core/v0.1.37/openasr-0.1.37-qualification-cuda-sm_89.json";
 
     fn roots() -> [CatalogTrustRoot; 1] {
         [CatalogTrustRoot {

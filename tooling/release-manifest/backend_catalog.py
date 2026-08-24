@@ -220,9 +220,39 @@ def materialized_tree_sha256(root: Path, extract_subdir: str) -> str:
         relative = f"{extract_subdir}/{relative}" if extract_subdir else relative
         sha256, size = sha256_size(path)
         files.append((relative, size, sha256))
+    return materialized_tree_sha256_rows(files)
+
+
+def materialized_tree_sha256_rows(files: list[tuple[str, int, str]]) -> str:
+    """Hash a materialized backend tree from canonical path/size/digest rows."""
+
     if not files:
         raise BackendCatalogError("vendor runtime tree is empty")
-    files.sort(key=lambda item: item[0])
+    seen: set[str] = set()
+    for relative, size, sha256 in files:
+        _validate_materialized_tree_path(relative)
+        folded = relative.lower()
+        if folded in seen:
+            raise BackendCatalogError(
+                f"materialized tree path is duplicated case-insensitively: {relative!r}"
+            )
+        seen.add(folded)
+        if (
+            not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or size > (1 << 64) - 1
+        ):
+            raise BackendCatalogError(f"materialized tree size is invalid: {relative!r}")
+        if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            raise BackendCatalogError(f"materialized tree sha256 is invalid: {relative!r}")
+    for relative, _size, _sha256 in files:
+        parts = relative.split("/")
+        if any("/".join(parts[:index]).lower() in seen for index in range(1, len(parts))):
+            raise BackendCatalogError(
+                f"materialized tree path is nested below another file: {relative!r}"
+            )
+    files = sorted(files, key=lambda item: item[0])
     digest = hashlib.sha256(b"openasr-backend-tree-v1\0")
     for relative, size, sha256 in files:
         encoded = relative.encode("utf-8")
@@ -231,6 +261,40 @@ def materialized_tree_sha256(root: Path, extract_subdir: str) -> str:
         digest.update(struct.pack("<Q", size))
         digest.update(sha256.encode("ascii"))
     return digest.hexdigest()
+
+
+def _validate_materialized_tree_path(relative: str) -> list[str]:
+    if not isinstance(relative, str):
+        raise BackendCatalogError("materialized tree path must be text")
+    parts = relative.split("/")
+    if (
+        not relative
+        or not relative.isascii()
+        or relative.startswith("/")
+        or relative.endswith("/")
+        or "\\" in relative
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        raise BackendCatalogError(f"materialized tree path is not canonical: {relative!r}")
+    for component in parts:
+        if (
+            component.endswith((".", " "))
+            or ":" in component
+            or any(character in '<>"|?*' for character in component)
+            or any(ord(character) < 32 for character in component)
+        ):
+            raise BackendCatalogError(
+                f"materialized tree path is unsafe on Windows: {relative!r}"
+            )
+        stem = component.split(".", 1)[0].upper()
+        if stem in {"CON", "PRN", "AUX", "NUL"} or (
+            (stem.startswith("COM") or stem.startswith("LPT"))
+            and stem[3:] in {str(number) for number in range(1, 10)}
+        ):
+            raise BackendCatalogError(
+                f"materialized tree path is unsafe on Windows: {relative!r}"
+            )
+    return parts
 
 
 def _read_json(path: Path) -> dict[str, Any]:

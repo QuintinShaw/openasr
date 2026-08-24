@@ -155,6 +155,10 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("backend_hardware_evidence.py", finalize)
         self.assertNotIn("backend-hardware-audit-*.json", finalize)
         self.assertNotIn("gpu-correctness-matrix.v1.json", finalize)
+        self.assertNotIn("gpu-correctness-source-inventory.json", finalize)
+        self.assertNotIn("gpu-correctness-source-model-catalog.json", finalize)
+        self.assertNotIn("gpu-correctness-source-backend-catalog.json", finalize)
+        self.assertNotIn("gpu_correctness_gate.py validate", finalize)
         self.assertIn("resolve_tag_commit", finalize)
         self.assertIn("git/tags/${object_sha}", finalize)
         self.assertIn("gh attestation verify", finalize)
@@ -172,7 +176,26 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("live catalog bytes differ", finalize)
         self.assertIn('gh release edit "$tag" --repo "$repository" --draft=false --latest', finalize)
         self.assertIn("RELEASE-PUBLISHED-INERT", finalize)
+        self.assertIn("qualification-release-lock.sh acquire", finalize)
+        self.assertIn("qualification-release-lock.sh release", finalize)
+        self.assertIn("qualification-index.tsv", finalize)
+        self.assertIn("__openasr-verify-qualification-manifest", finalize)
+        self.assertIn("qualification-subjects.txt", finalize)
+        self.assertIn("gh attestation verify", finalize)
+        self.assertIn("git/tags/${remote_tag_object}", finalize)
+        self.assertIn("done < <(tr -d '\\r' < \"$checksums\")", finalize)
+        self.assertNotIn('for subject in "$workdir"/*', finalize)
+        self.assertIn("tr -d '\\r'", finalize)
+        self.assertIn("did not succeed", finalize)
         self.assertLess(finalize.index("verify-cdn"), finalize.index("--draft=false"))
+        publish = finalize.index(
+            'gh release edit "$tag" --repo "$repository" --draft=false --latest'
+        )
+        self.assertLess(finalize.index("qualification-release-lock.sh acquire"), publish)
+        self.assertGreater(finalize.rindex("qualification-release-lock.sh release"), publish)
+        self.assertLess(
+            finalize.index("stopped being a draft before publication"), publish
+        )
 
     def test_finalizer_never_publishes_before_all_gpu_provider_entries(self) -> None:
         finalize = (ROOT / "scripts/finalize-core-release.sh").read_text(encoding="utf-8")

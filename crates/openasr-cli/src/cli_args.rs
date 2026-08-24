@@ -316,12 +316,12 @@ pub(crate) enum Command {
     /// embedded catalog matches a copied catalog resource.
     #[command(name = "catalog-fingerprint", hide = true)]
     CatalogFingerprint,
-    /// Internal helper: sign an inert qualification-manifest.json with the
-    /// production catalog key under the qualification-specific signature
+    /// Internal helper: sign an inert exact-cell qualification manifest with
+    /// the production catalog key under the qualification-specific signature
     /// domain. This command never signs a capability or activation policy.
     #[command(name = "__openasr-sign-qualification-manifest", hide = true)]
     SignQualificationManifest {
-        /// qualification-manifest.json file to sign.
+        /// Exact-cell qualification manifest file to sign.
         manifest: PathBuf,
         /// Output qualification-manifest.signature.json path.
         #[arg(long)]
@@ -341,7 +341,7 @@ pub(crate) enum Command {
     /// load any artifact.
     #[command(name = "__openasr-verify-qualification-manifest", hide = true)]
     VerifyQualificationManifest {
-        /// qualification-manifest.json file to verify.
+        /// Exact-cell qualification manifest file to verify.
         manifest: PathBuf,
         /// qualification-manifest.signature.json sidecar.
         #[arg(long)]

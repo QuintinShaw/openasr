@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -9,6 +13,8 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "release-binaries.yml"
 MATRIX = ROOT / "tooling" / "release-manifest" / "release_binaries_matrix.json"
 CORE_BUILD_RS = ROOT / "crates" / "openasr-core" / "build.rs"
+QUALIFICATION_SIGN = ROOT / "scripts" / "sign-and-verify-qualification-manifests.sh"
+QUALIFICATION_LOCK = ROOT / "scripts" / "qualification-release-lock.sh"
 
 
 class WindowsBackendReleaseContractTests(unittest.TestCase):
@@ -17,6 +23,8 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         cls.workflow = WORKFLOW.read_text(encoding="utf-8")
         cls.core_build_rs = CORE_BUILD_RS.read_text(encoding="utf-8")
         cls.matrix = json.loads(MATRIX.read_text(encoding="utf-8"))
+        cls.qualification_sign = QUALIFICATION_SIGN.read_text(encoding="utf-8")
+        cls.qualification_lock = QUALIFICATION_LOCK.read_text(encoding="utf-8")
 
     def test_backend_abi_is_independent_of_git_checkout_newlines(self) -> None:
         self.assertIn(
@@ -283,6 +291,218 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         self.assertIn("formal release assets may be uploaded only to an existing draft", self.workflow)
         self.assertIn("contains unexpected asset(s)", self.workflow)
         self.assertIn("staging/*.sha256", self.workflow)
+    def test_qualification_manifests_bind_the_successful_attestation_bundle(self) -> None:
+        checksums = self.workflow.split("\n  checksums:\n", 1)[1].split(
+            "\n  upload-to-release:\n", 1
+        )[0]
+        self.assertIn("id: attest_release_3", checksums)
+        for attempt in (1, 2, 3):
+            self.assertIn(
+                f"steps.attest_release_{attempt}.outputs.bundle-path", checksums
+            )
+            self.assertIn(f'ATTEST_{attempt}_OUTCOME:', checksums)
+        self.assertNotIn("\n          gh attestation download", checksums)
+        self.assertIn("qualification_manifest.py", checksums)
+        self.assertIn(
+            "QUALIFICATION_SOURCE_DIGEST: ${{ needs.select-matrix.outputs.source_digest }}",
+            checksums,
+        )
+        self.assertIn('--source-digest "$QUALIFICATION_SOURCE_DIGEST"', checksums)
+        self.assertIn("if actual != expected:", checksums)
+        self.assertIn("--bundled-vulkan-target vulkan-windows-x86_64", checksums)
+        self.assertIn("backend-qualification-assets", checksums)
+        self.assertIn("openasr-*-build-provenance.bundle.json", checksums)
+        self.assertIn("openasr-*-qualification-*.json", checksums)
+        self.assertLess(
+            checksums.index("subject-checksums: dist/SHA256SUMS"),
+            checksums.index("Compile inert backend qualification manifests"),
+        )
+        compile_step = checksums.split(
+            "- name: Compile inert backend qualification manifests", 1
+        )[1].split("- name: Upload inert backend qualification assets", 1)[0]
+        for forbidden in ("activation_mode", "active.json", "catalog.backends.candidate"):
+            self.assertNotIn(forbidden, compile_step)
+
+    def test_qualification_signing_is_local_exact_tag_and_round_trip_verified(self) -> None:
+        checksums = self.workflow.split("\n  checksums:\n", 1)[1].split(
+            "\n  upload-to-release:\n", 1
+        )[0]
+        self.assertNotIn("OPENASR_CATALOG_SIGNING_KEY_SEED_HEX", checksums)
+        for fragment in (
+            'if [ "${CI:-}" = "true" ] || [ "${GITHUB_ACTIONS:-}" = "true" ]',
+            'git status --porcelain --untracked-files=normal',
+            'git rev-parse "${tag}^{commit}"',
+            '[ "$head_commit" = "$tag_commit" ]',
+            'git/ref/tags/${tag}',
+            '[ "$remote_tag_object" = "$local_tag_object" ]',
+            '[ "$remote_tag_commit" = "$tag_commit" ]',
+            '[ "$is_draft" = "true" ]',
+            'source_digest != tag_commit',
+            'cells != expected_cells',
+            'compiler._safe_basename',
+            'expected_signature_count=',
+            '--promote-cuda-targets',
+            'unknown promoted CUDA target(s)',
+            'qualification-release-lock.sh acquire "$tag" "$lock_token"',
+            'qualification-release-lock.sh release "$tag" "$lock_token"',
+            "stopped being a draft before signature upload",
+            "gh attestation verify",
+            '--signer-workflow "${repository}/.github/workflows/release-binaries.yml"',
+            '--source-digest "$source_digest"',
+            "--deny-self-hosted-runners",
+            "__openasr-sign-qualification-manifest",
+            "__openasr-verify-qualification-manifest",
+            'gh release upload "$tag"',
+            "QUALIFICATION-MANIFESTS-SIGNED-AND-VERIFIED",
+        ):
+            self.assertIn(fragment, self.qualification_sign)
+        self.assertLess(
+            self.qualification_sign.index(
+                "unset OPENASR_CATALOG_SIGNING_KEY_SEED_HEX"
+            ),
+            self.qualification_sign.index("cargo build --quiet -p openasr-cli"),
+        )
+        self.assertIn(
+            'OPENASR_CATALOG_SIGNING_KEY_SEED_HEX="$signing_key_seed"',
+            self.qualification_sign,
+        )
+        self.assertNotIn("cargo run", self.qualification_sign)
+
+    def test_qualification_release_mutations_share_an_atomic_remote_lock(self) -> None:
+        self.assertIn(
+            'asset_name="openasr-${version}-qualification-mutation.lock"',
+            self.qualification_lock,
+        )
+        self.assertIn(
+            'gh release upload "$tag" "$temporary/$asset_name"',
+            self.qualification_lock,
+        )
+        acquire = self.qualification_lock.split("  acquire)", 1)[1].split(
+            "  release)", 1
+        )[0]
+        self.assertNotIn("--clobber", acquire)
+        self.assertIn(
+            'cmp -s -- "$token_file" "$temporary/$asset_name"',
+            self.qualification_lock,
+        )
+        self.assertIn("gh release delete-asset", self.qualification_lock)
+        self.assertEqual(
+            self.workflow.count(
+                'scripts/qualification-release-lock.sh acquire "$tag" "$lock_token"'
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.workflow.count(
+                'scripts/qualification-release-lock.sh release "$tag" "$lock_token"'
+            ),
+            2,
+        )
+        self.assertIn(
+            'lock_asset="openasr-${version}-qualification-mutation.lock"',
+            self.workflow,
+        )
+        self.assertIn("stopped being a draft before asset upload", self.workflow)
+
+    def test_qualification_release_lock_is_exclusive_and_nonce_owned(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary_dir = root / "bin"
+            remote = root / "release-assets"
+            binary_dir.mkdir()
+            remote.mkdir()
+            fake_gh = binary_dir / "gh"
+            fake_gh.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import os
+                    import shutil
+                    import sys
+                    from pathlib import Path
+
+                    args = sys.argv[1:]
+                    remote = Path(os.environ["FAKE_GH_REMOTE"])
+                    if args[:2] == ["release", "upload"]:
+                        source = Path(args[3])
+                        target = remote / source.name
+                        if target.exists():
+                            raise SystemExit(1)
+                        shutil.copyfile(source, target)
+                    elif args[:2] == ["release", "download"]:
+                        asset = args[args.index("-p") + 1]
+                        destination = Path(args[args.index("-D") + 1]) / asset
+                        shutil.copyfile(remote / asset, destination)
+                    elif args[:2] == ["release", "delete-asset"]:
+                        (remote / args[3]).unlink()
+                    else:
+                        raise SystemExit(2)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_gh.chmod(0o755)
+            environment = dict(os.environ)
+            environment["FAKE_GH_REMOTE"] = str(remote)
+            environment["PATH"] = f"{binary_dir}:{environment['PATH']}"
+            first = root / "first.token"
+            second = root / "second.token"
+            wrong = root / "wrong.token"
+            lock_asset = remote / "openasr-1.2.3-qualification-mutation.lock"
+
+            subprocess.run(
+                [QUALIFICATION_LOCK, "acquire", "v1.2.3", first],
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertTrue(lock_asset.is_file())
+            refused = subprocess.run(
+                [QUALIFICATION_LOCK, "acquire", "v1.2.3", second],
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertFalse(second.exists())
+            wrong.write_text("0" * 64 + "\n", encoding="ascii")
+            refused = subprocess.run(
+                [QUALIFICATION_LOCK, "release", "v1.2.3", wrong],
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertTrue(lock_asset.is_file())
+            subprocess.run(
+                [QUALIFICATION_LOCK, "release", "v1.2.3", first],
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertFalse(lock_asset.exists())
+            self.assertFalse(first.exists())
+
+    def test_release_jobs_pin_one_event_tag_and_checkout_source_digest(self) -> None:
+        select = self.workflow.split("\n  select-matrix:\n", 1)[1].split(
+            "\n  build:\n", 1
+        )[0]
+        self.assertIn('checkout_commit="$(git rev-parse HEAD^{commit})"', select)
+        self.assertIn('[ "$checkout_commit" = "$GITHUB_SHA" ]', select)
+        self.assertIn('[ "$tag_commit" = "$checkout_commit" ]', select)
+        self.assertIn('echo "source_digest=$checkout_commit"', select)
+        self.assertGreaterEqual(
+            self.workflow.count("ref: ${{ needs.select-matrix.outputs.source_digest }}"),
+            3,
+        )
+        self.assertGreaterEqual(
+            self.workflow.count("ref: ${{ needs.checksums.outputs.source_digest }}"),
+            2,
+        )
 
     def test_catalog_candidate_uses_only_release_blocking_plugin_targets(self) -> None:
         required_cuda = [

@@ -2739,7 +2739,7 @@ fn verify_qualification_manifest_rejects_a_missing_signature_before_runtime_init
         .arg("--signature")
         .arg(home.path().join("qualification-manifest.signature.json"))
         .arg("--manifest-url")
-        .arg("https://dl.openasr.org/core/v0.1.37/qualification/cuda-sm_89/qualification-manifest.json")
+        .arg("https://dl.openasr.org/core/v0.1.37/openasr-0.1.37-qualification-cuda-sm_89.json")
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -2767,7 +2767,7 @@ fn sign_qualification_manifest_rejects_activation_policy_before_writing() {
         .arg("--out")
         .arg(&output)
         .arg("--manifest-url")
-        .arg("https://dl.openasr.org/core/v0.1.37/qualification/cuda-sm_89/qualification-manifest.json")
+        .arg("https://dl.openasr.org/core/v0.1.37/openasr-0.1.37-qualification-cuda-sm_89.json")
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -2812,7 +2812,7 @@ fn qualification_parent_rejects_missing_signature_before_artifact_or_runtime_wor
         .arg("--signature")
         .arg(home.path().join("missing.signature.json"))
         .arg("--manifest-url")
-        .arg("https://dl.openasr.org/core/v0.1.37/qualification/cuda-sm_89/qualification-manifest.json")
+        .arg("https://dl.openasr.org/core/v0.1.37/openasr-0.1.37-qualification-cuda-sm_89.json")
         .arg("--qualification-home")
         .arg(&qualification_home)
         .assert()

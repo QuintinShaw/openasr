@@ -80,7 +80,9 @@ fn windows_safe_path_component(component: &str) -> bool {
     if component.is_empty()
         || component.ends_with(['.', ' '])
         || component.contains(':')
-        || component.chars().any(char::is_control)
+        || component.chars().any(|character| {
+            character.is_control() || matches!(character, '<' | '>' | '"' | '|' | '?' | '*')
+        })
     {
         return false;
     }
@@ -157,6 +159,12 @@ mod tests {
             "vendor/COM1",
             "vendor/LPT9.bin",
             "vendor/stream:payload",
+            "vendor/less<than.dll",
+            "vendor/greater>than.dll",
+            "vendor/quote\"name.dll",
+            "vendor/pipe|name.dll",
+            "vendor/question?.dll",
+            "vendor/star*.dll",
             "vendor/trailing.",
             "vendor/trailing ",
         ] {

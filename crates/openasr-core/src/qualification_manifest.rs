@@ -20,7 +20,6 @@ use crate::{
 };
 
 pub const QUALIFICATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const QUALIFICATION_MANIFEST_FILE_NAME: &str = "qualification-manifest.json";
 pub const QUALIFICATION_ATTESTATION_REPOSITORY: &str = "QuintinShaw/openasr";
 pub const QUALIFICATION_ATTESTATION_SIGNER_WORKFLOW: &str =
     "QuintinShaw/openasr/.github/workflows/release-binaries.yml";
@@ -214,6 +213,7 @@ pub fn verify_and_parse_qualification_manifest(
     )
     .map_err(QualificationManifestError::Signature)?;
     let manifest = parse_and_validate_qualification_manifest(manifest_text)?;
+    validate_canonical_manifest_url(&manifest, expected_manifest_url)?;
     Ok(VerifiedQualificationManifest {
         manifest,
         signature,
@@ -238,7 +238,9 @@ pub fn render_validated_qualification_manifest_signature(
     key_id: &str,
     signing_key_seed_hex: &str,
 ) -> Result<String, QualificationManifestSigningError> {
-    validate_qualification_manifest_for_signing(manifest_contents)
+    let manifest = validate_qualification_manifest_for_signing(manifest_contents)
+        .map_err(QualificationManifestSigningError::Manifest)?;
+    validate_canonical_manifest_url(&manifest, manifest_url)
         .map_err(QualificationManifestSigningError::Manifest)?;
     let signature = render_qualification_manifest_signature(
         manifest_contents,
@@ -268,12 +270,18 @@ impl QualificationManifest {
                 found: self.schema_version,
             });
         }
-        require_text("release_subject", &self.release_subject)?;
+        validate_release_subject(&self.release_subject)?;
         validate_host_abi(&self.host_abi)?;
-        if !self.host_abi.target.ends_with("-pc-windows-msvc") {
+        if self.host_abi.target != "x86_64-pc-windows-msvc" {
             return Err(invalid(
                 "host_abi.target",
-                "qualification v1 requires a Windows MSVC release host",
+                "qualification v1 requires the x86_64 Windows MSVC release host",
+            ));
+        }
+        if self.host_abi.crt != "msvc-md" {
+            return Err(invalid(
+                "host_abi.crt",
+                "qualification v1 requires the dynamic MSVC CRT",
             ));
         }
         if self.provider_target.provider == QualificationProvider::Unknown {
@@ -291,10 +299,12 @@ impl QualificationManifest {
         for vendor in &self.artifacts.vendor {
             vendor.validate("artifacts.vendor", QualificationArtifactFormat::ZipArchive)?;
         }
-        require_text(
-            "attestation.predicate_type",
-            &self.attestation.predicate_type,
-        )?;
+        if self.attestation.predicate_type != "https://slsa.dev/provenance/v1" {
+            return Err(invalid(
+                "attestation.predicate_type",
+                "must be https://slsa.dev/provenance/v1",
+            ));
+        }
         if self.attestation.repository != QUALIFICATION_ATTESTATION_REPOSITORY {
             return Err(invalid(
                 "attestation.repository",
@@ -328,16 +338,40 @@ impl QualificationManifest {
     }
 
     fn validate_packaging(&self) -> Result<(), QualificationManifestError> {
+        let version = self
+            .release_subject
+            .strip_prefix('v')
+            .expect("release subject was validated before packaging");
+        if self.artifacts.binary.file_name != "openasr.exe" {
+            return Err(invalid(
+                "artifacts.binary.file_name",
+                "qualification v1 requires the openasr.exe member",
+            ));
+        }
+        let expected_binary_bundle = format!("openasr-{version}-windows-x86_64-neutral.zip");
+        if self.artifacts.binary.bundle.file_name != expected_binary_bundle {
+            return Err(invalid(
+                "artifacts.binary.bundle.file_name",
+                format!("must bind {expected_binary_bundle}"),
+            ));
+        }
+        let expected_attestation_bundle = format!("openasr-{version}-build-provenance.bundle.json");
+        if self.attestation.bundle.file_name != expected_attestation_bundle {
+            return Err(invalid(
+                "attestation.bundle.file_name",
+                format!("must bind {expected_attestation_bundle}"),
+            ));
+        }
         match self.provider_target.provider {
             QualificationProvider::Cuda | QualificationProvider::Hip => {
-                if self.artifacts.plugin.is_none() {
-                    return Err(QualificationManifestError::InvalidPackaging {
+                let plugin = self.artifacts.plugin.as_ref().ok_or_else(|| {
+                    QualificationManifestError::InvalidPackaging {
                         reason: format!(
                             "{} qualification requires a neutral-dynamic plugin artifact",
                             self.provider_target.provider.as_str()
                         ),
-                    });
-                }
+                    }
+                })?;
                 if self.artifacts.vendor.is_empty() {
                     return Err(QualificationManifestError::InvalidPackaging {
                         reason: format!(
@@ -345,6 +379,24 @@ impl QualificationManifest {
                             self.provider_target.provider.as_str()
                         ),
                     });
+                }
+                let release_provider = match self.provider_target.provider {
+                    QualificationProvider::Cuda => "cuda",
+                    QualificationProvider::Hip => "rocm",
+                    _ => unreachable!(),
+                };
+                let expected_plugin = format!(
+                    "openasr-{version}-windows-x86_64-{release_provider}-{}-plugin.dll",
+                    self.provider_target.target
+                );
+                if plugin.file_name != expected_plugin {
+                    return Err(invalid(
+                        "artifacts.plugin.file_name",
+                        format!("must bind exact provider/target as {expected_plugin}"),
+                    ));
+                }
+                for vendor in &self.artifacts.vendor {
+                    validate_vendor_artifact_name(vendor, release_provider)?;
                 }
             }
             QualificationProvider::Vulkan => {
@@ -356,6 +408,13 @@ impl QualificationManifest {
                 }
             }
             QualificationProvider::Unknown => unreachable!("rejected before packaging validation"),
+        }
+        let artifacts = std::iter::once(&self.artifacts.binary.bundle)
+            .chain(self.artifacts.plugin.iter())
+            .chain(self.artifacts.vendor.iter())
+            .chain(std::iter::once(&self.attestation.bundle));
+        for artifact in artifacts {
+            validate_release_artifact_urls(&self.release_subject, artifact)?;
         }
         Ok(())
     }
@@ -382,6 +441,106 @@ impl QualificationManifest {
         }
         Ok(())
     }
+}
+
+fn validate_vendor_artifact_name(
+    artifact: &QualificationArtifact,
+    release_provider: &str,
+) -> Result<(), QualificationManifestError> {
+    let prefix = format!("openasr-vendor-{release_provider}-runtime-");
+    let short_digest = artifact
+        .file_name
+        .strip_prefix(&prefix)
+        .and_then(|value| value.strip_suffix(".zip"))
+        .ok_or_else(|| {
+            invalid(
+                "artifacts.vendor.file_name",
+                format!("must use {prefix}<sha12>.zip"),
+            )
+        })?;
+    if short_digest.len() != 12
+        || !short_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || !artifact.sha256.starts_with(short_digest)
+    {
+        return Err(invalid(
+            "artifacts.vendor.file_name",
+            "content-addressed suffix must equal the artifact sha256 prefix",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_release_artifact_urls(
+    release_subject: &str,
+    artifact: &QualificationArtifact,
+) -> Result<(), QualificationManifestError> {
+    let expected = [
+        format!(
+            "https://dl.openasr.org/core/{release_subject}/{}",
+            artifact.file_name
+        ),
+        format!(
+            "https://github.com/QuintinShaw/openasr/releases/download/{release_subject}/{}",
+            artifact.file_name
+        ),
+    ];
+    if artifact.urls != expected {
+        return Err(invalid(
+            "artifacts.urls",
+            "must contain the canonical CDN URL followed by the immutable GitHub release mirror",
+        ));
+    }
+    Ok(())
+}
+
+fn qualification_manifest_asset_file_name(manifest: &QualificationManifest) -> String {
+    let version = manifest
+        .release_subject
+        .strip_prefix('v')
+        .expect("validated qualification release subject has a v prefix");
+    let cell = match manifest.provider_target.provider {
+        QualificationProvider::Vulkan => manifest.provider_target.target.clone(),
+        provider => format!("{}-{}", provider.as_str(), manifest.provider_target.target),
+    };
+    format!("openasr-{version}-qualification-{cell}.json")
+}
+
+fn validate_release_subject(value: &str) -> Result<(), QualificationManifestError> {
+    let Some(version) = value.strip_prefix('v') else {
+        return Err(invalid("release_subject", "must use canonical vX.Y.Z"));
+    };
+    let parts = version.split('.').collect::<Vec<_>>();
+    if parts.len() != 3
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || !part.bytes().all(|byte| byte.is_ascii_digit())
+                || (part.len() > 1 && part.starts_with('0'))
+                || part.parse::<u64>().is_err()
+        })
+    {
+        return Err(invalid("release_subject", "must use canonical vX.Y.Z"));
+    }
+    Ok(())
+}
+
+fn validate_canonical_manifest_url(
+    manifest: &QualificationManifest,
+    manifest_url: &str,
+) -> Result<(), QualificationManifestError> {
+    let expected = format!(
+        "https://dl.openasr.org/core/{}/{}",
+        manifest.release_subject,
+        qualification_manifest_asset_file_name(manifest)
+    );
+    if manifest_url != expected {
+        return Err(invalid(
+            "manifest_url",
+            format!("must bind the exact release/cell URL {expected}"),
+        ));
+    }
+    Ok(())
 }
 
 impl QualificationBinaryArtifact {
@@ -499,7 +658,7 @@ fn validate_provider_target(
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         }),
-        QualificationProvider::Vulkan => target.target.starts_with("vulkan-windows-"),
+        QualificationProvider::Vulkan => target.target == "vulkan-windows-x86_64",
         QualificationProvider::Unknown => false,
     };
     valid.then_some(()).ok_or_else(|| {
@@ -674,7 +833,7 @@ mod tests {
     const TEST_SEED: &str = "0101010101010101010101010101010101010101010101010101010101010101";
     const TEST_KEY_ID: &str = "test-qualification-key";
     const URL: &str =
-        "https://dl.openasr.org/core/v0.1.37/qualification/cuda-sm_89/qualification-manifest.json";
+        "https://dl.openasr.org/core/v0.1.37/openasr-0.1.37-qualification-cuda-sm_89.json";
 
     fn roots() -> [CatalogTrustRoot; 1] {
         [CatalogTrustRoot {
@@ -707,7 +866,10 @@ mod tests {
             "size_bytes": 1,
             "unpacked_size_bytes": unpacked_size_bytes,
             "unpacked_tree_sha256": unpacked_tree_sha256,
-            "urls": [format!("https://dl.openasr.org/core/v0.1.37/{file_name}")],
+            "urls": [
+                format!("https://dl.openasr.org/core/v0.1.37/{file_name}"),
+                format!("https://github.com/QuintinShaw/openasr/releases/download/v0.1.37/{file_name}"),
+            ],
         })
     }
 
@@ -716,7 +878,7 @@ mod tests {
             "file_name": "openasr.exe",
             "sha256": "7".repeat(64),
             "size_bytes": 1,
-            "bundle": artifact("openasr-windows-x86_64-neutral.zip", 'd'),
+            "bundle": artifact("openasr-0.1.37-windows-x86_64-neutral.zip", 'd'),
         })
     }
 
@@ -740,8 +902,8 @@ mod tests {
             "provider_target": {"provider": "cuda", "target": "sm_89"},
             "artifacts": {
                 "binary": binary_artifact(),
-                "plugin": artifact("openasr-cuda.dll", '8'),
-                "vendor": [artifact("cuda-runtime.zip", '9')],
+                "plugin": artifact("openasr-0.1.37-windows-x86_64-cuda-sm_89-plugin.dll", '8'),
+                "vendor": [artifact("openasr-vendor-cuda-runtime-999999999999.zip", '9')],
             },
             "attestation": {
                 "predicate_type": "https://slsa.dev/provenance/v1",
@@ -749,7 +911,7 @@ mod tests {
                 "signer_workflow": QUALIFICATION_ATTESTATION_SIGNER_WORKFLOW,
                 "source_digest": "b".repeat(40),
                 "deny_self_hosted_runners": true,
-                "bundle": artifact("attestation.jsonl", 'a'),
+                "bundle": artifact("openasr-0.1.37-build-provenance.bundle.json", 'a'),
             },
         })
     }
@@ -776,6 +938,26 @@ mod tests {
         );
         assert_eq!(manifest.provider_target.target, "sm_89");
         assert!(manifest.artifacts.plugin.is_some());
+        validate_canonical_manifest_url(&manifest, URL).expect("canonical cell URL");
+        assert!(
+            validate_canonical_manifest_url(
+                &manifest,
+                "https://dl.openasr.org/core/v0.1.37/openasr-0.1.37-qualification-cuda-sm_90.json",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn release_subject_is_a_canonical_stable_semver() {
+        for release_subject in ["0.1.37", "v0.1.37-alpha.1", "v01.1.37"] {
+            let mut manifest = manifest_value();
+            manifest["release_subject"] = serde_json::json!(release_subject);
+            assert!(
+                verify_with_test_root(&manifest).is_err(),
+                "{release_subject}"
+            );
+        }
     }
 
     #[test]
@@ -820,6 +1002,10 @@ mod tests {
     #[test]
     fn attestation_identity_is_pinned_and_self_hosted_is_denied() {
         for (field, value) in [
+            (
+                "predicate_type",
+                serde_json::json!("https://example.com/provenance/v1"),
+            ),
             ("repository", serde_json::json!("attacker/repo")),
             (
                 "signer_workflow",
@@ -892,6 +1078,59 @@ mod tests {
             verify_with_test_root(&wrong_plugin_extension),
             Err(QualificationManifestError::InvalidField { .. })
         ));
+
+        for (field, value) in [
+            ("target", "aarch64-pc-windows-msvc"),
+            ("crt", "msvc-static"),
+        ] {
+            let mut manifest = manifest_value();
+            manifest["host_abi"][field] = serde_json::json!(value);
+            assert!(matches!(
+                verify_with_test_root(&manifest),
+                Err(QualificationManifestError::InvalidField { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn release_artifact_names_bind_version_provider_target_and_content_digest() {
+        let mut mutations = Vec::new();
+
+        let mut wrong_binary = manifest_value();
+        wrong_binary["artifacts"]["binary"]["file_name"] = serde_json::json!("other-openasr.exe");
+        mutations.push(wrong_binary);
+
+        let mut wrong_bundle = manifest_value();
+        wrong_bundle["artifacts"]["binary"]["bundle"] =
+            artifact("openasr-0.1.38-windows-x86_64-neutral.zip", 'd');
+        mutations.push(wrong_bundle);
+
+        let mut wrong_plugin_target = manifest_value();
+        wrong_plugin_target["artifacts"]["plugin"] =
+            artifact("openasr-0.1.37-windows-x86_64-cuda-sm_90-plugin.dll", '8');
+        mutations.push(wrong_plugin_target);
+
+        let mut wrong_vendor_provider = manifest_value();
+        wrong_vendor_provider["artifacts"]["vendor"][0] =
+            artifact("openasr-vendor-rocm-runtime-999999999999.zip", '9');
+        mutations.push(wrong_vendor_provider);
+
+        let mut wrong_vendor_digest = manifest_value();
+        wrong_vendor_digest["artifacts"]["vendor"][0] =
+            artifact("openasr-vendor-cuda-runtime-888888888888.zip", '9');
+        mutations.push(wrong_vendor_digest);
+
+        let mut wrong_attestation = manifest_value();
+        wrong_attestation["attestation"]["bundle"] =
+            artifact("openasr-0.1.38-build-provenance.bundle.json", 'a');
+        mutations.push(wrong_attestation);
+
+        for manifest in mutations {
+            assert!(matches!(
+                verify_with_test_root(&manifest),
+                Err(QualificationManifestError::InvalidField { .. })
+            ));
+        }
     }
 
     #[test]
@@ -929,9 +1168,10 @@ mod tests {
     #[test]
     fn manifest_rejects_mutable_or_path_like_download_authority() {
         for url in [
-            "file:///C:/temp/openasr-cuda.dll",
-            "https://dl.openasr.org/core/v0.1.37/openasr-cuda.dll?download=temporary",
+            "file:///C:/temp/openasr-0.1.37-windows-x86_64-cuda-sm_89-plugin.dll",
+            "https://dl.openasr.org/core/v0.1.37/openasr-0.1.37-windows-x86_64-cuda-sm_89-plugin.dll?download=temporary",
             "https://dl.openasr.org/core/v0.1.37/different.dll",
+            "https://example.com/openasr-0.1.37-windows-x86_64-cuda-sm_89-plugin.dll",
         ] {
             let mut manifest = manifest_value();
             manifest["artifacts"]["plugin"]["urls"] = serde_json::json!([url]);
