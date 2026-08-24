@@ -274,12 +274,11 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
     }
 
     fn record_batched_runtime_receipt(&mut self, width: usize) {
-        if !self.batched_runtime_receipts.contains_key(&width) {
-            if let Some(resource) =
+        if !self.batched_runtime_receipts.contains_key(&width)
+            && let Some(resource) =
                 self.acquire_semantic_resource(format!("serve-batch.batch-runtime-width={width}"))
-            {
-                self.batched_runtime_receipts.insert(width, resource);
-            }
+        {
+            self.batched_runtime_receipts.insert(width, resource);
         }
     }
 
@@ -1415,10 +1414,10 @@ impl ServeBatchReuseSignal {
             }
             return;
         }
-        if state.pending {
-            if let Some(collector) = self.collector.as_ref() {
-                collector.record_notification_coalesced();
-            }
+        if state.pending
+            && let Some(collector) = self.collector.as_ref()
+        {
+            collector.record_notification_coalesced();
         }
         state.latest_attempt = attempt;
         state.pending = true;
@@ -1837,11 +1836,11 @@ where
                     let mut active = self.active.lock().map_err(|_| registry_error())?;
                     active.retain(|_, weak| weak.strong_count() > 0);
                     if let Some(weak) = active.get(&key) {
-                        if let Some(engine) = weak.upgrade() {
-                            if is_alive(&engine) {
-                                on_reuse(&engine);
-                                return Ok(engine);
-                            }
+                        if let Some(engine) = weak.upgrade()
+                            && is_alive(&engine)
+                        {
+                            on_reuse(&engine);
+                            return Ok(engine);
                         }
                         active.remove(&key);
                     }
@@ -2120,18 +2119,18 @@ where
                     let mut active = self.active.lock().map_err(|_| F::registry_poisoned())?;
                     active.retain(|_, weak| weak.strong_count() > 0);
                     if let Some(weak) = active.get(&key) {
-                        if let Some(engine) = weak.upgrade() {
-                            if serve_batch_owner_alive(&engine.is_alive) {
-                                engine.record_receipt_reuse();
-                                let registry = self.clone();
-                                let failed_key = key.clone();
-                                let failed_engine = Arc::clone(&engine);
-                                crate::models::native_execution_services::
-                                    stage_execution_cache_rollback(move || {
-                                        registry.evict_exact(&failed_key, &failed_engine)
-                                    });
-                                return Ok(engine);
-                            }
+                        if let Some(engine) = weak.upgrade()
+                            && serve_batch_owner_alive(&engine.is_alive)
+                        {
+                            engine.record_receipt_reuse();
+                            let registry = self.clone();
+                            let failed_key = key.clone();
+                            let failed_engine = Arc::clone(&engine);
+                            crate::models::native_execution_services::
+                                stage_execution_cache_rollback(move || {
+                                    registry.evict_exact(&failed_key, &failed_engine)
+                                });
+                            return Ok(engine);
                         }
                         active.remove(&key);
                     }
@@ -2217,15 +2216,15 @@ where
                 registry.complete_pending_failure(&key, &staged_pending);
                 return;
             }
-            if let Some(existing) = engines.get(&key) {
-                if serve_batch_owner_alive(&existing.is_alive) {
-                    if let Ok(mut active) = registry.active.lock() {
-                        active.insert(key.clone(), Arc::downgrade(&existing));
-                    }
-                    staged_pending.complete(Ok(existing));
-                    registry.remove_pending_if(&key, &staged_pending);
-                    return;
+            if let Some(existing) = engines.get(&key)
+                && serve_batch_owner_alive(&existing.is_alive)
+            {
+                if let Ok(mut active) = registry.active.lock() {
+                    active.insert(key.clone(), Arc::downgrade(&existing));
                 }
+                staged_pending.complete(Ok(existing));
+                registry.remove_pending_if(&key, &staged_pending);
+                return;
             }
             engines.remove(&key);
             let _ = engines.insert_if_idle_capacity(key.clone(), Arc::clone(&staged_engine));

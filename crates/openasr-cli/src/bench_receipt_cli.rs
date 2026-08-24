@@ -82,10 +82,10 @@ pub(crate) fn bench_receipt_short_audio(
         .trace_out
         .map(|trace_out| fixed_receipt_and_trace_targets(options.out, trace_out))
         .transpose()?;
-    if let Some((_, trace_target)) = &fixed_output_targets {
-        if trace_target.path().exists() {
-            bail!("refusing to overwrite runtime trace output");
-        }
+    if let Some((_, trace_target)) = &fixed_output_targets
+        && trace_target.path().exists()
+    {
+        bail!("refusing to overwrite runtime trace output");
     }
 
     let home = openasr_home()?;
@@ -690,7 +690,7 @@ fn atomic_create_new_trace_at_target_with(
     temp.as_file()
         .sync_all()
         .context("Could not sync runtime trace temporary file")?;
-    if let Err(error) = fs::hard_link(temp.path(), &target) {
+    if let Err(error) = fs::hard_link(temp.path(), target) {
         let _ = temp.close();
         return Err(anyhow::anyhow!(
             "Could not create runtime trace {} without replacing an existing file: {error}",

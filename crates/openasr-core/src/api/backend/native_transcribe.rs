@@ -5014,7 +5014,7 @@ mod tests {
         let plan = resolve_longform_vad_execution_plan(services.as_ref(), &ExecutionIntent::Auto)
             .expect("Auto VAD plan");
         let installed = std::sync::atomic::AtomicBool::new(false);
-        let value = run_auxiliary_stage_with_policy(
+        run_auxiliary_stage_with_policy(
             services.as_ref(),
             &plan,
             "longform-vad",
@@ -5033,7 +5033,6 @@ mod tests {
             installed.load(std::sync::atomic::Ordering::SeqCst),
             "run_auxiliary_stage_with_policy must install CandidateActivationQuoteSource before the attempt"
         );
-        let _ = value;
     }
 
     #[test]

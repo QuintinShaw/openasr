@@ -47,7 +47,7 @@ type FireRedRealtimeVadActor =
     PinnedRuntimeActorCheckout<AuxiliaryPinnedRuntimeCacheKey, FireRedRealtimeVadRuntime>;
 
 enum FireRedRealtimeVadCandidate {
-    Host(Mutex<FireRedStreamingVad>),
+    Host(Box<Mutex<FireRedStreamingVad>>),
     Accelerated(FireRedRealtimeVadActor),
 }
 
@@ -123,7 +123,7 @@ impl fmt::Debug for FireRedRealtimeVadSession {
 }
 
 enum FireRedRealtimeVadSessionRuntime {
-    Host(FireRedStreamingVad),
+    Host(Box<FireRedStreamingVad>),
     Policy(
         Box<PolicyResolvedStatefulAuxRuntime<FireRedRealtimeVadCandidate, FireRedStreamVadError>>,
     ),
@@ -154,7 +154,7 @@ impl FireRedRealtimeVadSession {
             }
         })?;
         Ok(Self {
-            runtime: FireRedRealtimeVadSessionRuntime::Host(streaming),
+            runtime: FireRedRealtimeVadSessionRuntime::Host(Box::new(streaming)),
             expected_frame_samples: frame_samples,
             precommit_frames: Vec::new(),
             _request_receipt_owner: super::receipt_owner(
@@ -345,7 +345,9 @@ fn build_candidate(
                 reason: "vendored Stream-VAD weights failed to parse".to_string(),
             }
         })?;
-        return Ok(FireRedRealtimeVadCandidate::Host(Mutex::new(streaming)));
+        return Ok(FireRedRealtimeVadCandidate::Host(Box::new(Mutex::new(
+            streaming,
+        ))));
     }
 
     let backend = resolved_runtime_for_auxiliary_candidate(candidate).backend();

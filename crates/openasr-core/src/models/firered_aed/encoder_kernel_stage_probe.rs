@@ -97,15 +97,13 @@ fn kernel_stage_class_name(class: EncoderKernelStageClass) -> &'static str {
 
 fn first_mismatch(left: &[i32], right: &[i32]) -> Option<usize> {
     let limit = left.len().min(right.len());
-    (0..limit)
-        .find(|&index| left[index] != right[index])
-        .or_else(|| {
-            if left.len() == right.len() {
-                None
-            } else {
-                Some(limit)
-            }
-        })
+    (0..limit).find(|&index| left[index] != right[index]).or({
+        if left.len() == right.len() {
+            None
+        } else {
+            Some(limit)
+        }
+    })
 }
 
 fn decoder_state(

@@ -387,14 +387,13 @@ impl<T> SystemMemoryOwner<T> {
                             Some(observation_confidence),
                         )
                         .and_then(|descriptor| collector.acquire_resource(owner_id, descriptor))
-                        .map(|resource| {
+                        .inspect(|resource| {
                             // Receipts are attached after the broker lease has
                             // already committed. Leaving them Reserved would
                             // make shadow comparison charge them as pending.
                             resource.set_state(
                                 crate::models::runtime_receipts::RuntimeResourceState::Committed,
                             );
-                            resource
                         })
                 });
                 Some((Some(owner), resource))

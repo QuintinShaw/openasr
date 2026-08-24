@@ -6,7 +6,7 @@
 //! reservations, staged owners, attestation contracts, and a journal factory.
 //! Production NES attempts and default-model activation both enter here;
 //! family modules must not construct a second transaction.
-#![allow(dead_code, private_bounds, private_interfaces)]
+#![allow(dead_code, private_bounds, private_interfaces, clippy::type_complexity)]
 
 use std::marker::PhantomData;
 
@@ -55,17 +55,26 @@ impl ActivationStage {
     /// Check an edge independently of a transaction. The typestate wrappers
     /// make the same invalid edges unrepresentable at call sites.
     pub const fn transition(self, to: Self) -> Result<(), InvalidTransition> {
-        let valid = match (self, to) {
+        let valid = matches!(
+            (self, to),
             (Self::Prepared, Self::Reserved | Self::RolledBack)
-            | (Self::Reserved, Self::Materialized | Self::RolledBack | Self::Quarantined)
-            | (
-                Self::Materialized,
-                Self::AttestationPending | Self::RolledBack | Self::Quarantined,
-            )
-            | (Self::AttestationPending, Self::Attested | Self::RolledBack | Self::Quarantined)
-            | (Self::Attested, Self::Committed | Self::RolledBack | Self::Quarantined) => true,
-            _ => false,
-        };
+                | (
+                    Self::Reserved,
+                    Self::Materialized | Self::RolledBack | Self::Quarantined
+                )
+                | (
+                    Self::Materialized,
+                    Self::AttestationPending | Self::RolledBack | Self::Quarantined,
+                )
+                | (
+                    Self::AttestationPending,
+                    Self::Attested | Self::RolledBack | Self::Quarantined
+                )
+                | (
+                    Self::Attested,
+                    Self::Committed | Self::RolledBack | Self::Quarantined
+                )
+        );
 
         if valid {
             Ok(())
@@ -660,7 +669,7 @@ where
                 _private: PhantomData,
             })
         } else {
-            result.map(|_| unreachable!()).map_err(|error| error)
+            result.map(|_| unreachable!())
         }
     }
 
@@ -677,7 +686,7 @@ where
                 _private: PhantomData,
             })
         } else {
-            result.map(|_| unreachable!()).map_err(|error| error)
+            result.map(|_| unreachable!())
         }
     }
 }
@@ -734,7 +743,7 @@ where
                 _private: PhantomData,
             })
         } else {
-            result.map(|_| unreachable!()).map_err(|error| error)
+            result.map(|_| unreachable!())
         }
     }
 
@@ -749,7 +758,7 @@ where
                 _private: PhantomData,
             })
         } else {
-            result.map(|_| unreachable!()).map_err(|error| error)
+            result.map(|_| unreachable!())
         }
     }
 }
@@ -825,7 +834,7 @@ where
                 _private: PhantomData,
             })
         } else {
-            result.map(|_| unreachable!()).map_err(|error| error)
+            result.map(|_| unreachable!())
         }
     }
 
@@ -840,7 +849,7 @@ where
                 _private: PhantomData,
             })
         } else {
-            result.map(|_| unreachable!()).map_err(|error| error)
+            result.map(|_| unreachable!())
         }
     }
 }
@@ -956,7 +965,7 @@ where
                 _private: PhantomData,
             })
         } else {
-            result.map(|_| unreachable!()).map_err(|error| error)
+            result.map(|_| unreachable!())
         }
     }
 }
@@ -1064,7 +1073,7 @@ where
                 _private: PhantomData,
             })
         } else {
-            result.map(|_| unreachable!()).map_err(|error| error)
+            result.map(|_| unreachable!())
         }
     }
 
@@ -1079,7 +1088,7 @@ where
                 _private: PhantomData,
             })
         } else {
-            result.map(|_| unreachable!()).map_err(|error| error)
+            result.map(|_| unreachable!())
         }
     }
 }
@@ -1705,7 +1714,7 @@ impl
                     record
                         .architecture_id
                         .as_deref()
-                        .map_or(true, |architecture| architecture == self.architecture_id)
+                        .is_none_or(|architecture| architecture == self.architecture_id)
                         && crate::default_selection::execution_intent_from_v2_wire(
                             &record.execution_intent,
                         )

@@ -324,10 +324,10 @@ impl QwenReuseSignal {
             }
             return;
         }
-        if state.pending {
-            if let Some(collector) = self.collector.as_ref() {
-                collector.record_notification_coalesced();
-            }
+        if state.pending
+            && let Some(collector) = self.collector.as_ref()
+        {
+            collector.record_notification_coalesced();
         }
         state.latest_attempt = attempt;
         state.pending = true;
@@ -709,10 +709,10 @@ fn qwen_owner_thread_loop(
     };
     let mut deferred = VecDeque::new();
     loop {
-        if let Some(attempt) = reuse.consume() {
-            if let Some(owner) = receipt_owner.as_ref() {
-                owner.record_reuse(attempt);
-            }
+        if let Some(attempt) = reuse.consume()
+            && let Some(owner) = receipt_owner.as_ref()
+        {
+            owner.record_reuse(attempt);
         }
         let Some(batch) = serve_batch_drain_compatible_batch(
             &mut deferred,

@@ -238,17 +238,16 @@ impl DomainAttribution {
                 resource_id,
                 descriptor,
             } = event
+                && let Some(domain) = descriptor.domain
             {
-                if let Some(domain) = descriptor.domain {
-                    attribution
-                        .owner_domains
-                        .entry(*owner_id)
-                        .or_default()
-                        .insert(domain.kind);
-                    attribution
-                        .resource_domains
-                        .insert(*resource_id, (*owner_id, domain.kind));
-                }
+                attribution
+                    .owner_domains
+                    .entry(*owner_id)
+                    .or_default()
+                    .insert(domain.kind);
+                attribution
+                    .resource_domains
+                    .insert(*resource_id, (*owner_id, domain.kind));
             }
         }
         attribution

@@ -2731,8 +2731,10 @@ mod tests {
                 assert_eq!(requested_bytes, INCIDENT_REQUESTED);
                 assert_eq!(committed_bytes, INCIDENT_COMMITTED);
                 assert_eq!(available_bytes, INCIDENT_POLICY_REMAINDER);
-                assert!(INCIDENT_REQUESTED > INCIDENT_POLICY_REMAINDER);
-                assert!(INCIDENT_REQUESTED > INCIDENT_OBSERVED_FREE);
+                const {
+                    assert!(INCIDENT_REQUESTED > INCIDENT_POLICY_REMAINDER);
+                    assert!(INCIDENT_REQUESTED > INCIDENT_OBSERVED_FREE);
+                }
             }
             other => panic!("incident arithmetic must fail closed, got {other:?}"),
         }

@@ -878,7 +878,7 @@ pub(crate) fn current_stream_vad_embedded_slot()
 /// than writing a process-global TLS owner table.
 pub(crate) fn current_loaded_weight_owners() -> Option<crate::ggml_runtime::LoadedWeightOwnerCache>
 {
-    CURRENT_LOADED_WEIGHT_OWNERS.with(|current| current.borrow().clone())
+    CURRENT_LOADED_WEIGHT_OWNERS.with(|current| *current.borrow())
 }
 
 pub(crate) fn current_execution_placement() -> Option<ExecutionPlacement> {

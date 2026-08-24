@@ -165,7 +165,7 @@ pub(crate) fn activate_default_model_blocking(
     }
 
     let staged = NativeActivationStagedOwner::stage(
-        &runtime,
+        runtime,
         identity.path().to_path_buf(),
         identity.pack_content_id().to_string(),
     );

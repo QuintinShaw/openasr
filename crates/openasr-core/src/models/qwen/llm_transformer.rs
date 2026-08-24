@@ -3116,10 +3116,9 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
     pub(crate) fn supports_fused_top1(&self) -> bool {
         #[cfg(test)]
         {
-            return (self.test_native_output_enabled
-                || self.resolved_runtime.output_plan()
-                    == GgmlDecodeOutputPlan::NativeFirstMaxToken)
-                && self.fused_logits_head.is_some();
+            (self.test_native_output_enabled
+                || self.resolved_runtime.output_plan() == GgmlDecodeOutputPlan::NativeFirstMaxToken)
+                && self.fused_logits_head.is_some()
         }
         #[cfg(not(test))]
         {

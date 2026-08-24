@@ -254,7 +254,7 @@ fn encode_intent_atom(value: &str) -> String {
 }
 
 fn decode_intent_atom(value: &str) -> Result<String, String> {
-    if value.is_empty() || value.len() % 2 != 0 {
+    if value.is_empty() || !value.len().is_multiple_of(2) {
         return Err("encoded execution-intent atom has an invalid length".to_string());
     }
     let mut bytes = Vec::with_capacity(value.len() / 2);

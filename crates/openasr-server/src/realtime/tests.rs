@@ -6052,26 +6052,20 @@ where
     if resources.is_empty() {
         return HostOwnerAttribution::AttributionIncomplete;
     }
-    let mut same_owner_equivalent = false;
     let mut distinct_owner_equivalent = false;
     for (index, left) in resources.iter().enumerate() {
         for right in resources.iter().skip(index + 1) {
             if left.key == right.key
                 && left.retained_bytes.abs_diff(expected_retained) <= retained_tolerance
                 && right.retained_bytes.abs_diff(expected_retained) <= retained_tolerance
+                && left.owner_id != right.owner_id
             {
-                if left.owner_id == right.owner_id {
-                    same_owner_equivalent = true;
-                } else {
-                    distinct_owner_equivalent = true;
-                }
+                distinct_owner_equivalent = true;
             }
         }
     }
     if distinct_owner_equivalent {
         HostOwnerAttribution::SupportedEquivalentDuplicatedWeights
-    } else if same_owner_equivalent {
-        HostOwnerAttribution::RejectedSingleOrNonEquivalentOwners
     } else {
         HostOwnerAttribution::RejectedSingleOrNonEquivalentOwners
     }
