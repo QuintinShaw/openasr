@@ -693,6 +693,10 @@ mod tests {
             crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight(),
             crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID,
         );
+        let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+            (GgmlAsrBackendPreference::Auto).request_backend_override(),
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        );
         GgmlAsrStreamingSessionRequest {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
@@ -704,11 +708,10 @@ mod tests {
             request_options: GgmlAsrExecutionOptions::default(),
             configured_diarize: false,
             backend_preference: GgmlAsrBackendPreference::Auto,
-            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
-                (GgmlAsrBackendPreference::Auto).request_backend_override(),
-                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            resolved_runtime,
+            execution_lane: crate::models::native_execution_services::current_execution_lane_key(
+                resolved_runtime.backend(),
             ),
-            execution_lane: None,
             final_text_processor: None,
             session_context: crate::NativeAsrSessionContext::new("rt_ggml_transcript_session"),
             session_config: crate::NativeAsrStreamingSessionConfig::new()

@@ -46,6 +46,14 @@ impl XasrIncrementalDecoder {
         adapter_id: &'static str,
         runtime: XasrRuntimeActor,
     ) -> Result<Self, GgmlAsrExecutionError> {
+        let _execution_scope =
+            crate::models::native_execution_services::install_native_execution_services(
+                request.execution_services.as_ref(),
+            );
+        let _resolved_lane =
+            crate::models::native_execution_services::install_resolved_execution_lane(
+                request.execution_lane.clone(),
+            );
         let decode_state = runtime
             .call_mut(|runtime| runtime.new_decode_state())
             .map_err(|error| {
@@ -319,6 +327,10 @@ impl IncrementalAudioDecoder for XasrIncrementalDecoder {
             crate::models::native_execution_services::install_native_execution_services(
                 self.request.execution_services.as_ref(),
             );
+        let _resolved_lane =
+            crate::models::native_execution_services::install_resolved_execution_lane(
+                self.request.execution_lane.clone(),
+            );
         if samples.iter().any(|value| !value.is_finite()) {
             return Err(self.failed("xasr streaming requires finite audio samples"));
         }
@@ -333,6 +345,10 @@ impl IncrementalAudioDecoder for XasrIncrementalDecoder {
         let _execution_scope =
             crate::models::native_execution_services::install_native_execution_services(
                 self.request.execution_services.as_ref(),
+            );
+        let _resolved_lane =
+            crate::models::native_execution_services::install_resolved_execution_lane(
+                self.request.execution_lane.clone(),
             );
         let _thread_override = install_request_inference_threads_override(
             self.request.request_options.inference_threads,
@@ -384,6 +400,14 @@ impl IncrementalAudioDecoder for XasrIncrementalDecoder {
     }
 
     fn reset(&mut self) {
+        let _execution_scope =
+            crate::models::native_execution_services::install_native_execution_services(
+                self.request.execution_services.as_ref(),
+            );
+        let _resolved_lane =
+            crate::models::native_execution_services::install_resolved_execution_lane(
+                self.request.execution_lane.clone(),
+            );
         self.audio.clear();
         self.dropped_samples = 0;
         self.features.data.clear();
@@ -423,6 +447,17 @@ impl IncrementalAudioDecoder for XasrIncrementalDecoder {
     /// those are process/runtime-lifetime residency, not per-utterance state,
     /// and staying warm across the reset is the entire point.
     fn warm_up(&mut self) -> Result<(), GgmlAsrExecutionError> {
+        let _execution_scope =
+            crate::models::native_execution_services::install_native_execution_services(
+                self.request.execution_services.as_ref(),
+            );
+        let _resolved_lane =
+            crate::models::native_execution_services::install_resolved_execution_lane(
+                self.request.execution_lane.clone(),
+            );
+        let _thread_override = install_request_inference_threads_override(
+            self.request.request_options.inference_threads,
+        );
         let target_frames = self
             .runtime
             .call_mut(|runtime| runtime.first_chunk_input_frames())
@@ -648,7 +683,9 @@ mod tests {
             configured_diarize: false,
             backend_preference: crate::GgmlAsrBackendPreference::CpuOnly,
             resolved_runtime,
-            execution_lane: None,
+            execution_lane: crate::models::native_execution_services::current_execution_lane_key(
+                resolved_runtime.backend(),
+            ),
             final_text_processor: None,
             session_context: crate::NativeAsrSessionContext::new("rt_xasr_streaming_match"),
             session_config: crate::NativeAsrStreamingSessionConfig::new()
@@ -664,6 +701,7 @@ mod tests {
                 &runtime_pool,
                 &preflight,
                 resolved_runtime.backend(),
+                &request.execution_lane,
             )
             .expect("streaming runtime"),
         )
@@ -751,6 +789,7 @@ mod tests {
                 &runtime_pool,
                 &preflight,
                 resolved_runtime.backend(),
+                &request.execution_lane,
             )
             .expect("streaming runtime");
             let mut decoder = XasrIncrementalDecoder::new(
@@ -804,7 +843,9 @@ mod tests {
                 (crate::GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
                 crate::ggml_runtime::AutoGpuPolicy::AllBackends,
             ),
-            execution_lane: None,
+            execution_lane: crate::models::native_execution_services::current_execution_lane_key(
+                crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            ),
             final_text_processor: None,
             session_context: crate::NativeAsrSessionContext::new("rt_xasr_streaming_warmup"),
             session_config: crate::NativeAsrStreamingSessionConfig::new()
@@ -835,6 +876,7 @@ mod tests {
             &runtime_pool,
             &preflight,
             request.resolved_runtime.backend(),
+            &request.execution_lane,
         )
         .expect("streaming runtime");
         let mut decoder = XasrIncrementalDecoder::new(
@@ -932,6 +974,7 @@ mod tests {
                 &runtime_pool,
                 &preflight,
                 request.resolved_runtime.backend(),
+                &request.execution_lane,
             )
             .expect("streaming runtime");
             let mut decoder = XasrIncrementalDecoder::new(

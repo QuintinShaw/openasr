@@ -104,6 +104,29 @@ class CommittedRegistryGateTest(unittest.TestCase):
         failures = run_gate(registry_dir=REGISTRY, allow_dev_key=False)
         self.assertEqual(failures, [])
 
+    def test_catalog_pair_cli_uses_the_production_signature_trust_root(self) -> None:
+        command = [
+            sys.executable,
+            str(SCRIPT_DIR / "check_catalog_consistency.py"),
+            "--catalog-pair",
+            str(REGISTRY / "catalog.public.json"),
+            str(REGISTRY / "catalog.public.signature.json"),
+        ]
+        completed = subprocess.run(command, check=False, capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        with tempfile.TemporaryDirectory() as temp:
+            tampered = Path(temp) / "catalog.json"
+            tampered.write_bytes((REGISTRY / "catalog.public.json").read_bytes() + b" ")
+            rejected = subprocess.run(
+                [*command[:3], str(tampered), command[-1]],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("content hash mismatch", rejected.stderr)
+
     def test_tampered_catalog_fails_on_hash_binding(self) -> None:
         registry = copy_registry()
         try:

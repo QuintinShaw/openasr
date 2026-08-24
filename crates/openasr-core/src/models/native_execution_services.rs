@@ -12,6 +12,7 @@ use std::{
     collections::BTreeMap,
     ffi::{CStr, c_char, c_void},
     fmt,
+    hash::{Hash, Hasher},
     rc::Rc,
     sync::{
         Arc, Mutex, OnceLock,
@@ -427,9 +428,36 @@ impl Drop for ExecutionCacheJournalScope {
 /// `GgmlCpuGraphBackend::Gpu` deliberately is not sufficient: it folds CUDA,
 /// HIP, Vulkan and every visible card together. The route key retains the
 /// provider-local stable id plus PCI identity when ggml exposes it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub(crate) struct ResolvedDeviceKey {
     route: ExecutionRouteCacheKey,
+    resolved_route: ResolvedExecutionRoute,
+}
+
+impl ResolvedDeviceKey {
+    fn new(resolved_route: ResolvedExecutionRoute) -> Self {
+        Self {
+            route: resolved_route.cache_key(),
+            resolved_route,
+        }
+    }
+}
+
+// Runtime isolation deliberately ignores registry ordinal; the full route is
+// retained only so an immutable lane can reinstall exact backend selection on
+// another worker without enumerating devices again.
+impl PartialEq for ResolvedDeviceKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.route == other.route
+    }
+}
+
+impl Eq for ResolvedDeviceKey {}
+
+impl Hash for ResolvedDeviceKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.route.hash(state);
+    }
 }
 
 /// Cache key shared by every resident object that owns a ggml backend, device
@@ -482,6 +510,23 @@ impl ExecutionLaneKey {
         self.placement
     }
 
+    pub(crate) fn request_backend_preference(&self) -> RequestBackendPreference {
+        match self.provider() {
+            ExecutionProvider::Cpu => RequestBackendPreference::CpuOnly,
+            ExecutionProvider::Metal
+            | ExecutionProvider::Cuda
+            | ExecutionProvider::Hip
+            | ExecutionProvider::Vulkan => {
+                RequestBackendPreference::Exact(self.device.resolved_route.clone())
+            }
+            // These providers cannot occur in a production candidate lane;
+            // retain the coarse fallback only for legacy low-level fixtures.
+            ExecutionProvider::Accelerator | ExecutionProvider::Unknown => {
+                RequestBackendPreference::Accelerated
+            }
+        }
+    }
+
     /// Observe memory for this exact lane. Enumeration order never selects a
     /// different device: both provider and provider-local stable id must
     /// match, and a missing observation remains unknown.
@@ -503,9 +548,7 @@ impl ExecutionLaneKey {
         let device = if matches!(backend, GgmlCpuGraphBackend::Cpu)
             && matches!(placement, ExecutionPlacement::CpuOnly)
         {
-            ResolvedDeviceKey {
-                route: ResolvedExecutionRoute::cpu().cache_key(),
-            }
+            ResolvedDeviceKey::new(ResolvedExecutionRoute::cpu())
         } else {
             self.device.clone()
         };
@@ -542,9 +585,7 @@ impl ExecutionLaneKey {
             return Err("execution candidate lane is incompatible with resolved backend/placement");
         }
         Ok(Self {
-            device: ResolvedDeviceKey {
-                route: candidate.device.route.cache_key(),
-            },
+            device: ResolvedDeviceKey::new(candidate.device.route.clone()),
             placement: candidate.placement,
             backend,
         })
@@ -555,9 +596,7 @@ impl ExecutionLaneKey {
     pub(crate) fn unscoped_for_backend(backend: GgmlCpuGraphBackend) -> Self {
         let route = fallback_route_for_unscoped_backend(backend);
         Self {
-            device: ResolvedDeviceKey {
-                route: route.cache_key(),
-            },
+            device: ResolvedDeviceKey::new(route),
             placement: match backend {
                 GgmlCpuGraphBackend::Cpu => ExecutionPlacement::CpuOnly,
                 GgmlCpuGraphBackend::Metal | GgmlCpuGraphBackend::Gpu => {
@@ -934,6 +973,42 @@ pub(crate) fn current_execution_lane() -> Option<ExecutionLaneKey> {
     CURRENT_EXECUTION_LANE.with(|current| current.borrow().clone())
 }
 
+/// Install one already-resolved lane as the sole backend/placement authority.
+/// The full route travels with the lane, so worker handoff never enumerates a
+/// first/best device again. Other native execution services remain untouched.
+pub(crate) struct ResolvedExecutionLaneGuard {
+    previous_placement: Option<ExecutionPlacement>,
+    previous_execution_lane: Option<ExecutionLaneKey>,
+    backend: RequestBackendOverrideGuard,
+}
+
+impl Drop for ResolvedExecutionLaneGuard {
+    fn drop(&mut self) {
+        CURRENT_EXECUTION_PLACEMENT.with(|current| current.set(self.previous_placement));
+        CURRENT_EXECUTION_LANE.with(|current| {
+            *current.borrow_mut() = self.previous_execution_lane.take();
+        });
+        // `backend` restores itself after this `Drop` returns.
+        let _ = &self.backend;
+    }
+}
+
+#[must_use = "the resolved execution lane is uninstalled when the guard drops"]
+pub(crate) fn install_resolved_execution_lane(
+    lane: ExecutionLaneKey,
+) -> ResolvedExecutionLaneGuard {
+    let backend = install_request_backend_override(Some(lane.request_backend_preference()));
+    let previous_placement =
+        CURRENT_EXECUTION_PLACEMENT.with(|current| current.replace(Some(lane.placement())));
+    let previous_execution_lane =
+        CURRENT_EXECUTION_LANE.with(|current| current.replace(Some(lane)));
+    ResolvedExecutionLaneGuard {
+        previous_placement,
+        previous_execution_lane,
+        backend,
+    }
+}
+
 pub(crate) fn current_execution_observation_sink() -> Option<ExecutionObservationSink> {
     CURRENT_EXECUTION_OBSERVATION_SINK.with(|current| current.borrow().clone())
 }
@@ -1181,9 +1256,7 @@ pub(crate) fn current_execution_lane_key(backend: GgmlCpuGraphBackend) -> Execut
         route = ResolvedExecutionRoute::cpu();
     }
     ExecutionLaneKey {
-        device: ResolvedDeviceKey {
-            route: route.cache_key(),
-        },
+        device: ResolvedDeviceKey::new(route),
         placement,
         backend,
     }
@@ -2798,6 +2871,64 @@ mod tests {
             ExecutionLaneKey::from_candidate(&candidate, GgmlCpuGraphBackend::Metal).is_err(),
             "a CUDA candidate must not be relabeled as Metal"
         );
+    }
+
+    #[test]
+    fn resolved_lane_guard_restores_backend_placement_and_lane_as_one_scope() {
+        let outer = ExecutionLaneKey::from_candidate(
+            &gpu_candidate(
+                ExecutionProvider::Vulkan,
+                "Vulkan0",
+                "0000:00:03.0",
+                ExecutionPlacement::Hybrid,
+            ),
+            GgmlCpuGraphBackend::Gpu,
+        )
+        .expect("outer lane");
+        let inner = ExecutionLaneKey::from_candidate(
+            &gpu_candidate(
+                ExecutionProvider::Cuda,
+                "CUDA1",
+                "0000:00:04.0",
+                ExecutionPlacement::FullDevice,
+            ),
+            GgmlCpuGraphBackend::Gpu,
+        )
+        .expect("inner lane");
+        let original_backend = request_backend_override();
+        let original_placement = current_execution_placement();
+        let original_lane = current_execution_lane();
+
+        {
+            let _outer = install_resolved_execution_lane(outer.clone());
+            assert_eq!(
+                request_backend_override(),
+                Some(outer.request_backend_preference())
+            );
+            assert_eq!(current_execution_placement(), Some(outer.placement()));
+            assert_eq!(current_execution_lane(), Some(outer.clone()));
+
+            {
+                let _inner = install_resolved_execution_lane(inner.clone());
+                assert_eq!(
+                    request_backend_override(),
+                    Some(inner.request_backend_preference())
+                );
+                assert_eq!(current_execution_placement(), Some(inner.placement()));
+                assert_eq!(current_execution_lane(), Some(inner));
+            }
+
+            assert_eq!(
+                request_backend_override(),
+                Some(outer.request_backend_preference())
+            );
+            assert_eq!(current_execution_placement(), Some(outer.placement()));
+            assert_eq!(current_execution_lane(), Some(outer));
+        }
+
+        assert_eq!(request_backend_override(), original_backend);
+        assert_eq!(current_execution_placement(), original_placement);
+        assert_eq!(current_execution_lane(), original_lane);
     }
 
     fn record_test_graph_placements(backends: &[&str]) {

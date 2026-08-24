@@ -11,7 +11,7 @@ use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
     PinnedRuntimeActorCheckout,
 };
-use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
+use crate::models::native_execution_services::{ExecutionLaneKey, install_resolved_execution_lane};
 use crate::models::runtime_cache_coordinator::PackContentKey;
 use crate::models::system_memory_owner::{
     SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
@@ -211,22 +211,54 @@ pub(super) fn new_runtime_actor_pool() -> XasrRuntimeActorPool {
     )
 }
 
+struct XasrRuntimeCheckoutPlan {
+    key: XasrRuntimeActorKey,
+    graph_config: crate::ggml_runtime::GgmlCpuGraphConfig,
+    speculative_blank_batch: bool,
+}
+
+fn plan_prepared_runtime_checkout(
+    preflight: &GgufRuntimeSourcePreflight,
+    resolved_backend: GgmlCpuGraphBackend,
+    execution_lane: &ExecutionLaneKey,
+) -> Result<XasrRuntimeCheckoutPlan, String> {
+    if execution_lane.backend() != resolved_backend {
+        return Err("xasr runtime lane disagrees with the resolved backend".to_string());
+    }
+    let _lane = install_resolved_execution_lane(execution_lane.clone());
+    let graph_config = xasr_zipformer_encoder_graph_config(resolved_backend);
+    let backend = graph_config.backend;
+    if backend != resolved_backend {
+        return Err("xasr graph configuration changed the candidate-resolved backend".to_string());
+    }
+    let stage_lane = execution_lane.for_stage(backend, execution_lane.placement());
+    let speculative_blank_batch = xasr_zipformer_speculative_blank_batch(backend);
+    Ok(XasrRuntimeCheckoutPlan {
+        key: (
+            PackContentKey::for_runtime_source(&preflight.runtime_source),
+            stage_lane,
+            speculative_blank_batch,
+        ),
+        graph_config,
+        speculative_blank_batch,
+    })
+}
+
 pub(super) fn checkout_prepared_runtime(
     pool: &XasrRuntimeActorPool,
     preflight: &GgufRuntimeSourcePreflight,
     resolved_backend: GgmlCpuGraphBackend,
+    execution_lane: &ExecutionLaneKey,
 ) -> Result<XasrRuntimeActor, String> {
-    let backend = xasr_zipformer_encoder_graph_config(resolved_backend).backend;
-    let speculative_blank_batch = xasr_zipformer_speculative_blank_batch(backend);
-    let key = (
-        PackContentKey::for_runtime_source(&preflight.runtime_source),
-        current_execution_lane_key(backend),
-        speculative_blank_batch,
-    );
+    let plan = plan_prepared_runtime_checkout(preflight, resolved_backend, execution_lane)?;
+    let _lane = install_resolved_execution_lane(execution_lane.clone());
+    let backend = plan.graph_config.backend;
+    let speculative_blank_batch = plan.speculative_blank_batch;
+    let graph_config = plan.graph_config;
     let preflight = preflight.clone();
     let pack_content_id = preflight.runtime_source.content_id().to_string();
     pool.checkout_or_try_build_with(
-        key,
+        plan.key,
         move || {
             let reader = build_runtime_tensor_reader_from_preflight(&preflight)
                 .map_err(|error| error.to_string())?;
@@ -239,15 +271,21 @@ pub(super) fn checkout_prepared_runtime(
             .map_err(|error| error.to_string())?;
             Ok((
                 quote.retained_bytes,
-                (preflight, reader, quote, backend, speculative_blank_batch),
+                (
+                    preflight,
+                    reader,
+                    quote,
+                    graph_config,
+                    speculative_blank_batch,
+                ),
             ))
         },
-        |(preflight, reader, quote, backend, speculative_blank_batch)| {
+        |(preflight, reader, quote, graph_config, speculative_blank_batch)| {
             match SystemMemoryOwner::try_allocate_transaction(quote, || {
-                let runtime = XasrZipformerPreparedRuntime::from_reader_metadata_with_speculation(
+                let runtime = XasrZipformerPreparedRuntime::from_reader_metadata_with_graph_config(
                     &reader,
                     &preflight.metadata,
-                    backend,
+                    graph_config,
                     speculative_blank_batch,
                 )?;
                 let retained = runtime.retained_system_memory_bytes;
@@ -469,13 +507,27 @@ impl XasrZipformerPreparedRuntime {
         backend: GgmlCpuGraphBackend,
         speculative_blank_batch: bool,
     ) -> Result<Self, String> {
+        let graph_config = xasr_zipformer_encoder_graph_config(backend);
+        Self::from_reader_metadata_with_graph_config(
+            reader,
+            gguf_metadata,
+            graph_config,
+            speculative_blank_batch,
+        )
+    }
+
+    fn from_reader_metadata_with_graph_config(
+        reader: &GgufTensorDataReader,
+        gguf_metadata: &GgufMetadata,
+        graph_config: crate::ggml_runtime::GgmlCpuGraphConfig,
+        speculative_blank_batch: bool,
+    ) -> Result<Self, String> {
         let metadata =
             parse_xasr_zipformer_execution_metadata(gguf_metadata).map_err(|e| e.to_string())?;
         let tokenizer = XasrZipformerTokenizer::from_metadata(gguf_metadata, metadata.blank_id)?;
-        let backend = xasr_zipformer_encoder_graph_config(backend).backend;
+        let backend = graph_config.backend;
         let encoder_weights =
             load_xasr_encoder_weights(reader, &metadata).map_err(|e| e.to_string())?;
-        let graph_config = xasr_zipformer_encoder_graph_config(backend);
         let mut retained = crate::models::system_memory_owner::SystemMemoryCapacity::default();
         retained.add(
             metadata
@@ -905,6 +957,72 @@ fn xasr_profile_log_duration(stage: &str, elapsed: Duration, detail: std::fmt::A
 mod tests {
     use super::*;
 
+    fn exact_gpu_lane(
+        provider: crate::device::execution_route::ExecutionProvider,
+        stable_id: &str,
+        physical_id: &str,
+    ) -> ExecutionLaneKey {
+        let candidate = crate::device::execution_policy::ExecutionCandidate {
+            device: crate::device::execution_policy::ExecutionDeviceSnapshot {
+                route: crate::device::execution_route::ResolvedExecutionRoute {
+                    provider,
+                    stable_id: stable_id.to_string(),
+                    registry_ordinal: 0,
+                    kind: crate::device::execution_route::RouteDeviceKind::Accelerated,
+                    addressability:
+                        crate::device::execution_route::DeviceAddressability::ExactlyAddressable {
+                            physical_key: crate::device::execution_route::PhysicalResourceKey::new(
+                                physical_id,
+                            )
+                            .expect("physical test id"),
+                        },
+                },
+                ggml_kind: crate::ggml_runtime::GgmlBackendKind::Gpu,
+                memory: None,
+                buffer_alignment: None,
+            },
+            placement: crate::device::execution_policy::ExecutionPlacement::FullDevice,
+        };
+        ExecutionLaneKey::from_candidate(&candidate, GgmlCpuGraphBackend::Gpu)
+            .expect("exact test lane")
+    }
+
+    #[test]
+    fn checkout_plan_uses_request_lane_instead_of_ambient_tls_lane() {
+        let requested = exact_gpu_lane(
+            crate::device::execution_route::ExecutionProvider::Cuda,
+            "CUDA1",
+            "0000:02:00.0",
+        );
+        let ambient = exact_gpu_lane(
+            crate::device::execution_route::ExecutionProvider::Vulkan,
+            "Vulkan0",
+            "0000:03:00.0",
+        );
+        let _ambient = install_resolved_execution_lane(ambient.clone());
+        assert_eq!(
+            crate::models::native_execution_services::current_execution_lane(),
+            Some(ambient.clone())
+        );
+
+        let preflight = crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight();
+        let plan = plan_prepared_runtime_checkout(&preflight, GgmlCpuGraphBackend::Gpu, &requested)
+            .expect("request lane must plan without ambient re-resolution");
+
+        assert_eq!(
+            plan.key.1,
+            requested.for_stage(
+                GgmlCpuGraphBackend::Gpu,
+                crate::device::execution_policy::ExecutionPlacement::FullDevice,
+            )
+        );
+        assert_ne!(plan.key.1, ambient);
+        assert_eq!(
+            crate::models::native_execution_services::current_execution_lane(),
+            Some(ambient)
+        );
+    }
+
     fn xasr_test_pack_or_skip(file_name: &str) -> Option<PathBuf> {
         let pack = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tmp/xasr-test/out")
@@ -928,16 +1046,20 @@ mod tests {
         let preflight = crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index(&pack)
             .expect("runtime preflight");
         let pool = new_runtime_actor_pool();
-        let runtime = checkout_prepared_runtime(&pool, &preflight, resolved_backend)
-            .expect("first checkout must build");
+        let execution_lane =
+            crate::models::native_execution_services::current_execution_lane_key(resolved_backend);
+        let runtime =
+            checkout_prepared_runtime(&pool, &preflight, resolved_backend, &execution_lane)
+                .expect("first checkout must build");
         drop(runtime);
         assert_eq!(pool.usage_for_test().0, 1);
 
         pool.clear();
         assert_eq!(pool.usage_for_test(), (0, 0));
 
-        let rebuilt = checkout_prepared_runtime(&pool, &preflight, resolved_backend)
-            .expect("checkout after clear must rebuild");
+        let rebuilt =
+            checkout_prepared_runtime(&pool, &preflight, resolved_backend, &execution_lane)
+                .expect("checkout after clear must rebuild");
         let samples = (0..16_000)
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16_000.0).sin() * 0.05)
             .collect::<Vec<_>>();

@@ -71,9 +71,10 @@ contract. Reversing the vocabulary row and applying ordinary `ARGMAX` therefore
 cannot implement OpenASR's deterministic first-maximum contract on those
 backends.
 
-This defect is release-blocking even though exact maximum ties may be uncommon.
-It affects a shared production path used directly or indirectly by multiple
-families. It must be fixed centrally. It is not, by itself, enough to attribute
+This defect blocks capability activation even though exact maximum ties may be
+uncommon; it also blocks a release if any already-selectable lane still uses the
+defective path. It affects a shared production path used directly or indirectly
+by multiple families. It must be fixed centrally. It is not, by itself, enough to attribute
 the entire field failure: a constant token sequence can also result from stale
 persistent output, reusable-KV state, mask or row-update defects, or incorrect
 encoder/cross-attention values. The implementation must first run the
@@ -91,8 +92,9 @@ The target solution is:
    reusable-KV correctness into planner-internal runtime evidence;
 5. validate backend operators, reusable graphs, and real model packs as three
    distinct layers; and
-6. make the resulting evidence a pre-publication gate rather than a
-   post-release observation.
+6. make the resulting evidence an exact-backend capability-activation gate,
+   rather than post-release monitoring; public bytes may precede it only while
+   they remain `PublishedInert` and unselectable.
 
 No family-specific FireRed workaround satisfies this contract.
 
@@ -785,14 +787,15 @@ Current evidence has different scopes:
   deferred;
 - the audit-form parser checks document structure and unfinished placeholders,
   not the semantic evidence in each backend cell;
-- the Qwen GPU parity workflow is manual-dispatch only and has no completed
-  passing historical run at this evidence baseline;
+- the Qwen GPU parity workflow is a manual raw diagnostic, not a release gate,
+  and has no completed passing historical run at this evidence baseline;
 - backend hardware evidence can prove artifact identity, fresh-process
   determinism, FullDevice placement, and no CPU fallback for its selected
   workload, but not every family or token path;
 - Vulkan lavapipe smoke is software and synthetic; and
-- release-event family regression runs after publication, so they cannot prevent
-  a bad release.
+- scheduled and release-event family regression runs are post-publication
+  monitoring; the reusable pre-publication CPU contract now blocks the release,
+  while GPU correctness remains an exact-target activation gate.
 
 These facts explain how CPU correctness, plugin packaging, and placement could
 all appear healthy while FireRed CUDA token correctness remained unproved.
@@ -807,31 +810,34 @@ Keep these result classes separate:
 | Placement and resource smoke | selected device, FullDevice compute, no fallback, resource observations | token or transcript correctness |
 | Token and transcript correctness | real model behavior against the oracle | packaging completeness unless artifact-bound |
 
-A release requires all applicable classes.
+An `Activated` provider requires all applicable classes. The core release may
+publish signed provider bytes as `PublishedInert` after build/packaging and the
+CPU family gate; inert bytes are not runtime-selectable.
 
-### Required pre-publication DAG
+### Required release and capability-activation DAG
 
 ```text
 build immutable release candidates
 -> sign and attest candidates
--> generate a staging catalog snapshot
--> run real-hardware backend evidence
--> run reusable-graph and family token-parity matrices
--> run desktop plugin-switch product E2E
--> validate and bind all receipts
--> obtain human publication approval
--> atomically activate catalog and release
--> run post-publication monitoring
+-> generate and sign a staging catalog with every provider PublishedInert
+-> run the release-candidate CPU family and packaging/CDN gates
+-> obtain human release approval
+-> deploy the PublishedInert catalog and publish those exact release bytes
+-> run real-hardware backend evidence on the exact public bytes
+-> run reusable-graph, family token-parity, and Desktop plugin-switch matrices
+-> validate and bind both evidence classes to exact target and backend id
+-> obtain separate human backend-scoped activation approval
+-> sign and deploy a new Activated catalog epoch
+-> run monitoring and retain one-way revocation
 ```
 
-Do not publish first and use a release-event regression as the blocker.
-
-This is an intentional policy change, not a description of current behavior. It
-conflicts with the current release-event timing in `family-regression.yml` and
-with lifecycle/releasing guidance that treats the CPU family regression as the
-public-ready family gate. Implementation must update those documents and the
-release orchestrator in the same reviewed policy change; this design cannot make
-the DAG true by assertion alone.
+Publishing immutable `PublishedInert` artifacts is not capability activation.
+The neutral runtime rejects those providers in Auto and explicit selection, so
+post-publication hardware testing can bind the exact distributed bytes without
+making an unproved lane usable. Do not activate first and treat release-event
+regression as the blocker: qualification and explicit activation are separate
+fail-closed transitions. Scheduled and release-event family jobs remain
+monitoring and do not grant GPU authority.
 
 ### Generated evidence matrix
 
@@ -861,7 +867,8 @@ selectable:
 - an audit form cannot grandfather a production execution path with no evidence;
 - evidence includes artifact, pack, fixture, provider/device, driver, execution
   plan, and result identity; and
-- the release finalizer consumes the matrix receipts before public activation;
+- the backend activation transition consumes both hardware and matrix receipts
+  before a provider becomes publicly selectable;
 - execution policy generates only family/provider placements whose correctness
   cell is approved; and
 - memory pressure may choose among approved placements of the same model but
@@ -1027,18 +1034,23 @@ select distinct kernels.
 Exit criterion: every enabled family/provider cell has current three-layer
 evidence. Untested cells are not activatable.
 
-### Phase 5: release enforcement
+### Phase 5: release and activation enforcement
 
-1. Make the evidence matrix a pre-publication finalizer dependency.
-2. Correct audit parsing and remove evidence-free grandfather paths.
-3. Turn family regression into a release-candidate blocker.
-4. Update model-family lifecycle and release documentation to record the
-   intentional policy change.
-5. Add desktop plugin-switch E2E.
-6. Retain post-release jobs only as monitoring.
+1. Publish GPU provider artifacts only as `PublishedInert`; the ordinary runtime
+   must reject them in both Auto and explicit selection.
+2. Run exact-target hardware and correctness qualification only against the
+   immutable public release bytes.
+3. Make both evidence gates dependencies of the explicit backend activation
+   transition, not of inert artifact publication.
+4. Correct audit parsing and remove evidence-free grandfather paths.
+5. Turn the CPU family regression into a release-candidate blocker.
+6. Update model-family lifecycle and release documentation to record the
+   separation between publication and activation.
+7. Add desktop plugin-switch E2E before activation.
+8. Retain scheduled and release-event jobs only as monitoring.
 
-Exit criterion: no public catalog or release activation can occur without the
-required bound receipts.
+Exit criterion: no public provider capability can become selectable without the
+required bound receipts, while unqualified release bytes remain inert.
 
 ### Phase 6: continue ownership and activation migration
 
@@ -1266,7 +1278,8 @@ The work is complete only when all of the following are true:
     evidence or by explicit non-activation.
 11. Backend-op, placement, and token-correctness evidence remain distinct and are
     bound to release artifacts.
-12. Family and provider correctness is a pre-publication blocker.
+12. Family and provider correctness is a capability-activation blocker;
+    publishing inert artifact bytes cannot make the provider selectable.
 13. Desktop plugin switching passes install, restart, real-transcribe,
     persistence, and rollback E2E.
 14. Request receipts identify provider/device, placement, output plan, reuse mode,

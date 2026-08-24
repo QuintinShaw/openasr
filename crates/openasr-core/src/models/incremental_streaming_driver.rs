@@ -16,7 +16,6 @@
 
 use std::time::Instant;
 
-use crate::ggml_runtime::install_request_backend_override;
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
     GgmlAsrPreparedAudioView, GgmlAsrStreamingSessionRequest,
@@ -202,6 +201,7 @@ where
     // driver builds for the life of the session copies it in directly.
     let resolved_runtime = request.resolved_runtime;
     let execution_lane = request.execution_lane.clone();
+    let decode_execution_lane = execution_lane.clone();
     let partial_granularity = crate::arch::streaming_partial_granularity_for_model_architecture(
         request.selected_family.model_architecture,
     );
@@ -211,13 +211,7 @@ where
         GgmlAsrExecutionViewRequest<'static>,
         GgmlAsrExecutionError,
     > {
-        let execution_lane = execution_lane.clone().ok_or_else(|| {
-            GgmlAsrExecutionError::executor_failed(
-                executor_id,
-                adapter_id,
-                "streaming request is missing its candidate-resolved execution lane",
-            )
-        })?;
+        let execution_lane = execution_lane.clone();
         let mut request_options = request_options.clone();
         if let Some(prompt) =
             merge_partial_prompt(request_options.prompt.as_deref(), partial_prompt)
@@ -304,17 +298,14 @@ where
                 crate::models::native_execution_services::install_native_execution_services(
                     decode_execution_services.as_ref(),
                 );
+            let _resolved_lane =
+                crate::models::native_execution_services::install_resolved_execution_lane(
+                    decode_execution_lane.clone(),
+                );
             let _thread_override = install_request_inference_threads_override(inference_threads);
-            // Mirror GgmlAsrExecutionDispatch::execute's override install (the
-            // offline/batch entry point): the streaming path calls the
-            // per-family `decode` fn directly instead of going through that
-            // dispatch, so without this the request's `backend_preference`
-            // (already threaded into every rebuilt request below) would be
-            // silently ignored by the few remaining thread-local readers
-            // unrelated to this driver's own resolved backend (already
-            // carried on `make_request`'s `resolved_runtime` field above).
-            let _backend_override =
-                install_request_backend_override(backend_preference.request_backend_override());
+            // This direct family call bypasses dispatch, so reinstall the
+            // immutable lane itself above. Installing the coarse request
+            // preference here would lose the selected physical device.
             let transcription = decode(&executor, &make_request(audio, partial_prompt)?)
                 .map(|result| result.transcription)?;
             Ok(StreamingDecodeOutput { transcription })
@@ -1820,7 +1811,10 @@ mod tests {
                 configured_diarize: false,
                 backend_preference,
                 resolved_runtime,
-                execution_lane: None,
+                execution_lane:
+                    crate::models::native_execution_services::current_execution_lane_key(
+                        resolved_runtime.backend(),
+                    ),
                 final_text_processor: None,
                 session_context: crate::NativeAsrSessionContext::new("rt_backend_override_test"),
                 session_config: crate::NativeAsrStreamingSessionConfig::new()
@@ -1837,10 +1831,17 @@ mod tests {
         // architecture-declared `AutoGpuPolicy`.
         fn observed_backend_during_decode(
             backend_preference: crate::GgmlAsrBackendPreference,
-        ) -> (Option<RequestBackendPreference>, GgmlCpuGraphBackend) {
+        ) -> GgmlCpuGraphBackend {
             let request = session_request(backend_preference);
+            let expected_lane = request.execution_lane.clone();
             let observed: Arc<
-                Mutex<Option<(Option<RequestBackendPreference>, GgmlCpuGraphBackend)>>,
+                Mutex<
+                    Option<(
+                        Option<RequestBackendPreference>,
+                        GgmlCpuGraphBackend,
+                        Option<crate::models::native_execution_services::ExecutionLaneKey>,
+                    )>,
+                >,
             > = Arc::new(Mutex::new(None));
             let observed_for_decode = Arc::clone(&observed);
             let mut driver = build_streaming_driver(
@@ -1853,6 +1854,7 @@ mod tests {
                     *observed_for_decode.lock().unwrap() = Some((
                         crate::ggml_runtime::request_backend_override(),
                         _request.resolved_runtime.backend(),
+                        _request.execution_context.native_execution_lane().cloned(),
                     ));
                     Ok(GgmlAsrExecutionResult {
                         transcription: transcription(""),
@@ -1862,30 +1864,31 @@ mod tests {
                 },
             );
             driver.warm_up().expect("warm up should decode once");
-            observed
+            let (backend_override, backend, execution_lane) = observed
                 .lock()
                 .unwrap()
                 .take()
-                .expect("decode closure should have run")
+                .expect("decode closure should have run");
+            assert_eq!(execution_lane, Some(expected_lane.clone()));
+            assert_eq!(
+                backend_override,
+                Some(expected_lane.request_backend_preference())
+            );
+            backend
         }
 
-        // Auto: no override installed. qwen3-asr's policy is `AllBackends` (a
-        // no-op gate), so the resolved input must match the generic
-        // Auto-mode resolution exactly -- host-independent equality, not a
-        // fixed value.
+        // Auto: qwen3-asr's policy is `AllBackends` (a no-op gate), so the
+        // resolved input must match the generic Auto-mode resolution exactly.
+        // The direct decode still installs the candidate-resolved lane rather
+        // than leaving an absent/coarse thread-local preference.
         let expected_auto_backend = GgmlCpuGraphConfig::runtime_default().backend;
-        let (auto_override, auto_backend) =
-            observed_backend_during_decode(crate::GgmlAsrBackendPreference::Auto);
-        assert_eq!(auto_override, None);
+        let auto_backend = observed_backend_during_decode(crate::GgmlAsrBackendPreference::Auto);
         assert_eq!(auto_backend, expected_auto_backend);
 
-        // Explicit Accelerated: the transcribe closure must install the
-        // override itself, so the resolved input reflects Accelerated and
-        // does not fall back to whatever Auto would have picked. This is the
-        // case that regressed.
-        let (accel_override, accel_backend) =
+        // Explicit Accelerated: the transcribe closure installs the resolved
+        // physical lane, so it cannot fall back to whatever Auto would pick.
+        let accel_backend =
             observed_backend_during_decode(crate::GgmlAsrBackendPreference::Accelerated);
-        assert_eq!(accel_override, Some(RequestBackendPreference::Accelerated));
         assert_ne!(accel_backend, GgmlCpuGraphBackend::Cpu);
     }
 

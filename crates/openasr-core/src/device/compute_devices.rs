@@ -3,10 +3,9 @@
 //! The device list a desktop/mobile shell shows in its settings ("Auto", "CPU",
 //! and any accelerated GPU backend) must reflect the ggml runtime of the
 //! **process that actually runs inference** -- the daemon/sidecar -- not whoever
-//! happened to ask. On platforms where the shell and the inference process are
-//! built in different backend shapes (e.g. a CPU-only desktop shell supervising
-//! a Vulkan sidecar on Windows), asking the shell's own [`GgmlRuntimeInfo`]
-//! enumerates the wrong process and hides the GPU. Keeping the shaping here in
+//! happened to ask. A Windows shell that inspects itself instead of the
+//! CPU-neutral inference host after it activates a signed optional provider
+//! enumerates the wrong process and hides that GPU. Keeping the shaping here in
 //! open core lets the server expose it over its local HTTP API (authoritative,
 //! runs in the inference process) while a shell can still call the same function
 //! for an offline fallback -- one vocabulary, no drift.
@@ -41,8 +40,8 @@ pub struct ComputeDevice {
     pub effective_target: String,
     /// Typed provider identity of the concrete device behind this row. This
     /// is independent from the coarse `accelerated` target and lets a shell
-    /// attest that a requested CUDA/HIP plugin actually loaded instead of
-    /// mistaking the bundled Vulkan rescue device for success.
+    /// attest that the Activated-only optional provider actually loaded instead
+    /// of mistaking an unactivated GPU device for activation success.
     pub provider: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<String>,
@@ -209,9 +208,9 @@ mod tests {
 
     #[test]
     fn gpu_runtime_adds_accelerated_and_auto_resolves_to_it() {
-        // A Windows Vulkan sidecar reports both a CPU and a GPU device: the
-        // picker must surface the accelerated entry and make Auto resolve to it,
-        // which is exactly what the CPU-only desktop shell could not see.
+        // An Activated Vulkan provider in a neutral Windows host reports both
+        // a CPU and a GPU device. The picker must surface the accelerated entry
+        // and make Auto resolve to it.
         let runtime = runtime_with(
             vec![
                 GgmlBackendDevice::for_test("CPU", "Intel Core", GgmlBackendKind::Cpu, None),

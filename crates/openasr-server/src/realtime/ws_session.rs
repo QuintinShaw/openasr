@@ -1012,7 +1012,7 @@ impl WsSession {
         partial_results: bool,
         word_timestamps: bool,
     ) -> Result<(), ()> {
-        let Some(model_pack_path) = self.runtime.model_pack_path.current() else {
+        let Some(active_model) = self.runtime.model_pack_path.current_snapshot() else {
             self.emit_error(
                 RealtimeErrorCode::StartupConfigError,
                 "Native realtime streaming requires an explicit local runtime pack path.",
@@ -1021,6 +1021,7 @@ impl WsSession {
             .await?;
             return Err(());
         };
+        let model_pack_path = active_model.path().to_path_buf();
         let Some(adapter) = native_runtime_model_adapter_for_path(&model_pack_path) else {
             self.emit_error(
                 RealtimeErrorCode::StartupConfigError,
@@ -1065,10 +1066,11 @@ impl WsSession {
                 }
             };
         super::wait_while_native_warmup_in_flight().await;
-        let model_session_permit = match self
-            .runtime
-            .acquire_native_execution(&model_session_key, resolved_route.as_ref())
-        {
+        let admitted_execution = match self.runtime.acquire_native_execution_for_snapshot(
+            &active_model,
+            &model_session_key,
+            resolved_route.as_ref(),
+        ) {
             Ok(permit) => permit,
             Err(error) => {
                 let recoverable = matches!(error, ApiError::ModelSessionCapacity(_));
@@ -1078,6 +1080,11 @@ impl WsSession {
                 return Err(());
             }
         };
+        // The admission guard began while the active-snapshot barrier was
+        // still held. Retain it through adapter/session construction and the
+        // worker attach; the worker mints its own movable guard before this
+        // setup guard drops, leaving no idle-unload gap.
+        let (model_session_permit, _native_setup_activity) = admitted_execution.into_parts();
         let model_pack = match adapter.model_pack_ref(model_id) {
             Ok(model_pack) => model_pack,
             Err(error) => {
@@ -1163,8 +1170,9 @@ impl WsSession {
         // socket ingest for this session.
         if let Err(message) = self
             .attach_native_streaming_session_admitted(
-                NativeStreamingWorkerKey::with_route(
+                NativeStreamingWorkerKey::with_route_and_residency(
                     model_pack.root.clone(),
+                    active_model.residency_key().clone(),
                     hardware_target,
                     resolved_route.as_ref(),
                     self.inference_threads,

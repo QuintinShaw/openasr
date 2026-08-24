@@ -52,6 +52,26 @@ pub(crate) struct ShortAudioReceiptOptions<'a> {
     pub(crate) trace_out: Option<&'a Path>,
 }
 
+/// Delegate release eligibility to the core-owned receipt predicate. The GPU
+/// matrix gate remains the approval authority; this command deliberately has
+/// no matrix, catalog, target, or activation policy of its own.
+pub(crate) fn validate_qualification_receipts(paths: &[PathBuf]) -> Result<()> {
+    if paths.is_empty() {
+        bail!("at least one --receipt is required");
+    }
+    for (index, path) in paths.iter().enumerate() {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("Could not read qualification receipt #{}", index + 1))?;
+        let receipt = ShortAudioReceipt::from_json_str(&raw)
+            .with_context(|| format!("Qualification receipt #{} is invalid", index + 1))?;
+        receipt
+            .validate_qualification_eligibility()
+            .with_context(|| format!("Qualification receipt #{} is ineligible", index + 1))?;
+    }
+    println!("validated {} qualification receipt(s)", paths.len());
+    Ok(())
+}
+
 pub(crate) fn bench_receipt_short_audio(
     native_execution_services: &Arc<NativeExecutionServices>,
     options: ShortAudioReceiptOptions<'_>,
@@ -798,6 +818,7 @@ fn atomic_create_new_trace_at_target_with(
 fn validate_release_trace(jsonl: &str) -> Result<()> {
     let mut token_steps = BTreeSet::new();
     let mut top_k_steps = BTreeSet::new();
+    let mut logits_steps = BTreeSet::new();
     for line in jsonl.lines() {
         let event: serde_json::Value =
             serde_json::from_str(line).context("runtime trace contains invalid JSON")?;
@@ -829,11 +850,38 @@ fn validate_release_trace(jsonl: &str) -> Result<()> {
                     bail!("runtime top-k trace has duplicate step_index {step}");
                 }
             }
+            Some("logits_digest") => {
+                let step =
+                    step.ok_or_else(|| anyhow::anyhow!("runtime logits digest has no step_index"))?;
+                let digest = event.get("sha256").and_then(serde_json::Value::as_str);
+                if event
+                    .get("element_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_none_or(|count| count == 0)
+                    || event
+                        .get("non_finite_count")
+                        .and_then(serde_json::Value::as_u64)
+                        != Some(0)
+                    || digest.is_none_or(|value| {
+                        value.len() != 64
+                            || value.bytes().any(|byte| {
+                                !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte)
+                            })
+                    })
+                {
+                    bail!("runtime logits digest is invalid at step {step}");
+                }
+                if !logits_steps.insert(step) {
+                    bail!("runtime logits trace has duplicate step_index {step}");
+                }
+            }
             _ => {}
         }
     }
-    if token_steps.is_empty() || token_steps != top_k_steps {
-        bail!("every runtime token trace step must have exactly one same-step top-k/margin record");
+    if token_steps.is_empty() || token_steps != top_k_steps || token_steps != logits_steps {
+        bail!(
+            "every runtime token trace step must have exactly one same-step top-k/margin and logits-digest record"
+        );
     }
     Ok(())
 }
@@ -1262,10 +1310,11 @@ mod tests {
     }
 
     #[test]
-    fn strict_trace_requires_same_step_top_k_and_margin() {
+    fn strict_trace_requires_same_step_logits_top_k_and_margin() {
         let valid = concat!(
             "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"header\"}\n",
             "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"token\",\"step_index\":0}\n",
+            "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"logits_digest\",\"step_index\":0,\"element_count\":2,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"non_finite_count\":0}\n",
             "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"top_k\",\"step_index\":0,\"items\":[{\"token_id\":1,\"value\":2.0},{\"token_id\":2,\"value\":1.0}],\"top1_top2_margin\":1.0}\n"
         );
         validate_release_trace(valid).expect("complete trace accepted");
@@ -1368,5 +1417,18 @@ mod tests {
             .observed_compute_nodes_by_backend
             .insert("CPU".to_string(), 1);
         assert!(validate_observed_accelerator_placement("metal", &observed).is_err());
+    }
+
+    #[test]
+    fn qualification_cli_delegates_to_strict_core_receipt_validation() {
+        let temp = TempDir::new().unwrap();
+        let receipt = temp.path().join("legacy.json");
+        fs::write(&receipt, r#"{"schema":"openasr.short-audio-receipt.v0"}"#).unwrap();
+        let error = validate_qualification_receipts(&[receipt]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Qualification receipt #1 is invalid")
+        );
     }
 }

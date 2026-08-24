@@ -94,9 +94,31 @@ class FailClosedEvidenceTests(unittest.TestCase):
         }
         backends = {
             "backends": [
-                {"id": "cuda-test", "vendor": "cuda"},
-                {"id": "vulkan-test", "vendor": "vulkan"},
-                {"id": "hip-test", "vendor": "hip"},
+                {
+                    "id": "cuda-test",
+                    "vendor": "cuda",
+                    "version": "0.1.36",
+                    "targets": ["sm_89"],
+                    "host_abi": {"fingerprint": "8" * 64},
+                    "files": [{"filename": "cuda.dll", "role": "plugin", "sha256": "5" * 64, "size_bytes": 1}],
+                },
+                {
+                    "id": "vulkan-test",
+                    "vendor": "vulkan",
+                    "version": "0.1.36",
+                    "targets": [],
+                    "qualification_target": "vulkan-pci-10de-2820",
+                    "host_abi": {"fingerprint": "8" * 64},
+                    "files": [{"filename": "vulkan.dll", "role": "plugin", "sha256": "6" * 64, "size_bytes": 1}],
+                },
+                {
+                    "id": "hip-test",
+                    "vendor": "hip",
+                    "version": "0.1.36",
+                    "targets": ["gfx1200"],
+                    "host_abi": {"fingerprint": "8" * 64},
+                    "files": [{"filename": "hip.dll", "role": "plugin", "sha256": "7" * 64, "size_bytes": 1}],
+                },
             ]
         }
         matrix = GATE.project_matrix(
@@ -110,12 +132,12 @@ class FailClosedEvidenceTests(unittest.TestCase):
             },
             candidate={
                 "release_subject": "v0.1.36-test",
+                "release_version": "0.1.36",
                 "core_commit": "0123456789abcdef0123456789abcdef01234567",
                 "binary_sha256": "4" * 64,
-                "plugin_sha256": "5" * 64,
             },
         )
-        closed: set[tuple[str, str, str, str, str, str]] = set()
+        closed: set[GATE.ReceiptKey] = set()
         with self.assertRaisesRegex(GATE.MatrixError, "not selectable"):
             GATE.require_untested_hosts_not_activatable(matrix, closed, HARDWARE)
         with self.assertRaisesRegex(GATE.MatrixError, "not selectable"):

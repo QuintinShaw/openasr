@@ -22,20 +22,17 @@ on:
   # correctness evidence; the finalizer invokes this only after the gate passes.
   workflow_call:
     inputs:
-      correctness_artifact:
+      activation_transition:
+        description: "published-inert, activated, or fail-safe revoked"
         required: true
         type: string
-      correctness_sources_artifact:
-        required: true
+      backend_id:
+        description: "Exact backend id for an activated transition"
+        required: false
         type: string
-      correctness_traces_artifact:
-        required: true
-        type: string
-      public_catalog_artifact:
-        required: true
-        type: string
-      public_catalog_signature_artifact:
-        required: true
+      qualification_run_ids:
+        description: "Space-separated trusted qualification run ids"
+        required: false
         type: string
       orchestrator_run_id:
         required: true
@@ -57,45 +54,217 @@ concurrency:
   group: deploy-catalog
   cancel-in-progress: false
 
+permissions:
+  actions: read
+  attestations: read
+  contents: read
+
 jobs:
-  gate-correctness:
-    name: Verify immutable correctness matrix and receipts
+  gate-activation:
+    name: Verify release-bound catalog activation state
     if: github.repository == 'QuintinShaw/openasr'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Download staged correctness artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ inputs.correctness_artifact }}
-          path: staging/correctness
-      - name: Download canonical source snapshots
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ inputs.correctness_sources_artifact }}
-          path: staging/sources
-      - name: Download immutable trace artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ inputs.correctness_traces_artifact }}
-          path: staging/traces
-      - name: Verify matrix, source digests, artifact bindings, and trace contents
+      - name: Verify PublishedInert state against exact release entries
+        if: inputs.activation_transition == 'published-inert'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          matrix="$(find staging/correctness -name 'gpu-correctness-matrix.v1.json' -type f -print -quit)"
-          inventory="$(find staging/sources -name 'gpu-correctness-source-inventory.json' -type f -print -quit)"
-          catalog="$(find staging/sources -name 'gpu-correctness-source-model-catalog.json' -type f -print -quit)"
-          backends="$(find staging/sources -name 'gpu-correctness-source-backend-catalog.json' -type f -print -quit)"
-          test -n "$matrix" -a -n "$inventory" -a -n "$catalog" -a -n "$backends"
-          mapfile -t receipts < <(find staging/correctness -name 'gpu-correctness-receipt-*.json' -type f | sort)
-          mapfile -t traces < <(find staging/traces -type f -name 'gpu-correctness-trace-*.jsonl' | sort)
-          test "${#receipts[@]}" -gt 0
-          test "${#traces[@]}" -gt 0
-          receipt_args=(); for item in "${receipts[@]}"; do receipt_args+=(--receipt "$item"); done
-          trace_args=(); for item in "${traces[@]}"; do trace_args+=(--trace "$item"); done
-          python3 tooling/release-manifest/gpu_correctness_gate.py validate \
-            --manifest "$matrix" --inventory "$inventory" --catalog "$catalog" \
-            --backend-catalog "$backends" "${receipt_args[@]}" "${trace_args[@]}"
+          activation_catalog="model-registry/catalog.public.json"
+          [ -f "$activation_catalog" ] || { echo "committed public catalog is missing" >&2; exit 1; }
+          version="${{ inputs.release_tag }}"; version="${version#v}"
+          mkdir -p staging/release
+          gh release download "${{ inputs.release_tag }}" -p 'backend-pack-*.json' -D staging/release
+          mapfile -t entries < <(find staging/release -name 'backend-pack-*.json' -type f | sort)
+          [ "${#entries[@]}" -eq 21 ] || {
+            echo "expected 21 exact release backend entries, found ${#entries[@]}" >&2; exit 1;
+          }
+          entry_args=(); for item in "${entries[@]}"; do entry_args+=(--entry "$item"); done
+          python3 tooling/release-manifest/backend_catalog.py verify-catalog \
+            --catalog "$activation_catalog" "${entry_args[@]}"
+          python3 tooling/release-manifest/backend_hardware_evidence.py \
+            "${entry_args[@]}" --catalog "$activation_catalog" --version "$version"
+
+      - name: Replay and verify Qualified to Activated from attested evidence
+        if: inputs.activation_transition == 'activated'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          BACKEND_ID: ${{ inputs.backend_id }}
+          QUALIFICATION_RUN_IDS: ${{ inputs.qualification_run_ids }}
+        run: |
+          set -euo pipefail
+          [ "${GITHUB_REF}" = "refs/heads/main" ] || {
+            echo "activated catalog deployment may run only from protected main" >&2; exit 1;
+          }
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$BACKEND_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$ ]]
+          read -r -a run_ids <<< "$QUALIFICATION_RUN_IDS"
+          [ "${#run_ids[@]}" -gt 0 ] || { echo "activation requires qualification run ids" >&2; exit 1; }
+          git fetch --force --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          tag_commit="$(git rev-parse "${RELEASE_TAG}^{}")"
+          [[ "$tag_commit" =~ ^[0-9a-f]{40}$ ]]
+          release_json="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease,tagName,publishedAt)"
+          python3 - "$release_json" "$RELEASE_TAG" <<'PY'
+          import json, sys
+          value = json.loads(sys.argv[1])
+          if (value.get("isDraft") or value.get("isPrerelease")
+                  or value.get("tagName") != sys.argv[2]
+                  or not value.get("publishedAt")):
+              raise SystemExit("activation requires an already-public stable release")
+          PY
+          workdir="${RUNNER_TEMP}/activation-evidence"
+          mkdir -p "$workdir/runs" "$workdir/release"
+          for run_id in "${run_ids[@]}"; do
+            [[ "$run_id" =~ ^[1-9][0-9]*$ ]]
+            gh run view "$run_id" --repo "$GITHUB_REPOSITORY" \
+              --json workflowName,conclusion,headSha > "$workdir/run-$run_id.json"
+            python3 - "$workdir/run-$run_id.json" "$tag_commit" <<'PY'
+          import json, sys
+          value = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert value.get("workflowName") == "Qualify Windows backend"
+          assert value.get("conclusion") == "success"
+          assert value.get("headSha") == sys.argv[2]
+          PY
+            gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+              --dir "$workdir/runs/$run_id"
+          done
+
+          find_one() {
+            local root="$1" pattern="$2"
+            mapfile -t paths < <(find "$root" -type f -name "$pattern" -print | sort)
+            [ "${#paths[@]}" -eq 1 ] || { echo "expected one $pattern under $root" >&2; exit 1; }
+            printf '%s\n' "${paths[0]}"
+          }
+          first_root="$workdir/runs/${run_ids[0]}"
+          matrix="$(find_one "$first_root" 'gpu-correctness-matrix.v1.json')"
+          inventory="$(find_one "$first_root" 'gpu-correctness-source-inventory.json')"
+          models="$(find_one "$first_root" 'gpu-correctness-source-model-catalog.json')"
+          backends="$(find_one "$first_root" 'gpu-correctness-source-backend-catalog.json')"
+          hardware_evidence="$(find_one "$first_root" 'backend-hardware-evidence-*.json')"
+          hardware_raw="$(find_one "$first_root" 'backend-hardware-audit-*.json')"
+          receipts=(); traces=()
+          for run_id in "${run_ids[@]}"; do
+            root="$workdir/runs/$run_id"
+            for name in gpu-correctness-matrix.v1.json gpu-correctness-source-inventory.json gpu-correctness-source-model-catalog.json gpu-correctness-source-backend-catalog.json; do
+              cmp -s "$(find_one "$root" "$name")" "$(find_one "$first_root" "$name")" || {
+                echo "qualification runs disagree on $name" >&2; exit 1;
+              }
+            done
+            mapfile -t run_receipts < <(find "$root" -type f -name 'gpu-correctness-receipt-*.json' -print | sort)
+            mapfile -t run_traces < <(find "$root" -type f -name 'gpu-correctness-trace-*.jsonl' -print | sort)
+            receipts+=("${run_receipts[@]}"); traces+=("${run_traces[@]}")
+          done
+          [ "${#receipts[@]}" -ge 4 ] && [ "${#traces[@]}" -ge 2 ]
+
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            -p 'backend-pack-*.json' -p SHA256SUMS -D "$workdir/release"
+          mapfile -t entries < <(find "$workdir/release" -type f -name 'backend-pack-*.json' -print | sort)
+          [ "${#entries[@]}" -eq 21 ]
+          python3 - "$hardware_raw" > "$workdir/subject-names.txt" <<'PY'
+          import json, pathlib, sys
+          raw = json.load(open(sys.argv[1], encoding="utf-8"))
+          names = set()
+          for item in raw.get("attested_release_subjects", []):
+              name = item.get("filename") if isinstance(item, dict) else None
+              assert isinstance(name, str) and pathlib.Path(name).name == name
+              names.add(name)
+          print("\n".join(sorted(names)))
+          PY
+          while IFS= read -r name; do
+            [ -n "$name" ] && gh release download "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" -p "$name" -D "$workdir/release" --clobber
+          done < "$workdir/subject-names.txt"
+          entry_args=(); for path in "${entries[@]}"; do entry_args+=(--entry "$path"); done
+          subject_args=(); while IFS= read -r name; do [ -n "$name" ] && subject_args+=(--release-subject "$workdir/release/$name"); done < "$workdir/subject-names.txt"
+          release_signer="${GITHUB_REPOSITORY}/.github/workflows/release-binaries.yml"
+          qualification_signer="${GITHUB_REPOSITORY}/.github/workflows/qualify-windows-backend.yml"
+          python3 tooling/release-manifest/backend_hardware_evidence.py \
+            "${entry_args[@]}" --evidence "$hardware_evidence" --raw-audit "$hardware_raw" \
+            "${subject_args[@]}" --checksums "$workdir/release/SHA256SUMS" \
+            --repo "$GITHUB_REPOSITORY" --signer-workflow "$release_signer" \
+            --qualification-signer-workflow "$qualification_signer" --source-digest "$tag_commit"
+
+          python3 tooling/publish-model/scripts/check_catalog_consistency.py \
+            --catalog-pair model-registry/catalog.public.json \
+            model-registry/catalog.public.signature.json
+          curl -fsSL "https://catalog.openasr.org/v1/catalog.json?before-activation=${GITHUB_RUN_ID}" \
+            -o "$workdir/current-catalog.json"
+          curl -fsSL "https://catalog.openasr.org/v1/catalog.signature.json?before-activation=${GITHUB_RUN_ID}" \
+            -o "$workdir/current-catalog.signature.json"
+          python3 tooling/publish-model/scripts/check_catalog_consistency.py \
+            --catalog-pair "$workdir/current-catalog.json" \
+            "$workdir/current-catalog.signature.json"
+          receipt_args=(); for path in "${receipts[@]}"; do receipt_args+=(--receipt "$path"); done
+          trace_args=(); for path in "${traces[@]}"; do trace_args+=(--trace "$path"); done
+          python3 tooling/release-manifest/gpu_correctness_gate.py verify-catalog-transition \
+            --manifest "$matrix" --inventory "$inventory" --catalog "$models" \
+            --backend-catalog "$backends" --current-activation-catalog "$workdir/current-catalog.json" \
+            --candidate-activation-catalog model-registry/catalog.public.json \
+            --backend-id "$BACKEND_ID" "${entry_args[@]}" \
+            --hardware-evidence "$hardware_evidence" --hardware-raw-audit "$hardware_raw" \
+            "${receipt_args[@]}" "${trace_args[@]}" \
+            --evidence-repo "$GITHUB_REPOSITORY" \
+            --evidence-signer-workflow "$qualification_signer" \
+            --evidence-source-digest "$tag_commit"
+
+      - name: Replay and verify exact fail-safe revocation
+        if: inputs.activation_transition == 'revoked'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          BACKEND_ID: ${{ inputs.backend_id }}
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = "refs/heads/main" ] || {
+            echo "revoked catalog deployment may run only from protected main" >&2; exit 1;
+          }
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$BACKEND_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$ ]]
+          release_json="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease,tagName,publishedAt)"
+          python3 - "$release_json" "$RELEASE_TAG" <<'PY'
+          import json, sys
+          value = json.loads(sys.argv[1])
+          if (value.get("isDraft") or value.get("isPrerelease")
+                  or value.get("tagName") != sys.argv[2]
+                  or not value.get("publishedAt")):
+              raise SystemExit("revocation requires an already-public stable release")
+          PY
+          version="${RELEASE_TAG#v}"
+          python3 - model-registry/catalog.public.json "$BACKEND_ID" "$version" <<'PY'
+          import json, sys
+          catalog = json.load(open(sys.argv[1], encoding="utf-8"))
+          matches = [item for item in catalog.get("backends", []) if item.get("id") == sys.argv[2]]
+          if len(matches) != 1 or str(matches[0].get("version")) != sys.argv[3]:
+              raise SystemExit("revoked backend does not belong to the authorized release")
+          PY
+          workdir="${RUNNER_TEMP}/revocation-evidence"
+          mkdir -p "$workdir"
+          curl -fsSL "https://catalog.openasr.org/v1/catalog.json?before-revocation=${GITHUB_RUN_ID}" \
+            -o "$workdir/current-catalog.json"
+          curl -fsSL "https://catalog.openasr.org/v1/catalog.signature.json?before-revocation=${GITHUB_RUN_ID}" \
+            -o "$workdir/current-catalog.signature.json"
+          python3 tooling/publish-model/scripts/check_catalog_consistency.py \
+            --catalog-pair "$workdir/current-catalog.json" \
+            "$workdir/current-catalog.signature.json"
+          python3 tooling/publish-model/scripts/check_catalog_consistency.py \
+            --catalog-pair model-registry/catalog.public.json \
+            model-registry/catalog.public.signature.json
+          python3 tooling/release-manifest/gpu_correctness_gate.py \
+            verify-revocation-transition \
+            --current-activation-catalog "$workdir/current-catalog.json" \
+            --candidate-activation-catalog model-registry/catalog.public.json \
+            --backend-id "$BACKEND_ID"
+
+      - name: Reject unknown activation transition
+        if: inputs.activation_transition != 'published-inert' && inputs.activation_transition != 'activated' && inputs.activation_transition != 'revoked'
+        run: |
+          echo "unsupported activation_transition=${{ inputs.activation_transition }}" >&2
+          exit 1
 
   gate-released-binary-compat:
     # Same repo scope as `deploy`: this reads public GitHub releases only (no
@@ -105,20 +274,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          name: ${{ inputs.public_catalog_artifact }}
-          path: staging/public
-      - uses: actions/download-artifact@v8
-        with:
-          name: ${{ inputs.public_catalog_signature_artifact }}
-          path: staging/public
       - name: Verify candidate public catalog contents
         run: |
           set -euo pipefail
-          catalog="$(find staging/public -name catalog.json -type f -print -quit)"
-          signature="$(find staging/public -name catalog.signature.json -type f -print -quit)"
-          test -n "$catalog" -a -n "$signature"
+          python3 tooling/publish-model/scripts/check_catalog_consistency.py
+          catalog="model-registry/catalog.public.json"
+          signature="model-registry/catalog.public.signature.json"
+          test -f "$catalog" -a -f "$signature"
           sha256sum "$catalog" "$signature"
           python3 - "$catalog" "$signature" <<'PY'
           import hashlib, json, pathlib, sys
@@ -134,12 +296,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          catalog="$(find staging/public -name catalog.json -type f -print -quit)"
-          signature="$(find staging/public -name catalog.signature.json -type f -print -quit)"
+          catalog="model-registry/catalog.public.json"
+          signature="model-registry/catalog.public.signature.json"
           scripts/gate-catalog-against-released-binary.sh "$catalog" "$signature"
 
   deploy:
-    needs: [gate-correctness, gate-released-binary-compat]
+    needs: [gate-activation, gate-released-binary-compat]
     # Forks should never attempt to deploy to the maintainer's Cloudflare
     # account (and would fail anyway without CLOUDFLARE_API_TOKEN).
     if: github.repository == 'QuintinShaw/openasr'
@@ -150,20 +312,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v8
-        with:
-          name: ${{ inputs.public_catalog_artifact }}
-          path: staging/public
-      - uses: actions/download-artifact@v8
-        with:
-          name: ${{ inputs.public_catalog_signature_artifact }}
-          path: staging/public
       - name: Verify candidate public catalog
         run: |
           set -euo pipefail
-          catalog="$(find staging/public -name catalog.json -type f -print -quit)"
-          signature="$(find staging/public -name catalog.signature.json -type f -print -quit)"
-          test -n "$catalog" -a -n "$signature"
+          python3 tooling/publish-model/scripts/check_catalog_consistency.py
+          catalog="model-registry/catalog.public.json"
+          signature="model-registry/catalog.public.signature.json"
+          test -f "$catalog" -a -f "$signature"
           cp "$catalog" candidate-catalog.json
           cp "$signature" candidate-catalog.signature.json
           python3 - <<'PY'
@@ -187,10 +342,12 @@ jobs:
         id: binding
         run: |
           set -euo pipefail
-          echo "deploy_run_id=${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
-          echo "caller_run_id=${{ inputs.orchestrator_run_id }}" >> "$GITHUB_OUTPUT"
-          echo "workflow_name=Deploy catalog" >> "$GITHUB_OUTPUT"
-          echo "catalog_sha256=$(sha256sum candidate-catalog.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          {
+            echo "deploy_run_id=${GITHUB_RUN_ID}"
+            echo "caller_run_id=${{ inputs.orchestrator_run_id }}"
+            echo "workflow_name=Deploy catalog"
+            echo "catalog_sha256=$(sha256sum candidate-catalog.json | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Deploy to Cloudflare
         uses: cloudflare/wrangler-action@v3
@@ -235,3 +392,49 @@ jobs:
             echo "::error::live catalog exposes public:false entries"; exit 1
           fi
           echo "live catalog.openasr.org matches the committed public projection (public-only)"
+
+      - name: Record immutable deploy binding
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ACTIVATION_TRANSITION: ${{ inputs.activation_transition }}
+          BACKEND_ID: ${{ inputs.backend_id }}
+          ORCHESTRATOR_RUN_ID: ${{ inputs.orchestrator_run_id }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          def sha256(path: str) -> str:
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+          run_id = os.environ["GITHUB_RUN_ID"]
+          orchestrator = os.environ["ORCHESTRATOR_RUN_ID"]
+          if orchestrator != run_id:
+              raise SystemExit("deploy binding does not belong to its orchestrator run")
+          binding = {
+              "schema_version": 1,
+              "release_tag": os.environ["RELEASE_TAG"],
+              "activation_transition": os.environ["ACTIVATION_TRANSITION"],
+              "backend_id": os.environ.get("BACKEND_ID", ""),
+              "orchestrator_run_id": orchestrator,
+              "deploy_run_id": run_id,
+              "source_commit": os.environ["GITHUB_SHA"],
+              "catalog_sha256": sha256("candidate-catalog.json"),
+              "catalog_signature_sha256": sha256("candidate-catalog.signature.json"),
+          }
+          Path("deploy-catalog-binding.json").write_text(
+              json.dumps(binding, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload immutable deploy binding
+        uses: actions/upload-artifact@v7
+        with:
+          name: deploy-catalog-binding-${{ github.run_id }}
+          path: deploy-catalog-binding.json
+          if-no-files-found: error
+          retention-days: 30

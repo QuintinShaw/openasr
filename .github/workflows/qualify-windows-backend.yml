@@ -1,0 +1,329 @@
+name: Qualify Windows backend
+
+# Run this workflow on the release tag (`--ref vX.Y.Z`). It consumes already
+# public PublishedInert bytes and emits attested hardware + exact-cell evidence.
+# It never edits a release, signs a catalog, or changes production activation.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Exact public vX.Y.Z release"
+        required: true
+        type: string
+      provider:
+        description: "cuda, hip, or vulkan"
+        required: true
+        type: choice
+        options: [hip, vulkan, cuda]
+      runner_label:
+        description: "Self-hosted hardware label, for example HIP"
+        required: true
+        type: string
+      device_target:
+        description: "Exact sm_XX, gfxXXXX, or vk_caps_* target"
+        required: true
+        type: string
+      backend_id:
+        description: "Exact signed backend entry id"
+        required: true
+        type: string
+      model_id:
+        description: "One public ASR model id projected by the matrix"
+        required: true
+        type: string
+      quant:
+        description: "Exact public quant tag"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  attestations: write
+  contents: read
+  id-token: write
+
+concurrency:
+  group: qualify-${{ inputs.release_tag }}-${{ inputs.backend_id }}-${{ inputs.model_id }}-${{ inputs.quant }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    if: github.repository == 'QuintinShaw/openasr'
+    runs-on: [self-hosted, Windows, X64, "${{ inputs.runner_label }}"]
+    timeout-minutes: 180
+    env:
+      QUAL_RELEASE_TAG: ${{ inputs.release_tag }}
+      QUAL_PROVIDER: ${{ inputs.provider }}
+      QUAL_DEVICE_TARGET: ${{ inputs.device_target }}
+      QUAL_BACKEND_ID: ${{ inputs.backend_id }}
+      QUAL_MODEL_ID: ${{ inputs.model_id }}
+      QUAL_QUANT: ${{ inputs.quant }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.QUAL_RELEASE_TAG }}
+          submodules: recursive
+
+      - name: Require workflow source to be the exact release commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:GITHUB_REF -ne "refs/tags/$env:QUAL_RELEASE_TAG") {
+            throw "dispatch this workflow with --ref $env:QUAL_RELEASE_TAG"
+          }
+          if ($env:GITHUB_SHA -notmatch '^[0-9a-f]{40}$') {
+            throw "workflow source digest is not one commit"
+          }
+          if ($env:QUAL_RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "release_tag must be vX.Y.Z"
+          }
+          if ($env:QUAL_PROVIDER -notin @('cuda', 'hip', 'vulkan')) {
+            throw "provider must be cuda, hip, or vulkan"
+          }
+          if ($env:QUAL_BACKEND_ID -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$') {
+            throw "backend_id is not canonical"
+          }
+          if ($env:QUAL_MODEL_ID -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' -or
+              $env:QUAL_QUANT -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') {
+            throw "model_id or quant is not canonical"
+          }
+          $targetValid = switch ($env:QUAL_PROVIDER) {
+            'cuda' { $env:QUAL_DEVICE_TARGET -match '^sm_[0-9]{2,3}$' }
+            'hip' { $env:QUAL_DEVICE_TARGET -match '^gfx[0-9]{3,4}[a-z]?$' }
+            'vulkan' { $env:QUAL_DEVICE_TARGET -match '^vk_caps_[0-9a-f]{8}_[0-9a-f]{8}_[0-9a-f]{32}$' }
+          }
+          if (-not $targetValid) {
+            throw "device_target is not canonical for $env:QUAL_PROVIDER"
+          }
+
+      - name: Resolve exact released inputs
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env:QUAL_RELEASE_TAG
+          $version = $tag.Substring(1)
+          $release = gh release view $tag --repo $env:GITHUB_REPOSITORY `
+            --json isDraft,isPrerelease,tagName,publishedAt | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "public release $tag does not exist" }
+          if ($release.isDraft -or $release.isPrerelease -or
+              $release.tagName -ne $tag -or -not $release.publishedAt) {
+            throw "qualification may consume only already-public PublishedInert release bytes"
+          }
+          $releaseDir = Join-Path $env:RUNNER_TEMP "openasr-release-inputs"
+          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+          gh release download $tag --repo $env:GITHUB_REPOSITORY `
+            --pattern "backend-pack-*.json" `
+            --pattern "catalog.backends.candidate.json" `
+            --pattern "SHA256SUMS" `
+            --pattern "openasr-$version-windows-x86_64-neutral.zip" `
+            --dir $releaseDir
+          if ($LASTEXITCODE -ne 0) { throw "could not download exact release inputs" }
+
+          $entries = @(Get-ChildItem -LiteralPath $releaseDir -Filter "backend-pack-*.json" -File)
+          if ($entries.Count -ne 21) { throw "expected 21 backend entries, found $($entries.Count)" }
+          $selected = @($entries | Where-Object {
+            (Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json).id -eq $env:QUAL_BACKEND_ID
+          })
+          if ($selected.Count -ne 1) { throw "backend_id must select exactly one release entry" }
+          $entry = Get-Content -LiteralPath $selected[0].FullName -Raw | ConvertFrom-Json
+          if ($entry.vendor -ne $env:QUAL_PROVIDER) { throw "backend provider differs from workflow input" }
+          if ($entry.vendor -in @("cuda", "hip") -and @($entry.targets).Count -eq 1 -and $entry.targets[0] -ne $env:QUAL_DEVICE_TARGET) {
+            throw "backend entry target differs from workflow input"
+          }
+          if ($entry.vendor -eq "vulkan" -and @($entry.targets).Count -ne 0) {
+            throw "Vulkan release entry is not artifact-generic"
+          }
+          foreach ($file in $entry.files) {
+            gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern $file.filename --dir $releaseDir
+            if ($LASTEXITCODE -ne 0) { throw "could not download $($file.filename)" }
+          }
+          $pluginRows = @($entry.files | Where-Object { $_.role -eq "plugin" })
+          $archiveRows = @($entry.files | Where-Object { $_.role -eq "archive" })
+          if ($pluginRows.Count -ne 1 -or $archiveRows.Count -ne 1) {
+            throw "selected backend must declare one plugin and one vendor archive"
+          }
+
+          $neutralArchive = Join-Path $releaseDir "openasr-$version-windows-x86_64-neutral.zip"
+          $entryArgs = @()
+          foreach ($item in $entries) { $entryArgs += @("--entry", $item.FullName) }
+          $releaseSubjects = @($entries | ForEach-Object { $_.FullName })
+          $releaseSubjects += @(
+            $neutralArchive,
+            (Join-Path $releaseDir "catalog.backends.candidate.json")
+          )
+          foreach ($file in $entry.files) {
+            $releaseSubjects += (Join-Path $releaseDir $file.filename)
+          }
+          $subjectArgs = @()
+          foreach ($subject in $releaseSubjects) {
+            $subjectArgs += @("--release-subject", $subject)
+          }
+          & python tooling/release-manifest/backend_hardware_evidence.py `
+            @entryArgs @subjectArgs --checksums (Join-Path $releaseDir "SHA256SUMS") `
+            --repo $env:GITHUB_REPOSITORY `
+            --signer-workflow "$env:GITHUB_REPOSITORY/.github/workflows/release-binaries.yml" `
+            --source-digest $env:GITHUB_SHA --release-preflight-only
+          if ($LASTEXITCODE -ne 0) {
+            throw "release subject provenance preflight failed before execution"
+          }
+
+          $neutralDir = Join-Path $env:RUNNER_TEMP "openasr-neutral"
+          Expand-Archive -LiteralPath $neutralArchive -DestinationPath $neutralDir -Force
+          $executables = @(Get-ChildItem -LiteralPath $neutralDir -Filter "openasr.exe" -File -Recurse)
+          if ($executables.Count -ne 1) { throw "neutral archive must contain exactly one openasr.exe" }
+
+          $home = Join-Path $env:RUNNER_TEMP "openasr-qualification-home"
+          New-Item -ItemType Directory -Force -Path $home | Out-Null
+          $catalog = Join-Path $home "catalog.json"
+          $signature = Join-Path $home "catalog.signature.json"
+          Invoke-WebRequest -UseBasicParsing "https://catalog.openasr.org/v1/catalog.json" -OutFile $catalog
+          Invoke-WebRequest -UseBasicParsing "https://catalog.openasr.org/v1/catalog.signature.json" -OutFile $signature
+          $env:OPENASR_HOME = $home
+          $env:OPENASR_CATALOG_FILE = $catalog
+          $env:OPENASR_CATALOG_IDENTITY = "https://catalog.openasr.org/v1/catalog.json"
+          $modelRef = "{0}:{1}" -f $env:QUAL_MODEL_ID, $env:QUAL_QUANT
+          & $executables[0].FullName pull $modelRef
+          if ($LASTEXITCODE -ne 0) { throw "could not pull the exact public model pack" }
+          $packs = @(Get-ChildItem -LiteralPath (Join-Path $home "models") -Filter "*.oasr" -File -Recurse)
+          if ($packs.Count -ne 1) { throw "isolated home must contain exactly one pulled model pack" }
+
+          "OPENASR_QUAL_RELEASE_DIR=$releaseDir" | Out-File $env:GITHUB_ENV -Append
+          "OPENASR_QUAL_NEUTRAL_ARCHIVE=$neutralArchive" | Out-File $env:GITHUB_ENV -Append
+          "OPENASR_QUAL_EXE=$($executables[0].FullName)" | Out-File $env:GITHUB_ENV -Append
+          "OPENASR_QUAL_PLUGIN=$(Join-Path $releaseDir $pluginRows[0].filename)" | Out-File $env:GITHUB_ENV -Append
+          "OPENASR_QUAL_VENDOR_ARCHIVE=$(Join-Path $releaseDir $archiveRows[0].filename)" | Out-File $env:GITHUB_ENV -Append
+          "OPENASR_QUAL_CATALOG=$catalog" | Out-File $env:GITHUB_ENV -Append
+          "OPENASR_QUAL_SIGNATURE=$signature" | Out-File $env:GITHUB_ENV -Append
+          "OPENASR_QUAL_HOME=$home" | Out-File $env:GITHUB_ENV -Append
+          "OPENASR_QUAL_PACK=$($packs[0].FullName)" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Produce exact hardware evidence
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE "qualification-evidence"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $entries = @(Get-ChildItem -LiteralPath $env:OPENASR_QUAL_RELEASE_DIR -Filter "backend-pack-*.json" -File)
+          $entryArgs = @()
+          foreach ($entry in $entries) { $entryArgs += @("--entry", $entry.FullName) }
+          $summary = Join-Path $out ("backend-hardware-evidence-{0}-{1}.json" -f $env:QUAL_PROVIDER, $env:QUAL_DEVICE_TARGET)
+          $raw = Join-Path $out ("backend-hardware-audit-{0}-{1}.json" -f $env:QUAL_PROVIDER, $env:QUAL_DEVICE_TARGET)
+          & python tooling/release-manifest/generate_backend_hardware_evidence.py `
+            @entryArgs --provider $env:QUAL_PROVIDER --device-target $env:QUAL_DEVICE_TARGET `
+            --binary $env:OPENASR_QUAL_EXE --neutral-archive $env:OPENASR_QUAL_NEUTRAL_ARCHIVE `
+            --plugin $env:OPENASR_QUAL_PLUGIN --vendor-archive $env:OPENASR_QUAL_VENDOR_ARCHIVE `
+            --catalog-candidate (Join-Path $env:OPENASR_QUAL_RELEASE_DIR "catalog.backends.candidate.json") `
+            --catalog $env:OPENASR_QUAL_CATALOG --catalog-signature $env:OPENASR_QUAL_SIGNATURE `
+            --checksums (Join-Path $env:OPENASR_QUAL_RELEASE_DIR "SHA256SUMS") `
+            --repo $env:GITHUB_REPOSITORY `
+            --signer-workflow "$env:GITHUB_REPOSITORY/.github/workflows/release-binaries.yml" `
+            --model ("{0}:{1}" -f $env:QUAL_MODEL_ID, $env:QUAL_QUANT) --model-pack $env:OPENASR_QUAL_PACK `
+            --audio fixtures/jfk.wav --home $env:OPENASR_QUAL_HOME `
+            --catalog-url "https://catalog.openasr.org/v1/catalog.json" `
+            --core-commit $env:GITHUB_SHA --fresh-process-runs 5 `
+            --output $summary --raw-output $raw
+          if ($LASTEXITCODE -ne 0) { throw "hardware evidence producer failed" }
+          "OPENASR_QUAL_EVIDENCE_DIR=$out" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Prepare isolated correctness scope and project exact matrix
+        shell: pwsh
+        run: |
+          $nonce = [Guid]::NewGuid().ToString("N").ToLowerInvariant()
+          $scope = "gpu-correctness/$nonce"
+          & $env:OPENASR_QUAL_EXE __openasr-backend-plugin prepare-qualification `
+            $env:QUAL_BACKEND_ID --device-target $env:QUAL_DEVICE_TARGET --scope $scope
+          if ($LASTEXITCODE -ne 0) { throw "could not prepare isolated correctness scope" }
+          "OPENASR_BACKEND_QUALIFICATION_SCOPE=$scope" | Out-File $env:GITHUB_ENV -Append
+
+          $inventory = Join-Path $env:OPENASR_QUAL_EVIDENCE_DIR "gpu-correctness-source-inventory.json"
+          $models = Join-Path $env:OPENASR_QUAL_EVIDENCE_DIR "gpu-correctness-source-model-catalog.json"
+          $backends = Join-Path $env:OPENASR_QUAL_EVIDENCE_DIR "gpu-correctness-source-backend-catalog.json"
+          Copy-Item tooling/model-family-inventory.v1.json $inventory
+          Copy-Item $env:OPENASR_QUAL_CATALOG $models
+          Copy-Item (Join-Path $env:OPENASR_QUAL_RELEASE_DIR "catalog.backends.candidate.json") $backends
+          $matrix = Join-Path $env:OPENASR_QUAL_EVIDENCE_DIR "gpu-correctness-matrix.v1.json"
+          $binarySha = (Get-FileHash -LiteralPath $env:OPENASR_QUAL_EXE -Algorithm SHA256).Hash.ToLowerInvariant()
+          $version = $env:QUAL_RELEASE_TAG.Substring(1)
+          $vulkanArgs = @()
+          if ($env:QUAL_PROVIDER -eq "vulkan") {
+            $vulkanArgs = @("--vulkan-target", ("{0}={1}" -f $env:QUAL_BACKEND_ID, $env:QUAL_DEVICE_TARGET))
+          }
+          & python tooling/release-manifest/gpu_correctness_gate.py project `
+            --inventory $inventory --catalog $models --backend-catalog $backends `
+            --out $matrix --release-subject $env:QUAL_RELEASE_TAG `
+            --release-version $version `
+            --core-commit $env:GITHUB_SHA --binary-sha256 $binarySha @vulkanArgs
+          if ($LASTEXITCODE -ne 0) { throw "matrix projection failed" }
+          "OPENASR_QUAL_MATRIX=$matrix" | Out-File $env:GITHUB_ENV -Append
+          "OPENASR_QUAL_INVENTORY=$inventory" | Out-File $env:GITHUB_ENV -Append
+          "OPENASR_QUAL_MODELS=$models" | Out-File $env:GITHUB_ENV -Append
+          "OPENASR_QUAL_BACKENDS=$backends" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Produce one exact correctness cell
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:OPENASR_QUALIFICATION_EXE = $env:OPENASR_QUAL_EXE
+          $env:OPENASR_QUALIFICATION_MATRIX = $env:OPENASR_QUAL_MATRIX
+          $env:OPENASR_QUALIFICATION_INVENTORY = $env:OPENASR_QUAL_INVENTORY
+          $env:OPENASR_QUALIFICATION_MODEL_CATALOG = $env:OPENASR_QUAL_MODELS
+          $env:OPENASR_QUALIFICATION_BACKEND_CATALOG = $env:OPENASR_QUAL_BACKENDS
+          $env:OPENASR_QUALIFICATION_BACKEND_ID = $env:QUAL_BACKEND_ID
+          $env:OPENASR_QUALIFICATION_MODEL_ID = $env:QUAL_MODEL_ID
+          $env:OPENASR_QUALIFICATION_QUANT = $env:QUAL_QUANT
+          $env:OPENASR_QUALIFICATION_PLUGIN = $env:OPENASR_QUAL_PLUGIN
+          $env:OPENASR_QUALIFICATION_PACK = $env:OPENASR_QUAL_PACK
+          $env:OPENASR_QUALIFICATION_AUDIO = Join-Path $env:GITHUB_WORKSPACE "fixtures\jfk.wav"
+          $env:OPENASR_QUALIFICATION_OUTPUT_DIR = Join-Path $env:OPENASR_QUAL_EVIDENCE_DIR "correctness"
+          $env:OPENASR_HOME = $env:OPENASR_QUAL_HOME
+          $env:OPENASR_CATALOG_FILE = $env:OPENASR_QUAL_CATALOG
+          $env:OPENASR_CATALOG_IDENTITY = "https://catalog.openasr.org/v1/catalog.json"
+          & pwsh -NoProfile -File tooling/windows-backend-qualification/run.ps1
+          if ($LASTEXITCODE -ne 0) { throw "correctness cell producer failed" }
+
+      - name: Clear isolated qualification selector
+        if: always()
+        shell: pwsh
+        run: |
+          if (-not $env:OPENASR_BACKEND_QUALIFICATION_SCOPE -or
+              -not $env:OPENASR_QUAL_EXE -or -not $env:OPENASR_QUAL_HOME) {
+            Write-Host "qualification selector was never created; nothing to clear"
+            exit 0
+          }
+          $env:OPENASR_HOME = $env:OPENASR_QUAL_HOME
+          $env:OPENASR_CATALOG_FILE = $env:OPENASR_QUAL_CATALOG
+          $env:OPENASR_CATALOG_IDENTITY = "https://catalog.openasr.org/v1/catalog.json"
+          & $env:OPENASR_QUAL_EXE __openasr-backend-plugin clear-qualification `
+            --scope $env:OPENASR_BACKEND_QUALIFICATION_SCOPE
+          if ($LASTEXITCODE -ne 0) { throw "qualification cleanup failed" }
+
+      - name: Freeze the exact qualification subject set
+        shell: pwsh
+        run: |
+          $root = (Resolve-Path $env:OPENASR_QUAL_EVIDENCE_DIR).Path
+          $checksumPath = Join-Path $root "SHA256SUMS"
+          $lines = @(Get-ChildItem -LiteralPath $root -File -Recurse | Where-Object {
+            $_.FullName -ne $checksumPath
+          } | Sort-Object FullName | ForEach-Object {
+            $relative = [IO.Path]::GetRelativePath($env:GITHUB_WORKSPACE, $_.FullName).Replace('\', '/')
+            $digest = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$digest  $relative"
+          })
+          if ($lines.Count -lt 9) { throw "qualification subject set is incomplete" }
+          [IO.File]::WriteAllLines($checksumPath, $lines, [Text.UTF8Encoding]::new($false))
+
+      - name: Attest exact hardware and correctness evidence bytes
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-checksums: qualification-evidence/SHA256SUMS
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-backend-qualification-${{ env.QUAL_PROVIDER }}-${{ env.QUAL_DEVICE_TARGET }}-${{ env.QUAL_MODEL_ID }}-${{ env.QUAL_QUANT }}
+          path: qualification-evidence
+          if-no-files-found: error
+          retention-days: 30

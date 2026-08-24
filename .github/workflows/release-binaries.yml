@@ -1,15 +1,10 @@
 name: Release binaries
 
-# Two ways in:
-#   1. workflow_call -- release-core.yml calls this workflow directly after it
-#      creates the draft GitHub Release. This is the only formal release-matrix
-#      entrypoint; accepting the annotated tag push here as well used to race
-#      the orchestrator and could build the same expensive matrix twice.
-#   2. workflow_dispatch -- manual re-run/dry-run, with the same `ref` input
-#      as workflow_call so a maintainer can target an existing tag (e.g. to
-#      retry a failed platform leg, recover aggregation from a completed run's
-#      immutable artifacts, or dry-run the upload/completeness logic against an
-#      already-released tag without touching its assets).
+# Formal release bytes have exactly one entrypoint: release-core.yml calls this
+# workflow and sets the workflow_call-only `formal_release` capability. Manual
+# dispatch is deliberately a one-target diagnostic build: it can upload an
+# Actions artifact for inspection, but cannot aggregate, attest, or mutate any
+# GitHub Release (draft or public).
 on:
   workflow_dispatch:
     inputs:
@@ -17,60 +12,27 @@ on:
         description: "Git ref (tag) to build; empty = default branch"
         required: false
         default: ""
-      dry_run:
-        description: "Evaluate upload/completeness logic but do not upload or edit the release"
-        required: false
-        default: false
-        type: boolean
       only_target:
-        description: "Build only this matrix.target key (empty = all legs; for validating a single platform without the full matrix)"
-        required: false
-        default: ""
-      source_run_id:
-        description: "Reuse immutable build artifacts from this completed release-core run and execute only aggregation/upload/completeness"
-        required: false
-        default: ""
-      supplemental_source_run_id:
-        description: "Optional completed single-target run whose immutable artifacts supplement source_run_id during recovery"
-        required: false
-        default: ""
-      promote_cuda_targets:
-        description: "Comma-separated experimental CUDA targets to promote during a recovery (for example 120)"
-        required: false
-        default: ""
+        description: "Required exact matrix.target key for this non-release diagnostic"
+        required: true
+        type: string
       cuda_gpu_targets:
         description: "Optional CUDA arch list for a diagnostic workflow_dispatch build (empty = release defaults)"
         required: false
         default: ""
   workflow_call:
     inputs:
+      formal_release:
+        description: "Capability set only by release-core.yml"
+        required: true
+        type: boolean
       ref:
         description: "Git ref (tag) to build"
         required: false
         type: string
         default: ""
-      source_run_id:
-        description: "Existing release-core run whose immutable build artifacts should be finalized"
-        required: false
-        type: string
-        default: ""
-      supplemental_source_run_id:
-        description: "Optional completed single-target run whose immutable artifacts supplement source_run_id during recovery"
-        required: false
-        type: string
-        default: ""
-      dry_run:
-        description: "Evaluate upload/completeness logic but do not upload or edit the release"
-        required: false
-        type: boolean
-        default: false
       only_target:
         description: "Build only this matrix.target key (empty = all legs; for validating a single platform without the full matrix)"
-        required: false
-        type: string
-        default: ""
-      promote_cuda_targets:
-        description: "Comma-separated experimental CUDA targets to promote during a recovery (for example 120)"
         required: false
         type: string
         default: ""
@@ -84,7 +46,7 @@ on:
   # the same expensive matrix twice for one annotated tag.
 
 permissions:
-  contents: write
+  contents: read
 
 # Serialize a full matrix by ref. Diagnostic only_target dispatches share the
 # ref but must not queue behind (or replace) each other. Never cancel a
@@ -97,6 +59,8 @@ jobs:
   select-matrix:
     name: Select release matrix
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       include: ${{ steps.select.outputs.include }}
       mode: ${{ steps.select.outputs.mode }}
@@ -109,8 +73,31 @@ jobs:
         id: select
         env:
           ONLY_TARGET: ${{ inputs.only_target || '' }}
+          FORMAL_RELEASE: ${{ inputs.formal_release || false }}
+          RELEASE_REF: ${{ inputs.ref || '' }}
+          CUDA_GPU_TARGETS: ${{ inputs.cuda_gpu_targets || '' }}
+          CALLER_WORKFLOW: ${{ github.workflow }}
+          CALLER_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
+          if [ "$FORMAL_RELEASE" = "true" ]; then
+            [ "$CALLER_WORKFLOW" = "Release core" ] && [ "$CALLER_REF" = "refs/heads/main" ] || {
+              echo "formal release capability is restricted to Release core on protected main" >&2; exit 1;
+            }
+            [ -z "$ONLY_TARGET" ] || {
+              echo "formal release cannot select a partial matrix" >&2; exit 1;
+            }
+            [ -z "$CUDA_GPU_TARGETS" ] || {
+              echo "formal release cannot override target-scoped CUDA rows" >&2; exit 1;
+            }
+            [[ "$RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+              echo "formal release ref must be one exact vX.Y.Z tag" >&2; exit 1;
+            }
+          else
+            [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ -n "$ONLY_TARGET" ] || {
+              echo "manual release-binaries runs require one diagnostic only_target" >&2; exit 1;
+            }
+          fi
           include="$(python3 tooling/release-manifest/select_release_matrix.py --only-target "${ONLY_TARGET}")"
           {
             echo "include<<INCLUDE_EOF"
@@ -127,7 +114,6 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     needs: [select-matrix]
-    if: ${{ inputs.source_run_id == '' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout || 60 }}
     # Container images (CUDA/ROCm wrappers, official devel) default to sh.
@@ -173,15 +159,15 @@ jobs:
       # AMD HIP SDK "PRO Edition" silent-installer release train, matched to
       # llama.cpp's current Windows HIP release job.
       HIPSDK_INSTALLER_VERSION: 26.Q1
-      # Windows Vulkan loader (vulkan-1.dll) redistributable, bundled into the
-      # windows-x86_64-neutral CLI zip -- see the "Stage Vulkan loader" step
+      # Windows Vulkan loader (vulkan-1.dll) redistributable, shipped in the
+      # inert optional Vulkan provider pack -- see the "Stage Vulkan loader" step
       # below for why (#132: STATUS_DLL_NOT_FOUND on machines with no GPU
       # driver). This is a *runtime redistributable* pin, independent of
       # VULKAN_VERSION above (that one pins the *build-time* SDK used to
-      # compile/link openasr.exe). Kept in lockstep with the desktop product's
-      # Vulkan loader staging script, which pins the identical
-      # version + both hashes for the desktop neutral-host bundle -- bump all three
-      # together in both places, cross-checked against LunarG's own published
+      # compile/link the open-core provider). The provider pack is the sole
+      # owner of this loader; Desktop neither stages nor mutates it. Bump the
+      # version and both hashes together, cross-checked against LunarG's own
+      # published
       # hash at https://vulkan.lunarg.com/sdk/sha/<version>/windows/VulkanRT-X64-<version>-Components.zip.json.
       VULKAN_LOADER_VERSION: 1.4.350.0
       # sha256 of the downloaded vulkan-runtime-components.zip archive.
@@ -191,12 +177,10 @@ jobs:
       # file extracted) is caught even though the archive-level hash above
       # already matched.
       VULKAN_LOADER_DLL_SHA256: 0419974f00e82a3d619077ba414da265a774f8db9d45ad93bc1843f44b2c2c1f
-      # BACKEND_DL compiles the neutral CPU/Vulkan host even when the selected
-      # release artifact is only a CUDA/HIP module. Keep build-time SDK needs
-      # separate from runtime loader packaging: plugin legs need the SDK but
-      # must not publish a second Vulkan loader beside the optional module.
-      NEEDS_WINDOWS_VULKAN_SDK: ${{ matrix.target == 'x86_64-pc-windows-msvc' || contains(matrix.features, 'vulkan') || matrix.distribution == 'host' || matrix.distribution == 'plugin' }}
-      BUNDLES_WINDOWS_VULKAN_LOADER: ${{ matrix.target == 'x86_64-pc-windows-msvc' || contains(matrix.features, 'vulkan') || matrix.distribution == 'host' }}
+      # The neutral host is CPU-only. Only the optional Vulkan provider leg
+      # needs the build-time SDK and owns the pinned loader redistributable.
+      NEEDS_WINDOWS_VULKAN_SDK: ${{ contains(matrix.features, 'vulkan') }}
+      BUNDLES_WINDOWS_VULKAN_LOADER: ${{ matrix.distribution == 'plugin' && matrix.provider == 'vulkan' }}
       # Full releases keep the hard-coded CUDA/HIP vendor owners. A diagnostic
       # exact-target dispatch must still upload that target's plugin + vendor
       # zip, so the selected plugin temporarily owns vendor publishing.
@@ -218,8 +202,8 @@ jobs:
     # unsuffixed default, musl would carry `-musl`.
     #
     # Windows releases use one neutral GGML_BACKEND_DL host. It bundles the
-    # CPU/Vulkan rescue modules and Vulkan loader; target-scoped CUDA/HIP
-    # plugins plus content-addressed vendor runtimes are separate artifacts.
+    # CPU rescue modules only. Vulkan/CUDA/HIP are separately signed,
+    # published-inert provider packs with content-addressed runtimes.
     # Legacy whole-engine Vulkan/CUDA/HIP sidecars ended with core 0.1.33.
     #
     # NOTE: jobs.verify-completeness below hardcodes this same asset/ext list
@@ -601,9 +585,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            export OPENASR_BUNDLED_VULKAN_LOADER_SHA256="$VULKAN_LOADER_DLL_SHA256"
-          fi
           if [ "${{ matrix.distribution }}" = "plugin" ]; then
             crate="openasr-core"
           else
@@ -719,7 +700,13 @@ jobs:
             Copy-Item (Join-Path $env:RELEASE_DIR "openasr-backend-packs\$provider\openasr-backend-host-abi-v1.json") $distDir -Force
             Copy-Item (Join-Path $env:RELEASE_DIR "openasr-backend-packs\$provider\openasr-backend-build-v1.json") $distDir -Force
             Add-Content $env:GITHUB_ENV "PLUGIN_ASSET_PATH=$pluginAsset"
-            $targetPack = if ($provider -eq "cuda") { "sm_${{ matrix.cuda_gpu_target }}" } else { "${{ matrix.hip_gpu_target }}" }
+            $targetPack = if ($provider -eq "cuda") {
+              "sm_${{ matrix.cuda_gpu_target }}"
+            } elseif ($provider -eq "hip") {
+              "${{ matrix.hip_gpu_target }}"
+            } else {
+              "generic"
+            }
             if ([string]::IsNullOrWhiteSpace($targetPack)) {
               Write-Error "target-scoped plugin leg has no GPU target"
             }
@@ -745,11 +732,9 @@ jobs:
           # from $distDir and the target-scoped plugin, so they
           # can ship as their own large, content-addressed `vendor_layers`
           # archive instead -- see the "Build deterministic vendor archive"
-          # step below and `docs/backend-kernels.md`'s schema v2 section. This
-          # is the split half of the fix for the old resolve_selected_kernel_
-          # binary staleness bug: keeping the vendor layer cached and
-          # version-independent means a core upgrade does not re-download the
-          # multi-hundred-MB GPU runtime when its content hash is unchanged.
+          # step below. Keeping the vendor layer cached and version-independent
+          # means a core upgrade does not re-download the multi-hundred-MB GPU
+          # runtime when its content hash is unchanged.
           # The per-core plugin can itself still be large and must not
           # be described to users as a small or zero-download update.
           if ($distribution -eq "plugin") {
@@ -860,6 +845,13 @@ jobs:
             if ($imports -match '(?im)^\s*(cudart64_|cublas64_|nvcuda\.dll)') {
               Write-Error "HIP plugin unexpectedly imports a CUDA runtime"
             }
+          } elseif ($provider -eq 'vulkan') {
+            if ($imports -notmatch '(?im)^\s*vulkan-1\.dll\s*$') {
+              Write-Error "Vulkan plugin does not import the pinned Vulkan loader"
+            }
+            if ($imports -match '(?im)^\s*(cudart64_|cublas64_|nvcuda\.dll|amdhip64|libhipblas|rocblas)') {
+              Write-Error "Vulkan plugin unexpectedly imports a CUDA/HIP runtime"
+            }
           } else {
             Write-Error "unsupported optional backend provider '$provider'"
           }
@@ -880,34 +872,21 @@ jobs:
       - name: Stage Vulkan loader (LunarG VulkanRT redistributable)
         if: runner.os == 'Windows' && env.BUNDLES_WINDOWS_VULKAN_LOADER == 'true'
         shell: pwsh
-        # openasr.exe's PE import table names vulkan-1.dll (ggml-vulkan links
+        # The optional ggml-vulkan.dll import table names vulkan-1.dll
         # Vulkan::Vulkan, the SYSTEM Vulkan loader import lib) -- the loader
         # itself is a thin, GPU-vendor-agnostic dispatch shim that does NOT
         # require a GPU or driver to LOAD, only to enumerate a device later.
-        # But the OS module loader resolves every PE import before main()
-        # runs at all, before openasr-core's HardwareFallbackPolicy ever gets
-        # a chance to fall back to CPU. A machine with no GPU driver installed
-        # (a clean Windows install, a VM) typically has no vulkan-1.dll
-        # anywhere on its DLL search path either (a driver install is what
-        # normally puts it there), so the exe dies at load time with
-        # STATUS_DLL_NOT_FOUND (0xC0000135) before any CPU fallback can run
-        # -- see #132.
+        # The loader is kept inside the verified optional vendor tree; a
+        # machine without it keeps running on bundled CPU because Vulkan bytes
+        # never enter the neutral process before signed activation.
         #
         # Fix: LunarG's Windows Vulkan Runtime redistributable ships the SAME
         # vulkan-1.dll every GPU driver installs, under a license (Apache-2.0
         # governs the loader itself; see VulkanRT-License.txt inside the
         # archive) that explicitly permits redistribution, entirely
         # independent of any GPU driver. Staging a pinned, hash-verified copy
-        # beside openasr.exe means the loader ALWAYS resolves (Windows
-        # searches the application directory before anything else on the
-        # default DLL search path), so a missing/absent GPU driver degrades
-        # exactly the way the original design intended: the loader loads
-        # fine, enumerates zero devices, and HardwareFallbackPolicy falls
-        # back to CPU in Rust -- never a DLL-load failure.
-        #
-        # Mirrors the desktop product's Vulkan loader staging script
-        # (identical version pin + identical two-layer hash verification) for
-        # the desktop neutral-host bundle. Fail-closed throughout: a download
+        # beside the optional plugin supplies one immutable dependency set.
+        # Fail-closed throughout: a download
         # failure, a hash mismatch at either layer, or a missing extracted
         # file all throw -- there is no silent fallback to an unverified DLL.
         run: |
@@ -939,7 +918,7 @@ jobs:
           if ($actualArchiveSha -ne $env:VULKAN_LOADER_ARCHIVE_SHA256) {
             Write-Error ("sha256 mismatch for Vulkan runtime archive: expected $env:VULKAN_LOADER_ARCHIVE_SHA256, got $actualArchiveSha. " +
               "Refusing to stage an unverified Vulkan runtime archive -- if LunarG genuinely rotated this release's bytes, re-pin " +
-              "VULKAN_LOADER_ARCHIVE_SHA256 (and VULKAN_LOADER_DLL_SHA256) here AND in the desktop product's Vulkan loader staging script, " +
+              "VULKAN_LOADER_ARCHIVE_SHA256 and VULKAN_LOADER_DLL_SHA256 together in this open-core provider workflow, " +
               "cross-checked against https://vulkan.lunarg.com/sdk/sha/$env:VULKAN_LOADER_VERSION/windows/VulkanRT-X64-$env:VULKAN_LOADER_VERSION-Components.zip.json.")
             exit 1
           }
@@ -966,8 +945,13 @@ jobs:
             exit 1
           }
 
-          Copy-Item $dll.FullName (Join-Path $env:DIST_DIR "vulkan-1.dll") -Force
-          Write-Host "stage-vulkan-loader: staged $(Join-Path $env:DIST_DIR 'vulkan-1.dll') (Vulkan runtime $env:VULKAN_LOADER_VERSION, sha256 $actualDllSha)."
+          $runtimeDestination = if ("${{ matrix.distribution }}" -eq "plugin" -and "${{ matrix.provider }}" -eq "vulkan") {
+            $env:VENDOR_DIR
+          } else {
+            $env:DIST_DIR
+          }
+          Copy-Item $dll.FullName (Join-Path $runtimeDestination "vulkan-1.dll") -Force
+          Write-Host "stage-vulkan-loader: staged $(Join-Path $runtimeDestination 'vulkan-1.dll') (Vulkan runtime $env:VULKAN_LOADER_VERSION, sha256 $actualDllSha)."
 
           # Ship the loader's own upstream license text verbatim (from the
           # same downloaded, hash-verified archive -- not hand-transcribed)
@@ -978,7 +962,10 @@ jobs:
             Write-Error "VulkanRT-License.txt not found in the Vulkan runtime archive -- archive layout may have changed."
             exit 1
           }
-          Copy-Item $licenseSrc.FullName (Join-Path $env:DIST_DIR "VULKAN-LOADER-LICENSE.txt") -Force
+          Copy-Item $licenseSrc.FullName (Join-Path $runtimeDestination "VULKAN-LOADER-LICENSE.txt") -Force
+          if ("${{ matrix.distribution }}" -eq "plugin" -and "${{ matrix.provider }}" -eq "vulkan") {
+            Add-Content $env:GITHUB_ENV "VENDOR_LAYER_KEY=vulkan-loader"
+          }
           Write-Host "stage-vulkan-loader: staged VULKAN-LOADER-LICENSE.txt from the archive's own VulkanRT-License.txt."
 
       - name: Resolve Windows binaries to sign
@@ -993,10 +980,7 @@ jobs:
         # (some already carrying the vendor's own Authenticode signature) and
         # are not ours to re-sign. Windows-kernel-dist v2 stages the cuda/hip
         # vendor DLLs into $env:VENDOR_DIR, a directory this step never scans
-        # (only $env:DIST_DIR), so they are excluded structurally, not just by
-        # the "ggml*.dll" filter below; vulkan-1.dll (staged directly into
-        # $env:DIST_DIR, since vulkan stays self-contained) still relies on
-        # not matching that filter, same as before.
+        # (only $env:DIST_DIR), so they are excluded structurally.
         run: |
           $ErrorActionPreference = "Stop"
           if ("${{ matrix.distribution }}" -eq "plugin") {
@@ -1025,10 +1009,8 @@ jobs:
         # job with -- or without -- secrets. Every run that gets here is a
         # release-core.yml's workflow_call or a maintainer's
         # workflow_dispatch, all of which do have repo secrets. The only
-        # legitimate no-secrets case is a maintainer smoke-testing build/
-        # package logic via workflow_dispatch with dry_run=true before the
-        # Azure Trusted Signing secrets are configured -- see the fail-closed
-        # step below.
+        # legitimate no-secrets case is a maintainer's one-target diagnostic,
+        # which never reaches aggregation, attestation, or release upload.
         run: |
           set -euo pipefail
           if [ -n "${AZURE_TENANT_ID:-}" ] && [ -n "${AZURE_CLIENT_ID:-}" ] && [ -n "${AZURE_CLIENT_SECRET:-}" ]; then
@@ -1038,10 +1020,10 @@ jobs:
           fi
 
       - name: Refuse to ship an unsigned Windows release binary
-        if: runner.os == 'Windows' && steps.signing-check.outputs.have_secrets != 'true' && !inputs.dry_run
+        if: runner.os == 'Windows' && steps.signing-check.outputs.have_secrets != 'true' && inputs.formal_release == true
         shell: bash
         run: |
-          echo "::error::AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_CLIENT_SECRET are not set -- refusing to package an unsigned Windows release binary. Configure the Azure Trusted Signing service principal secrets (see the desktop product's Windows signing docs for the account/profile this reuses), or re-run this workflow_dispatch with dry_run=true to build without signing for local debugging only." >&2
+          echo "::error::AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_CLIENT_SECRET are not set -- refusing to package an unsigned formal Windows release binary. Manual one-target diagnostics remain non-release Actions artifacts." >&2
           exit 1
 
       # Azure Trusted Signing (Artifact Signing): same account/certificate
@@ -1097,8 +1079,7 @@ jobs:
             python tooling/release-manifest/backend_catalog.py bundle `
               --directory "$env:DIST_DIR" `
               --host-abi "$env:DIST_DIR\openasr-backend-host-abi-v1.json" `
-              --out "$env:DIST_DIR\openasr-backend-bundle-v1.json" `
-              --require-vulkan-loader
+              --out "$env:DIST_DIR\openasr-backend-bundle-v1.json"
             if ($LASTEXITCODE -ne 0) { exit 1 }
           }
           # Smoke the binary from the staged dist dir (NOT target/release,
@@ -1117,16 +1098,9 @@ jobs:
             $doctor = & "$env:DIST_DIR\${{ matrix.binary_name }}" doctor 2>&1 | Out-String
             Write-Host $doctor
             if ($LASTEXITCODE -ne 0) { exit 1 }
-            # GitHub's Windows runner has no Vulkan device, so the verified
-            # Vulkan module may legitimately return NULL from backend init.
-            # Allow exactly that hardware-absence result; schema, byte hash,
-            # PE identity, ABI, loader, and path failures remain fatal.
-            $bundleVerified = $doctor -match "bundled CPU/Vulkan modules: verified"
-            $gpuLessVulkan = $doctor -match "bundled CPU/Vulkan modules: unavailable" -and
-              $doctor -match "backend pack 'bundled-vulkan' could not be loaded by ggml"
-            if (-not $bundleVerified -and -not $gpuLessVulkan) {
-              throw "staged neutral host rejected its post-signing CPU/Vulkan bundle contract"
-            }
+            # Optional Vulkan is published inert and cannot enter this neutral
+            # host until a signed activation epoch exists. The host smoke owns
+            # only the independently verified CPU rescue module.
             if ($doctor -notmatch "CPU backend CPU" -or $doctor -match "CPU backend unavailable") {
               throw "staged neutral host could not initialize its bundled CPU rescue backend"
             }
@@ -1135,8 +1109,8 @@ jobs:
             Compress-Archive -Path "$env:DIST_DIR" -DestinationPath "dist\$env:ARCHIVE_NAME.${{ matrix.archive_ext }}" -Force
           }
 
-      # Windows-kernel-dist v2: package the vendor GPU runtime DLLs staged
-      # into $env:VENDOR_DIR (cuda/hip only) as their own archive, named after
+      # Package the vendor GPU runtime DLLs staged into $env:VENDOR_DIR as
+      # their own archive, named after
       # (and deduped by) its own sha256 -- see
       # tooling/release-manifest/deterministic_zip.py's module doc for why
       # this can't reuse PowerShell's Compress-Archive (not byte-deterministic,
@@ -1146,7 +1120,7 @@ jobs:
       # maintainer would reproduce this locally, instead of PowerShell string
       # ops. Runs on the runner's preinstalled python3 (falls back to `python`
       # if the image ever drops the python3 alias).
-      - name: Build deterministic vendor archive (cuda/hip)
+      - name: Build deterministic vendor archive
         if: runner.os == 'Windows' && matrix.distribution == 'plugin'
         shell: bash
         run: |
@@ -1169,9 +1143,13 @@ jobs:
         run: |
           set -euo pipefail
           min_driver_api="${{ matrix.min_driver_api }}"
-          if [ -z "${min_driver_api}" ]; then
+          if [ -z "${min_driver_api}" ] && [ "${{ matrix.provider }}" != "vulkan" ]; then
             min_driver_api="12.0.0"
             if [ "${{ matrix.provider }}" = "hip" ]; then min_driver_api="7.2.0"; fi
+          fi
+          min_driver_args=()
+          if [ -n "${min_driver_api}" ]; then
+            min_driver_args+=(--minimum-driver-api "$min_driver_api")
           fi
           python_bin="python3"
           command -v python3 >/dev/null 2>&1 || python_bin="python"
@@ -1184,7 +1162,7 @@ jobs:
             --vendor-extract-subdir vendor \
             --version "$OPENASR_VERSION" \
             --minimum-cli-version "$OPENASR_VERSION" \
-            --minimum-driver-api "$min_driver_api" \
+            "${min_driver_args[@]}" \
             --base-url "https://dl.openasr.org/core/v$OPENASR_VERSION" \
             --mirror-base-url "https://github.com/QuintinShaw/openasr/releases/download/v$OPENASR_VERSION" \
             --require-single-target \
@@ -1226,7 +1204,7 @@ jobs:
     # A single-target diagnostic dispatch must consume only that platform's
     # runner. The SDK artifact belongs to complete releases, not to a Windows
     # or Linux `only_target` probe.
-    if: ${{ inputs.source_run_id == '' && (github.event_name != 'workflow_dispatch' || inputs.only_target == '') }}
+    if: ${{ inputs.formal_release == true }}
     # Not part of the `build` matrix above: it is a macOS/iOS SDK artifact
     # (three arch slices assembled via `xcodebuild -create-xcframework`), not
     # a CLI binary, so it gets its own job with its own toolchain/packaging
@@ -1310,13 +1288,11 @@ jobs:
     # Never assemble, attest, or upload a partial release. Experimental matrix
     # legs already express their own continue-on-error policy; every required
     # build and the complete-release xcframework must have reached its upload.
-    if: ${{ !cancelled() && needs.select-matrix.result == 'success' && ((github.event_name == 'workflow_dispatch' && inputs.source_run_id != '' && inputs.only_target == '') || (inputs.source_run_id == '' && needs.build.result == 'success' && (needs.xcframework.result == 'success' || needs.xcframework.result == 'skipped'))) }}
+    if: ${{ !cancelled() && inputs.formal_release == true && needs.select-matrix.result == 'success' && needs.build.result == 'success' && needs.xcframework.result == 'success' }}
     runs-on: ubuntu-latest
-    outputs:
-      recovery_tag: ${{ steps.upload_recovered.outputs.tag }}
     permissions:
       actions: read
-      contents: write
+      contents: read
       id-token: write
       attestations: write
     steps:
@@ -1326,83 +1302,30 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
       - name: Download archives
-        if: inputs.source_run_id == ''
         uses: actions/download-artifact@v8
         with:
           path: staging
           merge-multiple: true
-      - name: Download archives from source runs
-        if: inputs.source_run_id != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
-          SUPPLEMENTAL_SOURCE_RUN_ID: ${{ inputs.supplemental_source_run_id || '' }}
-        run: |
-          set -euo pipefail
-          [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]] || {
-            echo "source_run_id must be a positive Actions run id" >&2
-            exit 1
-          }
-          mkdir -p staging
-          run_ids=("$SOURCE_RUN_ID")
-          if [ -n "$SUPPLEMENTAL_SOURCE_RUN_ID" ]; then
-            [[ "$SUPPLEMENTAL_SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]] || {
-              echo "supplemental_source_run_id must be a positive Actions run id" >&2
-              exit 1
-            }
-            [ "$SUPPLEMENTAL_SOURCE_RUN_ID" != "$SOURCE_RUN_ID" ] || {
-              echo "supplemental_source_run_id must differ from source_run_id" >&2
-              exit 1
-            }
-            run_ids+=("$SUPPLEMENTAL_SOURCE_RUN_ID")
-          fi
-          for run_id in "${run_ids[@]}"; do
-            status="$(gh run view "$run_id" --repo "${{ github.repository }}" --json status --jq .status)"
-            [ "$status" = "completed" ] || {
-              echo "source run $run_id is not completed" >&2
-              exit 1
-            }
-            gh run download "$run_id" --repo "${{ github.repository }}" --dir "staging/$run_id"
-          done
       - name: Generate SHA256SUMS
         run: |
           set -euo pipefail
           mkdir -p dist
           find staging -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dll' -o -name '*.sha256' -o -name 'backend-pack-*.json' \) -exec cp {} dist/ \;
           cd dist
-          sha256sum * > SHA256SUMS
+          sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
 
       - name: Compile ABI-scoped backend catalog candidate
         if: inputs.only_target == ''
-        env:
-          PROMOTE_CUDA_TARGETS: ${{ inputs.promote_cuda_targets || '' }}
         run: |
           set -euo pipefail
           mapfile -t cuda_targets < <(python3 - <<'PY'
           import json
-          import os
           from pathlib import Path
 
           matrix = json.loads(Path("tooling/release-manifest/release_binaries_matrix.json").read_text())
-          promoted = {
-              target.removeprefix("sm_")
-              for token in os.environ.get("PROMOTE_CUDA_TARGETS", "").replace(",", " ").split()
-              if (target := token.strip())
-          }
-          known = {
-              str(row["cuda_gpu_target"])
-              for row in matrix
-              if row.get("provider") == "cuda"
-          }
-          unknown = promoted - known
-          if unknown:
-              raise SystemExit(f"unknown promoted CUDA target(s): {sorted(unknown)}")
           for row in matrix:
-              if row.get("provider") == "cuda" and (
-                  not row.get("experimental", False)
-                  or str(row["cuda_gpu_target"]) in promoted
-              ):
+              if row.get("provider") == "cuda" and not row.get("experimental", False):
                   print(row["cuda_gpu_target"])
           PY
           )
@@ -1416,8 +1339,8 @@ jobs:
                   print(row["hip_gpu_target"])
           PY
           )
-          if [ "${#cuda_targets[@]}" -lt 5 ] || [ "${#hip_targets[@]}" -ne 14 ]; then
-            echo "release matrix must define at least 5 required CUDA SM and exactly 14 required HIP gfx targets" >&2
+          if [ "${#cuda_targets[@]}" -ne 6 ] || [ "${#hip_targets[@]}" -ne 14 ]; then
+            echo "release matrix must define exactly 6 CUDA SM and 14 HIP gfx targets" >&2
             exit 1
           fi
           cuda_entries=()
@@ -1432,8 +1355,10 @@ jobs:
             [ -f "$entry" ] || { echo "missing required HIP entry: $entry" >&2; exit 1; }
             hip_entries+=("$entry")
           done
+          vulkan_entry="dist/backend-pack-vulkan-generic.json"
+          [ -f "$vulkan_entry" ] || { echo "missing required Vulkan entry: $vulkan_entry" >&2; exit 1; }
           backend_entry_args=()
-          for entry in "${cuda_entries[@]}" "${hip_entries[@]}"; do
+          for entry in "$vulkan_entry" "${cuda_entries[@]}" "${hip_entries[@]}"; do
             backend_entry_args+=(--entry "$entry")
           done
           python3 tooling/release-manifest/backend_catalog.py merge \
@@ -1454,6 +1379,7 @@ jobs:
           path: |
             dist/backend-pack-cuda-sm_*.json
             dist/backend-pack-hip-gfx*.json
+            dist/backend-pack-vulkan-generic.json
             dist/backend-plugin-hints.json
             dist/catalog.backends.candidate.json
           if-no-files-found: error
@@ -1503,35 +1429,14 @@ jobs:
           path: dist/SHA256SUMS
           if-no-files-found: error
 
-      - name: Upload recovered assets to release
-        id: upload_recovered
-        if: inputs.source_run_id != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          ref="${{ inputs.ref }}"
-          case "$ref" in
-            refs/tags/*) tag="${ref#refs/tags/}" ;;
-            v[0-9]*.*) tag="$ref" ;;
-            *) echo "recovery ref must be an existing vX.Y.Z tag" >&2; exit 1 ;;
-          esac
-          is_draft="$(gh release view "$tag" --repo "${{ github.repository }}" --json isDraft --jq .isDraft)"
-          [ "$is_draft" = "true" ] || {
-            echo "recovery only uploads to an existing draft release" >&2
-            exit 1
-          }
-          shopt -s nullglob
-          assets=(dist/*.tar.gz dist/*.zip dist/*.dll dist/backend-pack-*.json dist/backend-plugin-hints.json dist/catalog.backends.candidate.json dist/*.sha256 dist/SHA256SUMS)
-          [ "${#assets[@]}" -gt 0 ] || { echo "no recovered release assets found" >&2; exit 1; }
-          gh release upload "$tag" "${assets[@]}" --repo "${{ github.repository }}" --clobber
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
   upload-to-release:
     name: Upload assets to release
     needs: checksums
-    if: ${{ !cancelled() && inputs.source_run_id == '' && needs.checksums.result == 'success' }}
+    if: ${{ !cancelled() && inputs.formal_release == true && needs.checksums.result == 'success' }}
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
@@ -1542,59 +1447,51 @@ jobs:
       - name: Resolve the release tag for this ref
         id: tag
         shell: bash
-        # Only a ref that is (or resolves to) a `v*` tag has a GitHub Release
-        # to attach assets to. A `workflow_dispatch` run against a branch, or
-        # any other ref shape, has nothing to upload to -- that is not an
-        # error, just a no-op (lets this workflow still be dispatched for
-        # ad-hoc build-only smoke runs).
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
-          ref="${{ inputs.ref }}"
-          if [ -z "$ref" ]; then
-            ref="${{ github.ref }}"
-          fi
-          case "$ref" in
-            refs/tags/*) tag="${ref#refs/tags/}" ;;
-            v[0-9]*.*) tag="$ref" ;;
-            *) tag="" ;;
-          esac
-          if [ -z "$tag" ]; then
-            echo "ref '$ref' does not resolve to a release tag -- nothing to upload" >&2
-            echo "tag=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if ! git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
-            echo "tag ${tag} does not exist on origin -- nothing to upload" >&2
-            echo "tag=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          [[ "$RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "formal release ref must be one exact vX.Y.Z tag" >&2; exit 1;
+          }
+          tag="$RELEASE_REF"
+          git fetch --force --no-tags origin "refs/tags/${tag}:refs/tags/${tag}"
+          tag_commit="$(git rev-parse "${tag}^{}")"
+          checkout_commit="$(git rev-parse HEAD)"
+          [ "$tag_commit" = "$checkout_commit" ] || {
+            echo "release tag and checked-out source commit differ" >&2; exit 1;
+          }
+          is_draft="$(gh release view "$tag" --repo "${{ github.repository }}" \
+            --json isDraft --jq .isDraft)"
+          [ "$is_draft" = "true" ] || {
+            echo "formal release assets may be uploaded only to an existing draft" >&2; exit 1;
+          }
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
       - name: Download archives + SHA256SUMS
-        if: steps.tag.outputs.tag != ''
         uses: actions/download-artifact@v8
         with:
           path: staging
           merge-multiple: true
 
       - name: List what would be uploaded
-        if: steps.tag.outputs.tag != ''
         run: |
           set -euo pipefail
           echo "release: ${{ steps.tag.outputs.tag }}"
           find staging -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dll' -o -name 'backend-pack-*.json' -o -name 'backend-plugin-hints.json' -o -name 'catalog.backends.candidate.json' -o -name '*.sha256' -o -name 'SHA256SUMS' \) -print | sort
 
       - name: Upload assets to release
-        if: steps.tag.outputs.tag != '' && !inputs.dry_run
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag="${{ steps.tag.outputs.tag }}"
-          if ! gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "release ${tag} does not exist yet -- release-core.yml should create it before calling this workflow" >&2
-            exit 1
-          fi
+          is_draft="$(gh release view "$tag" --repo "${{ github.repository }}" \
+            --json isDraft --jq .isDraft)"
+          [ "$is_draft" = "true" ] || {
+            echo "refusing to overwrite assets on a public release" >&2; exit 1;
+          }
           # nullglob drops optional unmatched artifact patterns instead of
           # passing them to `gh` as literal paths.
           shopt -s nullglob
@@ -1604,21 +1501,14 @@ jobs:
           gh release upload "$tag" "${assets[@]}" \
             --repo "${{ github.repository }}" --clobber
 
-      - name: Dry run -- skipping upload
-        if: steps.tag.outputs.tag != '' && inputs.dry_run
-        run: echo "dry_run=true -- not uploading to ${{ steps.tag.outputs.tag }} (evaluated condition/logic only)"
-
   verify-completeness:
     name: Verify release completeness
     needs: [checksums, upload-to-release]
-    # Single-leg dispatch runs (only_target set) intentionally produce just
-    # one archive, not the full asset set this job asserts on -- skip the
-    # completeness gate for those runs instead of failing it by design.
-    if: ${{ always() && !cancelled() && needs.checksums.result == 'success' && (needs.upload-to-release.result == 'success' || inputs.source_run_id != '') && inputs.only_target == '' }}
+    if: ${{ always() && !cancelled() && inputs.formal_release == true && needs.checksums.result == 'success' && needs.upload-to-release.result == 'success' }}
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
-      RELEASE_TAG: ${{ needs.checksums.outputs.recovery_tag || needs.upload-to-release.outputs.tag }}
+      RELEASE_TAG: ${{ needs.upload-to-release.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1642,8 +1532,6 @@ jobs:
         # listed: they may fail without failing the run, so requiring their
         # asset here would defeat the escape hatch. Promote such a leg (drop
         # `experimental`, add its asset:ext here) once it proves green.
-        env:
-          PROMOTE_CUDA_TARGETS: ${{ inputs.promote_cuda_targets || '' }}
         run: |
           set -euo pipefail
           tag="${RELEASE_TAG}"
@@ -1668,53 +1556,41 @@ jobs:
           )
 
           expected_file="$(mktemp)"
-          for entry in "${TARGETS[@]}"; do
-            target="${entry%%:*}"
-            ext="${entry##*:}"
-            echo "openasr-${version}-${target}.${ext}" >> "$expected_file"
-          done
-          echo "openasr-${version}-xcframework.zip.sha256" >> "$expected_file"
+          base_expected="$(mktemp)"
+          {
+            for entry in "${TARGETS[@]}"; do
+              target="${entry%%:*}"
+              ext="${entry##*:}"
+              echo "openasr-${version}-${target}.${ext}"
+            done
+            echo "openasr-${version}-xcframework.zip.sha256"
+          } > "$base_expected"
           pack_names="$(mktemp)"
           python3 - "$pack_names" <<'PY'
           import json
-          import os
           import sys
           from pathlib import Path
 
           matrix = json.loads(Path("tooling/release-manifest/release_binaries_matrix.json").read_text())
-          promoted = {
-              token.strip().removeprefix("sm_")
-              for token in os.environ.get("PROMOTE_CUDA_TARGETS", "").replace(",", " ").split()
-              if token.strip()
-          }
-          known = {
-              str(row["cuda_gpu_target"])
-              for row in matrix
-              if row.get("provider") == "cuda"
-          }
-          unknown = promoted - known
-          if unknown:
-              raise SystemExit(f"unknown promoted CUDA target(s): {sorted(unknown)}")
           names = []
           for row in matrix:
               provider = row.get("provider")
-              if provider == "cuda" and (
-                  not row.get("experimental", False)
-                  or str(row["cuda_gpu_target"]) in promoted
-              ):
+              if provider == "cuda" and not row.get("experimental", False):
                   names.append(f"backend-pack-cuda-sm_{row['cuda_gpu_target']}.json")
               elif provider == "hip" and not row.get("experimental", False):
                   names.append(f"backend-pack-hip-{row['hip_gpu_target']}.json")
+              elif provider == "vulkan" and row.get("distribution") == "plugin":
+                  names.append("backend-pack-vulkan-generic.json")
           Path(sys.argv[1]).write_text("\n".join(names) + "\n", encoding="utf-8")
           PY
           pack_dir="$(mktemp -d)"
           while IFS= read -r pack_name; do
             [ -n "$pack_name" ] || continue
-            echo "$pack_name" >> "$expected_file"
             gh release download "$tag" --repo "${{ github.repository }}" \
               -p "$pack_name" -D "$pack_dir"
           done < "$pack_names"
-          python3 - "$pack_dir" >> "$expected_file" <<'PY'
+          pack_payload_names="$(mktemp)"
+          python3 - "$pack_dir" > "$pack_payload_names" <<'PY'
           import json
           import sys
           from pathlib import Path
@@ -1731,9 +1607,14 @@ jobs:
                       raise SystemExit(f"{entry_path.name} has unsafe filename {name!r}")
                   print(name)
           PY
-          echo "backend-plugin-hints.json" >> "$expected_file"
-          echo "catalog.backends.candidate.json" >> "$expected_file"
-          echo "SHA256SUMS" >> "$expected_file"
+          {
+            cat "$base_expected"
+            cat "$pack_names"
+            cat "$pack_payload_names"
+            echo "backend-plugin-hints.json"
+            echo "catalog.backends.candidate.json"
+            echo "SHA256SUMS"
+          } > "$expected_file"
           sort -u -o "$expected_file" "$expected_file"
 
           actual_file="$(mktemp)"
@@ -1746,9 +1627,15 @@ jobs:
           cat "$actual_file"
 
           missing="$(comm -23 "$expected_file" "$actual_file")"
+          extra="$(comm -13 "$expected_file" "$actual_file")"
           if [ -n "$missing" ]; then
             echo "::error::release ${tag} is missing expected asset(s):"
             echo "$missing"
+            exit 1
+          fi
+          if [ -n "$extra" ]; then
+            echo "::error::release ${tag} contains unexpected asset(s):"
+            echo "$extra"
             exit 1
           fi
           echo "release ${tag} has all $(wc -l < "$expected_file" | tr -d ' ') expected assets."

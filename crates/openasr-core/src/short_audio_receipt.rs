@@ -558,10 +558,25 @@ impl ShortAudioReceipt {
         if let Some(evidence) = &self.evidence {
             evidence.validate(self.observed_placement.as_ref())?;
             if evidence.core_commit != self.core_commit
-                || evidence.model_id != self.pack.model_id
+                || format!("{}:{}", evidence.model_id, evidence.quant) != self.pack.model_id
                 || evidence.quant != self.pack.quant
             {
                 return Err(ShortAudioReceiptError::EvidenceBindingMismatch);
+            }
+            if let Some(execution) = &evidence.execution {
+                let expected_run_state = match execution.mode {
+                    ShortAudioReuseMode::Cold => ("cold", "empty"),
+                    ShortAudioReuseMode::Reuse => ("warm", "populated"),
+                };
+                if (self.run.warmup.as_str(), self.run.cache_state.as_str()) != expected_run_state {
+                    return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                        field: "correctness.execution.mode",
+                        actual: format!(
+                            "{:?} contradicts run.warmup={}/cache_state={}",
+                            execution.mode, self.run.warmup, self.run.cache_state
+                        ),
+                    });
+                }
             }
         }
 
@@ -804,6 +819,16 @@ pub struct ShortAudioReceiptEvidence {
     pub quant: String,
     pub topology: String,
     pub provider: String,
+    /// Exact provider compilation/device target or an explicitly named,
+    /// reviewed equivalence class. Provider-only evidence is never eligible.
+    pub device_target: String,
+    /// Exact signed backend candidate that executed this receipt.
+    pub backend_id: String,
+    /// Exact driver version observed by the signed backend probe.
+    pub driver_version: String,
+    /// Canonical fingerprint of the complete signed backend entry, including
+    /// plugin and vendor runtime bytes.
+    pub artifact_fingerprint: String,
     /// Stable bounded device label or opaque identity; never a local path.
     pub device: String,
     pub placement: String,
@@ -909,6 +934,13 @@ impl ShortAudioReceiptEvidence {
             ("correctness.quant", self.quant.as_str()),
             ("correctness.topology", self.topology.as_str()),
             ("correctness.provider", self.provider.as_str()),
+            ("correctness.device_target", self.device_target.as_str()),
+            ("correctness.backend_id", self.backend_id.as_str()),
+            ("correctness.driver_version", self.driver_version.as_str()),
+            (
+                "correctness.artifact_fingerprint",
+                self.artifact_fingerprint.as_str(),
+            ),
             ("correctness.device", self.device.as_str()),
             ("correctness.placement", self.placement.as_str()),
             ("correctness.result", self.result.as_str()),
@@ -927,6 +959,25 @@ impl ShortAudioReceiptEvidence {
                 actual,
             },
         )?;
+        validate_sha256_hex(
+            "correctness.artifact_fingerprint",
+            &self.artifact_fingerprint,
+        )
+        .map_err(|actual| ShortAudioReceiptError::InvalidEvidenceDigest {
+            field: "correctness.artifact_fingerprint",
+            actual,
+        })?;
+        if self.driver_version.len() > 64
+            || !self
+                .driver_version
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                field: "correctness.driver_version",
+                actual: self.driver_version.clone(),
+            });
+        }
         validate_core_commit(&self.core_commit)?;
         self.catalog_digests.validate()?;
         if self.result != "pass" {
@@ -1440,7 +1491,7 @@ fn decode_step_from_native_token(
     Ok(ShortAudioReceiptDecodeStep {
         step: step_index,
         token_id: Some(token_id),
-        logits_sha256: None,
+        logits_sha256: step.logits_sha256.clone(),
         top2_margin: step.top2_margin,
         graph_rebuilt,
     })
@@ -1660,10 +1711,14 @@ mod tests {
                 backend_catalog_sha256: "3".repeat(64),
             },
             family: "qwen".to_string(),
-            model_id: "funasr-nano:q4_k".to_string(),
+            model_id: "funasr-nano".to_string(),
             quant: "q4_k".to_string(),
             topology: "causal-self-attention-kv".to_string(),
             provider: "cuda".to_string(),
+            device_target: "sm_89".to_string(),
+            backend_id: "cuda-windows-x86_64-test-sm_89".to_string(),
+            driver_version: "12.7.0".to_string(),
+            artifact_fingerprint: "9".repeat(64),
             device: "cuda0".to_string(),
             placement: "full_device".to_string(),
             capture_mode: ShortAudioCaptureMode::Disabled,
@@ -1708,6 +1763,23 @@ mod tests {
         let mut receipt = sample_receipt();
         receipt.evidence = Some(sample_token_evidence(ShortAudioReuseMode::Cold));
         ShortAudioReceipt::try_new(receipt).expect("complete token evidence should validate");
+    }
+
+    #[test]
+    fn correctness_process_mode_must_match_warmup_and_cache_state() {
+        let mut receipt = sample_receipt();
+        receipt.evidence = Some(sample_token_evidence(ShortAudioReuseMode::Reuse));
+        assert!(matches!(
+            receipt.validate(),
+            Err(ShortAudioReceiptError::InvalidEvidenceField {
+                field: "correctness.execution.mode",
+                ..
+            })
+        ));
+        receipt.run.warmup = "warm".to_string();
+        receipt.run.cache_state = "populated".to_string();
+        ShortAudioReceipt::try_new(receipt)
+            .expect("reuse evidence with one warmup and a populated cache should validate");
     }
 
     #[test]
@@ -2107,6 +2179,10 @@ mod tests {
         assert_eq!(diagnostics.steps[0].step, 0);
         assert_eq!(diagnostics.steps[0].token_id, Some(11));
         assert_eq!(diagnostics.steps[0].top2_margin, Some(1.0));
+        assert_eq!(
+            diagnostics.steps[0].logits_sha256.as_deref(),
+            Some(crate::ggml_runtime::diagnostic_logits_sha256(&[2.0, 1.0]).as_str())
+        );
         assert!(diagnostics.steps[0].graph_rebuilt);
         assert_eq!(diagnostics.steps[1].token_id, Some(7));
         assert_eq!(diagnostics.steps[1].top2_margin, None);

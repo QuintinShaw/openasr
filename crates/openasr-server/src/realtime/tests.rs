@@ -386,9 +386,8 @@ async fn realtime_backend_job_canceled_before_dispatch_releases_capacity_promptl
 
     let temp = tempfile::tempdir().unwrap();
     let pack_path = temp.path().join("realtime-cancel-releases-capacity.oasr");
-    let spec = openasr_core::testing::TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer(
-        "whisper-cancel-fixture",
-    );
+    let spec = openasr_core::testing::TinyGgufFixtureSpec::
+        whisper_oasr_v1_graph_ready_for_runtime_fail_closed("whisper-cancel-fixture");
     openasr_core::testing::write_tiny_gguf_runtime_source(&pack_path, &spec)
         .expect("write whisper fixture pack");
 
@@ -1754,14 +1753,19 @@ fn abandoned_worker_warm_up_does_not_mark_model_resident() {
     // instance the rest of the process has already forgotten about.
     let _generation_guard = crate::idle_activity::native_unload_generation_test_lock_blocking();
     crate::idle_activity::bump_native_unload_generation();
-    assert!(!crate::idle_activity::native_model_is_resident());
+    let residency_key = crate::idle_activity::NativeRuntimeResidencyKey::legacy_path(
+        std::path::Path::new("abandoned-warm-up"),
+    );
+    assert!(!crate::idle_activity::native_model_is_resident(
+        &residency_key
+    ));
 
     let abandoned = AtomicBool::new(true);
     let mut session = TestServerNativeSession::new("abandoned-warm-up");
-    warm_up_native_streaming_session_once(&mut session, &abandoned)
+    warm_up_native_streaming_session_once(&mut session, &abandoned, &residency_key)
         .expect("warm-up itself still succeeds -- only its process-wide side effect is discarded");
     assert!(
-        !crate::idle_activity::native_model_is_resident(),
+        !crate::idle_activity::native_model_is_resident(&residency_key),
         "a warm-up finishing after its worker was abandoned must not mark the model resident"
     );
 
@@ -1772,15 +1776,16 @@ fn abandoned_worker_warm_up_does_not_mark_model_resident() {
     // thread-local `WARMED_AT_GENERATION` gate (already warmed at this
     // generation on the current test thread, from the call above) does not
     // skip this one.
-    std::thread::spawn(|| {
+    let normal_key = residency_key.clone();
+    std::thread::spawn(move || {
         let not_abandoned = AtomicBool::new(false);
         let mut session = TestServerNativeSession::new("normal-warm-up");
-        warm_up_native_streaming_session_once(&mut session, &not_abandoned).unwrap();
+        warm_up_native_streaming_session_once(&mut session, &not_abandoned, &normal_key).unwrap();
     })
     .join()
     .unwrap();
     assert!(
-        crate::idle_activity::native_model_is_resident(),
+        crate::idle_activity::native_model_is_resident(&residency_key),
         "the normal (not abandoned) path must still mark resident"
     );
 }
@@ -2709,6 +2714,31 @@ async fn boot_native_warmup_skips_when_the_runtime_slot_is_occupied() {
     );
 }
 
+#[test]
+fn boot_native_warmup_cannot_claim_a_stale_path_during_activation() {
+    let runtime = ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(PathBuf::from("stale-boot-warmup.oasr")).into(),
+    };
+    let activation = runtime
+        .begin_native_activation()
+        .expect("fixture activation barrier");
+
+    let error = futures_util::FutureExt::now_or_never(warm_up_default_native_streaming_worker(
+        runtime.clone(),
+    ))
+    .expect("activation conflict must be reported without suspending")
+    .expect_err("boot warmup must not inspect or start the old active path");
+    assert!(
+        error.contains("activation"),
+        "the conflict must identify the active publication transition: {error}"
+    );
+    drop(activation);
+}
+
 #[tokio::test]
 async fn boot_warmup_does_not_consume_the_user_session_slot() {
     let warm_calls = Arc::new(AtomicUsize::new(0));
@@ -2894,6 +2924,7 @@ async fn native_streaming_warm_up_stays_once_across_reattach_without_an_idle_unl
     let _generation_lock = crate::idle_activity::native_unload_generation_test_lock().await;
     let warm_calls = Arc::new(AtomicUsize::new(0));
     let key = test_native_streaming_worker_key("warm-once-across-reattach-no-unload");
+    let residency_key = key.residency_key.clone();
 
     let (event_sender, _event_receiver) = mpsc::channel(8);
     let mut first_session =
@@ -2920,6 +2951,15 @@ async fn native_streaming_warm_up_stays_once_across_reattach_without_an_idle_unl
         .unwrap();
     assert_eq!(warm_calls.load(Ordering::Acquire), 1);
     first_session.finish("client_closed", true).await.unwrap();
+
+    // A conservative activation rollback may remove this identity's health
+    // marker without unloading its already-warm worker. The next attach's TLS
+    // fast path must restore the exact marker while still avoiding a second
+    // warm_up() call.
+    crate::idle_activity::forget_native_model_residency(&residency_key);
+    assert!(!crate::idle_activity::native_model_is_resident(
+        &residency_key
+    ));
 
     let (event_sender, _event_receiver) = mpsc::channel(8);
     let mut second_session =
@@ -2950,6 +2990,9 @@ async fn native_streaming_warm_up_stays_once_across_reattach_without_an_idle_unl
         "no idle-unload happened between the two attaches, so the second \
          attach's Warm must still be a no-op on the reused worker thread"
     );
+    assert!(crate::idle_activity::native_model_is_resident(
+        &residency_key
+    ));
     second_session.finish("client_closed", true).await.unwrap();
 }
 

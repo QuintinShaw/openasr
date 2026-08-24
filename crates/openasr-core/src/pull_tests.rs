@@ -2977,6 +2977,15 @@ fn hip_pack_resolved(plugin: &[u8], archive: &[u8]) -> ResolvedCatalogBackendPul
         host_abi: crate::backend_distribution::BackendHostAbi::current(),
         targets: vec!["gfx1200".to_string()],
         min_driver_api: Some("7.1.0".to_string()),
+        activation: crate::CatalogBackendActivation {
+            state: crate::CatalogBackendActivationState::Activated,
+            qualification_source_catalog_sha256: Some("1".repeat(64)),
+            hardware_evidence_sha256: Some("2".repeat(64)),
+            qualified_device_target: Some("gfx1200".to_string()),
+            qualified_driver_version: Some("7.1.0".to_string()),
+            correctness_matrix_sha256: Some("3".repeat(64)),
+            correctness_receipts_sha256: Some("4".repeat(64)),
+        },
         files: vec![
             CatalogBackendFile {
                 filename: "ggml-hip.dll".to_string(),

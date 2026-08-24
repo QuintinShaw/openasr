@@ -735,10 +735,70 @@ pub struct CatalogBackend {
     #[serde(default, alias = "min_driver")]
     pub min_driver_api: Option<String>,
     pub min_cli_version: String,
+    /// Signed publication/qualification state. Missing on older catalogs is
+    /// fail-closed `published-inert`; installation may prepare those bytes,
+    /// but ordinary Auto/explicit activation may consume only `activated`.
+    #[serde(default)]
+    pub activation: CatalogBackendActivation,
     /// Exact neutral-host ABI this plugin was built against. Backend packs are
     /// never selected by a loose core-version range.
     pub host_abi: BackendHostAbi,
     pub files: Vec<CatalogBackendFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogBackendActivation {
+    #[serde(default)]
+    pub state: CatalogBackendActivationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualification_source_catalog_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_evidence_sha256: Option<String>,
+    /// Exact live GPU target proven by the hardware qualification receipt.
+    /// CUDA/HIP must equal the entry's compiled target; Vulkan uses a narrow
+    /// vendor/device/pipeline compatibility class with driver bound separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualified_device_target: Option<String>,
+    /// Exact live driver version used by hardware and correctness evidence.
+    /// A driver change keeps the candidate inert until it is requalified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualified_driver_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correctness_matrix_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correctness_receipts_sha256: Option<String>,
+}
+
+impl Default for CatalogBackendActivation {
+    fn default() -> Self {
+        Self {
+            state: CatalogBackendActivationState::PublishedInert,
+            qualification_source_catalog_sha256: None,
+            hardware_evidence_sha256: None,
+            qualified_device_target: None,
+            qualified_driver_version: None,
+            correctness_matrix_sha256: None,
+            correctness_receipts_sha256: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CatalogBackendActivationState {
+    #[default]
+    PublishedInert,
+    Qualified,
+    Activated,
+    Revoked,
+    #[serde(other)]
+    Unknown,
+}
+
+impl CatalogBackendActivation {
+    pub fn is_activated(&self) -> bool {
+        self.state == CatalogBackendActivationState::Activated
+    }
 }
 
 /// One file in a [`CatalogBackend`] pack: the `ggml-<vendor>` plugin, a runtime
@@ -881,6 +941,7 @@ pub struct ResolvedCatalogBackendPull {
     pub host_abi: BackendHostAbi,
     pub targets: Vec<String>,
     pub min_driver_api: Option<String>,
+    pub activation: CatalogBackendActivation,
     pub files: Vec<CatalogBackendFile>,
 }
 
@@ -1249,7 +1310,7 @@ pub fn load_model_catalog(
 /// enumeration can run inside an async server handler, so it must never create
 /// a blocking HTTP client or perform network I/O. Backend installation already
 /// populated this signed cache; a missing or invalid cache therefore fails the
-/// optional activation transaction while bundled CPU/Vulkan remain available.
+/// optional activation transaction while bundled CPU remains available.
 pub(crate) fn load_model_catalog_from_verified_cache(
     catalog_url: Option<&str>,
     openasr_home: impl AsRef<Path>,
@@ -1686,7 +1747,7 @@ pub fn parse_model_catalog(contents: &str, source: &str) -> Result<ModelCatalog,
 /// a model whose `kind`, `license_class`, or (for a `capability-pack`)
 /// capability `role` deserialized to the tolerant `Unknown` catch-all (see
 /// each enum's `#[serde(other)]` variant), or a backend pack whose `vendor`
-/// or any file's `role` did the same. `license_class` and capability `role`
+/// activation state or any file's `role` did the same. `license_class` and capability `role`
 /// can gate what a client is allowed to show/download/stage, so "hide" (not
 /// "show with a guessed value") is the only safe degrade.
 ///
@@ -1727,6 +1788,13 @@ fn filter_forward_compatible_catalog(catalog: &mut ModelCatalog) -> Vec<String> 
         if backend.vendor == CatalogBackendVendor::Unknown {
             notes.push(format!(
                 "catalog: hiding backend '{}': unrecognized vendor (needs a newer OpenASR build)",
+                backend.id
+            ));
+            return false;
+        }
+        if backend.activation.state == CatalogBackendActivationState::Unknown {
+            notes.push(format!(
+                "catalog: hiding backend '{}': unrecognized activation state (needs a newer OpenASR build)",
                 backend.id
             ));
             return false;
@@ -1924,6 +1992,21 @@ pub(crate) fn live_backend_driver_floor(
     }
 }
 
+pub(crate) fn is_canonical_vulkan_qualification_target(target: &str) -> bool {
+    let Some(rest) = target.strip_prefix("vk_caps_") else {
+        return false;
+    };
+    let parts = rest.split('_').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts[0].len() == 8
+        && parts[1].len() == 8
+        && parts[2].len() == 32
+        && parts.iter().all(|part| {
+            part.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
 fn driver_version_at_least(current: &str, minimum: &str) -> bool {
     fn parse(value: &str) -> Option<Vec<u64>> {
         let value = value.trim();
@@ -1968,6 +2051,7 @@ fn resolved_catalog_backend_pull(backend: &CatalogBackend) -> ResolvedCatalogBac
         host_abi: backend.host_abi.clone(),
         targets: backend.targets.clone(),
         min_driver_api: backend.min_driver_api.clone(),
+        activation: backend.activation.clone(),
         files: backend.files.clone(),
     }
 }
@@ -2693,6 +2777,7 @@ fn validate_catalog_backend(backend: &CatalogBackend, source: &str) -> Result<()
             backend.id
         )));
     }
+    validate_catalog_backend_activation(backend)?;
     validate_catalog_backend_targets(backend)?;
     let host_abi = &backend.host_abi;
     if host_abi.schema_version != BACKEND_HOST_ABI_SCHEMA_VERSION {
@@ -2838,6 +2923,131 @@ fn validate_catalog_backend(backend: &CatalogBackend, source: &str) -> Result<()
                     backend.id, file.filename
                 )));
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_catalog_backend_activation(backend: &CatalogBackend) -> Result<(), CatalogError> {
+    let bindings = [
+        (
+            "qualification_source_catalog_sha256",
+            backend
+                .activation
+                .qualification_source_catalog_sha256
+                .as_deref(),
+        ),
+        (
+            "hardware_evidence_sha256",
+            backend.activation.hardware_evidence_sha256.as_deref(),
+        ),
+        (
+            "correctness_matrix_sha256",
+            backend.activation.correctness_matrix_sha256.as_deref(),
+        ),
+        (
+            "correctness_receipts_sha256",
+            backend.activation.correctness_receipts_sha256.as_deref(),
+        ),
+    ];
+    let present = bindings.iter().filter(|(_, value)| value.is_some()).count();
+    let qualified_target = backend.activation.qualified_device_target.as_deref();
+    let qualified_driver = backend.activation.qualified_driver_version.as_deref();
+    let qualifiers_complete = qualified_target.is_some() && qualified_driver.is_some();
+    let qualifiers_absent = qualified_target.is_none() && qualified_driver.is_none();
+    match backend.activation.state {
+        CatalogBackendActivationState::PublishedInert => {
+            if present != 0 || !qualifiers_absent {
+                return Err(CatalogError::InvalidCatalog(format!(
+                    "backend '{}' is published-inert but carries qualification bindings",
+                    backend.id
+                )));
+            }
+        }
+        CatalogBackendActivationState::Qualified => {
+            let hardware_complete = backend
+                .activation
+                .qualification_source_catalog_sha256
+                .is_some()
+                && backend.activation.hardware_evidence_sha256.is_some();
+            let correctness_absent = backend.activation.correctness_matrix_sha256.is_none()
+                && backend.activation.correctness_receipts_sha256.is_none();
+            if !hardware_complete || !qualifiers_complete || !correctness_absent {
+                return Err(CatalogError::InvalidCatalog(format!(
+                    "backend '{}' qualified activation must carry source, hardware, target, and driver bindings only",
+                    backend.id
+                )));
+            }
+        }
+        CatalogBackendActivationState::Activated => {
+            if present != bindings.len() || !qualifiers_complete {
+                return Err(CatalogError::InvalidCatalog(format!(
+                    "backend '{}' activated bindings are incomplete",
+                    backend.id
+                )));
+            }
+        }
+        CatalogBackendActivationState::Revoked => {
+            let preserved_hardware = backend
+                .activation
+                .qualification_source_catalog_sha256
+                .is_some()
+                && backend.activation.hardware_evidence_sha256.is_some()
+                && qualifiers_complete
+                && backend.activation.correctness_matrix_sha256.is_none()
+                && backend.activation.correctness_receipts_sha256.is_none();
+            let preserved_activation = present == bindings.len() && qualifiers_complete;
+            if (present != 0 || !qualifiers_absent) && !preserved_hardware && !preserved_activation
+            {
+                return Err(CatalogError::InvalidCatalog(format!(
+                    "backend '{}' revoked qualification bindings are partial",
+                    backend.id
+                )));
+            }
+        }
+        CatalogBackendActivationState::Unknown => {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "backend '{}' has an unsupported activation state",
+                backend.id
+            )));
+        }
+    }
+    for (field, value) in bindings {
+        if let Some(value) = value
+            && (value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "backend '{}' activation.{field} must be lowercase 64-hex",
+                backend.id
+            )));
+        }
+    }
+    if let (Some(target), Some(driver)) = (qualified_target, qualified_driver) {
+        let safe_target = (3..=128).contains(&target.len())
+            && target.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'_' | b'-' | b'.' | b':')
+            });
+        let safe_driver = (1..=64).contains(&driver.len())
+            && driver
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+        let target_matches_vendor = match backend.vendor {
+            CatalogBackendVendor::Cuda | CatalogBackendVendor::Hip => {
+                backend.targets.as_slice() == [target]
+            }
+            CatalogBackendVendor::Vulkan => is_canonical_vulkan_qualification_target(target),
+            CatalogBackendVendor::Cpu | CatalogBackendVendor::Unknown => false,
+        };
+        if !safe_target || !safe_driver || !target_matches_vendor {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "backend '{}' has invalid qualified target/driver identity",
+                backend.id
+            )));
         }
     }
     Ok(())

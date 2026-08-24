@@ -16,6 +16,7 @@ use crate::{
     device::{execution_policy::ExecutionPlacement, execution_route::ExecutionProvider},
     ggml_runtime::{
         GgmlCpuGraphBackend, GgmlExecutionPlacementSummary, ResolvedFamilyRuntimeInput,
+        diagnostic_logits_sha256,
     },
 };
 
@@ -44,6 +45,10 @@ pub struct NativeExecutionRequestFacts {
     pub(crate) execution_lane: ExecutionLaneKey,
     pub selected_provider: ExecutionProvider,
     pub stable_device_id: String,
+    pub backend_id: Option<String>,
+    pub device_target: Option<String>,
+    pub backend_driver_version: Option<String>,
+    pub backend_artifact_fingerprint: Option<String>,
     pub placement: ExecutionPlacement,
     pub backend: GgmlCpuGraphBackend,
     pub topology: NativeExecutionTopologyFacts,
@@ -67,6 +72,7 @@ pub struct NativeExecutionTokenStep {
     pub token_id: u32,
     pub is_eot: bool,
     pub top2_margin: Option<f32>,
+    pub logits_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -193,6 +199,7 @@ struct ReceiptState {
     trace_events: Vec<String>,
     token_steps: Vec<NativeExecutionTokenStep>,
     top_k_margins: BTreeMap<usize, f32>,
+    logits_hashes: BTreeMap<usize, String>,
     trace_overflowed: bool,
     completed: bool,
 }
@@ -282,6 +289,7 @@ impl NativeExecutionReceiptCollector {
         state.trace_events.clear();
         state.token_steps.clear();
         state.top_k_margins.clear();
+        state.logits_hashes.clear();
         state.trace_overflowed = false;
         state.completed = false;
     }
@@ -299,6 +307,7 @@ impl NativeExecutionReceiptCollector {
             state.trace_events.clear();
             state.token_steps.clear();
             state.top_k_margins.clear();
+            state.logits_hashes.clear();
             state.trace_overflowed = false;
             state.completed = false;
         }
@@ -367,6 +376,7 @@ impl NativeExecutionReceiptCollector {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let top2_margin = state.top_k_margins.get(&step_index).copied();
+            let logits_sha256 = state.logits_hashes.get(&step_index).cloned();
             if let Some(existing) = state
                 .token_steps
                 .iter_mut()
@@ -377,12 +387,16 @@ impl NativeExecutionReceiptCollector {
                 if existing.top2_margin.is_none() {
                     existing.top2_margin = top2_margin;
                 }
+                if existing.logits_sha256.is_none() {
+                    existing.logits_sha256 = logits_sha256;
+                }
             } else {
                 state.token_steps.push(NativeExecutionTokenStep {
                     step_index,
                     token_id,
                     is_eot,
                     top2_margin,
+                    logits_sha256,
                 });
             }
         }
@@ -393,6 +407,12 @@ impl NativeExecutionReceiptCollector {
     }
 
     pub fn record_top_k(&self, step_index: usize, logits: &[f32]) {
+        let logits_sha256 = diagnostic_logits_sha256(logits);
+        let non_finite_count = logits.iter().filter(|value| !value.is_finite()).count();
+        self.record_trace_event(format!(
+            "{{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"logits_digest\",\"step_index\":{step_index},\"element_count\":{},\"sha256\":\"{logits_sha256}\",\"non_finite_count\":{non_finite_count}}}",
+            logits.len(),
+        ));
         let mut top = Vec::<(usize, f32)>::new();
         for (token_id, logit) in logits.iter().copied().enumerate() {
             if !logit.is_finite() {
@@ -428,6 +448,22 @@ impl NativeExecutionReceiptCollector {
                 existing.top2_margin = Some(margin);
             }
         }
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state
+                .logits_hashes
+                .insert(step_index, logits_sha256.clone());
+            if let Some(existing) = state
+                .token_steps
+                .iter_mut()
+                .find(|step| step.step_index == step_index)
+            {
+                existing.logits_sha256 = Some(logits_sha256.clone());
+            }
+        }
         let items = top
             .iter()
             .map(|(token_id, logit)| format!("{{\"token_id\":{token_id},\"value\":{logit:.6}}}"))
@@ -460,10 +496,24 @@ impl NativeExecutionReceiptCollector {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut lines = Vec::new();
         if let Some(facts) = &state.facts {
+            let backend_id = facts.backend_id.as_deref().unwrap_or("unqualified");
+            let device_target = facts.device_target.as_deref().unwrap_or("unqualified");
+            let artifact_fingerprint = facts
+                .backend_artifact_fingerprint
+                .as_deref()
+                .unwrap_or("unqualified");
+            let driver_version = facts
+                .backend_driver_version
+                .as_deref()
+                .unwrap_or("unqualified");
             lines.push(format!(
-                "{{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"header\",\"mode\":\"{}\",\"provider\":\"{}\",\"device\":\"{}\"}}",
-                if facts.resolved_runtime.reuse_mode() == crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph { "cold" } else { "reuse" },
+                "{{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"header\",\"graph_mode\":\"{}\",\"provider\":\"{}\",\"device_target\":\"{}\",\"backend_id\":\"{}\",\"driver_version\":\"{}\",\"artifact_fingerprint\":\"{}\",\"device\":\"{}\"}}",
+                if facts.resolved_runtime.reuse_mode() == crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph { "fresh_graph" } else { "reusable_graph" },
                 facts.selected_provider.as_str(),
+                device_target,
+                backend_id,
+                driver_version,
+                artifact_fingerprint,
                 facts.stable_device_id,
             ));
         }
@@ -550,11 +600,25 @@ pub(crate) fn record_request_execution_facts(
         crate::arch::OpenAsrBlockStackStrategy::Shared(_) => "shared",
         crate::arch::OpenAsrBlockStackStrategy::ArchitectureGraph { .. } => "architecture-graph",
     };
+    let activated_backend = crate::ggml_runtime::activated_backend_execution_identity()
+        .filter(|identity| identity.provider == execution_lane.provider());
     receipt.record_facts(NativeExecutionRequestFacts {
         resolved_runtime,
         execution_lane: execution_lane.clone(),
         selected_provider: execution_lane.provider(),
         stable_device_id: execution_lane.stable_device_id().to_string(),
+        backend_id: activated_backend
+            .as_ref()
+            .map(|identity| identity.backend_id.clone()),
+        device_target: activated_backend
+            .as_ref()
+            .map(|identity| identity.device_target.clone()),
+        backend_driver_version: activated_backend
+            .as_ref()
+            .map(|identity| identity.driver_version.clone()),
+        backend_artifact_fingerprint: activated_backend
+            .as_ref()
+            .map(|identity| identity.artifact_fingerprint.clone()),
         placement: execution_lane.placement(),
         backend: execution_lane.backend(),
         topology: NativeExecutionTopologyFacts {
@@ -596,6 +660,10 @@ mod tests {
                 execution_lane: execution_lane.clone(),
                 selected_provider: ExecutionProvider::Cpu,
                 stable_device_id: "CPU".to_string(),
+                backend_id: None,
+                device_target: None,
+                backend_driver_version: None,
+                backend_artifact_fingerprint: None,
                 placement: ExecutionPlacement::CpuOnly,
                 backend: GgmlCpuGraphBackend::Cpu,
                 topology: NativeExecutionTopologyFacts {
@@ -693,6 +761,10 @@ mod tests {
             execution_lane,
             selected_provider: ExecutionProvider::Cpu,
             stable_device_id: "CPU".to_string(),
+            backend_id: None,
+            device_target: None,
+            backend_driver_version: None,
+            backend_artifact_fingerprint: None,
             placement: ExecutionPlacement::CpuOnly,
             backend: GgmlCpuGraphBackend::Cpu,
             topology: NativeExecutionTopologyFacts {

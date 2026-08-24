@@ -121,8 +121,8 @@ This design does not change these product policies:
 
 The relevant failure is recorded in the supplied logs:
 
-- `/Users/quintinshaw/Downloads/daemon.log:770-775`
-- `/Users/quintinshaw/Downloads/desktop.log:1199-1203`
+- supplied daemon diagnostic, lines 770-775
+- supplied Desktop diagnostic, lines 1199-1203
 
 The system-memory broker reported:
 
@@ -480,7 +480,18 @@ A host-neutral object intentionally has no execution lane. A device-owning objec
 must have one. `ExecutionLaneKey` must retain provider, stable physical device
 identity, placement, and graph backend. Different CUDA/HIP/Vulkan views,
 different cards, or different placements do not share merely because they are
-accelerators.
+accelerators. The key retains the already-resolved full route so a worker can
+reinstall exact provider/device selection without enumeration; cache equality
+and hashing use the stable route cache identity and deliberately exclude only
+registry ordinal.
+
+A stateful streaming session is already pinned to one policy candidate, so its
+session request carries a mandatory `ExecutionLaneKey`, not an optional hint.
+Seq2seq and CTC drivers copy that same key into every partial and final frame's
+execution context. They do not re-enumerate a device or omit the lane on a
+direct family decode path. XASR uses the same key for actor-pool checkout,
+owner-thread construction, and every later streaming operation, including
+warm-up and reset; ambient thread-local device state never creates its key.
 
 A bounded checkout additionally uses:
 
@@ -610,6 +621,19 @@ active-slot clear; Desktop is a daemon delegate. On startup, durable V2 is only
 requested intent: the fresh `ActiveRuntimeSlot` remains unavailable until the
 same transaction reverifies, reserves, warms, attests, reconciles, validates the
 unchanged durable record, and publishes the process-local identity.
+
+Resident readiness follows the same transaction boundary. The process-wide
+idle tracker grants an exclusive unload claim only after one complete idle
+epoch; session/activity enter and that claim are serialized, so a new request
+cannot start after the reaper observed zero activity but before owner teardown.
+Warm state is keyed by attested pack content identity plus the process-local
+runtime generation, not by one global boolean or path. Activation holds an
+activity guard across verification through live publication, advances the
+generation immediately before candidate warmup, and does not advance it again
+after the candidate has proved resident. Consequently candidate warmup cannot
+make the old pack look resident, rollback cannot publish the candidate, and a
+successful boot reactivation retains both its worker warm state and exact
+`model_resident` receipt.
 
 ### `ModelActivationTransaction`
 

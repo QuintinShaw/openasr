@@ -65,14 +65,15 @@ class GenerateBackendHardwareEvidenceTests(unittest.TestCase):
         activation = {
             "host_mode": "neutral_dynamic",
             "host_abi": {"fingerprint": "9" * 64},
-            "activated": {
+            "activated": None,
+            "qualification": {
                 "backend_id": identity.backend_id,
                 "vendor": identity.provider,
                 "version": identity.version,
                 "artifact_fingerprint": identity.artifact_fingerprint,
                 "host_abi_fingerprint": "9" * 64,
                 "device_target": identity.target,
-                "driver_version": "test-driver",
+                "driver_version": "12.7.0",
             },
         }
         extracted = self.root / "neutral-extracted"
@@ -96,8 +97,25 @@ if args == ["doctor"]:
     shutil.copyfile(catalog.with_name("catalog.signature.json"), home / "catalog.signature.json")
     print("Model registry: ok")
     raise SystemExit(0)
+if args[:3] == ["__openasr-backend-plugin", "prepare-qualification", %s]:
+    catalog = pathlib.Path(os.environ["OPENASR_CATALOG_FILE"])
+    home = pathlib.Path(os.environ["OPENASR_HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(catalog, home / "catalog.json")
+    shutil.copyfile(catalog.with_name("catalog.signature.json"), home / "catalog.signature.json")
+    print(json.dumps({"schema_version": 1, "event": "qualification_prepared"}))
+    raise SystemExit(0)
+if args[:2] == ["__openasr-backend-plugin", "clear-qualification"]:
+    print(json.dumps({"schema_version": 1, "event": "qualification_cleared"}))
+    raise SystemExit(0)
 if args == ["__openasr-backend-plugin", "status"]:
-    print(%s)
+    status = json.loads(%s)
+    scope = os.environ["OPENASR_BACKEND_QUALIFICATION_SCOPE"]
+    status["qualification"]["scope_sha256"] = hashlib.sha256(scope.encode("ascii")).hexdigest()
+    status["qualification"]["catalog_sha256"] = hashlib.sha256(
+        (pathlib.Path(os.environ["OPENASR_HOME"]) / "catalog.json").read_bytes()
+    ).hexdigest()
+    print(json.dumps(status))
     raise SystemExit(0)
 if args[:2] != ["bench-receipt", "short-audio"]:
     raise SystemExit(2)
@@ -125,14 +143,32 @@ receipt = {
         "direct_graph_computes": 1,
         "scheduler_graph_computes": 0,
         "observed_compute_nodes_by_backend": {"CUDA0": 10},
+        "fallback_node_samples_by_backend": {},
     },
     "transcript": {"text_sha256": "2" * 64},
+    "execution": {
+        "request_attempt_id": hashlib.sha256(value("--scope").encode()).hexdigest()[:32],
+        "request_attempt_conflicted": False,
+        "live_lease_reconciliation": "matched",
+        "live_state_complete": True,
+        "event_history_complete": True,
+        "dropped_events": 0,
+        "phase_duration_micros": {
+            "upload-ingest": 1,
+            "decode-normalize": 1,
+            "admission-wait": 1,
+            "compute": 1,
+        },
+        "timing_complete": True,
+        "terminal": "succeeded",
+        "request_receipt_complete": True,
+    },
 }
 pathlib.Path(value("--out")).write_text(json.dumps(receipt), encoding="utf-8")
 if os.environ.get("OPENASR_TEST_MUTATE_CATALOG") == "1":
     (pathlib.Path(os.environ["OPENASR_HOME"]) / "catalog.json").write_text("tampered")
 """
-            % json.dumps(json.dumps(activation)),
+            % (json.dumps(identity.backend_id), json.dumps(json.dumps(activation))),
             encoding="utf-8",
         )
         fake_binary.chmod(0o755)
@@ -248,8 +284,13 @@ if os.environ.get("OPENASR_TEST_MUTATE_CATALOG") == "1":
             output=args.output,
             raw_output=args.raw_output,
         )
-        self.assertEqual(gate.approved_entry_paths([entry_path], [args.output]), [entry_path])
-        self.assertEqual(evidence["schema_version"], 2)
+        self.assertEqual(
+            gate.approved_entry_paths([entry_path], [args.output], [args.raw_output]),
+            [entry_path],
+        )
+        self.assertEqual(evidence["schema_version"], 1)
+        self.assertNotIn("approved_targets", evidence)
+        self.assertNotIn("provider_matrix_sha256", evidence)
         self.assertEqual(evidence["evidence_sha256"], generate._canonical_sha256(raw_audit))
         self.assertEqual(len(raw_audit["runs"]), 5)
         self.assertEqual(len({run["nonce"] for run in raw_audit["runs"]}), 5)
@@ -425,6 +466,52 @@ if os.environ.get("OPENASR_TEST_MUTATE_CATALOG") == "1":
                 workload_sha=self._sha(args.audio),
                 model_pack_sha=self._sha(args.model_pack),
             )
+
+    def test_generic_vulkan_entry_is_bound_to_the_requested_capability_class(self) -> None:
+        target = "vk_caps_00001002_0000744c_0123456789abcdef0123456789abcdef"
+        entry = self.root / "backend-pack-vulkan-generic.json"
+        entry.write_text(
+            json.dumps(
+                {
+                    "id": "vulkan-windows-generic",
+                    "vendor": "vulkan",
+                    "version": "1.2.3",
+                    "targets": [],
+                    "host_abi": {"fingerprint": "9" * 64},
+                    "files": [
+                        {
+                            "role": "plugin",
+                            "filename": "ggml-vulkan.dll",
+                            "sha256": "8" * 64,
+                            "size_bytes": 123,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        selected, tested = generate._release_entries([entry], "vulkan", target)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0].target, "")
+        self.assertEqual(tested.target, target)
+
+        with self.assertRaisesRegex(gate.EvidenceError, "canonical vk_caps"):
+            generate._release_entries([entry], "vulkan", "vk_caps_invalid")
+
+    def test_qualification_command_always_carries_the_exact_target(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, b"{}", b"")
+        target = "vk_caps_00001002_0000744c_0123456789abcdef0123456789abcdef"
+        with mock.patch.object(generate.subprocess, "run", return_value=completed) as run:
+            generate._prepare_qualification(
+                Path("openasr.exe"),
+                {"OPENASR_HOME": "C:/isolated"},
+                backend_id="vulkan-windows-generic",
+                device_target=target,
+                scope="backend-hardware-evidence/selector/1234567890abcdef",
+            )
+        command = run.call_args.args[0]
+        self.assertEqual(command[3:5], ["vulkan-windows-generic", "--device-target"])
+        self.assertEqual(command[5], target)
 
     def test_output_paths_must_be_distinct_and_role_named(self) -> None:
         shared = self.root / "backend-hardware-evidence-v1.2.3-cuda.json"

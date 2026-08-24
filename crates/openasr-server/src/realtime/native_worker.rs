@@ -53,6 +53,7 @@ pub(crate) enum BackendResult {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct NativeStreamingWorkerKey {
     pub(crate) model_pack_path: PathBuf,
+    pub(crate) residency_key: crate::idle_activity::NativeRuntimeResidencyKey,
     pub(crate) hardware_target: String,
     /// Resolved execution-route isolation key (provider/stable_id[/pci:...]).
     /// Coarse targets without a resolved device keep the public spelling
@@ -79,6 +80,25 @@ impl NativeStreamingWorkerKey {
         inference_threads: Option<u16>,
     ) -> Self {
         let model_pack_path = model_pack_path.into();
+        let residency_key =
+            crate::idle_activity::NativeRuntimeResidencyKey::legacy_path(&model_pack_path);
+        Self::with_route_and_residency(
+            model_pack_path,
+            residency_key,
+            hardware_target,
+            resolved_route,
+            inference_threads,
+        )
+    }
+
+    pub(crate) fn with_route_and_residency(
+        model_pack_path: impl Into<PathBuf>,
+        residency_key: crate::idle_activity::NativeRuntimeResidencyKey,
+        hardware_target: openasr_core::NativeAsrHardwareTarget,
+        resolved_route: Option<&openasr_core::ResolvedExecutionRoute>,
+        inference_threads: Option<u16>,
+    ) -> Self {
+        let model_pack_path = model_pack_path.into();
         let model_pack_path = model_pack_path
             .canonicalize()
             .unwrap_or_else(|_| model_pack_path.clone());
@@ -87,6 +107,7 @@ impl NativeStreamingWorkerKey {
             openasr_core::worker_route_isolation_key(&hardware_target, resolved_route);
         Self {
             model_pack_path,
+            residency_key,
             hardware_target,
             execution_route_key,
             inference_threads,
@@ -608,7 +629,7 @@ pub(crate) fn native_streaming_worker_for_key(
         mpsc::channel::<NativeStreamingWorkerMessage>(SHARED_BACKEND_WORKER_QUEUE_CAPACITY);
     let state = Arc::new(NativeStreamingWorkerState::new_acquired(Instant::now()));
     let activity = crate::idle_activity::SharedNativeActivityGuard::new();
-    spawn_native_streaming_worker(receiver, state.clone());
+    spawn_native_streaming_worker(receiver, state.clone(), key.clone());
     workers.insert(
         key,
         NativeStreamingWorkerEntry {
@@ -830,6 +851,7 @@ pub(crate) fn abandon_stuck_native_streaming_worker(
 pub(crate) fn spawn_native_streaming_worker(
     mut receiver: mpsc::Receiver<NativeStreamingWorkerMessage>,
     state: Arc<NativeStreamingWorkerState>,
+    key: NativeStreamingWorkerKey,
 ) {
     std::thread::Builder::new()
         .name("openasr-rt-decode".to_string())
@@ -860,6 +882,7 @@ pub(crate) fn spawn_native_streaming_worker(
                             outcomes,
                             finalize_requested,
                             &token,
+                            &key.residency_key,
                         );
                         // Clear the occupant record first, then retire the
                         // per-key acquire count, this attach's activity guard,
@@ -890,6 +913,7 @@ pub(crate) fn run_native_streaming_session_on_worker(
     outcomes: mpsc::Sender<NativeStreamingOutcome>,
     finalize_requested: Arc<AtomicBool>,
     token: &AttachToken,
+    residency_key: &crate::idle_activity::NativeRuntimeResidencyKey,
 ) {
     let cancel_requested = &token.cancel_requested;
     let abandoned = &token.abandoned;
@@ -915,7 +939,7 @@ pub(crate) fn run_native_streaming_session_on_worker(
         }
         let (result, terminal) = match envelope.command {
             NativeStreamingCommand::Warm => (
-                warm_up_native_streaming_session_once(session.as_mut(), abandoned)
+                warm_up_native_streaming_session_once(session.as_mut(), abandoned, residency_key)
                     .map(|()| Vec::new()),
                 false,
             ),
@@ -962,7 +986,7 @@ pub(crate) fn run_native_streaming_session_on_worker(
 /// Pays the cold runtime-build cost exactly once per worker thread *per
 /// resident runtime generation* (worker threads are keyed by backend+pack and
 /// persist across sessions, well past any `idle_unload` eviction of the
-/// runtime they built -- see `idle_activity::native_unload_generation`). The
+/// runtime they built -- see `idle_activity::native_runtime_generation`). The
 /// old "warm only if idle for 5s" gate skipped warm-up the moment live audio
 /// frames queued — which is exactly the case where the cold build then landed
 /// on the first real decode and delayed the first partial by many seconds.
@@ -980,13 +1004,17 @@ pub(crate) fn run_native_streaming_session_on_worker(
 pub(crate) fn warm_up_native_streaming_session_once(
     session: &mut dyn NativeAsrSession,
     abandoned: &AtomicBool,
+    residency_key: &crate::idle_activity::NativeRuntimeResidencyKey,
 ) -> Result<(), openasr_core::NativeAsrError> {
     thread_local! {
         static WARMED_AT_GENERATION: std::cell::Cell<Option<u64>> =
             const { std::cell::Cell::new(None) };
     }
-    let current_generation = crate::idle_activity::native_unload_generation();
+    let current_generation = crate::idle_activity::native_runtime_generation();
     if WARMED_AT_GENERATION.with(std::cell::Cell::get) == Some(current_generation) {
+        if !abandoned.load(Ordering::Acquire) {
+            crate::idle_activity::mark_native_model_warm(residency_key);
+        }
         return Ok(());
     }
     openasr_core::stage_timing::log_event("realtime_warmup", "stage=start");
@@ -1009,7 +1037,7 @@ pub(crate) fn warm_up_native_streaming_session_once(
         // `/health` can answer "is the model resident" without reaching into
         // any worker thread's TLS -- see
         // `idle_activity::native_model_is_resident`.
-        crate::idle_activity::mark_native_model_warm();
+        crate::idle_activity::mark_native_model_warm(residency_key);
     }
     Ok(())
 }
@@ -1135,23 +1163,53 @@ pub(crate) fn spawn_boot_native_warmup(
         ) else {
             return;
         };
-        let _ = crate::activate_default_model_blocking(
+        if let Err(error) = crate::activate_default_model_blocking(
             &runtime,
             &home,
             &pack,
             record.quant_preference,
             intent,
             crate::DefaultModelActivationMode::ReactivateDurableSelection,
-        );
+        ) {
+            let mut reason = single_line_log_value(&error.to_string());
+            for sensitive_path in [&home, requested_path.as_path()] {
+                let rendered = sensitive_path.to_string_lossy();
+                if !rendered.is_empty() {
+                    reason = reason.replace(rendered.as_ref(), "<redacted-path>");
+                }
+            }
+            let reason = reason.chars().take(512).collect::<String>();
+            openasr_core::stage_timing::log_event(
+                "server_boot",
+                format_args!("stage=default_reactivation_failed reason={reason}"),
+            );
+        }
     })
 }
 
 /// Attest a candidate pack without publishing it as the live default.
 /// `candidate_pack` is loaded for warmup/probe only; live `model_pack_path`
 /// is left unchanged. `None` probes the currently bound pack (boot warmup).
+#[derive(Clone)]
+pub(crate) struct NativeWarmupTarget {
+    path: PathBuf,
+    residency_key: crate::idle_activity::NativeRuntimeResidencyKey,
+}
+
+impl NativeWarmupTarget {
+    pub(crate) fn attested(path: PathBuf, pack_content_id: &str) -> Self {
+        Self {
+            path,
+            residency_key: crate::idle_activity::NativeRuntimeResidencyKey::attested(
+                pack_content_id,
+            ),
+        }
+    }
+}
+
 pub(crate) async fn probe_native_activation(
     runtime: ServerRuntime,
-    candidate_pack: Option<PathBuf>,
+    candidate_pack: Option<NativeWarmupTarget>,
     preferences_home: Option<PathBuf>,
     reservation_context: Option<openasr_core::ActivationReservationContext>,
 ) -> Result<Option<openasr_core::NativeExecutionReceiptSnapshot>, ApiError> {
@@ -1177,7 +1235,7 @@ pub(crate) async fn probe_native_activation(
 /// runtime.
 pub(crate) fn probe_native_activation_blocking(
     runtime: ServerRuntime,
-    candidate_pack: Option<PathBuf>,
+    candidate_pack: Option<NativeWarmupTarget>,
     preferences_home: Option<PathBuf>,
     reservation_context: Option<openasr_core::ActivationReservationContext>,
 ) -> Result<Option<openasr_core::NativeExecutionReceiptSnapshot>, ApiError> {
@@ -1216,7 +1274,7 @@ pub(in crate::realtime) async fn warm_up_default_native_streaming_worker(
 
 async fn warm_up_native_pack(
     runtime: ServerRuntime,
-    candidate_pack: Option<PathBuf>,
+    candidate_pack: Option<NativeWarmupTarget>,
     preferences_home: Option<PathBuf>,
     reservation_context: Option<openasr_core::ActivationReservationContext>,
 ) -> Result<openasr_core::NativeExecutionReceiptSnapshot, String> {
@@ -1227,23 +1285,50 @@ async fn warm_up_native_pack(
     if runtime.backend != openasr_core::BackendKind::Native {
         return Ok(receipt.snapshot());
     }
-    let Some(model_pack_path) = candidate_pack.or_else(|| runtime.model_pack_path.current()) else {
-        // Fresh install / no model installed yet: nothing to warm. The daemon
-        // still serves `/health`; a later default-model rebind binds a pack
-        // in-process without restart, and the next request path loads it.
-        return Ok(receipt.snapshot());
+    // A boot warmup must claim the warmup lease while holding the same barrier
+    // used by activation and new-session admission. Reading the active path
+    // first and claiming the lease later leaves a window in which activation
+    // can publish a different model and evict the old runtime before this
+    // warmup starts. Candidate probes already run under the caller's activation
+    // barrier; they use the exact candidate path rather than the active slot.
+    let (target, _lease) = match candidate_pack {
+        Some(target) => {
+            if runtime.native_execution.has_active_sessions() {
+                return Err("native session is already active".to_string());
+            }
+            let Some(lease) = try_begin_native_warmup() else {
+                return Err("native warmup already in flight".to_string());
+            };
+            (target, lease)
+        }
+        None => {
+            {
+                let _activation_barrier = runtime
+                    .begin_native_activation()
+                    .map_err(|error| error.to_string())?;
+                let Some(active_model) = runtime.model_pack_path.current_snapshot() else {
+                    // Fresh install / no model installed yet: nothing to warm.
+                    // The daemon still serves `/health`; a later activation
+                    // binds and probes a verified pack transactionally.
+                    return Ok(receipt.snapshot());
+                };
+                if runtime.native_execution.has_active_sessions() {
+                    return Err("native session is already active".to_string());
+                }
+                let Some(lease) = try_begin_native_warmup() else {
+                    return Err("native warmup already in flight".to_string());
+                };
+                (
+                    NativeWarmupTarget {
+                        path: active_model.path().to_path_buf(),
+                        residency_key: active_model.residency_key().clone(),
+                    },
+                    lease,
+                )
+            }
+        }
     };
-    // Opportunistic for boot: a live user session already owns the slot and
-    // will Warm itself. Set-default treats this as probe failure so it cannot
-    // persist a pack that never activated. Never take
-    // `max-native-sessions-per-model`; that slot is only for
-    // transcription/realtime. Coalesce overlapping boot/rebind spawns.
-    if runtime.native_execution.has_active_sessions() {
-        return Err("native session is already active".to_string());
-    }
-    let Some(_lease) = try_begin_native_warmup() else {
-        return Err("native warmup already in flight".to_string());
-    };
+    let model_pack_path = target.path;
     let preferences_home = preferences_home.or_else(|| openasr_core::openasr_home().ok());
     let inference_threads = preferences_home
         .as_deref()
@@ -1309,8 +1394,9 @@ async fn warm_up_native_pack(
             return Err(error.to_string());
         }
     };
-    let key = NativeStreamingWorkerKey::with_route(
+    let key = NativeStreamingWorkerKey::with_route_and_residency(
         model_pack.root.clone(),
+        target.residency_key,
         hardware_target,
         resolved_route.as_ref(),
         inference_threads,
@@ -1331,7 +1417,6 @@ async fn warm_up_native_pack(
     Ok(receipt.snapshot())
 }
 
-#[cfg(test)]
 pub(crate) fn single_line_log_value(value: &str) -> String {
     value.replace('\r', "\\r").replace('\n', "\\n")
 }

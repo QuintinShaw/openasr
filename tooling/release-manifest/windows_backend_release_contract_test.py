@@ -35,8 +35,8 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         target: str,
         *,
         asset: str,
-        features: str,
-        provider: str,
+        features: str | None,
+        provider: str | None,
         distribution: str,
     ) -> None:
         matches = [row for row in self.matrix if row.get("target") == target]
@@ -53,11 +53,18 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         self.assert_matrix_leg(
             "x86_64-pc-windows-msvc-neutral",
             asset="windows-x86_64-neutral",
-            features="vulkan",
-            provider="vulkan",
+            features=None,
+            provider=None,
             distribution="host",
         )
-        for sm in ("75", "80", "86", "89", "90"):
+        self.assert_matrix_leg(
+            "x86_64-pc-windows-msvc-vulkan-generic-plugin",
+            asset="windows-x86_64-vulkan-generic-plugin",
+            features="vulkan",
+            provider="vulkan",
+            distribution="plugin",
+        )
+        for sm in ("75", "80", "86", "89", "90", "120"):
             self.assert_matrix_leg(
                 f"x86_64-pc-windows-msvc-cuda-sm_{sm}-plugin",
                 asset=f"windows-x86_64-cuda-sm_{sm}-plugin",
@@ -93,15 +100,23 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         ):
             self.assertNotIn(obsolete, self.workflow)
 
+    def test_neutral_host_build_stages_only_the_cpu_rescue_provider(self) -> None:
+        self.assertIn("let build_vulkan = feat_vulkan;", self.core_build_rs)
+        self.assertNotIn("feat_vulkan || use_backend_dl", self.core_build_rs)
+        self.assertIn('"schema_version": 4', self.core_build_rs)
+        self.assertNotIn("OPENASR_BUNDLED_VULKAN_CONTRACT_SHA256", self.core_build_rs)
+
     def test_target_scoped_optional_plugins_feed_one_catalog_and_update_hint(self) -> None:
         required = (
             "backend-pack-cuda-sm_*.json",
             "backend-pack-hip-gfx*.json",
+            "backend-pack-vulkan-generic.json",
             "--require-single-target",
             "--out dist/catalog.backends.candidate.json",
             "--out dist/backend-plugin-hints.json",
             'names.append(f"backend-pack-cuda-sm_{row[\'cuda_gpu_target\']}.json")',
             'names.append(f"backend-pack-hip-{row[\'hip_gpu_target\']}.json")',
+            'names.append("backend-pack-vulkan-generic.json")',
             'echo "backend-plugin-hints.json"',
             'echo "catalog.backends.candidate.json"',
             "staging/catalog.backends.candidate.json",
@@ -109,12 +124,13 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         for fragment in required:
             self.assertIn(fragment, self.workflow)
 
-    def test_plugin_vendor_and_signing_steps_cover_cuda_and_hip(self) -> None:
+    def test_plugin_vendor_and_signing_steps_cover_all_gpu_providers(self) -> None:
         self.assertIn(
             "matrix.distribution == 'plugin'", self.workflow
         )
         self.assertIn('$provider -eq "cuda"', self.workflow)
         self.assertIn('$provider -eq "hip"', self.workflow)
+        self.assertIn("$provider -eq 'vulkan'", self.workflow)
         self.assertIn("VENDOR_LAYER_KEY=cuda-runtime", self.workflow)
         self.assertIn("VENDOR_LAYER_KEY=rocm-runtime", self.workflow)
         self.assertIn("VENDOR_OWNER", self.workflow)
@@ -135,8 +151,48 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             "amdhip64",
             "libhipblas",
             "rocblas",
+            "vulkan-1\\.dll",
+            "VENDOR_LAYER_KEY=vulkan-loader",
         ):
             self.assertIn(symbol, self.workflow)
+
+    def test_provider_probe_driver_evidence_fails_closed_on_missing_or_truncated_output(self) -> None:
+        ggml = ROOT / "crates/openasr-core/third_party/openasr-ggml/src"
+        for source_path in (
+            ggml / "ggml-cuda/ggml-cuda.cu",
+            ggml / "ggml-vulkan/ggml-vulkan.cpp",
+        ):
+            source = source_path.read_text(encoding="utf-8")
+            self.assertIn(
+                "driver_out == nullptr || driver_out_capacity == 0", source
+            )
+            self.assertIn(
+                "static_cast<size_t>(driver_length) >= driver_out_capacity", source
+            )
+            self.assertIn("driver_out[0] = '\\0';", source)
+            self.assertIn("catch (...)", source)
+
+    def test_vulkan_exported_init_and_graph_compute_keep_exceptions_inside_status_boundaries(self) -> None:
+        source = (
+            ROOT
+            / "crates/openasr-core/third_party/openasr-ggml/src/ggml-vulkan/ggml-vulkan.cpp"
+        ).read_text(encoding="utf-8")
+        init = source.split("ggml_backend_t ggml_backend_vk_init", 1)[1].split(
+            "bool ggml_backend_is_vk", 1
+        )[0]
+        self.assertLess(init.index("try {"), init.index("VK_LOG_DEBUG"))
+        self.assertIn("catch (const vk::SystemError & error)", init)
+        self.assertIn("catch (...)", init)
+        self.assertIn("return nullptr;", init)
+
+        graph = source.split("static ggml_status ggml_backend_vk_graph_compute", 1)[
+            1
+        ].split("static void ggml_vk_graph_optimize", 1)[0]
+        self.assertIn("try {", graph)
+        self.assertIn("catch (const vk::SystemError & error)", graph)
+        self.assertIn("catch (const std::bad_alloc &)", graph)
+        self.assertIn("catch (...)", graph)
+        self.assertIn("GGML_STATUS_EXECUTION_FAILED", graph)
 
     def test_windows_cuda_release_remains_compatible_with_cuda_12_drivers(self) -> None:
         sm86 = next(
@@ -199,17 +255,34 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         self.assertIn("run: sleep 90", checksums)
         self.assertIn("needs.build.result == 'success'", checksums)
 
-    def test_failed_aggregation_can_reuse_completed_build_artifacts(self) -> None:
-        self.assertIn("source_run_id:", self.workflow)
-        self.assertIn("supplemental_source_run_id:", self.workflow)
-        self.assertIn("promote_cuda_targets:", self.workflow)
-        self.assertIn('gh run download "$run_id"', self.workflow)
-        self.assertIn("inputs.source_run_id == ''", self.workflow)
-        self.assertIn("inputs.source_run_id != ''", self.workflow)
-        self.assertIn("Upload recovered assets to release", self.workflow)
-        self.assertIn("recovery only uploads to an existing draft release", self.workflow)
-        self.assertIn("-name '*.sha256'", self.workflow)
-        self.assertIn("dist/*.sha256", self.workflow)
+    def test_manual_dispatch_cannot_recover_or_mutate_release_assets(self) -> None:
+        dispatch_inputs = self.workflow.split("  workflow_dispatch:\n", 1)[1].split(
+            "  workflow_call:\n", 1
+        )[0]
+        call_inputs = self.workflow.split("  workflow_call:\n", 1)[1].split(
+            "permissions:\n", 1
+        )[0]
+        self.assertNotIn("formal_release:", dispatch_inputs)
+        self.assertIn("formal_release:", call_inputs)
+        self.assertNotIn("source_run_id:", self.workflow)
+        self.assertNotIn("supplemental_source_run_id:", self.workflow)
+        self.assertNotIn("promote_cuda_targets:", self.workflow)
+        self.assertNotIn("Upload recovered assets to release", self.workflow)
+        self.assertIn("formal_release:", self.workflow)
+        self.assertIn("manual release-binaries runs require one diagnostic only_target", self.workflow)
+        self.assertIn("inputs.formal_release == true", self.workflow)
+        self.assertIn('CALLER_WORKFLOW: ${{ github.workflow }}', self.workflow)
+        self.assertIn('[ "$CALLER_WORKFLOW" = "Release core" ]', self.workflow)
+        self.assertIn('[ "$CALLER_REF" = "refs/heads/main" ]', self.workflow)
+        upload_job = self.workflow.split("\n  upload-to-release:\n", 1)[1].split(
+            "\n  verify-completeness:\n", 1
+        )[0]
+        self.assertIn("inputs.formal_release == true", upload_job)
+        self.assertIn("refusing to overwrite assets on a public release", self.workflow)
+        self.assertIn("release tag and checked-out source commit differ", self.workflow)
+        self.assertIn("formal release assets may be uploaded only to an existing draft", self.workflow)
+        self.assertIn("contains unexpected asset(s)", self.workflow)
+        self.assertIn("staging/*.sha256", self.workflow)
 
     def test_catalog_candidate_uses_only_release_blocking_plugin_targets(self) -> None:
         required_cuda = [
@@ -222,8 +295,14 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             for row in self.matrix
             if row.get("provider") == "hip" and not row.get("experimental", False)
         ]
+        required_vulkan = [
+            row
+            for row in self.matrix
+            if row.get("provider") == "vulkan" and not row.get("experimental", False)
+        ]
         self.assertEqual(len(required_cuda), 6)
         self.assertEqual(len(required_hip), 14)
+        self.assertEqual(len(required_vulkan), 1)
         self.assertEqual(
             [f'backend-pack-cuda-sm_{row["cuda_gpu_target"]}.json' for row in required_cuda],
             [
@@ -250,6 +329,11 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             for row in self.matrix
             if row.get("provider") == "hip" and row.get("vendor_owner") is True
         ]
+        vulkan_owners = [
+            row["target"]
+            for row in self.matrix
+            if row.get("provider") == "vulkan" and row.get("vendor_owner") is True
+        ]
         self.assertEqual(
             cuda_owners,
             [
@@ -258,6 +342,10 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             ],
         )
         self.assertEqual(hip_owners, ["x86_64-pc-windows-msvc-hip-gfx1030-plugin"])
+        self.assertEqual(
+            vulkan_owners,
+            ["x86_64-pc-windows-msvc-vulkan-generic-plugin"],
+        )
 
     def test_diagnostic_only_target_temporarily_owns_vendor_assets(self) -> None:
         self.assertIn(
@@ -278,20 +366,16 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         )
         self.assertIn("rocblas\\library", self.workflow)
 
-    def test_neutral_hosts_and_optional_plugins_install_the_vulkan_sdk(self) -> None:
+    def test_only_optional_vulkan_plugin_installs_the_vulkan_sdk(self) -> None:
         self.assertIn(
-            "NEEDS_WINDOWS_VULKAN_SDK: ${{ matrix.target == "
-            "'x86_64-pc-windows-msvc' || contains(matrix.features, 'vulkan') || "
-            "matrix.distribution == 'host' || matrix.distribution == 'plugin' }}",
+            "NEEDS_WINDOWS_VULKAN_SDK: ${{ contains(matrix.features, 'vulkan') }}",
             self.workflow,
         )
         self.assertIn("env.NEEDS_WINDOWS_VULKAN_SDK == 'true'", self.workflow)
 
-    def test_only_host_archives_bundle_the_vulkan_loader(self) -> None:
+    def test_only_optional_vulkan_pack_owns_the_vulkan_loader(self) -> None:
         self.assertIn(
-            "BUNDLES_WINDOWS_VULKAN_LOADER: ${{ matrix.target == "
-            "'x86_64-pc-windows-msvc' || contains(matrix.features, 'vulkan') || "
-            "matrix.distribution == 'host' }}",
+            "BUNDLES_WINDOWS_VULKAN_LOADER: ${{ matrix.distribution == 'plugin' && matrix.provider == 'vulkan' }}",
             self.workflow,
         )
         self.assertEqual(
@@ -315,11 +399,7 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         xcframework = self.workflow.split("\n  xcframework:\n", 1)[1].split(
             "\n  checksums:\n", 1
         )[0]
-        self.assertIn(
-            "if: ${{ inputs.source_run_id == '' && "
-            "(github.event_name != 'workflow_dispatch' || inputs.only_target == '') }}",
-            xcframework,
-        )
+        self.assertIn("if: ${{ inputs.formal_release == true }}", xcframework)
 
     def test_windows_arm64_cross_build_disables_openmp(self) -> None:
         openmp_contract = self.core_build_rs.split(

@@ -111,6 +111,10 @@ fn build_request(pack: &Path) -> GgmlAsrStreamingSessionRequest {
         architecture.identity.model_architecture, selected_family.model_architecture,
         "architecture registry and adapter projection disagree"
     );
+    let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+        (GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
+        crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+    );
     GgmlAsrStreamingSessionRequest {
         execution_services:
             crate::models::native_execution_services::test_native_execution_services(),
@@ -120,11 +124,10 @@ fn build_request(pack: &Path) -> GgmlAsrStreamingSessionRequest {
         request_options: GgmlAsrExecutionOptions::default(),
         configured_diarize: false,
         backend_preference: GgmlAsrBackendPreference::CpuOnly,
-        resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
-            (GgmlAsrBackendPreference::CpuOnly).request_backend_override(),
-            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        resolved_runtime,
+        execution_lane: crate::models::native_execution_services::current_execution_lane_key(
+            resolved_runtime.backend(),
         ),
-        execution_lane: None,
         final_text_processor: None,
         session_context: NativeAsrSessionContext::new("rt_finalize_bench"),
         session_config: NativeAsrStreamingSessionConfig::new()

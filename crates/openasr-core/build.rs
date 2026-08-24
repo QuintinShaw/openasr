@@ -60,8 +60,9 @@ fn main() {
     let host = env::var("HOST").unwrap_or_default();
     // Backend-DL plugin build for the neutral Windows host:
     // ship ggml-base.dll + ggml.dll + ggml-cpu-<variant>.dll loaded via the ggml
-    // registry. The installer owns this neutral host plus CPU/Vulkan rescue;
-    // signed CUDA/HIP packs are installed and selected independently.
+    // registry. The installer owns this neutral host plus its CPU rescue;
+    // every GPU provider is installed and selected independently from signed
+    // PublishedInert bytes after exact hardware qualification.
     //
     // Scoped to Windows on purpose. macOS ships a self-contained static binary
     // with Metal/Accelerate (no plugin story). Linux is the CI/CLI platform: a
@@ -93,10 +94,10 @@ fn main() {
     // neutral plugin topology for that cross target would both require the
     // wrong SDK import library and misstate the released capability.
     let use_backend_dl = is_windows && !is_windows_arm64 && !legacy_static_windows;
-    // The neutral Windows host always carries a Vulkan rescue module. CUDA/HIP
-    // are optional packs; CPU+Vulkan are the installer-owned LKG and must not
-    // depend on a consumer remembering to enable a feature.
-    let build_vulkan = feat_vulkan || use_backend_dl;
+    // CPU is the only installer-owned LKG. Vulkan is compiled only by its
+    // optional-provider release leg; the neutral host must not register GPU
+    // code that can bypass signed activation.
+    let build_vulkan = feat_vulkan;
     println!(
         "cargo:rustc-env=OPENASR_WINDOWS_GGML_TOPOLOGY={}",
         if legacy_static_windows {
@@ -1214,14 +1215,17 @@ fn emit_backend_host_abi(
         u8::from(backend_dl),
     );
     let compile_flags_sha256 = sha256_hex(compile_flags_contract.as_bytes());
+    // Schema 3 makes signed-catalog activation enforcement part of the host
+    // contract.  A schema-2 host ignores the catalog activation field, so it
+    // must never consider a newly published-inert optional module compatible.
     let build_contract = format!(
-        "schema=2\ntarget={target}\ncrt={crt}\ntoolchain={toolchain}\ncompile_flags_sha256={compile_flags_sha256}\nbackend_dl={}\nshared={}\nbackend_api_version={backend_api_version}\nggml_revision={ggml_revision}\nggml_headers_sha256={headers_sha256}\nopenasr_ffi_sha256={openasr_ffi_sha256}\nopenasr_extension_sha256={openasr_extension_sha256}\n",
+        "schema=3\nactivation_policy=activated-catalog-v1\ntarget={target}\ncrt={crt}\ntoolchain={toolchain}\ncompile_flags_sha256={compile_flags_sha256}\nbackend_dl={}\nshared={}\nbackend_api_version={backend_api_version}\nggml_revision={ggml_revision}\nggml_headers_sha256={headers_sha256}\nopenasr_ffi_sha256={openasr_ffi_sha256}\nopenasr_extension_sha256={openasr_extension_sha256}\n",
         u8::from(backend_dl),
         u8::from(backend_dl),
     );
     let fingerprint = sha256_hex(build_contract.as_bytes());
 
-    println!("cargo:rustc-env=OPENASR_BACKEND_ABI_SCHEMA_VERSION=2");
+    println!("cargo:rustc-env=OPENASR_BACKEND_ABI_SCHEMA_VERSION=3");
     println!("cargo:rustc-env=OPENASR_BACKEND_HOST_ABI_FINGERPRINT={fingerprint}");
     println!("cargo:rustc-env=OPENASR_BACKEND_TARGET={target}");
     println!("cargo:rustc-env=OPENASR_BACKEND_CRT={crt}");
@@ -1236,7 +1240,7 @@ fn emit_backend_host_abi(
     println!("cargo:rerun-if-env-changed=OPENASR_GGML_REVISION_OVERRIDE");
     println!("cargo:rerun-if-changed={}", openasr_ffi.display());
     let json = serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "fingerprint": fingerprint,
         "target": target,
         "crt": crt,
@@ -1403,10 +1407,7 @@ fn stage_windows_backend_dl_artifacts(
         .filter(|path| {
             path.file_name().is_some_and(|name| {
                 let name = name.to_string_lossy().to_ascii_lowercase();
-                name == "ggml.dll"
-                    || name == "ggml-base.dll"
-                    || name.starts_with("ggml-cpu")
-                    || (feat_vulkan && name == "ggml-vulkan.dll")
+                name == "ggml.dll" || name == "ggml-base.dll" || name.starts_with("ggml-cpu")
             })
         })
         .cloned()
@@ -1424,8 +1425,6 @@ fn stage_windows_backend_dl_artifacts(
             let lower = filename.to_ascii_lowercase();
             let provider = if lower.starts_with("ggml-cpu") {
                 "cpu"
-            } else if lower == "ggml-vulkan.dll" {
-                "vulkan"
             } else {
                 "host"
             };
@@ -1471,29 +1470,13 @@ fn stage_windows_backend_dl_artifacts(
         )
     };
     let bundled_cpu_contract_sha256 = provider_contract("cpu");
-    let bundled_vulkan_contract_sha256 = provider_contract("vulkan");
     println!("cargo:rustc-env=OPENASR_BUNDLED_BACKEND_CONTRACT_SHA256={bundled_contract_sha256}");
     println!("cargo:rustc-env=OPENASR_BUNDLED_CPU_CONTRACT_SHA256={bundled_cpu_contract_sha256}");
-    println!(
-        "cargo:rustc-env=OPENASR_BUNDLED_VULKAN_CONTRACT_SHA256={bundled_vulkan_contract_sha256}"
-    );
-    println!("cargo:rerun-if-env-changed=OPENASR_BUNDLED_VULKAN_LOADER_SHA256");
-    if let Ok(loader_sha256) = env::var("OPENASR_BUNDLED_VULKAN_LOADER_SHA256") {
-        assert!(
-            loader_sha256.len() == 64
-                && loader_sha256
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-            "OPENASR_BUNDLED_VULKAN_LOADER_SHA256 must be lowercase 64-hex"
-        );
-        println!("cargo:rustc-env=OPENASR_BUNDLED_VULKAN_LOADER_SHA256={loader_sha256}");
-    }
     let mut bundled_manifest = serde_json::to_vec(&serde_json::json!({
-        "schema_version": 3,
+        "schema_version": 4,
         "host_abi_fingerprint": backend_host_abi_fingerprint,
         "bundle_contract_sha256": bundled_contract_sha256,
         "cpu_contract_sha256": bundled_cpu_contract_sha256,
-        "vulkan_contract_sha256": bundled_vulkan_contract_sha256,
         "files": manifest_files
             .iter()
             .map(|(file, _)| file)
@@ -1516,6 +1499,10 @@ fn stage_windows_backend_dl_artifacts(
             "sycl": feat_sycl,
         },
         "backend_targets": {
+            // Vulkan SPIR-V is artifact-generic. Physical device UUID and
+            // driver are bound later by hardware qualification, never baked
+            // into the plugin artifact identity.
+            "vulkan": Vec::<String>::new(),
             "cuda": cuda_targets
                 .split(';')
                 .filter(|value| !value.is_empty())
@@ -1563,13 +1550,6 @@ fn stage_windows_backend_dl_artifacts(
         }),
         "missing required BACKEND_DL CPU plugin"
     );
-    if feat_vulkan {
-        assert!(
-            by_name("ggml-vulkan.dll").is_some(),
-            "missing bundled Vulkan rescue plugin"
-        );
-    }
-
     let flat_destinations = [profile_dir.to_path_buf(), profile_dir.join("deps")];
     let destinations = flat_destinations
         .iter()
@@ -1585,8 +1565,13 @@ fn stage_windows_backend_dl_artifacts(
         fs::create_dir_all(&dest).expect("create BACKEND_DL runtime directory");
         // Optional accelerators are never application-directory plugins. Clear
         // stale copies left by a previous build topology before staging the
-        // neutral host and bundled rescue set.
-        for optional in ["ggml-cuda.dll", "ggml-hip.dll"] {
+        // neutral host and bundled CPU rescue set.
+        for optional in [
+            "ggml-cuda.dll",
+            "ggml-hip.dll",
+            "ggml-vulkan.dll",
+            "vulkan-1.dll",
+        ] {
             match fs::remove_file(dest.join(optional)) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1617,6 +1602,7 @@ fn stage_windows_backend_dl_artifacts(
     }
 
     for (enabled, provider, filename) in [
+        (feat_vulkan, "vulkan", "ggml-vulkan.dll"),
         (feat_cuda, "cuda", "ggml-cuda.dll"),
         (feat_hip, "hip", "ggml-hip.dll"),
     ] {

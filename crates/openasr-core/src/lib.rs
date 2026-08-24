@@ -1,6 +1,5 @@
 mod atomic_file;
 mod backend_device_probe;
-mod backends_manifest_security;
 mod catalog_security;
 mod catalog_series;
 // This module exists in the compiled library only to host a regression test:
@@ -53,11 +52,13 @@ pub use arch::{
 pub use backend_distribution::{
     ACTIVATED_BACKEND_SCHEMA_VERSION, ActivatedBackendPack, BACKEND_HOST_ABI_SCHEMA_VERSION,
     BackendActivationError, BackendHostAbi, BackendPluginStatus, BackendProviderDescription,
-    PreparedBackendPack, activate_installed_backend_pack, activate_installed_backend_pack_auto,
-    activated_backend_path, backend_plugin_status, deactivate_backend_pack,
-    describe_backend_provider, install_and_activate_backend_pack,
-    install_and_activate_backend_provider, install_backend_pack_from_catalog,
-    prepare_backend_provider_for_live_device, read_activated_backend,
+    PreparedBackendPack, QualificationBackendPack, activate_installed_backend_pack,
+    activate_installed_backend_pack_auto, activated_backend_path, backend_plugin_status,
+    clear_backend_qualification, deactivate_backend_pack, describe_backend_provider,
+    install_and_activate_backend_pack, install_and_activate_backend_provider,
+    install_backend_pack_from_catalog, prepare_backend_pack_for_qualification,
+    prepare_backend_provider_for_live_device, qualification_backend_from_environment,
+    qualification_backend_path, read_activated_backend, read_qualification_backend,
 };
 pub(crate) mod audio;
 pub mod family_inventory;
@@ -66,11 +67,7 @@ pub use family_inventory::{
     ModelFamilyInventoryV1, builtin_model_family_inventory,
 };
 pub use file_identity::StrongFileIdentity;
-// `pub` (not `pub(crate)`): the desktop app reaches this by path
-// (`openasr_core::backend_manifest::verify_and_parse`) to verify the
-// downloaded inference-kernel manifest -- see the module doc comment.
 pub mod backend_distribution;
-pub mod backend_manifest;
 pub(crate) mod batch;
 pub(crate) mod benchmark;
 pub(crate) mod capability_pack;
@@ -159,13 +156,6 @@ pub use audio::{
     probe_wav_duration, recognized_audio_extensions, validate_audio_input,
 };
 pub(crate) use audio::{PcmBuffer, PcmSlice};
-pub use backends_manifest_security::{
-    BACKENDS_MANIFEST_PRODUCTION_KEY_ID, BACKENDS_MANIFEST_SIGNATURE_ALGORITHM,
-    BACKENDS_MANIFEST_SIGNATURE_FILE_NAME, BACKENDS_MANIFEST_SIGNATURE_SCHEMA_VERSION,
-    BackendsManifestSecurityError, BackendsManifestSignature, BackendsManifestSignatureValue,
-    VerifiedBackendsManifestSignature, render_backends_manifest_signature,
-    verify_backends_manifest_signature,
-};
 pub use batch::{
     BatchError, BatchFailure, BatchInput, BatchItem, BatchOutput, BatchSummary, batch_output_path,
     discover_batch_inputs, render_batch_summary, response_format_extension,
@@ -432,19 +422,20 @@ pub use realtime::{
 };
 pub use registry::{
     BackendResolutionError, CATALOG_FEATURE_SPEAKER_DIARIZATION, CATALOG_FEATURE_WORD_TIMESTAMPS,
-    CatalogBackend, CatalogBackendFile, CatalogBackendFileRole, CatalogBackendVendor,
-    CatalogCapability, CatalogCapabilityRole, CatalogError, CatalogLanguageMode, CatalogMirror,
-    CatalogModel, CatalogModelKind, CatalogProse, CatalogPullRequest, CatalogQuant,
-    CatalogQuantPerf, CatalogQuantRecommendationProfile, CatalogSpeakerSource,
-    CatalogWordTimestampSource, LicenseClass, LocalCatalogEnvOverride, ModelAvailability,
-    ModelCard, ModelCatalog, ModelInstallLicenseDecision, ModelRef, ModelResolutionError,
-    ModelVariantMetadata, OPENASR_CATALOG_FILE_ENV_VAR, OPENASR_CATALOG_IDENTITY_ENV_VAR,
-    RegistryError, ResolvedCatalogBackendPull, ResolvedCatalogPull, ResolvedModel,
-    ResolvedRuntimeModelRef, RuntimeModelRefSource, RuntimeModelResolutionError,
-    RuntimeRegistryError, canonical_quant_tag, current_cli_version, default_catalog_cache_path,
-    default_catalog_url, default_registry_dir, embedded_catalog_fingerprint,
-    load_embedded_signed_catalog, load_local_catalog_file_with_identity, load_model_catalog,
-    load_registry, model_cards_from_catalog, model_install_license_decision,
+    CatalogBackend, CatalogBackendActivation, CatalogBackendActivationState, CatalogBackendFile,
+    CatalogBackendFileRole, CatalogBackendVendor, CatalogCapability, CatalogCapabilityRole,
+    CatalogError, CatalogLanguageMode, CatalogMirror, CatalogModel, CatalogModelKind, CatalogProse,
+    CatalogPullRequest, CatalogQuant, CatalogQuantPerf, CatalogQuantRecommendationProfile,
+    CatalogSpeakerSource, CatalogWordTimestampSource, LicenseClass, LocalCatalogEnvOverride,
+    ModelAvailability, ModelCard, ModelCatalog, ModelInstallLicenseDecision, ModelRef,
+    ModelResolutionError, ModelVariantMetadata, OPENASR_CATALOG_FILE_ENV_VAR,
+    OPENASR_CATALOG_IDENTITY_ENV_VAR, RegistryError, ResolvedCatalogBackendPull,
+    ResolvedCatalogPull, ResolvedModel, ResolvedRuntimeModelRef, RuntimeModelRefSource,
+    RuntimeModelResolutionError, RuntimeRegistryError, canonical_quant_tag, current_cli_version,
+    default_catalog_cache_path, default_catalog_url, default_registry_dir,
+    embedded_catalog_fingerprint, load_embedded_signed_catalog,
+    load_local_catalog_file_with_identity, load_model_catalog, load_registry,
+    model_cards_from_catalog, model_install_license_decision,
     model_reference_matches_resolved_source, model_refs_match_with_optional_tag_alias,
     parse_model_catalog, parse_model_ref, preview_local_catalog_file_with_identity,
     recommend_catalog_quant, resolve_catalog_backend_pull, resolve_catalog_backend_pull_for_host,

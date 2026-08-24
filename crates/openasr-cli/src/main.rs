@@ -24,10 +24,10 @@ use openasr_core::{
     convert_local_qwen_source_to_runtime_pack, convert_local_whisper_hf_source_to_runtime_pack,
     derive_catalog_public_key_hex, discover_batch_inputs, embedded_catalog_fingerprint,
     load_config, models_dir, openasr_home, parse_model_catalog, parse_model_ref,
-    render_backends_manifest_signature, render_batch_summary, render_benchmark,
-    render_catalog_signature_manifest, resolve_registry_model_ref, resolve_runtime_model_ref,
-    runtime_registry, save_config, validate_local_native_model_pack_path,
-    verify_catalog_signature_manifest, verify_local_catalog_signature_manifest,
+    render_batch_summary, render_benchmark, render_catalog_signature_manifest,
+    resolve_registry_model_ref, resolve_runtime_model_ref, runtime_registry, save_config,
+    validate_local_native_model_pack_path, verify_catalog_signature_manifest,
+    verify_local_catalog_signature_manifest,
 };
 
 mod backend_plugin_cli;
@@ -291,24 +291,6 @@ async fn run() -> Result<()> {
             print_public_key,
         ),
         Command::CatalogFingerprint => catalog_fingerprint_command(),
-        Command::SignBackendsManifest {
-            manifest,
-            out,
-            manifest_url,
-            key_id,
-            print_public_key,
-        } => sign_backends_manifest_command(
-            &manifest,
-            &out,
-            &manifest_url,
-            &key_id,
-            print_public_key,
-        ),
-        Command::VerifyBackendsManifest {
-            manifest,
-            signature,
-            manifest_url,
-        } => verify_backends_manifest_command(&manifest, &signature, &manifest_url),
         Command::Transcribe {
             inputs,
             formats,
@@ -414,6 +396,9 @@ async fn run() -> Result<()> {
                         trace_out: trace_out.as_deref(),
                     },
                 )
+            }
+            BenchReceiptCommand::ValidateQualification { receipt } => {
+                bench_receipt_cli::validate_qualification_receipts(&receipt)
             }
         },
         Command::Live {
@@ -763,106 +748,6 @@ fn sign_catalog_manifest_command(
         )
     })?;
     println!("Wrote catalog signature manifest: {}", out.display());
-    Ok(())
-}
-
-fn sign_backends_manifest_command(
-    manifest: &Path,
-    out: &Path,
-    manifest_url: &str,
-    key_id: &str,
-    print_public_key: bool,
-) -> Result<()> {
-    // Deliberately the SAME env var (and therefore the SAME signing seed) as
-    // `sign_catalog_manifest_command` -- see backends_manifest_security's
-    // module doc for why this manifest reuses the catalog's key/trust root
-    // instead of minting a second one.
-    let signing_key_seed_hex =
-        env::var(OPENASR_CATALOG_SIGNING_KEY_SEED_HEX).with_context(|| {
-            format!(
-                "{OPENASR_CATALOG_SIGNING_KEY_SEED_HEX} must be set to a 32-byte hex Ed25519 seed"
-            )
-        })?;
-
-    if print_public_key {
-        let public_key = derive_catalog_public_key_hex(&signing_key_seed_hex)
-            .context("Could not derive backends-manifest signature public key")?;
-        println!("{public_key}");
-        return Ok(());
-    }
-
-    let manifest_contents = fs::read_to_string(manifest).with_context(|| {
-        format!(
-            "Could not read backends-manifest JSON '{}'",
-            manifest.display()
-        )
-    })?;
-
-    let signature = render_backends_manifest_signature(
-        &manifest_contents,
-        manifest_url,
-        key_id,
-        &signing_key_seed_hex,
-    )
-    .context("Could not render backends-manifest signature")?;
-    openasr_core::verify_backends_manifest_signature(&manifest_contents, &signature, manifest_url)
-        .context(
-            "Rendered backends-manifest signature did not verify against the production trust root",
-        )?;
-
-    if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Could not create output directory '{}'", parent.display()))?;
-    }
-    atomic_write_text(out, &signature).with_context(|| {
-        format!(
-            "Could not write backends-manifest signature '{}'",
-            out.display()
-        )
-    })?;
-    println!("Wrote backends-manifest signature: {}", out.display());
-    Ok(())
-}
-
-/// Read-only counterpart to `sign_backends_manifest_command`: verifies an
-/// already-signed `backends-manifest.json` + `.signature.json` pair against
-/// the production trust root. Needs no signing seed and touches no
-/// filesystem beyond reading the two inputs -- safe to run in CI as a
-/// post-release probe for the LOCAL-only signing step being forgotten.
-fn verify_backends_manifest_command(
-    manifest: &Path,
-    signature: &Path,
-    manifest_url: &str,
-) -> Result<()> {
-    let manifest_contents = fs::read_to_string(manifest).with_context(|| {
-        format!(
-            "Could not read backends-manifest JSON '{}'",
-            manifest.display()
-        )
-    })?;
-    let signature_contents = fs::read_to_string(signature).with_context(|| {
-        format!(
-            "Could not read backends-manifest signature '{}'",
-            signature.display()
-        )
-    })?;
-
-    let verified = openasr_core::verify_backends_manifest_signature(
-        &manifest_contents,
-        &signature_contents,
-        manifest_url,
-    )
-    .context("backends-manifest signature did not verify against the production trust root")?;
-
-    println!(
-        "{}",
-        serde_json::json!({
-            "verified": true,
-            "manifest_url": manifest_url,
-            "manifest_sha256": verified.manifest_sha256,
-            "key_id": verified.key_id,
-        })
-    );
     Ok(())
 }
 
@@ -1516,6 +1401,33 @@ mod tests {
         assert_eq!(
             trace_out.as_deref(),
             Some(std::path::Path::new("trace.jsonl"))
+        );
+    }
+
+    #[test]
+    fn parses_bench_receipt_qualification_validator_inputs() {
+        let cli = Cli::try_parse_from([
+            "openasr",
+            "bench-receipt",
+            "validate-qualification",
+            "--receipt",
+            "cold.json",
+            "--receipt",
+            "reuse.json",
+        ])
+        .expect("qualification receipt options parse");
+        let Command::BenchReceipt {
+            command: BenchReceiptCommand::ValidateQualification { receipt },
+        } = cli.command
+        else {
+            panic!("expected bench receipt qualification validator command");
+        };
+        assert_eq!(
+            receipt,
+            vec![
+                std::path::PathBuf::from("cold.json"),
+                std::path::PathBuf::from("reuse.json")
+            ]
         );
     }
 

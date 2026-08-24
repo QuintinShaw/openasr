@@ -1,6 +1,11 @@
-# qwen GPU parity gate
+# qwen GPU parity diagnostic
 
-A correctness gate for the qwen3-asr decoder on discrete GPUs.
+A raw troubleshooting diagnostic for the qwen3-asr decoder on discrete GPUs.
+
+> This tool is not a release gate. It consumes runner-local activation state
+> and caller-provided labels, and its `*.diagnostic.*` output is not accepted by
+> `gpu_correctness_gate.py`. Only the exact target/backend-bound common matrix
+> and strict receipts can qualify an artifact.
 
 ## Why
 
@@ -14,22 +19,21 @@ GPU, so it shipped unnoticed.
 The runtime guard for this is a conservative default: native GQA is **off** on
 the discrete-GPU lane and **on** for CPU/Metal (see
 `qwen_llm_native_gqa_default_for_backend` in
-`crates/openasr-core/src/models/qwen/llm_transformer.rs`). This gate is what
-proves a given GPU is safe to re-enable and catches any future regression of the
-GPU decode path.
+`crates/openasr-core/src/models/qwen/llm_transformer.rs`). This diagnostic helps
+reproduce that failure class; it cannot prove a target safe to activate.
 
 > A synthetic in-process numeric self-check was tried and **rejected**: a probe
 > that exercises one op/shape can *false-pass* when the real decoder mis-computes
 > a different op (e.g. the masked prefill `mul_mat` broadcast vs. an unmasked
-> single-query flash). Only an end-to-end transcript comparison is complete by
-> construction, so correctness is gated here, not by a runtime probe.
+> single-query flash). End-to-end comparison is necessary, but release
+> correctness is gated by the common matrix rather than this convenience script.
 
 ## What it does
 
-For each configured audio path the producer compares CPU reference output with
+For each configured audio path the script compares CPU reference output with
 an explicitly selected GPU provider/device and requires cold and same-process
-reuse per-step traces. Missing GPU, fixture, pack, candidate identity, or trace
-is a hard failure; there is no CPU-only success path.
+reuse per-step diagnostic traces. Missing GPU, fixture, pack, or trace is a hard
+failure; there is no CPU-only success path.
 
 ## Run it locally
 
@@ -48,11 +52,13 @@ Overrides (env):
 | `OPENASR_QWEN_PARITY_MODEL` | `qwen3-asr-0.6b` |
 | `OPENASR_QWEN_PARITY_QUANT` | `q8_0` |
 | `OPENASR_QWEN_PARITY_AUDIO` | `;`-separated audio paths |
+| `OPENASR_QWEN_PARITY_EXPECTED_PROVIDER` | required operator assertion |
+| `OPENASR_QWEN_PARITY_EXPECTED_DEVICE` | required operator assertion |
+| `OPENASR_QWEN_PARITY_TRACE_DIR` | required output directory |
 
 ## CI
 
-The workflow requires immutable candidate CLI, staging catalog, exact `.oasr`
-pack, correctness matrix/receipt, expected provider/device, and runtime-produced
-cold/reuse per-step trace artifacts. It fails closed when any is absent,
-unstable, mismatched, or when the host selects CPU/another device. A transcript
-comparison without those identity-bound traces is not a passing run.
+The workflow attests one CLI, binds one exact `.oasr` input, and records cold and
+reuse output from the provider already active on the self-hosted runner. It
+rejects missing or ambiguous files and CPU/other-device selection. The output is
+intentionally diagnostic and is never consumed by release finalization.

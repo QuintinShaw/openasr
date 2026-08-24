@@ -1,0 +1,74 @@
+name: Activate backend catalog
+
+# Manual post-publication transition only. The maintainer must type an exact
+# backend-scoped authorization; qualification workflow success alone never
+# deploys or activates anything.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Published release whose inert bytes were qualified"
+        required: true
+        type: string
+      backend_id:
+        description: "Exact signed backend id to activate"
+        required: true
+        type: string
+      qualification_run_ids:
+        description: "Space-separated Qualify Windows backend run ids covering every matrix cell"
+        required: true
+        type: string
+      authorization:
+        description: "Type activate:<backend_id>"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  attestations: read
+  contents: read
+
+concurrency:
+  group: activate-backend-catalog
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    if: github.repository == 'QuintinShaw/openasr'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require one explicit backend-scoped authorization
+        env:
+          BACKEND_ID: ${{ inputs.backend_id }}
+          AUTHORIZATION: ${{ inputs.authorization }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RUN_IDS: ${{ inputs.qualification_run_ids }}
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = "refs/heads/main" ] || {
+            echo "backend activation may run only from protected main" >&2; exit 1;
+          }
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$BACKEND_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$ ]]
+          [ "$AUTHORIZATION" = "activate:${BACKEND_ID}" ] || {
+            echo "authorization must equal activate:${BACKEND_ID}" >&2; exit 1;
+          }
+          read -r -a ids <<< "$RUN_IDS"
+          [ "${#ids[@]}" -gt 0 ]
+          for id in "${ids[@]}"; do [[ "$id" =~ ^[1-9][0-9]*$ ]]; done
+
+  deploy:
+    needs: authorize
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    uses: ./.github/workflows/deploy-catalog.yml
+    with:
+      orchestrator_run_id: ${{ github.run_id }}
+      release_tag: ${{ inputs.release_tag }}
+      activation_transition: activated
+      backend_id: ${{ inputs.backend_id }}
+      qualification_run_ids: ${{ inputs.qualification_run_ids }}
+    secrets: inherit

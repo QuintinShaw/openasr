@@ -1,35 +1,40 @@
 # Building the GPU backend plugins (Vulkan / HIP / CUDA)
 
-OpenASR's terminal Windows topology is one neutral `GGML_BACKEND_DL` host:
-`ggml-base.dll`, `ggml.dll`, the CPU variants, and Vulkan are installer-owned;
-CUDA and HIP are optional signed backend packs. The host loads the bundled
-CPU/Vulkan rescue set from its verified application directory and at most one
-selected optional pack from its verified, content-addressed directory under
-`OPENASR_HOME/backends/`. It never scans every installed pack or accepts a
-plugin merely because its filename looks compatible.
+OpenASR's terminal Windows topology is one CPU-neutral `GGML_BACKEND_DL` host.
+`ggml-base.dll`, `ggml.dll`, and the CPU variants are installer-owned; Vulkan,
+CUDA, and HIP are all optional signed open-core provider packs. The host loads
+only its verified CPU modules from the application directory. It may load one
+provider from its verified, content-addressed directory under
+`OPENASR_HOME/backends/` only after the signed catalog marks that exact pack
+`activated`. It never chooses a first enumerated GPU, scans every installed
+pack, or accepts a module merely because its filename looks compatible.
 
 Every module is built from the same vendored ggml revision and generated host
-ABI contract. Activation also binds provider, SM/gfx targets, minimum driver,
+ABI contract. Activation binds provider, SM/gfx targets, minimum driver,
 plugin bytes, and vendor-tree bytes. A matching ABI string is necessary but is
 not sufficient: installation rehashes every declared file and activation
-probes the real exported backend API before committing the selected pointer.
+probes the real exported backend API before committing the selected provider.
+Prepared or published-inert bytes are not executable providers: ordinary Auto
+and explicit runtime selection are Activated-only.
 
-The one-release migration rail still produces whole, statically linked
-CUDA/HIP sidecars. Those sidecars are rollback artifacts only and must never be
-mixed into the neutral host process.
+Historical whole, statically linked GPU sidecars are a legacy rollback format,
+not an alternative build or runtime switch. Current neutral hosts reject them,
+and legacy-static hosts must never load an optional provider pack.
 
-This document records the **verified** standalone build recipes and the
-local validation results on an RX 9060 XT (gfx1200, RDNA4) device.
+This document records the standalone build recipes and historical local
+validation results on an RX 9060 XT (gfx1200, RDNA4) device. Those measurements
+do not qualify the current release bytes.
 
 > The SDK paths below are examples; adjust for your install.
 > Use a **short build directory** (`E:\vk`, `E:\hip`) — the deep
 > `vulkan-shaders-gen` / HIP template-instance paths trip `MAX_PATH` (C1083)
 > under a normal nested target dir.
 
-## Vulkan plugin (`ggml-vulkan.dll`)
+## Vulkan provider (`ggml-vulkan.dll`)
 
-Single self-contained DLL (~55 MB); its only runtime dep is the driver's
-`vulkan-1.dll`. Cross-vendor fallback (AMD / NVIDIA / Intel). Built with the
+This cross-vendor optional provider (AMD / NVIDIA / Intel) is not a bundled
+rescue path. Its signed pack carries the required Vulkan loader runtime and
+may enter a CPU-neutral host only after catalog activation. Build it with the
 **VS generator** (MSVC is fine for Vulkan):
 
 ```
@@ -114,12 +119,14 @@ Recursive, unconditional MOTW removal is not part of the trust model.
 
 ## CUDA plugin (`ggml-cuda.dll`, NVIDIA)
 
-On Windows, enabling the `cuda` Cargo feature without the explicit
-`legacy-windows-static-sidecar` feature builds a neutral host and stages
-`ggml-cuda.dll` as a separate optional backend pack. The release workflow
-extracts that DLL, stages the CUDA runtime/cuBLAS vendor tree separately,
-compiles one signed catalog entry, and publishes both byte identities. Other
-platforms retain their platform-specific static distribution topology.
+On Windows, the `cuda` Cargo feature stages `ggml-cuda.dll` as a separate
+optional provider pack for the CPU-neutral host. The
+`legacy-windows-static-sidecar` feature names the historical rollback format;
+it is rejected from normal neutral-host release and activation paths. The
+release workflow extracts the DLL, stages the CUDA runtime/cuBLAS vendor tree
+separately, compiles one signed catalog entry, and publishes both byte
+identities. Other platforms retain their platform-specific distribution
+topology.
 
 Release plugin legs compile `openasr-core` only so CMake still stages
 `target\release\openasr-backend-packs\cuda\ggml-cuda.dll` with the same flags
@@ -142,7 +149,7 @@ cargo build -p openasr-core --release --features cuda
 
 The resulting optional module is staged under
 `target\release\openasr-backend-packs\cuda\ggml-cuda.dll`; the application
-directory contains only the neutral host and bundled rescue modules.
+directory contains only the CPU-neutral host and its CPU modules.
 
 The default arch list is `75;80;86;89;90` -- sm_75 (Turing: RTX 20xx, GTX 16xx,
 T4, 2080 Ti) through sm_90 (Hopper). That is also this build's **hardware
@@ -153,19 +160,27 @@ which is tracked but not shipped yet. Override the list with
 `OPENASR_CUDA_GPU_TARGETS` for a narrower, wider, or newer set (e.g. add `120`
 for Blackwell on a CUDA 12.8+ toolchain).
 
-Users on pre-Turing NVIDIA hardware (Pascal/Volta and older) are expected to be
-able to use the Vulkan plugin instead, same as any other vendor -- this is the
-expected behavior of the cross-vendor Vulkan path above, not something
-separately verified against that specific old hardware.
+Users on pre-Turing NVIDIA hardware (Pascal/Volta and older) may use an
+Activated Vulkan provider when a compatible signed pack and driver are
+available. This is not a bundled fallback and has not been separately verified
+against that specific old hardware.
 
 ## Validation boundary
 
-The current Windows release gate builds and packages both optional providers,
-but hardware claims remain provider-specific. CUDA and Vulkan have current
-neutral-host installation, activation, enumeration, exact-placement, and real
-transcription evidence on an RTX 3060 (sm_86). A machine without supported AMD
-hardware may prove only the HIP build/package/catalog/loader contract; it must
-not report HIP inference as passed.
+The formal release publishes all 21 signed provider entries only as
+`PublishedInert`. After publication, qualification runs from the exact release
+tag and a separate backend-scoped authorization may activate one new signed
+catalog epoch. See [RELEASING.md](../RELEASING.md) and
+[`tooling/release-manifest/README.md`](../tooling/release-manifest/README.md).
+
+The current Windows release gate builds and packages all three optional
+providers, but hardware claims remain provider- and exact-target-specific. This
+integration checkpoint has no release-bound CUDA, physical Vulkan, or HIP
+receipt, so every such entry remains `PublishedInert`. A machine without the
+matching hardware may prove only build/package/catalog/loader structure; it
+must not report inference, placement, or token correctness as passed. Historical
+host measurements below preserve tuning context only and cannot activate a
+current release.
 
 ### Historical RX 9060 XT / gfx1200 measurement
 

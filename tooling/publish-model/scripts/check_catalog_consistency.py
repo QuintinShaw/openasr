@@ -452,7 +452,33 @@ def main(argv: list[str]) -> int:
         help="accept the local-dev signing key (preview workflows only; "
         "committed state must be production-signed)",
     )
+    parser.add_argument(
+        "--catalog-pair",
+        nargs=2,
+        type=Path,
+        metavar=("CATALOG", "SIGNATURE"),
+        help="verify one arbitrary catalog/signature pair under the same trust roots",
+    )
     args = parser.parse_args(argv)
+
+    if args.catalog_pair is not None:
+        if args.registry_dir is not None:
+            parser.error("--catalog-pair and --registry-dir are mutually exclusive")
+        catalog_path, manifest_path = (path.resolve() for path in args.catalog_pair)
+        try:
+            check_manifest_binding(
+                label=manifest_path.name,
+                catalog_path=catalog_path,
+                manifest_path=manifest_path,
+                allow_dev_key=args.allow_dev_key,
+            )
+        except GateFailure as failure:
+            print(f"FAIL: {failure}", file=sys.stderr)
+            return 1
+        print(
+            f"catalog signature verified: {catalog_path} <-> {manifest_path}"
+        )
+        return 0
 
     registry_dir = args.registry_dir
     if registry_dir is None:

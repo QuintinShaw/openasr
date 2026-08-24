@@ -81,7 +81,6 @@ jobs:
           mkdir -p release-metadata
           gh release download "$TAG" \
             --pattern 'backend-pack-*.json' \
-            --pattern 'backend-hardware-evidence-*.json' \
             --dir release-metadata
       - name: Require the finalizer's live distribution invariants
         env:
@@ -93,31 +92,13 @@ jobs:
           entries=(release-metadata/backend-pack-*.json)
           cuda_entries=(release-metadata/backend-pack-cuda-sm_*.json)
           hip_entries=(release-metadata/backend-pack-hip-gfx*.json)
-          evidence=(release-metadata/backend-hardware-evidence-*.json)
-          if [ "${#entries[@]}" -ne 20 ] || [ "${#cuda_entries[@]}" -ne 6 ] || [ "${#hip_entries[@]}" -ne 14 ]; then
-            echo "::error::release must contain exactly 6 CUDA and 14 HIP backend-pack metadata files"
+          vulkan_entries=(release-metadata/backend-pack-vulkan-generic.json)
+          if [ "${#entries[@]}" -ne 21 ] || [ "${#cuda_entries[@]}" -ne 6 ] || [ "${#hip_entries[@]}" -ne 14 ] || [ "${#vulkan_entries[@]}" -ne 1 ]; then
+            echo "::error::release must contain exactly 1 Vulkan, 6 CUDA, and 14 HIP backend-pack metadata files"
             exit 1
           fi
-          [ "${#evidence[@]}" -gt 0 ] || {
-            echo "::error::release has no hardware evidence"; exit 1;
-          }
-
           entry_args=()
           for entry in "${entries[@]}"; do entry_args+=(--entry "$entry"); done
-          evidence_args=()
-          for receipt in "${evidence[@]}"; do evidence_args+=(--evidence "$receipt"); done
-          python3 tooling/release-manifest/backend_hardware_evidence.py \
-            "${entry_args[@]}" "${evidence_args[@]}" \
-            > approved-entries.txt
-          approved_args=()
-          while IFS= read -r entry || [ -n "$entry" ]; do
-            [ -n "$entry" ] || continue
-            approved_args+=(--entry "$entry")
-          done < <(tr -d '\r' < approved-entries.txt)
-          [ "${#approved_args[@]}" -gt 0 ] || {
-            echo "::error::release has no hardware-approved backend entry"; exit 1;
-          }
-
           cache_bust="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           curl -fsSL "https://catalog.openasr.org/v1/catalog.json?channels=${cache_bust}" -o catalog.json
           curl -fsSL "https://catalog.openasr.org/v1/catalog.signature.json?channels=${cache_bust}" -o catalog.signature.json
@@ -134,9 +115,9 @@ jobs:
           assert sig["catalog_url"] == "https://catalog.openasr.org/v1/catalog.json", "live catalog has a non-canonical signed identity"
           PY
           python3 tooling/release-manifest/backend_catalog.py verify-catalog \
-            --catalog catalog.json "${approved_args[@]}"
+            --catalog catalog.json "${entry_args[@]}"
           python3 tooling/release-manifest/backend_hardware_evidence.py \
-            "${entry_args[@]}" "${evidence_args[@]}" \
+            "${entry_args[@]}" \
             --catalog catalog.json --version "$VERSION" >/dev/null
           python3 tooling/release-manifest/backend_catalog.py verify-cdn \
             --catalog catalog.json --version "$VERSION"

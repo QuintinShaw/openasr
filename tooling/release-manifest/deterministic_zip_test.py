@@ -7,11 +7,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from deterministic_zip import (
-    FIXED_DATE_TIME,
-    DeterministicZipError,
-    create_deterministic_zip,
-)
+from deterministic_zip import FIXED_DATE_TIME, DeterministicZipError, create_deterministic_zip
 
 
 class CreateDeterministicZipTest(unittest.TestCase):
@@ -32,13 +28,6 @@ class CreateDeterministicZipTest(unittest.TestCase):
         src_a = self.root / "src-a"
         src_a.mkdir()
         self._write_tree(src_a)
-
-        # Same content, different physical write order/mtimes -- a second
-        # source dir built by writing the SAME three files in reverse order,
-        # with an artificially different mtime on one file, must still
-        # produce a byte-identical zip: that is the entire point of
-        # deterministic packaging (content-addressed dedup on the sha256 of
-        # the OUTPUT zip, not of the source tree).
         src_b = self.root / "src-b"
         (src_b / "rocblas" / "library").mkdir(parents=True)
         (src_b / "rocblas" / "library" / "TensileLibrary.dat").write_bytes(b"fake-tensile-bytes")
@@ -48,16 +37,11 @@ class CreateDeterministicZipTest(unittest.TestCase):
         import os
 
         os.utime(src_b / "amdhip64_6.dll", (old_time, old_time))
-
         out_a = self.root / "a.zip"
         out_b = self.root / "b.zip"
         create_deterministic_zip(out_a, src_a)
         create_deterministic_zip(out_b, src_b)
-
-        self.assertEqual(
-            hashlib.sha256(out_a.read_bytes()).hexdigest(),
-            hashlib.sha256(out_b.read_bytes()).hexdigest(),
-        )
+        self.assertEqual(hashlib.sha256(out_a.read_bytes()).hexdigest(), hashlib.sha256(out_b.read_bytes()).hexdigest())
 
     def test_rebuilding_from_the_same_source_dir_is_byte_identical(self) -> None:
         self._write_tree(self.src_dir)
@@ -91,9 +75,7 @@ class CreateDeterministicZipTest(unittest.TestCase):
         with zipfile.ZipFile(out) as archive:
             self.assertEqual(archive.read("amdhip64_6.dll"), b"fake-amdhip64-bytes")
             self.assertEqual(archive.read("rocblas.dll"), b"fake-rocblas-bytes")
-            self.assertEqual(
-                archive.read("rocblas/library/TensileLibrary.dat"), b"fake-tensile-bytes"
-            )
+            self.assertEqual(archive.read("rocblas/library/TensileLibrary.dat"), b"fake-tensile-bytes")
 
     def test_missing_source_dir_fails_loudly(self) -> None:
         with self.assertRaises(DeterministicZipError):

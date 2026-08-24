@@ -964,7 +964,9 @@ pub struct GgmlAsrStreamingSessionRequest {
     /// `GgmlAsrExecutionRequest` they build for the life of the session.
     pub resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput,
     /// Candidate-resolved exact lane copied into every streaming frame context.
-    pub(crate) execution_lane: Option<ExecutionLaneKey>,
+    /// This is mandatory: a streaming session is already pinned to one policy
+    /// candidate and must never re-resolve or silently omit that identity.
+    pub(crate) execution_lane: ExecutionLaneKey,
     /// Optional session-stable auxiliary FINAL-text processor. It has its own
     /// execution plan/lane and is never derived from `resolved_runtime`.
     pub(crate) final_text_processor: Option<GgmlAsrStreamingFinalTextProcessorSlot>,
@@ -1483,6 +1485,11 @@ impl GgmlAsrExecutionDispatch {
             crate::models::native_execution_services::install_native_execution_services(
                 request.execution_services.as_ref(),
             );
+        let _resolved_lane = request
+            .execution_context
+            .native_execution_lane()
+            .cloned()
+            .map(crate::models::native_execution_services::install_resolved_execution_lane);
         ensure_verified_pack_matches_family(&request.verified_pack, &request.selected_family)?;
         // Honor the request's execution preference for the few remaining
         // thread-local readers unrelated to backend resolution proper (the
@@ -1540,6 +1547,11 @@ impl GgmlAsrExecutionDispatch {
             crate::models::native_execution_services::install_native_execution_services(
                 request.execution_services.as_ref(),
             );
+        let _resolved_lane = request
+            .execution_context
+            .native_execution_lane()
+            .cloned()
+            .map(crate::models::native_execution_services::install_resolved_execution_lane);
         ensure_verified_pack_matches_family(&request.verified_pack, &request.selected_family)?;
         let attempt_override =
             crate::models::native_execution_services::current_execution_placement()
@@ -1637,6 +1649,10 @@ impl GgmlAsrExecutionDispatch {
         let _execution_scope =
             crate::models::native_execution_services::install_native_execution_services(
                 request.execution_services.as_ref(),
+            );
+        let _resolved_lane =
+            crate::models::native_execution_services::install_resolved_execution_lane(
+                request.execution_lane.clone(),
             );
         ensure_verified_pack_matches_family(&request.verified_pack, &request.selected_family)?;
         // Same reasoning as `execute` above: the family's resolved backend
@@ -2432,6 +2448,10 @@ mod tests {
             crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight(),
             model_architecture,
         );
+        let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+            backend_preference.request_backend_override(),
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        );
         GgmlAsrStreamingSessionRequest {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
@@ -2441,11 +2461,10 @@ mod tests {
             request_options: GgmlAsrExecutionOptions::default(),
             configured_diarize: false,
             backend_preference,
-            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
-                backend_preference.request_backend_override(),
-                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            resolved_runtime,
+            execution_lane: crate::models::native_execution_services::current_execution_lane_key(
+                resolved_runtime.backend(),
             ),
-            execution_lane: None,
             final_text_processor: None,
             session_context: crate::NativeAsrSessionContext::new("rt_ggml_streaming"),
             session_config: crate::NativeAsrStreamingSessionConfig::new().into(),

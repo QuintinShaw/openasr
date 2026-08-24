@@ -90,7 +90,7 @@ see `docs/design/gpu-weight-placement.md`).
 | --- | --- | --- | --- | --- |
 | CPU | Yes | Yes (short goldens en/zh/mixed; cross-backend byte parity spot) | Yes (RTF matrix 2026-07-24; q4 jfk 0.75, enzh 0.63; q8 jfk 1.17, enzh 1.03; fp16 jfk 2.17, enzh 1.95) | |
 | Metal | Yes | Yes (same goldens byte-identical on Metal) | Yes (RTF matrix 2026-07-24; Metal wins or ties all cells; 0.6b q4 Metal 0.26-0.31 vs CPU 0.32-0.38) | |
-| CUDA | Untested | No | No | Shared qwen executor path; no CUDA host available for family golden. Unlock: community/dev-host run of golden + `qwen-gpu-parity` (tooling exists). Bulk CUDA/HIP prefill (#223) already landed in shared path. |
+| CUDA | Untested | No | No | Shared qwen executor path; no CUDA host available for family golden. Unlock: exact target/backend-bound common correctness receipts; `qwen-gpu-parity` is diagnostic only. Bulk CUDA/HIP prefill (#223) already landed in shared path. |
 | Vulkan | Untested | No | No | Same as CUDA; xasr-class offset-view fix (0.1.22) hardened shared Vulkan path. Unlock: AMD/Intel Vulkan host validation. |
 | HIP | Untested | No | No | Plain per-chunk path; qwen's HIP prefill-chunk tuning deliberately not replicated (short prompts under longform cap). Unlock: HIP host validation. |
 

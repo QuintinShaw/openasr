@@ -1909,7 +1909,7 @@ async fn set_default_model_http_keeps_previous_selection_when_activation_probe_f
 }
 
 #[tokio::test]
-async fn set_default_model_http_host_pressure_rejects_before_publication_and_preserves_old_state() {
+async fn activation_rechecks_capacity_after_successful_forecast_and_preserves_old_state() {
     use axum::body::{Body, to_bytes};
     use openasr_core::device::execution_memory::{
         DeviceMemorySnapshot, DomainFootprint, DomainReservationRequest, MemoryDomainKey,
@@ -1928,7 +1928,7 @@ async fn set_default_model_http_host_pressure_rejects_before_publication_and_pre
         "q4",
         "whisper-tiny",
     );
-    let _next_path = write_installed_pack_ref(
+    let next_path = write_installed_pack_ref(
         &home,
         "whisper-base",
         "whisper-base:q4",
@@ -1944,6 +1944,31 @@ async fn set_default_model_http_host_pressure_rejects_before_publication_and_pre
     let native_execution = NativeExecutionSupervisor::default();
     let services = Arc::clone(native_execution.execution_services());
     let broker = Arc::clone(services.memory_broker());
+    let next = installed_pack_by_pull(&home, "whisper-base:q4");
+    let verified_next = openasr_core::PackVerifier
+        .verify_candidate(openasr_core::PackCandidate::new(next_path))
+        .expect("forecast candidate pack must verify");
+    let before_forecast = broker.usage(&MemoryDomainKey::SystemMemory);
+    let forecast = openasr_core::resolve_default_model_activation(
+        services.as_ref(),
+        &verified_next,
+        openasr_core::device::execution_policy::ExecutionIntent::CpuOnly,
+        next.pull.clone(),
+        next.path.clone(),
+    )
+    .expect("advisory activation facts must resolve")
+    .quote()
+    .expect("advisory activation forecast must succeed before pressure changes");
+    drop(forecast);
+    assert_eq!(
+        broker.usage(&MemoryDomainKey::SystemMemory),
+        before_forecast,
+        "an advisory quote must not reserve or commit physical capacity"
+    );
+
+    // Capacity changes after the successful advisory forecast. The real
+    // activation below must obtain a fresh quote/reservation and reject this
+    // pressure rather than treating forecast success as authorization.
     let pressure_bytes = 1_u64 << 60;
     let mut pressure = broker
         .try_reserve_batch(vec![DomainReservationRequest::from_footprint(
@@ -2580,6 +2605,44 @@ fn active_runtime_barrier_closes_session_admission_race() {
     drop(permit);
 }
 
+#[test]
+fn stale_active_runtime_snapshot_cannot_start_after_republication() {
+    let pack = PathBuf::from("active-runtime-snapshot.oasr");
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack.clone()).into(),
+    };
+    let snapshot = runtime
+        .model_pack_path
+        .current_snapshot()
+        .expect("initial active runtime snapshot");
+
+    // Re-publishing even the same path is a new generation: the underlying
+    // bytes may have been reinstalled in place, so path equality cannot be an
+    // admission authority and must not create an ABA hole.
+    runtime
+        .model_pack_path
+        .set_legacy_binding(Some(pack.clone()));
+
+    assert!(matches!(
+        runtime.acquire_native_execution_for_snapshot(&snapshot, "stale-snapshot", None),
+        Err(ApiError::Conflict(_))
+    ));
+    assert!(!runtime.native_execution.has_active_sessions());
+
+    let fresh = runtime
+        .model_pack_path
+        .current_snapshot()
+        .expect("republished active runtime snapshot");
+    let permit = runtime
+        .acquire_native_execution_for_snapshot(&fresh, "fresh-snapshot", None)
+        .expect("the current publication may be admitted");
+    drop(permit);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn boot_reactivation_attests_v2_before_publishing_active_runtime() {
     let temp = tempfile::tempdir().unwrap();
@@ -2633,6 +2696,10 @@ async fn boot_reactivation_attests_v2_before_publishing_active_runtime() {
     assert_eq!(
         runtime.model_pack_path.current().as_deref(),
         Some(pack_path.as_path())
+    );
+    assert!(
+        runtime.model_is_resident(),
+        "successful reactivation must publish the exact candidate resident marker without staling its warmup generation"
     );
     assert_eq!(
         openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap(),

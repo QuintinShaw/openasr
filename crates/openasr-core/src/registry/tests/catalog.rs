@@ -2438,7 +2438,7 @@ fn valid_hip_backend_json() -> String {
       "targets": ["gfx1200"],
       "min_cli_version": "0.1.0",
       "host_abi": {{
-        "schema_version": 2,
+        "schema_version": 3,
         "fingerprint": "{BACKEND_SHA_A}",
         "target": "x86_64-pc-windows-msvc",
         "crt": "msvc-md",
@@ -2484,6 +2484,136 @@ fn catalog_parser_accepts_backend_entries() {
         .find(|file| file.role == CatalogBackendFileRole::Archive)
         .expect("archive file");
     assert_eq!(archive.extract_subdir.as_deref(), Some("rocblas/library"));
+}
+
+fn hip_backend_with_activation(activation: &str) -> String {
+    valid_hip_backend_json().replace(
+        "      \"host_abi\": {",
+        &format!("      \"activation\": {activation},\n      \"host_abi\": {{"),
+    )
+}
+
+fn vulkan_backend_with_activation(activation: &str) -> String {
+    valid_hip_backend_json()
+        .replace("\"hip-radeon\"", "\"vulkan-generic\"")
+        .replace("\"vendor\": \"hip\"", "\"vendor\": \"vulkan\"")
+        .replace("AMD ROCm (HIP)", "Vulkan")
+        .replace("\"targets\": [\"gfx1200\"]", "\"targets\": []")
+        .replace("ggml-hip.dll", "ggml-vulkan.dll")
+        .replace(
+            "      \"host_abi\": {",
+            &format!("      \"activation\": {activation},\n      \"host_abi\": {{"),
+        )
+}
+
+#[test]
+fn catalog_backend_activation_state_has_non_overlapping_binding_shapes() {
+    let qualified = format!(
+        r#"{{"state":"qualified","qualification_source_catalog_sha256":"{BACKEND_SHA_A}","hardware_evidence_sha256":"{BACKEND_SHA_B}","qualified_device_target":"gfx1200","qualified_driver_version":"7.2.0"}}"#
+    );
+    parse_model_catalog(
+        &catalog_json_with_backends(&hip_backend_with_activation(&qualified)),
+        "fixture",
+    )
+    .expect("hardware-only qualified state");
+
+    let activated = format!(
+        r#"{{"state":"activated","qualification_source_catalog_sha256":"{BACKEND_SHA_A}","hardware_evidence_sha256":"{BACKEND_SHA_B}","qualified_device_target":"gfx1200","qualified_driver_version":"7.2.0","correctness_matrix_sha256":"{BACKEND_SHA_A}","correctness_receipts_sha256":"{BACKEND_SHA_B}"}}"#
+    );
+    parse_model_catalog(
+        &catalog_json_with_backends(&hip_backend_with_activation(&activated)),
+        "fixture",
+    )
+    .expect("fully bound activated state");
+    parse_model_catalog(
+        &catalog_json_with_backends(&hip_backend_with_activation(
+            &activated.replace("activated", "revoked"),
+        )),
+        "fixture",
+    )
+    .expect("revocation preserves complete activation bindings for audit");
+    parse_model_catalog(
+        &catalog_json_with_backends(&hip_backend_with_activation(r#"{"state":"revoked"}"#)),
+        "fixture",
+    )
+    .expect("a never-qualified published backend may be revoked without bindings");
+
+    let qualified_with_correctness = activated.replace("activated", "qualified");
+    let error = parse_model_catalog(
+        &catalog_json_with_backends(&hip_backend_with_activation(&qualified_with_correctness)),
+        "fixture",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("target, and driver bindings only"),
+        "{error}"
+    );
+
+    let activated_without_receipts = activated.replace(
+        &format!(r#","correctness_receipts_sha256":"{BACKEND_SHA_B}""#),
+        "",
+    );
+    let error = parse_model_catalog(
+        &catalog_json_with_backends(&hip_backend_with_activation(&activated_without_receipts)),
+        "fixture",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("activated bindings are incomplete"),
+        "{error}"
+    );
+    let partial_revocation = activated_without_receipts.replace("activated", "revoked");
+    let error = parse_model_catalog(
+        &catalog_json_with_backends(&hip_backend_with_activation(&partial_revocation)),
+        "fixture",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("revoked qualification bindings are partial"),
+        "{error}"
+    );
+}
+
+#[test]
+fn vulkan_activation_uses_a_canonical_reusable_capability_class() {
+    let target = "vk_caps_00001002_0000744c_0123456789abcdef0123456789abcdef";
+    let activated = format!(
+        r#"{{"state":"activated","qualification_source_catalog_sha256":"{BACKEND_SHA_A}","hardware_evidence_sha256":"{BACKEND_SHA_B}","qualified_device_target":"{target}","qualified_driver_version":"305419896","correctness_matrix_sha256":"{BACKEND_SHA_A}","correctness_receipts_sha256":"{BACKEND_SHA_B}"}}"#
+    );
+    let catalog = parse_model_catalog(
+        &catalog_json_with_backends(&vulkan_backend_with_activation(&activated)),
+        "fixture",
+    )
+    .expect("canonical Vulkan capability class");
+    assert_eq!(catalog.backends[0].targets, Vec::<String>::new());
+    assert_eq!(
+        catalog.backends[0]
+            .activation
+            .qualified_device_target
+            .as_deref(),
+        Some(target)
+    );
+
+    for invalid in [
+        "vk_uuid_0123456789abcdef0123456789abcdef",
+        "vk_caps_1002_744c_0123456789abcdef0123456789abcdef",
+        "vk_caps_00001002_0000744c_0123456789ABCDEF0123456789ABCDEF",
+    ] {
+        let invalid_activation = activated.replace(target, invalid);
+        let error = parse_model_catalog(
+            &catalog_json_with_backends(&vulkan_backend_with_activation(&invalid_activation)),
+            "fixture",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("invalid qualified target/driver identity"),
+            "{error}"
+        );
+    }
 }
 
 #[test]

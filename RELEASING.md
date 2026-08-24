@@ -96,100 +96,101 @@ No pre-release channels: the core releases plain `X.Y.Z` versions only.
 
 `workflow_dispatch` on the `Release core` workflow performs the same
 resolve-and-release for the version currently on `main`. It can create a
-missing draft, but an already-existing draft is an intentional no-op; recover
-failed matrix legs through the `Release binaries` workflow below rather than
-starting a competing second orchestrator.
+missing draft. After the generated PublishedInert catalog has been reviewed,
+signed, committed, and pushed, dispatching it again runs the pre-publication
+family gate and catalog deployment for that same draft. Failed build or
+aggregation jobs are recovered only with GitHub's **Re-run failed jobs** on the
+original release run, which preserves its exact tag/source/artifact lineage.
 
 `workflow_dispatch` on `Release binaries` (`.github/workflows/release-binaries.yml`)
-independently rebuilds/re-uploads the full matrix for an existing tag: pass
-`ref: vX.Y.Z` to target it, or `dry_run: true` to exercise the tag-resolution,
-upload, and completeness-gate logic without mutating the release's assets
-(the completeness check still runs and will fail loudly if that release is
-genuinely incomplete -- that failure is expected and informative, not a bug
-in the dry run).
+is diagnostic-only: `only_target` is mandatory and the run may publish only an
+Actions artifact for that one matrix row. It cannot aggregate or attest a
+release subject set and cannot upload, replace, or delete either draft or
+public GitHub Release assets. Full release assembly is available only through
+the `formal_release` capability declared on `workflow_call` and supplied by
+`Release core`.
 
 The core GitHub Release is created as a **draft**. This is load-bearing for the
-Windows plugin topology: CUDA/HIP payload hashes exist only after the release
+Windows plugin topology: provider payload hashes exist only after the release
 matrix has built them, while the neutral host resolves those hashes from the
 production-signed catalog. Core 0.1.34 and later publish no legacy whole-engine
-Windows sidecars and no per-release `backends-manifest.json`. A draft is not
-made public until the signed catalog distribution plane is complete:
+Windows sidecars and no per-release `backends-manifest.json`.
 
-1. Attach `backend-hardware-evidence-*.json` receipts for every provider that is
-   intended to become runtime-selectable. Schema v1 approves only the exact
-   tested target; schema v2 may approve an explicit provider matrix. Placement
-   and resource evidence remains separate from model token correctness. For
-   0.1.36, produce schema v2 with
-   `tooling/release-manifest/generate_backend_hardware_evidence.py` and attach
-   both its `backend-hardware-evidence-*.json` summary and separately named
-   `backend-hardware-audit-*.json` raw audit. The runner verifies every release
-   subject against `SHA256SUMS` and GitHub build provenance, proves the executed
-   binary and its complete companion-file tree match the neutral release ZIP,
-   restricts the local preview catalog to exact file-URL substitutions from the
-   attested candidate, cryptographically preflights its local-dev signature in
-   a fresh empty home, checks the evidence-home cache is the same signed pair,
-   and checks the model pack against that candidate. It owns at least five fresh
-   child processes, checks the exact activation before
-   and after each child, and binds each raw receipt to a unique nonce. Model and
-   audio inputs are content-hash bound but are not release subjects. The
-   summary's `evidence_sha256` is the
-   canonical raw-audit digest. The v0.1.36 tag gate validates the schema-v2
-   summary and provider matrix; it does not parse the raw audit, which must be
-   downloaded and independently checked before catalog publication. A future
-   release may make that binding part of the tag-integrated schema. A
-   provider-matrix receipt is compatibility policy, not a claim that every GPU
-   ran. Building a target, copying one receipt five times, scheduler/hybrid
-   execution, or CPU/other-provider compute is rejected.
-2. Attach exactly one projected `gpu-correctness-matrix.v1.json`, canonical source
-   snapshots, immutable `gpu-correctness-receipt-*.json` files, and the actual
-   `gpu-correctness-trace-*.jsonl` artifacts. Generate the projection from the
-   candidate architecture inventory, staging model catalog, and staging backend
-   catalog, and bind the candidate release subject/core commit, binary/plugin,
-   pack, fixture, and catalog digests into every receipt. The validator
-   re-hashes the source snapshots and trace contents and re-projects the matrix;
-   a copied or partial JSON receipt cannot pass. The matrix requires separate
-   build/packaging, placement/resource, and token/transcript evidence for every
-   concrete family/model/quant/topology/provider/placement/capture/scheduler/
-   kernel bucket and cold/reuse mode. A missing, stale, wrong-artifact,
-   placement-only, CPU-only, or partial matrix fails the finalizer.
-3. The only catalog deployment entrypoint is the reusable
-   `.github/workflows/deploy-catalog.yml` called by the release orchestrator.
-   It has no `push: branches: [main]` trigger, downloads candidate catalog and
-   correctness artifacts, verifies their hashes/provenance/content, runs the
-   correctness gate, and deploys the candidate catalog only after that gate.
-4. Before catalog activation, call the reusable pre-publication contract in
-   `.github/workflows/family-regression.yml` with the immutable candidate CLI,
-   staging catalog, and correctness-matrix artifacts. Its existing release and
-   nightly jobs remain CPU-only post-release monitoring.
-4. Run `scripts/sync-windows-backend-cdn.sh vX.Y.Z` locally with the B2
-   release credentials. It copies the hardware-approved plugin and vendor
-   files to `https://dl.openasr.org/core/vX.Y.Z/`. The signed catalog's
-   `files[].url` values point only at this prefix; GitHub release mirrors are
-   not a runtime download fallback.
-5. Run `scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z` locally with
-   the production catalog signing seed. It downloads and hashes all 6 CUDA and
-   14 HIP build artifacts, but merges only the target entries approved by those
-   receipts. Before touching the catalog it verifies that every selected CDN
-   payload is already live, then bumps the epoch and signs the full/public
-   catalogs. Review, commit, and push those catalog files.
-6. Invoke the reusable `deploy-catalog.yml` workflow from the release
-   orchestrator with the candidate public catalog/signature, correctness matrix,
-   canonical source snapshots, receipts, and trace artifact names. It downloads
-   and validates those exact artifacts, then deploys the public catalog only
-   after correctness and released-binary compatibility gates pass. Record its
-   successful run id as `OPENASR_DEPLOY_CATALOG_RUN_ID`.
-7. Wait for the no-credential CDN gate and prove the signed public bytes are
-   live. Metadata is never deployed ahead of its immutable payloads.
-8. Run `scripts/finalize-core-release.sh vX.Y.Z` with
-   `OPENASR_DEPLOY_CATALOG_RUN_ID` set. The finalizer refuses to publish the
-   GitHub draft unless that reusable deploy run succeeded, the live signed
-   catalog target set equals the hardware-approved subset, and every signed CDN
-   URL for that version is live.
+Artifact publication and runtime capability activation are separate. A signed
+provider pack may be public as `PublishedInert`, but ordinary Auto and explicit
+selection reject it. Real-hardware evidence can therefore test the exact public
+bytes without exposing an unqualified provider to users.
 
-None of these scripts publishes code or a catalog implicitly. A failure leaves
-the release draft and therefore unavailable to users. Publishing the GitHub
-release triggers `publish-core-channels.yml`, which moves Docker/Homebrew only
-after the canonical catalog/CDN plane is complete.
+### Publish the inert release bytes
+
+1. Let `Release core` create the draft and let its single formal
+   `release-binaries.yml` call build and checksum the complete release matrix,
+   sign the applicable Windows binaries, and attest the full subject set. Do not
+   use the diagnostic one-target dispatch to assemble or mutate a release.
+2. Run `scripts/sync-windows-backend-cdn.sh vX.Y.Z` locally with the B2 release
+   credentials. It verifies and copies every file declared by the 1 Vulkan, 6
+   CUDA, and 14 HIP release entries to
+   `https://dl.openasr.org/core/vX.Y.Z/`. GitHub is the provenance mirror, not a
+   runtime download fallback.
+3. Run `scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z` locally with
+   the production catalog signing seed. It verifies all 21 exact entries and
+   their already-live CDN bytes, merges every entry as `PublishedInert`, bumps
+   the epoch, and signs the full/public catalogs. It consumes no hardware or
+   token-correctness receipt. Review, commit, and push the five catalog/epoch
+   files.
+4. Dispatch `Release core` again. Its reusable pre-publication family contract
+   verifies the immutable draft CLI and runs the real-pack CPU family gate. The
+   orchestrator then calls the sole deployment entrypoint,
+   `.github/workflows/deploy-catalog.yml`, with
+   `activation_transition: published-inert`. The deploy job checks the signed
+   catalog, CDN payloads, and released-binary compatibility before writing it.
+5. Record the successful orchestrator run id as
+   `OPENASR_DEPLOY_CATALOG_RUN_ID`, wait until the no-credential catalog/CDN
+   checks see the committed bytes, and run
+   `scripts/finalize-core-release.sh vX.Y.Z`. The finalizer binds the exact tag,
+   source commit, deploy run, catalog SHA, signature SHA, release subjects, and
+   live CDN bytes before removing the GitHub draft flag.
+
+Publishing the release triggers `publish-core-channels.yml`, which moves
+Docker/Homebrew only after the canonical catalog/CDN plane is complete. Any
+failure in this pre-publication sequence leaves the GitHub release as a draft.
+
+### Qualify and activate one exact backend after publication
+
+1. Dispatch `.github/workflows/qualify-windows-backend.yml` on the exact release
+   tag (`--ref vX.Y.Z`) for one `(provider, device_target, backend_id, model_id,
+   quant)` cell. The workflow accepts only an already-public stable release and
+   re-hashes every executed release subject against `SHA256SUMS` and build
+   provenance.
+2. The qualification workflow emits separately attested placement/resource
+   evidence (`backend-hardware-evidence-*.json` plus its raw audit) and
+   token/transcript evidence (the projected matrix, receipts, and traces). It
+   proves the exact provider, target, backend id, artifact tree, pack, fixture,
+   driver, FullDevice placement, cold/reuse behavior, and fresh-process nonces.
+   It never edits a release or catalog and never grants runtime authority.
+3. Once the run ids cover every required matrix cell for that exact backend,
+   run `scripts/activate-windows-backend-catalog-release.sh vX.Y.Z BACKEND_ID
+   RUN_ID...` locally with the production signing seed. The script independently
+   authenticates and replays `PublishedInert -> Qualified -> Activated`, verifies
+   the intermediate Qualified projection, and signs one new reviewed catalog
+   epoch. A separate public Qualified epoch is not required.
+4. Review, commit, and push the catalog/epoch files, then dispatch
+   `.github/workflows/activate-backend-catalog.yml` with those run ids and the
+   exact authorization text `activate:<backend_id>`. The reusable deploy workflow
+   replays both gates before deployment; qualification success alone cannot
+   activate anything.
+5. To fail safe, prepare a one-way exact-backend revocation with
+   `scripts/revoke-windows-backend-catalog-release.sh`, then dispatch
+   `.github/workflows/revoke-backend-catalog.yml` with
+   `revoke:<backend_id>`. Revocation preserves old bindings for audit and cannot
+   activate another backend as a side effect.
+
+Hardware qualification is exact-target and exact-backend scoped: an `sm_89`
+receipt cannot approve `sm_75`, a HIP/Vulkan/CPU result cannot approve CUDA, and
+placement evidence cannot replace token correctness. A failed post-publication
+qualification leaves the release public but the provider inert and unselectable.
+See `tooling/release-manifest/README.md` for the two gate authorities and local
+validation commands.
 
 ## Legacy backends manifests
 

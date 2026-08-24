@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copy hardware-approved Windows CUDA/HIP release bytes to
+# Copy every signed Windows CUDA/HIP/Vulkan provider byte to
 # https://dl.openasr.org/core/vX.Y.Z/.
 #
 # The signed catalog's files[].url values point only at this prefix. GitHub
@@ -48,40 +48,18 @@ trap 'rm -rf "$workdir"' EXIT
 echo "==> downloading backend entries for ${tag}"
 gh release download "$tag" \
   -p 'backend-pack-*.json' \
-  -p 'backend-hardware-evidence-*.json' \
   -D "$workdir" --clobber
 
 shopt -s nullglob
 backend_entries=("$workdir"/backend-pack-*.json)
-hardware_evidence=("$workdir"/backend-hardware-evidence-*.json)
 cuda_entries=("$workdir"/backend-pack-cuda-sm_*.json)
 hip_entries=("$workdir"/backend-pack-hip-gfx*.json)
-if [ "${#cuda_entries[@]}" -ne 6 ] || [ "${#hip_entries[@]}" -ne 14 ] || [ "${#backend_entries[@]}" -ne 20 ]; then
-  fail "release ${tag} must contain exactly 6 CUDA SM and 14 HIP gfx backend-pack metadata files"
+vulkan_entries=("$workdir"/backend-pack-vulkan-generic.json)
+if [ "${#cuda_entries[@]}" -ne 6 ] || [ "${#hip_entries[@]}" -ne 14 ] || [ "${#vulkan_entries[@]}" -ne 1 ] || [ "${#backend_entries[@]}" -ne 21 ]; then
+  fail "release ${tag} must contain 1 Vulkan, 6 CUDA SM, and 14 HIP gfx backend-pack metadata files"
 fi
-all_backend_entry_args=()
-for entry in "${backend_entries[@]}"; do
-  all_backend_entry_args+=(--entry "$entry")
-done
-[ "${#hardware_evidence[@]}" -gt 0 ] \
-  || fail "release ${tag} has no real-hardware backend evidence"
-hardware_evidence_args=()
-for evidence in "${hardware_evidence[@]}"; do
-  hardware_evidence_args+=(--evidence "$evidence")
-done
-python3 tooling/release-manifest/backend_hardware_evidence.py \
-  "${all_backend_entry_args[@]}" "${hardware_evidence_args[@]}" \
-  > "$workdir/hardware-approved-entries.txt"
-approved_entries=()
-while IFS= read -r line || [ -n "$line" ]; do
-  [ -n "$line" ] || continue
-  approved_entries+=("$line")
-done < <(tr -d '\r' < "$workdir/hardware-approved-entries.txt")
-[ "${#approved_entries[@]}" -gt 0 ] \
-  || fail "release ${tag} has no backend entry approved by hardware evidence"
-
-echo "==> downloading approved release bytes"
-python3 - "$workdir" "${approved_entries[@]}" <<'PY'
+echo "==> downloading all signed release bytes (qualification remains separate)"
+python3 - "$workdir" "${backend_entries[@]}" <<'PY'
 import hashlib
 import json
 import subprocess
@@ -125,7 +103,7 @@ print(f"verified {len(downloaded)} unique files", file=sys.stderr)
 PY
 
 sync_files=()
-python3 - "$workdir" "${approved_entries[@]}" <<'PY' > "$workdir/sync-files.txt"
+python3 - "$workdir" "${backend_entries[@]}" <<'PY' > "$workdir/sync-files.txt"
 import json
 import sys
 from pathlib import Path
@@ -145,12 +123,12 @@ while IFS= read -r line || [ -n "$line" ]; do
   [ -n "$line" ] || continue
   sync_files+=("$line")
 done < "$workdir/sync-files.txt"
-[ "${#sync_files[@]}" -gt 0 ] || fail "no approved files to upload"
+[ "${#sync_files[@]}" -gt 0 ] || fail "no signed backend files to upload"
 
 echo "==> uploading ${#sync_files[@]} objects to core/v${version}/"
 python3 tooling/release-manifest/b2_sync.py sync --version "$version" "${sync_files[@]}"
 
-python3 - "$workdir" "$version" "${approved_entries[@]}" <<'PY'
+python3 - "$workdir" "$version" "${backend_entries[@]}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -168,6 +146,7 @@ PY
 
 echo
 echo "BACKEND-CDN-SYNCED for ${tag}"
-echo "  uploaded ${#sync_files[@]} hardware-approved objects to https://dl.openasr.org/core/v${version}/"
+echo "  uploaded ${#sync_files[@]} signed objects to https://dl.openasr.org/core/v${version}/"
+echo "  runtime-selectable entries: 0 (hardware/token qualification is post-publication)"
 echo "  next: load the production catalog signing seed and run:"
 echo "    scripts/prepare-windows-backend-catalog-release.sh ${tag}"

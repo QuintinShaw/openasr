@@ -1,0 +1,64 @@
+name: Revoke backend catalog
+
+# Emergency/maintenance fail-safe transition. Revocation never runs from a
+# qualification result and cannot activate another backend as a side effect.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Published release containing the backend bytes"
+        required: true
+        type: string
+      backend_id:
+        description: "Exact signed backend id to revoke"
+        required: true
+        type: string
+      authorization:
+        description: "Type revoke:<backend_id>"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  attestations: read
+  contents: read
+
+concurrency:
+  group: revoke-backend-catalog
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    if: github.repository == 'QuintinShaw/openasr'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require one explicit backend-scoped revocation
+        env:
+          BACKEND_ID: ${{ inputs.backend_id }}
+          AUTHORIZATION: ${{ inputs.authorization }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = "refs/heads/main" ] || {
+            echo "backend revocation may run only from protected main" >&2; exit 1;
+          }
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$BACKEND_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$ ]]
+          [ "$AUTHORIZATION" = "revoke:${BACKEND_ID}" ] || {
+            echo "authorization must equal revoke:${BACKEND_ID}" >&2; exit 1;
+          }
+
+  deploy:
+    needs: authorize
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    uses: ./.github/workflows/deploy-catalog.yml
+    with:
+      orchestrator_run_id: ${{ github.run_id }}
+      release_tag: ${{ inputs.release_tag }}
+      activation_transition: revoked
+      backend_id: ${{ inputs.backend_id }}
+    secrets: inherit

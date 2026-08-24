@@ -406,11 +406,29 @@ impl EnumeratedComputeDevice {
 pub fn enumerate_compute_devices_from_ggml(
     devices: &[GgmlBackendDevice],
 ) -> Vec<EnumeratedComputeDevice> {
+    let activated_provider = crate::ggml_runtime::activated_backend_execution_provider();
     devices
         .iter()
         .enumerate()
         .map(|(registry_ordinal, device)| enumerated_from_ggml_device(registry_ordinal, device))
+        .filter(|device| {
+            provider_is_runtime_activatable(
+                device.provider,
+                activated_provider,
+                cfg!(target_os = "windows"),
+            )
+        })
         .collect()
+}
+
+fn provider_is_runtime_activatable(
+    provider: ExecutionProvider,
+    activated_provider: Option<ExecutionProvider>,
+    require_signed_activation: bool,
+) -> bool {
+    provider == ExecutionProvider::Cpu
+        || !require_signed_activation
+        || activated_provider == Some(provider)
 }
 
 fn enumerated_from_ggml_device(
@@ -1000,5 +1018,34 @@ mod tests {
             Some(ExecutionHardwareVendor::Amd)
         );
         assert_eq!(inventory[1].hardware_vendor, None);
+    }
+
+    #[test]
+    fn signed_activation_policy_hides_all_unactivated_windows_gpu_routes() {
+        assert!(provider_is_runtime_activatable(
+            ExecutionProvider::Cpu,
+            None,
+            true
+        ));
+        assert!(!provider_is_runtime_activatable(
+            ExecutionProvider::Vulkan,
+            None,
+            true
+        ));
+        assert!(!provider_is_runtime_activatable(
+            ExecutionProvider::Vulkan,
+            Some(ExecutionProvider::Cuda),
+            true
+        ));
+        assert!(provider_is_runtime_activatable(
+            ExecutionProvider::Cuda,
+            Some(ExecutionProvider::Cuda),
+            true
+        ));
+        assert!(provider_is_runtime_activatable(
+            ExecutionProvider::Vulkan,
+            None,
+            false
+        ));
     }
 }

@@ -8,9 +8,9 @@ name: Family Regression
 # Nightly and published-release jobs remain CPU-only/post-release monitoring.
 # They cannot authorize catalog or release activation. The reusable
 # `workflow_call` with `pre_publication: true` is the candidate blocker:
-# release-core must call it with immutable candidate, staging-catalog, and
-# correctness-matrix artifacts before deploy-catalog. The finalizer also
-# consumes the same bound matrix before flipping a draft public.
+# release-core must call it with immutable candidate and staging-catalog bytes
+# before deploying the PublishedInert catalog. GPU correctness is a separate,
+# post-publication exact-target activation gate.
 
 on:
   # This reusable entrypoint is the pre-publication contract seam. The release
@@ -22,16 +22,8 @@ on:
         description: "Require a release-candidate family regression contract"
         required: true
         type: boolean
-      candidate_cli_artifact:
-        description: "Artifact name containing the immutable candidate CLI"
-        required: false
-        type: string
-      staging_catalog_artifact:
-        description: "Artifact name containing the staging catalog snapshot"
-        required: false
-        type: string
-      correctness_matrix_artifact:
-        description: "Artifact name containing the projected correctness matrix"
+      release_tag:
+        description: "Exact draft/public vX.Y.Z release whose CLI is under test"
         required: false
         type: string
   workflow_dispatch:
@@ -63,43 +55,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Download immutable candidate inputs
-        uses: actions/download-artifact@v8
-        with:
-          pattern: ${{ inputs.candidate_cli_artifact }}
-          merge-multiple: true
-          path: staging/candidate
-      - name: Download staging catalog and correctness matrix
-        uses: actions/download-artifact@v8
-        with:
-          pattern: ${{ inputs.staging_catalog_artifact }}
-          merge-multiple: true
-          path: staging/catalog
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: ${{ inputs.correctness_matrix_artifact }}
-          merge-multiple: true
-          path: staging/correctness
-      - name: Verify artifact contents and provenance before family work
+      - name: Verify exact draft CLI provenance and committed staging catalog
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
-          candidate="$(find staging/candidate -type f -perm -111 -print -quit)"
-          catalog="$(find staging/catalog -type f -name 'catalog.json' -print -quit)"
-          matrix="$(find staging/correctness -type f -name 'gpu-correctness-matrix.v1.json' -print -quit)"
-          test -n "$candidate" -a -n "$catalog" -a -n "$matrix"
-          sha256sum "$candidate" "$catalog" "$matrix"
-          python3 - "$catalog" "$matrix" <<'PY'
-          import json, pathlib, sys
-          for raw in sys.argv[1:]:
-              value = json.loads(pathlib.Path(raw).read_text())
-              assert isinstance(value, dict), raw
-          PY
-          gh attestation verify "$candidate" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-binaries.yml" || {
-            echo "candidate CLI has no verifiable provenance" >&2; exit 1;
-          }
-          echo "immutable candidate, staging catalog, and matrix contents verified"
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          version="${RELEASE_TAG#v}"
+          mkdir -p staging/candidate
+          asset="openasr-${version}-linux-x86_64.tar.gz"
+          gh release download "$RELEASE_TAG" -p "$asset" -p SHA256SUMS -D staging/candidate
+          python3 tooling/release-manifest/release_asset_verifier.py \
+            --asset "staging/candidate/$asset" --checksums staging/candidate/SHA256SUMS
+          git fetch --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          source_digest="$(git rev-parse "${RELEASE_TAG}^{}")"
+          gh attestation verify "staging/candidate/$asset" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-binaries.yml" \
+            --source-digest "$source_digest"
+          python3 -m json.tool model-registry/catalog.json >/dev/null
+          sha256sum model-registry/catalog.json model-registry/catalog.signature.json
+          echo "exact release CLI and committed staging catalog verified"
 
   build-cli-linux:
     name: Build CLI (ubuntu-latest)
@@ -121,7 +98,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ASSET_SUFFIX: linux-x86_64
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
         run: |
           set -uo pipefail
           available=false
@@ -203,7 +180,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ASSET_SUFFIX: macos-arm64
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
         run: |
           set -uo pipefail
           available=false

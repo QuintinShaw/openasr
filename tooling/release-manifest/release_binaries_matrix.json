@@ -41,10 +41,20 @@
     "asset": "windows-x86_64-neutral",
     "binary_name": "openasr.exe",
     "archive_ext": "zip",
-    "features": "vulkan",
-    "provider": "vulkan",
     "distribution": "host",
     "timeout": 120
+  },
+  {
+    "os": "windows-latest",
+    "target": "x86_64-pc-windows-msvc-vulkan-generic-plugin",
+    "asset": "windows-x86_64-vulkan-generic-plugin",
+    "binary_name": "openasr.exe",
+    "archive_ext": "dll",
+    "features": "vulkan",
+    "provider": "vulkan",
+    "distribution": "plugin",
+    "vendor_owner": true,
+    "timeout": 180
   },
   {
     "os": "windows-2022",

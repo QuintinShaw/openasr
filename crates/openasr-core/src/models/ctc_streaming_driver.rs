@@ -8,7 +8,6 @@
 
 use std::time::Instant;
 
-use crate::ggml_runtime::install_request_backend_override;
 use crate::models::ctc_greedy_decode::CtcGreedyDecodeResult;
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionResult, GgmlAsrExecutionViewRequest,
@@ -74,6 +73,8 @@ where
     // the session request, not a thread-local): every per-frame request this
     // driver builds for the life of the session copies it in directly.
     let resolved_runtime = request.resolved_runtime;
+    let partial_execution_lane = request.execution_lane.clone();
+    let partial_request_lane = partial_execution_lane.clone();
     let make_request =
         move |audio: &GgmlAsrPreparedAudioView<'static>| GgmlAsrExecutionViewRequest {
             execution_services: std::sync::Arc::clone(&partial_execution_services),
@@ -90,11 +91,14 @@ where
             // transcription id) -- an uncancellable context is a real,
             // well-formed context that simply has no other holder, not an
             // omitted one.
-            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
-                "per-frame streaming partial decode: this request type carries no \
-             execution-context field of its own yet, and a live session ends by the \
-             caller dropping it rather than canceling a transcription id",
-            )),
+            execution_context: std::sync::Arc::new(
+                crate::RequestExecutionContext::uncancellable(
+                    "per-frame streaming partial decode: this request type carries no \
+                     execution-context field of its own yet, and a live session ends by the \
+                     caller dropping it rather than canceling a transcription id",
+                )
+                .with_native_execution_lane(partial_request_lane.clone()),
+            ),
         };
 
     let partial_executor = executor.clone();
@@ -103,16 +107,13 @@ where
             crate::models::native_execution_services::install_native_execution_services(
                 partial_decode_execution_services.as_ref(),
             );
+        let _resolved_lane =
+            crate::models::native_execution_services::install_resolved_execution_lane(
+                partial_execution_lane.clone(),
+            );
         let _thread_override = install_request_inference_threads_override(inference_threads);
-        // This closure calls the per-family decode fn directly instead of
-        // going through GgmlAsrExecutionDispatch::execute_view, so the request's
-        // backend_preference must be installed here or an explicit
-        // CpuOnly/Accelerated choice is silently dropped for streaming
-        // partials by the few remaining thread-local readers unrelated to
-        // this driver's own resolved backend (already carried on
-        // `make_request`'s `resolved_runtime` field above).
-        let _backend_override =
-            install_request_backend_override(backend_preference.request_backend_override());
+        // This closure bypasses dispatch. The exact lane above, not the coarse
+        // request preference, remains authoritative for every TLS reader.
         partial_decode(&partial_executor, &make_request(audio))
     });
 
@@ -124,6 +125,8 @@ where
     let selected_family = request.selected_family.clone();
     let request_options = request.request_options.clone();
     let backend_preference = request.backend_preference;
+    let final_execution_lane = request.execution_lane.clone();
+    let final_request_execution_lane = final_execution_lane.clone();
     let make_final_request =
         move |audio: &GgmlAsrPreparedAudioView<'static>| GgmlAsrExecutionViewRequest {
             execution_services: std::sync::Arc::clone(&final_execution_services),
@@ -138,20 +141,25 @@ where
             // execution-context field on this request type yet, and a live
             // session ends by the caller dropping it rather than canceling a
             // transcription id.
-            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
-                "per-frame streaming final decode: this request type carries no \
-             execution-context field of its own yet, and a live session ends by the \
-             caller dropping it rather than canceling a transcription id",
-            )),
+            execution_context: std::sync::Arc::new(
+                crate::RequestExecutionContext::uncancellable(
+                    "per-frame streaming final decode: this request type carries no \
+                     execution-context field of its own yet, and a live session ends by the \
+                     caller dropping it rather than canceling a transcription id",
+                )
+                .with_native_execution_lane(final_request_execution_lane.clone()),
+            ),
         };
     let final_transcribe = Box::new(move |audio: &GgmlAsrPreparedAudioView<'static>| {
         let _execution_scope =
             crate::models::native_execution_services::install_native_execution_services(
                 final_decode_execution_services.as_ref(),
             );
+        let _resolved_lane =
+            crate::models::native_execution_services::install_resolved_execution_lane(
+                final_execution_lane.clone(),
+            );
         let _thread_override = install_request_inference_threads_override(inference_threads);
-        let _backend_override =
-            install_request_backend_override(backend_preference.request_backend_override());
         final_decode(&final_executor, &make_final_request(audio)).map(|result| result.transcription)
     });
 
@@ -504,7 +512,10 @@ mod tests {
                 configured_diarize: false,
                 backend_preference,
                 resolved_runtime,
-                execution_lane: None,
+                execution_lane:
+                    crate::models::native_execution_services::current_execution_lane_key(
+                        resolved_runtime.backend(),
+                    ),
                 final_text_processor: None,
                 session_context: crate::NativeAsrSessionContext::new(
                     "rt_ctc_backend_override_test",
@@ -523,10 +534,17 @@ mod tests {
         // from the request's architecture-declared `AutoGpuPolicy`.
         fn observed_backend_during_partial_decode(
             backend_preference: crate::GgmlAsrBackendPreference,
-        ) -> (Option<RequestBackendPreference>, GgmlCpuGraphBackend) {
+        ) -> GgmlCpuGraphBackend {
             let request = session_request(backend_preference);
+            let expected_lane = request.execution_lane.clone();
             let observed: Arc<
-                Mutex<Option<(Option<RequestBackendPreference>, GgmlCpuGraphBackend)>>,
+                Mutex<
+                    Option<(
+                        Option<RequestBackendPreference>,
+                        GgmlCpuGraphBackend,
+                        Option<crate::models::native_execution_services::ExecutionLaneKey>,
+                    )>,
+                >,
             > = Arc::new(Mutex::new(None));
             let observed_for_decode = Arc::clone(&observed);
             let mut driver = build_ctc_streaming_driver(
@@ -539,6 +557,7 @@ mod tests {
                     *observed_for_decode.lock().unwrap() = Some((
                         crate::ggml_runtime::request_backend_override(),
                         _request.resolved_runtime.backend(),
+                        _request.execution_context.native_execution_lane().cloned(),
                     ));
                     Ok(ctc_result("", 0))
                 },
@@ -559,11 +578,17 @@ mod tests {
                 },
             );
             driver.warm_up().expect("warm up should decode once");
-            observed
+            let (backend_override, backend, execution_lane) = observed
                 .lock()
                 .unwrap()
                 .take()
-                .expect("partial decode closure should have run")
+                .expect("partial decode closure should have run");
+            assert_eq!(execution_lane, Some(expected_lane.clone()));
+            assert_eq!(
+                backend_override,
+                Some(expected_lane.request_backend_preference())
+            );
+            backend
         }
 
         // Auto: no override installed. wav2vec2-ctc's policy is `AllBackends`
@@ -572,18 +597,16 @@ mod tests {
         // fixed value, since this dev machine's own GPU availability decides
         // what "generic Auto" picks.
         let expected_auto_backend = GgmlCpuGraphConfig::runtime_default().backend;
-        let (auto_override, auto_backend) =
+        let auto_backend =
             observed_backend_during_partial_decode(crate::GgmlAsrBackendPreference::Auto);
-        assert_eq!(auto_override, None);
         assert_eq!(auto_backend, expected_auto_backend);
 
         // Explicit Accelerated: the partial_transcribe closure must install
         // the override itself, so the resolved input reflects Accelerated
         // instead of silently falling back to whatever Auto would have
         // picked.
-        let (accel_override, accel_backend) =
+        let accel_backend =
             observed_backend_during_partial_decode(crate::GgmlAsrBackendPreference::Accelerated);
-        assert_eq!(accel_override, Some(RequestBackendPreference::Accelerated));
         assert_ne!(accel_backend, GgmlCpuGraphBackend::Cpu);
     }
 }

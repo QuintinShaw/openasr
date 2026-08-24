@@ -82,6 +82,12 @@ pub(crate) fn activate_default_model_blocking(
                 .to_string(),
         ));
     }
+    // Bridge the entire candidate transaction across verification, warmup,
+    // durable commit, and live publication. The idle reaper serializes its
+    // exclusive teardown claim against this guard, so it cannot evict the
+    // candidate after attestation but before publication.
+    let _activation_activity =
+        (runtime.backend == BackendKind::Native).then(NativeActivityGuard::enter);
 
     runtime
         .model_pack_path
@@ -246,6 +252,11 @@ impl NativeActivationStagedOwner {
         if self.runtime.backend != BackendKind::Native {
             return Ok(());
         }
+        crate::idle_activity::forget_native_model_residency(
+            &crate::idle_activity::NativeRuntimeResidencyKey::attested(
+                self.candidate_content_id.clone(),
+            ),
+        );
         if self.previous_path.as_deref() == Some(self.candidate_path.as_path()) {
             return Ok(());
         }
@@ -331,9 +342,17 @@ impl
             .model_pack_path
             .inject_activation_failure(ModelActivationFailpoint::FirstComputeAttestation)
             .map_err(|error| openasr_core::AttestationFailure::Rejected(error.to_string()))?;
+        // The candidate warmup must run *in* the replacement generation.
+        // Advancing after warmup would instantly stale both its worker TLS and
+        // its exact resident marker, causing a duplicate first-request warmup
+        // and a false `/health.model_resident=false` after a valid commit.
+        crate::idle_activity::advance_native_runtime_generation();
         let probe = crate::realtime::probe_native_activation_blocking(
             self.runtime.clone(),
-            Some(self.identity.path().to_path_buf()),
+            Some(crate::realtime::NativeWarmupTarget::attested(
+                self.identity.path().to_path_buf(),
+                self.identity.pack_content_id(),
+            )),
             Some(self.home.clone()),
             Some(self.reservation_context),
         )

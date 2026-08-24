@@ -12,8 +12,8 @@ pub(super) fn print_runtime_doctor() {
 
 fn print_ggml_runtime_doctor() {
     match openasr_core::bundled_backend_activation_status() {
-        Ok(()) => println!("  - bundled CPU/Vulkan modules: verified"),
-        Err(error) => println!("  - bundled CPU/Vulkan modules: unavailable ({error})"),
+        Ok(()) => println!("  - bundled CPU module: verified"),
+        Err(error) => println!("  - bundled CPU module: unavailable ({error})"),
     }
     match openasr_core::backend_plugin_activation_status() {
         Ok(Some(backend_id)) => println!("  - optional backend plugin: active ({backend_id})"),

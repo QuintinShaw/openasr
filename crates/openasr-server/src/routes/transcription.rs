@@ -2208,7 +2208,7 @@ pub(crate) async fn transcribe_with_runtime(
         }
         BackendKind::Native => {
             tokio::task::spawn_blocking(move || {
-                let model_pack_path = runtime.model_pack_path.current().ok_or_else(|| {
+                let active_model = runtime.model_pack_path.current_snapshot().ok_or_else(|| {
                     ApiError::Backend(openasr_core::BackendError::NativeModelPackPathRejected {
                         reason: format!(
                             "Model '{}' is not installed. No models are installed on this server yet -- install one first (openasr pull {}, or via the model market).",
@@ -2216,6 +2216,7 @@ pub(crate) async fn transcribe_with_runtime(
                         ),
                     })
                 })?;
+                let model_pack_path = active_model.path().to_path_buf();
                 let adapter = native_runtime_model_adapter_for_path(&model_pack_path).ok_or_else(|| {
                     ApiError::Backend(openasr_core::BackendError::NativeFailClosed {
                         reason: "could not verify and select a native model adapter from the selected runtime source".to_string(),
@@ -2255,8 +2256,12 @@ pub(crate) async fn transcribe_with_runtime(
                 let model_session_key = native_model_session_key(&adapter)?;
                 let admission_wait_started = Instant::now();
                 crate::realtime::wait_while_native_warmup_in_flight_blocking();
-                let model_session_permit = runtime
-                    .acquire_native_execution(&model_session_key, resolved_route.as_ref());
+                let admitted_execution = runtime
+                    .acquire_native_execution_for_snapshot(
+                        &active_model,
+                        &model_session_key,
+                        resolved_route.as_ref(),
+                    );
                 let admission_wait_duration = admission_wait_started.elapsed();
                 openasr_core::stage_timing::log_stage(
                     "http_transcription",
@@ -2269,14 +2274,15 @@ pub(crate) async fn transcribe_with_runtime(
                         admission_wait_duration,
                     );
                 }
-                let model_session_permit = model_session_permit?;
+                let (model_session_permit, activity_guard) =
+                    admitted_execution?.into_parts();
                 let compute_started = Instant::now();
                 let compute_result = run_admitted_native_transcription(model_session_permit, move || {
-                    // Marks this offline (file-transcription / realtime-per-utterance
-                    // backend-job) decode as active for the whole synchronous run, so
-                    // the idle_unload reaper never evicts the model runtime cache out
-                    // from under it; dropped (any exit path) once the decode returns.
-                    let _activity_guard = NativeActivityGuard::enter();
+                    // Admission entered native activity atomically with the
+                    // active-snapshot check. Keep that guard alive through the
+                    // whole synchronous decode; the idle reaper cannot unload
+                    // either during setup or under this compute.
+                    let _activity_guard = activity_guard;
                     let mut request = request;
                     request.input_path = prepared.path().to_path_buf();
                     let word_timestamps = request.word_timestamps;
@@ -2348,7 +2354,9 @@ pub(crate) async fn transcribe_with_runtime(
                     // built (or reused) and actually ran, so this is the resident
                     // signal `/health`'s `model_resident` field reads -- see
                     // `idle_activity::native_model_is_resident`.
-                    crate::idle_activity::mark_native_model_warm();
+                    crate::idle_activity::mark_native_model_warm(
+                        active_model.residency_key(),
+                    );
                     if word_timestamps {
                         add_segment_word_timestamps(&mut transcription);
                     }

@@ -10,7 +10,7 @@ export type ComputeDevice = { id: string, name: string, meta: string, kind: stri
 /**
  * Typed provider identity of the concrete device behind this row. This
  * is independent from the coarse `accelerated` target and lets a shell
- * attest that a requested CUDA/HIP plugin actually loaded instead of
- * mistaking the bundled Vulkan rescue device for success.
+ * attest that the Activated-only optional provider actually loaded instead
+ * of mistaking an unactivated GPU device for activation success.
  */
 provider: string, memory: string | null, };

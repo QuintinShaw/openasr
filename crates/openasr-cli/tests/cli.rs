@@ -1331,9 +1331,15 @@ fn spawn_serve_with_extra_args_and_wait_until_listening(
     }
 }
 
-fn install_default_moonshine_pack(home: &Path) {
+fn install_default_fixture_pack(
+    home: &Path,
+    model_id: &str,
+    quant: &str,
+    suffix: &str,
+    spec: &TinyGgufFixtureSpec,
+) {
     let source = home.join("fixture-source.oasr");
-    write_moonshine_oasr_v1_fixture(&source, "moonshine-tiny");
+    write_tiny_gguf_runtime_source(&source, spec).expect("write installed-pack fixture");
     let bytes = std::fs::read(&source).expect("read installed-pack fixture");
     std::fs::remove_file(&source).expect("remove source after populating object store");
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
@@ -1344,18 +1350,18 @@ fn install_default_moonshine_pack(home: &Path) {
     std::fs::create_dir_all(object.parent().expect("object parent")).expect("create object store");
     std::fs::write(&object, &bytes).expect("write installed-pack object");
 
-    let reference = home.join("models/refs/moonshine-tiny/q8_0.json");
+    let reference = home.join(format!("models/refs/{model_id}/{quant}.json"));
     std::fs::create_dir_all(reference.parent().expect("reference parent"))
         .expect("create model reference directory");
     let pack = openasr_core::InstalledPack {
-        model_id: "moonshine-tiny".to_string(),
-        display_name: "Moonshine Tiny".to_string(),
-        quant: "q8_0".to_string(),
-        suffix: "q8".to_string(),
-        pull: "moonshine-tiny:q8".to_string(),
-        filename: "moonshine-tiny-q8_0.oasr".to_string(),
+        model_id: model_id.to_string(),
+        display_name: model_id.to_string(),
+        quant: quant.to_string(),
+        suffix: suffix.to_string(),
+        pull: format!("{model_id}:{suffix}"),
+        filename: format!("{model_id}-{quant}.oasr"),
         path: object,
-        url: "https://example.invalid/moonshine-tiny-q8_0.oasr".to_string(),
+        url: format!("https://example.invalid/{model_id}-{quant}.oasr"),
         hf_revision: "test".to_string(),
         sha256,
         size_bytes: bytes.len() as u64,
@@ -1370,11 +1376,31 @@ fn install_default_moonshine_pack(home: &Path) {
     openasr_core::save_config(
         home,
         &openasr_core::OpenAsrConfig {
-            default_model: Some("moonshine-tiny".to_string()),
+            default_model: Some(model_id.to_string()),
             ..Default::default()
         },
     )
     .expect("persist installed default model");
+}
+
+fn install_default_moonshine_pack(home: &Path) {
+    install_default_fixture_pack(
+        home,
+        "moonshine-tiny",
+        "q8_0",
+        "q8",
+        &TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready("moonshine-tiny"),
+    );
+}
+
+fn install_default_cohere_pack(home: &Path) {
+    install_default_fixture_pack(
+        home,
+        "cohere-restart",
+        "q4_0",
+        "q4",
+        &TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("cohere-restart"),
+    );
 }
 
 fn raw_http_request(addr: &str, request: &[u8]) -> String {
@@ -1387,6 +1413,26 @@ fn raw_http_request(addr: &str, request: &[u8]) -> String {
     let mut response = Vec::new();
     (&stream).read_to_end(&mut response).expect("read response");
     String::from_utf8_lossy(&response).into_owned()
+}
+
+fn wait_for_reactivated_health(addr: &str) -> Result<String, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let response = raw_http_request(
+            addr,
+            format!("GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+        );
+        if response.starts_with("HTTP/1.1 200")
+            && response.contains("\"model_installed\":true")
+            && response.contains("\"model_resident\":true")
+        {
+            return Ok(response);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(response);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 #[test]
@@ -1415,6 +1461,75 @@ fn serve_native_without_installed_model_starts_and_answers_health() {
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[test]
+fn committed_v2_reactivates_across_real_daemon_process_restarts() {
+    let temp = tempfile::tempdir().unwrap();
+    install_default_cohere_pack(temp.path());
+    let mut config = openasr_core::load_config_document(temp.path()).unwrap();
+    config.preferences.execution_target = openasr_core::ExecutionTarget::Cpu;
+    openasr_core::save_config_document(temp.path(), &config).unwrap();
+    let pack = openasr_core::list_installed_packs(temp.path())
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("installed restart fixture");
+    let verified = openasr_core::PackVerifier
+        .verify_candidate(openasr_core::PackCandidate::new(pack.path.clone()))
+        .expect("restart fixture must verify");
+    openasr_core::default_selection::persist_activation_detailed(
+        temp.path(),
+        &pack,
+        openasr_core::QuantPreference::pinned(&pack.quant),
+        verified.model_architecture(),
+        &openasr_core::device::execution_policy::ExecutionIntent::CpuOnly,
+    )
+    .expect("commit durable V2 fixture before process start");
+    let durable_before =
+        openasr_core::default_selection::read_active_model_selection_v2(temp.path()).unwrap();
+
+    // A crash may leave a private atomic-write staging file. Startup must
+    // ignore or safely clean it; it must never supersede the complete V2
+    // record. This deliberately uses the exact private staging-name grammar.
+    let orphan = temp.path().join(".openasr-a-b-c.tmp");
+    std::fs::write(&orphan, b"incomplete selection").unwrap();
+
+    for restart in 0..2 {
+        let (mut child, addr) = spawn_serve_and_wait_until_listening(temp.path());
+        let health = match wait_for_reactivated_health(&addr) {
+            Ok(health) => health,
+            Err(last_health) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let mut stderr = String::new();
+                if let Some(mut handle) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = handle.read_to_string(&mut stderr);
+                }
+                panic!(
+                    "durable V2 selection was not re-attested after restart {restart}; last health: {last_health}; stderr: {stderr}"
+                );
+            }
+        };
+        assert!(
+            health.contains("\"model_resident\":true"),
+            "restart {restart} published the selection without retaining its attested runtime: {health}"
+        );
+        assert_eq!(
+            openasr_core::default_selection::read_active_model_selection_v2(temp.path()).unwrap(),
+            durable_before,
+            "restart recovery must be read-only for the committed V2 record"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    assert_eq!(
+        openasr_core::default_selection::read_active_model_selection_v2(temp.path()).unwrap(),
+        durable_before,
+        "an orphan staging file must not become durable authority"
+    );
 }
 
 #[test]
@@ -2601,104 +2716,6 @@ fn doctor_marks_unknown_saved_default_backend_as_unknown() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Default backend: mokk (unknown)"));
-}
-
-// `__openasr-verify-backends-manifest` is the read-only counterpart to
-// `__openasr-sign-backends-manifest`, used as a post-release CI probe (see
-// tooling/release-manifest/README.md's "Signing" section and
-// .github/workflows/release-binaries.yml's verify-backends-manifest-signature
-// job). It has no local-dev key -- verification is hardcoded to the real
-// production trust root -- so these tests can only exercise the fail-closed
-// paths (a valid production signature can't be minted without the real seed,
-// which never lives in this repo or CI).
-
-fn write_probe_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, contents).expect("write probe fixture file");
-    path
-}
-
-#[test]
-fn verify_backends_manifest_rejects_a_missing_signature_file() {
-    let home = temp_home();
-    let manifest = write_probe_file(
-        home.path(),
-        "backends-manifest.json",
-        r#"{"schema_version":2,"core_version":"0.1.20"}"#,
-    );
-
-    openasr()
-        .arg("__openasr-verify-backends-manifest")
-        .arg(&manifest)
-        .arg("--signature")
-        .arg(home.path().join("backends-manifest.signature.json"))
-        .arg("--manifest-url")
-        .arg("https://dl.openasr.org/core/v0.1.20/backends-manifest.json")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "Could not read backends-manifest signature",
-        ));
-}
-
-#[test]
-fn verify_backends_manifest_rejects_a_malformed_signature_file() {
-    let home = temp_home();
-    let manifest = write_probe_file(
-        home.path(),
-        "backends-manifest.json",
-        r#"{"schema_version":2,"core_version":"0.1.20"}"#,
-    );
-    let signature = write_probe_file(home.path(), "backends-manifest.signature.json", "not json");
-
-    openasr()
-        .arg("__openasr-verify-backends-manifest")
-        .arg(&manifest)
-        .arg("--signature")
-        .arg(&signature)
-        .arg("--manifest-url")
-        .arg("https://dl.openasr.org/core/v0.1.20/backends-manifest.json")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "did not verify against the production trust root",
-        ));
-}
-
-#[test]
-fn verify_backends_manifest_rejects_a_signature_bound_to_a_different_url() {
-    let home = temp_home();
-    let manifest = write_probe_file(
-        home.path(),
-        "backends-manifest.json",
-        r#"{"schema_version":2,"core_version":"0.1.20"}"#,
-    );
-    // Well-formed shape but signed (nonsense value) for a different manifest
-    // URL than the one this probe expects -- must be rejected as a URL
-    // mismatch before any crypto check even runs, exactly the class of bug
-    // #145 fixed on the desktop fetch side.
-    let signature = write_probe_file(
-        home.path(),
-        "backends-manifest.signature.json",
-        &format!(
-            r#"{{"schema_version":1,"manifest_url":"https://dl.openasr.org/core/v9.9.9/backends-manifest.json","manifest_sha256":"{}","signature":{{"algorithm":"ed25519","key_id":"openasr-catalog-v1","value":"{}"}}}}"#,
-            "0".repeat(64),
-            "0".repeat(128)
-        ),
-    );
-
-    openasr()
-        .arg("__openasr-verify-backends-manifest")
-        .arg(&manifest)
-        .arg("--signature")
-        .arg(&signature)
-        .arg("--manifest-url")
-        .arg("https://dl.openasr.org/core/v0.1.20/backends-manifest.json")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "did not verify against the production trust root",
-        ));
 }
 
 // --- model-pack audit-quant (quantization-strategy self-check) -------------

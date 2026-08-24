@@ -22,28 +22,6 @@ on:
     paths:
       - "Cargo.toml"
   workflow_dispatch:
-    inputs:
-      candidate_cli_artifact:
-        required: true
-        type: string
-      staging_catalog_artifact:
-        required: true
-        type: string
-      correctness_artifact:
-        required: true
-        type: string
-      correctness_sources_artifact:
-        required: true
-        type: string
-      correctness_traces_artifact:
-        required: true
-        type: string
-      public_catalog_artifact:
-        required: true
-        type: string
-      public_catalog_signature_artifact:
-        required: true
-        type: string
 
 # tag annotation is read-only (git fetch); write scope is for creating the
 # release and calling release-binaries.yml (contents: write).
@@ -67,10 +45,13 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
-      should_release: ${{ steps.v.outputs.should_release }}
+      should_build: ${{ steps.v.outputs.should_build }}
+      should_finalize: ${{ steps.v.outputs.should_finalize }}
       highlights: ${{ steps.highlights.outputs.highlights }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - id: v
         name: Read workspace version and check whether it is already released
         run: |
@@ -99,19 +80,49 @@ jobs:
             } >&2
             exit 1
           fi
+          git fetch --force --no-tags origin \
+            "refs/tags/${tag}:refs/tags/${tag}" \
+            "+refs/heads/main:refs/remotes/origin/main"
+          tag_commit="$(git rev-parse "${tag}^{}")"
+          [[ "$tag_commit" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::tag ${tag} does not peel to one commit" >&2; exit 1;
+          }
+          [ "${GITHUB_REF}" = "refs/heads/main" ] || {
+            echo "::error::core releases may run only from protected main" >&2; exit 1;
+          }
+          [ "$(git rev-parse refs/remotes/origin/main)" = "${GITHUB_SHA}" ] || {
+            echo "::error::workflow source is not the current origin/main commit" >&2; exit 1;
+          }
 
-          if gh release view "${tag}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "release ${tag} already exists -- nothing to do"
-            echo "should_release=false" >> "${GITHUB_OUTPUT}"
-          else
+          if ! gh release view "${tag}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            [ "$tag_commit" = "${GITHUB_SHA}" ] || {
+              echo "::error::new release tag ${tag} points to ${tag_commit}, not workflow commit ${GITHUB_SHA}" >&2
+              exit 1
+            }
             echo "release ${tag} does not exist yet -- will build and release"
-            echo "should_release=true" >> "${GITHUB_OUTPUT}"
+            echo "should_build=true" >> "${GITHUB_OUTPUT}"
+            echo "should_finalize=false" >> "${GITHUB_OUTPUT}"
+          else
+            is_draft="$(gh release view "${tag}" --repo "${{ github.repository }}" --json isDraft --jq .isDraft)"
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ "$is_draft" = "true" ]; then
+              git merge-base --is-ancestor "$tag_commit" "${GITHUB_SHA}" || {
+                echo "::error::finalization commit does not descend from release tag ${tag}" >&2
+                exit 1
+              }
+              echo "release ${tag} is a draft -- will validate and deploy its committed PublishedInert catalog"
+              echo "should_build=false" >> "${GITHUB_OUTPUT}"
+              echo "should_finalize=true" >> "${GITHUB_OUTPUT}"
+            else
+              echo "release ${tag} already exists -- nothing to do"
+              echo "should_build=false" >> "${GITHUB_OUTPUT}"
+              echo "should_finalize=false" >> "${GITHUB_OUTPUT}"
+            fi
           fi
         env:
           GH_TOKEN: ${{ github.token }}
       - id: highlights
         name: Read the annotated tag's message as release Highlights
-        if: steps.v.outputs.should_release == 'true'
+        if: steps.v.outputs.should_build == 'true'
         run: |
           set -euo pipefail
           tag="${{ steps.v.outputs.tag }}"
@@ -134,7 +145,7 @@ jobs:
   release:
     name: Create draft release
     needs: resolve
-    if: needs.resolve.outputs.should_release == 'true' && success()
+    if: needs.resolve.outputs.should_build == 'true' && success()
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -185,7 +196,7 @@ jobs:
   binaries:
     name: Build full release matrix
     needs: [resolve, release]
-    if: needs.resolve.outputs.should_release == 'true' && success()
+    if: needs.resolve.outputs.should_build == 'true' && success()
     # Grants the ceiling for every job in the called workflow -- reusable
     # workflows cannot elevate beyond what the caller job grants here. Only
     # the called workflow's checksum aggregation job consumes OIDC and writes
@@ -198,6 +209,7 @@ jobs:
       packages: read
     uses: ./.github/workflows/release-binaries.yml
     with:
+      formal_release: true
       ref: ${{ needs.resolve.outputs.tag }}
     # Reusable workflows do NOT see the caller's repository secrets unless
     # they are passed explicitly; without this the called workflow's Windows
@@ -207,35 +219,38 @@ jobs:
 
   prepublication-family:
     name: Pre-publication family correctness gate
-    needs: [resolve, binaries]
-    if: needs.resolve.outputs.should_release == 'true' && success() && github.event_name == 'workflow_dispatch'
+    needs: [resolve]
+    if: needs.resolve.outputs.should_finalize == 'true' && success()
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+      packages: read
     uses: ./.github/workflows/family-regression.yml
     with:
       pre_publication: true
-      candidate_cli_artifact: ${{ inputs.candidate_cli_artifact }}
-      staging_catalog_artifact: ${{ inputs.staging_catalog_artifact }}
-      correctness_matrix_artifact: ${{ inputs.correctness_artifact }}
+      release_tag: ${{ needs.resolve.outputs.tag }}
     secrets: inherit
 
   deploy-catalog:
-    name: Deploy candidate catalog after correctness
-    needs: [resolve, binaries, prepublication-family]
-    if: needs.resolve.outputs.should_release == 'true' && success() && github.event_name == 'workflow_dispatch'
+    name: Deploy PublishedInert candidate catalog
+    needs: [resolve, prepublication-family]
+    if: needs.resolve.outputs.should_finalize == 'true' && success()
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
     uses: ./.github/workflows/deploy-catalog.yml
     with:
-      correctness_artifact: ${{ inputs.correctness_artifact }}
-      correctness_sources_artifact: ${{ inputs.correctness_sources_artifact }}
-      correctness_traces_artifact: ${{ inputs.correctness_traces_artifact }}
-      public_catalog_artifact: ${{ inputs.public_catalog_artifact }}
-      public_catalog_signature_artifact: ${{ inputs.public_catalog_signature_artifact }}
       orchestrator_run_id: ${{ github.run_id }}
       release_tag: ${{ needs.resolve.outputs.tag }}
+      activation_transition: published-inert
     secrets: inherit
 
   finalize-notes:
     name: Finalize Install & Verify with real assets
-    needs: [resolve, release, binaries, prepublication-family, deploy-catalog]
-    if: needs.resolve.outputs.should_release == 'true' && success() && github.event_name == 'workflow_dispatch'
+    needs: [resolve, prepublication-family, deploy-catalog]
+    if: needs.resolve.outputs.should_finalize == 'true' && success()
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}

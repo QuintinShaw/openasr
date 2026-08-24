@@ -12,44 +12,68 @@
 //! native model runtime after the tracker has read zero active for at least
 //! the configured threshold.
 
-use std::sync::{
-    Arc, Mutex, OnceLock,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
-};
 use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Condvar, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 struct NativeActivityTracker {
-    active: AtomicUsize,
-    idle_since: Mutex<Instant>,
+    state: Mutex<NativeActivityState>,
+    unload_finished: Condvar,
+}
+
+struct NativeActivityState {
+    active: usize,
+    idle_since: Instant,
+    unload_in_progress: bool,
+    unloaded_this_idle_epoch: bool,
 }
 
 impl NativeActivityTracker {
     fn new() -> Self {
         Self {
-            active: AtomicUsize::new(0),
-            idle_since: Mutex::new(Instant::now()),
+            state: Mutex::new(NativeActivityState {
+                active: 0,
+                idle_since: Instant::now(),
+                unload_in_progress: false,
+                unloaded_this_idle_epoch: false,
+            }),
+            unload_finished: Condvar::new(),
         }
     }
 
     fn enter(&self) {
-        self.active.fetch_add(1, Ordering::AcqRel);
+        let mut state = self
+            .state
+            .lock()
+            .expect("native activity state mutex poisoned");
+        while state.unload_in_progress {
+            state = self
+                .unload_finished
+                .wait(state)
+                .expect("native activity state mutex poisoned while waiting for idle unload");
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .expect("native activity count exhausted");
+        state.unloaded_this_idle_epoch = false;
     }
 
     fn exit(&self) {
-        // Saturate at zero instead of a plain `fetch_sub`: a bare `fetch_sub`
-        // on an already-zero counter wraps to `usize::MAX` (atomics use
-        // wrapping arithmetic unconditionally, in debug and release alike),
-        // which would pin `is_idle_for` to "never idle" -- silently and
-        // permanently disabling `idle_unload` -- for the rest of the
-        // process's life. `fetch_update` lets us clamp the new value while
-        // still reading the pre-update count to detect the mismatch.
-        let previous = self
-            .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_sub(1))
-            })
-            .expect("closure always returns Some, so fetch_update never returns Err");
+        let mut state = self
+            .state
+            .lock()
+            .expect("native activity state mutex poisoned");
+        let previous = state.active;
+        state.active = state.active.saturating_sub(1);
         if previous == 0 {
+            drop(state);
             // An enter/exit accounting bug (a double-release, or an exit
             // whose matching enter never landed). Catch it loudly in debug
             // builds where a panic is safe and useful to a developer -- but
@@ -70,29 +94,32 @@ impl NativeActivityTracker {
             return;
         }
         if previous == 1 {
-            *self
-                .idle_since
-                .lock()
-                .expect("native activity idle mutex poisoned") = Instant::now();
+            state.idle_since = Instant::now();
         }
     }
 
+    #[cfg(test)]
     fn is_idle_for(&self, now: Instant, idle_for: Duration) -> bool {
-        if self.active.load(Ordering::Acquire) != 0 {
-            return false;
-        }
-        let idle_since = *self
-            .idle_since
+        let state = self
+            .state
             .lock()
-            .expect("native activity idle mutex poisoned");
-        now.checked_duration_since(idle_since).unwrap_or_default() >= idle_for
+            .expect("native activity state mutex poisoned");
+        state.active == 0
+            && !state.unload_in_progress
+            && now
+                .checked_duration_since(state.idle_since)
+                .unwrap_or_default()
+                >= idle_for
     }
 
     /// Current active native request/session count. Debug-observability
     /// getter (surfaced by `/health` as `native_active_count`); the reaper
     /// itself only ever needs [`Self::is_idle_for`]'s bool.
     fn active_count(&self) -> usize {
-        self.active.load(Ordering::Acquire)
+        self.state
+            .lock()
+            .expect("native activity state mutex poisoned")
+            .active
     }
 
     /// Seconds elapsed since the active count last returned to zero, as of
@@ -104,16 +131,59 @@ impl NativeActivityTracker {
     /// field `is_idle_for` already reads, so the two can never disagree
     /// about what "idle" means.
     fn idle_seconds(&self, now: Instant) -> u64 {
-        if self.active.load(Ordering::Acquire) != 0 {
+        let state = self
+            .state
+            .lock()
+            .expect("native activity state mutex poisoned");
+        if state.active != 0 {
             return 0;
         }
-        let idle_since = *self
-            .idle_since
-            .lock()
-            .expect("native activity idle mutex poisoned");
-        now.checked_duration_since(idle_since)
+        now.checked_duration_since(state.idle_since)
             .unwrap_or_default()
             .as_secs()
+    }
+
+    fn try_claim_idle_unload(
+        &self,
+        now: Instant,
+        idle_for: Duration,
+    ) -> Option<NativeIdleUnloadClaim<'_>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("native activity state mutex poisoned");
+        let idle_long_enough = now
+            .checked_duration_since(state.idle_since)
+            .unwrap_or_default()
+            >= idle_for;
+        if state.active != 0
+            || state.unload_in_progress
+            || state.unloaded_this_idle_epoch
+            || !idle_long_enough
+        {
+            return None;
+        }
+        state.unload_in_progress = true;
+        state.unloaded_this_idle_epoch = true;
+        drop(state);
+        Some(NativeIdleUnloadClaim { tracker: self })
+    }
+}
+
+struct NativeIdleUnloadClaim<'a> {
+    tracker: &'a NativeActivityTracker,
+}
+
+impl Drop for NativeIdleUnloadClaim<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .tracker
+            .state
+            .lock()
+            .expect("native activity state mutex poisoned");
+        state.unload_in_progress = false;
+        drop(state);
+        self.tracker.unload_finished.notify_all();
     }
 }
 
@@ -123,24 +193,48 @@ fn native_activity() -> &'static NativeActivityTracker {
     NATIVE_ACTIVITY.get_or_init(NativeActivityTracker::new)
 }
 
-/// Process-wide count of successful `unload_idle_native_model_runtime_caches`
-/// calls, bumped once per eviction by [`bump_native_unload_generation`]
-/// (currently only [`spawn_idle_unload_reaper`]'s loop). A realtime-streaming
-/// decode worker's OS thread survives an `idle_unload` eviction -- it only
-/// tears down much later, at the separate hard-release threshold -- so its
-/// thread-local "have I warmed this thread" state cannot be a bare bool: that
-/// would keep reading "warmed" after the resident runtime it warmed has
-/// already been evicted, skipping re-warm and pushing the cold rebuild onto
-/// the first real decode of the next attach instead. The warm-up gate in
-/// `native_worker.rs` instead records the generation it warmed at and
-/// re-warms whenever the current generation has moved on.
-static NATIVE_UNLOAD_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Process-wide native runtime generation. It advances before an idle-unload
+/// owner teardown and immediately before warming an activation replacement.
+/// A realtime worker thread survives both events, so its thread-local "have I
+/// warmed this thread" state cannot be a bare bool: it records this generation
+/// and re-warms whenever the generation moves on.
+static NATIVE_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// Current unload generation. `Relaxed` is sufficient: this is a coarse
-/// "has an unload happened since I last checked" signal, not a coordination
-/// primitive, and it is never combined with a specific unload's Ordering.
-pub(crate) fn native_unload_generation() -> u64 {
-    NATIVE_UNLOAD_GENERATION.load(Ordering::Relaxed)
+/// Exact runtime identity used by the resident marker. Production daemon
+/// bindings are content-addressed. `LegacyPath` exists only for the public
+/// `ServerRuntime` compatibility constructor, whose caller has no attested
+/// content identity to supply.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum NativeRuntimeResidencyKey {
+    AttestedContent(String),
+    LegacyPath(PathBuf),
+}
+
+impl NativeRuntimeResidencyKey {
+    pub(crate) fn attested(pack_content_id: impl Into<String>) -> Self {
+        Self::AttestedContent(pack_content_id.into())
+    }
+
+    pub(crate) fn legacy_path(path: &Path) -> Self {
+        Self::LegacyPath(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+    }
+}
+
+#[derive(Default)]
+struct NativeResidentRuntimes {
+    by_key: HashMap<NativeRuntimeResidencyKey, u64>,
+}
+
+fn native_resident_runtimes() -> &'static Mutex<NativeResidentRuntimes> {
+    static RESIDENT: OnceLock<Mutex<NativeResidentRuntimes>> = OnceLock::new();
+    RESIDENT.get_or_init(|| Mutex::new(NativeResidentRuntimes::default()))
+}
+
+/// Current runtime generation. `Relaxed` is sufficient for worker TLS's
+/// coarse stale-generation check; teardown/session exclusion is provided by
+/// the activity claim, not by this counter's memory ordering.
+pub(crate) fn native_runtime_generation() -> u64 {
+    NATIVE_RUNTIME_GENERATION.load(Ordering::Relaxed)
 }
 
 /// Marks one `unload_idle_native_model_runtime_caches` eviction. Exposed
@@ -148,49 +242,65 @@ pub(crate) fn native_unload_generation() -> u64 {
 /// idle-unload deterministically instead of waiting on the reaper's poll
 /// interval.
 pub(crate) fn bump_native_unload_generation() {
-    NATIVE_UNLOAD_GENERATION.fetch_add(1, Ordering::Relaxed);
+    advance_native_runtime_generation();
 }
 
-/// Process-wide unload generation as of the most recent successful native
-/// model warm state transition (an offline decode or a realtime streaming
-/// warm-up that actually built or reused the resident runtime). Compared
-/// against [`native_unload_generation`], this is the source of truth for
-/// `/health`'s `model_resident` field: the two read equal only when no
-/// `idle_unload` eviction has happened since that last successful load.
-///
-/// `u64::MAX` is the "never warmed yet" sentinel -- unreachable via the
-/// generation counter's own increments in a running process -- so a fresh
-/// boot reads as not-resident until the first successful load completes,
-/// same as after a real eviction.
-static LAST_WARM_GENERATION: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Starts a new process-local runtime generation and invalidates every warm
+/// marker from the prior generation. Activation advances this immediately
+/// before warming a replacement, so the replacement worker records the new
+/// generation (and remains warm after publication) while a rollback merely
+/// forces the still-active pack to re-attest warmth on its next attach.
+pub(crate) fn advance_native_runtime_generation() {
+    let mut resident = native_resident_runtimes()
+        .lock()
+        .expect("native resident runtime mutex poisoned");
+    NATIVE_RUNTIME_GENERATION.fetch_add(1, Ordering::AcqRel);
+    resident.by_key.clear();
+}
 
-/// Records that the native model runtime is resident as of right now, at the
-/// current unload generation. Call sites: [`crate::realtime::native_worker`]'s
-/// streaming warm-up gate and the offline-decode path in
-/// `routes::transcription`, both right after their respective build/decode
-/// succeeds.
+/// Records that one exact native model runtime is resident as of right now, at
+/// the current runtime generation. Multiple candidates may coexist during a
+/// transactional activation, so this is a keyed set rather than one global
+/// boolean. A candidate warmup therefore cannot make the previously active
+/// pack look resident, nor can it erase that pack's still-valid marker if the
+/// activation later rolls back.
 ///
-/// Safe against a racing `idle_unload` eviction: the reaper only unloads
-/// while [`native_activity_is_idle_for`] reads true, i.e. while the active
-/// count is zero, and every call site runs from inside an active
-/// [`NativeActivityGuard`] (or an attached streaming session's equivalent
-/// window) -- so the generation read here cannot be bumped out from under an
-/// in-flight caller before its request finishes.
-pub(crate) fn mark_native_model_warm() {
-    LAST_WARM_GENERATION.store(native_unload_generation(), Ordering::Relaxed);
+/// Safe against a racing `idle_unload` eviction: activity enter and the
+/// reaper's exclusive unload claim are serialized by [`NativeActivityTracker`].
+/// Every production call site holds a [`NativeActivityGuard`] (or an attached
+/// streaming session's equivalent window), so the generation cannot advance
+/// underneath this write.
+pub(crate) fn mark_native_model_warm(key: &NativeRuntimeResidencyKey) {
+    let generation = native_runtime_generation();
+    native_resident_runtimes()
+        .lock()
+        .expect("native resident runtime mutex poisoned")
+        .by_key
+        .insert(key.clone(), generation);
+}
+
+pub(crate) fn forget_native_model_residency(key: &NativeRuntimeResidencyKey) {
+    native_resident_runtimes()
+        .lock()
+        .expect("native resident runtime mutex poisoned")
+        .by_key
+        .remove(key);
 }
 
 /// Whether the bound native model runtime is resident right now: warmed, and
 /// not evicted by an `idle_unload` sweep since. Reads `false` before the
 /// first successful load of the process's lifetime, and `false` again after
 /// any eviction until the next successful load.
-pub(crate) fn native_model_is_resident() -> bool {
-    LAST_WARM_GENERATION.load(Ordering::Relaxed) == native_unload_generation()
+pub(crate) fn native_model_is_resident(key: &NativeRuntimeResidencyKey) -> bool {
+    let resident = native_resident_runtimes()
+        .lock()
+        .expect("native resident runtime mutex poisoned");
+    resident.by_key.get(key).copied() == Some(native_runtime_generation())
 }
 
 /// Single shared lock serializing every test in this crate that mutates
-/// `NATIVE_UNLOAD_GENERATION` (via [`bump_native_unload_generation`]) or
-/// `LAST_WARM_GENERATION` (via [`mark_native_model_warm`], including
+/// `NATIVE_RUNTIME_GENERATION` (via [`bump_native_unload_generation`]) or the
+/// exact resident-runtime map (via [`mark_native_model_warm`], including
 /// indirectly by exercising a real `warm_up_native_streaming_session_once`
 /// success path with a fake session) against each other -- without it, a
 /// bump or mark from one test could land between another test's own bump and
@@ -238,10 +348,9 @@ pub(crate) fn native_activity_exit() {
 }
 
 /// Whether the process-wide tracker has read zero active native
-/// requests/sessions for at least `idle_for`, as of `now`. Exposed (beyond
-/// [`spawn_idle_unload_reaper`]'s own use) so integration tests can assert
-/// the real attach/release call sites in `native_worker.rs` actually keep
-/// this in lockstep with a real session's lifetime.
+/// requests/sessions for at least `idle_for`, as of `now`. Test-only so the
+/// real attach/release call sites can prove they keep the tracker in lockstep.
+#[cfg(test)]
 pub(crate) fn native_activity_is_idle_for(now: Instant, idle_for: Duration) -> bool {
     native_activity().is_idle_for(now, idle_for)
 }
@@ -257,9 +366,8 @@ pub(crate) fn native_activity_active_count() -> usize {
 
 /// Seconds since the process-wide tracker's active count last returned to
 /// zero, as of `now` (`0` while any activity is active). Debug-only
-/// observability, surfaced by `/health` as `idle_seconds`; expressed via the
-/// same tracker state `native_activity_is_idle_for` reads, so the two can
-/// never disagree about what "idle" means.
+/// observability, surfaced by `/health` as `idle_seconds`; expressed from the
+/// same state the reaper's exclusive claim inspects.
 pub(crate) fn native_activity_idle_seconds(now: Instant) -> u64 {
     native_activity().idle_seconds(now)
 }
@@ -350,9 +458,14 @@ pub(crate) fn spawn_idle_unload_reaper(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(poll_interval).await;
-            if native_activity_is_idle_for(Instant::now(), idle_for) {
-                execution_services.unload_idle_native_model_runtime_caches();
+            if let Some(_claim) = native_activity().try_claim_idle_unload(Instant::now(), idle_for)
+            {
+                // Invalidate health/TLS state before touching runtime owners.
+                // New activity cannot enter until `_claim` drops, so no caller
+                // can observe the advanced generation and start rebuilding
+                // while the prior generation is still being torn down.
                 bump_native_unload_generation();
+                execution_services.unload_idle_native_model_runtime_caches();
             }
         }
     });
@@ -502,7 +615,7 @@ mod tests {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tracker.exit()));
 
         assert_eq!(
-            tracker.active.load(Ordering::Acquire),
+            tracker.active_count(),
             0,
             "the counter must saturate at zero, never wrap past it"
         );
@@ -539,7 +652,7 @@ mod tests {
         let tracker = NativeActivityTracker::new();
         tracker.exit();
         tracker.exit();
-        assert_eq!(tracker.active.load(Ordering::Acquire), 0);
+        assert_eq!(tracker.active_count(), 0);
         assert!(tracker.is_idle_for(
             Instant::now() + Duration::from_secs(3600),
             Duration::from_secs(1)
@@ -624,29 +737,25 @@ mod tests {
 
     #[test]
     fn native_model_is_not_resident_before_any_warm_mark() {
-        // Regression guard for the `u64::MAX` sentinel: a generation counter
-        // that starts at 0 must never accidentally equal it, or a fresh boot
-        // (before the first successful load) would misreport resident.
         let _generation_guard = native_unload_generation_test_lock_blocking();
-        assert_ne!(
-            native_unload_generation(),
-            u64::MAX,
-            "a real process-wide generation must never coincide with the never-warmed sentinel"
-        );
+        bump_native_unload_generation();
+        let key = NativeRuntimeResidencyKey::legacy_path(Path::new("never-warmed"));
+        assert!(!native_model_is_resident(&key));
     }
 
     #[test]
     fn marking_warm_makes_native_model_read_resident() {
         let _generation_guard = native_unload_generation_test_lock_blocking();
         bump_native_unload_generation();
+        let key = NativeRuntimeResidencyKey::legacy_path(Path::new("warm-marker"));
         assert!(
-            !native_model_is_resident(),
+            !native_model_is_resident(&key),
             "a fresh bump with no matching mark must read as not resident"
         );
 
-        mark_native_model_warm();
+        mark_native_model_warm(&key);
         assert!(
-            native_model_is_resident(),
+            native_model_is_resident(&key),
             "marking warm at the current generation must read as resident"
         );
     }
@@ -660,22 +769,83 @@ mod tests {
         // second signal to notice the eviction.
         let _generation_guard = native_unload_generation_test_lock_blocking();
         bump_native_unload_generation();
-        mark_native_model_warm();
+        let key = NativeRuntimeResidencyKey::legacy_path(Path::new("idle-unload"));
+        mark_native_model_warm(&key);
         assert!(
-            native_model_is_resident(),
+            native_model_is_resident(&key),
             "just-marked warm at the current generation must read as resident"
         );
 
         bump_native_unload_generation();
         assert!(
-            !native_model_is_resident(),
+            !native_model_is_resident(&key),
             "an idle-unload eviction must flip resident back to false until the next mark"
         );
 
-        mark_native_model_warm();
+        mark_native_model_warm(&key);
         assert!(
-            native_model_is_resident(),
+            native_model_is_resident(&key),
             "a reload after the eviction (mark at the new generation) must flip resident back to true"
+        );
+    }
+
+    #[test]
+    fn resident_markers_are_scoped_to_exact_runtime_identity() {
+        let _generation_guard = native_unload_generation_test_lock_blocking();
+        bump_native_unload_generation();
+        let active = NativeRuntimeResidencyKey::attested("sha256:active");
+        let candidate = NativeRuntimeResidencyKey::attested("sha256:candidate");
+
+        mark_native_model_warm(&candidate);
+        assert!(native_model_is_resident(&candidate));
+        assert!(
+            !native_model_is_resident(&active),
+            "warming a candidate must not make the previously active identity look resident"
+        );
+
+        mark_native_model_warm(&active);
+        forget_native_model_residency(&candidate);
+        assert!(native_model_is_resident(&active));
+        assert!(!native_model_is_resident(&candidate));
+    }
+
+    #[test]
+    fn idle_unload_claim_serializes_against_new_activity_and_runs_once_per_idle_epoch() {
+        use std::sync::mpsc;
+
+        let tracker = Arc::new(NativeActivityTracker::new());
+        let claim = tracker
+            .try_claim_idle_unload(
+                Instant::now() + Duration::from_secs(10),
+                Duration::from_secs(1),
+            )
+            .expect("an idle tracker past its threshold must grant one unload claim");
+        let entering = Arc::clone(&tracker);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            entering.enter();
+            entered_tx.send(()).unwrap();
+            entering.exit();
+        });
+
+        assert!(
+            entered_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "new activity must not enter while owner teardown holds the exclusive idle claim"
+        );
+        drop(claim);
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("activity must enter once the idle teardown claim releases");
+        thread.join().unwrap();
+
+        assert!(
+            tracker
+                .try_claim_idle_unload(
+                    Instant::now() + Duration::from_secs(10),
+                    Duration::from_secs(1)
+                )
+                .is_some(),
+            "a real activity epoch resets the one-unload-per-idle-epoch latch"
         );
     }
 }

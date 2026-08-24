@@ -95,13 +95,14 @@ fn transcribe_xasr_zipformer_pcm_cached(
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
     backend: GgmlCpuGraphBackend,
+    execution_lane: &crate::models::native_execution_services::ExecutionLaneKey,
     control: std::sync::Arc<crate::api::backend::TranscriptionControl>,
     decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
 ) -> Result<XasrZipformerTranscription, String> {
     if phrase_bias.is_some() {
         return Err("xasr-zipformer phrase bias is not supported".to_string());
     }
-    let actor = checkout_prepared_runtime(runtime_pool, preflight, backend)?;
+    let actor = checkout_prepared_runtime(runtime_pool, preflight, backend, execution_lane)?;
     let samples = samples.to_vec();
     actor
         .call_mut(move |runtime| {
@@ -194,6 +195,12 @@ impl GgmlAsrViewExecutor for XasrZipformerGgmlExecutor {
             )
         };
         let preflight = request.runtime_source_preflight();
+        let execution_lane = request
+            .execution_context
+            .native_execution_lane()
+            .ok_or_else(|| {
+                fail("xasr request is missing its candidate-resolved execution lane".to_string())
+            })?;
         let output = transcribe_xasr_zipformer_pcm_cached(
             &self.runtime_pool,
             &request.prepared_audio.samples_f32,
@@ -201,6 +208,7 @@ impl GgmlAsrViewExecutor for XasrZipformerGgmlExecutor {
             request.request_options.phrase_bias.as_ref(),
             request.request_options.word_timestamps,
             request.resolved_runtime.backend(),
+            execution_lane,
             std::sync::Arc::clone(&request.execution_context.control),
             request
                 .execution_context
@@ -272,16 +280,11 @@ impl GgmlAsrStreamingExecutor for XasrZipformerGgmlExecutor {
         }
 
         let preflight = request.runtime_source_preflight();
-        // The pool key and the prepared encoder graph bake the backend at
-        // checkout, so the session's execution preference must be installed
-        // before the runtime is selected.
-        let _backend_guard = crate::ggml_runtime::install_request_backend_override(
-            request.backend_preference.request_backend_override(),
-        );
         let runtime = checkout_prepared_runtime(
             &self.runtime_pool,
             preflight,
             request.resolved_runtime.backend(),
+            &request.execution_lane,
         )
         .map_err(fail)?;
         let session_suffix = &request.session_context.session_id.0;

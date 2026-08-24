@@ -48,7 +48,7 @@ type FireRedRealtimeVadActor =
 
 enum FireRedRealtimeVadCandidate {
     Host(Box<Mutex<FireRedStreamingVad>>),
-    Accelerated(FireRedRealtimeVadActor),
+    Accelerated(Box<FireRedRealtimeVadActor>),
 }
 
 impl FireRedRealtimeVadCandidate {
@@ -392,7 +392,7 @@ fn build_candidate(
             Ok::<(), FireRedStreamVadError>(())
         })
         .map_err(map_actor_error)??;
-    Ok(FireRedRealtimeVadCandidate::Accelerated(checkout))
+    Ok(FireRedRealtimeVadCandidate::Accelerated(Box::new(checkout)))
 }
 
 fn realtime_actor_cache_key(

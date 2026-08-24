@@ -284,55 +284,6 @@ pub(crate) enum Command {
     /// embedded catalog matches a copied catalog resource.
     #[command(name = "catalog-fingerprint", hide = true)]
     CatalogFingerprint,
-    /// Internal helper: sign a release `backends-manifest.json` (the
-    /// per-release index of downloadable Windows GPU-kernel sidecars) with
-    /// the SAME production signing key and trust root as the model catalog.
-    /// Signing stays local -- run this with
-    /// `OPENASR_CATALOG_SIGNING_KEY_SEED_HEX` set to the real production
-    /// seed, never in CI. See
-    /// `tooling/release-manifest/backends_manifest.py` for generating the
-    /// unsigned manifest this command signs.
-    #[command(name = "__openasr-sign-backends-manifest", hide = true)]
-    SignBackendsManifest {
-        /// backends-manifest.json file to sign.
-        manifest: PathBuf,
-        /// Output backends-manifest.signature.json path.
-        #[arg(long)]
-        out: PathBuf,
-        /// The canonical URL this manifest will be served from, e.g.
-        /// `https://dl.openasr.org/core/v0.1.10/backends-manifest.json`.
-        #[arg(long)]
-        manifest_url: String,
-        /// Signature key id. Defaults to the production catalog key id
-        /// (`openasr-catalog-v1`) -- this manifest has no local-dev key.
-        #[arg(long, default_value = "openasr-catalog-v1")]
-        key_id: String,
-        /// Print the derived public key for the env signing seed and exit.
-        #[arg(long)]
-        print_public_key: bool,
-    },
-    /// Internal helper: read-only verification of an already-signed
-    /// `backends-manifest.json` + `backends-manifest.signature.json` pair
-    /// against the production trust root. Does not sign anything and needs no
-    /// signing seed -- safe to run in CI. Exits non-zero (with a typed error
-    /// message) if the signature file is missing, malformed, bound to a
-    /// different `--manifest-url`, or fails Ed25519 verification. Used as a
-    /// post-release CI probe to catch the LOCAL-only signing step being
-    /// forgotten (see `tooling/release-manifest/README.md`'s "Signing"
-    /// section).
-    #[command(name = "__openasr-verify-backends-manifest", hide = true)]
-    VerifyBackendsManifest {
-        /// backends-manifest.json file to verify.
-        manifest: PathBuf,
-        /// backends-manifest.signature.json sidecar to verify.
-        #[arg(long)]
-        signature: PathBuf,
-        /// The canonical URL the signature must be bound to, e.g.
-        /// `https://dl.openasr.org/core/v0.1.20/backends-manifest.json`
-        /// (`openasr_core::backend_manifest::canonical_manifest_url`).
-        #[arg(long)]
-        manifest_url: String,
-    },
     /// Transcribe one or more audio files (or directories of audio).
     #[command(visible_alias = "t")]
     Transcribe {
@@ -636,13 +587,13 @@ pub(crate) enum BackendPluginCommand {
     Status,
     /// Report conservative download sizes for all target packs of a provider.
     DescribeProvider {
-        #[arg(value_parser = ["cuda", "hip"])]
+        #[arg(value_parser = ["cuda", "hip", "vulkan"])]
         provider: String,
     },
     /// Discover the live GPU target and install only its signed pack without
     /// changing the activation selector.
     PrepareProvider {
-        #[arg(value_parser = ["cuda", "hip"])]
+        #[arg(value_parser = ["cuda", "hip", "vulkan"])]
         provider: String,
     },
     /// Download and fully verify a signed-catalog pack without activating it.
@@ -654,10 +605,28 @@ pub(crate) enum BackendPluginCommand {
     /// Discover the current GPU target, install its signed pack, and activate
     /// it after live target proof.
     InstallActivateProvider {
-        #[arg(value_parser = ["cuda", "hip"])]
+        #[arg(value_parser = ["cuda", "hip", "vulkan"])]
         provider: String,
     },
-    /// Remove the optional backend selector; bundled CPU/Vulkan remain.
+    /// Install and live-probe one exact inert candidate for an isolated,
+    /// non-product qualification scope. Never writes `active.json`.
+    #[command(name = "prepare-qualification", hide = true)]
+    PrepareQualification {
+        backend_id: String,
+        /// Exact live capability target. Required for generic Vulkan artifacts;
+        /// CUDA/HIP infer it from their one-target catalog entry.
+        #[arg(long)]
+        device_target: Option<String>,
+        #[arg(long)]
+        scope: String,
+    },
+    /// Delete the selector for one completed qualification scope.
+    #[command(name = "clear-qualification", hide = true)]
+    ClearQualification {
+        #[arg(long)]
+        scope: String,
+    },
+    /// Remove the optional GPU selector; bundled CPU remains.
     Deactivate,
     /// Reclaim unselected backend-pack generations and shared vendor objects.
     /// Active and explicitly retained backend ids are never removed.
@@ -670,6 +639,10 @@ pub(crate) enum BackendPluginCommand {
 }
 
 #[derive(Debug, Subcommand)]
+// Clap owns this short-lived parse tree exactly once per process. Boxing an
+// individual option solely to shrink the enum would complicate every command
+// pattern without reducing resident runtime state.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum BenchReceiptCommand {
     /// Run one short-audio transcription and write `openasr.short-audio-receipt.v0` JSON.
     #[command(name = "short-audio")]
@@ -713,6 +686,15 @@ pub(crate) enum BenchReceiptCommand {
         /// native candidate records execution facts.
         #[arg(long)]
         trace_out: Option<PathBuf>,
+    },
+    /// Validate one or more receipts with the core-owned release qualification
+    /// predicate. This command does not approve a matrix cell; it only proves
+    /// that the receipt is eligible to be consumed by the existing gate.
+    #[command(name = "validate-qualification", hide = true)]
+    ValidateQualification {
+        /// Receipt JSON to validate. Repeat for every candidate receipt.
+        #[arg(long, required = true)]
+        receipt: Vec<PathBuf>,
     },
 }
 

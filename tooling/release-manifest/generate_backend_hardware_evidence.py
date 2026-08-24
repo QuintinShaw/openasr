@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generate auditable Windows GPU release evidence from fresh processes.
 
-The published summary stays schema-v2 compatible with the validator embedded
-in the release tag. A separate raw audit asset binds the attested release
+The published summary is an exact schema-v1 target receipt. A separate raw
+audit asset binds the attested release
 subjects, exact activated backend status before and after every child, unique
 nonce-scoped receipts, and actual graph placement. The summary's
 ``evidence_sha256`` is the canonical SHA-256 of that raw audit document.
@@ -18,11 +18,13 @@ import subprocess
 import tempfile
 import uuid
 import zipfile
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 import backend_hardware_evidence as gate
+from backend_target_identity import is_vulkan_qualification_target
 
 
 RAW_SCHEMA = "openasr.backend-hardware-audit.v1"
@@ -245,6 +247,62 @@ def _status(binary: Path, env: dict[str, str]) -> dict[str, Any]:
     return value
 
 
+def _prepare_qualification(
+    binary: Path,
+    env: dict[str, str],
+    *,
+    backend_id: str,
+    device_target: str,
+    scope: str,
+) -> None:
+    prepare_env = env.copy()
+    prepare_env.pop("OPENASR_BACKEND_QUALIFICATION_SCOPE", None)
+    completed = subprocess.run(
+        [
+            str(binary),
+            "__openasr-backend-plugin",
+            "prepare-qualification",
+            backend_id,
+            "--device-target",
+            device_target,
+            "--scope",
+            scope,
+        ],
+        env=prepare_env,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if completed.returncode != 0:
+        raise gate.EvidenceError(
+            "qualification preparation failed: "
+            + completed.stderr.decode("utf-8", errors="replace").strip()
+        )
+
+
+def _clear_qualification(binary: Path, env: dict[str, str], *, scope: str) -> None:
+    clear_env = env.copy()
+    clear_env.pop("OPENASR_BACKEND_QUALIFICATION_SCOPE", None)
+    completed = subprocess.run(
+        [
+            str(binary),
+            "__openasr-backend-plugin",
+            "clear-qualification",
+            "--scope",
+            scope,
+        ],
+        env=clear_env,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if completed.returncode != 0:
+        raise gate.EvidenceError(
+            "qualification cleanup failed: "
+            + completed.stderr.decode("utf-8", errors="replace").strip()
+        )
+
+
 def _release_entries(
     paths: list[Path], provider: str, target: str
 ) -> tuple[list[gate.EntryIdentity], gate.EntryIdentity]:
@@ -258,6 +316,14 @@ def _release_entries(
     targets = [identity.target for identity in selected]
     if len(targets) != len(set(targets)):
         raise gate.EvidenceError(f"duplicate {provider} release targets")
+    if provider == "vulkan":
+        if len(selected) != 1:
+            raise gate.EvidenceError("expected exactly one generic Vulkan release entry")
+        if not is_vulkan_qualification_target(target):
+            raise gate.EvidenceError(
+                "Vulkan qualification target must be one canonical vk_caps class"
+            )
+        return selected, replace(selected[0], target=target)
     tested = [identity for identity in selected if identity.target == target]
     if len(tested) != 1:
         raise gate.EvidenceError(
@@ -391,13 +457,21 @@ def _verify_preview_catalog(
 def _activation_matches(
     status: object,
     tested: gate.EntryIdentity,
-) -> None:
+    catalog_sha256: str,
+) -> str:
     if not isinstance(status, dict) or status.get("host_mode") != "neutral_dynamic":
         raise gate.EvidenceError("backend status is not a neutral dynamic host")
     host_abi = status.get("host_abi")
     activated = status.get("activated")
-    if not isinstance(host_abi, dict) or not isinstance(activated, dict):
-        raise gate.EvidenceError("backend status lacks host ABI or active backend")
+    qualification = status.get("qualification")
+    if (
+        not isinstance(host_abi, dict)
+        or activated is not None
+        or not isinstance(qualification, dict)
+    ):
+        raise gate.EvidenceError(
+            "backend status lacks an isolated qualification selector or also has active.json"
+        )
     entry = _load_json(tested.path)
     host_fingerprint = entry.get("host_abi", {}).get("fingerprint")
     expected = {
@@ -407,22 +481,28 @@ def _activation_matches(
         "artifact_fingerprint": tested.artifact_fingerprint,
         "host_abi_fingerprint": host_fingerprint,
         "device_target": tested.target,
+        "catalog_sha256": catalog_sha256,
     }
     if host_abi.get("fingerprint") != host_fingerprint:
         raise gate.EvidenceError("active host ABI does not match the tested release entry")
     for field, value in expected.items():
-        if activated.get(field) != value:
-            raise gate.EvidenceError(f"active backend {field} does not match the release entry")
-    if not isinstance(activated.get("driver_version"), str) or not activated.get(
+        if qualification.get(field) != value:
+            raise gate.EvidenceError(
+                f"qualification backend {field} does not match the release entry"
+            )
+    if not isinstance(qualification.get("driver_version"), str) or not qualification.get(
         "driver_version"
     ):
-        raise gate.EvidenceError("active backend has no live driver version")
+        raise gate.EvidenceError("qualification backend has no live driver version")
+    return qualification["driver_version"]
 
 
 def _provider_backend_name(provider: str, backend_name: str) -> bool:
     normalized = backend_name.strip().lower()
     if provider == "hip":
         return normalized.startswith("hip") or normalized.startswith("rocm")
+    if provider == "vulkan":
+        return normalized.startswith("vulkan")
     return normalized.startswith("cuda") or "nvidia" in normalized
 
 
@@ -511,7 +591,9 @@ def _run_receipt(
     scope = f"{base_scope}/{nonce}"
     _catalog_cache_matches(home, preview_catalog_sha, preview_signature_sha)
     activation_before = _status(binary, env)
-    _activation_matches(activation_before, tested)
+    driver_before = _activation_matches(
+        activation_before, tested, preview_catalog_sha
+    )
     command = [
         str(binary),
         "bench-receipt",
@@ -547,7 +629,11 @@ def _run_receipt(
     stdout, stderr = process.communicate()
     ended_at = _utc_now()
     activation_after = _status(binary, env)
-    _activation_matches(activation_after, tested)
+    driver_after = _activation_matches(
+        activation_after, tested, preview_catalog_sha
+    )
+    if driver_before != driver_after:
+        raise gate.EvidenceError("qualification driver changed during the child process")
     _catalog_cache_matches(home, preview_catalog_sha, preview_signature_sha)
     if process.returncode != 0:
         raise gate.EvidenceError(
@@ -699,7 +785,7 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
     attested_sha_by_name = {
         subject["filename"]: subject["sha256"] for subject in attestations
     }
-    provider_entries, tested = _release_entries(
+    _provider_entries, tested = _release_entries(
         args.entry, args.provider, args.device_target
     )
     plugin_sha, vendor_archive_sha = _verify_local_backend_payloads(
@@ -746,38 +832,58 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
         preview_catalog_sha=preview_catalog_sha,
         preview_signature_sha=preview_signature_sha,
     )
+    qualification_scope = f"{RUN_SCOPE}/selector/{uuid.uuid4().hex}"
+    _prepare_qualification(
+        args.binary,
+        env,
+        backend_id=tested.backend_id,
+        device_target=tested.target,
+        scope=qualification_scope,
+    )
+    env["OPENASR_BACKEND_QUALIFICATION_SCOPE"] = qualification_scope
     _catalog_cache_matches(args.home, preview_catalog_sha, preview_signature_sha)
+    qualification_driver_version = _activation_matches(
+        _status(args.binary, env), tested, preview_catalog_sha
+    )
     scope = f"{RUN_SCOPE}-v{tested.version}-{args.provider}"
     runs: list[dict[str, Any]] = []
     transcript_hashes: set[str] = set()
-    with tempfile.TemporaryDirectory(prefix="openasr-hardware-evidence-") as temp:
-        root = Path(temp)
-        for index in range(args.fresh_process_runs):
-            run, transcript_sha = _run_receipt(
-                binary=args.binary,
-                model=args.model,
-                model_pack=args.model_pack,
-                audio=args.audio,
-                tested=tested,
-                core_commit=args.core_commit,
-                base_scope=scope,
-                workload_sha=workload_sha,
-                model_pack_sha=model_pack_sha,
-                env=env,
-                output=root / f"receipt-{index + 1}.json",
-                home=args.home,
-                preview_catalog_sha=preview_catalog_sha,
-                preview_signature_sha=preview_signature_sha,
-            )
-            runs.append(run)
-            transcript_hashes.add(transcript_sha)
-    if len({run["process_id"] for run in runs}) != len(runs):
-        raise gate.EvidenceError("fresh child processes did not have unique process ids")
-    if len({run["nonce"] for run in runs}) != len(runs):
-        raise gate.EvidenceError("fresh child processes did not have unique nonces")
-    if len(transcript_hashes) != 1:
-        raise gate.EvidenceError("fresh child processes did not produce one stable transcript")
-    _catalog_cache_matches(args.home, preview_catalog_sha, preview_signature_sha)
+    try:
+        with tempfile.TemporaryDirectory(prefix="openasr-hardware-evidence-") as temp:
+            root = Path(temp)
+            for index in range(args.fresh_process_runs):
+                run, transcript_sha = _run_receipt(
+                    binary=args.binary,
+                    model=args.model,
+                    model_pack=args.model_pack,
+                    audio=args.audio,
+                    tested=tested,
+                    core_commit=args.core_commit,
+                    base_scope=scope,
+                    workload_sha=workload_sha,
+                    model_pack_sha=model_pack_sha,
+                    env=env,
+                    output=root / f"receipt-{index + 1}.json",
+                    home=args.home,
+                    preview_catalog_sha=preview_catalog_sha,
+                    preview_signature_sha=preview_signature_sha,
+                )
+                runs.append(run)
+                transcript_hashes.add(transcript_sha)
+        if len({run["process_id"] for run in runs}) != len(runs):
+            raise gate.EvidenceError("fresh child processes did not have unique process ids")
+        if len({run["nonce"] for run in runs}) != len(runs):
+            raise gate.EvidenceError("fresh child processes did not have unique nonces")
+        if len(transcript_hashes) != 1:
+            raise gate.EvidenceError("fresh child processes did not produce one stable transcript")
+        _catalog_cache_matches(args.home, preview_catalog_sha, preview_signature_sha)
+        final_driver_version = _activation_matches(
+            _status(args.binary, env), tested, preview_catalog_sha
+        )
+        if final_driver_version != qualification_driver_version:
+            raise gate.EvidenceError("qualification driver changed across evidence runs")
+    finally:
+        _clear_qualification(args.binary, env, scope=qualification_scope)
 
     unchanged_inputs = {
         **{
@@ -802,11 +908,20 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
 
     raw_audit: dict[str, Any] = {
         "schema": RAW_SCHEMA,
+        "provider": tested.provider,
+        "device_target": tested.target,
+        "backend_id": tested.backend_id,
+        "artifact_fingerprint": tested.artifact_fingerprint,
+        "release_version": tested.version,
+        "driver_version": qualification_driver_version,
         "generator_sha256": generator_sha,
         "repository": args.repo,
         "signer_workflow": args.signer_workflow,
         "source_digest": args.core_commit,
         "scope": scope,
+        "qualification_scope_sha256": hashlib.sha256(
+            qualification_scope.encode("ascii")
+        ).hexdigest(),
         "binary_sha256": binary_sha,
         "neutral_archive_sha256": neutral_archive_sha,
         "neutral_extracted_tree_sha256": neutral_tree_sha,
@@ -824,13 +939,13 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
         "runs": runs,
     }
     evidence: dict[str, Any] = {
-        "schema_version": 2,
-        "scope": "provider_matrix",
+        "schema_version": 1,
         "result": "pass",
         "provider": tested.provider,
         "device_target": tested.target,
         "backend_id": tested.backend_id,
         "release_version": tested.version,
+        "driver_version": qualification_driver_version,
         "artifact_fingerprint": tested.artifact_fingerprint,
         "plugin_sha256": tested.plugin_sha256,
         "binary_sha256": binary_sha,
@@ -840,8 +955,6 @@ def generate(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
         "fresh_process_runs": len(runs),
         "placement": "full_device",
         "cpu_fallback": False,
-        "approved_targets": sorted(identity.target for identity in provider_entries),
-        "provider_matrix_sha256": gate.provider_matrix_sha256(provider_entries),
     }
     return evidence, raw_audit
 
@@ -875,7 +988,7 @@ def _write_validated_outputs(
             handle.write(raw_encoded)
             raw_temp = Path(handle.name)
             temporary_paths.append(raw_temp)
-        gate.approved_entry_paths(entry_paths, [evidence_temp])
+        gate.approved_entry_paths(entry_paths, [evidence_temp], [raw_temp])
         if _canonical_sha256(_load_json(raw_temp)) != evidence["evidence_sha256"]:
             raise gate.EvidenceError("raw audit does not match evidence_sha256")
         for temporary, destination in (
@@ -932,7 +1045,7 @@ def _validate_output_paths(output: Path, raw_output: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--entry", action="append", type=Path, required=True)
-    parser.add_argument("--provider", choices=("cuda", "hip"), required=True)
+    parser.add_argument("--provider", choices=("cuda", "hip", "vulkan"), required=True)
     parser.add_argument("--device-target", required=True)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--neutral-archive", type=Path, required=True)

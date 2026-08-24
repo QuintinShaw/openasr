@@ -1357,10 +1357,55 @@ struct ActiveRuntimeBinding {
     attested_identity: Option<openasr_core::DefaultModelActivationIdentity>,
 }
 
+impl ActiveRuntimeBinding {
+    fn residency_key(&self) -> idle_activity::NativeRuntimeResidencyKey {
+        self.attested_identity.as_ref().map_or_else(
+            || idle_activity::NativeRuntimeResidencyKey::legacy_path(&self.path),
+            |identity| {
+                idle_activity::NativeRuntimeResidencyKey::attested(identity.pack_content_id())
+            },
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveRuntimeSlotState {
     requested_path: Option<PathBuf>,
     active: Option<ActiveRuntimeBinding>,
+    /// Monotonic process-local publication generation. A request may inspect
+    /// an active path before doing expensive audio/model preparation, but it
+    /// may only acquire a native session permit if this generation is still
+    /// current while holding `activation_barrier`. This closes the otherwise
+    /// possible stale-path admission race across a model activation.
+    generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveRuntimeSnapshot {
+    generation: u64,
+    path: PathBuf,
+    residency_key: idle_activity::NativeRuntimeResidencyKey,
+}
+
+pub(crate) struct AdmittedNativeExecution {
+    permit: ModelSessionPermit,
+    activity: NativeActivityGuard,
+}
+
+impl AdmittedNativeExecution {
+    pub(crate) fn into_parts(self) -> (ModelSessionPermit, NativeActivityGuard) {
+        (self.permit, self.activity)
+    }
+}
+
+impl ActiveRuntimeSnapshot {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn residency_key(&self) -> &idle_activity::NativeRuntimeResidencyKey {
+        &self.residency_key
+    }
 }
 
 /// Compatibility name retained for embedders while the implementation is an
@@ -1403,6 +1448,7 @@ impl From<Option<PathBuf>> for ActiveRuntimeSlot {
             inner: Arc::new(RwLock::new(ActiveRuntimeSlotState {
                 requested_path: path,
                 active,
+                generation: 0,
             })),
             activation_barrier: Arc::new(Mutex::new(())),
             activation_probe_failpoint: Arc::new(RwLock::new(None)),
@@ -1419,6 +1465,7 @@ impl ActiveRuntimeSlot {
             inner: Arc::new(RwLock::new(ActiveRuntimeSlotState {
                 requested_path: path,
                 active: None,
+                generation: 0,
             })),
             activation_barrier: Arc::new(Mutex::new(())),
             activation_probe_failpoint: Arc::new(RwLock::new(None)),
@@ -1439,10 +1486,25 @@ impl ActiveRuntimeSlot {
     }
 
     pub fn current(&self) -> Option<PathBuf> {
-        self.lock_read()
-            .active
-            .as_ref()
-            .map(|binding| binding.path.clone())
+        self.current_snapshot().map(|snapshot| snapshot.path)
+    }
+
+    pub(crate) fn current_snapshot(&self) -> Option<ActiveRuntimeSnapshot> {
+        let state = self.lock_read();
+        state.active.as_ref().map(|binding| ActiveRuntimeSnapshot {
+            generation: state.generation,
+            path: binding.path.clone(),
+            residency_key: binding.residency_key(),
+        })
+    }
+
+    fn snapshot_is_current(&self, snapshot: &ActiveRuntimeSnapshot) -> bool {
+        let state = self.lock_read();
+        state.generation == snapshot.generation
+            && state
+                .active
+                .as_ref()
+                .is_some_and(|binding| binding.path == snapshot.path)
     }
 
     pub fn requested_path(&self) -> Option<PathBuf> {
@@ -1460,6 +1522,10 @@ impl ActiveRuntimeSlot {
     #[cfg(test)]
     fn set_legacy_binding(&self, path: Option<PathBuf>) {
         let mut state = self.lock_write();
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .expect("active runtime generation exhausted");
         state.requested_path = path.clone();
         state.active = path.map(|path| ActiveRuntimeBinding {
             path,
@@ -1470,6 +1536,10 @@ impl ActiveRuntimeSlot {
     fn publish_attested(&self, identity: openasr_core::DefaultModelActivationIdentity) {
         let path = identity.path().to_path_buf();
         let mut state = self.lock_write();
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .expect("active runtime generation exhausted");
         state.requested_path = Some(path.clone());
         state.active = Some(ActiveRuntimeBinding {
             path,
@@ -1479,6 +1549,10 @@ impl ActiveRuntimeSlot {
 
     fn clear_active(&self) {
         let mut state = self.lock_write();
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .expect("active runtime generation exhausted");
         state.requested_path = None;
         state.active = None;
     }
@@ -1595,6 +1669,7 @@ impl ServerRuntime {
     /// does not split the slot: CPU and accelerated/Exact requests for the same
     /// model share one capacity unit. Route identity isolates streaming workers
     /// and thread-local ggml backend handles instead.
+    #[cfg(test)]
     pub(crate) fn acquire_native_execution(
         &self,
         verified_model_identity: &str,
@@ -1609,6 +1684,48 @@ impl ServerRuntime {
                 ));
             }
         };
+        self.try_acquire_native_execution(verified_model_identity, route)
+    }
+
+    /// Admits a request only if the active model inspected before preparation
+    /// is still the same publication. Reading `current()` and later acquiring
+    /// a generic permit is insufficient: an activation can commit between the
+    /// two operations and an old adapter would then start after the cutover.
+    pub(crate) fn acquire_native_execution_for_snapshot(
+        &self,
+        snapshot: &ActiveRuntimeSnapshot,
+        verified_model_identity: &str,
+        route: Option<&openasr_core::ResolvedExecutionRoute>,
+    ) -> Result<AdmittedNativeExecution, ApiError> {
+        let _activation_gate = match self.model_pack_path.activation_barrier.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(ApiError::Conflict(
+                    "Cannot start a native session while the active model is changing.".to_string(),
+                ));
+            }
+        };
+        if !self.model_pack_path.snapshot_is_current(snapshot) {
+            return Err(ApiError::Conflict(
+                "The active model changed while the native session was being prepared; retry the request."
+                    .to_string(),
+            ));
+        }
+        // Enter activity while still holding the activation barrier. The idle
+        // reaper's exclusive unload claim and this enter are serialized, so
+        // runtime/session construction cannot begin in the gap after the
+        // reaper observed zero activity but before it tears owners down.
+        let activity = NativeActivityGuard::enter();
+        let permit = self.try_acquire_native_execution(verified_model_identity, route)?;
+        Ok(AdmittedNativeExecution { permit, activity })
+    }
+
+    fn try_acquire_native_execution(
+        &self,
+        verified_model_identity: &str,
+        route: Option<&openasr_core::ResolvedExecutionRoute>,
+    ) -> Result<ModelSessionPermit, ApiError> {
         let identity = openasr_core::admission_identity_for_route(verified_model_identity, route);
         self.native_execution
             .try_acquire(identity)
@@ -1733,7 +1850,12 @@ impl ServerRuntime {
                 .execution_services()
                 .evict_prepared_runtime_content_id(previous.pack_content_id());
         }
-        idle_activity::bump_native_unload_generation();
+        // Attestation warmed this identity after advancing the runtime
+        // generation. Do not advance again here: that would invalidate the
+        // candidate worker's TLS and exact resident marker immediately after
+        // the transaction proved them. Old content was evicted explicitly
+        // above, and new-session admission remains behind the activation
+        // barrier until this non-fallible publication returns.
         invalidate_cached_native_realtime_capabilities();
     }
 
@@ -1768,7 +1890,13 @@ impl ServerRuntime {
     fn model_is_resident(&self) -> bool {
         match self.backend {
             BackendKind::Mock => true,
-            BackendKind::Native => idle_activity::native_model_is_resident(),
+            BackendKind::Native => {
+                self.model_pack_path
+                    .current_snapshot()
+                    .is_some_and(|snapshot| {
+                        idle_activity::native_model_is_resident(snapshot.residency_key())
+                    })
+            }
         }
     }
 }
