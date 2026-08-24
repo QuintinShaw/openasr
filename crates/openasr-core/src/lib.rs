@@ -97,6 +97,7 @@ mod ownership_evidence;
 pub(crate) mod pull;
 pub(crate) mod punctuation;
 mod qualification_manifest;
+mod qualification_runtime;
 pub mod realtime;
 pub(crate) mod registry;
 pub(crate) mod remote_compute;
@@ -217,6 +218,12 @@ pub use qualification_manifest_security::{
     QUALIFICATION_MANIFEST_PRODUCTION_KEY_ID, QUALIFICATION_MANIFEST_SIGNATURE_ALGORITHM,
     QUALIFICATION_MANIFEST_SIGNATURE_FILE_NAME, QUALIFICATION_MANIFEST_SIGNATURE_SCHEMA_VERSION,
     QualificationManifestSecurityError,
+};
+pub use qualification_runtime::{
+    QUALIFICATION_ARTIFACT_PREPARATION_SCHEMA, QUALIFICATION_BACKEND_RUNTIME_SCHEMA,
+    QualificationArtifactPreparation, QualificationAttestationVerification,
+    QualificationBackendRuntimeEvidence, QualificationRuntimeError, execute_backend_qualification,
+    prepare_backend_qualification_artifacts,
 };
 pub use short_audio_receipt::{
     DecodeFirstDivergenceClass, EncoderDecoderSplitLane, EncoderDecoderSplitProbeRecord,

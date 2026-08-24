@@ -15,13 +15,23 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
+#[cfg(windows)]
+use std::os::windows::{fs::MetadataExt as _, io::AsRawHandle as _};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, GetFileInformationByHandle,
+};
+
 use crate::models::pack_verifier::{
     AdmittedPack, PackCandidate, PackRoute, PackVerificationError, PackVerifier,
 };
 use crate::{
     BackendAvailability, CatalogBackendFile, CatalogBackendFileRole, CatalogBackendVendor,
     CatalogModel, CatalogPullRequest, CatalogQuant, ModelCatalog, OPENASR_RUNTIME_PACK_EXTENSION,
-    ResolvedCatalogBackendPull, ResolvedCatalogPull, atomic_file, canonical_quant_tag,
+    QualificationArtifact, QualificationArtifactFormat, ResolvedCatalogBackendPull,
+    ResolvedCatalogPull, VerifiedQualificationManifest, atomic_file, canonical_quant_tag,
     catalog_series::family_aliases_match,
     content_store,
     download_source::{self, DownloadSource},
@@ -3143,11 +3153,61 @@ fn reject_symlink(path: &Path) -> Result<(), PullError> {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return Ok(());
     };
-    if metadata.file_type().is_symlink() {
+    #[cfg(windows)]
+    let is_reparse_point = metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    #[cfg(not(windows))]
+    let is_reparse_point = false;
+    if metadata.file_type().is_symlink() || is_reparse_point {
         return Err(PullError::UnsafeStoragePath {
             path: path.to_path_buf(),
         });
     }
+    Ok(())
+}
+
+pub(crate) fn reject_qualification_file_links(path: &Path) -> Result<(), PullError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| PullError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(PullError::UnsafeStoragePath {
+            path: path.to_path_buf(),
+        });
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        return Err(PullError::UnsafeStoragePath {
+            path: path.to_path_buf(),
+        });
+    }
+    #[cfg(windows)]
+    {
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(PullError::UnsafeStoragePath {
+                path: path.to_path_buf(),
+            });
+        }
+        let file = File::open(path).map_err(|source| PullError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` owns a live handle and `information` is writable for
+        // the exact structure required by GetFileInformationByHandle.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0
+            || information.nNumberOfLinks != 1
+        {
+            return Err(PullError::UnsafeStoragePath {
+                path: path.to_path_buf(),
+            });
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    return Err(PullError::UnsafeStoragePath {
+        path: path.to_path_buf(),
+    });
+    #[cfg(any(unix, windows))]
     Ok(())
 }
 
@@ -3627,7 +3687,7 @@ pub fn available_disk_space_bytes(path: &Path) -> Option<u64> {
     available_space_bytes(path)
 }
 
-fn file_size_and_sha256(path: &Path) -> Result<(u64, String), PullError> {
+pub(crate) fn file_size_and_sha256(path: &Path) -> Result<(u64, String), PullError> {
     let mut file = File::open(path).map_err(|source| PullError::Io {
         path: path.to_path_buf(),
         source,
@@ -5014,9 +5074,11 @@ fn should_hash_installed_backend_file(
 }
 
 fn backend_content_object_dir(home: &Path, file: &CatalogBackendFile) -> PathBuf {
-    home.join("backends")
-        .join("_objects")
-        .join(file.sha256.to_ascii_lowercase())
+    backend_content_object_dir_in(&home.join("backends").join("_objects"), file)
+}
+
+fn backend_content_object_dir_in(objects_root: &Path, file: &CatalogBackendFile) -> PathBuf {
+    objects_root.join(file.sha256.to_ascii_lowercase())
 }
 
 fn backend_pack_staging_dir(
@@ -5034,8 +5096,11 @@ fn backend_pack_staging_dir(
 }
 
 fn backend_object_staging_source(home: &Path, file: &CatalogBackendFile) -> PathBuf {
-    home.join("backends")
-        .join("_objects")
+    backend_object_staging_source_in(&home.join("backends").join("_objects"), file)
+}
+
+fn backend_object_staging_source_in(objects_root: &Path, file: &CatalogBackendFile) -> PathBuf {
+    objects_root
         .join(".staging")
         .join(file.sha256.to_ascii_lowercase())
         .join("source")
@@ -5196,6 +5261,14 @@ fn verify_backend_content_object(
             reason: "object identity does not match the signed catalog file".to_string(),
         });
     }
+    let source_path = object_dir.join("source").join(&file.filename);
+    if !backend_file_matches(&source_path, file) {
+        return Err(PullError::InvalidTarget {
+            field: "backend content object source",
+            reason: "content object no longer contains the signed source bytes".to_string(),
+        });
+    }
+    preflight_backend_file(&source_path, backend_file_format(file.role)?)?;
     let actual_files = collect_materialized_files(&object_dir.join("payload"))?;
     if actual_files != object.files {
         return Err(PullError::InvalidTarget {
@@ -5276,11 +5349,22 @@ fn ensure_backend_content_object<C: DownloadClient>(
     progress: &mut impl FnMut(PullProgress),
 ) -> Result<BackendContentObject, PullError> {
     let objects_root = home.join("backends").join("_objects");
-    fs::create_dir_all(&objects_root).map_err(|source| PullError::Io {
-        path: objects_root.clone(),
+    ensure_backend_content_object_in(client, file, &objects_root, None, None, progress)
+}
+
+fn ensure_backend_content_object_in<C: DownloadClient>(
+    client: &mut C,
+    file: &CatalogBackendFile,
+    objects_root: &Path,
+    signed_urls: Option<&[String]>,
+    expected_unpacked_size_bytes: Option<u64>,
+    progress: &mut impl FnMut(PullProgress),
+) -> Result<BackendContentObject, PullError> {
+    fs::create_dir_all(objects_root).map_err(|source| PullError::Io {
+        path: objects_root.to_path_buf(),
         source,
     })?;
-    let object_dir = backend_content_object_dir(home, file);
+    let object_dir = backend_content_object_dir_in(objects_root, file);
     let lock_path = objects_root.join(format!("{}.lock", file.sha256.to_ascii_lowercase()));
     let _lock = BackendInstallLock::acquire(&lock_path)?;
     if let Ok(object) = verify_backend_content_object(&object_dir, file) {
@@ -5298,7 +5382,11 @@ fn ensure_backend_content_object<C: DownloadClient>(
     let source_valid = file_size_and_sha256(&source_path)
         .is_ok_and(|(size, sha)| size == file.size_bytes && sha.eq_ignore_ascii_case(&file.sha256));
     if !source_valid {
-        download_backend_file(client, file, &source_path, progress)?;
+        if let Some(urls) = signed_urls {
+            download_backend_file_from_signed_urls(client, file, urls, &source_path, progress)?;
+        } else {
+            download_backend_file(client, file, &source_path, progress)?;
+        }
     }
     preflight_backend_file(&source_path, backend_file_format(file.role)?)?;
 
@@ -5322,10 +5410,11 @@ fn ensure_backend_content_object<C: DownloadClient>(
             link_or_copy_backend_payload(&source_path, &payload.join(&file.filename))?;
         }
         CatalogBackendFileRole::Archive => {
-            extract_backend_archive(
+            extract_backend_archive_with_expected_size(
                 &source_path,
                 &payload,
                 file.extract_subdir.as_deref().unwrap_or(""),
+                expected_unpacked_size_bytes,
             )?;
         }
         CatalogBackendFileRole::Plugin | CatalogBackendFileRole::Unknown => {
@@ -5730,6 +5819,246 @@ pub(crate) struct PreparedBackendRuntimeFile {
 pub(crate) struct PreparedBackendRuntimeObjects {
     pub dependency_dirs: Vec<PathBuf>,
     pub files: Vec<PreparedBackendRuntimeFile>,
+}
+
+/// Downloaded qualification artifact whose bytes were selected exclusively by
+/// a production-signature-verified qualification manifest. Paths stay
+/// crate-private so no caller can turn this into an arbitrary plugin-path API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedQualificationFile {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+/// Verified archive release subject and its separately namespaced extracted
+/// payload. `materialized_files` is the same canonical tree representation the
+/// ordinary backend store uses; qualification adds the signed total-byte
+/// bound before extraction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedQualificationArchive {
+    pub source: PreparedQualificationFile,
+    pub payload_root: PathBuf,
+    pub materialized_files: Vec<InstalledBackendMaterializedFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedQualificationArtifacts {
+    pub artifact_root: PathBuf,
+    pub binary_bundle: PreparedQualificationArchive,
+    pub plugin: Option<PreparedQualificationFile>,
+    pub vendor: Vec<PreparedQualificationArchive>,
+    pub attestation_bundle: PreparedQualificationFile,
+}
+
+/// Fetch and materialize the inert release subjects named by one verified
+/// qualification manifest. This deliberately does not install a backend pack,
+/// touch the ordinary backend store, or create an activation pointer.
+pub(crate) fn prepare_qualification_release_artifacts(
+    verified: &VerifiedQualificationManifest,
+    qualification_store_root: &Path,
+    mut progress: impl FnMut(PullProgress),
+) -> Result<PreparedQualificationArtifacts, PullError> {
+    let artifact_root = qualification_store_root.join(verified.manifest_sha256());
+    let downloads_root = artifact_root.join("downloads");
+    let objects_root = artifact_root.join("objects");
+    let locks_root = artifact_root.join("locks");
+    for path in [
+        qualification_store_root,
+        artifact_root.as_path(),
+        downloads_root.as_path(),
+        objects_root.as_path(),
+        locks_root.as_path(),
+    ] {
+        ensure_safe_directory_under_root(qualification_store_root, path)?;
+    }
+
+    let manifest = verified.manifest();
+    let mut client = HttpDownloadClient::new()?;
+    let binary_bundle = prepare_qualification_archive(
+        &mut client,
+        &manifest.artifacts.binary.bundle,
+        &objects_root,
+        &mut progress,
+    )?;
+    let plugin = manifest
+        .artifacts
+        .plugin
+        .as_ref()
+        .map(|artifact| {
+            prepare_qualification_direct_file(
+                &mut client,
+                artifact,
+                &downloads_root,
+                &locks_root,
+                Some(BackendFileFormat::NativeLibrary),
+                &mut progress,
+            )
+        })
+        .transpose()?;
+    let vendor = manifest
+        .artifacts
+        .vendor
+        .iter()
+        .map(|artifact| {
+            prepare_qualification_archive(&mut client, artifact, &objects_root, &mut progress)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let attestation_bundle = prepare_qualification_direct_file(
+        &mut client,
+        &manifest.attestation.bundle,
+        &downloads_root,
+        &locks_root,
+        None,
+        &mut progress,
+    )?;
+    Ok(PreparedQualificationArtifacts {
+        artifact_root,
+        binary_bundle,
+        plugin,
+        vendor,
+        attestation_bundle,
+    })
+}
+
+fn qualification_catalog_file(
+    artifact: &QualificationArtifact,
+    role: CatalogBackendFileRole,
+    expected_format: QualificationArtifactFormat,
+) -> Result<CatalogBackendFile, PullError> {
+    if role == CatalogBackendFileRole::Unknown || artifact.format != expected_format {
+        return Err(PullError::InvalidTarget {
+            field: "qualification artifact format",
+            reason: format!(
+                "signed {:?} artifact cannot be materialized as {role:?}",
+                artifact.format
+            ),
+        });
+    }
+    Ok(CatalogBackendFile {
+        filename: artifact.file_name.clone(),
+        url: artifact
+            .urls
+            .first()
+            .cloned()
+            .ok_or(PullError::InvalidTarget {
+                field: "qualification artifact URLs",
+                reason: "at least one signed URL is required".to_string(),
+            })?,
+        mirrors: Vec::new(),
+        sha256: artifact.sha256.clone(),
+        size_bytes: artifact.size_bytes,
+        role,
+        extract_subdir: (role == CatalogBackendFileRole::Archive).then(String::new),
+        extracted_tree_sha256: artifact.unpacked_tree_sha256.clone(),
+    })
+}
+
+fn prepare_qualification_direct_file<C: DownloadClient>(
+    client: &mut C,
+    artifact: &QualificationArtifact,
+    downloads_root: &Path,
+    locks_root: &Path,
+    preflight: Option<BackendFileFormat>,
+    progress: &mut impl FnMut(PullProgress),
+) -> Result<PreparedQualificationFile, PullError> {
+    let format_role = match artifact.format {
+        QualificationArtifactFormat::NativeLibrary => CatalogBackendFileRole::Plugin,
+        QualificationArtifactFormat::AttestationBundle => CatalogBackendFileRole::Runtime,
+        QualificationArtifactFormat::ZipArchive | QualificationArtifactFormat::Unknown => {
+            return Err(PullError::InvalidTarget {
+                field: "qualification direct artifact format",
+                reason: "only native libraries and attestation bundles are direct files"
+                    .to_string(),
+            });
+        }
+    };
+    let file = qualification_catalog_file(artifact, format_role, artifact.format)?;
+    let digest_dir = downloads_root.join(&artifact.sha256);
+    ensure_safe_directory_under_root(downloads_root, &digest_dir)?;
+    let lock_path = locks_root.join(format!("{}.lock", artifact.sha256));
+    let _lock = BackendInstallLock::acquire(&lock_path)?;
+    let path = digest_dir.join(&artifact.file_name);
+    download_backend_file_from_signed_urls(client, &file, &artifact.urls, &path, progress)?;
+    reject_qualification_file_links(&path)?;
+    if let Some(format) = preflight {
+        preflight_backend_file(&path, format)?;
+    }
+    Ok(PreparedQualificationFile {
+        path,
+        size_bytes: artifact.size_bytes,
+        sha256: artifact.sha256.clone(),
+    })
+}
+
+fn prepare_qualification_archive<C: DownloadClient>(
+    client: &mut C,
+    artifact: &QualificationArtifact,
+    objects_root: &Path,
+    progress: &mut impl FnMut(PullProgress),
+) -> Result<PreparedQualificationArchive, PullError> {
+    let file = qualification_catalog_file(
+        artifact,
+        CatalogBackendFileRole::Archive,
+        QualificationArtifactFormat::ZipArchive,
+    )?;
+    let expected_unpacked_size_bytes =
+        artifact
+            .unpacked_size_bytes
+            .ok_or(PullError::InvalidTarget {
+                field: "qualification archive unpacked_size_bytes",
+                reason: "signed unpacked size is required".to_string(),
+            })?;
+    let object = ensure_backend_content_object_in(
+        client,
+        &file,
+        objects_root,
+        Some(&artifact.urls),
+        Some(expected_unpacked_size_bytes),
+        progress,
+    )?;
+    let object_dir = backend_content_object_dir_in(objects_root, &file);
+    let source_path = object_dir.join("source").join(&artifact.file_name);
+    reject_qualification_file_links(&source_path)?;
+    let (source_size, source_sha256) = file_size_and_sha256(&source_path)?;
+    if source_size != artifact.size_bytes {
+        return Err(PullError::SizeMismatch {
+            path: source_path,
+            expected: artifact.size_bytes,
+            actual: source_size,
+        });
+    }
+    if source_sha256 != artifact.sha256 {
+        return Err(PullError::ShaMismatch {
+            path: source_path,
+            expected: artifact.sha256.clone(),
+            actual: source_sha256,
+        });
+    }
+    let actual_unpacked_size_bytes = object.files.iter().try_fold(0_u64, |total, file| {
+        total
+            .checked_add(file.size_bytes)
+            .ok_or(PullError::InvalidTarget {
+                field: "qualification archive unpacked_size_bytes",
+                reason: "materialized file total overflowed u64".to_string(),
+            })
+    })?;
+    if actual_unpacked_size_bytes != expected_unpacked_size_bytes {
+        return Err(PullError::SizeMismatch {
+            path: object_dir.join("payload"),
+            expected: expected_unpacked_size_bytes,
+            actual: actual_unpacked_size_bytes,
+        });
+    }
+    Ok(PreparedQualificationArchive {
+        source: PreparedQualificationFile {
+            path: object_dir.join("source").join(&artifact.file_name),
+            size_bytes: artifact.size_bytes,
+            sha256: artifact.sha256.clone(),
+        },
+        payload_root: object_dir.join("payload"),
+        materialized_files: object.files,
+    })
 }
 
 pub(crate) fn prepare_backend_runtime_objects_locked(
@@ -6291,6 +6620,47 @@ fn prune_empty_directories(root: &Path) {
 /// a replacement Desktop process can resume after NSIS terminates the old
 /// process. The signed sha256 remains the final authority; ETag is only a
 /// transport guard that prevents appending bytes from two representations.
+fn download_backend_file_from_signed_urls<C: DownloadClient>(
+    client: &mut C,
+    file: &CatalogBackendFile,
+    urls: &[String],
+    dest: &Path,
+    progress: &mut impl FnMut(PullProgress),
+) -> Result<(), PullError> {
+    if urls.is_empty() {
+        return Err(PullError::InvalidTarget {
+            field: "qualification artifact URLs",
+            reason: "at least one signed URL is required".to_string(),
+        });
+    }
+    let mut last_error = None;
+    for (index, url) in urls.iter().enumerate() {
+        if index > 0 {
+            let (partial, partial_meta) = backend_partial_paths(dest)?;
+            discard_backend_partial(&partial, &partial_meta);
+        }
+        let mut candidate = file.clone();
+        candidate.url.clone_from(url);
+        match download_backend_file(client, &candidate, dest, progress) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if matches!(
+                    &error,
+                    PullError::Http { .. }
+                        | PullError::UnexpectedStatus { .. }
+                        | PullError::RestartedPartial { .. }
+                        | PullError::SizeMismatch { .. }
+                        | PullError::ShaMismatch { .. }
+                ) =>
+            {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.expect("non-empty signed URL list produced an error"))
+}
+
 fn download_backend_file<C: DownloadClient>(
     client: &mut C,
     file: &CatalogBackendFile,
@@ -6590,10 +6960,11 @@ fn download_backend_file_attempt<C: DownloadClient>(
 /// Extract a verified zip archive into `<pack_dir>/<subdir>`, rejecting any entry
 /// whose path escapes the destination (zip-slip). The archive's own sha256 was
 /// already checked by the caller; this guards only the per-entry paths.
-fn extract_backend_archive(
+fn extract_backend_archive_with_expected_size(
     zip_path: &Path,
     pack_dir: &Path,
     subdir: &str,
+    expected_unpacked_size_bytes: Option<u64>,
 ) -> Result<(), PullError> {
     let dest_root = pack_dir.join(subdir);
     let file = File::open(zip_path).map_err(|source| PullError::Io {
@@ -6605,6 +6976,8 @@ fn extract_backend_archive(
             path: zip_path.to_path_buf(),
             reason: format!("could not open zip archive: {error}"),
         })?;
+    let mut seen_paths = BTreeSet::new();
+    let mut unpacked_size_bytes = 0_u64;
     for index in 0..archive.len() {
         let mut entry =
             archive
@@ -6620,6 +6993,39 @@ fn extract_backend_archive(
                 reason: format!("zip entry '{}' escapes the extraction dir", entry.name()),
             });
         };
+        let relative_text = relative
+            .to_str()
+            .ok_or_else(|| PullError::BackendFilePreflight {
+                path: zip_path.to_path_buf(),
+                reason: format!("zip entry '{}' has a non-UTF-8 path", entry.name()),
+            })?;
+        validate_safe_relative_path("backend archive entry", relative_text).map_err(|reason| {
+            PullError::BackendFilePreflight {
+                path: zip_path.to_path_buf(),
+                reason,
+            }
+        })?;
+        if !seen_paths.insert(relative_text.to_lowercase()) {
+            return Err(PullError::BackendFilePreflight {
+                path: zip_path.to_path_buf(),
+                reason: format!(
+                    "zip entry '{}' collides case-insensitively with another entry",
+                    entry.name()
+                ),
+            });
+        }
+        if entry.unix_mode().is_some_and(|mode| {
+            let kind = mode & 0o170000;
+            kind != 0 && kind != 0o040000 && kind != 0o100000
+        }) {
+            return Err(PullError::BackendFilePreflight {
+                path: zip_path.to_path_buf(),
+                reason: format!(
+                    "zip entry '{}' is not a regular file or directory",
+                    entry.name()
+                ),
+            });
+        }
         let out_path = dest_root.join(&relative);
         if entry.is_dir() {
             fs::create_dir_all(&out_path).map_err(|source| PullError::Io {
@@ -6634,14 +7040,48 @@ fn extract_backend_archive(
                 source,
             })?;
         }
+        let remaining = expected_unpacked_size_bytes
+            .map(|expected| expected.saturating_sub(unpacked_size_bytes));
+        if remaining.is_some_and(|remaining| entry.size() > remaining) {
+            return Err(PullError::BackendFilePreflight {
+                path: zip_path.to_path_buf(),
+                reason: "archive exceeds its signed unpacked_size_bytes".to_string(),
+            });
+        }
         let mut out = File::create(&out_path).map_err(|source| PullError::Io {
             path: out_path.clone(),
             source,
         })?;
-        io::copy(&mut entry, &mut out).map_err(|source| PullError::Io {
+        let copied = match remaining {
+            Some(remaining) => io::copy(&mut entry.take(remaining.saturating_add(1)), &mut out),
+            None => io::copy(&mut entry, &mut out),
+        }
+        .map_err(|source| PullError::Io {
             path: out_path.clone(),
             source,
         })?;
+        if remaining.is_some_and(|remaining| copied > remaining) {
+            return Err(PullError::BackendFilePreflight {
+                path: zip_path.to_path_buf(),
+                reason: "archive exceeds its signed unpacked_size_bytes".to_string(),
+            });
+        }
+        unpacked_size_bytes = unpacked_size_bytes.checked_add(copied).ok_or_else(|| {
+            PullError::BackendFilePreflight {
+                path: zip_path.to_path_buf(),
+                reason: "archive unpacked size overflowed u64".to_string(),
+            }
+        })?;
+    }
+    if let Some(expected) = expected_unpacked_size_bytes
+        && expected != unpacked_size_bytes
+    {
+        return Err(PullError::BackendFilePreflight {
+            path: zip_path.to_path_buf(),
+            reason: format!(
+                "archive unpacked size mismatch: expected {expected}, got {unpacked_size_bytes}"
+            ),
+        });
     }
     Ok(())
 }

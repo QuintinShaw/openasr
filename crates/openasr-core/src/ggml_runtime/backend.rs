@@ -65,6 +65,8 @@ pub enum BackendPluginActivationError {
     LoadFailed { backend_id: String },
     #[error("backend pack '{backend_id}' failed live device/driver attestation")]
     LiveProbeFailed { backend_id: String },
+    #[error("qualification artifact verification failed before provider load: {0}")]
+    QualificationArtifactInvalid(String),
     #[error("backend pack '{backend_id}' registered '{actual}', expected provider '{expected}'")]
     ProviderMismatch {
         backend_id: String,
@@ -477,6 +479,12 @@ pub(crate) struct ActivatedBackendExecutionIdentity {
     pub driver_version: String,
     pub artifact_fingerprint: String,
     pub provider: ExecutionProvider,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct QualificationBackendActivation {
+    pub backend_id: String,
+    pub driver_api_version: Option<String>,
 }
 
 impl AcceleratedDeviceSelectionRule {
@@ -1248,6 +1256,113 @@ fn activate_selected_backend_plugin()
         artifact_fingerprint: backend_artifact_fingerprint(&resolved),
         provider: execution_provider_for_catalog_vendor(resolved.vendor),
     }))
+}
+
+/// Load an optional provider only from the private artifact-bound
+/// qualification typestate. This does not read a catalog, accept a path from a
+/// caller, or persist an activation selector.
+pub(crate) fn activate_attested_qualification_backend(
+    attested: &crate::qualification_runtime::AttestedQualificationBackend,
+) -> Result<QualificationBackendActivation, BackendPluginActivationError> {
+    // CUDA/HIP are optional DLLs and therefore require the neutral dynamic
+    // host. Physical Vulkan qualification instead binds a release executable
+    // with Vulkan compiled into that immutable bundle; it must not be forced
+    // through the optional-plugin loader (or a second ggml registry).
+    if attested.provider() != crate::QualificationProvider::Vulkan
+        && !ggml_backend_dl_build_enabled()
+    {
+        return Err(BackendPluginActivationError::DynamicLoadingUnavailable);
+    }
+    bundled_cpu_activation_cell()
+        .get_or_init(load_bundled_cpu_module)
+        .clone()?;
+    attested.reverify_for_load().map_err(|error| {
+        BackendPluginActivationError::QualificationArtifactInvalid(error.to_string())
+    })?;
+
+    let vendor = match attested.provider() {
+        crate::QualificationProvider::Cuda => CatalogBackendVendor::Cuda,
+        crate::QualificationProvider::Hip => CatalogBackendVendor::Hip,
+        crate::QualificationProvider::Vulkan => {
+            return Ok(QualificationBackendActivation {
+                backend_id: format!(
+                    "qualification:{}:vulkan:{}",
+                    attested.manifest_sha256(),
+                    attested.target()
+                ),
+                driver_api_version: None,
+            });
+        }
+        crate::QualificationProvider::Unknown => {
+            return Err(BackendPluginActivationError::QualificationArtifactInvalid(
+                "unknown qualification provider".to_string(),
+            ));
+        }
+    };
+    if backend_plugin_activation_cell().get().is_some() {
+        return Err(BackendPluginActivationError::QualificationArtifactInvalid(
+            "optional backend activation was initialized before qualification load".to_string(),
+        ));
+    }
+    let plugin_path = attested.plugin_path().ok_or_else(|| {
+        BackendPluginActivationError::QualificationArtifactInvalid(
+            "optional qualification provider has no signed plugin".to_string(),
+        )
+    })?;
+    let dependency_dirs = attested.dependency_dirs();
+    if vendor == CatalogBackendVendor::Hip {
+        crate::backend_distribution::bind_verified_hip_kernel_libpaths(&dependency_dirs);
+    }
+    let backend_id = format!(
+        "qualification:{}:{}:{}",
+        attested.manifest_sha256(),
+        attested.provider().as_str(),
+        attested.target()
+    );
+    let _load_guards =
+        lock_verified_backend_load_files(&backend_id, plugin_path, &dependency_dirs)?;
+    attested.reverify_for_load().map_err(|error| {
+        BackendPluginActivationError::QualificationArtifactInvalid(error.to_string())
+    })?;
+    let driver_api_version = probe_exact_backend_plugin_candidate(
+        &backend_id,
+        vendor,
+        plugin_path,
+        &dependency_dirs,
+        attested.target(),
+        None,
+    )?;
+    let artifact_fingerprint = attested.plugin_sha256().ok_or_else(|| {
+        BackendPluginActivationError::QualificationArtifactInvalid(
+            "optional qualification provider has no signed plugin identity".to_string(),
+        )
+    })?;
+    load_exact_backend_plugin(
+        &backend_id,
+        vendor,
+        plugin_path,
+        &dependency_dirs,
+        attested.target(),
+        None,
+    )?;
+    let provider = execution_provider_for_catalog_vendor(vendor);
+    backend_plugin_activation_cell()
+        .set(Ok(Some(ActivatedBackendRuntime {
+            backend_id: backend_id.clone(),
+            device_target: attested.target().to_string(),
+            driver_version: driver_api_version.clone(),
+            artifact_fingerprint: artifact_fingerprint.to_string(),
+            provider,
+        })))
+        .map_err(|_| {
+            BackendPluginActivationError::QualificationArtifactInvalid(
+                "optional backend activation raced qualification load".to_string(),
+            )
+        })?;
+    Ok(QualificationBackendActivation {
+        backend_id,
+        driver_api_version: Some(driver_api_version),
+    })
 }
 
 const fn execution_provider_for_catalog_vendor(vendor: CatalogBackendVendor) -> ExecutionProvider {

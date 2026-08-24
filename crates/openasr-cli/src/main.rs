@@ -47,6 +47,7 @@ mod panic_hook;
 mod parent_watchdog;
 mod progress;
 mod pull_cli;
+mod qualification_cli;
 
 use catalog_cli::*;
 use cli_args::*;
@@ -247,6 +248,42 @@ async fn run() -> Result<()> {
         } => {
             return verify_qualification_manifest_command(&manifest, &signature, &manifest_url);
         }
+        Command::QualifyBackend {
+            manifest,
+            signature,
+            manifest_url,
+            qualification_home,
+        } => {
+            return tokio::task::spawn_blocking(move || {
+                qualification_cli::run_parent(
+                    &manifest,
+                    &signature,
+                    &manifest_url,
+                    &qualification_home,
+                )
+            })
+            .await
+            .context("qualification parent worker task failed")?;
+        }
+        Command::QualificationChild {
+            manifest,
+            signature,
+            manifest_url,
+            qualification_home,
+            expected_manifest_sha256,
+        } => {
+            return tokio::task::spawn_blocking(move || {
+                qualification_cli::run_child(
+                    &manifest,
+                    &signature,
+                    &manifest_url,
+                    &qualification_home,
+                    &expected_manifest_sha256,
+                )
+            })
+            .await
+            .context("qualification child worker task failed")?;
+        }
         Command::BackendPlugin { command } => {
             // Backend-pack installation uses the blocking catalog/download
             // client by design: the same implementation is shared with the
@@ -343,7 +380,10 @@ async fn run() -> Result<()> {
             print_public_key,
         ),
         Command::CatalogFingerprint => catalog_fingerprint_command(),
-        Command::SignQualificationManifest { .. } | Command::VerifyQualificationManifest { .. } => {
+        Command::SignQualificationManifest { .. }
+        | Command::VerifyQualificationManifest { .. }
+        | Command::QualifyBackend { .. }
+        | Command::QualificationChild { .. } => {
             unreachable!("handled before runtime initialization")
         }
         Command::Transcribe {

@@ -2779,6 +2779,50 @@ fn sign_qualification_manifest_rejects_activation_policy_before_writing() {
     );
 }
 
+#[test]
+fn qualification_runner_surface_has_no_plugin_or_activation_bypass() {
+    openasr()
+        .args(["__openasr-qualify-backend", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--manifest <MANIFEST>"))
+        .stdout(predicate::str::contains("--signature <SIGNATURE>"))
+        .stdout(predicate::str::contains(
+            "--qualification-home <QUALIFICATION_HOME>",
+        ))
+        .stdout(predicate::str::contains("--plugin-path").not())
+        .stdout(predicate::str::contains("--backend-id").not())
+        .stdout(predicate::str::contains("--activation-mode").not());
+}
+
+#[test]
+fn qualification_parent_rejects_missing_signature_before_artifact_or_runtime_work() {
+    let home = temp_home();
+    let manifest = write_probe_file(
+        home.path(),
+        "qualification-manifest.json",
+        r#"{"schema_version":1}"#,
+    );
+    let qualification_home = home.path().join("qualification-home");
+
+    openasr()
+        .arg("__openasr-qualify-backend")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--signature")
+        .arg(home.path().join("missing.signature.json"))
+        .arg("--manifest-url")
+        .arg("https://dl.openasr.org/core/v0.1.37/qualification/cuda-sm_89/qualification-manifest.json")
+        .arg("--qualification-home")
+        .arg(&qualification_home)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "could not read qualification signature",
+        ));
+    assert!(!qualification_home.exists());
+}
+
 // --- model-pack audit-quant (quantization-strategy self-check) -------------
 
 #[test]

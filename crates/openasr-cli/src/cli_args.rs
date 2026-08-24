@@ -350,6 +350,35 @@ pub(crate) enum Command {
         #[arg(long)]
         manifest_url: String,
     },
+    /// Explicit parent runner for inert, signed backend qualification assets.
+    /// It has no plugin-path or activation-mode argument and spawns a fresh
+    /// child using this exact executable.
+    #[command(name = "__openasr-qualify-backend", hide = true)]
+    QualifyBackend {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        signature: PathBuf,
+        #[arg(long)]
+        manifest_url: String,
+        #[arg(long)]
+        qualification_home: PathBuf,
+    },
+    /// Fresh-process half of `__openasr-qualify-backend`. The expected
+    /// manifest digest binds the child to the bytes the parent prepared.
+    #[command(name = "__openasr-qualification-child", hide = true)]
+    QualificationChild {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        signature: PathBuf,
+        #[arg(long)]
+        manifest_url: String,
+        #[arg(long)]
+        qualification_home: PathBuf,
+        #[arg(long)]
+        expected_manifest_sha256: String,
+    },
     /// Transcribe one or more audio files (or directories of audio).
     #[command(visible_alias = "t")]
     Transcribe {

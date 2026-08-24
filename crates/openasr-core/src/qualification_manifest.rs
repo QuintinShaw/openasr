@@ -270,10 +270,17 @@ impl QualificationManifest {
         }
         require_text("release_subject", &self.release_subject)?;
         validate_host_abi(&self.host_abi)?;
+        if !self.host_abi.target.ends_with("-pc-windows-msvc") {
+            return Err(invalid(
+                "host_abi.target",
+                "qualification v1 requires a Windows MSVC release host",
+            ));
+        }
         if self.provider_target.provider == QualificationProvider::Unknown {
             return Err(invalid("provider_target.provider", "unknown provider"));
         }
         require_token("provider_target.target", &self.provider_target.target)?;
+        validate_provider_target(&self.provider_target)?;
         self.artifacts.binary.validate()?;
         if let Some(plugin) = &self.artifacts.plugin {
             plugin.validate(
@@ -380,6 +387,12 @@ impl QualificationManifest {
 impl QualificationBinaryArtifact {
     fn validate(&self) -> Result<(), QualificationManifestError> {
         require_file_name("artifacts.binary.file_name", &self.file_name)?;
+        if !self.file_name.to_ascii_lowercase().ends_with(".exe") {
+            return Err(invalid(
+                "artifacts.binary.file_name",
+                "Windows qualification binary must use an .exe basename",
+            ));
+        }
         require_lower_hex("artifacts.binary.sha256", &self.sha256, 64)?;
         if self.size_bytes == 0 {
             return Err(invalid(
@@ -408,6 +421,21 @@ impl QualificationArtifact {
                     "artifact format {:?} does not match required role {:?}",
                     self.format, expected_format
                 ),
+            ));
+        }
+        let lower_name = self.file_name.to_ascii_lowercase();
+        let extension_matches = match self.format {
+            QualificationArtifactFormat::NativeLibrary => lower_name.ends_with(".dll"),
+            QualificationArtifactFormat::ZipArchive => lower_name.ends_with(".zip"),
+            QualificationArtifactFormat::AttestationBundle => {
+                lower_name.ends_with(".json") || lower_name.ends_with(".jsonl")
+            }
+            QualificationArtifactFormat::Unknown => false,
+        };
+        if !extension_matches {
+            return Err(invalid(
+                field,
+                "artifact basename does not match its format",
             ));
         }
         require_lower_hex(field, &self.sha256, 64)?;
@@ -456,6 +484,33 @@ impl QualificationArtifact {
         }
         Ok(())
     }
+}
+
+fn validate_provider_target(
+    target: &QualificationProviderTarget,
+) -> Result<(), QualificationManifestError> {
+    let valid = match target.provider {
+        QualificationProvider::Cuda => target.target.strip_prefix("sm_").is_some_and(|suffix| {
+            matches!(suffix.len(), 2 | 3) && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        }),
+        QualificationProvider::Hip => target.target.strip_prefix("gfx").is_some_and(|suffix| {
+            (3..=8).contains(&suffix.len())
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }),
+        QualificationProvider::Vulkan => target.target.starts_with("vulkan-windows-"),
+        QualificationProvider::Unknown => false,
+    };
+    valid.then_some(()).ok_or_else(|| {
+        invalid(
+            "provider_target.target",
+            format!(
+                "target is not canonical for provider {}",
+                target.provider.as_str()
+            ),
+        )
+    })
 }
 
 fn validate_host_abi(host_abi: &QualificationHostAbi) -> Result<(), QualificationManifestError> {
@@ -801,6 +856,7 @@ mod tests {
 
         let mut hip = manifest_value();
         hip["provider_target"]["provider"] = serde_json::json!("hip");
+        hip["provider_target"]["target"] = serde_json::json!("gfx1200");
         hip["artifacts"]
             .as_object_mut()
             .expect("artifacts")
@@ -808,6 +864,33 @@ mod tests {
         assert!(matches!(
             verify_with_test_root(&hip),
             Err(QualificationManifestError::InvalidPackaging { .. })
+        ));
+    }
+
+    #[test]
+    fn provider_targets_and_windows_artifact_extensions_are_canonical() {
+        for (provider, target) in [
+            ("cuda", "gfx1200"),
+            ("hip", "sm_89"),
+            ("vulkan", "vulkan-any"),
+        ] {
+            let mut manifest = manifest_value();
+            manifest["provider_target"]["provider"] = serde_json::json!(provider);
+            manifest["provider_target"]["target"] = serde_json::json!(target);
+            assert!(matches!(
+                verify_with_test_root(&manifest),
+                Err(QualificationManifestError::InvalidField { .. })
+            ));
+        }
+
+        let mut wrong_plugin_extension = manifest_value();
+        wrong_plugin_extension["artifacts"]["plugin"]["file_name"] =
+            serde_json::json!("openasr-cuda.bin");
+        wrong_plugin_extension["artifacts"]["plugin"]["urls"] =
+            serde_json::json!(["https://dl.openasr.org/core/v0.1.37/openasr-cuda.bin"]);
+        assert!(matches!(
+            verify_with_test_root(&wrong_plugin_extension),
+            Err(QualificationManifestError::InvalidField { .. })
         ));
     }
 

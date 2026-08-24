@@ -73,12 +73,36 @@ vendor hashes, host ABI, provider target, attestation, and immutable download
 locations. It carries no activation modes and never enters ordinary runtime
 candidate generation.
 
+On Windows, `artifacts.binary` binds both the exact `openasr.exe` member and
+the attested release ZIP that contains it. The ZIP also carries a signed
+unpacked-byte total and canonical tree digest, so qualification rejects a
+correct executable combined with changed or extra companion DLLs. Plugin DLLs
+and vendor ZIPs use the same signed URL/hash discipline in a qualification-only
+content namespace; none is installed into the ordinary backend store.
+
 Before qualification succeeds, the ordinary capability-aware runtime catalog
 contains no CUDA candidate compatible with the new host ABI. The explicit
 qualification runner consumes the signed manifest in an isolated child process
 using the exact final release bytes. It refuses the real user home, does not
 write ordinary `active.json`, accepts no arbitrary plugin path, and exposes no
 Auto or Explicit activation path.
+
+The explicit `__openasr-qualify-backend` parent verifies and prepares the
+manifest, then starts the same executable as a fresh
+`__openasr-qualification-child` bound to the parent's manifest SHA. The child
+re-verifies the production signature, exact host ABI, release-bundle tree,
+artifact hashes, and attestations before loading anything. Windows file handles
+deny write/delete sharing from the final rehash through provider execution;
+directory components reject symlinks, junctions, and reparse points.
+
+GitHub CLI is currently part of the qualification-host trusted computing base
+for Sigstore bundle verification. The runner resolves `gh.exe` once to an
+absolute non-linked file, holds a deny-write/delete handle, records its version
+and SHA-256, passes the signed repository/workflow/source/predicate constraints,
+and supplies the signed offline bundle. This is an explicit host-tool
+assumption, not an OpenASR artifact correctness proof; replacing it with an
+in-process Sigstore verifier may narrow the TCB later without changing the
+manifest or capability contract.
 
 ### Old-client rejection
 
