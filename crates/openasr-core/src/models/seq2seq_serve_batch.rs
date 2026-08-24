@@ -258,9 +258,9 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
         }
     }
 
-    fn acquire_not_priced_legacy_resource(&self, kind: String) -> Option<RuntimeResourceGuard> {
+    fn acquire_semantic_resource(&self, kind: String) -> Option<RuntimeResourceGuard> {
         let receipt = self.receipt_context.as_ref()?;
-        let descriptor = receipt.collector.unpriced_resource_descriptor(&kind)?;
+        let descriptor = receipt.collector.no_broker_resource_descriptor(&kind)?;
         receipt
             .collector
             .acquire_resource(receipt.owner_id, descriptor)
@@ -268,17 +268,16 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
 
     fn record_serial_runtime_receipt(&mut self) {
         if self.serial_runtime.is_some() && self.serial_runtime_receipt.is_none() {
-            self.serial_runtime_receipt = self.acquire_not_priced_legacy_resource(
-                "serve-batch.serial-runtime:NotPricedLegacy".to_string(),
-            );
+            self.serial_runtime_receipt =
+                self.acquire_semantic_resource("serve-batch.serial-runtime".to_string());
         }
     }
 
     fn record_batched_runtime_receipt(&mut self, width: usize) {
         if !self.batched_runtime_receipts.contains_key(&width) {
-            if let Some(resource) = self.acquire_not_priced_legacy_resource(format!(
-                "serve-batch.batch-runtime-width={width}:NotPricedLegacy"
-            )) {
+            if let Some(resource) =
+                self.acquire_semantic_resource(format!("serve-batch.batch-runtime-width={width}"))
+            {
                 self.batched_runtime_receipts.insert(width, resource);
             }
         }
@@ -289,8 +288,8 @@ impl<F: Seq2SeqServeBatchFamily> OwnerThreadState<F> {
         active_slots: usize,
         max_batch: usize,
     ) -> Option<RuntimeResourceGuard> {
-        self.acquire_not_priced_legacy_resource(format!(
-            "serve-batch.session-state:active-slots={active_slots}:current-width=NotPricedLegacy:max-batch={max_batch}"
+        self.acquire_semantic_resource(format!(
+            "serve-batch.session-state:active-slots={active_slots}:max-batch={max_batch}"
         ))
     }
 
@@ -2818,14 +2817,20 @@ mod slot_isolation_tests {
         assert!(resource.descriptor.domain.is_none());
         assert_eq!(
             resource.descriptor.requested,
-            crate::models::runtime_receipts::RuntimeReceiptMetric::Unknown
+            crate::models::runtime_receipts::RuntimeReceiptMetric::Known(0)
         );
-        let wire = serde_json::to_value(resource).expect("unpriced receipt serializes");
         assert_eq!(
-            wire["descriptor"]["requested"],
-            serde_json::json!("Unknown")
+            resource.descriptor.ledger_binding,
+            crate::models::runtime_receipts::RuntimeResourceLedgerBinding::NoBrokerLease
         );
+        let wire = serde_json::to_value(resource).expect("semantic receipt serializes");
         assert_eq!(wire["descriptor"]["domain"], serde_json::Value::Null);
+        assert_eq!(
+            services
+                .runtime_receipts()
+                .reconcile_live_leases(services.memory_broker()),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
         assert!(live.events.iter().any(|event| matches!(
             event,
             crate::models::runtime_receipts::RuntimeReceiptEvent::OwnerCreated { .. }

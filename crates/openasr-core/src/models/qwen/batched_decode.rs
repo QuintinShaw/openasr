@@ -1857,10 +1857,10 @@ impl Qwen3AsrOwnerThreadState {
             return;
         };
         for kind in [
-            "serve-batch.qwen.decoder-runtime:NotPricedLegacy",
-            "serve-batch.qwen.logits-runtime:NotPricedLegacy",
+            "serve-batch.qwen.decoder-runtime",
+            "serve-batch.qwen.logits-runtime",
         ] {
-            if let Some(descriptor) = receipt.collector.unpriced_resource_descriptor(kind)
+            if let Some(descriptor) = receipt.collector.no_broker_resource_descriptor(kind)
                 && let Some(resource) = receipt
                     .collector
                     .acquire_resource(receipt.owner_id, descriptor)

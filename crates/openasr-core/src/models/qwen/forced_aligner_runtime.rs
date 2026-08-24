@@ -53,7 +53,11 @@ use super::tensor_names::OUTPUT_WEIGHT;
 use super::token_embedding::load_qwen3_token_embedding_table_from_reader;
 use crate::models::ggml_asr_executor::GgmlAsrPreparedAudioView;
 use crate::models::mapped_token_embedding::{MappedTokenEmbeddingError, MappedTokenEmbeddingTable};
-use crate::models::runtime_receipts::{RuntimeOwnerGuard, RuntimeResourceGuard};
+use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
+use crate::models::system_memory_owner::{
+    SystemMemoryAllocationOutcome, SystemMemoryAllocationQuote,
+    SystemMemoryAllocationTransactionError, SystemMemoryOwner, SystemMemoryOwnerError,
+};
 
 /// Same rope theta as the shared qwen3-asr LLM stack (`QWEN_ROPE_THETA` in
 /// `batched_decode.rs`); the forced aligner's LM shares that architecture
@@ -149,6 +153,8 @@ pub(crate) enum Qwen3ForcedAlignerRuntimeError {
     TensorRead(#[from] GgufTensorDataReadError),
     #[error("qwen3-forced-aligner llm layer projection load failed: {0}")]
     LlmTransformerFailed(#[from] super::llm_transformer::Qwen3AsrLlmTransformerError),
+    #[error("qwen3-forced-aligner prepared assets admission failed: {reason}")]
+    PreparedAssetsAdmissionFailed { reason: String },
 }
 
 /// Parsed `qwen3_forced_aligner.*` GGUF metadata, with the embedding-table
@@ -328,47 +334,29 @@ pub(crate) enum ForcedAlignerProgressEvent {
     Finalized,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ForcedAlignerStageBackends {
     audio: ResolvedFamilyRuntimeInput,
     decoder: ResolvedFamilyRuntimeInput,
     logits: ResolvedFamilyRuntimeInput,
+    audio_lane: ExecutionLaneKey,
+    decoder_lane: ExecutionLaneKey,
+    logits_lane: ExecutionLaneKey,
 }
 
-const FORCED_ALIGNER_REQUEST_COMPONENT: &str = "qwen3-forced-aligner.request";
-const FORCED_ALIGNER_ASSETS_RESOURCE: &str = "qwen3-forced-aligner.prepared-assets";
-
-fn request_receipts(content_id: &str) -> (Option<RuntimeOwnerGuard>, Option<RuntimeResourceGuard>) {
-    let Some(collector) = crate::models::native_execution_services::current_runtime_receipts()
-        .filter(|collector| collector.is_available())
-    else {
-        return (None, None);
-    };
-    let Some(descriptor) = collector.owner_descriptor(
-        FORCED_ALIGNER_REQUEST_COMPONENT,
-        Some(content_id),
-        Some("request"),
-        None,
-    ) else {
-        return (None, None);
-    };
-    let owner = collector.start_owner(
-        descriptor,
-        crate::models::native_execution_services::current_execution_cache_attempt_id(),
-    );
-    let resource = owner.owner_id().and_then(|owner_id| {
-        collector
-            .unpriced_resource_descriptor(FORCED_ALIGNER_ASSETS_RESOURCE)
-            .and_then(|descriptor| collector.acquire_resource(owner_id, descriptor))
-    });
-    (Some(owner), resource)
-}
-
-fn transient_receipt_owner(component: &str, content_id: &str) -> Option<RuntimeOwnerGuard> {
+fn transient_receipt_owner(
+    component: &str,
+    content_id: &str,
+    lane: &ExecutionLaneKey,
+) -> Option<crate::models::runtime_receipts::RuntimeOwnerGuard> {
     let collector = crate::models::native_execution_services::current_runtime_receipts()
         .filter(|collector| collector.is_available())?;
-    let descriptor =
-        collector.owner_descriptor(component, Some(content_id), Some("request-transient"), None)?;
+    let descriptor = collector.owner_descriptor(
+        component,
+        Some(content_id),
+        Some("request-transient"),
+        lane.receipt_projection(&collector),
+    )?;
     Some(collector.start_owner(
         descriptor,
         crate::models::native_execution_services::current_execution_cache_attempt_id(),
@@ -376,11 +364,15 @@ fn transient_receipt_owner(component: &str, content_id: &str) -> Option<RuntimeO
 }
 
 impl ForcedAlignerStageBackends {
-    const fn uniform(runtime: ResolvedFamilyRuntimeInput) -> Self {
+    fn uniform(runtime: ResolvedFamilyRuntimeInput) -> Self {
+        let lane = current_execution_lane_key(runtime.backend());
         Self {
             audio: runtime,
             decoder: runtime,
             logits: runtime,
+            audio_lane: lane.clone(),
+            decoder_lane: lane.clone(),
+            logits_lane: lane,
         }
     }
 
@@ -389,22 +381,27 @@ impl ForcedAlignerStageBackends {
             Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
             crate::ggml_runtime::AutoGpuPolicy::AllBackends,
         );
+        let audio_lane = current_execution_lane_key(audio_runtime.backend());
+        let cpu_lane = current_execution_lane_key(cpu_runtime.backend());
         Self {
             audio: audio_runtime,
             decoder: cpu_runtime,
             logits: cpu_runtime,
+            audio_lane,
+            decoder_lane: cpu_lane.clone(),
+            logits_lane: cpu_lane,
         }
     }
 
-    fn audio_backend(self) -> crate::ggml_runtime::GgmlCpuGraphBackend {
+    fn audio_backend(&self) -> crate::ggml_runtime::GgmlCpuGraphBackend {
         self.audio.backend()
     }
 
-    fn decoder_backend(self) -> crate::ggml_runtime::GgmlCpuGraphBackend {
+    fn decoder_backend(&self) -> crate::ggml_runtime::GgmlCpuGraphBackend {
         self.decoder.backend()
     }
 
-    fn logits_backend(self) -> crate::ggml_runtime::GgmlCpuGraphBackend {
+    fn logits_backend(&self) -> crate::ggml_runtime::GgmlCpuGraphBackend {
         self.logits.backend()
     }
 }
@@ -493,6 +490,107 @@ pub(crate) struct Qwen3ForcedAlignerPreparedAssets {
     pub token_embedding_table: MappedTokenEmbeddingTable,
     pub logits_head: Qwen3AsrLlmLogitsHead,
     pub decoder_plan: QwenWholeDecoderPlan,
+}
+
+impl Qwen3ForcedAlignerPreparedAssets {
+    fn system_memory_quote(
+        preflight: &GgufRuntimeSourcePreflight,
+        runtime: ResolvedFamilyRuntimeInput,
+    ) -> Result<SystemMemoryAllocationQuote, SystemMemoryOwnerError> {
+        let execution = parse_forced_aligner_runtime_metadata(preflight.metadata.as_ref())
+            .map_err(|error| {
+                SystemMemoryOwnerError::capacity_failure(
+                    "prepared_runtime_quote",
+                    error.to_string(),
+                )
+            })?
+            .as_embedding_execution_metadata();
+        let context = crate::models::prepared_runtime_cache::PreparedRuntimeQuoteContext {
+            model_architecture: super::QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID,
+            metadata: preflight.metadata.as_ref(),
+            tensor_index: preflight.tensor_index.as_ref(),
+            backend: runtime.backend(),
+        };
+        let mut quote = crate::models::prepared_runtime_cache::PreparedRuntimeQuoteBuilder::new::<
+            Self,
+        >(preflight.runtime_source.content_id());
+        quote.add_tokenizer_metadata(context.metadata, true)?;
+        let decoder_contract =
+            super::runtime_contract::qwen3_asr_decoder_contract(context.tensor_index, execution)
+                .map_err(|error| {
+                    SystemMemoryOwnerError::capacity_failure(
+                        "prepared_runtime_quote",
+                        error.to_string(),
+                    )
+                })?;
+        let decoder_tensor_names = decoder_contract
+            .runtime_tensor_descriptors()
+            .map_err(|reason| {
+                SystemMemoryOwnerError::capacity_failure("prepared_runtime_quote", reason)
+            })?
+            .into_iter()
+            .map(|descriptor| descriptor.tensor_name)
+            .collect::<std::collections::HashSet<_>>();
+        let tail = decoder_contract.tail();
+        for tensor in context.tensor_index.tensors() {
+            if tensor.name == tail.token_embd || tail.output_weight == Some(tensor.name.as_str()) {
+                continue;
+            }
+            if decoder_tensor_names.contains(&tensor.name) {
+                quote.add_tensor_metadata(context.tensor_index, &tensor.name)?;
+                continue;
+            }
+            quote.add_tensor_f32_or_raw_upper_bound(context.tensor_index, &tensor.name)?;
+            quote.add_tensor_metadata(context.tensor_index, &tensor.name)?;
+        }
+        super::add_qwen_decoder_prepared_runtime_quote(&mut quote, context, &decoder_contract)?;
+        quote.finish()
+    }
+
+    fn retained_system_memory_bytes(&self) -> Result<u64, String> {
+        let mut bytes = crate::models::system_memory_owner::SystemMemoryCapacity::default();
+        bytes.add_usize(
+            self.token_to_id
+                .len()
+                .checked_mul(std::mem::size_of::<(String, u32)>())
+                .ok_or_else(|| "forced-aligner token map byte count overflowed".to_string())?,
+            "forced-aligner token map entries",
+        )?;
+        for token in self.token_to_id.keys() {
+            bytes.add_string(token, "forced-aligner token map key")?;
+        }
+        bytes.add_usize(
+            self.merge_rank
+                .len()
+                .checked_mul(std::mem::size_of::<(String, usize)>())
+                .ok_or_else(|| "forced-aligner merge map byte count overflowed".to_string())?,
+            "forced-aligner merge map entries",
+        )?;
+        for merge in self.merge_rank.keys() {
+            bytes.add_string(merge, "forced-aligner merge map key")?;
+        }
+        bytes.add(
+            self.mel_frontend_plan.retained_system_memory_bytes()?,
+            "forced-aligner frontend",
+        )?;
+        bytes.add(
+            self.audio_encoder_weights.retained_system_memory_bytes()?,
+            "forced-aligner audio weights",
+        )?;
+        bytes.add(
+            self.token_embedding_table.retained_system_memory_bytes()?,
+            "forced-aligner token embedding",
+        )?;
+        bytes.add(
+            self.logits_head.retained_system_memory_bytes()?,
+            "forced-aligner logits head",
+        )?;
+        bytes.add(
+            self.decoder_plan.retained_system_memory_bytes()?,
+            "forced-aligner decoder plan",
+        )?;
+        Ok(bytes.finish())
+    }
 }
 
 pub(crate) fn load_forced_aligner_prepared_assets(
@@ -625,6 +723,7 @@ fn align_forced_with_stage_backends(
     let audio_receipt_owner = transient_receipt_owner(
         "qwen3-forced-aligner.audio-runtime",
         preflight.runtime_source.content_id(),
+        &backends.audio_lane,
     );
     let audio_runtime_result = if matches!(
         backends.audio_backend(),
@@ -672,6 +771,7 @@ fn align_forced_with_stage_backends(
     let decoder_receipt_owner = transient_receipt_owner(
         "qwen3-forced-aligner.decoder-runtime",
         preflight.runtime_source.content_id(),
+        &backends.decoder_lane,
     );
     let mut whole_decoder = if backends.decoder_backend().is_gpu_class() {
         let device_embedding = assets
@@ -765,6 +865,7 @@ fn align_forced_with_stage_backends(
     let logits_receipt_owner = transient_receipt_owner(
         "qwen3-forced-aligner.logits-runtime",
         preflight.runtime_source.content_id(),
+        &backends.logits_lane,
     );
     let mut logits_runtime = assets.logits_head.new_runtime(backends.logits_backend())?;
     let expected_timestamp_positions = word_list.len() * 2;
@@ -869,10 +970,8 @@ fn round_to_millis(value: f64) -> f64 {
 /// proportional to the largest ASR segment rather than the whole recording.
 pub(crate) struct Qwen3ForcedAlignerSession {
     verified: VerifiedPack,
-    assets: Qwen3ForcedAlignerPreparedAssets,
+    assets: SystemMemoryOwner<Qwen3ForcedAlignerPreparedAssets>,
     backends: ForcedAlignerStageBackends,
-    _receipt_prepared_assets: Option<RuntimeResourceGuard>,
-    _receipt_owner: Option<RuntimeOwnerGuard>,
 }
 
 pub(crate) fn validate_forced_aligner_quantization_contract(
@@ -1084,15 +1183,40 @@ impl Qwen3ForcedAlignerSession {
         verified: VerifiedPack,
         backends: ForcedAlignerStageBackends,
     ) -> Result<Self, Qwen3ForcedAlignerRuntimeError> {
-        let assets = load_forced_aligner_prepared_assets(verified.preflight(), backends.logits)?;
-        let (receipt_owner, receipt_prepared_assets) =
-            request_receipts(verified.preflight().runtime_source.content_id());
+        let quote = Qwen3ForcedAlignerPreparedAssets::system_memory_quote(
+            verified.preflight(),
+            backends.logits,
+        )
+        .map_err(|error| {
+            Qwen3ForcedAlignerRuntimeError::PreparedAssetsAdmissionFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let assets = SystemMemoryOwner::try_allocate_transaction(quote, || {
+            let assets =
+                load_forced_aligner_prepared_assets(verified.preflight(), backends.logits)?;
+            let retained = assets.retained_system_memory_bytes().map_err(|reason| {
+                Qwen3ForcedAlignerRuntimeError::PreparedAssetsAdmissionFailed { reason }
+            })?;
+            Ok::<_, Qwen3ForcedAlignerRuntimeError>(SystemMemoryAllocationOutcome::new(
+                assets, retained, retained,
+            ))
+        });
+        let assets = match assets {
+            Ok(assets) => assets,
+            Err(SystemMemoryAllocationTransactionError::Allocation(error)) => return Err(error),
+            Err(SystemMemoryAllocationTransactionError::Capacity(error)) => {
+                return Err(
+                    Qwen3ForcedAlignerRuntimeError::PreparedAssetsAdmissionFailed {
+                        reason: error.to_string(),
+                    },
+                );
+            }
+        };
         Ok(Self {
             verified,
             assets,
             backends,
-            _receipt_prepared_assets: receipt_prepared_assets,
-            _receipt_owner: receipt_owner,
         })
     }
 
@@ -1108,7 +1232,7 @@ impl Qwen3ForcedAlignerSession {
             audio_samples_16khz_mono,
             text,
             language,
-            self.backends,
+            self.backends.clone(),
             None,
         )
     }
@@ -1126,7 +1250,7 @@ impl Qwen3ForcedAlignerSession {
             audio_samples_16khz_mono,
             text,
             language,
-            self.backends,
+            self.backends.clone(),
             Some(observer),
         )
     }
@@ -1134,8 +1258,6 @@ impl Qwen3ForcedAlignerSession {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use super::*;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1240,98 +1362,41 @@ mod tests {
     }
 
     #[test]
-    fn forced_aligner_request_receipts_release_assets_on_success_and_error() {
+    fn forced_aligner_transient_receipts_use_exact_stage_lanes_without_unpriced_resources() {
         let services = crate::models::native_execution_services::test_native_execution_services();
         let _context = crate::models::native_execution_services::install_native_execution_services(
             services.as_ref(),
         );
-        for success in [true, false] {
-            let (owner, assets) = request_receipts("forced-aligner-test-content");
-            assert!(owner.is_some(), "request owner must be recorded");
-            assert!(
-                assets.is_some(),
-                "prepared assets must have an Unknown receipt"
-            );
-            assert_eq!(services.runtime_receipts().summary().live_owner_count, 1);
-            assert_eq!(services.runtime_receipts().summary().live_resource_count, 1);
-            let result: Result<(), &str> = if success { Ok(()) } else { Err("align failed") };
-            drop(assets);
-            drop(owner);
-            if success {
-                assert!(result.is_ok());
-            } else {
-                assert!(result.is_err());
-            }
-            assert_eq!(services.runtime_receipts().summary().live_owner_count, 0);
-            assert_eq!(services.runtime_receipts().summary().live_resource_count, 0);
-        }
-    }
-    #[test]
-    fn forced_aligner_logits_receipts_release_after_runtime_drop() {
-        struct RuntimeDropProbe(Arc<Mutex<Vec<&'static str>>>);
-
-        impl Drop for RuntimeDropProbe {
-            fn drop(&mut self) {
-                self.0.lock().unwrap().push("runtime-dropped");
-            }
-        }
-
-        let services = crate::models::native_execution_services::test_native_execution_services();
-        let _context = crate::models::native_execution_services::install_native_execution_services(
-            services.as_ref(),
+        let cpu_runtime = ResolvedFamilyRuntimeInput::resolve(
+            Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
         );
-        let collector = services.runtime_receipts();
-        let descriptor = collector
-            .owner_descriptor(
-                "qwen3-forced-aligner.logits-runtime",
-                Some("forced-aligner-test-content"),
-                Some("request-transient"),
-                None,
+        let backends = ForcedAlignerStageBackends::uniform(cpu_runtime);
+        let owner = transient_receipt_owner(
+            "qwen3-forced-aligner.logits-runtime",
+            "forced-aligner-test-content",
+            &backends.logits_lane,
+        )
+        .expect("transient owner receipt");
+        let snapshot = services.runtime_receipts().snapshot();
+        assert_eq!(snapshot.live_owners.len(), 1);
+        assert!(snapshot.live_owners[0].resources.is_empty());
+        assert!(matches!(
+            snapshot.live_owners[0].descriptor.placement,
+            crate::models::runtime_receipts::RuntimeOwnerPlacement::LaneBound(
+                crate::models::runtime_receipts::SafeExecutionLaneProjection {
+                    provider: crate::device::execution_route::ExecutionProvider::Cpu,
+                    backend: crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+                    ..
+                }
             )
-            .expect("logits owner descriptor");
-        let owner = collector.start_owner(descriptor, None);
-        let resource = owner
-            .owner_id()
-            .and_then(|owner_id| {
-                collector
-                    .unpriced_resource_descriptor("qwen3-forced-aligner.logits-resource")
-                    .and_then(|descriptor| collector.acquire_resource(owner_id, descriptor))
-            })
-            .expect("logits resource receipt");
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let runtime = RuntimeDropProbe(Arc::clone(&order));
-
-        drop(runtime);
-        assert_eq!(order.lock().unwrap().as_slice(), ["runtime-dropped"]);
-        drop(resource);
-        order.lock().unwrap().push("resource-released");
+        ));
         drop(owner);
-        order.lock().unwrap().push("owner-released");
-        assert_eq!(
-            order.lock().unwrap().as_slice(),
-            ["runtime-dropped", "resource-released", "owner-released"]
-        );
+        assert_eq!(services.runtime_receipts().summary().live_owner_count, 0);
 
-        let events = collector.snapshot().events;
-        let resource_release = events
-            .iter()
-            .position(|event| {
-                matches!(
-                    event,
-                    crate::models::runtime_receipts::RuntimeReceiptEvent::ResourceReleased { .. }
-                )
-            })
-            .expect("resource release receipt");
-        let owner_release = events
-            .iter()
-            .position(|event| {
-                matches!(
-                    event,
-                    crate::models::runtime_receipts::RuntimeReceiptEvent::OwnerReleased { .. }
-                )
-            })
-            .expect("owner release receipt");
-        assert!(resource_release < owner_release);
+        let source = include_str!("forced_aligner_runtime.rs");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(!production.contains("unpriced_resource_descriptor"));
     }
 
     #[test]
@@ -1346,22 +1411,24 @@ mod tests {
 
     #[test]
     fn discrete_gpu_hybrid_accelerates_only_the_audio_encoder() {
-        let runtime = ResolvedFamilyRuntimeInput::resolve(
-            Some(crate::ggml_runtime::RequestBackendPreference::Exact(
-                crate::device::execution_route::ResolvedExecutionRoute {
-                    provider: crate::device::execution_route::ExecutionProvider::Cuda,
-                    stable_id: "cuda0".to_string(),
-                    registry_ordinal: 0,
-                    kind: crate::device::execution_route::RouteDeviceKind::Accelerated,
-                    addressability:
-                        crate::device::execution_route::DeviceAddressability::ExactlyAddressable {
-                            physical_key: crate::device::execution_route::PhysicalResourceKey::new(
-                                "0000:01:00.0",
-                            )
-                            .expect("physical key"),
-                        },
+        let route = crate::device::execution_route::ResolvedExecutionRoute {
+            provider: crate::device::execution_route::ExecutionProvider::Cuda,
+            stable_id: "cuda0".to_string(),
+            registry_ordinal: 0,
+            kind: crate::device::execution_route::RouteDeviceKind::Accelerated,
+            addressability:
+                crate::device::execution_route::DeviceAddressability::ExactlyAddressable {
+                    physical_key: crate::device::execution_route::PhysicalResourceKey::new(
+                        "0000:01:00.0",
+                    )
+                    .expect("physical key"),
                 },
-            )),
+        };
+        let _route = crate::ggml_runtime::install_request_backend_override(Some(
+            crate::ggml_runtime::RequestBackendPreference::Exact(route.clone()),
+        ));
+        let runtime = ResolvedFamilyRuntimeInput::resolve(
+            Some(crate::ggml_runtime::RequestBackendPreference::Exact(route)),
             crate::ggml_runtime::AutoGpuPolicy::AllBackends,
         );
         let backends = ForcedAlignerStageBackends::gpu_audio_hybrid(runtime);
@@ -1376,6 +1443,18 @@ mod tests {
         assert_eq!(
             backends.logits_backend(),
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu
+        );
+        assert_eq!(
+            backends.audio_lane.provider(),
+            crate::device::execution_route::ExecutionProvider::Cuda
+        );
+        assert_eq!(
+            backends.decoder_lane.provider(),
+            crate::device::execution_route::ExecutionProvider::Cpu
+        );
+        assert_eq!(
+            backends.logits_lane.provider(),
+            crate::device::execution_route::ExecutionProvider::Cpu
         );
 
         let cpu = ForcedAlignerStageBackends::uniform(ResolvedFamilyRuntimeInput::resolve(

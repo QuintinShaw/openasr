@@ -476,8 +476,17 @@ impl ExecutionLaneKey {
         backend: GgmlCpuGraphBackend,
         placement: ExecutionPlacement,
     ) -> Self {
+        let device = if matches!(backend, GgmlCpuGraphBackend::Cpu)
+            && matches!(placement, ExecutionPlacement::CpuOnly)
+        {
+            ResolvedDeviceKey {
+                route: ResolvedExecutionRoute::cpu().cache_key(),
+            }
+        } else {
+            self.device.clone()
+        };
         Self {
-            device: self.device.clone(),
+            device,
             placement,
             backend,
         }
@@ -1106,7 +1115,7 @@ pub(crate) fn current_execution_lane_key(backend: GgmlCpuGraphBackend) -> Execut
         return lane.for_stage(backend, placement);
     }
     let preference = request_backend_override();
-    let route = match preference.as_ref() {
+    let mut route = match preference.as_ref() {
         Some(RequestBackendPreference::Exact(route)) => route.clone(),
         Some(RequestBackendPreference::CpuOnly) => ResolvedExecutionRoute::cpu(),
         Some(RequestBackendPreference::Accelerated) | None => {
@@ -1120,6 +1129,11 @@ pub(crate) fn current_execution_lane_key(backend: GgmlCpuGraphBackend) -> Execut
         GgmlCpuGraphBackend::Cpu => ExecutionPlacement::CpuOnly,
         GgmlCpuGraphBackend::Metal | GgmlCpuGraphBackend::Gpu => ExecutionPlacement::FullDevice,
     });
+    if matches!(backend, GgmlCpuGraphBackend::Cpu)
+        && matches!(placement, ExecutionPlacement::CpuOnly)
+    {
+        route = ResolvedExecutionRoute::cpu();
+    }
     ExecutionLaneKey {
         device: ResolvedDeviceKey {
             route: route.cache_key(),

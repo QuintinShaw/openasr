@@ -32,7 +32,9 @@ use crate::device::execution_memory::{
     PhaseSet, PhysicalDeviceKey, QuoteConfidence,
 };
 
-use crate::models::native_execution_services::{current_execution_lane, current_runtime_receipts};
+use crate::models::native_execution_services::{
+    current_execution_lane_key, current_runtime_receipts,
+};
 
 use super::{
     backend_memory::{
@@ -447,7 +449,22 @@ impl NativeMemoryAllocationTransaction {
         let Some(first_group) = self.groups.first() else {
             return;
         };
-        let lane = current_execution_lane().and_then(|lane| lane.receipt_projection(&collector));
+        let backend = match first_group.provider {
+            crate::device::execution_route::ExecutionProvider::Cpu => {
+                crate::ggml_runtime::GgmlCpuGraphBackend::Cpu
+            }
+            crate::device::execution_route::ExecutionProvider::Metal => {
+                crate::ggml_runtime::GgmlCpuGraphBackend::Metal
+            }
+            crate::device::execution_route::ExecutionProvider::Cuda
+            | crate::device::execution_route::ExecutionProvider::Hip
+            | crate::device::execution_route::ExecutionProvider::Vulkan
+            | crate::device::execution_route::ExecutionProvider::Accelerator
+            | crate::device::execution_route::ExecutionProvider::Unknown => {
+                crate::ggml_runtime::GgmlCpuGraphBackend::Gpu
+            }
+        };
+        let lane = current_execution_lane_key(backend).receipt_projection(&collector);
         let Some(owner_descriptor) = collector.owner_descriptor(
             "native-memory-owner",
             None,

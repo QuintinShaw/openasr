@@ -270,6 +270,7 @@ const LEASE_CONSTRUCTION_INVENTORY: &[(&str, &str)] = &[
     ("ggml_runtime/cpu_graph.rs", "attach_receipt"),
     ("ggml_runtime/cpu_graph.rs", "try_reserve_invocation"),
     ("device/pack_weight_residency.rs", "attach_receipt"),
+    ("models/native_execution_services.rs", "attach_receipt"),
     ("models/cohere/ggml_executor.rs", "try_allocate_transaction"),
     ("models/dolphin/executor.rs", "try_allocate_transaction"),
     ("models/firered_aed/executor.rs", "try_allocate_transaction"),
@@ -300,6 +301,10 @@ const LEASE_CONSTRUCTION_INVENTORY: &[(&str, &str)] = &[
         "try_allocate_transaction",
     ),
     ("models/qwen/ggml_executor.rs", "try_allocate_transaction"),
+    (
+        "models/qwen/forced_aligner_runtime.rs",
+        "try_allocate_transaction",
+    ),
     ("models/qwen/kv_cache.rs", "try_allocate"),
     ("models/sensevoice/executor.rs", "try_allocate_transaction"),
     ("models/system_memory_owner.rs", "try_allocate"),
@@ -1427,6 +1432,27 @@ fn serve_batch_publication_requires_candidate_attempt() {
         engine.contains("current_execution_cache_attempt_id"),
         "engine_for_key must refuse attempt-free publication: {engine}"
     );
+}
+
+#[test]
+fn migrated_owner_shapes_cannot_reintroduce_unpriced_live_resources() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/models");
+    for relative in [
+        "seq2seq_serve_batch.rs",
+        "qwen/batched_decode.rs",
+        "qwen/forced_aligner_runtime.rs",
+    ] {
+        let source = std::fs::read_to_string(root.join(relative)).expect("read owner source");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production source prefix");
+        assert!(
+            !production.contains("unpriced_resource_descriptor")
+                && !production.contains("NotPricedLegacy"),
+            "migrated owner {relative} reintroduced an unpriced live resource"
+        );
+    }
 }
 
 #[test]

@@ -509,8 +509,10 @@ impl RuntimeReceiptCollector {
         descriptor
     }
 
-    /// Serve-batch and other legacy components whose memory footprint is not
-    /// priced yet use typed Unknown metrics and no fabricated memory domain.
+    /// Test fixture for proving that unknown memory never compares as zero.
+    /// Production owner shapes must use a brokered descriptor or an explicit
+    /// semantic [`RuntimeResourceLedgerBinding::NoBrokerLease`] marker.
+    #[cfg(test)]
     pub(crate) fn unpriced_resource_descriptor(
         &self,
         kind: &str,
@@ -523,6 +525,28 @@ impl RuntimeReceiptCollector {
             peak: RuntimeReceiptMetric::Unknown,
             retained: RuntimeReceiptMetric::Unknown,
             quote_confidence: QuoteConfidence::Unknown,
+            observation_confidence: None,
+            native: None,
+        })
+    }
+
+    /// Semantic lifetime marker for an object whose physical allocations are
+    /// owned and receipted by child broker leases. This descriptor contributes
+    /// no bytes and is never a substitute for pricing a native/system-memory
+    /// owner; live reconciliation simply skips it after validating the typed
+    /// `NoBrokerLease` binding.
+    pub(crate) fn no_broker_resource_descriptor(
+        &self,
+        kind: &str,
+    ) -> Option<RuntimeResourceDescriptor> {
+        Some(RuntimeResourceDescriptor {
+            kind: self.digest(b"resource-kind", kind)?,
+            domain: None,
+            ledger_binding: RuntimeResourceLedgerBinding::NoBrokerLease,
+            requested: RuntimeReceiptMetric::Known(0),
+            peak: RuntimeReceiptMetric::Known(0),
+            retained: RuntimeReceiptMetric::Known(0),
+            quote_confidence: QuoteConfidence::ExactCommitted,
             observation_confidence: None,
             native: None,
         })
@@ -1617,6 +1641,31 @@ mod tests {
             LeaseReceiptShadow::Incomparable {
                 reason: LeaseReceiptShadowIncomparable::UnpricedLiveResource,
             }
+        );
+        drop(resource);
+        drop(owner);
+    }
+
+    #[test]
+    fn semantic_child_marker_does_not_duplicate_its_broker_owned_children() {
+        let collector = collector(8);
+        let owner = owner(&collector);
+        let resource = collector
+            .acquire_resource(
+                owner.owner_id().unwrap(),
+                collector
+                    .no_broker_resource_descriptor("serve-batch.runtime-width=4")
+                    .unwrap(),
+            )
+            .expect("semantic marker receipt");
+        let broker =
+            DeviceMemoryBrokerSet::new(crate::device::execution_memory::DeviceMemoryPolicy {
+                maximum_owned_basis_points: 10_000,
+                minimum_headroom_bytes: 0,
+            });
+        assert_eq!(
+            collector.reconcile_live_leases(&broker),
+            LeaseReceiptShadow::Matched
         );
         drop(resource);
         drop(owner);
