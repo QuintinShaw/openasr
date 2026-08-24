@@ -35,6 +35,8 @@ pub enum LocalTrustError {
     UnsupportedMediaIdentity,
     #[error("selected media handle could not be cloned: {0}")]
     CloneMedia(#[source] std::io::Error),
+    #[error("selected media changed after the grant was issued")]
+    MediaIdentityChanged,
 }
 
 /// A parsed proof that a managed-daemon origin is exact plain HTTP loopback.
@@ -155,6 +157,7 @@ impl SelectedMedia {
     }
 
     pub fn try_clone_file(&self) -> Result<File, LocalTrustError> {
+        self.ensure_identity()?;
         self.file.try_clone().map_err(LocalTrustError::CloneMedia)
     }
 
@@ -170,10 +173,11 @@ impl SelectedMedia {
     /// path-only consumers. The registry must keep this proof alive for the
     /// duration of the consumer operation.
     #[cfg(unix)]
-    pub fn descriptor_path(&self) -> PathBuf {
+    pub fn descriptor_path(&self) -> Result<PathBuf, LocalTrustError> {
         use std::os::fd::AsRawFd;
 
-        PathBuf::from(format!("/dev/fd/{}", self.file.as_raw_fd()))
+        self.ensure_identity()?;
+        Ok(PathBuf::from(format!("/dev/fd/{}", self.file.as_raw_fd())))
     }
 
     pub fn display_name(&self) -> &str {
@@ -186,6 +190,20 @@ impl SelectedMedia {
 
     pub const fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    fn ensure_identity(&self) -> Result<(), LocalTrustError> {
+        let metadata = self
+            .file
+            .metadata()
+            .map_err(LocalTrustError::InspectOpenedMedia)?;
+        let current = StrongFileIdentity::of_file(&self.file, &metadata)
+            .ok_or(LocalTrustError::UnsupportedMediaIdentity)?;
+        if current == self.identity {
+            Ok(())
+        } else {
+            Err(LocalTrustError::MediaIdentityChanged)
+        }
     }
 }
 
@@ -310,6 +328,19 @@ mod tests {
         assert!(matches!(
             SelectedMedia::open(directory.path()),
             Err(LocalTrustError::MediaIsNotRegularFile)
+        ));
+    }
+
+    #[test]
+    fn selected_media_rejects_in_place_mutation_before_cloning() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("selected.wav");
+        std::fs::write(&path, b"selected-generation").unwrap();
+        let selected = SelectedMedia::open(&path).unwrap();
+        std::fs::write(&path, b"replacement-generation").unwrap();
+        assert!(matches!(
+            selected.try_clone_file(),
+            Err(LocalTrustError::MediaIdentityChanged)
         ));
     }
 
