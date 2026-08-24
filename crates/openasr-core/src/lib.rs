@@ -205,8 +205,10 @@ pub use metrics::{
 };
 pub use models::pack_verifier::{PackCandidate, PackVerificationError, PackVerifier, VerifiedPack};
 pub use qualification_manifest::{
+    QUALIFICATION_ATTESTATION_REPOSITORY, QUALIFICATION_ATTESTATION_SIGNER_WORKFLOW,
     QUALIFICATION_MANIFEST_FILE_NAME, QUALIFICATION_MANIFEST_SCHEMA_VERSION, QualificationArtifact,
-    QualificationArtifacts, QualificationAttestation, QualificationHostAbi, QualificationManifest,
+    QualificationArtifactFormat, QualificationArtifacts, QualificationAttestation,
+    QualificationBinaryArtifact, QualificationHostAbi, QualificationManifest,
     QualificationManifestError, QualificationManifestSigningError, QualificationProvider,
     QualificationProviderTarget, VerifiedQualificationManifest,
     render_validated_qualification_manifest_signature, verify_and_parse_qualification_manifest,

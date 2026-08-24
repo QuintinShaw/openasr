@@ -21,6 +21,9 @@ use crate::{
 
 pub const QUALIFICATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const QUALIFICATION_MANIFEST_FILE_NAME: &str = "qualification-manifest.json";
+pub const QUALIFICATION_ATTESTATION_REPOSITORY: &str = "QuintinShaw/openasr";
+pub const QUALIFICATION_ATTESTATION_SIGNER_WORKFLOW: &str =
+    "QuintinShaw/openasr/.github/workflows/release-binaries.yml";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,8 +89,10 @@ pub struct QualificationProviderTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationArtifacts {
-    /// Final host executable used for qualification.
-    pub binary: QualificationArtifact,
+    /// Final host executable used for qualification. The executable is a
+    /// member of `bundle`, because Windows release subjects are immutable ZIP
+    /// archives rather than separately published executable assets.
+    pub binary: QualificationBinaryArtifact,
     /// Neutral-dynamic backend plugin. `None` is reserved for the bundled
     /// physical-Vulkan build; CUDA and HIP qualification require a plugin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -99,20 +104,53 @@ pub struct QualificationArtifacts {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct QualificationArtifact {
-    /// Basename only. It is diagnostic identity, never a local load path.
+pub struct QualificationBinaryArtifact {
+    /// Basename of the executable member inside the release archive. The
+    /// runner requires exactly one case-insensitive member with this name.
     pub file_name: String,
     pub sha256: String,
     pub size_bytes: u64,
+    /// Attested immutable release subject containing the executable and every
+    /// companion DLL. Its unpacked tree identity prevents qualification from
+    /// combining the right executable with unbound sibling libraries.
+    pub bundle: QualificationArtifact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationArtifact {
+    /// Basename only. It is diagnostic identity, never a local load path.
+    pub file_name: String,
+    pub format: QualificationArtifactFormat,
+    pub sha256: String,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpacked_size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpacked_tree_sha256: Option<String>,
     /// Immutable signed download locations. The runner chooses only from this
     /// list and never accepts a caller-provided plugin path.
     pub urls: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationArtifactFormat {
+    NativeLibrary,
+    ZipArchive,
+    AttestationBundle,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationAttestation {
     pub predicate_type: String,
+    pub repository: String,
+    pub signer_workflow: String,
+    pub source_digest: String,
+    pub deny_self_hosted_runners: bool,
     pub bundle: QualificationArtifact,
 }
 
@@ -236,18 +274,47 @@ impl QualificationManifest {
             return Err(invalid("provider_target.provider", "unknown provider"));
         }
         require_token("provider_target.target", &self.provider_target.target)?;
-        self.artifacts.binary.validate("artifacts.binary")?;
+        self.artifacts.binary.validate()?;
         if let Some(plugin) = &self.artifacts.plugin {
-            plugin.validate("artifacts.plugin")?;
+            plugin.validate(
+                "artifacts.plugin",
+                QualificationArtifactFormat::NativeLibrary,
+            )?;
         }
         for vendor in &self.artifacts.vendor {
-            vendor.validate("artifacts.vendor")?;
+            vendor.validate("artifacts.vendor", QualificationArtifactFormat::ZipArchive)?;
         }
         require_text(
             "attestation.predicate_type",
             &self.attestation.predicate_type,
         )?;
-        self.attestation.bundle.validate("attestation.bundle")?;
+        if self.attestation.repository != QUALIFICATION_ATTESTATION_REPOSITORY {
+            return Err(invalid(
+                "attestation.repository",
+                format!("must be {QUALIFICATION_ATTESTATION_REPOSITORY}"),
+            ));
+        }
+        if self.attestation.signer_workflow != QUALIFICATION_ATTESTATION_SIGNER_WORKFLOW {
+            return Err(invalid(
+                "attestation.signer_workflow",
+                format!("must be {QUALIFICATION_ATTESTATION_SIGNER_WORKFLOW}"),
+            ));
+        }
+        require_lower_hex(
+            "attestation.source_digest",
+            &self.attestation.source_digest,
+            40,
+        )?;
+        if !self.attestation.deny_self_hosted_runners {
+            return Err(invalid(
+                "attestation.deny_self_hosted_runners",
+                "must be true",
+            ));
+        }
+        self.attestation.bundle.validate(
+            "attestation.bundle",
+            QualificationArtifactFormat::AttestationBundle,
+        )?;
         self.validate_packaging()?;
         self.validate_unique_artifacts()?;
         Ok(())
@@ -289,7 +356,9 @@ impl QualificationManifest {
     fn validate_unique_artifacts(&self) -> Result<(), QualificationManifestError> {
         let mut windows_names = BTreeSet::new();
         let mut digests = BTreeSet::new();
-        let artifacts = std::iter::once(&self.artifacts.binary)
+        windows_names.insert(self.artifacts.binary.file_name.to_ascii_lowercase());
+        digests.insert(self.artifacts.binary.sha256.as_str());
+        let artifacts = std::iter::once(&self.artifacts.binary.bundle)
             .chain(self.artifacts.plugin.iter())
             .chain(self.artifacts.vendor.iter())
             .chain(std::iter::once(&self.attestation.bundle));
@@ -308,9 +377,39 @@ impl QualificationManifest {
     }
 }
 
+impl QualificationBinaryArtifact {
+    fn validate(&self) -> Result<(), QualificationManifestError> {
+        require_file_name("artifacts.binary.file_name", &self.file_name)?;
+        require_lower_hex("artifacts.binary.sha256", &self.sha256, 64)?;
+        if self.size_bytes == 0 {
+            return Err(invalid(
+                "artifacts.binary.size_bytes",
+                "must be greater than zero",
+            ));
+        }
+        self.bundle.validate(
+            "artifacts.binary.bundle",
+            QualificationArtifactFormat::ZipArchive,
+        )
+    }
+}
+
 impl QualificationArtifact {
-    fn validate(&self, field: &'static str) -> Result<(), QualificationManifestError> {
+    fn validate(
+        &self,
+        field: &'static str,
+        expected_format: QualificationArtifactFormat,
+    ) -> Result<(), QualificationManifestError> {
         require_file_name(field, &self.file_name)?;
+        if self.format != expected_format || self.format == QualificationArtifactFormat::Unknown {
+            return Err(invalid(
+                field,
+                format!(
+                    "artifact format {:?} does not match required role {:?}",
+                    self.format, expected_format
+                ),
+            ));
+        }
         require_lower_hex(field, &self.sha256, 64)?;
         if self.size_bytes == 0 {
             return Err(invalid(field, "size_bytes must be greater than zero"));
@@ -327,6 +426,33 @@ impl QualificationArtifact {
                 return Err(invalid(field, "download URLs must be unique"));
             }
             validate_download_url(field, url, &self.file_name)?;
+        }
+        match self.format {
+            QualificationArtifactFormat::ZipArchive => {
+                if self.unpacked_size_bytes.is_none_or(|size| size == 0) {
+                    return Err(invalid(
+                        field,
+                        "zip archive requires non-zero unpacked_size_bytes",
+                    ));
+                }
+                require_lower_hex(
+                    field,
+                    self.unpacked_tree_sha256.as_deref().unwrap_or_default(),
+                    64,
+                )?;
+            }
+            QualificationArtifactFormat::NativeLibrary
+            | QualificationArtifactFormat::AttestationBundle => {
+                if self.unpacked_size_bytes.is_some() || self.unpacked_tree_sha256.is_some() {
+                    return Err(invalid(
+                        field,
+                        "non-archive artifact cannot declare unpacked identity",
+                    ));
+                }
+            }
+            QualificationArtifactFormat::Unknown => {
+                return Err(invalid(field, "unknown artifact format"));
+            }
         }
         Ok(())
     }
@@ -507,11 +633,35 @@ mod tests {
     }
 
     fn artifact(file_name: &str, fill: char) -> serde_json::Value {
+        let format = if file_name.ends_with(".dll") {
+            "native_library"
+        } else if file_name.ends_with(".zip") {
+            "zip_archive"
+        } else {
+            "attestation_bundle"
+        };
+        let (unpacked_size_bytes, unpacked_tree_sha256) = if format == "zip_archive" {
+            (serde_json::json!(1), serde_json::json!("c".repeat(64)))
+        } else {
+            (serde_json::Value::Null, serde_json::Value::Null)
+        };
         serde_json::json!({
             "file_name": file_name,
+            "format": format,
             "sha256": fill.to_string().repeat(64),
             "size_bytes": 1,
+            "unpacked_size_bytes": unpacked_size_bytes,
+            "unpacked_tree_sha256": unpacked_tree_sha256,
             "urls": [format!("https://dl.openasr.org/core/v0.1.37/{file_name}")],
+        })
+    }
+
+    fn binary_artifact() -> serde_json::Value {
+        serde_json::json!({
+            "file_name": "openasr.exe",
+            "sha256": "7".repeat(64),
+            "size_bytes": 1,
+            "bundle": artifact("openasr-windows-x86_64-neutral.zip", 'd'),
         })
     }
 
@@ -534,12 +684,16 @@ mod tests {
             },
             "provider_target": {"provider": "cuda", "target": "sm_89"},
             "artifacts": {
-                "binary": artifact("openasr.exe", '7'),
+                "binary": binary_artifact(),
                 "plugin": artifact("openasr-cuda.dll", '8'),
                 "vendor": [artifact("cuda-runtime.zip", '9')],
             },
             "attestation": {
                 "predicate_type": "https://slsa.dev/provenance/v1",
+                "repository": QUALIFICATION_ATTESTATION_REPOSITORY,
+                "signer_workflow": QUALIFICATION_ATTESTATION_SIGNER_WORKFLOW,
+                "source_digest": "b".repeat(40),
+                "deny_self_hosted_runners": true,
                 "bundle": artifact("attestation.jsonl", 'a'),
             },
         })
@@ -609,6 +763,26 @@ mod tests {
     }
 
     #[test]
+    fn attestation_identity_is_pinned_and_self_hosted_is_denied() {
+        for (field, value) in [
+            ("repository", serde_json::json!("attacker/repo")),
+            (
+                "signer_workflow",
+                serde_json::json!("attacker/repo/.github/workflows/build.yml"),
+            ),
+            ("source_digest", serde_json::json!("c".repeat(39))),
+            ("deny_self_hosted_runners", serde_json::json!(false)),
+        ] {
+            let mut manifest = manifest_value();
+            manifest["attestation"][field] = value;
+            assert!(matches!(
+                verify_with_test_root(&manifest),
+                Err(QualificationManifestError::InvalidField { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn provider_packaging_cannot_cross_optional_and_bundled_boundaries() {
         let mut vulkan = manifest_value();
         vulkan["provider_target"]["provider"] = serde_json::json!("vulkan");
@@ -634,6 +808,38 @@ mod tests {
         assert!(matches!(
             verify_with_test_root(&hip),
             Err(QualificationManifestError::InvalidPackaging { .. })
+        ));
+    }
+
+    #[test]
+    fn artifact_roles_and_archive_tree_identity_are_closed() {
+        let mut wrong_role = manifest_value();
+        wrong_role["artifacts"]["plugin"]["format"] = serde_json::json!("zip_archive");
+        assert!(matches!(
+            verify_with_test_root(&wrong_role),
+            Err(QualificationManifestError::InvalidField { .. })
+        ));
+
+        for missing in ["unpacked_size_bytes", "unpacked_tree_sha256"] {
+            let mut manifest = manifest_value();
+            manifest["artifacts"]["vendor"][0]
+                .as_object_mut()
+                .expect("vendor artifact")
+                .remove(missing);
+            assert!(matches!(
+                verify_with_test_root(&manifest),
+                Err(QualificationManifestError::InvalidField { .. })
+            ));
+        }
+
+        let mut binary_bundle_without_tree = manifest_value();
+        binary_bundle_without_tree["artifacts"]["binary"]["bundle"]
+            .as_object_mut()
+            .expect("binary bundle")
+            .remove("unpacked_tree_sha256");
+        assert!(matches!(
+            verify_with_test_root(&binary_bundle_without_tree),
+            Err(QualificationManifestError::InvalidField { .. })
         ));
     }
 

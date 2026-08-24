@@ -892,9 +892,11 @@ fn verify_qualification_manifest_command(
             "target": body.provider_target.target,
             "host_abi_fingerprint": body.host_abi.fingerprint,
             "binary_sha256": body.artifacts.binary.sha256,
+            "binary_bundle_sha256": body.artifacts.binary.bundle.sha256,
             "plugin_sha256": body.artifacts.plugin.as_ref().map(|artifact| artifact.sha256.as_str()),
             "vendor_sha256": body.artifacts.vendor.iter().map(|artifact| artifact.sha256.as_str()).collect::<Vec<_>>(),
             "attestation_sha256": body.attestation.bundle.sha256,
+            "source_digest": body.attestation.source_digest,
         })
     );
     Ok(())
