@@ -13,6 +13,7 @@ mod gguf_metadata;
 mod gguf_tensor_data;
 mod gguf_tensor_index;
 mod gguf_write;
+mod graph_lifecycle;
 mod job_cancel;
 mod kv_element;
 mod package_probe;
@@ -77,20 +78,24 @@ pub(crate) use cpu_graph::{
     ResidentHostImportCapability,
 };
 pub use decode_conformance::{
-    DecodeFirstDivergenceClass, EncoderDecoderSplitLane, EncoderDecoderSplitProbeRecord,
-    EncoderKernelStageClass, SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS,
-    ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptDecodeStep, ShortAudioReceiptOutputPlan,
-    ShortAudioReceiptReuseMode,
+    DecodeFirstDivergenceClass, DiagnosticDecodeSelection, DiagnosticDecoderGraphMode,
+    DiagnosticFamilyCompactPolicy, DiagnosticFourQuadrantReport, DiagnosticLayer1Case,
+    DiagnosticLayer1Report, DiagnosticLayer2Report, DiagnosticQuadrantTrace,
+    EncoderDecoderSplitLane, EncoderDecoderSplitProbeRecord, EncoderKernelStageClass,
+    SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS, ShortAudioReceiptDecodeDiagnostics,
+    ShortAudioReceiptDecodeStep, ShortAudioReceiptOutputPlan, ShortAudioReceiptReuseMode,
+    run_diagnostic_four_quadrant_exact_route_probe, run_diagnostic_layer1_exact_route_probe,
+    run_diagnostic_layer2_exact_route_probe,
 };
 #[allow(unused_imports)]
 pub(crate) use decode_conformance::{
-    DiagnosticFamilyCompactPolicy, DiagnosticFourQuadrantClassificationInput,
-    EncoderKernelStageChecksumPair, EncoderKernelStageClassification,
-    EncoderKernelStageClassificationInput, EncoderKernelStageLayerChecksums,
-    EncoderKernelStageStemChecksums, classify_encoder_kernel_stage,
-    classify_four_quadrant_first_divergence, diagnostic_host_first_max_token,
-    diagnostic_logits_sha256, diagnostic_top2, run_diagnostic_dual_output_conformance,
-    run_diagnostic_four_quadrant_cpu_probe, synthetic_cpu_encoder_decoder_split_record,
+    DiagnosticFourQuadrantClassificationInput, EncoderKernelStageChecksumPair,
+    EncoderKernelStageClassification, EncoderKernelStageClassificationInput,
+    EncoderKernelStageLayerChecksums, EncoderKernelStageStemChecksums,
+    classify_encoder_kernel_stage, classify_four_quadrant_first_divergence,
+    diagnostic_host_first_max_token, diagnostic_logits_sha256, diagnostic_top2,
+    run_diagnostic_dual_output_conformance, run_diagnostic_four_quadrant_cpu_probe,
+    synthetic_cpu_encoder_decoder_split_record,
 };
 pub(crate) use env_flags::{env_toggle_with_raw, env_var_truthy};
 pub use execution_telemetry::{
@@ -135,6 +140,14 @@ pub(crate) use gguf_write::{
     GgufStreamTensorSpec, GgufWriteError, GgufWriteTensor, GgufWriteTensorType, GgufWriteValue,
     build_provenance_from_env, quantize_f32_to_ggml_tensor_data,
     quantize_f32_to_ggml_tensor_data_into, write_gguf_file_streaming_v0, write_gguf_file_v0,
+};
+pub use graph_lifecycle::{
+    GGML_GRAPH_LIFECYCLE_SCHEMA, GgmlActualDeviceFacts, GgmlGraphLifecycleCollector,
+    GgmlGraphLifecycleEvent, GgmlGraphLifecycleEventKind, GgmlGraphLifecycleGuard,
+    GgmlGraphLifecycleSnapshot, GgmlGraphPoisonReason, GgmlGraphRebuildReason,
+};
+pub(crate) use graph_lifecycle::{
+    current_graph_lifecycle_collector, install_graph_lifecycle_collector, mint_opaque_graph_id,
 };
 pub(crate) use job_cancel::{
     InheritedJobCancelGuard, arm_thread_job_cancel_flag, cancel_flag_requested_from_data,

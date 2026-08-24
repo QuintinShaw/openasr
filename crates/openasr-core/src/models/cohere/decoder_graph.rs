@@ -1461,7 +1461,7 @@ impl CohereDecoderGraphRuntime {
                     source,
                 }
             })?;
-            graph.add_side_effect_root(write_key).map_err(|source| {
+            graph.add_kv_write_root(write_key).map_err(|source| {
                 CohereDecoderGraphError::GraphBuildFailed {
                     step: "ggml_build_forward_expand(dec_cross_k_cache)",
                     source,
@@ -1490,7 +1490,7 @@ impl CohereDecoderGraphRuntime {
                     source,
                 }
             })?;
-            graph.add_side_effect_root(write_value).map_err(|source| {
+            graph.add_kv_write_root(write_value).map_err(|source| {
                 CohereDecoderGraphError::GraphBuildFailed {
                     step: "ggml_build_forward_expand(dec_cross_v_cache)",
                     source,
@@ -4454,6 +4454,8 @@ mod tests {
     #[test]
     fn decoder_runtime_reuses_persistent_self_kv_for_incremental_step() {
         with_forced_cpu_backend_for_test(|| {
+            let lifecycle = crate::GgmlGraphLifecycleCollector::new();
+            let _lifecycle_guard = lifecycle.install();
             let (_runtime_path, preflight) = write_runtime_ready_preflight();
             let metadata =
                 super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
@@ -4510,6 +4512,10 @@ mod tests {
             assert_eq!(incremental_logits.len(), metadata.vocab_size);
             assert!(incremental_logits.iter().all(|value| value.is_finite()));
             assert_eq!(runtime.cached_positions, next_prefix.len());
+            assert!(lifecycle.snapshot().events.iter().any(|event| matches!(
+                event.kind,
+                crate::GgmlGraphLifecycleEventKind::KvWriteCommitted { .. }
+            )));
         });
     }
 

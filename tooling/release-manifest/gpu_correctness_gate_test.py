@@ -17,6 +17,16 @@ GATE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(GATE)
 
 
+def actual_device(provider: str, device: str) -> dict:
+    return {
+        "type": "cpu" if provider == "cpu" else "gpu",
+        "name": device,
+        "description": f"test {provider} device",
+        "provider_device_id": f"{provider}:0",
+        "pci_vendor_id": None,
+    }
+
+
 class GpuCorrectnessGateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.inventory = {
@@ -130,57 +140,92 @@ class GpuCorrectnessGateTests(unittest.TestCase):
         backend_id: str | None = None,
         artifact_fingerprint: str | None = None,
     ) -> str:
-        return (
-            json.dumps(
-                {
-                    "schema": "openasr.gpu-correctness-trace.v1",
-                    "event": "header",
-                    "graph_mode": cell["graph_mode"],
-                    "provider": provider or cell["provider"],
-                    "device_target": device_target or cell["device_target"],
-                    "backend_id": backend_id or cell["backend_id"],
-                    "driver_version": "12.7.0",
-                    "artifact_fingerprint": artifact_fingerprint
-                    or cell["artifact_fingerprint"],
-                    "device": f"test-{cell['provider']}",
-                }
-            )
-            + "\n"
-            + json.dumps(
-                {
-                    "schema": "openasr.gpu-correctness-trace.v1",
-                    "event": "logits_digest",
-                    "step_index": 0,
-                    "element_count": 2,
-                    "sha256": "a" * 64,
-                    "non_finite_count": 0,
-                }
-            )
-            + "\n"
-            + json.dumps(
-                {
-                    "schema": "openasr.gpu-correctness-trace.v1",
-                    "event": "token",
-                    "step_index": 0,
-                    "token_id": 7,
-                    "is_eot": 0,
-                }
-            )
-            + "\n"
-            + json.dumps(
-                {
-                    "schema": "openasr.gpu-correctness-trace.v1",
-                    "event": "top_k",
-                    "step_index": 0,
-                    "items": [
-                        {"token_id": 7, "value": 1.25},
-                        {"token_id": 8, "value": 0.75},
-                    ],
-                    "top1_top2_margin": 0.5,
-                }
-            )
-            + "\n"
-        )
+        observed_provider = provider or cell["provider"]
+        device = f"test-{cell['provider']}"
+        route = {
+            "schema": "openasr.ggml-graph-lifecycle.v1",
+            "provider": observed_provider,
+            "device": device,
+            "graph_instance": 1,
+            "graph_generation": 1,
+        }
+        events = [
+            {
+                "schema": "openasr.gpu-correctness-trace.v1",
+                "event": "header",
+                "mode": mode,
+                "graph_mode": cell["graph_mode"],
+                "provider": observed_provider,
+                "device_target": device_target or cell["device_target"],
+                "backend_id": backend_id or cell["backend_id"],
+                "driver_version": "12.7.0",
+                "artifact_fingerprint": artifact_fingerprint
+                or cell["artifact_fingerprint"],
+                "device": device,
+                "actual_provider": observed_provider,
+                "actual_stable_device_id": device,
+                "actual_device": actual_device(observed_provider, device),
+            },
+            {**route, "event": "created", "sequence": 1, "scheduler_enabled": False},
+            {**route, "event": "prepared", "sequence": 2, "prepare_generation": 1},
+            {
+                **route,
+                "event": "input_write",
+                "sequence": 3,
+                "input_generation": 1,
+                "bytes": 8,
+            },
+            {
+                **route,
+                "event": "compute_started",
+                "sequence": 4,
+                "compute_sequence": 1,
+                "prepare_generation": 1,
+                "input_generation_consumed": 1,
+                "capture_executable_generation": None,
+            },
+            {
+                **route,
+                "event": "compute_completed",
+                "sequence": 5,
+                "compute_sequence": 1,
+                "output_generation": 1,
+            },
+            {
+                **route,
+                "event": "output_read",
+                "sequence": 6,
+                "compute_sequence": 1,
+                "output_generation_consumed": 1,
+                "bytes": 8,
+            },
+            {
+                "schema": "openasr.gpu-correctness-trace.v1",
+                "event": "logits_digest",
+                "step_index": 0,
+                "element_count": 2,
+                "sha256": "a" * 64,
+                "non_finite_count": 0,
+            },
+            {
+                "schema": "openasr.gpu-correctness-trace.v1",
+                "event": "token",
+                "step_index": 0,
+                "token_id": 7,
+                "is_eot": 0,
+            },
+            {
+                "schema": "openasr.gpu-correctness-trace.v1",
+                "event": "top_k",
+                "step_index": 0,
+                "items": [
+                    {"token_id": 7, "value": 1.25},
+                    {"token_id": 8, "value": 0.75},
+                ],
+                "top1_top2_margin": 0.5,
+            },
+        ]
+        return "\n".join(json.dumps(event) for event in events) + "\n"
 
     def receipt(self, cell: dict, evidence_class: str, mode: str) -> dict:
         token_content = self.trace_content(cell, mode)
@@ -211,6 +256,11 @@ class GpuCorrectnessGateTests(unittest.TestCase):
             "driver_version": "12.7.0",
             "artifact_fingerprint": cell["artifact_fingerprint"],
             "device": f"test-{cell['provider']}",
+            "actual_provider": cell["provider"],
+            "actual_stable_device_id": f"test-{cell['provider']}",
+            "actual_device": actual_device(
+                cell["provider"], f"test-{cell['provider']}"
+            ),
             "placement": cell["placement"],
             "capture_mode": cell["capture_mode"],
             "scheduler_mode": cell["scheduler_mode"],
@@ -835,8 +885,15 @@ class GpuCorrectnessGateTests(unittest.TestCase):
                     "driver_version": "unqualified",
                     "artifact_fingerprint": "unqualified",
                     "device": "cpu0",
+                    "actual_provider": "cpu",
+                    "actual_stable_device_id": "cpu0",
+                    "actual_device": actual_device("cpu", "cpu0"),
                 }
             )
+            for event in cpu_lines[1:]:
+                if event.get("schema") == "openasr.ggml-graph-lifecycle.v1":
+                    event["provider"] = "cpu"
+                    event["device"] = "cpu0"
             cpu_trace = root / "cpu-oracle.jsonl"
             cpu_trace.write_text("\n".join(json.dumps(line) for line in cpu_lines) + "\n")
 
@@ -884,7 +941,9 @@ class GpuCorrectnessGateTests(unittest.TestCase):
             self.assertEqual(token["evidence"]["device_target"], "sm_75")
             self.assertEqual(token["evidence"]["trace"]["logits"]["label"], gpu_trace.name)
 
-            cpu_lines[2]["token_id"] = 99
+            next(event for event in cpu_lines if event.get("event") == "token")[
+                "token_id"
+            ] = 99
             cpu_trace.write_text("\n".join(json.dumps(line) for line in cpu_lines) + "\n")
             with self.assertRaisesRegex(GATE.MatrixError, "CPU family oracle"):
                 GATE.bind_runtime_cell_receipts(

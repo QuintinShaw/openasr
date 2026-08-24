@@ -582,7 +582,7 @@ impl FireRedDecoderGraphRuntime {
                 .cpy(key_rows, key_target)
                 .map_err(|source| map_err("cross_cache_k_write", source))?;
             graph
-                .add_side_effect_root(write_key)
+                .add_kv_write_root(write_key)
                 .map_err(|source| map_err("cross_cache_k_root", source))?;
 
             let value_rows = apply_linear_with_bias(
@@ -600,7 +600,7 @@ impl FireRedDecoderGraphRuntime {
                 .cpy(value_rows, value_target)
                 .map_err(|source| map_err("cross_cache_v_write", source))?;
             graph
-                .add_side_effect_root(write_value)
+                .add_kv_write_root(write_value)
                 .map_err(|source| map_err("cross_cache_v_root", source))?;
             last_value_rows = Some(value_rows);
         }

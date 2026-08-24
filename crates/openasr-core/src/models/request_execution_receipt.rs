@@ -15,7 +15,8 @@ use crate::{
     RequestAttemptId,
     device::{execution_policy::ExecutionPlacement, execution_route::ExecutionProvider},
     ggml_runtime::{
-        GgmlCpuGraphBackend, GgmlExecutionPlacementSummary, ResolvedFamilyRuntimeInput,
+        GgmlActualDeviceFacts, GgmlCpuGraphBackend, GgmlExecutionPlacementSummary,
+        GgmlGraphLifecycleCollector, GgmlGraphLifecycleSnapshot, ResolvedFamilyRuntimeInput,
         diagnostic_logits_sha256,
     },
 };
@@ -56,6 +57,7 @@ pub struct NativeExecutionRequestFacts {
     pub pack_size_bytes: u64,
     pub actual_provider: Option<ExecutionProvider>,
     pub actual_stable_device_id: Option<String>,
+    pub actual_device: Option<GgmlActualDeviceFacts>,
     pub scheduler_enabled: Option<bool>,
 }
 
@@ -86,6 +88,7 @@ pub struct NativeExecutionReceiptSnapshot {
     pub facts: Option<NativeExecutionRequestFacts>,
     pub placement: GgmlExecutionPlacementSummary,
     pub trace: NativeExecutionTraceSnapshot,
+    pub graph_lifecycle: GgmlGraphLifecycleSnapshot,
     pub token_steps: Vec<NativeExecutionTokenStep>,
     pub completed: bool,
 }
@@ -187,6 +190,7 @@ impl NativeExecutionReceiptSnapshot {
         }
         if facts.actual_provider != Some(expected_provider)
             || facts.actual_stable_device_id.as_deref() != Some(expected_stable_device_id)
+            || facts.actual_device.is_none()
             || facts.scheduler_enabled.is_none()
         {
             return Err(NativeExecutionAttestationError::LiveBackendMismatch {
@@ -215,6 +219,7 @@ struct ReceiptState {
     top_k_margins: BTreeMap<usize, f32>,
     logits_hashes: BTreeMap<usize, String>,
     trace_overflowed: bool,
+    graph_lifecycle_checkpoint: (usize, bool),
     completed: bool,
 }
 
@@ -223,6 +228,7 @@ struct ReceiptState {
 #[derive(Debug, Clone, Default)]
 pub struct NativeExecutionReceiptCollector {
     state: Arc<Mutex<ReceiptState>>,
+    graph_lifecycle: GgmlGraphLifecycleCollector,
 }
 
 impl NativeExecutionReceiptCollector {
@@ -305,6 +311,7 @@ impl NativeExecutionReceiptCollector {
         state.top_k_margins.clear();
         state.logits_hashes.clear();
         state.trace_overflowed = false;
+        state.graph_lifecycle_checkpoint = self.graph_lifecycle.checkpoint();
         state.completed = false;
     }
 
@@ -316,6 +323,8 @@ impl NativeExecutionReceiptCollector {
         if committed && !state.request_attempt_conflicted {
             state.completed = true;
         } else {
+            self.graph_lifecycle
+                .truncate(state.graph_lifecycle_checkpoint);
             state.facts = None;
             state.placement = GgmlExecutionPlacementSummary::default();
             state.trace_events.clear();
@@ -325,6 +334,10 @@ impl NativeExecutionReceiptCollector {
             state.trace_overflowed = false;
             state.completed = false;
         }
+    }
+
+    pub(crate) fn graph_lifecycle_collector(&self) -> GgmlGraphLifecycleCollector {
+        self.graph_lifecycle.clone()
     }
 
     pub(crate) fn record_facts(&self, facts: NativeExecutionRequestFacts) {
@@ -347,6 +360,7 @@ impl NativeExecutionReceiptCollector {
         &self,
         provider: ExecutionProvider,
         stable_device_id: &str,
+        actual_device: &GgmlActualDeviceFacts,
         scheduler_enabled: bool,
     ) {
         let mut state = self
@@ -364,6 +378,10 @@ impl NativeExecutionReceiptCollector {
                 .as_deref()
                 .is_some_and(|actual| actual != stable_device_id)
             || facts
+                .actual_device
+                .as_ref()
+                .is_some_and(|actual| actual != actual_device)
+            || facts
                 .scheduler_enabled
                 .is_some_and(|actual| actual != scheduler_enabled)
         {
@@ -372,6 +390,7 @@ impl NativeExecutionReceiptCollector {
         }
         facts.actual_provider = Some(provider);
         facts.actual_stable_device_id = Some(stable_device_id.to_string());
+        facts.actual_device = Some(actual_device.clone());
         facts.scheduler_enabled = Some(scheduler_enabled);
     }
 
@@ -509,7 +528,13 @@ impl NativeExecutionReceiptCollector {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut lines = Vec::new();
-        if let Some(facts) = &state.facts {
+        if let Some(facts) = &state.facts
+            && let (Some(provider), Some(device), Some(actual_device)) = (
+                facts.actual_provider,
+                facts.actual_stable_device_id.as_deref(),
+                facts.actual_device.as_ref(),
+            )
+        {
             let backend_id = facts.backend_id.as_deref().unwrap_or("unqualified");
             let device_target = facts.device_target.as_deref().unwrap_or("unqualified");
             let artifact_fingerprint = facts
@@ -520,17 +545,32 @@ impl NativeExecutionReceiptCollector {
                 .backend_driver_version
                 .as_deref()
                 .unwrap_or("unqualified");
-            lines.push(format!(
-                "{{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"header\",\"graph_mode\":\"{}\",\"provider\":\"{}\",\"device_target\":\"{}\",\"backend_id\":\"{}\",\"driver_version\":\"{}\",\"artifact_fingerprint\":\"{}\",\"device\":\"{}\"}}",
-                if facts.resolved_runtime.reuse_mode() == crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph { "fresh_graph" } else { "reusable_graph" },
-                facts.selected_provider.as_str(),
-                device_target,
-                backend_id,
-                driver_version,
-                artifact_fingerprint,
-                facts.stable_device_id,
-            ));
+            lines.push(
+                serde_json::json!({
+                    "schema": "openasr.gpu-correctness-trace.v1",
+                    "event": "header",
+                    "mode": if facts.resolved_runtime.reuse_mode() == crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph { "cold" } else { "reuse" },
+                    "graph_mode": if facts.resolved_runtime.reuse_mode() == crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph { "fresh_graph" } else { "reusable_graph" },
+                    "provider": provider.as_str(),
+                    "device": device,
+                    "device_target": device_target,
+                    "backend_id": backend_id,
+                    "driver_version": driver_version,
+                    "artifact_fingerprint": artifact_fingerprint,
+                    "actual_provider": provider.as_str(),
+                    "actual_stable_device_id": device,
+                    "actual_device": actual_device,
+                })
+                .to_string(),
+            );
         }
+        let graph_lifecycle = self.graph_lifecycle.snapshot();
+        lines.extend(
+            graph_lifecycle
+                .events
+                .iter()
+                .filter_map(|event| serde_json::to_string(event).ok()),
+        );
         lines.extend(state.trace_events.iter().cloned());
         NativeExecutionReceiptSnapshot {
             request_attempt_id: state.request_attempt_id,
@@ -558,6 +598,7 @@ impl NativeExecutionReceiptCollector {
                 overflowed: state.trace_overflowed,
                 event_count: state.trace_events.len(),
             },
+            graph_lifecycle,
             token_steps: state.token_steps.clone(),
             completed: state.completed,
         }
@@ -648,6 +689,7 @@ pub(crate) fn record_request_execution_facts(
         pack_size_bytes: verified_pack.preflight().runtime_source().byte_len(),
         actual_provider: None,
         actual_stable_device_id: None,
+        actual_device: None,
         scheduler_enabled: None,
     });
     Ok(())
@@ -656,6 +698,16 @@ pub(crate) fn record_request_execution_facts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_actual_device() -> GgmlActualDeviceFacts {
+        GgmlActualDeviceFacts {
+            device_type: "cpu".to_string(),
+            name: "CPU".to_string(),
+            description: "test CPU".to_string(),
+            provider_device_id: None,
+            pci_vendor_id: None,
+        }
+    }
 
     #[test]
     fn warm_and_measured_passes_require_fresh_backend_attestation() {
@@ -693,9 +745,15 @@ mod tests {
                 pack_size_bytes: 1,
                 actual_provider: None,
                 actual_stable_device_id: None,
+                actual_device: None,
                 scheduler_enabled: None,
             });
-            receipt.record_backend_observation(ExecutionProvider::Cpu, "CPU", false);
+            receipt.record_backend_observation(
+                ExecutionProvider::Cpu,
+                "CPU",
+                &test_actual_device(),
+                false,
+            );
             receipt.record_token(0, token_id, true);
             receipt.record_top_k(0, &[2.0, 1.0]);
             receipt.finish_candidate_attempt(true);
@@ -794,6 +852,7 @@ mod tests {
             pack_size_bytes: 1,
             actual_provider: None,
             actual_stable_device_id: None,
+            actual_device: None,
             scheduler_enabled: None,
         }
     }
@@ -805,7 +864,12 @@ mod tests {
         let expected_runtime = facts.resolved_runtime;
         receipt.begin_candidate_attempt();
         receipt.record_facts(facts);
-        receipt.record_backend_observation(ExecutionProvider::Cpu, "CPU", false);
+        receipt.record_backend_observation(
+            ExecutionProvider::Cpu,
+            "CPU",
+            &test_actual_device(),
+            false,
+        );
         receipt.finish_candidate_attempt(true);
         let snapshot = receipt.snapshot();
 
@@ -855,7 +919,12 @@ mod tests {
         let receipt = NativeExecutionReceiptCollector::new();
         receipt.begin_candidate_attempt();
         receipt.record_facts(seq2seq_facts());
-        receipt.record_backend_observation(ExecutionProvider::Cpu, "CPU", false);
+        receipt.record_backend_observation(
+            ExecutionProvider::Cpu,
+            "CPU",
+            &test_actual_device(),
+            false,
+        );
         receipt.finish_candidate_attempt(true);
         let snapshot = receipt.snapshot();
         assert!(snapshot.completed);
@@ -877,7 +946,12 @@ mod tests {
         let receipt = NativeExecutionReceiptCollector::new();
         receipt.begin_candidate_attempt();
         receipt.record_facts(seq2seq_facts());
-        receipt.record_backend_observation(ExecutionProvider::Cpu, "CPU", false);
+        receipt.record_backend_observation(
+            ExecutionProvider::Cpu,
+            "CPU",
+            &test_actual_device(),
+            false,
+        );
         receipt.record_token(0, 11, false);
         receipt.record_top_k(0, &[4.0, 1.5]);
         receipt.finish_candidate_attempt(true);

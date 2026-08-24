@@ -1013,13 +1013,13 @@ impl MoonshineDecoderGraphRuntime {
                 .cpy(key, key_target)
                 .map_err(build_err("ggml_cpy(cross_k_cache)"))?;
             graph
-                .add_side_effect_root(write_key)
+                .add_kv_write_root(write_key)
                 .map_err(build_err("side_effect(cross_k)"))?;
             let write_value = graph
                 .cpy(value, value_target)
                 .map_err(build_err("ggml_cpy(cross_v_cache)"))?;
             graph
-                .add_side_effect_root(write_value)
+                .add_kv_write_root(write_value)
                 .map_err(build_err("side_effect(cross_v)"))?;
             graph
                 .set_output(value)
@@ -1896,10 +1896,10 @@ fn run_incremental_decoder_layer<'a>(
     )?;
     let v = reshape_incremental_for_attn(graph, v, head_dim, heads, n_seq, "dec_v_attn")?;
     let k = graph
-        .set_rows(self_k_cache, k, row_index)
+        .set_kv_rows(self_k_cache, k, row_index)
         .map_err(build_err("ggml_set_rows(dec_self_k_cache)"))?;
     let v = graph
-        .set_rows(self_v_cache, v, row_index)
+        .set_kv_rows(self_v_cache, v, row_index)
         .map_err(build_err("ggml_set_rows(dec_self_v_cache)"))?;
     let k = view_self_kv_prefix(
         graph,
@@ -2059,10 +2059,10 @@ fn run_prefill_decoder_layer<'a>(
         "prefill_dec_v_attn",
     )?;
     let k = graph
-        .set_rows(self_k_cache, k, row_index)
+        .set_kv_rows(self_k_cache, k, row_index)
         .map_err(build_err("ggml_set_rows(prefill_dec_self_k_cache)"))?;
     let v = graph
-        .set_rows(self_v_cache, v, row_index)
+        .set_kv_rows(self_v_cache, v, row_index)
         .map_err(build_err("ggml_set_rows(prefill_dec_self_v_cache)"))?;
     let k = view_self_kv_prefix(
         graph,

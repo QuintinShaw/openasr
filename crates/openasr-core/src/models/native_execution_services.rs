@@ -48,8 +48,9 @@ use crate::ggml_runtime::{
 use crate::ggml_runtime::{
     GgmlBackend, GgmlBackendKind, GgmlCpuGraphBackend, GgmlDeviceMemory,
     GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector, GgmlExecutionTelemetryGuard,
-    RequestBackendOverrideGuard, RequestBackendPreference, current_execution_telemetry_collector,
-    ensure_backends_loaded, ggml_available_devices, install_execution_telemetry_collector,
+    GgmlGraphLifecycleGuard, RequestBackendOverrideGuard, RequestBackendPreference,
+    current_execution_telemetry_collector, ensure_backends_loaded, ggml_available_devices,
+    install_execution_telemetry_collector, install_graph_lifecycle_collector,
     install_request_backend_override, request_backend_override, resolve_request_execution_route,
 };
 use crate::models::pack_verifier::{PackRoute, VerifiedPack};
@@ -191,6 +192,7 @@ pub(crate) struct ExecutionBackendObservation {
     pub(crate) backend_name: String,
     pub(crate) actual_provider: ExecutionProvider,
     pub(crate) actual_stable_id: String,
+    pub(crate) actual_device: crate::GgmlActualDeviceFacts,
     pub(crate) use_scheduler: bool,
     /// In-process join key only. It is never emitted by the smoke receipt.
     backend_identity: usize,
@@ -784,6 +786,7 @@ pub(crate) struct NativeExecutionContextGuard {
     previous_cache_attempt_id: Option<ExecutionCacheAttemptId>,
     previous_activation_reservation_cohort: Option<MemoryReservationCohortId>,
     execution_telemetry: GgmlExecutionTelemetryGuard,
+    _graph_lifecycle: GgmlGraphLifecycleGuard,
     previous_receipt: Option<NativeExecutionReceiptCollector>,
     backend: RequestBackendOverrideGuard,
 }
@@ -1025,6 +1028,7 @@ pub(crate) fn current_request_attempt_id() -> Option<crate::RequestAttemptId> {
 
 pub(crate) struct ExecutionReceiptCollectorGuard {
     previous: Option<NativeExecutionReceiptCollector>,
+    _graph_lifecycle: GgmlGraphLifecycleGuard,
 }
 
 impl Drop for ExecutionReceiptCollectorGuard {
@@ -1041,8 +1045,16 @@ impl Drop for ExecutionReceiptCollectorGuard {
 pub(crate) fn install_execution_receipt_collector(
     collector: Option<NativeExecutionReceiptCollector>,
 ) -> ExecutionReceiptCollectorGuard {
+    let graph_lifecycle = install_graph_lifecycle_collector(
+        collector
+            .as_ref()
+            .map(NativeExecutionReceiptCollector::graph_lifecycle_collector),
+    );
     let previous = CURRENT_EXECUTION_RECEIPT.with(|current| current.replace(collector));
-    ExecutionReceiptCollectorGuard { previous }
+    ExecutionReceiptCollectorGuard {
+        previous,
+        _graph_lifecycle: graph_lifecycle,
+    }
 }
 
 /// Records a runner-backed observation only while an explicitly instrumented
@@ -1055,10 +1067,16 @@ pub(crate) fn record_current_execution_backend_observation(
     backend_name: &str,
     actual_provider: ExecutionProvider,
     actual_stable_id: &str,
+    actual_device: &crate::GgmlActualDeviceFacts,
     use_scheduler: bool,
 ) {
     if let Some(receipt) = current_execution_receipt_collector() {
-        receipt.record_backend_observation(actual_provider, actual_stable_id, use_scheduler);
+        receipt.record_backend_observation(
+            actual_provider,
+            actual_stable_id,
+            actual_device,
+            use_scheduler,
+        );
     }
     let Some(sink) = current_execution_observation_sink() else {
         return;
@@ -1078,6 +1096,7 @@ pub(crate) fn record_current_execution_backend_observation(
         backend_name: backend_name.to_string(),
         actual_provider,
         actual_stable_id: actual_stable_id.to_string(),
+        actual_device: actual_device.clone(),
         use_scheduler,
         backend_identity,
         memory_receipts: Vec::new(),
@@ -1367,6 +1386,12 @@ pub(crate) fn install_native_execution_context(
     let previous_activation_reservation_cohort = CURRENT_ACTIVATION_RESERVATION_COHORT
         .with(|current| current.replace(context.activation_reservation_cohort));
     let execution_telemetry = install_execution_telemetry_collector(context.execution_telemetry);
+    let graph_lifecycle = install_graph_lifecycle_collector(
+        context
+            .receipt
+            .as_ref()
+            .map(NativeExecutionReceiptCollector::graph_lifecycle_collector),
+    );
     let previous_receipt =
         CURRENT_EXECUTION_RECEIPT.with(|current| current.replace(context.receipt));
     let backend = install_request_backend_override(context.backend_preference);
@@ -1383,6 +1408,7 @@ pub(crate) fn install_native_execution_context(
         previous_cache_attempt_id,
         previous_activation_reservation_cohort,
         execution_telemetry,
+        _graph_lifecycle: graph_lifecycle,
         previous_receipt,
         backend,
     }
@@ -2862,8 +2888,19 @@ mod tests {
         },
     };
     use crate::ggml_runtime::{
-        GgmlBackendKind, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
+        GgmlActualDeviceFacts, GgmlBackendKind, GgmlCpuGraphConfig, GgmlCpuGraphError,
+        GgmlCpuGraphRunner,
     };
+
+    fn test_cuda_device() -> GgmlActualDeviceFacts {
+        GgmlActualDeviceFacts {
+            device_type: "gpu".to_string(),
+            name: "CUDA0".to_string(),
+            description: "test CUDA device".to_string(),
+            provider_device_id: Some("0000:01:00.0".to_string()),
+            pci_vendor_id: Some(0x10de),
+        }
+    }
 
     fn nes_unit_test_declared_resident() -> SystemMemoryAllocationQuote {
         SystemMemoryAllocationQuote::new("nes-unit-test.declared-resident", 64 * 1024, 64 * 1024)
@@ -3213,6 +3250,7 @@ mod tests {
                     "CUDA0",
                     ExecutionProvider::Cuda,
                     "CUDA0",
+                    &test_cuda_device(),
                     true,
                 );
             })
@@ -3230,6 +3268,7 @@ mod tests {
                 backend_name: "CUDA0".to_string(),
                 actual_provider: ExecutionProvider::Cuda,
                 actual_stable_id: "CUDA0".to_string(),
+                actual_device: test_cuda_device(),
                 use_scheduler: true,
                 backend_identity: 1,
                 memory_receipts: Vec::new(),
@@ -3262,6 +3301,7 @@ mod tests {
                 "CUDA0",
                 ExecutionProvider::Cuda,
                 "CUDA0",
+                &test_cuda_device(),
                 false,
             );
             record_current_execution_candidate_failure(ExecutionCandidateFailure::capacity(
@@ -3281,6 +3321,7 @@ mod tests {
                 "CUDA0",
                 ExecutionProvider::Cuda,
                 "CUDA0",
+                &test_cuda_device(),
                 false,
             );
             Ok::<_, &str>(())

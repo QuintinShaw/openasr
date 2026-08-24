@@ -1769,7 +1769,7 @@ pub fn ggml_available_devices() -> Vec<GgmlBackendDevice> {
 
 /// Optional backend hardware fact queried through ggml's shared no-throw
 /// adapter. Older plugins remain ABI-safe and report zero/unknown.
-unsafe fn device_pci_vendor_id(device: NonNull<c_void>) -> Option<u32> {
+pub(crate) unsafe fn device_pci_vendor_id(device: NonNull<c_void>) -> Option<u32> {
     let vendor_id = unsafe { ffi::ggml_backend_dev_pci_vendor_id(device.as_ptr()) };
     (vendor_id != 0).then_some(vendor_id)
 }

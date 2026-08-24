@@ -1,0 +1,352 @@
+//! Request-scoped observation of real ggml graph lifecycle operations.
+//!
+//! Every identity in this module is minted at the operation boundary that owns
+//! it. None is reconstructed from a planner decision, a provider label, or the
+//! presence of an optional native pointer. Values are opaque outside the
+//! current process and must never be compared across process starts.
+
+use std::{
+    cell::RefCell,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+use serde::{Deserialize, Serialize};
+
+pub const GGML_GRAPH_LIFECYCLE_SCHEMA: &str = "openasr.ggml-graph-lifecycle.v1";
+pub const MAX_GRAPH_LIFECYCLE_EVENTS: usize = 16_384;
+
+/// Bounded facts read from the live ggml device handle that initialized the
+/// runner. `provider_device_id` preserves ggml's spelling (normally a PCI BDF)
+/// and must not be reinterpreted as a Vulkan `VkPhysicalDeviceProperties`
+/// device id. Missing optional backend facts remain absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GgmlActualDeviceFacts {
+    #[serde(rename = "type")]
+    pub device_type: String,
+    pub name: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pci_vendor_id: Option<u32>,
+}
+
+static NEXT_OPAQUE_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn mint_opaque_graph_id() -> u64 {
+    NEXT_OPAQUE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GgmlGraphRebuildReason {
+    FreshStep,
+    TopologyChanged,
+    PoisonRecovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GgmlGraphPoisonReason {
+    ComputeFailed,
+    ReadbackFailed,
+    MemoryCommitFailed,
+    Explicit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GgmlGraphLifecycleEvent {
+    pub schema: String,
+    pub sequence: u64,
+    pub provider: String,
+    pub device: String,
+    pub graph_instance: u64,
+    pub graph_generation: u64,
+    #[serde(flatten)]
+    pub kind: GgmlGraphLifecycleEventKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum GgmlGraphLifecycleEventKind {
+    Created {
+        scheduler_enabled: bool,
+    },
+    Prepared {
+        prepare_generation: u64,
+    },
+    InputWrite {
+        input_generation: u64,
+        bytes: u64,
+    },
+    ComputeStarted {
+        compute_sequence: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prepare_generation: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_generation_consumed: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        capture_executable_generation: Option<u64>,
+    },
+    ComputeCompleted {
+        compute_sequence: u64,
+        output_generation: u64,
+    },
+    OutputRead {
+        compute_sequence: u64,
+        output_generation_consumed: u64,
+        bytes: u64,
+    },
+    KvWriteCommitted {
+        compute_sequence: u64,
+        kv_write_generation: u64,
+    },
+    Rebuilt {
+        previous_graph_generation: u64,
+        reason: GgmlGraphRebuildReason,
+    },
+    Poisoned {
+        reason: GgmlGraphPoisonReason,
+    },
+    Dropped,
+    /// This event is reserved for a callback from the backend API that creates
+    /// or replaces an executable capture. The Rust graph layer never emits it
+    /// from a HIP/CUDA label or build option.
+    CaptureExecutableCreated {
+        capture_executable_generation: u64,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GgmlGraphLifecycleSnapshot {
+    pub events: Vec<GgmlGraphLifecycleEvent>,
+    pub overflowed: bool,
+}
+
+#[derive(Debug, Default)]
+struct LifecycleState {
+    events: Vec<GgmlGraphLifecycleEvent>,
+    overflowed: bool,
+    next_sequence: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GgmlGraphLifecycleCollector {
+    state: Arc<Mutex<LifecycleState>>,
+}
+
+impl GgmlGraphLifecycleCollector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn install(&self) -> GgmlGraphLifecycleGuard {
+        install_graph_lifecycle_collector(Some(self.clone()))
+    }
+
+    pub fn snapshot(&self) -> GgmlGraphLifecycleSnapshot {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        GgmlGraphLifecycleSnapshot {
+            events: state.events.clone(),
+            overflowed: state.overflowed,
+        }
+    }
+
+    pub(crate) fn checkpoint(&self) -> (usize, bool) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (state.events.len(), state.overflowed)
+    }
+
+    pub(crate) fn truncate(&self, checkpoint: (usize, bool)) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.events.truncate(checkpoint.0);
+        state.overflowed = checkpoint.1;
+    }
+
+    pub(crate) fn record(
+        &self,
+        provider: &str,
+        device: &str,
+        graph_instance: u64,
+        graph_generation: u64,
+        kind: GgmlGraphLifecycleEventKind,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.events.len() >= MAX_GRAPH_LIFECYCLE_EVENTS {
+            state.overflowed = true;
+            return;
+        }
+        state.next_sequence = state.next_sequence.saturating_add(1);
+        let sequence = state.next_sequence;
+        state.events.push(GgmlGraphLifecycleEvent {
+            schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+            sequence,
+            provider: provider.to_string(),
+            device: device.to_string(),
+            graph_instance,
+            graph_generation,
+            kind,
+        });
+    }
+}
+
+thread_local! {
+    static CURRENT_GRAPH_LIFECYCLE_COLLECTOR:
+        RefCell<Option<GgmlGraphLifecycleCollector>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn current_graph_lifecycle_collector() -> Option<GgmlGraphLifecycleCollector> {
+    CURRENT_GRAPH_LIFECYCLE_COLLECTOR.with(|current| current.borrow().clone())
+}
+
+pub(crate) fn install_graph_lifecycle_collector(
+    collector: Option<GgmlGraphLifecycleCollector>,
+) -> GgmlGraphLifecycleGuard {
+    let previous = CURRENT_GRAPH_LIFECYCLE_COLLECTOR.with(|current| current.replace(collector));
+    GgmlGraphLifecycleGuard { previous }
+}
+
+pub struct GgmlGraphLifecycleGuard {
+    previous: Option<GgmlGraphLifecycleCollector>,
+}
+
+impl Drop for GgmlGraphLifecycleGuard {
+    fn drop(&mut self) {
+        CURRENT_GRAPH_LIFECYCLE_COLLECTOR.with(|current| {
+            *current.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NN_DECODER: &str = include_str!("../nn/decoder.rs");
+    const COHERE_DECODER: &str = include_str!("../models/cohere/decoder_graph.rs");
+    const FIRERED_DECODER: &str = include_str!("../models/firered_aed/decoder_graph.rs");
+    const GRANITE_DECODER: &str = include_str!("../models/granite_speech/decode_session.rs");
+    const MOONSHINE_DECODER: &str = include_str!("../models/moonshine/decoder_graph.rs");
+    const WHISPER_DECODER: &str = include_str!("../models/whisper/ggml_decoder_graph.rs");
+    const XASR_ENCODER: &str = include_str!("../models/xasr_zipformer/encoder_graph.rs");
+    const XASR_HEAD: &str = include_str!("../models/xasr_zipformer/device_head_graph.rs");
+    const PARAKEET_TDT_DECODER: &str =
+        include_str!("../models/parakeet_tdt/device_decoder_graph.rs");
+
+    #[test]
+    fn rollback_discards_failed_attempt_events_without_reusing_sequence() {
+        let collector = GgmlGraphLifecycleCollector::new();
+        let checkpoint = collector.checkpoint();
+        collector.record(
+            "cpu",
+            "CPU",
+            1,
+            2,
+            GgmlGraphLifecycleEventKind::Created {
+                scheduler_enabled: false,
+            },
+        );
+        collector.truncate(checkpoint);
+        collector.record(
+            "cpu",
+            "CPU",
+            3,
+            4,
+            GgmlGraphLifecycleEventKind::Created {
+                scheduler_enabled: false,
+            },
+        );
+        let snapshot = collector.snapshot();
+        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(snapshot.events[0].sequence, 2);
+        assert_eq!(snapshot.events[0].graph_instance, 3);
+    }
+
+    #[test]
+    fn production_kv_writes_use_typed_lifecycle_registration() {
+        let sources = [
+            ("nn decoder", NN_DECODER),
+            ("cohere decoder", COHERE_DECODER),
+            ("firered decoder", FIRERED_DECODER),
+            ("granite decoder", GRANITE_DECODER),
+            ("moonshine decoder", MOONSHINE_DECODER),
+            ("whisper decoder", WHISPER_DECODER),
+            ("xasr encoder", XASR_ENCODER),
+        ];
+        let compact = sources
+            .iter()
+            .map(|(label, source)| (*label, source.split_whitespace().collect::<String>()))
+            .collect::<Vec<_>>();
+        for (label, source) in &compact {
+            for forbidden in [
+                "add_side_effect_root(write_key)",
+                "add_side_effect_root(write_value)",
+                "add_side_effect_root(k_write)",
+                "add_side_effect_root(v_write)",
+                "add_side_effect_root(key_write)",
+                "add_side_effect_root(value_write)",
+                "add_side_effect_root(k_seed)",
+                "add_side_effect_root(v_seed)",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{label} routes a named KV write through the generic side-effect API: {forbidden}"
+                );
+            }
+        }
+
+        let required = [
+            ("nn decoder", "add_kv_write_root(write)"),
+            ("nn decoder", "set_kv_rows(self_kv.key"),
+            ("nn decoder", "set_kv_rows(kv.key_history"),
+            ("cohere decoder", "add_kv_write_root(write_key)"),
+            ("firered decoder", "add_kv_write_root(write_key)"),
+            ("granite decoder", "set_kv_rows(arena_k"),
+            ("granite decoder", "add_kv_write_root(k_seed)"),
+            ("moonshine decoder", "add_kv_write_root(write_key)"),
+            ("moonshine decoder", "set_kv_rows(self_k_cache"),
+            ("whisper decoder", "set_kv_rows(k_layer"),
+            ("whisper decoder", "add_kv_write_root(k_write)"),
+            ("whisper decoder", "add_kv_write_root(key_write)"),
+            (
+                "xasr encoder",
+                "resident_kv_cache_side_effect\",graph.add_kv_write_root(write)",
+            ),
+        ];
+        for (label, pattern) in required {
+            let source = compact
+                .iter()
+                .find_map(|(candidate, source)| (*candidate == label).then_some(source))
+                .expect("audited source label exists");
+            assert!(
+                source.contains(pattern),
+                "{label} is missing typed KV lifecycle registration: {pattern}"
+            );
+        }
+
+        for (label, source) in [
+            ("xasr device head", XASR_HEAD),
+            ("parakeet TDT recurrent decoder", PARAKEET_TDT_DECODER),
+        ] {
+            assert!(
+                !source.contains("add_kv_write_root") && !source.contains("set_kv_rows"),
+                "{label} ordinary persistent state must not be mislabeled as KV"
+            );
+        }
+    }
+}

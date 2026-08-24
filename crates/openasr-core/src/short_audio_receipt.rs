@@ -20,7 +20,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::RequestAttemptId;
-use crate::ggml_runtime::{GgmlExecutionPlacementSummary, ResolvedFamilyRuntimeInput};
+use crate::ggml_runtime::{
+    GgmlActualDeviceFacts, GgmlExecutionPlacementSummary, GgmlGraphLifecycleSnapshot,
+    ResolvedFamilyRuntimeInput,
+};
 use crate::models::request_execution_receipt::{
     NativeExecutionReceiptSnapshot, NativeExecutionTokenStep,
 };
@@ -142,6 +145,19 @@ pub struct ShortAudioReceipt {
     /// and non-ggml backends may omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_placement: Option<GgmlExecutionPlacementSummary>,
+    /// Real graph lifecycle operations observed by the shared ggml runtime.
+    /// IDs are opaque within this producer process and are not stable receipt
+    /// identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_lifecycle: Option<GgmlGraphLifecycleSnapshot>,
+    /// Final live backend identity. These three fields are all-or-none and are
+    /// never reconstructed from `run.device` or the requested placement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_stable_device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_device: Option<GgmlActualDeviceFacts>,
     /// Optional versioned evidence. Its class determines which release gate it
     /// can satisfy; old receipts omit this field and remain readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -613,6 +629,52 @@ impl ShortAudioReceipt {
                 });
             }
         }
+        if let Some(lifecycle) = &self.graph_lifecycle {
+            if lifecycle.overflowed || lifecycle.events.is_empty() {
+                return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                    field: "graph_lifecycle",
+                    actual: "empty or overflowed lifecycle evidence".to_string(),
+                });
+            }
+            if lifecycle.events.iter().any(|event| {
+                event.schema != crate::ggml_runtime::GGML_GRAPH_LIFECYCLE_SCHEMA
+                    || event.provider.is_empty()
+                    || event.device.is_empty()
+            }) {
+                return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                    field: "graph_lifecycle.events",
+                    actual: "unversioned or unbound lifecycle event".to_string(),
+                });
+            }
+        }
+        match (
+            self.actual_provider.as_deref(),
+            self.actual_stable_device_id.as_deref(),
+            self.actual_device.as_ref(),
+        ) {
+            (None, None, None) => {}
+            (Some(provider), Some(stable_id), Some(device)) => {
+                validate_actual_device_facts("actual_device", provider, stable_id, device)?;
+                if let Some(lifecycle) = &self.graph_lifecycle
+                    && lifecycle
+                        .events
+                        .iter()
+                        .any(|event| event.provider != provider || event.device != stable_id)
+                {
+                    return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                        field: "actual_device",
+                        actual: "lifecycle route differs from final live backend".to_string(),
+                    });
+                }
+            }
+            _ => {
+                return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                    field: "actual_device",
+                    actual: "actual provider/device facts must be complete and consistent"
+                        .to_string(),
+                });
+            }
+        }
 
         match (self.metrics.rtf_median, self.metrics.rtf_samples.is_empty()) {
             (Some(_), true) => return Err(ShortAudioReceiptError::MedianWithoutSamples),
@@ -831,6 +893,12 @@ pub struct ShortAudioReceiptEvidence {
     pub artifact_fingerprint: String,
     /// Stable bounded device label or opaque identity; never a local path.
     pub device: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_stable_device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_device: Option<GgmlActualDeviceFacts>,
     pub placement: String,
     pub capture_mode: ShortAudioCaptureMode,
     pub scheduler_mode: ShortAudioSchedulerMode,
@@ -990,11 +1058,13 @@ impl ShortAudioReceiptEvidence {
         match self.evidence_class {
             ShortAudioEvidenceClass::BuildPackaging => {}
             ShortAudioEvidenceClass::PlacementResource => {
+                self.validate_actual_device()?;
                 if observed_placement.is_none() {
                     return Err(ShortAudioReceiptError::PlacementEvidenceMissing);
                 }
             }
             ShortAudioEvidenceClass::TokenTranscript => {
+                self.validate_actual_device()?;
                 if self.output_plan.is_none()
                     || self.family_oracle.is_none()
                     || self.execution.is_none()
@@ -1052,6 +1122,31 @@ impl ShortAudioReceiptEvidence {
             }
         }
         Ok(())
+    }
+
+    fn validate_actual_device(&self) -> Result<(), ShortAudioReceiptError> {
+        let (Some(actual_provider), Some(actual_stable_device_id), Some(actual_device)) = (
+            self.actual_provider.as_deref(),
+            self.actual_stable_device_id.as_deref(),
+            self.actual_device.as_ref(),
+        ) else {
+            return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                field: "correctness.actual_device",
+                actual: "missing final live backend facts".to_string(),
+            });
+        };
+        if actual_provider != self.provider || actual_stable_device_id != self.device {
+            return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                field: "correctness.actual_device",
+                actual: "final live backend identity differs from the evidence lane".to_string(),
+            });
+        }
+        validate_actual_device_facts(
+            "correctness.actual_device",
+            actual_provider,
+            actual_stable_device_id,
+            actual_device,
+        )
     }
 }
 
@@ -1422,6 +1517,38 @@ fn validate_safe_environment(
     Ok(())
 }
 
+fn validate_actual_device_facts(
+    field: &'static str,
+    provider: &str,
+    stable_device_id: &str,
+    device: &GgmlActualDeviceFacts,
+) -> Result<(), ShortAudioReceiptError> {
+    let bounded = |value: &str, max_chars: usize| {
+        !value.trim().is_empty()
+            && value.chars().count() <= max_chars
+            && !value.contains(['\n', '\r'])
+    };
+    let provider_device_id_valid = device
+        .provider_device_id
+        .as_deref()
+        .is_none_or(|value| bounded(value, 128));
+    if !bounded(provider, 64)
+        || !bounded(stable_device_id, 128)
+        || stable_device_id != device.name
+        || !bounded(&device.device_type, 64)
+        || !bounded(&device.name, 128)
+        || !bounded(&device.description, 256)
+        || !provider_device_id_valid
+        || device.pci_vendor_id == Some(0)
+    {
+        return Err(ShortAudioReceiptError::InvalidEvidenceField {
+            field,
+            actual: "live backend facts are empty, unbounded, or inconsistent".to_string(),
+        });
+    }
+    Ok(())
+}
+
 const MAX_ENCODER_DECODER_SPLITS: usize = 8;
 const NATIVE_RECEIPT_SEQ2SEQ_DECODE_DRIVER: &str = "shared-seq2seq-greedy";
 
@@ -1664,6 +1791,10 @@ mod tests {
                 observed_node_output_bytes_by_backend: BTreeMap::from([("CPU".to_string(), 4096)]),
                 fallback_node_samples_by_backend: BTreeMap::new(),
             }),
+            graph_lifecycle: None,
+            actual_provider: None,
+            actual_stable_device_id: None,
+            actual_device: None,
             evidence: None,
             execution: None,
             scope: SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE.to_string(),
@@ -1720,6 +1851,15 @@ mod tests {
             driver_version: "12.7.0".to_string(),
             artifact_fingerprint: "9".repeat(64),
             device: "cuda0".to_string(),
+            actual_provider: Some("cuda".to_string()),
+            actual_stable_device_id: Some("cuda0".to_string()),
+            actual_device: Some(GgmlActualDeviceFacts {
+                device_type: "gpu".to_string(),
+                name: "cuda0".to_string(),
+                description: "test cuda device".to_string(),
+                provider_device_id: Some("0000:01:00.0".to_string()),
+                pci_vendor_id: Some(0x10de),
+            }),
             placement: "full_device".to_string(),
             capture_mode: ShortAudioCaptureMode::Disabled,
             scheduler_mode: ShortAudioSchedulerMode::Disabled,
@@ -2001,6 +2141,27 @@ mod tests {
                 Err(ShortAudioReceiptError::InvalidPrivacyProjection { field: "scope", .. })
             ));
         }
+    }
+
+    #[test]
+    fn actual_device_facts_are_bounded_and_route_consistent() {
+        let mut receipt = sample_receipt();
+        receipt.actual_provider = Some("cpu".to_string());
+        receipt.actual_stable_device_id = Some("CPU".to_string());
+        receipt.actual_device = Some(GgmlActualDeviceFacts {
+            device_type: "cpu".to_string(),
+            name: "CPU".to_string(),
+            description: "x".repeat(257),
+            provider_device_id: None,
+            pci_vendor_id: None,
+        });
+        assert!(matches!(
+            ShortAudioReceipt::try_new(receipt),
+            Err(ShortAudioReceiptError::InvalidEvidenceField {
+                field: "actual_device",
+                ..
+            })
+        ));
     }
 
     #[test]

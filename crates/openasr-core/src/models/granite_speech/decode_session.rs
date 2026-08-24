@@ -1247,10 +1247,10 @@ impl GraniteSpeechDecodeSession {
             // the returned handles are the full `[head_dim, max_positions,
             // kv_heads]` span (with the new row now live) that attention reads.
             let k_full = graph
-                .set_rows(arena_k, pre.k_perm, row_index)
+                .set_kv_rows(arena_k, pre.k_perm, row_index)
                 .map_err(map_ggml("reuse_k_set_rows"))?;
             let v_full = graph
-                .set_rows(arena_v, pre.v_perm, row_index)
+                .set_kv_rows(arena_v, pre.v_perm, row_index)
                 .map_err(map_ggml("reuse_v_set_rows"))?;
             let attended = if use_flash_attention {
                 graph
@@ -1733,13 +1733,13 @@ fn run_prefill_graph_seeding_resident(
             .set_rows(arena_k, pre.k_perm, seed_indices)
             .map_err(map_ggml("seed_prefill_k_set_rows"))?;
         graph
-            .add_side_effect_root(k_seed)
+            .add_kv_write_root(k_seed)
             .map_err(map_ggml("seed_prefill_k_root"))?;
         let v_seed = graph
             .set_rows(arena_v, pre.v_perm, seed_indices)
             .map_err(map_ggml("seed_prefill_v_set_rows"))?;
         graph
-            .add_side_effect_root(v_seed)
+            .add_kv_write_root(v_seed)
             .map_err(map_ggml("seed_prefill_v_root"))?;
 
         let attended = if use_flash_attention {

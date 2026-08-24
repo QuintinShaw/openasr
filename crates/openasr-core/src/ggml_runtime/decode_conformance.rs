@@ -15,9 +15,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlDecodeOutputPlan, GgmlDecodeReuseMode, GgmlPersistentGraphSession,
+    GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlDecodeOutputPlan, GgmlDecodeReuseMode,
+    GgmlGraphLifecycleCollector, GgmlGraphLifecycleSnapshot, GgmlGraphRebuildReason,
+    GgmlPersistentGraphSession, RequestBackendPreference, install_graph_lifecycle_collector,
+    install_request_backend_override,
 };
+use crate::device::execution_route::{ExecutionProvider, ResolvedExecutionRoute};
 
 /// Bounded per-step diagnostic records on a short-audio receipt.
 pub const SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS: usize = 64;
@@ -236,6 +240,159 @@ pub struct DiagnosticFourQuadrantReport {
     pub case_c: Option<DiagnosticQuadrantTrace>,
     pub case_d: Option<DiagnosticQuadrantTrace>,
     pub classification: DecodeFirstDivergenceClass,
+    pub graph_lifecycle: GgmlGraphLifecycleSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiagnosticLayer1Case {
+    pub label: &'static str,
+    pub expected_tokens: Vec<i32>,
+    pub actual_tokens: Vec<i32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiagnosticLayer1Report {
+    pub provider: ExecutionProvider,
+    pub stable_device_id: String,
+    pub cases: Vec<DiagnosticLayer1Case>,
+    pub unsupported_rank_rejected: bool,
+    pub graph_lifecycle: GgmlGraphLifecycleSnapshot,
+}
+
+/// Complete Layer-1 ARGMAX_FIRST semantic fixture on one exact final route.
+pub fn run_diagnostic_layer1_exact_route_probe(
+    route: ResolvedExecutionRoute,
+) -> Result<DiagnosticLayer1Report, GgmlCpuGraphError> {
+    const FIRERED_VOCAB: usize = 7_832;
+    let lifecycle = GgmlGraphLifecycleCollector::new();
+    let _lifecycle_guard = install_graph_lifecycle_collector(Some(lifecycle.clone()));
+    let _route_guard =
+        install_request_backend_override(Some(RequestBackendPreference::Exact(route.clone())));
+    let mut runner = GgmlCpuGraphRunner::new(exact_route_graph_config(&route))?;
+    let mut firered = vec![0.0_f32; FIRERED_VOCAB];
+    firered[100] = 1.0;
+    firered[200] = 1.0;
+    let cases = [
+        ("unique_maximum", vec![1.0, 7.0, 3.0, 0.0], vec![1]),
+        ("exact_first_tie", vec![2.0, 1.0, 5.0, 5.0], vec![2]),
+        ("all_equal", vec![5.0, 5.0, 5.0, 5.0], vec![0]),
+        ("negative_values", vec![-4.0, -1.0, -1.0, -8.0], vec![1]),
+        ("leading_nan", vec![f32::NAN, 3.0, 3.0, 1.0], vec![0]),
+        (
+            "positive_infinity",
+            vec![1.0, f32::INFINITY, 1.0, 0.0],
+            vec![1],
+        ),
+        ("firered_vocab_width", firered, vec![100]),
+        (
+            "multiple_rows",
+            vec![1.0, 5.0, 5.0, 2.0, 9.0, 3.0, 2.0, 1.0],
+            vec![1, 0],
+        ),
+    ];
+    let mut results = Vec::with_capacity(cases.len());
+    for (label, values, expected_tokens) in cases {
+        let rows = expected_tokens.len();
+        let width = values.len() / rows;
+        let mut graph = runner.start_graph();
+        let logits = graph.new_tensor_2d_f32(width, rows, "layer1_exact_route_logits")?;
+        graph.set_input(logits)?;
+        let token = graph.top1_argmax_first_max(logits)?;
+        graph.set_output(token)?;
+        graph.set_f32_slice(logits, &values, "layer1_exact_route_logits")?;
+        let actual_tokens = graph.compute_output_i32(token, rows)?;
+        results.push(DiagnosticLayer1Case {
+            label,
+            expected_tokens,
+            actual_tokens,
+        });
+    }
+    let graph = runner.start_graph();
+    let unsupported = graph.new_tensor_3d_f32(4, 1, 2, "layer1_unsupported_rank")?;
+    let unsupported_rank_rejected = graph.top1_argmax_first_max(unsupported).is_err();
+    drop(graph);
+    drop(runner);
+    let graph_lifecycle = lifecycle.snapshot();
+    validate_lifecycle_route(&graph_lifecycle, &route)?;
+    Ok(DiagnosticLayer1Report {
+        provider: route.provider,
+        stable_device_id: route.stable_id,
+        cases: results,
+        unsupported_rank_rejected,
+        graph_lifecycle,
+    })
+}
+
+/// Capture-aware Layer-2 producer. Capture generation remains absent unless a
+/// backend API callback actually reported an executable capture generation.
+pub fn run_diagnostic_layer2_exact_route_probe(
+    route: ResolvedExecutionRoute,
+) -> Result<DiagnosticLayer2Report, GgmlCpuGraphError> {
+    let lifecycle = GgmlGraphLifecycleCollector::new();
+    let _lifecycle_guard = install_graph_lifecycle_collector(Some(lifecycle.clone()));
+    let _route_guard =
+        install_request_backend_override(Some(RequestBackendPreference::Exact(route.clone())));
+    let config = exact_route_graph_config(&route);
+    let mut runner = GgmlCpuGraphRunner::new(config)?;
+    let mut arena = runner.start_state_tensor_arena(config.context_bytes)?;
+    let cache = arena.new_tensor_2d_typed(2, 2, super::ffi::GGML_TYPE_F32, "layer2_kv")?;
+    arena.set_f32_slice(cache, &[0.0; 4], "layer2_kv")?;
+
+    let mut session = runner.start_persistent_graph_session(config.context_bytes)?;
+    let (src, rows, output) = {
+        let graph = session.builder();
+        let src = graph.new_tensor_2d_f32(2, 1, "layer2_kv_src")?;
+        let rows = graph.new_tensor_1d_i32(1, "layer2_kv_rows")?;
+        graph.set_input(src)?;
+        graph.set_input(rows)?;
+        let output = graph.set_kv_rows(arena.graph_tensor(cache), src, rows)?;
+        graph.add_kv_write_root(output)?;
+        graph.set_output(output)?;
+        graph.prepare_outputs_for_upload(&[output])?;
+        (src, rows, output)
+    };
+    let mut refreshed_outputs = Vec::new();
+    for (row, values) in [(0_i32, [1.0_f32, 2.0]), (1_i32, [3.0_f32, 4.0])] {
+        let graph = session.builder();
+        graph.set_f32_slice(src, &values, "layer2_kv_src")?;
+        graph.set_i32_slice(rows, &[row], "layer2_kv_rows")?;
+        refreshed_outputs.push(graph.compute_output_f32(output, 4)?);
+    }
+    drop(session);
+
+    let mut rebuilt = runner.rebuild_persistent_graph_session(
+        config.context_bytes,
+        GgmlGraphRebuildReason::TopologyChanged,
+    )?;
+    {
+        let graph = rebuilt.builder();
+        let input = graph.new_tensor_1d_f32(1, "layer2_rebuilt_input")?;
+        graph.set_input(input)?;
+        graph.set_output(input)?;
+        graph.prepare_outputs_for_upload(&[input])?;
+        graph.set_f32_slice(input, &[9.0], "layer2_rebuilt_input")?;
+        let _ = graph.compute_output_f32(input, 1)?;
+        graph.mark_poisoned_after_failed_compute();
+    }
+    drop(rebuilt);
+    drop(arena);
+    drop(runner);
+    let graph_lifecycle = lifecycle.snapshot();
+    validate_lifecycle_route(&graph_lifecycle, &route)?;
+    Ok(DiagnosticLayer2Report {
+        provider: route.provider,
+        stable_device_id: route.stable_id,
+        refreshed_outputs,
+        graph_lifecycle,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DiagnosticLayer2Report {
+    pub provider: ExecutionProvider,
+    pub stable_device_id: String,
+    pub refreshed_outputs: Vec<Vec<f32>>,
+    pub graph_lifecycle: GgmlGraphLifecycleSnapshot,
 }
 
 /// Inputs used to classify a four-quadrant first divergence.
@@ -688,6 +845,21 @@ pub fn run_diagnostic_four_quadrant_cpu_probe(
     steps: &[&[f32]],
     family_policy: DiagnosticFamilyCompactPolicy,
 ) -> Result<DiagnosticFourQuadrantReport, GgmlCpuGraphError> {
+    run_diagnostic_four_quadrant_exact_route_probe(
+        ResolvedExecutionRoute::cpu(),
+        steps,
+        family_policy,
+    )
+}
+
+/// Backend-neutral four-quadrant producer bound to one exact live ggml route.
+/// The runner re-attests the initialized device on every compute; lifecycle
+/// events are rejected if they name a different final provider/device.
+pub fn run_diagnostic_four_quadrant_exact_route_probe(
+    route: ResolvedExecutionRoute,
+    steps: &[&[f32]],
+    family_policy: DiagnosticFamilyCompactPolicy,
+) -> Result<DiagnosticFourQuadrantReport, GgmlCpuGraphError> {
     if steps.is_empty() || steps.len() > SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS {
         return Err(GgmlCpuGraphError::UnsupportedInputs {
             reason: "diagnostic four-quadrant step count is empty or unbounded",
@@ -700,8 +872,13 @@ pub fn run_diagnostic_four_quadrant_cpu_probe(
         });
     }
 
-    let mut fresh_runtime = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())?;
-    let mut reusable_runtime = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())?;
+    let lifecycle = GgmlGraphLifecycleCollector::new();
+    let _lifecycle_guard = install_graph_lifecycle_collector(Some(lifecycle.clone()));
+    let _route_guard =
+        install_request_backend_override(Some(RequestBackendPreference::Exact(route.clone())));
+    let config = exact_route_graph_config(&route);
+    let mut fresh_runtime = GgmlCpuGraphRunner::new(config)?;
+    let mut reusable_runtime = GgmlCpuGraphRunner::new(config)?;
 
     let case_a = run_fresh_complete_logits(&mut fresh_runtime, steps)?;
     let case_b = run_reusable_complete_logits(&mut reusable_runtime, steps)?;
@@ -731,13 +908,48 @@ pub fn run_diagnostic_four_quadrant_cpu_probe(
             cpu_reference: Some(&cpu_reference),
         });
 
+    drop(fresh_runtime);
+    drop(reusable_runtime);
+    let graph_lifecycle = lifecycle.snapshot();
+    validate_lifecycle_route(&graph_lifecycle, &route)?;
     Ok(DiagnosticFourQuadrantReport {
         case_a,
         case_b,
         case_c,
         case_d,
         classification,
+        graph_lifecycle,
     })
+}
+
+fn exact_route_graph_config(route: &ResolvedExecutionRoute) -> GgmlCpuGraphConfig {
+    let backend = match route.provider {
+        ExecutionProvider::Cpu => GgmlCpuGraphBackend::Cpu,
+        ExecutionProvider::Metal => GgmlCpuGraphBackend::Metal,
+        ExecutionProvider::Cuda
+        | ExecutionProvider::Hip
+        | ExecutionProvider::Vulkan
+        | ExecutionProvider::Accelerator
+        | ExecutionProvider::Unknown => GgmlCpuGraphBackend::Gpu,
+    };
+    GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend)
+}
+
+fn validate_lifecycle_route(
+    lifecycle: &GgmlGraphLifecycleSnapshot,
+    route: &ResolvedExecutionRoute,
+) -> Result<(), GgmlCpuGraphError> {
+    if lifecycle.overflowed
+        || lifecycle.events.is_empty()
+        || lifecycle.events.iter().any(|event| {
+            event.provider != route.provider.as_str() || event.device != route.stable_id
+        })
+    {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "diagnostic lifecycle is empty, overflowed, or not bound to the exact route",
+        });
+    }
+    Ok(())
 }
 
 pub fn classify_four_quadrant_first_divergence(
@@ -1110,6 +1322,86 @@ mod tests {
             report.classification,
             DecodeFirstDivergenceClass::NoneObserved
         );
+        assert!(report.graph_lifecycle.events.iter().any(|event| matches!(
+            event.kind,
+            crate::GgmlGraphLifecycleEventKind::Rebuilt {
+                reason: GgmlGraphRebuildReason::FreshStep,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn exact_route_layer1_binds_real_cpu_provider_and_semantic_cases() {
+        let report = run_diagnostic_layer1_exact_route_probe(ResolvedExecutionRoute::cpu())
+            .expect("Layer-1 exact CPU probe");
+        assert_eq!(report.provider, ExecutionProvider::Cpu);
+        assert_eq!(report.stable_device_id, "CPU");
+        assert!(report.unsupported_rank_rejected);
+        assert!(
+            report
+                .cases
+                .iter()
+                .all(|case| case.actual_tokens == case.expected_tokens)
+        );
+        assert!(
+            report.graph_lifecycle.events.iter().all(|event| {
+                event.provider == "cpu" && event.device == report.stable_device_id
+            })
+        );
+    }
+
+    #[test]
+    fn exact_route_layer2_records_refresh_kv_rebuild_poison_and_drop() {
+        let report = run_diagnostic_layer2_exact_route_probe(ResolvedExecutionRoute::cpu())
+            .expect("Layer-2 exact CPU probe");
+        assert_eq!(
+            report.refreshed_outputs,
+            vec![vec![1.0, 2.0, 0.0, 0.0], vec![1.0, 2.0, 3.0, 4.0]]
+        );
+        for expected in [
+            "created",
+            "prepared",
+            "input_write",
+            "compute_started",
+            "compute_completed",
+            "output_read",
+            "kv_write_committed",
+            "rebuilt",
+            "poisoned",
+            "dropped",
+        ] {
+            assert!(
+                report
+                    .graph_lifecycle
+                    .events
+                    .iter()
+                    .any(|event| lifecycle_event_label(&event.kind) == expected),
+                "missing {expected}"
+            );
+        }
+        assert!(report.graph_lifecycle.events.iter().all(|event| !matches!(
+            event.kind,
+            crate::GgmlGraphLifecycleEventKind::CaptureExecutableCreated { .. }
+        )));
+    }
+
+    fn lifecycle_event_label(kind: &crate::GgmlGraphLifecycleEventKind) -> &'static str {
+        match kind {
+            crate::GgmlGraphLifecycleEventKind::Created { .. } => "created",
+            crate::GgmlGraphLifecycleEventKind::Prepared { .. } => "prepared",
+            crate::GgmlGraphLifecycleEventKind::InputWrite { .. } => "input_write",
+            crate::GgmlGraphLifecycleEventKind::ComputeStarted { .. } => "compute_started",
+            crate::GgmlGraphLifecycleEventKind::ComputeCompleted { .. } => "compute_completed",
+            crate::GgmlGraphLifecycleEventKind::OutputRead { .. } => "output_read",
+            crate::GgmlGraphLifecycleEventKind::KvWriteCommitted { .. } => "kv_write_committed",
+            crate::GgmlGraphLifecycleEventKind::Rebuilt { .. } => "rebuilt",
+            crate::GgmlGraphLifecycleEventKind::Poisoned { .. } => "poisoned",
+            crate::GgmlGraphLifecycleEventKind::Dropped => "dropped",
+            crate::GgmlGraphLifecycleEventKind::CaptureExecutableCreated { .. } => {
+                "capture_executable_created"
+            }
+        }
     }
 
     #[test]
@@ -1737,6 +2029,10 @@ mod tests {
             transcript: ShortAudioReceiptTranscript::from_text(""),
             placement: "cpu".to_string(),
             observed_placement: None,
+            graph_lifecycle: None,
+            actual_provider: None,
+            actual_stable_device_id: None,
+            actual_device: None,
             evidence: None,
             execution: None,
             scope: SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE.to_string(),

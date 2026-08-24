@@ -6529,22 +6529,30 @@ fn register_resident_cache_writes<'a>(
     destination: XasrDeviceLayerCacheTensors,
 ) -> Result<(), XasrEncoderGraphError> {
     let destination = destination.as_graph_tensors();
-    for (source, target) in [
-        (output.new_cached_key, destination.cached_key),
+    for (source, target, is_kv_cache) in [
+        (output.new_cached_key, destination.cached_key, true),
         (
             output.new_cached_nonlin_attention,
             destination.cached_nonlin_attention,
+            false,
         ),
-        (output.new_cached_val1, destination.cached_val1),
-        (output.new_cached_val2, destination.cached_val2),
-        (output.new_cached_conv1, destination.cached_conv1),
-        (output.new_cached_conv2, destination.cached_conv2),
+        (output.new_cached_val1, destination.cached_val1, true),
+        (output.new_cached_val2, destination.cached_val2, true),
+        (output.new_cached_conv1, destination.cached_conv1, false),
+        (output.new_cached_conv2, destination.cached_conv2, false),
     ] {
         let write = map_ggml_stage("resident_cache_copy", graph.cpy(source, target))?;
-        map_ggml_stage(
-            "resident_cache_side_effect",
-            graph.add_side_effect_root(write),
-        )?;
+        if is_kv_cache {
+            map_ggml_stage(
+                "resident_kv_cache_side_effect",
+                graph.add_kv_write_root(write),
+            )?;
+        } else {
+            map_ggml_stage(
+                "resident_cache_side_effect",
+                graph.add_side_effect_root(write),
+            )?;
+        }
     }
     Ok(())
 }

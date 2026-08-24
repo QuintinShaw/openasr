@@ -1913,15 +1913,151 @@ pub struct GgmlCpuGraphRunner {
     /// Session-scoped: callers that cache this runner across decode sessions
     /// MUST call `release_cpu_step_buffer_pool` when a session/slice ends.
     cpu_step_buffer_pool: GgmlCpuStepBufferPool,
+    last_transient_graph_generation: Option<u64>,
+    last_persistent_graph_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GgmlRunnerExecutionIdentity {
     actual_provider: ExecutionProvider,
     actual_stable_device_id: String,
+    actual_device: super::GgmlActualDeviceFacts,
     backend_name: String,
     scheduler_enabled: bool,
     placement: Option<ExecutionPlacement>,
+}
+
+struct GgmlGraphLifecycleState {
+    provider: String,
+    device: String,
+    graph_instance: u64,
+    graph_generation: u64,
+    prepare_generation: Option<u64>,
+    latest_input_generation: Option<u64>,
+    latest_output_generation: Option<u64>,
+    compute_sequence: u64,
+    last_completed_compute: Option<u64>,
+    capture_executable_generation: Option<u64>,
+    kv_write_tensors: HashSet<usize>,
+    poisoned_recorded: bool,
+}
+
+impl GgmlGraphLifecycleState {
+    fn created(identity: &GgmlRunnerExecutionIdentity, graph_instance: u64) -> Self {
+        let state = Self {
+            provider: identity.actual_provider.as_str().to_string(),
+            device: identity.actual_stable_device_id.clone(),
+            graph_instance,
+            graph_generation: super::mint_opaque_graph_id(),
+            prepare_generation: None,
+            latest_input_generation: None,
+            latest_output_generation: None,
+            compute_sequence: 0,
+            last_completed_compute: None,
+            capture_executable_generation: None,
+            kv_write_tensors: HashSet::new(),
+            poisoned_recorded: false,
+        };
+        state.record(super::GgmlGraphLifecycleEventKind::Created {
+            scheduler_enabled: identity.scheduler_enabled,
+        });
+        state
+    }
+
+    fn record(&self, kind: super::GgmlGraphLifecycleEventKind) {
+        if let Some(collector) = super::current_graph_lifecycle_collector() {
+            collector.record(
+                &self.provider,
+                &self.device,
+                self.graph_instance,
+                self.graph_generation,
+                kind,
+            );
+        }
+    }
+
+    fn rebuilt_from(&self, previous_graph_generation: u64, reason: super::GgmlGraphRebuildReason) {
+        self.record(super::GgmlGraphLifecycleEventKind::Rebuilt {
+            previous_graph_generation,
+            reason,
+        });
+    }
+
+    fn prepared(&mut self) {
+        let prepare_generation = super::mint_opaque_graph_id();
+        self.prepare_generation = Some(prepare_generation);
+        self.record(super::GgmlGraphLifecycleEventKind::Prepared { prepare_generation });
+    }
+
+    fn ensure_prepared(&mut self) {
+        if self.prepare_generation.is_none() {
+            self.prepared();
+        }
+    }
+
+    fn input_written(&mut self, bytes: usize) {
+        let input_generation = super::mint_opaque_graph_id();
+        self.latest_input_generation = Some(input_generation);
+        self.record(super::GgmlGraphLifecycleEventKind::InputWrite {
+            input_generation,
+            bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+        });
+    }
+
+    fn compute_started(&mut self) -> u64 {
+        self.compute_sequence = self.compute_sequence.saturating_add(1);
+        let compute_sequence = self.compute_sequence;
+        self.record(super::GgmlGraphLifecycleEventKind::ComputeStarted {
+            compute_sequence,
+            prepare_generation: self.prepare_generation,
+            input_generation_consumed: self.latest_input_generation,
+            capture_executable_generation: self.capture_executable_generation,
+        });
+        compute_sequence
+    }
+
+    fn compute_completed(&mut self, compute_sequence: u64, kv_writes_reached_compute: bool) {
+        let output_generation = super::mint_opaque_graph_id();
+        self.latest_output_generation = Some(output_generation);
+        self.last_completed_compute = Some(compute_sequence);
+        self.record(super::GgmlGraphLifecycleEventKind::ComputeCompleted {
+            compute_sequence,
+            output_generation,
+        });
+        if kv_writes_reached_compute {
+            self.record(super::GgmlGraphLifecycleEventKind::KvWriteCommitted {
+                compute_sequence,
+                kv_write_generation: super::mint_opaque_graph_id(),
+            });
+        }
+    }
+
+    fn output_read(&self, bytes: usize) {
+        let (Some(compute_sequence), Some(output_generation_consumed)) =
+            (self.last_completed_compute, self.latest_output_generation)
+        else {
+            return;
+        };
+        self.record(super::GgmlGraphLifecycleEventKind::OutputRead {
+            compute_sequence,
+            output_generation_consumed,
+            bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+        });
+    }
+
+    fn poisoned(&mut self, reason: super::GgmlGraphPoisonReason) {
+        if self.poisoned_recorded {
+            return;
+        }
+        self.poisoned_recorded = true;
+        self.record(super::GgmlGraphLifecycleEventKind::Poisoned { reason });
+    }
+}
+
+impl Drop for GgmlGraphLifecycleState {
+    fn drop(&mut self) {
+        self.record(super::GgmlGraphLifecycleEventKind::Dropped);
+    }
 }
 
 /// Session-scoped grow-to-fit backend buffer for the CPU per-token decode
@@ -2373,6 +2509,7 @@ pub(crate) struct GgmlCpuGraphBuilder<'a> {
     /// result, and replay that evidence to each new request collector while
     /// still counting every compute.
     observed_placement: Option<GgmlObservedGraphPlacement>,
+    lifecycle: GgmlGraphLifecycleState,
     _runner_borrow: PhantomData<&'a mut GgmlCpuGraphRunner>,
 }
 
@@ -2525,10 +2662,12 @@ impl GgmlCpuGraphRunner {
             request_backend_override(),
             Some(RequestBackendPreference::Exact(_))
         );
-        let (actual_provider, actual_stable_id) = backend_provider_and_stable_id(backend.raw)?;
+        let (actual_provider, actual_stable_id, actual_device) =
+            backend_actual_device_facts(backend.raw)?;
         let execution_identity = GgmlRunnerExecutionIdentity {
             actual_provider,
             actual_stable_device_id: actual_stable_id,
+            actual_device,
             backend_name: backend_name.clone(),
             scheduler_enabled: scheduler.is_some(),
             placement: execution_placement,
@@ -2551,6 +2690,7 @@ impl GgmlCpuGraphRunner {
                 &backend_name,
                 execution_identity.actual_provider,
                 &execution_identity.actual_stable_device_id,
+                &execution_identity.actual_device,
                 execution_identity.scheduler_enabled,
             );
             if crate::models::native_execution_services::current_execution_observation_sink()
@@ -2576,6 +2716,8 @@ impl GgmlCpuGraphRunner {
             _scheduler_cpu_fallback: scheduler_cpu_fallback,
             scheduler,
             cpu_step_buffer_pool: GgmlCpuStepBufferPool::new(),
+            last_transient_graph_generation: None,
+            last_persistent_graph_generation: None,
         })
     }
 
@@ -2631,6 +2773,7 @@ impl GgmlCpuGraphRunner {
         self.start_persistent_graph_session_with_capacities(
             GgmlCpuGraphConfig::metadata_context_bytes(graph_size),
             graph_size,
+            None,
         )
     }
 
@@ -2774,6 +2917,16 @@ impl GgmlCpuGraphRunner {
         let step_buffer_pool = (scheduler.is_none()
             && matches!(self.backend_kind, GgmlCpuGraphBackend::Cpu))
         .then_some(&mut self.cpu_step_buffer_pool);
+        let lifecycle = GgmlGraphLifecycleState::created(
+            &self.execution_identity,
+            super::mint_opaque_graph_id(),
+        );
+        if let Some(previous) = self
+            .last_transient_graph_generation
+            .replace(lifecycle.graph_generation)
+        {
+            lifecycle.rebuilt_from(previous, super::GgmlGraphRebuildReason::FreshStep);
+        }
         GgmlCpuGraphBuilder {
             context: self.context.raw,
             backend: self.backend.raw,
@@ -2797,6 +2950,7 @@ impl GgmlCpuGraphRunner {
             direct_graph_private_pending: Vec::new(),
             execution_graph_id: NEXT_EXECUTION_GRAPH_ID.fetch_add(1, Ordering::Relaxed),
             observed_placement: None,
+            lifecycle,
             _runner_borrow: PhantomData,
         }
     }
@@ -2953,13 +3107,26 @@ impl GgmlCpuGraphRunner {
         &mut self,
         context_bytes: usize,
     ) -> Result<GgmlPersistentGraphSession, GgmlCpuGraphError> {
-        self.start_persistent_graph_session_with_capacities(context_bytes, self.graph_size)
+        self.start_persistent_graph_session_with_capacities(context_bytes, self.graph_size, None)
+    }
+
+    pub(crate) fn rebuild_persistent_graph_session(
+        &mut self,
+        context_bytes: usize,
+        reason: super::GgmlGraphRebuildReason,
+    ) -> Result<GgmlPersistentGraphSession, GgmlCpuGraphError> {
+        self.start_persistent_graph_session_with_capacities(
+            context_bytes,
+            self.graph_size,
+            Some(reason),
+        )
     }
 
     fn start_persistent_graph_session_with_capacities(
         &mut self,
         context_bytes: usize,
         graph_size: usize,
+        rebuild_reason: Option<super::GgmlGraphRebuildReason>,
     ) -> Result<GgmlPersistentGraphSession, GgmlCpuGraphError> {
         if context_bytes == 0 {
             return Err(GgmlCpuGraphError::InvalidContextBytes);
@@ -2968,6 +3135,16 @@ impl GgmlCpuGraphRunner {
             return Err(GgmlCpuGraphError::InvalidGraphSize);
         }
         let context = GgmlContextGuard::new(context_bytes, "ggml.persistent-graph-context")?;
+        let lifecycle = GgmlGraphLifecycleState::created(
+            &self.execution_identity,
+            super::mint_opaque_graph_id(),
+        );
+        if let (Some(previous), Some(reason)) =
+            (self.last_persistent_graph_generation, rebuild_reason)
+        {
+            lifecycle.rebuilt_from(previous, reason);
+        }
+        self.last_persistent_graph_generation = Some(lifecycle.graph_generation);
         let builder = GgmlCpuGraphBuilder {
             context: context.raw,
             backend: self.backend.raw,
@@ -3003,6 +3180,7 @@ impl GgmlCpuGraphRunner {
             direct_graph_private_pending: Vec::new(),
             execution_graph_id: NEXT_EXECUTION_GRAPH_ID.fetch_add(1, Ordering::Relaxed),
             observed_placement: None,
+            lifecycle,
             _runner_borrow: PhantomData,
         };
         Ok(GgmlPersistentGraphSession {
@@ -4042,7 +4220,7 @@ impl GgmlStaticTensorArena {
     }
 
     fn write_tensor_bytes_checked(
-        &self,
+        &mut self,
         tensor: GgmlStaticTensor,
         data_ptr: *const c_void,
         offset: usize,
@@ -5735,12 +5913,43 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.new_tensor_checked(raw, "ggml_set_rows")
     }
 
+    /// Build one row-indexed persistent K/V-cache write and register its
+    /// successful graph compute as a KV commit. Callers whose write tensor is
+    /// already transitively reachable from an output do not add another root.
+    pub(crate) fn set_kv_rows(
+        &mut self,
+        dst: GgmlCpuTensor<'a>,
+        src: GgmlCpuTensor<'a>,
+        row_indices: GgmlCpuTensor<'a>,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        let write = self.set_rows(dst, src, row_indices)?;
+        self.lifecycle
+            .kv_write_tensors
+            .insert(write.raw.as_ptr() as usize);
+        Ok(write)
+    }
+
     pub(crate) fn add_side_effect_root(
         &mut self,
         tensor: GgmlCpuTensor<'a>,
     ) -> Result<(), GgmlCpuGraphError> {
         self.ensure_can_extend_graph("ggml_build_forward_expand(side_effect)")?;
         self.side_effect_roots.push(tensor.raw);
+        Ok(())
+    }
+
+    /// Declare a side-effect root that commits decoder K/V rows. Together with
+    /// [`Self::set_kv_rows`], this typed semantic marker is the only path that
+    /// emits `kv_write_committed`; ordinary `cpy`/`set_rows` roots are never
+    /// guessed to be K/V.
+    pub(crate) fn add_kv_write_root(
+        &mut self,
+        tensor: GgmlCpuTensor<'a>,
+    ) -> Result<(), GgmlCpuGraphError> {
+        self.add_side_effect_root(tensor)?;
+        self.lifecycle
+            .kv_write_tensors
+            .insert(tensor.raw.as_ptr() as usize);
         Ok(())
     }
 
@@ -6332,6 +6541,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             self.allocate_direct_graph(graph)?;
         }
         self.prepared_graph = Some(graph);
+        self.lifecycle.ensure_prepared();
         Ok(())
     }
 
@@ -6352,6 +6562,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             self.ensure_backend_buffer()?;
         }
         self.prepared_graph = Some(graph);
+        self.lifecycle.ensure_prepared();
         Ok(())
     }
 
@@ -6759,6 +6970,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         if let Some(lifetime) = &mut self.scheduler_graph_lifetime {
             lifetime.graph = Some(graph);
         }
+        self.lifecycle.prepared();
         Ok(())
     }
 
@@ -6843,6 +7055,8 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
 
     fn poison_scheduler_after_allocation_commit(&mut self) {
         self.poisoned_after_failed_compute = true;
+        self.lifecycle
+            .poisoned(super::GgmlGraphPoisonReason::MemoryCommitFailed);
         if let Some(owner) = &self.scheduler_memory_owner {
             owner.poisoned.store(true, Ordering::Release);
         }
@@ -6980,11 +7194,22 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         )?;
         self.ensure_scheduler_graph_active(graph)?;
         self.prepare_direct_graph_private_gate(graph)?;
+        self.lifecycle.ensure_prepared();
         self.record_execution_placement(graph);
         #[cfg(test)]
         TEST_COMPUTE_GATE_ATTEMPT_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+        let kv_writes_reached_compute = super::current_graph_lifecycle_collector().is_some()
+            && self.registered_kv_writes_reached_by(graph);
+        let compute_sequence = self.lifecycle.compute_started();
         let compute = compute_graph_with_current_job_cancel(self.backend, self.scheduler, graph);
         let result = self.finish_compute_result(compute);
+        if result.is_ok() {
+            self.lifecycle
+                .compute_completed(compute_sequence, kv_writes_reached_compute);
+        } else {
+            self.lifecycle
+                .poisoned(super::GgmlGraphPoisonReason::ComputeFailed);
+        }
         if result.is_ok()
             && crate::models::native_execution_services::current_execution_observation_sink()
                 .is_some()
@@ -6995,6 +7220,21 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             );
         }
         result
+    }
+
+    fn registered_kv_writes_reached_by(&self, graph: NonNull<c_void>) -> bool {
+        if self.lifecycle.kv_write_tensors.is_empty() {
+            return false;
+        }
+        let mut observed = 0usize;
+        let node_count = unsafe { ffi::ggml_graph_n_nodes(graph.as_ptr()) };
+        for index in 0..node_count.max(0) {
+            let node = unsafe { ffi::ggml_graph_node(graph.as_ptr(), index) };
+            if self.lifecycle.kv_write_tensors.contains(&(node as usize)) {
+                observed = observed.saturating_add(1);
+            }
+        }
+        observed == self.lifecycle.kv_write_tensors.len()
     }
 
     fn record_execution_placement(&mut self, graph: NonNull<c_void>) {
@@ -7219,7 +7459,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                         expected_nbytes,
                     )
                 };
-                self.finish_readback_status(status)?;
+                self.finish_output_read(status, expected_nbytes)?;
                 results.push(GgmlCpuGraphOutputValue::F32(values));
             } else {
                 let mut values = vec![0_i32; expected_len];
@@ -7231,7 +7471,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                         expected_nbytes,
                     )
                 };
-                self.finish_readback_status(status)?;
+                self.finish_output_read(status, expected_nbytes)?;
                 results.push(GgmlCpuGraphOutputValue::I32(values));
             }
         }
@@ -7294,7 +7534,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     output_nbytes,
                 )
             };
-            self.finish_readback_status(status)?;
+            self.finish_output_read(status, output_nbytes)?;
             results.push(values);
         }
         Ok(results)
@@ -7359,7 +7599,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     target.len() * F32_WIDTH_BYTES,
                 )
             };
-            self.finish_readback_status(status)?;
+            self.finish_output_read(status, target.len() * F32_WIDTH_BYTES)?;
         }
         Ok(())
     }
@@ -7452,7 +7692,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     output_nbytes,
                 )
             };
-            self.finish_readback_status(status)?;
+            self.finish_output_read(status, output_nbytes)?;
             f32_results.push(values);
         }
 
@@ -7467,7 +7707,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     output_nbytes,
                 )
             };
-            self.finish_readback_status(status)?;
+            self.finish_output_read(status, output_nbytes)?;
             i32_results.push(values);
         }
 
@@ -7543,7 +7783,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 output_nbytes,
             )
         };
-        self.finish_readback_status(status)?;
+        self.finish_output_read(status, output_nbytes)?;
         Ok(values)
     }
 
@@ -7655,6 +7895,8 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             return Ok(());
         }
         self.poisoned_after_failed_compute = true;
+        self.lifecycle
+            .poisoned(super::GgmlGraphPoisonReason::ReadbackFailed);
         let mapped = map_compute_status(status);
         if matches!(
             mapped,
@@ -7666,6 +7908,12 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             }
         }
         mapped
+    }
+
+    fn finish_output_read(&mut self, status: c_int, bytes: usize) -> Result<(), GgmlCpuGraphError> {
+        self.finish_readback_status(status)?;
+        self.lifecycle.output_read(bytes);
+        Ok(())
     }
 
     fn ensure_not_poisoned(&self) -> Result<(), GgmlCpuGraphError> {
@@ -7725,6 +7973,8 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             }
             Ok(status) => {
                 self.poisoned_after_failed_compute = true;
+                self.lifecycle
+                    .poisoned(super::GgmlGraphPoisonReason::ComputeFailed);
                 if private_finalize_error.is_some()
                     && let Some(owner) = &self.scheduler_memory_owner
                 {
@@ -7744,6 +7994,8 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             }
             Err(error) => {
                 self.poisoned_after_failed_compute = true;
+                self.lifecycle
+                    .poisoned(super::GgmlGraphPoisonReason::ComputeFailed);
                 if private_finalize_error.is_some()
                     && let Some(owner) = &self.scheduler_memory_owner
                 {
@@ -7764,6 +8016,8 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
 
     pub(crate) fn mark_poisoned_after_failed_compute(&mut self) {
         self.poisoned_after_failed_compute = true;
+        self.lifecycle
+            .poisoned(super::GgmlGraphPoisonReason::Explicit);
     }
 
     fn build_forward_graph(
@@ -7841,7 +8095,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     }
 
     fn write_tensor_bytes_checked(
-        &self,
+        &mut self,
         tensor: GgmlCpuTensor<'a>,
         data_ptr: *const c_void,
         offset_nbytes: usize,
@@ -7866,6 +8120,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         unsafe {
             write_tensor_data(tensor.raw, data_ptr, offset_nbytes, expected_nbytes)?;
         }
+        self.lifecycle.input_written(expected_nbytes);
         Ok(())
     }
 
@@ -9978,9 +10233,9 @@ fn quote_scheduler_groups(
 /// device handle. `props.name` is the same provider-local stable-id namespace
 /// used by execution-route inventory (`CUDA0`, `Vulkan0`, ...); `device_id`
 /// is reserved there for physical addressability and must not replace it.
-fn backend_provider_and_stable_id(
+fn backend_actual_device_facts(
     backend: NonNull<c_void>,
-) -> Result<(ExecutionProvider, String), GgmlCpuGraphError> {
+) -> Result<(ExecutionProvider, String, super::GgmlActualDeviceFacts), GgmlCpuGraphError> {
     ensure_backend_device_present(backend)?;
     let device = NonNull::new(unsafe { ffi::ggml_backend_get_device(backend.as_ptr()) })
         .expect("device presence was checked immediately above");
@@ -9994,8 +10249,41 @@ fn backend_provider_and_stable_id(
         caps: ffi::GgmlBackendDevCaps::default(),
     };
     unsafe { ffi::ggml_backend_dev_get_props(device.as_ptr(), &mut props) };
-    let name = cstr_lossy(props.name);
-    Ok((ExecutionProvider::from_backend_name(&name), name))
+    let name = bounded_device_fact(props.name, 128);
+    let description = bounded_device_fact(props.description, 256);
+    let provider_device_id = {
+        let value = bounded_device_fact(props.device_id, 128);
+        (!value.is_empty()).then_some(value)
+    };
+    let device_type = match props.type_ {
+        ffi::GGML_BACKEND_DEVICE_TYPE_CPU => "cpu".to_string(),
+        ffi::GGML_BACKEND_DEVICE_TYPE_GPU => "gpu".to_string(),
+        ffi::GGML_BACKEND_DEVICE_TYPE_IGPU => "integrated_gpu".to_string(),
+        ffi::GGML_BACKEND_DEVICE_TYPE_ACCEL => "accelerator".to_string(),
+        ffi::GGML_BACKEND_DEVICE_TYPE_META => "meta".to_string(),
+        unknown => format!("unknown:{unknown}"),
+    };
+    let provider = ExecutionProvider::from_backend_name(&name);
+    let actual_device = super::GgmlActualDeviceFacts {
+        device_type,
+        name: name.clone(),
+        description,
+        provider_device_id,
+        pci_vendor_id: unsafe { super::backend::device_pci_vendor_id(device) },
+    };
+    Ok((provider, name, actual_device))
+}
+
+fn bounded_device_fact(value: *const std::ffi::c_char, max_chars: usize) -> String {
+    if value.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(value) }
+        .to_string_lossy()
+        .trim()
+        .chars()
+        .take(max_chars)
+        .collect()
 }
 
 fn attest_runner_execution_identity(
@@ -10005,9 +10293,10 @@ fn attest_runner_execution_identity(
     identity: &GgmlRunnerExecutionIdentity,
     scheduler_enabled: bool,
 ) -> Result<(), GgmlCpuGraphError> {
-    let (actual_provider, actual_stable_id) = backend_provider_and_stable_id(backend)?;
+    let (actual_provider, actual_stable_id, actual_device) = backend_actual_device_facts(backend)?;
     if actual_provider != identity.actual_provider
         || actual_stable_id != identity.actual_stable_device_id
+        || actual_device != identity.actual_device
         || scheduler_enabled != identity.scheduler_enabled
     {
         return Err(GgmlCpuGraphError::RunnerIdentityChanged {
@@ -10038,6 +10327,7 @@ fn attest_runner_execution_identity(
         backend_name,
         actual_provider,
         &identity.actual_stable_device_id,
+        &actual_device,
         scheduler_enabled,
     );
     if crate::models::native_execution_services::current_execution_observation_sink().is_some() {
@@ -16355,7 +16645,7 @@ mod tests {
             .set_rows(cache_tensor, src, rows)
             .expect("set_rows should build");
         graph
-            .add_side_effect_root(write_rows)
+            .add_kv_write_root(write_rows)
             .expect("set_rows should be a side effect root");
 
         let row_stride = 2 * std::mem::size_of::<u16>();
@@ -16382,7 +16672,7 @@ mod tests {
             .cpy_into_view(window_src, cache_window)
             .expect("copy into view should build");
         graph
-            .add_side_effect_root(write_window)
+            .add_kv_write_root(write_window)
             .expect("copy into view should be a side effect root");
 
         let output = graph
@@ -16449,8 +16739,8 @@ mod tests {
         let value_t = arena.graph_tensor(value);
         let write_k = graph.set_rows(key_t, src_k, rows).expect("set_rows q8 k");
         let write_v = graph.set_rows(value_t, src_v, rows).expect("set_rows q8 v");
-        graph.add_side_effect_root(write_k).expect("k side effect");
-        graph.add_side_effect_root(write_v).expect("v side effect");
+        graph.add_kv_write_root(write_k).expect("k side effect");
+        graph.add_kv_write_root(write_v).expect("v side effect");
         let attended = graph
             .flash_attn_ext(
                 q,

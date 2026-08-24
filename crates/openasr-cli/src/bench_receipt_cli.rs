@@ -328,8 +328,11 @@ pub(crate) fn bench_receipt_short_audio(
             || snapshot.trace.overflowed
             || snapshot.trace.event_count == 0
             || snapshot.trace.jsonl.is_empty()
+            || snapshot.graph_lifecycle.overflowed
+            || snapshot.graph_lifecycle.events.is_empty()
             || facts.actual_provider != Some(facts.selected_provider)
             || facts.actual_stable_device_id.as_deref() != Some(facts.stable_device_id.as_str())
+            || facts.actual_device.is_none()
             || facts.scheduler_enabled.is_none()
         {
             bail!("native trace is incomplete; refusing to emit an approval trace");
@@ -403,6 +406,23 @@ pub(crate) fn bench_receipt_short_audio(
         transcript: ShortAudioReceiptTranscript::from_text(last_text),
         placement: device_label,
         observed_placement: (!observed_placement.is_empty()).then_some(observed_placement),
+        graph_lifecycle: native_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.graph_lifecycle.clone())
+            .filter(|lifecycle| !lifecycle.events.is_empty()),
+        actual_provider: native_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.facts.as_ref())
+            .and_then(|facts| facts.actual_provider)
+            .map(|provider| provider.as_str().to_string()),
+        actual_stable_device_id: native_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.facts.as_ref())
+            .and_then(|facts| facts.actual_stable_device_id.clone()),
+        actual_device: native_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.facts.as_ref())
+            .and_then(|facts| facts.actual_device.clone()),
         evidence: receipt_evidence,
         execution,
         scope: options.scope.to_string(),
@@ -819,11 +839,83 @@ fn validate_release_trace(jsonl: &str) -> Result<()> {
     let mut token_steps = BTreeSet::new();
     let mut top_k_steps = BTreeSet::new();
     let mut logits_steps = BTreeSet::new();
-    for line in jsonl.lines() {
+    let mut lifecycle_kinds = BTreeSet::new();
+    let mut header_route = None::<(String, String)>;
+    for (line_index, line) in jsonl.lines().enumerate() {
         let event: serde_json::Value =
             serde_json::from_str(line).context("runtime trace contains invalid JSON")?;
+        if event.get("schema").and_then(serde_json::Value::as_str)
+            == Some(openasr_core::GGML_GRAPH_LIFECYCLE_SCHEMA)
+        {
+            let lifecycle: openasr_core::GgmlGraphLifecycleEvent = serde_json::from_value(event)
+                .context("runtime graph lifecycle event is invalid")?;
+            let Some((provider, device)) = &header_route else {
+                bail!("runtime graph lifecycle event precedes the strict trace header");
+            };
+            if &lifecycle.provider != provider || &lifecycle.device != device {
+                bail!("runtime graph lifecycle event is not bound to the final route");
+            }
+            lifecycle_kinds.insert(match lifecycle.kind {
+                openasr_core::GgmlGraphLifecycleEventKind::Created { .. } => "created",
+                openasr_core::GgmlGraphLifecycleEventKind::Prepared { .. } => "prepared",
+                openasr_core::GgmlGraphLifecycleEventKind::InputWrite { .. } => "input_write",
+                openasr_core::GgmlGraphLifecycleEventKind::ComputeStarted { .. } => {
+                    "compute_started"
+                }
+                openasr_core::GgmlGraphLifecycleEventKind::ComputeCompleted { .. } => {
+                    "compute_completed"
+                }
+                openasr_core::GgmlGraphLifecycleEventKind::OutputRead { .. } => "output_read",
+                openasr_core::GgmlGraphLifecycleEventKind::KvWriteCommitted { .. } => {
+                    "kv_write_committed"
+                }
+                openasr_core::GgmlGraphLifecycleEventKind::Rebuilt { .. } => "rebuilt",
+                openasr_core::GgmlGraphLifecycleEventKind::Poisoned { .. } => "poisoned",
+                openasr_core::GgmlGraphLifecycleEventKind::Dropped => "dropped",
+                openasr_core::GgmlGraphLifecycleEventKind::CaptureExecutableCreated { .. } => {
+                    "capture_executable_created"
+                }
+            });
+            continue;
+        }
         let step = event.get("step_index").and_then(serde_json::Value::as_u64);
         match event.get("event").and_then(serde_json::Value::as_str) {
+            Some("header") => {
+                if line_index != 0 || header_route.is_some() {
+                    bail!("runtime trace must contain exactly one leading header");
+                }
+                let provider = event
+                    .get("provider")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("runtime trace header has no provider"))?;
+                let device = event
+                    .get("device")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("runtime trace header has no device"))?;
+                if event
+                    .get("actual_provider")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(provider)
+                    || event
+                        .get("actual_stable_device_id")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(device)
+                {
+                    bail!("runtime trace header lacks matching live backend identity");
+                }
+                let actual_device: openasr_core::GgmlActualDeviceFacts =
+                    serde_json::from_value(event.get("actual_device").cloned().ok_or_else(
+                        || anyhow::anyhow!("runtime trace header has no actual_device"),
+                    )?)
+                    .context("runtime trace header actual_device is invalid")?;
+                if actual_device.name != device
+                    || actual_device.device_type.is_empty()
+                    || actual_device.description.is_empty()
+                {
+                    bail!("runtime trace header actual_device does not match its stable id");
+                }
+                header_route = Some((provider.to_string(), device.to_string()));
+            }
             Some("token") => {
                 let step =
                     step.ok_or_else(|| anyhow::anyhow!("runtime token trace has no step_index"))?;
@@ -875,13 +967,28 @@ fn validate_release_trace(jsonl: &str) -> Result<()> {
                     bail!("runtime logits trace has duplicate step_index {step}");
                 }
             }
-            _ => {}
+            _ => bail!("runtime trace contains an unknown event"),
         }
+    }
+    if header_route.is_none() {
+        bail!("runtime trace has no strict header");
     }
     if token_steps.is_empty() || token_steps != top_k_steps || token_steps != logits_steps {
         bail!(
             "every runtime token trace step must have exactly one same-step top-k/margin and logits-digest record"
         );
+    }
+    for required in [
+        "created",
+        "prepared",
+        "input_write",
+        "compute_started",
+        "compute_completed",
+        "output_read",
+    ] {
+        if !lifecycle_kinds.contains(required) {
+            bail!("runtime trace lacks required lifecycle event {required}");
+        }
     }
     Ok(())
 }
@@ -1312,7 +1419,13 @@ mod tests {
     #[test]
     fn strict_trace_requires_same_step_logits_top_k_and_margin() {
         let valid = concat!(
-            "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"header\"}\n",
+            "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"header\",\"mode\":\"cold\",\"provider\":\"cpu\",\"device\":\"CPU\",\"actual_provider\":\"cpu\",\"actual_stable_device_id\":\"CPU\",\"actual_device\":{\"type\":\"cpu\",\"name\":\"CPU\",\"description\":\"test CPU\"}}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":1,\"provider\":\"cpu\",\"device\":\"CPU\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"created\",\"scheduler_enabled\":false}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":2,\"provider\":\"cpu\",\"device\":\"CPU\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"prepared\",\"prepare_generation\":3}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":3,\"provider\":\"cpu\",\"device\":\"CPU\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"input_write\",\"input_generation\":4,\"bytes\":16}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":4,\"provider\":\"cpu\",\"device\":\"CPU\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"compute_started\",\"compute_sequence\":1,\"prepare_generation\":3,\"input_generation_consumed\":4}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":5,\"provider\":\"cpu\",\"device\":\"CPU\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"compute_completed\",\"compute_sequence\":1,\"output_generation\":5}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":6,\"provider\":\"cpu\",\"device\":\"CPU\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"output_read\",\"compute_sequence\":1,\"output_generation_consumed\":5,\"bytes\":4}\n",
             "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"token\",\"step_index\":0}\n",
             "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"logits_digest\",\"step_index\":0,\"element_count\":2,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"non_finite_count\":0}\n",
             "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"top_k\",\"step_index\":0,\"items\":[{\"token_id\":1,\"value\":2.0},{\"token_id\":2,\"value\":1.0}],\"top1_top2_margin\":1.0}\n"
