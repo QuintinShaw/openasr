@@ -644,6 +644,13 @@ trait NativeStreamingSessionCandidateBuilder: Send + Sync {
         None
     }
 
+    fn activation_quote_source(
+        &self,
+    ) -> Option<crate::models::native_execution_services::CandidateActivationQuoteSource> {
+        self.activation_pack()
+            .map(crate::models::native_execution_services::CandidateActivationQuoteSource::Pack)
+    }
+
     fn initialize_auxiliary_runtimes(&self) -> Result<(), NativeAsrError> {
         Ok(())
     }
@@ -702,10 +709,9 @@ impl NativeStreamingSessionCandidateBuilder for NativeStreamingSessionCandidateF
         let receipt = self.session_context.native_execution_receipt();
         let _receipt_guard =
             crate::models::native_execution_services::install_execution_receipt_collector(receipt);
-        let _activation_pack =
-            crate::models::native_execution_services::install_candidate_activation_pack(
-                self.verified_pack.as_ref().clone(),
-            );
+        let _activation_quote = self
+            .activation_quote_source()
+            .map(crate::models::native_execution_services::install_candidate_activation_quote);
         crate::models::native_execution_services::run_execution_candidate_attempt(
             self.execution_services.as_ref(),
             candidate,
@@ -849,10 +855,10 @@ impl PolicyResolvedNativeStreamingSession {
             crate::models::native_execution_services::install_execution_receipt_collector(
                 self.factory.execution_receipt(),
             );
-        let _activation_pack = self
+        let _activation_quote = self
             .factory
-            .activation_pack()
-            .map(crate::models::native_execution_services::install_candidate_activation_pack);
+            .activation_quote_source()
+            .map(crate::models::native_execution_services::install_candidate_activation_quote);
         let factory = Arc::clone(&self.factory);
         crate::models::native_execution_services::run_execution_candidate_attempt(
             services.as_ref(),
@@ -3327,6 +3333,23 @@ mod tests {
             Ok(())
         }
 
+        fn activation_quote_source(
+            &self,
+        ) -> Option<crate::models::native_execution_services::CandidateActivationQuoteSource>
+        {
+            let quote = crate::models::system_memory_owner::SystemMemoryAllocationQuote::new(
+                "test-streaming-session-candidate",
+                1,
+                1,
+            )
+            .expect("test candidate quote");
+            Some(
+                crate::models::native_execution_services::CandidateActivationQuoteSource::Declared(
+                    quote,
+                ),
+            )
+        }
+
         fn build(
             &self,
             candidate: &ExecutionCandidate,
@@ -3334,6 +3357,9 @@ mod tests {
             Box<dyn NativeAsrSession>,
             NativeAsrError,
         > {
+            let _quote = self
+                .activation_quote_source()
+                .map(crate::models::native_execution_services::install_candidate_activation_quote);
             crate::models::native_execution_services::run_execution_candidate_attempt(
                 self.services.as_ref(),
                 candidate,

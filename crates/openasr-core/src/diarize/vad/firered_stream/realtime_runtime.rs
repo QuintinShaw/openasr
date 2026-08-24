@@ -646,45 +646,93 @@ mod tests {
             160,
         )
         .expect("embedded Stream-VAD model");
-        let snapshot = services.runtime_receipts().snapshot();
-        assert_eq!(snapshot.live_owners.len(), 4);
+        let collector = services.runtime_receipts();
+        let embedded_source = collector
+            .host_neutral_owner_descriptor(
+                "system-memory-owner",
+                None,
+                Some("firered-stream-vad.embedded-model"),
+            )
+            .unwrap()
+            .source;
+        let session_source = collector
+            .host_neutral_owner_descriptor(
+                "system-memory-owner",
+                None,
+                Some("firered-stream-vad.host-session"),
+            )
+            .unwrap()
+            .source;
+        let request_component = collector
+            .host_neutral_owner_descriptor(
+                "firered-stream-vad.realtime.request",
+                Some("frame-samples=160"),
+                Some("request"),
+            )
+            .unwrap()
+            .component;
+        let snapshot = collector.snapshot();
+        assert_eq!(snapshot.live_owners.len(), 3);
+        assert!(
+            snapshot
+                .live_owners
+                .iter()
+                .any(|owner| owner.descriptor.source == embedded_source)
+        );
+        assert!(
+            snapshot
+                .live_owners
+                .iter()
+                .any(|owner| owner.descriptor.source == session_source)
+        );
+        assert!(
+            snapshot
+                .live_owners
+                .iter()
+                .any(|owner| owner.descriptor.component == request_component)
+        );
         assert!(snapshot.events.iter().any(|event| matches!(
             event,
             crate::models::runtime_receipts::RuntimeReceiptEvent::OwnerCreated { .. }
         )));
+        assert_eq!(
+            collector.reconcile_live_leases(services.memory_broker()),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
         drop(session);
+        assert_eq!(services.runtime_receipts().summary().live_owner_count, 1);
+        services.unload_idle_native_model_runtime_caches();
         assert_eq!(services.runtime_receipts().summary().live_owner_count, 0);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn accelerated_candidate_build_has_one_frontend_and_cache_receipt() {
+    fn accelerated_candidate_build_has_one_actor_and_brokered_runtime_receipt() {
         let services = Arc::new(
             NativeExecutionServices::for_local_process()
                 .expect("construct native execution services"),
         );
         let _scope =
             crate::models::native_execution_services::install_native_execution_services(&services);
-        let frontend_component = services
+        let actor_component = services
             .runtime_receipts()
             .owner_descriptor(
-                "firered-stream-vad.frontend",
-                Some("kaldi-fbank-cmvn"),
-                Some("session"),
+                "firered-stream-vad.realtime.actor-runtime",
+                Some("firered-stream-vad-embedded-v1:frame-samples=160"),
+                Some("accelerated actor checkout"),
                 None,
             )
-            .expect("frontend receipt descriptor")
+            .expect("actor receipt descriptor")
             .component;
-        let cache_component = services
+        let runtime_source = services
             .runtime_receipts()
-            .owner_descriptor(
-                "firered-stream-vad.cache",
-                Some("causal-dfsmn-lookback"),
-                Some("session"),
+            .host_neutral_owner_descriptor(
+                "system-memory-owner",
                 None,
+                Some("aux.firered-stream-vad.realtime-runtime.160"),
             )
-            .expect("cache receipt descriptor")
-            .component;
+            .expect("runtime system-memory receipt descriptor")
+            .source;
         let session = FireRedRealtimeVadSession::for_execution(
             Arc::clone(&services),
             ExecutionIntent::AcceleratedOnly,
@@ -707,8 +755,21 @@ mod tests {
                 })
                 .count()
         };
-        assert_eq!(count_component(frontend_component), 1);
-        assert_eq!(count_component(cache_component), 1);
+        assert_eq!(count_component(actor_component), 1);
+        assert_eq!(
+            snapshot
+                .live_owners
+                .iter()
+                .filter(|owner| owner.descriptor.source == runtime_source)
+                .count(),
+            1
+        );
+        assert_eq!(
+            services
+                .runtime_receipts()
+                .reconcile_live_leases(services.memory_broker()),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
         drop(session);
         services.unload_idle_native_model_runtime_caches();
         assert_eq!(services.runtime_receipts().summary().live_owner_count, 0);

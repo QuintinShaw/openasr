@@ -12191,6 +12191,10 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
 
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _scope = crate::models::native_execution_services::install_native_execution_services(
+            services.as_ref(),
+        );
         let config = GgmlCpuGraphConfig {
             backend: GgmlCpuGraphBackend::Metal,
             use_scheduler: false,

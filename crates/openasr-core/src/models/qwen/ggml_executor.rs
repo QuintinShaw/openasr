@@ -2645,23 +2645,28 @@ mod tests {
     }
 
     #[test]
-    fn split_loaded_qkv_is_limited_to_unified_exact_cuda_vulkan_runtime() {
+    fn split_loaded_qkv_stays_disabled_until_exact_gpu_reuse_is_proven() {
         for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
             let preference = exactly_addressable_preference(provider);
             let resolved = ResolvedFamilyRuntimeInput::resolve(
                 Some(preference.clone()),
                 crate::ggml_runtime::AutoGpuPolicy::AllBackends,
             );
-            assert!(qwen_unified_runtime_owner_enabled(
+            assert_eq!(
+                resolved.reuse_mode(),
+                crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph
+            );
+            let enabled = qwen_unified_runtime_owner_enabled(
                 resolved,
                 GgmlNativeGqaCapability::Validated,
                 true,
                 Some(&preference),
                 Some(ExecutionPlacement::FullDevice),
-            ));
+            );
+            assert!(!enabled);
             assert_eq!(
-                qwen_qkv_execution_mode(true, true),
-                QwenQkvExecutionMode::SplitLoaded
+                qwen_qkv_execution_mode(enabled, true),
+                QwenQkvExecutionMode::FusedArena
             );
             assert_eq!(
                 qwen_qkv_execution_mode(true, false),

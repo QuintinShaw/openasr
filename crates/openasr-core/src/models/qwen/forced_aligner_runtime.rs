@@ -381,7 +381,10 @@ impl ForcedAlignerStageBackends {
             Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
             crate::ggml_runtime::AutoGpuPolicy::AllBackends,
         );
-        let audio_lane = current_execution_lane_key(audio_runtime.backend());
+        let audio_lane = current_execution_lane_key(audio_runtime.backend()).for_stage(
+            audio_runtime.backend(),
+            crate::device::execution_policy::ExecutionPlacement::FullDevice,
+        );
         let cpu_lane = current_execution_lane_key(cpu_runtime.backend());
         Self {
             audio: audio_runtime,

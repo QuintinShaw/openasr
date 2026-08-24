@@ -989,17 +989,18 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_stage_lanes_keep_exact_device_and_split_backend_identity() {
+    fn hybrid_stage_lanes_bind_gpu_encoder_and_physical_cpu_decoder() {
         let candidate = ExecutionLaneKey::unscoped_for_backend(GgmlCpuGraphBackend::Gpu);
         let encoder = candidate.for_stage(GgmlCpuGraphBackend::Gpu, ExecutionPlacement::FullDevice);
         let decoder = candidate.for_stage(GgmlCpuGraphBackend::Cpu, ExecutionPlacement::CpuOnly);
         let cpu_encoder =
             candidate.for_stage(GgmlCpuGraphBackend::Cpu, ExecutionPlacement::CpuOnly);
         assert_eq!(encoder.provider(), candidate.provider());
-        assert_eq!(decoder.provider(), candidate.provider());
+        assert_eq!(decoder.provider(), ExecutionProvider::Cpu);
         assert_eq!(encoder.backend(), GgmlCpuGraphBackend::Gpu);
         assert_eq!(decoder.backend(), GgmlCpuGraphBackend::Cpu);
         assert_eq!(cpu_encoder.placement(), ExecutionPlacement::CpuOnly);
+        assert_eq!(cpu_encoder.provider(), ExecutionProvider::Cpu);
         assert_ne!(encoder, decoder);
     }
     #[test]

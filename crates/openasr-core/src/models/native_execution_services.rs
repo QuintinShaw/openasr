@@ -1107,9 +1107,6 @@ pub(crate) fn current_execution_lane_key(backend: GgmlCpuGraphBackend) -> Execut
     if let Some(lane) = current_execution_lane() {
         let placement = match (lane.placement(), backend) {
             (ExecutionPlacement::Hybrid, GgmlCpuGraphBackend::Cpu) => ExecutionPlacement::CpuOnly,
-            (ExecutionPlacement::Hybrid, GgmlCpuGraphBackend::Metal | GgmlCpuGraphBackend::Gpu) => {
-                ExecutionPlacement::FullDevice
-            }
             (placement, _) => placement,
         };
         return lane.for_stage(backend, placement);
@@ -2555,6 +2552,10 @@ impl NativeExecutionServices {
         self.pyannote_segmenter_actors.clear();
         self.redimnet_runtime_actors.clear();
         self.firered_stream_vad_realtime_actors.clear();
+        *self
+            .firered_stream_vad_embedded
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.loaded_weight_owners.clear();
     }
 
@@ -3198,8 +3199,11 @@ mod tests {
                 .expect("published host owner should be reusable");
             assert!(Arc::ptr_eq(&first, &second));
             let live = services.runtime_receipts().summary();
-            assert_eq!(live.live_owner_count, 1);
-            assert_eq!(live.live_resource_count, 1);
+            // One owner is the candidate-level forecast reservation; the
+            // other is the committed SystemMemory allocation. Both must be
+            // visible while the attempt is active.
+            assert_eq!(live.live_owner_count, 2);
+            assert_eq!(live.live_resource_count, 2);
             assert!(
                 services
                     .runtime_receipts()
@@ -3215,12 +3219,13 @@ mod tests {
             drop(second);
             cache.clear();
             let released = services.runtime_receipts().summary();
-            assert_eq!(released.live_owner_count, 0);
-            assert_eq!(released.live_resource_count, 0);
+            assert_eq!(released.live_owner_count, 1);
+            assert_eq!(released.live_resource_count, 1);
             Ok::<_, String>(())
         });
         assert!(outcome.result.is_ok());
         assert!(outcome.candidate_failure.is_none());
+        assert_eq!(services.runtime_receipts().summary().live_owner_count, 0);
     }
     #[test]
     fn entropy_failure_keeps_service_execution_alive_and_reports_unavailable() {
@@ -3420,6 +3425,10 @@ mod tests {
         let lane_for = |candidate: &ExecutionCandidate| {
             let sink = ExecutionCandidateFailureSink::new();
             let _guard = install_execution_candidate_attempt(services.as_ref(), candidate, sink);
+            assert_eq!(
+                current_execution_lane(),
+                ExecutionLaneKey::from_candidate(candidate, GgmlCpuGraphBackend::Gpu).ok()
+            );
             current_execution_lane_key(GgmlCpuGraphBackend::Gpu)
         };
         let cuda0_lane = lane_for(&cuda0);
