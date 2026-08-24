@@ -5,12 +5,15 @@
 //! activation / pressure-helper receipts to immutable release artifacts and a
 //! causal phase sequence. Admission and runtime policy never consume it.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const OWNERSHIP_EVIDENCE_SCHEMA: &str = "openasr.runtime-ownership-evidence.v1";
+pub const OWNERSHIP_ACTIVATION_RECEIPT_SCHEMA: &str = "openasr.model-activation-receipt.v1";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OwnershipEvidenceScenario {
     ColdWarmLifecycle,
@@ -18,7 +21,7 @@ pub enum OwnershipEvidenceScenario {
     RealHostPressureRollback,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OwnershipEvidencePhaseKind {
     BaselineAdmissible,
@@ -62,8 +65,129 @@ pub struct OwnershipReleaseBinding {
     pub catalog_signature_sha256: String,
     pub capability_matrix_sha256: String,
     pub capability_epoch: u64,
+    pub capability_cell_sha256: String,
+    pub family: String,
+    pub model_id: String,
+    pub quant: String,
+    pub topology: String,
     pub provider: String,
     pub device_target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_target_set_sha256: Option<String>,
+    pub placement: String,
+    pub output_plan: String,
+    pub reuse_mode: String,
+    pub capture_mode: String,
+    pub scheduler_mode: String,
+    pub evidence_revision: u64,
+    pub activation_mode: String,
+}
+
+/// Bounded production fact emitted by the shared model-activation transaction.
+/// The ownership envelope hashes this artifact; release tooling validates it
+/// against the exact candidate and immutable release binding. It contains no
+/// model path or raw runtime/device identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnershipActivationReceipt {
+    pub schema: String,
+    pub result: String,
+    pub daemon_start_identity: OwnershipDaemonStartIdentity,
+    pub release_subject: String,
+    pub core_commit: String,
+    pub pack_sha256: String,
+    pub capability_matrix_sha256: String,
+    pub capability_epoch: u64,
+    pub provider: String,
+    pub device_target: String,
+    pub failure_stage: String,
+    pub fresh_reserve: OwnershipAdmissionObservation,
+    pub durable_selection_before_sha256: String,
+    pub durable_selection_after_sha256: String,
+    pub live_runtime_before_sha256: String,
+    pub live_runtime_after_sha256: String,
+    pub staged_owner_cleanup: String,
+}
+
+impl OwnershipActivationReceipt {
+    pub fn try_new(mut receipt: Self) -> Result<Self, OwnershipEvidenceError> {
+        receipt.schema = OWNERSHIP_ACTIVATION_RECEIPT_SCHEMA.to_string();
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    pub fn validate(&self) -> Result<(), OwnershipEvidenceError> {
+        if self.schema != OWNERSHIP_ACTIVATION_RECEIPT_SCHEMA {
+            return Err(OwnershipEvidenceError::ActivationReceiptSchemaMismatch);
+        }
+        if self.result != "rejected" || self.failure_stage != "fresh_reserve" {
+            return Err(OwnershipEvidenceError::ActivationReceiptNotFreshReserveRejection);
+        }
+        if self.daemon_start_identity.pid == 0
+            || self.daemon_start_identity.started_at_unix_secs == 0
+        {
+            return Err(OwnershipEvidenceError::InvalidDaemonIdentity);
+        }
+        require_lower_hex(
+            "activation.daemon_start_identity.nonce",
+            &self.daemon_start_identity.nonce,
+            32,
+        )?;
+        require_non_empty("activation.release_subject", &self.release_subject)?;
+        require_lower_hex("activation.core_commit", &self.core_commit, 40)?;
+        for (field, value) in [
+            ("activation.pack_sha256", self.pack_sha256.as_str()),
+            (
+                "activation.capability_matrix_sha256",
+                self.capability_matrix_sha256.as_str(),
+            ),
+            (
+                "activation.durable_selection_before_sha256",
+                self.durable_selection_before_sha256.as_str(),
+            ),
+            (
+                "activation.durable_selection_after_sha256",
+                self.durable_selection_after_sha256.as_str(),
+            ),
+            (
+                "activation.live_runtime_before_sha256",
+                self.live_runtime_before_sha256.as_str(),
+            ),
+            (
+                "activation.live_runtime_after_sha256",
+                self.live_runtime_after_sha256.as_str(),
+            ),
+        ] {
+            require_lower_hex(field, value, 64)?;
+        }
+        if self.capability_epoch == 0 {
+            return Err(OwnershipEvidenceError::InvalidField {
+                field: "activation.capability_epoch",
+            });
+        }
+        require_one_of(
+            "activation.provider",
+            &self.provider,
+            &["cpu", "metal", "cuda", "hip", "vulkan"],
+        )?;
+        require_non_empty("activation.device_target", &self.device_target)?;
+        self.fresh_reserve.validate()?;
+        if !self.fresh_reserve.crosses_rejection_threshold() {
+            return Err(OwnershipEvidenceError::ActivationReceiptNotFreshReserveRejection);
+        }
+        if self.durable_selection_before_sha256 != self.durable_selection_after_sha256
+            || self.live_runtime_before_sha256 != self.live_runtime_after_sha256
+            || self.staged_owner_cleanup != "released"
+        {
+            return Err(OwnershipEvidenceError::ActivationReceiptDidNotPreserveOldState);
+        }
+        Ok(())
+    }
+
+    pub fn from_json_str(raw: &str) -> Result<Self, OwnershipActivationReceiptLoadError> {
+        let receipt: Self = serde_json::from_str(raw)?;
+        receipt.validate()?;
+        Ok(receipt)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,12 +198,45 @@ pub struct OwnershipDaemonStartIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OwnershipCandidateObservation {
+pub struct OwnershipAdmissionObservation {
     /// Digest of the exact pack/lane/artifact/capability cell being attempted.
     pub candidate_sha256: String,
-    pub requested_bytes: u64,
-    pub policy_remainder_bytes: u64,
-    pub observed_available_bytes: u64,
+    /// Full policy-ledger charge for the exact candidate.
+    pub policy_requested_bytes: u64,
+    /// Remaining policy capacity after live pending/committed/unreclaimable owners.
+    pub policy_remaining_bytes: u64,
+    /// Bytes that must fit in the fresh native/OS observation. This may be
+    /// smaller than the policy charge for reclaimable file-backed residency.
+    pub observed_requested_bytes: u64,
+    /// Fresh native/OS capacity remaining at the actual reserve attempt.
+    pub observed_remaining_bytes: u64,
+}
+
+impl OwnershipAdmissionObservation {
+    pub fn is_admissible(&self) -> bool {
+        self.policy_requested_bytes <= self.policy_remaining_bytes
+            && self.observed_requested_bytes <= self.observed_remaining_bytes
+    }
+
+    pub fn crosses_rejection_threshold(&self) -> bool {
+        self.policy_requested_bytes > self.policy_remaining_bytes
+            || self.observed_requested_bytes > self.observed_remaining_bytes
+    }
+
+    fn validate(&self) -> Result<(), OwnershipEvidenceError> {
+        require_lower_hex("admission.candidate_sha256", &self.candidate_sha256, 64)?;
+        if self.policy_requested_bytes == 0 {
+            return Err(OwnershipEvidenceError::InvalidField {
+                field: "admission.policy_requested_bytes",
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnershipCandidateObservation {
+    pub admission: OwnershipAdmissionObservation,
     pub safety_floor_bytes: u64,
     pub helper_committed_bytes: u64,
     pub helper_touched_bytes: u64,
@@ -87,12 +244,15 @@ pub struct OwnershipCandidateObservation {
 
 impl OwnershipCandidateObservation {
     pub fn is_admissible(&self) -> bool {
-        self.requested_bytes <= self.policy_remainder_bytes
-            && self.requested_bytes <= self.observed_available_bytes
+        self.admission.is_admissible()
+    }
+
+    pub fn crosses_rejection_threshold(&self) -> bool {
+        self.admission.crosses_rejection_threshold()
     }
 
     pub fn crosses_observed_rejection_threshold(&self) -> bool {
-        self.requested_bytes > self.observed_available_bytes
+        self.admission.observed_requested_bytes > self.admission.observed_remaining_bytes
     }
 }
 
@@ -146,6 +306,14 @@ impl OwnershipEvidenceEnvelope {
             }
             phase.validate()?;
         }
+        if self.phases.iter().any(|phase| {
+            phase.observation.as_ref().is_some_and(|observation| {
+                observation.admission.candidate_sha256 != self.release.capability_cell_sha256
+            })
+        }) {
+            return Err(OwnershipEvidenceError::CandidateIdentityChanged);
+        }
+        self.validate_artifact_bindings()?;
         match self.scenario {
             OwnershipEvidenceScenario::ColdWarmLifecycle => self.validate_cold_warm_lifecycle(),
             OwnershipEvidenceScenario::DeterministicPressureRace => {
@@ -165,6 +333,49 @@ impl OwnershipEvidenceEnvelope {
         let envelope: Self = serde_json::from_str(raw)?;
         envelope.validate()?;
         Ok(envelope)
+    }
+
+    /// All external artifacts referenced by this envelope, deduplicated by
+    /// their safe release-asset label. The envelope remains data-only; release
+    /// tooling rehashes these files before accepting the evidence bundle.
+    pub fn artifact_bindings(&self) -> Vec<&OwnershipEvidenceArtifact> {
+        let mut artifacts = BTreeMap::<&str, &OwnershipEvidenceArtifact>::new();
+        for phase in &self.phases {
+            for artifact in [
+                Some(&phase.runtime_snapshot),
+                phase.request_receipt.as_ref(),
+                phase.activation_receipt.as_ref(),
+                phase.pressure_helper_receipt.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                artifacts.entry(artifact.label.as_str()).or_insert(artifact);
+            }
+        }
+        artifacts.into_values().collect()
+    }
+
+    fn validate_artifact_bindings(&self) -> Result<(), OwnershipEvidenceError> {
+        let mut digests = BTreeMap::<&str, &str>::new();
+        for phase in &self.phases {
+            for artifact in [
+                Some(&phase.runtime_snapshot),
+                phase.request_receipt.as_ref(),
+                phase.activation_receipt.as_ref(),
+                phase.pressure_helper_receipt.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Some(previous) = digests.insert(&artifact.label, &artifact.sha256)
+                    && previous != artifact.sha256
+                {
+                    return Err(OwnershipEvidenceError::ArtifactDigestConflict);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn validate_cold_warm_lifecycle(&self) -> Result<(), OwnershipEvidenceError> {
@@ -210,7 +421,7 @@ impl OwnershipEvidenceEnvelope {
         if !baseline.is_admissible() {
             return Err(OwnershipEvidenceError::BaselineNotAdmissible);
         }
-        if !changed.crosses_observed_rejection_threshold() {
+        if !changed.crosses_rejection_threshold() {
             return Err(OwnershipEvidenceError::PressureDidNotCrossThreshold);
         }
         if !recovered.is_admissible() {
@@ -245,7 +456,7 @@ impl OwnershipEvidenceEnvelope {
         {
             return Err(OwnershipEvidenceError::PressureDidNotCrossThreshold);
         }
-        if pressured.observed_available_bytes < pressured.safety_floor_bytes {
+        if pressured.admission.observed_remaining_bytes < pressured.safety_floor_bytes {
             return Err(OwnershipEvidenceError::SafetyFloorViolated);
         }
         if !recovered.is_admissible()
@@ -337,10 +548,10 @@ impl OwnershipEvidenceEnvelope {
         &self,
         observations: [&OwnershipCandidateObservation; N],
     ) -> Result<(), OwnershipEvidenceError> {
-        let first = &observations[0].candidate_sha256;
+        let first = &observations[0].admission.candidate_sha256;
         if observations
             .iter()
-            .any(|observation| &observation.candidate_sha256 != first)
+            .any(|observation| &observation.admission.candidate_sha256 != first)
         {
             return Err(OwnershipEvidenceError::CandidateIdentityChanged);
         }
@@ -380,6 +591,10 @@ impl OwnershipReleaseBinding {
                 "release.capability_matrix_sha256",
                 self.capability_matrix_sha256.as_str(),
             ),
+            (
+                "release.capability_cell_sha256",
+                self.capability_cell_sha256.as_str(),
+            ),
         ] {
             require_lower_hex(field, value, 64)?;
         }
@@ -388,8 +603,58 @@ impl OwnershipReleaseBinding {
                 field: "release.capability_epoch",
             });
         }
-        require_non_empty("release.provider", &self.provider)?;
-        require_non_empty("release.device_target", &self.device_target)
+        if self.evidence_revision == 0 {
+            return Err(OwnershipEvidenceError::InvalidField {
+                field: "release.evidence_revision",
+            });
+        }
+        for (field, value) in [
+            ("release.family", self.family.as_str()),
+            ("release.model_id", self.model_id.as_str()),
+            ("release.quant", self.quant.as_str()),
+            ("release.topology", self.topology.as_str()),
+            ("release.device_target", self.device_target.as_str()),
+        ] {
+            require_non_empty(field, value)?;
+        }
+        if let Some(digest) = &self.approved_target_set_sha256 {
+            require_lower_hex("release.approved_target_set_sha256", digest, 64)?;
+        }
+        require_one_of(
+            "release.provider",
+            &self.provider,
+            &["cpu", "metal", "cuda", "hip", "vulkan"],
+        )?;
+        require_one_of(
+            "release.placement",
+            &self.placement,
+            &["cpu_only", "full_device", "hybrid"],
+        )?;
+        require_one_of(
+            "release.output_plan",
+            &self.output_plan,
+            &["full_logits", "complete_scores", "native_first_max_token"],
+        )?;
+        require_one_of(
+            "release.reuse_mode",
+            &self.reuse_mode,
+            &["fresh_graph", "reusable_graph"],
+        )?;
+        require_one_of(
+            "release.capture_mode",
+            &self.capture_mode,
+            &["disabled", "enabled", "unsupported"],
+        )?;
+        require_one_of(
+            "release.scheduler_mode",
+            &self.scheduler_mode,
+            &["disabled", "enabled"],
+        )?;
+        require_one_of(
+            "release.activation_mode",
+            &self.activation_mode,
+            &["auto", "explicit"],
+        )
     }
 }
 
@@ -417,16 +682,7 @@ impl OwnershipEvidencePhase {
             artifact.validate()?;
         }
         if let Some(observation) = &self.observation {
-            require_lower_hex(
-                "phase.observation.candidate_sha256",
-                &observation.candidate_sha256,
-                64,
-            )?;
-            if observation.requested_bytes == 0 {
-                return Err(OwnershipEvidenceError::InvalidField {
-                    field: "phase.observation.requested_bytes",
-                });
-            }
+            observation.admission.validate()?;
         }
         Ok(())
     }
@@ -434,7 +690,7 @@ impl OwnershipEvidencePhase {
 
 impl OwnershipEvidenceArtifact {
     fn validate(&self) -> Result<(), OwnershipEvidenceError> {
-        require_non_empty("artifact.label", &self.label)?;
+        require_safe_artifact_label(&self.label)?;
         require_lower_hex("artifact.sha256", &self.sha256, 64)
     }
 }
@@ -479,6 +735,18 @@ pub enum OwnershipEvidenceError {
     MissingPressureHelperReceipt { phase: OwnershipEvidencePhaseKind },
     #[error("one or more ownership phases did not reconcile to the broker ledger")]
     LeaseReconciliationNotMatched,
+    #[error("ownership evidence artifact label is unsafe")]
+    UnsafeArtifactLabel,
+    #[error("one ownership artifact label is bound to more than one digest")]
+    ArtifactDigestConflict,
+    #[error("model activation receipt schema mismatch")]
+    ActivationReceiptSchemaMismatch,
+    #[error("model activation receipt is not a fresh-reserve rejection")]
+    ActivationReceiptNotFreshReserveRejection,
+    #[error(
+        "model activation receipt did not preserve old durable/live state and release staged owners"
+    )]
+    ActivationReceiptDidNotPreserveOldState,
 }
 
 #[derive(Debug, Error)]
@@ -489,11 +757,35 @@ pub enum OwnershipEvidenceLoadError {
     Validate(#[from] OwnershipEvidenceError),
 }
 
+#[derive(Debug, Error)]
+pub enum OwnershipActivationReceiptLoadError {
+    #[error("could not parse model activation receipt: {0}")]
+    Parse(#[from] serde_json::Error),
+    #[error(transparent)]
+    Validate(#[from] OwnershipEvidenceError),
+}
+
 fn require_non_empty(field: &'static str, value: &str) -> Result<(), OwnershipEvidenceError> {
-    if value.trim().is_empty() || value.trim() != value {
+    if value.trim().is_empty()
+        || value.trim() != value
+        || value.len() > 512
+        || value.chars().any(char::is_control)
+    {
         Err(OwnershipEvidenceError::InvalidField { field })
     } else {
         Ok(())
+    }
+}
+
+fn require_one_of(
+    field: &'static str,
+    value: &str,
+    allowed: &[&str],
+) -> Result<(), OwnershipEvidenceError> {
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(OwnershipEvidenceError::InvalidField { field })
     }
 }
 
@@ -510,6 +802,20 @@ fn require_lower_hex(
         Ok(())
     } else {
         Err(OwnershipEvidenceError::InvalidField { field })
+    }
+}
+
+fn require_safe_artifact_label(value: &str) -> Result<(), OwnershipEvidenceError> {
+    if value.is_empty()
+        || value.len() > 160
+        || matches!(value, "." | "..")
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        Err(OwnershipEvidenceError::UnsafeArtifactLabel)
+    } else {
+        Ok(())
     }
 }
 
@@ -532,8 +838,21 @@ mod tests {
             catalog_signature_sha256: SHA_A.to_string(),
             capability_matrix_sha256: SHA_B.to_string(),
             capability_epoch: 3,
+            capability_cell_sha256: SHA_B.to_string(),
+            family: "qwen3_asr".to_string(),
+            model_id: "qwen3-asr-0.6b".to_string(),
+            quant: "q8_0".to_string(),
+            topology: "discrete".to_string(),
             provider: "hip".to_string(),
             device_target: "gfx1200".to_string(),
+            approved_target_set_sha256: None,
+            placement: "full_device".to_string(),
+            output_plan: "full_logits".to_string(),
+            reuse_mode: "fresh_graph".to_string(),
+            capture_mode: "enabled".to_string(),
+            scheduler_mode: "disabled".to_string(),
+            evidence_revision: 1,
+            activation_mode: "explicit".to_string(),
         }
     }
 
@@ -552,12 +871,41 @@ mod tests {
         }
     }
 
+    fn activation_receipt() -> OwnershipActivationReceipt {
+        OwnershipActivationReceipt {
+            schema: OWNERSHIP_ACTIVATION_RECEIPT_SCHEMA.to_string(),
+            result: "rejected".to_string(),
+            daemon_start_identity: daemon(),
+            release_subject: binding().release_subject,
+            core_commit: binding().core_commit,
+            pack_sha256: binding().pack_sha256,
+            capability_matrix_sha256: binding().capability_matrix_sha256,
+            capability_epoch: binding().capability_epoch,
+            provider: binding().provider,
+            device_target: binding().device_target,
+            failure_stage: "fresh_reserve".to_string(),
+            fresh_reserve: admission(300),
+            durable_selection_before_sha256: SHA_A.to_string(),
+            durable_selection_after_sha256: SHA_A.to_string(),
+            live_runtime_before_sha256: SHA_B.to_string(),
+            live_runtime_after_sha256: SHA_B.to_string(),
+            staged_owner_cleanup: "released".to_string(),
+        }
+    }
+
+    fn admission(available: u64) -> OwnershipAdmissionObservation {
+        OwnershipAdmissionObservation {
+            candidate_sha256: SHA_B.to_string(),
+            policy_requested_bytes: 500,
+            policy_remaining_bytes: 1_000,
+            observed_requested_bytes: 500,
+            observed_remaining_bytes: available,
+        }
+    }
+
     fn observation(available: u64, helper: u64) -> OwnershipCandidateObservation {
         OwnershipCandidateObservation {
-            candidate_sha256: SHA_B.to_string(),
-            requested_bytes: 500,
-            policy_remainder_bytes: 1_000,
-            observed_available_bytes: available,
+            admission: admission(available),
             safety_floor_bytes: 200,
             helper_committed_bytes: helper,
             helper_touched_bytes: helper,
@@ -702,6 +1050,27 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_race_accepts_a_policy_ledger_state_flip() {
+        let mut envelope = deterministic_pressure_envelope();
+        let changed = envelope.phases[2].observation.as_mut().unwrap();
+        changed.admission.observed_remaining_bytes = 800;
+        changed.admission.policy_remaining_bytes = 300;
+        OwnershipEvidenceEnvelope::try_new(envelope).unwrap();
+    }
+
+    #[test]
+    fn real_host_pressure_must_cross_the_native_observation_axis() {
+        let mut envelope = real_pressure_envelope();
+        let pressured = envelope.phases[2].observation.as_mut().unwrap();
+        pressured.admission.observed_remaining_bytes = 800;
+        pressured.admission.policy_remaining_bytes = 300;
+        assert_eq!(
+            envelope.validate().unwrap_err(),
+            OwnershipEvidenceError::PressureDidNotCrossThreshold
+        );
+    }
+
+    #[test]
     fn cold_warm_lifecycle_requires_request_and_release_phases() {
         OwnershipEvidenceEnvelope::try_new(cold_warm_envelope()).unwrap();
     }
@@ -713,7 +1082,8 @@ mod tests {
             .observation
             .as_mut()
             .unwrap()
-            .observed_available_bytes = 300;
+            .admission
+            .observed_remaining_bytes = 300;
         assert_eq!(
             envelope.validate().unwrap_err(),
             OwnershipEvidenceError::BaselineNotAdmissible
@@ -727,7 +1097,8 @@ mod tests {
             .observation
             .as_mut()
             .unwrap()
-            .observed_available_bytes = 700;
+            .admission
+            .observed_remaining_bytes = 700;
         assert_eq!(
             envelope.validate().unwrap_err(),
             OwnershipEvidenceError::PressureDidNotCrossThreshold
@@ -755,7 +1126,8 @@ mod tests {
             .observation
             .as_mut()
             .unwrap()
-            .observed_available_bytes = 400;
+            .admission
+            .observed_remaining_bytes = 400;
         assert_eq!(
             envelope.validate().unwrap_err(),
             OwnershipEvidenceError::ObservationDidNotRecover
@@ -769,7 +1141,18 @@ mod tests {
             .observation
             .as_mut()
             .unwrap()
+            .admission
             .candidate_sha256 = SHA_A.to_string();
+        assert_eq!(
+            envelope.validate().unwrap_err(),
+            OwnershipEvidenceError::CandidateIdentityChanged
+        );
+    }
+
+    #[test]
+    fn every_observation_must_bind_the_release_capability_cell() {
+        let mut envelope = real_pressure_envelope();
+        envelope.release.capability_cell_sha256 = SHA_A.to_string();
         assert_eq!(
             envelope.validate().unwrap_err(),
             OwnershipEvidenceError::CandidateIdentityChanged
@@ -792,5 +1175,75 @@ mod tests {
         assert!(!json.contains("owner_id"));
         assert!(!json.contains("join_id"));
         OwnershipEvidenceEnvelope::from_json_str(&json).unwrap();
+    }
+
+    #[test]
+    fn artifact_labels_are_release_safe_basenames() {
+        let mut envelope = real_pressure_envelope();
+        envelope.phases[0].runtime_snapshot.label = "../snapshot.json".to_string();
+        assert_eq!(
+            envelope.validate().unwrap_err(),
+            OwnershipEvidenceError::UnsafeArtifactLabel
+        );
+    }
+
+    #[test]
+    fn one_artifact_label_cannot_name_different_bytes() {
+        let mut envelope = real_pressure_envelope();
+        envelope.phases[1].runtime_snapshot.label =
+            envelope.phases[0].runtime_snapshot.label.clone();
+        envelope.phases[1].runtime_snapshot.sha256 = SHA_B.to_string();
+        assert_eq!(
+            envelope.validate().unwrap_err(),
+            OwnershipEvidenceError::ArtifactDigestConflict
+        );
+    }
+
+    #[test]
+    fn artifact_bindings_are_deduplicated_by_label() {
+        let mut envelope = real_pressure_envelope();
+        envelope.phases[1].runtime_snapshot = envelope.phases[0].runtime_snapshot.clone();
+        envelope.validate().unwrap();
+        let labels = envelope
+            .artifact_bindings()
+            .into_iter()
+            .map(|artifact| artifact.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|label| **label == "snapshot-0.json")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn activation_receipt_proves_fresh_rejection_and_old_state_preservation() {
+        let receipt = OwnershipActivationReceipt::try_new(activation_receipt()).unwrap();
+        let json = serde_json::to_string(&receipt).unwrap();
+        OwnershipActivationReceipt::from_json_str(&json).unwrap();
+    }
+
+    #[test]
+    fn activation_receipt_rejects_durable_or_live_state_drift() {
+        let mut receipt = activation_receipt();
+        receipt.fresh_reserve.observed_remaining_bytes = 1_000;
+        assert_eq!(
+            receipt.validate().unwrap_err(),
+            OwnershipEvidenceError::ActivationReceiptNotFreshReserveRejection
+        );
+        let mut receipt = activation_receipt();
+        receipt.durable_selection_after_sha256 = SHA_B.to_string();
+        assert_eq!(
+            receipt.validate().unwrap_err(),
+            OwnershipEvidenceError::ActivationReceiptDidNotPreserveOldState
+        );
+        let mut receipt = activation_receipt();
+        receipt.staged_owner_cleanup = "quarantined".to_string();
+        assert_eq!(
+            receipt.validate().unwrap_err(),
+            OwnershipEvidenceError::ActivationReceiptDidNotPreserveOldState
+        );
     }
 }

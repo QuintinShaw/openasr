@@ -264,6 +264,17 @@ pub(crate) enum Command {
         #[arg(long, default_value_t = 60)]
         timeout_seconds: u64,
     },
+    /// Validate a complete artifact-bound ownership evidence bundle without
+    /// consulting runtime policy or network state.
+    #[command(name = "__openasr-validate-ownership-evidence", hide = true)]
+    ValidateOwnershipEvidence {
+        /// Directory containing the immutable release evidence artifacts.
+        #[arg(long)]
+        artifact_dir: PathBuf,
+        /// Ownership envelope. Repeat exactly once per required scenario.
+        #[arg(long = "envelope", required = true)]
+        envelopes: Vec<PathBuf>,
+    },
     /// Internal helper for sandboxed GGUF C parser probes.
     #[command(name = "__openasr-gguf-c-parser-probe", hide = true)]
     GgufCParserProbe {

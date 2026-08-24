@@ -393,10 +393,12 @@ pub use output::{
     atomic_write_text_to_resolved_target, resolve_output_target, resolve_output_target_handle,
 };
 pub use ownership_evidence::{
-    OWNERSHIP_EVIDENCE_SCHEMA, OwnershipCandidateObservation, OwnershipDaemonStartIdentity,
-    OwnershipEvidenceArtifact, OwnershipEvidenceEnvelope, OwnershipEvidenceError,
-    OwnershipEvidenceLoadError, OwnershipEvidencePhase, OwnershipEvidencePhaseKind,
-    OwnershipEvidenceScenario, OwnershipLeaseReconciliationStatus, OwnershipReleaseBinding,
+    OWNERSHIP_ACTIVATION_RECEIPT_SCHEMA, OWNERSHIP_EVIDENCE_SCHEMA, OwnershipActivationReceipt,
+    OwnershipActivationReceiptLoadError, OwnershipAdmissionObservation,
+    OwnershipCandidateObservation, OwnershipDaemonStartIdentity, OwnershipEvidenceArtifact,
+    OwnershipEvidenceEnvelope, OwnershipEvidenceError, OwnershipEvidenceLoadError,
+    OwnershipEvidencePhase, OwnershipEvidencePhaseKind, OwnershipEvidenceScenario,
+    OwnershipLeaseReconciliationStatus, OwnershipReleaseBinding,
 };
 pub use pull::{
     BackendFileFormat, BackendPackDownloadPlan, BackendStoreGcReport, DefaultPackPointer,

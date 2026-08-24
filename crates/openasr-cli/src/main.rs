@@ -41,6 +41,7 @@ mod live;
 mod memory_pressure_helper;
 mod model_pack_cli;
 mod native_segment_cli;
+mod ownership_evidence_cli;
 mod panic_hook;
 mod parent_watchdog;
 mod progress;
@@ -217,6 +218,12 @@ async fn run() -> Result<()> {
                 timeout_seconds,
             });
         }
+        Command::ValidateOwnershipEvidence {
+            artifact_dir,
+            envelopes,
+        } => {
+            return ownership_evidence_cli::validate_bundle(&artifact_dir, &envelopes);
+        }
         Command::BackendPlugin { command } => {
             // Backend-pack installation uses the blocking catalog/download
             // client by design: the same implementation is shared with the
@@ -287,6 +294,9 @@ async fn run() -> Result<()> {
         Command::ModelPack { command } => model_pack_command(command),
         Command::BackendPlugin { .. } => unreachable!("handled before runtime initialization"),
         Command::MemoryPressureHelper { .. } => {
+            unreachable!("handled before runtime initialization")
+        }
+        Command::ValidateOwnershipEvidence { .. } => {
             unreachable!("handled before runtime initialization")
         }
         Command::GgufCParserProbe { path } => {
