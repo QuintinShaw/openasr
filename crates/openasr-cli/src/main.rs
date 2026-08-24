@@ -38,6 +38,7 @@ mod cli_args;
 mod consent;
 mod doctor_cli;
 mod live;
+mod memory_pressure_helper;
 mod model_pack_cli;
 mod native_segment_cli;
 mod panic_hook;
@@ -201,6 +202,21 @@ fn migrate_model_store_once() {
 
 async fn run() -> Result<()> {
     let command = match Cli::parse().command {
+        Command::MemoryPressureHelper {
+            parent_pid,
+            candidate_required_bytes,
+            absolute_floor_bytes,
+            proportional_floor_basis_points,
+            timeout_seconds,
+        } => {
+            return memory_pressure_helper::run(memory_pressure_helper::PressureHelperOptions {
+                parent_pid,
+                candidate_required_bytes,
+                absolute_floor_bytes,
+                proportional_floor_basis_points,
+                timeout_seconds,
+            });
+        }
         Command::BackendPlugin { command } => {
             // Backend-pack installation uses the blocking catalog/download
             // client by design: the same implementation is shared with the
@@ -270,6 +286,9 @@ async fn run() -> Result<()> {
         Command::Show { target } => show_model(&target),
         Command::ModelPack { command } => model_pack_command(command),
         Command::BackendPlugin { .. } => unreachable!("handled before runtime initialization"),
+        Command::MemoryPressureHelper { .. } => {
+            unreachable!("handled before runtime initialization")
+        }
         Command::GgufCParserProbe { path } => {
             let output = openasr_core::render_gguf_c_parser_sandbox_child_output(&path)?;
             println!("{output}");

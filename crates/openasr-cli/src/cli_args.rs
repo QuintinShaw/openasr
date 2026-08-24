@@ -243,6 +243,27 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: BackendPluginCommand,
     },
+    /// Qualification-only Windows helper that safely creates real host-memory
+    /// pressure for the ownership/activation evidence harness.
+    #[command(name = "__openasr-memory-pressure-helper", hide = true)]
+    MemoryPressureHelper {
+        /// PID of the qualification parent. The helper exits if it dies.
+        #[arg(long)]
+        parent_pid: u32,
+        /// Exact candidate request whose native observation must cross from
+        /// admissible to rejected. This is not an arbitrary allocation size.
+        #[arg(long)]
+        candidate_required_bytes: u64,
+        /// Absolute available-memory floor. Values below 2 GiB are rejected.
+        #[arg(long, default_value_t = 2 * 1024_u64 * 1024 * 1024)]
+        absolute_floor_bytes: u64,
+        /// Proportional available-memory floor in basis points of physical RAM.
+        #[arg(long, default_value_t = 2_000)]
+        proportional_floor_basis_points: u16,
+        /// Hard lifetime limit. The helper never accepts more than 120 seconds.
+        #[arg(long, default_value_t = 60)]
+        timeout_seconds: u64,
+    },
     /// Internal helper for sandboxed GGUF C parser probes.
     #[command(name = "__openasr-gguf-c-parser-probe", hide = true)]
     GgufCParserProbe {
