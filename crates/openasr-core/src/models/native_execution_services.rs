@@ -2092,6 +2092,25 @@ fn quote_candidate_activation_plan(
         resident_topology.architecture,
         prepared_components.join(",")
     );
+    quote_pack_activation_plan(pack, candidate, &topology_resource)
+}
+
+/// Quote the verified pack bytes for one already-resolved activation resource.
+/// ASR callers derive that identity from their resident topology. Auxiliary
+/// callers derive it from the canonical aux registry instead of masquerading
+/// as an ASR architecture descriptor.
+fn quote_pack_activation_plan(
+    pack: &VerifiedPack,
+    candidate: &ExecutionCandidate,
+    activation_resource: &str,
+) -> Result<
+    (
+        Vec<GgmlBackend>,
+        std::sync::Arc<memmap2::Mmap>,
+        NativeMemoryAdmissionPlan,
+    ),
+    String,
+> {
     let mmap = pack.preflight().runtime_source().backing_mmap();
     let requested_bytes = pack.preflight().runtime_source().byte_len();
     if requested_bytes == 0 || mmap.is_empty() {
@@ -2108,7 +2127,7 @@ fn quote_candidate_activation_plan(
         currently_allocated_bytes: 0,
         ..Default::default()
     };
-    let host_group_id = format!("candidate-activation-host-import:{topology_resource}");
+    let host_group_id = format!("candidate-activation-host-import:{activation_resource}");
     let host_group = quote_activation_group(&host_group_id, &host, host_import).or_else(|_| {
         let device = unsafe { ffi::ggml_backend_get_device(host.as_ptr()) };
         if device.is_null() {
@@ -2129,7 +2148,7 @@ fn quote_candidate_activation_plan(
             ..Default::default()
         };
         quote_activation_group(
-            &format!("candidate-activation-host-copy:{topology_resource}"),
+            &format!("candidate-activation-host-copy:{activation_resource}"),
             &host,
             host_copy,
         )
@@ -2156,7 +2175,7 @@ fn quote_candidate_activation_plan(
             ..Default::default()
         };
         groups.push(quote_activation_group(
-            &format!("candidate-activation-device-copy:{topology_resource}"),
+            &format!("candidate-activation-device-copy:{activation_resource}"),
             &device,
             device_copy,
         )?);
@@ -2329,19 +2348,52 @@ pub(crate) fn quote_and_reserve_candidate_activation(
     pack: &VerifiedPack,
 ) -> Result<BrokerActivationReservation, String> {
     let architecture_id = architecture_id_from_pack(pack)?;
-    let descriptor = crate::arch::OpenAsrArchitectureRegistry::with_builtins()
-        .find_by_model_architecture(architecture_id)
-        .ok_or_else(|| {
-            format!("candidate activation has no architecture descriptor for {architecture_id}")
-        })?;
-    let intent = ExecutionIntent::Exact(
-        crate::device::execution_route::ExactDeviceSelector::StableId {
-            provider: Some(candidate.device.route.provider),
-            stable_id: candidate.device.route.stable_id.clone(),
-        },
-    );
-    let topology = resolve_resident_topology_plan(descriptor, pack, candidate, &intent, true)?;
-    let (_backends, _mapping, plan) = quote_candidate_activation_plan(pack, candidate, &topology)?;
+    let (_backends, _mapping, plan) = match pack.route() {
+        PackRoute::Asr { .. } => {
+            let descriptor = crate::arch::OpenAsrArchitectureRegistry::with_builtins()
+                .find_by_model_architecture(architecture_id)
+                .ok_or_else(|| {
+                    format!(
+                        "candidate activation has no architecture descriptor for {architecture_id}"
+                    )
+                })?;
+            let intent = ExecutionIntent::Exact(
+                crate::device::execution_route::ExactDeviceSelector::StableId {
+                    provider: Some(candidate.device.route.provider),
+                    stable_id: candidate.device.route.stable_id.clone(),
+                },
+            );
+            let topology =
+                resolve_resident_topology_plan(descriptor, pack, candidate, &intent, true)?;
+            quote_candidate_activation_plan(pack, candidate, &topology)?
+        }
+        PackRoute::Aux { .. } => {
+            let policy = super::aux_pack_registry::auxiliary_execution_policy(architecture_id)
+                .ok_or_else(|| {
+                    format!(
+                        "candidate activation has no auxiliary execution descriptor for {architecture_id}"
+                    )
+                })?;
+            let super::aux_pack_registry::AuxiliaryExecutionPolicy::RequestScoped {
+                capabilities,
+                ..
+            } = policy;
+            if !capabilities.supports(candidate.device.route.provider, candidate.placement) {
+                return Err(format!(
+                    "candidate activation lane is not permitted by auxiliary architecture {architecture_id}"
+                ));
+            }
+            let ownership =
+                super::aux_pack_registry::auxiliary_runtime_ownership(architecture_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "candidate activation has no auxiliary ownership descriptor for {architecture_id}"
+                        )
+                    })?;
+            let activation_resource = format!("aux:{architecture_id}:{}", ownership.as_str());
+            quote_pack_activation_plan(pack, candidate, &activation_resource)?
+        }
+    };
     reserve_activation_plan(services, &plan, candidate, Some(pack.content_id()))
 }
 
@@ -3817,6 +3869,60 @@ mod tests {
             )
         })
         .clone()
+    }
+
+    fn auxiliary_activation_verified_pack() -> (tempfile::TempDir, VerifiedPack) {
+        let directory = tempfile::tempdir().expect("aux activation pack dir");
+        let path = directory.path().join("redimnet2-activation-quote.oasr");
+        let tensor = crate::ggml_runtime::GgufWriteTensor {
+            name: "fixture.tensor".to_string(),
+            dims: vec![1],
+            tensor_type: crate::ggml_runtime::GgufWriteTensorType::F32,
+            data: 0.0_f32.to_le_bytes().to_vec(),
+        };
+        crate::models::oasr_metadata::OasrPackWriter::write(
+            &path,
+            crate::models::oasr_metadata::PackEnvelope::aux(
+                crate::models::aux_pack_registry::REDIMNET2_GGML_ARCHITECTURE_ID,
+            ),
+            std::collections::BTreeMap::new(),
+            &[tensor],
+        )
+        .expect("write aux activation quote fixture");
+        let preflight = crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index(&path)
+            .expect("aux activation quote fixture preflight");
+        let pack = VerifiedPack::from_unverified_aux_preflight_for_test(
+            preflight,
+            crate::models::aux_pack_registry::AuxPackKind::Diarization,
+            crate::models::aux_pack_registry::REDIMNET2_GGML_ARCHITECTURE_ID,
+        );
+        (directory, pack)
+    }
+
+    #[test]
+    fn auxiliary_pack_activation_uses_aux_registry_without_asr_descriptor() {
+        let services = test_native_execution_services();
+        let candidate = cpu_candidate();
+        let (_directory, pack) = auxiliary_activation_verified_pack();
+        assert!(
+            crate::arch::OpenAsrArchitectureRegistry::with_builtins()
+                .find_by_model_architecture(pack.model_architecture())
+                .is_none(),
+            "the aux pack must not masquerade as an ASR descriptor"
+        );
+        let broker = Arc::clone(services.memory_broker());
+        let before = broker.usage(&MemoryDomainKey::SystemMemory);
+        let reservation =
+            quote_and_reserve_candidate_activation(services.as_ref(), &candidate, &pack)
+                .expect("registered auxiliary pack must receive a physical-domain quote");
+        let during = broker.usage(&MemoryDomainKey::SystemMemory);
+        assert!(
+            during.pending_bytes > before.pending_bytes
+                || during.committed_bytes > before.committed_bytes,
+            "auxiliary activation must reserve nonzero physical bytes"
+        );
+        drop(reservation);
+        assert_eq!(broker.usage(&MemoryDomainKey::SystemMemory), before);
     }
 
     #[test]

@@ -138,6 +138,21 @@ impl VerifiedPack {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_unverified_aux_preflight_for_test(
+        preflight: GgufRuntimeSourcePreflight,
+        kind: AuxPackKind,
+        model_architecture: impl Into<String>,
+    ) -> Self {
+        Self {
+            preflight,
+            route: PackRoute::Aux {
+                kind,
+                model_architecture: model_architecture.into(),
+            },
+        }
+    }
+
     /// Canonical catalog family projected from the route proven from these
     /// exact bytes. This is the value download/install targets must bind to;
     /// a model id or filename is not a family proof.
