@@ -872,6 +872,12 @@ fn validate_release_trace(jsonl: &str) -> Result<()> {
                 openasr_core::GgmlGraphLifecycleEventKind::Rebuilt { .. } => "rebuilt",
                 openasr_core::GgmlGraphLifecycleEventKind::Poisoned { .. } => "poisoned",
                 openasr_core::GgmlGraphLifecycleEventKind::Dropped => "dropped",
+                openasr_core::GgmlGraphLifecycleEventKind::CaptureStateObserved { .. } => {
+                    "capture_state_observed"
+                }
+                openasr_core::GgmlGraphLifecycleEventKind::CaptureExecutableObserved { .. } => {
+                    "capture_executable_observed"
+                }
                 openasr_core::GgmlGraphLifecycleEventKind::CaptureExecutableCreated { .. } => {
                     "capture_executable_created"
                 }
@@ -1426,6 +1432,8 @@ mod tests {
             "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":4,\"provider\":\"cpu\",\"device\":\"CPU\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"compute_started\",\"compute_sequence\":1,\"prepare_generation\":3,\"input_generation_consumed\":4}\n",
             "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":5,\"provider\":\"cpu\",\"device\":\"CPU\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"compute_completed\",\"compute_sequence\":1,\"output_generation\":5}\n",
             "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":6,\"provider\":\"cpu\",\"device\":\"CPU\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"output_read\",\"compute_sequence\":1,\"output_generation_consumed\":5,\"bytes\":4}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":7,\"provider\":\"cpu\",\"device\":\"CPU\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"capture_state_observed\",\"capture_supported\":true,\"graph_tracked\":true,\"capture_enabled\":true,\"executable_present\":true}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":8,\"provider\":\"cpu\",\"device\":\"CPU\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"capture_executable_observed\",\"capture_executable_generation\":6,\"last_change\":\"instantiated\"}\n",
             "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"token\",\"step_index\":0}\n",
             "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"logits_digest\",\"step_index\":0,\"element_count\":2,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"non_finite_count\":0}\n",
             "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"top_k\",\"step_index\":0,\"items\":[{\"token_id\":1,\"value\":2.0},{\"token_id\":2,\"value\":1.0}],\"top1_top2_margin\":1.0}\n"
