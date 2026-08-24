@@ -271,7 +271,10 @@ impl MoonshineGgmlExecutor {
             .execution_context
             .native_execution_lane()
             .cloned()
-            .unwrap_or_else(|| ExecutionLaneKey::unscoped_for_backend(backend));
+            .ok_or_else(|| MoonshineGgmlExecutorError::RuntimeOwnershipFailed {
+                stage: "request-lane",
+                reason: "candidate-resolved execution lane is missing".to_string(),
+            })?;
         let encoder_config = moonshine_encoder_graph_config(backend);
         let decoder_config = moonshine_decoder_graph_config(backend, Some(request_lane.provider()));
         let encoder_execution_lane = request_lane.for_stage(

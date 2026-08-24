@@ -26,9 +26,10 @@ pub use native::{
     verify_native_runtime_model_pack_path,
 };
 pub(crate) use native::{UnstableDecodeTextObserver, WorkProgressObserver};
+pub(crate) use request_context::log_failure_context;
 pub use request_context::{
-    FailureCategory, RequestSource, format_failure_context_line, format_request_context_line,
-    log_failure_context, log_request_context,
+    FailureCategory, FailureGpuMemoryContext, RequestSource, format_failure_context_line,
+    format_request_context_line, log_request_context,
 };
 
 pub const NATIVE_RUNTIME_MODEL_ID_AUTO: &str = "__openasr_native_runtime_model_id_auto__";

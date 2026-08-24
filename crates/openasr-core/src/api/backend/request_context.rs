@@ -184,6 +184,14 @@ pub enum FailureCategory {
     Decode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureGpuMemoryContext {
+    pub provider: String,
+    pub stable_device_id: String,
+    pub free_mib: u64,
+    pub total_mib: u64,
+}
+
 impl FailureCategory {
     pub fn as_log_label(self) -> &'static str {
         match self {
@@ -207,7 +215,7 @@ impl FailureCategory {
 pub fn format_failure_context_line(
     category: FailureCategory,
     available_memory_mib: Option<u64>,
-    gpu_memory_mib: Option<(u64, u64)>,
+    gpu_memory: Option<&FailureGpuMemoryContext>,
 ) -> String {
     let mut line = format!(
         "stage=transcribe_failure error_category={}",
@@ -217,9 +225,10 @@ pub fn format_failure_context_line(
         Some(mib) => line.push_str(&format!(" mem_available_mib={mib}")),
         None => line.push_str(" mem_available_mib=unknown"),
     }
-    if let Some((free_mib, total_mib)) = gpu_memory_mib {
+    if let Some(gpu) = gpu_memory {
         line.push_str(&format!(
-            " gpu_mem_free_mib={free_mib} gpu_mem_total_mib={total_mib}"
+            " execution_provider={} stable_device_id={} gpu_mem_free_mib={} gpu_mem_total_mib={}",
+            gpu.provider, gpu.stable_device_id, gpu.free_mib, gpu.total_mib
         ));
     }
     line
@@ -227,45 +236,41 @@ pub fn format_failure_context_line(
 
 /// Logs [`format_failure_context_line`]'s output at the moment a native
 /// transcription request fails, using the process's current best-effort
-/// available-memory reading (and, if a GPU-class device is present, its
-/// free/total VRAM from the same device enumeration `stage=ggml_backend`
-/// logs at boot) -- never re-probing anything expensive, and never a hard
-/// dependency: a probe returning `None` just narrows the logged line.
-pub fn log_failure_context(category: FailureCategory) {
+/// available-memory reading and, only when the failing request supplies an
+/// exact GPU lane, that lane's point-in-time free/total device memory. A
+/// missing observation is omitted rather than borrowing another device.
+pub(crate) fn log_failure_context(
+    category: FailureCategory,
+    lane: Option<&crate::models::native_execution_services::ExecutionLaneKey>,
+) {
     let available_memory_mib =
         crate::host_available_memory_bytes().map(|bytes| bytes / (1024 * 1024));
-    let gpu_memory_mib = first_gpu_class_device_memory_mib();
+    let gpu_memory = lane.and_then(exact_lane_gpu_memory_context);
     stage_timing::log_event(
         "native_transcribe",
-        format_failure_context_line(category, available_memory_mib, gpu_memory_mib),
+        format_failure_context_line(category, available_memory_mib, gpu_memory.as_ref()),
     );
 }
 
-/// Best-effort `(free_mib, total_mib)` for the first GPU-class device ggml's
-/// device registry reports memory for. Reuses the same
-/// `ggml_runtime_info()`/`GgmlBackendDevice` enumeration the boot-time
-/// `stage=ggml_backend` line already walks, rather than a second device
-/// probe -- this is a point-in-time snapshot at failure time, not the boot
-/// snapshot, so it can catch VRAM pressure that developed since boot.
-fn first_gpu_class_device_memory_mib() -> Option<(u64, u64)> {
-    use crate::ggml_runtime::GgmlBackendKind;
-
-    crate::ggml_runtime_info()
-        .devices
-        .iter()
-        .find_map(|device| {
-            let is_gpu_class = matches!(
-                device.kind,
-                GgmlBackendKind::Gpu
-                    | GgmlBackendKind::IntegratedGpu
-                    | GgmlBackendKind::Accelerator
-            );
-            let memory = device.memory?;
-            is_gpu_class.then_some((
-                (memory.free_bytes as u64) / (1024 * 1024),
-                (memory.total_bytes as u64) / (1024 * 1024),
-            ))
-        })
+/// Best-effort memory projection for the request's exact GPU lane. Device
+/// identity is joined once by `ExecutionLaneKey::live_memory_sample`; this
+/// logger cannot independently select a first, largest, or preferred GPU.
+fn exact_lane_gpu_memory_context(
+    lane: &crate::models::native_execution_services::ExecutionLaneKey,
+) -> Option<FailureGpuMemoryContext> {
+    if !lane.backend().is_gpu_class() {
+        return None;
+    }
+    let sample = lane.live_memory_sample()?;
+    if !sample.device_kind.is_gpu() {
+        return None;
+    }
+    Some(FailureGpuMemoryContext {
+        provider: sample.provider.as_str().to_string(),
+        stable_device_id: sample.stable_device_id,
+        free_mib: sample.memory.free_bytes as u64 / (1024 * 1024),
+        total_mib: sample.memory.total_bytes as u64 / (1024 * 1024),
+    })
 }
 
 #[cfg(test)]
@@ -448,9 +453,16 @@ mod tests {
 
     #[test]
     fn failure_context_line_includes_gpu_memory_when_present() {
-        let line =
-            format_failure_context_line(FailureCategory::Alloc, Some(2048), Some((512, 8192)));
+        let gpu = FailureGpuMemoryContext {
+            provider: "cuda".to_string(),
+            stable_device_id: "CUDA0".to_string(),
+            free_mib: 512,
+            total_mib: 8192,
+        };
+        let line = format_failure_context_line(FailureCategory::Alloc, Some(2048), Some(&gpu));
         assert!(line.contains("mem_available_mib=2048"));
+        assert!(line.contains("execution_provider=cuda"));
+        assert!(line.contains("stable_device_id=CUDA0"));
         assert!(line.contains("gpu_mem_free_mib=512"));
         assert!(line.contains("gpu_mem_total_mib=8192"));
     }

@@ -30,7 +30,8 @@ use crate::models::decode_policy_component_registry::{
 };
 use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
 use crate::models::native_execution_services::{
-    current_native_execution_context, current_runtime_receipts, install_native_execution_context,
+    current_execution_lane, current_native_execution_context, current_runtime_receipts,
+    install_native_execution_context,
 };
 use crate::models::prepared_runtime_cache::PreparedRuntimeHandle;
 use crate::models::runtime_prepared_registry::BuiltinPreparedRuntime;
@@ -480,9 +481,11 @@ impl Qwen3AsrServeBatchConfig {
         if job.resolved_runtime.reuse_mode() != GgmlDecodeReuseMode::ReusableGraph {
             return Err(Qwen3AsrServeBatchError::UnsupportedBackend { backend });
         }
+        let lane = current_execution_lane();
         let max_batch = serve_batch_vram_capped_max_batch(
             self.max_batch,
             backend,
+            lane.as_ref(),
             qwen_serve_batch_vram_slot_bytes(job),
         );
         Ok(Self { max_batch, ..self })

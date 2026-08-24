@@ -27,7 +27,6 @@ use crate::models::ggml_streaming_session::{
     GgmlAsrStreamingTranscriptUpdate,
 };
 use crate::models::graph_runtime_config::install_request_inference_threads_override;
-use crate::models::native_execution_services::ExecutionLaneKey;
 use crate::models::streaming_partial_cadence::PartialDecodeCadence;
 use crate::{
     NativeAsrSession, RealtimeAudioFrame, StreamingPartialGranularity, TranscriptUpdate,
@@ -202,10 +201,7 @@ where
     // the session request, not a thread-local): every per-frame request this
     // driver builds for the life of the session copies it in directly.
     let resolved_runtime = request.resolved_runtime;
-    let execution_lane = request
-        .execution_lane
-        .clone()
-        .unwrap_or_else(|| ExecutionLaneKey::unscoped_for_backend(resolved_runtime.backend()));
+    let execution_lane = request.execution_lane.clone();
     let partial_granularity = crate::arch::streaming_partial_granularity_for_model_architecture(
         request.selected_family.model_architecture,
     );
@@ -215,6 +211,13 @@ where
         GgmlAsrExecutionViewRequest<'static>,
         GgmlAsrExecutionError,
     > {
+        let execution_lane = execution_lane.clone().ok_or_else(|| {
+            GgmlAsrExecutionError::executor_failed(
+                executor_id,
+                adapter_id,
+                "streaming request is missing its candidate-resolved execution lane",
+            )
+        })?;
         let mut request_options = request_options.clone();
         if let Some(prompt) =
             merge_partial_prompt(request_options.prompt.as_deref(), partial_prompt)

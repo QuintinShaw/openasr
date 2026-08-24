@@ -5,10 +5,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::ggml_runtime::{
-    GgmlBackendKind, GgmlCpuGraphBackend, GgmlDeviceMemory, accelerated_device_rank,
-    ggml_available_devices,
-};
+use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::models::native_execution_services::{ExecutionLaneKey, ExecutionLaneMemorySample};
 use crate::models::seq2seq_greedy_decode::{
     MAX_REPEAT_NGRAM, Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError,
     Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeStopReason,
@@ -295,14 +293,19 @@ pub(crate) fn serve_batch_trace_enabled() -> bool {
 pub(crate) fn serve_batch_vram_capped_max_batch(
     requested_max_batch: usize,
     backend: GgmlCpuGraphBackend,
+    lane: Option<&ExecutionLaneKey>,
     estimated_slot_bytes: usize,
 ) -> usize {
     if !backend.is_gpu_class() || requested_max_batch <= 2 || estimated_slot_bytes == 0 {
         return requested_max_batch;
     }
-    let Some(sample) = selected_gpu_memory_sample() else {
+    let Some(lane) = lane.filter(|lane| lane.backend() == backend) else {
         trace_serve_batch_vram_cap_unavailable(backend, requested_max_batch, estimated_slot_bytes);
-        return requested_max_batch;
+        return 1;
+    };
+    let Some(sample) = exact_lane_gpu_memory_sample(lane) else {
+        trace_serve_batch_vram_cap_unavailable(backend, requested_max_batch, estimated_slot_bytes);
+        return 1;
     };
     let decision = serve_batch_vram_cap_decision_for_memory(
         requested_max_batch,
@@ -455,13 +458,6 @@ pub(crate) fn serve_batch_estimate_seq2seq_slot_bytes(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ServeBatchGpuMemorySample {
-    device_name: String,
-    device_kind: GgmlBackendKind,
-    memory: GgmlDeviceMemory,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct ServeBatchVramCapDecision {
     requested_max_batch: usize,
     capped_max_batch: usize,
@@ -471,31 +467,9 @@ struct ServeBatchVramCapDecision {
     usable_bytes: usize,
 }
 
-fn selected_gpu_memory_sample() -> Option<ServeBatchGpuMemorySample> {
-    let devices = ggml_available_devices()
-        .into_iter()
-        .map(|device| (device.name, device.kind, device.memory))
-        .collect::<Vec<_>>();
-    selected_gpu_memory_sample_from_device_infos(&devices)
-}
-
-fn selected_gpu_memory_sample_from_device_infos(
-    devices: &[(String, GgmlBackendKind, Option<GgmlDeviceMemory>)],
-) -> Option<ServeBatchGpuMemorySample> {
-    // Same discrete-over-integrated preference as `init_gpu_backend` /
-    // `preferred_accelerated_device`: on a hybrid-graphics host the VRAM cap
-    // must be sized off the discrete GPU actually selected for inference, not
-    // whichever device the registry happens to enumerate first (which could
-    // be a small-memory integrated GPU).
-    let (name, kind, memory) = devices
-        .iter()
-        .filter(|(_, kind, _)| kind.is_gpu())
-        .min_by_key(|(_, kind, _)| accelerated_device_rank(*kind))?;
-    memory.map(|memory| ServeBatchGpuMemorySample {
-        device_name: name.clone(),
-        device_kind: *kind,
-        memory,
-    })
+fn exact_lane_gpu_memory_sample(lane: &ExecutionLaneKey) -> Option<ExecutionLaneMemorySample> {
+    lane.live_memory_sample()
+        .filter(|sample| sample.device_kind.is_gpu())
 }
 
 fn serve_batch_vram_cap_decision_for_memory(
@@ -509,7 +483,7 @@ fn serve_batch_vram_cap_decision_for_memory(
         requested_max_batch
     } else {
         let slots = usable_bytes / estimated_slot_bytes;
-        requested_max_batch.min(slots).max(1)
+        largest_materializable_batch_bucket(requested_max_batch, slots)
     };
     ServeBatchVramCapDecision {
         requested_max_batch,
@@ -519,6 +493,17 @@ fn serve_batch_vram_cap_decision_for_memory(
         reserve_bytes,
         usable_bytes,
     }
+}
+
+fn largest_materializable_batch_bucket(requested_max_batch: usize, slots: usize) -> usize {
+    if requested_max_batch <= 1 || slots == 0 {
+        return requested_max_batch.min(1);
+    }
+    if slots >= requested_max_batch {
+        return requested_max_batch;
+    }
+    let highest_power_of_two = 1_usize << (usize::BITS - 1 - slots.leading_zeros());
+    highest_power_of_two.min(requested_max_batch).max(1)
 }
 
 #[cfg(test)]
@@ -539,7 +524,7 @@ fn serve_batch_vram_capped_max_batch_for_memory(
 
 fn trace_serve_batch_vram_cap_decision(
     backend: GgmlCpuGraphBackend,
-    sample: &ServeBatchGpuMemorySample,
+    sample: &ExecutionLaneMemorySample,
     decision: &ServeBatchVramCapDecision,
 ) {
     if !serve_batch_trace_enabled() {
@@ -552,7 +537,7 @@ fn trace_serve_batch_vram_cap_decision(
     };
     eprintln!(
         "openasr serve batch: vram cap {status} backend={backend:?} device={} kind={:?} requested={} capped={} slot_mib={} free_mib={} total_mib={} reserve_mib={} usable_mib={}",
-        sample.device_name,
+        sample.stable_device_id,
         sample.device_kind,
         decision.requested_max_batch,
         decision.capped_max_batch,
@@ -615,6 +600,18 @@ mod tests {
                 1024 * MIB_BYTES
             ),
             1
+        );
+    }
+
+    #[test]
+    fn gpu_batch_without_an_exact_lane_fails_closed_to_serial() {
+        assert_eq!(
+            serve_batch_vram_capped_max_batch(8, GgmlCpuGraphBackend::Gpu, None, 512),
+            1
+        );
+        assert_eq!(
+            serve_batch_vram_capped_max_batch(8, GgmlCpuGraphBackend::Cpu, None, 512),
+            8
         );
     }
 
@@ -844,7 +841,7 @@ mod tests {
     fn serve_batch_vram_cap_preserves_minimum_enabled_bucket() {
         assert_eq!(
             serve_batch_vram_capped_max_batch_for_memory(8, 512, 4096, 1024),
-            6
+            4
         );
         assert_eq!(
             serve_batch_vram_capped_max_batch_for_memory(8, 512, 1500, 1024),
@@ -854,6 +851,17 @@ mod tests {
             serve_batch_vram_capped_max_batch_for_memory(2, 512, 1500, 1024),
             1
         );
+    }
+
+    #[test]
+    fn vram_cap_selects_only_materializable_graph_buckets() {
+        assert_eq!(largest_materializable_batch_bucket(8, 8), 8);
+        assert_eq!(largest_materializable_batch_bucket(8, 7), 4);
+        assert_eq!(largest_materializable_batch_bucket(8, 4), 4);
+        assert_eq!(largest_materializable_batch_bucket(8, 3), 2);
+        assert_eq!(largest_materializable_batch_bucket(6, 6), 6);
+        assert_eq!(largest_materializable_batch_bucket(6, 5), 4);
+        assert_eq!(largest_materializable_batch_bucket(6, 0), 1);
     }
 
     #[test]
@@ -871,90 +879,6 @@ mod tests {
         assert_eq!(decision.free_bytes, 3 * 1024 * MIB_BYTES);
         assert_eq!(decision.reserve_bytes, 1024 * MIB_BYTES);
         assert_eq!(decision.usable_bytes, 2 * 1024 * MIB_BYTES);
-    }
-
-    #[test]
-    fn serve_batch_vram_sample_uses_first_gpu_device_not_largest_gpu() {
-        let devices = vec![
-            (
-                "cpu".to_string(),
-                GgmlBackendKind::Cpu,
-                Some(GgmlDeviceMemory {
-                    free_bytes: 32 * MIB_BYTES,
-                    total_bytes: 64 * MIB_BYTES,
-                }),
-            ),
-            (
-                "first-gpu".to_string(),
-                GgmlBackendKind::Gpu,
-                Some(GgmlDeviceMemory {
-                    free_bytes: 4 * MIB_BYTES,
-                    total_bytes: 8 * MIB_BYTES,
-                }),
-            ),
-            (
-                "larger-second-gpu".to_string(),
-                GgmlBackendKind::Gpu,
-                Some(GgmlDeviceMemory {
-                    free_bytes: 16 * MIB_BYTES,
-                    total_bytes: 24 * MIB_BYTES,
-                }),
-            ),
-        ];
-
-        let sample =
-            selected_gpu_memory_sample_from_device_infos(&devices).expect("gpu memory sample");
-
-        assert_eq!(sample.device_name, "first-gpu");
-        assert_eq!(sample.memory.free_bytes, 4 * MIB_BYTES);
-    }
-
-    #[test]
-    fn serve_batch_vram_sample_prefers_discrete_gpu_over_integrated() {
-        // Optimus-style host: the integrated GPU enumerates first but must
-        // not be the one the VRAM cap is sized against.
-        let devices = vec![
-            (
-                "integrated".to_string(),
-                GgmlBackendKind::IntegratedGpu,
-                Some(GgmlDeviceMemory {
-                    free_bytes: 512 * MIB_BYTES,
-                    total_bytes: 1024 * MIB_BYTES,
-                }),
-            ),
-            (
-                "discrete".to_string(),
-                GgmlBackendKind::Gpu,
-                Some(GgmlDeviceMemory {
-                    free_bytes: 8 * 1024 * MIB_BYTES,
-                    total_bytes: 12 * 1024 * MIB_BYTES,
-                }),
-            ),
-        ];
-
-        let sample =
-            selected_gpu_memory_sample_from_device_infos(&devices).expect("gpu memory sample");
-
-        assert_eq!(sample.device_name, "discrete");
-        assert_eq!(sample.device_kind, GgmlBackendKind::Gpu);
-        assert_eq!(sample.memory.free_bytes, 8 * 1024 * MIB_BYTES);
-    }
-
-    #[test]
-    fn serve_batch_vram_sample_requires_selected_gpu_memory() {
-        let devices = vec![
-            ("first-gpu".to_string(), GgmlBackendKind::Gpu, None),
-            (
-                "larger-second-gpu".to_string(),
-                GgmlBackendKind::Gpu,
-                Some(GgmlDeviceMemory {
-                    free_bytes: 16 * MIB_BYTES,
-                    total_bytes: 24 * MIB_BYTES,
-                }),
-            ),
-        ];
-
-        assert!(selected_gpu_memory_sample_from_device_infos(&devices).is_none());
     }
 
     #[test]

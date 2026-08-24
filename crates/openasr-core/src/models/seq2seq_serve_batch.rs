@@ -23,8 +23,8 @@ use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlDecodeReuseMode};
 #[cfg(not(test))]
 use crate::models::native_execution_services::current_execution_cache_attempt_id;
 use crate::models::native_execution_services::{
-    NativeExecutionContext, current_native_execution_context, current_runtime_receipts,
-    install_native_execution_context,
+    NativeExecutionContext, current_execution_lane, current_native_execution_context,
+    current_runtime_receipts, install_native_execution_context,
 };
 use crate::models::runtime_receipts::{
     RuntimeOwnerGuard, RuntimeReceiptCollector, RuntimeResourceGuard,
@@ -1345,8 +1345,13 @@ impl ServeBatchConfig {
         if !reusable_decode_graph_supported(F::reuse_mode(job)) || F::uses_scheduler(job) {
             return Err(F::unsupported_backend(backend));
         }
-        let max_batch =
-            serve_batch_vram_capped_max_batch(self.max_batch, backend, F::vram_slot_bytes(job));
+        let lane = current_execution_lane();
+        let max_batch = serve_batch_vram_capped_max_batch(
+            self.max_batch,
+            backend,
+            lane.as_ref(),
+            F::vram_slot_bytes(job),
+        );
         let max_batch = F::effective_max_batch_after_vram_cap(max_batch, job)?;
         Ok(Self { max_batch, ..self })
     }

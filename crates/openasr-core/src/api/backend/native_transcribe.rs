@@ -346,6 +346,27 @@ struct SliceExecutionFallback {
     selected: ExecutionCandidate,
 }
 
+fn candidate_execution_lane(
+    candidate: &ExecutionCandidate,
+) -> Option<crate::models::native_execution_services::ExecutionLaneKey> {
+    let backend = match candidate.device.route.provider {
+        crate::device::execution_route::ExecutionProvider::Cpu => GgmlCpuGraphBackend::Cpu,
+        crate::device::execution_route::ExecutionProvider::Metal => GgmlCpuGraphBackend::Metal,
+        crate::device::execution_route::ExecutionProvider::Cuda
+        | crate::device::execution_route::ExecutionProvider::Hip
+        | crate::device::execution_route::ExecutionProvider::Vulkan => GgmlCpuGraphBackend::Gpu,
+        crate::device::execution_route::ExecutionProvider::Accelerator
+        | crate::device::execution_route::ExecutionProvider::Unknown => return None,
+    };
+    crate::models::native_execution_services::ExecutionLaneKey::from_candidate(candidate, backend)
+        .ok()
+}
+
+fn log_candidate_failure_context(error: &BackendError, candidate: &ExecutionCandidate) {
+    let lane = candidate_execution_lane(candidate);
+    log_failure_context(classify_backend_error_for_failure_log(error), lane.as_ref());
+}
+
 /// Runs one slice through the immutable execution plan. Every attempt covers
 /// decoder-state planning plus the complete family dispatch. A later candidate
 /// is tried only when the failing attempt's allocator/device boundary recorded
@@ -415,7 +436,10 @@ fn run_dispatch_once_with_progress_and_policy(
                 });
                 return Ok((result, fallback));
             }
-            (Err(error), None) => return Err(error),
+            (Err(error), None) => {
+                log_candidate_failure_context(&error, candidate);
+                return Err(error);
+            }
             (result, Some(failure)) => {
                 let error = crate::models::native_execution_services::execution_candidate_failure_source(result)
                     .unwrap_or_else(|| BackendError::NativeFailClosed {
@@ -425,6 +449,7 @@ fn run_dispatch_once_with_progress_and_policy(
                         ),
                     });
                 if candidate_index + 1 == candidates.len() {
+                    log_candidate_failure_context(&error, candidate);
                     return Err(error);
                 }
                 crate::stage_timing::log_detail_event(
@@ -1029,7 +1054,7 @@ pub(super) fn run_native_transcription_with_intent(
 ) -> Result<Transcription, BackendError> {
     run_native_transcription_fallible(request, &execution_services, execution_intent).inspect_err(
         |error| {
-            log_failure_context(classify_backend_error_for_failure_log(error));
+            log_failure_context(classify_backend_error_for_failure_log(error), None);
         },
     )
 }
@@ -1047,7 +1072,7 @@ pub(super) fn run_native_transcription_with_verified_pack(
         NativeRuntimePackInput::Verified(verified_pack),
     )
     .inspect_err(|error| {
-        log_failure_context(classify_backend_error_for_failure_log(error));
+        log_failure_context(classify_backend_error_for_failure_log(error), None);
     })
 }
 

@@ -45,10 +45,10 @@ use crate::ggml_runtime::{
     BackendMemoryUnknownReason, SafeBackendMemoryReceipt,
 };
 use crate::ggml_runtime::{
-    GgmlBackend, GgmlCpuGraphBackend, GgmlExecutionPlacementSummary,
-    GgmlExecutionTelemetryCollector, GgmlExecutionTelemetryGuard, RequestBackendOverrideGuard,
-    RequestBackendPreference, current_execution_telemetry_collector, ensure_backends_loaded,
-    ggml_available_devices, install_execution_telemetry_collector,
+    GgmlBackend, GgmlBackendKind, GgmlCpuGraphBackend, GgmlDeviceMemory,
+    GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector, GgmlExecutionTelemetryGuard,
+    RequestBackendOverrideGuard, RequestBackendPreference, current_execution_telemetry_collector,
+    ensure_backends_loaded, ggml_available_devices, install_execution_telemetry_collector,
     install_request_backend_override, request_backend_override, resolve_request_execution_route,
 };
 use crate::models::pack_verifier::{PackRoute, VerifiedPack};
@@ -439,6 +439,17 @@ pub(crate) struct ExecutionLaneKey {
     backend: GgmlCpuGraphBackend,
 }
 
+/// Live memory observation joined to the same provider + stable device id as
+/// an [`ExecutionLaneKey`]. Consumers may project this fact into telemetry or
+/// batching policy, but must not repeat device-enumeration identity joins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExecutionLaneMemorySample {
+    pub(crate) provider: ExecutionProvider,
+    pub(crate) stable_device_id: String,
+    pub(crate) device_kind: GgmlBackendKind,
+    pub(crate) memory: GgmlDeviceMemory,
+}
+
 impl ExecutionLaneKey {
     #[allow(dead_code)]
     pub(crate) fn receipt_projection(
@@ -467,6 +478,17 @@ impl ExecutionLaneKey {
 
     pub(crate) fn placement(&self) -> ExecutionPlacement {
         self.placement
+    }
+
+    /// Observe memory for this exact lane. Enumeration order never selects a
+    /// different device: both provider and provider-local stable id must
+    /// match, and a missing observation remains unknown.
+    pub(crate) fn live_memory_sample(&self) -> Option<ExecutionLaneMemorySample> {
+        let devices = ggml_available_devices()
+            .into_iter()
+            .map(|device| (device.name, device.kind, device.memory))
+            .collect::<Vec<_>>();
+        exact_lane_memory_sample_from_device_infos(self, &devices)
     }
 
     /// Derive a stage-specific lane from the request's already-resolved exact
@@ -527,6 +549,7 @@ impl ExecutionLaneKey {
     }
     /// Test/internal fallback for callers outside a request candidate. Native
     /// production dispatch attaches an exact lane to its request context.
+    #[cfg(test)]
     pub(crate) fn unscoped_for_backend(backend: GgmlCpuGraphBackend) -> Self {
         let route = fallback_route_for_unscoped_backend(backend);
         Self {
@@ -542,6 +565,22 @@ impl ExecutionLaneKey {
             backend,
         }
     }
+}
+
+fn exact_lane_memory_sample_from_device_infos(
+    lane: &ExecutionLaneKey,
+    devices: &[(String, GgmlBackendKind, Option<GgmlDeviceMemory>)],
+) -> Option<ExecutionLaneMemorySample> {
+    let (stable_device_id, device_kind, memory) = devices.iter().find(|(name, _, _)| {
+        name == lane.stable_device_id()
+            && ExecutionProvider::from_backend_name(name) == lane.provider()
+    })?;
+    Some(ExecutionLaneMemorySample {
+        provider: lane.provider(),
+        stable_device_id: stable_device_id.clone(),
+        device_kind: *device_kind,
+        memory: (*memory)?,
+    })
 }
 
 /// Stable identity of one explicitly constructed execution-service root.
@@ -3442,6 +3481,63 @@ mod tests {
             .expect("entropy-backed lane projection");
         assert_eq!(projection.provider, ExecutionProvider::Cuda);
         assert_eq!(projection.placement, ExecutionPlacement::FullDevice);
+    }
+
+    #[test]
+    fn execution_lane_memory_sample_is_exact_and_enumeration_order_invariant() {
+        let candidate = gpu_candidate(
+            ExecutionProvider::Cuda,
+            "CUDA1",
+            "0000:02:00.0",
+            ExecutionPlacement::FullDevice,
+        );
+        let lane = ExecutionLaneKey::from_candidate(&candidate, GgmlCpuGraphBackend::Gpu)
+            .expect("exact CUDA lane");
+        let vulkan = (
+            "Vulkan0".to_string(),
+            GgmlBackendKind::Gpu,
+            Some(GgmlDeviceMemory {
+                free_bytes: 3 * 1024 * 1024,
+                total_bytes: 7 * 1024 * 1024,
+            }),
+        );
+        let cuda0 = (
+            "CUDA0".to_string(),
+            GgmlBackendKind::Gpu,
+            Some(GgmlDeviceMemory {
+                free_bytes: 5 * 1024 * 1024,
+                total_bytes: 8 * 1024 * 1024,
+            }),
+        );
+        let cuda1 = (
+            "CUDA1".to_string(),
+            GgmlBackendKind::Gpu,
+            Some(GgmlDeviceMemory {
+                free_bytes: 11 * 1024 * 1024,
+                total_bytes: 16 * 1024 * 1024,
+            }),
+        );
+
+        for devices in [
+            vec![vulkan.clone(), cuda0.clone(), cuda1.clone()],
+            vec![cuda1.clone(), cuda0.clone(), vulkan.clone()],
+        ] {
+            let sample = exact_lane_memory_sample_from_device_infos(&lane, &devices)
+                .expect("exact CUDA1 memory sample");
+            assert_eq!(sample.provider, ExecutionProvider::Cuda);
+            assert_eq!(sample.stable_device_id, "CUDA1");
+            assert_eq!(sample.memory.free_bytes, 11 * 1024 * 1024);
+            assert_eq!(sample.memory.total_bytes, 16 * 1024 * 1024);
+        }
+
+        assert!(
+            exact_lane_memory_sample_from_device_infos(
+                &lane,
+                &[("CUDA1".to_string(), GgmlBackendKind::Gpu, None)],
+            )
+            .is_none()
+        );
+        assert!(exact_lane_memory_sample_from_device_infos(&lane, &[vulkan, cuda0]).is_none());
     }
 
     #[test]

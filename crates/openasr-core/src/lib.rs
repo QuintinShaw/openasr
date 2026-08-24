@@ -123,8 +123,8 @@ pub fn word_timestamp_forced_aligner_available() -> bool {
 
 pub use api::backend::{
     BackendError, BackendKind, DecodeTruncation, DecodeTruncationReason, ExecutionTarget,
-    FailureCategory, GgmlAbortCallbackGuard, NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend,
-    NativeBackendExecutor, NativeRuntimeModelAdapter, NativeRuntimeModelIdSource,
+    FailureCategory, FailureGpuMemoryContext, GgmlAbortCallbackGuard, NATIVE_RUNTIME_MODEL_ID_AUTO,
+    NativeBackend, NativeBackendExecutor, NativeRuntimeModelAdapter, NativeRuntimeModelIdSource,
     NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, RequestExecutionContext,
     RequestSource, Segment, SliceBoundaryControl, Transcription, TranscriptionBackend,
     TranscriptionControl, TranscriptionRequest, TranscriptionTask, TruncatedDecode, WordTimestamp,
