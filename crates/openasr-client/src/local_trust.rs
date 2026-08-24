@@ -244,7 +244,11 @@ fn open_without_following_final_link(path: &Path) -> std::io::Result<File> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read as _;
+    use std::{
+        io::{Read as _, Write as _},
+        net::TcpListener,
+        thread,
+    };
 
     use tempfile::tempdir;
 
@@ -322,6 +326,45 @@ mod tests {
         assert!(matches!(
             SelectedMedia::open(&link),
             Err(LocalTrustError::MediaIsNotRegularFile)
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_daemon_client_never_follows_redirects() {
+        let production = include_str!("local_trust.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(production.contains(".no_proxy()"));
+        assert!(production.contains(".redirect(reqwest::redirect::Policy::none())"));
+
+        let target = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        target.set_nonblocking(true).unwrap();
+        let target_address = target.local_addr().unwrap();
+        let redirect = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let redirect_address = redirect.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = redirect.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: http://{target_address}/capture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+
+        let response = managed_daemon_http_client()
+            .unwrap()
+            .get(format!("http://{redirect_address}/source"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        server.join().unwrap();
+        assert!(matches!(
+            target.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
     }
 }
