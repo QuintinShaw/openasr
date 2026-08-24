@@ -618,6 +618,7 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                     "active_compute": None,
                     "completed": {},
                     "capture": None,
+                    "compute_captures": [],
                     "poisoned": False,
                     "dropped": False,
                     "last_compute": 0,
@@ -644,7 +645,11 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                 state["input"] = input_generation
             elif kind == "capture_executable_created":
                 capture = event.get("capture_executable_generation")
-                if not positive_int(capture):
+                if (
+                    not positive_int(capture)
+                    or (state["capture"] is not None and capture <= state["capture"])
+                    or event.get("change") not in {"instantiated", "updated", "replaced"}
+                ):
                     raise MatrixError(f"{path} contains an invalid capture executable generation")
                 state["capture"] = capture
             elif kind == "compute_started":
@@ -662,6 +667,7 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                 if event.get("capture_executable_generation") != state["capture"]:
                     raise MatrixError(f"{path} compute capture generation was not observed from a backend API event")
                 state["active_compute"] = compute
+                state["compute_captures"].append(state["capture"])
             elif kind == "compute_completed":
                 compute = event.get("compute_sequence")
                 output = event.get("output_generation")
@@ -777,7 +783,14 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
         "margins": margins,
         "logits_digests": logits_digests,
         "actual_device": actual_device,
-        "lifecycle_kinds": lifecycle_kinds,
+        "lifecycle_kinds": sorted(lifecycle_kinds),
+        "capture_generation_observed": any(
+            state["capture"] is not None for state in graph_states.values()
+        ),
+        "capture_generation_consumed": any(
+            any(generation is not None for generation in state["compute_captures"])
+            for state in graph_states.values()
+        ),
     }
 
 
@@ -815,6 +828,9 @@ def parse_trace_artifact(path: Path) -> dict[str, Any]:
             step: event["sha256"]
             for step, event in trace["logits_digests"].items()
         },
+        "lifecycle_kinds": trace["lifecycle_kinds"],
+        "capture_generation_observed": trace["capture_generation_observed"],
+        "capture_generation_consumed": trace["capture_generation_consumed"],
     }
 
 
@@ -834,6 +850,25 @@ def parse_cpu_oracle_trace(path: Path) -> dict[str, Any]:
             step: event["token_id"] for step, event in trace["tokens"].items()
         },
     }
+
+
+def _require_trace_capture_policy(
+    path: Path, semantics: dict[str, Any], capture_mode: str
+) -> None:
+    capture_observed = semantics["capture_generation_observed"]
+    capture_consumed = semantics["capture_generation_consumed"]
+    if capture_mode == "enabled":
+        if not capture_observed or not capture_consumed:
+            raise MatrixError(
+                f"{path} capture-enabled lane lacks a native executable generation and a compute that consumed it"
+            )
+    elif capture_mode in {"disabled", "unsupported"}:
+        if capture_observed or capture_consumed:
+            raise MatrixError(
+                f"{path} capture-disabled/unsupported lane unexpectedly observed a native executable"
+            )
+    else:
+        raise MatrixError(f"{path} has invalid capture policy {capture_mode!r}")
 
 def _evidence_for(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     document = _read(path)
@@ -1180,6 +1215,7 @@ def closed_receipt_keys(
                 raise MatrixError(f"{path} trace header does not match receipt execution identity")
             if semantics["actual_device"] != evidence.get("actual_device"):
                 raise MatrixError(f"{path} trace actual-device facts do not match receipt evidence")
+            _require_trace_capture_policy(path, semantics, lane["capture_mode"])
             if lane["output_plan"]["requires_complete_output"]:
                 logits = trace.get("logits")
                 if not isinstance(logits, dict) or not _hex_digest(logits.get("sha256")):

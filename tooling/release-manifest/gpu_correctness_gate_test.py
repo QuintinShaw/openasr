@@ -225,6 +225,21 @@ class GpuCorrectnessGateTests(unittest.TestCase):
                 "top1_top2_margin": 0.5,
             },
         ]
+        if observed_provider == "hip":
+            events[4]["sequence"] = 5
+            events[4]["capture_executable_generation"] = 10
+            events[5]["sequence"] = 6
+            events[6]["sequence"] = 7
+            events.insert(
+                4,
+                {
+                    **route,
+                    "event": "capture_executable_created",
+                    "sequence": 4,
+                    "capture_executable_generation": 10,
+                    "change": "instantiated",
+                },
+            )
         return "\n".join(json.dumps(event) for event in events) + "\n"
 
     def receipt(self, cell: dict, evidence_class: str, mode: str) -> dict:
