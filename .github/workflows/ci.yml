@@ -132,6 +132,26 @@ jobs:
       - name: Doctests
         run: cargo test --workspace --doc
 
+  windows-core-compile:
+    name: Windows core compile gate
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-core-compile
+      # The Linux system-audio cross-check does not compile openasr-core's
+      # cfg(windows) trust and plugin-loading paths. Keep one native Windows
+      # compile gate so platform-only production code cannot merge unparsed.
+      - run: cargo check --locked -p openasr-core
+
   system-audio-macos:
     runs-on: macos-latest
     steps:

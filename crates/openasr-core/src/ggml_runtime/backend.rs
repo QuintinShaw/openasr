@@ -984,6 +984,9 @@ fn lock_verified_backend_load_files(
     plugin_path: &Path,
     dependency_dirs: &[PathBuf],
 ) -> Result<Vec<std::fs::File>, BackendPluginActivationError> {
+    use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
     fn collect_dlls(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
         for entry in std::fs::read_dir(directory)? {
             let entry = entry?;
