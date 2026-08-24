@@ -111,7 +111,12 @@ def _advertised_providers(descriptor: dict[str, Any]) -> list[tuple[str, str, li
 
 def _lane_policies(provider: str) -> tuple[str, str, str]:
     """Return explicit staging policies, not claims of successful hardware runs."""
-    capture = "enabled" if provider == "hip" else "disabled"
+    # HIP is the sole shipping lane compiled with executable-graph capture.
+    # CUDA is currently built with GGML_CUDA_GRAPHS=OFF; CPU, Vulkan, and
+    # Metal expose no equivalent executable-capture path. Those lanes are
+    # unsupported rather than runtime-disabled. A future runtime toggle is a
+    # distinct `disabled` cell and must provide a native disabled observation.
+    capture = "enabled" if provider == "hip" else "unsupported"
     scheduler = "disabled"
     # Production reuse evidence is currently Unknown, so qualification must
     # exercise the shipped FreshGraph plan in both cold- and warm-process rows.
@@ -618,6 +623,10 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                     "active_compute": None,
                     "completed": {},
                     "capture": None,
+                    "capture_supported": None,
+                    "capture_enabled": None,
+                    "capture_state_observed": False,
+                    "capture_present_observed": False,
                     "compute_captures": [],
                     "poisoned": False,
                     "dropped": False,
@@ -643,12 +652,42 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                 if not positive_int(input_generation) or not positive_int(event.get("bytes")):
                     raise MatrixError(f"{path} contains an invalid input write generation")
                 state["input"] = input_generation
+            elif kind == "capture_state_observed":
+                supported = event.get("capture_supported")
+                enabled = event.get("capture_enabled")
+                executable_present = event.get("executable_present")
+                if (
+                    not all(isinstance(value, bool) for value in (supported, enabled, executable_present))
+                    or (enabled and not supported)
+                    or (executable_present and not enabled)
+                    or (
+                        state["capture_supported"] is not None
+                        and state["capture_supported"] != supported
+                    )
+                    or (
+                        state["capture_enabled"] is not None
+                        and state["capture_enabled"] != enabled
+                    )
+                    or (
+                        state["capture_present_observed"]
+                        and not executable_present
+                    )
+                ):
+                    raise MatrixError(f"{path} contains an invalid or drifting native capture state")
+                state["capture_supported"] = supported
+                state["capture_enabled"] = enabled
+                state["capture_state_observed"] = True
+                state["capture_present_observed"] |= executable_present
             elif kind == "capture_executable_created":
                 capture = event.get("capture_executable_generation")
                 if (
                     not positive_int(capture)
                     or (state["capture"] is not None and capture <= state["capture"])
                     or event.get("change") not in {"instantiated", "updated", "replaced"}
+                    or not state["capture_state_observed"]
+                    or not state["capture_supported"]
+                    or not state["capture_enabled"]
+                    or not state["capture_present_observed"]
                 ):
                     raise MatrixError(f"{path} contains an invalid capture executable generation")
                 state["capture"] = capture
@@ -777,6 +816,14 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
         raise MatrixError(
             f"{path} has no single graph generation with a complete observed compute/read lifecycle"
         )
+    computed_states = [
+        state for state in graph_states.values() if state["last_compute"] > 0
+    ]
+    capture_state_modes = {
+        (state["capture_supported"], state["capture_enabled"])
+        for state in computed_states
+        if state["capture_state_observed"]
+    }
     return header, {
         "tokens": tokens,
         "topks": topks,
@@ -784,6 +831,14 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
         "logits_digests": logits_digests,
         "actual_device": actual_device,
         "lifecycle_kinds": sorted(lifecycle_kinds),
+        "computed_graph_count": len(computed_states),
+        "capture_state_graph_count": sum(
+            bool(state["capture_state_observed"]) for state in computed_states
+        ),
+        "capture_state_modes": capture_state_modes,
+        "capture_executable_present_observed": any(
+            state["capture_present_observed"] for state in computed_states
+        ),
         "capture_generation_observed": any(
             state["capture"] is not None for state in graph_states.values()
         ),
@@ -829,6 +884,12 @@ def parse_trace_artifact(path: Path) -> dict[str, Any]:
             for step, event in trace["logits_digests"].items()
         },
         "lifecycle_kinds": trace["lifecycle_kinds"],
+        "computed_graph_count": trace["computed_graph_count"],
+        "capture_state_graph_count": trace["capture_state_graph_count"],
+        "capture_state_modes": trace["capture_state_modes"],
+        "capture_executable_present_observed": trace[
+            "capture_executable_present_observed"
+        ],
         "capture_generation_observed": trace["capture_generation_observed"],
         "capture_generation_consumed": trace["capture_generation_consumed"],
     }
@@ -855,17 +916,45 @@ def parse_cpu_oracle_trace(path: Path) -> dict[str, Any]:
 def _require_trace_capture_policy(
     path: Path, semantics: dict[str, Any], capture_mode: str
 ) -> None:
+    computed_graphs = semantics["computed_graph_count"]
+    observed_graphs = semantics["capture_state_graph_count"]
+    observed_modes = semantics["capture_state_modes"]
+    executable_present = semantics["capture_executable_present_observed"]
     capture_observed = semantics["capture_generation_observed"]
     capture_consumed = semantics["capture_generation_consumed"]
     if capture_mode == "enabled":
-        if not capture_observed or not capture_consumed:
+        if (
+            computed_graphs == 0
+            or observed_graphs != computed_graphs
+            or observed_modes != {(True, True)}
+            or not executable_present
+            or not capture_observed
+            or not capture_consumed
+        ):
             raise MatrixError(
-                f"{path} capture-enabled lane lacks a native executable generation and a compute that consumed it"
+                f"{path} capture-enabled lane lacks observed native enablement, an executable generation, and a compute that consumed it"
             )
-    elif capture_mode in {"disabled", "unsupported"}:
-        if capture_observed or capture_consumed:
+    elif capture_mode == "disabled":
+        if (
+            computed_graphs == 0
+            or observed_graphs != computed_graphs
+            or observed_modes != {(True, False)}
+            or executable_present
+            or capture_observed
+            or capture_consumed
+        ):
             raise MatrixError(
-                f"{path} capture-disabled/unsupported lane unexpectedly observed a native executable"
+                f"{path} capture-disabled lane lacks observed native disablement or unexpectedly observed an executable"
+            )
+    elif capture_mode == "unsupported":
+        if (
+            observed_modes not in (set(), {(False, False)})
+            or executable_present
+            or capture_observed
+            or capture_consumed
+        ):
+            raise MatrixError(
+                f"{path} capture-unsupported lane unexpectedly observed native capture support or an executable"
             )
     else:
         raise MatrixError(f"{path} has invalid capture policy {capture_mode!r}")

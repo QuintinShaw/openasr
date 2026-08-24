@@ -226,16 +226,27 @@ class GpuCorrectnessGateTests(unittest.TestCase):
             },
         ]
         if observed_provider == "hip":
-            events[4]["sequence"] = 5
+            events[4]["sequence"] = 6
             events[4]["capture_executable_generation"] = 10
-            events[5]["sequence"] = 6
-            events[6]["sequence"] = 7
+            events[5]["sequence"] = 7
+            events[6]["sequence"] = 8
             events.insert(
                 4,
                 {
                     **route,
-                    "event": "capture_executable_created",
+                    "event": "capture_state_observed",
                     "sequence": 4,
+                    "capture_supported": True,
+                    "capture_enabled": True,
+                    "executable_present": True,
+                },
+            )
+            events.insert(
+                5,
+                {
+                    **route,
+                    "event": "capture_executable_created",
+                    "sequence": 5,
                     "capture_executable_generation": 10,
                     "change": "instantiated",
                 },
