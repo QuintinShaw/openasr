@@ -38,6 +38,126 @@ host has no CUDA, physical Vulkan, or HIP/ROCm lane, and its plugin host is
 including HIP capture-on and the original Windows CUDA fp16 reproduction, are
 not passes and remain non-activatable until release-bound receipts are returned.
 
+## Accepted completion program
+
+The remaining work is an implementation program, not a permanent
+`BLOCKED_BY_HARNESS` disposition. The program is complete only after the shared
+runtime can produce and the release gate can consume real provider evidence for
+the layers below.
+
+### Current diagnostic limitations
+
+The following baseline outputs must not be promoted into stronger claims:
+
+- `generate_backend_hardware_evidence.py` produces artifact-bound FullDevice
+  placement/resource evidence for HIP or CUDA. It does not prove token parity,
+  graph reuse, ownership lifecycle, or product behavior.
+- an ordinary `bench-receipt short-audio --trace-out` run is a request-scoped
+  runtime diagnostic, but its receipt currently carries no versioned correctness
+  evidence and cannot close the final matrix;
+- `graph_rebuilt=true` in the current short-audio diagnostic is derived from the
+  selected `FreshGraph` plan. It is not an observation that a graph instance was
+  created, prepared, or rebuilt; and
+- the Desktop JavaScript plugin-switch runner is a machine-protocol smoke. It
+  does not start the packaged Tauri application or traverse the production
+  kernel-switch transaction and `DaemonSupervisor`.
+
+These limitations are required producer work. They are not waivers.
+
+### Exact capability cell
+
+Activation evidence is keyed at least by:
+
+```text
+release subject
+x core / host ABI
+x binary / plugin artifact identity
+x pack content identity
+x family / model / quant
+x topology
+x provider
+x concrete target or explicitly approved target set
+x placement / output plan
+x capture / scheduler mode
+x evidence revision
+x Auto / Explicit activation mode
+```
+
+Exact target is the default. Cross-target approval requires a separately
+reviewed equivalence proof and an `approved_target_set` digest. Provider hardware
+schema v2 may project genuinely target-invariant build or packaging properties;
+it cannot project family token correctness from one gfx/SM target to another.
+
+Base `FullLogits + FreshGraph` execution, native compact selection, persistent
+graph reuse, and graph capture are independent capabilities. Passing one never
+authorizes another.
+
+The runtime ownership and activation contract owns the typed approval path from
+an `ExecutionCandidate` to an `ApprovedExecutionCandidate`. This contract
+requires that the approval bind the exact output/reuse plan and that no family
+code parse a provider, catalog, matrix, or approval record.
+
+### Observed graph lifecycle
+
+Formal graph evidence is emitted at the shared ggml runtime events where the
+operation actually occurs. It contains bounded, opaque process-local identities
+for:
+
+- graph instance and generation;
+- prepare generation;
+- compute sequence;
+- rebuild event and typed reason;
+- input, output, and KV write generations plus the generation actually consumed;
+- HIP capture executable generation;
+- graph poison; and
+- graph drop.
+
+Native pointers are never serialized. IDs are never compared across daemon
+starts. Planner state, `Option<prepared_graph>`, provider labels, and reuse mode
+cannot synthesize these events.
+
+The evidence must prove that fresh steps use distinct graph generations, reuse
+retains the intended graph/capture executable, refreshed input/output/KV state is
+consumed by the correct compute, topology changes rebuild for the declared
+reason, and poisoned graphs cannot execute or re-enter a cache.
+
+### Required shared producers
+
+One backend-neutral implementation serves HIP, physical Vulkan, and CUDA:
+
+1. An exact-route Layer-1 producer runs the final binary/plugin on the selected
+   physical device and covers the complete semantic selector fixture set.
+2. A capture-aware Layer-2 producer verifies actual persistent input/output/KV
+   refresh, topology rebuild, scheduler/capture identity, poison/drop, and
+   fresh/reuse behavior.
+3. A production-shape four-quadrant producer runs A/B/C/D in independent runtime
+   instances. Unsupported C/D cells remain explicit and non-activatable.
+4. A real-family producer fills the existing `ShortAudioReceipt evidence.v1`
+   schema with complete artifact/matrix bindings, token traces, required
+   logits/scores artifacts, actual graph lifecycle, and cold plus same-process
+   warm/reuse evidence.
+5. The artifact-bound hardware producer is generalized to physical Vulkan
+   without allowing software Vulkan to populate a physical-device cell.
+
+The real-family producer must emit the separate `placement_resource` and
+`token_transcript` evidence classes expected by the common gate. A diagnostic
+receipt whose evidence field is absent remains non-authorizing.
+
+### Product and release interaction
+
+The Desktop product gate launches the packaged Tauri application and enters
+through public IPC, production `kernel_switch_neutral_impl`, the production
+`DaemonSupervisor`, real transcription, persistence, and rollback. Direct core
+CLI control, handwritten Desktop state, or script-simulated rollback cannot
+populate that gate.
+
+Artifact publication and capability activation are separate gates. A final CUDA
+artifact may be published inert for qualification, but ordinary Auto, Explicit,
+and Desktop execution cannot see it until exact cells close and a separately
+authorized signed capability/catalog epoch activates them. The ownership and
+activation contract owns qualification, old-client rejection, revocation, and
+the publication sequence.
+
 This design complements [GPU weight placement](gpu-weight-placement.md),
 [Decoder state and native memory planning](decoder-state-memory-planning.md),
 [Runtime source preflight](runtime-source-preflight.md), and the

@@ -48,6 +48,198 @@ and HIP/ROCm (including HIP capture-on), plus the Windows neutral-dynamic
 plugin-switch product flow, still require release-bound real-host receipts. The
 gate must remain closed while those cells are missing, stale, or unavailable.
 
+## Accepted completion program
+
+The remaining work completes the release and real-host portions of this
+contract. Existing HTTP ownership snapshots and deterministic tests are strong
+diagnostics, but they are not a substitute for the artifact-bound ownership,
+pressure, capability, and product gates defined here.
+
+### Orthogonal artifact and capability state
+
+Publication is not a linear state enum. It is the product of two dimensions:
+
+- artifact state is `compiled` or `published` and is proven by immutable release
+  subjects, hashes, checksums, and attestations;
+- capability state is `qualification_only`, `activatable`, or `revoked` and is
+  derived from signed capability/catalog state plus complete exact-cell
+  receipts.
+
+Architecture inventory describes code and topology; it is not the mutable
+publication authority.
+
+A qualification manifest may contain only the release subject, binary/plugin/
+vendor hashes, host ABI, provider target, attestation, and immutable download
+locations. It carries no activation modes and never enters ordinary runtime
+candidate generation.
+
+Before qualification succeeds, the ordinary capability-aware runtime catalog
+contains no CUDA candidate compatible with the new host ABI. The explicit
+qualification runner consumes the signed manifest in an isolated child process
+using the exact final release bytes. It refuses the real user home, does not
+write ordinary `active.json`, accepts no arbitrary plugin path, and exposes no
+Auto or Explicit activation path.
+
+### Old-client rejection
+
+An unknown ordinary catalog field is not an old-client gate. The first
+capability-aware release must:
+
+1. bump `BACKEND_HOST_ABI_SCHEMA_VERSION` so previous stable clients hide or
+   reject every new qualification artifact;
+2. carry backend `min_cli_version` into `ResolvedCatalogBackendPull` and enforce
+   it during resolve, prepare, and install;
+3. set a later public CUDA entry's minimum version to the first
+   capability-aware stable release; and
+4. run the previous stable binary as a black box and prove the new entry cannot
+   resolve, install, or activate.
+
+After qualification, a public CUDA entry binds the new ABI, minimum CLI version,
+release subject, artifact identity, and signed capability matrix digest/epoch.
+`active.json` remains only an atomic pointer and never substitutes for the
+current signed catalog or capability proof.
+
+Legacy-ABI entries require signed tombstone/removal semantics. An offline client
+cannot know a tombstone it has not downloaded; this limitation is documented and
+does not justify forced networking or phone-home behavior.
+
+### Typed exact-cell approval
+
+`ExecutionCandidate` remains a pure device/placement type. Once the verified
+pack, family, quant, topology, candidate, output plan, and reuse plan are known,
+the shared `CapabilityApprovalResolver` performs an O(1) typed lookup against an
+immutable, already verified in-process `CapabilityApprovalSnapshot` and returns
+an `ApprovedExecutionCandidate`.
+
+Only the approved type may enter activation, request dispatch, resident owner/
+cache identity, or release-bound receipts. Family code cannot parse provider
+names, catalogs, matrices, or approval records.
+
+Approval is checked at four boundaries:
+
+1. catalog resolve/prepare/install validates artifact publication and host
+   compatibility;
+2. plugin activation validates artifact-level capability proof;
+3. daemon boot revalidates current signed catalog, epoch, matrix digest, and
+   tombstones; and
+4. model activation plus every request candidate generation validates the exact
+   family/model/quant/topology/provider/target/plan/mode cell.
+
+Approval epoch and matrix digest partition owner/cache identity. After a
+tombstone or epoch change, an old owner cannot be checked out by a new session.
+No network access, signature verification, or JSON parsing occurs on the request
+hot path.
+
+### Artifact-bound ownership evidence
+
+`openasr.runtime-ownership-receipt.v1` remains the production diagnostic
+snapshot for owner/resource/domain/lifecycle/completeness and ledger facts. Its
+random redaction key belongs to one service root, so redacted identities are not
+compared across daemon starts.
+
+Formal release evidence wraps, rather than replaces, those snapshots:
+
+```text
+artifact-bound ownership evidence envelope
+|- release / core / plugin / pack / catalog bindings
+|- ordered phase list
+|- daemon start identity per phase
+|- request / activation receipt bindings
+|- hashes of runtime-ownership-receipt.v1 snapshots
+|- expected transition assertions
+`- final result
+```
+
+The envelope is not an admission or policy authority. Cross-process continuity
+uses pack SHA, artifact identity, phase order, and daemon start identity. Within
+one process, request facts, doctor, and plugin activation attestation bind the
+raw selected device to the HTTP snapshot's redacted lane identity without
+publishing sensitive raw identifiers. The finalizer verifies every referenced
+snapshot and receipt hash.
+
+### Deterministic and real pressure gates
+
+Both gates require a causal state transition.
+
+The deterministic race requires:
+
+```text
+baseline forecast succeeds
+-> broker/native facts change
+-> activation reads fresh facts and rejects reserve
+-> old durable/live runtime remains
+-> staged owners release or quarantine correctly
+-> ledger reconciliation matches
+```
+
+The Windows real-host gate uses a repository-owned helper that actually commits
+and touches memory. It preserves absolute and proportional available-memory
+safety floors, refuses to cross either floor, has a hard timeout, runs inside a
+Job Object with kill-on-close, cleans up on parent death, continuously checks the
+floor, never locks pages, and releases all memory after every terminal path.
+
+A passing real-host sequence requires:
+
+```text
+same pack/exact lane is admissible and old runtime is active
+-> pressure helper becomes ready
+-> native observation crosses the rejection threshold
+-> the same candidate fails activation on a fresh observation
+-> old durable selection remains unchanged
+-> old live runtime completes a real transcription
+-> staged owners clean up and ledger reconciliation matches
+-> helper exits and available memory/observation recover
+```
+
+If the baseline already fails, the helper does not cross the boundary, crossing
+would violate a safety floor, the failure identity changes, or cleanup/recovery
+is incomplete, the result is `UNAVAILABLE`, `BLOCKED_BY_HARNESS`, or `FAIL`, not
+PASS.
+
+### Revocation and safe restart
+
+A downloaded signed tombstone supersedes cached approval. New activations and
+sessions cannot enter the revoked lane, and old owners cannot be checked out.
+An in-progress native call is not interrupted by unloading its DLL. The daemon
+drains it, blocks new work, and restarts onto a bundled approved backend. The
+offline client continues to use its last locally verified signed state until a
+new state is explicitly obtained.
+
+### Release sequence
+
+The release pipeline has two separately authorized gates:
+
+1. finish the implementation and local/HIP/physical-Vulkan evidence;
+2. publish the formal capability-aware release and inert CUDA qualification
+   assets only after explicit user approval;
+3. run the qualification runner on the external CUDA host using those exact
+   published bytes;
+4. bind passing receipts to exact capability cells;
+5. publish a signed capability/catalog epoch only after a second explicit user
+   approval; and
+6. activate those cells in the already-published runtime version without
+   creating a second binary release.
+
+If qualification fails, the assets stay inert and the code fix enters a later
+version.
+
+### Completion workstreams
+
+The coordinated program consists of six workstreams:
+
+1. exact-route Layer 1, capture-aware Layer 2, production-shape four-quadrant,
+   and observed graph lifecycle shared by HIP, physical Vulkan, and CUDA;
+2. formal real-family `ShortAudioReceipt evidence.v1` production with complete
+   logits/token traces and matrix binding;
+3. physical Vulkan artifact-bound hardware evidence;
+4. packaged Tauri product E2E through public IPC, the production kernel-switch
+   transaction, `DaemonSupervisor`, real transcription, persistence, and
+   rollback;
+5. artifact-publication/capability-activation gates, qualification, exact-cell
+   approval, old-client rejection, and signed revocation; and
+6. the ownership evidence envelope, finalizer consumption, deterministic race,
+   and safe real-host pressure/rollback harness.
+
 ## Executive decision
 
 The Windows FireRed failure that motivated this design is not a broker arithmetic
