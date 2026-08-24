@@ -8,7 +8,7 @@
 use std::{
     cell::RefCell,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -36,8 +36,22 @@ pub struct GgmlActualDeviceFacts {
 
 static NEXT_OPAQUE_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+thread_local! {
+    static TEST_OPAQUE_ID_MINT_COUNT: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 pub(crate) fn mint_opaque_graph_id() -> u64 {
+    #[cfg(test)]
+    TEST_OPAQUE_ID_MINT_COUNT.with(|count| count.set(count.get().saturating_add(1)));
     NEXT_OPAQUE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn test_opaque_graph_id_mint_count() -> u64 {
+    TEST_OPAQUE_ID_MINT_COUNT.with(std::cell::Cell::get)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +152,20 @@ pub struct GgmlGraphLifecycleCollector {
     state: Arc<Mutex<LifecycleState>>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct GgmlGraphLifecycleGeneration {
+    collector_state: Weak<Mutex<LifecycleState>>,
+    graph_generation: u64,
+}
+
+impl GgmlGraphLifecycleGeneration {
+    pub(crate) fn generation_for(&self, collector: &GgmlGraphLifecycleCollector) -> Option<u64> {
+        let current = Arc::downgrade(&collector.state);
+        (self.collector_state.strong_count() > 0 && Weak::ptr_eq(&self.collector_state, &current))
+            .then_some(self.graph_generation)
+    }
+}
+
 impl GgmlGraphLifecycleCollector {
     pub fn new() -> Self {
         Self::default()
@@ -155,6 +183,16 @@ impl GgmlGraphLifecycleCollector {
         GgmlGraphLifecycleSnapshot {
             events: state.events.clone(),
             overflowed: state.overflowed,
+        }
+    }
+
+    pub(crate) fn observed_generation(
+        &self,
+        graph_generation: u64,
+    ) -> GgmlGraphLifecycleGeneration {
+        GgmlGraphLifecycleGeneration {
+            collector_state: Arc::downgrade(&self.state),
+            graph_generation,
         }
     }
 

@@ -5,7 +5,7 @@
 //! backend label, environment variable, or CLI policy option after execution.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -213,6 +213,9 @@ struct ReceiptState {
     terminal: Option<RequestExecutionTerminal>,
     timeline_conflicted: bool,
     facts: Option<NativeExecutionRequestFacts>,
+    /// Live backend handles whose runner-cached device facts were already
+    /// checked during this candidate attempt.
+    observed_backend_identities: BTreeSet<usize>,
     placement: GgmlExecutionPlacementSummary,
     trace_events: Vec<String>,
     token_steps: Vec<NativeExecutionTokenStep>,
@@ -305,6 +308,7 @@ impl NativeExecutionReceiptCollector {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.facts = None;
+        state.observed_backend_identities.clear();
         state.placement = GgmlExecutionPlacementSummary::default();
         state.trace_events.clear();
         state.token_steps.clear();
@@ -326,6 +330,7 @@ impl NativeExecutionReceiptCollector {
             self.graph_lifecycle
                 .truncate(state.graph_lifecycle_checkpoint);
             state.facts = None;
+            state.observed_backend_identities.clear();
             state.placement = GgmlExecutionPlacementSummary::default();
             state.trace_events.clear();
             state.token_steps.clear();
@@ -358,6 +363,7 @@ impl NativeExecutionReceiptCollector {
 
     pub(crate) fn record_backend_observation(
         &self,
+        backend_identity: usize,
         provider: ExecutionProvider,
         stable_device_id: &str,
         actual_device: &GgmlActualDeviceFacts,
@@ -367,10 +373,13 @@ impl NativeExecutionReceiptCollector {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let backend_was_observed = state
+            .observed_backend_identities
+            .contains(&backend_identity);
         let Some(facts) = state.facts.as_mut() else {
             return;
         };
-        if facts
+        let route_drifted = facts
             .actual_provider
             .is_some_and(|actual| actual != provider)
             || facts
@@ -378,20 +387,36 @@ impl NativeExecutionReceiptCollector {
                 .as_deref()
                 .is_some_and(|actual| actual != stable_device_id)
             || facts
+                .scheduler_enabled
+                .is_some_and(|actual| actual != scheduler_enabled);
+        // Full device facts are immutable for one verified live backend
+        // handle. Recheck a newly observed handle once, while the per-compute
+        // hot path continues to attest provider, stable id, and scheduler.
+        let new_backend_device_drifted = !backend_was_observed
+            && facts
                 .actual_device
                 .as_ref()
-                .is_some_and(|actual| actual != actual_device)
-            || facts
-                .scheduler_enabled
-                .is_some_and(|actual| actual != scheduler_enabled)
-        {
+                .is_some_and(|actual| actual != actual_device);
+        if route_drifted || new_backend_device_drifted {
             state.facts = None;
+            state.observed_backend_identities.clear();
             return;
         }
-        facts.actual_provider = Some(provider);
-        facts.actual_stable_device_id = Some(stable_device_id.to_string());
-        facts.actual_device = Some(actual_device.clone());
-        facts.scheduler_enabled = Some(scheduler_enabled);
+        if facts.actual_provider.is_none() {
+            facts.actual_provider = Some(provider);
+        }
+        if facts.actual_stable_device_id.is_none() {
+            facts.actual_stable_device_id = Some(stable_device_id.to_string());
+        }
+        if facts.actual_device.is_none() {
+            facts.actual_device = Some(actual_device.clone());
+        }
+        if facts.scheduler_enabled.is_none() {
+            facts.scheduler_enabled = Some(scheduler_enabled);
+        }
+        if !backend_was_observed {
+            state.observed_backend_identities.insert(backend_identity);
+        }
     }
 
     pub(crate) fn record_placement(&self, placement: GgmlExecutionPlacementSummary) {
@@ -749,6 +774,7 @@ mod tests {
                 scheduler_enabled: None,
             });
             receipt.record_backend_observation(
+                1,
                 ExecutionProvider::Cpu,
                 "CPU",
                 &test_actual_device(),
@@ -865,6 +891,7 @@ mod tests {
         receipt.begin_candidate_attempt();
         receipt.record_facts(facts);
         receipt.record_backend_observation(
+            1,
             ExecutionProvider::Cpu,
             "CPU",
             &test_actual_device(),
@@ -920,6 +947,7 @@ mod tests {
         receipt.begin_candidate_attempt();
         receipt.record_facts(seq2seq_facts());
         receipt.record_backend_observation(
+            1,
             ExecutionProvider::Cpu,
             "CPU",
             &test_actual_device(),
@@ -947,6 +975,7 @@ mod tests {
         receipt.begin_candidate_attempt();
         receipt.record_facts(seq2seq_facts());
         receipt.record_backend_observation(
+            1,
             ExecutionProvider::Cpu,
             "CPU",
             &test_actual_device(),

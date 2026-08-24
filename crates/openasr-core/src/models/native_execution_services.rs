@@ -1072,6 +1072,7 @@ pub(crate) fn record_current_execution_backend_observation(
 ) {
     if let Some(receipt) = current_execution_receipt_collector() {
         receipt.record_backend_observation(
+            backend_identity,
             actual_provider,
             actual_stable_id,
             actual_device,
