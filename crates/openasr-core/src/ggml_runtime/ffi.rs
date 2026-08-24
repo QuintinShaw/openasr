@@ -116,6 +116,9 @@ pub(crate) const GGML_STATUS_EXECUTION_FAILED: c_int = 2;
 pub(crate) const GGML_STATUS_DEVICE_LOST: c_int = 3;
 pub(crate) const GGML_STATUS_BACKEND_POISONED: c_int = 4;
 pub(crate) const GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_MAY_HAVE_MUTATED: u32 = 1 << 0;
+pub(crate) const GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_RELEASE_PROVEN: u32 = 1 << 1;
+pub(crate) const GGML_GALLOCR_MEASURE_COMMIT_MAY_HAVE_MUTATED: u32 = 1 << 0;
+pub(crate) const GGML_GALLOCR_MEASURE_COMMIT_RELEASE_UNPROVEN: u32 = 1 << 1;
 pub(crate) const GGML_BACKEND_GRAPH_CANCEL_DISABLED: c_int = 0;
 pub(crate) const GGML_BACKEND_GRAPH_CANCEL_NATIVE: c_int = 1;
 pub(crate) const GGML_BACKEND_GRAPH_CANCEL_SEGMENTED: c_int = 2;
@@ -328,9 +331,6 @@ pub(crate) struct GgmlBackendMemoryApiV1 {
     pub quarantine: Option<GgmlMemoryQuarantineFn>,
 }
 
-pub(crate) type GgmlBackendMemoryGetApiV1Fn =
-    unsafe extern "C" fn() -> *const GgmlBackendMemoryApiV1;
-
 /// ggml abort predicate: return true to abort the in-flight graph. Called from
 /// ggml worker threads -- must stay panic-free and lock-light.
 pub(crate) type GgmlAbortCallback = Option<unsafe extern "C" fn(data: *mut c_void) -> bool>;
@@ -399,6 +399,7 @@ pub(crate) const GGUF_TYPE_UINT64: c_int = 10;
 unsafe extern "C" {
     pub(crate) fn ggml_backend_name(backend: GgmlBackendRaw) -> *const c_char;
     pub(crate) fn ggml_backend_free(backend: GgmlBackendRaw);
+    pub(crate) fn ggml_backend_free_status(backend: GgmlBackendRaw) -> c_int;
     pub(crate) fn ggml_backend_init_best() -> GgmlBackendRaw;
     pub(crate) fn ggml_backend_init_by_type(
         dev_type: c_int,
@@ -440,7 +441,12 @@ unsafe extern "C" {
     ) -> GgmlBackendRegRaw;
     pub(crate) fn ggml_backend_unload(reg: GgmlBackendRegRaw);
     pub(crate) fn ggml_backend_reg_name(reg: GgmlBackendRegRaw) -> *const c_char;
-    pub(crate) fn ggml_backend_buffer_free(buffer: GgmlBackendBufferRaw);
+    pub(crate) fn ggml_backend_dev_pci_vendor_id(device: GgmlBackendDevRaw) -> u32;
+    pub(crate) fn ggml_backend_set_n_threads_if_supported(
+        backend: GgmlBackendRaw,
+        n_threads: c_int,
+    ) -> c_int;
+    pub(crate) fn ggml_backend_buffer_free_status(buffer: GgmlBackendBufferRaw) -> c_int;
     pub(crate) fn ggml_backend_buffer_is_host(buffer: GgmlBackendBufferRaw) -> bool;
     pub(crate) fn ggml_backend_buffer_set_usage(buffer: GgmlBackendBufferRaw, usage: c_int);
     // Keep raw graph execution inside ggml_runtime. Model families must use
@@ -465,7 +471,7 @@ unsafe extern "C" {
         parallel: bool,
         op_offload: bool,
     ) -> GgmlBackendSchedRaw;
-    pub(crate) fn ggml_backend_sched_free(sched: GgmlBackendSchedRaw);
+    pub(crate) fn ggml_backend_sched_free_status(sched: GgmlBackendSchedRaw) -> c_int;
     pub(crate) fn ggml_backend_sched_reset(sched: GgmlBackendSchedRaw);
     pub(crate) fn ggml_backend_sched_get_tensor_backend(
         sched: GgmlBackendSchedRaw,
@@ -489,6 +495,48 @@ unsafe extern "C" {
         out_flags: *mut u32,
     ) -> c_int;
     pub(crate) fn ggml_backend_sched_memory_plan_free_v1(plan: GgmlBackendSchedMemoryPlanRaw);
+    pub(crate) fn ggml_backend_memory_api_for_backend_v1(
+        backend: GgmlBackendRaw,
+    ) -> *const GgmlBackendMemoryApiV1;
+    pub(crate) fn ggml_backend_memory_api_get_domains_v1(
+        api: *const GgmlBackendMemoryApiV1,
+        dev: GgmlBackendDevRaw,
+        domains: *mut GgmlBackendMemoryDomainV1,
+        inout_count: *mut u32,
+    ) -> c_int;
+    pub(crate) fn ggml_backend_memory_api_quote_v1(
+        api: *const GgmlBackendMemoryApiV1,
+        requests: *const GgmlBackendMemoryRequestV1,
+        request_count: u32,
+        quote: *mut GgmlBackendMemoryQuoteV1,
+        claims: *mut GgmlBackendMemoryClaimV1,
+        inout_claim_count: *mut u32,
+    ) -> c_int;
+    pub(crate) fn ggml_backend_memory_api_reserve_private_v1(
+        api: *const GgmlBackendMemoryApiV1,
+        requests: *const GgmlBackendMemoryRequestV1,
+        request_count: u32,
+        quote: *const GgmlBackendMemoryQuoteV1,
+        actual: *mut GgmlBackendMemoryClaimV1,
+        inout_actual_count: *mut u32,
+    ) -> c_int;
+    pub(crate) fn ggml_backend_memory_api_get_stats_v1(
+        api: *const GgmlBackendMemoryApiV1,
+        dev: GgmlBackendDevRaw,
+        backend: GgmlBackendRaw,
+        stats: *mut GgmlBackendMemoryStatsV1,
+        inout_count: *mut u32,
+    ) -> c_int;
+    pub(crate) fn ggml_backend_memory_api_trim_v1(
+        api: *const GgmlBackendMemoryApiV1,
+        backend: GgmlBackendRaw,
+        flags: u64,
+    ) -> c_int;
+    pub(crate) fn ggml_backend_memory_api_quarantine_v1(
+        api: *const GgmlBackendMemoryApiV1,
+        backend: GgmlBackendRaw,
+        request: *const GgmlBackendMemoryQuarantineV1,
+    ) -> c_int;
     pub(crate) fn ggml_backend_sched_graph_compute(
         sched: GgmlBackendSchedRaw,
         cgraph: GgmlCgraphRaw,
@@ -537,7 +585,7 @@ unsafe extern "C" {
     ) -> GgmlBackendBufferRaw;
     pub(crate) fn ggml_backend_buffer_get_size(buffer: GgmlBackendBufferRaw) -> usize;
     pub(crate) fn ggml_gallocr_new(buft: GgmlBackendBufferTypeRaw) -> GgmlGallocrRaw;
-    pub(crate) fn ggml_gallocr_free(galloc: GgmlGallocrRaw);
+    pub(crate) fn ggml_gallocr_free_status(galloc: GgmlGallocrRaw) -> c_int;
     pub(crate) fn ggml_gallocr_measure_n_v1(
         galloc: GgmlGallocrRaw,
         graph: GgmlCgraphRaw,
@@ -552,8 +600,14 @@ unsafe extern "C" {
         requested_bytes: *mut u64,
         currently_allocated_bytes: *mut u64,
     ) -> bool;
-    pub(crate) fn ggml_gallocr_measure_commit_v1(galloc: GgmlGallocrRaw) -> bool;
-    pub(crate) fn ggml_gallocr_alloc_graph(galloc: GgmlGallocrRaw, graph: GgmlCgraphRaw) -> bool;
+    pub(crate) fn ggml_gallocr_measure_commit_v2(
+        galloc: GgmlGallocrRaw,
+        out_flags: *mut u32,
+    ) -> c_int;
+    pub(crate) fn ggml_gallocr_alloc_graph_v2(
+        galloc: GgmlGallocrRaw,
+        graph: GgmlCgraphRaw,
+    ) -> c_int;
     // Tensor allocator (ggml-alloc.h): binds tensors into an already-allocated
     // buffer -- the primitive `ggml_backend_alloc_ctx_tensors` itself uses,
     // exposed here to bind the CPU step pool's *reused* buffer without
@@ -595,11 +649,6 @@ unsafe extern "C" {
         device: GgmlBackendDevRaw,
         op: GgmlTensorRaw,
     ) -> bool;
-    pub(crate) fn ggml_backend_dev_backend_reg(device: GgmlBackendDevRaw) -> GgmlBackendRegRaw;
-    pub(crate) fn ggml_backend_reg_get_proc_address(
-        reg: GgmlBackendRegRaw,
-        name: *const c_char,
-    ) -> *mut c_void;
 
     // The host sets CPU threads through the registry proc-address table
     // (`backend_set_n_threads`), which works under GGML_BACKEND_DL where the

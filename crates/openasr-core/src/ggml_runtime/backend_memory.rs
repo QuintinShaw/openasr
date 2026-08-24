@@ -10,18 +10,17 @@ use std::{ffi::c_void, marker::PhantomData, mem, ptr};
 
 use thiserror::Error;
 
-use crate::device::execution_memory::MemoryObservationConfidence;
+use crate::device::execution_memory::{MemoryDomainKey, MemoryObservationConfidence};
 use crate::device::execution_route::ExecutionProvider;
 
 use super::ffi;
-
-const MEMORY_API_PROC: &[u8] = b"ggml_backend_memory_get_api_v1\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackendMemoryLifecyclePoint {
     BackendInitialized,
     AdmissionQuote,
     PostAllocationReconciliation,
+    TerminalFailure,
     AfterGraphCompute,
 }
 
@@ -66,11 +65,53 @@ pub(crate) enum BackendMemoryDomainKind {
     Unknown(u32),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackendDeviceHealth {
+    Healthy,
+    Degraded,
+    Quarantined,
+    DeviceLost,
+    Unavailable,
+    Unknown(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackendTerminalStatusClass {
+    Success,
+    Validation,
+    Capacity,
+    Cancelled,
+    Execution,
+    DeviceLost,
+    BackendPoisoned,
+    Unknown(i32),
+}
+
+impl BackendTerminalStatusClass {
+    fn from_raw(status: i32) -> Self {
+        match status {
+            ffi::GGML_STATUS_SUCCESS => Self::Success,
+            ffi::GGML_STATUS_FAILED => Self::Validation,
+            ffi::GGML_STATUS_ALLOC_FAILED => Self::Capacity,
+            ffi::GGML_STATUS_ABORTED => Self::Cancelled,
+            ffi::GGML_STATUS_EXECUTION_FAILED => Self::Execution,
+            ffi::GGML_STATUS_DEVICE_LOST => Self::DeviceLost,
+            ffi::GGML_STATUS_BACKEND_POISONED => Self::BackendPoisoned,
+            status => Self::Unknown(status),
+        }
+    }
+}
+
 /// Sanitized memory evidence attached to an Exact smoke observation. It never
 /// exposes physical UUIDs, backend pointers, paths, or native error text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SafeBackendMemoryReceipt {
+    pub(crate) provider: ExecutionProvider,
     pub(crate) lifecycle: BackendMemoryLifecyclePoint,
+    pub(crate) device_health: BackendDeviceHealth,
+    pub(crate) last_status: BackendTerminalStatusClass,
+    pub(crate) last_native_error: i64,
+    pub(crate) quarantine_generation: u64,
     pub(crate) domain_kind: Option<BackendMemoryDomainKind>,
     pub(crate) heap_index: Option<u32>,
     pub(crate) total_bytes: BackendMemoryBytes,
@@ -94,9 +135,22 @@ impl SafeBackendMemoryReceipt {
         lifecycle: BackendMemoryLifecyclePoint,
         reason: BackendMemoryUnknownReason,
     ) -> Self {
+        Self::unknown_for_provider(ExecutionProvider::Unknown, lifecycle, reason)
+    }
+
+    fn unknown_for_provider(
+        provider: ExecutionProvider,
+        lifecycle: BackendMemoryLifecyclePoint,
+        reason: BackendMemoryUnknownReason,
+    ) -> Self {
         let value = BackendMemoryBytes::Unknown(reason);
         Self {
+            provider,
             lifecycle,
+            device_health: BackendDeviceHealth::Unavailable,
+            last_status: BackendTerminalStatusClass::Unknown(i32::MIN),
+            last_native_error: 0,
+            quarantine_generation: 0,
             domain_kind: None,
             heap_index: None,
             total_bytes: value,
@@ -146,6 +200,13 @@ impl BackendMemoryAbiError {
     pub(crate) fn may_have_committed_private_state(&self) -> bool {
         matches!(self, Self::ReservePrivatePostCommitCountMismatch { .. })
     }
+
+    pub(crate) fn terminal_status(&self) -> i32 {
+        match self {
+            Self::Status { status, .. } => *status,
+            _ => i32::MAX,
+        }
+    }
 }
 
 fn status(operation: &'static str, value: i32) -> Result<(), BackendMemoryAbiError> {
@@ -183,21 +244,9 @@ impl BackendMemoryAbi {
         if device.is_null() {
             return Err(BackendMemoryAbiError::Unavailable);
         }
-        // SAFETY: `device` came from the live backend.
-        let reg = unsafe { ffi::ggml_backend_dev_backend_reg(device) };
-        if reg.is_null() {
-            return Err(BackendMemoryAbiError::Unavailable);
-        }
-        // SAFETY: NUL-terminated static proc name and live registry.
-        let proc =
-            unsafe { ffi::ggml_backend_reg_get_proc_address(reg, MEMORY_API_PROC.as_ptr().cast()) };
-        if proc.is_null() {
-            return Err(BackendMemoryAbiError::Unavailable);
-        }
-        // SAFETY: the versioned proc name's C contract fixes this signature.
-        let get_api: ffi::GgmlBackendMemoryGetApiV1Fn = unsafe { mem::transmute(proc) };
-        // SAFETY: function pointer was resolved from the backend registry.
-        let raw = unsafe { get_api() };
+        // SAFETY: the shared ggml trampoline owns registry lookup and catches
+        // every provider exception before it can cross this Rust FFI seam.
+        let raw = unsafe { ffi::ggml_backend_memory_api_for_backend_v1(backend) };
         let Some(raw) = (unsafe { raw.as_ref() }) else {
             return Err(BackendMemoryAbiError::Unavailable);
         };
@@ -220,13 +269,17 @@ impl BackendMemoryAbi {
     pub(crate) fn domains(
         &self,
     ) -> Result<Vec<ffi::GgmlBackendMemoryDomainV1>, BackendMemoryAbiError> {
-        let get_domains = self
-            .raw
+        self.raw
             .get_domains
             .ok_or(BackendMemoryAbiError::Incompatible)?;
         let mut count = 0_u32;
         status("domains/count", unsafe {
-            get_domains(self.device, ptr::null_mut(), &mut count)
+            ffi::ggml_backend_memory_api_get_domains_v1(
+                self.raw,
+                self.device,
+                ptr::null_mut(),
+                &mut count,
+            )
         })?;
         let mut domains: Vec<_> = (0..count)
             .map(|_| ffi::GgmlBackendMemoryDomainV1 {
@@ -238,7 +291,12 @@ impl BackendMemoryAbi {
             .collect();
         let mut capacity = count;
         status("domains", unsafe {
-            get_domains(self.device, domains.as_mut_ptr(), &mut capacity)
+            ffi::ggml_backend_memory_api_get_domains_v1(
+                self.raw,
+                self.device,
+                domains.as_mut_ptr(),
+                &mut capacity,
+            )
         })?;
         if capacity > count {
             return Err(BackendMemoryAbiError::UnstableCount {
@@ -254,7 +312,7 @@ impl BackendMemoryAbi {
         requests: &[ffi::GgmlBackendMemoryRequestV1],
     ) -> Result<BackendMemoryQuote, BackendMemoryAbiError> {
         self.validate_primary_backends(requests)?;
-        let quote_fn = self.raw.quote.ok_or(BackendMemoryAbiError::Incompatible)?;
+        self.raw.quote.ok_or(BackendMemoryAbiError::Incompatible)?;
         let count = u32::try_from(requests.len())
             .map_err(|_| BackendMemoryAbiError::UnstableCount { operation: "quote" })?;
         let request_ptr = if requests.is_empty() {
@@ -269,7 +327,8 @@ impl BackendMemoryAbi {
         let mut claim_count = 0_u32;
         // SAFETY: all pointers refer to initialized values for this call.
         status("quote/count", unsafe {
-            quote_fn(
+            ffi::ggml_backend_memory_api_quote_v1(
+                self.raw,
                 request_ptr,
                 count,
                 &mut raw,
@@ -282,7 +341,8 @@ impl BackendMemoryAbi {
         let mut capacity = claim_count;
         // SAFETY: `claims` has initialized writable elements and capacity.
         status("quote", unsafe {
-            quote_fn(
+            ffi::ggml_backend_memory_api_quote_v1(
+                self.raw,
                 request_ptr,
                 count,
                 &mut raw,
@@ -306,8 +366,7 @@ impl BackendMemoryAbi {
         quote: &BackendMemoryQuote,
     ) -> Result<Vec<ffi::GgmlBackendMemoryClaimV1>, BackendMemoryAbiError> {
         self.validate_primary_backends(requests)?;
-        let reserve = self
-            .raw
+        self.raw
             .reserve_private
             .ok_or(BackendMemoryAbiError::Incompatible)?;
         let count =
@@ -322,7 +381,8 @@ impl BackendMemoryAbi {
         let mut actual_count = 0_u32;
         // First call is a sizing query and must not mutate backend state.
         status("reserve_private/count", unsafe {
-            reserve(
+            ffi::ggml_backend_memory_api_reserve_private_v1(
+                self.raw,
                 request_ptr,
                 count,
                 &quote.raw,
@@ -335,7 +395,8 @@ impl BackendMemoryAbi {
         let mut actual = initialized_claims(actual_count.max(1) as usize);
         let mut capacity = actual_count;
         status("reserve_private", unsafe {
-            reserve(
+            ffi::ggml_backend_memory_api_reserve_private_v1(
+                self.raw,
                 request_ptr,
                 count,
                 &quote.raw,
@@ -356,18 +417,24 @@ impl BackendMemoryAbi {
     }
 
     pub(crate) fn stats(&self) -> Result<BackendMemoryStatsSnapshot, BackendMemoryAbiError> {
-        let get_stats = self
-            .raw
+        self.raw
             .get_stats
             .ok_or(BackendMemoryAbiError::Incompatible)?;
         let mut count = 0_u32;
         status("stats/count", unsafe {
-            get_stats(self.device, self.backend, ptr::null_mut(), &mut count)
+            ffi::ggml_backend_memory_api_get_stats_v1(
+                self.raw,
+                self.device,
+                self.backend,
+                ptr::null_mut(),
+                &mut count,
+            )
         })?;
         let mut domains = initialized_stats(count as usize);
         let mut capacity = count;
         status("stats", unsafe {
-            get_stats(
+            ffi::ggml_backend_memory_api_get_stats_v1(
+                self.raw,
                 self.device,
                 self.backend,
                 domains.as_mut_ptr(),
@@ -408,19 +475,22 @@ impl BackendMemoryAbi {
     }
 
     pub(crate) fn trim(&self, flags: u64) -> Result<(), BackendMemoryAbiError> {
-        let trim = self.raw.trim.ok_or(BackendMemoryAbiError::Incompatible)?;
-        status("trim", unsafe { trim(self.backend, flags) })
+        self.raw.trim.ok_or(BackendMemoryAbiError::Incompatible)?;
+        status("trim", unsafe {
+            ffi::ggml_backend_memory_api_trim_v1(self.raw, self.backend, flags)
+        })
     }
 
     pub(crate) fn quarantine(
         &self,
         request: &ffi::GgmlBackendMemoryQuarantineV1,
     ) -> Result<(), BackendMemoryAbiError> {
-        let quarantine = self
-            .raw
+        self.raw
             .quarantine
             .ok_or(BackendMemoryAbiError::Incompatible)?;
-        status("quarantine", unsafe { quarantine(self.backend, request) })
+        status("quarantine", unsafe {
+            ffi::ggml_backend_memory_api_quarantine_v1(self.raw, self.backend, request)
+        })
     }
 
     fn validate_primary_backends(
@@ -503,7 +573,8 @@ fn safe_receipt(
     raw: &ffi::GgmlBackendMemoryStatsV1,
 ) -> SafeBackendMemoryReceipt {
     if raw.struct_size < mem::size_of::<ffi::GgmlBackendMemoryStatsV1>() as u32 {
-        return SafeBackendMemoryReceipt::unknown(
+        return SafeBackendMemoryReceipt::unknown_for_provider(
+            provider,
             lifecycle,
             BackendMemoryUnknownReason::IncompatibleStats,
         );
@@ -562,7 +633,18 @@ fn safe_receipt(
         )
     };
     SafeBackendMemoryReceipt {
+        provider,
         lifecycle,
+        device_health: match raw.health {
+            ffi::GGML_BACKEND_MEMORY_HEALTHY => BackendDeviceHealth::Healthy,
+            ffi::GGML_BACKEND_MEMORY_DEGRADED => BackendDeviceHealth::Degraded,
+            ffi::GGML_BACKEND_MEMORY_QUARANTINED => BackendDeviceHealth::Quarantined,
+            ffi::GGML_BACKEND_MEMORY_DEVICE_LOST => BackendDeviceHealth::DeviceLost,
+            health => BackendDeviceHealth::Unknown(health),
+        },
+        last_status: BackendTerminalStatusClass::from_raw(raw.last_ggml_status),
+        last_native_error: raw.last_native_error,
+        quarantine_generation: raw.quarantine_generation,
         domain_kind: Some(domain_kind),
         heap_index: Some(raw.domain.heap_index),
         total_bytes,
@@ -615,28 +697,294 @@ pub(crate) struct SchedulerMemoryPlan<'scheduler> {
     _scheduler: PhantomData<&'scheduler mut c_void>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackendMutationEvidence {
+    ProvenUnchanged,
+    MayHaveMutated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackendReleaseProof {
+    NotRequired,
+    Proven,
+    Unproven,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackendFailureDisposition {
+    Complete,
+    Cancel,
+    Refund,
+    Quarantine,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackendTerminalStage {
+    BackendPrivateReserve,
+    EngineOwnedCommit,
+    EngineOwnedReconcile,
+    EngineOwnedRelease,
+    SchedulerPlanCommit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BackendTerminalResourceDomains {
+    Exact(Vec<MemoryDomainKey>),
+    Unavailable,
+}
+
+/// Failure-time evidence sampled from every concrete backend named by the
+/// frozen scheduler plan. Successful receipts are retained even when another
+/// backend is unavailable, but policy treats any missing backend as unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackendTerminalEvidence {
+    pub(crate) receipts: Vec<SafeBackendMemoryReceipt>,
+    pub(crate) unavailable_backend_count: usize,
+}
+
+impl BackendTerminalEvidence {
+    fn unavailable() -> Self {
+        Self {
+            receipts: Vec::new(),
+            unavailable_backend_count: 1,
+        }
+    }
+
+    fn device_health(&self) -> BackendDeviceHealth {
+        let mut health = if self.unavailable_backend_count == 0 && !self.receipts.is_empty() {
+            BackendDeviceHealth::Healthy
+        } else {
+            BackendDeviceHealth::Unavailable
+        };
+        for receipt in &self.receipts {
+            health = strongest_device_health(health, receipt.device_health);
+        }
+        health
+    }
+
+    pub(crate) fn capture(
+        backends: &[BackendMemoryAbi],
+        mut unavailable_backend_count: usize,
+    ) -> Self {
+        let mut receipts = Vec::new();
+        for abi in backends {
+            match abi.stats_at(BackendMemoryLifecyclePoint::TerminalFailure) {
+                Ok(snapshot) => {
+                    let mut backend_receipts = snapshot.safe_receipts(
+                        abi.provider(),
+                        BackendMemoryLifecyclePoint::TerminalFailure,
+                    );
+                    if backend_receipts.is_empty() {
+                        unavailable_backend_count += 1;
+                    } else {
+                        receipts.append(&mut backend_receipts);
+                    }
+                }
+                Err(_) => unavailable_backend_count += 1,
+            }
+        }
+        if receipts.is_empty() && unavailable_backend_count == 0 {
+            unavailable_backend_count = 1;
+        }
+        Self {
+            receipts,
+            unavailable_backend_count,
+        }
+    }
+}
+
+fn strongest_device_health(
+    left: BackendDeviceHealth,
+    right: BackendDeviceHealth,
+) -> BackendDeviceHealth {
+    let rank = |health| match health {
+        BackendDeviceHealth::Healthy => 0,
+        BackendDeviceHealth::Degraded => 1,
+        BackendDeviceHealth::Unavailable | BackendDeviceHealth::Unknown(_) => 2,
+        BackendDeviceHealth::Quarantined => 3,
+        BackendDeviceHealth::DeviceLost => 4,
+    };
+    if rank(right) > rank(left) {
+        right
+    } else {
+        left
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackendTerminalIdentity {
+    pub(crate) provider: ExecutionProvider,
+    pub(crate) stable_device_id: String,
+    pub(crate) resource_domains: BackendTerminalResourceDomains,
+}
+
+impl BackendTerminalIdentity {
+    pub(crate) fn exact(
+        provider: ExecutionProvider,
+        stable_device_id: impl Into<String>,
+        resource_domains: Vec<MemoryDomainKey>,
+    ) -> Self {
+        Self {
+            provider,
+            stable_device_id: stable_device_id.into(),
+            resource_domains: BackendTerminalResourceDomains::Exact(resource_domains),
+        }
+    }
+
+    pub(crate) fn unavailable(provider: ExecutionProvider, stable_device_id: &str) -> Self {
+        Self {
+            provider,
+            stable_device_id: stable_device_id.to_owned(),
+            resource_domains: BackendTerminalResourceDomains::Unavailable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackendTerminalOutcome {
+    pub(crate) stage: BackendTerminalStage,
+    pub(crate) identity: BackendTerminalIdentity,
+    pub(crate) status: BackendTerminalStatusClass,
+    pub(crate) mutation: BackendMutationEvidence,
+    pub(crate) device_health: BackendDeviceHealth,
+    pub(crate) release_proof: BackendReleaseProof,
+    pub(crate) evidence: BackendTerminalEvidence,
+}
+
+impl BackendTerminalOutcome {
+    pub(crate) fn backend_operation(
+        stage: BackendTerminalStage,
+        status: i32,
+        may_have_mutated: bool,
+        identity: BackendTerminalIdentity,
+        evidence: BackendTerminalEvidence,
+    ) -> Self {
+        let status = BackendTerminalStatusClass::from_raw(status);
+        let device_health = evidence.device_health();
+        Self {
+            stage,
+            identity,
+            status,
+            mutation: if may_have_mutated {
+                BackendMutationEvidence::MayHaveMutated
+            } else {
+                BackendMutationEvidence::ProvenUnchanged
+            },
+            device_health,
+            release_proof: if may_have_mutated {
+                BackendReleaseProof::Unproven
+            } else {
+                BackendReleaseProof::NotRequired
+            },
+            evidence,
+        }
+    }
+
+    fn scheduler_commit(
+        status: i32,
+        flags: u32,
+        identity: BackendTerminalIdentity,
+        evidence: BackendTerminalEvidence,
+    ) -> Self {
+        let status = BackendTerminalStatusClass::from_raw(status);
+        let device_health = evidence.device_health();
+        let mutation_flag = ffi::GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_MAY_HAVE_MUTATED;
+        let release_flag = ffi::GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_RELEASE_PROVEN;
+        let unknown_flags = flags & !(mutation_flag | release_flag);
+        let may_have_mutated = flags & (mutation_flag | release_flag) != 0 || unknown_flags != 0;
+        let mutation = if may_have_mutated {
+            BackendMutationEvidence::MayHaveMutated
+        } else {
+            BackendMutationEvidence::ProvenUnchanged
+        };
+        let release_proof = if !may_have_mutated {
+            BackendReleaseProof::NotRequired
+        } else if flags & release_flag != 0 && unknown_flags == 0 {
+            BackendReleaseProof::Proven
+        } else {
+            BackendReleaseProof::Unproven
+        };
+        Self {
+            stage: BackendTerminalStage::SchedulerPlanCommit,
+            identity,
+            status,
+            mutation,
+            device_health,
+            release_proof,
+            evidence,
+        }
+    }
+
+    pub(crate) fn with_release_proof(mut self, release_proof: BackendReleaseProof) -> Self {
+        if self.mutation == BackendMutationEvidence::MayHaveMutated {
+            self.release_proof = release_proof;
+        }
+        self
+    }
+
+    pub(crate) fn disposition(&self) -> BackendFailureDisposition {
+        if self.status == BackendTerminalStatusClass::Success {
+            return BackendFailureDisposition::Complete;
+        }
+        if matches!(
+            self.status,
+            BackendTerminalStatusClass::DeviceLost
+                | BackendTerminalStatusClass::BackendPoisoned
+                | BackendTerminalStatusClass::Unknown(_)
+        ) {
+            return BackendFailureDisposition::Quarantine;
+        }
+        // Cancellation remains the user-visible request result, but it cannot
+        // authorize a physical refund after native state may have changed.
+        // The transaction quarantines that lease first; error projection can
+        // still report Canceled to the caller.
+        if self.mutation == BackendMutationEvidence::MayHaveMutated
+            && self.release_proof != BackendReleaseProof::Proven
+        {
+            return BackendFailureDisposition::Quarantine;
+        }
+        if self.status == BackendTerminalStatusClass::Cancelled {
+            return BackendFailureDisposition::Cancel;
+        }
+        if matches!(
+            self.device_health,
+            BackendDeviceHealth::DeviceLost
+                | BackendDeviceHealth::Quarantined
+                | BackendDeviceHealth::Unavailable
+                | BackendDeviceHealth::Unknown(_)
+        ) {
+            return BackendFailureDisposition::Quarantine;
+        }
+        BackendFailureDisposition::Refund
+    }
+}
+
 #[derive(Debug, Error)]
-#[error("{source} (scheduler native allocation may_have_mutated={may_have_mutated})")]
+#[error("{source} (scheduler terminal outcome={outcome:?})")]
 pub(crate) struct SchedulerMemoryPlanCommitError {
     source: BackendMemoryAbiError,
-    may_have_mutated: bool,
+    outcome: BackendTerminalOutcome,
 }
 
 impl SchedulerMemoryPlanCommitError {
     pub(crate) fn requires_quarantine(&self) -> bool {
-        if self.may_have_mutated {
-            return true;
-        }
-        match &self.source {
-            BackendMemoryAbiError::Status { status, .. } => {
-                *status != ffi::GGML_STATUS_FAILED && *status != ffi::GGML_STATUS_ALLOC_FAILED
-            }
-            _ => true,
-        }
+        self.outcome.disposition() == BackendFailureDisposition::Quarantine
+    }
+
+    pub(crate) fn outcome(&self) -> BackendTerminalOutcome {
+        self.outcome.clone()
     }
 
     pub(crate) fn into_source(self) -> BackendMemoryAbiError {
         self.source
+    }
+}
+
+impl super::backend_memory_admission::NativeOwnerAttachedCommitOutcome
+    for SchedulerMemoryPlanCommitError
+{
+    fn requires_quarantine(&self) -> bool {
+        SchedulerMemoryPlanCommitError::requires_quarantine(self)
     }
 }
 
@@ -710,25 +1058,45 @@ impl<'scheduler> SchedulerMemoryPlan<'scheduler> {
         Ok(batches)
     }
 
-    pub(crate) fn commit(mut self) -> Result<(), SchedulerMemoryPlanCommitError> {
+    pub(crate) fn commit(
+        mut self,
+        identity: BackendTerminalIdentity,
+    ) -> Result<(), SchedulerMemoryPlanCommitError> {
         let mut flags = 0_u32;
         if let Err(source) = status("scheduler_plan/commit", unsafe {
             ffi::ggml_backend_sched_memory_plan_commit_v2(self.raw, &mut flags)
         }) {
-            let known_mutation =
-                flags & ffi::GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_MAY_HAVE_MUTATED != 0;
-            let unknown_flags =
-                flags & !ffi::GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_MAY_HAVE_MUTATED;
+            let raw_status = match &source {
+                BackendMemoryAbiError::Status { status, .. } => *status,
+                _ => i32::MAX,
+            };
+            let evidence = self.terminal_evidence();
             return Err(SchedulerMemoryPlanCommitError {
                 source,
-                // Unknown future flags are conservative: only an exact zero
-                // proves that native scheduler allocation did not change.
-                may_have_mutated: known_mutation || unknown_flags != 0,
+                outcome: BackendTerminalOutcome::scheduler_commit(
+                    raw_status, flags, identity, evidence,
+                ),
             });
         }
         unsafe { ffi::ggml_backend_sched_memory_plan_free_v1(self.raw) };
         self.raw = ptr::null_mut();
         Ok(())
+    }
+
+    fn terminal_evidence(&self) -> BackendTerminalEvidence {
+        let batches = match self.requests_by_backend() {
+            Ok(batches) => batches,
+            Err(_) => return BackendTerminalEvidence::unavailable(),
+        };
+        let mut backends = Vec::new();
+        let mut unavailable_backend_count = 0;
+        for (backend, _) in batches {
+            match unsafe { BackendMemoryAbi::from_backend(backend) } {
+                Ok(abi) => backends.push(abi),
+                Err(_) => unavailable_backend_count += 1,
+            }
+        }
+        BackendTerminalEvidence::capture(&backends, unavailable_backend_count)
     }
 }
 
@@ -830,22 +1198,165 @@ mod tests {
         assert_eq!(receipt.device_free_bytes, unknown);
     }
 
+    fn terminal_evidence(
+        provider: ExecutionProvider,
+        health: BackendDeviceHealth,
+        last_status: i32,
+        native_error: i64,
+        quarantine_generation: u64,
+    ) -> BackendTerminalEvidence {
+        let raw_health = match health {
+            BackendDeviceHealth::Healthy => ffi::GGML_BACKEND_MEMORY_HEALTHY,
+            BackendDeviceHealth::Degraded => ffi::GGML_BACKEND_MEMORY_DEGRADED,
+            BackendDeviceHealth::Quarantined => ffi::GGML_BACKEND_MEMORY_QUARANTINED,
+            BackendDeviceHealth::DeviceLost => ffi::GGML_BACKEND_MEMORY_DEVICE_LOST,
+            BackendDeviceHealth::Unavailable | BackendDeviceHealth::Unknown(_) => u32::MAX,
+        };
+        let mut raw = test_stats();
+        raw.health = raw_health;
+        raw.last_ggml_status = last_status;
+        raw.last_native_error = native_error;
+        raw.quarantine_generation = quarantine_generation;
+        BackendTerminalEvidence {
+            receipts: vec![safe_receipt(
+                provider,
+                BackendMemoryLifecyclePoint::TerminalFailure,
+                &raw,
+            )],
+            unavailable_backend_count: 0,
+        }
+    }
+
+    fn healthy_terminal_evidence(provider: ExecutionProvider) -> BackendTerminalEvidence {
+        terminal_evidence(
+            provider,
+            BackendDeviceHealth::Healthy,
+            ffi::GGML_STATUS_SUCCESS,
+            0,
+            0,
+        )
+    }
+
     #[test]
     fn scheduler_commit_quarantines_only_unrecoverable_failures() {
-        let error = |status, may_have_mutated| SchedulerMemoryPlanCommitError {
+        let identity =
+            || BackendTerminalIdentity::unavailable(ExecutionProvider::Vulkan, "Vulkan0");
+        let error = |status, flags, evidence| SchedulerMemoryPlanCommitError {
             source: BackendMemoryAbiError::Status {
                 operation: "scheduler_plan/commit",
                 status,
             },
-            may_have_mutated,
+            outcome: BackendTerminalOutcome::scheduler_commit(status, flags, identity(), evidence),
         };
+        let healthy = || healthy_terminal_evidence(ExecutionProvider::Vulkan);
+        let mutated = ffi::GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_MAY_HAVE_MUTATED;
+        let released = mutated | ffi::GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_RELEASE_PROVEN;
 
-        assert!(!error(ffi::GGML_STATUS_FAILED, false).requires_quarantine());
-        assert!(!error(ffi::GGML_STATUS_ALLOC_FAILED, false).requires_quarantine());
-        assert!(error(ffi::GGML_STATUS_FAILED, true).requires_quarantine());
-        assert!(error(ffi::GGML_STATUS_DEVICE_LOST, false).requires_quarantine());
-        assert!(error(ffi::GGML_STATUS_BACKEND_POISONED, false).requires_quarantine());
-        assert!(error(i32::MAX, false).requires_quarantine());
+        assert!(!error(ffi::GGML_STATUS_FAILED, 0, healthy()).requires_quarantine());
+        assert!(!error(ffi::GGML_STATUS_ALLOC_FAILED, 0, healthy()).requires_quarantine());
+        assert!(!error(ffi::GGML_STATUS_EXECUTION_FAILED, 0, healthy()).requires_quarantine());
+        assert!(error(ffi::GGML_STATUS_FAILED, mutated, healthy()).requires_quarantine());
+        assert!(error(ffi::GGML_STATUS_ALLOC_FAILED, mutated, healthy()).requires_quarantine());
+        assert!(!error(ffi::GGML_STATUS_ALLOC_FAILED, released, healthy()).requires_quarantine());
+        assert!(error(ffi::GGML_STATUS_DEVICE_LOST, 0, healthy()).requires_quarantine());
+        assert!(error(ffi::GGML_STATUS_BACKEND_POISONED, 0, healthy()).requires_quarantine());
+        assert!(error(i32::MAX, 0, healthy()).requires_quarantine());
+        assert_eq!(
+            error(
+                ffi::GGML_STATUS_ABORTED,
+                mutated,
+                BackendTerminalEvidence::unavailable()
+            )
+            .outcome()
+            .disposition(),
+            BackendFailureDisposition::Quarantine
+        );
+        assert_eq!(
+            error(ffi::GGML_STATUS_ABORTED, 0, healthy())
+                .outcome()
+                .disposition(),
+            BackendFailureDisposition::Cancel
+        );
+        assert_eq!(
+            error(ffi::GGML_STATUS_ABORTED, released, healthy())
+                .outcome()
+                .disposition(),
+            BackendFailureDisposition::Cancel
+        );
+
+        let released_outcome = BackendTerminalOutcome::scheduler_commit(
+            ffi::GGML_STATUS_ALLOC_FAILED,
+            released,
+            identity(),
+            healthy(),
+        );
+        assert_eq!(
+            released_outcome.disposition(),
+            BackendFailureDisposition::Refund
+        );
+        assert_eq!(
+            released_outcome.identity.provider,
+            ExecutionProvider::Vulkan
+        );
+        assert_eq!(released_outcome.identity.stable_device_id, "Vulkan0");
+
+        let lost_evidence = terminal_evidence(
+            ExecutionProvider::Vulkan,
+            BackendDeviceHealth::DeviceLost,
+            ffi::GGML_STATUS_DEVICE_LOST,
+            -4,
+            7,
+        );
+        assert!(error(ffi::GGML_STATUS_ALLOC_FAILED, 0, lost_evidence).requires_quarantine());
+        assert!(
+            error(
+                ffi::GGML_STATUS_ALLOC_FAILED,
+                0,
+                BackendTerminalEvidence::unavailable(),
+            )
+            .requires_quarantine()
+        );
+    }
+
+    #[test]
+    fn terminal_outcome_preserves_exact_lane_and_resource_domains() {
+        let identity = BackendTerminalIdentity::exact(
+            ExecutionProvider::Hip,
+            "HIP0",
+            vec![MemoryDomainKey::SystemMemory],
+        );
+        let outcome = BackendTerminalOutcome::scheduler_commit(
+            ffi::GGML_STATUS_ALLOC_FAILED,
+            0,
+            identity,
+            healthy_terminal_evidence(ExecutionProvider::Hip),
+        );
+        assert_eq!(outcome.stage, BackendTerminalStage::SchedulerPlanCommit);
+        assert_eq!(outcome.identity.provider, ExecutionProvider::Hip);
+        assert_eq!(outcome.identity.stable_device_id, "HIP0");
+        assert_eq!(
+            outcome.identity.resource_domains,
+            BackendTerminalResourceDomains::Exact(vec![MemoryDomainKey::SystemMemory])
+        );
+        assert_eq!(outcome.disposition(), BackendFailureDisposition::Refund);
+    }
+
+    #[test]
+    fn safe_receipt_preserves_typed_terminal_health_evidence() {
+        let mut raw = test_stats();
+        raw.health = ffi::GGML_BACKEND_MEMORY_DEVICE_LOST;
+        raw.last_ggml_status = ffi::GGML_STATUS_DEVICE_LOST;
+        raw.last_native_error = -4;
+        raw.quarantine_generation = 7;
+        let receipt = safe_receipt(
+            ExecutionProvider::Vulkan,
+            BackendMemoryLifecyclePoint::AfterGraphCompute,
+            &raw,
+        );
+        assert_eq!(receipt.device_health, BackendDeviceHealth::DeviceLost);
+        assert_eq!(receipt.last_status, BackendTerminalStatusClass::DeviceLost);
+        assert_eq!(receipt.last_native_error, -4);
+        assert_eq!(receipt.quarantine_generation, 7);
     }
 
     #[cfg(target_os = "macos")]

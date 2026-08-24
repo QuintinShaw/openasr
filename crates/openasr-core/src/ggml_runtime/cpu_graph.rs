@@ -21,12 +21,17 @@ use std::{
 use memmap2::Mmap;
 use thiserror::Error;
 
-use super::backend_memory::{BackendMemoryAbi, BackendMemoryAbiError, SchedulerMemoryPlan};
+use super::backend_memory::{
+    BackendFailureDisposition, BackendMemoryAbi, BackendMemoryAbiError, BackendReleaseProof,
+    BackendTerminalIdentity, BackendTerminalOutcome, BackendTerminalStatusClass,
+    SchedulerMemoryPlan,
+};
 use super::backend_memory_admission::{
-    NativeBackendPrivateMemoryError, NativeBackendPrivateMemoryLease, NativeMemoryAdmissionError,
-    NativeMemoryAdmissionPlan, NativeMemoryAllocation, NativeMemoryAllocationError,
-    NativeMemoryClaimSemantics, NativeOwnerAttachedCommitFailure, NativeOwnerAttachedMemoryError,
-    NativeOwnerAttachedMemoryLease, NativeQuotedBackendGroup, NativeRequestClass,
+    NativeBackendPrivateMemoryError, NativeBackendPrivateMemoryLease, NativeEngineCommitFailure,
+    NativeMemoryAdmissionError, NativeMemoryAdmissionPlan, NativeMemoryAllocation,
+    NativeMemoryAllocationError, NativeMemoryClaimSemantics, NativeMemoryOwner,
+    NativeOwnerAttachedMemoryError, NativeOwnerAttachedMemoryLease, NativeQuotedBackendGroup,
+    NativeRequestClass,
 };
 use super::ffi;
 use super::{
@@ -2852,7 +2857,7 @@ impl GgmlCpuGraphRunner {
         )?;
         let released_owner = current.memory_owner.clone();
         let released_private_leases = released_owner.private_leases();
-        let previous = self
+        let mut previous = self
             .scheduler
             .replace(replacement)
             .expect("scheduler presence was checked above");
@@ -2861,7 +2866,14 @@ impl GgmlCpuGraphRunner {
         // CUDA may return freed buffers to its backend pool, so trim each
         // participating backend only after gallocr destruction. The trim ABI
         // synchronizes first and releases only reclaimable backend cache.
+        let scheduler_release = previous.release_native();
         drop(previous);
+        if scheduler_release != BackendReleaseProof::Proven {
+            return Err(memory_admission_failure(
+                "scheduler-release/native",
+                "scheduler native release did not complete; its broker lease was quarantined",
+            ));
+        }
         for raw in released_owner.backend_private_leases.keys().copied() {
             let backend = raw as ffi::GgmlBackendRaw;
             if let Err(source) = trim_backend(backend) {
@@ -3037,6 +3049,11 @@ impl GgmlCpuGraphRunner {
 
 impl Drop for GgmlCpuGraphRunner {
     fn drop(&mut self) {
+        // Engine-owned buffers retain release callbacks into the concrete
+        // backend. Release them while that backend and its memory-evidence ABI
+        // are still live; declaration-order field drop would otherwise free
+        // the backend before the step pool.
+        self.release_cpu_step_buffer_pool();
         // The scheduler references every backend passed to its constructor and
         // owns its gallocr buffers. Destroy it (which also releases its
         // owner-attached broker leases) before Rust drops any backend guard.
@@ -3175,13 +3192,20 @@ impl GgmlLoadedWeightContext {
                     });
                 }
             } else {
-                unsafe {
+                let status = unsafe {
                     ffi::ggml_backend_tensor_set(
                         raw.as_ptr(),
                         payload.bytes.as_ptr().cast::<c_void>(),
                         0,
                         payload.bytes.len(),
-                    );
+                    )
+                };
+                if status != ffi::GGML_STATUS_SUCCESS {
+                    return Err(GgmlCpuGraphError::LoadedWeightContextFailed {
+                        reason: format!(
+                            "backend tensor upload failed for '{name}' with status={status}"
+                        ),
+                    });
                 }
             }
             tensors.insert(name, GgmlLoadedTensor { raw });
@@ -6391,7 +6415,12 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         {
             Ok(plan) => plan,
             Err(source) => {
-                return Err(self.scheduler_plan_error("scheduler-plan/create", source, false));
+                return Err(self.scheduler_plan_error(
+                    "scheduler-plan/create",
+                    source,
+                    None,
+                    false,
+                ));
             }
         };
         let batches = plan.requests_by_backend().map_err(|source| {
@@ -6420,11 +6449,14 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         else {
             #[cfg(test)]
             {
-                let committed = plan.commit().map_err(|error| {
+                let terminal_identity = self.scheduler_terminal_identity(None);
+                let committed = plan.commit(terminal_identity).map_err(|error| {
+                    let outcome = error.outcome();
                     let requires_quarantine = error.requires_quarantine();
                     self.scheduler_plan_error(
                         "scheduler-plan/test-direct-commit",
                         error.into_source(),
+                        Some(outcome),
                         requires_quarantine,
                     )
                 });
@@ -6505,6 +6537,13 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         let transactions =
             NativeMemoryAdmissionPlan::try_reserve_partitioned(partition_plans, &broker, cohort_id)
                 .map_err(|source| memory_admission_error("scheduler-candidate", source))?;
+        let terminal_identity = self.scheduler_terminal_identity(Some(
+            transactions
+                .iter()
+                .flat_map(|transaction| transaction.reservation_requests())
+                .map(|request| request.domain.clone())
+                .collect(),
+        ));
         let mut private_transaction = None;
         let mut engine_transaction = None;
         for (kind, transaction) in partition_kinds.into_iter().zip(transactions) {
@@ -6521,17 +6560,20 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         let mut private_lease = None;
         if let Some(transaction) = private_transaction {
             let provisional = transaction.requires_reconciliation();
-            let lease = match transaction.reserve_backend_private_deferred() {
+            let lease = match transaction
+                .reserve_backend_private_deferred(terminal_identity.clone())
+            {
                 Ok(lease) => lease,
                 Err(NativeBackendPrivateMemoryError::PrivateReserve {
-                    source,
-                    quarantined,
-                    ..
+                    source, outcome, ..
                 }) => {
+                    let requires_quarantine =
+                        outcome.disposition() == BackendFailureDisposition::Quarantine;
                     return Err(self.scheduler_plan_error(
                         "scheduler-private/reserve",
                         source,
-                        quarantined,
+                        Some(outcome),
+                        requires_quarantine,
                     ));
                 }
                 Err(source) => {
@@ -6585,75 +6627,86 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             )?)
             .and_then(|fresh| transaction.rebind_fresh_plan(fresh));
             match fresh_transaction {
-                Ok(transaction) => match transaction.commit_owner_attached_with(|| {
-                    match plan.commit() {
-                        Ok(()) => {
-                            engine_commit_requires_quarantine = true;
+                Ok(transaction) => {
+                    match transaction.commit_owner_attached_with(terminal_identity.clone(), || {
+                        match plan.commit(terminal_identity.clone()) {
+                            Ok(()) => {
+                                engine_commit_requires_quarantine = true;
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }) {
+                        Ok(lease) => {
+                            memory_owner
+                                .scheduler_leases
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(lease);
                             Ok(())
                         }
-                        Err(error) => {
-                            engine_commit_requires_quarantine = error.requires_quarantine();
-                            let source = error.into_source();
-                            if engine_commit_requires_quarantine {
-                                Err(NativeOwnerAttachedCommitFailure::quarantine(source))
-                            } else {
-                                Err(NativeOwnerAttachedCommitFailure::reclaimable(source))
-                            }
+                        Err(NativeOwnerAttachedMemoryError::NativeCommit {
+                            source,
+                            quarantined,
+                        }) => {
+                            let outcome = source.outcome();
+                            debug_assert_eq!(
+                                outcome.disposition() == BackendFailureDisposition::Quarantine,
+                                quarantined,
+                            );
+                            Err(self.scheduler_plan_error(
+                                "scheduler-plan/commit",
+                                source.into_source(),
+                                Some(outcome),
+                                quarantined,
+                            ))
                         }
+                        Err(NativeOwnerAttachedMemoryError::PostAllocationStats { source }) => {
+                            self.poison_scheduler_after_allocation_commit();
+                            Err(memory_admission_error("scheduler-engine/reconcile", source))
+                        }
+                        Err(NativeOwnerAttachedMemoryError::BrokerCommit { source }) => {
+                            self.poison_scheduler_after_allocation_commit();
+                            Err(memory_admission_error(
+                                "scheduler-engine/reconcile",
+                                NativeMemoryAdmissionError::Planning(source),
+                            ))
+                        }
+                        Err(NativeOwnerAttachedMemoryError::PrivateReserve {
+                            source,
+                            outcome,
+                            ..
+                        }) => {
+                            let requires_quarantine =
+                                outcome.disposition() == BackendFailureDisposition::Quarantine;
+                            Err(self.scheduler_plan_error(
+                                "scheduler-engine/validate",
+                                source,
+                                Some(outcome),
+                                requires_quarantine,
+                            ))
+                        }
+                        Err(error) => Err(memory_admission_failure(
+                            "scheduler-engine/validate",
+                            error.to_string(),
+                        )),
                     }
-                }) {
-                    Ok(lease) => {
-                        memory_owner
-                            .scheduler_leases
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(lease);
-                        Ok(())
-                    }
-                    Err(NativeOwnerAttachedMemoryError::NativeCommit {
-                        source,
-                        quarantined,
-                    }) => {
-                        Err(self.scheduler_plan_error("scheduler-plan/commit", source, quarantined))
-                    }
-                    Err(NativeOwnerAttachedMemoryError::PostAllocationStats { source }) => {
-                        self.poison_scheduler_after_allocation_commit();
-                        Err(memory_admission_error("scheduler-engine/reconcile", source))
-                    }
-                    Err(NativeOwnerAttachedMemoryError::BrokerCommit { source }) => {
-                        self.poison_scheduler_after_allocation_commit();
-                        Err(memory_admission_error(
-                            "scheduler-engine/reconcile",
-                            NativeMemoryAdmissionError::Planning(source),
-                        ))
-                    }
-                    Err(NativeOwnerAttachedMemoryError::PrivateReserve {
-                        source,
-                        quarantined,
-                        ..
-                    }) => Err(self.scheduler_plan_error(
-                        "scheduler-engine/validate",
-                        source,
-                        quarantined,
-                    )),
-                    Err(error) => Err(memory_admission_failure(
-                        "scheduler-engine/validate",
-                        error.to_string(),
-                    )),
-                },
+                }
                 Err(source) => Err(memory_admission_error("scheduler-engine/refresh", source)),
             }
         } else {
-            match plan.commit() {
+            match plan.commit(terminal_identity) {
                 Ok(()) => {
                     engine_commit_requires_quarantine = true;
                     Ok(())
                 }
                 Err(error) => {
+                    let outcome = error.outcome();
                     engine_commit_requires_quarantine = error.requires_quarantine();
                     Err(self.scheduler_plan_error(
                         "scheduler-plan/commit",
                         error.into_source(),
+                        Some(outcome),
                         engine_commit_requires_quarantine,
                     ))
                 }
@@ -6705,10 +6758,36 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         &mut self,
         operation: &'static str,
         source: BackendMemoryAbiError,
+        outcome: Option<BackendTerminalOutcome>,
         requires_poison: bool,
     ) -> GgmlCpuGraphError {
         if requires_poison {
             self.poison_scheduler_after_allocation_commit();
+        }
+        if let Some(outcome) = outcome {
+            if outcome.release_proof == BackendReleaseProof::Proven
+                && let Some(owner) = &self.scheduler_memory_owner
+            {
+                owner.release_scheduler_leases_after_native_recovery();
+            }
+            match outcome.status {
+                BackendTerminalStatusClass::Cancelled => return GgmlCpuGraphError::Canceled,
+                BackendTerminalStatusClass::DeviceLost => {
+                    self.poison_scheduler_after_allocation_commit();
+                    record_device_lost(operation, "typed terminal device-lost outcome");
+                    return GgmlCpuGraphError::DeviceLost;
+                }
+                BackendTerminalStatusClass::BackendPoisoned => {
+                    self.poison_scheduler_after_allocation_commit();
+                    record_device_lost(operation, "typed terminal backend-poisoned outcome");
+                    return GgmlCpuGraphError::BackendPoisoned;
+                }
+                BackendTerminalStatusClass::Capacity => {
+                    record_capacity_failure(operation, "typed terminal capacity outcome");
+                    return GgmlCpuGraphError::BackendSchedulerGraphAllocationFailed;
+                }
+                _ => {}
+            }
         }
         match source {
             BackendMemoryAbiError::Status { status, .. }
@@ -6730,6 +6809,27 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 GgmlCpuGraphError::BackendSchedulerGraphAllocationFailed
             }
             source => memory_admission_failure(operation, source.to_string()),
+        }
+    }
+
+    fn scheduler_terminal_identity(
+        &self,
+        resource_domains: Option<Vec<MemoryDomainKey>>,
+    ) -> BackendTerminalIdentity {
+        match resource_domains {
+            Some(mut domains) => {
+                domains.sort();
+                domains.dedup();
+                BackendTerminalIdentity::exact(
+                    self.runner_identity.actual_provider,
+                    self.runner_identity.actual_stable_device_id.clone(),
+                    domains,
+                )
+            }
+            None => BackendTerminalIdentity::unavailable(
+                self.runner_identity.actual_provider,
+                &self.runner_identity.actual_stable_device_id,
+            ),
         }
     }
 
@@ -6811,18 +6911,26 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 )
             })
             .map_err(|source| memory_admission_error("direct-graph-private/admit", source))?;
+        let terminal_identity = self.scheduler_terminal_identity(Some(
+            transaction
+                .reservation_requests()
+                .iter()
+                .map(|request| request.domain.clone())
+                .collect(),
+        ));
         let provisional = transaction.requires_reconciliation();
-        let lease = match transaction.reserve_backend_private_deferred() {
+        let lease = match transaction.reserve_backend_private_deferred(terminal_identity) {
             Ok(lease) => lease,
             Err(NativeBackendPrivateMemoryError::PrivateReserve {
-                source,
-                quarantined,
-                ..
+                source, outcome, ..
             }) => {
+                let requires_quarantine =
+                    outcome.disposition() == BackendFailureDisposition::Quarantine;
                 return Err(self.scheduler_plan_error(
                     "direct-graph-private/reserve",
                     source,
-                    quarantined,
+                    Some(outcome),
+                    requires_quarantine,
                 ));
             }
             Err(source) => {
@@ -8757,6 +8865,7 @@ struct GgmlCachedBackendGuard {
 struct GgmlBackendSchedulerGuard {
     raw: NonNull<c_void>,
     memory_owner: GgmlSchedulerMemoryOwner,
+    released: bool,
 }
 
 type GgmlBackendPrivateLeaseOwner = Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>>;
@@ -8778,6 +8887,26 @@ struct GgmlSchedulerMemoryOwner {
 }
 
 impl GgmlSchedulerMemoryOwner {
+    fn release_scheduler_leases_after_native_recovery(&self) {
+        self.active_graph_address.set(None);
+        self.scheduler_leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    fn quarantine_scheduler_leases_after_failed_native_release(&self) {
+        self.poisoned.store(true, Ordering::Release);
+        self.active_graph_address.set(None);
+        let mut leases = self
+            .scheduler_leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for lease in leases.iter_mut() {
+            lease.quarantine();
+        }
+    }
+
     fn finalize_pending_backend_private_leases(
         &self,
     ) -> Result<(), NativeBackendPrivateMemoryError> {
@@ -9465,8 +9594,7 @@ impl GgmlBackendGuard {
         // ggml_backend_cpu_set_n_threads symbol: under GGML_BACKEND_DL that symbol
         // lives in the loaded ggml-cpu plugin and is not linked into the host.
         // Works for static builds too; a no-op if the backend lacks the tunable.
-        backend_set_n_threads(self.raw, n_threads);
-        Ok(())
+        backend_set_n_threads(self.raw, n_threads)
     }
 
     #[cfg(target_os = "macos")]
@@ -9535,24 +9663,16 @@ unsafe extern "C" fn openasr_ggml_abort_trampoline(data: *mut c_void) -> bool {
 /// `ggml_backend_cpu_set_n_threads` lives in the loaded ggml-cpu plugin rather
 /// than the linked core. No-op if the backend's device/registry does not expose
 /// the `ggml_backend_set_n_threads` tunable. Works for static builds too.
-fn backend_set_n_threads(backend: NonNull<c_void>, n_threads: c_int) {
-    type SetNThreadsFn = unsafe extern "C" fn(ffi::GgmlBackendRaw, c_int);
-    unsafe {
-        let device = ffi::ggml_backend_get_device(backend.as_ptr());
-        if device.is_null() {
-            return;
-        }
-        let reg = ffi::ggml_backend_dev_backend_reg(device);
-        if reg.is_null() {
-            return;
-        }
-        let proc =
-            ffi::ggml_backend_reg_get_proc_address(reg, c"ggml_backend_set_n_threads".as_ptr());
-        if proc.is_null() {
-            return;
-        }
-        let set_fn: SetNThreadsFn = std::mem::transmute(proc);
-        set_fn(backend.as_ptr(), n_threads);
+fn backend_set_n_threads(
+    backend: NonNull<c_void>,
+    n_threads: c_int,
+) -> Result<(), GgmlCpuGraphError> {
+    let status =
+        unsafe { ffi::ggml_backend_set_n_threads_if_supported(backend.as_ptr(), n_threads) };
+    if status == ffi::GGML_STATUS_SUCCESS {
+        Ok(())
+    } else {
+        Err(GgmlCpuGraphError::ComputeFailed { status })
     }
 }
 
@@ -10065,14 +10185,24 @@ fn ggml_op_is_metadata_only(op: &str) -> bool {
 impl Drop for GgmlBackendGuard {
     fn drop(&mut self) {
         if self.free_on_drop {
-            unsafe { ffi::ggml_backend_free(self.raw.as_ptr()) };
+            let status = unsafe { ffi::ggml_backend_free_status(self.raw.as_ptr()) };
+            if status != ffi::GGML_STATUS_SUCCESS {
+                for lease in self.private_memory_leases.borrow().iter() {
+                    lease.quarantine();
+                }
+            }
         }
     }
 }
 
 impl Drop for GgmlCachedBackendGuard {
     fn drop(&mut self) {
-        unsafe { ffi::ggml_backend_free(self.raw.as_ptr()) };
+        let status = unsafe { ffi::ggml_backend_free_status(self.raw.as_ptr()) };
+        if status != ffi::GGML_STATUS_SUCCESS {
+            for lease in self.private_memory_leases.borrow().iter() {
+                lease.quarantine();
+            }
+        }
     }
 }
 
@@ -10106,6 +10236,7 @@ impl GgmlBackendSchedulerGuard {
                     active_graph_address: Rc::new(Cell::new(None)),
                     poisoned: Arc::new(AtomicBool::new(false)),
                 },
+                released: false,
             })
             .ok_or_else(|| {
                 record_device_unavailable("scheduler-init", "ggml_backend_sched_new returned null");
@@ -10157,30 +10288,85 @@ fn build_graph_scheduler(
     GgmlBackendSchedulerGuard::new(&mut backends, backend_private_leases, graph_size)
 }
 
+impl GgmlBackendSchedulerGuard {
+    fn release_native(&mut self) -> BackendReleaseProof {
+        if self.released {
+            return BackendReleaseProof::NotRequired;
+        }
+        self.released = true;
+        let status = unsafe { ffi::ggml_backend_sched_free_status(self.raw.as_ptr()) };
+        if status == ffi::GGML_STATUS_SUCCESS {
+            BackendReleaseProof::Proven
+        } else {
+            self.memory_owner
+                .quarantine_scheduler_leases_after_failed_native_release();
+            BackendReleaseProof::Unproven
+        }
+    }
+}
+
 impl Drop for GgmlBackendSchedulerGuard {
     fn drop(&mut self) {
-        unsafe { ffi::ggml_backend_sched_free(self.raw.as_ptr()) };
+        let _ = self.release_native();
     }
 }
 
 struct GgmlRawBackendBufferGuard {
     raw: NonNull<c_void>,
+    released: bool,
+}
+
+impl NativeMemoryOwner for GgmlRawBackendBufferGuard {
+    fn release_native(&mut self) -> BackendReleaseProof {
+        if self.released {
+            return BackendReleaseProof::NotRequired;
+        }
+        self.released = true;
+        let status = unsafe { ffi::ggml_backend_buffer_free_status(self.raw.as_ptr()) };
+        if status == ffi::GGML_STATUS_SUCCESS {
+            BackendReleaseProof::Proven
+        } else {
+            BackendReleaseProof::Unproven
+        }
+    }
 }
 
 impl Drop for GgmlRawBackendBufferGuard {
     fn drop(&mut self) {
-        unsafe { ffi::ggml_backend_buffer_free(self.raw.as_ptr()) };
+        let _ = self.release_native();
     }
 }
 
 struct GgmlRawGraphAllocatorGuard {
     raw: NonNull<c_void>,
+    released: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GgmlGallocrCommitEvidence {
+    may_have_mutated: bool,
+    release_must_remain_unproven: bool,
+}
+
+fn ggml_gallocr_commit_evidence(flags: u32) -> GgmlGallocrCommitEvidence {
+    let known_mutation = flags & ffi::GGML_GALLOCR_MEASURE_COMMIT_MAY_HAVE_MUTATED != 0;
+    let release_unproven = flags & ffi::GGML_GALLOCR_MEASURE_COMMIT_RELEASE_UNPROVEN != 0;
+    let known_flags = ffi::GGML_GALLOCR_MEASURE_COMMIT_MAY_HAVE_MUTATED
+        | ffi::GGML_GALLOCR_MEASURE_COMMIT_RELEASE_UNPROVEN;
+    let has_unknown_flags = flags & !known_flags != 0;
+    GgmlGallocrCommitEvidence {
+        may_have_mutated: known_mutation || release_unproven || has_unknown_flags,
+        release_must_remain_unproven: release_unproven || has_unknown_flags,
+    }
 }
 
 impl GgmlRawGraphAllocatorGuard {
     fn new(buft: NonNull<c_void>) -> Result<Self, GgmlCpuGraphError> {
         NonNull::new(unsafe { ffi::ggml_gallocr_new(buft.as_ptr()) })
-            .map(|raw| Self { raw })
+            .map(|raw| Self {
+                raw,
+                released: false,
+            })
             .ok_or_else(|| {
                 memory_admission_failure("direct-gallocr/create", "ggml_gallocr_new returned null")
             })
@@ -10234,26 +10420,65 @@ impl GgmlRawGraphAllocatorGuard {
         Ok(chunks)
     }
 
-    fn commit_and_bind(&self, graph: NonNull<c_void>) -> Result<(), GgmlCpuGraphError> {
-        if !unsafe { ffi::ggml_gallocr_measure_commit_v1(self.raw.as_ptr()) } {
-            return Err(memory_admission_failure(
-                "direct-gallocr/commit",
-                "ggml_gallocr_measure_commit_v1 failed",
-            ));
+    fn commit_and_bind(
+        &self,
+        graph: NonNull<c_void>,
+    ) -> Result<(), NativeEngineCommitFailure<GgmlCpuGraphError>> {
+        let mut commit_flags = 0_u32;
+        let commit_status =
+            unsafe { ffi::ggml_gallocr_measure_commit_v2(self.raw.as_ptr(), &mut commit_flags) };
+        if commit_status != ffi::GGML_STATUS_SUCCESS {
+            let evidence = ggml_gallocr_commit_evidence(commit_flags);
+            let failure = NativeEngineCommitFailure::new(
+                memory_admission_failure(
+                    "direct-gallocr/commit",
+                    format!(
+                        "ggml_gallocr_measure_commit_v2 failed with status {commit_status} flags=0x{commit_flags:x}"
+                    ),
+                ),
+                commit_status,
+                evidence.may_have_mutated,
+            );
+            return Err(if evidence.release_must_remain_unproven {
+                failure.with_unproven_release()
+            } else {
+                failure
+            });
         }
-        if !unsafe { ffi::ggml_gallocr_alloc_graph(self.raw.as_ptr(), graph.as_ptr()) } {
-            return Err(memory_admission_failure(
-                "direct-gallocr/bind",
-                "ggml_gallocr_alloc_graph failed",
+        let bind_status =
+            unsafe { ffi::ggml_gallocr_alloc_graph_v2(self.raw.as_ptr(), graph.as_ptr()) };
+        if bind_status != ffi::GGML_STATUS_SUCCESS {
+            return Err(NativeEngineCommitFailure::new(
+                memory_admission_failure(
+                    "direct-gallocr/bind",
+                    format!("ggml_gallocr_alloc_graph_v2 failed with status {bind_status}"),
+                ),
+                bind_status,
+                true,
             ));
         }
         Ok(())
     }
 }
 
+impl NativeMemoryOwner for GgmlRawGraphAllocatorGuard {
+    fn release_native(&mut self) -> BackendReleaseProof {
+        if self.released {
+            return BackendReleaseProof::NotRequired;
+        }
+        self.released = true;
+        let status = unsafe { ffi::ggml_gallocr_free_status(self.raw.as_ptr()) };
+        if status == ffi::GGML_STATUS_SUCCESS {
+            BackendReleaseProof::Proven
+        } else {
+            BackendReleaseProof::Unproven
+        }
+    }
+}
+
 impl Drop for GgmlRawGraphAllocatorGuard {
     fn drop(&mut self) {
-        unsafe { ffi::ggml_gallocr_free(self.raw.as_ptr()) };
+        let _ = self.release_native();
     }
 }
 
@@ -10300,7 +10525,9 @@ impl GgmlGraphAllocatorGuard {
         else {
             #[cfg(test)]
             {
-                allocator.commit_and_bind(graph)?;
+                allocator
+                    .commit_and_bind(graph)
+                    .map_err(NativeEngineCommitFailure::into_source)?;
                 return Ok(Self {
                     _ownership: GgmlGraphAllocatorOwnership::Direct { _owner: allocator },
                     requested_bytes,
@@ -10371,13 +10598,12 @@ impl GgmlGraphAllocatorGuard {
             })
             .map_err(|source| memory_admission_error("direct-gallocr/reserve", source))?;
         let allocation = transaction
-            .commit_engine_owned_with(|| {
-                allocator.commit_and_bind(graph)?;
-                Ok::<_, GgmlCpuGraphError>(allocator)
+            .commit_prepared_engine_owner_with(allocator, |allocator| {
+                allocator.commit_and_bind(graph)
             })
             .map_err(|error| match error {
-                NativeMemoryAllocationError::NativeCommit { source } => source,
-                NativeMemoryAllocationError::PostAllocationStats { source } => {
+                NativeMemoryAllocationError::NativeCommit { source, .. } => source,
+                NativeMemoryAllocationError::PostAllocationStats { source, .. } => {
                     memory_admission_error("direct-gallocr/reconcile", source)
                 }
                 other => memory_admission_failure("direct-gallocr/commit", other.to_string()),
@@ -10477,7 +10703,10 @@ impl GgmlBackendBufferGuard {
         let native_allocate = || {
             let raw = unsafe { ffi::ggml_backend_buft_alloc_buffer(buft.as_ptr(), size) };
             NonNull::new(raw)
-                .map(|raw| GgmlRawBackendBufferGuard { raw })
+                .map(|raw| GgmlRawBackendBufferGuard {
+                    raw,
+                    released: false,
+                })
                 .ok_or_else(|| backend_buffer_allocation_failure("cpu-step-buffer-pool"))
         };
         let request = ffi::GgmlBackendMemoryRequestV1 {
@@ -10540,7 +10769,10 @@ impl GgmlBackendBufferGuard {
             let raw = NonNull::new(raw)
                 .ok_or_else(|| backend_buffer_allocation_failure(backend_name(backend)))?;
             unsafe { ffi::ggml_backend_buffer_set_usage(raw.as_ptr(), usage) };
-            Ok(GgmlRawBackendBufferGuard { raw })
+            Ok(GgmlRawBackendBufferGuard {
+                raw,
+                released: false,
+            })
         };
 
         let buft =
@@ -10670,10 +10902,14 @@ fn allocate_native_buffers_with_admission(
         })
         .map_err(|source| memory_admission_error_maybe(operation, source, record_capacity))?;
     let allocation = transaction
-        .commit_engine_owned_with(native_allocate)
+        .commit_engine_owned_with(|| {
+            native_allocate().map_err(|source| {
+                NativeEngineCommitFailure::new(source, ffi::GGML_STATUS_ALLOC_FAILED, true)
+            })
+        })
         .map_err(|error| match error {
-            NativeMemoryAllocationError::NativeCommit { source } => source,
-            NativeMemoryAllocationError::PostAllocationStats { source } => {
+            NativeMemoryAllocationError::NativeCommit { source, .. } => source,
+            NativeMemoryAllocationError::PostAllocationStats { source, .. } => {
                 memory_admission_error_maybe(operation, source, record_capacity)
             }
             other => memory_admission_failure_maybe(operation, other.to_string(), record_capacity),
@@ -10738,7 +10974,10 @@ fn maybe_allocate_weight_buffer_from_host_ptr(
         unsafe {
             ffi::ggml_backend_buffer_set_usage(raw.as_ptr(), ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
         };
-        Ok(GgmlRawBackendBufferGuard { raw })
+        Ok(GgmlRawBackendBufferGuard {
+            raw,
+            released: false,
+        })
     };
 
     let requested_bytes =
@@ -10961,16 +11200,39 @@ mod tests {
         GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor, GgmlWeightMaterialization,
         GgmlWeightMaterializationKind, GpuProbeCache, GpuProbeOutcome, GpuProbeState,
         METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS, backend_satisfies_execution_placement,
-        flash_attn_ext_head_dim_supported_on_backend, gpu_probe_failed_log_message,
-        gpu_probe_log_message, install_test_graph_compute_status_override,
-        install_test_tensor_readback_status_override, memory_admission_failure,
-        mul_mat_requires_f32_precision_to_preserve_rhs_range,
+        flash_attn_ext_head_dim_supported_on_backend, ggml_gallocr_commit_evidence,
+        gpu_probe_failed_log_message, gpu_probe_log_message,
+        install_test_graph_compute_status_override, install_test_tensor_readback_status_override,
+        memory_admission_failure, mul_mat_requires_f32_precision_to_preserve_rhs_range,
         reset_test_compute_gate_attempt_count, reset_test_native_graph_submission_count,
         reset_test_tensor_readback_count, runtime_gpu_is_available,
         scheduler_allows_cpu_participants, test_compute_gate_attempt_count,
         test_native_graph_submission_count, test_tensor_readback_count,
         validate_graph_cancel_capability,
     };
+
+    #[test]
+    fn gallocr_release_unproven_and_unknown_flags_cannot_be_cleared_by_owner_free() {
+        let unchanged = ggml_gallocr_commit_evidence(0);
+        assert!(!unchanged.may_have_mutated);
+        assert!(!unchanged.release_must_remain_unproven);
+
+        let mutated =
+            ggml_gallocr_commit_evidence(ffi::GGML_GALLOCR_MEASURE_COMMIT_MAY_HAVE_MUTATED);
+        assert!(mutated.may_have_mutated);
+        assert!(!mutated.release_must_remain_unproven);
+
+        let orphaned = ggml_gallocr_commit_evidence(
+            ffi::GGML_GALLOCR_MEASURE_COMMIT_MAY_HAVE_MUTATED
+                | ffi::GGML_GALLOCR_MEASURE_COMMIT_RELEASE_UNPROVEN,
+        );
+        assert!(orphaned.may_have_mutated);
+        assert!(orphaned.release_must_remain_unproven);
+
+        let future_unknown = ggml_gallocr_commit_evidence(1 << 31);
+        assert!(future_unknown.may_have_mutated);
+        assert!(future_unknown.release_must_remain_unproven);
+    }
 
     #[test]
     fn full_device_runner_rejects_cpu_backend_and_excludes_cpu_scheduler_participants() {

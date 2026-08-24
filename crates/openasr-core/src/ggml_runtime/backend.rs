@@ -1747,24 +1747,10 @@ pub fn ggml_available_devices() -> Vec<GgmlBackendDevice> {
     devices
 }
 
-/// Optional backend procedure added without extending ggml's device interface,
-/// so an older dynamically loaded plugin remains ABI-safe and simply reports
-/// `None`. A zero return is the backend's explicit "unknown" value.
+/// Optional backend hardware fact queried through ggml's shared no-throw
+/// adapter. Older plugins remain ABI-safe and report zero/unknown.
 unsafe fn device_pci_vendor_id(device: NonNull<c_void>) -> Option<u32> {
-    const PROC_NAME: &[u8] = b"ggml_backend_device_pci_vendor_id\0";
-    let registry = unsafe { ffi::ggml_backend_dev_backend_reg(device.as_ptr()) };
-    if registry.is_null() {
-        return None;
-    }
-    let procedure = unsafe {
-        ffi::ggml_backend_reg_get_proc_address(registry, PROC_NAME.as_ptr().cast::<c_char>())
-    };
-    if procedure.is_null() {
-        return None;
-    }
-    type DevicePciVendorId = unsafe extern "C" fn(ffi::GgmlBackendDevRaw) -> u32;
-    let query: DevicePciVendorId = unsafe { std::mem::transmute(procedure) };
-    let vendor_id = unsafe { query(device.as_ptr()) };
+    let vendor_id = unsafe { ffi::ggml_backend_dev_pci_vendor_id(device.as_ptr()) };
     (vendor_id != 0).then_some(vendor_id)
 }
 

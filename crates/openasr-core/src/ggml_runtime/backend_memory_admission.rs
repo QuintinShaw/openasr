@@ -38,8 +38,10 @@ use crate::models::native_execution_services::{
 
 use super::{
     backend_memory::{
-        BackendMemoryAbi, BackendMemoryAbiError, BackendMemoryDomainKind,
-        BackendMemoryLifecyclePoint, BackendMemoryQuote, BackendMemoryStatsSnapshot,
+        BackendFailureDisposition, BackendMemoryAbi, BackendMemoryAbiError,
+        BackendMemoryDomainKind, BackendMemoryLifecyclePoint, BackendMemoryQuote,
+        BackendMemoryStatsSnapshot, BackendReleaseProof, BackendTerminalEvidence,
+        BackendTerminalIdentity, BackendTerminalOutcome, BackendTerminalStage,
         backend_owned_unknown_reason,
     },
     ffi,
@@ -387,42 +389,99 @@ pub(crate) struct NativeMemoryAllocationTransaction {
     reservation: DeviceMemoryReservationBatch,
 }
 
-#[derive(Debug)]
-pub(crate) enum NativeOwnerAttachedCommitFailure<E> {
-    Reclaimable(E),
-    Quarantine(E),
+/// Typed failure Interface consumed by the owner-attached transaction. The
+/// failure producer owns evidence interpretation; the transaction alone owns
+/// the broker state transition, so callers cannot classify one error twice.
+pub(crate) trait NativeOwnerAttachedCommitOutcome {
+    fn requires_quarantine(&self) -> bool;
 }
 
-impl<E> NativeOwnerAttachedCommitFailure<E> {
-    pub(crate) fn reclaimable(source: E) -> Self {
-        Self::Reclaimable(source)
-    }
+/// Engine-owned native resources must expose status-aware destruction. The
+/// broker may refund their lease only after this owner proves that every
+/// native release callback completed.
+pub(crate) trait NativeMemoryOwner {
+    fn release_native(&mut self) -> BackendReleaseProof;
+}
 
-    pub(crate) fn quarantine(source: E) -> Self {
-        Self::Quarantine(source)
-    }
+/// Typed native commit failure consumed by the single broker transaction.
+/// `may_have_mutated` is conservative: once a provider callback or allocator
+/// binding phase was entered, the caller must set it even when the provider
+/// returned an ordinary OOM status.
+pub(crate) struct NativeEngineCommitFailure<E> {
+    source: E,
+    status: i32,
+    may_have_mutated: bool,
+    release_must_remain_unproven: bool,
+}
 
-    fn requires_quarantine(&self) -> bool {
-        matches!(self, Self::Quarantine(_))
-    }
-
-    fn into_source(self) -> E {
-        match self {
-            Self::Reclaimable(source) | Self::Quarantine(source) => source,
+impl<E> NativeEngineCommitFailure<E> {
+    pub(crate) fn new(source: E, status: i32, may_have_mutated: bool) -> Self {
+        Self {
+            source,
+            status,
+            may_have_mutated,
+            release_must_remain_unproven: false,
         }
+    }
+
+    pub(crate) fn with_unproven_release(mut self) -> Self {
+        self.release_must_remain_unproven = true;
+        self
+    }
+
+    pub(crate) fn into_source(self) -> E {
+        self.source
+    }
+}
+
+struct NativeMemoryReleaseAudit {
+    backends: Vec<BackendMemoryAbi>,
+    identity: BackendTerminalIdentity,
+}
+
+impl NativeMemoryReleaseAudit {
+    fn outcome(
+        &self,
+        stage: BackendTerminalStage,
+        status: i32,
+        may_have_mutated: bool,
+        release_proof: BackendReleaseProof,
+    ) -> BackendTerminalOutcome {
+        BackendTerminalOutcome::backend_operation(
+            stage,
+            status,
+            may_have_mutated,
+            self.identity.clone(),
+            BackendTerminalEvidence::capture(&self.backends, 0),
+        )
+        .with_release_proof(release_proof)
+    }
+
+    fn release_outcome<T: NativeMemoryOwner>(
+        &self,
+        owner: &mut T,
+        stage: BackendTerminalStage,
+        status: i32,
+        may_have_mutated: bool,
+    ) -> BackendTerminalOutcome {
+        let release_proof = owner.release_native();
+        self.outcome(stage, status, may_have_mutated, release_proof)
     }
 }
 
 fn owner_attached_native_commit_error<E>(
     reservation: &mut DeviceMemoryReservationBatch,
-    failure: NativeOwnerAttachedCommitFailure<E>,
-) -> NativeOwnerAttachedMemoryError<E> {
+    failure: E,
+) -> NativeOwnerAttachedMemoryError<E>
+where
+    E: NativeOwnerAttachedCommitOutcome,
+{
     let quarantined = failure.requires_quarantine();
     if quarantined {
         reservation.quarantine();
     }
     NativeOwnerAttachedMemoryError::NativeCommit {
-        source: failure.into_source(),
+        source: failure,
         quarantined,
     }
 }
@@ -438,6 +497,64 @@ impl NativeMemoryAllocationTransaction {
 
     pub(crate) fn reservation_requests(&self) -> &[DomainReservationRequest] {
         &self.requests
+    }
+
+    fn terminal_evidence(&self) -> BackendTerminalEvidence {
+        let mut seen = HashSet::new();
+        let backends = self
+            .groups
+            .iter()
+            .filter_map(|group| {
+                seen.insert(group.abi.backend() as usize)
+                    .then_some(group.abi)
+            })
+            .collect::<Vec<_>>();
+        BackendTerminalEvidence::capture(&backends, 0)
+    }
+
+    fn private_reserve_outcome(
+        &self,
+        identity: BackendTerminalIdentity,
+        source: &BackendMemoryAbiError,
+        may_have_mutated: bool,
+    ) -> BackendTerminalOutcome {
+        BackendTerminalOutcome::backend_operation(
+            BackendTerminalStage::BackendPrivateReserve,
+            source.terminal_status(),
+            may_have_mutated,
+            identity,
+            self.terminal_evidence(),
+        )
+    }
+
+    fn private_reserve_identity(&self, group_index: usize) -> BackendTerminalIdentity {
+        let group = &self.groups[group_index];
+        let mut domains = self
+            .requests
+            .iter()
+            .map(|request| request.domain.clone())
+            .collect::<Vec<_>>();
+        domains.sort();
+        domains.dedup();
+        BackendTerminalIdentity::exact(
+            group.provider,
+            group.backend_device_identity.as_str().to_owned(),
+            domains,
+        )
+    }
+
+    fn standalone_release_audit(
+        &self,
+    ) -> Result<NativeMemoryReleaseAudit, NativeMemoryRequestKindError> {
+        if self.groups.len() != 1 {
+            return Err(NativeMemoryRequestKindError::StandaloneOwnerSpansBackends {
+                backend_count: self.groups.len(),
+            });
+        }
+        Ok(NativeMemoryReleaseAudit {
+            backends: vec![self.groups[0].abi],
+            identity: self.private_reserve_identity(0),
+        })
     }
 
     fn attach_runtime_receipt(&mut self) {
@@ -627,35 +744,57 @@ impl NativeMemoryAllocationTransaction {
     /// 4. return one owner wrapper that drops native state before its lease.
     ///
     /// The backends referenced by the quote groups must outlive this call and
-    /// the returned `T`. On a closure error, all partial owners created inside
-    /// the closure must already have been dropped by normal Rust unwinding.
+    /// the returned `T`. A closure failure must classify whether entering the
+    /// native callback may have changed provider state; no untyped error may
+    /// implicitly refund the reservation.
     pub(crate) fn commit_engine_owned_with<T, E, F>(
         mut self,
         native_commit: F,
     ) -> Result<NativeMemoryAllocation<T>, NativeMemoryAllocationError<E>>
     where
-        F: FnOnce() -> Result<T, E>,
+        T: NativeMemoryOwner,
+        F: FnOnce() -> Result<T, NativeEngineCommitFailure<E>>,
     {
         self.require_request_class(NativeRequestClass::EngineOwned)
             .map_err(NativeMemoryAllocationError::RequestKinds)?;
+        let release_audit = self
+            .standalone_release_audit()
+            .map_err(NativeMemoryAllocationError::RequestKinds)?;
         for index in 0..self.groups.len() {
             if let Err(source) = self.groups[index].reserve_private() {
-                let quarantined = source.may_have_committed_private_state();
+                let outcome = self.private_reserve_outcome(
+                    self.private_reserve_identity(index),
+                    &source,
+                    source.may_have_committed_private_state(),
+                );
+                let quarantined = outcome.disposition() == BackendFailureDisposition::Quarantine;
                 if quarantined {
                     self.reservation.quarantine();
                 }
                 return Err(NativeMemoryAllocationError::PrivateReserve {
                     group_id: self.groups[index].group_id.clone(),
                     source,
-                    quarantined,
+                    outcome,
                 });
             }
         }
 
-        let owner = match native_commit() {
+        let mut owner = match native_commit() {
             Ok(owner) => owner,
-            Err(source) => {
-                return Err(NativeMemoryAllocationError::NativeCommit { source });
+            Err(failure) => {
+                let outcome = release_audit.outcome(
+                    BackendTerminalStage::EngineOwnedCommit,
+                    failure.status,
+                    failure.may_have_mutated,
+                    BackendReleaseProof::Unproven,
+                );
+                if outcome.disposition() == BackendFailureDisposition::Quarantine {
+                    self.reservation.quarantine();
+                }
+                return Err(NativeMemoryAllocationError::NativeCommit {
+                    source: failure.source,
+                    outcome,
+                });
             }
         };
 
@@ -667,14 +806,130 @@ impl NativeMemoryAllocationTransaction {
         }) {
             Ok(()) => {}
             Err(ReservationFinalizeError::Evidence(source)) => {
-                // The native owner must disappear before pending broker bytes
-                // are released.
+                let outcome = release_audit.release_outcome(
+                    &mut owner,
+                    BackendTerminalStage::EngineOwnedReconcile,
+                    ffi::GGML_STATUS_FAILED,
+                    true,
+                );
                 drop(owner);
-                return Err(NativeMemoryAllocationError::PostAllocationStats { source });
+                if outcome.disposition() == BackendFailureDisposition::Quarantine {
+                    self.reservation.quarantine();
+                }
+                return Err(NativeMemoryAllocationError::PostAllocationStats { source, outcome });
             }
             Err(ReservationFinalizeError::Broker(source)) => {
+                let outcome = release_audit.release_outcome(
+                    &mut owner,
+                    BackendTerminalStage::EngineOwnedReconcile,
+                    ffi::GGML_STATUS_FAILED,
+                    true,
+                );
                 drop(owner);
-                return Err(NativeMemoryAllocationError::BrokerCommit { source });
+                if outcome.disposition() == BackendFailureDisposition::Quarantine {
+                    self.reservation.quarantine();
+                }
+                return Err(NativeMemoryAllocationError::BrokerCommit { source, outcome });
+            }
+        }
+
+        Ok(NativeMemoryAllocation {
+            owner: Some(owner),
+            reservation: Some(self.reservation),
+        })
+    }
+
+    /// Commits a native owner that already exists before its fallible commit
+    /// phase (the direct ggml graph allocator). Ownership moves into this
+    /// transaction before any provider mutation, so every failure can destroy
+    /// the owner synchronously and combine release proof with fresh exact-
+    /// backend health evidence before deciding refund versus quarantine.
+    pub(crate) fn commit_prepared_engine_owner_with<T, E, F>(
+        mut self,
+        mut owner: T,
+        native_commit: F,
+    ) -> Result<NativeMemoryAllocation<T>, NativeMemoryAllocationError<E>>
+    where
+        T: NativeMemoryOwner,
+        F: FnOnce(&mut T) -> Result<(), NativeEngineCommitFailure<E>>,
+    {
+        self.require_request_class(NativeRequestClass::EngineOwned)
+            .map_err(NativeMemoryAllocationError::RequestKinds)?;
+        let release_audit = self
+            .standalone_release_audit()
+            .map_err(NativeMemoryAllocationError::RequestKinds)?;
+        for index in 0..self.groups.len() {
+            if let Err(source) = self.groups[index].reserve_private() {
+                let outcome = release_audit.release_outcome(
+                    &mut owner,
+                    BackendTerminalStage::BackendPrivateReserve,
+                    source.terminal_status(),
+                    source.may_have_committed_private_state(),
+                );
+                drop(owner);
+                if outcome.disposition() == BackendFailureDisposition::Quarantine {
+                    self.reservation.quarantine();
+                }
+                return Err(NativeMemoryAllocationError::PrivateReserve {
+                    group_id: self.groups[index].group_id.clone(),
+                    source,
+                    outcome,
+                });
+            }
+        }
+
+        if let Err(failure) = native_commit(&mut owner) {
+            let mut outcome = release_audit.release_outcome(
+                &mut owner,
+                BackendTerminalStage::EngineOwnedCommit,
+                failure.status,
+                failure.may_have_mutated,
+            );
+            if failure.release_must_remain_unproven {
+                outcome = outcome.with_release_proof(BackendReleaseProof::Unproven);
+            }
+            drop(owner);
+            if outcome.disposition() == BackendFailureDisposition::Quarantine {
+                self.reservation.quarantine();
+            }
+            return Err(NativeMemoryAllocationError::NativeCommit {
+                source: failure.source,
+                outcome,
+            });
+        }
+
+        let groups = &self.groups;
+        let baseline = &self.reconciliation_baseline;
+        let requests = &self.requests;
+        match finalize_reservation_with(&mut self.reservation, || {
+            build_live_reconciliations(groups, baseline, requests)
+        }) {
+            Ok(()) => {}
+            Err(ReservationFinalizeError::Evidence(source)) => {
+                let outcome = release_audit.release_outcome(
+                    &mut owner,
+                    BackendTerminalStage::EngineOwnedReconcile,
+                    ffi::GGML_STATUS_FAILED,
+                    true,
+                );
+                drop(owner);
+                if outcome.disposition() == BackendFailureDisposition::Quarantine {
+                    self.reservation.quarantine();
+                }
+                return Err(NativeMemoryAllocationError::PostAllocationStats { source, outcome });
+            }
+            Err(ReservationFinalizeError::Broker(source)) => {
+                let outcome = release_audit.release_outcome(
+                    &mut owner,
+                    BackendTerminalStage::EngineOwnedReconcile,
+                    ffi::GGML_STATUS_FAILED,
+                    true,
+                );
+                drop(owner);
+                if outcome.disposition() == BackendFailureDisposition::Quarantine {
+                    self.reservation.quarantine();
+                }
+                return Err(NativeMemoryAllocationError::BrokerCommit { source, outcome });
             }
         }
 
@@ -698,23 +953,28 @@ impl NativeMemoryAllocationTransaction {
     /// broker reservation and require poisoning or destroying the owner.
     pub(crate) fn commit_owner_attached_with<E, F>(
         mut self,
+        identity: BackendTerminalIdentity,
         native_commit: F,
     ) -> Result<NativeOwnerAttachedMemoryLease, NativeOwnerAttachedMemoryError<E>>
     where
-        F: FnOnce() -> Result<(), NativeOwnerAttachedCommitFailure<E>>,
+        E: NativeOwnerAttachedCommitOutcome,
+        F: FnOnce() -> Result<(), E>,
     {
         self.require_request_class(NativeRequestClass::EngineOwned)
             .map_err(NativeOwnerAttachedMemoryError::RequestKinds)?;
         for index in 0..self.groups.len() {
             if let Err(source) = self.groups[index].reserve_private() {
-                let quarantined = source.may_have_committed_private_state();
+                let may_have_mutated = source.may_have_committed_private_state();
+                let outcome =
+                    self.private_reserve_outcome(identity.clone(), &source, may_have_mutated);
+                let quarantined = outcome.disposition() == BackendFailureDisposition::Quarantine;
                 if quarantined {
                     self.reservation.quarantine();
                 }
                 return Err(NativeOwnerAttachedMemoryError::PrivateReserve {
                     group_id: self.groups[index].group_id.clone(),
                     source,
-                    quarantined,
+                    outcome,
                 });
             }
         }
@@ -754,8 +1014,9 @@ impl NativeMemoryAllocationTransaction {
     /// reservation; this layer never calls broad `trim` on a shared backend.
     pub(crate) fn commit_backend_private(
         self,
+        identity: BackendTerminalIdentity,
     ) -> Result<NativeBackendPrivateMemoryLease, NativeBackendPrivateMemoryError> {
-        let lease = self.reserve_backend_private_deferred()?;
+        let lease = self.reserve_backend_private_deferred(identity)?;
         lease.finalize_pending()?;
         Ok(lease)
     }
@@ -767,20 +1028,24 @@ impl NativeMemoryAllocationTransaction {
     /// water, then calls [`NativeBackendPrivateMemoryLease::finalize_pending`].
     pub(crate) fn reserve_backend_private_deferred(
         mut self,
+        identity: BackendTerminalIdentity,
     ) -> Result<NativeBackendPrivateMemoryLease, NativeBackendPrivateMemoryError> {
         self.require_request_class(NativeRequestClass::BackendPrivate)
             .map_err(NativeBackendPrivateMemoryError::RequestKinds)?;
         let mut any_reserved = false;
         for index in 0..self.groups.len() {
             if let Err(source) = self.groups[index].reserve_private() {
-                let quarantined = any_reserved || source.may_have_committed_private_state();
+                let may_have_mutated = any_reserved || source.may_have_committed_private_state();
+                let outcome =
+                    self.private_reserve_outcome(identity.clone(), &source, may_have_mutated);
+                let quarantined = outcome.disposition() == BackendFailureDisposition::Quarantine;
                 if quarantined {
                     self.reservation.quarantine();
                 }
                 return Err(NativeBackendPrivateMemoryError::PrivateReserve {
                     group_id: self.groups[index].group_id.clone(),
                     source,
-                    quarantined,
+                    outcome,
                 });
             }
             any_reserved = true;
@@ -930,6 +1195,10 @@ pub(crate) enum NativeMemoryRequestKindError {
     Mixed,
     #[error("native memory allocation transaction contains unsupported request kind {kind}")]
     Unsupported { kind: u32 },
+    #[error(
+        "one standalone native owner cannot span {backend_count} backend quote groups; use an owner-attached transaction"
+    )]
+    StandaloneOwnerSpansBackends { backend_count: usize },
     #[error("native memory transaction requires {expected} requests but received {actual}")]
     WrongTransaction {
         expected: NativeRequestClass,
@@ -940,7 +1209,7 @@ pub(crate) enum NativeMemoryRequestKindError {
 /// The true native owner and its committed process-wide memory lease. This
 /// wrapper intentionally has an explicit `Drop`: native buffers disappear
 /// before the reservation can refund committed bytes.
-pub(crate) struct NativeMemoryAllocation<T> {
+pub(crate) struct NativeMemoryAllocation<T: NativeMemoryOwner> {
     owner: Option<T>,
     /// The broker batch owns the one receipt row for this physical owner. Its
     /// state moves Reserved -> Committed/Reconciled -> Released together with
@@ -1089,7 +1358,7 @@ impl NativeBackendPrivateMemoryLease {
     }
 }
 
-impl<T> NativeMemoryAllocation<T> {
+impl<T: NativeMemoryOwner> NativeMemoryAllocation<T> {
     pub(crate) fn record_receipt_reuse(&self) {
         self.reservation().record_receipt_reuse();
     }
@@ -1113,7 +1382,7 @@ impl<T> NativeMemoryAllocation<T> {
     }
 }
 
-impl<T> Deref for NativeMemoryAllocation<T> {
+impl<T: NativeMemoryOwner> Deref for NativeMemoryAllocation<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -1121,15 +1390,23 @@ impl<T> Deref for NativeMemoryAllocation<T> {
     }
 }
 
-impl<T> DerefMut for NativeMemoryAllocation<T> {
+impl<T: NativeMemoryOwner> DerefMut for NativeMemoryAllocation<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.owner_mut()
     }
 }
 
-impl<T> Drop for NativeMemoryAllocation<T> {
+impl<T: NativeMemoryOwner> Drop for NativeMemoryAllocation<T> {
     fn drop(&mut self) {
-        drop(self.owner.take());
+        if let Some(mut owner) = self.owner.take() {
+            let release_proof = owner.release_native();
+            drop(owner);
+            if release_proof != BackendReleaseProof::Proven
+                && let Some(reservation) = self.reservation.as_mut()
+            {
+                reservation.quarantine();
+            }
+        }
         drop(self.reservation.take());
     }
 }
@@ -1140,16 +1417,19 @@ pub(crate) enum NativeMemoryAllocationError<E> {
     PrivateReserve {
         group_id: String,
         source: BackendMemoryAbiError,
-        quarantined: bool,
+        outcome: BackendTerminalOutcome,
     },
     NativeCommit {
         source: E,
+        outcome: BackendTerminalOutcome,
     },
     PostAllocationStats {
         source: NativeMemoryAdmissionError,
+        outcome: BackendTerminalOutcome,
     },
     BrokerCommit {
         source: MemoryPlanningError,
+        outcome: BackendTerminalOutcome,
     },
 }
 
@@ -1159,7 +1439,7 @@ pub(crate) enum NativeOwnerAttachedMemoryError<E> {
     PrivateReserve {
         group_id: String,
         source: BackendMemoryAbiError,
-        quarantined: bool,
+        outcome: BackendTerminalOutcome,
     },
     NativeCommit {
         source: E,
@@ -1180,10 +1460,10 @@ impl<E: fmt::Display> fmt::Display for NativeOwnerAttachedMemoryError<E> {
             Self::PrivateReserve {
                 group_id,
                 source,
-                quarantined,
+                outcome,
             } => write!(
                 formatter,
-                "native quote-token validation failed for owner group '{group_id}' (quarantined={quarantined}): {source}"
+                "native quote-token validation failed for owner group '{group_id}' (outcome={outcome:?}): {source}"
             ),
             Self::NativeCommit {
                 source,
@@ -1211,22 +1491,28 @@ impl<E: fmt::Display> fmt::Display for NativeMemoryAllocationError<E> {
             Self::PrivateReserve {
                 group_id,
                 source,
-                quarantined,
+                outcome,
             } => write!(
                 formatter,
-                "native quote-token validation failed for group '{group_id}' (quarantined={quarantined}): {source}"
+                "native quote-token validation failed for group '{group_id}' (outcome={outcome:?}): {source}"
             ),
-            Self::NativeCommit { source } => {
-                write!(formatter, "native allocation commit failed: {source}")
-            }
-            Self::PostAllocationStats { source } => {
+            Self::NativeCommit { source, outcome } => {
                 write!(
                     formatter,
-                    "post-allocation native memory stats failed: {source}"
+                    "native allocation commit failed (outcome={outcome:?}): {source}"
                 )
             }
-            Self::BrokerCommit { source } => {
-                write!(formatter, "native memory broker commit failed: {source}")
+            Self::PostAllocationStats { source, outcome } => {
+                write!(
+                    formatter,
+                    "post-allocation native memory stats failed (outcome={outcome:?}): {source}"
+                )
+            }
+            Self::BrokerCommit { source, outcome } => {
+                write!(
+                    formatter,
+                    "native memory broker commit failed (outcome={outcome:?}): {source}"
+                )
             }
         }
     }
@@ -1237,12 +1523,12 @@ pub(crate) enum NativeBackendPrivateMemoryError {
     #[error(transparent)]
     RequestKinds(#[from] NativeMemoryRequestKindError),
     #[error(
-        "native backend-private reserve failed for group '{group_id}' (quarantined={quarantined}): {source}"
+        "native backend-private reserve failed for group '{group_id}' (outcome={outcome:?}): {source}"
     )]
     PrivateReserve {
         group_id: String,
         source: BackendMemoryAbiError,
-        quarantined: bool,
+        outcome: BackendTerminalOutcome,
     },
     #[error(
         "post-allocation backend-private stats failed and the reservation was quarantined: {source}"
@@ -1632,7 +1918,9 @@ fn map_group_stats(
                 return Err(NativeMemoryAdmissionError::UnhealthyBackend {
                     group_id: group_id.to_owned(),
                     health: raw.health,
+                    status: raw.last_ggml_status,
                     native_error: raw.last_native_error,
+                    quarantine_generation: raw.quarantine_generation,
                 });
             }
             health => {
@@ -2070,12 +2358,14 @@ pub(crate) enum NativeMemoryAdmissionError {
     )]
     InvalidStatsSnapshot { group_id: String, heap_index: u32 },
     #[error(
-        "native memory backend group '{group_id}' is unhealthy: health={health}, native_error={native_error}"
+        "native memory backend group '{group_id}' is unhealthy: health={health}, status={status}, native_error={native_error}, quarantine_generation={quarantine_generation}"
     )]
     UnhealthyBackend {
         group_id: String,
         health: u32,
+        status: i32,
         native_error: i64,
+        quarantine_generation: u64,
     },
     #[error("native memory backend group '{group_id}' returned unknown health {health}")]
     UnknownBackendHealth { group_id: String, health: u32 },
@@ -3161,13 +3451,14 @@ mod tests {
             observed_committed: Arc<Mutex<Option<u64>>>,
         }
 
-        impl Drop for OwnerDropProbe {
-            fn drop(&mut self) {
+        impl NativeMemoryOwner for OwnerDropProbe {
+            fn release_native(&mut self) -> BackendReleaseProof {
                 let committed = self
                     .broker
                     .usage(&MemoryDomainKey::SystemMemory)
                     .committed_bytes;
                 *self.observed_committed.lock().unwrap() = Some(committed);
+                BackendReleaseProof::Proven
             }
         }
 
@@ -3336,12 +3627,18 @@ mod tests {
 
         let error = owner_attached_native_commit_error(
             &mut reservation,
-            NativeOwnerAttachedCommitFailure::Reclaimable("stale graph"),
+            TestCommitFailure {
+                message: "stale graph",
+                quarantine: false,
+            },
         );
         assert!(matches!(
             error,
             NativeOwnerAttachedMemoryError::NativeCommit {
-                source: "stale graph",
+                source: TestCommitFailure {
+                    message: "stale graph",
+                    ..
+                },
                 quarantined: false,
             }
         ));
@@ -3367,12 +3664,18 @@ mod tests {
 
         let error = owner_attached_native_commit_error(
             &mut reservation,
-            NativeOwnerAttachedCommitFailure::Quarantine("allocation changed"),
+            TestCommitFailure {
+                message: "allocation changed",
+                quarantine: true,
+            },
         );
         assert!(matches!(
             error,
             NativeOwnerAttachedMemoryError::NativeCommit {
-                source: "allocation changed",
+                source: TestCommitFailure {
+                    message: "allocation changed",
+                    ..
+                },
                 quarantined: true,
             }
         ));
@@ -3386,5 +3689,17 @@ mod tests {
             broker.try_reserve_batch(vec![dedicated_request(dedicated, 1, "scheduler-blocked")]),
             Err(MemoryPlanningError::DeviceQuarantined { .. })
         ));
+    }
+
+    #[derive(Debug)]
+    struct TestCommitFailure {
+        message: &'static str,
+        quarantine: bool,
+    }
+
+    impl NativeOwnerAttachedCommitOutcome for TestCommitFailure {
+        fn requires_quarantine(&self) -> bool {
+            self.quarantine
+        }
     }
 }
