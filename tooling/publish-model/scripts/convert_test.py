@@ -122,7 +122,11 @@ class ConvertTest(unittest.TestCase):
         subprocess.run(["git", "commit", "--no-gpg-sign", "--no-verify", "-qm", "fixture"], cwd=root, check=True)
         (root / "tmp" / "publish" / "mimo-v2.5-asr" / "src").mkdir(parents=True)
         self._write_fake_binary(root)
-        return root
+        # macOS exposes the temporary directory through both `/var` and its
+        # canonical `/private/var` spelling. Return one canonical root so shell
+        # arguments (which `convert.sh` resolves) and pathlib expectations use
+        # the same identity on every POSIX host.
+        return root.resolve()
 
     def _run(self, root: Path, quant: str, **extra_env: str) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
