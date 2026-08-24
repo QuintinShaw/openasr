@@ -142,8 +142,16 @@ pub enum NativeExecutionAttestationError {
     RuntimePlanMismatch,
     #[error("candidate attempt selected a different execution lane")]
     LaneMismatch,
-    #[error("candidate attempt lacks matching live backend attestation")]
-    LiveBackendMismatch,
+    #[error(
+        "candidate attempt lacks matching live backend attestation: expected provider={expected_provider} stable_device_id={expected_stable_device_id}, actual provider={actual_provider:?} stable_device_id={actual_stable_device_id:?} scheduler_enabled={scheduler_enabled:?}"
+    )]
+    LiveBackendMismatch {
+        expected_provider: ExecutionProvider,
+        expected_stable_device_id: String,
+        actual_provider: Option<ExecutionProvider>,
+        actual_stable_device_id: Option<String>,
+        scheduler_enabled: Option<bool>,
+    },
 }
 
 impl NativeExecutionReceiptSnapshot {
@@ -181,7 +189,13 @@ impl NativeExecutionReceiptSnapshot {
             || facts.actual_stable_device_id.as_deref() != Some(expected_stable_device_id)
             || facts.scheduler_enabled.is_none()
         {
-            return Err(NativeExecutionAttestationError::LiveBackendMismatch);
+            return Err(NativeExecutionAttestationError::LiveBackendMismatch {
+                expected_provider,
+                expected_stable_device_id: expected_stable_device_id.to_string(),
+                actual_provider: facts.actual_provider,
+                actual_stable_device_id: facts.actual_stable_device_id.clone(),
+                scheduler_enabled: facts.scheduler_enabled,
+            });
         }
         Ok(())
     }
@@ -819,7 +833,7 @@ mod tests {
         missing_live.begin_candidate_attempt();
         missing_live.record_facts(seq2seq_facts());
         missing_live.finish_candidate_attempt(true);
-        assert_eq!(
+        assert!(matches!(
             missing_live.snapshot().attest_activation(
                 "test-pack",
                 expected_runtime,
@@ -827,8 +841,13 @@ mod tests {
                 "CPU",
                 ExecutionPlacement::CpuOnly,
             ),
-            Err(NativeExecutionAttestationError::LiveBackendMismatch)
-        );
+            Err(NativeExecutionAttestationError::LiveBackendMismatch {
+                expected_provider: ExecutionProvider::Cpu,
+                actual_provider: None,
+                scheduler_enabled: None,
+                ..
+            })
+        ));
     }
 
     #[test]

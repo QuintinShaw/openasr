@@ -876,6 +876,22 @@ impl PolicyResolvedNativeStreamingSession {
         )
     }
 
+    fn run_control_current<T>(
+        &mut self,
+        operation: impl FnOnce(&mut dyn NativeAsrSession) -> T,
+    ) -> Option<T> {
+        let candidate = self.candidate().clone();
+        let services = self.factory.execution_services();
+        let session = self.session.as_deref_mut()?;
+        Some(
+            crate::models::native_execution_services::run_execution_candidate_control_scope(
+                services.as_ref(),
+                &candidate,
+                || operation(session),
+            ),
+        )
+    }
+
     fn replace_with_next_candidate(
         &mut self,
         previous_error: NativeAsrError,
@@ -978,11 +994,7 @@ impl NativeAsrSession for PolicyResolvedNativeStreamingSession {
 
     fn set_cancellation_token(&mut self, cancelled: Arc<AtomicBool>) {
         self.cancellation_token = Some(Arc::clone(&cancelled));
-        let attempt = self.run_current(|session| {
-            session.set_cancellation_token(cancelled);
-            Ok::<_, NativeAsrError>(())
-        });
-        let _ = self.finish_current_attempt("set-cancellation-token", attempt);
+        let _ = self.run_control_current(|session| session.set_cancellation_token(cancelled));
     }
 
     fn push_audio(
@@ -1058,9 +1070,11 @@ impl NativeAsrSession for PolicyResolvedNativeStreamingSession {
     fn cancel(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
         // Cancellation is cleanup, never an inference boundary. It must stay
         // allocation-free even when the session was canceled before warmup or
-        // the first audio frame.
-        let attempt = self.run_current(|session| session.cancel());
-        self.finish_current_attempt("cancel", attempt)
+        // the first audio frame. In particular it must not start a fresh
+        // candidate transaction and overwrite the last completed inference
+        // receipt with a cleanup-only row that has no live backend observation.
+        self.run_control_current(|session| session.cancel())
+            .unwrap_or_else(|| Ok(Vec::new()))
     }
 }
 
@@ -1802,7 +1816,7 @@ mod tests {
         env, fs,
         path::{Path, PathBuf},
         sync::Barrier,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     #[test]
@@ -3317,6 +3331,9 @@ mod tests {
     struct TestStreamingCandidateBuilder {
         services: Arc<NativeExecutionServices>,
         builds: Arc<Mutex<Vec<ExecutionProvider>>>,
+        receipt: Option<crate::NativeExecutionReceiptCollector>,
+        control_lanes:
+            Arc<Mutex<Vec<Option<crate::models::native_execution_services::ExecutionLaneKey>>>>,
         fail_build_on_accelerated: bool,
         fail_build_on_cpu_untyped: bool,
         fail_warmup_on_accelerated: bool,
@@ -3327,6 +3344,10 @@ mod tests {
     impl NativeStreamingSessionCandidateBuilder for TestStreamingCandidateBuilder {
         fn execution_services(&self) -> Arc<NativeExecutionServices> {
             Arc::clone(&self.services)
+        }
+
+        fn execution_receipt(&self) -> Option<crate::NativeExecutionReceiptCollector> {
+            self.receipt.clone()
         }
 
         fn initialize_auxiliary_runtimes(&self) -> Result<(), NativeAsrError> {
@@ -3387,6 +3408,7 @@ mod tests {
                     }
                     Ok(Box::new(TestPolicyNativeSession {
                         provider,
+                        control_lanes: Arc::clone(&self.control_lanes),
                         fail_warmup_on_accelerated: self.fail_warmup_on_accelerated,
                         fail_push_on_accelerated: self.fail_push_on_accelerated,
                     }) as Box<dyn NativeAsrSession>)
@@ -3397,6 +3419,8 @@ mod tests {
 
     struct TestPolicyNativeSession {
         provider: ExecutionProvider,
+        control_lanes:
+            Arc<Mutex<Vec<Option<crate::models::native_execution_services::ExecutionLaneKey>>>>,
         fail_warmup_on_accelerated: bool,
         fail_push_on_accelerated: bool,
     }
@@ -3404,6 +3428,13 @@ mod tests {
     impl NativeAsrSession for TestPolicyNativeSession {
         fn session_id(&self) -> &str {
             "policy-streaming-test"
+        }
+
+        fn set_cancellation_token(&mut self, _cancelled: Arc<AtomicBool>) {
+            self.control_lanes
+                .lock()
+                .unwrap()
+                .push(crate::models::native_execution_services::current_execution_lane());
         }
 
         fn push_audio(
@@ -3448,6 +3479,10 @@ mod tests {
         }
 
         fn cancel(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
+            self.control_lanes
+                .lock()
+                .unwrap()
+                .push(crate::models::native_execution_services::current_execution_lane());
             Ok(Vec::new())
         }
     }
@@ -3509,6 +3544,8 @@ mod tests {
             Arc::new(TestStreamingCandidateBuilder {
                 services: native_execution_services_for_test(),
                 builds: Arc::clone(&builds),
+                receipt: None,
+                control_lanes: Arc::new(Mutex::new(Vec::new())),
                 fail_build_on_accelerated: fail_build,
                 fail_build_on_cpu_untyped: false,
                 fail_warmup_on_accelerated: fail_warmup,
@@ -3551,6 +3588,49 @@ mod tests {
     }
 
     #[test]
+    fn streaming_control_cleanup_cannot_overwrite_completed_execution_receipt() {
+        let receipt = crate::NativeExecutionReceiptCollector::new();
+        let builds = Arc::new(Mutex::new(Vec::new()));
+        let control_lanes = Arc::new(Mutex::new(Vec::new()));
+        let builder: Arc<dyn NativeStreamingSessionCandidateBuilder> =
+            Arc::new(TestStreamingCandidateBuilder {
+                services: native_execution_services_for_test(),
+                builds,
+                receipt: Some(receipt.clone()),
+                control_lanes: Arc::clone(&control_lanes),
+                fail_build_on_accelerated: false,
+                fail_build_on_cpu_untyped: false,
+                fail_warmup_on_accelerated: false,
+                fail_push_on_accelerated: false,
+                auxiliary_initializations: Arc::new(AtomicUsize::new(0)),
+            });
+        let candidate =
+            streaming_policy_candidate(ExecutionProvider::Cpu, ExecutionPlacement::CpuOnly);
+        let expected_lane =
+            crate::models::native_execution_services::ExecutionLaneKey::from_candidate(
+                &candidate,
+                crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            )
+            .unwrap();
+        let plan = ExecutionPlan::for_test(ExecutionIntent::CpuOnly, vec![candidate]);
+        let mut session = PolicyResolvedNativeStreamingSession::start(builder, plan).unwrap();
+
+        // Stand in for the already-completed warmup attempt. Control setup and
+        // channel-close cancellation happen after that boundary and must be
+        // observationally invisible to its immutable receipt.
+        receipt.record_token(0, 7, false);
+        let completed = receipt.snapshot();
+        session.set_cancellation_token(Arc::new(AtomicBool::new(false)));
+        assert_eq!(receipt.snapshot(), completed);
+        session.cancel().unwrap();
+        assert_eq!(receipt.snapshot(), completed);
+        assert_eq!(
+            *control_lanes.lock().unwrap(),
+            vec![Some(expected_lane.clone()), Some(expected_lane)]
+        );
+    }
+
+    #[test]
     fn streaming_never_retries_after_first_audio_enters_session() {
         let (builder, builds, _) = streaming_test_builder(false, false, true);
         let mut session =
@@ -3584,6 +3664,8 @@ mod tests {
             Arc::new(TestStreamingCandidateBuilder {
                 services: native_execution_services_for_test(),
                 builds: Arc::clone(&builds),
+                receipt: None,
+                control_lanes: Arc::new(Mutex::new(Vec::new())),
                 fail_build_on_accelerated: false,
                 fail_build_on_cpu_untyped: true,
                 fail_warmup_on_accelerated: true,

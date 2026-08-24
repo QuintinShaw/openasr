@@ -1022,6 +1022,24 @@ impl GgmlAsrStreamingSessionRequest {
     pub fn runtime_source_preflight(&self) -> &GgufRuntimeSourcePreflight {
         self.verified_pack.preflight()
     }
+
+    /// Build the immutable authority carried by every per-frame decode in
+    /// this session. Streaming frames still have no independent cancel/pause
+    /// surface, but they must retain the session's attempt, receipt, and exact
+    /// lane instead of silently creating a second untracked request.
+    pub(crate) fn per_frame_execution_context(
+        &self,
+        uncancellable_reason: &'static str,
+    ) -> Arc<RequestExecutionContext> {
+        let mut context = RequestExecutionContext::uncancellable(uncancellable_reason);
+        if let Some(attempt_id) = self.session_context.request_attempt_id() {
+            context = context.with_request_attempt_id(attempt_id);
+        }
+        if let Some(receipt) = self.session_context.native_execution_receipt() {
+            context = context.with_native_execution_receipt(receipt);
+        }
+        Arc::new(context.with_native_execution_lane(self.execution_lane.clone()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -200,8 +200,11 @@ where
     // the session request, not a thread-local): every per-frame request this
     // driver builds for the life of the session copies it in directly.
     let resolved_runtime = request.resolved_runtime;
-    let execution_lane = request.execution_lane.clone();
-    let decode_execution_lane = execution_lane.clone();
+    let decode_execution_lane = request.execution_lane.clone();
+    let frame_execution_context = request.per_frame_execution_context(
+        "per-frame streaming decode has no independent cancel/pause surface; the live session \
+         ends when its caller drops it",
+    );
     let partial_granularity = crate::arch::streaming_partial_granularity_for_model_architecture(
         request.selected_family.model_architecture,
     );
@@ -211,7 +214,6 @@ where
         GgmlAsrExecutionViewRequest<'static>,
         GgmlAsrExecutionError,
     > {
-        let execution_lane = execution_lane.clone();
         let mut request_options = request_options.clone();
         if let Some(prompt) =
             merge_partial_prompt(request_options.prompt.as_deref(), partial_prompt)
@@ -278,14 +280,7 @@ where
                 // one prefix per token and fan them out as transcript.partials, which
                 // trips Native ASR `max_queued_events` (64) and kills the live session.
                 // The completed window text below is the one overlay this driver emits.
-                std::sync::Arc::new(
-                    crate::RequestExecutionContext::uncancellable(
-                        "per-frame streaming decode: this request type carries no \
-                         execution-context field of its own yet, and a live session ends by \
-                         the caller dropping it rather than canceling a transcription id",
-                    )
-                    .with_native_execution_lane(execution_lane.clone()),
-                )
+                std::sync::Arc::clone(&frame_execution_context)
             },
         })
     };
@@ -1786,6 +1781,9 @@ mod tests {
         fn session_request(
             backend_preference: crate::GgmlAsrBackendPreference,
         ) -> GgmlAsrStreamingSessionRequest {
+            let request_attempt_id =
+                crate::RequestAttemptId::parse("00112233445566778899aabbccddeeff").unwrap();
+            let receipt = crate::NativeExecutionReceiptCollector::new();
             let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
                 backend_preference.request_backend_override(),
                 crate::arch::family_auto_gpu_policy_for_model_architecture(
@@ -1816,7 +1814,9 @@ mod tests {
                         resolved_runtime.backend(),
                     ),
                 final_text_processor: None,
-                session_context: crate::NativeAsrSessionContext::new("rt_backend_override_test"),
+                session_context: crate::NativeAsrSessionContext::new("rt_backend_override_test")
+                    .with_request_attempt_id(request_attempt_id)
+                    .with_native_execution_receipt(receipt),
                 session_config: crate::NativeAsrStreamingSessionConfig::new()
                     .with_partial_results(true)
                     .into(),
@@ -1834,15 +1834,15 @@ mod tests {
         ) -> GgmlCpuGraphBackend {
             let request = session_request(backend_preference);
             let expected_lane = request.execution_lane.clone();
-            let observed: Arc<
-                Mutex<
-                    Option<(
-                        Option<RequestBackendPreference>,
-                        GgmlCpuGraphBackend,
-                        Option<crate::models::native_execution_services::ExecutionLaneKey>,
-                    )>,
-                >,
-            > = Arc::new(Mutex::new(None));
+            let expected_attempt = request.session_context.request_attempt_id();
+            type ObservedDecode = (
+                Option<RequestBackendPreference>,
+                GgmlCpuGraphBackend,
+                Option<crate::models::native_execution_services::ExecutionLaneKey>,
+                Option<crate::RequestAttemptId>,
+                bool,
+            );
+            let observed: Arc<Mutex<Option<ObservedDecode>>> = Arc::new(Mutex::new(None));
             let observed_for_decode = Arc::clone(&observed);
             let mut driver = build_streaming_driver(
                 (),
@@ -1855,6 +1855,11 @@ mod tests {
                         crate::ggml_runtime::request_backend_override(),
                         _request.resolved_runtime.backend(),
                         _request.execution_context.native_execution_lane().cloned(),
+                        _request.execution_context.request_attempt_id(),
+                        _request
+                            .execution_context
+                            .native_execution_receipt()
+                            .is_some(),
                     ));
                     Ok(GgmlAsrExecutionResult {
                         transcription: transcription(""),
@@ -1864,12 +1869,18 @@ mod tests {
                 },
             );
             driver.warm_up().expect("warm up should decode once");
-            let (backend_override, backend, execution_lane) = observed
-                .lock()
-                .unwrap()
-                .take()
-                .expect("decode closure should have run");
+            let (backend_override, backend, execution_lane, request_attempt_id, has_receipt) =
+                observed
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("decode closure should have run");
             assert_eq!(execution_lane, Some(expected_lane.clone()));
+            assert_eq!(request_attempt_id, expected_attempt);
+            assert!(
+                has_receipt,
+                "per-frame decode must retain receipt authority"
+            );
             assert_eq!(
                 backend_override,
                 Some(expected_lane.request_backend_preference())

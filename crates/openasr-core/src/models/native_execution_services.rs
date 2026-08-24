@@ -1412,15 +1412,9 @@ pub(crate) fn install_native_execution_services(
     })
 }
 
-/// Installs one transactional policy candidate around the complete family
-/// dispatch. The returned guard also propagates through
-/// [`current_native_execution_context`] into explicitly spawned native worker
-/// threads (serve-batch included).
-pub(crate) fn install_execution_candidate_attempt(
-    services: &NativeExecutionServices,
+fn execution_candidate_context_identity(
     candidate: &ExecutionCandidate,
-    failure_sink: ExecutionCandidateFailureSink,
-) -> NativeExecutionContextGuard {
+) -> (Option<RequestBackendPreference>, Option<ExecutionLaneKey>) {
     let backend_preference = if candidate.placement == ExecutionPlacement::CpuOnly {
         Some(RequestBackendPreference::CpuOnly)
     } else {
@@ -1438,6 +1432,19 @@ pub(crate) fn install_execution_candidate_attempt(
         | ExecutionProvider::Unknown => GgmlCpuGraphBackend::Gpu,
     };
     let execution_lane = ExecutionLaneKey::from_candidate(candidate, backend).ok();
+    (backend_preference, execution_lane)
+}
+
+/// Installs one transactional policy candidate around the complete family
+/// dispatch. The returned guard also propagates through
+/// [`current_native_execution_context`] into explicitly spawned native worker
+/// threads (serve-batch included).
+pub(crate) fn install_execution_candidate_attempt(
+    services: &NativeExecutionServices,
+    candidate: &ExecutionCandidate,
+    failure_sink: ExecutionCandidateFailureSink,
+) -> NativeExecutionContextGuard {
+    let (backend_preference, execution_lane) = execution_candidate_context_identity(candidate);
     install_native_execution_context(NativeExecutionContext {
         scope_id: services.scope_id,
         memory_broker: Arc::clone(&services.memory_broker),
@@ -1454,6 +1461,38 @@ pub(crate) fn install_execution_candidate_attempt(
         execution_telemetry: current_execution_telemetry_collector(),
         receipt: current_execution_receipt_collector(),
     })
+}
+
+/// Runs control-only session cleanup in the already-selected candidate lane.
+///
+/// This deliberately installs the service root and exact backend identity but
+/// none of the mutable attempt authorities: no cache journal, activation
+/// reservation, failure/observation sink, placement telemetry, or execution
+/// receipt. Cancellation may release candidate-owned resources, but it cannot
+/// begin a new inference attempt or overwrite the last completed receipt.
+pub(crate) fn run_execution_candidate_control_scope<T>(
+    services: &NativeExecutionServices,
+    candidate: &ExecutionCandidate,
+    operation: impl FnOnce() -> T,
+) -> T {
+    let (backend_preference, execution_lane) = execution_candidate_context_identity(candidate);
+    let _control_scope = install_native_execution_context(NativeExecutionContext {
+        scope_id: services.scope_id,
+        memory_broker: Arc::clone(&services.memory_broker),
+        runtime_receipts: services.runtime_receipts.clone(),
+        stream_vad_embedded: Arc::clone(&services.firered_stream_vad_embedded),
+        loaded_weight_owners: services.loaded_weight_owners,
+        backend_preference,
+        placement: Some(candidate.placement),
+        execution_lane,
+        observation_sink: None,
+        failure_sink: None,
+        cache_attempt_id: None,
+        activation_reservation_cohort: None,
+        execution_telemetry: None,
+        receipt: None,
+    });
+    operation()
 }
 
 /// Result of one complete candidate-local operation. The operation's ordinary
