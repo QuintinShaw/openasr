@@ -92,6 +92,7 @@ pub mod model_store_gc;
 pub mod models;
 mod nn;
 pub(crate) mod output;
+mod ownership_evidence;
 pub(crate) mod pull;
 pub(crate) mod punctuation;
 pub mod realtime;
@@ -390,6 +391,12 @@ pub use models::{
 pub use output::{
     OutputWriteError, ResolvedOutputTarget, atomic_write_text,
     atomic_write_text_to_resolved_target, resolve_output_target, resolve_output_target_handle,
+};
+pub use ownership_evidence::{
+    OWNERSHIP_EVIDENCE_SCHEMA, OwnershipCandidateObservation, OwnershipDaemonStartIdentity,
+    OwnershipEvidenceArtifact, OwnershipEvidenceEnvelope, OwnershipEvidenceError,
+    OwnershipEvidenceLoadError, OwnershipEvidencePhase, OwnershipEvidencePhaseKind,
+    OwnershipEvidenceScenario, OwnershipLeaseReconciliationStatus, OwnershipReleaseBinding,
 };
 pub use pull::{
     BackendFileFormat, BackendPackDownloadPlan, BackendStoreGcReport, DefaultPackPointer,
