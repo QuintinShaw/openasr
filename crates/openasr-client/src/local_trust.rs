@@ -1,5 +1,6 @@
 use std::{
     fs::{File, OpenOptions},
+    io::{Seek, SeekFrom},
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -158,7 +159,13 @@ impl SelectedMedia {
 
     pub fn try_clone_file(&self) -> Result<File, LocalTrustError> {
         self.ensure_identity()?;
-        self.file.try_clone().map_err(LocalTrustError::CloneMedia)
+        // Unix dup() shares the file offset. A prior upload that read the grant
+        // to EOF would otherwise clone an empty stream (precise-timeline 400).
+        let mut cloned = self.file.try_clone().map_err(LocalTrustError::CloneMedia)?;
+        cloned
+            .seek(SeekFrom::Start(0))
+            .map_err(LocalTrustError::CloneMedia)?;
+        Ok(cloned)
     }
 
     pub fn canonical_path(&self) -> &Path {
@@ -320,6 +327,14 @@ mod tests {
         assert_eq!(bytes, b"selected-generation");
         assert_eq!(selected.display_name(), "selected.wav");
         assert_eq!(selected.len(), b"selected-generation".len() as u64);
+
+        let mut second = Vec::new();
+        selected
+            .try_clone_file()
+            .unwrap()
+            .read_to_end(&mut second)
+            .unwrap();
+        assert_eq!(second, b"selected-generation");
     }
 
     #[test]
