@@ -41,6 +41,13 @@ The shared software migration is in place:
   `ggml-hip.dll` through the qualification selector (`schema_version` 3,
   gfx1200). That still is not a production-catalog or Authenticode release
   cell;
+- the same RX 9060 XT then produced diagnostic-not-release evidence.v1 for
+  physical Vulkan on the same CPU-neutral host after loading a locally
+  verified `ggml-vulkan.dll` through the qualification selector
+  (`schema_version` 3, empty catalog targets, live
+  `vk_caps_00001002_00007590_*`, capture unsupported, FreshGraph,
+  cold+reuse, `funasr-nano:q4_k`). That still is not a production-catalog
+  or Authenticode release cell;
 - native `ARGMAX_FIRST` now has one cross-backend non-finite rule: any NaN or
   infinity in a row yields the `-1` sentinel, which request decoding rejects
   instead of accepting a provider-dependent token;
@@ -53,10 +60,10 @@ The shared software migration is in place:
 
 The evidence boundary remains strict. The committed CPU/Metal Layer-3 receipts
 at the earlier checkpoint do not authorize a later release commit. The Windows
-HIP sidecar and local-dev plugin evidence.v1 runs do not authorize a
-production-signed catalog epoch, Authenticode release ZIP, physical Vulkan, or
-CUDA. Those cells remain non-activatable until release-bound receipts are
-returned.
+HIP sidecar, local-dev HIP plugin, and local-dev physical Vulkan plugin
+evidence.v1 runs do not authorize a production-signed catalog epoch,
+Authenticode release ZIP, or CUDA. Those cells remain non-activatable until
+release-bound receipts are returned.
 
 ## Accepted completion program
 
@@ -1098,7 +1105,10 @@ boundary while adding output-plan, token-trace, reuse, and lane evidence.
 ## Interaction with runtime ownership and model activation
 
 GPU output correctness and runtime ownership are related but separate contracts.
-They should not land as one unreviewable change.
+They should not land as one unreviewable change. Local-dev Vulkan
+`funasr-nano:q4_k` now has both: token evidence.v1 (this contract) and a
+verifier-passing diagnostic ColdWarm ownership envelope (the ownership
+contract). Compact output remains disabled.
 
 The required sequencing is:
 

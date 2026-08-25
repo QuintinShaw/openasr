@@ -1147,21 +1147,56 @@ pub(crate) fn spawn_boot_native_warmup(
         let Some(requested_path) = runtime.model_pack_path.requested_path() else {
             return;
         };
-        let Ok(Some(record)) =
-            openasr_core::default_selection::read_active_model_selection_v2(&home)
-        else {
-            return;
+        let record = match openasr_core::default_selection::read_active_model_selection_v2(&home) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                log_default_reactivation_failed(
+                    &home,
+                    requested_path.as_path(),
+                    "durable V2 default-selection is missing",
+                );
+                return;
+            }
+            Err(error) => {
+                log_default_reactivation_failed(
+                    &home,
+                    requested_path.as_path(),
+                    &error.to_string(),
+                );
+                return;
+            }
         };
-        let Ok(packs) = openasr_core::list_installed_packs(&home) else {
-            return;
+        let packs = match openasr_core::list_installed_packs(&home) {
+            Ok(packs) => packs,
+            Err(error) => {
+                log_default_reactivation_failed(
+                    &home,
+                    requested_path.as_path(),
+                    &error.to_string(),
+                );
+                return;
+            }
         };
         let Some(pack) = packs.into_iter().find(|pack| pack.path == requested_path) else {
+            log_default_reactivation_failed(
+                &home,
+                requested_path.as_path(),
+                "requested pack is not in InstalledModelStore",
+            );
             return;
         };
-        let Ok(intent) = openasr_core::default_selection::execution_intent_from_v2_wire(
+        let intent = match openasr_core::default_selection::execution_intent_from_v2_wire(
             &record.execution_intent,
-        ) else {
-            return;
+        ) {
+            Ok(intent) => intent,
+            Err(error) => {
+                log_default_reactivation_failed(
+                    &home,
+                    requested_path.as_path(),
+                    &error.to_string(),
+                );
+                return;
+            }
         };
         if let Err(error) = crate::activate_default_model_blocking(
             &runtime,
@@ -1171,20 +1206,24 @@ pub(crate) fn spawn_boot_native_warmup(
             intent,
             crate::DefaultModelActivationMode::ReactivateDurableSelection,
         ) {
-            let mut reason = single_line_log_value(&error.to_string());
-            for sensitive_path in [&home, requested_path.as_path()] {
-                let rendered = sensitive_path.to_string_lossy();
-                if !rendered.is_empty() {
-                    reason = reason.replace(rendered.as_ref(), "<redacted-path>");
-                }
-            }
-            let reason = reason.chars().take(512).collect::<String>();
-            openasr_core::stage_timing::log_event(
-                "server_boot",
-                format_args!("stage=default_reactivation_failed reason={reason}"),
-            );
+            log_default_reactivation_failed(&home, requested_path.as_path(), &error.to_string());
         }
     })
+}
+
+fn log_default_reactivation_failed(home: &Path, requested_path: &Path, reason: &str) {
+    let mut reason = single_line_log_value(reason);
+    for sensitive_path in [home, requested_path] {
+        let rendered = sensitive_path.to_string_lossy();
+        if !rendered.is_empty() {
+            reason = reason.replace(rendered.as_ref(), "<redacted-path>");
+        }
+    }
+    let reason = reason.chars().take(512).collect::<String>();
+    openasr_core::stage_timing::log_event(
+        "server_boot",
+        format_args!("stage=default_reactivation_failed reason={reason}"),
+    );
 }
 
 /// Attest a candidate pack without publishing it as the live default.

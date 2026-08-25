@@ -2716,7 +2716,9 @@ pub(crate) struct GgmlCpuGraphBuilder<'a> {
     poisoned_after_failed_compute: bool,
     /// A direct Vulkan/CUDA graph holds a provisional domain-exclusive gate
     /// from immediately before first compute until post-compute stats can price
-    /// the backend pool high water. Fixed-shape persistent graphs need this once.
+    /// the backend pool high water. The committed lease lives on the cached
+    /// backend owner; later fresh-graph builders reuse that row instead of
+    /// admitting another native-memory owner per compute.
     direct_graph_private_prepared: bool,
     direct_graph_private_pending: Vec<NativeBackendPrivateMemoryLease>,
     /// Stable process-local identity used by request collectors to count this
@@ -7024,9 +7026,25 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         // their combined physical-domain footprint once. The broker returns
         // separate child batches so backend-private and scheduler-owned bytes
         // retain their true owner lifetimes without a check-then-act gap.
+        // GRAPH_PRIVATE high-water already attached to the cached backend must
+        // not be re-admitted when a later graph is rebound onto the same
+        // backends; that would accumulate live receipt owners until unload.
+        let reuse_backend_private = !private_owners.is_empty()
+            && private_owners
+                .iter()
+                .all(|owner| !owner.borrow().is_empty());
+        if reuse_backend_private {
+            for owner in &private_owners {
+                if let Some(lease) = owner.borrow().last().cloned()
+                    && !lease.is_pending()
+                {
+                    lease.record_receipt_reuse();
+                }
+            }
+        }
         let mut partition_kinds = Vec::new();
         let mut partition_plans = Vec::new();
-        if !private_batches.is_empty() {
+        if !private_batches.is_empty() && !reuse_backend_private {
             partition_kinds.push(NativeRequestClass::BackendPrivate);
             partition_plans.push(
                 NativeMemoryAdmissionPlan::from_groups(quote_scheduler_groups(
@@ -7381,6 +7399,19 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             || !self.backend_kind.is_gpu_class()
             || self.direct_graph_private_prepared
         {
+            return Ok(());
+        }
+        if let Some(lease) = self.backend_private_memory_owner.borrow().last().cloned() {
+            // Cached GPU backends outlive each fresh-graph builder. GRAPH_PRIVATE
+            // high-water is that backend's retained pool, so a second admit would
+            // leave a live receipt owner until idle-unload even when retained
+            // bytes stay zero.
+            if lease.is_pending() {
+                self.direct_graph_private_pending.push(lease);
+            } else {
+                lease.record_receipt_reuse();
+            }
+            self.direct_graph_private_prepared = true;
             return Ok(());
         }
         let Some(broker) =

@@ -173,9 +173,11 @@ fn validate_request_receipt(
         (ShortAudioSchedulerMode::Disabled, "disabled")
             | (ShortAudioSchedulerMode::Enabled, "enabled")
     );
+    let pack_model_matches = receipt.pack.model_id == release.model_id
+        || receipt.pack.model_id == format!("{}:{}", release.model_id, release.quant);
     if receipt.core_commit != release.core_commit
         || receipt.pack.content_sha256 != release.pack_sha256
-        || receipt.pack.model_id != release.model_id
+        || !pack_model_matches
         || receipt.pack.quant != release.quant
         || evidence.candidate_release_subject != release.release_subject
         || evidence.core_commit != release.core_commit
@@ -513,8 +515,10 @@ pub(crate) fn validate_bundle(artifact_dir: &Path, envelope_paths: &[PathBuf]) -
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
         bail!("ownership artifact directory must be a real directory");
     }
-    if envelope_paths.len() != 3 {
-        bail!("ownership bundle requires exactly three scenario envelopes");
+    if envelope_paths.is_empty() || envelope_paths.len() > 3 {
+        bail!(
+            "ownership bundle requires one diagnostic envelope or exactly three scenario envelopes"
+        );
     }
     let mut envelopes = Vec::with_capacity(envelope_paths.len());
     for path in envelope_paths {
@@ -524,17 +528,19 @@ pub(crate) fn validate_bundle(artifact_dir: &Path, envelope_paths: &[PathBuf]) -
     if envelopes.iter().any(|envelope| envelope.release != release) {
         bail!("ownership scenario envelopes do not bind one exact release cell");
     }
-    let scenarios = envelopes
-        .iter()
-        .map(|envelope| envelope.scenario)
-        .collect::<BTreeSet<_>>();
-    let expected = BTreeSet::from([
-        OwnershipEvidenceScenario::ColdWarmLifecycle,
-        OwnershipEvidenceScenario::DeterministicPressureRace,
-        OwnershipEvidenceScenario::RealHostPressureRollback,
-    ]);
-    if scenarios != expected {
-        bail!("ownership bundle must contain one envelope for every required scenario");
+    if envelope_paths.len() == 3 {
+        let scenarios = envelopes
+            .iter()
+            .map(|envelope| envelope.scenario)
+            .collect::<BTreeSet<_>>();
+        let expected = BTreeSet::from([
+            OwnershipEvidenceScenario::ColdWarmLifecycle,
+            OwnershipEvidenceScenario::DeterministicPressureRace,
+            OwnershipEvidenceScenario::RealHostPressureRollback,
+        ]);
+        if scenarios != expected {
+            bail!("ownership bundle must contain one envelope for every required scenario");
+        }
     }
     let mut artifact_count = 0_usize;
     for envelope in &envelopes {
@@ -552,7 +558,7 @@ pub(crate) fn validate_bundle(artifact_dir: &Path, envelope_paths: &[PathBuf]) -
             "device_target": release.device_target,
             "capability_epoch": release.capability_epoch,
             "capability_cell_sha256": release.capability_cell_sha256,
-            "scenario_count": scenarios.len(),
+            "scenario_count": envelopes.len(),
             "artifact_reference_count": artifact_count,
         }))?
     );

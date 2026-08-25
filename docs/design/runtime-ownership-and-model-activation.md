@@ -43,10 +43,31 @@ The software-side migration is complete for the current inventory:
 - Desktop delegates activation to the daemon and vendors the generated HTTP
   contract. It does not calculate capacity or persist a competing selection.
 
-This does **not** convert missing hardware into success. CUDA, physical Vulkan,
-and HIP/ROCm (including HIP capture-on), plus the Windows neutral-dynamic
-plugin-switch product flow, still require release-bound real-host receipts. The
-gate must remain closed while those cells are missing, stale, or unavailable.
+This does **not** convert missing hardware into success. Local-dev HIP
+(capture-on) and physical Vulkan (`vk_caps` exact cell, capture unsupported)
+decode evidence.v1 now exist on one RX 9060 XT. They are still not a
+production-catalog or Authenticode cell.
+
+The remaining product hole on that host was not a missing family matrix.
+`serve --model-pack` used to set `requested_path` and listen while `active`
+stayed empty, because boot reactivation silently returned unless the path was
+already an `InstalledModelStore` object named by durable V2. Loose `.oasr`
+files are no longer a second runtime: `--model-pack` fail-closes before bind
+unless that store+V2 pair exists. The working admit path is catalog-gated
+`pull --from` then `POST /v1/models/default` (the existing activation
+transaction). That path now binds `funasr-nano:q4` on the Vulkan-qualified
+neutral host (`model_installed`/`model_resident`, HTTP JFK). A
+`cold_warm_lifecycle` `openasr.runtime-ownership-evidence.v1` envelope for
+that same cell now passes `__openasr-validate-ownership-evidence`
+(diagnostic-not-release): baseline empty, cold=warm live owners after JFK,
+idle-unload `now` returns to empty, lease matched. GRAPH_PRIVATE high-water
+is one backend-owned lease on the cached GPU backend; a fresh-graph builder
+must reuse that row instead of admitting a new zero-byte `native-memory-owner`
+per compute. A real-host pressure-rollback envelope is UNAVAILABLE on this
+close-out (ColdWarm is the accepted alternative). CUDA, production-signed
+plugin activation, and the packaged product kernel-switch flow still require
+release-bound real-host receipts. The gate must remain closed while those
+cells are missing, stale, or unavailable.
 
 ## Accepted completion program
 

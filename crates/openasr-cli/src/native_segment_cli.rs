@@ -543,6 +543,51 @@ pub(super) fn resolve_serve_model_source(
     })
 }
 
+/// Serve `--model-pack` must name the content-addressed object already in
+/// `InstalledModelStore`, and a durable V2 selection must already request
+/// that same digest. Loose `.oasr` files are not a second runtime authority.
+fn require_installed_durable_pack_for_serve(
+    home: &Path,
+    validated_pack_path: &Path,
+) -> Result<PathBuf> {
+    let want = fs::canonicalize(validated_pack_path).with_context(|| {
+        format!(
+            "could not canonicalize native serve pack '{}'",
+            validated_pack_path.display()
+        )
+    })?;
+    let packs = openasr_core::list_installed_packs(home)
+        .context("Could not list installed packs for native serve")?;
+    let Some(pack) = packs.into_iter().find(|pack| {
+        fs::canonicalize(&pack.path)
+            .ok()
+            .is_some_and(|installed| installed == want)
+    }) else {
+        bail!(
+            "Native serve --model-pack must be an already installed content-addressed pack under OPENASR_HOME/models (objects/sha256/<sha>/content).\nLoose .oasr files are not a second runtime. Install with `openasr pull <id> --from <file>` so catalog sha256/size match, persist the V2 default selection, then serve."
+        );
+    };
+    match openasr_core::default_selection::read_active_model_selection_v2(home) {
+        Ok(Some(record))
+            if record.status
+                == openasr_core::default_selection::ActiveModelSelectionStatus::Installed
+                && record
+                    .expected_pack
+                    .as_ref()
+                    .is_some_and(|expected| expected.sha256 == pack.sha256) => {}
+        Ok(Some(_)) => bail!(
+            "Native serve --model-pack requires the durable V2 default-selection to request this installed pack before the listener binds.\nSet the default after pull; serve will not listen with an empty active runtime."
+        ),
+        Ok(None) => bail!(
+            "Native serve --model-pack requires a durable V2 default-selection for this installed pack before the listener binds.\nSet the default after pull; serve will not listen with an empty active runtime."
+        ),
+        Err(error) => {
+            return Err(anyhow!(error).context("Could not read durable V2 default-selection"));
+        }
+    }
+    Ok(pack.path)
+}
+
 pub(super) async fn serve(
     native_execution_services: Arc<NativeExecutionServices>,
     addr: SocketAddr,
@@ -595,6 +640,13 @@ pub(super) async fn serve(
                 model_source.model_id,
                 local_model_id
             );
+        }
+        // `--model-pack` is launch intent, not a second runtime. Boot
+        // reactivation only attests an InstalledModelStore object that a
+        // durable V2 record already names. A loose file would leave
+        // `active=None` while the listener reports ready.
+        if model_pack.is_some() {
+            let _ = require_installed_durable_pack_for_serve(&home, model_pack_path)?;
         }
     } else if backend == BackendKind::Native && no_model {
         eprintln!(
