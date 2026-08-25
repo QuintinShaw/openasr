@@ -72,26 +72,75 @@ pub(crate) fn speech_frame_bounds(
     attention: &[Vec<f32>],
     is_content: &[bool],
 ) -> Option<(usize, usize)> {
+    speech_band_from_rows(attention, is_content, None)
+}
+
+/// Frame index band the DTW path should align onto, derived from the given
+/// per-token rows. `masked_frames` holds the early artifact ("sink") frames a
+/// caller already knows are the shared diffuse-attention priming, not real
+/// per-token speech location; for those rows the band skips the masked peak
+/// and uses the row's next-strongest frame instead.
+///
+/// The band must be derived from the same rows the DTW will actually run on.
+/// Deriving it from *unmasked* rows after a sink strip understates the
+/// earliest bound: the stripped rows' true earliest per-token peak is a late
+/// word, but the unmasked rows still carry the sink at the window start, so
+/// the "earliest per-token peak" collapses to the artifact frame (within one
+/// margin of frame 0) and the DTW is handed a band that begins in the leading
+/// silence. The path bias then walks that silence to reach the first real
+/// peak, and every word's start inherits the silence length (measured ~0.7 to
+/// 5.9s of phantom lead on long-form chunks whose true speech starts several
+/// seconds into the window). Skipping the known sink frames keeps the band
+/// anchored on real attention on exactly the rows the DTW can see.
+pub(crate) fn speech_band_from_rows(
+    attention: &[Vec<f32>],
+    is_content: &[bool],
+    masked_frames: Option<&[u32]>,
+) -> Option<(usize, usize)> {
     let frame_count = attention.first()?.len();
     if frame_count == 0 {
         return None;
     }
+    let is_masked = |frame: usize| {
+        masked_frames
+            .map(|masked| masked.iter().any(|m| *m as usize == frame))
+            .unwrap_or(false)
+    };
     let mut earliest: Option<usize> = None;
     let mut latest: Option<usize> = None;
     for (index, row) in attention.iter().enumerate() {
         if row.len() != frame_count || !is_content.get(index).copied().unwrap_or(false) {
             continue;
         }
-        let (dominant_frame, &dominant_value) = row
+        let finite: Vec<(usize, f32)> = row
             .iter()
             .enumerate()
-            .filter(|&(_, &value)| value.is_finite())
-            .max_by(|(_, a), (_, b)| a.total_cmp(b))?;
-        if dominant_value > 0.0 {
-            earliest =
-                Some(earliest.map_or(dominant_frame, |existing| existing.min(dominant_frame)));
-            latest = Some(latest.map_or(dominant_frame, |existing| existing.max(dominant_frame)));
+            .filter(|&(_, value)| value.is_finite())
+            .map(|(frame, value)| (frame, *value))
+            .collect();
+        // A content row without a single finite entry means the rows are
+        // malformed, not merely quiet: bail to the caller's duration fallback,
+        // matching the original `speech_frame_bounds` contract.
+        let &(dominant_frame, dominant_value) = finite.iter().max_by(|a, b| a.1.total_cmp(&b.1))?;
+        if dominant_value <= 0.0 {
+            continue;
         }
+        // The dominant frame is the (masked) sink artifact: the row's real
+        // speech location is its next strongest unmasked frame.
+        let frame = if is_masked(dominant_frame) {
+            match finite
+                .iter()
+                .filter(|(candidate, _)| *candidate != dominant_frame && !is_masked(*candidate))
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+            {
+                Some(&(alternate_frame, _)) => alternate_frame,
+                None => continue,
+            }
+        } else {
+            dominant_frame
+        };
+        earliest = Some(earliest.map_or(frame, |existing| existing.min(frame)));
+        latest = Some(latest.map_or(frame, |existing| existing.max(frame)));
     }
     let earliest = earliest?;
     let latest = latest?;
@@ -312,4 +361,67 @@ fn token_spans_from_path(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(len: usize, peaks: &[(usize, f32)]) -> Vec<f32> {
+        let mut row = vec![0.01f32; len];
+        for &(frame, value) in peaks {
+            row[frame] = value;
+        }
+        row
+    }
+
+    #[test]
+    fn speech_band_without_masks_uses_every_content_peak() {
+        let rows = vec![row(50, &[(3, 0.9)]), row(50, &[(40, 0.9)])];
+        let content = vec![true, true];
+        assert_eq!(
+            speech_band_from_rows(&rows, &content, None),
+            Some((0, 50)),
+            "earliest content peak 3 minus margin 10 clamps to 0; latest peak 40 plus margin reaches 50"
+        );
+    }
+
+    #[test]
+    fn speech_band_skips_masked_sink_for_that_rows_bound() {
+        // Row 0's strongest frame is the shared sink at frame 3; after the
+        // strip its real speech location is frame 40. Row 1 peaks at 40 on
+        // its own. With the sink masked the band must start from 40, not 3.
+        let rows = vec![row(50, &[(3, 0.9), (40, 0.4)]), row(50, &[(40, 0.9)])];
+        let content = vec![true, true];
+        assert_eq!(
+            speech_band_from_rows(&rows, &content, Some(&[3])),
+            Some((30, 50)),
+            "masked frame 3 must not bound the band; real earliest peak is 40 -> 40-10=30"
+        );
+        // Same rows, no mask: the raw bound still sees frame 3.
+        assert_eq!(speech_band_from_rows(&rows, &content, None), Some((0, 50)));
+    }
+
+    #[test]
+    fn speech_band_ignores_masked_frames_not_peaking_any_row() {
+        // Masking a frame no row peaks on changes nothing.
+        let rows = vec![row(50, &[(20, 0.9)]), row(50, &[(35, 0.9)])];
+        let content = vec![true, true];
+        let unmasked = speech_band_from_rows(&rows, &content, None);
+        let masked = speech_band_from_rows(&rows, &content, Some(&[1]));
+        assert_eq!(unmasked, Some((10, 46)), "latest peak 35 + margin -> 46");
+        assert_eq!(masked, unmasked);
+    }
+
+    #[test]
+    fn speech_band_row_whose_only_mass_is_masked_is_skipped() {
+        // A row whose sole finite mass above the floor sits on the masked sink
+        // has no surviving bound; the band comes from the other row only.
+        let rows = vec![row(50, &[(3, 0.9)]), row(50, &[(40, 0.9)])];
+        let content = vec![true, true];
+        assert_eq!(
+            speech_band_from_rows(&rows, &content, Some(&[3])),
+            Some((30, 50))
+        );
+    }
 }

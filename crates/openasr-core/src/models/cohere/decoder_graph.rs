@@ -30,7 +30,7 @@ use crate::models::device_greedy_token::{
 };
 use crate::models::seq2seq_decoder_state::Seq2SeqDecoderState;
 use crate::models::seq2seq_dtw_alignment::{
-    dtw_align_token_frames, speech_frame_bounds, token_text_carries_speech,
+    dtw_align_token_frames, speech_band_from_rows, token_text_carries_speech,
 };
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
@@ -426,56 +426,25 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
     // any one token is spoken. Stripping it lets each masked row's
     // next-strongest frame (its real region) surface, which restores a
     // monotone peak order on clips where every non-artifact row already
-    // pointed the right way. Rejected after both tests -> uniform fallback.
-    let dtw_window: Option<Vec<Vec<f32>>> = if cross_attention_peaks_order_aligned(
-        &full_window,
-        &is_content,
-    ) {
-        None
-    } else {
-        match mask_dominant_early_sinks(&full_window, &is_content) {
-            Some(window) if cross_attention_peaks_order_aligned(&window, &is_content) => {
-                if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
-                    eprintln!("cohere cross gate: order restored after sink strip, using DTW");
-                }
-                Some(window)
-            }
-            Some(window)
-                if content_backward_fraction(&window, &is_content)
-                    <= COHERE_DTW_MAX_BACKWARD_PAIR_FRACTION
-                    && band_duration_seconds(&full_window, seconds_per_frame)
-                        >= COHERE_DTW_TOLERANT_MIN_BAND_SECONDS =>
-            {
-                // Not perfectly monotone, but the backward jumps are a
-                // tiny minority of content pairs: the strip exposed a
-                // mostly-clean left-to-right signal and the DTW path can be
-                // trusted for it. This tier is strictly more permissive than
-                // the strict re-test  above, applies only after the sink strip,
-                // and is scoped to long windows (cohere's 30s long-form chunks)
-                // where the pauses are actually measurable. Windows shorter than
-                // the threshold follow the current strict path and fall
-                // back to the provably-uniform baseline when they don't
-                // reach the strict re-test, keeping short-clip behavior
-                // unchanged.
-                if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
-                    eprintln!(
-                        "cohere cross gate: order restored after sink strip (tolerant), using DTW"
-                    );
-                }
-                Some(window)
-            }
-            _ => {
-                // The strict and tolerant DTW tests both rejected the window:
-                // on a pause-heavy 30s chunk the per-word peak order zig-zags
-                // too much for the DTW pass, and the monotone tiling the DTW
-                // would emit (or the uniform fallback the caller would use)
-                // would stretch a few seconds of speech across all 30s. On
-                // LONG windows (where that stretch is large and measurable)
-                // place each word at its own strongest attention frame instead:
-                // the windows-are-diffuse-but-real case, where most tokens do
-                // point the right way and only a few back-jump. Short windows
-                // keep the provably-uniform baseline -- the stretch is small
-                // there and the peak signal too noisy to be worth the risk.
+    // pointed the right way. A zigzag with no detectable sink, or a stripped
+    // signal the tolerant tier rejects, goes to the fallback tier instead
+    // (long window -> per-word peak placement, short -> the caller's uniform
+    // baseline), never the DTW pass.
+    // `stripped_sinks` holds the early frames the strip removed, so the DTW
+    // band below can skip them when it brackets the speech. `None` when the
+    // raw window is aligned as-is.
+    let mut stripped_sinks: Option<Vec<u32>> = None;
+    let dtw_window: Option<Vec<Vec<f32>>> =
+        if cross_attention_peaks_order_aligned(&full_window, &is_content) {
+            None
+        } else {
+            let detected =
+                detect_dominant_early_sinks(&full_window, &is_content).unwrap_or_default();
+            if detected.is_empty() {
+                // No early artifact explains the zigzag: the per-token peaks
+                // genuinely jump back and forth and no masking can expose a clean
+                // signal, so the window takes the fallback tier (long -> peak
+                // fallback, short -> uniform), never the DTW pass.
                 if band_duration_seconds(&full_window, seconds_per_frame)
                     >= COHERE_DTW_PEAK_FALLBACK_MIN_SECONDS
                 {
@@ -496,20 +465,70 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
                 }
                 return Ok(Vec::new());
             }
-        }
-    };
-    // The band is always derived from the unmasked raw attention: masking
-    // zeroed frames would corrupt the earliest-peak bound, and the DTW cost
-    // normalizes each row anyway, so the slice only needs the right range.
-    let (band_start, band_end) = speech_frame_bounds(&full_window, &is_content).map_or_else(
-        move || {
-            (
-                0usize,
-                ((duration / seconds_per_frame).ceil() as usize).clamp(1, frame_count),
-            )
-        },
-        |(start, end)| (start, end.clamp(start + 1, frame_count)),
-    );
+            stripped_sinks = Some(detected.clone());
+            let window = mask_frames_early(&full_window, &detected);
+            if cross_attention_peaks_order_aligned(&window, &is_content) {
+                if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
+                    eprintln!("cohere cross gate: order restored after sink strip, using DTW");
+                }
+                Some(window)
+            } else if content_backward_fraction(&window, &is_content)
+                <= COHERE_DTW_MAX_BACKWARD_PAIR_FRACTION
+                && band_duration_seconds(&full_window, seconds_per_frame)
+                    >= COHERE_DTW_TOLERANT_MIN_BAND_SECONDS
+            {
+                // Not perfectly monotone, but the backward jumps are a tiny
+                // minority of content pairs: the strip exposed a mostly-clean
+                // left-to-right signal the DTW can be trusted for. Scoped to long
+                // windows (cohere's 30s long-form chunks) where the pauses are
+                // actually measurable.
+                if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
+                    eprintln!(
+                        "cohere cross gate: order restored after sink strip (tolerant), using DTW"
+                    );
+                }
+                Some(window)
+            } else if band_duration_seconds(&full_window, seconds_per_frame)
+                >= COHERE_DTW_PEAK_FALLBACK_MIN_SECONDS
+            {
+                // The strip was detected and the gate rejected the stripped
+                // signal, but the window is long enough that per-word peak
+                // placement beats the uniform baseline.
+                if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
+                    eprintln!("cohere cross gate: peaks not aligned, using peak fallback");
+                }
+                return cohere_peak_fallback_word_timestamps(
+                    &full_window,
+                    &is_content,
+                    token_alignments,
+                    generated_probabilities,
+                    seconds_per_frame,
+                    decode_text,
+                );
+            } else {
+                if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
+                    eprintln!("cohere cross gate: peaks not order-aligned, using uniform");
+                }
+                return Ok(Vec::new());
+            }
+        };
+    // The band is derived from the unmasked raw attention except for the strip
+    // artifact frames, which are skipped: on a stripped window the raw rows
+    // still carry the sink at the window start, and bracketing the band on it
+    // would begin the DTW in the leading silence (see `speech_band_from_rows`).
+    // Masking the frames to zero instead would corrupt the earliest-peak
+    // bound for the same reason the strip is only ever applied to the DTW
+    // window, not the band.
+    let (band_start, band_end) =
+        speech_band_from_rows(&full_window, &is_content, stripped_sinks.as_deref()).map_or_else(
+            move || {
+                (
+                    0usize,
+                    ((duration / seconds_per_frame).ceil() as usize).clamp(1, frame_count),
+                )
+            },
+            |(start, end)| (start, end.clamp(start + 1, frame_count)),
+        );
     if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
         eprintln!(
             "cohere cross band=({band_start},{band_end}) frames={frame_count} spf={seconds_per_frame}"
@@ -3240,7 +3259,13 @@ fn content_backward_fraction(attention: &[Vec<f32>], is_content: &[bool]) -> f32
 /// on a masked frame has no valid peak after the strip, which the order gate
 /// reads as a missing peak and ignores; when enough rows lose their peak the
 /// order collapses and the gate rejects (the safe outcome).
-fn mask_dominant_early_sinks(window: &[Vec<f32>], is_content: &[bool]) -> Option<Vec<Vec<f32>>> {
+///
+/// Splits detection from application so the DTW band can be derived from the
+/// raw window with exactly these frames skipped (see
+/// [`speech_band_from_rows`]) instead of from a zero-masked copy. The caller
+/// still re-runs the order gate on the masked window; this pair only finds and
+/// removes the artifact.
+fn detect_dominant_early_sinks(window: &[Vec<f32>], is_content: &[bool]) -> Option<Vec<u32>> {
     let row_count = window.len();
     let frame_count = window.first()?.len();
     if frame_count == 0 {
@@ -3265,15 +3290,13 @@ fn mask_dominant_early_sinks(window: &[Vec<f32>], is_content: &[bool]) -> Option
             content_row_count += 1;
         }
     }
-    let mut masked = vec![false; search];
     let mut sinks = Vec::new();
     for frame in 0..search {
         let is_all_majority = all_peak_counts[frame].saturating_mul(2) > row_count;
         let is_content_majority = content_row_count > 0
             && content_peak_counts[frame].saturating_mul(2) > content_row_count;
         if is_all_majority || is_content_majority {
-            masked[frame] = true;
-            sinks.push(frame);
+            sinks.push(frame as u32);
         }
     }
     if sinks.is_empty() {
@@ -3282,23 +3305,36 @@ fn mask_dominant_early_sinks(window: &[Vec<f32>], is_content: &[bool]) -> Option
     if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
         eprintln!("cohere cross sink strip: masking frames {sinks:?}");
     }
-    Some(
-        window
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .enumerate()
-                    .map(|(frame, &value)| {
-                        if frame < search && masked[frame] {
-                            0.0
-                        } else {
-                            value
-                        }
-                    })
-                    .collect()
-            })
-            .collect(),
-    )
+    Some(sinks)
+}
+
+/// Returns a copy of `window` with each frame in `masked_frames` zeroed in
+/// every row. The DTW only ever runs on this masked window, so zeroing is
+/// safe there; the band must skip the frames instead of reading a masked copy
+/// (see [`detect_dominant_early_sinks`]).
+fn mask_frames_early(window: &[Vec<f32>], masked_frames: &[u32]) -> Vec<Vec<f32>> {
+    let search = SINK_STRIP_SEARCH_FRAMES;
+    window
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(frame, &value)| {
+                    if frame < search && masked_frames.iter().any(|m| *m as usize == frame) {
+                        0.0
+                    } else {
+                        value
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Combined detect-and-mask for callers that only need the masked window.
+#[cfg(test)]
+fn mask_dominant_early_sinks(window: &[Vec<f32>], is_content: &[bool]) -> Option<Vec<Vec<f32>>> {
+    detect_dominant_early_sinks(window, is_content).map(|sinks| mask_frames_early(window, &sinks))
 }
 
 fn compute_greedy_step_output_for_graph<'a>(
@@ -5496,6 +5532,82 @@ mod tests {
                 row
             })
             .collect()
+    }
+
+    #[test]
+    fn cohere_dtw_word_timestamps_band_skips_stripped_sink_on_long_window() {
+        let (_runtime_path, preflight) = write_runtime_ready_preflight();
+        let metadata = super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
+            &preflight.metadata,
+        )
+        .expect("parse metadata");
+        let spf = 8.0 * metadata.hop_length as f32 / metadata.sample_rate_hz as f32;
+        let frames = 250; // 20.0s window
+        let duration = (frames as f32) * spf;
+        // Five content words. Row 0 already escaped the sink (peaks at its
+        // real frame 30); the others peak on the shared sink at frame 3 with
+        // their real frames further in. The raw order zigzags (30 then 3), so
+        // only the sink-stripped path can admit the DTW, and the earliest
+        // *real* peak (frame 30, 2.4s) must bound the band -- not the sink.
+        let rows: Vec<Vec<f32>> = (0..5)
+            .map(|i| {
+                let mut row = vec![0.01_f32; frames];
+                if i > 0 {
+                    row[3] = 0.5;
+                }
+                row[30 + i * 25] = 0.4 + (i == 0) as u8 as f32 * 0.1;
+                row
+            })
+            .collect();
+        assert!(
+            !cross_attention_peaks_order_aligned(&rows, &vec![true; rows.len()]),
+            "the shared early sink must zigzag the raw peak order"
+        );
+        let token_ids: Vec<u32> = (10..15).collect();
+        let alignments: Vec<(u32, Vec<f32>)> = rows
+            .iter()
+            .zip(&token_ids)
+            .map(|(row, &id)| (id, row.to_vec()))
+            .collect();
+        let decode_text = |token_ids: &[u32]| {
+            let mut s = String::new();
+            for &id in token_ids {
+                use std::fmt::Write;
+                let _ = write!(s, "w{id} ");
+            }
+            Ok(s.trim_end().to_string())
+        };
+        let words = cohere_dtw_word_timestamps::<()>(
+            &alignments,
+            metadata,
+            &vec![0.99; token_ids.len()],
+            duration,
+            &decode_text,
+        )
+        .expect("dtw words");
+        assert!(
+            !words.is_empty(),
+            "stripped monotone window must emit DTW words"
+        );
+        // The stripped sink (frame 3) must not drag the first word back into
+        // the leading silence: the band starts at the earliest real peak
+        // (frame 30) minus the margin (frame 20, 1.6s), and the DTW cannot
+        // place anything before the band start.
+        let first_start = words[0].start;
+        assert!(
+            first_start >= (20.0_f32 * spf) - 1e-6,
+            "first word start ({first_start}s) must not precede the sink-skipped band start ({:?}s)",
+            20.0 * spf
+        );
+        // Timeline still tiles the band monotonone to the window end.
+        for pair in words.windows(2) {
+            assert!(
+                pair[0].start <= pair[1].start + 1e-6,
+                "timeline must be monotone"
+            );
+            assert!(pair[0].end - 1e-6 <= pair[1].start, "no overlaps");
+        }
+        assert!(words.last().is_some_and(|last| last.end <= duration + 1e-3));
     }
 
     #[test]
