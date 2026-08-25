@@ -2017,7 +2017,7 @@ pub fn ggml_native_build_enabled() -> bool {
 /// `use_backend_dl`): the CPU/GPU compute backends are runtime-loaded plugin
 /// DLLs rather than statically linked. See [`ensure_backends_loaded`] for why
 /// this gates the `ggml_backend_load_all` directory scan.
-fn ggml_backend_dl_build_enabled() -> bool {
+pub(crate) fn ggml_backend_dl_build_enabled() -> bool {
     option_env!("OPENASR_GGML_BACKEND_DL_ENABLED") == Some("1")
 }
 

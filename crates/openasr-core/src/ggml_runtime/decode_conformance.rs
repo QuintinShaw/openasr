@@ -1858,14 +1858,20 @@ fn validate_computed_graph(
     {
         return false;
     }
-    if stats.capture_enabled_observed
-        && (!stats.capture_executable_observed
-            || !stats
+    if stats.capture_enabled_observed {
+        if !stats.capture_executable_observed {
+            return false;
+        }
+        // A single compute can only create the executable after it returns.
+        // Reuse is proven when a later compute starts with that generation.
+        if expected_computes >= 2
+            && !stats
                 .computes_started
                 .iter()
-                .any(|(_, _, _, capture)| capture.is_some()))
-    {
-        return false;
+                .any(|(_, _, _, capture)| capture.is_some())
+        {
+            return false;
+        }
     }
     true
 }
@@ -2442,6 +2448,59 @@ mod tests {
         let mut tampered = report;
         tampered.layer1.cases[0].actual_tokens[0] = 2;
         assert!(tampered.validate().is_err());
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn shared_decode_conformance_suite_passes_on_live_hip_route() {
+        let route = live_hip_route();
+        let report = run_diagnostic_decode_conformance_suite(route.clone())
+            .expect("shared exact-route HIP conformance suite");
+        assert_eq!(report.schema, GPU_DECODE_CONFORMANCE_SCHEMA);
+        assert_eq!(report.result, "pass");
+        assert_eq!(report.provider, ExecutionProvider::Hip);
+        assert_eq!(report.stable_device_id, route.stable_id);
+        assert_eq!(
+            report.production_shape_four_quadrant.classification,
+            DecodeFirstDivergenceClass::NoneObserved
+        );
+        report.validate().expect("generated HIP suite revalidates");
+        validate_layer2_lifecycle(&report.layer2.graph_lifecycle, ExecutionProvider::Hip)
+            .expect("HIP Layer-2 must include native capture observations");
+        assert!(
+            report.layer2.graph_lifecycle.events.iter().any(|event| {
+                matches!(
+                    event.kind,
+                    crate::GgmlGraphLifecycleEventKind::CaptureStateObserved { .. }
+                        | crate::GgmlGraphLifecycleEventKind::CaptureExecutableObserved { .. }
+                        | crate::GgmlGraphLifecycleEventKind::CaptureExecutableCreated { .. }
+                )
+            }),
+            "HIP Layer-2 must record native capture observations"
+        );
+    }
+
+    #[cfg(feature = "hip")]
+    fn live_hip_route() -> ResolvedExecutionRoute {
+        crate::ggml_available_devices()
+            .iter()
+            .enumerate()
+            .find_map(|(ordinal, device)| {
+                let row = crate::device::execution_route::enumerated_from_ggml_device(
+                    ordinal, device,
+                );
+                matches!(
+                    row.ggml_kind,
+                    crate::ggml_runtime::GgmlBackendKind::Gpu
+                        | crate::ggml_runtime::GgmlBackendKind::IntegratedGpu
+                )
+                .then_some(row)
+                .filter(|row| row.provider == ExecutionProvider::Hip)
+                .map(|row| row.to_resolved_route())
+            })
+            .expect(
+                "HIP feature build must enumerate a live HIP GPU; on Windows use --features hip,legacy-windows-static-sidecar so the probe is compiled into the test binary",
+            )
     }
 
     fn lifecycle_event_label(kind: &crate::GgmlGraphLifecycleEventKind) -> &'static str {

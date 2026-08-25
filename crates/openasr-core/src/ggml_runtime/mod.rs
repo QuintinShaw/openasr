@@ -55,7 +55,8 @@ pub use backend::{
 pub(crate) use backend::{
     accelerated_device_rank, activate_attested_qualification_backend,
     activated_backend_execution_identity, activated_backend_execution_provider,
-    ensure_backends_loaded, preferred_accelerated_device, probe_exact_backend_plugin_candidate,
+    ensure_backends_loaded, ggml_backend_dl_build_enabled, preferred_accelerated_device,
+    probe_exact_backend_plugin_candidate,
 };
 pub(crate) use backend_memory::{
     BackendMemoryBytes, BackendMemoryLifecyclePoint, BackendMemoryStatsSnapshot,
