@@ -5,15 +5,15 @@
 //! artifact identity. It does not select a provider, enable compact output, or
 //! write `active.json`.
 
+use crate::short_audio_receipt::ShortAudioTraceSummary;
 use crate::{
-    GgmlGraphLifecycleEventKind, ShortAudioArtifactIdentity, ShortAudioCaptureMode,
+    GgmlGraphLifecycleEventKind, SHORT_AUDIO_RECEIPT_ARTIFACT_CONTRACT,
+    SHORT_AUDIO_RECEIPT_EVIDENCE_SCHEMA, ShortAudioArtifactIdentity, ShortAudioCaptureMode,
     ShortAudioCatalogDigests, ShortAudioEvidenceClass, ShortAudioExecutionMode,
     ShortAudioFamilyOracle, ShortAudioOutputPlan, ShortAudioReceipt, ShortAudioReceiptArtifacts,
     ShortAudioReceiptError, ShortAudioReceiptEvidence, ShortAudioReceiptReuseMode,
     ShortAudioReuseMode, ShortAudioSchedulerMode, ShortAudioTopKSummary,
-    SHORT_AUDIO_RECEIPT_ARTIFACT_CONTRACT, SHORT_AUDIO_RECEIPT_EVIDENCE_SCHEMA,
 };
-use crate::short_audio_receipt::ShortAudioTraceSummary;
 
 /// Caller-supplied identity that a diagnostic receipt cannot infer.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -93,8 +93,10 @@ pub fn bind_real_family_evidence(
             reason: "decode graph mode does not match the evidence binding",
         });
     }
-    let execution_mode = match (diagnostic.run.warmup.as_str(), diagnostic.run.cache_state.as_str())
-    {
+    let execution_mode = match (
+        diagnostic.run.warmup.as_str(),
+        diagnostic.run.cache_state.as_str(),
+    ) {
         ("cold", "empty") => ShortAudioReuseMode::Cold,
         ("warm", "populated") => ShortAudioReuseMode::Reuse,
         _ => {
@@ -106,8 +108,7 @@ pub fn bind_real_family_evidence(
     validate_live_identity(&diagnostic, binding)?;
     validate_pack_and_fixture(&diagnostic, binding)?;
     validate_capture_and_scheduler(&diagnostic, binding)?;
-    if binding.output_plan.kind
-        == crate::ShortAudioOutputPlanKind::FullLogits
+    if binding.output_plan.kind == crate::ShortAudioOutputPlanKind::FullLogits
         && traces.logits.is_none()
     {
         return Err(ShortAudioReceiptError::InvalidEvidenceField {
@@ -127,49 +128,48 @@ pub fn bind_real_family_evidence(
     let actual_provider = diagnostic.actual_provider.clone();
     let actual_stable_device_id = diagnostic.actual_stable_device_id.clone();
     let actual_device = diagnostic.actual_device.clone();
-    let common = |class: ShortAudioEvidenceClass,
-                  include_token_fields: bool|
-     -> ShortAudioReceiptEvidence {
-        ShortAudioReceiptEvidence {
-            schema: SHORT_AUDIO_RECEIPT_EVIDENCE_SCHEMA.to_string(),
-            contract: SHORT_AUDIO_RECEIPT_ARTIFACT_CONTRACT.to_string(),
-            evidence_class: class,
-            matrix_sha256: binding.matrix_sha256.clone(),
-            candidate_release_subject: binding.candidate_release_subject.clone(),
-            core_commit: core_commit.clone(),
-            catalog_digests: binding.catalog_digests.clone(),
-            family: binding.family.clone(),
-            model_id: binding.model_id.clone(),
-            quant: binding.quant.clone(),
-            topology: binding.topology.clone(),
-            provider: binding.provider.clone(),
-            device_target: binding.device_target.clone(),
-            backend_id: binding.backend_id.clone(),
-            driver_version: binding.driver_version.clone(),
-            artifact_fingerprint: binding.artifact_fingerprint.clone(),
-            device: binding.device.clone(),
-            actual_provider: actual_provider.clone(),
-            actual_stable_device_id: actual_stable_device_id.clone(),
-            actual_device: actual_device.clone(),
-            placement: binding.placement.clone(),
-            capture_mode: binding.capture_mode,
-            scheduler_mode: binding.scheduler_mode,
-            result: "pass".to_string(),
-            artifacts: binding.artifacts.clone(),
-            output_plan: include_token_fields.then(|| binding.output_plan.clone()),
-            family_oracle: include_token_fields.then(|| family_oracle.clone()),
-            execution: include_token_fields.then_some(ShortAudioExecutionMode {
-                mode: execution_mode,
-                graph_rebuild_reason: None,
-            }),
-            trace: include_token_fields.then(|| ShortAudioTraceSummary {
-                token_trace: traces.token_trace.clone(),
-                logits: traces.logits.clone(),
-                top_k: traces.top_k.clone(),
-                top1_top2_margin: traces.top1_top2_margin,
-            }),
-        }
-    };
+    let common =
+        |class: ShortAudioEvidenceClass, include_token_fields: bool| -> ShortAudioReceiptEvidence {
+            ShortAudioReceiptEvidence {
+                schema: SHORT_AUDIO_RECEIPT_EVIDENCE_SCHEMA.to_string(),
+                contract: SHORT_AUDIO_RECEIPT_ARTIFACT_CONTRACT.to_string(),
+                evidence_class: class,
+                matrix_sha256: binding.matrix_sha256.clone(),
+                candidate_release_subject: binding.candidate_release_subject.clone(),
+                core_commit: core_commit.clone(),
+                catalog_digests: binding.catalog_digests.clone(),
+                family: binding.family.clone(),
+                model_id: binding.model_id.clone(),
+                quant: binding.quant.clone(),
+                topology: binding.topology.clone(),
+                provider: binding.provider.clone(),
+                device_target: binding.device_target.clone(),
+                backend_id: binding.backend_id.clone(),
+                driver_version: binding.driver_version.clone(),
+                artifact_fingerprint: binding.artifact_fingerprint.clone(),
+                device: binding.device.clone(),
+                actual_provider: actual_provider.clone(),
+                actual_stable_device_id: actual_stable_device_id.clone(),
+                actual_device: actual_device.clone(),
+                placement: binding.placement.clone(),
+                capture_mode: binding.capture_mode,
+                scheduler_mode: binding.scheduler_mode,
+                result: "pass".to_string(),
+                artifacts: binding.artifacts.clone(),
+                output_plan: include_token_fields.then(|| binding.output_plan.clone()),
+                family_oracle: include_token_fields.then(|| family_oracle.clone()),
+                execution: include_token_fields.then_some(ShortAudioExecutionMode {
+                    mode: execution_mode,
+                    graph_rebuild_reason: None,
+                }),
+                trace: include_token_fields.then(|| ShortAudioTraceSummary {
+                    token_trace: traces.token_trace.clone(),
+                    logits: traces.logits.clone(),
+                    top_k: traces.top_k.clone(),
+                    top1_top2_margin: traces.top1_top2_margin,
+                }),
+            }
+        };
 
     let mut placement = diagnostic.clone();
     placement.evidence = Some(common(ShortAudioEvidenceClass::PlacementResource, false));
@@ -269,7 +269,9 @@ fn validate_capture_and_scheduler(
     let mut created_during_compute = false;
     for event in &lifecycle.events {
         match &event.kind {
-            GgmlGraphLifecycleEventKind::Created { scheduler_enabled: enabled }
+            GgmlGraphLifecycleEventKind::Created {
+                scheduler_enabled: enabled,
+            }
             | GgmlGraphLifecycleEventKind::ExistingGraphObserved {
                 scheduler_enabled: enabled,
                 ..
@@ -348,16 +350,16 @@ fn validate_capture_and_scheduler(
 mod tests {
     use super::*;
     use crate::{
+        SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE, SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK,
+        SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioExecutionProjection, ShortAudioLeaseReconciliation,
+        ShortAudioOutputPlanKind, ShortAudioReceiptAudio, ShortAudioReceiptDecodeDiagnostics,
+        ShortAudioReceiptMetrics, ShortAudioReceiptOutputPlan, ShortAudioReceiptPack,
+        ShortAudioReceiptRun, ShortAudioReceiptTranscript, ShortAudioTiePolicy,
         ggml_runtime::{
             GGML_GRAPH_LIFECYCLE_SCHEMA, GgmlActualDeviceFacts, GgmlCaptureExecutableChange,
             GgmlCaptureObservationPhase, GgmlExecutionPlacementSummary, GgmlGraphLifecycleEvent,
             GgmlGraphLifecycleSnapshot,
         },
-        ShortAudioLeaseReconciliation, ShortAudioOutputPlanKind, ShortAudioReceiptAudio,
-        ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptMetrics, ShortAudioReceiptOutputPlan,
-        ShortAudioReceiptPack, ShortAudioReceiptRun, ShortAudioReceiptTranscript,
-        ShortAudioTiePolicy, SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE, SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK,
-        SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioExecutionProjection,
     };
     use std::collections::BTreeMap;
 
@@ -491,10 +493,7 @@ mod tests {
                 backend: "native".to_string(),
                 device: "hip".to_string(),
                 os: "windows".to_string(),
-                command: vec![
-                    "openasr".to_string(),
-                    "qualify-family".to_string(),
-                ],
+                command: vec!["openasr".to_string(), "qualify-family".to_string()],
                 env_allowlist: BTreeMap::from([
                     ("OPENASR_GGML_BACKEND".to_string(), "hip".to_string()),
                     (
@@ -617,17 +616,22 @@ mod tests {
             ShortAudioEvidenceClass::PlacementResource
         );
         assert_eq!(
-            set.token_transcript.evidence.as_ref().unwrap().evidence_class,
+            set.token_transcript
+                .evidence
+                .as_ref()
+                .unwrap()
+                .evidence_class,
             ShortAudioEvidenceClass::TokenTranscript
         );
         assert!(set.placement.evidence.as_ref().unwrap().trace.is_none());
-        assert!(set
-            .token_transcript
-            .evidence
-            .as_ref()
-            .unwrap()
-            .trace
-            .is_some());
+        assert!(
+            set.token_transcript
+                .evidence
+                .as_ref()
+                .unwrap()
+                .trace
+                .is_some()
+        );
         set.placement
             .validate_qualification_eligibility()
             .expect("placement class is qualification-eligible");

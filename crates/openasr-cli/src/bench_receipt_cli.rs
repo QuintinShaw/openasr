@@ -19,10 +19,10 @@ use openasr_core::{
     InstalledPack, NativeExecutionReceiptCollector, NativeExecutionReceiptSnapshot,
     NativeExecutionServices, NativeExecutionTraceMode, RequestAttemptId, RequestExecutionPhase,
     RequestExecutionTerminal, ResolvedOutputTarget, SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK,
-    SHORT_AUDIO_RECEIPT_SCHEMA,
-    ShortAudioExecutionProjection, ShortAudioReceipt, ShortAudioReceiptAudio,
-    ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptMetrics, ShortAudioReceiptPack,
-    ShortAudioReceiptRun, ShortAudioReceiptTranscript, TranscriptionRequest, atomic_write_text,
+    SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioExecutionProjection, ShortAudioReceipt,
+    ShortAudioReceiptAudio, ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptMetrics,
+    ShortAudioReceiptPack, ShortAudioReceiptRun, ShortAudioReceiptTranscript, TranscriptionRequest,
+    atomic_write_text,
     ggml_runtime::{
         AutoGpuPolicy, GgmlDecodeLogitsConsumers, GgmlDecodeOutputContract,
         RequestBackendPreference, ResolvedFamilyRuntimeInput,
@@ -498,7 +498,8 @@ pub(crate) fn bench_receipt_short_audio(
         })?;
         let elapsed = started.elapsed();
         if let Some((_, receipt)) = &pass_receipt {
-            receipt.record_phase_duration(RequestExecutionPhase::UploadIngest, upload_ingest_duration);
+            receipt
+                .record_phase_duration(RequestExecutionPhase::UploadIngest, upload_ingest_duration);
             receipt.record_phase_duration(
                 RequestExecutionPhase::DecodeNormalize,
                 decode_normalize_duration,

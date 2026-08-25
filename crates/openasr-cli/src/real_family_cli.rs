@@ -12,7 +12,9 @@ use openasr_core::{
     ShortAudioArtifactIdentity, ShortAudioTopKSummary, bind_real_family_evidence, sha256_hex_bytes,
 };
 
-use crate::bench_receipt_cli::{CollectedShortAudio, ShortAudioReceiptOptions, bench_receipt_short_audio};
+use crate::bench_receipt_cli::{
+    CollectedShortAudio, ShortAudioReceiptOptions, bench_receipt_short_audio,
+};
 
 pub(crate) fn run(
     native_execution_services: &Arc<NativeExecutionServices>,
@@ -25,12 +27,14 @@ pub(crate) fn run(
     core_commit: Option<&str>,
     ffmpeg_bin: Option<std::path::PathBuf>,
 ) -> Result<()> {
-    let binding: RealFamilyEvidenceBinding = serde_json::from_str(
-        &fs::read_to_string(binding_path).with_context(|| {
-            format!("could not read real-family binding {}", binding_path.display())
-        })?,
-    )
-    .context("real-family binding JSON is invalid")?;
+    let binding: RealFamilyEvidenceBinding =
+        serde_json::from_str(&fs::read_to_string(binding_path).with_context(|| {
+            format!(
+                "could not read real-family binding {}",
+                binding_path.display()
+            )
+        })?)
+        .context("real-family binding JSON is invalid")?;
     fs::create_dir_all(out_dir).with_context(|| {
         format!(
             "could not create real-family output directory {}",
@@ -113,16 +117,19 @@ fn write_bound_pair(
     out_dir: &Path,
     mode: &str,
 ) -> Result<()> {
-    let token_jsonl = collected.token_trace_jsonl.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("native real-family run did not produce a token trace")
-    })?;
+    let token_jsonl = collected
+        .token_trace_jsonl
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("native real-family run did not produce a token trace"))?;
     let token_label = format!("token-{mode}.jsonl");
     let token_path = out_dir.join(&token_label);
-    fs::write(&token_path, token_jsonl).with_context(|| {
-        format!("could not write token trace {}", token_path.display())
-    })?;
+    fs::write(&token_path, token_jsonl)
+        .with_context(|| format!("could not write token trace {}", token_path.display()))?;
     if let Ok(json) = collected.receipt.to_pretty_json() {
-        let _ = fs::write(out_dir.join(format!("diagnostic-{mode}.json")), format!("{json}\n"));
+        let _ = fs::write(
+            out_dir.join(format!("diagnostic-{mode}.json")),
+            format!("{json}\n"),
+        );
     }
     let traces = RealFamilyTraceArtifacts {
         token_trace: hashed_artifact(&token_label, token_jsonl.as_bytes()),
@@ -141,7 +148,9 @@ fn write_bound_pair(
     };
     let bound = bind_real_family_evidence(collected.receipt.clone(), binding, &traces).map_err(
         |error| {
-            anyhow::anyhow!("diagnostic receipt could not be bound as real-family evidence: {error}")
+            anyhow::anyhow!(
+                "diagnostic receipt could not be bound as real-family evidence: {error}"
+            )
         },
     )?;
     write_receipt(
@@ -200,11 +209,16 @@ fn parse_margin(jsonl: &str) -> Option<f64> {
         if value.get("event").and_then(|event| event.as_str()) != Some("top_k") {
             return None;
         }
-        value.get("top1_top2_margin").and_then(|margin| margin.as_f64())
+        value
+            .get("top1_top2_margin")
+            .and_then(|margin| margin.as_f64())
     })
 }
 
-fn write_receipt(path: std::path::PathBuf, receipt: &openasr_core::ShortAudioReceipt) -> Result<()> {
+fn write_receipt(
+    path: std::path::PathBuf,
+    receipt: &openasr_core::ShortAudioReceipt,
+) -> Result<()> {
     let json = receipt
         .to_pretty_json()
         .context("could not serialize bound real-family receipt")?;

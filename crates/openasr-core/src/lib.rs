@@ -98,11 +98,11 @@ pub(crate) mod pull;
 pub(crate) mod punctuation;
 mod qualification_manifest;
 mod qualification_runtime;
+pub(crate) mod real_family_evidence;
 pub mod realtime;
 pub(crate) mod registry;
 pub(crate) mod remote_compute;
 pub(crate) mod safety;
-pub(crate) mod real_family_evidence;
 pub(crate) mod short_audio_receipt;
 pub mod stage_timing;
 pub mod subtitle;
@@ -229,6 +229,10 @@ pub use qualification_runtime::{
     QualificationBackendRuntimeEvidence, QualificationRuntimeError, execute_backend_qualification,
     prepare_backend_qualification_artifacts,
 };
+pub use real_family_evidence::{
+    RealFamilyEvidenceBinding, RealFamilyEvidenceSet, RealFamilyTraceArtifacts,
+    bind_real_family_evidence,
+};
 pub use short_audio_receipt::{
     DecodeFirstDivergenceClass, EncoderDecoderSplitLane, EncoderDecoderSplitProbeRecord,
     SHORT_AUDIO_RECEIPT_ARTIFACT_CONTRACT, SHORT_AUDIO_RECEIPT_DEFAULT_SCOPE,
@@ -244,13 +248,8 @@ pub use short_audio_receipt::{
     ShortAudioReceiptOutputPlan, ShortAudioReceiptPack, ShortAudioReceiptReuseMode,
     ShortAudioReceiptRun, ShortAudioReceiptSerializeError, ShortAudioReceiptTranscript,
     ShortAudioReuseMode, ShortAudioSchedulerMode, ShortAudioTiePolicy, ShortAudioTopKSummary,
-    ShortAudioTraceSummary,
-    decode_diagnostics_from_shipped_runtime, median_f64, receipt_os_id, resolve_core_commit,
-    sha256_file, sha256_hex_bytes, validate_core_commit,
-};
-pub use real_family_evidence::{
-    RealFamilyEvidenceBinding, RealFamilyEvidenceSet, RealFamilyTraceArtifacts,
-    bind_real_family_evidence,
+    ShortAudioTraceSummary, decode_diagnostics_from_shipped_runtime, median_f64, receipt_os_id,
+    resolve_core_commit, sha256_file, sha256_hex_bytes, validate_core_commit,
 };
 pub use subtitle::{
     TimelinePrecisionPolicy, TimelineQuality, WordAnchorQuality, WordAnchorValidation,
