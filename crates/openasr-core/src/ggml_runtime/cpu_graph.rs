@@ -1960,7 +1960,6 @@ struct GgmlGraphLifecycleState {
     last_completed_compute: Option<u64>,
     capture_state: Option<GgmlNativeCaptureState>,
     capture_executable_generation: Option<u64>,
-    capture_state_observed_in_scope: bool,
     capture_executable_observed_in_scope: bool,
     kv_write_tensors: HashSet<usize>,
     poisoned_recorded: bool,
@@ -1988,7 +1987,6 @@ impl GgmlGraphLifecycleState {
             last_completed_compute: None,
             capture_state: None,
             capture_executable_generation: None,
-            capture_state_observed_in_scope: false,
             capture_executable_observed_in_scope: false,
             kv_write_tensors: HashSet::new(),
             poisoned_recorded: false,
@@ -2035,7 +2033,6 @@ impl GgmlGraphLifecycleState {
         self.collector = current;
         self.collector_scope = Some(current_scope);
         self.recording_enabled = true;
-        self.capture_state_observed_in_scope = false;
         self.capture_executable_observed_in_scope = false;
         self.record(super::GgmlGraphLifecycleEventKind::ExistingGraphObserved {
             scheduler_enabled: self.scheduler_enabled,
@@ -2178,15 +2175,20 @@ impl GgmlGraphLifecycleState {
             (None, None) => None,
         };
 
-        if self.capture_state != Some(next_state) || !self.capture_state_observed_in_scope {
-            self.record(super::GgmlGraphLifecycleEventKind::CaptureStateObserved {
-                capture_supported: next_state.capture_supported,
-                graph_tracked: next_state.graph_tracked,
-                capture_enabled: next_state.capture_enabled,
-                executable_present: next_state.executable_present,
-            });
-            self.capture_state_observed_in_scope = true;
-        }
+        self.record(super::GgmlGraphLifecycleEventKind::CaptureStateObserved {
+            phase: match phase {
+                GgmlNativeGraphObservationPhase::BeforeCompute => {
+                    super::GgmlCaptureObservationPhase::BeforeCompute
+                }
+                GgmlNativeGraphObservationPhase::AfterCompute => {
+                    super::GgmlCaptureObservationPhase::AfterCompute
+                }
+            },
+            capture_supported: next_state.capture_supported,
+            graph_tracked: next_state.graph_tracked,
+            capture_enabled: next_state.capture_enabled,
+            executable_present: next_state.executable_present,
+        });
         self.capture_state = Some(next_state);
         if let Some((capture_executable_generation, change, existed_before_compute)) =
             executable_event
@@ -5057,8 +5059,9 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.new_tensor_checked(raw, "ggml_argmax")
     }
 
-    /// Returns the lowest column index whose finite value is maximal in each
-    /// row. This is the exact tie policy used by OpenASR greedy decoding.
+    /// Returns the lowest column index whose value is maximal in each row.
+    /// A row containing any NaN or infinity returns the `-1` fail-closed
+    /// sentinel; family token validation rejects it before decode can continue.
     pub(crate) fn top1_argmax_first_max(
         &self,
         input: GgmlCpuTensor<'a>,
@@ -12016,10 +12019,10 @@ unsafe fn write_tensor_data(
 #[cfg(test)]
 mod tests {
     use crate::ggml_runtime::{
-        GgmlActualDeviceFacts, GgmlCaptureExecutableChange, GgmlGraphLifecycleCollector,
-        GgmlGraphLifecycleEventKind, GgmlGraphPoisonReason, GgmlSelectionEvidenceRef,
-        GgufTensorMetadata, GgufWeightTensorElementType, GgufWeightTensorPayload, ffi,
-        test_opaque_graph_id_mint_count,
+        GgmlActualDeviceFacts, GgmlCaptureExecutableChange, GgmlCaptureObservationPhase,
+        GgmlGraphLifecycleCollector, GgmlGraphLifecycleEventKind, GgmlGraphPoisonReason,
+        GgmlSelectionEvidenceRef, GgufTensorMetadata, GgufWeightTensorElementType,
+        GgufWeightTensorPayload, ffi, test_opaque_graph_id_mint_count,
     };
     use crate::nn::half::f32_to_f16_bits as f32_to_f16_bits_for_test;
 
@@ -12099,7 +12102,7 @@ mod tests {
         lifecycle
             .observe_native_capture(existing, GgmlNativeGraphObservationPhase::BeforeCompute)
             .expect("pre-existing native capture");
-        lifecycle.compute_started();
+        let compute_sequence = lifecycle.compute_started();
         let updated = native_capture_observation(
             true,
             true,
@@ -12110,9 +12113,15 @@ mod tests {
         lifecycle
             .observe_native_capture(updated, GgmlNativeGraphObservationPhase::AfterCompute)
             .expect("updated native capture");
+        lifecycle.compute_completed(compute_sequence, false);
         lifecycle
             .observe_native_capture(updated, GgmlNativeGraphObservationPhase::BeforeCompute)
             .expect("unchanged generation is deduplicated before the next compute");
+        let second_compute_sequence = lifecycle.compute_started();
+        lifecycle
+            .observe_native_capture(updated, GgmlNativeGraphObservationPhase::AfterCompute)
+            .expect("unchanged generation remains observable after the next compute");
+        lifecycle.compute_completed(second_compute_sequence, false);
         assert_eq!(
             lifecycle.observe_native_capture(
                 native_capture_observation(
@@ -12128,16 +12137,22 @@ mod tests {
         );
 
         let snapshot = collector.snapshot();
+        let capture_phases = snapshot
+            .events
+            .iter()
+            .filter_map(|event| match event.kind {
+                GgmlGraphLifecycleEventKind::CaptureStateObserved { phase, .. } => Some(phase),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            snapshot
-                .events
-                .iter()
-                .filter(|event| matches!(
-                    event.kind,
-                    GgmlGraphLifecycleEventKind::CaptureStateObserved { .. }
-                ))
-                .count(),
-            1
+            capture_phases,
+            vec![
+                GgmlCaptureObservationPhase::BeforeCompute,
+                GgmlCaptureObservationPhase::AfterCompute,
+                GgmlCaptureObservationPhase::BeforeCompute,
+                GgmlCaptureObservationPhase::AfterCompute,
+            ]
         );
         let observed = snapshot
             .events
@@ -18070,20 +18085,20 @@ mod tests {
             100
         );
 
-        // CPU ARGMAX_FIRST uses serial strict `>`; NaN comparisons never
-        // replace, so a leading NaN stays selected and a later NaN cannot
-        // displace a finite maximum.
+        // Every backend uses the same fail-closed non-finite sentinel. This
+        // prevents a provider-specific NaN reduction order from becoming a
+        // legal token.
         assert_eq!(
             native_argmax_first_row(&[f32::NAN, 3.0, 3.0, 1.0]).expect("leading NaN"),
-            0
+            -1
         );
         assert_eq!(
             native_argmax_first_row(&[3.0, f32::NAN, 3.0, 1.0]).expect("interior NaN"),
-            0
+            -1
         );
         assert_eq!(
             native_argmax_first_row(&[1.0, f32::INFINITY, 1.0, 0.0]).expect("+inf"),
-            1
+            -1
         );
 
         let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())

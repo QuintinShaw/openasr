@@ -25,8 +25,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    BackendHostAbi, ExecutionProvider, GgmlBackendKind, PullError, PullProgress,
-    QualificationBinaryArtifact, QualificationProvider, VerifiedQualificationManifest, atomic_file,
+    BackendHostAbi, DiagnosticDecodeConformanceSuite, ExecutionProvider, GgmlBackendKind,
+    NativeExecutionServices, PullError, PullProgress, QualificationBinaryArtifact,
+    QualificationProvider, VerifiedQualificationManifest, atomic_file,
     pull::{
         PreparedQualificationArchive, PreparedQualificationFile, file_size_and_sha256,
         prepare_qualification_release_artifacts, reject_qualification_file_links,
@@ -39,7 +40,8 @@ pub const QUALIFICATION_BACKEND_RUNTIME_SCHEMA: &str = "openasr.qualification-ba
 const QUALIFICATION_ROOT_MARKER_SCHEMA_VERSION: u32 = 1;
 const QUALIFICATION_ROOT_MARKER_FILE: &str = "qualification-root.json";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QualificationArtifactPreparation {
     pub schema: String,
     pub manifest_sha256: String,
@@ -59,14 +61,16 @@ pub struct QualificationArtifactPreparation {
     pub vendor_file_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QualificationAttestationVerification {
     pub file_name: String,
     pub sha256: String,
     pub verification_sha256: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QualificationBackendRuntimeEvidence {
     pub schema: String,
     pub preparation: QualificationArtifactPreparation,
@@ -80,7 +84,58 @@ pub struct QualificationBackendRuntimeEvidence {
     pub device_id: String,
     pub pci_vendor_id: u32,
     pub provider_device_count: usize,
+    /// Shared exact-route Layer-1/Layer-2/production-shape operator evidence.
+    /// It remains distinct from real-family token/transcript correctness.
+    pub decode_conformance: DiagnosticDecodeConformanceSuite,
     pub ordinary_activation_pointer_written: bool,
+}
+
+impl QualificationBackendRuntimeEvidence {
+    /// Validate the fresh child stdout against the exact artifact preparation
+    /// completed by its parent. A JSON parse alone is not evidence.
+    pub fn validate_child_result(
+        &self,
+        expected_preparation: &QualificationArtifactPreparation,
+    ) -> Result<(), QualificationRuntimeError> {
+        let bounded = |value: &str, max: usize| {
+            !value.trim().is_empty() && value.len() <= max && !value.contains(['\n', '\r'])
+        };
+        if self.schema != QUALIFICATION_BACKEND_RUNTIME_SCHEMA
+            || &self.preparation != expected_preparation
+            || self.preparation.schema != QUALIFICATION_ARTIFACT_PREPARATION_SCHEMA
+            || self.provider != self.preparation.provider
+            || self.target != self.preparation.target
+            || !bounded(&self.backend_id, 128)
+            || !bounded(&self.provider, 32)
+            || !bounded(&self.target, 128)
+            || !bounded(&self.device_name, 128)
+            || !bounded(&self.device_description, 256)
+            || !bounded(&self.device_kind, 32)
+            || !bounded(&self.device_id, 128)
+            || !matches!(self.device_kind.as_str(), "discrete_gpu" | "integrated_gpu")
+            || self.pci_vendor_id == 0
+            || self.provider_device_count == 0
+            || self.ordinary_activation_pointer_written
+            || self.decode_conformance.provider.as_str() != self.provider
+            || self.decode_conformance.stable_device_id != self.device_name
+        {
+            return Err(QualificationRuntimeError::InvalidChildEvidence(
+                "runtime identity does not match the parent-bound preparation".to_string(),
+            ));
+        }
+        if let Some(driver) = self.driver_api_version.as_deref()
+            && !bounded(driver, 128)
+        {
+            return Err(QualificationRuntimeError::InvalidChildEvidence(
+                "driver API version is empty or unbounded".to_string(),
+            ));
+        }
+        self.decode_conformance.validate().map_err(|error| {
+            QualificationRuntimeError::InvalidChildEvidence(format!(
+                "decode conformance result is invalid: {error}"
+            ))
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -129,6 +184,10 @@ pub enum QualificationRuntimeError {
     BackendActivation(#[source] crate::ggml_runtime::BackendPluginActivationError),
     #[error("qualification provider/device placement failed closed: {0}")]
     DevicePlacement(String),
+    #[error("qualification shared decode conformance failed closed: {0}")]
+    DecodeConformance(String),
+    #[error("qualification child evidence failed closed: {0}")]
+    InvalidChildEvidence(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,9 +242,10 @@ pub fn prepare_backend_qualification_artifacts(
         .map(|prepared| prepared.receipt)
 }
 
-/// Prepare, attest, and load the provider in the current qualification child.
-/// This is artifact/placement evidence only; model/token correctness still
-/// requires the shared ShortAudioReceipt evidence producer.
+/// Prepare, attest, load the provider, and run shared exact-route Layer-1/2
+/// conformance in the current qualification child. This is still not real-model
+/// token/transcript correctness; that requires the shared ShortAudioReceipt
+/// evidence producer and exact pack/fixture/matrix bindings.
 pub fn execute_backend_qualification(
     verified: &VerifiedQualificationManifest,
     qualification_home: impl AsRef<Path>,
@@ -253,6 +313,28 @@ pub fn execute_backend_qualification(
             "qualified GPU did not expose a PCI vendor identity".to_string(),
         )
     })?;
+    let route = crate::enumerate_compute_devices_from_ggml(&runtime.devices)
+        .into_iter()
+        .find(|candidate| {
+            candidate.provider == expected_provider && candidate.stable_id == device.name
+        })
+        .map(|candidate| candidate.to_resolved_route())
+        .ok_or_else(|| {
+            QualificationRuntimeError::DevicePlacement(
+                "qualified live device could not be resolved back to one exact route".to_string(),
+            )
+        })?;
+    let services = NativeExecutionServices::for_local_process().map_err(|error| {
+        QualificationRuntimeError::DecodeConformance(format!(
+            "could not construct an isolated native service root: {error}"
+        ))
+    })?;
+    let decode_conformance = {
+        let _services =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+        crate::run_diagnostic_decode_conformance_suite(route)
+            .map_err(|error| QualificationRuntimeError::DecodeConformance(error.to_string()))?
+    };
     prepared.backend.reverify_for_load()?;
     let active_pointer = qualification_home
         .as_ref()
@@ -263,7 +345,7 @@ pub fn execute_backend_qualification(
             active_pointer,
         ));
     }
-    Ok(QualificationBackendRuntimeEvidence {
+    let evidence = QualificationBackendRuntimeEvidence {
         schema: QUALIFICATION_BACKEND_RUNTIME_SCHEMA.to_string(),
         preparation: prepared.receipt,
         backend_id: activation.backend_id,
@@ -281,8 +363,11 @@ pub fn execute_backend_qualification(
         device_id,
         pci_vendor_id,
         provider_device_count: provider_devices.len(),
+        decode_conformance,
         ordinary_activation_pointer_written: false,
-    })
+    };
+    evidence.validate_child_result(&evidence.preparation)?;
+    Ok(evidence)
 }
 
 fn prepare_attested_backend_qualification(
@@ -1148,5 +1233,77 @@ mod tests {
             verify_binary_bundle_at_path(&bundle, &binary, &extracted.join("openasr.exe"),),
             Err(QualificationRuntimeError::BinaryBundle(_))
         ));
+    }
+
+    fn sample_preparation() -> QualificationArtifactPreparation {
+        QualificationArtifactPreparation {
+            schema: QUALIFICATION_ARTIFACT_PREPARATION_SCHEMA.to_string(),
+            manifest_sha256: "1".repeat(64),
+            release_subject: "v0.1.36-test".to_string(),
+            provider: "cpu".to_string(),
+            target: "cpu-test".to_string(),
+            host_abi_fingerprint: "2".repeat(64),
+            binary_sha256: "3".repeat(64),
+            binary_bundle_sha256: "4".repeat(64),
+            plugin_sha256: None,
+            vendor_sha256: Vec::new(),
+            attestation_bundle_sha256: "5".repeat(64),
+            attestation_verifier_version: "gh version test".to_string(),
+            attestation_verifier_sha256: "6".repeat(64),
+            attestation_verifications: vec![QualificationAttestationVerification {
+                file_name: "openasr-test".to_string(),
+                sha256: "7".repeat(64),
+                verification_sha256: "8".repeat(64),
+            }],
+            host_bundle_file_count: 1,
+            vendor_file_count: 0,
+        }
+    }
+
+    #[test]
+    fn qualification_child_evidence_is_typed_parent_bound_and_revalidated() {
+        let preparation = sample_preparation();
+        let evidence = QualificationBackendRuntimeEvidence {
+            schema: QUALIFICATION_BACKEND_RUNTIME_SCHEMA.to_string(),
+            preparation: preparation.clone(),
+            backend_id: "builtin-cpu-test".to_string(),
+            provider: "cpu".to_string(),
+            target: "cpu-test".to_string(),
+            driver_api_version: None,
+            device_name: "CPU".to_string(),
+            device_description: "test CPU".to_string(),
+            device_kind: "discrete_gpu".to_string(),
+            device_id: "test-device".to_string(),
+            pci_vendor_id: 0x8086,
+            provider_device_count: 1,
+            decode_conformance: crate::run_diagnostic_decode_conformance_suite(
+                crate::ResolvedExecutionRoute::cpu(),
+            )
+            .expect("CPU conformance fixture"),
+            ordinary_activation_pointer_written: false,
+        };
+        evidence
+            .validate_child_result(&preparation)
+            .expect("typed evidence matches its parent preparation");
+        let json = serde_json::to_string(&evidence).expect("serialize child evidence");
+        let decoded: QualificationBackendRuntimeEvidence =
+            serde_json::from_str(&json).expect("strict child evidence round-trip");
+        decoded
+            .validate_child_result(&preparation)
+            .expect("round-tripped child evidence remains valid");
+
+        let mut unknown = serde_json::to_value(&evidence).expect("evidence value");
+        unknown
+            .as_object_mut()
+            .expect("evidence object")
+            .insert("activation_mode".to_string(), serde_json::json!("auto"));
+        assert!(serde_json::from_value::<QualificationBackendRuntimeEvidence>(unknown).is_err());
+
+        let mut tampered = evidence.clone();
+        tampered.decode_conformance.result = "pass-ish".to_string();
+        assert!(tampered.validate_child_result(&preparation).is_err());
+        let mut wrong_parent = preparation.clone();
+        wrong_parent.binary_sha256 = "9".repeat(64);
+        assert!(evidence.validate_child_result(&wrong_parent).is_err());
     }
 }

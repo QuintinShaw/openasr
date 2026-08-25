@@ -119,69 +119,19 @@ def trace_content(
     compute_sequence = 1
     output_generation = 5
     if provider == "hip":
-        lifecycle[4:6] = [
-            {
-                **route,
-                "sequence": 5,
-                "event": "capture_state_observed",
-                "capture_supported": True,
-                "graph_tracked": True,
-                "capture_enabled": True,
-                "executable_present": True,
-            },
-            {
-                **route,
-                "sequence": 6,
-                "event": "capture_executable_created",
-                "capture_executable_generation": 10,
-                "change": "instantiated",
-            },
-            {
-                **route,
-                "sequence": 7,
-                "event": "compute_completed",
-                "compute_sequence": 1,
-                "output_generation": 5,
-            },
-            {
-                **route,
-                "sequence": 8,
-                "event": "output_read",
-                "compute_sequence": 1,
-                "output_generation_consumed": 5,
-                "bytes": 36,
-            },
-            {
-                **route,
-                "sequence": 9,
-                "event": "input_write",
-                "input_generation": 6,
-                "bytes": 16,
-            },
-            {
-                **route,
-                "sequence": 10,
-                "event": "compute_started",
-                "compute_sequence": 2,
-                "prepare_generation": 3,
-                "input_generation_consumed": 6,
-                "capture_executable_generation": 10,
-            },
-            {
-                **route,
-                "sequence": 11,
-                "event": "compute_completed",
-                "compute_sequence": 2,
-                "output_generation": 7,
-            },
-            {
-                **route,
-                "sequence": 12,
-                "event": "output_read",
-                "compute_sequence": 2,
-                "output_generation_consumed": 7,
-                "bytes": 36,
-            },
+        lifecycle[3:] = [
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 4, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "capture_state_observed", "phase": "before_compute", "capture_supported": True, "graph_tracked": False, "executable_present": False},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 5, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "compute_started", "compute_sequence": 1, "prepare_generation": 3, "input_generation_consumed": 4},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 6, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "capture_state_observed", "phase": "after_compute", "capture_supported": True, "graph_tracked": True, "capture_enabled": True, "executable_present": True},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 7, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "capture_executable_created", "capture_executable_generation": 10, "change": "instantiated"},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 8, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "compute_completed", "compute_sequence": 1, "output_generation": 5},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 9, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "output_read", "compute_sequence": 1, "output_generation_consumed": 5, "bytes": 36},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 10, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "input_write", "input_generation": 6, "bytes": 16},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 11, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "capture_state_observed", "phase": "before_compute", "capture_supported": True, "graph_tracked": True, "capture_enabled": True, "executable_present": True},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 12, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "compute_started", "compute_sequence": 2, "prepare_generation": 3, "input_generation_consumed": 6, "capture_executable_generation": 10},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 13, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "capture_state_observed", "phase": "after_compute", "capture_supported": True, "graph_tracked": True, "capture_enabled": True, "executable_present": True},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 14, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "compute_completed", "compute_sequence": 2, "output_generation": 7},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 15, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "output_read", "compute_sequence": 2, "output_generation_consumed": 7, "bytes": 36},
         ]
         compute_sequence = 2
         output_generation = 7
@@ -1464,6 +1414,39 @@ class GpuCorrectnessGateTests(unittest.TestCase):
             with self.assertRaisesRegex(GATE.MatrixError, "no versioned correctness evidence"):
                 GATE.validate_matrix(matrix, [path], **self.bind_kwargs([trace]))
 
+    def test_trace_rejects_unknown_lifecycle_fields(self) -> None:
+        events = [json.loads(line) for line in trace_content("cpu", "CPU", "cold").splitlines()]
+        next(event for event in events if event.get("event") == "created")["activation_mode"] = "auto"
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "unknown-lifecycle-field.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with self.assertRaisesRegex(GATE.MatrixError, "unknown or missing fields"):
+                GATE.parse_trace_artifact(path)
+
+    def test_trace_rejects_capture_creation_before_after_compute_observation(self) -> None:
+        events = [json.loads(line) for line in trace_content("hip", "HIP0", "cold").splitlines()]
+        after_index = next(
+            index
+            for index, event in enumerate(events)
+            if event.get("event") == "capture_state_observed"
+            and event.get("phase") == "after_compute"
+        )
+        created_index = next(
+            index
+            for index, event in enumerate(events)
+            if event.get("event") == "capture_executable_created"
+        )
+        created = events.pop(created_index)
+        events.insert(after_index, created)
+        for sequence, event in enumerate(events[1:], start=1):
+            if event.get("schema") == "openasr.ggml-graph-lifecycle.v1":
+                event["sequence"] = sequence
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "premature-capture-created.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with self.assertRaisesRegex(GATE.MatrixError, "invalid capture executable generation"):
+                GATE.parse_trace_artifact(path)
+
     def test_trace_rejects_token_without_compute_reference(self) -> None:
         events = [json.loads(line) for line in trace_content("cpu", "CPU", "cold").splitlines()]
         next(event for event in events if event.get("event") == "token").pop("compute")
@@ -1568,7 +1551,20 @@ class GpuCorrectnessGateTests(unittest.TestCase):
         attachment = lifecycle[("created", None)]
         attachment["event"] = "existing_graph_observed"
         attachment["prepare_generation"] = 3
-        capture_state = lifecycle[("capture_state_observed", None)]
+        capture_before = copy.deepcopy(next(
+            event
+            for event in source
+            if event.get("event") == "capture_state_observed"
+            and event.get("phase") == "before_compute"
+            and event.get("executable_present") is True
+        ))
+        capture_after = copy.deepcopy(next(
+            event
+            for event in source
+            if event.get("event") == "capture_state_observed"
+            and event.get("phase") == "after_compute"
+            and event.get("executable_present") is True
+        ))
         capture_observed = lifecycle[("capture_executable_created", None)]
         capture_observed["event"] = "capture_executable_observed"
         capture_observed["last_change"] = capture_observed.pop("change")
@@ -1576,9 +1572,10 @@ class GpuCorrectnessGateTests(unittest.TestCase):
             header,
             attachment,
             lifecycle[("input_write", None)],
-            capture_state,
+            capture_before,
             capture_observed,
             lifecycle[("compute_started", 2)],
+            capture_after,
             lifecycle[("compute_completed", 2)],
             lifecycle[("output_read", 2)],
             *[
@@ -1791,9 +1788,9 @@ class GpuCorrectnessGateTests(unittest.TestCase):
             {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "created", "scheduler_enabled": False},
             {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "prepared", "prepare_generation": 22},
             {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "input_write", "input_generation": 23, "bytes": 16},
-            {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "capture_state_observed", "capture_supported": True, "graph_tracked": True, "capture_enabled": True, "executable_present": False},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "capture_state_observed", "phase": "before_compute", "capture_supported": True, "graph_tracked": True, "capture_enabled": True, "executable_present": False},
             {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "compute_started", "compute_sequence": 1, "prepare_generation": 22, "input_generation_consumed": 23},
-            {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "capture_state_observed", "capture_supported": True, "graph_tracked": True, "capture_enabled": True, "executable_present": True},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "capture_state_observed", "phase": "after_compute", "capture_supported": True, "graph_tracked": True, "capture_enabled": True, "executable_present": True},
             {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "capture_executable_created", "capture_executable_generation": 24, "change": "instantiated"},
             {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "compute_completed", "compute_sequence": 1, "output_generation": 25},
             {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "output_read", "compute_sequence": 1, "output_generation_consumed": 25, "bytes": 36},
@@ -1821,25 +1818,21 @@ class GpuCorrectnessGateTests(unittest.TestCase):
             for event in events
             if event.get("event") != "capture_executable_created"
             and not (
-                event.get("event") == "compute_started"
-                and event.get("compute_sequence") == 2
-            )
-            and not (
-                event.get("event") in {"compute_completed", "output_read"}
-                and event.get("compute_sequence") == 2
-            )
-            and not (
-                event.get("event") == "input_write"
-                and event.get("input_generation") == 6
+                event.get("schema") == "openasr.ggml-graph-lifecycle.v1"
+                and event.get("sequence", 0) >= 10
             )
         ]
-        capture_state = next(event for event in events if event.get("event") == "capture_state_observed")
-        capture_state["capture_enabled"] = False
-        capture_state["executable_present"] = False
         for event in events:
+            if event.get("event") == "capture_state_observed":
+                event["graph_tracked"] = True
+                event["capture_enabled"] = False
+                event["executable_present"] = False
             if event.get("event") in {"token", "top_k"}:
                 event["compute"]["compute_sequence"] = 1
                 event["compute"]["output_generation"] = 5
+        for sequence, event in enumerate(events[1:], start=1):
+            if event.get("schema") == "openasr.ggml-graph-lifecycle.v1":
+                event["sequence"] = sequence
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "hip-capture-disabled.jsonl"
             path.write_text("".join(json.dumps(event) + "\n" for event in events))
@@ -1861,7 +1854,15 @@ class GpuCorrectnessGateTests(unittest.TestCase):
         trace_events = [event for event in events[1:] if event.get("schema") != "openasr.ggml-graph-lifecycle.v1"]
         lifecycle = [event for event in events[1:] if event.get("schema") == "openasr.ggml-graph-lifecycle.v1"]
         first_compute = next(event for event in lifecycle if event.get("event") == "compute_started")
-        state = next(event for event in lifecycle if event.get("event") == "capture_state_observed")
+        state = next(
+            event
+            for event in lifecycle
+            if event.get("event") == "capture_state_observed"
+            and event.get("phase") == "before_compute"
+        )
+        state["graph_tracked"] = True
+        state["capture_enabled"] = True
+        state["executable_present"] = True
         capture = next(event for event in lifecycle if event.get("event") == "capture_executable_created")
         capture["event"] = "capture_executable_observed"
         capture["last_change"] = capture.pop("change")
@@ -1894,7 +1895,7 @@ class GpuCorrectnessGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "capture-without-change.jsonl"
             path.write_text("".join(json.dumps(event) + "\n" for event in events))
-            with self.assertRaisesRegex(GATE.MatrixError, "invalid capture executable generation"):
+            with self.assertRaisesRegex(GATE.MatrixError, "unknown or missing fields"):
                 GATE.parse_trace_artifact(path)
 
     def test_trace_rejects_non_monotonic_lifecycle_sequence(self) -> None:

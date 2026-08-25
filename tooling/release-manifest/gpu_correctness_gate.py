@@ -584,6 +584,50 @@ def _strict_selection_ref(value: object) -> tuple[int, int, int, int, int, int] 
     return tuple(value[field] for field in fields)
 
 
+_LIFECYCLE_COMMON_FIELDS = {
+    "schema", "sequence", "provider", "device", "graph_instance",
+    "graph_generation", "event",
+}
+_LIFECYCLE_EVENT_FIELDS: dict[str, tuple[set[str], set[str]]] = {
+    "created": ({"scheduler_enabled"}, set()),
+    "existing_graph_observed": ({"scheduler_enabled"}, {"prepare_generation"}),
+    "prepared": ({"prepare_generation"}, set()),
+    "input_write": ({"input_generation", "bytes"}, set()),
+    "compute_started": (
+        {"compute_sequence"},
+        {"prepare_generation", "input_generation_consumed", "capture_executable_generation"},
+    ),
+    "compute_completed": ({"compute_sequence", "output_generation"}, set()),
+    "output_read": ({"compute_sequence", "output_generation_consumed", "bytes"}, set()),
+    "kv_write_committed": ({"compute_sequence", "kv_write_generation"}, set()),
+    "rebuilt": ({"previous_graph_generation", "reason"}, set()),
+    "poisoned": ({"reason"}, set()),
+    "dropped": (set(), set()),
+    "capture_state_observed": (
+        {"phase", "capture_supported", "graph_tracked", "executable_present"},
+        {"capture_enabled"},
+    ),
+    "capture_executable_observed": ({"capture_executable_generation", "last_change"}, set()),
+    "capture_executable_created": ({"capture_executable_generation", "change"}, set()),
+}
+
+
+def _require_lifecycle_event_shape(path: Path, event: object) -> None:
+    if not isinstance(event, dict) or not isinstance(event.get("event"), str):
+        raise MatrixError(f"{path} contains a malformed lifecycle event")
+    kind = event["event"]
+    contract = _LIFECYCLE_EVENT_FIELDS.get(kind)
+    if contract is None:
+        raise MatrixError(f"{path} contains an unknown lifecycle event")
+    required, optional = contract
+    actual = set(event)
+    required_all = _LIFECYCLE_COMMON_FIELDS | required
+    if not required_all <= actual or not actual <= required_all | optional:
+        raise MatrixError(
+            f"{path} lifecycle event {kind!r} has unknown or missing fields"
+        )
+
+
 def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     if not events or events[0].get("schema") != TOKEN_TRACE_SCHEMA or events[0].get("event") != "header":
@@ -650,6 +694,7 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     last_lifecycle_sequence = 0
     for event_index, event in enumerate(events[1:], start=1):
         if event.get("schema") == "openasr.ggml-graph-lifecycle.v1":
+            _require_lifecycle_event_shape(path, event)
             if event.get("provider") != header["actual_provider"] or event.get("device") != header["actual_stable_device_id"]:
                 raise MatrixError(f"{path} lifecycle event is not bound to the final trace route")
             instance = event.get("graph_instance")
@@ -691,6 +736,10 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                     "graph_tracked": None,
                     "capture_enabled": None,
                     "capture_state_observed": False,
+                    "capture_before_pending": False,
+                    "capture_before_computes": set(),
+                    "capture_after_computes": set(),
+                    "last_capture_phase": None,
                     "capture_executable_present": False,
                     "capture_present_observed": False,
                     "compute_captures": [],
@@ -719,12 +768,14 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                     raise MatrixError(f"{path} contains an invalid input write generation")
                 state["input"] = input_generation
             elif kind == "capture_state_observed":
+                phase = event.get("phase")
                 supported = event.get("capture_supported")
                 graph_tracked = event.get("graph_tracked")
                 enabled = event.get("capture_enabled")
                 executable_present = event.get("executable_present")
                 if (
                     not all(isinstance(value, bool) for value in (supported, graph_tracked, executable_present))
+                    or phase not in {"before_compute", "after_compute"}
                     or (graph_tracked and not isinstance(enabled, bool))
                     or (not graph_tracked and enabled is not None)
                     or (graph_tracked and not supported)
@@ -748,10 +799,24 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                     )
                 ):
                     raise MatrixError(f"{path} contains an invalid or drifting native capture state")
+                if phase == "before_compute":
+                    if state["active_compute"] is not None or state["capture_before_pending"]:
+                        raise MatrixError(f"{path} contains a duplicate or in-compute capture-before observation")
+                    state["capture_before_pending"] = True
+                else:
+                    compute = state["active_compute"]
+                    if (
+                        compute is None
+                        or compute not in state["capture_before_computes"]
+                        or compute in state["capture_after_computes"]
+                    ):
+                        raise MatrixError(f"{path} capture-after observation is not paired with the active compute")
+                    state["capture_after_computes"].add(compute)
                 state["capture_supported"] = supported
                 state["graph_tracked"] = graph_tracked
                 state["capture_enabled"] = enabled
                 state["capture_state_observed"] = True
+                state["last_capture_phase"] = phase
                 state["capture_executable_present"] = executable_present
                 state["capture_present_observed"] |= executable_present
             elif kind == "capture_executable_observed":
@@ -761,6 +826,7 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                     or state["capture"] is not None
                     or event.get("last_change") not in {"instantiated", "updated", "replaced"}
                     or state["active_compute"] is not None
+                    or state["last_capture_phase"] != "before_compute"
                     or not state["capture_state_observed"]
                     or not state["capture_supported"]
                     or not state["graph_tracked"]
@@ -776,6 +842,7 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                     or (state["capture"] is not None and capture <= state["capture"])
                     or event.get("change") not in {"instantiated", "updated", "replaced"}
                     or state["active_compute"] is None
+                    or state["last_capture_phase"] != "after_compute"
                     or not state["capture_state_observed"]
                     or not state["capture_supported"]
                     or not state["graph_tracked"]
@@ -792,6 +859,13 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                     or state["active_compute"] is not None
                     or state["prepare"] is None
                     or state["input"] is None
+                    or (
+                        state["capture_state_observed"]
+                        and (
+                            not state["capture_before_pending"]
+                            or state["last_capture_phase"] != "before_compute"
+                        )
+                    )
                 ):
                     raise MatrixError(f"{path} contains an invalid compute start")
                 if event.get("prepare_generation") != state["prepare"] or event.get("input_generation_consumed") != state["input"]:
@@ -799,11 +873,21 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                 if event.get("capture_executable_generation") != state["capture"]:
                     raise MatrixError(f"{path} compute capture generation was not observed from a backend API event")
                 state["active_compute"] = compute
+                if state["capture_before_pending"]:
+                    state["capture_before_computes"].add(compute)
+                    state["capture_before_pending"] = False
                 state["compute_captures"].append(state["capture"])
             elif kind == "compute_completed":
                 compute = event.get("compute_sequence")
                 output = event.get("output_generation")
-                if compute != state["active_compute"] or not positive_int(output):
+                if (
+                    compute != state["active_compute"]
+                    or not positive_int(output)
+                    or (
+                        state["capture_state_observed"]
+                        and compute not in state["capture_after_computes"]
+                    )
+                ):
                     raise MatrixError(f"{path} contains an unmatched compute completion")
                 state["active_compute"] = None
                 state["last_compute"] = compute
@@ -926,6 +1010,15 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     computed_states = [
         state for state in graph_states.values() if state["last_compute"] > 0
     ]
+    for state in computed_states:
+        if state["capture_state_observed"] and (
+            state["capture_before_pending"]
+            or state["capture_before_computes"] != set(state["completed"])
+            or state["capture_after_computes"] != set(state["completed"])
+        ):
+            raise MatrixError(
+                f"{path} does not contain one backend capture observation before and after every completed compute"
+            )
     capture_state_modes = {
         (state["capture_supported"], state["graph_tracked"], state["capture_enabled"])
         for state in computed_states
@@ -943,6 +1036,9 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
         "computed_graph_count": len(computed_states),
         "capture_state_graph_count": sum(
             bool(state["capture_state_observed"]) for state in computed_states
+        ),
+        "capture_phase_paired_compute_count": sum(
+            len(state["capture_after_computes"]) for state in computed_states
         ),
         "capture_state_modes": capture_state_modes,
         "capture_executable_present_observed": any(
@@ -998,6 +1094,9 @@ def parse_trace_artifact(path: Path) -> dict[str, Any]:
         "lifecycle_kinds": trace["lifecycle_kinds"],
         "computed_graph_count": trace["computed_graph_count"],
         "capture_state_graph_count": trace["capture_state_graph_count"],
+        "capture_phase_paired_compute_count": trace[
+            "capture_phase_paired_compute_count"
+        ],
         "capture_state_modes": trace["capture_state_modes"],
         "capture_executable_present_observed": trace[
             "capture_executable_present_observed"
@@ -1210,6 +1309,7 @@ def _require_trace_capture_policy(
 ) -> None:
     computed_graphs = semantics["computed_graph_count"]
     observed_graphs = semantics["capture_state_graph_count"]
+    paired_computes = semantics["capture_phase_paired_compute_count"]
     observed_modes = semantics["capture_state_modes"]
     executable_present = semantics["capture_executable_present_observed"]
     capture_observed = semantics["capture_generation_observed"]
@@ -1218,6 +1318,7 @@ def _require_trace_capture_policy(
         if (
             computed_graphs == 0
             or observed_graphs != computed_graphs
+            or paired_computes == 0
             or observed_modes != {(True, True, True)}
             or not executable_present
             or not capture_observed
@@ -1230,6 +1331,7 @@ def _require_trace_capture_policy(
         if (
             computed_graphs == 0
             or observed_graphs != computed_graphs
+            or paired_computes == 0
             or observed_modes != {(True, True, False)}
             or executable_present
             or capture_observed

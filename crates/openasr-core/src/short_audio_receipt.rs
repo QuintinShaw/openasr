@@ -1583,13 +1583,12 @@ pub fn decode_diagnostics_from_shipped_runtime(
             actual: token_steps.len(),
         });
     }
-    let graph_rebuilt = matches!(
-        ShortAudioReceiptReuseMode::from(resolved.reuse_mode()),
-        ShortAudioReceiptReuseMode::FreshGraph
-    );
     let mut steps = Vec::with_capacity(token_steps.len());
     for step in token_steps {
-        steps.push(decode_step_from_native_token(step, graph_rebuilt)?);
+        steps.push(decode_step_from_native_token(
+            step,
+            snapshot.map(|snapshot| &snapshot.graph_lifecycle),
+        )?);
     }
     Ok(ShortAudioReceiptDecodeDiagnostics {
         output_plan: ShortAudioReceiptOutputPlan::from(resolved.output_plan()),
@@ -1603,7 +1602,7 @@ pub fn decode_diagnostics_from_shipped_runtime(
 
 fn decode_step_from_native_token(
     step: &NativeExecutionTokenStep,
-    graph_rebuilt: bool,
+    lifecycle: Option<&GgmlGraphLifecycleSnapshot>,
 ) -> Result<ShortAudioReceiptDecodeStep, ShortAudioReceiptError> {
     let step_index = u32::try_from(step.step_index).map_err(|_| {
         ShortAudioReceiptError::DecodeStepsUnbounded {
@@ -1616,6 +1615,7 @@ fn decode_step_from_native_token(
             field: "decode_diagnostics.steps.token_id",
             actual: step.token_id.to_string(),
         })?;
+    let graph_rebuilt = observed_graph_built_for_compute(step, lifecycle)?;
     Ok(ShortAudioReceiptDecodeStep {
         step: step_index,
         token_id: Some(token_id),
@@ -1623,6 +1623,71 @@ fn decode_step_from_native_token(
         top2_margin: step.top2_margin,
         graph_rebuilt,
     })
+}
+
+fn observed_graph_built_for_compute(
+    step: &NativeExecutionTokenStep,
+    lifecycle: Option<&GgmlGraphLifecycleSnapshot>,
+) -> Result<bool, ShortAudioReceiptError> {
+    let Some(compute) = step.compute.as_ref() else {
+        return Err(ShortAudioReceiptError::InvalidEvidenceField {
+            field: "decode_diagnostics.steps.graph_rebuilt",
+            actual: "token step has no native compute witness".to_string(),
+        });
+    };
+    let Some(lifecycle) = lifecycle else {
+        return Err(ShortAudioReceiptError::InvalidEvidenceField {
+            field: "decode_diagnostics.steps.graph_rebuilt",
+            actual: "native token step has no graph lifecycle snapshot".to_string(),
+        });
+    };
+    let (graph_instance, graph_generation, compute_sequence, output_generation) =
+        compute.compute_identity();
+    let mut created = false;
+    let mut attached_existing = false;
+    let mut first_compute = None::<u64>;
+    let mut started = false;
+    let mut completed = false;
+    let mut read = false;
+    for event in lifecycle.events.iter().filter(|event| {
+        event.graph_instance == graph_instance && event.graph_generation == graph_generation
+    }) {
+        match event.kind {
+            crate::ggml_runtime::GgmlGraphLifecycleEventKind::Created { .. } => created = true,
+            crate::ggml_runtime::GgmlGraphLifecycleEventKind::ExistingGraphObserved { .. } => {
+                attached_existing = true
+            }
+            crate::ggml_runtime::GgmlGraphLifecycleEventKind::ComputeStarted {
+                compute_sequence: observed,
+                ..
+            } => {
+                first_compute = Some(first_compute.map_or(observed, |first| first.min(observed)));
+                started |= observed == compute_sequence;
+            }
+            crate::ggml_runtime::GgmlGraphLifecycleEventKind::ComputeCompleted {
+                compute_sequence: observed,
+                output_generation: output,
+            } => {
+                completed |= observed == compute_sequence && output == output_generation;
+            }
+            crate::ggml_runtime::GgmlGraphLifecycleEventKind::OutputRead {
+                compute_sequence: observed,
+                output_generation_consumed: output,
+                ..
+            } => {
+                read |= observed == compute_sequence && output == output_generation;
+            }
+            _ => {}
+        }
+    }
+    if created == attached_existing || !started || !completed || !read {
+        return Err(ShortAudioReceiptError::InvalidEvidenceField {
+            field: "decode_diagnostics.steps.graph_rebuilt",
+            actual: "native compute witness is not bound to one observed graph lifecycle"
+                .to_string(),
+        });
+    }
+    Ok(created && first_compute == Some(compute_sequence))
 }
 
 fn validate_decode_diagnostics(
@@ -2320,34 +2385,80 @@ mod tests {
     }
 
     #[test]
-    fn shipped_emitter_projects_token_steps_from_collector() {
+    fn shipped_emitter_projects_observed_created_and_existing_graphs() {
+        let resolved = cpu_resolved_runtime();
+        let first = crate::NativeExecutionReceiptCollector::new();
+        first.begin_candidate_attempt();
+        let first_lifecycle = first.graph_lifecycle_collector();
+        let first_scope = first_lifecycle.install();
+        let mut runner = crate::ggml_runtime::GgmlCpuGraphRunner::new(
+            crate::ggml_runtime::GgmlCpuGraphConfig::conservative_default(),
+        )
+        .expect("CPU graph runner");
+        let mut graph = runner.start_graph();
+        let input = graph
+            .new_tensor_1d_f32(3, "receipt_graph_input")
+            .expect("input");
+        graph.set_input(input).expect("set input");
+        graph.set_output(input).expect("set output");
+        graph
+            .set_f32_slice(input, &[0.0, 2.0, 1.0], "receipt_graph_input")
+            .expect("first input upload");
+        let (_, first_compute) = graph
+            .compute_output_f32_with_evidence(input, 3)
+            .expect("first output read")
+            .into_parts();
+        first.begin_decode_step(0, first_compute);
+        first.record_token(0, 1, false);
+        first.finish_decode_step(0);
+        drop(first_scope);
+        first.finish_candidate_attempt(true);
+        let first_snapshot = first.snapshot();
+        let first_diagnostics =
+            decode_diagnostics_from_shipped_runtime(Some(&resolved), Some(&first_snapshot))
+                .expect("created graph projects from its compute lifecycle");
+        assert!(first_diagnostics.steps[0].graph_rebuilt);
+
+        let reuse = crate::NativeExecutionReceiptCollector::new();
+        reuse.begin_candidate_attempt();
+        let reuse_lifecycle = reuse.graph_lifecycle_collector();
+        let reuse_scope = reuse_lifecycle.install();
+        graph
+            .set_f32_slice(input, &[3.0, 1.0, 2.0], "receipt_graph_input")
+            .expect("reuse input upload");
+        let (_, reuse_compute) = graph
+            .compute_output_f32_with_evidence(input, 3)
+            .expect("reuse output read")
+            .into_parts();
+        reuse.begin_decode_step(0, reuse_compute);
+        reuse.record_token(0, 0, false);
+        reuse.finish_decode_step(0);
+        drop(reuse_scope);
+        reuse.finish_candidate_attempt(true);
+        let reuse_snapshot = reuse.snapshot();
+        let reuse_diagnostics =
+            decode_diagnostics_from_shipped_runtime(Some(&resolved), Some(&reuse_snapshot))
+                .expect("existing graph projects from its request-local lifecycle");
+        assert!(!reuse_diagnostics.steps[0].graph_rebuilt);
+    }
+
+    #[test]
+    fn shipped_emitter_rejects_tokens_without_native_compute_witness() {
         let resolved = cpu_resolved_runtime();
         let collector = crate::NativeExecutionReceiptCollector::new();
         collector.record_top_k(0, &[2.0, 1.0]);
         collector.record_token(0, 11, false);
         collector.record_token(1, 7, true);
         let snapshot = collector.snapshot();
-        let diagnostics = decode_diagnostics_from_shipped_runtime(Some(&resolved), Some(&snapshot))
-            .expect("collector token steps must project");
-        assert_eq!(
-            diagnostics.output_plan,
-            ShortAudioReceiptOutputPlan::from(resolved.output_plan())
-        );
-        assert_eq!(
-            diagnostics.reuse_mode,
-            ShortAudioReceiptReuseMode::from(resolved.reuse_mode())
-        );
-        assert_eq!(diagnostics.steps.len(), 2);
-        assert_eq!(diagnostics.steps[0].step, 0);
-        assert_eq!(diagnostics.steps[0].token_id, Some(11));
-        assert_eq!(diagnostics.steps[0].top2_margin, Some(1.0));
-        assert_eq!(
-            diagnostics.steps[0].logits_sha256.as_deref(),
-            Some(crate::ggml_runtime::diagnostic_logits_sha256(&[2.0, 1.0]).as_str())
-        );
-        assert!(diagnostics.steps[0].graph_rebuilt);
-        assert_eq!(diagnostics.steps[1].token_id, Some(7));
-        assert_eq!(diagnostics.steps[1].top2_margin, None);
+        let error = decode_diagnostics_from_shipped_runtime(Some(&resolved), Some(&snapshot))
+            .expect_err("caller-recorded tokens cannot synthesize graph lifecycle evidence");
+        assert!(matches!(
+            error,
+            ShortAudioReceiptError::InvalidEvidenceField {
+                field: "decode_diagnostics.steps.graph_rebuilt",
+                ..
+            }
+        ));
     }
 
     #[test]

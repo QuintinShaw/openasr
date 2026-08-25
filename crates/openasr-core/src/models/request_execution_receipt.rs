@@ -114,6 +114,7 @@ pub struct NativeExecutionTokenStep {
     pub is_eot: bool,
     pub top2_margin: Option<f32>,
     pub logits_sha256: Option<String>,
+    pub(crate) compute: Option<GgmlSelectionEvidenceRef>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -687,6 +688,16 @@ impl NativeExecutionReceiptCollector {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let top2_margin = state.top_k_margins.get(&step_index).copied();
             let logits_sha256 = state.logits_hashes.get(&step_index).cloned();
+            let compute = match state.active_decode_step.as_mut() {
+                Some(active) if active.step_index == step_index && !active.token_recorded => {
+                    active.token_recorded = true;
+                    active.compute
+                }
+                _ => {
+                    state.trace_binding_invalid = true;
+                    None
+                }
+            };
             if let Some(existing) = state
                 .token_steps
                 .iter_mut()
@@ -700,6 +711,7 @@ impl NativeExecutionReceiptCollector {
                 if existing.logits_sha256.is_none() {
                     existing.logits_sha256 = logits_sha256;
                 }
+                existing.compute = compute;
             } else {
                 state.token_steps.push(NativeExecutionTokenStep {
                     step_index,
@@ -707,18 +719,10 @@ impl NativeExecutionReceiptCollector {
                     is_eot,
                     top2_margin,
                     logits_sha256,
+                    compute,
                 });
             }
-            match state.active_decode_step.as_mut() {
-                Some(active) if active.step_index == step_index && !active.token_recorded => {
-                    active.token_recorded = true;
-                    active.compute
-                }
-                _ => {
-                    state.trace_binding_invalid = true;
-                    None
-                }
-            }
+            compute
         };
         self.record_trace_event(
             serde_json::json!({
@@ -1333,6 +1337,9 @@ mod tests {
         assert!(!snapshot.trace.invalid_binding);
         assert!(!snapshot.trace.overflowed);
         assert_eq!(snapshot.trace.full_logits_step_count, 1);
+        let diagnostics = crate::decode_diagnostics_from_shipped_runtime(None, Some(&snapshot))
+            .expect("observed graph lifecycle projects decode diagnostics");
+        assert!(diagnostics.steps[0].graph_rebuilt);
         let artifact = snapshot
             .trace
             .full_logits_jsonl
@@ -1473,7 +1480,7 @@ mod tests {
     }
 
     #[test]
-    fn seq2seq_receipt_projects_token_steps_from_record_token() {
+    fn seq2seq_receipt_rejects_token_steps_without_native_compute_witness() {
         let receipt = NativeExecutionReceiptCollector::new();
         receipt.begin_candidate_attempt();
         receipt.record_facts(seq2seq_facts());
@@ -1488,11 +1495,15 @@ mod tests {
         receipt.record_top_k(0, &[4.0, 1.5]);
         receipt.finish_candidate_attempt(true);
         let snapshot = receipt.snapshot();
-        let diagnostics = crate::decode_diagnostics_from_shipped_runtime(None, Some(&snapshot))
-            .expect("seq2seq token steps must project");
-        assert_eq!(diagnostics.steps.len(), 1);
-        assert_eq!(diagnostics.steps[0].token_id, Some(11));
-        assert_eq!(diagnostics.steps[0].top2_margin, Some(2.5));
+        let error = crate::decode_diagnostics_from_shipped_runtime(None, Some(&snapshot))
+            .expect_err("a caller-recorded token is not graph evidence");
+        assert!(matches!(
+            error,
+            crate::ShortAudioReceiptError::InvalidEvidenceField {
+                field: "decode_diagnostics.steps.graph_rebuilt",
+                ..
+            }
+        ));
         assert!(snapshot.completed);
         assert!(snapshot.trace.event_count > 0);
         assert_eq!(

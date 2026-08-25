@@ -190,15 +190,18 @@ pub use catalog_security::{
     verify_catalog_signature_manifest, verify_local_catalog_signature_manifest,
 };
 pub use ggml_runtime::{
-    DiagnosticDecodeSelection, DiagnosticDecoderGraphMode, DiagnosticFamilyCompactPolicy,
-    DiagnosticFourQuadrantReport, DiagnosticLayer1Case, DiagnosticLayer1Report,
-    DiagnosticLayer2Report, DiagnosticQuadrantTrace, GGML_GRAPH_LIFECYCLE_SCHEMA,
-    GgmlActualDeviceFacts, GgmlCaptureExecutableChange, GgmlExecutionNodeSample,
-    GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector, GgmlExecutionTelemetryGuard,
-    GgmlGraphLifecycleCollector, GgmlGraphLifecycleEvent, GgmlGraphLifecycleEventKind,
-    GgmlGraphLifecycleGuard, GgmlGraphLifecycleSnapshot, GgmlGraphPoisonReason,
-    GgmlGraphRebuildReason, run_diagnostic_four_quadrant_exact_route_probe,
-    run_diagnostic_layer1_exact_route_probe, run_diagnostic_layer2_exact_route_probe,
+    DiagnosticDecodeConformanceSuite, DiagnosticDecodeSelection, DiagnosticDecoderGraphMode,
+    DiagnosticFamilyCompactPolicy, DiagnosticFourQuadrantReport, DiagnosticLayer1Case,
+    DiagnosticLayer1Report, DiagnosticLayer2Report, DiagnosticQuadrantTrace,
+    GGML_GRAPH_LIFECYCLE_SCHEMA, GPU_DECODE_CONFORMANCE_PRODUCTION_VOCAB,
+    GPU_DECODE_CONFORMANCE_SCHEMA, GgmlActualDeviceFacts, GgmlCaptureExecutableChange,
+    GgmlCaptureObservationPhase, GgmlExecutionNodeSample, GgmlExecutionPlacementSummary,
+    GgmlExecutionTelemetryCollector, GgmlExecutionTelemetryGuard, GgmlGraphLifecycleCollector,
+    GgmlGraphLifecycleEvent, GgmlGraphLifecycleEventKind, GgmlGraphLifecycleGuard,
+    GgmlGraphLifecycleSnapshot, GgmlGraphPoisonReason, GgmlGraphRebuildReason,
+    ggml_graph_lifecycle_json_shape_is_strict, run_diagnostic_decode_conformance_suite,
+    run_diagnostic_four_quadrant_exact_route_probe, run_diagnostic_layer1_exact_route_probe,
+    run_diagnostic_layer2_exact_route_probe,
 };
 pub use metrics::{
     ProcessMemorySnapshot, WerCounts, cer_counts, current_rss_bytes, normalize_text,

@@ -24,6 +24,13 @@ The shared software migration is in place:
 - same-graph dual output, fresh/reuse four-quadrant, backend-op, Layer-3, and
   release-matrix gates are separate; missing, stale, deferred, or mismatched
   cells fail closed;
+- the signed-artifact qualification child now runs one backend-neutral,
+  exact-route Layer-1/Layer-2/production-width four-quadrant suite and its
+  parent strictly revalidates the typed result against the prepared artifacts;
+  this remains diagnostic evidence and does not close a real-family cell;
+- native `ARGMAX_FIRST` now has one cross-backend non-finite rule: any NaN or
+  infinity in a row yields the `-1` sentinel, which request decoding rejects
+  instead of accepting a provider-dependent token;
 - FireRed's test-only encoder twin now taps every bounded subsample seam before
   relative-position attention/depthwise/readback, so a complete run can name
   the first input, convolution, bias, ReLU, layout, or projection divergence;
@@ -55,9 +62,11 @@ The following baseline outputs must not be promoted into stronger claims:
 - an ordinary `bench-receipt short-audio --trace-out` run is a request-scoped
   runtime diagnostic, but its receipt currently carries no versioned correctness
   evidence and cannot close the final matrix;
-- `graph_rebuilt=true` in the current short-audio diagnostic is derived from the
-  selected `FreshGraph` plan. It is not an observation that a graph instance was
-  created, prepared, or rebuilt; and
+- older short-audio diagnostics derived `graph_rebuilt=true` from the selected
+  `FreshGraph` plan. The current emitter instead requires a runtime-minted
+  compute/output witness bound to one `created` or `existing_graph_observed`
+  lifecycle; missing or ambiguous evidence fails closed. This correction does
+  not make an ordinary evidence-less bench receipt release-authorizing; and
 - the Desktop JavaScript plugin-switch runner is a machine-protocol smoke. It
   does not start the packaged Tauri application or traverse the production
   kernel-switch transaction and `DaemonSupervisor`.
@@ -127,6 +136,9 @@ starts. Formal cold/reuse pairs carry distinct random request IDs plus the same
 process-random nonce and OS process ID before any process-local graph identity is
 compared. Planner state, `Option<prepared_graph>`, provider labels, caller-
 supplied trace headers, and reuse mode cannot synthesize these events.
+Serialized lifecycle events use an exact per-kind field contract. Rust artifact
+parsers and the Python finalizer reject unknown, missing, reordered, or
+unpaired capture fields before consuming the event semantically.
 
 Attachment is scoped to each transactional request/candidate attempt, not only
 to collector pointer identity. A warm scope must repeat the live native capture
@@ -159,6 +171,13 @@ One backend-neutral implementation serves HIP, physical Vulkan, and CUDA:
    warm/reuse evidence.
 5. The artifact-bound hardware producer is generalized to physical Vulkan
    without allowing software Vulkan to populate a physical-device cell.
+
+The shared implementation for items 1-3 is executed by the isolated
+qualification child after the signed final provider is loaded. Its nested typed
+report is revalidated by the parent and is deliberately not consumed by the
+capability finalizer. Formal release authorization still requires item 4 to
+carry the same observed lifecycle through the existing short-audio receipt and
+trace schema; no standalone conformance JSON is a policy authority.
 
 The real-family producer must emit the separate `placement_resource` and
 `token_transcript` evidence classes expected by the common gate. A diagnostic
@@ -863,6 +882,12 @@ On every actual backend claiming native first-max support, test:
 - the real FireRed vocabulary width;
 - changing inputs across repeated execution; and
 - fail-closed rejection of unsupported type, layout, or shape.
+
+The non-finite policy is exact: if any element of an `ARGMAX_FIRST` row is NaN,
+positive infinity, or negative infinity, the operator returns signed `-1`.
+The family/runtime token boundary must reject that sentinel. It must never wrap
+or clamp it into a vocabulary token, and no backend may substitute a different
+NaN reduction order.
 
 Run the tests on real hardware and the final compiled plugin. A software Vulkan
 implementation is useful additional coverage but not proof for a physical

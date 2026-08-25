@@ -79,14 +79,15 @@ pub(crate) use cpu_graph::{
     LoadedWeightOwnerCache, ResidentDeviceCopyCapability, ResidentHostImportCapability,
 };
 pub use decode_conformance::{
-    DecodeFirstDivergenceClass, DiagnosticDecodeSelection, DiagnosticDecoderGraphMode,
-    DiagnosticFamilyCompactPolicy, DiagnosticFourQuadrantReport, DiagnosticLayer1Case,
-    DiagnosticLayer1Report, DiagnosticLayer2Report, DiagnosticQuadrantTrace,
+    DecodeFirstDivergenceClass, DiagnosticDecodeConformanceSuite, DiagnosticDecodeSelection,
+    DiagnosticDecoderGraphMode, DiagnosticFamilyCompactPolicy, DiagnosticFourQuadrantReport,
+    DiagnosticLayer1Case, DiagnosticLayer1Report, DiagnosticLayer2Report, DiagnosticQuadrantTrace,
     EncoderDecoderSplitLane, EncoderDecoderSplitProbeRecord, EncoderKernelStageClass,
+    GPU_DECODE_CONFORMANCE_PRODUCTION_VOCAB, GPU_DECODE_CONFORMANCE_SCHEMA,
     SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS, ShortAudioReceiptDecodeDiagnostics,
     ShortAudioReceiptDecodeStep, ShortAudioReceiptOutputPlan, ShortAudioReceiptReuseMode,
-    run_diagnostic_four_quadrant_exact_route_probe, run_diagnostic_layer1_exact_route_probe,
-    run_diagnostic_layer2_exact_route_probe,
+    run_diagnostic_decode_conformance_suite, run_diagnostic_four_quadrant_exact_route_probe,
+    run_diagnostic_layer1_exact_route_probe, run_diagnostic_layer2_exact_route_probe,
 };
 #[allow(unused_imports)]
 pub(crate) use decode_conformance::{
@@ -146,9 +147,9 @@ pub(crate) use gguf_write::{
 pub(crate) use graph_lifecycle::test_opaque_graph_id_mint_count;
 pub use graph_lifecycle::{
     GGML_GRAPH_LIFECYCLE_SCHEMA, GgmlActualDeviceFacts, GgmlCaptureExecutableChange,
-    GgmlGraphLifecycleCollector, GgmlGraphLifecycleEvent, GgmlGraphLifecycleEventKind,
-    GgmlGraphLifecycleGuard, GgmlGraphLifecycleSnapshot, GgmlGraphPoisonReason,
-    GgmlGraphRebuildReason,
+    GgmlCaptureObservationPhase, GgmlGraphLifecycleCollector, GgmlGraphLifecycleEvent,
+    GgmlGraphLifecycleEventKind, GgmlGraphLifecycleGuard, GgmlGraphLifecycleSnapshot,
+    GgmlGraphPoisonReason, GgmlGraphRebuildReason, ggml_graph_lifecycle_json_shape_is_strict,
 };
 pub(crate) use graph_lifecycle::{
     GgmlComputeEvidenceRef, GgmlGraphLifecycleGeneration, GgmlSelectionEvidenceRef,

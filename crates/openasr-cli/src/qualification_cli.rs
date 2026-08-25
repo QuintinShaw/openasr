@@ -2,8 +2,9 @@ use std::{env, fs, path::Path, process::Command};
 
 use anyhow::{Context, Result, bail};
 use openasr_core::{
-    PullProgress, VerifiedQualificationManifest, execute_backend_qualification,
-    prepare_backend_qualification_artifacts, verify_and_parse_qualification_manifest,
+    PullProgress, QualificationBackendRuntimeEvidence, VerifiedQualificationManifest,
+    execute_backend_qualification, prepare_backend_qualification_artifacts,
+    verify_and_parse_qualification_manifest,
 };
 
 pub(crate) fn run_parent(
@@ -67,9 +68,40 @@ pub(crate) fn run_parent(
     }
     let stdout =
         std::str::from_utf8(&output.stdout).context("qualification child output was not UTF-8")?;
-    let value: serde_json::Value =
-        serde_json::from_str(stdout).context("qualification child output was not JSON")?;
-    println!("{}", serde_json::to_string_pretty(&value)?);
+    let value: serde_json::Value = serde_json::from_str(stdout)
+        .context("qualification child output was not runtime evidence JSON")?;
+    validate_embedded_lifecycle_json(&value)?;
+    let evidence: QualificationBackendRuntimeEvidence = serde_json::from_value(value)
+        .context("qualification child output was not strict runtime evidence JSON")?;
+    evidence
+        .validate_child_result(&preparation)
+        .context("qualification child output did not match parent preparation")?;
+    println!("{}", serde_json::to_string_pretty(&evidence)?);
+    Ok(())
+}
+
+fn validate_embedded_lifecycle_json(value: &serde_json::Value) -> Result<()> {
+    match value {
+        serde_json::Value::Object(object) => {
+            if object.get("schema").and_then(serde_json::Value::as_str)
+                == Some(openasr_core::GGML_GRAPH_LIFECYCLE_SCHEMA)
+            {
+                if !openasr_core::ggml_graph_lifecycle_json_shape_is_strict(value) {
+                    bail!("qualification child lifecycle event has unknown or missing fields");
+                }
+                return Ok(());
+            }
+            for nested in object.values() {
+                validate_embedded_lifecycle_json(nested)?;
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for nested in values {
+                validate_embedded_lifecycle_json(nested)?;
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -137,5 +169,32 @@ fn render_pull_progress(progress: PullProgress) {
         PullProgress::Verifying { bytes_done } => {
             eprintln!("qualification verify: {bytes_done} bytes")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qualification_parent_rejects_unknown_embedded_lifecycle_fields() {
+        let mut event = serde_json::json!({
+            "schema": openasr_core::GGML_GRAPH_LIFECYCLE_SCHEMA,
+            "sequence": 1,
+            "provider": "cpu",
+            "device": "CPU",
+            "graph_instance": 2,
+            "graph_generation": 3,
+            "event": "created",
+            "scheduler_enabled": false
+        });
+        let value = serde_json::json!({"decode_conformance": {"events": [event.clone()]}});
+        validate_embedded_lifecycle_json(&value).expect("strict lifecycle shape");
+        event
+            .as_object_mut()
+            .expect("event object")
+            .insert("activation_mode".to_string(), serde_json::json!("auto"));
+        let value = serde_json::json!({"decode_conformance": {"events": [event]}});
+        assert!(validate_embedded_lifecycle_json(&value).is_err());
     }
 }

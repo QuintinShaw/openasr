@@ -18,6 +18,75 @@ use serde::{Deserialize, Serialize};
 pub const GGML_GRAPH_LIFECYCLE_SCHEMA: &str = "openasr.ggml-graph-lifecycle.v1";
 pub const MAX_GRAPH_LIFECYCLE_EVENTS: usize = 16_384;
 
+/// Exact JSON field contract for one serialized lifecycle event. Serde's
+/// flattened tagged enum cannot use `deny_unknown_fields`, so every artifact
+/// parser must call this before deserializing untrusted JSON.
+pub fn ggml_graph_lifecycle_json_shape_is_strict(value: &serde_json::Value) -> bool {
+    const COMMON: &[&str] = &[
+        "schema",
+        "sequence",
+        "provider",
+        "device",
+        "graph_instance",
+        "graph_generation",
+        "event",
+    ];
+    if value.get("schema").and_then(serde_json::Value::as_str) != Some(GGML_GRAPH_LIFECYCLE_SCHEMA)
+    {
+        return false;
+    }
+    let Some(event) = value.get("event").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let (required, optional): (&[&str], &[&str]) = match event {
+        "created" => (&["scheduler_enabled"], &[]),
+        "existing_graph_observed" => (&["scheduler_enabled"], &["prepare_generation"]),
+        "prepared" => (&["prepare_generation"], &[]),
+        "input_write" => (&["input_generation", "bytes"], &[]),
+        "compute_started" => (
+            &["compute_sequence"],
+            &[
+                "prepare_generation",
+                "input_generation_consumed",
+                "capture_executable_generation",
+            ],
+        ),
+        "compute_completed" => (&["compute_sequence", "output_generation"], &[]),
+        "output_read" => (
+            &["compute_sequence", "output_generation_consumed", "bytes"],
+            &[],
+        ),
+        "kv_write_committed" => (&["compute_sequence", "kv_write_generation"], &[]),
+        "rebuilt" => (&["previous_graph_generation", "reason"], &[]),
+        "poisoned" => (&["reason"], &[]),
+        "dropped" => (&[], &[]),
+        "capture_state_observed" => (
+            &[
+                "phase",
+                "capture_supported",
+                "graph_tracked",
+                "executable_present",
+            ],
+            &["capture_enabled"],
+        ),
+        "capture_executable_observed" => (&["capture_executable_generation", "last_change"], &[]),
+        "capture_executable_created" => (&["capture_executable_generation", "change"], &[]),
+        _ => return false,
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    COMMON
+        .iter()
+        .chain(required)
+        .all(|field| object.contains_key(*field))
+        && object.keys().all(|field| {
+            COMMON.contains(&field.as_str())
+                || required.contains(&field.as_str())
+                || optional.contains(&field.as_str())
+        })
+}
+
 /// Bounded facts read from the live ggml device handle that initialized the
 /// runner. `provider_device_id` preserves ggml's spelling (normally a PCI BDF)
 /// and must not be reinterpreted as a Vulkan `VkPhysicalDeviceProperties`
@@ -78,6 +147,17 @@ pub enum GgmlCaptureExecutableChange {
     Instantiated,
     Updated,
     Replaced,
+}
+
+/// Exact side of a measured native graph compute at which capture state was
+/// read from the backend ABI.  This is deliberately an observed phase rather
+/// than a planner policy: a capture-enabled lane must prove both observations
+/// around every successful compute it wants to use as evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GgmlCaptureObservationPhase {
+    BeforeCompute,
+    AfterCompute,
 }
 
 /// Opaque, process-local proof that a concrete graph compute completed and
@@ -142,6 +222,15 @@ pub(crate) struct GgmlSelectionEvidenceRef {
 }
 
 impl GgmlSelectionEvidenceRef {
+    pub(crate) fn compute_identity(&self) -> (u64, u64, u64, u64) {
+        (
+            self.graph_instance,
+            self.graph_generation,
+            self.compute_sequence,
+            self.output_generation,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn identity_tuple(&self) -> (u64, u64, u64, u64, usize, usize) {
         (
@@ -222,6 +311,7 @@ pub enum GgmlGraphLifecycleEventKind {
     /// the optional backend ABI, never inferred from a build option, provider
     /// label, or planner policy.
     CaptureStateObserved {
+        phase: GgmlCaptureObservationPhase,
         capture_supported: bool,
         graph_tracked: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -542,6 +632,7 @@ mod tests {
             1,
             2,
             GgmlGraphLifecycleEventKind::CaptureStateObserved {
+                phase: GgmlCaptureObservationPhase::BeforeCompute,
                 capture_supported: true,
                 graph_tracked: false,
                 capture_enabled: None,
@@ -554,6 +645,7 @@ mod tests {
             1,
             2,
             GgmlGraphLifecycleEventKind::CaptureStateObserved {
+                phase: GgmlCaptureObservationPhase::AfterCompute,
                 capture_supported: true,
                 graph_tracked: true,
                 capture_enabled: Some(true),
@@ -588,12 +680,21 @@ mod tests {
             .map(|event| serde_json::to_value(event).expect("serialize lifecycle event"))
             .collect::<Vec<_>>();
         assert_eq!(values[0]["event"], "capture_state_observed");
+        assert_eq!(values[0]["phase"], "before_compute");
         assert_eq!(values[0]["graph_tracked"], false);
         assert!(values[0].get("capture_enabled").is_none());
         assert_eq!(values[1]["event"], "capture_state_observed");
+        assert_eq!(values[1]["phase"], "after_compute");
         assert_eq!(values[1]["capture_enabled"], true);
         assert_eq!(values[2]["event"], "capture_executable_observed");
         assert_eq!(values[2]["last_change"], "instantiated");
+        assert!(values.iter().all(ggml_graph_lifecycle_json_shape_is_strict));
+        let mut unknown = values[0].clone();
+        unknown
+            .as_object_mut()
+            .expect("lifecycle event object")
+            .insert("activation_mode".to_string(), serde_json::json!("auto"));
+        assert!(!ggml_graph_lifecycle_json_shape_is_strict(&unknown));
         assert_eq!(values[3]["event"], "capture_executable_created");
         assert_eq!(values[3]["change"], "updated");
     }

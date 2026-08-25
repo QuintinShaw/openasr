@@ -58,6 +58,10 @@ struct ArtifactCaptureLifecycleState {
     executable_present: bool,
     capture_generation: Option<u64>,
     capture_generation_consumed: bool,
+    capture_before_pending: bool,
+    capture_before_computes: BTreeSet<u64>,
+    capture_after_computes: BTreeSet<u64>,
+    last_capture_phase: Option<openasr_core::GgmlCaptureObservationPhase>,
     computed: bool,
     active_compute: Option<u64>,
 }
@@ -86,6 +90,7 @@ fn validate_artifact_capture_lifecycle(
         .ok_or_else(|| anyhow::anyhow!("runtime lifecycle event precedes graph attachment"))?;
     match &event.kind {
         Kind::CaptureStateObserved {
+            phase,
             capture_supported,
             graph_tracked,
             capture_enabled,
@@ -105,10 +110,33 @@ fn validate_artifact_capture_lifecycle(
             {
                 bail!("runtime trace contains invalid or drifting native capture state");
             }
+            match phase {
+                openasr_core::GgmlCaptureObservationPhase::BeforeCompute => {
+                    if state.active_compute.is_some() || state.capture_before_pending {
+                        bail!(
+                            "runtime trace contains a duplicate or in-compute capture-before observation"
+                        );
+                    }
+                    state.capture_before_pending = true;
+                }
+                openasr_core::GgmlCaptureObservationPhase::AfterCompute => {
+                    let compute_sequence = state.active_compute.ok_or_else(|| {
+                        anyhow::anyhow!("runtime capture-after observation has no active compute")
+                    })?;
+                    if !state.capture_before_computes.contains(&compute_sequence)
+                        || !state.capture_after_computes.insert(compute_sequence)
+                    {
+                        bail!(
+                            "runtime capture-after observation is not paired with the active compute"
+                        );
+                    }
+                }
+            }
             state.capture_supported = Some(*capture_supported);
             state.graph_tracked = Some(*graph_tracked);
             state.capture_enabled = *capture_enabled;
             state.executable_present = *executable_present;
+            state.last_capture_phase = Some(*phase);
         }
         Kind::CaptureExecutableObserved {
             capture_executable_generation,
@@ -117,6 +145,8 @@ fn validate_artifact_capture_lifecycle(
             if *capture_executable_generation == 0
                 || state.capture_generation.is_some()
                 || state.active_compute.is_some()
+                || state.last_capture_phase
+                    != Some(openasr_core::GgmlCaptureObservationPhase::BeforeCompute)
                 || state.capture_supported != Some(true)
                 || state.graph_tracked != Some(true)
                 || state.capture_enabled != Some(true)
@@ -135,6 +165,8 @@ fn validate_artifact_capture_lifecycle(
                     .capture_generation
                     .is_some_and(|previous| *capture_executable_generation <= previous)
                 || state.active_compute.is_none()
+                || state.last_capture_phase
+                    != Some(openasr_core::GgmlCaptureObservationPhase::AfterCompute)
                 || state.capture_supported != Some(true)
                 || state.graph_tracked != Some(true)
                 || state.capture_enabled != Some(true)
@@ -151,6 +183,7 @@ fn validate_artifact_capture_lifecycle(
         } => {
             if *compute_sequence == 0
                 || state.active_compute.is_some()
+                || (state.capture_supported.is_some() && !state.capture_before_pending)
                 || *capture_executable_generation != state.capture_generation
             {
                 bail!(
@@ -158,13 +191,20 @@ fn validate_artifact_capture_lifecycle(
                 );
             }
             state.capture_generation_consumed |= capture_executable_generation.is_some();
+            if state.capture_before_pending {
+                state.capture_before_computes.insert(*compute_sequence);
+                state.capture_before_pending = false;
+            }
             state.computed = true;
             state.active_compute = Some(*compute_sequence);
         }
         Kind::ComputeCompleted {
             compute_sequence, ..
         } => {
-            if state.active_compute != Some(*compute_sequence) {
+            if state.active_compute != Some(*compute_sequence)
+                || (state.capture_supported.is_some()
+                    && !state.capture_after_computes.contains(compute_sequence))
+            {
                 bail!("runtime trace contains an unmatched compute completion");
             }
             state.active_compute = None;
@@ -1094,6 +1134,7 @@ fn validate_strict_runtime_trace(jsonl: &str) -> Result<()> {
     let mut output_reads = BTreeMap::<ArtifactComputeIdentity, u64>::new();
     let mut capture_states = BTreeMap::<(u64, u64), ArtifactCaptureLifecycleState>::new();
     let mut lifecycle_kinds = BTreeSet::new();
+    let mut last_lifecycle_sequence = 0_u64;
     let mut header_route = None::<(String, String)>;
     for (line_index, line) in jsonl.lines().enumerate() {
         let event: serde_json::Value =
@@ -1101,8 +1142,15 @@ fn validate_strict_runtime_trace(jsonl: &str) -> Result<()> {
         if event.get("schema").and_then(serde_json::Value::as_str)
             == Some(openasr_core::GGML_GRAPH_LIFECYCLE_SCHEMA)
         {
+            if !openasr_core::ggml_graph_lifecycle_json_shape_is_strict(&event) {
+                bail!("runtime lifecycle event has unknown or missing fields");
+            }
             let lifecycle: openasr_core::GgmlGraphLifecycleEvent = serde_json::from_value(event)
                 .context("runtime graph lifecycle event is invalid")?;
+            if lifecycle.sequence <= last_lifecycle_sequence {
+                bail!("runtime graph lifecycle sequence is not strictly increasing");
+            }
+            last_lifecycle_sequence = lifecycle.sequence;
             let Some((provider, device)) = &header_route else {
                 bail!("runtime graph lifecycle event precedes the strict trace header");
             };
@@ -2125,6 +2173,11 @@ mod tests {
         assert!(validate_full_logits_trace(&mismatched_process_id, valid).is_err());
         let invalid_process_id = valid.replace("\"process_id\":4242", "\"process_id\":0");
         assert!(validate_strict_runtime_trace(&invalid_process_id).is_err());
+        let unknown_lifecycle_field = valid.replace(
+            "\"scheduler_enabled\":false}",
+            "\"scheduler_enabled\":false,\"activation_mode\":\"auto\"}",
+        );
+        assert!(validate_strict_runtime_trace(&unknown_lifecycle_field).is_err());
         assert!(validate_full_logits_trace("", valid).is_err());
         assert!(validate_strict_runtime_trace("{\"event\":\"token\",\"step_index\":0}\n").is_err());
     }
@@ -2139,7 +2192,7 @@ mod tests {
             "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":4,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"compute_started\",\"compute_sequence\":1,\"prepare_generation\":3,\"input_generation_consumed\":4}\n",
             "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":5,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"compute_completed\",\"compute_sequence\":1,\"output_generation\":5}\n",
             "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":6,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"output_read\",\"compute_sequence\":1,\"output_generation_consumed\":5,\"bytes\":12}\n",
-            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":7,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"capture_state_observed\",\"capture_supported\":true,\"graph_tracked\":true,\"capture_enabled\":true,\"executable_present\":true}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":7,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"capture_state_observed\",\"phase\":\"after_compute\",\"capture_supported\":true,\"graph_tracked\":true,\"capture_enabled\":true,\"executable_present\":true}\n",
             "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":8,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"capture_executable_observed\",\"capture_executable_generation\":6,\"last_change\":\"instantiated\"}\n",
             "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"token\",\"step_index\":0,\"token_id\":1,\"is_eot\":0,\"compute\":{\"graph_instance\":1,\"graph_generation\":2,\"compute_sequence\":1,\"output_generation\":5,\"output_index\":0,\"output_count\":1}}\n",
             "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"top_k\",\"step_index\":0,\"items\":[{\"token_id\":1,\"value\":2.0},{\"token_id\":2,\"value\":1.0}],\"top1_top2_margin\":1.0,\"compute\":{\"graph_instance\":1,\"graph_generation\":2,\"compute_sequence\":1,\"output_generation\":5,\"output_index\":0,\"output_count\":1}}\n"
@@ -2148,16 +2201,85 @@ mod tests {
     }
 
     #[test]
+    fn capture_executable_creation_requires_post_compute_observation() {
+        use openasr_core::{
+            GGML_GRAPH_LIFECYCLE_SCHEMA, GgmlCaptureExecutableChange, GgmlCaptureObservationPhase,
+            GgmlGraphLifecycleEvent, GgmlGraphLifecycleEventKind,
+        };
+
+        let event = |sequence, kind| GgmlGraphLifecycleEvent {
+            schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+            sequence,
+            provider: "hip".to_string(),
+            device: "HIP0".to_string(),
+            graph_instance: 1,
+            graph_generation: 2,
+            kind,
+        };
+        let mut states = BTreeMap::new();
+        validate_artifact_capture_lifecycle(
+            &mut states,
+            &event(
+                1,
+                GgmlGraphLifecycleEventKind::Created {
+                    scheduler_enabled: false,
+                },
+            ),
+        )
+        .expect("attach graph");
+        validate_artifact_capture_lifecycle(
+            &mut states,
+            &event(
+                2,
+                GgmlGraphLifecycleEventKind::CaptureStateObserved {
+                    phase: GgmlCaptureObservationPhase::BeforeCompute,
+                    capture_supported: true,
+                    graph_tracked: true,
+                    capture_enabled: Some(true),
+                    executable_present: false,
+                },
+            ),
+        )
+        .expect("observe pre-compute state");
+        validate_artifact_capture_lifecycle(
+            &mut states,
+            &event(
+                3,
+                GgmlGraphLifecycleEventKind::ComputeStarted {
+                    compute_sequence: 1,
+                    prepare_generation: Some(3),
+                    input_generation_consumed: Some(4),
+                    capture_executable_generation: None,
+                },
+            ),
+        )
+        .expect("start compute");
+        let error = validate_artifact_capture_lifecycle(
+            &mut states,
+            &event(
+                4,
+                GgmlGraphLifecycleEventKind::CaptureExecutableCreated {
+                    capture_executable_generation: 5,
+                    change: GgmlCaptureExecutableChange::Instantiated,
+                },
+            ),
+        )
+        .expect_err("capture creation cannot precede the after-compute ABI observation");
+        assert!(error.to_string().contains("capture executable generation"));
+    }
+
+    #[test]
     fn strict_trace_requires_request_local_warm_capture_observation() {
         let warm = concat!(
             "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"header\",\"run_id\":\"0123456789abcdef0123456789abcdef\",\"process_nonce\":\"abcdef0123456789abcdef0123456789\",\"process_id\":4242,\"mode\":\"reuse\",\"graph_mode\":\"fresh_graph\",\"provider\":\"hip\",\"device_target\":\"gfx1100\",\"backend_id\":\"hip-test\",\"driver_version\":\"1.0\",\"artifact_fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"device\":\"HIP0\",\"actual_provider\":\"hip\",\"actual_stable_device_id\":\"HIP0\",\"actual_device\":{\"type\":\"gpu\",\"name\":\"HIP0\",\"description\":\"test HIP device\"}}\n",
             "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":1,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"existing_graph_observed\",\"scheduler_enabled\":false,\"prepare_generation\":3}\n",
             "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":2,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"input_write\",\"input_generation\":4,\"bytes\":16}\n",
-            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":3,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"capture_state_observed\",\"capture_supported\":true,\"graph_tracked\":true,\"capture_enabled\":true,\"executable_present\":true}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":3,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"capture_state_observed\",\"phase\":\"before_compute\",\"capture_supported\":true,\"graph_tracked\":true,\"capture_enabled\":true,\"executable_present\":true}\n",
             "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":4,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"capture_executable_observed\",\"capture_executable_generation\":10,\"last_change\":\"instantiated\"}\n",
             "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":5,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"compute_started\",\"compute_sequence\":2,\"prepare_generation\":3,\"input_generation_consumed\":4,\"capture_executable_generation\":10}\n",
-            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":6,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"compute_completed\",\"compute_sequence\":2,\"output_generation\":5}\n",
-            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":7,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"output_read\",\"compute_sequence\":2,\"output_generation_consumed\":5,\"bytes\":12}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":6,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"capture_state_observed\",\"phase\":\"after_compute\",\"capture_supported\":true,\"graph_tracked\":true,\"capture_enabled\":true,\"executable_present\":true}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":7,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"compute_completed\",\"compute_sequence\":2,\"output_generation\":5}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":8,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"output_read\",\"compute_sequence\":2,\"output_generation_consumed\":5,\"bytes\":12}\n",
             "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"token\",\"step_index\":0,\"token_id\":1,\"is_eot\":0,\"compute\":{\"graph_instance\":1,\"graph_generation\":2,\"compute_sequence\":2,\"output_generation\":5,\"output_index\":0,\"output_count\":1}}\n",
             "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"top_k\",\"step_index\":0,\"items\":[{\"token_id\":1,\"value\":2.0},{\"token_id\":2,\"value\":1.0}],\"top1_top2_margin\":1.0,\"compute\":{\"graph_instance\":1,\"graph_generation\":2,\"compute_sequence\":2,\"output_generation\":5,\"output_index\":0,\"output_count\":1}}\n"
         );
@@ -2184,15 +2306,15 @@ mod tests {
         let one_shot_capture_graph = format!(
             "{warm}{}",
             concat!(
-                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":8,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"created\",\"scheduler_enabled\":false}\n",
-                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":9,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"prepared\",\"prepare_generation\":22}\n",
-                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":10,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"input_write\",\"input_generation\":23,\"bytes\":16}\n",
-                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":11,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"capture_state_observed\",\"capture_supported\":true,\"graph_tracked\":true,\"capture_enabled\":true,\"executable_present\":false}\n",
-                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":12,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"compute_started\",\"compute_sequence\":1,\"prepare_generation\":22,\"input_generation_consumed\":23}\n",
-                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":13,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"capture_state_observed\",\"capture_supported\":true,\"graph_tracked\":true,\"capture_enabled\":true,\"executable_present\":true}\n",
-                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":14,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"capture_executable_created\",\"capture_executable_generation\":24,\"change\":\"instantiated\"}\n",
-                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":15,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"compute_completed\",\"compute_sequence\":1,\"output_generation\":25}\n",
-                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":16,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"output_read\",\"compute_sequence\":1,\"output_generation_consumed\":25,\"bytes\":12}\n"
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":9,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"created\",\"scheduler_enabled\":false}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":10,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"prepared\",\"prepare_generation\":22}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":11,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"input_write\",\"input_generation\":23,\"bytes\":16}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":12,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"capture_state_observed\",\"phase\":\"before_compute\",\"capture_supported\":true,\"graph_tracked\":true,\"capture_enabled\":true,\"executable_present\":false}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":13,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"compute_started\",\"compute_sequence\":1,\"prepare_generation\":22,\"input_generation_consumed\":23}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":14,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"capture_state_observed\",\"phase\":\"after_compute\",\"capture_supported\":true,\"graph_tracked\":true,\"capture_enabled\":true,\"executable_present\":true}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":15,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"capture_executable_created\",\"capture_executable_generation\":24,\"change\":\"instantiated\"}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":16,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"compute_completed\",\"compute_sequence\":1,\"output_generation\":25}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":17,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"output_read\",\"compute_sequence\":1,\"output_generation_consumed\":25,\"bytes\":12}\n"
             )
         );
         validate_strict_runtime_trace(&one_shot_capture_graph)
@@ -2255,7 +2377,7 @@ mod tests {
     }
 
     #[test]
-    fn shipped_emitter_projects_token_steps_from_collector_record_token() {
+    fn shipped_emitter_rejects_tokens_without_native_compute_witness() {
         let resolved = resolved_runtime(
             Some(RequestBackendPreference::CpuOnly),
             GgmlDecodeLogitsConsumers::none(),
@@ -2265,15 +2387,8 @@ mod tests {
         collector.record_token(0, 11, false);
         collector.record_token(1, 7, true);
         let snapshot = collector.snapshot();
-        let diagnostics = project_decode_diagnostics(Some(resolved), Some(&snapshot))
-            .expect("collector token steps must project");
-        assert_eq!(diagnostics.steps.len(), 2);
-        assert_eq!(diagnostics.steps[0].step, 0);
-        assert_eq!(diagnostics.steps[0].token_id, Some(11));
-        assert_eq!(diagnostics.steps[0].top2_margin, Some(1.0));
-        assert!(diagnostics.steps[0].graph_rebuilt);
-        assert_eq!(diagnostics.steps[1].token_id, Some(7));
-        assert_eq!(diagnostics.steps[1].top2_margin, None);
+        project_decode_diagnostics(Some(resolved), Some(&snapshot))
+            .expect_err("caller-recorded tokens cannot synthesize graph lifecycle evidence");
         assert!(snapshot.trace.event_count > 0);
     }
 
