@@ -48,6 +48,7 @@ mod parent_watchdog;
 mod progress;
 mod pull_cli;
 mod qualification_cli;
+mod real_family_cli;
 
 use catalog_cli::*;
 use cli_args::*;
@@ -491,12 +492,25 @@ async fn run() -> Result<()> {
                         git_cwd: git_cwd.as_deref(),
                         trace_out: trace_out.as_deref(),
                         logits_out: logits_out.as_deref(),
+                        write_outputs: true,
                     },
                 )
+                .map(|_| ())
             }
             BenchReceiptCommand::ValidateQualification { receipt } => {
                 bench_receipt_cli::validate_qualification_receipts(&receipt)
             }
+            BenchReceiptCommand::QualifyFamily { args } => real_family_cli::run(
+                &native_execution_services,
+                args.model.as_deref(),
+                &args.audio,
+                &args.device,
+                args.model_pack.as_deref(),
+                &args.binding,
+                &args.out_dir,
+                args.core_commit.as_deref(),
+                args.ffmpeg_bin,
+            ),
         },
         Command::Live {
             source,

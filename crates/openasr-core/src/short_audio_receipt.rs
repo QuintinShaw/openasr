@@ -136,6 +136,8 @@ pub enum ShortAudioReceiptError {
     QualificationIneligible { reason: &'static str },
     #[error("short-audio formal correctness evidence cannot contain free-form notes")]
     FormalEvidenceNotesNotAllowed,
+    #[error("short-audio real-family evidence is incomplete: {reason}")]
+    RealFamilyEvidenceIncomplete { reason: &'static str },
 }
 
 /// Top-level short-audio receipt document.

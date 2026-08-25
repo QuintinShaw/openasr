@@ -28,6 +28,10 @@ The shared software migration is in place:
   exact-route Layer-1/Layer-2/production-width four-quadrant suite and its
   parent strictly revalidates the typed result against the prepared artifacts;
   this remains diagnostic evidence and does not close a real-family cell;
+- `bind_real_family_evidence` and hidden `bench-receipt qualify-family` are the
+  only constructors that may attach `ShortAudioReceipt evidence.v1`; generic
+  `bench-receipt short-audio` still leaves `evidence` absent. Binding does not
+  close a matrix cell until cold+reuse receipts run on final artifacts;
 - native `ARGMAX_FIRST` now has one cross-backend non-finite rule: any NaN or
   infinity in a row yields the `-1` sentinel, which request decoding rejects
   instead of accepting a provider-dependent token;

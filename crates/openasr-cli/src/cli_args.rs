@@ -17,6 +17,27 @@ pub(crate) struct RuntimePathOverrides {
     pub(crate) ffmpeg_bin: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, clap::Args)]
+pub(crate) struct QualifyFamilyDecodeArgs {
+    #[arg(long, short = 'm')]
+    pub model: Option<String>,
+    #[arg(long)]
+    pub audio: PathBuf,
+    #[arg(long, default_value = "cpu")]
+    pub device: String,
+    #[arg(long)]
+    pub model_pack: Option<PathBuf>,
+    /// JSON `RealFamilyEvidenceBinding` with matrix/catalog/artifact identity.
+    #[arg(long)]
+    pub binding: PathBuf,
+    #[arg(long)]
+    pub out_dir: PathBuf,
+    #[arg(long)]
+    pub core_commit: Option<String>,
+    #[arg(long)]
+    pub ffmpeg_bin: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TranscribeCommandOptions<'a> {
     pub(crate) inputs: &'a [PathBuf],
@@ -794,6 +815,13 @@ pub(crate) enum BenchReceiptCommand {
         /// Receipt JSON to validate. Repeat for every candidate receipt.
         #[arg(long, required = true)]
         receipt: Vec<PathBuf>,
+    },
+    /// Bind a native short-audio cold+reuse pair to formal evidence.v1.
+    /// Generic `short-audio` remains evidence-free.
+    #[command(name = "qualify-family", hide = true)]
+    QualifyFamily {
+        #[command(flatten)]
+        args: Box<QualifyFamilyDecodeArgs>,
     },
 }
 

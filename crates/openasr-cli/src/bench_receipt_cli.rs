@@ -271,6 +271,15 @@ pub(crate) struct ShortAudioReceiptOptions<'a> {
     pub(crate) git_cwd: Option<&'a Path>,
     pub(crate) trace_out: Option<&'a Path>,
     pub(crate) logits_out: Option<&'a Path>,
+    pub(crate) write_outputs: bool,
+}
+
+/// Native short-audio observation before any evidence.v1 binding.
+#[derive(Debug, Clone)]
+pub(crate) struct CollectedShortAudio {
+    pub receipt: openasr_core::ShortAudioReceipt,
+    pub token_trace_jsonl: Option<String>,
+    pub logits_jsonl: Option<String>,
 }
 
 /// Delegate release eligibility to the core-owned receipt predicate. The GPU
@@ -296,7 +305,7 @@ pub(crate) fn validate_qualification_receipts(paths: &[PathBuf]) -> Result<()> {
 pub(crate) fn bench_receipt_short_audio(
     native_execution_services: &Arc<NativeExecutionServices>,
     options: ShortAudioReceiptOptions<'_>,
-) -> Result<()> {
+) -> Result<CollectedShortAudio> {
     if options.runs == 0 {
         bail!("--runs must be >= 1");
     }
@@ -436,7 +445,7 @@ pub(crate) fn bench_receipt_short_audio(
             } else {
                 NativeExecutionTraceMode::Reuse
             });
-            if options.logits_out.is_some() && !is_warmup {
+            if (options.logits_out.is_some() || !options.write_outputs) && !is_warmup {
                 receipt.enable_full_logits_trace();
             }
             Some((attempt_id, receipt))
@@ -692,6 +701,22 @@ pub(crate) fn bench_receipt_short_audio(
     })
     .context("Constructed short-audio receipt failed validation")?;
 
+    let token_trace_jsonl = native_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.trace.jsonl.clone())
+        .filter(|jsonl| !jsonl.is_empty());
+    let logits_jsonl = native_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.trace.full_logits_jsonl.clone());
+    let collected = CollectedShortAudio {
+        receipt: receipt.clone(),
+        token_trace_jsonl,
+        logits_jsonl,
+    };
+    if !options.write_outputs {
+        return Ok(collected);
+    }
+
     let json = receipt
         .to_pretty_json()
         .context("Could not serialize short-audio receipt JSON")?;
@@ -727,7 +752,7 @@ pub(crate) fn bench_receipt_short_audio(
         SHORT_AUDIO_RECEIPT_SCHEMA,
         options.out.display()
     );
-    Ok(())
+    Ok(collected)
 }
 
 #[derive(Debug, Clone)]
@@ -1930,6 +1955,7 @@ mod tests {
                 git_cwd: None,
                 trace_out: None,
                 logits_out: None,
+                write_outputs: true,
             },
         );
         match previous_home {
@@ -2019,6 +2045,7 @@ mod tests {
             git_cwd: None,
             trace_out: Some(&trace_out),
             logits_out: Some(&logits_out),
+            write_outputs: true,
         };
         let pack = PackBinding {
             model_id: "whisper-tiny:q4_k".to_string(),
