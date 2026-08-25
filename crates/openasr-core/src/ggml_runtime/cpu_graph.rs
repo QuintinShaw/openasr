@@ -1813,6 +1813,10 @@ pub enum GgmlCpuGraphError {
     #[error("ggml cpu graph backend scheduler is poisoned after an incomplete allocation commit")]
     BackendSchedulerPoisoned,
     #[error(
+        "ggml cpu graph cannot replace its backend scheduler while a persistent graph session is alive"
+    )]
+    PersistentGraphSessionActive,
+    #[error(
         "ggml backend returned an invalid graph cancellation capability: mechanism={mechanism}, observation_granularity={observation_granularity}"
     )]
     GraphCancellationContractFailed {
@@ -2781,6 +2785,14 @@ struct GgmlObservedGraphPlacement {
 pub(crate) struct GgmlPersistentGraphSession {
     builder: GgmlCpuGraphBuilder<'static>,
     _context: GgmlContextGuard,
+    // A persistent builder stores raw native handles so model runtimes can
+    // keep it beside the runner without a self-referential Rust borrow. These
+    // shared guards are the lifetime authority: backend/scheduler destruction
+    // is deferred until the last session drops, even if its runner drops first.
+    _scheduler: Option<GgmlBackendSchedulerGuard>,
+    _backend: GgmlBackendGuard,
+    _scheduler_accel_backends: Vec<GgmlBackendGuard>,
+    _scheduler_cpu_fallback: Option<GgmlBackendGuard>,
 }
 
 impl GgmlPersistentGraphSession {
@@ -3260,6 +3272,9 @@ impl GgmlCpuGraphRunner {
         let Some(current) = self.scheduler.as_ref() else {
             return Ok(());
         };
+        if current.has_dependent_handles() {
+            return Err(GgmlCpuGraphError::PersistentGraphSessionActive);
+        }
         if current
             .memory_owner
             .poisoned
@@ -3361,8 +3376,9 @@ impl GgmlCpuGraphRunner {
     /// only refresh inputs via `set_*_slice` and call `compute_outputs_f32`
     /// again — the prepared cgraph is reused (no rebuild, no `sched_reset`).
     ///
-    /// SAFETY: the returned session holds raw pointers into this runner's
-    /// backend + scheduler, so the runner MUST outlive the session.
+    /// Native backend and scheduler handles are retained by shared lifetime
+    /// guards in the returned session. The runner may therefore be dropped
+    /// first without invalidating the persistent builder's raw handles.
     pub(crate) fn start_persistent_graph_session(
         &mut self,
         context_bytes: usize,
@@ -3450,6 +3466,10 @@ impl GgmlCpuGraphRunner {
         Ok(GgmlPersistentGraphSession {
             builder,
             _context: context,
+            _scheduler: self.scheduler.clone(),
+            _backend: self.backend.clone(),
+            _scheduler_accel_backends: self._scheduler_accel_backends.clone(),
+            _scheduler_cpu_fallback: self._scheduler_cpu_fallback.clone(),
         })
     }
 
@@ -3505,8 +3525,10 @@ impl Drop for GgmlCpuGraphRunner {
         // the backend before the step pool.
         self.release_cpu_step_buffer_pool();
         // The scheduler references every backend passed to its constructor and
-        // owns its gallocr buffers. Destroy it (which also releases its
-        // owner-attached broker leases) before Rust drops any backend guard.
+        // owns its gallocr buffers. Drop the runner's handle before Rust drops
+        // its backend handles. A persistent session retains shared scheduler
+        // and backend guards, so native destruction is deferred until that
+        // session has first released its graph allocation and context.
         drop(self.scheduler.take());
     }
 }
@@ -9567,26 +9589,40 @@ impl Drop for GgufContextGuard {
     }
 }
 
+#[derive(Clone)]
 struct GgmlBackendGuard {
     raw: NonNull<c_void>,
-    free_on_drop: bool,
     /// Broker leases for backend-private retained high-water allocations.
     /// Cached GPU handles share this owner with their cache entry; ordinary
     /// CPU handles own it directly. The native backend is freed before these
     /// leases drop, so the ledger never refunds bytes ahead of reality.
     private_memory_leases: Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>>,
+    _lifetime: Rc<GgmlBackendLifetime>,
 }
 
-struct GgmlCachedBackendGuard {
+struct GgmlBackendLifetime {
     raw: NonNull<c_void>,
     private_memory_leases: Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>>,
     _receipt_owner: Option<crate::models::runtime_receipts::RuntimeOwnerGuard>,
 }
 
+struct GgmlCachedBackendGuard {
+    raw: NonNull<c_void>,
+    private_memory_leases: Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>>,
+    _lifetime: Rc<GgmlBackendLifetime>,
+}
+
+#[derive(Clone)]
 struct GgmlBackendSchedulerGuard {
     raw: NonNull<c_void>,
     memory_owner: GgmlSchedulerMemoryOwner,
-    released: bool,
+    lifetime: Rc<GgmlBackendSchedulerLifetime>,
+}
+
+struct GgmlBackendSchedulerLifetime {
+    raw: NonNull<c_void>,
+    memory_owner: GgmlSchedulerMemoryOwner,
+    released: Cell<bool>,
 }
 
 type GgmlBackendPrivateLeaseOwner = Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>>;
@@ -9678,8 +9714,8 @@ impl GgmlSchedulerMemoryOwner {
 
 /// GPU-class backends are expensive to initialize (device enumeration + driver
 /// context creation) and are safe to keep resident for the thread's lifetime,
-/// so they are cached per-thread per resolved route and handed out with
-/// `free_on_drop=false` (the cached entry owns the single instance).
+/// so they are cached per-thread per resolved route. The cache entry and every
+/// handed-out guard share the same native lifetime owner.
 ///
 /// The table is a thread-affine implementation detail, not a process-global
 /// owner: every cached key includes the current NES scope and exact route, and
@@ -9984,6 +10020,34 @@ fn compute_graph_with_current_job_cancel(
 }
 
 impl GgmlBackendGuard {
+    fn from_owned(
+        raw: NonNull<c_void>,
+        private_memory_leases: Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>>,
+    ) -> Self {
+        Self {
+            raw,
+            private_memory_leases: Rc::clone(&private_memory_leases),
+            _lifetime: Rc::new(GgmlBackendLifetime {
+                raw,
+                private_memory_leases,
+                _receipt_owner: None,
+            }),
+        }
+    }
+
+    fn from_shared_lifetime(
+        raw: NonNull<c_void>,
+        private_memory_leases: Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>>,
+        lifetime: Rc<GgmlBackendLifetime>,
+    ) -> Self {
+        debug_assert_eq!(lifetime.raw, raw);
+        Self {
+            raw,
+            private_memory_leases,
+            _lifetime: lifetime,
+        }
+    }
+
     fn cpu() -> Result<Self, GgmlCpuGraphError> {
         // Registry path, not ggml_backend_cpu_init: under GGML_BACKEND_DL the CPU
         // backend is a loaded plugin (ggml-cpu-<variant>.dll) whose init symbol is
@@ -9999,11 +10063,7 @@ impl GgmlBackendGuard {
             );
             GgmlCpuGraphError::CpuBackendUnavailable
         })?;
-        Ok(Self {
-            raw,
-            free_on_drop: true,
-            private_memory_leases: Rc::new(RefCell::new(Vec::new())),
-        })
+        Ok(Self::from_owned(raw, Rc::new(RefCell::new(Vec::new()))))
     }
 
     fn metal() -> Result<Self, GgmlCpuGraphError> {
@@ -10042,8 +10102,9 @@ impl GgmlBackendGuard {
     }
 
     /// Return a thread-local cached backend of `key`, initializing it once via
-    /// `init` on first use. The cached entry owns the backend for the thread's
-    /// lifetime; handed-out guards never free it (`free_on_drop=false`).
+    /// `init` on first use. The cache entry and every handed-out runner/session
+    /// share one lifetime guard, so a backend cannot be freed while a persistent
+    /// graph still retains its raw handle.
     ///
     /// The cached object retains no job pointer between compute calls. The
     /// compute-scoped cancellation API carries the current job's flag on the
@@ -10054,28 +10115,24 @@ impl GgmlBackendGuard {
     ) -> Result<Self, GgmlCpuGraphError> {
         let key = CachedBackendKey::for_current_scope(device_key.clone());
         if let Some(key) = key.as_ref()
-            && let Some((raw, private_memory_leases)) = Self::cached_backend_lookup(key)
+            && let Some((raw, private_memory_leases, lifetime)) = Self::cached_backend_lookup(key)
         {
-            return Ok(Self {
+            return Ok(Self::from_shared_lifetime(
                 raw,
-                free_on_drop: false,
                 private_memory_leases,
-            });
+                lifetime,
+            ));
         }
         let raw = init()?;
         let Some(key) = key else {
-            return Ok(Self {
-                raw,
-                free_on_drop: true,
-                private_memory_leases: Rc::new(RefCell::new(Vec::new())),
-            });
+            return Ok(Self::from_owned(raw, Rc::new(RefCell::new(Vec::new()))));
         };
-        let private_memory_leases = Self::cached_backend_insert(key, raw);
-        Ok(Self {
+        let (private_memory_leases, lifetime) = Self::cached_backend_insert(key, raw);
+        Ok(Self::from_shared_lifetime(
             raw,
-            free_on_drop: false,
             private_memory_leases,
-        })
+            lifetime,
+        ))
     }
 
     /// Defensively re-checks `is_backend_poisoned` on every lookup (not just at
@@ -10086,24 +10143,32 @@ impl GgmlBackendGuard {
     ) -> Option<(
         NonNull<c_void>,
         Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>>,
+        Rc<GgmlBackendLifetime>,
     )> {
-        let (raw, private_memory_leases) = THREAD_BACKEND_CACHE_BY_KIND.with(|cache| {
-            cache
-                .borrow()
-                .get(key)
-                .map(|guard| (guard.raw, Rc::clone(&guard.private_memory_leases)))
-        })?;
+        let (raw, private_memory_leases, lifetime) =
+            THREAD_BACKEND_CACHE_BY_KIND.with(|cache| {
+                cache.borrow().get(key).map(|guard| {
+                    (
+                        guard.raw,
+                        Rc::clone(&guard.private_memory_leases),
+                        Rc::clone(&guard._lifetime),
+                    )
+                })
+            })?;
         if is_backend_poisoned(raw) {
             mark_backend_poisoned_sticky(raw);
             return None;
         }
-        Some((raw, private_memory_leases))
+        Some((raw, private_memory_leases, lifetime))
     }
 
     fn cached_backend_insert(
         key: CachedBackendKey,
         raw: NonNull<c_void>,
-    ) -> Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>> {
+    ) -> (
+        Rc<RefCell<Vec<NativeBackendPrivateMemoryLease>>>,
+        Rc<GgmlBackendLifetime>,
+    ) {
         let private_memory_leases = Rc::new(RefCell::new(Vec::new()));
         let backend = match &key.device {
             CachedBackendDeviceKey::Metal => GgmlCpuGraphBackend::Metal,
@@ -10125,17 +10190,22 @@ impl GgmlBackendGuard {
                     crate::models::native_execution_services::current_execution_cache_attempt_id(),
                 ))
             });
+        let lifetime = Rc::new(GgmlBackendLifetime {
+            raw,
+            private_memory_leases: Rc::clone(&private_memory_leases),
+            _receipt_owner: receipt_owner,
+        });
         THREAD_BACKEND_CACHE_BY_KIND.with(|cache| {
             cache.borrow_mut().insert(
                 key,
                 GgmlCachedBackendGuard {
                     raw,
                     private_memory_leases: Rc::clone(&private_memory_leases),
-                    _receipt_owner: receipt_owner,
+                    _lifetime: Rc::clone(&lifetime),
                 },
             )
         });
-        private_memory_leases
+        (private_memory_leases, lifetime)
     }
 
     /// Preferred/Auto GPU init with Optimus-aware ranked fallthrough.
@@ -10164,29 +10234,26 @@ impl GgmlBackendGuard {
                 route.cache_key(),
             ));
             if let Some(key) = key.as_ref()
-                && let Some((raw, private_memory_leases)) = Self::cached_backend_lookup(key)
+                && let Some((raw, private_memory_leases, lifetime)) =
+                    Self::cached_backend_lookup(key)
             {
-                return Ok(Self {
+                return Ok(Self::from_shared_lifetime(
                     raw,
-                    free_on_drop: false,
                     private_memory_leases,
-                });
+                    lifetime,
+                ));
             }
             match Self::init_route_gpu_device(&devices, &route) {
                 Ok(raw) => {
                     let Some(key) = key else {
-                        return Ok(Self {
-                            raw,
-                            free_on_drop: true,
-                            private_memory_leases: Rc::new(RefCell::new(Vec::new())),
-                        });
+                        return Ok(Self::from_owned(raw, Rc::new(RefCell::new(Vec::new()))));
                     };
-                    let private_memory_leases = Self::cached_backend_insert(key, raw);
-                    return Ok(Self {
+                    let (private_memory_leases, lifetime) = Self::cached_backend_insert(key, raw);
+                    return Ok(Self::from_shared_lifetime(
                         raw,
-                        free_on_drop: false,
                         private_memory_leases,
-                    });
+                        lifetime,
+                    ));
                 }
                 Err(error) => {
                     last_init_error = Some(error);
@@ -10214,11 +10281,7 @@ impl GgmlBackendGuard {
             let Some(raw) = NonNull::new(raw) else {
                 return Vec::new();
             };
-            let mut backend = Self {
-                raw,
-                free_on_drop: true,
-                private_memory_leases: Rc::new(RefCell::new(Vec::new())),
-            };
+            let mut backend = Self::from_owned(raw, Rc::new(RefCell::new(Vec::new())));
             if let Some(n_threads) = n_threads {
                 let _ = backend.set_n_threads_if_supported(n_threads);
             }
@@ -10398,10 +10461,10 @@ fn backend_set_n_threads(
 }
 
 /// True when `backend` still resolves to a device. A live ggml backend always
-/// has one; a null device means the backend is no longer usable -- e.g. a
-/// cached (`free_on_drop=false`) Metal/GPU backend whose owning thread-local
-/// `THREAD_BACKEND_CACHE_BY_KIND` entry was dropped when its thread exited,
-/// leaving a non-owning guard elsewhere pointing at freed memory.
+/// has one; a null device means the backend is no longer usable (for example,
+/// after a device-fatal native transition). Cached runners and persistent
+/// sessions share the cache entry's lifetime owner, so cache teardown alone
+/// cannot leave a non-owning guard pointing at freed memory.
 /// `ggml_backend_alloc_ctx_tensors` dereferences the device unconditionally and
 /// `GGML_ASSERT(device)`-aborts the whole daemon on null, so buffer allocation
 /// fails closed here (typed error, propagated up the graph builder) instead.
@@ -11013,20 +11076,7 @@ fn ggml_op_is_metadata_only(op: &str) -> bool {
     matches!(op, "NONE" | "RESHAPE" | "VIEW" | "PERMUTE" | "TRANSPOSE")
 }
 
-impl Drop for GgmlBackendGuard {
-    fn drop(&mut self) {
-        if self.free_on_drop {
-            let status = unsafe { ffi::ggml_backend_free_status(self.raw.as_ptr()) };
-            if status != ffi::GGML_STATUS_SUCCESS {
-                for lease in self.private_memory_leases.borrow().iter() {
-                    lease.quarantine();
-                }
-            }
-        }
-    }
-}
-
-impl Drop for GgmlCachedBackendGuard {
+impl Drop for GgmlBackendLifetime {
     fn drop(&mut self) {
         let status = unsafe { ffi::ggml_backend_free_status(self.raw.as_ptr()) };
         if status != ffi::GGML_STATUS_SUCCESS {
@@ -11058,16 +11108,23 @@ impl GgmlBackendSchedulerGuard {
             )
         };
         NonNull::new(raw)
-            .map(|raw| Self {
-                raw,
-                memory_owner: GgmlSchedulerMemoryOwner {
+            .map(|raw| {
+                let memory_owner = GgmlSchedulerMemoryOwner {
                     backend_private_leases,
                     scheduler_private_leases: Rc::new(RefCell::new(Vec::new())),
                     scheduler_leases: Arc::new(Mutex::new(Vec::new())),
                     active_graph_address: Rc::new(Cell::new(None)),
                     poisoned: Arc::new(AtomicBool::new(false)),
-                },
-                released: false,
+                };
+                Self {
+                    raw,
+                    memory_owner: memory_owner.clone(),
+                    lifetime: Rc::new(GgmlBackendSchedulerLifetime {
+                        raw,
+                        memory_owner,
+                        released: Cell::new(false),
+                    }),
+                }
             })
             .ok_or_else(|| {
                 record_device_unavailable("scheduler-init", "ggml_backend_sched_new returned null");
@@ -11120,11 +11177,23 @@ fn build_graph_scheduler(
 }
 
 impl GgmlBackendSchedulerGuard {
+    fn has_dependent_handles(&self) -> bool {
+        Rc::strong_count(&self.lifetime) > 1
+    }
+
     fn release_native(&mut self) -> BackendReleaseProof {
-        if self.released {
+        if self.has_dependent_handles() {
             return BackendReleaseProof::NotRequired;
         }
-        self.released = true;
+        self.lifetime.release_native()
+    }
+}
+
+impl GgmlBackendSchedulerLifetime {
+    fn release_native(&self) -> BackendReleaseProof {
+        if self.released.replace(true) {
+            return BackendReleaseProof::NotRequired;
+        }
         let status = unsafe { ffi::ggml_backend_sched_free_status(self.raw.as_ptr()) };
         if status == ffi::GGML_STATUS_SUCCESS {
             BackendReleaseProof::Proven
@@ -11136,7 +11205,7 @@ impl GgmlBackendSchedulerGuard {
     }
 }
 
-impl Drop for GgmlBackendSchedulerGuard {
+impl Drop for GgmlBackendSchedulerLifetime {
     fn drop(&mut self) {
         let _ = self.release_native();
     }
@@ -13054,10 +13123,13 @@ mod tests {
             scope_id: crate::models::native_execution_services::NativeExecutionScopeId::next(),
             device: super::CachedBackendDeviceKey::Metal,
         };
-        super::GgmlBackendGuard::cached_backend_insert(key.clone(), sentinel);
+        let (_, inserted_lifetime) =
+            super::GgmlBackendGuard::cached_backend_insert(key.clone(), sentinel);
+        let (_, _, looked_up_lifetime) = super::GgmlBackendGuard::cached_backend_lookup(&key)
+            .expect("precondition: cache must contain the seeded entry before poisoning");
         assert!(
-            super::GgmlBackendGuard::cached_backend_lookup(&key).is_some(),
-            "precondition: cache must contain the seeded entry before poisoning"
+            std::rc::Rc::ptr_eq(&inserted_lifetime, &looked_up_lifetime),
+            "cache lookups must retain the cache entry's native lifetime owner"
         );
 
         super::mark_backend_poisoned_sticky(sentinel);
@@ -16019,6 +16091,56 @@ mod tests {
         assert_eq!(released.pending_bytes, baseline.pending_bytes);
         assert_eq!(released.committed_bytes, baseline.committed_bytes);
         assert_eq!(released.exclusive_pending, baseline.exclusive_pending);
+    }
+
+    #[test]
+    fn persistent_graph_session_retains_native_backend_after_runner_drop() {
+        let (mut session, input, output) = {
+            let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+                .expect("direct cpu graph runner should initialize");
+            let mut session = runner
+                .start_persistent_graph_session(1024 * 1024)
+                .expect("persistent session should open");
+            let graph = session.builder();
+            let input = graph.new_tensor_1d_f32(3, "input").expect("input tensor");
+            graph.set_input(input).expect("input flag");
+            let output = graph.mul(input, input).expect("square graph");
+            graph.set_output(output).expect("output flag");
+            graph
+                .prepare_outputs_for_upload(&[output])
+                .expect("persistent graph allocation");
+            (session, input, output)
+        };
+
+        let graph = session.builder();
+        graph
+            .set_f32_slice(input, &[2.0, 3.0, 4.0], "input")
+            .expect("input upload after runner drop");
+        assert_eq!(
+            graph
+                .compute_output_f32(output, 3)
+                .expect("session-owned backend must remain live"),
+            vec![4.0, 9.0, 16.0]
+        );
+    }
+
+    #[test]
+    fn scheduler_working_set_cannot_be_replaced_while_session_retains_it() {
+        let mut config = GgmlCpuGraphConfig::conservative_default();
+        config.use_scheduler = true;
+        let mut runner =
+            GgmlCpuGraphRunner::new(config).expect("scheduler cpu graph runner should initialize");
+        let session = runner
+            .start_persistent_graph_session(1024 * 1024)
+            .expect("persistent session should open");
+        assert_eq!(
+            runner.release_transient_scheduler_working_set(),
+            Err(GgmlCpuGraphError::PersistentGraphSessionActive)
+        );
+        drop(session);
+        runner
+            .release_transient_scheduler_working_set()
+            .expect("scheduler replacement should proceed after the session drops");
     }
 
     #[test]

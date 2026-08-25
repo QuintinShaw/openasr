@@ -607,6 +607,11 @@ failures may advance to another candidate. Error strings are not policy.
 15. After the planned-topology migration gate, production family code may
     materialize declared components on demand but may not allocate, retry,
     publish, or fall back through an unplanned family-local JIT path.
+16. A persistent graph's raw backend and scheduler handles are covered by the
+    same shared native lifetime owners as its runner/cache entry. Runner or
+    thread-cache teardown cannot free those handles first, and scheduler
+    replacement fails before mutation while any persistent session retains the
+    old scheduler.
 
 ## Target architecture
 
