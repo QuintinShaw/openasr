@@ -468,6 +468,18 @@ unsafe extern "C" {
         driver_out: *mut c_char,
         driver_out_capacity: usize,
     ) -> bool;
+    pub(crate) fn ggml_backend_probe_identity_verified_v1_utf8(
+        path_utf8: *const c_char,
+        dependency_dirs_utf8: *const *const c_char,
+        dependency_dir_count: usize,
+        expected_openasr_abi_v1: *const c_char,
+        expected_provider_v1: *const c_char,
+        device_index: usize,
+        target_out: *mut c_char,
+        target_out_capacity: usize,
+        driver_out: *mut c_char,
+        driver_out_capacity: usize,
+    ) -> bool;
     pub(crate) fn ggml_backend_load_best_verified_utf8(
         paths_utf8: *const *const c_char,
         path_count: usize,

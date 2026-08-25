@@ -309,7 +309,11 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         )
         self.assertIn('--source-digest "$QUALIFICATION_SOURCE_DIGEST"', checksums)
         self.assertIn("if actual != expected:", checksums)
-        self.assertIn("--bundled-vulkan-target vulkan-windows-x86_64", checksums)
+        self.assertIn("dist/backend-pack-vulkan-generic.json", checksums)
+        self.assertIn("compiler.artifact_cell", checksums)
+        self.assertIn("compiler.expected_artifact_cells", checksums)
+        self.assertNotIn("--bundled-vulkan-target", checksums)
+        self.assertNotIn("vulkan-windows-x86_64", checksums)
         self.assertIn("backend-qualification-assets", checksums)
         self.assertIn("openasr-*-build-provenance.bundle.json", checksums)
         self.assertIn("openasr-*-qualification-*.json", checksums)
@@ -339,6 +343,8 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             '[ "$is_draft" = "true" ]',
             'source_digest != tag_commit',
             'cells != expected_cells',
+            'compiler.expected_artifact_cells',
+            'compiler.SCHEMA_VERSION',
             'compiler._safe_basename',
             'expected_signature_count=',
             '--promote-cuda-targets',

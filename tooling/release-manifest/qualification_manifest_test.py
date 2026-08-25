@@ -173,16 +173,19 @@ class QualificationManifestCompilerTests(unittest.TestCase):
         }
         self.attestation.write_text(json.dumps(bundle), encoding="utf-8")
 
-    def _args(self, *, vulkan: bool = False) -> argparse.Namespace:
+    def _args(
+        self,
+        entry: Path | None = None,
+        *,
+        provider: str = "cuda",
+        target: str = "sm_89",
+    ) -> argparse.Namespace:
         output = qualification_manifest.manifest_asset_name(
-            self.version,
-            "vulkan" if vulkan else "cuda",
-            "vulkan-windows-x86_64" if vulkan else "sm_89",
+            self.version, provider, target
         )
         return argparse.Namespace(
             neutral_archive=self.neutral,
-            backend_entry=None if vulkan else self.entry,
-            bundled_vulkan_target="vulkan-windows-x86_64" if vulkan else None,
+            backend_entry=entry or self.entry,
             asset_directory=self.root,
             attestation_bundle=self.attestation,
             release_subject=self.tag,
@@ -192,9 +195,77 @@ class QualificationManifestCompilerTests(unittest.TestCase):
             out=self.root / output,
         )
 
+    def _vulkan_pack(self) -> tuple[Path, Path, Path]:
+        plugin = (
+            self.root
+            / f"openasr-{self.version}-windows-x86_64-vulkan-generic-plugin.dll"
+        )
+        plugin.write_bytes(b"MZ-vulkan-plugin")
+        vendor_raw = self.root / "vulkan-vendor-raw.zip"
+        write_zip(
+            vendor_raw,
+            [("vulkan-1.dll", b"loader", stat.S_IFREG | 0o644)],
+        )
+        vendor_sha, vendor_size = sha256_size(vendor_raw)
+        vendor = (
+            self.root / f"openasr-vendor-vulkan-loader-{vendor_sha[:12]}.zip"
+        )
+        vendor_raw.rename(vendor)
+        plugin_sha, plugin_size = sha256_size(plugin)
+        vendor_tree = qualification_manifest.inspect_zip(vendor)
+        entry = self.root / "backend-pack-vulkan-generic.json"
+        entry.write_text(
+            json.dumps(
+                {
+                    "id": "vulkan-windows-x86_64-generic",
+                    "vendor": "vulkan",
+                    "version": self.version,
+                    "display_name": "Vulkan",
+                    "description": "fixture",
+                    "targets": [],
+                    "min_driver_api": "1.2.0",
+                    "min_cli_version": self.version,
+                    "host_abi": HOST_ABI,
+                    "files": [
+                        {
+                            "filename": plugin.name,
+                            "url": f"{self.base_url}/{plugin.name}",
+                            "mirrors": [
+                                {
+                                    "source": "github",
+                                    "url": f"{self.mirror_url}/{plugin.name}",
+                                }
+                            ],
+                            "sha256": plugin_sha,
+                            "size_bytes": plugin_size,
+                            "role": "plugin",
+                        },
+                        {
+                            "filename": vendor.name,
+                            "url": f"{self.base_url}/{vendor.name}",
+                            "mirrors": [
+                                {
+                                    "source": "github",
+                                    "url": f"{self.mirror_url}/{vendor.name}",
+                                }
+                            ],
+                            "sha256": vendor_sha,
+                            "size_bytes": vendor_size,
+                            "role": "archive",
+                            "extract_subdir": "vendor",
+                            "extracted_tree_sha256": vendor_tree.digest("vendor"),
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._write_attestation([self.neutral, plugin, vendor])
+        return entry, plugin, vendor
+
     def test_compile_binds_host_plugin_vendor_and_attestation_without_policy(self) -> None:
         manifest = qualification_manifest.compile_manifest(self._args())
-        self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(manifest["schema_version"], 2)
         self.assertEqual(manifest["release_subject"], self.tag)
         self.assertEqual(manifest["host_abi"], HOST_ABI)
         self.assertEqual(
@@ -216,13 +287,65 @@ class QualificationManifestCompilerTests(unittest.TestCase):
         for forbidden in ("activation_mode", "activatable", "model_id", "pack_sha256"):
             self.assertNotIn(forbidden, rendered)
 
-    def test_compile_bundled_vulkan_has_no_optional_artifacts(self) -> None:
-        manifest = qualification_manifest.compile_manifest(self._args(vulkan=True))
+    def test_compile_generic_vulkan_binds_plugin_and_loader_not_a_device_target(
+        self,
+    ) -> None:
+        entry, plugin, vendor = self._vulkan_pack()
+        manifest = qualification_manifest.compile_manifest(
+            self._args(entry, provider="vulkan", target="generic")
+        )
+        self.assertEqual(manifest["schema_version"], 2)
         self.assertEqual(
             manifest["provider_target"],
-            {"provider": "vulkan", "target": "vulkan-windows-x86_64"},
+            {"provider": "vulkan", "target": "generic"},
         )
-        self.assertEqual(set(manifest["artifacts"]), {"binary"})
+        self.assertEqual(
+            manifest["artifacts"]["plugin"]["sha256"], sha256_size(plugin)[0]
+        )
+        self.assertEqual(
+            manifest["artifacts"]["vendor"][0]["file_name"], vendor.name
+        )
+        self.assertTrue(vendor.name.startswith("openasr-vendor-vulkan-loader-"))
+
+    def test_generic_vulkan_entry_cannot_encode_a_physical_device(self) -> None:
+        entry, _, _ = self._vulkan_pack()
+        payload = json.loads(entry.read_text(encoding="utf-8"))
+        payload["targets"] = [
+            "vk_caps_00001002_0000744c_00112233445566778899aabbccddeeff"
+        ]
+        entry.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(
+            qualification_manifest.QualificationManifestError,
+            "must not encode a physical device target",
+        ):
+            qualification_manifest.compile_manifest(
+                self._args(entry, provider="vulkan", target="generic")
+            )
+
+    def test_expected_artifact_cells_use_generic_vulkan_and_compiled_gpu_targets(
+        self,
+    ) -> None:
+        matrix = [
+            {"provider": "cuda", "cuda_gpu_target": "89"},
+            {"provider": "cuda", "cuda_gpu_target": "120", "experimental": True},
+            {"provider": "hip", "hip_gpu_target": "gfx1200"},
+            {"provider": "vulkan"},
+        ]
+        self.assertEqual(
+            qualification_manifest.expected_artifact_cells(matrix),
+            {("cuda", "sm_89"), ("hip", "gfx1200"), ("vulkan", "generic")},
+        )
+        self.assertEqual(
+            qualification_manifest.expected_artifact_cells(
+                matrix, promoted_cuda_targets={"120"}
+            ),
+            {
+                ("cuda", "sm_89"),
+                ("cuda", "sm_120"),
+                ("hip", "gfx1200"),
+                ("vulkan", "generic"),
+            },
+        )
 
     def test_backend_host_abi_must_equal_neutral_archive(self) -> None:
         self.entry_data["host_abi"] = dict(HOST_ABI, fingerprint="8" * 64)

@@ -111,7 +111,7 @@ for path in sorted(root.glob(f"openasr-{version}-qualification-*.json")):
     if path.name.endswith(".signature.json"):
         continue
     value = json.loads(path.read_text(encoding="utf-8"))
-    if value.get("schema_version") != 1 or value.get("release_subject") != f"v{version}":
+    if value.get("schema_version") != compiler.SCHEMA_VERSION or value.get("release_subject") != f"v{version}":
         raise SystemExit(f"invalid qualification manifest identity: {path.name}")
     provider_target = value.get("provider_target")
     if not isinstance(provider_target, dict):
@@ -170,7 +170,6 @@ for path in sorted(root.glob(f"openasr-{version}-qualification-*.json")):
 matrix = json.loads(
     Path("tooling/release-manifest/release_binaries_matrix.json").read_text(encoding="utf-8")
 )
-expected_cells = {("vulkan", "vulkan-windows-x86_64")}
 promoted = {
     token.strip().removeprefix("sm_")
     for token in promote_cuda_targets.replace(",", " ").split()
@@ -183,15 +182,7 @@ known_cuda = {
 }
 if unknown := promoted - known_cuda:
     raise SystemExit(f"unknown promoted CUDA target(s): {sorted(unknown)}")
-for row in matrix:
-    provider = row.get("provider")
-    if provider == "cuda" and (
-        not row.get("experimental", False)
-        or str(row["cuda_gpu_target"]) in promoted
-    ):
-        expected_cells.add(("cuda", f"sm_{row['cuda_gpu_target']}"))
-    elif provider == "hip" and not row.get("experimental", False):
-        expected_cells.add(("hip", str(row["hip_gpu_target"])))
+expected_cells = compiler.expected_artifact_cells(matrix, promoted_cuda_targets=promoted)
 if cells != expected_cells:
     raise SystemExit(
         f"qualification cells differ from the tag matrix: missing={sorted(expected_cells-cells)} extra={sorted(cells-expected_cells)}"

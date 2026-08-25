@@ -172,14 +172,13 @@ tag_commit = sys.argv[3]
 sys.path.insert(0, "tooling/release-manifest")
 import qualification_manifest as compiler
 
-cells = {("vulkan", "vulkan-windows-x86_64")}
+cells = set()
 for entry_path in sorted(root.glob("backend-pack-*.json")):
     entry = json.loads(entry_path.read_text(encoding="utf-8"))
-    provider = entry.get("vendor")
-    targets = entry.get("targets")
-    if provider not in {"cuda", "hip"} or not isinstance(targets, list) or len(targets) != 1:
-        raise SystemExit(f"invalid exact-target backend entry: {entry_path.name}")
-    cell = (provider, targets[0])
+    try:
+        cell = compiler.artifact_cell(entry)
+    except compiler.QualificationManifestError as error:
+        raise SystemExit(f"invalid backend qualification entry {entry_path.name}: {error}") from error
     if cell in cells:
         raise SystemExit(f"duplicate qualification cell: {cell}")
     cells.add(cell)
@@ -216,7 +215,7 @@ referenced = set()
 rows = []
 for manifest_name in sorted(expected_manifests):
     value = json.loads((root / manifest_name).read_text(encoding="utf-8"))
-    if value.get("schema_version") != 1 or value.get("release_subject") != f"v{version}":
+    if value.get("schema_version") != compiler.SCHEMA_VERSION or value.get("release_subject") != f"v{version}":
         raise SystemExit(f"qualification manifest identity changed: {manifest_name}")
     provider_target = value.get("provider_target")
     if not isinstance(provider_target, dict):

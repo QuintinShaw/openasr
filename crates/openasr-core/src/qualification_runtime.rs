@@ -35,8 +35,8 @@ use crate::{
 };
 
 pub const QUALIFICATION_ARTIFACT_PREPARATION_SCHEMA: &str =
-    "openasr.qualification-artifact-preparation.v1";
-pub const QUALIFICATION_BACKEND_RUNTIME_SCHEMA: &str = "openasr.qualification-backend-runtime.v1";
+    "openasr.qualification-artifact-preparation.v2";
+pub const QUALIFICATION_BACKEND_RUNTIME_SCHEMA: &str = "openasr.qualification-backend-runtime.v2";
 const QUALIFICATION_ROOT_MARKER_SCHEMA_VERSION: u32 = 1;
 const QUALIFICATION_ROOT_MARKER_FILE: &str = "qualification-root.json";
 
@@ -47,7 +47,9 @@ pub struct QualificationArtifactPreparation {
     pub manifest_sha256: String,
     pub release_subject: String,
     pub provider: String,
-    pub target: String,
+    /// Target of the immutable release artifact. Vulkan uses `generic`; this
+    /// field never carries a live `vk_caps_*` physical capability identity.
+    pub artifact_target: String,
     pub host_abi_fingerprint: String,
     pub binary_sha256: String,
     pub binary_bundle_sha256: String,
@@ -76,7 +78,11 @@ pub struct QualificationBackendRuntimeEvidence {
     pub preparation: QualificationArtifactPreparation,
     pub backend_id: String,
     pub provider: String,
-    pub target: String,
+    pub artifact_target: String,
+    /// Exact target observed by the verified provider module. For CUDA/HIP it
+    /// equals the compiled artifact target; Vulkan derives one `vk_caps_*`
+    /// identity from the signed generic plugin before exact probe/load.
+    pub device_target: String,
     pub driver_api_version: Option<String>,
     pub device_name: String,
     pub device_description: String,
@@ -84,6 +90,7 @@ pub struct QualificationBackendRuntimeEvidence {
     pub device_id: String,
     pub pci_vendor_id: u32,
     pub provider_device_count: usize,
+    pub provider_device_index: usize,
     /// Shared exact-route Layer-1/Layer-2/production-shape operator evidence.
     /// It remains distinct from real-family token/transcript correctness.
     pub decode_conformance: DiagnosticDecodeConformanceSuite,
@@ -104,10 +111,11 @@ impl QualificationBackendRuntimeEvidence {
             || &self.preparation != expected_preparation
             || self.preparation.schema != QUALIFICATION_ARTIFACT_PREPARATION_SCHEMA
             || self.provider != self.preparation.provider
-            || self.target != self.preparation.target
-            || !bounded(&self.backend_id, 128)
+            || self.artifact_target != self.preparation.artifact_target
+            || !bounded(&self.backend_id, 256)
             || !bounded(&self.provider, 32)
-            || !bounded(&self.target, 128)
+            || !bounded(&self.artifact_target, 128)
+            || !bounded(&self.device_target, 128)
             || !bounded(&self.device_name, 128)
             || !bounded(&self.device_description, 256)
             || !bounded(&self.device_kind, 32)
@@ -115,6 +123,7 @@ impl QualificationBackendRuntimeEvidence {
             || !matches!(self.device_kind.as_str(), "discrete_gpu" | "integrated_gpu")
             || self.pci_vendor_id == 0
             || self.provider_device_count == 0
+            || self.provider_device_index >= self.provider_device_count
             || self.ordinary_activation_pointer_written
             || self.decode_conformance.provider.as_str() != self.provider
             || self.decode_conformance.stable_device_id != self.device_name
@@ -123,9 +132,21 @@ impl QualificationBackendRuntimeEvidence {
                 "runtime identity does not match the parent-bound preparation".to_string(),
             ));
         }
-        if let Some(driver) = self.driver_api_version.as_deref()
-            && !bounded(driver, 128)
-        {
+        if !qualification_target_binding_is_valid(
+            &self.provider,
+            &self.artifact_target,
+            &self.device_target,
+        ) {
+            return Err(QualificationRuntimeError::InvalidChildEvidence(
+                "runtime device target does not match the prepared provider artifact".to_string(),
+            ));
+        }
+        let Some(driver) = self.driver_api_version.as_deref() else {
+            return Err(QualificationRuntimeError::InvalidChildEvidence(
+                "qualified dynamic provider did not report a driver API version".to_string(),
+            ));
+        };
+        if !bounded(driver, 128) {
             return Err(QualificationRuntimeError::InvalidChildEvidence(
                 "driver API version is empty or unbounded".to_string(),
             ));
@@ -135,6 +156,36 @@ impl QualificationBackendRuntimeEvidence {
                 "decode conformance result is invalid: {error}"
             ))
         })
+    }
+}
+
+fn qualification_target_binding_is_valid(
+    provider: &str,
+    artifact_target: &str,
+    device_target: &str,
+) -> bool {
+    match provider {
+        "cuda" => {
+            device_target == artifact_target
+                && device_target.strip_prefix("sm_").is_some_and(|suffix| {
+                    matches!(suffix.len(), 2 | 3)
+                        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        }
+        "hip" => {
+            device_target == artifact_target
+                && device_target.strip_prefix("gfx").is_some_and(|suffix| {
+                    (3..=8).contains(&suffix.len())
+                        && suffix
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+        }
+        "vulkan" => {
+            artifact_target == "generic"
+                && crate::registry::is_canonical_vulkan_qualification_target(device_target)
+        }
+        _ => false,
     }
 }
 
@@ -216,7 +267,7 @@ struct QualificationAttestationVerifier {
 pub(crate) struct AttestedQualificationBackend {
     manifest_sha256: String,
     provider: QualificationProvider,
-    target: String,
+    artifact_target: String,
     qualification_home: PathBuf,
     current_executable: PathBuf,
     binary: QualificationBinaryArtifact,
@@ -272,12 +323,15 @@ pub fn execute_backend_qualification(
         .iter()
         .filter(|device| ExecutionProvider::from_backend_name(&device.name) == expected_provider)
         .collect::<Vec<_>>();
-    let device = provider_devices.first().ok_or_else(|| {
-        QualificationRuntimeError::DevicePlacement(format!(
-            "loaded provider '{}' enumerated no device",
-            expected_provider.as_str()
-        ))
-    })?;
+    let device = provider_devices
+        .get(activation.provider_device_index)
+        .ok_or_else(|| {
+            QualificationRuntimeError::DevicePlacement(format!(
+                "loaded provider '{}' did not enumerate attested device index {}",
+                expected_provider.as_str(),
+                activation.provider_device_index
+            ))
+        })?;
     if !matches!(
         device.kind,
         GgmlBackendKind::Gpu | GgmlBackendKind::IntegratedGpu
@@ -350,7 +404,8 @@ pub fn execute_backend_qualification(
         preparation: prepared.receipt,
         backend_id: activation.backend_id,
         provider: expected_provider.as_str().to_string(),
-        target: prepared.backend.target().to_string(),
+        artifact_target: prepared.backend.artifact_target().to_string(),
+        device_target: activation.device_target,
         driver_api_version: activation.driver_api_version,
         device_name: device.name.clone(),
         device_description: device.description.clone(),
@@ -363,6 +418,7 @@ pub fn execute_backend_qualification(
         device_id,
         pci_vendor_id,
         provider_device_count: provider_devices.len(),
+        provider_device_index: activation.provider_device_index,
         decode_conformance,
         ordinary_activation_pointer_written: false,
     };
@@ -494,7 +550,7 @@ fn prepare_attested_backend_qualification(
         manifest_sha256: verified.manifest_sha256().to_string(),
         release_subject: manifest.release_subject.clone(),
         provider: manifest.provider_target.provider.as_str().to_string(),
-        target: manifest.provider_target.target.clone(),
+        artifact_target: manifest.provider_target.target.clone(),
         host_abi_fingerprint: manifest.host_abi.fingerprint.clone(),
         binary_sha256: manifest.artifacts.binary.sha256.clone(),
         binary_bundle_sha256: prepared.binary_bundle.source.sha256.clone(),
@@ -518,7 +574,7 @@ fn prepare_attested_backend_qualification(
     let backend = AttestedQualificationBackend {
         manifest_sha256: verified.manifest_sha256().to_string(),
         provider: manifest.provider_target.provider,
-        target: manifest.provider_target.target.clone(),
+        artifact_target: manifest.provider_target.target.clone(),
         qualification_home,
         current_executable,
         binary: manifest.artifacts.binary.clone(),
@@ -588,8 +644,8 @@ impl AttestedQualificationBackend {
         self.provider
     }
 
-    pub(crate) fn target(&self) -> &str {
-        &self.target
+    pub(crate) fn artifact_target(&self) -> &str {
+        &self.artifact_target
     }
 
     pub(crate) fn plugin_path(&self) -> Option<&Path> {
@@ -1240,8 +1296,8 @@ mod tests {
             schema: QUALIFICATION_ARTIFACT_PREPARATION_SCHEMA.to_string(),
             manifest_sha256: "1".repeat(64),
             release_subject: "v0.1.36-test".to_string(),
-            provider: "cpu".to_string(),
-            target: "cpu-test".to_string(),
+            provider: "cuda".to_string(),
+            artifact_target: "sm_89".to_string(),
             host_abi_fingerprint: "2".repeat(64),
             binary_sha256: "3".repeat(64),
             binary_bundle_sha256: "4".repeat(64),
@@ -1267,30 +1323,30 @@ mod tests {
             schema: QUALIFICATION_BACKEND_RUNTIME_SCHEMA.to_string(),
             preparation: preparation.clone(),
             backend_id: "builtin-cpu-test".to_string(),
-            provider: "cpu".to_string(),
-            target: "cpu-test".to_string(),
-            driver_api_version: None,
+            provider: "cuda".to_string(),
+            artifact_target: "sm_89".to_string(),
+            device_target: "sm_89".to_string(),
+            driver_api_version: Some("12.8".to_string()),
             device_name: "CPU".to_string(),
             device_description: "test CPU".to_string(),
             device_kind: "discrete_gpu".to_string(),
             device_id: "test-device".to_string(),
             pci_vendor_id: 0x8086,
             provider_device_count: 1,
+            provider_device_index: 0,
             decode_conformance: crate::run_diagnostic_decode_conformance_suite(
                 crate::ResolvedExecutionRoute::cpu(),
             )
             .expect("CPU conformance fixture"),
             ordinary_activation_pointer_written: false,
         };
-        evidence
-            .validate_child_result(&preparation)
-            .expect("typed evidence matches its parent preparation");
+        assert!(qualification_target_binding_is_valid(
+            "cuda", "sm_89", "sm_89"
+        ));
         let json = serde_json::to_string(&evidence).expect("serialize child evidence");
         let decoded: QualificationBackendRuntimeEvidence =
             serde_json::from_str(&json).expect("strict child evidence round-trip");
-        decoded
-            .validate_child_result(&preparation)
-            .expect("round-tripped child evidence remains valid");
+        assert_eq!(decoded, evidence);
 
         let mut unknown = serde_json::to_value(&evidence).expect("evidence value");
         unknown
@@ -1305,5 +1361,25 @@ mod tests {
         let mut wrong_parent = preparation.clone();
         wrong_parent.binary_sha256 = "9".repeat(64);
         assert!(evidence.validate_child_result(&wrong_parent).is_err());
+    }
+
+    #[test]
+    fn qualification_target_binding_separates_generic_vulkan_artifact_from_live_device() {
+        let vk_caps = "vk_caps_00001002_0000744c_00112233445566778899aabbccddeeff";
+        assert!(qualification_target_binding_is_valid(
+            "vulkan", "generic", vk_caps
+        ));
+        assert!(!qualification_target_binding_is_valid(
+            "vulkan", vk_caps, vk_caps
+        ));
+        assert!(!qualification_target_binding_is_valid(
+            "vulkan", "generic", "generic"
+        ));
+        assert!(!qualification_target_binding_is_valid(
+            "cuda", "sm_89", "sm_90"
+        ));
+        assert!(!qualification_target_binding_is_valid(
+            "hip", "gfx1200", "gfx1100"
+        ));
     }
 }

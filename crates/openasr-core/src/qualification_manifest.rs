@@ -19,7 +19,7 @@ use crate::{
     },
 };
 
-pub const QUALIFICATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const QUALIFICATION_MANIFEST_SCHEMA_VERSION: u32 = 2;
 pub const QUALIFICATION_ATTESTATION_REPOSITORY: &str = "QuintinShaw/openasr";
 pub const QUALIFICATION_ATTESTATION_SIGNER_WORKFLOW: &str =
     "QuintinShaw/openasr/.github/workflows/release-binaries.yml";
@@ -79,9 +79,11 @@ impl QualificationProvider {
 #[serde(deny_unknown_fields)]
 pub struct QualificationProviderTarget {
     pub provider: QualificationProvider,
-    /// Exact compiled target (for example `sm_89` or `gfx1200`). A manifest
-    /// never represents an equivalence set; any cross-target projection is a
-    /// later capability-finalizer decision with its own proof digest.
+    /// Immutable artifact target: one exact compiled target for CUDA/HIP (for
+    /// example `sm_89` or `gfx1200`) or `generic` for the generic Vulkan
+    /// plugin. This is not the live physical-device target. A manifest never
+    /// represents an equivalence set; any cross-target projection is a later
+    /// capability-finalizer decision with its own proof digest.
     pub target: String,
 }
 
@@ -92,8 +94,9 @@ pub struct QualificationArtifacts {
     /// member of `bundle`, because Windows release subjects are immutable ZIP
     /// archives rather than separately published executable assets.
     pub binary: QualificationBinaryArtifact,
-    /// Neutral-dynamic backend plugin. `None` is reserved for the bundled
-    /// physical-Vulkan build; CUDA and HIP qualification require a plugin.
+    /// Neutral-dynamic backend plugin. Every qualification provider requires
+    /// this artifact; physical Vulkan is qualified through the same generic,
+    /// attested plugin chain as CUDA/HIP rather than a bundled fast path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin: Option<QualificationArtifact>,
     /// Content-addressed vendor runtime archives, if the plugin needs them.
@@ -275,13 +278,13 @@ impl QualificationManifest {
         if self.host_abi.target != "x86_64-pc-windows-msvc" {
             return Err(invalid(
                 "host_abi.target",
-                "qualification v1 requires the x86_64 Windows MSVC release host",
+                "qualification v2 requires the x86_64 Windows MSVC release host",
             ));
         }
         if self.host_abi.crt != "msvc-md" {
             return Err(invalid(
                 "host_abi.crt",
-                "qualification v1 requires the dynamic MSVC CRT",
+                "qualification v2 requires the dynamic MSVC CRT",
             ));
         }
         if self.provider_target.provider == QualificationProvider::Unknown {
@@ -345,7 +348,7 @@ impl QualificationManifest {
         if self.artifacts.binary.file_name != "openasr.exe" {
             return Err(invalid(
                 "artifacts.binary.file_name",
-                "qualification v1 requires the openasr.exe member",
+                "qualification v2 requires the openasr.exe member",
             ));
         }
         let expected_binary_bundle = format!("openasr-{version}-windows-x86_64-neutral.zip");
@@ -362,52 +365,35 @@ impl QualificationManifest {
                 format!("must bind {expected_attestation_bundle}"),
             ));
         }
-        match self.provider_target.provider {
-            QualificationProvider::Cuda | QualificationProvider::Hip => {
-                let plugin = self.artifacts.plugin.as_ref().ok_or_else(|| {
-                    QualificationManifestError::InvalidPackaging {
-                        reason: format!(
-                            "{} qualification requires a neutral-dynamic plugin artifact",
-                            self.provider_target.provider.as_str()
-                        ),
-                    }
-                })?;
-                if self.artifacts.vendor.is_empty() {
-                    return Err(QualificationManifestError::InvalidPackaging {
-                        reason: format!(
-                            "{} qualification requires at least one signed vendor artifact",
-                            self.provider_target.provider.as_str()
-                        ),
-                    });
-                }
-                let release_provider = match self.provider_target.provider {
-                    QualificationProvider::Cuda => "cuda",
-                    QualificationProvider::Hip => "rocm",
-                    _ => unreachable!(),
-                };
-                let expected_plugin = format!(
-                    "openasr-{version}-windows-x86_64-{release_provider}-{}-plugin.dll",
-                    self.provider_target.target
-                );
-                if plugin.file_name != expected_plugin {
-                    return Err(invalid(
-                        "artifacts.plugin.file_name",
-                        format!("must bind exact provider/target as {expected_plugin}"),
-                    ));
-                }
-                for vendor in &self.artifacts.vendor {
-                    validate_vendor_artifact_name(vendor, release_provider)?;
-                }
+        let plugin = self.artifacts.plugin.as_ref().ok_or_else(|| {
+            QualificationManifestError::InvalidPackaging {
+                reason: format!(
+                    "{} qualification requires a neutral-dynamic plugin artifact",
+                    self.provider_target.provider.as_str()
+                ),
             }
-            QualificationProvider::Vulkan => {
-                if self.artifacts.plugin.is_some() || !self.artifacts.vendor.is_empty() {
-                    return Err(QualificationManifestError::InvalidPackaging {
-                        reason: "physical Vulkan qualification is bundled and cannot name optional plugin/vendor artifacts"
-                            .to_string(),
-                    });
-                }
-            }
-            QualificationProvider::Unknown => unreachable!("rejected before packaging validation"),
+        })?;
+        if self.artifacts.vendor.is_empty() {
+            return Err(QualificationManifestError::InvalidPackaging {
+                reason: format!(
+                    "{} qualification requires at least one signed vendor artifact",
+                    self.provider_target.provider.as_str()
+                ),
+            });
+        }
+        let expected_plugin = format!(
+            "openasr-{version}-windows-x86_64-{}-{}-plugin.dll",
+            plugin_release_prefix(self.provider_target.provider),
+            self.provider_target.target
+        );
+        if plugin.file_name != expected_plugin {
+            return Err(invalid(
+                "artifacts.plugin.file_name",
+                format!("must bind exact provider/artifact target as {expected_plugin}"),
+            ));
+        }
+        for vendor in &self.artifacts.vendor {
+            validate_vendor_artifact_name(vendor, vendor_layer_key(self.provider_target.provider))?;
         }
         let artifacts = std::iter::once(&self.artifacts.binary.bundle)
             .chain(self.artifacts.plugin.iter())
@@ -443,11 +429,33 @@ impl QualificationManifest {
     }
 }
 
+fn plugin_release_prefix(provider: QualificationProvider) -> &'static str {
+    match provider {
+        QualificationProvider::Cuda => "cuda",
+        QualificationProvider::Hip => "rocm",
+        QualificationProvider::Vulkan => "vulkan",
+        QualificationProvider::Unknown => {
+            unreachable!("rejected before packaging validation")
+        }
+    }
+}
+
+fn vendor_layer_key(provider: QualificationProvider) -> &'static str {
+    match provider {
+        QualificationProvider::Cuda => "cuda-runtime",
+        QualificationProvider::Hip => "rocm-runtime",
+        QualificationProvider::Vulkan => "vulkan-loader",
+        QualificationProvider::Unknown => {
+            unreachable!("rejected before packaging validation")
+        }
+    }
+}
+
 fn validate_vendor_artifact_name(
     artifact: &QualificationArtifact,
-    release_provider: &str,
+    vendor_layer: &str,
 ) -> Result<(), QualificationManifestError> {
-    let prefix = format!("openasr-vendor-{release_provider}-runtime-");
+    let prefix = format!("openasr-vendor-{vendor_layer}-");
     let short_digest = artifact
         .file_name
         .strip_prefix(&prefix)
@@ -500,10 +508,11 @@ fn qualification_manifest_asset_file_name(manifest: &QualificationManifest) -> S
         .release_subject
         .strip_prefix('v')
         .expect("validated qualification release subject has a v prefix");
-    let cell = match manifest.provider_target.provider {
-        QualificationProvider::Vulkan => manifest.provider_target.target.clone(),
-        provider => format!("{}-{}", provider.as_str(), manifest.provider_target.target),
-    };
+    let cell = format!(
+        "{}-{}",
+        manifest.provider_target.provider.as_str(),
+        manifest.provider_target.target
+    );
     format!("openasr-{version}-qualification-{cell}.json")
 }
 
@@ -658,7 +667,7 @@ fn validate_provider_target(
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         }),
-        QualificationProvider::Vulkan => target.target == "vulkan-windows-x86_64",
+        QualificationProvider::Vulkan => target.target == "generic",
         QualificationProvider::Unknown => false,
     };
     valid.then_some(()).ok_or_else(|| {
@@ -1024,21 +1033,36 @@ mod tests {
     }
 
     #[test]
-    fn provider_packaging_cannot_cross_optional_and_bundled_boundaries() {
+    fn vulkan_generic_uses_the_same_plugin_and_vendor_chain() {
         let mut vulkan = manifest_value();
         vulkan["provider_target"]["provider"] = serde_json::json!("vulkan");
-        vulkan["provider_target"]["target"] = serde_json::json!("vulkan-windows-x86_64");
+        vulkan["provider_target"]["target"] = serde_json::json!("generic");
+        vulkan["artifacts"]["plugin"] = artifact(
+            "openasr-0.1.37-windows-x86_64-vulkan-generic-plugin.dll",
+            '8',
+        );
+        vulkan["artifacts"]["vendor"] = serde_json::json!([artifact(
+            "openasr-vendor-vulkan-loader-999999999999.zip",
+            '9'
+        )]);
+        assert!(verify_with_test_root(&vulkan).is_ok());
+
+        let mut live_target = vulkan.clone();
+        live_target["provider_target"]["target"] =
+            serde_json::json!("vk_caps_00001002_0000744c_00112233445566778899aabbccddeeff");
         assert!(matches!(
-            verify_with_test_root(&vulkan),
-            Err(QualificationManifestError::InvalidPackaging { .. })
+            verify_with_test_root(&live_target),
+            Err(QualificationManifestError::InvalidField { .. })
         ));
 
         vulkan["artifacts"]
             .as_object_mut()
             .expect("artifacts")
             .remove("plugin");
-        vulkan["artifacts"]["vendor"] = serde_json::json!([]);
-        assert!(verify_with_test_root(&vulkan).is_ok());
+        assert!(matches!(
+            verify_with_test_root(&vulkan),
+            Err(QualificationManifestError::InvalidPackaging { .. })
+        ));
 
         let mut hip = manifest_value();
         hip["provider_target"]["provider"] = serde_json::json!("hip");

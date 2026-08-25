@@ -929,7 +929,7 @@ fn verify_qualification_manifest_command(
             "key_id": verified.signature_key_id(),
             "release_subject": body.release_subject,
             "provider": body.provider_target.provider.as_str(),
-            "target": body.provider_target.target,
+            "artifact_target": body.provider_target.target,
             "host_abi_fingerprint": body.host_abi.fingerprint,
             "binary_sha256": body.artifacts.binary.sha256,
             "binary_bundle_sha256": body.artifacts.binary.bundle.sha256,

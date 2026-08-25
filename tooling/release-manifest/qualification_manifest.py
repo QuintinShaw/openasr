@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Compile inert, exact-target backend qualification manifests.
+"""Compile inert backend qualification artifact manifests.
 
 The compiler joins three independent release facts without creating a runtime
 activation authority:
 
 * a neutral Windows host archive supplies the exact executable and host ABI;
-* one backend-pack candidate supplies an exact CUDA/HIP plugin target and its
-  vendor archives (or an explicit bundled-Vulkan target supplies no plugin);
+* one backend-pack candidate supplies an exact CUDA/HIP plugin target or the
+  generic Vulkan plugin, together with its vendor archives;
 * one Sigstore bundle supplies provenance for every referenced release subject.
 
 The resulting JSON intentionally contains no model, activation mode, or
@@ -33,7 +33,7 @@ from urllib.parse import urlsplit
 import backend_catalog
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 HOST_ABI_SCHEMA_VERSION = 3
 HOST_ABI_MEMBER = "openasr-backend-host-abi-v1.json"
 BINARY_MEMBER = "openasr.exe"
@@ -65,7 +65,16 @@ HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 RELEASE_SUBJECT = re.compile(r"v([0-9]+\.[0-9]+\.[0-9]+)\Z")
 CUDA_TARGET = re.compile(r"sm_[0-9]{2,3}\Z")
 HIP_TARGET = re.compile(r"gfx[0-9a-f]{3,8}\Z")
-VULKAN_TARGET = re.compile(r"vulkan-windows-[A-Za-z0-9_.-]+\Z")
+PLUGIN_RELEASE_PREFIX = {
+    "cuda": "cuda",
+    "hip": "rocm",
+    "vulkan": "vulkan",
+}
+VENDOR_LAYER_KEY = {
+    "cuda": "cuda-runtime",
+    "hip": "rocm-runtime",
+    "vulkan": "vulkan-loader",
+}
 
 
 class QualificationManifestError(ValueError):
@@ -437,6 +446,73 @@ def _candidate_urls(file: dict[str, Any]) -> list[str]:
     return values
 
 
+def artifact_cell(entry: dict[str, Any]) -> tuple[str, str]:
+    """Return the immutable qualification artifact cell for one backend pack.
+
+    CUDA/HIP cells are the compiled target. Vulkan cells are always
+    ``("vulkan", "generic")``; a live ``vk_caps_*`` identity is never a
+    release-artifact fact.
+    """
+
+    provider = entry.get("vendor")
+    targets = entry.get("targets")
+    if provider == "vulkan":
+        if targets != []:
+            raise QualificationManifestError(
+                "generic Vulkan qualification artifact must not encode a physical device target"
+            )
+        return "vulkan", "generic"
+    if provider not in {"cuda", "hip"}:
+        raise QualificationManifestError(
+            "backend qualification entry must be CUDA, HIP, or Vulkan"
+        )
+    if not isinstance(targets, list) or len(targets) != 1 or not isinstance(targets[0], str):
+        raise QualificationManifestError("CUDA/HIP qualification entry must declare one target")
+    target = targets[0]
+    pattern = CUDA_TARGET if provider == "cuda" else HIP_TARGET
+    if not pattern.fullmatch(target):
+        raise QualificationManifestError(
+            f"backend target {target!r} is not canonical for {provider}"
+        )
+    return provider, target
+
+
+def expected_artifact_cells(
+    matrix: list[dict[str, Any]],
+    *,
+    promoted_cuda_targets: set[str] | None = None,
+) -> set[tuple[str, str]]:
+    """Return inert qualification cells implied by the release matrix.
+
+    CUDA/HIP cells use the compiled target. Vulkan is always the generic
+    artifact cell; a live ``vk_caps_*`` identity is never a matrix fact.
+    Experimental CUDA rows enter only when explicitly promoted.
+    """
+
+    promoted = promoted_cuda_targets or set()
+    cells: set[tuple[str, str]] = set()
+    for row in matrix:
+        if not isinstance(row, dict):
+            continue
+        provider = row.get("provider")
+        experimental = bool(row.get("experimental", False))
+        if provider == "cuda":
+            target = row.get("cuda_gpu_target")
+            if target is None:
+                continue
+            token = str(target)
+            if not experimental or token in promoted:
+                cells.add(("cuda", f"sm_{token}"))
+        elif provider == "hip" and not experimental:
+            target = row.get("hip_gpu_target")
+            if target is None:
+                continue
+            cells.add(("hip", str(target)))
+        elif provider == "vulkan" and not experimental:
+            cells.add(("vulkan", "generic"))
+    return cells
+
+
 def _backend_artifacts(
     entry_path: Path,
     asset_directory: Path,
@@ -446,16 +522,7 @@ def _backend_artifacts(
     mirror_base_url: str | None,
 ) -> tuple[str, str, dict[str, Any], list[Path]]:
     entry = _read_json_object(entry_path)
-    provider = entry.get("vendor")
-    if provider not in {"cuda", "hip"}:
-        raise QualificationManifestError("backend qualification entry must be CUDA or HIP")
-    targets = entry.get("targets")
-    if not isinstance(targets, list) or len(targets) != 1 or not isinstance(targets[0], str):
-        raise QualificationManifestError("backend qualification entry must declare one target")
-    target = targets[0]
-    target_pattern = CUDA_TARGET if provider == "cuda" else HIP_TARGET
-    if not target_pattern.fullmatch(target):
-        raise QualificationManifestError(f"backend target {target!r} is not canonical for {provider}")
+    provider, target = artifact_cell(entry)
     if entry.get("version") != release_version:
         raise QualificationManifestError("backend entry version differs from release subject")
     entry_abi = entry.get("host_abi")
@@ -478,9 +545,9 @@ def _backend_artifacts(
     plugin_name = _safe_basename(plugin_file.get("filename"), "backend plugin filename")
     if not plugin_name.lower().endswith(".dll"):
         raise QualificationManifestError("backend plugin must be a Windows DLL")
-    release_provider = "rocm" if provider == "hip" else provider
+    release_prefix = PLUGIN_RELEASE_PREFIX[provider]
     expected_plugin_name = (
-        f"openasr-{release_version}-windows-x86_64-{release_provider}-{target}-plugin.dll"
+        f"openasr-{release_version}-windows-x86_64-{release_prefix}-{target}-plugin.dll"
     )
     if plugin_name != expected_plugin_name:
         raise QualificationManifestError(
@@ -502,12 +569,13 @@ def _backend_artifacts(
         )
         if not archive_name.lower().endswith(".zip"):
             raise QualificationManifestError("backend vendor artifact must be a ZIP archive")
+        vendor_layer = VENDOR_LAYER_KEY[provider]
         expected_vendor = re.compile(
-            rf"openasr-vendor-{re.escape(release_provider)}-runtime-[0-9a-f]{{12}}\.zip\Z"
+            rf"openasr-vendor-{re.escape(vendor_layer)}-[0-9a-f]{{12}}\.zip\Z"
         )
         if not expected_vendor.fullmatch(archive_name):
             raise QualificationManifestError(
-                f"backend vendor filename does not bind provider {release_provider!r}"
+                f"backend vendor filename does not bind vendor layer {vendor_layer!r}"
             )
         archive_path = asset_directory / archive_name
         archive_sha256, archive_size = _sha256_size(archive_path)
@@ -552,8 +620,7 @@ def _backend_artifacts(
 
 
 def manifest_asset_name(version: str, provider: str, target: str) -> str:
-    cell = target if provider == "vulkan" else f"{provider}-{target}"
-    return f"openasr-{version}-qualification-{cell}.json"
+    return f"openasr-{version}-qualification-{provider}-{target}.json"
 
 
 def compile_manifest(args: argparse.Namespace) -> dict[str, Any]:
@@ -588,25 +655,17 @@ def compile_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "bundle": binary_bundle,
         }
     }
-    if args.backend_entry is not None:
-        provider, target, optional, referenced = _backend_artifacts(
-            args.backend_entry.resolve(),
-            asset_directory,
-            release_version,
-            host_abi,
-            args.base_url,
-            args.mirror_base_url,
-        )
-        artifacts.update(optional)
-        for path in referenced:
-            _require_attested(attested_subjects, path)
-    else:
-        provider = "vulkan"
-        target = args.bundled_vulkan_target
-        if not isinstance(target, str) or not VULKAN_TARGET.fullmatch(target):
-            raise QualificationManifestError(
-                "bundled Vulkan target must use vulkan-windows-<target>"
-            )
+    provider, target, optional, referenced = _backend_artifacts(
+        args.backend_entry.resolve(),
+        asset_directory,
+        release_version,
+        host_abi,
+        args.base_url,
+        args.mirror_base_url,
+    )
+    artifacts.update(optional)
+    for path in referenced:
+        _require_attested(attested_subjects, path)
     expected_output = manifest_asset_name(release_version, provider, target)
     if args.out.name != expected_output:
         raise QualificationManifestError(
@@ -637,9 +696,7 @@ def compile_manifest(args: argparse.Namespace) -> dict[str, Any]:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--neutral-archive", type=Path, required=True)
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--backend-entry", type=Path)
-    source.add_argument("--bundled-vulkan-target")
+    parser.add_argument("--backend-entry", type=Path, required=True)
     parser.add_argument("--asset-directory", type=Path, required=True)
     parser.add_argument("--attestation-bundle", type=Path, required=True)
     parser.add_argument("--release-subject", required=True)

@@ -1508,28 +1508,25 @@ jobs:
           python3 -m json.tool "$bundle_asset" >/dev/null
 
           shopt -s nullglob
-          backend_entries=(dist/backend-pack-cuda-sm_*.json dist/backend-pack-hip-gfx*.json)
+          backend_entries=(
+            dist/backend-pack-cuda-sm_*.json
+            dist/backend-pack-hip-gfx*.json
+            dist/backend-pack-vulkan-generic.json
+          )
           python3 - "${backend_entries[@]}" <<'PY'
           import json
           import sys
           from pathlib import Path
 
+          sys.path.insert(0, "tooling/release-manifest")
+          import qualification_manifest as compiler
+
           matrix = json.loads(Path("tooling/release-manifest/release_binaries_matrix.json").read_text())
-          expected = set()
-          for row in matrix:
-              provider = row.get("provider")
-              if provider == "cuda" and not row.get("experimental", False):
-                  expected.add(("cuda", f"sm_{row['cuda_gpu_target']}"))
-              elif provider == "hip" and not row.get("experimental", False):
-                  expected.add(("hip", str(row["hip_gpu_target"])))
+          expected = compiler.expected_artifact_cells(matrix)
           actual = set()
           for entry_path in map(Path, sys.argv[1:]):
               entry = json.loads(entry_path.read_text(encoding="utf-8"))
-              provider = entry.get("vendor")
-              targets = entry.get("targets")
-              if provider not in {"cuda", "hip"} or not isinstance(targets, list) or len(targets) != 1:
-                  raise SystemExit(f"invalid exact-target backend entry: {entry_path}")
-              cell = (provider, targets[0])
+              cell = compiler.artifact_cell(entry)
               if cell in actual:
                   raise SystemExit(f"duplicate exact-target backend entry: {cell}")
               actual.add(cell)
@@ -1544,12 +1541,13 @@ jobs:
           import sys
           from pathlib import Path
 
-          entry = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          provider = entry.get("vendor")
-          targets = entry.get("targets")
-          if provider not in {"cuda", "hip"} or not isinstance(targets, list) or len(targets) != 1:
-              raise SystemExit(f"invalid exact-target backend entry: {sys.argv[1]}")
-          print(provider, targets[0])
+          sys.path.insert(0, "tooling/release-manifest")
+          import qualification_manifest as compiler
+
+          provider, target = compiler.artifact_cell(
+              json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          )
+          print(provider, target)
           PY
             )
             out="dist/openasr-${version}-qualification-${provider}-${target}.json"
@@ -1564,16 +1562,6 @@ jobs:
               --mirror-base-url "$mirror_base_url" \
               --out "$out"
           done
-          python3 tooling/release-manifest/qualification_manifest.py \
-            --neutral-archive "$neutral" \
-            --bundled-vulkan-target vulkan-windows-x86_64 \
-            --asset-directory dist \
-            --attestation-bundle "$bundle_asset" \
-            --release-subject "$tag" \
-            --source-digest "$QUALIFICATION_SOURCE_DIGEST" \
-            --base-url "$base_url" \
-            --mirror-base-url "$mirror_base_url" \
-            --out "dist/openasr-${version}-qualification-vulkan-windows-x86_64.json"
 
       - name: Upload inert backend qualification assets
         if: inputs.only_target == ''
