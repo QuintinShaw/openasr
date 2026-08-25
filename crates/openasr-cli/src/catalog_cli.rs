@@ -91,6 +91,26 @@ fn load_catalog(catalog_url: Option<&str>, openasr_home: &Path) -> Result<ModelC
     Ok(load_model_catalog(catalog_url, openasr_home)?)
 }
 
+/// Operator catalog authority shared by `serve` and `pull`.
+///
+/// `--catalog-url` wins when the caller passed one. Otherwise this is the same
+/// resolver `openasr serve` uses (`OPENASR_CATALOG_FILE`/`_IDENTITY`, then
+/// `OPENASR_CATALOG_URL`, then a checkout catalog). Only when none of those
+/// exist does it fall through to the signed production default. Passing `None`
+/// must not mean "ignore the process catalog env and fetch production".
+pub(crate) fn load_operator_model_catalog(
+    catalog_url: Option<&str>,
+    openasr_home: &Path,
+) -> Result<ModelCatalog> {
+    if let Some(url) = catalog_url.map(str::trim).filter(|url| !url.is_empty()) {
+        return load_catalog(Some(url), openasr_home);
+    }
+    match load_cli_model_catalog(openasr_home)? {
+        Some(catalog) => Ok(catalog),
+        None => load_catalog(None, openasr_home),
+    }
+}
+
 fn local_catalog_candidates() -> Result<Vec<PathBuf>> {
     let mut candidates = Vec::new();
     candidates.push(
@@ -271,5 +291,61 @@ mod tests {
             .expect("local override must win and verify")
             .expect("a matching override must produce Some(catalog)");
         assert!(!catalog.models.is_empty());
+    }
+
+    #[test]
+    fn operator_catalog_without_flag_uses_openasr_catalog_url() {
+        let _lock = catalog_env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let catalog_path = temp.path().join("catalog.json");
+        let contents = r#"{
+  "schema_version": 1,
+  "generated_at": "2026-05-31T00:00:00Z",
+  "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
+  "models": [{
+    "id": "env-catalog-probe",
+    "display_name": "Env Catalog Probe",
+    "family": "env-catalog-probe",
+    "aliases": ["env-catalog-probe"],
+    "pull_alias": "env-catalog-probe",
+    "size": "tiny",
+    "languages": ["en"],
+    "vendor": "OpenASR",
+    "license": "MIT",
+    "license_url": "https://example.invalid/license",
+    "license_class": "permissive",
+    "hf_repo": "OpenASR/env-catalog-probe",
+    "hf_revision": "0123456789abcdef0123456789abcdef01234567",
+    "public": true,
+    "min_cli_version": "0.1.0",
+    "recommended_quant": "q8_0",
+    "pull_recommended": "env-catalog-probe:q8",
+    "quants": [{
+      "quant": "q8_0",
+      "suffix": "q8",
+      "pull": "env-catalog-probe:q8",
+      "filename": "env-catalog-probe-q8_0.oasr",
+      "url": "https://huggingface.co/OpenASR/env-catalog-probe/resolve/0123456789abcdef0123456789abcdef01234567/env-catalog-probe-q8_0.oasr",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "size_bytes": 16,
+      "recommended": true
+    }]
+  }]
+}"#;
+        openasr_core::testing::write_local_dev_signed_catalog(&catalog_path, contents, 1);
+        let file_url = format!("file://{}", catalog_path.display());
+        let _guard = CatalogEnvGuard::set_url_override(&file_url);
+        let catalog = load_operator_model_catalog(None, &home).expect(
+            "OPENASR_CATALOG_URL must be the operator catalog when --catalog-url is omitted",
+        );
+        assert!(
+            catalog
+                .models
+                .iter()
+                .any(|model| model.id == "env-catalog-probe"),
+            "operator catalog must load the env-signed local catalog, not the production default"
+        );
     }
 }
