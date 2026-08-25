@@ -2578,11 +2578,12 @@ fn load_signed_catalog_from_cache(
             ),
         })?;
     let verified = read_and_verify_cached_catalog_manifest(source, home, &cached, error)?;
-    parse_and_check_production_catalog(&cache_path.display().to_string(), &cached, &verified)
-        .map_err(|parse_error| CatalogError::CatalogSecurity {
+    parse_and_check_production_catalog(source, &cached, &verified).map_err(|parse_error| {
+        CatalogError::CatalogSecurity {
             catalog_source: source.to_string(),
             message: format!("{error}; cached catalog rejected: {parse_error}"),
-        })
+        }
+    })
 }
 
 /// Load the signed catalog snapshot embedded in the binary at build time. Used as
@@ -2861,7 +2862,7 @@ fn validate_model_catalog(catalog: &ModelCatalog, source: &str) -> Result<(), Ca
 /// Production catalogs may only point at https payloads. A local-dev
 /// `file://` catalog identity may also point at `file://` payloads so a
 /// HIP/CUDA candidate pack can be installed offline.
-fn backend_file_url_is_allowed(source: &str, url: &str) -> bool {
+pub(crate) fn backend_file_url_is_allowed(source: &str, url: &str) -> bool {
     url.starts_with("https://") || (source.starts_with("file://") && url.starts_with("file://"))
 }
 

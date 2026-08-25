@@ -3193,6 +3193,26 @@ fn compatible_hip_backend_resolution_ignores_bundled_runtime_driver_floor() {
 }
 
 #[test]
+fn local_file_catalog_identity_allows_file_backend_urls() {
+    assert!(backend_file_url_is_allowed(
+        "file:///tmp/catalog.json",
+        "file:///tmp/ggml-hip.dll",
+    ));
+    assert!(backend_file_url_is_allowed(
+        "https://catalog.openasr.org/v1/catalog.json",
+        "https://dl.openasr.org/plugin.dll",
+    ));
+    assert!(!backend_file_url_is_allowed(
+        "https://catalog.openasr.org/v1/catalog.json",
+        "file:///tmp/ggml-hip.dll",
+    ));
+    assert!(
+        !backend_file_url_is_allowed(r"E:\openasr\catalog.json", "file:///tmp/ggml-hip.dll"),
+        "cached filesystem path is not the catalog identity; file:// backend URLs follow the signed source URL"
+    );
+}
+
+#[test]
 fn live_backend_driver_floor_drops_only_hip_catalog_minimum() {
     assert_eq!(
         live_backend_driver_floor(CatalogBackendVendor::Hip, Some("7.2.0")),

@@ -36,6 +36,11 @@ The shared software migration is in place:
   `placement_resource` and `token_transcript` evidence.v1 for
   `funasr-nano:q4_k` on gfx1200 (capture-on, FreshGraph, cold+reuse). That
   run is not a signed-plugin or release-artifact cell;
+- the same machine also produced diagnostic-not-release evidence.v1 on the
+  CPU-neutral `GGML_BACKEND_DL` host after loading a locally verified
+  `ggml-hip.dll` through the qualification selector (`schema_version` 3,
+  gfx1200). That still is not a production-catalog or Authenticode release
+  cell;
 - native `ARGMAX_FIRST` now has one cross-backend non-finite rule: any NaN or
   infinity in a row yields the `-1` sentinel, which request decoding rejects
   instead of accepting a provider-dependent token;
@@ -48,10 +53,10 @@ The shared software migration is in place:
 
 The evidence boundary remains strict. The committed CPU/Metal Layer-3 receipts
 at the earlier checkpoint do not authorize a later release commit. The Windows
-HIP sidecar evidence.v1 run does not authorize the shipped `neutral_dynamic`
-plugin host, physical Vulkan, or CUDA. Those cells, including signed HIP
-plugins and the original Windows CUDA fp16 reproduction, are not passes and
-remain non-activatable until release-bound receipts are returned.
+HIP sidecar and local-dev plugin evidence.v1 runs do not authorize a
+production-signed catalog epoch, Authenticode release ZIP, physical Vulkan, or
+CUDA. Those cells remain non-activatable until release-bound receipts are
+returned.
 
 ## Accepted completion program
 
