@@ -92,6 +92,7 @@ pub fn ggml_graph_lifecycle_json_shape_is_strict(value: &serde_json::Value) -> b
 /// and must not be reinterpreted as a Vulkan `VkPhysicalDeviceProperties`
 /// device id. Missing optional backend facts remain absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GgmlActualDeviceFacts {
     #[serde(rename = "type")]
     pub device_type: String,
@@ -336,6 +337,7 @@ pub enum GgmlGraphLifecycleEventKind {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GgmlGraphLifecycleSnapshot {
     pub events: Vec<GgmlGraphLifecycleEvent>,
     pub overflowed: bool,

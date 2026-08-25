@@ -2738,11 +2738,13 @@ def bind_runtime_cell_receipts(
         },
     }
     placement_receipt = copy.deepcopy(gpu_receipt)
+    placement_receipt["notes"] = []
     placement_receipt["evidence"] = {
         **copy.deepcopy(common_evidence),
         "evidence_class": "placement_resource",
     }
     token_receipt = copy.deepcopy(gpu_receipt)
+    token_receipt["notes"] = []
     token_receipt["evidence"] = {
         **copy.deepcopy(common_evidence),
         "evidence_class": "token_transcript",

@@ -97,6 +97,7 @@ pub enum EncoderDecoderSplitLane {
 
 /// One bounded decode step recorded on a short-audio receipt.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioReceiptDecodeStep {
     pub step: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,6 +116,7 @@ pub struct ShortAudioReceiptDecodeStep {
 /// [`GgmlDecodeOutputPlan`] / [`GgmlDecodeReuseMode`] projection, including the
 /// unique `full_logits` fallback when compact selection is unproven.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortAudioReceiptDecodeDiagnostics {
     pub output_plan: ShortAudioReceiptOutputPlan,
     pub reuse_mode: ShortAudioReceiptReuseMode,
@@ -133,6 +135,7 @@ pub struct ShortAudioReceiptDecodeDiagnostics {
 
 /// One encoder/decoder split comparison record.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncoderDecoderSplitProbeRecord {
     pub lane: EncoderDecoderSplitLane,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -72,10 +72,10 @@ wrong-artifact, placement-only, CPU-only, or partial matrices.
 | `run.env_allowlist` | no | Small non-path allowlisted env snapshot. `OPENASR_HOME` is forbidden. Never a full env dump. |
 | `run.warmup` | yes | `cold` or `warm`. |
 | `run.cache_state` | yes | `empty` or `populated`. |
-| `metrics.rtf_samples` | no | Wall-clock RTF samples; may be empty. |
-| `metrics.rtf_median` | no | Median of `rtf_samples` when samples exist. |
-| `metrics.measurement_method` | no | v0 uses `wall_clock_process_elapsed`. |
-| `metrics.wer_or_cer` / `metrics.ttft_s` | no | Optional quality/latency values; leave null/absent when not measured. |
+| `metrics.rtf_samples` | no | Finite, non-negative wall-clock RTF samples; may be empty. |
+| `metrics.rtf_median` | no | Finite, non-negative median of `rtf_samples` when present. |
+| `metrics.measurement_method` | conditional | Must be exactly `wall_clock_process_elapsed` whenever RTF samples exist; other methods are rejected on load rather than normalized. |
+| `metrics.wer_or_cer` / `metrics.ttft_s` | no | Optional finite, non-negative quality/latency values; leave null/absent when not measured. |
 | `metrics.peak_rss_before_model_bytes` / `metrics.peak_rss_bytes` | no | Process RSS high-water before model execution and after all runs. Their difference isolates model-created high-water from CLI/audio setup. |
 | `metrics.rss_before_model_bytes` / `metrics.rss_after_model_bytes` | no | Current process RSS immediately before the first model run and after the last run while runtime caches remain warm. |
 | `metrics.phys_footprint_before_model_bytes` / `metrics.phys_footprint_after_model_bytes` | no | Darwin current physical footprint at the same lifecycle boundaries; absent on unsupported platforms. |
@@ -89,7 +89,12 @@ wrong-artifact, placement-only, CPU-only, or partial matrices.
 | `execution` | no | Additive projection of the existing request/runtime receipts: request and candidate attempts, safe exact lanes/domains, live lease reconciliation, independent live/event completeness, four-phase timings, and typed terminal. No new journal/schema authority is created. |
 | `decode_diagnostics` | yes | Fail-closed projection of the runtime `GgmlDecodeOutputPlan` and reuse mode, including the unique `full_logits` fallback when compact selection is unproven. Dual-output agreement here is not compact-path authorization. |
 | `scope` | yes | Default `short-audio-gate`. Hardware runners may append exactly one `/<32-lower-hex nonce>` segment; absolute, UNC, drive and traversal paths are invalid. |
-| `notes` | no | Free-form annotations. |
+| `notes` | no | Diagnostic-only annotations on unbound v0 receipts. Any receipt carrying formal `evidence.v1` must use an empty list; free-form text never enters release qualification evidence. |
+
+Every qualification-consumable object rejects unknown JSON fields. The flattened
+graph-lifecycle event union is checked against its exact per-event field shape
+before deserialization, so an unrecognized local path or policy field cannot be
+silently dropped and then republished as valid evidence.
 
 ## Emitter
 
