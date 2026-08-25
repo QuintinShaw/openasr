@@ -13,7 +13,8 @@ Local engineering scripts for validation and iteration.
 
 - `bump-version.sh`
   - Bump the workspace release version, commit, and tag it (`--notes`
-    required; see `RELEASING.md`).
+    required). This only pins the version; it does not publish. See
+    `RELEASING.md`.
 - `render-install-verify.sh`
   - Render a release's "Install & Verify" section from its actual asset list
     (used by `.github/workflows/release-core.yml`, both for the initial stub

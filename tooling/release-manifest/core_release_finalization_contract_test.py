@@ -81,6 +81,10 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
 
         self.assertIn("gh release create", release)
         self.assertIn("--draft", release)
+        self.assertNotRegex(release, r"(?m)^  push:")
+        self.assertIn("workflow_dispatch:", release)
+        self.assertIn("WANT: ${{ inputs.version }}", release)
+        self.assertNotIn('want="${{ inputs.version }}"', release)
         self.assertIn("should_build", release)
         self.assertIn("should_finalize", release)
         self.assertIn('tag_commit="$(git rev-parse "${tag}^{}")"', release)

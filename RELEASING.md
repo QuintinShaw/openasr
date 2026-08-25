@@ -1,14 +1,16 @@
 # Releasing
 
-OpenASR uses a single workspace version and a commit-driven release flow: a
-version bump pushed to `main` IS the release.
+OpenASR uses a single workspace version. A version bump and annotated
+`vX.Y.Z` tag pin the commit; they do **not** publish. Publishing is a
+maintainer-triggered `workflow_dispatch` of `.github/workflows/release-core.yml`,
+the same posture as the desktop product's `release-desktop.yml`.
 
-Feature, fix, and any other content changes go through pull requests as usual.
-The release bump itself is the exception: a maintainer pushes it directly to
-`main` as a single `chore(release)` commit plus its annotated `vX.Y.Z` tag.
-Routing the bump through a PR adds nothing (the release fires on the merge
-commit anyway). Routine CI is PR-only to avoid rebuilding every merge; its
-narrow `main` push gate runs only for this direct `chore(release)` commit.
+Feature, fix, and other content changes go through pull requests as usual.
+The release bump may be pushed directly to `main` as a single
+`chore(release)` commit plus its annotated tag; ordinary CI still runs, but
+the release workflows do not. Routine CI is PR-only to avoid rebuilding every
+merge; its narrow `main` push gate runs only for this direct `chore(release)`
+commit.
 
 ## Versioning
 
@@ -47,35 +49,37 @@ bump, or CI's `--locked` builds fail:
    commit, and if the tag already exists locally it is left alone (delete it
    first with `git tag -d vX.Y.Z` to redo the notes).
 
-2. Push the commit **and** the tag together:
+2. Push the commit **and** the tag together (this is only the pin; it must
+   not start a release):
 
    ```bash
    git push --follow-tags
    ```
 
-   Pushing just the commit without the tag (plain `git push`) is a mistake
-   `release-core.yml` catches and fails loudly on -- it needs the tag's
-   annotation for Highlights and refuses to guess.
+   Pushing just the commit without the tag (plain `git push`) leaves nothing
+   for `release-core.yml` to check out. The dispatch fails closed until the
+   annotated tag exists on origin.
 
-3. The `Release core` workflow (`.github/workflows/release-core.yml`)
-   triggers on `Cargo.toml` changes:
-   - reads the workspace version and confirms the `vX.Y.Z` tag exists on
-     origin (failing loudly if it's missing -- see step 2);
-   - exits cleanly if a GitHub Release for `vX.Y.Z` already exists (so
-     unrelated `Cargo.toml` edits and re-runs are no-ops);
-   - otherwise reads the tag annotation for Highlights and immediately creates
-     an empty draft GitHub Release with a three-part body (see below);
-   - then calls `.github/workflows/release-binaries.yml` directly (as a
-     `workflow_call`, the only formal matrix entrypoint) to build the full
-     release matrix (Linux x86_64/arm64, macOS
-     x86_64/arm64, Windows, plus Vulkan/CUDA/HIP feature variants) and
-     upload every archive to the draft. There is no bootstrap macOS/Linux
-     rebuild and no second `push: tags` matrix racing the orchestrator;
-   - `release-binaries.yml`'s own completeness gate then asserts the release
-     ends up with every expected platform archive, failing the run if one is
-     missing instead of silently shipping a partial release;
-   - finally, `release-core.yml` rewrites the release's Install & Verify
-     section from the now-complete, real asset list.
+3. Confirm `main` is green at that bump commit, then dispatch `Release core`
+   (`release-core.yml`) from **protected `main`**. The `version` input must
+   equal `Cargo.toml` -- it confirms the committed pin and cannot override
+   it. For a new draft the annotated tag must peel to this same commit.
+   Agents do not dispatch this workflow.
+
+   ```bash
+   gh workflow run release-core.yml -f version=X.Y.Z
+   ```
+
+   - If no GitHub Release exists yet, the workflow creates the **draft**, then
+     calls `release-binaries.yml` with `formal_release: true` (Linux
+     x86_64/arm64, macOS x86_64/arm64, Windows, plus Vulkan/CUDA/HIP
+     variants). There is no bootstrap macOS/Linux rebuild and no `push: tags`
+     matrix racing the orchestrator. Completeness fails the run if a required
+     archive is missing.
+   - If the matching release is still a draft, a second dispatch runs the
+     pre-publication family gate and deploys the committed PublishedInert
+     catalog (see below).
+   - A published (non-draft) release is a no-op.
 
 ### Release notes structure
 
@@ -94,13 +98,13 @@ No pre-release channels: the core releases plain `X.Y.Z` versions only.
 
 ## Manual runs
 
-`workflow_dispatch` on the `Release core` workflow performs the same
-resolve-and-release for the version currently on `main`. It can create a
-missing draft. After the generated PublishedInert catalog has been reviewed,
-signed, committed, and pushed, dispatching it again runs the pre-publication
-family gate and catalog deployment for that same draft. Failed build or
-aggregation jobs are recovered only with GitHub's **Re-run failed jobs** on the
-original release run, which preserves its exact tag/source/artifact lineage.
+`Release core` is `workflow_dispatch` only. The first dispatch (no GitHub
+Release yet) creates the draft and builds the matrix. After the generated
+PublishedInert catalog has been reviewed, signed, committed, and pushed,
+dispatch it again with the same `version` to run the pre-publication family
+gate and catalog deployment for that draft. Failed build or aggregation jobs
+are recovered only with GitHub's **Re-run failed jobs** on the original
+release run, which preserves its exact tag/source/artifact lineage.
 
 `workflow_dispatch` on `Release binaries` (`.github/workflows/release-binaries.yml`)
 is diagnostic-only: `only_target` is mandatory and the run may publish only an

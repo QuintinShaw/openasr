@@ -1,27 +1,29 @@
 name: Release core
 
-# Version-bump-triggered release. When the workspace version in the root
-# Cargo.toml changes on main, this creates the draft GitHub Release tagged
-# `vX.Y.Z`, then delegates every distributable build to one release matrix. Editing
-# Cargo.toml without changing the version (deps, metadata) is a safe no-op because
-# the resolve job exits cleanly when a Release for `vX.Y.Z` already exists.
-# `workflow_dispatch` lets the maintainer cut the very first release (no bump)
-# or re-run a failed one.
+# Manual, workflow_dispatch-only release pipeline for OpenASR core. A version
+# bump and annotated `vX.Y.Z` tag on main are the committed pin -- they do
+# not publish. Publishing is a maintainer-triggered dispatch:
 #
-# The `vX.Y.Z` tag itself is created locally by `scripts/bump-version.sh
-# --notes "..."` (an *annotated* tag whose message is the release notes) and
-# shipped to origin by `git push --follow-tags` alongside the version-bump
-# commit -- see RELEASING.md. This workflow does not create the tag; it reads
-# the tag's annotation for the release's Highlights section and fails loudly
-# if the tag is missing (a maintainer who forgot `--follow-tags` should see
-# that immediately, not get a release with an empty Highlights block).
+#   1. preflight: `version` must equal `[workspace.package] version` on the
+#      dispatch ref (protected main). The annotated tag must already exist
+#      and, for a new draft, peel to this commit. Dispatch inputs confirm
+#      the pin; they never override it.
+#   2. If no GitHub Release exists yet: create the empty draft, then call
+#      release-binaries.yml with `formal_release: true`.
+#   3. If the matching release is still a draft: run the pre-publication
+#      family gate and deploy the committed PublishedInert catalog.
+#
+# The GitHub Release stays a draft until `scripts/finalize-core-release.sh`
+# runs locally after the signed catalog + CDN plane is live. Agents do not
+# dispatch this workflow. See RELEASING.md.
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "Cargo.toml"
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Core version to release, e.g. 0.1.36 (must equal Cargo.toml on main / tag v<version>)"
+        required: true
+        type: string
 
 # tag annotation is read-only (git fetch); write scope is for creating the
 # release and calling release-binaries.yml (contents: write).
@@ -30,7 +32,7 @@ permissions:
 
 # Serialize releases; never cancel one mid-flight.
 concurrency:
-  group: release-core
+  group: release-core-${{ inputs.version }}
   cancel-in-progress: false
 
 env:
@@ -53,15 +55,23 @@ jobs:
         with:
           fetch-depth: 0
       - id: v
-        name: Read workspace version and check whether it is already released
+        name: Confirm pin and whether this version still needs a draft or catalog deploy
+        env:
+          WANT: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          want="${WANT}"
           # Single source of truth: [workspace.package] version in the root
           # Cargo.toml (all crates inherit via version.workspace = true). The
           # anchored match hits the only column-0 version line in the file.
           version="$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')"
           if [ -z "${version}" ]; then
             echo "could not read workspace version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [ "${version}" != "${want}" ]; then
+            echo "::error::dispatch version ${want} does not match Cargo.toml ${version} on this ref. Dispatch inputs confirm the committed pin; they cannot override it. See RELEASING.md." >&2
             exit 1
           fi
           tag="v${version}"
@@ -118,14 +128,14 @@ jobs:
               echo "should_finalize=false" >> "${GITHUB_OUTPUT}"
             fi
           fi
-        env:
-          GH_TOKEN: ${{ github.token }}
       - id: highlights
         name: Read the annotated tag's message as release Highlights
         if: steps.v.outputs.should_build == 'true'
+        env:
+          TAG: ${{ steps.v.outputs.tag }}
         run: |
           set -euo pipefail
-          tag="${{ steps.v.outputs.tag }}"
+          tag="${TAG}"
           git fetch --no-tags origin "refs/tags/${tag}:refs/tags/${tag}"
           # Strip the trailing PGP signature block (present if the tagger's
           # git config auto-signs tags) -- only the annotation text itself is

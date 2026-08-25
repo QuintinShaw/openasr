@@ -28,9 +28,9 @@
 #
 # After it succeeds:
 #   git push --follow-tags
-# Pushing the commit + annotated tag together to main triggers
-# `.github/workflows/release-core.yml`, which reads the tag annotation for
-# Highlights and publishes the release (see RELEASING.md).
+# That ships the commit + annotated tag as the release pin. It does not
+# publish. Dispatch `.github/workflows/release-core.yml` with
+# `version=X.Y.Z` from protected main (see RELEASING.md).
 
 set -euo pipefail
 
@@ -149,6 +149,6 @@ fi
 cat <<EOF
 
 Next step:
-  git push --follow-tags   # ships the commit + ${tag}; triggers
-                           # .github/workflows/release-core.yml on main
+  git push --follow-tags
+  gh workflow run release-core.yml -f version=${version}
 EOF
