@@ -32,6 +32,10 @@ The shared software migration is in place:
   only constructors that may attach `ShortAudioReceipt evidence.v1`; generic
   `bench-receipt short-audio` still leaves `evidence` absent. Binding does not
   close a matrix cell until cold+reuse receipts run on final artifacts;
+- a Windows HIP static sidecar host produced diagnostic-not-release
+  `placement_resource` and `token_transcript` evidence.v1 for
+  `funasr-nano:q4_k` on gfx1200 (capture-on, FreshGraph, cold+reuse). That
+  run is not a signed-plugin or release-artifact cell;
 - native `ARGMAX_FIRST` now has one cross-backend non-finite rule: any NaN or
   infinity in a row yields the `-1` sentinel, which request decoding rejects
   instead of accepting a provider-dependent token;
@@ -43,11 +47,11 @@ The shared software migration is in place:
   failed activation on the previous selected/LKG backend.
 
 The evidence boundary remains strict. The committed CPU/Metal Layer-3 receipts
-at the earlier checkpoint do not authorize a later release commit. This Apple
-host has no CUDA, physical Vulkan, or HIP/ROCm lane, and its plugin host is
-`legacy_static`, not the shipped Windows `neutral_dynamic` host. Those cells,
-including HIP capture-on and the original Windows CUDA fp16 reproduction, are
-not passes and remain non-activatable until release-bound receipts are returned.
+at the earlier checkpoint do not authorize a later release commit. The Windows
+HIP sidecar evidence.v1 run does not authorize the shipped `neutral_dynamic`
+plugin host, physical Vulkan, or CUDA. Those cells, including signed HIP
+plugins and the original Windows CUDA fp16 reproduction, are not passes and
+remain non-activatable until release-bound receipts are returned.
 
 ## Accepted completion program
 

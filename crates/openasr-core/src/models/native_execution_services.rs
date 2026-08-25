@@ -2469,6 +2469,9 @@ pub(crate) fn run_execution_candidate_attempt<T, E>(
         let _telemetry = install_execution_telemetry_collector(combined_collector);
         let _attempt =
             install_execution_candidate_attempt(services, candidate, failure_sink.clone());
+        if receipt.is_some() {
+            services.runtime_receipts.begin_request_event_window();
+        }
         let journal_scope = ExecutionCacheJournalScope::begin();
         let reservation = match quote_and_reserve_current_candidate_activation(services, candidate)
         {

@@ -121,6 +121,9 @@ fn write_bound_pair(
     fs::write(&token_path, token_jsonl).with_context(|| {
         format!("could not write token trace {}", token_path.display())
     })?;
+    if let Ok(json) = collected.receipt.to_pretty_json() {
+        let _ = fs::write(out_dir.join(format!("diagnostic-{mode}.json")), format!("{json}\n"));
+    }
     let traces = RealFamilyTraceArtifacts {
         token_trace: hashed_artifact(&token_label, token_jsonl.as_bytes()),
         logits: match collected.logits_jsonl.as_deref() {
@@ -136,8 +139,11 @@ fn write_bound_pair(
         top_k: parse_top_k(token_jsonl)?,
         top1_top2_margin: parse_margin(token_jsonl),
     };
-    let bound = bind_real_family_evidence(collected.receipt.clone(), binding, &traces)
-        .context("diagnostic receipt could not be bound as real-family evidence")?;
+    let bound = bind_real_family_evidence(collected.receipt.clone(), binding, &traces).map_err(
+        |error| {
+            anyhow::anyhow!("diagnostic receipt could not be bound as real-family evidence: {error}")
+        },
+    )?;
     write_receipt(
         out_dir.join(format!("placement-{mode}.json")),
         &bound.placement,

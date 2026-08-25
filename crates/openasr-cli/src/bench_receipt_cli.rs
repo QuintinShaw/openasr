@@ -8,7 +8,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 #[cfg(test)]
 use std::{fs, io::Write};
@@ -17,8 +17,9 @@ use anyhow::{Context, Result, bail};
 use openasr_core::{
     BackendKind, ExecutionTarget, GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector,
     InstalledPack, NativeExecutionReceiptCollector, NativeExecutionReceiptSnapshot,
-    NativeExecutionServices, NativeExecutionTraceMode, RequestAttemptId, RequestExecutionTerminal,
-    ResolvedOutputTarget, SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK, SHORT_AUDIO_RECEIPT_SCHEMA,
+    NativeExecutionServices, NativeExecutionTraceMode, RequestAttemptId, RequestExecutionPhase,
+    RequestExecutionTerminal, ResolvedOutputTarget, SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK,
+    SHORT_AUDIO_RECEIPT_SCHEMA,
     ShortAudioExecutionProjection, ShortAudioReceipt, ShortAudioReceiptAudio,
     ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptMetrics, ShortAudioReceiptPack,
     ShortAudioReceiptRun, ShortAudioReceiptTranscript, TranscriptionRequest, atomic_write_text,
@@ -390,9 +391,12 @@ pub(crate) fn bench_receipt_short_audio(
         &home,
     )?;
 
+    let upload_ingest_started = Instant::now();
     let (_audio_size, audio_sha256) = sha256_file(options.audio)
         .with_context(|| format!("Could not hash audio file {}", options.audio.display()))?;
+    let upload_ingest_duration = upload_ingest_started.elapsed();
 
+    let decode_normalize_started = Instant::now();
     let prepared_audio = prepare_audio_input(
         options.audio,
         &crate::native_segment_cli::audio_preparation_options(
@@ -401,6 +405,7 @@ pub(crate) fn bench_receipt_short_audio(
             prepared_run.ffmpeg_bin_explicit,
         ),
     )?;
+    let decode_normalize_duration = decode_normalize_started.elapsed();
     let audio_duration_s = prepared_audio.duration_seconds();
     let memory_before_model = process_memory_snapshot();
 
@@ -493,6 +498,13 @@ pub(crate) fn bench_receipt_short_audio(
         })?;
         let elapsed = started.elapsed();
         if let Some((_, receipt)) = &pass_receipt {
+            receipt.record_phase_duration(RequestExecutionPhase::UploadIngest, upload_ingest_duration);
+            receipt.record_phase_duration(
+                RequestExecutionPhase::DecodeNormalize,
+                decode_normalize_duration,
+            );
+            receipt.record_phase_duration(RequestExecutionPhase::AdmissionWait, Duration::ZERO);
+            receipt.record_phase_duration(RequestExecutionPhase::Compute, elapsed);
             receipt.record_terminal(RequestExecutionTerminal::Succeeded);
             if !is_warmup {
                 last_request_receipt = Some(receipt.clone());
@@ -861,22 +873,21 @@ fn find_installed_pack<'a>(
 }
 
 fn display_model_id(model_arg: Option<&str>, resolved_model_id: &str, quant: &str) -> String {
-    if let Some(model_arg) = model_arg
+    let source = model_arg
         .map(str::trim)
         .filter(|value| !value.is_empty() && !looks_like_local_path(value))
-    {
-        if model_arg.contains(':') {
-            return model_arg.to_string();
-        }
-        if quant != "unknown" {
-            return format!("{model_arg}:{quant}");
-        }
-        return model_arg.to_string();
-    }
+        .unwrap_or(resolved_model_id);
+    let family = match parse_model_ref(source) {
+        Ok(model_ref) => model_ref.family,
+        Err(_) => source
+            .split_once(':')
+            .map(|(family, _)| family.to_string())
+            .unwrap_or_else(|| source.to_string()),
+    };
     if quant != "unknown" {
-        format!("{resolved_model_id}:{quant}")
+        format!("{family}:{quant}")
     } else {
-        resolved_model_id.to_string()
+        family
     }
 }
 
@@ -2379,7 +2390,7 @@ mod tests {
     fn display_model_id_prefers_explicit_quant_ref() {
         assert_eq!(
             display_model_id(Some("funasr-nano:q4"), "funasr-nano", "q4_k"),
-            "funasr-nano:q4"
+            "funasr-nano:q4_k"
         );
         assert_eq!(
             display_model_id(Some("funasr-nano"), "funasr-nano", "q4_k"),

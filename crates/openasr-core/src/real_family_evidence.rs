@@ -223,7 +223,13 @@ fn validate_pack_and_fixture(
 ) -> Result<(), ShortAudioReceiptError> {
     let expected_model = format!("{}:{}", binding.model_id, binding.quant);
     if diagnostic.pack.model_id != expected_model || diagnostic.pack.quant != binding.quant {
-        return Err(ShortAudioReceiptError::EvidenceBindingMismatch);
+        return Err(ShortAudioReceiptError::InvalidEvidenceField {
+            field: "pack.model_id",
+            actual: format!(
+                "{} / {} vs binding {expected_model} / {}",
+                diagnostic.pack.model_id, diagnostic.pack.quant, binding.quant
+            ),
+        });
     }
     if binding.artifacts.pack.sha256 != diagnostic.pack.content_sha256 {
         return Err(ShortAudioReceiptError::RealFamilyEvidenceIncomplete {
@@ -259,6 +265,8 @@ fn validate_capture_and_scheduler(
     let mut executable = false;
     let mut executable_generation = false;
     let mut compute_consumed_generation = false;
+    let mut compute_in_flight = false;
+    let mut created_during_compute = false;
     for event in &lifecycle.events {
         match &event.kind {
             GgmlGraphLifecycleEventKind::Created { scheduler_enabled: enabled }
@@ -282,15 +290,23 @@ fn validate_capture_and_scheduler(
                 }
                 executable |= *executable_present;
             }
-            GgmlGraphLifecycleEventKind::CaptureExecutableCreated { .. }
-            | GgmlGraphLifecycleEventKind::CaptureExecutableObserved { .. } => {
+            GgmlGraphLifecycleEventKind::CaptureExecutableCreated { .. } => {
+                executable_generation = true;
+                created_during_compute |= compute_in_flight;
+            }
+            GgmlGraphLifecycleEventKind::CaptureExecutableObserved { .. } => {
                 executable_generation = true;
             }
             GgmlGraphLifecycleEventKind::ComputeStarted {
                 capture_executable_generation,
                 ..
             } => {
+                compute_in_flight = true;
                 compute_consumed_generation |= capture_executable_generation.is_some();
+            }
+            GgmlGraphLifecycleEventKind::ComputeCompleted { .. }
+            | GgmlGraphLifecycleEventKind::Dropped => {
+                compute_in_flight = false;
             }
             _ => {}
         }
@@ -317,7 +333,9 @@ fn validate_capture_and_scheduler(
         });
     }
     if binding.capture_mode == ShortAudioCaptureMode::Enabled
-        && (!executable || !executable_generation || !compute_consumed_generation)
+        && (!executable
+            || !executable_generation
+            || !(compute_consumed_generation || created_during_compute))
     {
         return Err(ShortAudioReceiptError::RealFamilyEvidenceIncomplete {
             reason: "capture-enabled lane did not observe an executable consumed by compute",
@@ -618,6 +636,122 @@ mod tests {
             .expect("token class is qualification-eligible");
     }
 
+    fn first_compute_capture_lifecycle() -> GgmlGraphLifecycleSnapshot {
+        let device = "ROCm0";
+        let provider = "hip";
+        GgmlGraphLifecycleSnapshot {
+            events: vec![
+                GgmlGraphLifecycleEvent {
+                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+                    sequence: 1,
+                    provider: provider.to_string(),
+                    device: device.to_string(),
+                    graph_instance: 78,
+                    graph_generation: 79,
+                    kind: GgmlGraphLifecycleEventKind::Created {
+                        scheduler_enabled: false,
+                    },
+                },
+                GgmlGraphLifecycleEvent {
+                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+                    sequence: 2,
+                    provider: provider.to_string(),
+                    device: device.to_string(),
+                    graph_instance: 78,
+                    graph_generation: 79,
+                    kind: GgmlGraphLifecycleEventKind::CaptureStateObserved {
+                        phase: GgmlCaptureObservationPhase::BeforeCompute,
+                        capture_supported: true,
+                        graph_tracked: false,
+                        capture_enabled: None,
+                        executable_present: false,
+                    },
+                },
+                GgmlGraphLifecycleEvent {
+                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+                    sequence: 3,
+                    provider: provider.to_string(),
+                    device: device.to_string(),
+                    graph_instance: 78,
+                    graph_generation: 79,
+                    kind: GgmlGraphLifecycleEventKind::ComputeStarted {
+                        compute_sequence: 1,
+                        prepare_generation: Some(1),
+                        input_generation_consumed: Some(1),
+                        capture_executable_generation: None,
+                    },
+                },
+                GgmlGraphLifecycleEvent {
+                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+                    sequence: 4,
+                    provider: provider.to_string(),
+                    device: device.to_string(),
+                    graph_instance: 78,
+                    graph_generation: 79,
+                    kind: GgmlGraphLifecycleEventKind::CaptureStateObserved {
+                        phase: GgmlCaptureObservationPhase::AfterCompute,
+                        capture_supported: true,
+                        graph_tracked: true,
+                        capture_enabled: Some(true),
+                        executable_present: true,
+                    },
+                },
+                GgmlGraphLifecycleEvent {
+                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+                    sequence: 5,
+                    provider: provider.to_string(),
+                    device: device.to_string(),
+                    graph_instance: 78,
+                    graph_generation: 79,
+                    kind: GgmlGraphLifecycleEventKind::CaptureExecutableCreated {
+                        capture_executable_generation: 1,
+                        change: GgmlCaptureExecutableChange::Instantiated,
+                    },
+                },
+                GgmlGraphLifecycleEvent {
+                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+                    sequence: 6,
+                    provider: provider.to_string(),
+                    device: device.to_string(),
+                    graph_instance: 78,
+                    graph_generation: 79,
+                    kind: GgmlGraphLifecycleEventKind::ComputeCompleted {
+                        compute_sequence: 1,
+                        output_generation: 6,
+                    },
+                },
+                GgmlGraphLifecycleEvent {
+                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+                    sequence: 7,
+                    provider: provider.to_string(),
+                    device: device.to_string(),
+                    graph_instance: 78,
+                    graph_generation: 79,
+                    kind: GgmlGraphLifecycleEventKind::Dropped,
+                },
+            ],
+            overflowed: false,
+        }
+    }
+
+    #[test]
+    fn binder_accepts_first_compute_capture_launch_on_fresh_graph() {
+        let mut diagnostic = diagnostic_receipt();
+        diagnostic.actual_stable_device_id = Some("ROCm0".to_string());
+        diagnostic.actual_device = Some(GgmlActualDeviceFacts {
+            device_type: "gpu".to_string(),
+            name: "ROCm0".to_string(),
+            description: "test hip device".to_string(),
+            provider_device_id: Some("0000:03:00.0".to_string()),
+            pci_vendor_id: Some(0x1002),
+        });
+        diagnostic.graph_lifecycle = Some(first_compute_capture_lifecycle());
+        let mut binding = binding();
+        binding.device = "ROCm0".to_string();
+        bind_real_family_evidence(diagnostic, &binding, &traces())
+            .expect("FreshGraph capture-on launches the executable on the capturing compute");
+    }
+
     #[test]
     fn binder_rejects_mock_and_capture_mismatch() {
         let mut mock = diagnostic_receipt();
@@ -650,5 +784,15 @@ mod tests {
             bind_real_family_evidence(diagnostic_receipt(), &wrong_provider, &traces()),
             Err(ShortAudioReceiptError::RealFamilyEvidenceIncomplete { .. })
         ));
+
+        let mut aliased_quant = binding();
+        aliased_quant.quant = "q4".to_string();
+        let error = bind_real_family_evidence(diagnostic_receipt(), &aliased_quant, &traces())
+            .expect_err("alias quant must not bind as canonical pack identity");
+        assert!(
+            error
+                .to_string()
+                .contains("funasr-nano:q4_k / q4_k vs binding funasr-nano:q4 / q4")
+        );
     }
 }

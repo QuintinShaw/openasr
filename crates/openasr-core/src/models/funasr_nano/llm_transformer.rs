@@ -94,6 +94,12 @@ impl FunasrNanoDecoderRuntime {
         self.whole_decoder.graph_lane()
     }
 
+    pub(crate) fn take_compute_evidence(
+        &mut self,
+    ) -> Option<crate::ggml_runtime::GgmlSelectionEvidenceRef> {
+        self.logits_runtime.take_compute_evidence()
+    }
+
     pub(crate) fn loaded_weight_binding_identity(
         &self,
     ) -> Option<crate::ggml_runtime::GgmlLoadedWeightBindingIdentity> {
