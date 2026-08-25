@@ -967,7 +967,8 @@ fn thread_affine_backend_cache_is_scoped_and_receipted() {
         source
             .contains("_receipt_owner: Option<crate::models::runtime_receipts::RuntimeOwnerGuard>")
     );
-    assert!(source.contains("free_on_drop: true"));
+    assert!(source.contains("impl Drop for GgmlBackendLifetime"));
+    assert!(source.contains("ggml_backend_free_status(self.raw.as_ptr())"));
 }
 
 #[test]
