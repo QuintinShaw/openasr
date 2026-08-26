@@ -126,7 +126,10 @@ pub(crate) fn source_chain_from_env() -> Vec<DownloadSource> {
     {
         return resolve_chain(&pref);
     }
-    default_source_chain(http::hf_endpoint_is_set(), transport::locale_prefers_china_sources())
+    default_source_chain(
+        http::hf_endpoint_is_set(),
+        transport::locale_prefers_china_sources(),
+    )
 }
 
 fn default_source_chain(hf_endpoint_set: bool, prefer_china: bool) -> Vec<DownloadSource> {
@@ -343,9 +346,13 @@ mod tests {
 
     #[test]
     fn chinese_locale_and_timezone_prefer_china_sources() {
-        assert!(transport::locale_value_prefers_china_sources("zh-Hans_US.UTF-8"));
+        assert!(transport::locale_value_prefers_china_sources(
+            "zh-Hans_US.UTF-8"
+        ));
         assert!(transport::locale_value_prefers_china_sources("zh_CN.UTF-8"));
-        assert!(!transport::locale_value_prefers_china_sources("zh_TW.UTF-8"));
+        assert!(!transport::locale_value_prefers_china_sources(
+            "zh_TW.UTF-8"
+        ));
         assert!(transport::timezone_value_prefers_china_sources(
             "/var/db/timezone/zoneinfo/Asia/Shanghai"
         ));

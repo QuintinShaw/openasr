@@ -2252,7 +2252,7 @@ fn catalog_parser_rejects_disabled_modelscope_mirror() {
         .unwrap_err()
         .to_string();
 
-    assert!(error.contains("ModelScope mirrors are disabled"));
+    assert!(error.contains("mirror URL host is not allowed"));
 }
 
 #[test]
@@ -2280,7 +2280,7 @@ fn catalog_parser_rejects_derived_modelscope_mirror_path() {
         .unwrap_err()
         .to_string();
 
-    assert!(error.contains("ModelScope mirrors are disabled"));
+    assert!(error.contains("mirror URL host is not allowed"));
 }
 
 #[test]
@@ -2288,6 +2288,20 @@ fn catalog_parser_rejects_uppercase_modelscope_owner() {
     let contents = catalog_json_with_first_fp16_mirror(
         "modelscope",
         "https://modelscope.cn/models/OpenASR/moonshine-tiny/resolve/0123456789abcdef0123456789abcdef01234567/moonshine-tiny-fp16.oasr",
+    );
+
+    let error = parse_model_catalog(&contents, "fixture")
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("mirror URL host is not allowed"));
+}
+
+#[test]
+fn catalog_parser_rejects_modelscope_mirror_source_on_hf_url() {
+    let contents = catalog_json_with_first_fp16_mirror(
+        "modelscope",
+        "https://huggingface.co/OpenASR/moonshine-tiny/resolve/0123456789abcdef0123456789abcdef01234567/moonshine-tiny-fp16.oasr",
     );
 
     let error = parse_model_catalog(&contents, "fixture")

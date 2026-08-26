@@ -124,11 +124,9 @@ pub(crate) fn is_allowed_mirror_host(url: &str) -> bool {
     let Some(host) = parsed.host_str().map(str::to_ascii_lowercase) else {
         return false;
     };
-    host == "huggingface.co"
-        || host.ends_with(".huggingface.co")
-        || host == "hf-mirror.com"
-        || host == "modelscope.cn"
-        || host == "www.modelscope.cn"
+    // Catalog `mirrors[]` is provenance only; pull never iterates it.
+    // ModelScope is a DownloadSource transport rewrite, not a catalog mirror.
+    host == "huggingface.co" || host.ends_with(".huggingface.co") || host == "hf-mirror.com"
 }
 
 /// The legacy Hugging Face LFS CDN (`cdn-lfs.huggingface.co`, `cdn-lfs-us-1...`,
@@ -203,10 +201,11 @@ mod tests {
     }
 
     #[test]
-    fn catalog_endpoint_rewrites_only_the_pinned_catalog_host() {
-        // The catalog is served from Cloudflare: the pinned huggingface.co host is
-        // swapped onto the catalog endpoint while the path (the signed identity)
-        // is preserved verbatim.
+    fn rewrite_to_mirror_swaps_only_the_huggingface_host() {
+        // Host-swap helper for HF pack URLs, not `apply_catalog_endpoint`.
+        // A huggingface.co catalog object path is rewritten like any other HF
+        // URL; identity vs transport for live catalog.openasr.org lives in
+        // `transport.rs`.
         let pinned = "https://huggingface.co/OpenASR/catalog/resolve/main/catalog.json";
         assert_eq!(
             rewrite_to_mirror(pinned, Some(CANONICAL_CATALOG_ENDPOINT)),

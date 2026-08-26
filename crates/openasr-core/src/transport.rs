@@ -41,8 +41,7 @@ pub(crate) fn apply_catalog_endpoint(url: &str) -> String {
     if let Some(rest) = url.strip_prefix(CANONICAL_CATALOG_ENDPOINT) {
         return format!("{endpoint}{rest}");
     }
-    const LEGACY_HF_CATALOG: &str =
-        "https://huggingface.co/OpenASR/catalog/resolve/main/";
+    const LEGACY_HF_CATALOG: &str = "https://huggingface.co/OpenASR/catalog/resolve/main/";
     if let Some(name) = url.strip_prefix(LEGACY_HF_CATALOG)
         && (name == "catalog.json" || name == "catalog.signature.json")
     {
@@ -178,12 +177,7 @@ fn resolved_dl_endpoint() -> String {
     }
 }
 
-fn resolve_endpoint(
-    env_var: &str,
-    allowlist: &[&str],
-    canonical: &str,
-    china: &str,
-) -> String {
+fn resolve_endpoint(env_var: &str, allowlist: &[&str], canonical: &str, china: &str) -> String {
     if let Some(value) = endpoint_from_env(env_var) {
         if is_allowed_https_endpoint(&value, allowlist) {
             return value;
@@ -229,7 +223,12 @@ fn is_allowed_https_endpoint(endpoint: &str, allowlist: &[&str]) -> bool {
 
 /// Rewrite `canonical_origin` (and optionally a legacy origin) onto `endpoint`.
 /// `legacy_origin` may be empty.
-fn rewrite_origin_prefix(url: &str, canonical_origin: &str, endpoint: &str, legacy_origin: &str) -> String {
+fn rewrite_origin_prefix(
+    url: &str,
+    canonical_origin: &str,
+    endpoint: &str,
+    legacy_origin: &str,
+) -> String {
     if let Some(rest) = url.strip_prefix(canonical_origin) {
         return format!("{endpoint}{rest}");
     }
@@ -324,7 +323,10 @@ mod tests {
         use std::ffi::OsString;
         crate::test_process_env::with_test_process_env(
             [
-                (CATALOG_ENDPOINT_ENV, Some(OsString::from(CHINA_CATALOG_ENDPOINT))),
+                (
+                    CATALOG_ENDPOINT_ENV,
+                    Some(OsString::from(CHINA_CATALOG_ENDPOINT)),
+                ),
                 ("OPENASR_DOWNLOAD_SOURCE", Some(OsString::from("global"))),
             ],
             || {
@@ -341,7 +343,10 @@ mod tests {
         );
         crate::test_process_env::with_test_process_env(
             [
-                (CATALOG_ENDPOINT_ENV, Some(OsString::from("https://evil.example"))),
+                (
+                    CATALOG_ENDPOINT_ENV,
+                    Some(OsString::from("https://evil.example")),
+                ),
                 ("OPENASR_DOWNLOAD_SOURCE", Some(OsString::from("global"))),
             ],
             || {
@@ -391,7 +396,9 @@ mod tests {
     fn modelscope_rewrite_uses_lowercase_owner_and_master_revision() {
         assert_eq!(
             apply_modelscope_endpoint(HF_PACK).as_deref(),
-            Some("https://www.modelscope.cn/models/openasr/moonshine-tiny/resolve/master/moonshine-tiny-q8_0.oasr")
+            Some(
+                "https://www.modelscope.cn/models/openasr/moonshine-tiny/resolve/master/moonshine-tiny-q8_0.oasr"
+            )
         );
         assert_eq!(apply_modelscope_endpoint(IDENTITY), None);
         assert_eq!(
@@ -399,9 +406,7 @@ mod tests {
             None
         );
         assert_eq!(
-            apply_modelscope_endpoint(
-                "https://huggingface.co/OpenASR/evil/resolve/abc/../secrets"
-            ),
+            apply_modelscope_endpoint("https://huggingface.co/OpenASR/evil/resolve/abc/../secrets"),
             None
         );
     }

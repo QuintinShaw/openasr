@@ -470,6 +470,30 @@ fn download_source_rejects_unknown_value() {
 }
 
 #[test]
+fn download_source_validate_rejects_hand_edited_modelscope_pin() {
+    let mut config = OpenAsrConfig::default();
+    config.download_source = DownloadSourcePref::pinned(DownloadSource::ModelScope);
+    let error = config.validate(&registry()).unwrap_err();
+    assert!(
+        matches!(error, ConfigError::UnsupportedDownloadSource(value) if value == "modelscope")
+    );
+}
+
+#[test]
+fn load_config_rejects_hand_edited_modelscope_pin() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.json"),
+        r#"{"download_source":{"mode":"pinned","source":"modelscope"}}"#,
+    )
+    .unwrap();
+    let error = load_config(temp.path()).unwrap_err();
+    assert!(
+        matches!(error, ConfigError::UnsupportedDownloadSource(value) if value == "modelscope")
+    );
+}
+
+#[test]
 fn unknown_key_returns_friendly_error() {
     let error = "missing.key".parse::<ConfigKey>().unwrap_err().to_string();
     assert!(error.contains("Unknown config key 'missing.key'"));

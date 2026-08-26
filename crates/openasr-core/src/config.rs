@@ -9,10 +9,11 @@ use thiserror::Error;
 
 use crate::{
     BackendKind, ExecutionTarget, ModelCard, ModelCatalog, ModelResolutionError, PhraseBiasConfig,
-    RuntimeModelResolutionError, atomic_file, resolve_registry_model_ref,
-    resolve_runtime_model_ref,
+    RuntimeModelResolutionError, atomic_file,
+    download_source::{DownloadSource, DownloadSourcePref},
+    launch_pack::QuantPreference,
+    resolve_registry_model_ref, resolve_runtime_model_ref,
 };
-use crate::{download_source::DownloadSourcePref, launch_pack::QuantPreference};
 
 /// The CLI's bare-invocation convention: which model id `transcribe`/`live`/
 /// `pull` resolve to when the caller passes neither `--model` nor has a
@@ -476,6 +477,16 @@ impl OpenAsrConfig {
                 ));
             }
         }
+        if matches!(
+            self.download_source,
+            DownloadSourcePref::Pinned {
+                source: DownloadSource::ModelScope
+            }
+        ) {
+            return Err(ConfigError::UnsupportedDownloadSource(
+                "modelscope".to_string(),
+            ));
+        }
         if let Some(models_dir) = self.models_dir.as_deref() {
             // Deliberately lenient beyond "absolute": an override naming a
             // directory that does not exist yet is valid -- pull/list/delete
@@ -605,8 +616,23 @@ pub fn load_config_document(
 ) -> Result<OpenAsrConfigDocument, ConfigError> {
     let path = config_path(openasr_home);
     match fs::read_to_string(&path) {
-        Ok(contents) => serde_json::from_str(&contents)
-            .map_err(|source| ConfigError::ParseConfig { path, source }),
+        Ok(contents) => {
+            let document: OpenAsrConfigDocument = serde_json::from_str(&contents)
+                .map_err(|source| ConfigError::ParseConfig { path, source })?;
+            // User-facing knobs stay china/global. A hand-edited pin must not
+            // sneak ModelScope past parse_env_value.
+            if matches!(
+                document.config.download_source,
+                DownloadSourcePref::Pinned {
+                    source: DownloadSource::ModelScope
+                }
+            ) {
+                return Err(ConfigError::UnsupportedDownloadSource(
+                    "modelscope".to_string(),
+                ));
+            }
+            Ok(document)
+        }
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
             Ok(OpenAsrConfigDocument::default())
         }

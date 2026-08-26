@@ -5777,9 +5777,8 @@ pub fn install_backend_pack(
     let home = home.as_ref();
     let mut client = HttpDownloadClient::new()?;
     let worker = client.clone();
-    let factory = move || -> Result<BoxedDownloadClient, PullError> {
-        Ok(Box::new(worker.clone()))
-    };
+    let factory =
+        move || -> Result<BoxedDownloadClient, PullError> { Ok(Box::new(worker.clone())) };
     let parallel = ParallelDownloadConfig {
         connections: pull_connections_from_env(),
         factory: &factory,
@@ -5800,9 +5799,8 @@ pub(crate) fn install_backend_pack_locked(
 ) -> Result<InstalledBackend, PullError> {
     let mut client = HttpDownloadClient::new()?;
     let worker = client.clone();
-    let factory = move || -> Result<BoxedDownloadClient, PullError> {
-        Ok(Box::new(worker.clone()))
-    };
+    let factory =
+        move || -> Result<BoxedDownloadClient, PullError> { Ok(Box::new(worker.clone())) };
     let parallel = ParallelDownloadConfig {
         connections: pull_connections_from_env(),
         factory: &factory,
@@ -6120,9 +6118,8 @@ pub(crate) fn prepare_backend_runtime_objects_locked(
 ) -> Result<PreparedBackendRuntimeObjects, PullError> {
     let mut client = HttpDownloadClient::new()?;
     let worker = client.clone();
-    let factory = move || -> Result<BoxedDownloadClient, PullError> {
-        Ok(Box::new(worker.clone()))
-    };
+    let factory =
+        move || -> Result<BoxedDownloadClient, PullError> { Ok(Box::new(worker.clone())) };
     let parallel = ParallelDownloadConfig {
         connections: pull_connections_from_env(),
         factory: &factory,
@@ -6264,7 +6261,8 @@ fn install_backend_pack_with_client_locked<C: DownloadClient>(
                 }]
             }
             CatalogBackendFileRole::Runtime | CatalogBackendFileRole::Archive => {
-                let object = ensure_backend_content_object(client, file, home, &mut progress, parallel)?;
+                let object =
+                    ensure_backend_content_object(client, file, home, &mut progress, parallel)?;
                 materialize_backend_content_object(home, &staging_dir, file, &object)?
             }
             CatalogBackendFileRole::Unknown => {
@@ -6680,12 +6678,13 @@ fn pull_paths_for_backend_dest(dest: &Path) -> Result<PullPaths, PullError> {
             field: "backend.files.filename",
             reason: format!("'{}' has no UTF-8 file name", dest.display()),
         })?;
-    let dir = dest.parent().map(Path::to_path_buf).ok_or_else(|| {
-        PullError::InvalidTarget {
+    let dir = dest
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| PullError::InvalidTarget {
             field: "backend install path",
             reason: "destination has no parent".to_string(),
-        }
-    })?;
+        })?;
     Ok(PullPaths {
         partial_path: partial,
         partial_meta_path: partial_meta,

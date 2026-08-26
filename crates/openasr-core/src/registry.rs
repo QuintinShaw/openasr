@@ -3346,47 +3346,11 @@ fn validate_catalog_mirror_url(
             model.id, quant.quant
         )));
     }
-    let parsed = reqwest::Url::parse(&mirror.url).map_err(|source| {
-        CatalogError::InvalidCatalog(format!(
-            "model '{}' quant '{}' mirror URL is invalid: {source}",
-            model.id, quant.quant
-        ))
-    })?;
-    let host = parsed.host_str().unwrap_or_default();
     if mirror.source == "modelscope" && !MODELSCOPE_CATALOG_MIRRORS_ENABLED {
         return Err(CatalogError::InvalidCatalog(format!(
             "model '{}' quant '{}' ModelScope mirrors are disabled; use Hugging Face with the hf-mirror download source",
             model.id, quant.quant
         )));
-    }
-    if matches!(host, "modelscope.cn" | "www.modelscope.cn") {
-        if !MODELSCOPE_CATALOG_MIRRORS_ENABLED {
-            return Err(CatalogError::InvalidCatalog(format!(
-                "model '{}' quant '{}' ModelScope mirrors are disabled; use Hugging Face with the hf-mirror download source",
-                model.id, quant.quant
-            )));
-        }
-        let segments = parsed
-            .path_segments()
-            .map(|segments| segments.collect::<Vec<_>>())
-            .unwrap_or_default();
-        let (hf_owner, hf_name) = model.hf_repo.split_once('/').unwrap_or_default();
-        let modelscope_owner = hf_owner.to_ascii_lowercase();
-        let revision = segments.get(4).copied().unwrap_or_default();
-        if segments.len() != 6
-            || segments[0] != "models"
-            || segments[1] != modelscope_owner
-            || segments[2] != hf_name
-            || segments[3] != "resolve"
-            || revision.len() != 40
-            || !revision.chars().all(|ch| ch.is_ascii_hexdigit())
-            || segments[5] != quant.filename
-        {
-            return Err(CatalogError::InvalidCatalog(format!(
-                "model '{}' quant '{}' ModelScope mirror URL must use /models/{{lowercase-hf-owner}}/{{hf-repo-name}}/resolve/{{40-hex-revision}}/{{filename}}",
-                model.id, quant.quant
-            )));
-        }
     }
     Ok(())
 }
