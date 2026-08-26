@@ -18,9 +18,9 @@
 #   OPENASR_CNB_API      default https://api.cnb.cool
 #   OPENASR_CNB_STRICT=1 fail the caller on CNB errors
 #   OPENASR_CNB_GITHUB_REPO  git+release source (default QuintinShaw/openasr).
-#                            Never inherit GITHUB_REPOSITORY: desktop CI runs in
-#                            private openasr-org/openasr-app and must not fetch
-#                            or push that repo's desktop-v* tags onto public CNB.
+#                            Never inherit GITHUB_REPOSITORY: Actions sets that
+#                            to the host repo, which is not always this public
+#                            open core. CNB tags must come from here.
 
 set -euo pipefail
 

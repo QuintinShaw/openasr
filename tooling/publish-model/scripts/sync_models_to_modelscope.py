@@ -8,6 +8,9 @@ URLs back into the catalog.
 Skip (exit 0) when no token is set:
   MODELSCOPE_SDK_TOKEN or MS_TOKEN
 
+Cache:
+  OPENASR_MODELSCOPE_CACHE  override download cache (default ~/.cache/openasr-modelscope-sync)
+
 Usage:
   tooling/publish-model/scripts/sync_models_to_modelscope.py [--catalog PATH] [--dry-run]
 """
@@ -155,10 +158,8 @@ def part_path(dest: Path) -> Path:
 
 
 def cache_root() -> Path:
-    path = Path(
-        os.environ.get("OPENASR_MODELSCOPE_CACHE")
-        or "/Volumes/QuintinDocument/openasr-dev/.cache/modelscope-sync"
-    )
+    raw = os.environ.get("OPENASR_MODELSCOPE_CACHE", "").strip()
+    path = Path(raw) if raw else Path.home() / ".cache" / "openasr-modelscope-sync"
     path.mkdir(parents=True, exist_ok=True)
     return path
 

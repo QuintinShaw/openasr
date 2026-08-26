@@ -232,6 +232,20 @@ class ModelscopeMappingTest(unittest.TestCase):
         self.assertEqual(dest.read_bytes(), payload)
         self.assertFalse(sidecar.exists())
 
+    def test_cache_root_honors_env_and_avoids_workstation_paths(self) -> None:
+        import os
+        import tempfile
+        from pathlib import Path
+
+        from sync_models_to_modelscope import cache_root
+
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["OPENASR_MODELSCOPE_CACHE"] = td
+            try:
+                self.assertEqual(cache_root(), Path(td))
+            finally:
+                del os.environ["OPENASR_MODELSCOPE_CACHE"]
+
 
 if __name__ == "__main__":
     unittest.main()
