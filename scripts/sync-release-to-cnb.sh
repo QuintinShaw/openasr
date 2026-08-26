@@ -9,8 +9,9 @@
 #   scripts/sync-release-to-cnb.sh <tag> [file ...]
 #
 # If no files are given, downloads every asset of GitHub release <tag> into a
-# temp dir and uploads those. Desktop callers pass extra local files that are
-# not on GitHub (macOS .app.tar.gz).
+# temp dir and uploads those. Desktop callers still pass extra local files
+# (macOS .app.tar.gz plus its .sig) so the minisign signature, which is not
+# a GitHub asset, lands on CNB.
 #
 # Env:
 #   CNB_TOKEN            required for upload (Bearer)

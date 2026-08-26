@@ -13,6 +13,8 @@ pub const CANONICAL_CATALOG_ENDPOINT: &str = "https://catalog.openasr.org";
 pub const CHINA_CATALOG_ENDPOINT: &str = "https://catalog.bug.im";
 pub const CANONICAL_DL_ENDPOINT: &str = "https://dl.openasr.org";
 pub const CHINA_DL_ENDPOINT: &str = "https://dl.bug.im";
+pub const GITHUB_RELEASE_DOWNLOAD: &str =
+    "https://github.com/QuintinShaw/openasr/releases/download";
 
 pub const CATALOG_ENDPOINT_ENV: &str = "OPENASR_CATALOG_ENDPOINT";
 pub const DL_ENDPOINT_ENV: &str = "OPENASR_DL_ENDPOINT";
@@ -35,7 +37,32 @@ const ALLOWED_DL_ENDPOINTS: &[&str] = &[CANONICAL_DL_ENDPOINT, CHINA_DL_ENDPOINT
 /// `catalog.openasr.org` prefix and the retired Hugging Face catalog object
 /// paths are rewritten — never an arbitrary `huggingface.co` pack URL.
 pub(crate) fn apply_catalog_endpoint(url: &str) -> String {
-    let endpoint = resolved_catalog_endpoint();
+    rewrite_catalog_identity(url, &resolved_catalog_endpoint())
+}
+
+/// Transport URLs for one catalog identity. An explicit allowlisted
+/// `OPENASR_CATALOG_ENDPOINT` pins a single host. Otherwise Cloudflare and
+/// Aliyun ESA are both listed (preferred first) so the caller can race them.
+pub(crate) fn catalog_transport_urls(identity_url: &str) -> Vec<String> {
+    let canonical = rewrite_catalog_identity(identity_url, CANONICAL_CATALOG_ENDPOINT);
+    let china = rewrite_catalog_identity(identity_url, CHINA_CATALOG_ENDPOINT);
+    if canonical == china {
+        return vec![identity_url.to_string()];
+    }
+    if let Some(pinned) = endpoint_from_env(CATALOG_ENDPOINT_ENV) {
+        if is_allowed_https_endpoint(&pinned, ALLOWED_CATALOG_ENDPOINTS) {
+            return vec![rewrite_catalog_identity(identity_url, &pinned)];
+        }
+        return vec![canonical];
+    }
+    if prefer_china_transport_without_catalog_env() {
+        vec![china, canonical]
+    } else {
+        vec![canonical, china]
+    }
+}
+
+fn rewrite_catalog_identity(url: &str, endpoint: &str) -> String {
     if let Some(rest) = url.strip_prefix(CANONICAL_CATALOG_ENDPOINT) {
         return format!("{endpoint}{rest}");
     }
@@ -53,6 +80,127 @@ pub(crate) fn apply_catalog_endpoint(url: &str) -> String {
 /// signed identity stays on `dl.openasr.org`.
 pub(crate) fn apply_dl_endpoint(url: &str) -> String {
     rewrite_origin_prefix(url, CANONICAL_DL_ENDPOINT, &resolved_dl_endpoint(), "")
+}
+
+/// Ordered fetch URLs for a signed release artifact. Identity stays the
+/// catalog/GitHub URL; this list is transportation only.
+///
+/// China: `dl.bug.im` → official → GitHub.
+/// Overseas: GitHub → official. An explicit `OPENASR_DL_ENDPOINT` pins one host.
+pub(crate) fn artifact_fetch_urls(url: &str) -> Vec<String> {
+    if url.starts_with("file://") {
+        return vec![url.to_string()];
+    }
+    if let Some(pinned) = endpoint_from_env(DL_ENDPOINT_ENV) {
+        if is_allowed_https_endpoint(&pinned, ALLOWED_DL_ENDPOINTS) {
+            return vec![rewrite_origin_prefix(
+                &official_artifact_url(url).unwrap_or_else(|| url.to_string()),
+                CANONICAL_DL_ENDPOINT,
+                &pinned,
+                "",
+            )];
+        }
+        return vec![apply_dl_endpoint(url)];
+    }
+    let Some(artifact) = parse_release_artifact(url) else {
+        return vec![apply_dl_endpoint(url)];
+    };
+    let github = format!(
+        "{GITHUB_RELEASE_DOWNLOAD}/{}/{}",
+        artifact.tag, artifact.filename
+    );
+    let official = artifact.official;
+    let china = rewrite_origin_prefix(&official, CANONICAL_DL_ENDPOINT, CHINA_DL_ENDPOINT, "");
+    let mut urls = if prefer_china_transport_without_catalog_env() {
+        vec![china, official, github]
+    } else {
+        vec![github, official]
+    };
+    urls.dedup();
+    urls
+}
+
+fn official_artifact_url(url: &str) -> Option<String> {
+    parse_release_artifact(url).map(|artifact| artifact.official)
+}
+
+struct ReleaseArtifact {
+    tag: String,
+    filename: String,
+    official: String,
+}
+
+fn parse_release_artifact(url: &str) -> Option<ReleaseArtifact> {
+    if let Some(rest) = url.strip_prefix(GITHUB_RELEASE_DOWNLOAD) {
+        let rest = rest.strip_prefix('/')?;
+        let (tag, filename) = split_tag_filename(rest)?;
+        let official = official_url_for_github_tag(tag, filename)?;
+        return Some(ReleaseArtifact {
+            tag: tag.to_string(),
+            filename: filename.to_string(),
+            official,
+        });
+    }
+    let path = url
+        .strip_prefix(CANONICAL_DL_ENDPOINT)
+        .or_else(|| url.strip_prefix(CHINA_DL_ENDPOINT))?;
+    if let Some(rest) = path.strip_prefix("/core/") {
+        let (tag, filename) = split_tag_filename(rest)?;
+        return Some(ReleaseArtifact {
+            tag: tag.to_string(),
+            filename: filename.to_string(),
+            official: format!("{CANONICAL_DL_ENDPOINT}/core/{tag}/{filename}"),
+        });
+    }
+    if let Some(rest) = path.strip_prefix("/cli/") {
+        let (tag, filename) = split_tag_filename(rest)?;
+        return Some(ReleaseArtifact {
+            tag: tag.to_string(),
+            filename: filename.to_string(),
+            official: format!("{CANONICAL_DL_ENDPOINT}/cli/{tag}/{filename}"),
+        });
+    }
+    if let Some(rest) = path.strip_prefix("/desktop/releases/") {
+        let (version, filename) = split_tag_filename(rest)?;
+        let version = version.strip_prefix('v')?;
+        if version.is_empty() {
+            return None;
+        }
+        return Some(ReleaseArtifact {
+            tag: format!("desktop-v{version}"),
+            filename: filename.to_string(),
+            official: format!("{CANONICAL_DL_ENDPOINT}/desktop/releases/v{version}/{filename}"),
+        });
+    }
+    None
+}
+
+fn official_url_for_github_tag(tag: &str, filename: &str) -> Option<String> {
+    if let Some(version) = tag.strip_prefix("desktop-v") {
+        if version.is_empty() {
+            return None;
+        }
+        return Some(format!(
+            "{CANONICAL_DL_ENDPOINT}/desktop/releases/v{version}/{filename}"
+        ));
+    }
+    if !tag.starts_with('v') {
+        return None;
+    }
+    Some(format!("{CANONICAL_DL_ENDPOINT}/core/{tag}/{filename}"))
+}
+
+fn split_tag_filename(rest: &str) -> Option<(&str, &str)> {
+    let (tag, filename) = rest.split_once('/')?;
+    if tag.is_empty()
+        || filename.is_empty()
+        || filename.contains('/')
+        || filename.contains("..")
+        || filename.contains('\\')
+    {
+        return None;
+    }
+    Some((tag, filename))
 }
 
 /// Map a signed Hugging Face pack URL onto ModelScope's resolve path.
@@ -435,5 +583,103 @@ mod tests {
             "/var/db/timezone/zoneinfo/Asia/Shanghai"
         ));
         assert!(!timezone_value_prefers_china_sources("America/Los_Angeles"));
+    }
+
+    #[test]
+    fn catalog_transport_races_both_hosts_when_unpinned() {
+        use std::ffi::OsString;
+        crate::test_process_env::with_test_process_env(
+            [
+                (CATALOG_ENDPOINT_ENV, None),
+                ("OPENASR_DOWNLOAD_SOURCE", Some(OsString::from("global"))),
+            ],
+            || {
+                assert_eq!(
+                    catalog_transport_urls(IDENTITY),
+                    vec![
+                        IDENTITY.to_string(),
+                        "https://catalog.bug.im/v1/catalog.json".to_string(),
+                    ]
+                );
+            },
+        );
+        crate::test_process_env::with_test_process_env(
+            [
+                (CATALOG_ENDPOINT_ENV, None),
+                ("OPENASR_DOWNLOAD_SOURCE", Some(OsString::from("china"))),
+            ],
+            || {
+                assert_eq!(
+                    catalog_transport_urls(IDENTITY),
+                    vec![
+                        "https://catalog.bug.im/v1/catalog.json".to_string(),
+                        IDENTITY.to_string(),
+                    ]
+                );
+            },
+        );
+        crate::test_process_env::with_test_process_env(
+            [
+                (
+                    CATALOG_ENDPOINT_ENV,
+                    Some(OsString::from(CHINA_CATALOG_ENDPOINT)),
+                ),
+                ("OPENASR_DOWNLOAD_SOURCE", Some(OsString::from("global"))),
+            ],
+            || {
+                assert_eq!(
+                    catalog_transport_urls(IDENTITY),
+                    vec!["https://catalog.bug.im/v1/catalog.json".to_string()]
+                );
+            },
+        );
+        assert_eq!(catalog_transport_urls(HF_PACK), vec![HF_PACK.to_string()]);
+    }
+
+    #[test]
+    fn artifact_fetch_urls_order_by_region() {
+        use std::ffi::OsString;
+        let core = "https://dl.openasr.org/core/v0.1.36/plugin.dll";
+        let github = format!("{GITHUB_RELEASE_DOWNLOAD}/v0.1.36/plugin.dll");
+        let china = "https://dl.bug.im/core/v0.1.36/plugin.dll";
+        crate::test_process_env::with_test_process_env(
+            [
+                (DL_ENDPOINT_ENV, None),
+                ("OPENASR_DOWNLOAD_SOURCE", Some(OsString::from("global"))),
+            ],
+            || {
+                assert_eq!(
+                    artifact_fetch_urls(core),
+                    vec![github.clone(), core.to_string()]
+                );
+            },
+        );
+        crate::test_process_env::with_test_process_env(
+            [
+                (DL_ENDPOINT_ENV, None),
+                ("OPENASR_DOWNLOAD_SOURCE", Some(OsString::from("china"))),
+            ],
+            || {
+                assert_eq!(
+                    artifact_fetch_urls(core),
+                    vec![china.to_string(), core.to_string(), github]
+                );
+            },
+        );
+        let desktop = "https://dl.openasr.org/desktop/releases/v0.1.22/OpenASR-Desktop-0.1.22-aarch64.app.tar.gz";
+        crate::test_process_env::with_test_process_env(
+            [
+                (DL_ENDPOINT_ENV, None),
+                ("OPENASR_DOWNLOAD_SOURCE", Some(OsString::from("global"))),
+            ],
+            || {
+                assert_eq!(
+                    artifact_fetch_urls(desktop)[0],
+                    format!(
+                        "{GITHUB_RELEASE_DOWNLOAD}/desktop-v0.1.22/OpenASR-Desktop-0.1.22-aarch64.app.tar.gz"
+                    )
+                );
+            },
+        );
     }
 }

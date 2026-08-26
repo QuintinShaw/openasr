@@ -24,7 +24,8 @@ pub enum DownloadSource {
     /// ModelScope resolve URL derived from the signed Hugging Face pack URL.
     /// Not a catalog identity: owner is the live ModelScope org `openasr`,
     /// path `/models/<owner>/<repo>/resolve/<rev>/<file>`. User-facing config
-    /// stays `china` / `global`; this variant is the China-chain primary.
+    /// stays `china` / `global`; this variant is the China-chain primary and an
+    /// independent overseas replica after the first-party HF proxy.
     #[serde(rename = "modelscope")]
     ModelScope,
 }
@@ -158,9 +159,13 @@ fn auto_source_chain(prefer_china: bool) -> Vec<DownloadSource> {
             DownloadSource::Hf,
         ]
     } else {
+        // Canonical is Hugging Face. The first-party proxy shares HF
+        // revision semantics; ModelScope is an independent replica; hf-mirror
+        // is a third-party HF transport last.
         vec![
             DownloadSource::Hf,
             DownloadSource::Weights,
+            DownloadSource::ModelScope,
             DownloadSource::HfMirror,
         ]
     }
@@ -215,14 +220,15 @@ mod tests {
     }
 
     #[test]
-    fn overseas_context_leads_with_direct_then_weights_then_mirror() {
-        // Overseas: direct huggingface.co primary (zero worker load), worker and
-        // mirror as fallbacks.
+    fn overseas_context_leads_with_direct_then_weights_then_modelscope_then_mirror() {
+        // Overseas: huggingface.co primary, first-party HF proxy, independent
+        // ModelScope replica, then the third-party HF mirror.
         assert_eq!(
             default_source_chain(false, false),
             vec![
                 DownloadSource::Hf,
                 DownloadSource::Weights,
+                DownloadSource::ModelScope,
                 DownloadSource::HfMirror,
             ]
         );

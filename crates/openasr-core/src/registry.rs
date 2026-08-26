@@ -3,6 +3,7 @@ use std::{
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
+    sync::mpsc,
     time::Duration,
 };
 
@@ -15,7 +16,7 @@ use crate::{
     catalog_security,
     catalog_series::{CatalogSeriesSpec, catalog_series_spec},
     config::DEFAULT_MODEL_ID,
-    http,
+    http, transport,
 };
 
 mod execution_approvals;
@@ -1338,43 +1339,54 @@ pub fn load_model_catalog(
     let cache_path = default_catalog_cache_path(home);
     let source = catalog_url.unwrap_or(DEFAULT_CATALOG_URL);
 
-    match read_catalog_source(source) {
-        Ok(contents) => match read_and_verify_catalog_manifest(source, home, &contents) {
-            Ok(verified) => {
-                match parse_and_check_production_catalog(source, &contents, &verified.signature) {
-                    Ok(catalog) => {
-                        // This tier (network fetch / explicit catalog_url
-                        // override) always runs the STRICT
-                        // `enforce_catalog_epoch_for_verified` (inside
-                        // `read_and_verify_catalog_manifest` above) -- there is
-                        // no below-floor outcome to reach here, so the floor
-                        // always advances on success.
-                        persist_catalog_cache(
-                            home,
-                            &cache_path,
-                            &contents,
-                            &verified.manifest_contents,
-                            &verified.signature,
-                            true,
-                        );
-                        catalog_security::clear_catalog_degraded(home);
-                        Ok(catalog)
-                    }
-                    // Parse/validate (or the staged-entries check above) failed
-                    // even though the signature verified: fall through to the
-                    // same cache/embedded degrade chain as a transport/signature
-                    // failure, rather than hard-failing the whole load. See
-                    // docs/CATALOG_COMPATIBILITY.md's "fallback chain" section --
-                    // this is the fix for the incident where a signature-valid
-                    // but structurally-wrong cached payload bricked the daemon
-                    // with no fallback attempted.
-                    Err(error) => load_cached_signed_catalog(source, home, &cache_path, error),
+    match load_verified_catalog_bytes(source, home) {
+        Ok((contents, verified)) => {
+            match parse_and_check_production_catalog(source, &contents, &verified.signature) {
+                Ok(catalog) => {
+                    // This tier (network fetch / explicit catalog_url
+                    // override) always runs the STRICT
+                    // `enforce_catalog_epoch_for_verified` (inside
+                    // `load_verified_catalog_bytes` above) -- there is
+                    // no below-floor outcome to reach here, so the floor
+                    // always advances on success.
+                    persist_catalog_cache(
+                        home,
+                        &cache_path,
+                        &contents,
+                        &verified.manifest_contents,
+                        &verified.signature,
+                        true,
+                    );
+                    catalog_security::clear_catalog_degraded(home);
+                    Ok(catalog)
                 }
+                // Parse/validate (or the staged-entries check above) failed
+                // even though the signature verified: fall through to the
+                // same cache/embedded degrade chain as a transport/signature
+                // failure, rather than hard-failing the whole load. See
+                // docs/CATALOG_COMPATIBILITY.md's "fallback chain" section --
+                // this is the fix for the incident where a signature-valid
+                // but structurally-wrong cached payload bricked the daemon
+                // with no fallback attempted.
+                Err(error) => load_cached_signed_catalog(source, home, &cache_path, error),
             }
-            Err(error) => load_cached_signed_catalog(source, home, &cache_path, error),
-        },
+        }
         Err(error) => load_cached_signed_catalog(source, home, &cache_path, error),
     }
+}
+
+fn load_verified_catalog_bytes(
+    source: &str,
+    home: &Path,
+) -> Result<(String, VerifiedCatalogManifestContents), CatalogError> {
+    if catalog_security::classify_catalog_identity(source)
+        == catalog_security::CatalogSourceKind::Remote
+    {
+        return fetch_verified_remote_catalog(source, home);
+    }
+    let contents = read_catalog_source(source)?;
+    let verified = read_and_verify_catalog_manifest(source, home, &contents)?;
+    Ok((contents, verified))
 }
 
 /// Loads only the already-verified on-disk catalog cache. Runtime backend
@@ -2402,27 +2414,8 @@ fn read_catalog_source(source: &str) -> Result<String, CatalogError> {
                 catalog_source: source.to_string(),
                 message: http::error_message(&error),
             })?;
-        // The catalog (and its sibling signature manifest, which also flows
-        // through this function) is served from the OpenASR catalog endpoint
-        // (Cloudflare), never Hugging Face. Only the transport host is rewritten:
-        // `source` stays the canonical, signed catalog_url everywhere it feeds
-        // verification (see `read_and_verify_catalog_manifest`), so a proxy cannot
-        // substitute a tampered catalog. Unlike weight downloads (pull.rs), the
-        // catalog uses a redirect-following client and the endpoint serves bytes
-        // directly, so the per-hop CDN rewrite used by weight downloads is
-        // deliberately NOT applied here.
-        let response = client
-            .get(http::apply_catalog_endpoint(source).as_str())
-            .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .map_err(|error| CatalogError::ReadCatalog {
-                catalog_source: source.to_string(),
-                message: http::error_message(&error),
-            })?;
-        return response.text().map_err(|error| CatalogError::ReadCatalog {
-            catalog_source: source.to_string(),
-            message: http::error_message(&error),
-        });
+        let url = http::apply_catalog_endpoint(source);
+        return get_https_text(&client, source, &url);
     }
 
     if let Some(path) = source.strip_prefix("file://") {
@@ -2443,6 +2436,126 @@ fn read_catalog_source(source: &str) -> Result<String, CatalogError> {
         catalog_source: source.to_string(),
         message: error.to_string(),
     })
+}
+
+fn get_https_text(
+    client: &reqwest::blocking::Client,
+    catalog_source: &str,
+    url: &str,
+) -> Result<String, CatalogError> {
+    let response = client
+        .get(url)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| CatalogError::ReadCatalog {
+            catalog_source: catalog_source.to_string(),
+            message: http::error_message(&error),
+        })?;
+    response.text().map_err(|error| CatalogError::ReadCatalog {
+        catalog_source: catalog_source.to_string(),
+        message: http::error_message(&error),
+    })
+}
+
+fn fetch_and_verify_catalog_pair(
+    identity: &str,
+    client: &reqwest::blocking::Client,
+    catalog_url: &str,
+    signature_url: &str,
+) -> Result<(String, String, catalog_security::VerifiedCatalogSignature), CatalogError> {
+    let contents = get_https_text(client, identity, catalog_url)?;
+    let manifest_contents = get_https_text(client, identity, signature_url)?;
+    let signature = verify_catalog_manifest_for_source(identity, &contents, &manifest_contents)
+        .map_err(|error| CatalogError::CatalogSecurity {
+            catalog_source: identity.to_string(),
+            message: error.to_string(),
+        })?;
+    Ok((contents, manifest_contents, signature))
+}
+
+fn fetch_verified_remote_catalog(
+    source: &str,
+    home: &Path,
+) -> Result<(String, VerifiedCatalogManifestContents), CatalogError> {
+    let catalog_urls = transport::catalog_transport_urls(source);
+    let signature_source = catalog_security::catalog_signature_source(source);
+    let signature_urls = transport::catalog_transport_urls(&signature_source);
+    let pairs: Vec<(String, String)> = catalog_urls.into_iter().zip(signature_urls).collect();
+    let client = http::blocking_client(CATALOG_HTTP_CONNECT_TIMEOUT, CATALOG_HTTP_TIMEOUT)
+        .map_err(|error| CatalogError::ReadCatalog {
+            catalog_source: source.to_string(),
+            message: http::error_message(&error),
+        })?;
+    let (contents, manifest_contents, signature) =
+        race_verified_catalog_pairs(source, client, pairs)?;
+    catalog_security::enforce_catalog_epoch_for_verified(home, &signature).map_err(|error| {
+        CatalogError::CatalogSecurity {
+            catalog_source: source.to_string(),
+            message: error.to_string(),
+        }
+    })?;
+    Ok((
+        contents,
+        VerifiedCatalogManifestContents {
+            manifest_contents,
+            signature,
+        },
+    ))
+}
+
+fn race_verified_catalog_pairs(
+    identity: &str,
+    client: reqwest::blocking::Client,
+    pairs: Vec<(String, String)>,
+) -> Result<(String, String, catalog_security::VerifiedCatalogSignature), CatalogError> {
+    if pairs.is_empty() {
+        return Err(CatalogError::ReadCatalog {
+            catalog_source: identity.to_string(),
+            message: "no catalog transport URL was available".to_string(),
+        });
+    }
+    if pairs.len() == 1 {
+        let (catalog_url, signature_url) = &pairs[0];
+        return fetch_and_verify_catalog_pair(identity, &client, catalog_url, signature_url);
+    }
+    let (tx, rx) = mpsc::channel();
+    let pair_count = pairs.len();
+    for (catalog_url, signature_url) in pairs {
+        let tx = tx.clone();
+        let client = client.clone();
+        let identity_owned = identity.to_string();
+        std::thread::Builder::new()
+            .name("openasr-catalog-race".to_string())
+            .spawn(move || {
+                let _ = tx.send(fetch_and_verify_catalog_pair(
+                    &identity_owned,
+                    &client,
+                    &catalog_url,
+                    &signature_url,
+                ));
+            })
+            .map_err(|error| CatalogError::ReadCatalog {
+                catalog_source: identity.to_string(),
+                message: error.to_string(),
+            })?;
+    }
+    drop(tx);
+    let mut last_error = None;
+    let mut remaining = pair_count;
+    while remaining > 0 {
+        match rx.recv() {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error)) => {
+                last_error = Some(error);
+                remaining -= 1;
+            }
+            Err(_) => break,
+        }
+    }
+    Err(last_error.unwrap_or_else(|| CatalogError::ReadCatalog {
+        catalog_source: identity.to_string(),
+        message: "catalog race produced no result".to_string(),
+    }))
 }
 
 struct VerifiedCatalogManifestContents {

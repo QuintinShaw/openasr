@@ -85,10 +85,6 @@ pub(crate) fn apply_modelscope_endpoint(url: &str) -> Option<String> {
     crate::transport::apply_modelscope_endpoint(url)
 }
 
-pub(crate) fn apply_dl_endpoint(url: &str) -> String {
-    crate::transport::apply_dl_endpoint(url)
-}
-
 fn hf_endpoint() -> Option<String> {
     crate::transport::hf_endpoint_env()
 }

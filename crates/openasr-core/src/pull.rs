@@ -3833,7 +3833,7 @@ impl PullTarget {
             suffix: String::new(),
             pull: file.filename.clone(),
             filename: file.filename.clone(),
-            url: http::apply_dl_endpoint(&file.url),
+            url: file.url.clone(),
             hf_revision: file.sha256.clone(),
             sha256: file.sha256.clone(),
             size_bytes: file.size_bytes,
@@ -4322,7 +4322,7 @@ fn is_source_fallback_error(error: &PullError) -> bool {
         // repeats the same verdict. These must fail the whole pull on the
         // first occurrence as a permanent error.
         PullError::UnexpectedStatus { status, .. } => {
-            *status >= 500 || *status == 403 || *status == 404
+            *status >= 500 || *status == 403 || *status == 404 || *status == 429
         }
         _ => false,
     }
@@ -5416,7 +5416,14 @@ fn ensure_backend_content_object_in<C: DownloadClient>(
         .is_ok_and(|(size, sha)| size == file.size_bytes && sha.eq_ignore_ascii_case(&file.sha256));
     if !source_valid {
         if let Some(urls) = signed_urls {
-            download_backend_file_from_signed_urls(client, file, urls, &source_path, progress)?;
+            download_backend_file_from_signed_urls(
+                client,
+                file,
+                urls,
+                &source_path,
+                progress,
+                parallel,
+            )?;
         } else {
             download_backend_file(client, file, &source_path, progress, parallel)?;
         }
@@ -6028,7 +6035,7 @@ fn prepare_qualification_direct_file<C: DownloadClient>(
     let lock_path = locks_root.join(format!("{}.lock", artifact.sha256));
     let _lock = BackendInstallLock::acquire(&lock_path)?;
     let path = digest_dir.join(&artifact.file_name);
-    download_backend_file_from_signed_urls(client, &file, &artifact.urls, &path, progress)?;
+    download_backend_file_from_signed_urls(client, &file, &artifact.urls, &path, progress, None)?;
     reject_qualification_file_links(&path)?;
     if let Some(format) = preflight {
         preflight_backend_file(&path, format)?;
@@ -6758,7 +6765,9 @@ fn download_backend_file_from_signed_urls<C: DownloadClient>(
     urls: &[String],
     dest: &Path,
     progress: &mut impl FnMut(PullProgress),
+    parallel: Option<&ParallelDownloadConfig>,
 ) -> Result<(), PullError> {
+    let urls = expand_artifact_fetch_urls(urls);
     if urls.is_empty() {
         return Err(PullError::InvalidTarget {
             field: "qualification artifact URLs",
@@ -6773,24 +6782,27 @@ fn download_backend_file_from_signed_urls<C: DownloadClient>(
         }
         let mut candidate = file.clone();
         candidate.url.clone_from(url);
-        match download_backend_file(client, &candidate, dest, progress, None) {
+        match download_backend_file_once(client, &candidate, dest, progress, parallel) {
             Ok(()) => return Ok(()),
-            Err(error)
-                if matches!(
-                    &error,
-                    PullError::Http { .. }
-                        | PullError::UnexpectedStatus { .. }
-                        | PullError::RestartedPartial { .. }
-                        | PullError::SizeMismatch { .. }
-                        | PullError::ShaMismatch { .. }
-                ) =>
-            {
+            Err(error) if is_source_fallback_error(&error) => {
                 last_error = Some(error);
             }
             Err(error) => return Err(error),
         }
     }
     Err(last_error.expect("non-empty signed URL list produced an error"))
+}
+
+fn expand_artifact_fetch_urls(urls: &[String]) -> Vec<String> {
+    let mut expanded = Vec::new();
+    for url in urls {
+        for fetch in crate::transport::artifact_fetch_urls(url) {
+            if !expanded.contains(&fetch) {
+                expanded.push(fetch);
+            }
+        }
+    }
+    expanded
 }
 
 fn download_backend_file<C: DownloadClient>(
@@ -6803,8 +6815,29 @@ fn download_backend_file<C: DownloadClient>(
     if backend_file_matches(dest, file) {
         return Ok(());
     }
-    if let Some(local_path) = file.url.strip_prefix("file://") {
+    if file.url.starts_with("file://") {
+        let local_path = file.url.strip_prefix("file://").unwrap_or(&file.url);
         return copy_local_backend_file(Path::new(local_path), dest, file, progress);
+    }
+    download_backend_file_from_signed_urls(
+        client,
+        file,
+        std::slice::from_ref(&file.url),
+        dest,
+        progress,
+        parallel,
+    )
+}
+
+fn download_backend_file_once<C: DownloadClient>(
+    client: &mut C,
+    file: &CatalogBackendFile,
+    dest: &Path,
+    progress: &mut impl FnMut(PullProgress),
+    parallel: Option<&ParallelDownloadConfig>,
+) -> Result<(), PullError> {
+    if backend_file_matches(dest, file) {
+        return Ok(());
     }
     if let Some(parallel) = parallel {
         return download_backend_file_via_pull(client, file, dest, progress, Some(parallel));
@@ -6956,7 +6989,7 @@ fn download_backend_file_attempt<C: DownloadClient>(
         *expected_etag = persisted_etag;
     }
     let response = client.open(
-        &http::apply_dl_endpoint(&file.url),
+        &file.url,
         (resume_from > 0).then(|| ByteRange::from_start(resume_from)),
     )?;
 

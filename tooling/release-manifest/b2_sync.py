@@ -52,6 +52,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
+from retention import apply_release_retention
+
 ALGORITHM = "AWS4-HMAC-SHA256"
 SERVICE = "s3"
 DEFAULT_BUCKET = "openasr-releases"
@@ -341,6 +343,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     sync.add_argument("--dl-base-url", default=DEFAULT_DL_BASE_URL)
     sync.add_argument("files", nargs="+", type=Path)
 
+    prune = subparsers.add_parser(
+        "prune",
+        help="Plan Official (B2) retention. Dry-run unless --execute or OPENASR_RELEASE_PRUNE=1.",
+    )
+    prune.add_argument("--latest-stable", required=True)
+    prune.add_argument(
+        "--keys-file",
+        type=Path,
+        help="Object keys to consider, one per line. Without this, only the policy is logged.",
+    )
+    prune.add_argument("--execute", action="store_true", help="Actually delete (also honors OPENASR_RELEASE_PRUNE=1).")
+
     return parser.parse_args(argv)
 
 
@@ -356,6 +370,23 @@ def main(argv: list[str]) -> int:
             return 1
         for url in urls:
             print(url)
+        apply_release_retention(profile="official", latest_stable=args.version)
+        return 0
+    if args.command == "prune":
+        keys = args.keys_file.read_text(encoding="utf-8").splitlines() if args.keys_file else []
+        keys = [line.strip() for line in keys if line.strip() and not line.startswith("#")]
+        apply_release_retention(
+            profile="official",
+            latest_stable=args.latest_stable,
+            keys=keys,
+            prune=False,
+        )
+        if args.execute or os.environ.get("OPENASR_RELEASE_PRUNE") == "1":
+            print(
+                "b2_sync.py: --execute/OPENASR_RELEASE_PRUNE is set but object "
+                "delete is not wired; listed would-delete only",
+                file=sys.stderr,
+            )
         return 0
     raise SystemExit(f"unknown command: {args.command}")
 
