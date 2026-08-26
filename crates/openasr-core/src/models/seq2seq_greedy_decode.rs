@@ -353,31 +353,26 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
         };
         let step_logits = step_executor.decode_step_logits(step_input)?;
         let compute_evidence = step_executor.take_compute_evidence();
-        let receipt =
-            crate::models::native_execution_services::current_execution_receipt_collector();
-        if let Some(receipt) = &receipt {
-            receipt.begin_decode_step(step_index, compute_evidence);
-        }
-        let selection = match select_seq2seq_greedy_step_token(
+        let logits_for_receipt = step_logits.logits.clone();
+        let selection = select_seq2seq_greedy_step_token(
             config,
             &generated,
             step_index,
             step_logits,
             stop_token_ids.as_slice(),
             on_topk,
-        ) {
-            Ok(selection) => selection,
-            Err(error) => {
-                if let Some(receipt) = &receipt {
-                    receipt.abort_decode_step(step_index);
-                }
-                return Err(error);
-            }
-        };
-        trace_token(step_index, selection.token_id, selection.reached_eot);
-        if let Some(receipt) = &receipt {
-            receipt.finish_decode_step(step_index);
+        )?;
+        if let Some(receipt) =
+            crate::models::native_execution_services::current_execution_receipt_collector()
+        {
+            receipt.commit_decode_step(
+                compute_evidence,
+                selection.token_id,
+                selection.reached_eot,
+                &logits_for_receipt,
+            );
         }
+        trace_token(step_index, selection.token_id, selection.reached_eot);
         if let Some(observer) = decode_work_progress {
             observer.report(step_index + 1, config.max_generated_tokens);
         }
@@ -487,6 +482,9 @@ pub(crate) fn select_seq2seq_greedy_step_token(
         let is_suppressed = config.suppress_token_ids.contains(&next_token)
             || (step_index == 0 && config.suppress_first_step_token_ids.contains(&next_token));
         if !is_suppressed {
+            if step_logits.logits.len() == config.vocab_size {
+                on_topk(step_index, &step_logits.logits);
+            }
             return Ok(Seq2SeqGreedyStepSelection {
                 token_id: next_token,
                 reached_eot: is_stop_token(next_token, stop_token_ids),
@@ -979,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn seq2seq_step_selection_uses_unsuppressed_hint_without_topk() {
+    fn seq2seq_step_selection_emits_topk_for_unsuppressed_hint_with_logits() {
         let config = Seq2SeqGreedyDecodeConfig {
             initial_prompt_tokens: vec![42],
             eot_token_id: 7,
@@ -1018,7 +1016,7 @@ mod tests {
                 probability: 1.0 / 16.0,
             }
         );
-        assert_eq!(topk_calls, 0);
+        assert_eq!(topk_calls, 1);
     }
 
     #[test]

@@ -63,8 +63,12 @@ that same cell now passes `__openasr-validate-ownership-evidence`
 idle-unload `now` returns to empty, lease matched. GRAPH_PRIVATE high-water
 is one backend-owned lease on the cached GPU backend; a fresh-graph builder
 must reuse that row instead of admitting a new zero-byte `native-memory-owner`
-per compute. A real-host pressure-rollback envelope is UNAVAILABLE on this
-close-out (ColdWarm is the accepted alternative). CUDA, production-signed
+per compute. After `8cf47e0f` (`origin/main`), isolated HIP and Vulkan HOMEs
+on the same RX 9060 XT official-admitted `funasr-nano:q4` via catalog-gated
+`pull --from` plus `POST /v1/models/default`; both backends then produced
+verifier-pass `cold_warm_lifecycle` envelopes (baseline empty, cold=warm 21
+live owners, idle-unload `now` empty, lease matched). A real-host
+pressure-rollback envelope is UNAVAILABLE on this close-out (ColdWarm is the accepted alternative). CUDA, production-signed
 plugin activation, and the packaged product kernel-switch flow still require
 release-bound real-host receipts. The gate must remain closed while those
 cells are missing, stale, or unavailable.

@@ -14,8 +14,8 @@ use thiserror::Error;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlStaticTensor,
-    GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext,
+    GgmlSelectionEvidenceRef, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
 };
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, STANDARD_HEAD_PERMUTE_AXES,
@@ -824,6 +824,7 @@ pub(crate) struct WhisperDecoderGraphExecutionOutput {
     pub prefix_len: usize,
     pub vocab_size: usize,
     pub last_token_cross_attention_frame_probs: Option<Vec<f32>>,
+    pub compute_evidence: Option<GgmlSelectionEvidenceRef>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3052,7 +3053,7 @@ fn execute_whisper_decoder_with_position_offset_ggml_v0(
     let upload_ms = upload_start.elapsed().as_millis();
 
     let compute_start = Instant::now();
-    let (logits, last_token_cross_attention_frame_probs) =
+    let (logits, last_token_cross_attention_frame_probs, compute_evidence) =
         if let Some(attention_tensor) = last_token_cross_attention_tensor {
             let attention_len = encoder_frames
                 .checked_mul(prefix_len)
@@ -3060,8 +3061,8 @@ fn execute_whisper_decoder_with_position_offset_ggml_v0(
                 .ok_or_else(|| WhisperDecoderGraphExecutionError::GraphExecutionFailed {
                     reason: "decoder cross-attention output shape overflowed".to_string(),
                 })?;
-            let mut outputs = graph
-                .compute_outputs_f32(&[
+            let output = graph
+                .compute_outputs_f32_with_evidence(&[
                     (last_token_logits_tensor, plan.output_projection.vocab_size),
                     (attention_tensor, attention_len),
                 ])
@@ -3070,6 +3071,7 @@ fn execute_whisper_decoder_with_position_offset_ggml_v0(
                         reason: format!("decoder graph compute failed: {error}"),
                     },
                 )?;
+            let (mut outputs, evidence) = output.into_parts();
             let attention = outputs.pop().ok_or_else(|| {
                 WhisperDecoderGraphExecutionError::GraphExecutionFailed {
                     reason: "decoder graph did not return cross-attention output".to_string(),
@@ -3086,16 +3088,20 @@ fn execute_whisper_decoder_with_position_offset_ggml_v0(
                 prefix_len,
                 config.attention_heads,
             )?;
-            (logits, Some(frame_probs))
+            (logits, Some(frame_probs), evidence)
         } else {
-            let logits = graph
-                .compute_output_f32(last_token_logits_tensor, plan.output_projection.vocab_size)
+            let output = graph
+                .compute_output_f32_with_evidence(
+                    last_token_logits_tensor,
+                    plan.output_projection.vocab_size,
+                )
                 .map_err(
                     |error| WhisperDecoderGraphExecutionError::GraphExecutionFailed {
                         reason: format!("decoder graph compute failed: {error}"),
                     },
                 )?;
-            (logits, None)
+            let (logits, evidence) = output.into_parts();
+            (logits, None, evidence)
         };
     if logits.iter().any(|value| !value.is_finite()) {
         return Err(WhisperDecoderGraphExecutionError::GraphExecutionFailed {
@@ -3113,6 +3119,7 @@ fn execute_whisper_decoder_with_position_offset_ggml_v0(
         prefix_len,
         vocab_size: plan.output_projection.vocab_size,
         last_token_cross_attention_frame_probs,
+        compute_evidence,
     };
     let compute_ms = compute_start.elapsed().as_millis();
 
@@ -3255,13 +3262,14 @@ pub(crate) fn run_whisper_decoder_reused_incremental_step_ggml_v0(
     let upload_ms = upload_start.elapsed().as_millis();
 
     let compute_start = Instant::now();
-    let logits = graph
-        .compute_output_f32(logits_tensor, plan.output_projection.vocab_size)
+    let output = graph
+        .compute_output_f32_with_evidence(logits_tensor, plan.output_projection.vocab_size)
         .map_err(
             |error| WhisperDecoderGraphExecutionError::GraphExecutionFailed {
                 reason: format!("decoder reusable graph compute failed: {error}"),
             },
         )?;
+    let (logits, compute_evidence) = output.into_parts();
     let compute_ms = compute_start.elapsed().as_millis();
     if logits.iter().any(|value| !value.is_finite()) {
         return Err(WhisperDecoderGraphExecutionError::GraphExecutionFailed {
@@ -3292,6 +3300,7 @@ pub(crate) fn run_whisper_decoder_reused_incremental_step_ggml_v0(
         prefix_len: 1,
         vocab_size: plan.output_projection.vocab_size,
         last_token_cross_attention_frame_probs: None,
+        compute_evidence,
     })
 }
 

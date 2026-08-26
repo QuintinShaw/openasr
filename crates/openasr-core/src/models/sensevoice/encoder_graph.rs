@@ -11,11 +11,11 @@
 
 use crate::ggml_runtime::{
     ArenaAllocError, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlStaticTensor,
-    GgmlStaticTensorArena, GgufRuntimeSourcePreflight, WeightSlot,
-    alloc_static_f16 as arena_alloc_static_f16, alloc_static_f32 as arena_alloc_static_f32,
-    bind_loaded as arena_bind_loaded, upload_static_f16 as arena_upload_static_f16,
-    upload_static_f32 as arena_upload_static_f32,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext,
+    GgmlSelectionEvidenceRef, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
+    WeightSlot, alloc_static_f16 as arena_alloc_static_f16,
+    alloc_static_f32 as arena_alloc_static_f32, bind_loaded as arena_bind_loaded,
+    upload_static_f16 as arena_upload_static_f16, upload_static_f32 as arena_upload_static_f32,
 };
 use crate::models::runtime_memory::{checked_sum, element_bytes};
 use crate::models::system_memory_owner::{SystemMemoryCapacity, SystemMemoryOwnerError};
@@ -72,6 +72,7 @@ pub(crate) struct SenseVoiceEncoderOutput {
     pub frame_count: usize,
     pub vocab_size: usize,
     pub logits: Vec<f32>,
+    pub frame_compute: Option<Vec<GgmlSelectionEvidenceRef>>,
 }
 
 // `WeightSlot` (imported above from `ggml_runtime`): arena tensor or
@@ -418,21 +419,7 @@ impl SenseVoiceEncoderGraph {
             .set_f32_slice(input_t, &input.data, "upload_input")
             .map_err(bf("upload_input"))?;
 
-        let want = metadata.vocab_size.checked_mul(frames).ok_or_else(|| {
-            SenseVoiceEncoderError::Shape {
-                reason: "logits overflow".into(),
-            }
-        })?;
-        let logits = graph.compute_output_f32(logits, want).map_err(|error| {
-            SenseVoiceEncoderError::GraphExecutionFailed {
-                reason: error.to_string(),
-            }
-        })?;
-        Ok(SenseVoiceEncoderOutput {
-            frame_count: frames,
-            vocab_size: metadata.vocab_size,
-            logits,
-        })
+        read_sensevoice_encoder_logits(&mut graph, logits, metadata.vocab_size, frames)
     }
 
     /// Build the four prompt rows, input scaling, and sinusoidal position
@@ -546,22 +533,33 @@ impl SenseVoiceEncoderGraph {
         graph
             .set_f32_slice(position, &positions, "sensevoice_positions")
             .map_err(bf("upload_positions"))?;
-        let want = metadata.vocab_size.checked_mul(frames).ok_or_else(|| {
-            SenseVoiceEncoderError::Shape {
-                reason: "SenseVoice logits size overflowed".to_string(),
-            }
-        })?;
-        let logits = graph.compute_output_f32(logits, want).map_err(|error| {
-            SenseVoiceEncoderError::GraphExecutionFailed {
-                reason: error.to_string(),
-            }
-        })?;
-        Ok(SenseVoiceEncoderOutput {
-            frame_count: frames,
-            vocab_size: metadata.vocab_size,
-            logits,
-        })
+        read_sensevoice_encoder_logits(&mut graph, logits, metadata.vocab_size, frames)
     }
+}
+
+fn read_sensevoice_encoder_logits<'a>(
+    graph: &mut GgmlCpuGraphBuilder<'a>,
+    logits: GgmlCpuTensor<'a>,
+    vocab_size: usize,
+    frames: usize,
+) -> Result<SenseVoiceEncoderOutput, SenseVoiceEncoderError> {
+    if vocab_size.checked_mul(frames).is_none() {
+        return Err(SenseVoiceEncoderError::Shape {
+            reason: "SenseVoice logits size overflowed".to_string(),
+        });
+    }
+    let output = graph
+        .compute_output_f32_rows_with_evidence(logits, vocab_size, frames)
+        .map_err(|error| SenseVoiceEncoderError::GraphExecutionFailed {
+            reason: error.to_string(),
+        })?;
+    let (logits, frame_compute) = output.into_parts();
+    Ok(SenseVoiceEncoderOutput {
+        frame_count: frames,
+        vocab_size,
+        logits,
+        frame_compute,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

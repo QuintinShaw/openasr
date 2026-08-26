@@ -246,6 +246,7 @@ impl SenseVoicePreparedRuntime {
             ctc_err_to_string,
             registry_err_to_string,
             decode_work_progress,
+            output.frame_compute.as_deref(),
         )
     }
 

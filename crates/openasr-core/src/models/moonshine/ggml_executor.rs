@@ -17,8 +17,8 @@ use super::decoder_graph::{
 use super::encoder_graph::{MoonshineEncoderGraphRuntime, MoonshineEncoderOutput};
 use super::frontend::{MoonshineFrontendError, moonshine_waveform_from_prepared_audio};
 use super::graph_config::{
-    MoonshineGraphConfigIdentity, moonshine_decoder_graph_config, moonshine_encoder_graph_config,
-    moonshine_graph_config_identity,
+    MoonshineGraphConfigIdentity, moonshine_decoder_graph_config_with_placement,
+    moonshine_encoder_graph_config, moonshine_graph_config_identity,
 };
 use super::lora::{
     MoonshineLoraError, moonshine_adapter_cache_fingerprint, resolve_moonshine_lora_adapter,
@@ -276,7 +276,11 @@ impl MoonshineGgmlExecutor {
                 reason: "candidate-resolved execution lane is missing".to_string(),
             })?;
         let encoder_config = moonshine_encoder_graph_config(backend);
-        let decoder_config = moonshine_decoder_graph_config(backend, Some(request_lane.provider()));
+        let decoder_config = moonshine_decoder_graph_config_with_placement(
+            backend,
+            Some(request_lane.provider()),
+            Some(request_lane.placement()),
+        );
         let encoder_execution_lane = request_lane.for_stage(
             encoder_config.backend,
             if encoder_config.backend == GgmlCpuGraphBackend::Cpu {

@@ -16,7 +16,13 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 pub const GGML_GRAPH_LIFECYCLE_SCHEMA: &str = "openasr.ggml-graph-lifecycle.v1";
-pub const MAX_GRAPH_LIFECYCLE_EVENTS: usize = 16_384;
+/// Bound for one request observation. FreshGraph seq2seq families mint a
+/// decoder graph and a logits-head graph per token; unsupported-capture
+/// backends still emit one capture observation per graph. Longform multi-slice
+/// receipts accumulate those events across every slice of one request, so
+/// 262,144 covers an 8-slice 2,048-token FreshGraph decode without dropping
+/// the start/complete/readback events a short-audio receipt still binds.
+pub const MAX_GRAPH_LIFECYCLE_EVENTS: usize = 262_144;
 
 /// Exact JSON field contract for one serialized lifecycle event. Serde's
 /// flattened tagged enum cannot use `deny_unknown_fields`, so every artifact
@@ -350,6 +356,10 @@ struct LifecycleState {
     next_sequence: u64,
     observation_scope: u64,
     observation_scope_open: bool,
+    /// Concurrent longform slices share one request collector. Begin/end must
+    /// be refcounted so a sibling finishing its candidate cannot close the
+    /// scope and drop the other worker's create/compute/read events.
+    observation_scope_refs: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -403,20 +413,30 @@ impl GgmlGraphLifecycleCollector {
     /// may survive a failed candidate or a later request while this collector
     /// remains allocated, so pointer identity alone cannot decide whether its
     /// attachment and native capture facts have already been emitted.
+    ///
+    /// Concurrent candidate attempts keep the collector open until the last
+    /// matching end. Each begin still mints a scope id so a later sequential
+    /// candidate can re-observe native capture; ending one sibling must not
+    /// drop the others' create/compute/read events.
     pub(crate) fn begin_observation_scope(&self) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.observation_scope = mint_opaque_graph_id();
+        state.observation_scope_refs = state.observation_scope_refs.saturating_add(1);
         state.observation_scope_open = true;
     }
 
     pub(crate) fn end_observation_scope(&self) {
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .observation_scope_open = false;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.observation_scope_refs = state.observation_scope_refs.saturating_sub(1);
+        if state.observation_scope_refs == 0 {
+            state.observation_scope_open = false;
+        }
     }
 
     pub(crate) fn observation_scope(&self) -> Option<u64> {
@@ -586,6 +606,27 @@ mod tests {
 
         collector.end_observation_scope();
         assert_eq!(next_generation.generation_for(&collector), None);
+    }
+
+    #[test]
+    fn concurrent_observation_scopes_stay_open_until_last_end() {
+        let collector = GgmlGraphLifecycleCollector::new();
+        collector.begin_observation_scope();
+        collector.begin_observation_scope();
+        collector.end_observation_scope();
+        collector.record(
+            "hip",
+            "ROCm0",
+            1,
+            2,
+            GgmlGraphLifecycleEventKind::Created {
+                scheduler_enabled: false,
+            },
+        );
+        assert_eq!(collector.snapshot().events.len(), 1);
+        collector.end_observation_scope();
+        collector.record("hip", "ROCm0", 1, 2, GgmlGraphLifecycleEventKind::Dropped);
+        assert_eq!(collector.snapshot().events.len(), 1);
     }
 
     #[test]

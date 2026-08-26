@@ -404,6 +404,7 @@ fn decode_wav2vec2_ctc_result_with_progress(
         ctc_err_to_string,
         registry_err_to_string,
         decode_work_progress,
+        None,
     )
 }
 

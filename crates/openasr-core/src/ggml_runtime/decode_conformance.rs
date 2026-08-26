@@ -28,7 +28,10 @@ use super::{
 use crate::device::execution_route::{ExecutionProvider, ResolvedExecutionRoute};
 
 /// Bounded per-step diagnostic records on a short-audio receipt.
-pub const SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS: usize = 64;
+/// 64 covers typical short-clip greedy loops. Longform clips that still go
+/// through this receipt path (69s mixed EN/ZH is ~70-90 steps on X-ASR) must
+/// stay bounded without failing a successful transcription.
+pub const SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS: usize = 256;
 
 /// Receipt-facing copy of the resolved output plan. Diagnostic only.
 ///

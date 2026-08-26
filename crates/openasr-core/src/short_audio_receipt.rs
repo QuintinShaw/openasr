@@ -713,16 +713,25 @@ impl ShortAudioReceipt {
             (None, None, None) => {}
             (Some(provider), Some(stable_id), Some(device)) => {
                 validate_actual_device_facts("actual_device", provider, stable_id, device)?;
-                if let Some(lifecycle) = &self.graph_lifecycle
-                    && lifecycle
-                        .events
-                        .iter()
-                        .any(|event| event.provider != provider || event.device != stable_id)
-                {
-                    return Err(ShortAudioReceiptError::InvalidEvidenceField {
-                        field: "actual_device",
-                        actual: "lifecycle route differs from final live backend".to_string(),
-                    });
+                if let Some(lifecycle) = &self.graph_lifecycle {
+                    let mut drifted = BTreeSet::new();
+                    for event in &lifecycle.events {
+                        if !lifecycle_event_proves_compute_route(&event.kind) {
+                            continue;
+                        }
+                        if event.provider != provider || event.device != stable_id {
+                            drifted.insert(format!("{}:{}", event.provider, event.device));
+                        }
+                    }
+                    if !drifted.is_empty() {
+                        return Err(ShortAudioReceiptError::InvalidEvidenceField {
+                            field: "actual_device",
+                            actual: format!(
+                                "lifecycle route differs from final live backend {provider}:{stable_id}; observed {}",
+                                drifted.into_iter().collect::<Vec<_>>().join(", ")
+                            ),
+                        });
+                    }
                 }
             }
             _ => {
@@ -1640,6 +1649,21 @@ fn validate_safe_environment(
     Ok(())
 }
 
+fn lifecycle_event_proves_compute_route(
+    kind: &crate::ggml_runtime::GgmlGraphLifecycleEventKind,
+) -> bool {
+    matches!(
+        kind,
+        crate::ggml_runtime::GgmlGraphLifecycleEventKind::ComputeStarted { .. }
+            | crate::ggml_runtime::GgmlGraphLifecycleEventKind::ComputeCompleted { .. }
+            | crate::ggml_runtime::GgmlGraphLifecycleEventKind::OutputRead { .. }
+            | crate::ggml_runtime::GgmlGraphLifecycleEventKind::KvWriteCommitted { .. }
+            | crate::ggml_runtime::GgmlGraphLifecycleEventKind::CaptureStateObserved { .. }
+            | crate::ggml_runtime::GgmlGraphLifecycleEventKind::CaptureExecutableObserved { .. }
+            | crate::ggml_runtime::GgmlGraphLifecycleEventKind::CaptureExecutableCreated { .. }
+    )
+}
+
 fn validate_actual_device_facts(
     field: &'static str,
     provider: &str,
@@ -1765,9 +1789,10 @@ fn observed_graph_built_for_compute(
     };
     let (graph_instance, graph_generation, compute_sequence, output_generation) =
         compute.compute_identity();
-    let mut created = false;
-    let mut attached_existing = false;
-    let mut first_compute = None::<u64>;
+    let mut last_origin_created = None::<bool>;
+    let mut first_compute_after_origin = None::<u64>;
+    let mut origin_at_this_compute = None::<bool>;
+    let mut first_compute_at_this_compute = None::<u64>;
     let mut started = false;
     let mut completed = false;
     let mut read = false;
@@ -1775,16 +1800,26 @@ fn observed_graph_built_for_compute(
         event.graph_instance == graph_instance && event.graph_generation == graph_generation
     }) {
         match event.kind {
-            crate::ggml_runtime::GgmlGraphLifecycleEventKind::Created { .. } => created = true,
+            crate::ggml_runtime::GgmlGraphLifecycleEventKind::Created { .. } => {
+                last_origin_created = Some(true);
+                first_compute_after_origin = None;
+            }
             crate::ggml_runtime::GgmlGraphLifecycleEventKind::ExistingGraphObserved { .. } => {
-                attached_existing = true
+                last_origin_created = Some(false);
+                first_compute_after_origin = None;
             }
             crate::ggml_runtime::GgmlGraphLifecycleEventKind::ComputeStarted {
                 compute_sequence: observed,
                 ..
             } => {
-                first_compute = Some(first_compute.map_or(observed, |first| first.min(observed)));
-                started |= observed == compute_sequence;
+                if first_compute_after_origin.is_none() {
+                    first_compute_after_origin = Some(observed);
+                }
+                if observed == compute_sequence {
+                    started = true;
+                    origin_at_this_compute = last_origin_created;
+                    first_compute_at_this_compute = first_compute_after_origin;
+                }
             }
             crate::ggml_runtime::GgmlGraphLifecycleEventKind::ComputeCompleted {
                 compute_sequence: observed,
@@ -1802,14 +1837,31 @@ fn observed_graph_built_for_compute(
             _ => {}
         }
     }
-    if created == attached_existing || !started || !completed || !read {
+    if origin_at_this_compute.is_none() || !started || !completed || !read {
+        let reason = match (
+            lifecycle.overflowed,
+            origin_at_this_compute,
+            started,
+            completed,
+            read,
+        ) {
+            (true, _, _, _, _) => {
+                "native graph lifecycle overflowed before this compute could be bound"
+            }
+            (_, None, _, _, _) => {
+                "native compute witness has no created or existing-graph origin before compute_started"
+            }
+            (_, _, false, _, _) => "native compute witness has no matching compute_started event",
+            (_, _, _, false, _) => "native compute witness has no matching compute_completed event",
+            _ => "native compute witness has no matching output_read event",
+        };
         return Err(ShortAudioReceiptError::InvalidEvidenceField {
             field: "decode_diagnostics.steps.graph_rebuilt",
-            actual: "native compute witness is not bound to one observed graph lifecycle"
-                .to_string(),
+            actual: reason.to_string(),
         });
     }
-    Ok(created && first_compute == Some(compute_sequence))
+    Ok(origin_at_this_compute == Some(true)
+        && first_compute_at_this_compute == Some(compute_sequence))
 }
 
 fn validate_decode_diagnostics(
@@ -2707,6 +2759,61 @@ mod tests {
             decode_diagnostics_from_shipped_runtime(Some(&resolved), Some(&reuse_snapshot))
                 .expect("existing graph projects from its request-local lifecycle");
         assert!(!reuse_diagnostics.steps[0].graph_rebuilt);
+    }
+
+    #[test]
+    fn shipped_emitter_binds_compute_to_origin_in_effect_not_snapshot_xor() {
+        let resolved = cpu_resolved_runtime();
+        let collector = crate::NativeExecutionReceiptCollector::new();
+        collector.begin_candidate_attempt();
+        let lifecycle = collector.graph_lifecycle_collector();
+        let scope = lifecycle.install();
+        let mut runner = crate::ggml_runtime::GgmlCpuGraphRunner::new(
+            crate::ggml_runtime::GgmlCpuGraphConfig::conservative_default(),
+        )
+        .expect("CPU graph runner");
+        let mut graph = runner.start_graph();
+        let input = graph
+            .new_tensor_1d_f32(3, "receipt_graph_input")
+            .expect("input");
+        graph.set_input(input).expect("set input");
+        graph.set_output(input).expect("set output");
+        graph
+            .set_f32_slice(input, &[0.0, 2.0, 1.0], "receipt_graph_input")
+            .expect("first input upload");
+        graph
+            .compute_output_f32_with_evidence(input, 3)
+            .expect("created-graph compute");
+        lifecycle.begin_observation_scope();
+        graph
+            .set_f32_slice(input, &[3.0, 1.0, 2.0], "receipt_graph_input")
+            .expect("re-attached input upload");
+        let (_, compute) = graph
+            .compute_output_f32_with_evidence(input, 3)
+            .expect("existing-graph compute")
+            .into_parts();
+        collector.begin_decode_step(0, compute);
+        collector.record_token(0, 1, false);
+        collector.finish_decode_step(0);
+        drop(scope);
+        collector.finish_candidate_attempt(true);
+        let snapshot = collector.snapshot();
+        let created = snapshot.graph_lifecycle.events.iter().any(|event| {
+            matches!(
+                event.kind,
+                crate::ggml_runtime::GgmlGraphLifecycleEventKind::Created { .. }
+            )
+        });
+        let attached = snapshot.graph_lifecycle.events.iter().any(|event| {
+            matches!(
+                event.kind,
+                crate::ggml_runtime::GgmlGraphLifecycleEventKind::ExistingGraphObserved { .. }
+            )
+        });
+        assert!(created && attached);
+        let diagnostics = decode_diagnostics_from_shipped_runtime(Some(&resolved), Some(&snapshot))
+            .expect("compute binds to the origin in effect at that compute");
+        assert!(!diagnostics.steps[0].graph_rebuilt);
     }
 
     #[test]

@@ -84,6 +84,12 @@ pub(crate) struct MimoLlmPrefillOutput {
 }
 
 impl MimoLlmDecoderRuntime {
+    pub(crate) fn take_compute_evidence(
+        &mut self,
+    ) -> Option<crate::ggml_runtime::GgmlSelectionEvidenceRef> {
+        self.logits_runtime.take_compute_evidence()
+    }
+
     pub(crate) fn new_from_preflight(
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         metadata: MimoLlmMetadata,

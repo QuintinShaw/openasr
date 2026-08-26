@@ -87,18 +87,30 @@ pub(crate) fn moonshine_encoder_graph_config(backend: GgmlCpuGraphBackend) -> Gg
     apply_moonshine_neural_graph_placement(config)
 }
 
-/// Keep decoder placement separate from encoder placement. Vulkan is the
-/// validated hybrid route: the encoder remains accelerated while the decoder
+/// Keep decoder placement separate from encoder placement. Vulkan Hybrid is
+/// the validated default: the encoder remains accelerated while the decoder
 /// defaults to CPU, unless the diagnostic stage override explicitly enables
-/// GPU decode. The request output/reuse contract is resolved at the dispatch
-/// boundary and consumed by the executor; this graph config only determines
-/// the stage backend and scheduler settings.
+/// GPU decode. A FullDevice candidate must not be rewritten to CPU; the
+/// request placement owns that decision.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn moonshine_decoder_graph_config(
     backend: GgmlCpuGraphBackend,
     provider: Option<ExecutionProvider>,
 ) -> GgmlCpuGraphConfig {
+    moonshine_decoder_graph_config_with_placement(backend, provider, None)
+}
+
+pub(crate) fn moonshine_decoder_graph_config_with_placement(
+    backend: GgmlCpuGraphBackend,
+    provider: Option<ExecutionProvider>,
+    placement: Option<ExecutionPlacement>,
+) -> GgmlCpuGraphConfig {
     let mut config = moonshine_runtime_graph_config_with_scheduler_default(backend, None);
-    if config.backend.is_gpu_class() && !decoder_gpu_enabled(config.backend, provider) {
+    let keep_full_device_decoder = placement == Some(ExecutionPlacement::FullDevice);
+    if config.backend.is_gpu_class()
+        && !keep_full_device_decoder
+        && !decoder_gpu_enabled(config.backend, provider)
+    {
         config.backend = GgmlCpuGraphBackend::Cpu;
         config.use_scheduler = false;
     }
@@ -181,6 +193,18 @@ mod tests {
             );
             assert_eq!(config.backend, GgmlCpuGraphBackend::Cpu);
             assert!(!config.use_scheduler);
+        });
+    }
+
+    #[test]
+    fn full_device_vulkan_keeps_moonshine_decoder_on_gpu() {
+        with_decoder_env(None, || {
+            let config = moonshine_decoder_graph_config_with_placement(
+                GgmlCpuGraphBackend::Gpu,
+                Some(crate::device::execution_route::ExecutionProvider::Vulkan),
+                Some(ExecutionPlacement::FullDevice),
+            );
+            assert_eq!(config.backend, GgmlCpuGraphBackend::Gpu);
         });
     }
 

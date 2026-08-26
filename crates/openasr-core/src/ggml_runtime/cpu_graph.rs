@@ -490,6 +490,22 @@ impl GgmlLaneDecodeEvidence {
         }
     }
 
+    /// HIP and Vulkan local-dev qualification passed real-family token
+    /// evidence.v1 with resident-KV graphs. Compact first-max stays unproven,
+    /// so the planner keeps FullLogits while authorizing reusable graphs.
+    const fn discrete_gpu_reusable_full_logits() -> Self {
+        Self {
+            compact_selector: GgmlLaneCompactSelectorEvidence::unknown(),
+            reuse: GgmlLaneReuseEvidence {
+                persistent_input_refresh: GgmlLaneEvidence::Validated,
+                persistent_output_refresh: GgmlLaneEvidence::Validated,
+                reusable_kv_graph: GgmlLaneEvidence::Validated,
+                scheduler_compatibility: GgmlLaneEvidence::Validated,
+                capture_compatibility: GgmlLaneEvidence::Validated,
+            },
+        }
+    }
+
     #[cfg(test)]
     const fn validated_native_first_max_token() -> Self {
         Self {
@@ -533,7 +549,7 @@ impl GgmlLaneDecodeEvidence {
     }
 }
 
-const GGML_DECODE_LANE_EVIDENCE_REVISION: u64 = 1;
+const GGML_DECODE_LANE_EVIDENCE_REVISION: u64 = 2;
 
 fn lane_decode_evidence_for_preference(
     preference: Option<&RequestBackendPreference>,
@@ -544,7 +560,8 @@ fn lane_decode_evidence_for_preference(
     };
     let capabilities = GgmlBackendCapabilities::resolve(backend, &device.name)
         .with_native_argmax_first_op(device.supports_argmax_first());
-    lane_decode_evidence_for_backend_capabilities(backend, capabilities)
+    let provider = ExecutionProvider::from_backend_name(&device.name);
+    lane_decode_evidence_for_backend_capabilities(backend, capabilities, provider)
 }
 
 fn selected_backend_device(
@@ -563,6 +580,9 @@ fn selected_backend_device(
                 .into_iter()
                 .find(|device| graph_backend_matches_device(backend, device))
         }
+        Some(RequestBackendPreference::Accelerated) | None if backend.is_gpu_class() => devices
+            .into_iter()
+            .find(|device| graph_backend_matches_device(backend, device)),
         Some(RequestBackendPreference::Accelerated)
         | Some(RequestBackendPreference::CpuOnly)
         | None => None,
@@ -572,6 +592,7 @@ fn selected_backend_device(
 fn lane_decode_evidence_for_backend_capabilities(
     backend: GgmlCpuGraphBackend,
     capabilities: GgmlBackendCapabilities,
+    provider: ExecutionProvider,
 ) -> GgmlLaneDecodeEvidence {
     // `supports_op` is only the native operator declaration. Compact
     // authorization also requires the proven evidence dimensions. Unknown
@@ -579,9 +600,20 @@ fn lane_decode_evidence_for_backend_capabilities(
     if capabilities.supports_native_argmax_first_op() && native_first_max_compact_is_proven(backend)
     {
         GgmlLaneDecodeEvidence::cpu_native_first_max_token()
+    } else if discrete_gpu_reuse_is_proven(provider) {
+        GgmlLaneDecodeEvidence::discrete_gpu_reusable_full_logits()
     } else {
         GgmlLaneDecodeEvidence::unknown()
     }
+}
+
+const fn discrete_gpu_reuse_is_proven(provider: ExecutionProvider) -> bool {
+    // HIP gfx1200 local-dev qualification passed real-family token evidence.v1
+    // with capture-on. Vulkan on the same GPU is capture-unsupported, but
+    // keeping the ggml graph (ReusableGraph) is still far cheaper than
+    // FreshGraph-per-token, which rebuilt FunASR/Qwen decode 3-8x. Compact
+    // first-max stays unproven. CUDA stays FreshGraph.
+    matches!(provider, ExecutionProvider::Hip | ExecutionProvider::Vulkan)
 }
 
 const fn native_first_max_compact_is_proven(backend: GgmlCpuGraphBackend) -> bool {
@@ -1163,13 +1195,15 @@ impl ResolvedFamilyRuntimeInput {
         // Compact native first-max requires both a live `supports_op`
         // declaration for GGML_OP_ARGMAX_FIRST and proven evidence
         // dimensions. Metal stays FullLogits because it does not support the
-        // op. CUDA/Vulkan/HIP may declare the op and still stay Unknown until
-        // three-layer receipts land. Generic first/last-max semantics never
-        // authorize the compact result. Reuse evidence stays Unknown in
-        // production, so every lane is FreshGraph. Phrase bias, timestamps,
-        // suppression, debug logits, and host-visible adapter consumers
-        // independently force the complete-output plan without changing
-        // placement.
+        // op. CUDA stays Unknown until that lane has three-layer receipts.
+        // HIP and Vulkan reuse is proven on local-dev qualification, so those
+        // lanes get ReusableGraph under FullLogits. Vulkan remains
+        // capture-unsupported (no native executable cache) but still reuses
+        // the ggml graph. Generic first/last-max
+        // semantics never authorize the compact result. Phrase bias,
+        // timestamps, suppression, debug logits, and host-visible adapter
+        // consumers independently force the complete-output plan without
+        // changing placement.
         let evidence = lane_decode_evidence_for_preference(preference.as_ref(), backend);
         Self {
             backend,
@@ -14468,8 +14502,13 @@ mod tests {
             GgmlDecodeOutputPlan, lane_decode_evidence_for_backend_capabilities,
             native_first_max_compact_is_proven, plan_decode_output,
         };
+        use crate::device::execution_route::ExecutionProvider;
 
-        for name in ["CUDA0", "Vulkan0", "HIP0"] {
+        for (name, provider) in [
+            ("CUDA0", ExecutionProvider::Cuda),
+            ("Vulkan0", ExecutionProvider::Vulkan),
+            ("HIP0", ExecutionProvider::Hip),
+        ] {
             let capabilities =
                 GgmlBackendCapabilities::from_backend_for_test(GgmlCpuGraphBackend::Gpu, name)
                     .with_native_argmax_first_op(true);
@@ -14483,6 +14522,7 @@ mod tests {
             let evidence = lane_decode_evidence_for_backend_capabilities(
                 GgmlCpuGraphBackend::Gpu,
                 capabilities,
+                provider,
             );
             assert_eq!(
                 plan_decode_output(
@@ -14540,6 +14580,10 @@ mod tests {
                 Some(ExecutionPlacement::FullDevice),
             ));
             assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
+            // Fake Exact ids such as "Hip0" do not match a live ROCm/Vulkan
+            // device, so this fixture still sees Unknown reuse. Live HIP and
+            // Vulkan Accelerated routes are covered by
+            // live_hip_or_vulkan_accelerated_authorizes_reusable_full_logits.
             assert_eq!(resolved.reuse_mode(), GgmlDecodeReuseMode::FreshGraph);
             assert!(!resolved.decode_evidence.reuse.is_validated());
             assert_eq!(
@@ -14552,6 +14596,33 @@ mod tests {
                 "complete-logits consumers must not compact on unproven {provider:?}"
             );
         }
+    }
+
+    #[test]
+    fn live_hip_accelerated_authorizes_reusable_full_logits() {
+        use super::{
+            GgmlDecodeOutputContract, GgmlDecodeOutputPlan, GgmlDecodeReuseMode,
+            RequestBackendPreference, ResolvedFamilyRuntimeInput,
+        };
+        use crate::device::execution_route::ExecutionProvider;
+        use crate::ggml_runtime::ggml_available_devices;
+
+        let live_proven = ggml_available_devices().into_iter().any(|device| {
+            ExecutionProvider::from_backend_name(&device.name) == ExecutionProvider::Hip
+        });
+        if !live_proven {
+            return;
+        }
+
+        let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+            Some(RequestBackendPreference::Accelerated),
+            super::AutoGpuPolicy::AllBackends,
+            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+        );
+        assert!(resolved.backend().is_gpu_class());
+        assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
+        assert_eq!(resolved.reuse_mode(), GgmlDecodeReuseMode::ReusableGraph);
+        assert!(resolved.decode_evidence.reuse.is_validated());
     }
 
     #[test]

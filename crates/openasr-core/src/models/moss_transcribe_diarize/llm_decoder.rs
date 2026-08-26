@@ -74,6 +74,12 @@ pub(crate) struct MossTdPrefillOutput {
 }
 
 impl MossTdDecoderRuntime {
+    pub(crate) fn take_compute_evidence(
+        &mut self,
+    ) -> Option<crate::ggml_runtime::GgmlSelectionEvidenceRef> {
+        self.logits_runtime.take_compute_evidence()
+    }
+
     pub(crate) fn graph_lanes(
         &self,
     ) -> (

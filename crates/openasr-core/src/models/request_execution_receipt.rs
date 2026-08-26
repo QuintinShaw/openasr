@@ -274,6 +274,70 @@ struct ReceiptState {
     trace_overflowed: bool,
     graph_lifecycle_checkpoint: (usize, bool),
     completed: bool,
+    /// Nested `begin_candidate_attempt` must not erase the parent candidate's
+    /// shipped facts. Auxiliary stages (punctuation, VAD, aligner) open an
+    /// inner attempt on the same collector; restoring this stack keeps the
+    /// ASR row intact after the inner attempt finishes.
+    attempt_stack: Vec<ReceiptAttemptCheckpoint>,
+}
+
+#[derive(Debug, Clone)]
+struct ReceiptAttemptCheckpoint {
+    facts: Option<NativeExecutionRequestFacts>,
+    observed_backend_identities: BTreeSet<usize>,
+    placement: GgmlExecutionPlacementSummary,
+    trace_events: Vec<String>,
+    token_steps: Vec<NativeExecutionTokenStep>,
+    top_k_margins: BTreeMap<usize, f32>,
+    logits_hashes: BTreeMap<usize, String>,
+    full_logits_steps: Vec<FullLogitsStep>,
+    full_logits_elements: usize,
+    next_decode_step_index: usize,
+    active_decode_step: Option<ActiveDecodeStep>,
+    trace_binding_invalid: bool,
+    trace_overflowed: bool,
+    graph_lifecycle_checkpoint: (usize, bool),
+    completed: bool,
+}
+
+impl ReceiptState {
+    fn take_attempt_checkpoint(&mut self) -> ReceiptAttemptCheckpoint {
+        ReceiptAttemptCheckpoint {
+            facts: self.facts.take(),
+            observed_backend_identities: std::mem::take(&mut self.observed_backend_identities),
+            placement: std::mem::take(&mut self.placement),
+            trace_events: std::mem::take(&mut self.trace_events),
+            token_steps: std::mem::take(&mut self.token_steps),
+            top_k_margins: std::mem::take(&mut self.top_k_margins),
+            logits_hashes: std::mem::take(&mut self.logits_hashes),
+            full_logits_steps: std::mem::take(&mut self.full_logits_steps),
+            full_logits_elements: std::mem::take(&mut self.full_logits_elements),
+            next_decode_step_index: std::mem::take(&mut self.next_decode_step_index),
+            active_decode_step: self.active_decode_step.take(),
+            trace_binding_invalid: std::mem::take(&mut self.trace_binding_invalid),
+            trace_overflowed: std::mem::take(&mut self.trace_overflowed),
+            graph_lifecycle_checkpoint: self.graph_lifecycle_checkpoint,
+            completed: std::mem::take(&mut self.completed),
+        }
+    }
+
+    fn restore_attempt_checkpoint(&mut self, checkpoint: ReceiptAttemptCheckpoint) {
+        self.facts = checkpoint.facts;
+        self.observed_backend_identities = checkpoint.observed_backend_identities;
+        self.placement = checkpoint.placement;
+        self.trace_events = checkpoint.trace_events;
+        self.token_steps = checkpoint.token_steps;
+        self.top_k_margins = checkpoint.top_k_margins;
+        self.logits_hashes = checkpoint.logits_hashes;
+        self.full_logits_steps = checkpoint.full_logits_steps;
+        self.full_logits_elements = checkpoint.full_logits_elements;
+        self.next_decode_step_index = checkpoint.next_decode_step_index;
+        self.active_decode_step = checkpoint.active_decode_step;
+        self.trace_binding_invalid = checkpoint.trace_binding_invalid;
+        self.trace_overflowed = checkpoint.trace_overflowed;
+        self.graph_lifecycle_checkpoint = checkpoint.graph_lifecycle_checkpoint;
+        self.completed = checkpoint.completed;
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -399,26 +463,27 @@ impl NativeExecutionReceiptCollector {
     }
 
     /// Candidate attempts are transactional: a failed candidate cannot leave
-    /// facts or trace events that a later fallback might publish.
+    /// facts or trace events that a later fallback might publish. Nested
+    /// attempts push the parent row aside and restore it on finish so an
+    /// auxiliary stage cannot erase the ASR candidate's shipped facts.
     pub(crate) fn begin_candidate_attempt(&self) {
         self.graph_lifecycle.begin_observation_scope();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.facts = None;
-        state.observed_backend_identities.clear();
-        state.placement = GgmlExecutionPlacementSummary::default();
-        state.trace_events.clear();
-        state.token_steps.clear();
-        state.top_k_margins.clear();
-        state.logits_hashes.clear();
-        state.full_logits_steps.clear();
-        state.full_logits_elements = 0;
-        state.next_decode_step_index = 0;
-        state.active_decode_step = None;
+        let parent = state.take_attempt_checkpoint();
+        // A nested begin happens while the outer attempt is still open.
+        // Sequential warmup/measured begins happen after the previous attempt
+        // finished (`completed == true`) and must start a fresh row.
+        let nested = !parent.completed
+            && (parent.facts.is_some()
+                || !parent.token_steps.is_empty()
+                || !parent.trace_events.is_empty());
+        if nested {
+            state.attempt_stack.push(parent);
+        }
         state.trace_binding_invalid = state.trace_mode.is_some() && state.trace_run_id.is_none();
-        state.trace_overflowed = false;
         state.graph_lifecycle_checkpoint = self.graph_lifecycle.checkpoint();
         state.completed = false;
     }
@@ -429,23 +494,21 @@ impl NativeExecutionReceiptCollector {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let committed = committed && !state.request_attempt_conflicted;
-        let rollback_checkpoint = (!committed).then_some(state.graph_lifecycle_checkpoint);
-        if committed {
+        let parent = state.attempt_stack.pop();
+        let restore_parent = parent.as_ref().is_some_and(|parent| {
+            !parent.completed
+                && (parent.facts.is_some()
+                    || !parent.token_steps.is_empty()
+                    || !parent.trace_events.is_empty())
+        });
+        let rollback_checkpoint =
+            (!committed || restore_parent).then_some(state.graph_lifecycle_checkpoint);
+        if restore_parent {
+            state.restore_attempt_checkpoint(parent.expect("parent presence checked"));
+        } else if committed {
             state.completed = true;
         } else {
-            state.facts = None;
-            state.observed_backend_identities.clear();
-            state.placement = GgmlExecutionPlacementSummary::default();
-            state.trace_events.clear();
-            state.token_steps.clear();
-            state.top_k_margins.clear();
-            state.logits_hashes.clear();
-            state.full_logits_steps.clear();
-            state.full_logits_elements = 0;
-            state.next_decode_step_index = 0;
-            state.active_decode_step = None;
-            state.trace_binding_invalid = false;
-            state.trace_overflowed = false;
+            let _ = state.take_attempt_checkpoint();
             state.completed = false;
         }
         // Lifecycle producers never run while the receipt mutex is held.
@@ -512,9 +575,8 @@ impl NativeExecutionReceiptCollector {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match &state.facts {
             Some(existing) if existing != &facts => {
-                // The same candidate may build several graphs, but immutable
-                // request facts must not drift within one receipt row.
-                state.facts = None;
+                // First writer wins. A later graph in the same candidate must
+                // not erase shipped output_plan/reuse_mode by disagreeing.
             }
             Some(_) => {}
             None => state.facts = Some(facts),
@@ -558,8 +620,11 @@ impl NativeExecutionReceiptCollector {
                 .as_ref()
                 .is_some_and(|actual| actual != actual_device);
         if route_drifted || new_backend_device_drifted {
-            state.facts = None;
-            state.observed_backend_identities.clear();
+            // Live backend attestation is fail-closed at the candidate
+            // boundary. Erasing request facts here would let transcription
+            // succeed while the shipped output_plan/reuse_mode disappeared
+            // from the receipt. Keep the first observation; a later handle
+            // still cannot overwrite it.
             return;
         }
         if facts.actual_provider.is_none() {
@@ -615,6 +680,99 @@ impl NativeExecutionReceiptCollector {
         step_index
     }
 
+    /// Bind one token under a single lock so concurrent longform slices cannot
+    /// overwrite each other's `active_decode_step`. Call after the shipped
+    /// decode already produced logits and the selected token.
+    pub(crate) fn commit_decode_step(
+        &self,
+        compute: Option<GgmlSelectionEvidenceRef>,
+        token_id: u32,
+        is_eot: bool,
+        logits: &[f32],
+    ) {
+        let logits_sha256 = (!logits.is_empty()).then(|| diagnostic_logits_sha256(logits));
+        let margin = if logits.len() < 2 {
+            None
+        } else {
+            let mut best = None;
+            let mut second = None;
+            for logit in logits.iter().copied().filter(|value| value.is_finite()) {
+                match best {
+                    None => best = Some(logit),
+                    Some(first) if logit > first => {
+                        second = best;
+                        best = Some(logit);
+                    }
+                    Some(first) if second.is_none_or(|value| logit > value) && logit != first => {
+                        second = Some(logit);
+                    }
+                    _ => {}
+                }
+            }
+            best.zip(second).map(|(first, second)| first - second)
+        };
+        let step_index = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let step_index = state.next_decode_step_index;
+            Self::begin_decode_step_locked(&mut state, step_index, compute);
+            if let Some(active) = state.active_decode_step.as_mut() {
+                if !logits.is_empty() {
+                    active.top_k_recorded = true;
+                }
+                active.token_recorded = true;
+            }
+            if let Some(margin) = margin {
+                state.top_k_margins.insert(step_index, margin);
+            }
+            if let Some(hash) = logits_sha256.clone() {
+                state.logits_hashes.insert(step_index, hash);
+            }
+            state.token_steps.push(NativeExecutionTokenStep {
+                step_index,
+                token_id,
+                is_eot,
+                top2_margin: margin,
+                logits_sha256,
+                compute,
+            });
+            let requires_complete_output = state.facts.as_ref().is_some_and(|facts| {
+                matches!(
+                    facts.resolved_runtime.output_plan(),
+                    crate::ggml_runtime::GgmlDecodeOutputPlan::FullLogits
+                )
+            });
+            let Some(active) = state.active_decode_step.take() else {
+                state.trace_binding_invalid = true;
+                return;
+            };
+            if active.compute.is_none()
+                || !active.token_recorded
+                || (requires_complete_output && !logits.is_empty() && !active.top_k_recorded)
+            {
+                state.trace_binding_invalid = true;
+            }
+            match state.next_decode_step_index.checked_add(1) {
+                Some(next) => state.next_decode_step_index = next,
+                None => state.trace_overflowed = true,
+            }
+            step_index
+        };
+        self.record_trace_event(
+            serde_json::json!({
+                "schema": "openasr.gpu-correctness-trace.v1",
+                "event": "token",
+                "step_index": step_index,
+                "token_id": token_id,
+                "is_eot": usize::from(is_eot),
+                "compute": compute,
+            })
+            .to_string(),
+        );
+    }
+
     fn begin_decode_step_locked(
         state: &mut ReceiptState,
         step_index: usize,
@@ -666,6 +824,7 @@ impl NativeExecutionReceiptCollector {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn abort_decode_step(&self, step_index: usize) {
         let mut state = self
             .state
@@ -1230,6 +1389,67 @@ mod tests {
         assert!(trace.contains("\"token_id\":22"));
         assert_eq!(snapshot.token_steps.len(), 1);
         assert_eq!(snapshot.token_steps[0].token_id, 22);
+    }
+
+    #[test]
+    fn nested_candidate_restores_parent_request_facts() {
+        let receipt = NativeExecutionReceiptCollector::new();
+        receipt.begin_candidate_attempt();
+        receipt.record_facts(seq2seq_facts());
+        receipt.record_token(0, 7, false);
+        receipt.begin_candidate_attempt();
+        let mut nested_facts = seq2seq_facts();
+        nested_facts.pack_content_id = "nested-aux-pack".to_string();
+        receipt.record_facts(nested_facts);
+        receipt.record_token(0, 99, false);
+        receipt.finish_candidate_attempt(true);
+        receipt.finish_candidate_attempt(true);
+        let snapshot = receipt.snapshot();
+        let facts = snapshot.facts.expect("parent facts");
+        assert_eq!(facts.pack_content_id, "test-pack");
+        assert_eq!(snapshot.token_steps.len(), 1);
+        assert_eq!(snapshot.token_steps[0].token_id, 7);
+        assert!(snapshot.completed);
+    }
+
+    #[test]
+    fn later_facts_writer_cannot_erase_first_request_facts() {
+        let receipt = NativeExecutionReceiptCollector::new();
+        receipt.begin_candidate_attempt();
+        receipt.record_facts(seq2seq_facts());
+        let mut drifted = seq2seq_facts();
+        drifted.pack_content_id = "other-pack".to_string();
+        receipt.record_facts(drifted);
+        receipt.finish_candidate_attempt(true);
+        let facts = receipt.snapshot().facts.expect("first facts");
+        assert_eq!(facts.pack_content_id, "test-pack");
+    }
+
+    #[test]
+    fn backend_observation_drift_does_not_erase_request_facts() {
+        let receipt = NativeExecutionReceiptCollector::new();
+        receipt.begin_candidate_attempt();
+        receipt.record_facts(seq2seq_facts());
+        receipt.record_backend_observation(
+            1,
+            ExecutionProvider::Cpu,
+            "CPU",
+            &test_actual_device(),
+            false,
+        );
+        let mut other = test_actual_device();
+        other.description = "other CPU".to_string();
+        receipt.record_backend_observation(2, ExecutionProvider::Cpu, "CPU", &other, true);
+        receipt.record_token(0, 7, false);
+        receipt.finish_candidate_attempt(true);
+        let facts = receipt.snapshot().facts.expect("request facts");
+        assert_eq!(facts.pack_content_id, "test-pack");
+        assert_eq!(facts.actual_provider, Some(ExecutionProvider::Cpu));
+        assert_eq!(facts.scheduler_enabled, Some(false));
+        assert_eq!(
+            facts.actual_device.as_ref().unwrap().description,
+            "test CPU"
+        );
     }
 
     #[test]

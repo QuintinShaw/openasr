@@ -1026,10 +1026,11 @@ pub(crate) fn resolve_qwen_family_production_kv_cache_policy(
 }
 
 /// Resident K/V graphs are authorized only by the immutable planner result.
-/// GPU class and scheduler-off are placement, not proof: production reuse
-/// evidence is Unknown, so every lane is FreshGraph and must materialize
-/// host KV. Compact first-max is a separate output_plan and cannot keep an
-/// empty ResidentOnly owner while the decode path rebuilds a growing graph.
+/// GPU class and scheduler-off are placement, not proof. HIP and Vulkan
+/// reuse is now planner-validated (ReusableGraph + FullLogits); CUDA and
+/// Metal stay FreshGraph and must materialize host KV. Compact first-max is
+/// a separate output_plan and cannot keep an empty ResidentOnly owner while
+/// the decode path rebuilds a growing graph.
 pub(crate) fn qwen_llm_uses_resident_kv_graph(
     resolved_runtime: ResolvedFamilyRuntimeInput,
 ) -> bool {

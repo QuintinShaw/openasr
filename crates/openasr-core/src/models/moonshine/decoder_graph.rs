@@ -9,8 +9,8 @@ use crate::PhraseBiasConfig;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
     GgmlCpuGraphRunner, GgmlCpuTensor, GgmlDecodeReuseMode, GgmlLoadedTensor,
-    GgmlLoadedWeightContext, GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
-    GgufRuntimeSourcePreflight,
+    GgmlLoadedWeightContext, GgmlRopeExtParams, GgmlSelectionEvidenceRef, GgmlStaticTensor,
+    GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, BuiltinSeq2SeqDecodePolicyConfigInput,
@@ -378,6 +378,7 @@ pub(crate) struct MoonshineDecoderGraphRuntime {
     n_seq: usize,
     greedy_step_output_mode: DeviceGreedyStepOutputMode,
     reuse_mode: GgmlDecodeReuseMode,
+    last_step_compute_evidence: Option<GgmlSelectionEvidenceRef>,
 }
 
 /// The resolved-input identity a decoder runtime is built from: the weights
@@ -428,6 +429,10 @@ impl Seq2SeqGreedyDecodeStepExecutor for MoonshineDecoderStepExecutor<'_> {
         })?;
         Ok(output)
     }
+
+    fn take_compute_evidence(&mut self) -> Option<GgmlSelectionEvidenceRef> {
+        self.runtime.last_step_compute_evidence.take()
+    }
 }
 
 fn reuse_mode_allows_persistent_graph(reuse_mode: GgmlDecodeReuseMode) -> bool {
@@ -437,6 +442,49 @@ fn reuse_mode_allows_persistent_graph(reuse_mode: GgmlDecodeReuseMode) -> bool {
 impl MoonshineDecoderGraphRuntime {
     fn supports_reusable_decode_graph(&self) -> bool {
         reuse_mode_allows_persistent_graph(self.reuse_mode)
+    }
+
+    fn finish_step_compute<'a>(
+        last_step_compute_evidence: &mut Option<GgmlSelectionEvidenceRef>,
+        vocab_size: usize,
+        graph: &mut GgmlCpuGraphBuilder<'a>,
+        logits: GgmlCpuTensor<'a>,
+        top1: Option<GgmlCpuTensor<'a>>,
+    ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, MoonshineDecoderGraphError> {
+        match top1 {
+            Some(top1) => {
+                let readback =
+                    graph
+                        .compute_output_i32_with_evidence(top1, 1)
+                        .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
+                            reason: error.to_string(),
+                        })?;
+                let (token_ids, evidence) = readback.into_parts();
+                *last_step_compute_evidence = evidence;
+                let token_id = token_ids.into_iter().next().ok_or_else(|| {
+                    MoonshineDecoderGraphError::GraphExecutionFailed {
+                        reason: "moonshine device top-1 returned no token id".to_string(),
+                    }
+                })?;
+                Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                    logits: Vec::new(),
+                    greedy_token_hint: Some(map_device_top1_token(token_id, vocab_size)?),
+                })
+            }
+            None => {
+                let readback = graph
+                    .compute_output_f32_with_evidence(logits, vocab_size)
+                    .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
+                        reason: error.to_string(),
+                    })?;
+                let (logits, evidence) = readback.into_parts();
+                *last_step_compute_evidence = evidence;
+                Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                    logits,
+                    greedy_token_hint: None,
+                })
+            }
+        }
     }
 
     fn ensure_resident_self_kv_arena(&mut self) -> Result<(), MoonshineDecoderGraphError> {
@@ -841,6 +889,7 @@ impl MoonshineDecoderGraphRuntime {
             n_seq,
             greedy_step_output_mode,
             reuse_mode,
+            last_step_compute_evidence: None,
         })
     }
 
@@ -1078,6 +1127,7 @@ impl MoonshineDecoderGraphRuntime {
         position: usize,
         output_mode: DeviceGreedyStepOutputMode,
     ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, MoonshineDecoderGraphError> {
+        self.last_step_compute_evidence = None;
         if !self.supports_reusable_decode_graph() {
             return Err(MoonshineDecoderGraphError::InvalidInput {
                 reason: "moonshine incremental decode requires ReusableGraph evidence".to_string(),
@@ -1152,35 +1202,13 @@ impl MoonshineDecoderGraphRuntime {
             .set_f16_bits_slice(attention_mask, &mask_bits, "moonshine_reuse_self_mask")
             .map_err(build_err("ggml_set_f16_bits_slice(reuse_mask)"))?;
 
-        match top1 {
-            Some(top1) => {
-                let token_id = graph
-                    .compute_output_i32(top1, 1)
-                    .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
-                        reason: error.to_string(),
-                    })?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| MoonshineDecoderGraphError::GraphExecutionFailed {
-                        reason: "moonshine device top-1 returned no token id".to_string(),
-                    })?;
-                Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-                    logits: Vec::new(),
-                    greedy_token_hint: Some(map_device_top1_token(
-                        token_id,
-                        self.metadata.vocab_size,
-                    )?),
-                })
-            }
-            None => Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits: graph
-                    .compute_output_f32(logits, self.metadata.vocab_size)
-                    .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
-                        reason: error.to_string(),
-                    })?,
-                greedy_token_hint: None,
-            }),
-        }
+        Self::finish_step_compute(
+            &mut self.last_step_compute_evidence,
+            self.metadata.vocab_size,
+            graph,
+            logits,
+            top1,
+        )
     }
 
     // Wired by the moonshine serve-batch owner thread in the follow-up step.
@@ -1638,6 +1666,7 @@ impl MoonshineDecoderGraphRuntime {
         tokens: &[u32],
         output_mode: DeviceGreedyStepOutputMode,
     ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, MoonshineDecoderGraphError> {
+        self.last_step_compute_evidence = None;
         let token_count = tokens.len();
         if token_count == 0 {
             return Err(MoonshineDecoderGraphError::InvalidInput {
@@ -1759,35 +1788,13 @@ impl MoonshineDecoderGraphRuntime {
                 .map_err(build_err("ggml_set_f16_bits_slice(self_mask)"))?;
         }
 
-        match top1 {
-            Some(top1) => {
-                let token_id = graph
-                    .compute_output_i32(top1, 1)
-                    .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
-                        reason: error.to_string(),
-                    })?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| MoonshineDecoderGraphError::GraphExecutionFailed {
-                        reason: "moonshine device top-1 returned no token id".to_string(),
-                    })?;
-                Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-                    logits: Vec::new(),
-                    greedy_token_hint: Some(map_device_top1_token(
-                        token_id,
-                        self.metadata.vocab_size,
-                    )?),
-                })
-            }
-            None => Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits: graph
-                    .compute_output_f32(logits, self.metadata.vocab_size)
-                    .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
-                        reason: error.to_string(),
-                    })?,
-                greedy_token_hint: None,
-            }),
-        }
+        Self::finish_step_compute(
+            &mut self.last_step_compute_evidence,
+            self.metadata.vocab_size,
+            &mut graph,
+            logits,
+            top1,
+        )
     }
 }
 

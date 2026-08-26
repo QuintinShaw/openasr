@@ -65,6 +65,9 @@ const UNSET_VALUE: &str = "<unset>";
 /// clap keeps its own `2` for usage/argument errors.
 fn exit_with_error(error: &anyhow::Error) -> ! {
     eprintln!("Error: {error}");
+    for cause in error.chain().skip(1) {
+        eprintln!("Caused by: {cause}");
+    }
     let code = error
         .downcast_ref::<consent::CliExit>()
         .map(|exit| exit.code as i32)

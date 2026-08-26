@@ -520,6 +520,7 @@ pub(crate) fn run_builtin_seq2seq_decode_policy<E>(
 /// `frame_logits[t]` is the length-`vocab_size` logit row for frame `t`;
 /// `decode_text_token_ids` maps the collapsed ids to text (its own error
 /// stringified by the family). Fails closed if the policy is not `CtcGreedyV0`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_builtin_ctc_decode_policy<E>(
     decode_policy_id: &str,
     frame_logits: &[&[f32]],
@@ -530,6 +531,7 @@ pub(crate) fn run_builtin_ctc_decode_policy<E>(
     map_ctc_error_to_family: fn(CtcGreedyDecodeError) -> E,
     map_registry_error: fn(BuiltinDecodePolicyComponentRegistryError) -> E,
     decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
+    frame_compute: Option<&[crate::ggml_runtime::GgmlSelectionEvidenceRef]>,
 ) -> Result<CtcGreedyDecodeResult, E> {
     let descriptor = resolve_builtin_decode_policy(decode_policy_id).map_err(map_registry_error)?;
     match descriptor.execution_kind {
@@ -557,6 +559,9 @@ pub(crate) fn run_builtin_ctc_decode_policy<E>(
                 |reason| CtcGreedyDecodeError::DetokenizeFailed { reason },
                 decode_work_progress,
             )
+            .inspect(|result| {
+                record_ctc_collapsed_token_receipt(result, frame_logits, frame_compute);
+            })
             .map_err(map_ctc_error_to_family)
         }
         // Fail closed: a seq2seq policy must never route through the CTC path.
@@ -767,6 +772,36 @@ pub(crate) fn seq2seq_transcript_byte_start(
     }
 }
 
+fn record_ctc_collapsed_token_receipt(
+    result: &CtcGreedyDecodeResult,
+    frame_logits: &[&[f32]],
+    frame_compute: Option<&[crate::ggml_runtime::GgmlSelectionEvidenceRef]>,
+) {
+    let Some(receipt) =
+        crate::models::native_execution_services::current_execution_receipt_collector()
+    else {
+        return;
+    };
+    let Some(frame_compute) = frame_compute else {
+        return;
+    };
+    if frame_compute.len() != result.frame_count {
+        return;
+    }
+    for (step_index, span) in result.token_spans.iter().enumerate() {
+        let Some(compute) = frame_compute.get(span.start_frame).copied() else {
+            continue;
+        };
+        let Some(row) = frame_logits.get(span.start_frame).copied() else {
+            continue;
+        };
+        receipt.begin_decode_step(step_index, Some(compute));
+        receipt.record_top_k(step_index, row);
+        receipt.record_token(step_index, span.token_id, false);
+        receipt.finish_decode_step(step_index);
+    }
+}
+
 fn emit_seq2seq_token_trace(
     kind: BuiltinDecodePolicySeq2SeqTraceKind,
     step_index: usize,
@@ -774,11 +809,6 @@ fn emit_seq2seq_token_trace(
     is_eot: bool,
 ) {
     if kind == BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1 {
-        if let Some(receipt) =
-            crate::models::native_execution_services::current_execution_receipt_collector()
-        {
-            receipt.record_token(step_index, token_id, is_eot);
-        }
         append_seq2seq_debug_jsonl_trace(&format!(
             "{{\"schema\":\"{SEQ2SEQ_DEBUG_TRACE_SCHEMA}\",\"event\":\"token\",\"step_index\":{step_index},\"token_id\":{token_id},\"is_eot\":{}}}",
             usize::from(is_eot)
@@ -802,11 +832,6 @@ fn emit_seq2seq_topk_trace(
     logits: &[f32],
 ) {
     if kind == BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1 {
-        if let Some(receipt) =
-            crate::models::native_execution_services::current_execution_receipt_collector()
-        {
-            receipt.record_top_k(step_index, logits);
-        }
         let mut top = Vec::<(usize, f32)>::new();
         for (token_id, logit) in logits.iter().copied().enumerate() {
             if !logit.is_finite() {
@@ -1526,6 +1551,7 @@ mod tests {
             ctc_err_to_string,
             registry_err_to_string,
             None,
+            None,
         )
         .expect("ctc decode");
         assert_eq!(result.token_ids, vec![5, 7]);
@@ -1546,6 +1572,7 @@ mod tests {
             &detok,
             ctc_err_to_string,
             registry_err_to_string,
+            None,
             None,
         )
         .expect_err("seq2seq policy must not run through the CTC path");

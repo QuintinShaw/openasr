@@ -3985,7 +3985,7 @@ mod tests {
             crate::ggml_runtime::GgmlDecodeOutputPlan::FullLogits,
             "word timestamps force complete logits on the same streaming planner seam"
         );
-        assert_eq!(facts.resolved_runtime.evidence_revision(), 1);
+        assert_eq!(facts.resolved_runtime.evidence_revision(), 2);
         assert_eq!(facts.topology.adapter_id, descriptor.adapter_id);
     }
 

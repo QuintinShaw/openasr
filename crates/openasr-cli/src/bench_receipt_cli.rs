@@ -912,9 +912,22 @@ fn project_decode_diagnostics(
 ) -> Result<ShortAudioReceiptDecodeDiagnostics> {
     openasr_core::decode_diagnostics_from_shipped_runtime(resolved.as_ref(), snapshot).map_err(
         |error| match error {
-            openasr_core::ShortAudioReceiptError::DecodeDiagnosticsMissing => anyhow::anyhow!(
-                "short-audio receipt is missing shipped output_plan/reuse_mode; refusing to emit a receipt"
-            ),
+            openasr_core::ShortAudioReceiptError::DecodeDiagnosticsMissing => {
+                let detail = match snapshot {
+                    None => "native snapshot is absent".to_string(),
+                    Some(snapshot) => format!(
+                        "native snapshot completed={} facts={} token_steps={} lifecycle_events={} overflowed={}",
+                        snapshot.completed,
+                        snapshot.facts.is_some(),
+                        snapshot.token_steps.len(),
+                        snapshot.graph_lifecycle.events.len(),
+                        snapshot.graph_lifecycle.overflowed,
+                    ),
+                };
+                anyhow::anyhow!(
+                    "short-audio receipt is missing shipped output_plan/reuse_mode; refusing to emit a receipt ({detail})"
+                )
+            }
             other => anyhow::anyhow!("{other}"),
         },
     )

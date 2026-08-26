@@ -80,6 +80,10 @@ pub(crate) trait XasrGreedyDecodeBackend {
     }
 }
 
+/// Record one emitted (non-blank) transcript token. Blank and speculative
+/// blank-prefix selections stay on the joiner alignment path and are not
+/// short-audio decode steps. The host joiner is pure Rust and has no ggml
+/// compute witness; only device-head rows are native receipt steps.
 fn record_selection_receipt(
     evidence: Option<&XasrSelectionEvidence>,
     output_index: usize,
@@ -90,12 +94,11 @@ fn record_selection_receipt(
     else {
         return;
     };
-    let row = evidence.and_then(|evidence| evidence.row(output_index));
-    let compute = row.map(|(_, compute)| compute);
-    let step_index = receipt.begin_next_decode_step(compute);
-    if let Some((row, _)) = row {
-        receipt.record_top_k_last_max(step_index, row);
-    }
+    let Some((row, compute)) = evidence.and_then(|evidence| evidence.row(output_index)) else {
+        return;
+    };
+    let step_index = receipt.begin_next_decode_step(Some(compute));
+    receipt.record_top_k_last_max(step_index, row);
     receipt.record_token(step_index, token_id, false);
     receipt.finish_decode_step(step_index);
 }
@@ -313,9 +316,6 @@ pub(crate) fn greedy_decode_frames_incremental_with_backend<B: XasrGreedyDecodeB
             if blank_prefix_len > remaining_frames {
                 return Err("xasr speculative blank prefix exceeds remaining frames".to_string());
             }
-            for output_index in 0..blank_prefix_len {
-                record_selection_receipt(speculative_evidence.as_ref(), output_index, blank_id);
-            }
             if speculative_context.is_some() {
                 decoder_projection_valid = true;
             }
@@ -334,7 +334,6 @@ pub(crate) fn greedy_decode_frames_incremental_with_backend<B: XasrGreedyDecodeB
             let token_id = backend.next_token()?;
             let selection_evidence = backend.take_selection_evidence();
             if token_id == blank_id {
-                record_selection_receipt(selection_evidence.as_ref(), 0, token_id);
                 break;
             }
             let probability = backend.token_probability(token_id)?;
@@ -724,13 +723,13 @@ mod tests {
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter(|event| event.get("event").and_then(serde_json::Value::as_str) == Some("token"))
             .collect::<Vec<_>>();
-        assert_eq!(tokens.len(), 4);
+        assert_eq!(tokens.len(), 1);
         assert_eq!(
             tokens
                 .iter()
                 .map(|event| event["token_id"].as_u64().unwrap())
                 .collect::<Vec<_>>(),
-            vec![0, 0, 1, 0]
+            vec![1]
         );
         assert_eq!(
             tokens
@@ -742,7 +741,7 @@ mod tests {
                     )
                 })
                 .collect::<Vec<_>>(),
-            vec![(0, 3), (1, 3), (0, 1), (0, 1)]
+            vec![(0, 1)]
         );
     }
 

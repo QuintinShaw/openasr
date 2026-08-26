@@ -30,8 +30,8 @@ use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
     GgmlCpuGraphRunner, GgmlCpuTensor, GgmlDecodeReuseMode, GgmlLoadedTensor,
-    GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext, GgmlStaticTensor,
-    GgmlStaticTensorArena, GgufRuntimeSourcePreflight, RequestBackendPreference,
+    GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext, GgmlSelectionEvidenceRef,
+    GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight, RequestBackendPreference,
     request_backend_override,
 };
 use crate::models::admitted_pinned_runtime_actor_pool::{
@@ -1160,6 +1160,7 @@ struct WhisperDecoderStepLogits {
     last_token_cross_attention_frame_probs: Option<Vec<f32>>,
     decoder_graph_run_ms: u128,
     logits_ms: u128,
+    compute_evidence: Option<GgmlSelectionEvidenceRef>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3628,6 +3629,7 @@ fn run_whisper_decoder_step_ggml_v0(
         last_token_cross_attention_frame_probs: output.last_token_cross_attention_frame_probs,
         decoder_graph_run_ms,
         logits_ms: logits_start.elapsed().as_millis(),
+        compute_evidence: output.compute_evidence,
     })
 }
 
@@ -5903,6 +5905,7 @@ struct WhisperGreedyDecodeStepRunnerAdapter<'a> {
     decoder_tensor_cache: WhisperDecoderExecutionTensorCache,
     plan_by_token_count: BTreeMap<usize, Arc<WhisperDecoderGraphPlan>>,
     token_alignments: Vec<WhisperGeneratedTokenAlignment>,
+    last_step_compute_evidence: Option<GgmlSelectionEvidenceRef>,
 }
 
 impl WhisperGreedyDecodeStepRunnerAdapter<'_> {
@@ -6072,6 +6075,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for WhisperGreedyDecodeStepRunnerAdapter<'_
                 last_token_cross_attention_frame_probs: None,
                 decoder_graph_run_ms,
                 logits_ms: logits_start.elapsed().as_millis(),
+                compute_evidence: output.compute_evidence,
             })
         } else {
             run_whisper_decoder_step_ggml_v0(
@@ -6146,10 +6150,15 @@ impl Seq2SeqGreedyDecodeStepExecutor for WhisperGreedyDecodeStepRunnerAdapter<'_
                 self.decode_loop_start,
             );
         }
+        self.last_step_compute_evidence = step_logits.compute_evidence;
         Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
             logits: step_logits.logits,
             greedy_token_hint: step_logits.greedy_token_hint,
         })
+    }
+
+    fn take_compute_evidence(&mut self) -> Option<GgmlSelectionEvidenceRef> {
+        self.last_step_compute_evidence.take()
     }
 }
 
@@ -6359,6 +6368,7 @@ fn run_whisper_decode_loop(
         decoder_tensor_cache: WhisperDecoderExecutionTensorCache::default(),
         plan_by_token_count: BTreeMap::new(),
         token_alignments: Vec::new(),
+        last_step_compute_evidence: None,
     };
     let decode_text_token_ids = |token_ids: &[u32]| {
         tokenizer.decode_text_token_ids(token_ids).map_err(|error| {

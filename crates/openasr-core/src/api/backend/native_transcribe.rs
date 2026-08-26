@@ -444,8 +444,8 @@ fn run_dispatch_once_with_progress_and_policy(
                 let error = crate::models::native_execution_services::execution_candidate_failure_source(result)
                     .unwrap_or_else(|| BackendError::NativeFailClosed {
                         reason: format!(
-                            "execution candidate reported {:?} during '{}' despite returning success",
-                            failure.kind, failure.operation
+                            "execution candidate reported {:?} during '{}' despite returning success: {}",
+                            failure.kind, failure.operation, failure.detail
                         ),
                     });
                 if candidate_index + 1 == candidates.len() {
@@ -784,6 +784,17 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
         let decode_positions_ref = &decode_positions;
         let cursor_ref = &cursor;
         let stop_ref = &stop;
+        // Concurrent slices are one request, not independent candidates.
+        // Each worker still opens its own attempt journal, so without a
+        // parent activation cohort they mint distinct exclusive gates and
+        // fail closed with DeviceDomainBusy while a sibling's pack import
+        // or runner-context is still pending. Install the request cohort
+        // before capturing TLS so workers inherit it.
+        let request_activation_cohort = crate::ActivationReservationContext::mint();
+        let _request_activation_cohort =
+            crate::models::native_execution_services::install_activation_reservation_context(Some(
+                request_activation_cohort,
+            ));
         // `thread::scope` does not inherit TLS. Capture the complete request
         // execution context once so every slice worker keeps the same broker,
         // Exact route namespace, telemetry, and transactional observation
@@ -805,6 +816,9 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
                 let native_execution_context = native_execution_context.clone();
                 let execution_observation_sink = execution_observation_sink.clone();
                 scope.spawn(move || {
+                    let _request_activation_cohort = crate::models::native_execution_services::install_activation_reservation_context(
+                        Some(request_activation_cohort),
+                    );
                     let _native_execution_context = native_execution_context.map(
                         crate::models::native_execution_services::install_native_execution_context,
                     );

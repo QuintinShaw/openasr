@@ -1704,6 +1704,17 @@ pub struct ActivationReservationContext {
     cohort_id: MemoryReservationCohortId,
 }
 
+impl ActivationReservationContext {
+    /// Mint a request-scoped cohort so concurrent longform slices and nested
+    /// host owners share one exclusive system-memory gate. Independent
+    /// candidate fallbacks still mint their own attempt journals underneath.
+    pub(crate) fn mint() -> Self {
+        Self {
+            cohort_id: MemoryReservationCohortId::new(ExecutionCacheAttemptId::next().0),
+        }
+    }
+}
+
 pub struct BrokerActivationReservation {
     batch: Option<DeviceMemoryReservationBatch>,
     context: ActivationReservationContext,
@@ -3485,6 +3496,36 @@ mod tests {
         assert!(next.result.is_ok());
         // A completed attempt must never reopen the previous cohort gate.
         assert_ne!(outer, next.result.unwrap());
+    }
+
+    #[test]
+    fn nested_candidate_attempts_keep_parent_activation_cohort() {
+        let services = test_native_execution_services();
+        let candidate = cpu_candidate();
+        let parent = ActivationReservationContext::mint();
+        let parent_id = parent.cohort_id;
+        let _guard = install_activation_reservation_context(Some(parent));
+        let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            assert_eq!(
+                current_memory_reservation_cohort_id().expect("attempt cohort"),
+                parent_id
+            );
+            let nested = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+                Ok::<_, ()>(current_memory_reservation_cohort_id().expect("nested cohort"))
+            });
+            assert_eq!(nested.result.unwrap(), parent_id);
+            let context = current_native_execution_context().expect("attempt context");
+            let worker = std::thread::spawn(move || {
+                let _guard = install_native_execution_context(context);
+                current_memory_reservation_cohort_id().expect("worker cohort")
+            })
+            .join()
+            .unwrap();
+            assert_eq!(worker, parent_id);
+            Ok::<_, ()>(())
+        });
+        assert!(outcome.result.is_ok());
+        assert!(outcome.candidate_failure.is_none());
     }
 
     #[test]

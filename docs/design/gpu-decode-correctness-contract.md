@@ -48,6 +48,21 @@ The shared software migration is in place:
   `vk_caps_00001002_00007590_*`, capture unsupported, FreshGraph,
   cold+reuse, `funasr-nano:q4_k`). That still is not a production-catalog
   or Authenticode release cell;
+- after `8cf47e0f` (`origin/main`), the same RX 9060 XT re-ran those local-dev
+  HIP and Vulkan plugin cells for `funasr-nano:q4_k` (qualify-family
+  cold+reuse token `evidence.v1` pass, HTTP JFK). Additional local-dev HIP
+  cells passed for `qwen3-asr-0.6b:q4_k`, `qwen3-asr-1.7b:q4_k`, and
+  `firered-aed-l-v2:q4_k`; Vulkan also passed `firered-aed-l-v2:q4_k`. A later
+  local receipt-contract rebuild on the same machine then passed HIP
+  `moonshine-tiny:q8_0` and Vulkan `qwen3-asr-0.6b:q4_k`,
+  `qwen3-asr-1.7b:q4_k`, `sensevoice-small:q8_0`, `xasr-zh-en:q8_0`,
+  `moonshine-tiny:q8_0`, `whisper-tiny:q4_k`, and `whisper-small:q4_k`. A
+  later HIP plugin rebuild on the same machine then passed HIP
+  `sensevoice-small:q8_0`, `xasr-zh-en:q8_0`, `whisper-tiny:q4_k`, and
+  `whisper-small:q4_k`. Compact remains off. HIP and Vulkan reuse evidence is
+  now planner-validated (`ReusableGraph` + `FullLogits` resident KV) so FunASR
+  q4_k HIP no longer rebuilds a host-KV graph every token; CUDA stays
+  `FreshGraph`. These are still not a production-catalog or Authenticode cell;
 - native `ARGMAX_FIRST` now has one cross-backend non-finite rule: any NaN or
   infinity in a row yields the `-1` sentinel, which request decoding rejects
   instead of accepting a provider-dependent token;
@@ -84,8 +99,10 @@ The following baseline outputs must not be promoted into stronger claims:
   evidence and cannot close the final matrix;
 - older short-audio diagnostics derived `graph_rebuilt=true` from the selected
   `FreshGraph` plan. The current emitter instead requires a runtime-minted
-  compute/output witness bound to one `created` or `existing_graph_observed`
-  lifecycle; missing or ambiguous evidence fails closed. This correction does
+  compute/output witness bound to the `created` or `existing_graph_observed`
+  origin in effect at that compute; a later observation-scope re-attach on the
+  same graph identity does not make earlier origin events ambiguous. Missing
+  origin, start, complete, or readback still fails closed. This correction does
   not make an ordinary evidence-less bench receipt release-authorizing; and
 - the Desktop JavaScript plugin-switch runner is a machine-protocol smoke. It
   does not start the packaged Tauri application or traverse the production
@@ -604,6 +621,19 @@ CUDA executable-graph capture is explicitly disabled by `build.rs` with
 currently defaults `OPENASR_HIP_GRAPHS` to true, the plugin build documents
 `GGML_HIP_GRAPHS=ON`, and HIP shares the CUDA `USE_CUDA_GRAPH` implementation
 path. CUDA capture-off evidence cannot authorize HIP capture-on behavior.
+
+HIP capture stays on. hipBLASLt GEMMs cannot join a capturing stream, so the
+HIP plugin pauses capture around those GEMMs, immediately launches each
+recorded fragment on the same stream (stream capture records kernels and
+does not execute them), keeps every non-empty fragment executable, and on
+reuse GraphLaunches those fragments in order interleaved with the same
+eager GEMMs. The first fragment remains the observable executable.
+Eager-walking the full ggml graph on mixed reuse is not the shipping
+path: FunASR q4_k HIP reuse regressed ~3x that way because capturable mmq
+kernels were re-launched one by one. Graphs that still have an instantiated
+executable are not time-evicted. Quantized-weight padding memset uses the
+per-thread stream rather than a blocking legacy-stream `cudaMemset`, which
+is illegal while another stream is capturing.
 
 For HIP, `CaptureCompatibility` must describe the current capture-on lane. A
 compact or reusable output plan remains unsupported until production-shape
