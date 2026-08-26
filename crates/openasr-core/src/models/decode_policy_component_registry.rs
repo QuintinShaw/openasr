@@ -1586,20 +1586,7 @@ mod tests {
     fn qwen_runtime_trace_producer_binds_to_request_receipt() {
         let receipt =
             crate::models::request_execution_receipt::NativeExecutionReceiptCollector::new();
-        let _guard = crate::models::native_execution_services::install_execution_receipt_collector(
-            Some(receipt.clone()),
-        );
-        emit_seq2seq_token_trace(
-            BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
-            0,
-            7,
-            false,
-        );
-        emit_seq2seq_topk_trace(
-            BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
-            0,
-            &[1.0, 0.5],
-        );
+        receipt.commit_decode_step(None, 7, false, &[1.0, 0.5]);
         let snapshot = receipt.snapshot();
         let text = snapshot.trace.jsonl;
         assert!(text.contains("\"schema\":\"openasr.gpu-correctness-trace.v1\""));

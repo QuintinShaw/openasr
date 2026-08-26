@@ -867,7 +867,7 @@ fn sensevoice_production_uses_complete_frame_logits_and_resolved_cache_identity(
     let encoder = std::fs::read_to_string(root.join("encoder_graph.rs"))
         .expect("read SenseVoice encoder graph");
     assert!(
-        encoder.contains("compute_output_f32(logits, want)"),
+        encoder.contains("compute_output_f32_rows_with_evidence(logits, vocab_size, frames)"),
         "SenseVoice production must read back complete frame logits",
     );
     for forbidden in ["FrameTokenIds", "top1_argmax_first_max", "device_greedy"] {

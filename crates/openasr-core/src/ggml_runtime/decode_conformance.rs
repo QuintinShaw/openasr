@@ -3008,7 +3008,10 @@ mod tests {
 
         let sensevoice = std::fs::read_to_string(root.join("sensevoice/encoder_graph.rs"))
             .expect("read SenseVoice encoder");
-        assert!(sensevoice.contains("compute_output_f32(logits, want)"));
+        assert!(
+            sensevoice
+                .contains("compute_output_f32_rows_with_evidence(logits, vocab_size, frames)")
+        );
         assert!(sensevoice.contains("retains complete per-frame logits"));
         assert!(!sensevoice.contains("FrameTokenIds"));
         assert!(!sensevoice.contains("top1_argmax_first_max"));

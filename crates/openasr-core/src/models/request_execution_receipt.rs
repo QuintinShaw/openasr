@@ -760,6 +760,40 @@ impl NativeExecutionReceiptCollector {
             }
             step_index
         };
+        if !logits.is_empty() {
+            let mut top = Vec::<(usize, f32)>::new();
+            for (token, logit) in logits.iter().copied().enumerate() {
+                if !logit.is_finite() {
+                    continue;
+                }
+                let insert_at = top
+                    .iter()
+                    .position(|(_, existing)| logit.total_cmp(existing).is_gt());
+                if let Some(insert_at) = insert_at {
+                    top.insert(insert_at, (token, logit));
+                } else if top.len() < MAX_TRACE_TOP_K {
+                    top.push((token, logit));
+                }
+                if top.len() > MAX_TRACE_TOP_K {
+                    top.truncate(MAX_TRACE_TOP_K);
+                }
+            }
+            let items = top
+                .iter()
+                .map(|(token, value)| serde_json::json!({"token_id": token, "value": value}))
+                .collect::<Vec<_>>();
+            self.record_trace_event(
+                serde_json::json!({
+                    "schema": "openasr.gpu-correctness-trace.v1",
+                    "event": "top_k",
+                    "step_index": step_index,
+                    "items": items,
+                    "top1_top2_margin": margin,
+                    "compute": compute,
+                })
+                .to_string(),
+            );
+        }
         self.record_trace_event(
             serde_json::json!({
                 "schema": "openasr.gpu-correctness-trace.v1",
