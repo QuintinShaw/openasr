@@ -17,7 +17,10 @@
 #   OPENASR_CNB_REPO     default openasr/openasr
 #   OPENASR_CNB_API      default https://api.cnb.cool
 #   OPENASR_CNB_STRICT=1 fail the caller on CNB errors
-#   GITHUB_REPOSITORY    source GitHub repo (default QuintinShaw/openasr)
+#   OPENASR_CNB_GITHUB_REPO  git+release source (default QuintinShaw/openasr).
+#                            Never inherit GITHUB_REPOSITORY: desktop CI runs in
+#                            private openasr-org/openasr-app and must not fetch
+#                            or push that repo's desktop-v* tags onto public CNB.
 
 set -euo pipefail
 
@@ -48,7 +51,7 @@ fi
 
 CNB_REPO="${OPENASR_CNB_REPO:-openasr/openasr}"
 CNB_API="${OPENASR_CNB_API:-https://api.cnb.cool}"
-GITHUB_REPO="${GITHUB_REPOSITORY:-QuintinShaw/openasr}"
+GITHUB_REPO="${OPENASR_CNB_GITHUB_REPO:-QuintinShaw/openasr}"
 ACCEPT="application/vnd.cnb.api+json"
 
 cnb_curl() {
