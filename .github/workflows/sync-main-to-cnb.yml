@@ -1,0 +1,31 @@
+name: Sync main to CNB
+
+# One-way fast-forward of GitHub main onto cnb.cool/openasr/openasr.
+# Never --mirror / --prune: CNB also stores desktop-v* tags that GitHub does
+# not have. Release assets still go through scripts/sync-release-to-cnb.sh.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: sync-main-to-cnb
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    if: github.repository == 'QuintinShaw/openasr'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fast-forward CNB main
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+        run: scripts/sync-main-to-cnb.sh HEAD
