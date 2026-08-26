@@ -14,8 +14,10 @@ It is the server side of the default catalog URL:
   no longer required to serve clients.
 - **It is not a trust anchor.** Bytes are served verbatim; the client verifies the
   ed25519 signature, the sha256, and the monotonic epoch. The signed `catalog_url`
-  stays HF-canonical purely as a verification identity, so hosting on CF needs **no
-  re-sign / signing seed** beyond the normal catalog publish step.
+  is always `https://catalog.openasr.org/v1/catalog.json`. `catalog.bug.im` is a
+  byte-identical Aliyun ESA replica (same two JSON files, no 302, no rewrite);
+  clients fetch it by setting `OPENASR_CATALOG_ENDPOINT=https://catalog.bug.im`
+  while verification still uses the `catalog.openasr.org` identity.
 - **Offline still works.** If `catalog.openasr.org` is unreachable, the client falls
   back to its on-disk cache and finally the catalog snapshot embedded in the binary.
 
@@ -50,8 +52,8 @@ npx wrangler login
 npm run deploy       # build:assets (copy from model-registry) -> wrangler deploy
 ```
 
-Clients default to this host; to point elsewhere (self-host, local testing, or
-straight to Hugging Face) set `OPENASR_CATALOG_ENDPOINT`.
+Clients default to this host; China transport sets `OPENASR_CATALOG_ENDPOINT=https://catalog.bug.im`
+(allowlisted). Hugging Face no longer serves the catalog.
 
 ## Caching
 

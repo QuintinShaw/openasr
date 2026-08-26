@@ -58,15 +58,9 @@ pub(crate) const HF_MIRROR_ENDPOINT: &str = "https://hf-mirror.com";
 
 /// First-party Cloudflare Worker that proxies `huggingface.co`'s `OpenASR/*`
 /// `/resolve/...` endpoint and transparently passes through the 302 into the Xet
-/// CDN. Used by [`DownloadSource::Weights`](crate::DownloadSource::Weights) as the
-/// primary China source (self-controlled, no dependency on third-party mirrors)
-/// and as an overseas fallback.
+/// CDN. Used by [`DownloadSource::Weights`](crate::DownloadSource::Weights) as a
+/// China-chain fallback after ModelScope, and as an overseas fallback.
 pub(crate) const WEIGHTS_ENDPOINT: &str = "https://weights.openasr.org";
-
-/// Optional transport host for legacy HF-shaped catalog URLs. The default catalog
-/// URL is already `https://catalog.openasr.org/v1/catalog.json`; this endpoint is
-/// retained for self-host tests and older pinned catalog identities.
-pub(crate) const DEFAULT_CATALOG_ENDPOINT: &str = "https://catalog.openasr.org";
 
 pub(crate) fn apply_default_hf_mirror(url: &str) -> String {
     let endpoint = hf_endpoint().unwrap_or_else(|| HF_MIRROR_ENDPOINT.to_string());
@@ -81,33 +75,22 @@ pub(crate) fn apply_weights_endpoint(url: &str) -> String {
     rewrite_to_mirror(url, Some(WEIGHTS_ENDPOINT))
 }
 
-/// Rewrite only legacy `https://huggingface.co/...` catalog identities onto the
-/// configured catalog endpoint. The current default `/v1/catalog.json` source is
-/// already on `catalog.openasr.org`, so it passes through unchanged.
+/// Rewrite the signed catalog identity onto the China replica (or an
+/// allowlisted `OPENASR_CATALOG_ENDPOINT`). Verification still uses `url`.
 pub(crate) fn apply_catalog_endpoint(url: &str) -> String {
-    rewrite_to_mirror(url, Some(catalog_endpoint().as_str()))
+    crate::transport::apply_catalog_endpoint(url)
 }
 
-/// Read a transport-endpoint override from `var`, normalised (trimmed, no trailing
-/// slash); `None` when unset or empty. Shared by [`hf_endpoint`] and
-/// [`catalog_endpoint`] so both knobs parse identically.
-fn endpoint_from_env(var: &str) -> Option<String> {
-    std::env::var(var)
-        .ok()
-        .map(|value| value.trim().trim_end_matches('/').to_string())
-        .filter(|value| !value.is_empty())
+pub(crate) fn apply_modelscope_endpoint(url: &str) -> Option<String> {
+    crate::transport::apply_modelscope_endpoint(url)
+}
+
+pub(crate) fn apply_dl_endpoint(url: &str) -> String {
+    crate::transport::apply_dl_endpoint(url)
 }
 
 fn hf_endpoint() -> Option<String> {
-    endpoint_from_env("HF_ENDPOINT")
-}
-
-/// The catalog transport host: `OPENASR_CATALOG_ENDPOINT` if set, else the
-/// built-in [`DEFAULT_CATALOG_ENDPOINT`]. Unlike [`hf_endpoint`] this never
-/// resolves to `None` — the catalog is always fetched from Cloudflare, never HF.
-fn catalog_endpoint() -> String {
-    endpoint_from_env("OPENASR_CATALOG_ENDPOINT")
-        .unwrap_or_else(|| DEFAULT_CATALOG_ENDPOINT.to_string())
+    crate::transport::hf_endpoint_env()
 }
 
 fn rewrite_to_mirror(url: &str, endpoint: Option<&str>) -> String {
@@ -128,7 +111,7 @@ pub(crate) fn apply_hf_mirror_redirect_with_endpoint(
 }
 
 pub(crate) fn hf_endpoint_is_set() -> bool {
-    hf_endpoint().is_some()
+    crate::transport::hf_endpoint_is_set()
 }
 
 pub(crate) fn is_allowed_mirror_host(url: &str) -> bool {
@@ -200,10 +183,8 @@ fn split_scheme_host(url: &str) -> Option<(&str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DEFAULT_CATALOG_ENDPOINT, rewrite_cdn_redirect_to_mirror, rewrite_to_mirror,
-        split_scheme_host,
-    };
+    use super::{rewrite_cdn_redirect_to_mirror, rewrite_to_mirror, split_scheme_host};
+    use crate::transport::CANONICAL_CATALOG_ENDPOINT;
 
     #[test]
     fn rewrites_only_huggingface_host_and_only_when_endpoint_set() {
@@ -228,25 +209,25 @@ mod tests {
         // is preserved verbatim.
         let pinned = "https://huggingface.co/OpenASR/catalog/resolve/main/catalog.json";
         assert_eq!(
-            rewrite_to_mirror(pinned, Some(DEFAULT_CATALOG_ENDPOINT)),
+            rewrite_to_mirror(pinned, Some(CANONICAL_CATALOG_ENDPOINT)),
             "https://catalog.openasr.org/OpenASR/catalog/resolve/main/catalog.json"
         );
         // The sibling signature object rides the same host swap.
         let signature =
             "https://huggingface.co/OpenASR/catalog/resolve/main/catalog.signature.json";
         assert_eq!(
-            rewrite_to_mirror(signature, Some(DEFAULT_CATALOG_ENDPOINT)),
+            rewrite_to_mirror(signature, Some(CANONICAL_CATALOG_ENDPOINT)),
             "https://catalog.openasr.org/OpenASR/catalog/resolve/main/catalog.signature.json"
         );
         // Custom / local catalog sources are never rewritten onto the endpoint.
         assert_eq!(
-            rewrite_to_mirror("file:///tmp/catalog.json", Some(DEFAULT_CATALOG_ENDPOINT)),
+            rewrite_to_mirror("file:///tmp/catalog.json", Some(CANONICAL_CATALOG_ENDPOINT)),
             "file:///tmp/catalog.json"
         );
         assert_eq!(
             rewrite_to_mirror(
                 "https://example.com/catalog.json",
-                Some(DEFAULT_CATALOG_ENDPOINT)
+                Some(CANONICAL_CATALOG_ENDPOINT)
             ),
             "https://example.com/catalog.json"
         );

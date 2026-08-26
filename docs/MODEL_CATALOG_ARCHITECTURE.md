@@ -198,12 +198,13 @@ because `public` is the download/import gate, not the ASR market-list gate. The
 catalog's URLs stay pinned to `huggingface.co` as
 the signed, canonical *identity*; the client rewrites only the transport *host*
 via `http::apply_catalog_endpoint`, controlled by `OPENASR_CATALOG_ENDPOINT`
-(default `https://catalog.openasr.org`; override only for a self-host/mirror).
-Because the signed `catalog_url` is unchanged, the host is an availability layer,
-not a trust anchor — moving it needs no re-sign or signing seed. This is
-independent of `HF_ENDPOINT`, which routes weight downloads only. Deploys are
-automated by the `deploy-catalog` workflow on push; signing stays local (the seed
-never enters CI).
+(allowlist: `https://catalog.openasr.org` — a no-op — and
+`https://catalog.bug.im`, the Aliyun ESA byte-identical replica). The signed
+`catalog_url` is always `https://catalog.openasr.org/v1/catalog.json`; swapping
+the fetch host needs no re-sign. This is independent of `HF_ENDPOINT`, which
+routes weight downloads only. Deploys push the same two JSON files to Cloudflare
+and, when `esa-cli` is logged in, to ESA; ESA never origin-fetches Cloudflare.
+Signing stays local (the seed never enters CI).
 
 ## Cache And Rollback Boundary
 

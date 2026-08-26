@@ -376,3 +376,9 @@ gh release edit "$tag" --repo "$repository" --draft=false --latest
 scripts/qualification-release-lock.sh release "$tag" "$lock_token"
 lock_acquired=false
 echo "RELEASE-PUBLISHED-INERT ${tag}"
+
+# China mirror: GitHub stays the signed source. Missing CNB_TOKEN skips.
+if [ -x "${REPO_ROOT}/scripts/sync-release-to-cnb.sh" ]; then
+  echo "==> syncing ${tag} assets to CNB (skip if no CNB_TOKEN)"
+  "${REPO_ROOT}/scripts/sync-release-to-cnb.sh" "$tag" || echo "CNB sync returned non-zero (overseas release already public)"
+fi

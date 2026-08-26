@@ -600,6 +600,7 @@ fn hf_token_only_attaches_to_the_huggingface_host() {
     assert!(!hf_token_allowed_for_host(Some("cdn-lfs.huggingface.co")));
     assert!(!hf_token_allowed_for_host(Some("hf-mirror.com")));
     assert!(!hf_token_allowed_for_host(Some("modelscope.cn")));
+    assert!(!hf_token_allowed_for_host(Some("www.modelscope.cn")));
     // The weights worker and the Xet CDN it forwards to are always anonymous.
     assert!(!hf_token_allowed_for_host(Some("weights.openasr.org")));
     assert!(!hf_token_allowed_for_host(Some("us.aws.cdn.hf.co")));
@@ -958,6 +959,46 @@ fn pull_falls_back_to_next_source_after_sha_mismatch() {
     let paths = paths_for(temp.path(), &resolved);
     assert!(paths.final_path.exists());
     assert!(!paths.partial_path.exists());
+}
+
+#[test]
+fn china_chain_tries_modelscope_before_direct_hf() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let mut client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 404,
+            body: Vec::new(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: bytes.clone(),
+        },
+    ]);
+
+    let installed = pull_model_pack_with_client_sources_and_cancel(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::default(),
+        &[DownloadSource::ModelScope, DownloadSource::Hf],
+        None,
+        None,
+        |_| {},
+        || false,
+        || false,
+    )
+    .unwrap();
+
+    assert_eq!(installed.pull, "moonshine-tiny:q8");
+    assert_eq!(
+        client.urls(),
+        vec![
+            "https://www.modelscope.cn/models/openasr/moonshine-tiny/resolve/master/moonshine-tiny-q8_0.oasr".to_string(),
+            resolved.url.clone(),
+        ]
+    );
 }
 
 #[test]
@@ -3989,7 +4030,7 @@ fn backend_pack_resume_survives_process_boundary_metadata_reload() {
         attempts: 1,
         ranges: Vec::new(),
     };
-    download_backend_file(&mut replacement, file, &dest, &mut |_| {}).unwrap();
+    download_backend_file(&mut replacement, file, &dest, &mut |_| {}, None).unwrap();
     assert_eq!(replacement.ranges(), vec![Some(700)]);
     assert_eq!(fs::read(dest).unwrap(), plugin);
     assert!(!partial.exists());

@@ -1,10 +1,8 @@
 use std::env;
-#[cfg(unix)]
-use std::fs;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ResolvedCatalogPull, http};
+use crate::{ResolvedCatalogPull, http, transport};
 
 const DOWNLOAD_SOURCE_ENV: &str = "OPENASR_DOWNLOAD_SOURCE";
 
@@ -23,6 +21,12 @@ pub enum DownloadSource {
     /// bearer token is never sent to the worker.
     #[serde(rename = "weights")]
     Weights,
+    /// ModelScope resolve URL derived from the signed Hugging Face pack URL.
+    /// Not a catalog identity: owner is the live ModelScope org `openasr`,
+    /// path `/models/<owner>/<repo>/resolve/<rev>/<file>`. User-facing config
+    /// stays `china` / `global`; this variant is the China-chain primary.
+    #[serde(rename = "modelscope")]
+    ModelScope,
 }
 
 impl DownloadSource {
@@ -31,6 +35,7 @@ impl DownloadSource {
             "hf" | "huggingface" | "hugging-face" => Some(Self::Hf),
             "hf-mirror" | "hf_mirror" | "mirror" => Some(Self::HfMirror),
             "weights" | "openasr" | "openasr-weights" => Some(Self::Weights),
+            "modelscope" | "ms" => Some(Self::ModelScope),
             _ => None,
         }
     }
@@ -40,6 +45,7 @@ impl DownloadSource {
             Self::Hf => "hf",
             Self::HfMirror => "hf-mirror",
             Self::Weights => "weights",
+            Self::ModelScope => "modelscope",
         }
     }
 
@@ -48,6 +54,7 @@ impl DownloadSource {
             Self::Hf => Some(pull.url.clone()),
             Self::HfMirror => Some(http::apply_default_hf_mirror(&pull.url)),
             Self::Weights => Some(http::apply_weights_endpoint(&pull.url)),
+            Self::ModelScope => http::apply_modelscope_endpoint(&pull.url),
         }
     }
 }
@@ -67,7 +74,7 @@ pub enum DownloadSourcePref {
     /// which performs its own single-point China detection (language OR
     /// timezone) in the frontend and hands the boolean result down here --
     /// core never re-derives the region for this variant, it just orders the
-    /// same three-source chain [`auto_source_chain`] would for that verdict.
+    /// same region chain [`auto_source_chain`] would for that verdict.
     AutoRegion {
         prefer_china: bool,
     },
@@ -95,14 +102,19 @@ impl DownloadSourcePref {
                 prefer_china: false,
             });
         }
-        DownloadSource::parse(value).map(Self::pinned)
+        DownloadSource::parse(value).and_then(|source| match source {
+            // User-facing knobs stay china/global. ModelScope is the China-chain
+            // primary, not a pin the settings UI or config.json should name.
+            DownloadSource::ModelScope => None,
+            other => Some(Self::pinned(other)),
+        })
     }
 }
 
 pub fn resolve_chain(pref: &DownloadSourcePref) -> Vec<DownloadSource> {
     match pref {
         DownloadSourcePref::Pinned { source } => vec![*source],
-        DownloadSourcePref::Auto => auto_source_chain(locale_prefers_china_sources()),
+        DownloadSourcePref::Auto => auto_source_chain(transport::locale_prefers_china_sources()),
         DownloadSourcePref::AutoRegion { prefer_china } => auto_source_chain(*prefer_china),
     }
 }
@@ -114,7 +126,7 @@ pub(crate) fn source_chain_from_env() -> Vec<DownloadSource> {
     {
         return resolve_chain(&pref);
     }
-    default_source_chain(http::hf_endpoint_is_set(), locale_prefers_china_sources())
+    default_source_chain(http::hf_endpoint_is_set(), transport::locale_prefers_china_sources())
 }
 
 fn default_source_chain(hf_endpoint_set: bool, prefer_china: bool) -> Vec<DownloadSource> {
@@ -133,67 +145,22 @@ fn default_source_chain(hf_endpoint_set: bool, prefer_china: bool) -> Vec<Downlo
 
 fn auto_source_chain(prefer_china: bool) -> Vec<DownloadSource> {
     if prefer_china {
-        // huggingface.co is walled from China networks (resolve times out), so lead
-        // with the first-party worker we control, keep hf-mirror.com as a deeper
-        // fallback (no longer a single point of failure), and try the direct source
-        // last.
+        // huggingface.co is walled from China networks, so lead with ModelScope
+        // (same bytes, signed sha256), then the first-party worker, hf-mirror,
+        // and the direct source last.
         vec![
+            DownloadSource::ModelScope,
             DownloadSource::Weights,
             DownloadSource::HfMirror,
             DownloadSource::Hf,
         ]
     } else {
-        // Overseas the direct source is reachable and carries zero worker load, so
-        // it leads; the worker and mirror are fallbacks.
         vec![
             DownloadSource::Hf,
             DownloadSource::Weights,
             DownloadSource::HfMirror,
         ]
     }
-}
-
-fn locale_prefers_china_sources() -> bool {
-    ["LC_ALL", "LC_MESSAGES", "LANG"]
-        .iter()
-        .filter_map(|key| env::var(key).ok())
-        .any(|value| locale_value_prefers_china_sources(&value))
-        || env::var("TZ")
-            .ok()
-            .is_some_and(|value| timezone_value_prefers_china_sources(&value))
-        || system_timezone_prefers_china_sources()
-}
-
-fn locale_value_prefers_china_sources(value: &str) -> bool {
-    value.to_ascii_lowercase().starts_with("zh")
-}
-
-fn timezone_value_prefers_china_sources(value: &str) -> bool {
-    let normalized = value.to_ascii_lowercase().replace('\\', "/");
-    [
-        "asia/shanghai",
-        "asia/chongqing",
-        "asia/harbin",
-        "asia/urumqi",
-        "asia/hong_kong",
-        "asia/macau",
-        "prc",
-    ]
-    .iter()
-    .any(|needle| normalized.ends_with(needle) || normalized.contains(&format!("/{needle}")))
-}
-
-#[cfg(unix)]
-fn system_timezone_prefers_china_sources() -> bool {
-    fs::read_link("/etc/localtime")
-        .ok()
-        .and_then(|path| path.to_str().map(str::to_owned))
-        .is_some_and(|value| timezone_value_prefers_china_sources(&value))
-}
-
-#[cfg(not(unix))]
-fn system_timezone_prefers_china_sources() -> bool {
-    false
 }
 
 #[cfg(test)]
@@ -232,12 +199,11 @@ mod tests {
     }
 
     #[test]
-    fn china_context_leads_with_weights_then_mirror_then_direct() {
-        // China: first-party worker primary, hf-mirror.com a deeper fallback (no
-        // longer the single point of failure), huggingface.co last.
+    fn china_context_leads_with_modelscope_then_weights_then_mirror_then_direct() {
         assert_eq!(
             default_source_chain(false, true),
             vec![
+                DownloadSource::ModelScope,
                 DownloadSource::Weights,
                 DownloadSource::HfMirror,
                 DownloadSource::Hf,
@@ -286,12 +252,12 @@ mod tests {
         // anonymous worker because huggingface.co is walled regardless of token.
         assert_eq!(
             resolve_chain(&DownloadSourcePref::Auto),
-            auto_source_chain(locale_prefers_china_sources())
+            auto_source_chain(transport::locale_prefers_china_sources())
         );
         assert_eq!(auto_source_chain(false).first(), Some(&DownloadSource::Hf));
         assert_eq!(
             auto_source_chain(true).first(),
-            Some(&DownloadSource::Weights)
+            Some(&DownloadSource::ModelScope)
         );
     }
 
@@ -377,12 +343,16 @@ mod tests {
 
     #[test]
     fn chinese_locale_and_timezone_prefer_china_sources() {
-        assert!(locale_value_prefers_china_sources("zh-Hans_US.UTF-8"));
-        assert!(timezone_value_prefers_china_sources(
+        assert!(transport::locale_value_prefers_china_sources("zh-Hans_US.UTF-8"));
+        assert!(transport::locale_value_prefers_china_sources("zh_CN.UTF-8"));
+        assert!(!transport::locale_value_prefers_china_sources("zh_TW.UTF-8"));
+        assert!(transport::timezone_value_prefers_china_sources(
             "/var/db/timezone/zoneinfo/Asia/Shanghai"
         ));
-        assert!(!locale_value_prefers_china_sources("C.UTF-8"));
-        assert!(!timezone_value_prefers_china_sources("America/Los_Angeles"));
+        assert!(!transport::locale_value_prefers_china_sources("C.UTF-8"));
+        assert!(!transport::timezone_value_prefers_china_sources(
+            "America/Los_Angeles"
+        ));
     }
 
     #[test]
@@ -401,8 +371,13 @@ mod tests {
             Some(DownloadSource::Weights)
         );
         assert_eq!(DownloadSource::Weights.as_env_value(), "weights");
-        assert_eq!(DownloadSource::parse("modelscope"), None);
+        assert_eq!(
+            DownloadSource::parse("modelscope"),
+            Some(DownloadSource::ModelScope)
+        );
+        assert_eq!(DownloadSource::ModelScope.as_env_value(), "modelscope");
         assert_eq!(DownloadSourcePref::parse_env_value("ms"), None);
+        assert_eq!(DownloadSourcePref::parse_env_value("modelscope"), None);
         assert_eq!(
             DownloadSourcePref::parse_env_value("auto"),
             Some(DownloadSourcePref::Auto)
@@ -424,6 +399,10 @@ mod tests {
         assert_eq!(
             DownloadSource::Weights.url_for(&pull),
             Some("https://weights.openasr.org/OpenASR/moonshine-tiny/resolve/0123456789abcdef0123456789abcdef01234567/moonshine-tiny-q8_0.oasr".to_string())
+        );
+        assert_eq!(
+            DownloadSource::ModelScope.url_for(&pull),
+            Some("https://www.modelscope.cn/models/openasr/moonshine-tiny/resolve/master/moonshine-tiny-q8_0.oasr".to_string())
         );
     }
 }

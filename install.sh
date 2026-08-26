@@ -124,7 +124,29 @@ info "installing openasr $version ($target) to $prefix"
 # -- Download + verify --------------------------------------------------------
 
 asset="openasr-${version_num}-${target}.tar.gz"
-base_url="$GITHUB/$REPO/releases/download/$version"
+github_base="$GITHUB/$REPO/releases/download/$version"
+china_base="https://dl.bug.im/cli/$version"
+
+china_transport() {
+  ds="$(printf '%s' "${OPENASR_DOWNLOAD_SOURCE-}" | tr 'A-Z' 'a-z')"
+  case "$ds" in
+    china) return 0 ;;
+    global) return 1 ;;
+  esac
+  loc="$(printf '%s' "${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}" | tr 'A-Z' 'a-z')"
+  loc_lang="$(printf '%s' "$loc" | sed 's/[.@].*//; s/-/_/g')"
+  case "$loc_lang" in
+    zh|zh_cn|zh_cn_*|zh_hans|zh_hans_*) return 0 ;;
+  esac
+  tz="$(printf '%s' "${TZ:-}" | tr 'A-Z' 'a-z' | tr '\\' '/')"
+  if [ -z "$tz" ] && [ -L /etc/localtime ]; then
+    tz="$(readlink /etc/localtime 2>/dev/null | tr 'A-Z' 'a-z' | tr '\\' '/')"
+  fi
+  case "$tz" in
+    *asia/shanghai* | *asia/chongqing* | *asia/harbin* | *asia/urumqi* | *asia/hong_kong* | *asia/macau* | prc) return 0 ;;
+  esac
+  return 1
+}
 
 workdir="$(mktemp -d)"
 cleanup() {
@@ -136,10 +158,19 @@ archive="$workdir/$asset"
 sums="$workdir/SHA256SUMS"
 
 info "downloading $asset"
-curl -fsSL -o "$archive" "$base_url/$asset" \
-  || err "download failed: $base_url/$asset (check that $version shipped a $target build)"
-curl -fsSL -o "$sums" "$base_url/SHA256SUMS" \
-  || err "download failed: $base_url/SHA256SUMS"
+if china_transport; then
+  if ! curl -fsSL -o "$archive" "$china_base/$asset"; then
+    info "China mirror missed $asset; falling back to GitHub"
+    curl -fsSL -o "$archive" "$github_base/$asset" \
+      || err "download failed: $github_base/$asset (check that $version shipped a $target build)"
+  fi
+else
+  curl -fsSL -o "$archive" "$github_base/$asset" \
+    || err "download failed: $github_base/$asset (check that $version shipped a $target build)"
+fi
+# Checksums always come from official GitHub, never from an accelerator.
+curl -fsSL -o "$sums" "$github_base/SHA256SUMS" \
+  || err "download failed: $github_base/SHA256SUMS"
 
 expected_line="$(grep -F " $asset" "$sums" || true)"
 [ -n "$expected_line" ] || err "SHA256SUMS has no entry for $asset -- refusing to install an unverifiable binary"

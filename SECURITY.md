@@ -55,10 +55,12 @@ Bundled model cards are metadata-only planning/provenance records and are non-do
 When a flow does fetch the model catalog (an explicit `pull`, or a
 consent-approved auto-install during `transcribe`/`live` — never silently), the catalog is served from
 OpenASR-operated infrastructure at `https://catalog.openasr.org` (a Cloudflare
-static-asset host) rather than Hugging Face. The signed `catalog_url` stays
-HF-canonical only as the verification identity; the ed25519 signature, sha256, and
-monotonic-epoch checks are unchanged, and model **weights are still fetched
-directly from Hugging Face** (the catalog host never sees or serves weights). Only
+static-asset host) rather than Hugging Face. The signed `catalog_url` is always
+`https://catalog.openasr.org/v1/catalog.json`; `catalog.bug.im` is an allowlisted
+fetch replica, not a second identity. The ed25519 signature, sha256, and
+monotonic-epoch checks are unchanged. Model **weights stay identified by the
+signed Hugging Face pack URL**; China transport may fetch the same bytes from
+ModelScope. The catalog host never sees or serves weights. Only
 the **public** projection is served/embedded — staged `public:false` entries are
 never exposed. It is not usage telemetry — only the catalog index is requested —
 but the catalog fetch's network metadata (e.g. client IP) is observable by the

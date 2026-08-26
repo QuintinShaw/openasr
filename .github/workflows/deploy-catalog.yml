@@ -50,6 +50,10 @@ on:
     secrets:
       CLOUDFLARE_API_TOKEN:
         required: true
+      ALIBABA_CLOUD_ACCESS_KEY_ID:
+        required: false
+      ALIBABA_CLOUD_ACCESS_KEY_SECRET:
+        required: false
 concurrency:
   group: deploy-catalog
   cancel-in-progress: false
@@ -392,6 +396,21 @@ jobs:
             echo "::error::live catalog exposes public:false entries"; exit 1
           fi
           echo "live catalog.openasr.org matches the committed public projection (public-only)"
+
+      - name: Deploy identical bytes to Aliyun ESA (catalog.bug.im)
+        env:
+          ALIBABA_CLOUD_ACCESS_KEY_ID: ${{ secrets.ALIBABA_CLOUD_ACCESS_KEY_ID }}
+          ALIBABA_CLOUD_ACCESS_KEY_SECRET: ${{ secrets.ALIBABA_CLOUD_ACCESS_KEY_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ALIBABA_CLOUD_ACCESS_KEY_ID:-}" ] && [ -n "${ALIBABA_CLOUD_ACCESS_KEY_SECRET:-}" ]; then
+            npm install -g esa-cli
+          fi
+          chmod +x scripts/deploy-catalog-esa.sh
+          # Skip (exit 0) when esa-cli is missing, not logged in, or live HTTPS
+          # is unreachable. Reachable catalog.bug.im with a sha256 mismatch
+          # fails the job.
+          scripts/deploy-catalog-esa.sh candidate-catalog.json candidate-catalog.signature.json
 
       - name: Record immutable deploy binding
         env:

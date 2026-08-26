@@ -1,0 +1,13 @@
+{
+  // Aliyun ESA twin of catalog.openasr.org. Same shape as bugim-cap/esa.jsonc:
+  // a single bundled ESM entry. Catalog JSON is baked into the bundle (see
+  // scripts/build-esa.mjs) so ESA never origin-fetches Cloudflare.
+  "name": "openasr-catalog",
+  "description": "catalog.bug.im — signed OpenASR catalog replica (byte-identical to catalog.openasr.org)",
+  "entry": "./dist/esa/index.js",
+  "codeVersions": [],
+  "dev": {
+    "port": 18070,
+    "localUpstream": ""
+  }
+}

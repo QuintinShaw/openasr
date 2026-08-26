@@ -49,15 +49,13 @@ const HTTP_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_LOW_SPEED_TIMEOUT: Duration = Duration::from_secs(60);
 const DOWNLOAD_LOW_SPEED_MIN_BYTES: u64 = 64 * 1024;
 const DOWNLOAD_USER_AGENT: &str = concat!("OpenASR/", env!("CARGO_PKG_VERSION"));
-/// Fixed segment size for concurrent chunked downloads. 64 MiB amortizes
-/// per-segment overhead (redirect resolution, TLS/connection setup) over a
-/// large body while still giving the default connection count real
-/// parallelism on typical multi-hundred-MB to multi-GB model packs (e.g. a
-/// 300 MB pack still splits into 5 segments at 4 connections). This is a
-/// fixed build-time constant, not an env knob: resumable segment bitmaps
-/// (`SegmentedPartialMeta`) are keyed on it, so changing it is a format
-/// change, not a runtime tuning parameter (see `PARALLEL_META_FORMAT`).
-const DOWNLOAD_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+/// Fixed segment size for concurrent chunked downloads. 8 MiB keeps
+/// per-segment overhead modest while making typical OpenASR packs (tens of
+/// MB) eligible for the default 4 connections (`parallel_download_eligible`
+/// requires `size >= 2 * segment`). Previously 64 MiB, which left common
+/// small packs on a single stream. Changing this must bump
+/// `PARALLEL_META_FORMAT`.
+const DOWNLOAD_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
 /// Default number of concurrent Range connections for chunked downloads.
 const DEFAULT_PULL_CONNECTIONS: usize = 4;
 /// Hard upper clamp on `OPENASR_PULL_CONNECTIONS` so a misconfigured
@@ -132,7 +130,7 @@ const SEGMENT_LOW_SPEED_REFERENCE_CAPACITY: usize = 64;
 /// resume never misreads a legacy (pre-chunking) `PartialMeta` -- or a future
 /// incompatible format -- as a valid segment bitmap. Bumping the segment size
 /// or the bitmap's shape must also bump this string.
-const PARALLEL_META_FORMAT: &str = "segmented-v1";
+const PARALLEL_META_FORMAT: &str = "segmented-v2";
 const BACKEND_STORE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_BACKEND_GC_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -3809,6 +3807,39 @@ impl PullTarget {
             ..self.clone()
         }
     }
+
+    fn for_backend_file(file: &CatalogBackendFile) -> Result<Self, PullError> {
+        validate_sha256("sha256", &file.sha256).map_err(|reason| PullError::InvalidTarget {
+            field: "backend.files.sha256",
+            reason,
+        })?;
+        if file.size_bytes == 0 {
+            return Err(PullError::InvalidTarget {
+                field: "backend.files.size_bytes",
+                reason: "size_bytes must be greater than zero".to_string(),
+            });
+        }
+        if file.filename.contains('/') || file.filename.contains('\\') {
+            return Err(PullError::InvalidTarget {
+                field: "backend.files.filename",
+                reason: "filename must be a local basename".to_string(),
+            });
+        }
+        Ok(Self {
+            model_id: "backend".to_string(),
+            expected_catalog_family_id: None,
+            display_name: file.filename.clone(),
+            quant: "file".to_string(),
+            suffix: String::new(),
+            pull: file.filename.clone(),
+            filename: file.filename.clone(),
+            url: http::apply_dl_endpoint(&file.url),
+            hf_revision: file.sha256.clone(),
+            sha256: file.sha256.clone(),
+            size_bytes: file.size_bytes,
+            source: None,
+        })
+    }
 }
 
 impl PartialMeta {
@@ -5347,9 +5378,10 @@ fn ensure_backend_content_object<C: DownloadClient>(
     file: &CatalogBackendFile,
     home: &Path,
     progress: &mut impl FnMut(PullProgress),
+    parallel: Option<&ParallelDownloadConfig>,
 ) -> Result<BackendContentObject, PullError> {
     let objects_root = home.join("backends").join("_objects");
-    ensure_backend_content_object_in(client, file, &objects_root, None, None, progress)
+    ensure_backend_content_object_in(client, file, &objects_root, None, None, progress, parallel)
 }
 
 fn ensure_backend_content_object_in<C: DownloadClient>(
@@ -5359,6 +5391,7 @@ fn ensure_backend_content_object_in<C: DownloadClient>(
     signed_urls: Option<&[String]>,
     expected_unpacked_size_bytes: Option<u64>,
     progress: &mut impl FnMut(PullProgress),
+    parallel: Option<&ParallelDownloadConfig>,
 ) -> Result<BackendContentObject, PullError> {
     fs::create_dir_all(objects_root).map_err(|source| PullError::Io {
         path: objects_root.to_path_buf(),
@@ -5385,7 +5418,7 @@ fn ensure_backend_content_object_in<C: DownloadClient>(
         if let Some(urls) = signed_urls {
             download_backend_file_from_signed_urls(client, file, urls, &source_path, progress)?;
         } else {
-            download_backend_file(client, file, &source_path, progress)?;
+            download_backend_file(client, file, &source_path, progress, parallel)?;
         }
     }
     preflight_backend_file(&source_path, backend_file_format(file.role)?)?;
@@ -5741,8 +5774,18 @@ pub fn install_backend_pack(
     home: impl AsRef<Path>,
     progress: impl FnMut(PullProgress),
 ) -> Result<InstalledBackend, PullError> {
+    let home = home.as_ref();
     let mut client = HttpDownloadClient::new()?;
-    install_backend_pack_with_client(resolved, home.as_ref(), &mut client, progress)
+    let worker = client.clone();
+    let factory = move || -> Result<BoxedDownloadClient, PullError> {
+        Ok(Box::new(worker.clone()))
+    };
+    let parallel = ParallelDownloadConfig {
+        connections: pull_connections_from_env(),
+        factory: &factory,
+    };
+    let _store_lock = BackendStoreMutationLock::acquire(home)?;
+    install_backend_pack_with_client_locked(resolved, home, &mut client, progress, Some(&parallel))
 }
 
 /// Installs one resolved pack while the caller holds the backend-store
@@ -5756,7 +5799,15 @@ pub(crate) fn install_backend_pack_locked(
     progress: impl FnMut(PullProgress),
 ) -> Result<InstalledBackend, PullError> {
     let mut client = HttpDownloadClient::new()?;
-    install_backend_pack_with_client_locked(resolved, home, &mut client, progress)
+    let worker = client.clone();
+    let factory = move || -> Result<BoxedDownloadClient, PullError> {
+        Ok(Box::new(worker.clone()))
+    };
+    let parallel = ParallelDownloadConfig {
+        connections: pull_connections_from_env(),
+        factory: &factory,
+    };
+    install_backend_pack_with_client_locked(resolved, home, &mut client, progress, Some(&parallel))
 }
 
 /// Conservative logical bytes that must remain reachable while `resolved` is
@@ -6016,6 +6067,7 @@ fn prepare_qualification_archive<C: DownloadClient>(
         Some(&artifact.urls),
         Some(expected_unpacked_size_bytes),
         progress,
+        None,
     )?;
     let object_dir = backend_content_object_dir_in(objects_root, &file);
     let source_path = object_dir.join("source").join(&artifact.file_name);
@@ -6067,6 +6119,14 @@ pub(crate) fn prepare_backend_runtime_objects_locked(
     mut progress: impl FnMut(PullProgress),
 ) -> Result<PreparedBackendRuntimeObjects, PullError> {
     let mut client = HttpDownloadClient::new()?;
+    let worker = client.clone();
+    let factory = move || -> Result<BoxedDownloadClient, PullError> {
+        Ok(Box::new(worker.clone()))
+    };
+    let parallel = ParallelDownloadConfig {
+        connections: pull_connections_from_env(),
+        factory: &factory,
+    };
     let mut dependency_dirs = BTreeSet::new();
     let mut verified_files = Vec::new();
     let mut saw_runtime = false;
@@ -6074,7 +6134,13 @@ pub(crate) fn prepare_backend_runtime_objects_locked(
         match file.role {
             CatalogBackendFileRole::Runtime | CatalogBackendFileRole::Archive => {
                 saw_runtime = true;
-                let object = ensure_backend_content_object(&mut client, file, home, &mut progress)?;
+                let object = ensure_backend_content_object(
+                    &mut client,
+                    file,
+                    home,
+                    &mut progress,
+                    Some(&parallel),
+                )?;
                 let payload = backend_content_object_dir(home, file).join("payload");
                 for materialized in &object.files {
                     let relative = Path::new(&materialized.relative_path);
@@ -6117,7 +6183,7 @@ fn install_backend_pack_with_client<C: DownloadClient>(
 ) -> Result<InstalledBackend, PullError> {
     ensure_backend_cli_version_for_install(resolved)?;
     let _store_lock = BackendStoreMutationLock::acquire(home)?;
-    install_backend_pack_with_client_locked(resolved, home, client, progress)
+    install_backend_pack_with_client_locked(resolved, home, client, progress, None)
 }
 
 fn ensure_backend_cli_version_for_install(
@@ -6142,6 +6208,7 @@ fn install_backend_pack_with_client_locked<C: DownloadClient>(
     home: &Path,
     client: &mut C,
     mut progress: impl FnMut(PullProgress),
+    parallel: Option<&ParallelDownloadConfig>,
 ) -> Result<InstalledBackend, PullError> {
     ensure_backend_cli_version_for_install(resolved)?;
     let vendor = backend_vendor_dirname(resolved.vendor)?;
@@ -6188,7 +6255,7 @@ fn install_backend_pack_with_client_locked<C: DownloadClient>(
         let materialized_files = match file.role {
             CatalogBackendFileRole::Plugin => {
                 let dest = staging_dir.join(&file.filename);
-                download_backend_file(client, file, &dest, &mut progress)?;
+                download_backend_file(client, file, &dest, &mut progress, parallel)?;
                 preflight_backend_file(&dest, backend_file_format(file.role)?)?;
                 vec![InstalledBackendMaterializedFile {
                     relative_path: file.filename.clone(),
@@ -6197,7 +6264,7 @@ fn install_backend_pack_with_client_locked<C: DownloadClient>(
                 }]
             }
             CatalogBackendFileRole::Runtime | CatalogBackendFileRole::Archive => {
-                let object = ensure_backend_content_object(client, file, home, &mut progress)?;
+                let object = ensure_backend_content_object(client, file, home, &mut progress, parallel)?;
                 materialize_backend_content_object(home, &staging_dir, file, &object)?
             }
             CatalogBackendFileRole::Unknown => {
@@ -6604,6 +6671,71 @@ fn prune_empty_directories(root: &Path) {
     }
 }
 
+fn pull_paths_for_backend_dest(dest: &Path) -> Result<PullPaths, PullError> {
+    let (partial, partial_meta) = backend_partial_paths(dest)?;
+    let stem = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| PullError::InvalidTarget {
+            field: "backend.files.filename",
+            reason: format!("'{}' has no UTF-8 file name", dest.display()),
+        })?;
+    let dir = dest.parent().map(Path::to_path_buf).ok_or_else(|| {
+        PullError::InvalidTarget {
+            field: "backend install path",
+            reason: "destination has no parent".to_string(),
+        }
+    })?;
+    Ok(PullPaths {
+        partial_path: partial,
+        partial_meta_path: partial_meta,
+        partial_segments_meta_path: dest.with_file_name(format!(".{stem}.partial.segments.json")),
+        installed_meta_path: dest.with_file_name(format!(".{stem}.installed.json")),
+        lock_path: dest.with_file_name(format!(".{stem}.pull.lock")),
+        dir,
+        final_path: dest.to_path_buf(),
+    })
+}
+
+fn download_backend_file_via_pull<C: DownloadClient>(
+    client: &mut C,
+    file: &CatalogBackendFile,
+    dest: &Path,
+    progress: &mut impl FnMut(PullProgress),
+    parallel: Option<&ParallelDownloadConfig>,
+) -> Result<(), PullError> {
+    let target = PullTarget::for_backend_file(file)?;
+    ensure_https_url(&target.url)?;
+    let paths = pull_paths_for_backend_dest(dest)?;
+    let downloaded = download_with_retries(
+        &target,
+        &paths,
+        client,
+        PullOptions::default(),
+        parallel,
+        progress,
+        &|| false,
+        &|| false,
+    )?;
+    if !downloaded.sha256.eq_ignore_ascii_case(&file.sha256) {
+        cleanup_partial(&paths);
+        return Err(PullError::ShaMismatch {
+            path: dest.to_path_buf(),
+            expected: file.sha256.clone(),
+            actual: downloaded.sha256,
+        });
+    }
+    atomic_file::replace_file_atomically(&paths.partial_path, dest).map_err(|source| {
+        PullError::Io {
+            path: dest.to_path_buf(),
+            source,
+        }
+    })?;
+    let _ = fs::remove_file(&paths.partial_meta_path);
+    let _ = fs::remove_file(&paths.partial_segments_meta_path);
+    Ok(())
+}
+
 /// Download a single backend-pack file (plugin binary or archive) to `dest`,
 /// streamed to a `.partial` file and sha256-verified before the atomic
 /// rename -- the backend-pack analogue of the model-pack single-stream path
@@ -6641,7 +6773,7 @@ fn download_backend_file_from_signed_urls<C: DownloadClient>(
         }
         let mut candidate = file.clone();
         candidate.url.clone_from(url);
-        match download_backend_file(client, &candidate, dest, progress) {
+        match download_backend_file(client, &candidate, dest, progress, None) {
             Ok(()) => return Ok(()),
             Err(error)
                 if matches!(
@@ -6666,12 +6798,16 @@ fn download_backend_file<C: DownloadClient>(
     file: &CatalogBackendFile,
     dest: &Path,
     progress: &mut impl FnMut(PullProgress),
+    parallel: Option<&ParallelDownloadConfig>,
 ) -> Result<(), PullError> {
     if backend_file_matches(dest, file) {
         return Ok(());
     }
     if let Some(local_path) = file.url.strip_prefix("file://") {
         return copy_local_backend_file(Path::new(local_path), dest, file, progress);
+    }
+    if let Some(parallel) = parallel {
+        return download_backend_file_via_pull(client, file, dest, progress, Some(parallel));
     }
     // The parent pack/object directory is already keyed by the full artifact
     // digest. Keep the leaf short enough for Windows MAX_PATH-era tools while
@@ -6820,7 +6956,7 @@ fn download_backend_file_attempt<C: DownloadClient>(
         *expected_etag = persisted_etag;
     }
     let response = client.open(
-        &file.url,
+        &http::apply_dl_endpoint(&file.url),
         (resume_from > 0).then(|| ByteRange::from_start(resume_from)),
     )?;
 
