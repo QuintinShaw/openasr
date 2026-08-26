@@ -6172,6 +6172,7 @@ pub(crate) fn prepare_backend_runtime_objects_locked(
     })
 }
 
+#[cfg(test)]
 fn install_backend_pack_with_client<C: DownloadClient>(
     resolved: &ResolvedCatalogBackendPull,
     home: &Path,

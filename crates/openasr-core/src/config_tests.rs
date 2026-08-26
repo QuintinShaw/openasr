@@ -471,8 +471,10 @@ fn download_source_rejects_unknown_value() {
 
 #[test]
 fn download_source_validate_rejects_hand_edited_modelscope_pin() {
-    let mut config = OpenAsrConfig::default();
-    config.download_source = DownloadSourcePref::pinned(DownloadSource::ModelScope);
+    let config = OpenAsrConfig {
+        download_source: DownloadSourcePref::pinned(DownloadSource::ModelScope),
+        ..OpenAsrConfig::default()
+    };
     let error = config.validate(&registry()).unwrap_err();
     assert!(
         matches!(error, ConfigError::UnsupportedDownloadSource(value) if value == "modelscope")

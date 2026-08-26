@@ -27,8 +27,6 @@ pub const MODELSCOPE_ORIGIN: &str = "https://www.modelscope.cn";
 /// policy`). Integrity stays the signed catalog sha256, not this branch name.
 pub const MODELSCOPE_DEFAULT_REVISION: &str = "master";
 
-pub(crate) const HUGGING_FACE_ORIGIN: &str = "https://huggingface.co";
-
 const ALLOWED_CATALOG_ENDPOINTS: &[&str] = &[CANONICAL_CATALOG_ENDPOINT, CHINA_CATALOG_ENDPOINT];
 const ALLOWED_DL_ENDPOINTS: &[&str] = &[CANONICAL_DL_ENDPOINT, CHINA_DL_ENDPOINT];
 
@@ -82,10 +80,10 @@ pub(crate) fn hf_endpoint_is_set() -> bool {
 /// endpoint. Desktop should set the env knobs from its one China toggle so
 /// this process and the sidecar daemon agree.
 pub fn prefer_china_transport() -> bool {
-    if let Some(endpoint) = endpoint_from_env(CATALOG_ENDPOINT_ENV) {
-        if is_allowed_https_endpoint(&endpoint, ALLOWED_CATALOG_ENDPOINTS) {
-            return endpoint == CHINA_CATALOG_ENDPOINT;
-        }
+    if let Some(endpoint) = endpoint_from_env(CATALOG_ENDPOINT_ENV)
+        && is_allowed_https_endpoint(&endpoint, ALLOWED_CATALOG_ENDPOINTS)
+    {
+        return endpoint == CHINA_CATALOG_ENDPOINT;
     }
     match env::var("OPENASR_DOWNLOAD_SOURCE")
         .ok()
@@ -267,6 +265,7 @@ mod tests {
 
     const IDENTITY: &str = "https://catalog.openasr.org/v1/catalog.json";
     const SIGNATURE: &str = "https://catalog.openasr.org/v1/catalog.signature.json";
+    const HUGGING_FACE_ORIGIN: &str = "https://huggingface.co";
     const HF_PACK: &str = "https://huggingface.co/OpenASR/moonshine-tiny/resolve/0123456789abcdef0123456789abcdef01234567/moonshine-tiny-q8_0.oasr";
 
     #[test]
