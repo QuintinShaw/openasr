@@ -813,6 +813,7 @@ impl SenseVoiceEncoderGraph {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compose_lfr_graph<'a>(
     graph: &mut GgmlCpuGraphBuilder<'a>,
     metadata: SenseVoiceExecutionMetadata,

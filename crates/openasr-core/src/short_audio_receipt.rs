@@ -2819,10 +2819,12 @@ mod tests {
         };
         super::validate_decode_diagnostics(&diagnostics)
             .expect("329 X-ASR device-head frames must fit the receipt bound");
-        assert!(
-            SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS >= 2048,
-            "longform CTC/RNN-T frames on the 69s fixture must stay in-bound"
-        );
+        const {
+            assert!(
+                SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS >= 2048,
+                "longform CTC/RNN-T frames on the 69s fixture must stay in-bound"
+            );
+        }
     }
 
     #[test]
