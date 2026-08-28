@@ -2908,7 +2908,8 @@ mod tests {
         graph
             .compute_output_f32_with_evidence(input, 3)
             .expect("created-graph compute");
-        lifecycle.begin_observation_scope();
+        collector.finish_candidate_attempt(true);
+        collector.begin_candidate_attempt();
         graph
             .set_f32_slice(input, &[3.0, 1.0, 2.0], "receipt_graph_input")
             .expect("re-attached input upload");

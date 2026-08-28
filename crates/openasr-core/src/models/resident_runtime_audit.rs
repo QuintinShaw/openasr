@@ -507,6 +507,10 @@ fn resident_inventory_set() -> BTreeSet<(String, String, String)> {
             "MoonshineEncoderRuntimePool",
         ),
         (
+            "models/moonshine/ggml_executor.rs",
+            "MoonshineUnifiedRuntimePool",
+        ),
+        (
             "models/moss_transcribe_diarize/executor.rs",
             "MossTdDecoderRuntimePool",
         ),

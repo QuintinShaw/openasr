@@ -1634,6 +1634,9 @@ fn summarize_lifecycle(
                     stats.capture_before_pending = false;
                 }
                 stats.active_compute = Some(*compute_sequence);
+                if let Some(input) = *input_generation_consumed {
+                    stats.input_generations.insert(input);
+                }
                 stats.computes_started.push((
                     *compute_sequence,
                     *prepare_generation,
@@ -2388,7 +2391,6 @@ mod tests {
         for expected in [
             "created",
             "prepared",
-            "input_write",
             "compute_started",
             "compute_completed",
             "output_read",
@@ -2406,6 +2408,16 @@ mod tests {
                 "missing {expected}"
             );
         }
+        assert!(
+            report.graph_lifecycle.events.iter().any(|event| matches!(
+                event.kind,
+                crate::GgmlGraphLifecycleEventKind::ComputeStarted {
+                    input_generation_consumed: Some(_),
+                    ..
+                }
+            )),
+            "Layer-2 input refresh is bound on compute_started, not a separate input_write event"
+        );
         assert!(report.graph_lifecycle.events.iter().all(|event| !matches!(
             event.kind,
             crate::GgmlGraphLifecycleEventKind::CaptureStateObserved { .. }

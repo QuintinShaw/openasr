@@ -729,6 +729,7 @@ mod tests {
     fn real_device_head_binds_speculative_rows_and_scalar_recompute_to_readbacks() {
         let receipt = crate::NativeExecutionReceiptCollector::new();
         receipt.set_trace_mode(crate::NativeExecutionTraceMode::Cold);
+        receipt.enable_full_logits_trace();
         receipt.begin_candidate_attempt();
         let _receipt_guard =
             crate::models::native_execution_services::install_execution_receipt_collector(Some(
