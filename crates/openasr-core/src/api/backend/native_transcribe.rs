@@ -471,12 +471,12 @@ fn run_dispatch_once_with_progress_and_policy(
     })
 }
 
-/// Upper bound on concurrent long-audio slice workers. Kept small: the win is
-/// filling encode/decode GPU bubbles (2-4 in-flight slices saturate a single
-/// GPU's execution pipeline, the same admission-concurrency effect the server
-/// path already relies on), not unbounded fan-out, and every extra worker costs
-/// another resident decoder runtime + KV cache.
-const SLICE_PIPELINE_MAX_WIDTH: usize = 4;
+/// Upper bound on concurrent long-audio slice workers. Kept at 2: that still
+/// fills encode/decode GPU bubbles on a single discrete GPU without keeping
+/// four resident decoder runtimes + KV caches, which is what pushed HIP
+/// longform peak RSS above the v0.1.36 packaged host. Extra width remains
+/// available via `OPENASR_SLICE_PIPELINE_WIDTH` (clamped to this max).
+const SLICE_PIPELINE_MAX_WIDTH: usize = 2;
 
 /// Memory head-room the concurrent slice pipeline always leaves free when
 /// deciding how many workers fit, so it never claims the last of available
@@ -515,8 +515,9 @@ fn slice_pipeline_explicit_width() -> Option<usize> {
 /// - Carry `Disabled`: the serial loop threads no cross-slice prompt anyway,
 ///   so the carry-light concurrent path is transcript-equivalent (proven
 ///   byte-identical by `concurrent_slice_pipeline_equivalence`). Default to
-///   [`SLICE_PIPELINE_MAX_WIDTH`] and let the capacity and slice-count gates
-///   in [`effective_slice_pipeline_width`] pick what actually fits.
+///   one worker so peak RSS stays at a single decoder+KV; extra width is
+///   opt-in through `OPENASR_SLICE_PIPELINE_WIDTH` (clamped to
+///   [`SLICE_PIPELINE_MAX_WIDTH`]).
 /// - Carry active (`Text` / `TokenHistory`): the concurrent path would drop
 ///   the carry and change the transcript (the short-audio audit measured
 ///   whole-clause deletions), so the default stays 1 -- the byte-identical
@@ -528,8 +529,9 @@ fn slice_pipeline_requested_width(carry_prompt_mode: LongformPromptCarryMode) ->
         return explicit;
     }
     match carry_prompt_mode {
-        LongformPromptCarryMode::Disabled => SLICE_PIPELINE_MAX_WIDTH,
-        LongformPromptCarryMode::Text | LongformPromptCarryMode::TokenHistory => 1,
+        LongformPromptCarryMode::Disabled
+        | LongformPromptCarryMode::Text
+        | LongformPromptCarryMode::TokenHistory => 1,
     }
 }
 
@@ -9184,15 +9186,13 @@ mod tests {
         unsafe {
             std::env::remove_var("OPENASR_SLICE_PIPELINE_WIDTH");
         }
-        // Carry disabled: concurrent is transcript-equivalent, so the default
-        // requests the maximum and lets the capacity gate pick K.
+        // Default is serial so longform peak RSS stays at one decoder+KV.
+        // Concurrent width is opt-in via OPENASR_SLICE_PIPELINE_WIDTH.
         assert_eq!(
             slice_pipeline_requested_width(LongformPromptCarryMode::Disabled),
-            SLICE_PIPELINE_MAX_WIDTH,
-            "carry-disabled run defaults to the concurrent pipeline"
+            1,
+            "carry-disabled run defaults to serial"
         );
-        // ... which still flows through the capacity gate: plenty of memory
-        // admits the full width, tight memory caps it back to serial.
         assert_eq!(
             slice_pipeline_capped_width(
                 slice_pipeline_requested_width(LongformPromptCarryMode::Disabled),
@@ -9201,7 +9201,7 @@ mod tests {
                 1 << 20,
                 0,
             ),
-            SLICE_PIPELINE_MAX_WIDTH,
+            1,
         );
         assert_eq!(
             slice_pipeline_capped_width(
@@ -9232,7 +9232,7 @@ mod tests {
         // Explicit widths override the carry-gated default in both directions:
         // ">=2" forces the carry-light concurrent path onto a carry-active
         // run, and "0"/"1" pin a carry-disabled run to serial.
-        for (value, expected) in [("0", 1), ("1", 1), ("2", 2), ("4", 4), ("9", 4)] {
+        for (value, expected) in [("0", 1), ("1", 1), ("2", 2), ("4", 2), ("9", 2)] {
             // SAFETY: nextest runs each test in its own process, so mutating
             // this process-global env var cannot race another test.
             unsafe {
@@ -9257,7 +9257,7 @@ mod tests {
         }
         assert_eq!(
             slice_pipeline_requested_width(LongformPromptCarryMode::Disabled),
-            SLICE_PIPELINE_MAX_WIDTH,
+            1,
         );
         assert_eq!(
             slice_pipeline_requested_width(LongformPromptCarryMode::TokenHistory),

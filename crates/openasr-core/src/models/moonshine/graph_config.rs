@@ -7,6 +7,10 @@ use crate::models::graph_runtime_config::{
 };
 
 const OPENASR_MOONSHINE_ENABLE_DECODER_GPU: &str = "OPENASR_MOONSHINE_ENABLE_DECODER_GPU";
+/// Tiny/base encoder+decoder cgraphs stay under 2k nodes. A 16_384 floor
+/// would still force a Zipformer-scale metadata reservation; 4096 is cgraph
+/// headroom and `metadata_context_bytes` keeps that bump at 1 MiB.
+const MOONSHINE_GRAPH_NODE_CAPACITY: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct MoonshineGraphConfigIdentity {
@@ -20,13 +24,9 @@ pub(crate) struct MoonshineGraphConfigIdentity {
 pub(crate) fn moonshine_graph_config_identity(
     config: GgmlCpuGraphConfig,
 ) -> MoonshineGraphConfigIdentity {
-    let graph_size = config.graph_size.max(16_384);
-    let context_bytes = config
-        .context_bytes
-        .max(GgmlCpuGraphConfig::metadata_context_bytes(graph_size));
     MoonshineGraphConfigIdentity {
-        context_bytes,
-        graph_size,
+        context_bytes: config.context_bytes,
+        graph_size: config.graph_size,
         n_threads: config.n_threads,
         backend: config.backend,
         use_scheduler: config.use_scheduler,
@@ -77,7 +77,7 @@ pub(crate) fn moonshine_encoder_graph_config(backend: GgmlCpuGraphBackend) -> Gg
     // Resolve operator and thread defaults before narrowing the neural graph to
     // its device-complete placement below.
     let mut config = moonshine_runtime_graph_config_with_scheduler_default(backend, Some(true));
-    config.graph_size = config.graph_size.max(16_384);
+    config.set_graph_node_capacity(MOONSHINE_GRAPH_NODE_CAPACITY);
     if !has_explicit_thread_override() {
         config.n_threads = GgmlCpuGraphConfig::resolve_runtime_thread_count_for(
             config.backend,
@@ -87,11 +87,12 @@ pub(crate) fn moonshine_encoder_graph_config(backend: GgmlCpuGraphBackend) -> Gg
     apply_moonshine_neural_graph_placement(config)
 }
 
-/// Keep decoder placement separate from encoder placement. Vulkan Hybrid is
-/// the validated default: the encoder remains accelerated while the decoder
-/// defaults to CPU, unless the diagnostic stage override explicitly enables
-/// GPU decode. A FullDevice candidate must not be rewritten to CPU; the
-/// request placement owns that decision.
+/// Keep decoder placement separate from encoder placement. v0.1.36 ran the
+/// Moonshine decoder on Vulkan; a CPU-decoder Hybrid default duplicated host
+/// weights and missed that PeakWorkingSet. Exact Vulkan still allows
+/// `OPENASR_MOONSHINE_ENABLE_DECODER_GPU=0` as a diagnostic opt-out. A
+/// FullDevice candidate must not be rewritten to CPU; the request placement
+/// owns that decision.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn moonshine_decoder_graph_config(
     backend: GgmlCpuGraphBackend,
@@ -136,7 +137,7 @@ fn decoder_gpu_enabled_with_inputs(
     let exact_vulkan =
         backend == GgmlCpuGraphBackend::Gpu && provider == Some(ExecutionProvider::Vulkan);
     if exact_vulkan {
-        crate::ggml_runtime::env_toggle_with_raw(None, gpu_raw, false)
+        crate::ggml_runtime::env_toggle_with_raw(None, gpu_raw, true)
     } else {
         // FullDevice providers must not be silently rewritten into a CPU
         // decoder by a stage-local setting.
@@ -185,8 +186,20 @@ mod tests {
     }
 
     #[test]
-    fn exact_vulkan_graph_config_defaults_decoder_to_cpu() {
+    fn exact_vulkan_graph_config_defaults_decoder_to_gpu() {
         with_decoder_env(None, || {
+            let config = moonshine_decoder_graph_config(
+                GgmlCpuGraphBackend::Gpu,
+                Some(crate::device::execution_route::ExecutionProvider::Vulkan),
+            );
+            assert_eq!(config.backend, GgmlCpuGraphBackend::Gpu);
+            assert!(!config.use_scheduler);
+        });
+    }
+
+    #[test]
+    fn exact_vulkan_env_can_opt_decoder_out_to_cpu() {
+        with_decoder_env(Some("0"), || {
             let config = moonshine_decoder_graph_config(
                 GgmlCpuGraphBackend::Gpu,
                 Some(crate::device::execution_route::ExecutionProvider::Vulkan),

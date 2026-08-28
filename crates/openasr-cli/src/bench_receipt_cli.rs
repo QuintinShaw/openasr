@@ -638,6 +638,20 @@ pub(crate) fn bench_receipt_short_audio(
     let receipt_evidence = None;
     let execution = native_snapshot.as_ref().map(|request_snapshot| {
         let runtime_snapshot = native_execution_services.runtime_receipts().snapshot();
+        if std::env::var_os("OPENASR_RECEIPT_MEMORY_NOTES").is_some() {
+            let live_resources = runtime_snapshot
+                .live_owners
+                .iter()
+                .map(|owner| owner.resources.len())
+                .sum::<usize>();
+            notes.push(format!(
+                "runtime_receipts events={} owners={} resources={} dropped={}",
+                runtime_snapshot.events.len(),
+                runtime_snapshot.live_owners.len(),
+                live_resources,
+                runtime_snapshot.completeness.dropped_events
+            ));
+        }
         let reconciliation = native_execution_services
             .runtime_receipts()
             .reconcile_live_leases_quiescent(native_execution_services.memory_broker());
@@ -1204,7 +1218,9 @@ fn validate_strict_runtime_trace(jsonl: &str) -> Result<()> {
             let Some((provider, device)) = &header_route else {
                 bail!("runtime graph lifecycle event precedes the strict trace header");
             };
-            if &lifecycle.provider != provider || &lifecycle.device != device {
+            if lifecycle.provider.as_ref() != provider.as_str()
+                || lifecycle.device.as_ref() != device.as_str()
+            {
                 bail!("runtime graph lifecycle event is not bound to the final route");
             }
             validate_artifact_capture_lifecycle(&mut capture_states, &lifecycle)?;
@@ -2260,10 +2276,10 @@ mod tests {
         };
 
         let event = |sequence, kind| GgmlGraphLifecycleEvent {
-            schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+            schema: GGML_GRAPH_LIFECYCLE_SCHEMA.into(),
             sequence,
-            provider: "hip".to_string(),
-            device: "HIP0".to_string(),
+            provider: "hip".into(),
+            device: "HIP0".into(),
             graph_instance: 1,
             graph_generation: 2,
             kind,

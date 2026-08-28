@@ -409,10 +409,10 @@ mod tests {
         GgmlGraphLifecycleSnapshot {
             events: vec![
                 GgmlGraphLifecycleEvent {
-                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.into(),
                     sequence: 1,
-                    provider: provider.to_string(),
-                    device: device.to_string(),
+                    provider: provider.into(),
+                    device: device.into(),
                     graph_instance: 1,
                     graph_generation: 1,
                     kind: GgmlGraphLifecycleEventKind::Created {
@@ -420,10 +420,10 @@ mod tests {
                     },
                 },
                 GgmlGraphLifecycleEvent {
-                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.into(),
                     sequence: 2,
-                    provider: provider.to_string(),
-                    device: device.to_string(),
+                    provider: provider.into(),
+                    device: device.into(),
                     graph_instance: 1,
                     graph_generation: 1,
                     kind: GgmlGraphLifecycleEventKind::CaptureStateObserved {
@@ -435,10 +435,10 @@ mod tests {
                     },
                 },
                 GgmlGraphLifecycleEvent {
-                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.into(),
                     sequence: 3,
-                    provider: provider.to_string(),
-                    device: device.to_string(),
+                    provider: provider.into(),
+                    device: device.into(),
                     graph_instance: 1,
                     graph_generation: 1,
                     kind: GgmlGraphLifecycleEventKind::ComputeStarted {
@@ -449,10 +449,10 @@ mod tests {
                     },
                 },
                 GgmlGraphLifecycleEvent {
-                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.into(),
                     sequence: 4,
-                    provider: provider.to_string(),
-                    device: device.to_string(),
+                    provider: provider.into(),
+                    device: device.into(),
                     graph_instance: 1,
                     graph_generation: 1,
                     kind: GgmlGraphLifecycleEventKind::CaptureExecutableObserved {
@@ -461,10 +461,10 @@ mod tests {
                     },
                 },
                 GgmlGraphLifecycleEvent {
-                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.into(),
                     sequence: 5,
-                    provider: provider.to_string(),
-                    device: device.to_string(),
+                    provider: provider.into(),
+                    device: device.into(),
                     graph_instance: 1,
                     graph_generation: 1,
                     kind: GgmlGraphLifecycleEventKind::Dropped,
@@ -646,10 +646,10 @@ mod tests {
         GgmlGraphLifecycleSnapshot {
             events: vec![
                 GgmlGraphLifecycleEvent {
-                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.into(),
                     sequence: 1,
-                    provider: provider.to_string(),
-                    device: device.to_string(),
+                    provider: provider.into(),
+                    device: device.into(),
                     graph_instance: 78,
                     graph_generation: 79,
                     kind: GgmlGraphLifecycleEventKind::Created {
@@ -657,10 +657,10 @@ mod tests {
                     },
                 },
                 GgmlGraphLifecycleEvent {
-                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.into(),
                     sequence: 2,
-                    provider: provider.to_string(),
-                    device: device.to_string(),
+                    provider: provider.into(),
+                    device: device.into(),
                     graph_instance: 78,
                     graph_generation: 79,
                     kind: GgmlGraphLifecycleEventKind::CaptureStateObserved {
@@ -672,10 +672,10 @@ mod tests {
                     },
                 },
                 GgmlGraphLifecycleEvent {
-                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.into(),
                     sequence: 3,
-                    provider: provider.to_string(),
-                    device: device.to_string(),
+                    provider: provider.into(),
+                    device: device.into(),
                     graph_instance: 78,
                     graph_generation: 79,
                     kind: GgmlGraphLifecycleEventKind::ComputeStarted {
@@ -686,10 +686,10 @@ mod tests {
                     },
                 },
                 GgmlGraphLifecycleEvent {
-                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.into(),
                     sequence: 4,
-                    provider: provider.to_string(),
-                    device: device.to_string(),
+                    provider: provider.into(),
+                    device: device.into(),
                     graph_instance: 78,
                     graph_generation: 79,
                     kind: GgmlGraphLifecycleEventKind::CaptureStateObserved {
@@ -701,10 +701,10 @@ mod tests {
                     },
                 },
                 GgmlGraphLifecycleEvent {
-                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.into(),
                     sequence: 5,
-                    provider: provider.to_string(),
-                    device: device.to_string(),
+                    provider: provider.into(),
+                    device: device.into(),
                     graph_instance: 78,
                     graph_generation: 79,
                     kind: GgmlGraphLifecycleEventKind::CaptureExecutableCreated {
@@ -713,10 +713,10 @@ mod tests {
                     },
                 },
                 GgmlGraphLifecycleEvent {
-                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.into(),
                     sequence: 6,
-                    provider: provider.to_string(),
-                    device: device.to_string(),
+                    provider: provider.into(),
+                    device: device.into(),
                     graph_instance: 78,
                     graph_generation: 79,
                     kind: GgmlGraphLifecycleEventKind::ComputeCompleted {
@@ -725,10 +725,10 @@ mod tests {
                     },
                 },
                 GgmlGraphLifecycleEvent {
-                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+                    schema: GGML_GRAPH_LIFECYCLE_SCHEMA.into(),
                     sequence: 7,
-                    provider: provider.to_string(),
-                    device: device.to_string(),
+                    provider: provider.into(),
+                    device: device.into(),
                     graph_instance: 78,
                     graph_generation: 79,
                     kind: GgmlGraphLifecycleEventKind::Dropped,

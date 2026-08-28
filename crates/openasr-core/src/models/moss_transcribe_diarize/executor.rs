@@ -321,12 +321,7 @@ fn moss_td_unified_runtime_enabled(
     allow_unified_runtime
         && backend == GgmlCpuGraphBackend::Gpu
         && placement == Some(ExecutionPlacement::FullDevice)
-        && matches!(
-            backend_preference,
-            Some(RequestBackendPreference::Exact(route))
-                if route.addressability.is_exactly_addressable()
-                    && matches!(route.provider, ExecutionProvider::Cuda | ExecutionProvider::Vulkan)
-        )
+        && crate::ggml_runtime::exact_discrete_gpu_unified_owner_is_proven(backend_preference)
         && encoder.backend == GgmlCpuGraphBackend::Gpu
         && !encoder.use_scheduler
         && decoder.backend == GgmlCpuGraphBackend::Gpu
@@ -1824,8 +1819,12 @@ mod tests {
     }
 
     #[test]
-    fn unified_runtime_is_ordinary_exact_direct_cuda_or_vulkan_full_device_only() {
-        for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
+    fn unified_runtime_is_ordinary_exact_direct_cuda_hip_or_vulkan_full_device_only() {
+        for provider in [
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Vulkan,
+        ] {
             let preference = exactly_addressable_preference(provider);
             assert!(moss_td_unified_runtime_enabled(
                 true,
@@ -1878,7 +1877,6 @@ mod tests {
         for provider in [
             ExecutionProvider::Cpu,
             ExecutionProvider::Metal,
-            ExecutionProvider::Hip,
             ExecutionProvider::Accelerator,
             ExecutionProvider::Unknown,
         ] {

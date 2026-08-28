@@ -233,7 +233,9 @@ impl FireRedLlmDecoderRuntime {
     }
 
     pub(crate) fn take_compute_evidence(&mut self) -> Option<GgmlSelectionEvidenceRef> {
-        self.logits_runtime.take_compute_evidence()
+        self.whole_decoder
+            .take_fused_compute_evidence()
+            .or_else(|| self.logits_runtime.take_compute_evidence())
     }
 
     pub(crate) fn uses_native_gqa(&self) -> bool {
@@ -511,6 +513,9 @@ impl FireRedLlmDecoderRuntime {
             self.metadata.n_kv_heads * self.metadata.head_dim,
             layer_kv_caches,
         )?;
+        if let Some(logits) = step.fused_logits {
+            return Ok(logits);
+        }
         self.logits_runtime
             .compute_logits_for_last_hidden(&self.logits_head, &step.hidden)
             .map_err(|error| FireRedLlmDecoderError::LogitsHeadFailed {

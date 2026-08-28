@@ -181,8 +181,18 @@ impl GgmlRuntimeInfo {
 
 impl GgmlBackendDevice {
     pub fn initialize(&self) -> Result<GgmlBackend, GgmlRuntimeError> {
+        if super::env_flags::env_var_truthy("OPENASR_LOG_GGML_BACKEND_INIT") {
+            eprintln!(
+                "ggml-backend-init name={} kind={:?} device_id={:?}",
+                self.name, self.kind, self.device_id
+            );
+        }
         let raw = unsafe { ffi::ggml_backend_dev_init(self.raw.as_ptr(), ptr::null()) };
         GgmlBackend::from_raw(raw, "device")
+    }
+
+    pub(crate) fn as_ptr(&self) -> ffi::GgmlBackendDevRaw {
+        self.raw.as_ptr()
     }
 
     /// Whether this device can execute a `mul_mat` whose weight operand has
@@ -598,12 +608,31 @@ pub(crate) fn preferred_accelerated_device(
     select_accelerated_device(devices, is_accelerated).map(|(device, _rule)| device)
 }
 
+/// Do not set `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM`. On ReBAR discrete GPUs
+/// every DeviceLocal heap is also HostVisible, so excluding HostVisible types
+/// fails closed with `no non-host-visible DeviceLocal memory type`.
+///
+/// SPIR-V float-controls patching makes AMD WDDM allocate ~2MiB ISA heap per
+/// compiled pipeline. Honor an explicit operator opt-in; otherwise disable
+/// the patch before the plugin reads getenv at device init.
+pub(crate) fn apply_vulkan_device_local_buffer_policy() {
+    const KEY: &str = "GGML_VK_DISABLE_FLOAT_CONTROLS_PATCH";
+    if std::env::var_os(KEY).is_none()
+        && std::env::var_os("GGML_VK_ENABLE_FLOAT_CONTROLS_PATCH").is_none()
+    {
+        // SAFETY: called once before vulkan device init; the plugin reads this
+        // with getenv on the same process. No concurrent set_var on this key.
+        unsafe { std::env::set_var(KEY, "1") };
+    }
+}
+
 /// Register backend modules once per process before the first registry query.
 /// A dynamic host loads only the bundled CPU rescue module and at most one
 /// exact, signed, integrity-verified optional GPU pack. Static hosts never load
 /// modules, avoiding the double-ggml global-state collision seen when a static
 /// GPU host loads a dynamic module.
 pub(crate) fn ensure_backends_loaded() {
+    apply_vulkan_device_local_buffer_policy();
     let _ = bundled_cpu_activation_cell().get_or_init(load_bundled_cpu_module);
     backend_plugin_activation_cell().get_or_init(|| {
         bundled_cpu_activation_cell()
@@ -1198,16 +1227,6 @@ fn activate_selected_backend_plugin()
         "ggml_backend_verify2",
         stage_started.elapsed(),
     );
-    let stage_started = Instant::now();
-    let live_driver = probe_exact_backend_plugin_candidate(
-        &backend_id,
-        requested.vendor,
-        &plugin_path,
-        &dependency_dirs,
-        &device_target,
-        live_backend_driver_floor(requested.vendor, requested.min_driver_api.as_deref()),
-    )?;
-    crate::stage_timing::log_stage("server_boot", "ggml_backend_probe", stage_started.elapsed());
     let expected_driver = activated_record
         .as_ref()
         .map(|record| record.driver_version.as_str())
@@ -1216,6 +1235,25 @@ fn activate_selected_backend_plugin()
                 .as_ref()
                 .map(|record| record.driver_version.as_str())
         });
+    // A throwaway LoadLibrary + vkCreateInstance leaves AMD WDDM ~2.1MiB host
+    // slabs in PeakWorkingSet after vkDestroyInstance. When the signed binding
+    // already names the driver, skip that extra instance: load_exact still
+    // live-proves the catalog target and driver floor on the production
+    // VkInstance.
+    let stage_started = Instant::now();
+    let live_driver = if let Some(expected) = expected_driver {
+        expected.to_string()
+    } else {
+        probe_exact_backend_plugin_candidate(
+            &backend_id,
+            requested.vendor,
+            &plugin_path,
+            &dependency_dirs,
+            &device_target,
+            live_backend_driver_floor(requested.vendor, requested.min_driver_api.as_deref()),
+        )?
+    };
+    crate::stage_timing::log_stage("server_boot", "ggml_backend_probe", stage_started.elapsed());
     if expected_driver.is_some_and(|expected| expected != live_driver) {
         return Err(BackendPluginActivationError::ActivationState(
             "live backend driver changed from the exact signed/scoped binding".to_string(),

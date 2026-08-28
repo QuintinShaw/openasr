@@ -131,6 +131,11 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   cards or falling back to CPU. Unavailable coarse `accelerated` targets still
   fail closed. Physical PCI keys are normalized (trim + lower-case) only; full
   BDF grammar validation is a follow-up.
+- On Windows ReBAR discrete GPUs, Vulkan Peak Working Set can exceed the HIP
+  and CPU figures even when DeviceLocal buffers are not mapped. ReBAR types
+  are DeviceLocal|HostVisible, so Windows still counts that VRAM toward the
+  process working set. This is a measured PeakWS tax, not a host leak; HIP
+  does not pay it the same way.
 - No public reproducible real-backend benchmark or long-audio stability evidence
   is published. The performance harness, regression gates, and competitive
   comparisons are internal (see [Performance](../perf/PERFORMANCE.md)); no claim of

@@ -450,7 +450,10 @@ impl RuntimeReceiptCollector {
                 next_resource_ordinal: AtomicU64::new(next_resource_ordinal),
                 identity_exhausted: false,
                 live_owners: BTreeMap::new(),
-                events: VecDeque::with_capacity(event_capacity),
+                // Bound is enforced on push; pre-filling 16k large events
+                // would commit a constant ~host-MiB tax on every NES root
+                // even when the request emits far fewer events.
+                events: VecDeque::new(),
                 dropped_events: 0,
                 dropped_owners: 0,
                 rejected_resources: 0,
@@ -1643,6 +1646,19 @@ mod tests {
             LeaseReceiptShadow::Matched,
             "bounded event history must not invalidate the authoritative live owner table"
         );
+    }
+
+    #[test]
+    fn event_ring_does_not_preallocate_the_advertised_capacity() {
+        let collector =
+            RuntimeReceiptCollector::new_for_test(scope(), DEFAULT_EVENT_CAPACITY).unwrap();
+        assert_eq!(
+            collector.lock_state().events.capacity(),
+            0,
+            "empty collector must not commit DEFAULT_EVENT_CAPACITY event slots"
+        );
+        assert_eq!(collector.summary().event_capacity, DEFAULT_EVENT_CAPACITY);
+        assert_eq!(collector.summary().event_count, 0);
     }
 
     #[test]

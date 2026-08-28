@@ -11,11 +11,12 @@
 
 use crate::ggml_runtime::{
     ArenaAllocError, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext,
-    GgmlSelectionEvidenceRef, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
-    WeightSlot, alloc_static_f16 as arena_alloc_static_f16,
-    alloc_static_f32 as arena_alloc_static_f32, bind_loaded as arena_bind_loaded,
-    upload_static_f16 as arena_upload_static_f16, upload_static_f32 as arena_upload_static_f32,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlDecodeReuseMode, GgmlGraphShapeKey, GgmlLoadedTensor,
+    GgmlLoadedWeightContext, GgmlSameShapePersistentGraph, GgmlSelectionEvidenceRef,
+    GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight, WeightSlot,
+    alloc_static_f16 as arena_alloc_static_f16, alloc_static_f32 as arena_alloc_static_f32,
+    bind_loaded as arena_bind_loaded, upload_static_f16 as arena_upload_static_f16,
+    upload_static_f32 as arena_upload_static_f32,
 };
 use crate::models::runtime_memory::{checked_sum, element_bytes};
 use crate::models::system_memory_owner::{SystemMemoryCapacity, SystemMemoryOwnerError};
@@ -185,9 +186,19 @@ pub(crate) fn quoted_graph_retained_bytes(
     )
 }
 
+struct SenseVoiceReuseTensors {
+    lfr: GgmlCpuTensor<'static>,
+    prompt: GgmlCpuTensor<'static>,
+    position: GgmlCpuTensor<'static>,
+    logits: GgmlCpuTensor<'static>,
+}
+
 pub(crate) struct SenseVoiceEncoderGraph {
     metadata: SenseVoiceExecutionMetadata,
     use_flash_attention: bool,
+    reuse_enabled: bool,
+    same_shape: GgmlSameShapePersistentGraph,
+    reuse_tensors: Option<SenseVoiceReuseTensors>,
     runner: GgmlCpuGraphRunner,
     // `loaded_weights` owns the mmap-backed buffer the `Loaded` slots alias
     // (drop-order note mirrors parakeet/cohere/qwen).
@@ -222,6 +233,7 @@ impl SenseVoiceEncoderGraph {
         metadata: SenseVoiceExecutionMetadata,
         runtime_preflight: &GgufRuntimeSourcePreflight,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        _reuse_mode: GgmlDecodeReuseMode,
     ) -> Result<Self, SenseVoiceEncoderError> {
         let total_layers = weights.enc_layers.len() + weights.tp_layers.len();
         let mut config = sensevoice_encoder_graph_config(backend);
@@ -354,6 +366,9 @@ impl SenseVoiceEncoderGraph {
         Ok(Self {
             metadata,
             use_flash_attention,
+            reuse_enabled: crate::ggml_runtime::encoder_same_shape_reuse_is_enabled(),
+            same_shape: GgmlSameShapePersistentGraph::default(),
+            reuse_tensors: None,
             runner,
             loaded_weights,
             arena,
@@ -369,6 +384,10 @@ impl SenseVoiceEncoderGraph {
             prompt_embedding_rows,
             positional_inv_timescales: positional_inv_timescales_t,
         })
+    }
+
+    pub(crate) fn backend(&self) -> crate::ggml_runtime::GgmlCpuGraphBackend {
+        self.runner.backend_kind()
     }
 
     pub(crate) fn encode(
@@ -467,48 +486,82 @@ impl SenseVoiceEncoderGraph {
             .map(|position| position as f32)
             .collect::<Vec<_>>();
 
-        let mut graph = self.runner.start_graph();
-        let lfr = graph
-            .new_tensor_2d_f32(metadata.feature_dim, lfr_frames, "sensevoice_lfr")
-            .map_err(bf("new_lfr"))?;
-        let prompt = graph
-            .new_tensor_1d_i32(prompt_ids.len(), "sensevoice_prompt_ids")
-            .map_err(bf("new_prompt_ids"))?;
-        let position = graph
-            .new_tensor_2d_f32(1, frames, "sensevoice_positions")
-            .map_err(bf("new_positions"))?;
-        graph.set_input(lfr).map_err(bf("set_lfr_input"))?;
-        graph.set_input(prompt).map_err(bf("set_prompt_input"))?;
-        graph
-            .set_input(position)
-            .map_err(bf("set_position_input"))?;
+        if self.reuse_enabled {
+            let shape = GgmlGraphShapeKey::new(lfr_frames, prompt_ids.len(), frames, 0);
+            let built = {
+                let (graph, reused) = self
+                    .same_shape
+                    .builder_for_shape(&mut self.runner, shape)
+                    .map_err(bf("same_shape_session"))?;
+                if reused {
+                    None
+                } else {
+                    let (lfr, prompt, position, logits) = compose_lfr_graph(
+                        graph,
+                        self.metadata,
+                        self.prompt_embedding,
+                        self.positional_inv_timescales,
+                        &self.arena,
+                        &self.enc_layers,
+                        &self.tp_layers,
+                        self.enc_after_norm_weight,
+                        self.enc_after_norm_bias,
+                        self.tp_norm_weight,
+                        self.tp_norm_bias,
+                        self.ctc_head_weight,
+                        self.ctc_head_bias,
+                        self.use_flash_attention,
+                        lfr_frames,
+                        prompt_ids.len(),
+                        frames,
+                    )?;
+                    graph.set_output(logits).map_err(bf("set_encoder_output"))?;
+                    graph
+                        .prepare_outputs_for_upload(&[logits])
+                        .map_err(bf("prepare_outputs"))?;
+                    Some(SenseVoiceReuseTensors {
+                        lfr,
+                        prompt,
+                        position,
+                        logits,
+                    })
+                }
+            };
+            if let Some(tensors) = built {
+                self.reuse_tensors = Some(tensors);
+            }
+            let graph = self
+                .same_shape
+                .builder_for_shape(&mut self.runner, shape)
+                .map_err(bf("same_shape_session"))?
+                .0;
+            let tensors = self
+                .reuse_tensors
+                .as_ref()
+                .expect("reuse tensors installed with the session");
+            graph
+                .set_f32_slice(tensors.lfr, lfr_features, "sensevoice_lfr")
+                .map_err(bf("upload_lfr"))?;
+            graph
+                .set_i32_slice(tensors.prompt, &prompt_ids, "sensevoice_prompt_ids")
+                .map_err(bf("upload_prompt_ids"))?;
+            graph
+                .set_f32_slice(tensors.position, &positions, "sensevoice_positions")
+                .map_err(bf("upload_positions"))?;
+            return read_sensevoice_encoder_logits(
+                graph,
+                tensors.logits,
+                metadata.vocab_size,
+                frames,
+            );
+        }
 
-        let prompt_rows = graph
-            .get_rows(self.prompt_embedding.as_graph_tensor(), prompt)
-            .map_err(bf("prompt_get_rows"))?;
-        let combined = graph
-            .concat(prompt_rows, lfr, 1)
-            .map_err(bf("prompt_lfr_concat"))?;
-        let scaled = graph
-            .scale(combined, (metadata.d_model as f32).sqrt())
-            .map_err(bf("input_scale"))?;
-        let angles = graph
-            .mul_mat(
-                self.arena.graph_tensor(self.positional_inv_timescales),
-                position,
-            )
-            .map_err(bf("positional_outer_product"))?;
-        let sin = graph.sin(angles).map_err(bf("positional_sin"))?;
-        let cos = graph.cos(angles).map_err(bf("positional_cos"))?;
-        let positional = graph.concat(sin, cos, 0).map_err(bf("positional_concat"))?;
-        let state = graph
-            .add(scaled, positional)
-            .map_err(bf("positional_add"))?;
-        let logits = compose_sensevoice_encoder_logits(
+        let mut graph = self.runner.start_graph();
+        let (lfr, prompt, position, logits) = compose_lfr_graph(
             &mut graph,
-            state,
-            frames,
-            metadata,
+            self.metadata,
+            self.prompt_embedding,
+            self.positional_inv_timescales,
             &self.arena,
             &self.enc_layers,
             &self.tp_layers,
@@ -519,6 +572,9 @@ impl SenseVoiceEncoderGraph {
             self.ctc_head_weight,
             self.ctc_head_bias,
             self.use_flash_attention,
+            lfr_frames,
+            prompt_ids.len(),
+            frames,
         )?;
         graph.set_output(logits).map_err(bf("set_encoder_output"))?;
         graph
@@ -535,6 +591,305 @@ impl SenseVoiceEncoderGraph {
             .map_err(bf("upload_positions"))?;
         read_sensevoice_encoder_logits(&mut graph, logits, metadata.vocab_size, frames)
     }
+
+    /// Same encoder graph as [`Self::encode_lfr_with_prompt`], but each logit
+    /// row is visited from a reused host buffer so CTC greedy never materializes
+    /// the full `[vocab, frames]` matrix while backend compute buffers are live.
+    pub(crate) fn encode_lfr_with_prompt_for_each_frame<F>(
+        &mut self,
+        lfr_features: &[f32],
+        prompt_indices: &[usize],
+        mut visit: F,
+    ) -> Result<Option<Vec<GgmlSelectionEvidenceRef>>, SenseVoiceEncoderError>
+    where
+        F: FnMut(usize, &[f32]) -> Result<(), SenseVoiceEncoderError>,
+    {
+        self.encode_lfr_prompt_rows(lfr_features, prompt_indices, &mut visit)
+    }
+
+    fn encode_lfr_prompt_rows<F>(
+        &mut self,
+        lfr_features: &[f32],
+        prompt_indices: &[usize],
+        visit: &mut F,
+    ) -> Result<Option<Vec<GgmlSelectionEvidenceRef>>, SenseVoiceEncoderError>
+    where
+        F: FnMut(usize, &[f32]) -> Result<(), SenseVoiceEncoderError>,
+    {
+        let metadata = self.metadata;
+        if lfr_features.is_empty() || !lfr_features.len().is_multiple_of(metadata.feature_dim) {
+            return Err(SenseVoiceEncoderError::Shape {
+                reason: format!(
+                    "SenseVoice LFR payload {} is not a positive multiple of {}",
+                    lfr_features.len(),
+                    metadata.feature_dim
+                ),
+            });
+        }
+        let prompt_ids = prompt_indices
+            .iter()
+            .map(|&index| {
+                if index >= self.prompt_embedding_rows {
+                    return Err(SenseVoiceEncoderError::Shape {
+                        reason: format!(
+                            "SenseVoice prompt index {index} exceeds {} rows",
+                            self.prompt_embedding_rows
+                        ),
+                    });
+                }
+                i32::try_from(index).map_err(|_| SenseVoiceEncoderError::Shape {
+                    reason: format!("SenseVoice prompt index {index} exceeds i32"),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let lfr_frames = lfr_features.len() / metadata.feature_dim;
+        let frames = prompt_ids.len().checked_add(lfr_frames).ok_or_else(|| {
+            SenseVoiceEncoderError::Shape {
+                reason: "SenseVoice encoder frame count overflowed".to_string(),
+            }
+        })?;
+        let positions = (1..=frames)
+            .map(|position| position as f32)
+            .collect::<Vec<_>>();
+
+        if self.reuse_enabled {
+            let shape = GgmlGraphShapeKey::new(lfr_frames, prompt_ids.len(), frames, 0);
+            let built = {
+                let (graph, reused) = self
+                    .same_shape
+                    .builder_for_shape(&mut self.runner, shape)
+                    .map_err(bf("same_shape_session"))?;
+                if reused {
+                    None
+                } else {
+                    let (lfr, prompt, position, logits) = compose_lfr_graph(
+                        graph,
+                        self.metadata,
+                        self.prompt_embedding,
+                        self.positional_inv_timescales,
+                        &self.arena,
+                        &self.enc_layers,
+                        &self.tp_layers,
+                        self.enc_after_norm_weight,
+                        self.enc_after_norm_bias,
+                        self.tp_norm_weight,
+                        self.tp_norm_bias,
+                        self.ctc_head_weight,
+                        self.ctc_head_bias,
+                        self.use_flash_attention,
+                        lfr_frames,
+                        prompt_ids.len(),
+                        frames,
+                    )?;
+                    graph.set_output(logits).map_err(bf("set_encoder_output"))?;
+                    graph
+                        .prepare_outputs_for_upload(&[logits])
+                        .map_err(bf("prepare_outputs"))?;
+                    Some(SenseVoiceReuseTensors {
+                        lfr,
+                        prompt,
+                        position,
+                        logits,
+                    })
+                }
+            };
+            if let Some(tensors) = built {
+                self.reuse_tensors = Some(tensors);
+            }
+            let graph = self
+                .same_shape
+                .builder_for_shape(&mut self.runner, shape)
+                .map_err(bf("same_shape_session"))?
+                .0;
+            let tensors = self
+                .reuse_tensors
+                .as_ref()
+                .expect("reuse tensors installed with the session");
+            graph
+                .set_f32_slice(tensors.lfr, lfr_features, "sensevoice_lfr")
+                .map_err(bf("upload_lfr"))?;
+            graph
+                .set_i32_slice(tensors.prompt, &prompt_ids, "sensevoice_prompt_ids")
+                .map_err(bf("upload_prompt_ids"))?;
+            graph
+                .set_f32_slice(tensors.position, &positions, "sensevoice_positions")
+                .map_err(bf("upload_positions"))?;
+            let logits = tensors.logits;
+            let mut visit_error = None;
+            let evidence = graph
+                .compute_output_f32_rows_for_each(
+                    logits,
+                    metadata.vocab_size,
+                    frames,
+                    |index, row| {
+                        if let Err(error) = visit(index, row) {
+                            visit_error = Some(error);
+                            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                                reason: "sensevoice frame visitor failed",
+                            });
+                        }
+                        Ok(())
+                    },
+                )
+                .map_err(|error| {
+                    visit_error.take().unwrap_or_else(|| {
+                        SenseVoiceEncoderError::GraphExecutionFailed {
+                            reason: error.to_string(),
+                        }
+                    })
+                })?;
+            if let Some(error) = visit_error {
+                return Err(error);
+            }
+            return Ok(evidence);
+        }
+
+        let mut graph = self.runner.start_graph();
+        let (lfr, prompt, position, logits) = compose_lfr_graph(
+            &mut graph,
+            self.metadata,
+            self.prompt_embedding,
+            self.positional_inv_timescales,
+            &self.arena,
+            &self.enc_layers,
+            &self.tp_layers,
+            self.enc_after_norm_weight,
+            self.enc_after_norm_bias,
+            self.tp_norm_weight,
+            self.tp_norm_bias,
+            self.ctc_head_weight,
+            self.ctc_head_bias,
+            self.use_flash_attention,
+            lfr_frames,
+            prompt_ids.len(),
+            frames,
+        )?;
+        graph.set_output(logits).map_err(bf("set_encoder_output"))?;
+        graph
+            .prepare_outputs_for_upload(&[logits])
+            .map_err(bf("prepare_outputs"))?;
+        graph
+            .set_f32_slice(lfr, lfr_features, "sensevoice_lfr")
+            .map_err(bf("upload_lfr"))?;
+        graph
+            .set_i32_slice(prompt, &prompt_ids, "sensevoice_prompt_ids")
+            .map_err(bf("upload_prompt_ids"))?;
+        graph
+            .set_f32_slice(position, &positions, "sensevoice_positions")
+            .map_err(bf("upload_positions"))?;
+        let mut visit_error = None;
+        let evidence = graph
+            .compute_output_f32_rows_for_each(logits, metadata.vocab_size, frames, |index, row| {
+                if let Err(error) = visit(index, row) {
+                    visit_error = Some(error);
+                    return Err(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "sensevoice frame visitor failed",
+                    });
+                }
+                Ok(())
+            })
+            .map_err(|error| {
+                visit_error
+                    .take()
+                    .unwrap_or_else(|| SenseVoiceEncoderError::GraphExecutionFailed {
+                        reason: error.to_string(),
+                    })
+            })?;
+        if let Some(error) = visit_error {
+            return Err(error);
+        }
+        Ok(evidence)
+    }
+
+    pub(crate) fn release_transient_compute_memory(
+        &mut self,
+    ) -> Result<(), SenseVoiceEncoderError> {
+        if self.reuse_enabled && self.same_shape.has_session() {
+            return Ok(());
+        }
+        self.runner
+            .release_transient_scheduler_working_set()
+            .map_err(bf("release_transient_scheduler_working_set"))
+    }
+}
+
+fn compose_lfr_graph<'a>(
+    graph: &mut GgmlCpuGraphBuilder<'a>,
+    metadata: SenseVoiceExecutionMetadata,
+    prompt_embedding: GgmlLoadedTensor,
+    positional_inv_timescales: GgmlStaticTensor,
+    arena: &GgmlStaticTensorArena,
+    enc_layers: &[LayerArena],
+    tp_layers: &[LayerArena],
+    enc_after_norm_weight: GgmlStaticTensor,
+    enc_after_norm_bias: GgmlStaticTensor,
+    tp_norm_weight: GgmlStaticTensor,
+    tp_norm_bias: GgmlStaticTensor,
+    ctc_head_weight: WeightSlot,
+    ctc_head_bias: GgmlStaticTensor,
+    use_flash_attention: bool,
+    lfr_frames: usize,
+    prompt_len: usize,
+    frames: usize,
+) -> Result<
+    (
+        GgmlCpuTensor<'a>,
+        GgmlCpuTensor<'a>,
+        GgmlCpuTensor<'a>,
+        GgmlCpuTensor<'a>,
+    ),
+    SenseVoiceEncoderError,
+> {
+    let lfr = graph
+        .new_tensor_2d_f32(metadata.feature_dim, lfr_frames, "sensevoice_lfr")
+        .map_err(bf("new_lfr"))?;
+    let prompt = graph
+        .new_tensor_1d_i32(prompt_len, "sensevoice_prompt_ids")
+        .map_err(bf("new_prompt_ids"))?;
+    let position = graph
+        .new_tensor_2d_f32(1, frames, "sensevoice_positions")
+        .map_err(bf("new_positions"))?;
+    graph.set_input(lfr).map_err(bf("set_lfr_input"))?;
+    graph.set_input(prompt).map_err(bf("set_prompt_input"))?;
+    graph
+        .set_input(position)
+        .map_err(bf("set_position_input"))?;
+
+    let prompt_rows = graph
+        .get_rows(prompt_embedding.as_graph_tensor(), prompt)
+        .map_err(bf("prompt_get_rows"))?;
+    let combined = graph
+        .concat(prompt_rows, lfr, 1)
+        .map_err(bf("prompt_lfr_concat"))?;
+    let scaled = graph
+        .scale(combined, (metadata.d_model as f32).sqrt())
+        .map_err(bf("input_scale"))?;
+    let angles = graph
+        .mul_mat(arena.graph_tensor(positional_inv_timescales), position)
+        .map_err(bf("positional_outer_product"))?;
+    let sin = graph.sin(angles).map_err(bf("positional_sin"))?;
+    let cos = graph.cos(angles).map_err(bf("positional_cos"))?;
+    let positional = graph.concat(sin, cos, 0).map_err(bf("positional_concat"))?;
+    let state = graph
+        .add(scaled, positional)
+        .map_err(bf("positional_add"))?;
+    let logits = compose_sensevoice_encoder_logits(
+        graph,
+        state,
+        frames,
+        metadata,
+        arena,
+        enc_layers,
+        tp_layers,
+        enc_after_norm_weight,
+        enc_after_norm_bias,
+        tp_norm_weight,
+        tp_norm_bias,
+        ctc_head_weight,
+        ctc_head_bias,
+        use_flash_attention,
+    )?;
+    Ok((lfr, prompt, position, logits))
 }
 
 fn read_sensevoice_encoder_logits<'a>(
@@ -568,7 +923,7 @@ fn compose_sensevoice_encoder_logits<'a>(
     mut state: GgmlCpuTensor<'a>,
     frames: usize,
     metadata: SenseVoiceExecutionMetadata,
-    arena: &'a GgmlStaticTensorArena,
+    arena: &GgmlStaticTensorArena,
     enc_layers: &[LayerArena],
     tp_layers: &[LayerArena],
     enc_after_norm_weight: GgmlStaticTensor,
@@ -705,7 +1060,7 @@ fn upload_layer(
     Ok(())
 }
 
-fn sanm_weights<'a>(arena: &'a GgmlStaticTensorArena, h: &LayerArena) -> SanMFsmnBlockWeights<'a> {
+fn sanm_weights<'a>(arena: &GgmlStaticTensorArena, h: &LayerArena) -> SanMFsmnBlockWeights<'a> {
     let g = |t: GgmlStaticTensor| arena.graph_tensor(t);
     let b = |slot: WeightSlot| slot.graph(arena);
     SanMFsmnBlockWeights {
@@ -803,6 +1158,27 @@ mod tests {
     use crate::models::sensevoice::encoder_weights::load_sensevoice_encoder_weights;
     use crate::models::sensevoice::runtime_contract::parse_sensevoice_execution_metadata;
 
+    #[test]
+    fn encoder_same_shape_reuse_is_not_gated_on_decode_reusable_graph() {
+        const SRC: &str = include_str!("encoder_graph.rs");
+        assert!(
+            crate::ggml_runtime::encoder_same_shape_reuse_is_enabled(),
+            "encoder same-shape reuse must stay on when decode evidence is FreshGraph"
+        );
+        let forbidden = format!(
+            "reuse_enabled: reuse_mode == {}::ReusableGraph",
+            "GgmlDecodeReuseMode"
+        );
+        assert!(
+            !SRC.contains(&forbidden),
+            "SenseVoice encoder same-shape must not bind to decode capture evidence"
+        );
+        assert!(
+            SRC.contains("encoder_same_shape_reuse_is_enabled()"),
+            "SenseVoice encoder must take same-shape reuse from the shared helper"
+        );
+    }
+
     /// Offline bring-up parity vs the PyTorch reference (ref.py oracle).
     /// Requires SENSEVOICE_BRINGUP_DIR with `ref_lfr_zh.bin` ([94,560] f32 LFR+CMVN
     /// features) + `ref_logits_zh.bin` ([98,25055] f32) and SENSEVOICE_PACK
@@ -847,6 +1223,7 @@ mod tests {
             metadata,
             &preflight,
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph,
         )
         .expect("graph");
         let out = graph.encode(&input).expect("encode");

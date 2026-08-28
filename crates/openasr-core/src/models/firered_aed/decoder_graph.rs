@@ -506,6 +506,14 @@ impl FireRedDecoderGraphRuntime {
         Ok(())
     }
 
+    pub(crate) fn release_transient_compute_memory(&mut self) -> Result<(), FireRedDecoderError> {
+        self.reuse = None;
+        match self.runner.release_request_compute_residency() {
+            Ok(()) | Err(GgmlCpuGraphError::PersistentGraphSessionActive) => Ok(()),
+            Err(error) => Err(map_err("release_request_compute_residency", error)),
+        }
+    }
+
     /// Precompute cross-attention K/V for every layer from the encoder output
     /// and write them into the persistent cross-KV cache. Must be called once
     /// before the first [`Self::compute_step_logits`]. `frame_count` must

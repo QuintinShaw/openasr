@@ -46,7 +46,7 @@ use crate::ggml_runtime::{
     BackendMemoryUnknownReason, SafeBackendMemoryReceipt,
 };
 use crate::ggml_runtime::{
-    GgmlBackend, GgmlBackendKind, GgmlCpuGraphBackend, GgmlDeviceMemory,
+    GgmlBackend, GgmlBackendDevice, GgmlBackendKind, GgmlCpuGraphBackend, GgmlDeviceMemory,
     GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector, GgmlExecutionTelemetryGuard,
     GgmlGraphLifecycleGuard, RequestBackendOverrideGuard, RequestBackendPreference,
     current_execution_telemetry_collector, ensure_backends_loaded, ggml_available_devices,
@@ -2014,6 +2014,12 @@ fn ggml_backend_physical_identity(
         return Err("candidate activation quote received a null ggml backend".to_string());
     }
     let device = unsafe { ffi::ggml_backend_get_device(backend) };
+    ggml_device_physical_identity(device)
+}
+
+fn ggml_device_physical_identity(
+    device: ffi::GgmlBackendDevRaw,
+) -> Result<PhysicalDeviceKey, String> {
     if device.is_null() {
         return Err("candidate activation backend has no device for physical identity".to_string());
     }
@@ -2044,9 +2050,9 @@ fn host_backend_for_activation() -> Result<GgmlBackend, String> {
     GgmlBackend::cpu().map_err(|error| error.to_string())
 }
 
-fn discrete_backend_for_candidate(
+fn discrete_device_for_candidate(
     candidate: &ExecutionCandidate,
-) -> Result<Option<GgmlBackend>, String> {
+) -> Result<Option<GgmlBackendDevice>, String> {
     match candidate.device.route.provider {
         ExecutionProvider::Cuda | ExecutionProvider::Hip | ExecutionProvider::Vulkan
             if candidate.placement != ExecutionPlacement::CpuOnly => {}
@@ -2056,30 +2062,22 @@ fn discrete_backend_for_candidate(
     let devices = ggml_available_devices();
     let wanted = candidate.device.route.provider;
     let stable = candidate.device.route.stable_id.as_str();
-    let device = devices.iter().find(|device| {
+    Ok(devices.into_iter().find(|device| {
         ExecutionProvider::from_backend_name(&device.name) == wanted
             && (device.name == stable
                 || device
                     .device_id
                     .as_deref()
                     .is_some_and(|id| id.eq_ignore_ascii_case(stable)))
-    });
-    match device {
-        Some(device) => device
-            .initialize()
-            .map(Some)
-            .map_err(|error| error.to_string()),
-        None => Ok(None),
-    }
+    }))
 }
 
 fn quote_activation_group(
     group_id: &str,
-    backend: &GgmlBackend,
+    identity: PhysicalDeviceKey,
+    abi: BackendMemoryAbi,
     request: ffi::GgmlBackendMemoryRequestV1,
 ) -> Result<NativeQuotedBackendGroup, String> {
-    let abi = unsafe { BackendMemoryAbi::from_backend(backend.as_ptr()) }
-        .map_err(|error| format!("candidate activation ABI: {error}"))?;
     let semantics = NativeMemoryClaimSemantics {
         resource_id: group_id.to_owned(),
         lifetime: AllocationLifetime::PackShared,
@@ -2087,13 +2085,79 @@ fn quote_activation_group(
     };
     NativeQuotedBackendGroup::quote(
         group_id,
-        ggml_backend_physical_identity(backend.as_ptr())?,
+        identity,
         abi,
         vec![request],
         BTreeMap::from([(request.request_id, semantics.clone())]),
         semantics,
     )
     .map_err(|error| format!("candidate activation ggml quote: {error}"))
+}
+
+fn quote_host_activation_group(
+    group_id: &str,
+    host: &GgmlBackend,
+    request: ffi::GgmlBackendMemoryRequestV1,
+) -> Result<NativeQuotedBackendGroup, String> {
+    let abi = unsafe { BackendMemoryAbi::from_backend(host.as_ptr()) }
+        .map_err(|error| format!("candidate activation ABI: {error}"))?;
+    quote_activation_group(
+        group_id,
+        ggml_backend_physical_identity(host.as_ptr())?,
+        abi,
+        request,
+    )
+}
+
+fn quote_discrete_activation_group(
+    device: &GgmlBackendDevice,
+    activation_resource: &str,
+    requested_bytes: u64,
+) -> Result<(NativeQuotedBackendGroup, Option<GgmlBackend>), String> {
+    let device_raw = device.as_ptr();
+    let buft = unsafe { ffi::ggml_backend_dev_buffer_type(device_raw) };
+    if buft.is_null() {
+        return Err("discrete activation device has no buffer type to quote".to_string());
+    }
+    let group_id = format!("candidate-activation-device-copy:{activation_resource}");
+    let identity = ggml_device_physical_identity(device_raw)?;
+    // Vulkan BUFFER quotes accept a registry `buft` with a null backend. CUDA
+    // and HIP still require a live backend context to mint the quote token.
+    if ExecutionProvider::from_backend_name(&device.name) == ExecutionProvider::Vulkan {
+        let request = ffi::GgmlBackendMemoryRequestV1 {
+            kind: ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER,
+            usage: ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS as u32,
+            request_id: 1,
+            backend: std::ptr::null_mut(),
+            buft,
+            requested_bytes,
+            currently_allocated_bytes: 0,
+            ..Default::default()
+        };
+        let abi = unsafe { BackendMemoryAbi::from_device(device_raw) }
+            .map_err(|error| format!("candidate activation device ABI: {error}"))?;
+        return Ok((
+            quote_activation_group(&group_id, identity, abi, request)?,
+            None,
+        ));
+    }
+    let backend = device.initialize().map_err(|error| error.to_string())?;
+    let request = ffi::GgmlBackendMemoryRequestV1 {
+        kind: ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER,
+        usage: ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS as u32,
+        request_id: 1,
+        backend: backend.as_ptr(),
+        buft,
+        requested_bytes,
+        currently_allocated_bytes: 0,
+        ..Default::default()
+    };
+    let abi = unsafe { BackendMemoryAbi::from_backend(backend.as_ptr()) }
+        .map_err(|error| format!("candidate activation ABI: {error}"))?;
+    Ok((
+        quote_activation_group(&group_id, identity, abi, request)?,
+        Some(backend),
+    ))
 }
 
 fn quote_candidate_activation_plan(
@@ -2166,58 +2230,41 @@ fn quote_pack_activation_plan(
         ..Default::default()
     };
     let host_group_id = format!("candidate-activation-host-import:{activation_resource}");
-    let host_group = quote_activation_group(&host_group_id, &host, host_import).or_else(|_| {
-        let device = unsafe { ffi::ggml_backend_get_device(host.as_ptr()) };
-        if device.is_null() {
-            return Err("host activation backend has no device".to_string());
-        }
-        let buft = unsafe { ffi::ggml_backend_dev_buffer_type(device) };
-        if buft.is_null() {
-            return Err("host activation backend has no buffer type to quote".to_string());
-        }
-        let host_copy = ffi::GgmlBackendMemoryRequestV1 {
-            kind: ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER,
-            usage: ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS as u32,
-            request_id: 1,
-            backend: host.as_ptr(),
-            buft,
-            requested_bytes,
-            currently_allocated_bytes: 0,
-            ..Default::default()
-        };
-        quote_activation_group(
-            &format!("candidate-activation-host-copy:{activation_resource}"),
-            &host,
-            host_copy,
-        )
-    })?;
+    let host_group =
+        quote_host_activation_group(&host_group_id, &host, host_import).or_else(|_| {
+            let device = unsafe { ffi::ggml_backend_get_device(host.as_ptr()) };
+            if device.is_null() {
+                return Err("host activation backend has no device".to_string());
+            }
+            let buft = unsafe { ffi::ggml_backend_dev_buffer_type(device) };
+            if buft.is_null() {
+                return Err("host activation backend has no buffer type to quote".to_string());
+            }
+            let host_copy = ffi::GgmlBackendMemoryRequestV1 {
+                kind: ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER,
+                usage: ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS as u32,
+                request_id: 1,
+                backend: host.as_ptr(),
+                buft,
+                requested_bytes,
+                currently_allocated_bytes: 0,
+                ..Default::default()
+            };
+            quote_host_activation_group(
+                &format!("candidate-activation-host-copy:{activation_resource}"),
+                &host,
+                host_copy,
+            )
+        })?;
     let mut groups = vec![host_group];
     let mut backends = vec![host];
-    if let Some(device) = discrete_backend_for_candidate(candidate)? {
-        let device_raw = unsafe { ffi::ggml_backend_get_device(device.as_ptr()) };
-        if device_raw.is_null() {
-            return Err("discrete activation backend has no device".to_string());
+    if let Some(device) = discrete_device_for_candidate(candidate)? {
+        let (group, live_backend) =
+            quote_discrete_activation_group(&device, activation_resource, requested_bytes)?;
+        groups.push(group);
+        if let Some(live_backend) = live_backend {
+            backends.push(live_backend);
         }
-        let buft = unsafe { ffi::ggml_backend_dev_buffer_type(device_raw) };
-        if buft.is_null() {
-            return Err("discrete activation backend has no buffer type to quote".to_string());
-        }
-        let device_copy = ffi::GgmlBackendMemoryRequestV1 {
-            kind: ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER,
-            usage: ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS as u32,
-            request_id: 1,
-            backend: device.as_ptr(),
-            buft,
-            requested_bytes,
-            currently_allocated_bytes: 0,
-            ..Default::default()
-        };
-        groups.push(quote_activation_group(
-            &format!("candidate-activation-device-copy:{activation_resource}"),
-            &device,
-            device_copy,
-        )?);
-        backends.push(device);
     }
     let plan = admission_plan_from_quoted_groups(groups)?;
     Ok((backends, mmap, plan))
@@ -2270,7 +2317,7 @@ fn quote_cpu_buffer_plan(
         currently_allocated_bytes: 0,
         ..Default::default()
     };
-    let group = quote_activation_group(group_id, &host, request)?;
+    let group = quote_host_activation_group(group_id, &host, request)?;
     let plan = admission_plan_from_quoted_groups(vec![group])?;
     Ok((host, plan))
 }

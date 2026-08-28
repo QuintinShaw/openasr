@@ -6,7 +6,8 @@ use thiserror::Error;
 use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlComputeOutput, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlSelectionEvidenceRef, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlGraphRebuildReason, GgmlPersistentGraphSession,
+    GgmlSelectionEvidenceRef, GgmlStaticTensor, GgmlStaticTensorArena,
     GgufOwnedWeightTensorPayload, GgufTensorDataReadError, GgufTensorDataReader,
     env_toggle_with_raw,
 };
@@ -162,7 +163,6 @@ impl LogitsWeightPayload {
     }
 }
 
-#[cfg(test)]
 pub(crate) struct Qwen3AsrLlmFusedLogitsHeadSpec<'a> {
     pub(crate) d_model: usize,
     pub(crate) vocab_size: usize,
@@ -172,11 +172,6 @@ pub(crate) struct Qwen3AsrLlmFusedLogitsHeadSpec<'a> {
     pub(crate) output_weight_ggml_type: i32,
     pub(crate) output_weight_dims: &'a [usize],
     pub(crate) output_weight_bytes: &'a [u8],
-}
-
-#[cfg(not(test))]
-pub(crate) struct Qwen3AsrLlmFusedLogitsHeadSpec<'a> {
-    _marker: std::marker::PhantomData<&'a ()>,
 }
 
 impl Qwen3AsrLlmLogitsHead {
@@ -285,7 +280,6 @@ impl Qwen3AsrLlmLogitsHead {
         Ok(bytes.finish())
     }
 
-    #[cfg(test)]
     pub(crate) fn fused_top1_spec(&self) -> Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>> {
         let output_weight = self.ggml_output_weight.as_ref()?;
         Some(Qwen3AsrLlmFusedLogitsHeadSpec {
@@ -293,18 +287,20 @@ impl Qwen3AsrLlmLogitsHead {
             vocab_size: self.vocab_size,
             rms_norm_epsilon: self.rms_norm_epsilon,
             output_norm_weight: &self.output_norm_weight,
-            output_weight_tensor_name: self.output_weight_tensor_name,
+            output_weight_tensor_name: {
+                #[cfg(test)]
+                {
+                    self.output_weight_tensor_name
+                }
+                #[cfg(not(test))]
+                {
+                    OUTPUT_WEIGHT_TENSOR_NAME
+                }
+            },
             output_weight_ggml_type: output_weight.ggml_type,
             output_weight_dims: &output_weight.dims,
             output_weight_bytes: output_weight.payload.bytes(),
         })
-    }
-
-    #[cfg(not(test))]
-    pub(crate) fn fused_top1_spec(&self) -> Option<Qwen3AsrLlmFusedLogitsHeadSpec<'_>> {
-        // Native compact output is a test-only seam until the shared planner
-        // receives device-specific evidence for this exact graph.
-        None
     }
 
     #[cfg(test)]
@@ -430,6 +426,33 @@ impl Qwen3AsrLlmLogitsHeadRuntime {
                 executor.runner.uses_scheduler(),
             )
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reused_logits_row_count_for_test(&self) -> Option<usize> {
+        self.executor
+            .as_ref()
+            .and_then(|executor| executor.reuse.as_ref().map(|reuse| reuse.row_count))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reused_logits_prepared_node_count_for_test(&self) -> Option<usize> {
+        self.executor.as_ref().and_then(|executor| {
+            executor
+                .reuse
+                .as_ref()
+                .and_then(|reuse| reuse.session.prepared_native_node_count_for_test())
+        })
+    }
+
+    /// Drops the persistent logits graph after a request so a cached decoder
+    /// actor does not keep its compute buffers across the next encode.
+    pub(crate) fn release_request_compute_residency(&mut self) {
+        let Some(executor) = self.executor.as_mut() else {
+            return;
+        };
+        executor.reuse = None;
+        let _ = executor.runner.release_request_compute_residency();
     }
 
     pub(crate) fn compute_logits_for_hidden_rows(
@@ -773,6 +796,13 @@ fn load_direct_output_weight_payload(
     }))
 }
 
+struct QwenReusableLogitsGraph {
+    hidden: GgmlCpuTensor<'static>,
+    logits: GgmlCpuTensor<'static>,
+    row_count: usize,
+    session: GgmlPersistentGraphSession,
+}
+
 struct Qwen3AsrLlmLogitsHeadGraphExecutor {
     d_model: usize,
     vocab_size: usize,
@@ -781,6 +811,7 @@ struct Qwen3AsrLlmLogitsHeadGraphExecutor {
     arena: GgmlStaticTensorArena,
     output_norm_weight: GgmlStaticTensor,
     output_weight: GgmlStaticTensor,
+    reuse: Option<QwenReusableLogitsGraph>,
 }
 
 impl fmt::Debug for Qwen3AsrLlmLogitsHeadGraphExecutor {
@@ -853,6 +884,7 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
             arena,
             output_norm_weight: norm,
             output_weight: weight,
+            reuse: None,
         })
     }
 
@@ -861,6 +893,56 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
         hidden: &[f32],
     ) -> Result<GgmlComputeOutput<Vec<f32>>, GgmlCpuGraphError> {
         self.compute_rows(hidden, 1)
+    }
+
+    fn ensure_reusable_graph(&mut self, row_count: usize) -> Result<(), GgmlCpuGraphError> {
+        let rebuild_reason = match self.reuse.as_ref() {
+            None => None,
+            Some(reuse) if reuse.row_count == row_count && !reuse.session.is_poisoned() => {
+                return Ok(());
+            }
+            Some(reuse) if reuse.session.is_poisoned() => {
+                Some(GgmlGraphRebuildReason::PoisonRecovery)
+            }
+            Some(_) => Some(GgmlGraphRebuildReason::TopologyChanged),
+        };
+        self.reuse = None;
+        self.reuse = Some(self.build_reusable_graph(row_count, rebuild_reason)?);
+        Ok(())
+    }
+
+    fn build_reusable_graph(
+        &mut self,
+        row_count: usize,
+        rebuild_reason: Option<GgmlGraphRebuildReason>,
+    ) -> Result<QwenReusableLogitsGraph, GgmlCpuGraphError> {
+        let context_bytes =
+            GgmlCpuGraphConfig::metadata_context_bytes(QWEN3_LLM_LOGITS_GRAPH_NODE_CAPACITY);
+        let mut session = match rebuild_reason {
+            Some(reason) => self
+                .runner
+                .rebuild_persistent_graph_session(context_bytes, reason)?,
+            None => self
+                .runner
+                .start_persistent_graph_session_with_node_capacity(
+                    QWEN3_LLM_LOGITS_GRAPH_NODE_CAPACITY,
+                )?,
+        };
+        let graph = session.builder();
+        let hidden_tensor =
+            graph.new_tensor_2d_f32(self.d_model, row_count, "qwen_llm_logits_hidden_rows")?;
+        graph.set_input(hidden_tensor)?;
+        let normed = graph.rms_norm(hidden_tensor, self.rms_norm_epsilon)?;
+        let normed = graph.mul(normed, self.arena.graph_tensor(self.output_norm_weight))?;
+        let logits = graph.mul_mat(self.arena.graph_tensor(self.output_weight), normed)?;
+        graph.set_output(logits)?;
+        graph.prepare_outputs_for_upload(&[logits])?;
+        Ok(QwenReusableLogitsGraph {
+            hidden: hidden_tensor,
+            logits,
+            row_count,
+            session,
+        })
     }
 
     fn compute_rows(
@@ -885,15 +967,14 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
                 .ok_or(GgmlCpuGraphError::UnsupportedInputs {
                     reason: "logits head output rows shape overflow",
                 })?;
-        let mut graph = self.runner.start_graph();
-        let hidden_tensor =
-            graph.new_tensor_2d_f32(self.d_model, row_count, "qwen_llm_logits_hidden_rows")?;
-        graph.set_input(hidden_tensor)?;
-        let normed = graph.rms_norm(hidden_tensor, self.rms_norm_epsilon)?;
-        let normed = graph.mul(normed, self.arena.graph_tensor(self.output_norm_weight))?;
-        let logits = graph.mul_mat(self.arena.graph_tensor(self.output_weight), normed)?;
-        graph.set_output(logits)?;
-        graph.prepare_outputs_for_upload(&[logits])?;
+        self.ensure_reusable_graph(row_count)?;
+        let reuse = self
+            .reuse
+            .as_mut()
+            .expect("reusable logits graph built above");
+        let hidden_tensor = reuse.hidden;
+        let logits = reuse.logits;
+        let graph = reuse.session.builder();
         graph.set_f32_slice(hidden_tensor, hidden, "qwen_llm_logits_hidden_rows")?;
         graph.compute_output_f32_with_evidence(logits, output_len)
     }
@@ -1332,17 +1413,44 @@ mod tests {
     }
 
     #[test]
+    fn fused_logits_spec_is_available_when_native_weight_is_bound() {
+        let head = ggml_logits_head(vec![1.0, 1.0]);
+        let spec = head
+            .fused_top1_spec()
+            .expect("native output weight must describe a fused lm-head");
+        assert_eq!(spec.d_model, 2);
+        assert_eq!(spec.vocab_size, 3);
+        assert_eq!(spec.output_weight_dims, [2, 3].as_slice());
+    }
+
+    #[test]
     fn explicit_runtime_reuses_one_native_graph_and_rejects_head_aliasing() {
         let first = ggml_logits_head(vec![1.0, 1.0]);
         let mut runtime = first
             .new_runtime(GgmlCpuGraphBackend::Cpu)
             .expect("build explicit logits runtime");
+        let first_logits = runtime
+            .compute_logits_for_last_hidden(&first, &[1.0, 2.0])
+            .expect("first call");
+        let prepared_nodes = runtime.reused_logits_prepared_node_count_for_test();
+        assert_eq!(runtime.reused_logits_row_count_for_test(), Some(1));
+        assert!(prepared_nodes.is_some_and(|count| count > 0));
+        let second_logits = runtime
+            .compute_logits_for_last_hidden(&first, &[1.0, 2.0])
+            .expect("same owner reuses its graph");
+        assert_eq!(first_logits, second_logits);
+        assert_eq!(runtime.reused_logits_row_count_for_test(), Some(1));
+        assert_eq!(
+            runtime.reused_logits_prepared_node_count_for_test(),
+            prepared_nodes,
+            "second serial decode must keep the prepared logits graph"
+        );
         let first_token = runtime
             .compute_top1_token_for_last_hidden(&first, &[1.0, 2.0])
-            .expect("first call");
+            .expect("top-1 after reused logits");
         let second_token = runtime
             .compute_top1_token_for_last_hidden(&first, &[1.0, 2.0])
-            .expect("same owner reuses its graph");
+            .expect("top-1 stays stable");
         assert_eq!(first_token, second_token);
 
         let distinct_head = ggml_logits_head(vec![1.0, 1.0]);
@@ -1350,6 +1458,24 @@ mod tests {
             runtime.compute_top1_token_for_last_hidden(&distinct_head, &[1.0, 2.0]),
             Err(Qwen3AsrLlmLogitsHeadError::RuntimeHeadMismatch)
         ));
+    }
+
+    #[test]
+    fn logits_runtime_drops_persistent_graph_at_request_end() {
+        let head = ggml_logits_head(vec![1.0, 1.0]);
+        let mut runtime = head
+            .new_runtime(GgmlCpuGraphBackend::Cpu)
+            .expect("build explicit logits runtime");
+        runtime
+            .compute_logits_for_last_hidden(&head, &[1.0, 2.0])
+            .expect("first call");
+        assert_eq!(runtime.reused_logits_row_count_for_test(), Some(1));
+        runtime.release_request_compute_residency();
+        assert_eq!(runtime.reused_logits_row_count_for_test(), None);
+        runtime
+            .compute_logits_for_last_hidden(&head, &[1.0, 2.0])
+            .expect("rebuild after request-end release");
+        assert_eq!(runtime.reused_logits_row_count_for_test(), Some(1));
     }
 
     #[test]
@@ -1371,6 +1497,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(batched_logits, repeated_logits);
+        assert_eq!(
+            runtime.reused_logits_row_count_for_test(),
+            Some(1),
+            "serial follow-up must rebuild the persistent logits graph for n_seq=1"
+        );
         let batched = runtime
             .compute_top1_tokens_for_hidden_rows(&head, &hidden, 3)
             .expect("batched top-1");

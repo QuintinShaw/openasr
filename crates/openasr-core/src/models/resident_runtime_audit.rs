@@ -958,11 +958,12 @@ fn thread_affine_backend_cache_is_scoped_and_receipted() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ggml_runtime/cpu_graph.rs");
     let source = std::fs::read_to_string(path).expect("read cpu graph source");
     assert!(source.contains("struct CachedBackendKey"));
-    assert!(
-        source
-            .contains("scope_id: crate::models::native_execution_services::NativeExecutionScopeId")
-    );
     assert!(source.contains("current_native_execution_scope_id"));
+    assert!(
+        !source
+            .contains("scope_id: crate::models::native_execution_services::NativeExecutionScopeId"),
+        "GPU backend contexts are thread+device state; request scopes must not split them"
+    );
     assert!(
         source
             .contains("_receipt_owner: Option<crate::models::runtime_receipts::RuntimeOwnerGuard>")
@@ -1395,6 +1396,21 @@ fn production_activation_reserve_does_not_use_placeholder_bytes() {
     assert!(
         !plan.contains("peak_bytes: 0,"),
         "activation plan must not emit zero-byte domain rows: {plan}"
+    );
+    let discrete = production
+        .split("fn discrete_device_for_candidate")
+        .nth(1)
+        .expect("discrete_device_for_candidate")
+        .split("fn quote_activation_group")
+        .next()
+        .expect("discrete device body");
+    assert!(
+        !discrete.contains("initialize"),
+        "Vulkan admission quote must not construct a throwaway ggml backend: {discrete}"
+    );
+    assert!(
+        plan.contains("from_device") && plan.contains("ExecutionProvider::Vulkan"),
+        "Vulkan activation quote must use the device-only memory ABI: {plan}"
     );
     assert!(
         !quote.contains("verified_pack_from_preflight_for_test")

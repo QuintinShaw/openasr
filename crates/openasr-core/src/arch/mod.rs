@@ -9,7 +9,10 @@ use crate::device::{
     execution_policy::{AcceleratedPlacementCapabilities, ExecutionCapabilities},
     execution_route::ExecutionProvider,
 };
-use crate::ggml_runtime::{AutoGpuPolicy, GgmlCpuGraphBackend, RequestBackendPreference};
+use crate::ggml_runtime::{
+    AutoGpuPolicy, GgmlCpuGraphBackend, RequestBackendPreference,
+    exact_discrete_gpu_unified_owner_is_proven,
+};
 use crate::models::decode_policy_component_registry::{
     self as decode_policy, BuiltinDecodePolicyComponentDescriptor,
 };
@@ -110,15 +113,7 @@ pub(crate) fn firered_llm_unified_runtime_enabled(
     allow_unified_runtime
         && backend == GgmlCpuGraphBackend::Gpu
         && placement == Some(crate::device::execution_policy::ExecutionPlacement::FullDevice)
-        && matches!(
-            backend_preference,
-            Some(RequestBackendPreference::Exact(route))
-                if route.addressability.is_exactly_addressable()
-                    && matches!(
-                        route.provider,
-                        ExecutionProvider::Cuda | ExecutionProvider::Vulkan
-                    )
-        )
+        && exact_discrete_gpu_unified_owner_is_proven(backend_preference)
 }
 
 pub const COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID: &str = "cohere-transcribe-conformer-transformer";

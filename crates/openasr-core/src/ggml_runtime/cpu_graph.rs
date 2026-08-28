@@ -38,6 +38,14 @@ use super::{
     GgmlBackendKind, GgmlRuntimeError, GgmlRuntimeSource, GgufTensorDataReader,
     GgufWeightTensorPayload, ensure_backends_loaded, ggml_available_devices,
 };
+
+// Not part of `ffi.rs`: that file is hashed into the host ABI fingerprint.
+// Persistent-only CUDA/HIP capture is an internal cgraph flag.
+unsafe extern "C" {
+    fn ggml_graph_set_capture_allowed(cgraph: *mut c_void, allowed: bool);
+    #[cfg(test)]
+    fn ggml_graph_capture_allowed(cgraph: *mut c_void) -> bool;
+}
 use crate::device::execution_policy::{ExecutionCandidateFailure, ExecutionPlacement};
 use crate::device::pack_weight_residency::PackWeightResidencyHandle;
 use crate::device::{
@@ -47,7 +55,7 @@ use crate::device::{
     },
     execution_route::{
         ExecutionProvider, ExecutionRouteCacheKey, ExecutionRouteError, ExecutionRouteRequest,
-        ResolvedExecutionRoute, enumerate_compute_devices_from_ggml,
+        ResolvedExecutionRoute, RouteDeviceKind, enumerate_compute_devices_from_ggml,
         ranked_preferred_accelerated_devices, resolve_execution_route,
     },
 };
@@ -616,6 +624,52 @@ const fn discrete_gpu_reuse_is_proven(provider: ExecutionProvider) -> bool {
     matches!(provider, ExecutionProvider::Hip | ExecutionProvider::Vulkan)
 }
 
+/// Exact CUDA, HIP, and Vulkan FullDevice lanes already share one encoder+
+/// decoder actor on the families that built that owner. HIP was left out of
+/// several copies of the gate, which split the same pack across two ggml
+/// threads (two device weight uploads, two backends) on an otherwise proven
+/// GPU route.
+///
+/// Vulkan (and rare CUDA/HIP builds) may omit a PCI `device_id`, so Exact by
+/// physical key is unavailable. `addressability_for_device` still treats the
+/// ggml `stable_id` as the cache/worker slot; requiring a PCI key here would
+/// split the same pack again on those GPUs. `--device vulkan` also arrives as
+/// `Accelerated` until execute installs the candidate lane: consult that lane
+/// so actor threads keep the same proven owner.
+pub(crate) fn exact_discrete_gpu_unified_owner_is_proven(
+    preference: Option<&RequestBackendPreference>,
+) -> bool {
+    proven_discrete_gpu_provider(preference).is_some()
+}
+
+pub(crate) fn proven_discrete_gpu_provider(
+    preference: Option<&RequestBackendPreference>,
+) -> Option<ExecutionProvider> {
+    if let Some(provider) = discrete_gpu_provider_from_exact_route(preference) {
+        return Some(provider);
+    }
+    crate::models::native_execution_services::current_execution_lane().and_then(|lane| {
+        discrete_gpu_provider_from_exact_route(Some(&lane.request_backend_preference()))
+    })
+}
+
+fn discrete_gpu_provider_from_exact_route(
+    preference: Option<&RequestBackendPreference>,
+) -> Option<ExecutionProvider> {
+    match preference {
+        Some(RequestBackendPreference::Exact(route))
+            if matches!(
+                route.provider,
+                ExecutionProvider::Cuda | ExecutionProvider::Hip | ExecutionProvider::Vulkan
+            ) && matches!(route.kind, RouteDeviceKind::Accelerated)
+                && !route.stable_id.is_empty() =>
+        {
+            Some(route.provider)
+        }
+        _ => None,
+    }
+}
+
 const fn native_first_max_compact_is_proven(backend: GgmlCpuGraphBackend) -> bool {
     // CPU is the only lane with three-layer compact receipts. CUDA/Vulkan/HIP
     // may declare GGML_OP_ARGMAX_FIRST through supports_op, but that is not
@@ -845,22 +899,32 @@ impl GgmlCpuGraphConfig {
     }
 
     /// Exact byte capacity a `no_alloc` metadata context needs to hold a forward
-    /// graph of up to `graph_size` nodes: the cgraph object itself plus
-    /// per-tensor bookkeeping for every node (leafs never exceed the node budget
-    /// in practice). This mirrors llama.cpp's compute-meta buffer sizing
-    /// (`ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(...)`) and
-    /// replaces hand-tuned byte counts that historically over-reserved by ~24x:
-    /// `ggml_init` always mallocs the full `mem_size` even when `no_alloc=true`,
-    /// so three coexisting 2 GiB encoder contexts committed 6 GiB and tripped
-    /// `_aligned_malloc` -> NULL -> `GGML_ASSERT(ctx->mem_buffer != NULL)` on CPU,
-    /// even though each context only ever used ~83 MB. Both `ggml_tensor_overhead`
-    /// and `ggml_graph_overhead_custom` are pure size arithmetic and need no
+    /// graph of up to `graph_size` nodes. The llama.cpp compute-meta formula
+    /// (`ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(...)`) is
+    /// exact when `graph_size` is the live node count. Families also pass a
+    /// *capacity* (4096) as headroom; multiplying a tensor object slot by every
+    /// unused cgraph entry then mallocs ~2.1 MiB per session even though the
+    /// live graph is a few hundred to ~2k tensors. `ggml_init` always commits
+    /// the full `mem_size` (`no_alloc` only skips tensor *data*), so that
+    /// headroom showed up as PeakWorkingSet. v0.1.36 kept those contexts at the
+    /// 1 MiB bump (`DEFAULT_CONTEXT_BYTES`) while still creating a `graph_size`
+    /// cgraph; tiny heads already fit the full formula in well under 1 MiB, and
+    /// Zipformer-scale graphs (16384+) keep the full reservation because their
+    /// cgraph arrays alone exceed half a MiB. Both `ggml_tensor_overhead` and
+    /// `ggml_graph_overhead_custom` are pure size arithmetic and need no
     /// initialized context or loaded backend, so this is safe to call at config
     /// time.
     pub fn metadata_context_bytes(graph_size: usize) -> usize {
         let per_tensor = unsafe { ffi::ggml_tensor_overhead() };
         let graph = unsafe { ffi::ggml_graph_overhead_custom(graph_size, false) };
-        graph_size.saturating_mul(per_tensor).saturating_add(graph)
+        let full = graph_size.saturating_mul(per_tensor).saturating_add(graph);
+        if full <= DEFAULT_CONTEXT_BYTES {
+            return full;
+        }
+        if graph_size <= DEFAULT_GRAPH_SIZE && graph <= DEFAULT_CONTEXT_BYTES / 2 {
+            return DEFAULT_CONTEXT_BYTES;
+        }
+        full
     }
 
     /// Keep the cgraph node capacity and its `no_alloc` metadata backing in
@@ -1601,16 +1665,9 @@ fn detect_gpu_available() -> bool {
     // GGML_BACKEND_DL the registry is otherwise empty and a stale cache would
     // read as "no GPU" forever.
     ensure_backends_loaded();
-    let best_backend_is_gpu = NonNull::new(unsafe { ffi::ggml_backend_init_best() })
-        .map(|raw| {
-            let name = backend_name(raw).to_ascii_lowercase();
-            unsafe { ffi::ggml_backend_free(raw.as_ptr()) };
-            backend_name_is_accelerated(&name)
-        })
-        .unwrap_or(false);
-    if best_backend_is_gpu {
-        return true;
-    }
+    // Enumerate registry devices only. `ggml_backend_init_best` constructs a
+    // full Vulkan/HIP backend context (command pools, fences) and freeing it
+    // still leaves AMD WDDM ~2.1MiB host slabs in PeakWorkingSet.
     ggml_available_devices()
         .into_iter()
         .any(|device| backend_kind_is_accelerated(device.kind))
@@ -1651,17 +1708,6 @@ fn find_ggml_device_for_route<'a>(
             }
     })?;
     devices.get(matched.registry_ordinal)
-}
-
-fn backend_name_is_accelerated(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    name.contains("metal")
-        || name.starts_with("mtl")
-        || name.contains("hip")
-        || name.contains("rocm")
-        || name.contains("cuda")
-        || name.contains("vulkan")
-        || name.contains("gpu")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1934,7 +1980,13 @@ pub enum GgmlCpuGraphError {
 }
 
 pub struct GgmlCpuGraphRunner {
-    context: GgmlContextGuard,
+    /// `no_alloc` metadata buffer used by `start_graph`. Allocated lazily on
+    /// the first `start_graph` so persistent-session and arena-only runners
+    /// never commit a second full cgraph metadata arena. Parked again while a
+    /// persistent session is live; `start_graph` reallocates if a fallback
+    /// rebuild needs it.
+    context: Option<GgmlContextGuard>,
+    context_bytes: usize,
     backend: GgmlBackendGuard,
     backend_kind: GgmlCpuGraphBackend,
     backend_name: String,
@@ -1999,7 +2051,13 @@ struct GgmlGraphLifecycleState {
     capture_state: Option<GgmlNativeCaptureState>,
     capture_executable_generation: Option<u64>,
     capture_executable_observed_in_scope: bool,
+    /// After the first AfterCompute native observe on this graph generation,
+    /// further FFI probes cannot change planner reuse and only inflate HIP
+    /// RTF (X-ASR longform was 5k+ capture observes per request).
+    skip_further_native_capture: bool,
     kv_write_tensors: HashSet<usize>,
+    kv_write_graph_addr: Option<usize>,
+    kv_write_graph_reached: bool,
     poisoned_recorded: bool,
 }
 
@@ -2026,7 +2084,10 @@ impl GgmlGraphLifecycleState {
             capture_state: None,
             capture_executable_generation: None,
             capture_executable_observed_in_scope: false,
+            skip_further_native_capture: false,
             kv_write_tensors: HashSet::new(),
+            kv_write_graph_addr: None,
+            kv_write_graph_reached: false,
             poisoned_recorded: false,
         };
         state.record(super::GgmlGraphLifecycleEventKind::Created {
@@ -2036,13 +2097,11 @@ impl GgmlGraphLifecycleState {
     }
 
     fn record(&self, kind: super::GgmlGraphLifecycleEventKind) {
-        if !self.recording_enabled
-            || self.collector_scope.is_none()
-            || self.collector.observation_scope() != self.collector_scope
-        {
+        if !self.recording_enabled {
             return;
         }
-        self.collector.record(
+        self.collector.record_for_scope(
+            self.collector_scope,
             &self.provider,
             &self.device,
             self.graph_instance,
@@ -2072,6 +2131,7 @@ impl GgmlGraphLifecycleState {
         self.collector_scope = Some(current_scope);
         self.recording_enabled = true;
         self.capture_executable_observed_in_scope = false;
+        self.skip_further_native_capture = false;
         self.record(super::GgmlGraphLifecycleEventKind::ExistingGraphObserved {
             scheduler_enabled: self.scheduler_enabled,
             prepare_generation: self.prepare_generation,
@@ -2115,22 +2175,44 @@ impl GgmlGraphLifecycleState {
     fn input_written(&mut self, bytes: usize) {
         let input_generation = super::mint_opaque_graph_id();
         self.latest_input_generation = Some(input_generation);
-        self.record(super::GgmlGraphLifecycleEventKind::InputWrite {
-            input_generation,
-            bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
-        });
+        let _ = bytes;
+        // InputWrite events are not consulted by graph_rebuilt binding and
+        // dominated HIP/Vulkan longform receipts (thousands per request).
     }
 
     fn compute_started(&mut self) -> u64 {
         self.compute_sequence = self.compute_sequence.saturating_add(1);
         let compute_sequence = self.compute_sequence;
-        self.record(super::GgmlGraphLifecycleEventKind::ComputeStarted {
-            compute_sequence,
-            prepare_generation: self.prepare_generation,
-            input_generation_consumed: self.latest_input_generation,
-            capture_executable_generation: self.capture_executable_generation,
-        });
+        // After the first AfterCompute observation, capture support is a
+        // backend-handle constant. Further ComputeStarted events are not
+        // consulted by graph_rebuilt binding and dominated Zipformer/HIP
+        // receipts (hundreds per request). Keep sequencing and evidence
+        // identities; stop appending to the receipt.
+        if self.should_record_hot_path_compute(compute_sequence) {
+            self.record(super::GgmlGraphLifecycleEventKind::ComputeStarted {
+                compute_sequence,
+                prepare_generation: self.prepare_generation,
+                input_generation_consumed: self.latest_input_generation,
+                capture_executable_generation: self.capture_executable_generation,
+            });
+        }
         compute_sequence
+    }
+
+    fn should_record_hot_path_compute(&self, compute_sequence: u64) -> bool {
+        // Keep the first few computes so decode-conformance (2-step Layer-2,
+        // 4-step reusable quadrant) still sees a complete event chain. Zipformer
+        // decode then stops appending (hundreds of steps per request).
+        compute_sequence <= 4 || !self.skip_further_native_capture_observe()
+    }
+
+    fn capture_is_settled_unsupported(&self) -> bool {
+        self.capture_state
+            .is_some_and(|state| !state.capture_supported)
+    }
+
+    fn skip_further_native_capture_observe(&self) -> bool {
+        self.skip_further_native_capture || self.capture_is_settled_unsupported()
     }
 
     fn observe_native_capture(
@@ -2141,6 +2223,14 @@ impl GgmlGraphLifecycleState {
         use super::backend_graph_lifecycle::{
             BackendGraphLifecycleError, NativeGraphExecutableChange,
         };
+
+        // Capture support is a backend-handle constant. Once a graph has
+        // observed unsupported, further FFI probes and CaptureStateObserved
+        // events cannot change the plan and only inflate RTF/RSS on
+        // capture-unsupported Vulkan (and any future same-shaped backend).
+        if self.skip_further_native_capture_observe() {
+            return Ok(());
+        }
 
         let next_state = GgmlNativeCaptureState {
             capture_supported: observation.capture_supported,
@@ -2258,22 +2348,29 @@ impl GgmlGraphLifecycleState {
             self.capture_executable_generation = Some(capture_executable_generation);
             self.capture_executable_observed_in_scope = true;
         }
+        if phase == GgmlNativeGraphObservationPhase::AfterCompute {
+            self.skip_further_native_capture = true;
+        }
         Ok(())
     }
 
     fn compute_completed(&mut self, compute_sequence: u64, kv_writes_reached_compute: bool) {
-        let output_generation = super::mint_opaque_graph_id();
-        self.latest_output_generation = Some(output_generation);
         self.last_completed_compute = Some(compute_sequence);
-        self.record(super::GgmlGraphLifecycleEventKind::ComputeCompleted {
-            compute_sequence,
-            output_generation,
-        });
-        if kv_writes_reached_compute {
-            self.record(super::GgmlGraphLifecycleEventKind::KvWriteCommitted {
+        if self.should_record_hot_path_compute(compute_sequence) {
+            let output_generation = super::mint_opaque_graph_id();
+            self.latest_output_generation = Some(output_generation);
+            self.record(super::GgmlGraphLifecycleEventKind::ComputeCompleted {
                 compute_sequence,
-                kv_write_generation: super::mint_opaque_graph_id(),
+                output_generation,
             });
+            if kv_writes_reached_compute {
+                self.record(super::GgmlGraphLifecycleEventKind::KvWriteCommitted {
+                    compute_sequence,
+                    kv_write_generation: super::mint_opaque_graph_id(),
+                });
+            }
+        } else if self.latest_output_generation.is_none() {
+            self.latest_output_generation = Some(super::mint_opaque_graph_id());
         }
     }
 
@@ -2283,11 +2380,13 @@ impl GgmlGraphLifecycleState {
         else {
             return None;
         };
-        self.record(super::GgmlGraphLifecycleEventKind::OutputRead {
-            compute_sequence,
-            output_generation_consumed,
-            bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
-        });
+        if self.should_record_hot_path_compute(compute_sequence) {
+            self.record(super::GgmlGraphLifecycleEventKind::OutputRead {
+                compute_sequence,
+                output_generation_consumed,
+                bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+            });
+        }
         Some(super::GgmlComputeEvidenceRef::new(
             self.graph_instance,
             self.graph_generation,
@@ -2590,14 +2689,23 @@ impl LoadedWeightOwnerCache {
         kind: GgmlWeightMaterializationKind,
         backend_kind: GgmlCpuGraphBackend,
     ) -> LoadedWeightOwnerKey {
+        let lane =
+            crate::models::native_execution_services::current_execution_lane_key(backend_kind);
+        // Pack-wide weight buffers live on the device, not in a placement. A
+        // Vulkan Hybrid request still DeviceCopies the same GGUF onto Vulkan0
+        // for the encoder (FullDevice stage) and GPU decoder; hashing Hybrid
+        // vs FullDevice as distinct owners doubles the 32 MiB copy.
+        let lane = if matches!(backend_kind, GgmlCpuGraphBackend::Cpu) {
+            lane
+        } else {
+            lane.for_stage(backend_kind, ExecutionPlacement::FullDevice)
+        };
         LoadedWeightOwnerKey {
             content_id: source.content_id().to_string(),
             source_identity: source.strong_file_identity(),
             mapping_identity: source.backing_mmap_identity(),
             kind,
-            lane: crate::models::native_execution_services::current_execution_lane_key(
-                backend_kind,
-            ),
+            lane,
         }
     }
 
@@ -2732,6 +2840,10 @@ pub(crate) struct GgmlCpuGraphBuilder<'a> {
     /// backends (Metal/GPU), which already get grow-to-fit allocation from
     /// the scheduler's own internal `ggml_gallocr`.
     step_buffer_pool: Option<&'a mut GgmlCpuStepBufferPool>,
+    /// CUDA/HIP capture is opt-in for persistent sessions only. `start_graph`
+    /// one-shot builders leave this false so mixed HIP instantiate is not
+    /// paid for encoder/prefill graphs that are dropped after one compute.
+    native_capture_allowed: bool,
     /// True once this builder has bound its tensors to backend memory (either
     /// via `buffer` or via `step_buffer_pool`) -- no further tensor creation
     /// is allowed past this point. Tracked separately from `buffer` because
@@ -2763,6 +2875,19 @@ pub(crate) struct GgmlCpuGraphBuilder<'a> {
     /// result, and replay that evidence to each new request collector while
     /// still counting every compute.
     observed_placement: Option<GgmlObservedGraphPlacement>,
+    /// The live backend handle cannot change for this builder. Re-querying
+    /// `ggml_backend_dev_name` on every token only inflates HIP/Vulkan RTF
+    /// (X-ASR longform is 600+ computes). Later steps still re-check request
+    /// placement and re-publish the cached identity to a new receipt.
+    identity_attested: bool,
+    /// Receipt pointer last published by `record_current_execution_backend_observation`.
+    /// The same persistent builder must re-publish when a later request installs
+    /// a new collector, but not on every subsequent token of that request.
+    observation_receipt_key: Option<usize>,
+    /// Backend memory stats after graph compute are a request-level high-water
+    /// probe, not a per-token metric. X-ASR reuse is 600+ computes; querying
+    /// Vulkan/HIP heaps on every joiner step only inflates RTF.
+    after_compute_memory_probed: bool,
     lifecycle: Option<GgmlGraphLifecycleState>,
     _runner_borrow: PhantomData<&'a mut GgmlCpuGraphRunner>,
 }
@@ -2852,11 +2977,83 @@ impl GgmlPersistentGraphSession {
     }
 
     #[cfg(test)]
+    pub(crate) fn prepared_graph_capture_allowed_for_test(&self) -> Option<bool> {
+        self.builder.prepared_graph_capture_allowed_for_test()
+    }
+
+    #[cfg(test)]
     pub(crate) fn prepared_allocation_bytes(&self) -> Option<u64> {
         self.builder
             .graph_allocator
             .as_ref()
             .map(GgmlGraphAllocatorGuard::requested_bytes)
+    }
+}
+
+/// Identity of a reusable ggml graph's input shape. Families compare this key
+/// and rebuild the persistent session only when it changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct GgmlGraphShapeKey {
+    pub dims: [u64; 4],
+}
+
+impl GgmlGraphShapeKey {
+    pub(crate) fn new(d0: usize, d1: usize, d2: usize, d3: usize) -> Self {
+        Self {
+            dims: [d0 as u64, d1 as u64, d2 as u64, d3 as u64],
+        }
+    }
+}
+
+/// Build-once / re-run helper for graphs whose topology is fixed but whose
+/// tensor extents depend on the request (audio frames, prompt length). A
+/// warmup and the measured run with the same shape skip `start_graph`.
+/// This is graph-object reuse, not decode-lane capture evidence; encoder
+/// families must not gate it on `GgmlDecodeReuseMode::ReusableGraph`.
+#[derive(Default)]
+pub(crate) struct GgmlSameShapePersistentGraph {
+    session: Option<GgmlPersistentGraphSession>,
+    shape: Option<GgmlGraphShapeKey>,
+}
+
+/// Encoder same-shape reuse is available on every backend that can keep a
+/// ggml graph. Decode `ReusableGraph` remains the capture-evidence gate.
+pub(crate) const fn encoder_same_shape_reuse_is_enabled() -> bool {
+    true
+}
+
+impl GgmlSameShapePersistentGraph {
+    /// Returns the persistent builder and whether it was reused for `shape`.
+    pub(crate) fn builder_for_shape(
+        &mut self,
+        runner: &mut GgmlCpuGraphRunner,
+        shape: GgmlGraphShapeKey,
+    ) -> Result<(&mut GgmlCpuGraphBuilder<'static>, bool), GgmlCpuGraphError> {
+        let reused = self.shape == Some(shape)
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|session| !session.is_poisoned());
+        if !reused {
+            self.session = None;
+            self.session = Some(runner.start_capacity_sized_persistent_graph_session()?);
+            self.shape = Some(shape);
+        }
+        let session = self
+            .session
+            .as_mut()
+            .expect("same-shape session is installed above");
+        Ok((session.builder(), reused))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn drop_session(&mut self) {
+        self.session = None;
+        self.shape = None;
+    }
+
+    pub(crate) fn has_session(&self) -> bool {
+        self.session.is_some()
     }
 }
 
@@ -2906,7 +3103,6 @@ impl GgmlCpuGraphRunner {
         // or execute CPU work before telemetry can reject the attempt).
         let use_scheduler = config.use_scheduler && scheduler_allows_cpu;
 
-        let context = GgmlContextGuard::new(config.context_bytes, "ggml.runner-context")?;
         let mut backend = match config.backend {
             GgmlCpuGraphBackend::Cpu => GgmlBackendGuard::cpu()?,
             GgmlCpuGraphBackend::Metal => GgmlBackendGuard::metal()?,
@@ -3009,7 +3205,8 @@ impl GgmlCpuGraphRunner {
             super::backend_graph_lifecycle::BackendGraphLifecycleBinding::resolve(backend.raw)
         };
         Ok(Self {
-            context,
+            context: None,
+            context_bytes: config.context_bytes,
             backend,
             backend_kind: config.backend,
             backend_name,
@@ -3194,6 +3391,33 @@ impl GgmlCpuGraphRunner {
         Ok(loaded)
     }
 
+    fn park_idle_runner_graph_context(&mut self) {
+        self.context = None;
+    }
+
+    fn ensure_runner_graph_context(&mut self) {
+        if self.context.is_none() {
+            self.context = Some(
+                GgmlContextGuard::new(self.context_bytes, "ggml.runner-context").unwrap_or_else(
+                    |error| {
+                        panic!(
+                            "failed to restore parked runner graph context ({} bytes): {error}",
+                            self.context_bytes
+                        )
+                    },
+                ),
+            );
+        }
+    }
+
+    #[cfg(test)]
+    fn runner_graph_context_bytes_for_test(&self) -> usize {
+        self.context
+            .as_ref()
+            .map(GgmlContextGuard::mem_size)
+            .unwrap_or(0)
+    }
+
     pub(crate) fn start_graph(&mut self) -> GgmlCpuGraphBuilder<'_> {
         if let Some(scheduler) = self.scheduler.as_ref() {
             // `ggml_reset` discards the old graph metadata. Detach any
@@ -3202,7 +3426,13 @@ impl GgmlCpuGraphRunner {
             unsafe { ffi::ggml_backend_sched_reset(scheduler.raw.as_ptr()) };
             scheduler.memory_owner.active_graph_address.set(None);
         }
-        unsafe { ffi::ggml_reset(self.context.raw.as_ptr()) };
+        self.ensure_runner_graph_context();
+        let context_raw = self
+            .context
+            .as_ref()
+            .expect("runner graph context installed for start_graph")
+            .raw;
+        unsafe { ffi::ggml_reset(context_raw.as_ptr()) };
         let scheduler = self.scheduler.as_ref().map(|scheduler| scheduler.raw);
         let scheduler_memory_owner = self
             .scheduler
@@ -3235,7 +3465,7 @@ impl GgmlCpuGraphRunner {
             self.last_transient_graph_generation = Some(lifecycle.observed_generation());
         }
         GgmlCpuGraphBuilder {
-            context: self.context.raw,
+            context: context_raw,
             backend: self.backend.raw,
             backend_kind: self.backend_kind,
             backend_capabilities: self.backend_capabilities,
@@ -3249,6 +3479,7 @@ impl GgmlCpuGraphRunner {
             buffer: None,
             graph_allocator: None,
             step_buffer_pool,
+            native_capture_allowed: false,
             frozen: false,
             prepared_graph: None,
             side_effect_roots: Vec::new(),
@@ -3258,6 +3489,9 @@ impl GgmlCpuGraphRunner {
             direct_graph_private_pending: Vec::new(),
             execution_graph_id: NEXT_EXECUTION_GRAPH_ID.fetch_add(1, Ordering::Relaxed),
             observed_placement: None,
+            identity_attested: false,
+            observation_receipt_key: None,
+            after_compute_memory_probed: false,
             lifecycle,
             _runner_borrow: PhantomData,
         }
@@ -3274,6 +3508,16 @@ impl GgmlCpuGraphRunner {
     /// process-resident allocation instead.
     pub(crate) fn release_cpu_step_buffer_pool(&mut self) {
         self.cpu_step_buffer_pool = GgmlCpuStepBufferPool::new();
+    }
+
+    /// After any persistent graph session has been dropped, release scheduler
+    /// gallocr buffers and the CPU step pool so a cached runner does not keep
+    /// request-scoped compute residency. Uploaded weights and backend handles
+    /// stay. Callers must drop `GgmlPersistentGraphSession` first or this
+    /// returns [`GgmlCpuGraphError::PersistentGraphSessionActive`].
+    pub(crate) fn release_request_compute_residency(&mut self) -> Result<(), GgmlCpuGraphError> {
+        self.release_cpu_step_buffer_pool();
+        self.release_transient_scheduler_working_set()
     }
 
     /// Releases a completed transient stage's scheduler-owned graph buffers
@@ -3306,7 +3550,14 @@ impl GgmlCpuGraphRunner {
         mut trim_backend: impl FnMut(ffi::GgmlBackendRaw) -> Result<(), GgmlCpuGraphError>,
     ) -> Result<(), GgmlCpuGraphError> {
         let Some(current) = self.scheduler.as_ref() else {
-            return Ok(());
+            // Direct GPU (Vulkan/HIP without a scheduler) still keeps
+            // backend-private cached buffers after `start_graph` drops.
+            // Trim those here so a cached runner does not hold request
+            // scratch. CPU has no trim ABI and is a no-op.
+            if !self.backend_kind.is_gpu_class() {
+                return Ok(());
+            }
+            return trim_backend(self.backend.raw.as_ptr());
         };
         if current.has_dependent_handles() {
             return Err(GgmlCpuGraphError::PersistentGraphSessionActive);
@@ -3446,6 +3697,9 @@ impl GgmlCpuGraphRunner {
         if graph_size == 0 {
             return Err(GgmlCpuGraphError::InvalidGraphSize);
         }
+        // Persistent sessions allocate their own metadata arena. Drop the idle
+        // start_graph buffer first so PeakWorkingSet never holds both.
+        self.park_idle_runner_graph_context();
         let context = GgmlContextGuard::new(context_bytes, "ggml.persistent-graph-context")?;
         let lifecycle = super::current_graph_lifecycle_collector()
             .map(|collector| GgmlGraphLifecycleState::created(&self.execution_identity, collector));
@@ -3487,6 +3741,7 @@ impl GgmlCpuGraphRunner {
             // allocation for the session's whole lifetime, so it does not
             // need the step pool's grow-to-fit reuse.
             step_buffer_pool: None,
+            native_capture_allowed: true,
             frozen: false,
             prepared_graph: None,
             side_effect_roots: Vec::new(),
@@ -3496,6 +3751,9 @@ impl GgmlCpuGraphRunner {
             direct_graph_private_pending: Vec::new(),
             execution_graph_id: NEXT_EXECUTION_GRAPH_ID.fetch_add(1, Ordering::Relaxed),
             observed_placement: None,
+            identity_attested: false,
+            observation_receipt_key: None,
+            after_compute_memory_probed: false,
             lifecycle,
             _runner_borrow: PhantomData,
         };
@@ -6250,6 +6508,8 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             lifecycle
                 .kv_write_tensors
                 .insert(write.raw.as_ptr() as usize);
+            lifecycle.kv_write_graph_addr = None;
+            lifecycle.kv_write_graph_reached = false;
         }
         Ok(write)
     }
@@ -6276,6 +6536,8 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             lifecycle
                 .kv_write_tensors
                 .insert(tensor.raw.as_ptr() as usize);
+            lifecycle.kv_write_graph_addr = None;
+            lifecycle.kv_write_graph_reached = false;
         }
         Ok(())
     }
@@ -6872,6 +7134,12 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             lifecycle.ensure_prepared();
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn prepared_graph_capture_allowed_for_test(&self) -> Option<bool> {
+        self.prepared_graph
+            .map(|graph| unsafe { ggml_graph_capture_allowed(graph.as_ptr()) })
     }
 
     pub(crate) fn prepare_side_effects_for_upload(&mut self) -> Result<(), GgmlCpuGraphError> {
@@ -7541,12 +7809,34 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         Ok(())
     }
 
-    fn compute_graph_with_memory_gate(
-        &mut self,
-        graph: NonNull<c_void>,
-    ) -> Result<(), GgmlCpuGraphError> {
-        if super::thread_job_cancel_flag().is_some_and(|flag| flag.load(Ordering::Acquire)) {
-            return self.finish_compute_result(Ok(ffi::GGML_STATUS_ABORTED));
+    fn attest_live_runner_identity(&mut self) -> Result<(), GgmlCpuGraphError> {
+        if self.identity_attested {
+            let placement = crate::models::native_execution_services::current_execution_placement();
+            if placement != self.runner_identity.placement {
+                return Err(GgmlCpuGraphError::RunnerPlacementChanged {
+                    expected: self.runner_identity.placement,
+                    actual: placement,
+                });
+            }
+            // Exact-route identity is a runner constant after the first
+            // compute. Re-attesting it on Zipformer/HIP decode steps only
+            // inflates RTF.
+            let receipt_key =
+                crate::models::native_execution_services::current_execution_receipt_collector()
+                    .map(|receipt| receipt.identity_key());
+            if self.observation_receipt_key != receipt_key {
+                crate::models::native_execution_services::record_current_execution_backend_observation(
+                    self.backend.as_ptr() as usize,
+                    self.backend_kind,
+                    &self.runner_identity.backend_name,
+                    self.runner_identity.actual_provider,
+                    &self.runner_identity.actual_stable_device_id,
+                    self.runner_identity.actual_device.as_ref(),
+                    self.scheduler.is_some(),
+                );
+                self.observation_receipt_key = receipt_key;
+            }
+            return Ok(());
         }
         attest_runner_execution_identity(
             self.backend,
@@ -7555,6 +7845,21 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             &self.runner_identity,
             self.scheduler.is_some(),
         )?;
+        self.identity_attested = true;
+        self.observation_receipt_key =
+            crate::models::native_execution_services::current_execution_receipt_collector()
+                .map(|receipt| receipt.identity_key());
+        Ok(())
+    }
+
+    fn compute_graph_with_memory_gate(
+        &mut self,
+        graph: NonNull<c_void>,
+    ) -> Result<(), GgmlCpuGraphError> {
+        if super::thread_job_cancel_flag().is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return self.finish_compute_result(Ok(ffi::GGML_STATUS_ABORTED));
+        }
+        self.attest_live_runner_identity()?;
         if let Some(lifecycle) = self.lifecycle.as_mut() {
             lifecycle.refresh_request_collector();
         }
@@ -7568,7 +7873,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         TEST_COMPUTE_GATE_ATTEMPT_COUNT.with(|count| count.set(count.get().saturating_add(1)));
         let kv_writes_reached_compute = self
             .lifecycle
-            .as_ref()
+            .as_mut()
             .is_some_and(|lifecycle| Self::registered_kv_writes_reached_by(graph, lifecycle));
         if self.lifecycle.is_some()
             && let Err(source) = self.observe_native_graph_lifecycle(
@@ -7603,6 +7908,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             }
         }
         if result.is_ok()
+            && !self.after_compute_memory_probed
             && crate::models::native_execution_services::current_execution_observation_sink()
                 .is_some()
         {
@@ -7610,6 +7916,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 self.backend.as_ptr(),
                 super::backend_memory::BackendMemoryLifecyclePoint::AfterGraphCompute,
             );
+            self.after_compute_memory_probed = true;
         }
         result
     }
@@ -7622,9 +7929,35 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         if self.lifecycle.is_none() || self.scheduler.is_some() {
             return Ok(());
         }
+        // One-shot `start_graph` builders opt out of CUDA/HIP capture. HIP
+        // still reports capture_supported; requiring tracking after compute
+        // would fail-close every encoder/prefill graph we intentionally left
+        // uninstantiated.
+        if !self.native_capture_allowed {
+            return Ok(());
+        }
+        if self
+            .lifecycle
+            .as_ref()
+            .is_some_and(GgmlGraphLifecycleState::skip_further_native_capture_observe)
+        {
+            return Ok(());
+        }
+        let backend_addr = self.backend.as_ptr() as usize;
+        let capture_unsupported = THREAD_CAPTURE_UNSUPPORTED_BACKEND_ADDRS
+            .try_with(|addrs| addrs.borrow().contains(&backend_addr))
+            .unwrap_or(false);
+        if capture_unsupported {
+            return Ok(());
+        }
         let Some(observation) = self.backend_graph_lifecycle.observe(self.backend, graph)? else {
             return Ok(());
         };
+        if !observation.capture_supported {
+            let _ = THREAD_CAPTURE_UNSUPPORTED_BACKEND_ADDRS.try_with(|addrs| {
+                addrs.borrow_mut().insert(backend_addr);
+            });
+        }
         self.lifecycle
             .as_mut()
             .expect("lifecycle presence checked before native observation")
@@ -7646,10 +7979,14 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
 
     fn registered_kv_writes_reached_by(
         graph: NonNull<c_void>,
-        lifecycle: &GgmlGraphLifecycleState,
+        lifecycle: &mut GgmlGraphLifecycleState,
     ) -> bool {
         if lifecycle.kv_write_tensors.is_empty() {
             return false;
+        }
+        let graph_addr = graph.as_ptr() as usize;
+        if lifecycle.kv_write_graph_addr == Some(graph_addr) {
+            return lifecycle.kv_write_graph_reached;
         }
         let mut observed = 0usize;
         let node_count = unsafe { ffi::ggml_graph_n_nodes(graph.as_ptr()) };
@@ -7659,7 +7996,10 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 observed = observed.saturating_add(1);
             }
         }
-        observed == lifecycle.kv_write_tensors.len()
+        let reached = observed == lifecycle.kv_write_tensors.len();
+        lifecycle.kv_write_graph_addr = Some(graph_addr);
+        lifecycle.kv_write_graph_reached = reached;
+        reached
     }
 
     fn record_execution_placement(&mut self, graph: NonNull<c_void>) {
@@ -7865,6 +8205,149 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             None
         };
         Ok(GgmlComputeRowsOutput { value, evidence })
+    }
+
+    /// One `ggml_backend_tensor_get` per CTC/argmax row waits on a discrete
+    /// GPU fence per frame. Cap the host transfer so PeakWS does not hold the
+    /// full logit matrix beside live compute buffers, but batch enough rows
+    /// that Vulkan/HIP pay one copy+fence per chunk. The visitor still sees
+    /// exactly one row.
+    const ROW_READBACK_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+    /// Computes once, then visits each output row from a reused host buffer.
+    /// Callers that can consume a row immediately (CTC greedy, argmax) must
+    /// use this instead of materializing the full host matrix while backend
+    /// compute buffers are still live.
+    pub(crate) fn compute_output_f32_rows_for_each<F>(
+        &mut self,
+        output: GgmlCpuTensor<'a>,
+        row_width: usize,
+        row_count: usize,
+        mut visit: F,
+    ) -> Result<Option<Vec<super::GgmlSelectionEvidenceRef>>, GgmlCpuGraphError>
+    where
+        F: FnMut(usize, &[f32]) -> Result<(), GgmlCpuGraphError>,
+    {
+        if row_width == 0 || row_count == 0 {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "row-partitioned output dimensions must be positive",
+            });
+        }
+        let expected_len =
+            row_width
+                .checked_mul(row_count)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "row-partitioned output element count overflow",
+                })?;
+        let row_nbytes =
+            row_width
+                .checked_mul(F32_WIDTH_BYTES)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "row byte width overflow",
+                })?;
+        let expected_nbytes = expected_len.checked_mul(F32_WIDTH_BYTES).ok_or(
+            GgmlCpuGraphError::UnsupportedInputs {
+                reason: "tensor byte width overflow",
+            },
+        )?;
+        self.ensure_not_poisoned()?;
+        self.ensure_tensor_type(
+            output,
+            ffi::GGML_TYPE_F32,
+            "compute_output_f32_rows_for_each",
+        )?;
+        let actual_nbytes = self.tensor_nbytes(output);
+        if actual_nbytes != expected_nbytes {
+            return Err(GgmlCpuGraphError::OutputByteSizeMismatch {
+                expected: expected_nbytes,
+                actual: actual_nbytes,
+            });
+        }
+
+        let graph_prepared = self.prepared_graph.is_some();
+        let graph = if let Some(graph) = self.prepared_graph {
+            graph
+        } else {
+            self.ensure_backend_buffer()?;
+            self.build_forward_graph(&[output])?
+        };
+        if self.scheduler.is_some() && !graph_prepared {
+            self.allocate_scheduler_graph_for_compute(graph)?;
+        }
+        self.compute_graph_with_memory_gate(graph)?;
+
+        let rows_per_chunk = Self::ROW_READBACK_CHUNK_BYTES
+            .checked_div(row_nbytes)
+            .filter(|&rows| rows > 0)
+            .unwrap_or(1)
+            .min(row_count);
+        let chunk_len =
+            row_width
+                .checked_mul(rows_per_chunk)
+                .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                    reason: "row-partitioned output element count overflow",
+                })?;
+        let mut chunk = vec![0.0f32; chunk_len];
+        let mut compute_evidence = None;
+        let mut evidence_rows = if self.lifecycle.is_some() {
+            Some(Vec::with_capacity(row_count))
+        } else {
+            None
+        };
+        let mut row_index = 0usize;
+        while row_index < row_count {
+            let rows_this = (row_count - row_index).min(rows_per_chunk);
+            let offset =
+                row_index
+                    .checked_mul(row_nbytes)
+                    .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "row byte offset overflow",
+                    })?;
+            let chunk_nbytes =
+                rows_this
+                    .checked_mul(row_nbytes)
+                    .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "row-partitioned output byte width overflow",
+                    })?;
+            let status = unsafe {
+                read_tensor_bytes(
+                    output.raw.as_ptr(),
+                    chunk.as_mut_ptr().cast::<c_void>(),
+                    offset,
+                    chunk_nbytes,
+                )
+            };
+            if row_index == 0 {
+                let output_evidence = self.finish_output_read(status, expected_nbytes)?;
+                if self.lifecycle.is_some() && output_evidence.is_none() {
+                    return Err(self.fail_output_evidence(
+                        "successful output readback did not produce a compute evidence ref",
+                    ));
+                }
+                compute_evidence = output_evidence;
+            } else {
+                self.finish_readback_status(status)?;
+            }
+            for local_index in 0..rows_this {
+                let abs_index = row_index + local_index;
+                let start = local_index * row_width;
+                let row = &chunk[start..start + row_width];
+                if let Some(rows) = evidence_rows.as_mut() {
+                    let Some(row_evidence) = compute_evidence
+                        .as_ref()
+                        .and_then(|compute| compute.selection(abs_index, row_count))
+                    else {
+                        return Err(self.fail_output_evidence(
+                            "readback layer could not mint a bounded output-row witness",
+                        ));
+                    };
+                    rows.push(row_evidence);
+                }
+                visit(abs_index, row)?;
+            }
+            row_index += rows_this;
+        }
+        Ok(evidence_rows)
     }
 
     /// Executes the graph once and reads every declared output in declaration
@@ -8585,10 +9068,14 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         &self,
         step: &'static str,
     ) -> Result<NonNull<c_void>, GgmlCpuGraphError> {
-        NonNull::new(unsafe {
+        let graph = NonNull::new(unsafe {
             ffi::ggml_new_graph_custom(self.context.as_ptr(), self.graph_size, false)
         })
-        .ok_or(GgmlCpuGraphError::GraphBuildFailed { step })
+        .ok_or(GgmlCpuGraphError::GraphBuildFailed { step })?;
+        if self.native_capture_allowed {
+            unsafe { ggml_graph_set_capture_allowed(graph.as_ptr(), true) };
+        }
+        Ok(graph)
     }
 
     fn ensure_can_extend_graph(&self, step: &'static str) -> Result<(), GgmlCpuGraphError> {
@@ -9588,6 +10075,22 @@ struct GgmlContextGuard {
     // Field order is load-bearing: `raw` is freed before the lease refunds
     // its committed SystemMemory bytes.
     _system_memory: crate::models::system_memory_owner::SystemMemoryOwner<()>,
+    log_label: &'static str,
+    log_bytes: usize,
+}
+
+fn log_ggml_contexts() -> bool {
+    std::env::var_os("OPENASR_LOG_GGML_CONTEXTS").is_some()
+}
+
+fn log_ggml_context_event(op: &str, label: &str, bytes: usize, raw: NonNull<c_void>) {
+    if !log_ggml_contexts() {
+        return;
+    }
+    eprintln!(
+        "ggml_context {op} label={label} bytes={bytes} ptr={raw:p}",
+        raw = raw.as_ptr()
+    );
 }
 
 impl GgmlContextGuard {
@@ -9600,12 +10103,15 @@ impl GgmlContextGuard {
                 no_alloc: true,
             })
         };
-        NonNull::new(raw)
-            .map(|raw| Self {
-                raw,
-                _system_memory: system_memory,
-            })
-            .ok_or(GgmlCpuGraphError::ContextInitFailed { context_bytes })
+        let raw =
+            NonNull::new(raw).ok_or(GgmlCpuGraphError::ContextInitFailed { context_bytes })?;
+        log_ggml_context_event("alloc", resource_id, context_bytes, raw);
+        Ok(Self {
+            raw,
+            _system_memory: system_memory,
+            log_label: resource_id,
+            log_bytes: context_bytes,
+        })
     }
 
     fn reserve_system_memory(
@@ -9627,19 +10133,29 @@ impl GgmlContextGuard {
         })
     }
 
+    #[cfg(test)]
+    fn mem_size(&self) -> usize {
+        unsafe { ffi::ggml_get_mem_size(self.raw.as_ptr()) }
+    }
+
     fn from_raw(
         raw: NonNull<c_void>,
         system_memory: crate::models::system_memory_owner::SystemMemoryOwner<()>,
     ) -> Self {
+        let bytes = unsafe { ffi::ggml_get_mem_size(raw.as_ptr()) };
+        log_ggml_context_event("adopt", "ggml.loaded-weight-context", bytes, raw);
         Self {
             raw,
             _system_memory: system_memory,
+            log_label: "ggml.loaded-weight-context",
+            log_bytes: bytes,
         }
     }
 }
 
 impl Drop for GgmlContextGuard {
     fn drop(&mut self) {
+        log_ggml_context_event("free", self.log_label, self.log_bytes, self.raw);
         unsafe { ffi::ggml_free(self.raw.as_ptr()) };
     }
 }
@@ -9783,16 +10299,17 @@ impl GgmlSchedulerMemoryOwner {
 /// handed-out guard share the same native lifetime owner.
 ///
 /// The table is a thread-affine implementation detail, not a process-global
-/// owner: every cached key includes the current NES scope and exact route, and
-/// an unscoped low-level caller receives an ordinary drop-owned backend rather
-/// than publishing into this cache.
+/// owner. The cache key is the device: a Vulkan/HIP/CUDA context is
+/// thread+device state, not a request. Unscoped name/capability probes that
+/// used to init+drop a throwaway backend left AMD WDDM ~2.1MiB host slabs in
+/// PeakWorkingSet after `ggml_backend_free`.
 ///
 /// Invariant: a cache entry's [`CachedBackendKey`] is always the route of the
 /// device that was actually initialized. Preferred/Auto may Optimus-fall
 /// through discrete -> iGPU, but each successful init is inserted under that
 /// device's own key -- never under a preferred route key while holding a
 /// different card. Exact never falls through.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum CachedBackendDeviceKey {
     /// System-default Metal device (not exactly addressable).
     Metal,
@@ -9800,19 +10317,17 @@ enum CachedBackendDeviceKey {
     Route(ExecutionRouteCacheKey),
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CachedBackendKey {
-    scope_id: crate::models::native_execution_services::NativeExecutionScopeId,
     device: CachedBackendDeviceKey,
 }
 
 impl CachedBackendKey {
-    fn for_current_scope(device: CachedBackendDeviceKey) -> Option<Self> {
-        Some(Self {
-            scope_id: crate::models::native_execution_services::current_native_execution_scope_id(
-            )?,
-            device,
-        })
+    fn for_current_scope(device: CachedBackendDeviceKey) -> Self {
+        // Do not require current_native_execution_scope_id: Vulkan BUFFER
+        // quotes and name/capability probes run before NES is installed, and
+        // a throwaway `ggml_backend_dev_init` is not reclaimed by AMD WDDM.
+        Self { device }
     }
 }
 
@@ -9824,6 +10339,12 @@ thread_local! {
     /// Stored as `usize` (never dereferenced) purely for pointer-identity
     /// comparison -- see `mark_backend_poisoned_sticky`.
     static THREAD_POISONED_BACKEND_ADDRS: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    /// Backend handles whose first native lifecycle observe reported
+    /// capture-unsupported. Capture support is a backend-handle constant, so
+    /// later start_graph builders skip the FFI probe instead of paying it on
+    /// every fresh graph (Vulkan on this GPU).
+    static THREAD_CAPTURE_UNSUPPORTED_BACKEND_ADDRS: RefCell<HashSet<usize>> =
+        RefCell::new(HashSet::new());
 }
 
 /// Sticky, thread-scoped poison for a backend handle that reported
@@ -10136,6 +10657,7 @@ impl GgmlBackendGuard {
     }
 
     fn gpu() -> Result<Self, GgmlCpuGraphError> {
+        super::apply_vulkan_device_local_buffer_policy();
         match request_backend_override() {
             Some(RequestBackendPreference::Exact(route)) => {
                 if route.provider == ExecutionProvider::Metal {
@@ -10178,10 +10700,8 @@ impl GgmlBackendGuard {
         device_key: CachedBackendDeviceKey,
         init: impl FnOnce() -> Result<NonNull<c_void>, GgmlCpuGraphError>,
     ) -> Result<Self, GgmlCpuGraphError> {
-        let key = CachedBackendKey::for_current_scope(device_key.clone());
-        if let Some(key) = key.as_ref()
-            && let Some((raw, private_memory_leases, lifetime)) = Self::cached_backend_lookup(key)
-        {
+        let key = CachedBackendKey::for_current_scope(device_key);
+        if let Some((raw, private_memory_leases, lifetime)) = Self::cached_backend_lookup(&key) {
             return Ok(Self::from_shared_lifetime(
                 raw,
                 private_memory_leases,
@@ -10189,9 +10709,6 @@ impl GgmlBackendGuard {
             ));
         }
         let raw = init()?;
-        let Some(key) = key else {
-            return Ok(Self::from_owned(raw, Rc::new(RefCell::new(Vec::new()))));
-        };
         let (private_memory_leases, lifetime) = Self::cached_backend_insert(key, raw);
         Ok(Self::from_shared_lifetime(
             raw,
@@ -10298,9 +10815,7 @@ impl GgmlBackendGuard {
             let key = CachedBackendKey::for_current_scope(CachedBackendDeviceKey::Route(
                 route.cache_key(),
             ));
-            if let Some(key) = key.as_ref()
-                && let Some((raw, private_memory_leases, lifetime)) =
-                    Self::cached_backend_lookup(key)
+            if let Some((raw, private_memory_leases, lifetime)) = Self::cached_backend_lookup(&key)
             {
                 return Ok(Self::from_shared_lifetime(
                     raw,
@@ -10310,9 +10825,6 @@ impl GgmlBackendGuard {
             }
             match Self::init_route_gpu_device(&devices, &route) {
                 Ok(raw) => {
-                    let Some(key) = key else {
-                        return Ok(Self::from_owned(raw, Rc::new(RefCell::new(Vec::new()))));
-                    };
                     let (private_memory_leases, lifetime) = Self::cached_backend_insert(key, raw);
                     return Ok(Self::from_shared_lifetime(
                         raw,
@@ -10390,6 +10902,7 @@ impl GgmlBackendGuard {
     fn init_exact_gpu_backend(
         route: &ResolvedExecutionRoute,
     ) -> Result<NonNull<c_void>, GgmlCpuGraphError> {
+        super::apply_vulkan_device_local_buffer_policy();
         let devices = ggml_available_devices();
         Self::init_route_gpu_device(&devices, route).inspect_err(|error| {
             record_device_unavailable("gpu-backend/exact-init", error.to_string());
@@ -12250,14 +12763,9 @@ mod tests {
         lifecycle.compute_completed(compute_sequence, false);
         lifecycle
             .observe_native_capture(updated, GgmlNativeGraphObservationPhase::BeforeCompute)
-            .expect("unchanged generation is deduplicated before the next compute");
-        let second_compute_sequence = lifecycle.compute_started();
+            .expect("further observes on a settled graph are skipped");
         lifecycle
-            .observe_native_capture(updated, GgmlNativeGraphObservationPhase::AfterCompute)
-            .expect("unchanged generation remains observable after the next compute");
-        lifecycle.compute_completed(second_compute_sequence, false);
-        assert_eq!(
-            lifecycle.observe_native_capture(
+            .observe_native_capture(
                 native_capture_observation(
                     true,
                     true,
@@ -12266,9 +12774,8 @@ mod tests {
                     Some(NativeGraphExecutableChange::Replaced),
                 ),
                 GgmlNativeGraphObservationPhase::BeforeCompute,
-            ),
-            Err(BackendGraphLifecycleError::CaptureGenerationChangedOutsideCompute)
-        );
+            )
+            .expect("settled capture does not keep probing for later generation changes");
 
         let snapshot = collector.snapshot();
         let capture_phases = snapshot
@@ -12282,8 +12789,6 @@ mod tests {
         assert_eq!(
             capture_phases,
             vec![
-                GgmlCaptureObservationPhase::BeforeCompute,
-                GgmlCaptureObservationPhase::AfterCompute,
                 GgmlCaptureObservationPhase::BeforeCompute,
                 GgmlCaptureObservationPhase::AfterCompute,
             ]
@@ -12350,6 +12855,7 @@ mod tests {
             .expect("warm request must re-observe unchanged native capture");
         lifecycle.compute_started();
 
+        warm_collector.end_observation_scope();
         warm_collector.begin_observation_scope();
         lifecycle.refresh_request_collector();
         lifecycle
@@ -12448,17 +12954,119 @@ mod tests {
     }
 
     #[test]
+    fn sibling_observation_scope_keeps_attached_graph_compute_completed() {
+        let collector = GgmlGraphLifecycleCollector::new();
+        collector.begin_observation_scope();
+        let mut lifecycle = test_graph_lifecycle_state(collector.clone());
+        let seq = lifecycle.compute_started();
+        collector.begin_observation_scope();
+        lifecycle.compute_completed(seq, false);
+        let events = collector.snapshot().events;
+        assert!(
+            events.iter().any(|event| matches!(
+                event.kind,
+                GgmlGraphLifecycleEventKind::ComputeStarted {
+                    compute_sequence,
+                    ..
+                } if compute_sequence == seq
+            )),
+            "compute_started must survive a sibling observation-scope begin"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event.kind,
+                GgmlGraphLifecycleEventKind::ComputeCompleted {
+                    compute_sequence,
+                    ..
+                } if compute_sequence == seq
+            )),
+            "compute_completed must still record on the graph attached before the sibling begin"
+        );
+    }
+
+    #[test]
+    fn native_capture_supported_skips_ffi_after_first_after_compute() {
+        let collector = GgmlGraphLifecycleCollector::new();
+        let mut lifecycle = test_graph_lifecycle_state(collector.clone());
+        let instantiated = native_capture_observation(
+            true,
+            true,
+            true,
+            Some(1),
+            Some(NativeGraphExecutableChange::Instantiated),
+        );
+        lifecycle
+            .observe_native_capture(instantiated, GgmlNativeGraphObservationPhase::BeforeCompute)
+            .expect("first before-compute");
+        lifecycle
+            .observe_native_capture(instantiated, GgmlNativeGraphObservationPhase::AfterCompute)
+            .expect("first after-compute settles capture");
+        let before = collector.snapshot().events.len();
+        lifecycle
+            .observe_native_capture(instantiated, GgmlNativeGraphObservationPhase::BeforeCompute)
+            .expect("settled supported capture skips later observes");
+        lifecycle
+            .observe_native_capture(instantiated, GgmlNativeGraphObservationPhase::AfterCompute)
+            .expect("settled supported capture skips later after-compute");
+        assert_eq!(
+            collector.snapshot().events.len(),
+            before,
+            "HIP-class capture must not emit a CaptureStateObserved event per decode step"
+        );
+    }
+
+    #[test]
+    fn native_capture_unsupported_is_observed_once() {
+        let collector = GgmlGraphLifecycleCollector::new();
+        let mut lifecycle = test_graph_lifecycle_state(collector.clone());
+        let unsupported = native_capture_observation(false, false, false, None, None);
+        lifecycle
+            .observe_native_capture(unsupported, GgmlNativeGraphObservationPhase::BeforeCompute)
+            .expect("first unsupported observation");
+        lifecycle
+            .observe_native_capture(unsupported, GgmlNativeGraphObservationPhase::AfterCompute)
+            .expect("settled unsupported skips later FFI-equivalent observes");
+        lifecycle
+            .observe_native_capture(
+                native_capture_observation(true, true, false, None, None),
+                GgmlNativeGraphObservationPhase::AfterCompute,
+            )
+            .expect("capture support is a backend constant; later probes are no-ops");
+        let capture_events = collector
+            .snapshot()
+            .events
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    GgmlGraphLifecycleEventKind::CaptureStateObserved { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            capture_events, 1,
+            "unsupported capture must not emit a CaptureStateObserved event per compute"
+        );
+    }
+
+    #[test]
     fn native_capture_state_fails_closed_on_drift_disappearance_and_regression() {
         let mut policy = test_graph_lifecycle_state(GgmlGraphLifecycleCollector::new());
         policy
             .observe_native_capture(
-                native_capture_observation(false, false, false, None, None),
+                native_capture_observation(
+                    true,
+                    true,
+                    true,
+                    Some(1),
+                    Some(NativeGraphExecutableChange::Instantiated),
+                ),
                 GgmlNativeGraphObservationPhase::BeforeCompute,
             )
-            .expect("unsupported state");
+            .expect("supported capture");
         assert_eq!(
             policy.observe_native_capture(
-                native_capture_observation(true, true, false, None, None),
+                native_capture_observation(false, false, false, None, None),
                 GgmlNativeGraphObservationPhase::AfterCompute,
             ),
             Err(BackendGraphLifecycleError::CapturePolicyDrift)
@@ -12508,12 +13116,6 @@ mod tests {
                 GgmlNativeGraphObservationPhase::BeforeCompute,
             )
             .expect("untracked pre-compute state");
-        tracking
-            .observe_native_capture(
-                native_capture_observation(true, true, false, None, None),
-                GgmlNativeGraphObservationPhase::AfterCompute,
-            )
-            .expect("tracked disabled post-compute state");
         assert_eq!(
             tracking.observe_native_capture(
                 native_capture_observation(true, false, false, None, None),
@@ -12646,7 +13248,8 @@ mod tests {
                     matches!(&event.kind, GgmlGraphLifecycleEventKind::InputWrite { .. })
                 })
                 .count(),
-            2
+            0,
+            "input_write events are not recorded; graph_rebuilt binds compute start/complete/read"
         );
         assert!(
             creation_events
@@ -12734,6 +13337,38 @@ mod tests {
             }
             other => panic!("expected runner identity drift, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reused_persistent_session_keeps_attesting_without_rebuilding() {
+        let mut config = GgmlCpuGraphConfig::conservative_default();
+        config.set_graph_node_capacity(64);
+        let mut runner = GgmlCpuGraphRunner::new(config).expect("cpu graph runner");
+        let mut session = runner
+            .start_persistent_graph_session_with_node_capacity(64)
+            .expect("persistent session");
+        let graph = session.builder();
+        let input = graph.new_tensor_1d_f32(2, "input").expect("input");
+        graph.set_input(input).expect("set_input");
+        let out = graph.add(input, input).expect("add");
+        graph.set_output(out).expect("set_output");
+        graph.prepare_outputs_for_upload(&[out]).expect("prepare");
+        graph
+            .set_f32_slice(input, &[1.0, 2.0], "input")
+            .expect("upload");
+        assert_eq!(
+            graph.compute_output_f32(out, 2).expect("first compute"),
+            vec![2.0, 4.0]
+        );
+        graph
+            .set_f32_slice(input, &[3.0, 4.0], "input")
+            .expect("refresh");
+        assert_eq!(
+            graph
+                .compute_output_f32(out, 2)
+                .expect("cached-identity compute"),
+            vec![6.0, 8.0]
+        );
     }
 
     #[test]
@@ -13185,7 +13820,6 @@ mod tests {
         let sentinel = std::ptr::NonNull::new(0x10 as *mut std::ffi::c_void)
             .expect("non-null sentinel address");
         let key = super::CachedBackendKey {
-            scope_id: crate::models::native_execution_services::NativeExecutionScopeId::next(),
             device: super::CachedBackendDeviceKey::Metal,
         };
         let (_, inserted_lifetime) =
@@ -13207,12 +13841,9 @@ mod tests {
     }
 
     #[test]
-    fn backend_cache_key_requires_and_separates_nes_scopes() {
-        assert!(
-            super::CachedBackendKey::for_current_scope(super::CachedBackendDeviceKey::Metal)
-                .is_none(),
-            "unscoped low-level callers must not publish into the TLS backend cache"
-        );
+    fn backend_cache_key_is_device_only_across_scopes() {
+        let unscoped =
+            super::CachedBackendKey::for_current_scope(super::CachedBackendDeviceKey::Metal);
         let first =
             crate::models::native_execution_services::NativeExecutionServices::for_local_process()
                 .unwrap();
@@ -13223,7 +13854,6 @@ mod tests {
             let _scope =
                 crate::models::native_execution_services::install_native_execution_services(&first);
             super::CachedBackendKey::for_current_scope(super::CachedBackendDeviceKey::Metal)
-                .unwrap()
         };
         let second_key = {
             let _scope =
@@ -13231,10 +13861,9 @@ mod tests {
                     &second,
                 );
             super::CachedBackendKey::for_current_scope(super::CachedBackendDeviceKey::Metal)
-                .unwrap()
         };
-        assert_ne!(first_key.scope_id, second_key.scope_id);
-        assert!(first_key != second_key);
+        assert_eq!(unscoped, first_key);
+        assert_eq!(first_key, second_key);
     }
 
     #[test]
@@ -14582,7 +15211,7 @@ mod tests {
             assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
             // Fake Exact ids such as "Hip0" do not match a live ROCm/Vulkan
             // device, so this fixture still sees Unknown reuse. Live HIP and
-            // Vulkan Accelerated routes are covered by
+            // Vulkan Exact routes are covered by
             // live_hip_or_vulkan_accelerated_authorizes_reusable_full_logits.
             assert_eq!(resolved.reuse_mode(), GgmlDecodeReuseMode::FreshGraph);
             assert!(!resolved.decode_evidence.reuse.is_validated());
@@ -14599,30 +15228,62 @@ mod tests {
     }
 
     #[test]
-    fn live_hip_accelerated_authorizes_reusable_full_logits() {
+    fn live_hip_or_vulkan_accelerated_authorizes_reusable_full_logits() {
         use super::{
             GgmlDecodeOutputContract, GgmlDecodeOutputPlan, GgmlDecodeReuseMode,
             RequestBackendPreference, ResolvedFamilyRuntimeInput,
         };
-        use crate::device::execution_route::ExecutionProvider;
+        use crate::device::execution_route::{
+            DeviceAddressability, ExecutionProvider, ResolvedExecutionRoute, RouteDeviceKind,
+        };
         use crate::ggml_runtime::ggml_available_devices;
 
-        let live_proven = ggml_available_devices().into_iter().any(|device| {
-            ExecutionProvider::from_backend_name(&device.name) == ExecutionProvider::Hip
-        });
-        if !live_proven {
+        let live = ggml_available_devices()
+            .into_iter()
+            .filter(|device| {
+                matches!(
+                    ExecutionProvider::from_backend_name(&device.name),
+                    ExecutionProvider::Hip | ExecutionProvider::Vulkan
+                )
+            })
+            .collect::<Vec<_>>();
+        if live.is_empty() {
             return;
         }
 
-        let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
-            Some(RequestBackendPreference::Accelerated),
-            super::AutoGpuPolicy::AllBackends,
-            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
-        );
-        assert!(resolved.backend().is_gpu_class());
-        assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
-        assert_eq!(resolved.reuse_mode(), GgmlDecodeReuseMode::ReusableGraph);
-        assert!(resolved.decode_evidence.reuse.is_validated());
+        for device in live {
+            let provider = ExecutionProvider::from_backend_name(&device.name);
+            let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+                Some(RequestBackendPreference::Exact(ResolvedExecutionRoute {
+                    provider,
+                    stable_id: device.name.clone(),
+                    registry_ordinal: 0,
+                    kind: RouteDeviceKind::Accelerated,
+                    addressability: DeviceAddressability::NotExactlyAddressable {
+                        reason: "live reuse planner uses the device name, not Exact pin",
+                    },
+                })),
+                super::AutoGpuPolicy::AllBackends,
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+            );
+            assert!(
+                resolved.backend().is_gpu_class(),
+                "{provider:?} {} must stay on a GPU-class runner",
+                device.name
+            );
+            assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
+            assert_eq!(
+                resolved.reuse_mode(),
+                GgmlDecodeReuseMode::ReusableGraph,
+                "{provider:?} {} must keep a reusable full-logits graph",
+                device.name
+            );
+            assert!(
+                resolved.decode_evidence.reuse.is_validated(),
+                "{provider:?} {} reuse evidence must be validated",
+                device.name
+            );
+        }
     }
 
     #[test]
@@ -14689,6 +15350,73 @@ mod tests {
                 GgmlNativeGqaCapability::Validated
             );
         }
+    }
+
+    #[test]
+    fn exact_discrete_gpu_unified_owner_covers_cuda_hip_and_vulkan() {
+        use super::{RequestBackendPreference, exact_discrete_gpu_unified_owner_is_proven};
+        use crate::device::execution_route::{
+            DeviceAddressability, ExecutionProvider, PhysicalResourceKey, ResolvedExecutionRoute,
+            RouteDeviceKind,
+        };
+
+        let exact = |provider, addressable| {
+            RequestBackendPreference::Exact(ResolvedExecutionRoute {
+                provider,
+                stable_id: format!("{}0", provider.as_str()),
+                registry_ordinal: 0,
+                kind: RouteDeviceKind::Accelerated,
+                addressability: if addressable {
+                    DeviceAddressability::ExactlyAddressable {
+                        physical_key: PhysicalResourceKey::new("0000:01:00.0")
+                            .expect("physical key"),
+                    }
+                } else {
+                    DeviceAddressability::NotExactlyAddressable {
+                        reason: "unified owner requires Exact addressability",
+                    }
+                },
+            })
+        };
+        for provider in [
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Vulkan,
+        ] {
+            assert!(exact_discrete_gpu_unified_owner_is_proven(Some(&exact(
+                provider, true
+            ))));
+            assert!(
+                exact_discrete_gpu_unified_owner_is_proven(Some(&exact(provider, false))),
+                "Exact {provider:?} by ggml stable_id must unify even without a PCI physical key"
+            );
+        }
+        for provider in [
+            ExecutionProvider::Cpu,
+            ExecutionProvider::Metal,
+            ExecutionProvider::Accelerator,
+            ExecutionProvider::Unknown,
+        ] {
+            assert!(!exact_discrete_gpu_unified_owner_is_proven(Some(&exact(
+                provider, true
+            ))));
+        }
+        assert!(!exact_discrete_gpu_unified_owner_is_proven(None));
+        assert!(!exact_discrete_gpu_unified_owner_is_proven(Some(
+            &RequestBackendPreference::Accelerated
+        )));
+        let empty_stable = RequestBackendPreference::Exact(ResolvedExecutionRoute {
+            provider: ExecutionProvider::Vulkan,
+            stable_id: String::new(),
+            registry_ordinal: 0,
+            kind: RouteDeviceKind::Accelerated,
+            addressability: DeviceAddressability::NotExactlyAddressable {
+                reason: "empty stable_id cannot identify a unified owner",
+            },
+        });
+        assert!(!exact_discrete_gpu_unified_owner_is_proven(Some(
+            &empty_stable
+        )));
     }
 
     #[test]
@@ -15377,6 +16105,50 @@ mod tests {
     }
 
     #[test]
+    fn native_capture_is_reserved_for_persistent_sessions() {
+        let mut ephemeral_runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let mut ephemeral = ephemeral_runner.start_graph();
+        let input = ephemeral
+            .new_tensor_2d_f32(2, 1, "input")
+            .expect("ephemeral input");
+        ephemeral.set_input(input).expect("set_input");
+        let out = ephemeral.mul(input, input).expect("mul");
+        ephemeral.set_output(out).expect("set_output");
+        ephemeral
+            .prepare_outputs_for_upload(&[out])
+            .expect("prepare ephemeral");
+        assert_eq!(
+            ephemeral.prepared_graph_capture_allowed_for_test(),
+            Some(false),
+            "start_graph one-shot cgraphs must not opt into CUDA/HIP capture"
+        );
+
+        let mut persistent_runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let mut session = persistent_runner
+            .start_persistent_graph_session(1024 * 1024)
+            .expect("persistent session should open");
+        {
+            let graph = session.builder();
+            let input = graph
+                .new_tensor_2d_f32(2, 1, "input")
+                .expect("persistent input");
+            graph.set_input(input).expect("set_input");
+            let out = graph.mul(input, input).expect("mul");
+            graph.set_output(out).expect("set_output");
+            graph
+                .prepare_outputs_for_upload(&[out])
+                .expect("prepare persistent");
+        }
+        assert_eq!(
+            session.prepared_graph_capture_allowed_for_test(),
+            Some(true),
+            "persistent sessions must opt the owned cgraph into native capture"
+        );
+    }
+
+    #[test]
     fn persistent_graph_session_reuses_built_graph_across_runs() {
         // Build `out = input * input` (element-wise square) ONCE into a
         // persistent session, then re-run it twice with different input data
@@ -15416,6 +16188,194 @@ mod tests {
             .compute_outputs_f32(&[(out, 4)])
             .expect("reuse compute run 2");
         assert_eq!(r2, vec![vec![4.0, 4.0, 25.0, 0.25]]);
+    }
+
+    #[test]
+    fn same_shape_persistent_graph_reuses_until_shape_changes() {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let mut reuse = super::GgmlSameShapePersistentGraph::default();
+        let shape = super::GgmlGraphShapeKey::new(4, 1, 0, 0);
+        let (graph, reused) = reuse
+            .builder_for_shape(&mut runner, shape)
+            .expect("first same-shape open");
+        assert!(!reused, "first open for a shape must build");
+        let input = graph
+            .new_tensor_2d_f32(4, 1, "input")
+            .expect("input tensor");
+        graph.set_input(input).expect("set_input");
+        let out = graph.mul(input, input).expect("element-wise square");
+        graph.set_output(out).expect("set_output");
+        graph.prepare_outputs_for_upload(&[out]).expect("prepare");
+        graph
+            .set_f32_slice(input, &[1.0, 2.0, 3.0, 4.0], "input")
+            .expect("upload");
+        assert_eq!(
+            graph.compute_output_f32(out, 4).expect("compute 1"),
+            vec![1.0, 4.0, 9.0, 16.0]
+        );
+
+        let (graph, reused) = reuse
+            .builder_for_shape(&mut runner, shape)
+            .expect("second same-shape open");
+        assert!(reused, "identical shape must reuse the persistent session");
+        graph
+            .set_f32_slice(input, &[2.0, 2.0, 5.0, 0.5], "input")
+            .expect("upload reused");
+        assert_eq!(
+            graph.compute_output_f32(out, 4).expect("compute 2"),
+            vec![4.0, 4.0, 25.0, 0.25]
+        );
+
+        let (graph, reused) = reuse
+            .builder_for_shape(&mut runner, super::GgmlGraphShapeKey::new(2, 1, 0, 0))
+            .expect("shape change must rebuild");
+        assert!(!reused, "a new shape must not reuse the previous session");
+        let input = graph
+            .new_tensor_2d_f32(2, 1, "input")
+            .expect("resized input");
+        graph.set_input(input).expect("set_input");
+        let out = graph.mul(input, input).expect("square");
+        graph.set_output(out).expect("set_output");
+        graph
+            .prepare_outputs_for_upload(&[out])
+            .expect("prepare resized");
+        graph
+            .set_f32_slice(input, &[3.0, 4.0], "input")
+            .expect("upload resized");
+        assert_eq!(
+            graph.compute_output_f32(out, 2).expect("compute resized"),
+            vec![9.0, 16.0]
+        );
+        reuse.drop_session();
+        let (_, reused) = reuse
+            .builder_for_shape(&mut runner, super::GgmlGraphShapeKey::new(2, 1, 0, 0))
+            .expect("drop_session must force a rebuild");
+        assert!(!reused, "dropping the session must not reuse it");
+    }
+
+    #[test]
+    fn metadata_context_bytes_keeps_capacity_headroom_at_the_default_bump() {
+        let tiny = GgmlCpuGraphConfig::metadata_context_bytes(64);
+        let reuse = GgmlCpuGraphConfig::metadata_context_bytes(4_096);
+        let full = GgmlCpuGraphConfig::metadata_context_bytes(16_384);
+        assert!(
+            tiny < 64 * 1024,
+            "tiny device-head metadata must stay a small exact reservation, got {tiny}"
+        );
+        assert_eq!(
+            reuse,
+            super::DEFAULT_CONTEXT_BYTES,
+            "4096-slot capacity is headroom; the bump must stay the historical 1MiB, got {reuse}"
+        );
+        assert!(
+            full > 4 * 1024 * 1024,
+            "16384-node encoder metadata must keep the full llama.cpp reservation, got {full}"
+        );
+    }
+
+    #[test]
+    fn persistent_session_node_capacity_is_smaller_than_full_runner_budget() {
+        let full = GgmlCpuGraphConfig::metadata_context_bytes(16_384);
+        let reuse = GgmlCpuGraphConfig::metadata_context_bytes(4_096);
+        assert!(
+            reuse < full,
+            "reuse-sized metadata {reuse} must be strictly smaller than runner budget {full}"
+        );
+        assert!(
+            full - reuse >= 2 * 1024 * 1024,
+            "right-sizing a 16384-node session to 4096 must drop at least 2MiB, saved {}",
+            full - reuse
+        );
+        let mut config = GgmlCpuGraphConfig::default();
+        config.set_graph_node_capacity(16_384);
+        let mut runner = GgmlCpuGraphRunner::new(config).expect("large runner");
+        let mut session = runner
+            .start_persistent_graph_session_with_node_capacity(4_096)
+            .expect("reuse-sized session must open on a larger runner");
+        let graph = session.builder();
+        let input = graph.new_tensor_1d_f32(4, "input").expect("input tensor");
+        graph.set_input(input).expect("set_input");
+        let out = graph.mul(input, input).expect("square");
+        graph.set_output(out).expect("set_output");
+        graph.prepare_outputs_for_upload(&[out]).expect("prepare");
+        graph
+            .set_f32_slice(input, &[1.0, 2.0, 3.0, 4.0], "input")
+            .expect("upload");
+        assert_eq!(
+            graph.compute_output_f32(out, 4).expect("compute"),
+            vec![1.0, 4.0, 9.0, 16.0]
+        );
+    }
+
+    #[test]
+    fn persistent_session_parks_idle_runner_graph_context() {
+        let mut config = GgmlCpuGraphConfig::default();
+        config.set_graph_node_capacity(16_384);
+        let full = GgmlCpuGraphConfig::metadata_context_bytes(16_384);
+        assert!(
+            full >= 2 * 1024 * 1024,
+            "16384-node runner metadata must be at least 2MiB, got {full}"
+        );
+        let mut runner = GgmlCpuGraphRunner::new(config).expect("large runner");
+        assert_eq!(
+            runner.runner_graph_context_bytes_for_test(),
+            0,
+            "start_graph metadata must stay unallocated until a transient graph needs it"
+        );
+        {
+            let graph = runner.start_graph();
+            drop(graph);
+        }
+        assert_eq!(
+            runner.runner_graph_context_bytes_for_test(),
+            full,
+            "start_graph must materialize the runner metadata arena"
+        );
+        let mut session = runner
+            .start_persistent_graph_session_with_node_capacity(4_096)
+            .expect("reuse-sized session must park the idle runner context");
+        assert_eq!(
+            runner.runner_graph_context_bytes_for_test(),
+            0,
+            "persistent session must not keep a second full runner metadata arena"
+        );
+        {
+            let graph = session.builder();
+            let input = graph.new_tensor_1d_f32(4, "input").expect("input tensor");
+            graph.set_input(input).expect("set_input");
+            let out = graph.mul(input, input).expect("square");
+            graph.set_output(out).expect("set_output");
+            graph.prepare_outputs_for_upload(&[out]).expect("prepare");
+            graph
+                .set_f32_slice(input, &[1.0, 2.0, 3.0, 4.0], "input")
+                .expect("upload");
+            assert_eq!(
+                graph.compute_output_f32(out, 4).expect("compute"),
+                vec![1.0, 4.0, 9.0, 16.0]
+            );
+        }
+        drop(session);
+        let mut graph = runner.start_graph();
+        let input = graph
+            .new_tensor_1d_f32(4, "fallback")
+            .expect("fallback input");
+        graph.set_input(input).expect("set_input");
+        let out = graph.mul(input, input).expect("square");
+        graph.set_output(out).expect("set_output");
+        graph.prepare_outputs_for_upload(&[out]).expect("prepare");
+        graph
+            .set_f32_slice(input, &[2.0, 3.0, 4.0, 5.0], "fallback")
+            .expect("upload");
+        assert_eq!(
+            graph.compute_output_f32(out, 4).expect("compute"),
+            vec![4.0, 9.0, 16.0, 25.0]
+        );
+        drop(graph);
+        assert!(
+            runner.runner_graph_context_bytes_for_test() >= 2 * 1024 * 1024,
+            "start_graph must restore the parked runner metadata arena"
+        );
     }
 
     #[test]
@@ -15882,6 +16842,42 @@ mod tests {
     }
 
     #[test]
+    fn shipped_load_gguf_weight_context_reuses_owner_across_two_runners() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _nes =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+        let (_dir, runtime_source) = tiny_loaded_weight_pack();
+        let preflight =
+            crate::ggml_runtime::GgufRuntimeSourcePreflight::from_runtime_source(&runtime_source)
+                .expect("preflight");
+        let first_runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("first runner should initialize");
+        let second_runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("second runner should initialize");
+        let first = first_runner
+            .load_gguf_weight_context_from_preflight(&preflight)
+            .expect("first runner load");
+        let after_first = system_memory_committed(&services);
+        let second = second_runner
+            .load_gguf_weight_context_from_preflight(&preflight)
+            .expect("second runner load");
+        assert!(
+            first.shares_storage_with(&second),
+            "encoder and decoder runners on one NES thread must share one pack-wide owner"
+        );
+        assert_eq!(
+            system_memory_committed(&services),
+            after_first,
+            "a second runner must not admit a second physical owner"
+        );
+        drop(first);
+        drop(second);
+        drop(first_runner);
+        drop(second_runner);
+        assert_eq!(system_memory_committed(&services), 0);
+    }
+
+    #[test]
     fn shipped_load_gguf_weight_context_host_import_and_copy_are_distinct_owners() {
         use crate::models::runtime_receipts::LeaseReceiptShadow;
 
@@ -16243,6 +17239,59 @@ mod tests {
         runner
             .release_transient_scheduler_working_set()
             .expect("scheduler replacement should proceed after the session drops");
+    }
+
+    #[test]
+    fn request_compute_residency_releases_after_persistent_session_drops() {
+        let mut config = GgmlCpuGraphConfig::conservative_default();
+        config.use_scheduler = true;
+        let mut runner =
+            GgmlCpuGraphRunner::new(config).expect("scheduler cpu graph runner should initialize");
+        let session = runner
+            .start_persistent_graph_session(1024 * 1024)
+            .expect("persistent session should open");
+        assert_eq!(
+            runner.release_request_compute_residency(),
+            Err(GgmlCpuGraphError::PersistentGraphSessionActive)
+        );
+        drop(session);
+        runner
+            .release_request_compute_residency()
+            .expect("request residency should release after the session drops");
+    }
+
+    #[test]
+    fn request_compute_residency_is_ok_on_direct_cpu_runner() {
+        let runner_config = GgmlCpuGraphConfig::conservative_default();
+        assert!(!runner_config.use_scheduler);
+        let mut runner = GgmlCpuGraphRunner::new(runner_config)
+            .expect("direct cpu graph runner should initialize");
+        runner
+            .release_request_compute_residency()
+            .expect("cpu has no backend trim ABI and must stay a no-op");
+    }
+
+    #[test]
+    fn vulkan_device_local_buffer_policy_does_not_force_ggml_env() {
+        crate::test_process_env::with_test_process_env(
+            [
+                ("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM", None),
+                ("GGML_VK_DISABLE_FLOAT_CONTROLS_PATCH", None),
+                ("GGML_VK_ENABLE_FLOAT_CONTROLS_PATCH", None),
+            ],
+            || {
+                crate::ggml_runtime::apply_vulkan_device_local_buffer_policy();
+                assert!(
+                    std::env::var_os("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM").is_none(),
+                    "ReBAR GPUs have no DeviceLocal-only heap; the host must not exclude HostVisible types"
+                );
+                assert_eq!(
+                    std::env::var("GGML_VK_DISABLE_FLOAT_CONTROLS_PATCH").as_deref(),
+                    Ok("1"),
+                    "host must disable SPIR-V float-controls patching before vulkan device init"
+                );
+            },
+        );
     }
 
     #[test]
@@ -16707,6 +17756,53 @@ mod tests {
             .compute_output_f32(tensor, 4)
             .expect("single-tensor forward graph should compute");
         assert_eq!(output, vec![1.25, -2.0, 3.5, 8.0]);
+    }
+
+    #[test]
+    fn row_visitor_reuses_one_host_row_and_matches_full_readback() {
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
+            .expect("cpu graph runner should initialize");
+        let mut graph = runner.start_graph();
+        let tensor = graph
+            .new_tensor_2d_f32(2, 3, "rows")
+            .expect("2d tensor allocation should succeed");
+        graph
+            .set_input(tensor)
+            .expect("set_input should succeed before allocation");
+        graph
+            .set_output(tensor)
+            .expect("set_output should succeed before allocation");
+        graph
+            .set_f32_slice(tensor, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], "rows")
+            .expect("row-major upload");
+
+        let mut visited = Vec::new();
+        let mut max_row_len = 0usize;
+        reset_test_tensor_readback_count();
+        graph
+            .compute_output_f32_rows_for_each(tensor, 2, 3, |index, row| {
+                max_row_len = max_row_len.max(row.len());
+                visited.push((index, row.to_vec()));
+                Ok(())
+            })
+            .expect("row visitor should compute once and stream rows");
+        assert_eq!(
+            test_tensor_readback_count(),
+            1,
+            "rows that fit in one transfer chunk must share a single tensor_get"
+        );
+        assert_eq!(
+            max_row_len, 2,
+            "visitor working set must be one logit row, not the full matrix"
+        );
+        assert_eq!(
+            visited,
+            vec![
+                (0, vec![1.0, 2.0]),
+                (1, vec![3.0, 4.0]),
+                (2, vec![5.0, 6.0]),
+            ]
+        );
     }
 
     #[test]

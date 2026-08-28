@@ -37,10 +37,13 @@ use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
     PinnedRuntimeActorCheckout,
 };
-use crate::models::ctc_greedy_decode::{CtcGreedyDecodeError, CtcGreedyDecodeResult};
+use crate::models::ctc_greedy_decode::{
+    CtcGreedyDecodeConfig, CtcGreedyDecodeError, CtcGreedyDecodeResult, IncrementalCtcGreedyDecoder,
+};
 use crate::models::ctc_streaming_driver::build_ctc_streaming_driver;
 use crate::models::decode_policy_component_registry::{
-    BuiltinDecodePolicyComponentRegistryError, run_builtin_ctc_decode_policy,
+    BuiltinDecodePolicyComponentRegistryError, resolve_builtin_decode_policy,
+    run_builtin_ctc_decode_policy,
 };
 use crate::models::ggml_asr_executor::{
     GgmlAsrExecutionError, GgmlAsrExecutionViewRequest, GgmlAsrStreamingExecutor,
@@ -58,7 +61,7 @@ use crate::models::system_memory_owner::{
 };
 use crate::{NativeAsrSession, SENSEVOICE_GGML_ADAPTER_ID};
 
-use super::encoder_graph::SenseVoiceEncoderGraph;
+use super::encoder_graph::{SenseVoiceEncoderError, SenseVoiceEncoderGraph};
 use super::encoder_weights::{load_sensevoice_encoder_weights, plan_sensevoice_system_memory};
 use super::frontend::{SenseVoiceFbankFrontend, apply_cmvn, apply_lfr};
 use super::graph_config::sensevoice_encoder_graph_config;
@@ -97,6 +100,15 @@ impl LayerCountResolver for SenseVoiceLayerCountResolver {
             _ => None,
         }
     }
+}
+
+const STREAM_HOST_LOGITS_BYTES: usize = 32 * 1024 * 1024;
+
+fn sensevoice_streams_host_logits(frame_count: usize, vocab_size: usize) -> bool {
+    frame_count
+        .saturating_mul(vocab_size)
+        .saturating_mul(std::mem::size_of::<f32>())
+        > STREAM_HOST_LOGITS_BYTES
 }
 
 fn ctc_err_to_string(error: CtcGreedyDecodeError) -> String {
@@ -152,13 +164,14 @@ fn materialize_sensevoice_prepared_runtime(
     metadata: SenseVoiceExecutionMetadata,
     backend: GgmlCpuGraphBackend,
     output_plan: GgmlDecodeOutputPlan,
+    reuse_mode: crate::ggml_runtime::GgmlDecodeReuseMode,
 ) -> Result<SenseVoicePreparedRuntime, String> {
     let tokenizer = SenseVoiceTokenizer::from_metadata(gguf_metadata)?;
     let weights = load_sensevoice_encoder_weights(reader, &metadata).map_err(|e| e.to_string())?;
     validate_sensevoice_block_stack(metadata, weights.enc_layers.len())?;
     let cmvn_neg_mean = weights.cmvn_neg_mean.values.clone();
     let cmvn_inv_stddev = weights.cmvn_inv_stddev.values.clone();
-    let graph = SenseVoiceEncoderGraph::new(&weights, metadata, preflight, backend)
+    let graph = SenseVoiceEncoderGraph::new(&weights, metadata, preflight, backend, reuse_mode)
         .map_err(|e| e.to_string())?;
     Ok(SenseVoicePreparedRuntime {
         metadata,
@@ -226,16 +239,40 @@ impl SenseVoicePreparedRuntime {
         )
         .map_err(|e| e.to_string())?;
 
-        let output = self
+        let frame_count = prompt
+            .embed_indices
+            .len()
+            .saturating_add(lfr.data.len() / self.metadata.feature_dim.max(1));
+        // Short utterances keep one bulk host readback (fewer GPU round-trips).
+        // Long CPU utterances stream rows so the full `[vocab, frames]` matrix
+        // is never resident beside host compute buffers. GPU PeakWorkingSet is
+        // dominated by ReBAR device buffers, so per-row D2H only burns RTF.
+        if phrase_bias.is_none()
+            && !self.graph.backend().is_gpu_class()
+            && sensevoice_streams_host_logits(frame_count, self.metadata.vocab_size)
+        {
+            return self.decode_result_streaming_greedy(
+                &lfr.data,
+                &prompt.embed_indices,
+                decode_work_progress,
+            );
+        }
+        let tokenizer = &self.tokenizer;
+        let detok = |ids: &[u32]| tokenizer.decode(ids);
+
+        let encode_result = self
             .graph
-            .encode_lfr_with_prompt(&lfr.data, &prompt.embed_indices)
-            .map_err(|e| e.to_string())?;
+            .encode_lfr_with_prompt(&lfr.data, &prompt.embed_indices);
+        let release_result = self.graph.release_transient_compute_memory();
+        let output = match (encode_result, release_result) {
+            (Ok(output), Ok(())) => output,
+            (Err(error), _) => return Err(error.to_string()),
+            (Ok(_), Err(error)) => return Err(error.to_string()),
+        };
 
         let frame_logits: Vec<&[f32]> = (0..output.frame_count)
             .map(|f| &output.logits[f * output.vocab_size..(f + 1) * output.vocab_size])
             .collect();
-        let tokenizer = &self.tokenizer;
-        let detok = |ids: &[u32]| tokenizer.decode(ids);
         run_builtin_ctc_decode_policy(
             crate::SENSEVOICE_DECODE_POLICY_ID,
             &frame_logits,
@@ -248,6 +285,59 @@ impl SenseVoicePreparedRuntime {
             decode_work_progress,
             output.frame_compute.as_deref(),
         )
+    }
+
+    fn decode_result_streaming_greedy(
+        &mut self,
+        lfr_data: &[f32],
+        prompt_indices: &[usize],
+        decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
+    ) -> Result<CtcGreedyDecodeResult, String> {
+        let descriptor = resolve_builtin_decode_policy(crate::SENSEVOICE_DECODE_POLICY_ID)
+            .map_err(registry_err_to_string)?;
+        let blank_token_id = descriptor.ctc_blank_token_id.ok_or_else(|| {
+            registry_err_to_string(
+                BuiltinDecodePolicyComponentRegistryError::CtcBlankTokenIdMissing {
+                    decode_policy_id: crate::SENSEVOICE_DECODE_POLICY_ID.to_string(),
+                },
+            )
+        })?;
+        let mut decoder = IncrementalCtcGreedyDecoder::new(CtcGreedyDecodeConfig {
+            blank_token_id,
+            vocab_size: self.metadata.vocab_size,
+            phrase_biases: Vec::new(),
+        })
+        .map_err(ctc_err_to_string)?;
+        let lfr_frames = lfr_data.len() / self.metadata.feature_dim;
+        let total_frames = prompt_indices.len().saturating_add(lfr_frames);
+        let encode_result = self.graph.encode_lfr_with_prompt_for_each_frame(
+            lfr_data,
+            prompt_indices,
+            |frame_index, row| {
+                decoder
+                    .append_frame(row)
+                    .map_err(|error| SenseVoiceEncoderError::Shape {
+                        reason: error.to_string(),
+                    })?;
+                if let Some(observer) = decode_work_progress {
+                    observer.report(frame_index.saturating_add(1), total_frames);
+                }
+                Ok(())
+            },
+        );
+        let release_result = self.graph.release_transient_compute_memory();
+        match (encode_result, release_result) {
+            (Ok(_), Ok(())) => {}
+            (Err(error), _) => return Err(error.to_string()),
+            (Ok(_), Err(error)) => return Err(error.to_string()),
+        }
+        let tokenizer = &self.tokenizer;
+        decoder
+            .finish(
+                |ids| tokenizer.decode(ids),
+                |reason| CtcGreedyDecodeError::DetokenizeFailed { reason },
+            )
+            .map_err(ctc_err_to_string)
     }
 
     fn transcribe(
@@ -388,10 +478,18 @@ fn checkout_sensevoice_prepared_runtime(
             .map_err(|error| error.to_string())?;
             Ok((
                 quote.retained_bytes,
-                (preflight, reader, metadata, quote, backend, output_plan),
+                (
+                    preflight,
+                    reader,
+                    metadata,
+                    quote,
+                    backend,
+                    output_plan,
+                    reuse_mode,
+                ),
             ))
         },
-        |(preflight, reader, metadata, quote, backend, output_plan)| {
+        |(preflight, reader, metadata, quote, backend, output_plan, reuse_mode)| {
             let measured_peak = quote.peak_bytes;
             match SystemMemoryOwner::try_allocate_transaction(quote, || {
                 let runtime = materialize_sensevoice_prepared_runtime(
@@ -401,6 +499,7 @@ fn checkout_sensevoice_prepared_runtime(
                     metadata,
                     backend,
                     output_plan,
+                    reuse_mode,
                 )?;
                 let retained = runtime.retained_system_memory_bytes()?;
                 Ok(SystemMemoryAllocationOutcome::new(
@@ -656,6 +755,23 @@ impl GgmlAsrStreamingExecutor for SenseVoiceGgmlExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_ctc_logits_stream_and_short_ones_do_not() {
+        let vocab = 25055;
+        assert!(
+            !sensevoice_streams_host_logits(187, vocab),
+            "jfk-length SenseVoice stays on one bulk host readback"
+        );
+        assert!(
+            sensevoice_streams_host_logits(1160, vocab),
+            "longform CPU SenseVoice must stream rows instead of a 100MB host matrix"
+        );
+        assert!(
+            crate::ggml_runtime::GgmlCpuGraphBackend::Gpu.is_gpu_class(),
+            "GPU SenseVoice keeps bulk readback; streaming is CPU-only"
+        );
+    }
 
     #[test]
     fn cache_identity_distinguishes_full_logits_from_compact() {

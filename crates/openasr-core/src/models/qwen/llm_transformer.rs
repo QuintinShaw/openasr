@@ -16,10 +16,10 @@ use thiserror::Error;
 use crate::GgmlRuntimeSource;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlDecodeOutputPlan, GgmlFlashAttentionPrecision, GgmlKvElementType, GgmlLoadedTensor,
-    GgmlNativeGqaCapability, GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
-    GgufTensorDataReadError, GgufTensorDataReader, ResolvedFamilyRuntimeInput, env_toggle_with_raw,
-    env_var_truthy,
+    GgmlDecodeOutputPlan, GgmlDecodeReuseMode, GgmlFlashAttentionPrecision, GgmlKvElementType,
+    GgmlLoadedTensor, GgmlNativeGqaCapability, GgmlRopeExtParams, GgmlSelectionEvidenceRef,
+    GgmlStaticTensor, GgmlStaticTensorArena, GgufTensorDataReadError, GgufTensorDataReader,
+    ResolvedFamilyRuntimeInput, env_toggle_with_raw, env_var_truthy,
 };
 
 use super::decoder_contract::{QwenDecoderContract, QwenDecoderContractGeometry};
@@ -1116,7 +1116,6 @@ struct Qwen3AsrLlmLayerWeightHandles {
     lora: QwenLayerLoraSlots,
 }
 
-#[cfg(test)]
 struct Qwen3AsrLlmFusedLogitsHeadHandles {
     vocab_size: usize,
     rms_norm_epsilon: f32,
@@ -1225,6 +1224,10 @@ fn qwen_llm_layer_weights_with_lora<'a>(
 
 pub(crate) struct Qwen3AsrLlmWholeStepOutput {
     pub hidden: Vec<f32>,
+    /// Full-vocab logits produced by the same reusable decode compute when the
+    /// fused lm-head is resident. `None` means the caller must run the separate
+    /// logits-head graph.
+    pub fused_logits: Option<Vec<f32>>,
     pub layer_kv: Vec<(Vec<f32>, Vec<f32>)>,
     /// Microseconds spent building the graph (start_graph + appending all layer
     /// ops + KV uploads) vs the single compute/dispatch — for decode profiling.
@@ -2040,7 +2043,6 @@ fn upload_layer_lora_slots(
     Ok(())
 }
 
-#[cfg(test)]
 fn allocate_fused_logits_head_tensors(
     arena: &mut GgmlStaticTensorArena,
     loaded: Option<&crate::ggml_runtime::GgmlLoadedWeightContext>,
@@ -2089,7 +2091,6 @@ fn allocate_fused_logits_head_tensors(
     })
 }
 
-#[cfg(test)]
 fn upload_fused_logits_head_weights(
     arena: &mut GgmlStaticTensorArena,
     handles: &Qwen3AsrLlmFusedLogitsHeadHandles,
@@ -2108,6 +2109,23 @@ fn upload_fused_logits_head_weights(
         )?;
     }
     Ok(())
+}
+
+fn build_fused_full_logits<'a>(
+    arena: &GgmlStaticTensorArena,
+    logits_head: &Qwen3AsrLlmFusedLogitsHeadHandles,
+    graph: &mut crate::ggml_runtime::GgmlCpuGraphBuilder<'a>,
+    state: GgmlCpuTensor<'a>,
+    n_seq: usize,
+) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+    if n_seq != 1 {
+        return Err(GgmlCpuGraphError::UnsupportedInputs {
+            reason: "fused whole-decoder logits currently require n_seq=1",
+        });
+    }
+    let normed = graph.rms_norm(state, logits_head.rms_norm_epsilon)?;
+    let normed = graph.mul(normed, arena.graph_tensor(logits_head.output_norm_weight))?;
+    graph.mul_mat(logits_head.output_weight.as_graph_tensor(arena), normed)
 }
 
 #[cfg(test)]
@@ -2362,7 +2380,6 @@ pub(crate) struct Qwen3AsrLlmWholeDecoderGraphExecutor {
     runner: GgmlCpuGraphRunner,
     arena: GgmlStaticTensorArena,
     layers: Vec<Qwen3AsrLlmLayerWeightHandles>,
-    #[cfg(test)]
     fused_logits_head: Option<Qwen3AsrLlmFusedLogitsHeadHandles>,
     resolved_runtime: ResolvedFamilyRuntimeInput,
     dims: Qwen3AsrLlmDecodeDims,
@@ -2370,6 +2387,7 @@ pub(crate) struct Qwen3AsrLlmWholeDecoderGraphExecutor {
     rms_norm_epsilon: f32,
     kv_cache_spec: LlmKvCacheSpec,
     flash_attention_precision: GgmlFlashAttentionPrecision,
+    last_fused_compute_evidence: Option<GgmlSelectionEvidenceRef>,
     #[cfg(test)]
     test_native_output_enabled: bool,
     #[cfg(test)]
@@ -2676,11 +2694,11 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             layers.push(handles);
         }
         let dims = dims.expect("non-empty whole-decoder plan sets dimensions");
-        #[cfg(not(test))]
-        let _ = fused_logits_head;
-        #[cfg(test)]
         let fused_logits_head = fused_logits_head
-            .filter(|_| resolved_runtime.output_plan() == GgmlDecodeOutputPlan::NativeFirstMaxToken)
+            .filter(|_| {
+                resolved_runtime.reuse_mode() == GgmlDecodeReuseMode::ReusableGraph
+                    && resolved_runtime.backend().is_gpu_class()
+            })
             .map(|spec| {
                 let handles =
                     allocate_fused_logits_head_tensors(&mut arena, loaded.as_ref(), dims, &spec)?;
@@ -2754,7 +2772,6 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             runner,
             arena,
             layers,
-            #[cfg(test)]
             fused_logits_head,
             resolved_runtime,
             dims,
@@ -2762,6 +2779,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             rms_norm_epsilon,
             kv_cache_spec: LlmKvCacheSpec::DEFAULT,
             flash_attention_precision: GgmlFlashAttentionPrecision::Default,
+            last_fused_compute_evidence: None,
             #[cfg(test)]
             test_native_output_enabled: false,
             #[cfg(test)]
@@ -3020,6 +3038,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             rms_norm_epsilon,
             kv_cache_spec: LlmKvCacheSpec::DEFAULT,
             flash_attention_precision: GgmlFlashAttentionPrecision::Default,
+            last_fused_compute_evidence: None,
             #[cfg(test)]
             test_native_output_enabled: true,
             materialization_peak_staging_bytes: 0,
@@ -3078,18 +3097,13 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
 
     /// Ends a decode session/slice: discards any reusable graph poisoned by an
     /// incomplete compute, then releases the CPU per-token grow-to-fit step
-    /// buffer (see `GgmlCpuGraphRunner::release_cpu_step_buffer_pool`). Callers that cache
-    /// this executor across sessions (qwen's `store_cached_whole_decoder`,
-    /// mimo/firered2's decoder-runtime caches) MUST call this before storing
-    /// it back so the buffer stays session-scoped instead of riding along
-    /// with the cached decoder indefinitely. The buffer release is a no-op on
-    /// Metal/GPU or when no CPU step ever ran.
+    /// buffer. Healthy reusable graphs stay resident so the next request can
+    /// re-run without a rebuild. Uploaded weights stay.
+    pub(crate) fn take_fused_compute_evidence(&mut self) -> Option<GgmlSelectionEvidenceRef> {
+        self.last_fused_compute_evidence.take()
+    }
+
     pub(crate) fn release_session_scoped_buffers(&mut self) {
-        // A failed graph compute may have committed only a prefix of resident
-        // KV writes. All qwen-family cache owners call this before putting the
-        // whole decoder back (qwen, firered-llm, moss-td), so discard poisoned
-        // graph + KV state here while retaining stateless loaded weights and the
-        // cached backend/device handle.
         if self
             .reuse
             .as_ref()
@@ -3348,6 +3362,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         }
         Ok(Qwen3AsrLlmWholeStepOutput {
             hidden: hidden_out,
+            fused_logits: None,
             layer_kv,
             build_micros,
             compute_micros,
@@ -4434,6 +4449,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             let compute_micros = compute_started_at.elapsed().as_micros();
             Ok(Qwen3AsrLlmWholeStepOutput {
                 hidden: hidden_out,
+                fused_logits: None,
                 layer_kv: Vec::new(),
                 build_micros,
                 compute_micros,
@@ -4787,6 +4803,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         }
         Ok(Qwen3AsrLlmWholeStepOutput {
             hidden: hidden_out,
+            fused_logits: None,
             layer_kv,
             build_micros,
             compute_micros,
@@ -4924,16 +4941,30 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 .transpose()?;
             #[cfg(not(test))]
             let top1: Option<GgmlCpuTensor<'_>> = None;
+            let fused_logits = if n_seq == 1 && top1.is_none() {
+                self.fused_logits_head
+                    .as_ref()
+                    .map(|head| build_fused_full_logits(&self.arena, head, graph, state, n_seq))
+                    .transpose()?
+            } else {
+                None
+            };
             graph.set_output(state)?;
             if let Some(top1) = top1 {
                 graph.set_output(top1)?;
             }
-            // The production output contract has no native compact result. The
-            // optional top1 root is retained only for the test-only numerical
-            // oracle and is never allocated in a production graph.
+            if let Some(fused_logits) = fused_logits {
+                graph.set_output(fused_logits)?;
+            }
+            // Compact top1 stays test-only. Production ReusableGraph GPU
+            // fuses the full-vocab lm-head into this same compute so decode
+            // does not launch a second logits graph per token.
             let mut prepared_outputs = vec![state];
             if let Some(top1) = top1 {
                 prepared_outputs.push(top1);
+            }
+            if let Some(fused_logits) = fused_logits {
+                prepared_outputs.push(fused_logits);
             }
             graph.prepare_outputs_for_upload(&prepared_outputs)?;
             self.reuse = Some(LlmReusableDecodeGraph::new(
@@ -4948,6 +4979,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
                 attention_mask,
                 state,
                 top1,
+                fused_logits,
             ));
         }
 
@@ -4979,6 +5011,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         let compute_micros = compute_started_at.elapsed().as_micros();
         Ok(Qwen3AsrLlmWholeStepOutput {
             hidden: hidden_out,
+            fused_logits: None,
             layer_kv: Vec::new(),
             build_micros: 0,
             compute_micros,
@@ -5357,16 +5390,27 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             .transpose()?;
         #[cfg(not(test))]
         let top1: Option<GgmlCpuTensor<'_>> = None;
+        let fused_logits = if n_seq == 1 && top1.is_none() {
+            self.fused_logits_head
+                .as_ref()
+                .map(|head| build_fused_full_logits(&self.arena, head, graph, state, n_seq))
+                .transpose()?
+        } else {
+            None
+        };
         graph.set_output(state)?;
         if let Some(top1) = top1 {
             graph.set_output(top1)?;
         }
-        // The production output contract has no native compact result. The
-        // optional top1 root is retained only for the test-only numerical
-        // oracle and is never allocated in a production graph.
+        if let Some(fused_logits) = fused_logits {
+            graph.set_output(fused_logits)?;
+        }
         let mut prepared_outputs = vec![state];
         if let Some(top1) = top1 {
             prepared_outputs.push(top1);
+        }
+        if let Some(fused_logits) = fused_logits {
+            prepared_outputs.push(fused_logits);
         }
         graph.prepare_outputs_for_upload(&prepared_outputs)?;
         self.reuse = Some(LlmReusableDecodeGraph::new(
@@ -5381,6 +5425,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
             attention_mask,
             state,
             top1,
+            fused_logits,
         ));
         Ok(())
     }
@@ -5500,6 +5545,7 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         let positions = reuse.positions;
         let attention_mask = reuse.attention_mask;
         let state = reuse.state;
+        let fused_logits_tensor = reuse.fused_logits;
         let graph = reuse.builder();
 
         match input {
@@ -5530,11 +5576,29 @@ impl Qwen3AsrLlmWholeDecoderGraphExecutor {
         graph.set_i32_slice(row_indices_tensor, &row_indices, "qwen_llm_reuse_row_index")?;
         graph.set_i32_slice(positions, &rope_positions, "qwen_llm_reuse_position")?;
 
+        let fused_vocab = self.fused_logits_head.as_ref().map(|head| head.vocab_size);
         let compute_started_at = std::time::Instant::now();
-        let hidden_out = graph.compute_output_f32(state, expected_hidden)?;
+        let (hidden_out, fused_logits) = if let (Some(logits_tensor), Some(vocab_size)) =
+            (fused_logits_tensor, fused_vocab)
+        {
+            let expected_logits =
+                vocab_size
+                    .checked_mul(n_seq)
+                    .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "fused logits width overflow",
+                    })?;
+            let output = graph.compute_output_f32_with_evidence(logits_tensor, expected_logits)?;
+            let (logits, evidence) = output.into_parts();
+            self.last_fused_compute_evidence = evidence;
+            (Vec::new(), Some(logits))
+        } else {
+            self.last_fused_compute_evidence = None;
+            (graph.compute_output_f32(state, expected_hidden)?, None)
+        };
         let compute_micros = compute_started_at.elapsed().as_micros();
         Ok(Qwen3AsrLlmWholeStepOutput {
             hidden: hidden_out,
+            fused_logits,
             layer_kv: Vec::new(),
             build_micros: 0,
             compute_micros,
@@ -9982,6 +10046,7 @@ mod tests {
         }
         Qwen3AsrLlmWholeStepOutput {
             hidden: full_hidden,
+            fused_logits: None,
             layer_kv: full_layer_kv,
             build_micros: 0,
             compute_micros: 0,

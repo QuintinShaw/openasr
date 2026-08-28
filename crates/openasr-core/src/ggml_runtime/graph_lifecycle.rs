@@ -9,11 +9,20 @@ use std::{
     cell::RefCell,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+fn serialize_arc_str<S: Serializer>(value: &Arc<str>, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(value)
+}
+
+fn deserialize_arc_str<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Arc<str>, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    Ok(Arc::from(value))
+}
 
 pub const GGML_GRAPH_LIFECYCLE_SCHEMA: &str = "openasr.ggml-graph-lifecycle.v1";
 /// Bound for one request observation. FreshGraph seq2seq families mint a
@@ -239,6 +248,23 @@ impl GgmlSelectionEvidenceRef {
     }
 
     #[cfg(test)]
+    pub(crate) fn from_parts_for_test(
+        graph_instance: u64,
+        graph_generation: u64,
+        compute_sequence: u64,
+        output_generation: u64,
+    ) -> Self {
+        Self {
+            graph_instance,
+            graph_generation,
+            compute_sequence,
+            output_generation,
+            output_index: 0,
+            output_count: 1,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn identity_tuple(&self) -> (u64, u64, u64, u64, usize, usize) {
         (
             self.graph_instance,
@@ -253,10 +279,22 @@ impl GgmlSelectionEvidenceRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GgmlGraphLifecycleEvent {
-    pub schema: String,
+    #[serde(
+        serialize_with = "serialize_arc_str",
+        deserialize_with = "deserialize_arc_str"
+    )]
+    pub schema: Arc<str>,
     pub sequence: u64,
-    pub provider: String,
-    pub device: String,
+    #[serde(
+        serialize_with = "serialize_arc_str",
+        deserialize_with = "deserialize_arc_str"
+    )]
+    pub provider: Arc<str>,
+    #[serde(
+        serialize_with = "serialize_arc_str",
+        deserialize_with = "deserialize_arc_str"
+    )]
+    pub device: Arc<str>,
     pub graph_instance: u64,
     pub graph_generation: u64,
     #[serde(flatten)]
@@ -349,7 +387,7 @@ pub struct GgmlGraphLifecycleSnapshot {
     pub overflowed: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct LifecycleState {
     events: Vec<GgmlGraphLifecycleEvent>,
     overflowed: bool,
@@ -360,11 +398,34 @@ struct LifecycleState {
     /// be refcounted so a sibling finishing its candidate cannot close the
     /// scope and drop the other worker's create/compute/read events.
     observation_scope_refs: u32,
+    interned_schema: Arc<str>,
+    interned_provider: Option<Arc<str>>,
+    interned_device: Option<Arc<str>>,
+}
+
+impl Default for LifecycleState {
+    fn default() -> Self {
+        Self {
+            events: Vec::with_capacity(4096),
+            overflowed: false,
+            next_sequence: 0,
+            observation_scope: 0,
+            observation_scope_open: false,
+            observation_scope_refs: 0,
+            interned_schema: Arc::from(GGML_GRAPH_LIFECYCLE_SCHEMA),
+            interned_provider: None,
+            interned_device: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct GgmlGraphLifecycleCollector {
     state: Arc<Mutex<LifecycleState>>,
+    /// Mirrored outside the event mutex so per-compute refresh can observe
+    /// the live scope without a second lock on the hot graph-compute path.
+    scope_id: Arc<AtomicU64>,
+    scope_open: Arc<AtomicBool>,
 }
 
 impl Default for GgmlGraphLifecycleCollector {
@@ -374,6 +435,8 @@ impl Default for GgmlGraphLifecycleCollector {
                 observation_scope_open: true,
                 ..LifecycleState::default()
             })),
+            scope_id: Arc::new(AtomicU64::new(0)),
+            scope_open: Arc::new(AtomicBool::new(true)),
         }
     }
 }
@@ -415,17 +478,23 @@ impl GgmlGraphLifecycleCollector {
     /// attachment and native capture facts have already been emitted.
     ///
     /// Concurrent candidate attempts keep the collector open until the last
-    /// matching end. Each begin still mints a scope id so a later sequential
-    /// candidate can re-observe native capture; ending one sibling must not
-    /// drop the others' create/compute/read events.
+    /// matching end. A new scope id is minted only when no attempt is live so
+    /// a later sequential candidate can re-observe native capture; a sibling
+    /// begin must keep the current id or already-attached graphs stop
+    /// recording compute_completed/output_read.
     pub(crate) fn begin_observation_scope(&self) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.observation_scope = mint_opaque_graph_id();
+        if state.observation_scope_refs == 0 {
+            state.observation_scope = mint_opaque_graph_id();
+        }
         state.observation_scope_refs = state.observation_scope_refs.saturating_add(1);
         state.observation_scope_open = true;
+        self.scope_id
+            .store(state.observation_scope, Ordering::Release);
+        self.scope_open.store(true, Ordering::Release);
     }
 
     pub(crate) fn end_observation_scope(&self) {
@@ -436,17 +505,14 @@ impl GgmlGraphLifecycleCollector {
         state.observation_scope_refs = state.observation_scope_refs.saturating_sub(1);
         if state.observation_scope_refs == 0 {
             state.observation_scope_open = false;
+            self.scope_open.store(false, Ordering::Release);
         }
     }
 
     pub(crate) fn observation_scope(&self) -> Option<u64> {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state
-            .observation_scope_open
-            .then_some(state.observation_scope)
+        self.scope_open
+            .load(Ordering::Acquire)
+            .then(|| self.scope_id.load(Ordering::Acquire))
     }
 
     pub fn snapshot(&self) -> GgmlGraphLifecycleSnapshot {
@@ -488,8 +554,32 @@ impl GgmlGraphLifecycleCollector {
         state.overflowed = checkpoint.1;
     }
 
+    #[cfg(test)]
     pub(crate) fn record(
         &self,
+        provider: &str,
+        device: &str,
+        graph_instance: u64,
+        graph_generation: u64,
+        kind: GgmlGraphLifecycleEventKind,
+    ) {
+        self.record_for_scope(
+            None,
+            provider,
+            device,
+            graph_instance,
+            graph_generation,
+            kind,
+        );
+    }
+
+    /// Record one event if the collector is still in `expected_scope`. Passing
+    /// `None` records into whichever scope is currently open (tests). The
+    /// scope check shares the event mutex so the compute hot path does not
+    /// lock twice per token.
+    pub(crate) fn record_for_scope(
+        &self,
+        expected_scope: Option<u64>,
         provider: &str,
         device: &str,
         graph_instance: u64,
@@ -503,22 +593,39 @@ impl GgmlGraphLifecycleCollector {
         if !state.observation_scope_open {
             return;
         }
+        if expected_scope.is_some_and(|scope| state.observation_scope != scope) {
+            return;
+        }
         if state.events.len() >= MAX_GRAPH_LIFECYCLE_EVENTS {
             state.overflowed = true;
             return;
         }
         state.next_sequence = state.next_sequence.saturating_add(1);
         let sequence = state.next_sequence;
+        let schema = Arc::clone(&state.interned_schema);
+        let provider = intern_lifecycle_label(&mut state.interned_provider, provider);
+        let device = intern_lifecycle_label(&mut state.interned_device, device);
         state.events.push(GgmlGraphLifecycleEvent {
-            schema: GGML_GRAPH_LIFECYCLE_SCHEMA.to_string(),
+            schema,
             sequence,
-            provider: provider.to_string(),
-            device: device.to_string(),
+            provider,
+            device,
             graph_instance,
             graph_generation,
             kind,
         });
     }
+}
+
+fn intern_lifecycle_label(slot: &mut Option<Arc<str>>, value: &str) -> Arc<str> {
+    if let Some(existing) = slot.as_ref()
+        && existing.as_ref() == value
+    {
+        return Arc::clone(existing);
+    }
+    let interned = Arc::<str>::from(value);
+    *slot = Some(Arc::clone(&interned));
+    interned
 }
 
 thread_local! {
@@ -609,10 +716,51 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_events_intern_repeated_provider_and_device_labels() {
+        let collector = GgmlGraphLifecycleCollector::new();
+        collector.record(
+            "vulkan",
+            "Vulkan0",
+            1,
+            2,
+            GgmlGraphLifecycleEventKind::Created {
+                scheduler_enabled: false,
+            },
+        );
+        collector.record(
+            "vulkan",
+            "Vulkan0",
+            1,
+            2,
+            GgmlGraphLifecycleEventKind::Dropped,
+        );
+        let events = collector.snapshot().events;
+        assert_eq!(events.len(), 2);
+        assert!(
+            Arc::ptr_eq(&events[0].provider, &events[1].provider),
+            "repeated provider labels must share one allocation"
+        );
+        assert!(
+            Arc::ptr_eq(&events[0].device, &events[1].device),
+            "repeated device labels must share one allocation"
+        );
+        assert!(
+            Arc::ptr_eq(&events[0].schema, &events[1].schema),
+            "schema must be interned for the collector"
+        );
+    }
+
+    #[test]
     fn concurrent_observation_scopes_stay_open_until_last_end() {
         let collector = GgmlGraphLifecycleCollector::new();
         collector.begin_observation_scope();
+        let first_scope = collector.observation_scope();
         collector.begin_observation_scope();
+        assert_eq!(
+            collector.observation_scope(),
+            first_scope,
+            "sibling begin must keep the live observation scope id"
+        );
         collector.end_observation_scope();
         collector.record(
             "hip",

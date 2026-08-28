@@ -44,6 +44,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Core: a discrete CUDA/HIP/Vulkan request now keeps encoder and decoder
+  graphs on one unified GPU owner, so weights and KV stay on a single ggml
+  actor instead of bouncing between thread-local caches.
+- Core: CUDA/HIP graph capture is reserved for persistent reuse sessions.
+  One-shot encoder/prefill graphs no longer instantiate HIP fragment
+  executables. The capture flag lives in ggml-impl, not the hashed host ABI.
+- ggml/Vulkan: DeviceLocal weight buffers prefer memory types that are not
+  also HostVisible. On ReBAR discrete GPUs those heaps are still HostVisible
+  to the process; the plugin skips mapping them and copies through chunked
+  staging. SPIR-V float-controls patching is opt-in (the host disables it
+  unless the operator sets `GGML_VK_ENABLE_FLOAT_CONTROLS_PATCH`).
 - Qwen3 Forced Aligner now publishes the policy-guarded `q4_k` tier as its
   recommended default. Boundary-sensitive audio, token-embedding, and
   timestamp-head matrices remain Q8_0; legacy all-Q4, Q3, and mislabeled mixed
@@ -79,6 +90,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- HIP decode reuse no longer recaptures every token after the first stable
+  capture: uid reuse keys on node count, op, type, and shape, and ignores
+  input-pointer churn that HIP writes on each launch.
+- ggml: throwaway Vulkan/HIP plugin probes now release their device contexts
+  instead of leaving them in the process working set.
 - `ggml`: unsupported Metal flash-attention head widths now select the existing
   non-flash attention path before graph construction instead of failing the
   request.

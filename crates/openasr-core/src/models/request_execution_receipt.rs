@@ -279,6 +279,10 @@ struct ReceiptState {
     /// inner attempt on the same collector; restoring this stack keeps the
     /// ASR row intact after the inner attempt finishes.
     attempt_stack: Vec<ReceiptAttemptCheckpoint>,
+    /// Thread that opened the in-flight attempt. Concurrent longform slice
+    /// workers join as siblings instead of nesting/truncating this row.
+    attempt_owner_thread: Option<std::thread::ThreadId>,
+    sibling_attempt_refs: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -401,6 +405,10 @@ impl NativeExecutionReceiptCollector {
         Self::default()
     }
 
+    pub(crate) fn identity_key(&self) -> usize {
+        Arc::as_ptr(&self.state) as usize
+    }
+
     /// Binds the request-level correlation identity once. Candidate retries
     /// share it; conflicting rebinding invalidates completion rather than
     /// choosing either value.
@@ -467,11 +475,38 @@ impl NativeExecutionReceiptCollector {
     /// attempts push the parent row aside and restore it on finish so an
     /// auxiliary stage cannot erase the ASR candidate's shipped facts.
     pub(crate) fn begin_candidate_attempt(&self) {
+        let thread = std::thread::current().id();
+        let join_as_sibling = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state
+                .attempt_owner_thread
+                .is_some_and(|owner| owner != thread)
+                && self.graph_lifecycle.observation_scope().is_some()
+        };
+        if join_as_sibling {
+            // Concurrent longform slices share the in-flight ASR attempt.
+            // Nesting would checkpoint/truncate the sibling's compute
+            // witnesses and fail graph_rebuilt binding.
+            self.graph_lifecycle.begin_observation_scope();
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.sibling_attempt_refs = state.sibling_attempt_refs.saturating_add(1);
+            return;
+        }
+
         self.graph_lifecycle.begin_observation_scope();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.attempt_owner_thread.is_none() {
+            state.attempt_owner_thread = Some(thread);
+        }
         let parent = state.take_attempt_checkpoint();
         // A nested begin happens while the outer attempt is still open.
         // Sequential warmup/measured begins happen after the previous attempt
@@ -489,6 +524,31 @@ impl NativeExecutionReceiptCollector {
     }
 
     pub(crate) fn finish_candidate_attempt(&self, committed: bool) {
+        let thread = std::thread::current().id();
+        let finish_as_sibling = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.sibling_attempt_refs > 0
+                && state
+                    .attempt_owner_thread
+                    .is_some_and(|owner| owner != thread)
+        };
+        if finish_as_sibling {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.sibling_attempt_refs = state.sibling_attempt_refs.saturating_sub(1);
+            if state.sibling_attempt_refs == 0 && state.completed {
+                state.attempt_owner_thread = None;
+            }
+            drop(state);
+            self.graph_lifecycle.end_observation_scope();
+            return;
+        }
+
         let mut state = self
             .state
             .lock()
@@ -510,6 +570,9 @@ impl NativeExecutionReceiptCollector {
         } else {
             let _ = state.take_attempt_checkpoint();
             state.completed = false;
+        }
+        if state.attempt_stack.is_empty() && state.sibling_attempt_refs == 0 {
+            state.attempt_owner_thread = None;
         }
         // Lifecycle producers never run while the receipt mutex is held.
         // Preserve that lock order during rollback and scope closure too.
@@ -566,6 +629,14 @@ impl NativeExecutionReceiptCollector {
             return;
         }
         state.capture_full_logits = true;
+    }
+
+    pub(crate) fn captures_full_logits(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.capture_full_logits
     }
 
     pub(crate) fn record_facts(&self, facts: NativeExecutionRequestFacts) {
@@ -690,7 +761,18 @@ impl NativeExecutionReceiptCollector {
         is_eot: bool,
         logits: &[f32],
     ) {
-        let logits_sha256 = (!logits.is_empty()).then(|| diagnostic_logits_sha256(logits));
+        let capture_full_logits = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.capture_full_logits
+        };
+        // SHA-256 of a full vocab row is a debug-artifact cost. Production
+        // decode and bench-receipt (write_outputs) leave this off; enabling
+        // `--logits-out` opts back into the hash.
+        let logits_sha256 =
+            (capture_full_logits && !logits.is_empty()).then(|| diagnostic_logits_sha256(logits));
         let margin = if logits.len() < 2 {
             None
         } else {
@@ -760,7 +842,7 @@ impl NativeExecutionReceiptCollector {
             }
             step_index
         };
-        if !logits.is_empty() {
+        if capture_full_logits && !logits.is_empty() {
             let mut top = Vec::<(usize, f32)>::new();
             for (token, logit) in logits.iter().copied().enumerate() {
                 if !logit.is_finite() {
@@ -939,6 +1021,66 @@ impl NativeExecutionReceiptCollector {
     }
 
     fn record_top_k_with_tie_order(&self, step_index: usize, logits: &[f32], last_maximum: bool) {
+        let capture_full_logits = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.capture_full_logits
+        };
+        // Same opt-in as `commit_decode_step`: bench-receipt / production
+        // decode leave SHA-256 and full-vocab top-k JSON off. X-ASR / CTC
+        // still need a cheap top2 margin for token_steps.
+        if !capture_full_logits {
+            let margin = if logits.len() < 2 {
+                None
+            } else {
+                let mut best = None;
+                let mut second = None;
+                for logit in logits.iter().copied().filter(|value| value.is_finite()) {
+                    match best {
+                        None => best = Some(logit),
+                        Some(first) if logit > first => {
+                            second = best;
+                            best = Some(logit);
+                        }
+                        Some(first) if last_maximum && logit == first => {
+                            second = Some(first);
+                        }
+                        Some(first)
+                            if second.is_none_or(|value| logit > value) && logit != first =>
+                        {
+                            second = Some(logit);
+                        }
+                        _ => {}
+                    }
+                }
+                best.zip(second).map(|(first, second)| first - second)
+            };
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(margin) = margin {
+                state.top_k_margins.insert(step_index, margin);
+                if let Some(existing) = state
+                    .token_steps
+                    .iter_mut()
+                    .find(|step| step.step_index == step_index)
+                {
+                    existing.top2_margin = Some(margin);
+                }
+            }
+            match state.active_decode_step.as_mut() {
+                Some(active) if active.step_index == step_index && !active.top_k_recorded => {
+                    active.top_k_recorded = true;
+                }
+                _ => {
+                    state.trace_binding_invalid = true;
+                }
+            }
+            return;
+        }
         let logits_sha256 = diagnostic_logits_sha256(logits);
         let mut top = Vec::<(usize, f32)>::new();
         for (token_id, logit) in logits.iter().copied().enumerate() {
@@ -1426,6 +1568,34 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_slice_attempts_keep_shared_token_steps() {
+        let receipt = NativeExecutionReceiptCollector::new();
+        receipt.begin_candidate_attempt();
+        let worker = receipt.clone();
+        let handle = std::thread::spawn(move || {
+            worker.begin_candidate_attempt();
+            worker.commit_decode_step(None, 11, false, &[1.0, 0.0]);
+            worker.finish_candidate_attempt(true);
+        });
+        receipt.commit_decode_step(None, 7, false, &[0.5, 0.0]);
+        handle.join().expect("sibling slice worker");
+        receipt.finish_candidate_attempt(true);
+        let snapshot = receipt.snapshot();
+        let mut tokens = snapshot
+            .token_steps
+            .iter()
+            .map(|step| step.token_id)
+            .collect::<Vec<_>>();
+        tokens.sort_unstable();
+        assert_eq!(
+            tokens,
+            vec![7, 11],
+            "concurrent slice workers must not nest/truncate each other's decode steps"
+        );
+        assert!(snapshot.completed);
+    }
+
+    #[test]
     fn nested_candidate_restores_parent_request_facts() {
         let receipt = NativeExecutionReceiptCollector::new();
         receipt.begin_candidate_attempt();
@@ -1731,6 +1901,45 @@ mod tests {
             error,
             crate::ShortAudioReceiptError::NativeSeq2SeqTokenStepsMissing
         );
+    }
+
+    #[test]
+    fn record_top_k_skips_sha256_and_json_until_full_logits_trace() {
+        let receipt = NativeExecutionReceiptCollector::new();
+        assert!(
+            !receipt.captures_full_logits(),
+            "bench-receipt default must not retain full logits on the decode hot path"
+        );
+        receipt.begin_candidate_attempt();
+        receipt.begin_decode_step(0, None);
+        receipt.record_top_k_last_max(0, &[3.0, 7.0, 7.0, 1.0]);
+        receipt.record_token(0, 2, false);
+        receipt.finish_decode_step(0);
+        receipt.finish_candidate_attempt(true);
+        let snapshot = receipt.snapshot();
+        assert!(
+            !snapshot.trace.jsonl.contains("\"event\":\"top_k\""),
+            "full-vocab top-k JSON is opt-in via enable_full_logits_trace"
+        );
+        assert_eq!(snapshot.token_steps.len(), 1);
+        assert_eq!(snapshot.token_steps[0].top2_margin, Some(0.0));
+        assert!(
+            snapshot.token_steps[0].logits_sha256.is_none(),
+            "SHA-256 of logits is opt-in via enable_full_logits_trace"
+        );
+
+        let traced = NativeExecutionReceiptCollector::new();
+        traced.enable_full_logits_trace();
+        assert!(traced.captures_full_logits());
+        traced.begin_candidate_attempt();
+        traced.begin_decode_step(0, None);
+        traced.record_top_k_last_max(0, &[3.0, 7.0, 7.0, 1.0]);
+        traced.record_token(0, 2, false);
+        traced.finish_decode_step(0);
+        traced.finish_candidate_attempt(true);
+        let traced_snapshot = traced.snapshot();
+        assert!(traced_snapshot.trace.jsonl.contains("\"event\":\"top_k\""));
+        assert!(traced_snapshot.token_steps[0].logits_sha256.is_some());
     }
 
     #[test]

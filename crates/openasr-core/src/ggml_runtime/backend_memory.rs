@@ -227,6 +227,12 @@ pub(crate) struct BackendMemoryAbi {
     device: ffi::GgmlBackendDevRaw,
 }
 
+unsafe extern "C" {
+    fn ggml_backend_memory_api_for_device_v1(
+        device: ffi::GgmlBackendDevRaw,
+    ) -> *const ffi::GgmlBackendMemoryApiV1;
+}
+
 impl BackendMemoryAbi {
     /// Resolves the optional v1 table from the concrete backend's registry.
     ///
@@ -262,6 +268,42 @@ impl BackendMemoryAbi {
         Ok(Self {
             raw,
             backend,
+            device,
+        })
+    }
+
+    /// Resolves the optional v1 table from a registry device without constructing
+    /// a live backend context. Vulkan BUFFER quotes accept a null `backend` when
+    /// `buft` is set; AMD WDDM does not return the ~2.1 MiB host slab that
+    /// `ggml_backend_dev_init` leaves behind after `ggml_backend_free`.
+    ///
+    /// `device` must remain a live registry device. Plugin registries are
+    /// process resident after loading, so the returned function table has
+    /// static lifetime.
+    pub(crate) unsafe fn from_device(
+        device: ffi::GgmlBackendDevRaw,
+    ) -> Result<Self, BackendMemoryAbiError> {
+        if device.is_null() {
+            return Err(BackendMemoryAbiError::Unavailable);
+        }
+        // SAFETY: the shared ggml trampoline owns registry lookup and catches
+        // every provider exception before it can cross this Rust FFI seam.
+        let raw = unsafe { ggml_backend_memory_api_for_device_v1(device) };
+        let Some(raw) = (unsafe { raw.as_ref() }) else {
+            return Err(BackendMemoryAbiError::Unavailable);
+        };
+        if raw.struct_size < mem::size_of::<ffi::GgmlBackendMemoryApiV1>() as u32
+            || raw.abi_version != ffi::GGML_BACKEND_MEMORY_ABI_V1
+            || raw.get_domains.is_none()
+            || raw.quote.is_none()
+            || raw.reserve_private.is_none()
+            || raw.get_stats.is_none()
+        {
+            return Err(BackendMemoryAbiError::Incompatible);
+        }
+        Ok(Self {
+            raw,
+            backend: ptr::null_mut(),
             device,
         })
     }
@@ -466,7 +508,10 @@ impl BackendMemoryAbi {
     }
 
     pub(crate) fn provider(&self) -> ExecutionProvider {
-        let name = unsafe { ffi::ggml_backend_name(self.backend) };
+        if self.device.is_null() {
+            return ExecutionProvider::Unknown;
+        }
+        let name = unsafe { ffi::ggml_backend_dev_name(self.device) };
         if name.is_null() {
             return ExecutionProvider::Unknown;
         }
@@ -1357,6 +1402,21 @@ mod tests {
         assert_eq!(receipt.last_status, BackendTerminalStatusClass::DeviceLost);
         assert_eq!(receipt.last_native_error, -4);
         assert_eq!(receipt.quarantine_generation, 7);
+    }
+
+    #[test]
+    fn memory_api_resolves_from_registry_device_without_a_backend_context() {
+        crate::ggml_runtime::ensure_backends_loaded();
+        let cpu = crate::ggml_available_devices()
+            .into_iter()
+            .find(|device| device.kind == crate::GgmlBackendKind::Cpu)
+            .expect("cpu device");
+        let abi =
+            unsafe { BackendMemoryAbi::from_device(cpu.as_ptr()) }.expect("device-only memory ABI");
+        assert!(abi.backend().is_null());
+        assert_eq!(abi.provider(), ExecutionProvider::Cpu);
+        abi.domains()
+            .expect("cpu registry device must expose memory domains");
     }
 
     #[cfg(target_os = "macos")]

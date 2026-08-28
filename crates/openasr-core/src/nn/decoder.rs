@@ -1499,6 +1499,7 @@ pub(crate) struct LlmReusableDecodeGraph {
     pub attention_mask: GgmlCpuTensor<'static>,
     pub state: GgmlCpuTensor<'static>,
     pub top1: Option<GgmlCpuTensor<'static>>,
+    pub fused_logits: Option<GgmlCpuTensor<'static>>,
 }
 
 impl LlmReusableDecodeGraph {
@@ -1515,6 +1516,7 @@ impl LlmReusableDecodeGraph {
         attention_mask: GgmlCpuTensor<'static>,
         state: GgmlCpuTensor<'static>,
         top1: Option<GgmlCpuTensor<'static>>,
+        fused_logits: Option<GgmlCpuTensor<'static>>,
     ) -> Self {
         Self {
             session,
@@ -1528,6 +1530,7 @@ impl LlmReusableDecodeGraph {
             attention_mask,
             state,
             top1,
+            fused_logits,
         }
     }
 

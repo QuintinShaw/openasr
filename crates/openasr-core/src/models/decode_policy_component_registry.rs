@@ -1591,10 +1591,25 @@ mod tests {
         let text = snapshot.trace.jsonl;
         assert!(text.contains("\"schema\":\"openasr.gpu-correctness-trace.v1\""));
         assert!(text.contains("\"event\":\"token\""));
-        assert!(text.contains("\"event\":\"top_k\""));
+        assert!(
+            !text.contains("\"event\":\"top_k\""),
+            "full-vocab top-k JSON is opt-in via enable_full_logits_trace"
+        );
         assert_eq!(snapshot.token_steps.len(), 1);
         assert_eq!(snapshot.token_steps[0].token_id, 7);
         assert_eq!(snapshot.token_steps[0].top2_margin, Some(0.5));
+        assert!(
+            snapshot.token_steps[0].logits_sha256.is_none(),
+            "SHA-256 of logits is opt-in via enable_full_logits_trace"
+        );
+
+        let traced =
+            crate::models::request_execution_receipt::NativeExecutionReceiptCollector::new();
+        traced.enable_full_logits_trace();
+        traced.commit_decode_step(None, 7, false, &[1.0, 0.5]);
+        let traced_snapshot = traced.snapshot();
+        assert!(traced_snapshot.trace.jsonl.contains("\"event\":\"top_k\""));
+        assert!(traced_snapshot.token_steps[0].logits_sha256.is_some());
     }
 
     #[test]

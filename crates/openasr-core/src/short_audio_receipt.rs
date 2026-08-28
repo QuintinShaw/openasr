@@ -695,7 +695,7 @@ impl ShortAudioReceipt {
                 });
             }
             if lifecycle.events.iter().any(|event| {
-                event.schema != crate::ggml_runtime::GGML_GRAPH_LIFECYCLE_SCHEMA
+                event.schema.as_ref() != crate::ggml_runtime::GGML_GRAPH_LIFECYCLE_SCHEMA
                     || event.provider.is_empty()
                     || event.device.is_empty()
             }) {
@@ -719,7 +719,12 @@ impl ShortAudioReceipt {
                         if !lifecycle_event_proves_compute_route(&event.kind) {
                             continue;
                         }
-                        if event.provider != provider || event.device != stable_id {
+                        if !lifecycle_route_matches_attested_or_hybrid_host(
+                            event.provider.as_ref(),
+                            event.device.as_ref(),
+                            provider,
+                            stable_id,
+                        ) {
                             drifted.insert(format!("{}:{}", event.provider, event.device));
                         }
                     }
@@ -1664,6 +1669,23 @@ fn lifecycle_event_proves_compute_route(
     )
 }
 
+fn lifecycle_route_matches_attested_or_hybrid_host(
+    event_provider: &str,
+    event_device: &str,
+    attested_provider: &str,
+    attested_stable_id: &str,
+) -> bool {
+    if event_provider == attested_provider && event_device == attested_stable_id {
+        return true;
+    }
+    // Product Hybrid (Moonshine Vulkan default) keeps the decoder on CPU
+    // while the attested live backend is the encoder accelerator. CPU
+    // events are the host half of that plan, not a second GPU route.
+    attested_provider != crate::device::execution_route::ExecutionProvider::Cpu.as_str()
+        && event_provider == crate::device::execution_route::ExecutionProvider::Cpu.as_str()
+        && event_device == "CPU"
+}
+
 fn validate_actual_device_facts(
     field: &'static str,
     provider: &str,
@@ -1837,31 +1859,44 @@ fn observed_graph_built_for_compute(
             _ => {}
         }
     }
-    if origin_at_this_compute.is_none() || !started || !completed || !read {
-        let reason = match (
-            lifecycle.overflowed,
-            origin_at_this_compute,
-            started,
-            completed,
-            read,
-        ) {
-            (true, _, _, _, _) => {
-                "native graph lifecycle overflowed before this compute could be bound"
-            }
-            (_, None, _, _, _) => {
-                "native compute witness has no created or existing-graph origin before compute_started"
-            }
-            (_, _, false, _, _) => "native compute witness has no matching compute_started event",
-            (_, _, _, false, _) => "native compute witness has no matching compute_completed event",
-            _ => "native compute witness has no matching output_read event",
-        };
-        return Err(ShortAudioReceiptError::InvalidEvidenceField {
-            field: "decode_diagnostics.steps.graph_rebuilt",
-            actual: reason.to_string(),
-        });
+    if origin_at_this_compute.is_some() && started {
+        // ComputeCompleted/OutputRead may be omitted on the capture-unsupported
+        // hot path. Origin plus ComputeStarted is enough to bind graph_rebuilt.
+        return Ok(origin_at_this_compute == Some(true)
+            && first_compute_at_this_compute == Some(compute_sequence));
     }
-    Ok(origin_at_this_compute == Some(true)
-        && first_compute_at_this_compute == Some(compute_sequence))
+    // HIP/Vulkan capture-unsupported graphs stop appending per-compute events
+    // after the first few sequences so Zipformer/longform receipts do not
+    // overflow. Later token steps still consume the same persistent graph:
+    // Created/ExistingGraphObserved plus an earlier attested compute is
+    // enough to project graph_rebuilt=false.
+    if !lifecycle.overflowed
+        && last_origin_created.is_some()
+        && first_compute_after_origin.is_some_and(|first| compute_sequence > first)
+    {
+        return Ok(false);
+    }
+    let reason = match (
+        lifecycle.overflowed,
+        origin_at_this_compute,
+        started,
+        completed,
+        read,
+    ) {
+        (true, _, _, _, _) => {
+            "native graph lifecycle overflowed before this compute could be bound"
+        }
+        (_, None, _, _, _) => {
+            "native compute witness has no created or existing-graph origin before compute_started"
+        }
+        (_, _, false, _, _) => "native compute witness has no matching compute_started event",
+        (_, _, _, false, _) => "native compute witness has no matching compute_completed event",
+        _ => "native compute witness has no matching output_read event",
+    };
+    Err(ShortAudioReceiptError::InvalidEvidenceField {
+        field: "decode_diagnostics.steps.graph_rebuilt",
+        actual: reason.to_string(),
+    })
 }
 
 fn validate_decode_diagnostics(
@@ -2483,6 +2518,67 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_cpu_decoder_lifecycle_is_not_route_drift_from_vulkan_encoder() {
+        use crate::ggml_runtime::{
+            GGML_GRAPH_LIFECYCLE_SCHEMA, GgmlGraphLifecycleEvent, GgmlGraphLifecycleEventKind,
+            GgmlGraphLifecycleSnapshot,
+        };
+        let compute = |provider: &str, device: &str, sequence: u64| GgmlGraphLifecycleEvent {
+            schema: GGML_GRAPH_LIFECYCLE_SCHEMA.into(),
+            sequence,
+            provider: provider.into(),
+            device: device.into(),
+            graph_instance: 1,
+            graph_generation: 1,
+            kind: GgmlGraphLifecycleEventKind::ComputeStarted {
+                compute_sequence: sequence,
+                prepare_generation: None,
+                input_generation_consumed: None,
+                capture_executable_generation: None,
+            },
+        };
+        let mut receipt = sample_receipt();
+        receipt.placement = "vulkan".to_string();
+        receipt.actual_provider = Some("vulkan".to_string());
+        receipt.actual_stable_device_id = Some("Vulkan0".to_string());
+        receipt.actual_device = Some(GgmlActualDeviceFacts {
+            device_type: "gpu".to_string(),
+            name: "Vulkan0".to_string(),
+            description: "test vulkan device".to_string(),
+            provider_device_id: Some("0000:03:00.0".to_string()),
+            pci_vendor_id: Some(0x1002),
+        });
+        receipt.graph_lifecycle = Some(GgmlGraphLifecycleSnapshot {
+            events: vec![compute("vulkan", "Vulkan0", 1), compute("cpu", "CPU", 2)],
+            overflowed: false,
+        });
+        ShortAudioReceipt::try_new(receipt).expect("hybrid CPU decoder events are the host half");
+
+        let mut drifted = sample_receipt();
+        drifted.placement = "vulkan".to_string();
+        drifted.actual_provider = Some("vulkan".to_string());
+        drifted.actual_stable_device_id = Some("Vulkan0".to_string());
+        drifted.actual_device = Some(GgmlActualDeviceFacts {
+            device_type: "gpu".to_string(),
+            name: "Vulkan0".to_string(),
+            description: "test vulkan device".to_string(),
+            provider_device_id: Some("0000:03:00.0".to_string()),
+            pci_vendor_id: Some(0x1002),
+        });
+        drifted.graph_lifecycle = Some(GgmlGraphLifecycleSnapshot {
+            events: vec![compute("cuda", "CUDA0", 1)],
+            overflowed: false,
+        });
+        assert!(matches!(
+            ShortAudioReceipt::try_new(drifted),
+            Err(ShortAudioReceiptError::InvalidEvidenceField {
+                field: "actual_device",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn actual_device_facts_are_bounded_and_route_consistent() {
         let mut receipt = sample_receipt();
         receipt.actual_provider = Some("cpu".to_string());
@@ -2704,6 +2800,32 @@ mod tests {
     }
 
     #[test]
+    fn decode_step_bound_admits_xasr_device_head_frame_count() {
+        let diagnostics = crate::ggml_runtime::ShortAudioReceiptDecodeDiagnostics {
+            output_plan: crate::ggml_runtime::ShortAudioReceiptOutputPlan::FullLogits,
+            reuse_mode: crate::ggml_runtime::ShortAudioReceiptReuseMode::ReusableGraph,
+            capability_evidence_revision: Some(2),
+            steps: (0..329)
+                .map(|step| crate::ggml_runtime::ShortAudioReceiptDecodeStep {
+                    step,
+                    token_id: Some(0),
+                    logits_sha256: None,
+                    top2_margin: None,
+                    graph_rebuilt: false,
+                })
+                .collect(),
+            first_divergence: None,
+            encoder_decoder_splits: Vec::new(),
+        };
+        super::validate_decode_diagnostics(&diagnostics)
+            .expect("329 X-ASR device-head frames must fit the receipt bound");
+        assert!(
+            SHORT_AUDIO_RECEIPT_MAX_DECODE_STEPS >= 2048,
+            "longform CTC/RNN-T frames on the 69s fixture must stay in-bound"
+        );
+    }
+
+    #[test]
     fn shipped_emitter_projects_observed_created_and_existing_graphs() {
         let resolved = cpu_resolved_runtime();
         let first = crate::NativeExecutionReceiptCollector::new();
@@ -2814,6 +2936,85 @@ mod tests {
         let diagnostics = decode_diagnostics_from_shipped_runtime(Some(&resolved), Some(&snapshot))
             .expect("compute binds to the origin in effect at that compute");
         assert!(!diagnostics.steps[0].graph_rebuilt);
+    }
+
+    #[test]
+    fn throttled_hot_path_computes_project_as_reused_not_missing_origin() {
+        use std::sync::Arc;
+
+        use crate::ggml_runtime::{
+            GgmlGraphLifecycleEvent, GgmlGraphLifecycleEventKind, GgmlGraphLifecycleSnapshot,
+            GgmlSelectionEvidenceRef,
+        };
+
+        let lifecycle = GgmlGraphLifecycleSnapshot {
+            events: vec![
+                GgmlGraphLifecycleEvent {
+                    schema: Arc::from("openasr.graph-lifecycle.v1"),
+                    sequence: 1,
+                    provider: Arc::from("hip"),
+                    device: Arc::from("HIP0"),
+                    graph_instance: 11,
+                    graph_generation: 22,
+                    kind: GgmlGraphLifecycleEventKind::ExistingGraphObserved {
+                        scheduler_enabled: false,
+                        prepare_generation: None,
+                    },
+                },
+                GgmlGraphLifecycleEvent {
+                    schema: Arc::from("openasr.graph-lifecycle.v1"),
+                    sequence: 2,
+                    provider: Arc::from("hip"),
+                    device: Arc::from("HIP0"),
+                    graph_instance: 11,
+                    graph_generation: 22,
+                    kind: GgmlGraphLifecycleEventKind::ComputeStarted {
+                        compute_sequence: 1,
+                        prepare_generation: None,
+                        input_generation_consumed: None,
+                        capture_executable_generation: None,
+                    },
+                },
+                GgmlGraphLifecycleEvent {
+                    schema: Arc::from("openasr.graph-lifecycle.v1"),
+                    sequence: 3,
+                    provider: Arc::from("hip"),
+                    device: Arc::from("HIP0"),
+                    graph_instance: 11,
+                    graph_generation: 22,
+                    kind: GgmlGraphLifecycleEventKind::ComputeCompleted {
+                        compute_sequence: 1,
+                        output_generation: 7,
+                    },
+                },
+                GgmlGraphLifecycleEvent {
+                    schema: Arc::from("openasr.graph-lifecycle.v1"),
+                    sequence: 4,
+                    provider: Arc::from("hip"),
+                    device: Arc::from("HIP0"),
+                    graph_instance: 11,
+                    graph_generation: 22,
+                    kind: GgmlGraphLifecycleEventKind::OutputRead {
+                        compute_sequence: 1,
+                        output_generation_consumed: 7,
+                        bytes: 16,
+                    },
+                },
+            ],
+            overflowed: false,
+        };
+        let step = crate::NativeExecutionTokenStep {
+            step_index: 8,
+            token_id: 3,
+            is_eot: false,
+            top2_margin: None,
+            logits_sha256: None,
+            compute: Some(GgmlSelectionEvidenceRef::from_parts_for_test(11, 22, 8, 99)),
+        };
+        assert!(
+            !super::observed_graph_built_for_compute(&step, Some(&lifecycle))
+                .expect("later HIP/Vulkan token steps must bind as reuse after hot-path throttle")
+        );
     }
 
     #[test]

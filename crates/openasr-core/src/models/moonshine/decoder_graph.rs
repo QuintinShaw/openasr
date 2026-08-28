@@ -47,11 +47,17 @@ const MOONSHINE_LAYER_NORM_EPSILON: f32 = 1.0e-5;
 /// `GgmlStaticTensorArena`/`allocate_zeroed_llm_resident_kv_arena`: real
 /// tensor bytes land in a backend buffer sized from actual shapes,
 /// independent of this context's size). Mirrors the encoder's proven
-/// `16_384` headroom (`moonshine_encoder_graph_config`).
-const MOONSHINE_DECODER_GRAPH_SIZE_FLOOR: usize = 16_384;
+/// Same bound as the encoder: prefill, cross-KV warmup, and incremental
+/// decode all fit in 4096 nodes. Matching the persistent session capacity
+/// means `start_graph` cannot leave a 6.4 MiB PeakWorkingSet watermark.
+const MOONSHINE_DECODER_GRAPH_SIZE_FLOOR: usize = 4_096;
+/// Incremental reusable decode cgraph only. Keep this identical to the runner
+/// floor so parking the idle runner does not allocate a second host context.
+const MOONSHINE_DECODER_REUSE_GRAPH_NODES: usize = 4_096;
 
 enum RuntimeWeightSource<'a> {
     Verified(&'a GgufRuntimeSourcePreflight),
+    Reused(GgmlLoadedWeightContext),
     #[cfg(test)]
     Synthetic,
 }
@@ -540,6 +546,27 @@ impl MoonshineDecoderGraphRuntime {
         )
     }
 
+    pub(crate) fn new_with_shared_pack_weights(
+        input: MoonshineDecoderRuntimeInput<'_>,
+        _runtime_preflight: &GgufRuntimeSourcePreflight,
+        adapter: Option<&MoonshineLoraAdapter>,
+        greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        shared_weights: GgmlLoadedWeightContext,
+    ) -> Result<Self, MoonshineDecoderGraphError> {
+        Self::new_with_n_seq_impl(
+            input.decoder_weights,
+            input.metadata,
+            input.decoder_state,
+            input.backend,
+            input.graph_config,
+            input.reuse_mode,
+            RuntimeWeightSource::Reused(shared_weights),
+            1,
+            adapter,
+            greedy_step_output_mode,
+        )
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn new_synthetic(
@@ -685,13 +712,7 @@ impl MoonshineDecoderGraphRuntime {
         }
 
         let mut config = graph_config;
-        config.graph_size = config.graph_size.max(MOONSHINE_DECODER_GRAPH_SIZE_FLOOR);
-        config.context_bytes =
-            config
-                .context_bytes
-                .max(GgmlCpuGraphConfig::metadata_context_bytes(
-                    config.graph_size,
-                ));
+        config.set_graph_node_capacity(config.graph_size.max(MOONSHINE_DECODER_GRAPH_SIZE_FLOOR));
         let runner = GgmlCpuGraphRunner::new(config).map_err(build_err("runner_init"))?;
         // Bind the per-layer 2-D linears (self/cross attn + ffn) zero-copy from the
         // mmap'd pack (native q8_0 [in,out]); the loader supplies them meta-only, so
@@ -703,6 +724,7 @@ impl MoonshineDecoderGraphRuntime {
                     .load_gguf_weight_context_from_preflight(preflight)
                     .map_err(build_err("load_gguf_weight_context"))?,
             ),
+            RuntimeWeightSource::Reused(shared) => Some(shared),
             #[cfg(test)]
             RuntimeWeightSource::Synthetic => None,
         };
@@ -936,6 +958,16 @@ impl MoonshineDecoderGraphRuntime {
         self.decoder_state = decoder_state;
         self.cross_frame_count = decoder_state.cross_attention.logical_positions;
         Ok(())
+    }
+
+    pub(crate) fn release_transient_compute_memory(
+        &mut self,
+    ) -> Result<(), MoonshineDecoderGraphError> {
+        self.reuse = None;
+        match self.runner.release_request_compute_residency() {
+            Ok(()) | Err(GgmlCpuGraphError::PersistentGraphSessionActive) => Ok(()),
+            Err(error) => Err(build_err("release_request_compute_residency")(error)),
+        }
     }
 
     /// Precompute per-layer cross-attention K/V from the encoder output (once per utterance).
@@ -1523,7 +1555,7 @@ impl MoonshineDecoderGraphRuntime {
 
         let mut session = self
             .runner
-            .start_capacity_sized_persistent_graph_session()
+            .start_persistent_graph_session_with_node_capacity(MOONSHINE_DECODER_REUSE_GRAPH_NODES)
             .map_err(build_err("moonshine_reuse_session"))?;
         let graph = session.builder();
         let token_id = graph

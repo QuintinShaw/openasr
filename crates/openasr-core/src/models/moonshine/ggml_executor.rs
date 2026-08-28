@@ -31,7 +31,8 @@ use crate::NativeAsrSession;
 use crate::device::execution_policy::ExecutionPlacement;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlDecodeOutputContract, GgmlDecodeOutputPlan,
-    GgmlDecodeReuseMode, GgufRuntimeSourcePreflight, ResolvedFamilyRuntimeInput,
+    GgmlDecodeReuseMode, GgufRuntimeSourcePreflight, RequestBackendPreference,
+    ResolvedFamilyRuntimeInput,
 };
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
@@ -55,6 +56,7 @@ use crate::models::prepared_runtime_cache::{
     PreparedRuntimeQuoteContext, SystemMemoryMaterialization,
 };
 use crate::models::runtime_cache_coordinator::{PackContentKey, canonical_runtime_cache_path};
+use crate::models::seq2seq_decoder_state::Seq2SeqResidentCapacity;
 use crate::models::system_memory_owner::SystemMemoryOwner;
 
 const MOONSHINE_EXECUTOR_ID: &str = crate::arch::MOONSHINE_EXECUTOR_COMPONENT_ID;
@@ -109,6 +111,26 @@ struct MoonshineDecoderActorState {
     _prepared_owner: PreparedRuntimeHandle<MoonshinePreparedRuntime>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct MoonshineUnifiedRuntimeCacheKey {
+    content: PackContentKey,
+    lane: ExecutionLaneKey,
+    encoder_config: MoonshineGraphConfigIdentity,
+    decoder_config: MoonshineGraphConfigIdentity,
+    resident_capacity: Seq2SeqResidentCapacity,
+    adapter_fingerprint: String,
+    output_contract: GgmlDecodeOutputContract,
+    output_plan: GgmlDecodeOutputPlan,
+    reuse_mode: GgmlDecodeReuseMode,
+    feature_key: MoonshineDecodeFeatureKey,
+}
+
+struct MoonshineUnifiedActorState {
+    encoder: MoonshineEncoderGraphRuntime,
+    decoder: MoonshineDecoderGraphRuntime,
+    _prepared_owner: PreparedRuntimeHandle<MoonshinePreparedRuntime>,
+}
+
 type MoonshineEncoderRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
     MoonshineEncoderRuntimeCacheKey,
     MoonshineEncoderActorState,
@@ -117,10 +139,37 @@ type MoonshineDecoderRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
     MoonshineDecoderRuntimeCacheKey,
     MoonshineDecoderActorState,
 >;
+type MoonshineUnifiedRuntimePool = AdmittedPinnedRuntimeActorCheckoutPool<
+    MoonshineUnifiedRuntimeCacheKey,
+    MoonshineUnifiedActorState,
+>;
 type MoonshineEncoderRuntimeActor =
     PinnedRuntimeActorCheckout<MoonshineEncoderRuntimeCacheKey, MoonshineEncoderActorState>;
 type MoonshineDecoderRuntimeActor =
     PinnedRuntimeActorCheckout<MoonshineDecoderRuntimeCacheKey, MoonshineDecoderActorState>;
+type MoonshineUnifiedRuntimeActor =
+    PinnedRuntimeActorCheckout<MoonshineUnifiedRuntimeCacheKey, MoonshineUnifiedActorState>;
+
+fn moonshine_unified_runtime_enabled(
+    encoder_config: GgmlCpuGraphConfig,
+    decoder_config: GgmlCpuGraphConfig,
+    backend_preference: Option<&RequestBackendPreference>,
+    placement: Option<ExecutionPlacement>,
+    adapter_active: bool,
+    serve_batch: bool,
+) -> bool {
+    !adapter_active
+        && !serve_batch
+        && encoder_config.backend == GgmlCpuGraphBackend::Gpu
+        && decoder_config.backend == GgmlCpuGraphBackend::Gpu
+        && !encoder_config.use_scheduler
+        && !decoder_config.use_scheduler
+        && matches!(
+            placement,
+            Some(ExecutionPlacement::FullDevice) | Some(ExecutionPlacement::Hybrid)
+        )
+        && crate::ggml_runtime::exact_discrete_gpu_unified_owner_is_proven(backend_preference)
+}
 
 #[cfg(test)]
 static DECODER_OWNER_GRAPH_CONFIG_PROBE: OnceLock<Mutex<Option<MoonshineGraphConfigIdentity>>> =
@@ -170,6 +219,7 @@ pub(crate) struct MoonshineGgmlExecutor {
     serve_batch_engines: MoonshineServeBatchEngineRegistry,
     encoder_runtimes: Arc<MoonshineEncoderRuntimePool>,
     decoder_runtimes: Arc<MoonshineDecoderRuntimePool>,
+    unified_gpu_runtimes: Arc<MoonshineUnifiedRuntimePool>,
     lora_adapters: ResolvedLoraAdapterCache,
 }
 
@@ -198,6 +248,10 @@ impl Default for MoonshineGgmlExecutor {
             )),
             decoder_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
                 "openasr-moonshine-decoder-owner",
+                limits,
+            )),
+            unified_gpu_runtimes: Arc::new(AdmittedPinnedRuntimeActorCheckoutPool::new(
+                "openasr-moonshine-unified-gpu-owner",
                 limits,
             )),
             lora_adapters: ResolvedLoraAdapterCache::default(),
@@ -304,16 +358,6 @@ impl MoonshineGgmlExecutor {
         )
         .map_err(map_frontend_error)?;
 
-        let encoder_output = self.encode_with_owned_runtime(
-            preflight,
-            Arc::clone(&prepared_runtime),
-            features,
-            adapter.clone(),
-            backend,
-            encoder_config,
-            encoder_execution_lane.clone(),
-        )?;
-
         let audio_duration = audio_duration_seconds(&request.prepared_audio);
         let serve_batch_config = MoonshineServeBatchConfig::from_policy::<
             super::batched_decode::MoonshineFamily,
@@ -327,16 +371,58 @@ impl MoonshineGgmlExecutor {
             decoder_config.use_scheduler,
             resolved_runtime,
         );
+        // Eligibility is not admission. GPU-decoder requests are serve-batch
+        // eligible, but the env default leaves the worker unadmitted. Gate
+        // unified on the admitted worker so encoder/decoder still share one
+        // pack-wide DeviceCopied owner.
+        let serve_batch_active = serve_batch_config.is_some() && can_use_serve_batch;
         let feature_key = MoonshineDecodeFeatureKey {
             output_mode: greedy_step_output_mode,
             adapter_active: adapter.is_some(),
             phrase_bias_active: request.request_options.phrase_bias.is_some(),
             word_timestamps: request.request_options.word_timestamps,
             streaming: skip_serve_batch,
-            serve_batch: can_use_serve_batch,
+            serve_batch: serve_batch_active,
+        };
+        let unified_gpu_runtime = if moonshine_unified_runtime_enabled(
+            encoder_config,
+            decoder_config,
+            Some(&request_lane.request_backend_preference()),
+            Some(request_lane.placement()),
+            adapter.is_some(),
+            serve_batch_active,
+        ) && resolved_runtime.reuse_mode()
+            == GgmlDecodeReuseMode::ReusableGraph
+        {
+            Some(self.checkout_unified_gpu_runtime(
+                preflight,
+                Arc::clone(&prepared_runtime),
+                adapter.clone(),
+                decoder_state,
+                resolved_runtime,
+                encoder_config,
+                decoder_config,
+                encoder_execution_lane.clone(),
+                greedy_step_output_mode,
+                feature_key,
+            )?)
+        } else {
+            None
+        };
+        let encoder_output = match unified_gpu_runtime.as_ref() {
+            Some(runtime) => self.encode_with_unified_gpu_runtime(runtime, features)?,
+            None => self.encode_with_owned_runtime(
+                preflight,
+                Arc::clone(&prepared_runtime),
+                features,
+                adapter.clone(),
+                backend,
+                encoder_config,
+                encoder_execution_lane.clone(),
+            )?,
         };
         let decode =
-            if let Some(serve_batch_config) = serve_batch_config.filter(|_| can_use_serve_batch) {
+            if let Some(serve_batch_config) = serve_batch_config.filter(|_| serve_batch_active) {
                 let decode_config = moonshine_serve_batch_decode_config(
                     prepared_runtime.metadata,
                     decoder_state,
@@ -390,6 +476,25 @@ impl MoonshineGgmlExecutor {
                     reason: error.to_string(),
                 },
             })?
+            } else if let Some(runtime) = unified_gpu_runtime.as_ref() {
+                self.decode_with_unified_gpu_runtime(
+                    runtime,
+                    Arc::clone(&prepared_runtime),
+                    encoder_output,
+                    request.request_options.phrase_bias.clone(),
+                    decoder_state,
+                    request.request_options.word_timestamps,
+                    audio_duration,
+                    Arc::clone(&request.execution_context.control),
+                    request
+                        .execution_context
+                        .decode_work_progress_observer()
+                        .cloned(),
+                    request
+                        .execution_context
+                        .unstable_decode_text_observer()
+                        .cloned(),
+                )?
             } else {
                 self.decode_with_owned_runtime(
                     preflight,
@@ -465,6 +570,8 @@ impl MoonshineGgmlExecutor {
             .evict_where(|key| key.0.pack_content_id == pack_content_id);
         self.decoder_runtimes
             .evict_where(|key| key.0.pack_content_id == pack_content_id);
+        self.unified_gpu_runtimes
+            .evict_where(|key| key.content.pack_content_id == pack_content_id);
         self.lora_adapters.evict_base_content_id(pack_content_id);
         self.runtime_cache_by_path.evict_content_id(pack_content_id);
         // Engine keys contain the old build identity, but the shared registry
@@ -656,7 +763,7 @@ impl MoonshineGgmlExecutor {
         runtime
             .call_mut(move |state| {
                 state.runtime.activate_decoder_state(decoder_state)?;
-                run_moonshine_decoder_short_form_with_runtime(
+                let decode_result = run_moonshine_decoder_short_form_with_runtime(
                     &mut state.runtime,
                     &tokenizer,
                     metadata,
@@ -667,9 +774,162 @@ impl MoonshineGgmlExecutor {
                     &control,
                     decode_work_progress.as_ref(),
                     unstable_decode_text.as_ref(),
-                )
+                );
+                let release_result = state.runtime.release_transient_compute_memory();
+                match (decode_result, release_result) {
+                    (Ok(output), Ok(())) => Ok(output),
+                    (Err(error), _) => Err(error),
+                    (Ok(_), Err(error)) => Err(error),
+                }
             })
             .map_err(|error| Self::map_actor_error("decoder", error))?
+            .map_err(map_decoder_error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn checkout_unified_gpu_runtime(
+        &self,
+        preflight: &GgufRuntimeSourcePreflight,
+        prepared: PreparedRuntimeHandle<MoonshinePreparedRuntime>,
+        adapter: Option<ResolvedLoraAdapterHandle>,
+        decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
+        encoder_config: GgmlCpuGraphConfig,
+        decoder_config: GgmlCpuGraphConfig,
+        lane: ExecutionLaneKey,
+        greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        feature_key: MoonshineDecodeFeatureKey,
+    ) -> Result<MoonshineUnifiedRuntimeActor, MoonshineGgmlExecutorError> {
+        let backend = resolved_runtime.backend();
+        let key = MoonshineUnifiedRuntimeCacheKey {
+            content: PackContentKey::for_runtime_source(&preflight.runtime_source),
+            lane,
+            encoder_config: moonshine_graph_config_identity(encoder_config),
+            decoder_config: moonshine_graph_config_identity(decoder_config),
+            resident_capacity: decoder_state.resident_capacity(),
+            adapter_fingerprint: moonshine_adapter_cache_fingerprint(
+                adapter.as_ref().map(resolved_lora_adapter),
+            ),
+            output_contract: resolved_runtime.output_contract(),
+            output_plan: resolved_runtime.output_plan(),
+            reuse_mode: resolved_runtime.reuse_mode(),
+            feature_key,
+        };
+        let preflight = preflight.clone();
+        self.unified_gpu_runtimes.checkout_or_try_build_with(
+            key,
+            move || Ok((0, (preflight, prepared, adapter))),
+            move |(preflight, prepared, adapter)| {
+                let encoder = MoonshineEncoderGraphRuntime::new_with_graph_config(
+                    &prepared.encoder_weights,
+                    prepared.metadata,
+                    &preflight,
+                    adapter.as_ref().map(resolved_lora_adapter),
+                    backend,
+                    encoder_config,
+                )
+                .map_err(|error| MoonshineGgmlExecutorError::EncoderFailed {
+                    reason: error.to_string(),
+                })?;
+                let decoder_input = MoonshineDecoderRuntimeInput {
+                    decoder_weights: &prepared.decoder_weights,
+                    metadata: prepared.metadata,
+                    decoder_state,
+                    backend,
+                    graph_config: decoder_config,
+                    reuse_mode: resolved_runtime.reuse_mode(),
+                };
+                let decoder = if let Some(shared_weights) = encoder.cloned_loaded_weights() {
+                    MoonshineDecoderGraphRuntime::new_with_shared_pack_weights(
+                        decoder_input,
+                        &preflight,
+                        adapter.as_ref().map(resolved_lora_adapter),
+                        greedy_step_output_mode,
+                        shared_weights,
+                    )
+                } else {
+                    MoonshineDecoderGraphRuntime::new_with_greedy_step_output_mode(
+                        decoder_input,
+                        &preflight,
+                        adapter.as_ref().map(resolved_lora_adapter),
+                        greedy_step_output_mode,
+                    )
+                }
+                .map_err(|error| MoonshineGgmlExecutorError::DecoderFailed {
+                    reason: error.to_string(),
+                })?;
+                Ok(SystemMemoryOwner::without_allocation(
+                    MoonshineUnifiedActorState {
+                        encoder,
+                        decoder,
+                        _prepared_owner: prepared,
+                    },
+                ))
+            },
+            |error| Self::map_actor_error("unified-runtime", error),
+        )
+    }
+
+    fn encode_with_unified_gpu_runtime(
+        &self,
+        runtime: &MoonshineUnifiedRuntimeActor,
+        features: super::frontend::MoonshineWaveformFeatures,
+    ) -> Result<MoonshineEncoderOutput, MoonshineGgmlExecutorError> {
+        runtime
+            .call_mut_fallible(move |state| {
+                let encode_result = state.encoder.encode(&features);
+                let release_result = state.encoder.release_transient_compute_memory();
+                match (encode_result, release_result) {
+                    (Ok(output), Ok(())) => Ok(output),
+                    (Err(error), _) => Err(error),
+                    (Ok(_), Err(error)) => Err(error),
+                }
+            })
+            .map_err(|error| Self::map_actor_error("unified-encoder", error))?
+            .map_err(|error| MoonshineGgmlExecutorError::EncoderFailed {
+                reason: error.to_string(),
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_with_unified_gpu_runtime(
+        &self,
+        runtime: &MoonshineUnifiedRuntimeActor,
+        prepared: PreparedRuntimeHandle<MoonshinePreparedRuntime>,
+        encoder_output: MoonshineEncoderOutput,
+        phrase_bias: Option<crate::PhraseBiasConfig>,
+        decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
+        word_timestamps: bool,
+        audio_duration_seconds: f32,
+        control: Arc<crate::api::backend::TranscriptionControl>,
+        decode_work_progress: Option<crate::api::backend::WorkProgressObserver>,
+        unstable_decode_text: Option<crate::api::backend::UnstableDecodeTextObserver>,
+    ) -> Result<super::decoder_graph::MoonshineDecodeOutput, MoonshineGgmlExecutorError> {
+        let tokenizer = prepared.tokenizer.clone();
+        let metadata = prepared.metadata;
+        runtime
+            .call_mut_fallible(move |state| {
+                state.decoder.activate_decoder_state(decoder_state)?;
+                let decode_result = run_moonshine_decoder_short_form_with_runtime(
+                    &mut state.decoder,
+                    &tokenizer,
+                    metadata,
+                    &encoder_output,
+                    phrase_bias.as_ref(),
+                    word_timestamps,
+                    audio_duration_seconds,
+                    &control,
+                    decode_work_progress.as_ref(),
+                    unstable_decode_text.as_ref(),
+                );
+                let release_result = state.decoder.release_transient_compute_memory();
+                match (decode_result, release_result) {
+                    (Ok(output), Ok(())) => Ok(output),
+                    (Err(error), _) => Err(error),
+                    (Ok(_), Err(error)) => Err(error),
+                }
+            })
+            .map_err(|error| Self::map_actor_error("unified-decoder", error))?
             .map_err(map_decoder_error)
     }
 }
@@ -762,6 +1022,7 @@ impl GgmlAsrViewExecutor for MoonshineGgmlExecutor {
         shutdown_moonshine_serve_batch_engines(&self.serve_batch_engines);
         self.encoder_runtimes.clear();
         self.decoder_runtimes.clear();
+        self.unified_gpu_runtimes.clear();
         self.lora_adapters.clear();
         self.runtime_cache_by_path.clear();
     }
@@ -826,6 +1087,7 @@ impl GgmlAsrStreamingExecutor for MoonshineGgmlExecutor {
         shutdown_moonshine_serve_batch_engines(&self.serve_batch_engines);
         self.encoder_runtimes.clear();
         self.decoder_runtimes.clear();
+        self.unified_gpu_runtimes.clear();
         self.lora_adapters.clear();
         self.runtime_cache_by_path.clear();
     }
@@ -861,6 +1123,7 @@ mod tests {
     use super::{
         DECODER_OWNER_GRAPH_CONFIG_PROBE, ExecutionLaneKey, MoonshineDecodeFeatureKey,
         MoonshineGgmlExecutor, can_use_moonshine_serve_batch, moonshine_greedy_step_output_mode,
+        moonshine_unified_runtime_enabled,
     };
     use crate::device::execution_policy::ExecutionPlacement;
     use crate::device::execution_route::{
@@ -975,6 +1238,97 @@ mod tests {
         let preflight =
             GgufRuntimeSourcePreflight::from_runtime_source(&source).expect("preflight empty GGUF");
         (directory, preflight)
+    }
+
+    #[test]
+    fn unified_owner_requires_exact_cuda_hip_or_vulkan_full_device_reusable_gpu_graphs() {
+        let gpu = GgmlCpuGraphConfig {
+            backend: GgmlCpuGraphBackend::Gpu,
+            use_scheduler: false,
+            ..GgmlCpuGraphConfig::conservative_default()
+        };
+        let cpu = GgmlCpuGraphConfig {
+            backend: GgmlCpuGraphBackend::Cpu,
+            ..gpu
+        };
+        let scheduled = GgmlCpuGraphConfig {
+            use_scheduler: true,
+            ..gpu
+        };
+        for provider in [
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Vulkan,
+        ] {
+            let preference = exact_preference(provider);
+            assert!(moonshine_unified_runtime_enabled(
+                gpu,
+                gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+                false,
+                false,
+            ));
+            assert!(
+                moonshine_unified_runtime_enabled(
+                    gpu,
+                    gpu,
+                    Some(&preference),
+                    Some(ExecutionPlacement::Hybrid),
+                    false,
+                    false,
+                ),
+                "Hybrid request with both neural graphs on GPU must share one owner"
+            );
+            assert!(!moonshine_unified_runtime_enabled(
+                gpu,
+                cpu,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+                false,
+                false,
+            ));
+            assert!(!moonshine_unified_runtime_enabled(
+                gpu,
+                scheduled,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+                false,
+                false,
+            ));
+            assert!(!moonshine_unified_runtime_enabled(
+                gpu,
+                gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+                true,
+                false,
+            ));
+            assert!(!moonshine_unified_runtime_enabled(
+                gpu,
+                gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+                false,
+                true,
+            ));
+        }
+        for provider in [
+            ExecutionProvider::Cpu,
+            ExecutionProvider::Metal,
+            ExecutionProvider::Accelerator,
+            ExecutionProvider::Unknown,
+        ] {
+            let preference = exact_preference(provider);
+            assert!(!moonshine_unified_runtime_enabled(
+                gpu,
+                gpu,
+                Some(&preference),
+                Some(ExecutionPlacement::FullDevice),
+                false,
+                false,
+            ));
+        }
     }
 
     #[test]

@@ -1337,8 +1337,12 @@ mod tests {
     }
 
     #[test]
-    fn unified_owner_is_limited_to_offline_exact_cuda_and_vulkan_full_device() {
-        for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
+    fn unified_owner_is_limited_to_offline_exact_cuda_hip_and_vulkan_full_device() {
+        for provider in [
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Vulkan,
+        ] {
             let preference = exactly_addressable_preference(provider);
             assert!(firered_llm_unified_runtime_enabled(
                 true,
@@ -1363,7 +1367,6 @@ mod tests {
         for provider in [
             ExecutionProvider::Cpu,
             ExecutionProvider::Metal,
-            ExecutionProvider::Hip,
             ExecutionProvider::Accelerator,
             ExecutionProvider::Unknown,
         ] {

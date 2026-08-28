@@ -3893,7 +3893,7 @@ fn build_whisper_decoder_reusable_incremental_graph_with_n_seq(
     let hidden = plan.input_shape.hidden_size;
     let encoder_frames = plan.input_shape.encoder_frames;
     let mut session = runner
-        .start_capacity_sized_persistent_graph_session()
+        .start_persistent_graph_session_with_node_capacity(4_096)
         .map_err(|error| map_decoder_execute_graph_error("whisper_reuse_session", error))?;
     let graph = session.builder();
     let token_id = graph

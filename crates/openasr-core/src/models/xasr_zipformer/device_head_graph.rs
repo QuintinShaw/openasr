@@ -415,9 +415,6 @@ impl XasrDeviceHead {
             .mul_mat(weights.output_weight.as_graph_tensor(), joined)
             .and_then(|value| graph.add(value, weights.output_bias.as_graph_tensor()))
             .map_err(|error| error.to_string())?;
-        // The speculative path uses the same host last-max oracle as scalar
-        // decode. A compact device top1 would authorize a tie policy that is
-        // not part of the named runtime capability contract.
         graph
             .set_output(logits)
             .map_err(|error| error.to_string())?;
@@ -484,10 +481,20 @@ impl XasrGreedyDecodeBackend for XasrDeviceHead {
         self.last_token = None;
         self.last_selection_evidence = None;
         let graph = self.joint.session.builder();
-        let output = graph
-            .compute_output_f32_rows_with_evidence(self.joint.logits, self.vocab_size, 1)
-            .map_err(|error| error.to_string())?;
-        let (logits, evidence) = output.into_parts();
+        let retain_evidence =
+            crate::models::native_execution_services::current_execution_receipt_collector()
+                .is_some_and(|receipt| receipt.captures_full_logits());
+        let (logits, evidence) = if retain_evidence {
+            let output = graph
+                .compute_output_f32_rows_with_evidence(self.joint.logits, self.vocab_size, 1)
+                .map_err(|error| error.to_string())?;
+            output.into_parts()
+        } else {
+            let logits = graph
+                .compute_output_f32(self.joint.logits, self.vocab_size)
+                .map_err(|error| error.to_string())?;
+            (logits, None)
+        };
         let token = argmax(&logits)
             .ok_or_else(|| "xasr device head produced no finite logits".to_string())?;
         let probability = crate::models::seq2seq_greedy_decode::token_softmax_probability(
@@ -499,8 +506,7 @@ impl XasrGreedyDecodeBackend for XasrDeviceHead {
         }
         self.last_token = Some(token);
         self.last_probability = probability;
-        if crate::models::native_execution_services::current_execution_receipt_collector().is_some()
-        {
+        if retain_evidence {
             self.last_selection_evidence = evidence
                 .map(|rows| XasrSelectionEvidence::new(rows, logits, self.vocab_size, 1))
                 .transpose()?;
@@ -556,14 +562,28 @@ impl XasrGreedyDecodeBackend for XasrDeviceHead {
                 "xasr_head_speculative_encoder_frames",
             )
             .map_err(|error| error.to_string())?;
-        let output = graph
-            .compute_output_f32_rows_with_evidence(
-                speculative.logits,
-                self.vocab_size,
-                speculative.frames,
-            )
-            .map_err(|error| error.to_string())?;
-        let (logits, evidence) = output.into_parts();
+        let retain_evidence =
+            crate::models::native_execution_services::current_execution_receipt_collector()
+                .is_some_and(|receipt| receipt.captures_full_logits());
+        let expected_len = self
+            .vocab_size
+            .checked_mul(speculative.frames)
+            .ok_or_else(|| "xasr speculative logits shape overflowed".to_string())?;
+        let (logits, evidence) = if retain_evidence {
+            let output = graph
+                .compute_output_f32_rows_with_evidence(
+                    speculative.logits,
+                    self.vocab_size,
+                    speculative.frames,
+                )
+                .map_err(|error| error.to_string())?;
+            output.into_parts()
+        } else {
+            let logits = graph
+                .compute_output_f32(speculative.logits, expected_len)
+                .map_err(|error| error.to_string())?;
+            (logits, None)
+        };
         let mut first_non_blank = speculative.frames;
         for (frame, frame_logits) in logits.chunks_exact(self.vocab_size).enumerate() {
             let token = argmax(frame_logits).ok_or_else(|| {
@@ -574,8 +594,7 @@ impl XasrGreedyDecodeBackend for XasrDeviceHead {
                 break;
             }
         }
-        if crate::models::native_execution_services::current_execution_receipt_collector().is_some()
-        {
+        if retain_evidence {
             self.last_selection_evidence = evidence
                 .map(|rows| {
                     XasrSelectionEvidence::new(rows, logits, self.vocab_size, speculative.frames)

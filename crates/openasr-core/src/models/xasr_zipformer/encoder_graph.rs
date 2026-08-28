@@ -8840,7 +8840,7 @@ mod tests {
 
         let mut config = GgmlCpuGraphConfig::conservative_default();
         config.context_bytes = 64 * 1024 * 1024;
-        config.graph_size = 65_536;
+        config.graph_size = crate::models::xasr_zipformer::graph_config::FULL_ENCODER_GRAPH_SIZE;
         let mut runner =
             GgmlCpuGraphRunner::new(config).expect("cpu graph runner should initialize");
         let mut graph = runner.start_graph();
@@ -9956,9 +9956,7 @@ mod tests {
         let weights = load_xasr_encoder_weights(&reader, &metadata).expect("weights");
         // Right-sized like the runtime path (see
         // `xasr_zipformer_encoder_graph_config`): stack0 is a strict subset of
-        // the full encoder, so the full-encoder node budget covers it with >5x
-        // headroom. The old flat 256 MB over-reserved the `no_alloc` metadata
-        // context, which only holds tensor bookkeeping.
+        // the full encoder, so the full-encoder node budget covers it.
         let mut config = GgmlCpuGraphConfig::conservative_default();
         config.graph_size = config
             .graph_size

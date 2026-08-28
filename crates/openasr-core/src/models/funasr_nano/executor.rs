@@ -20,6 +20,7 @@ use crate::NativeAsrSession;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::FUNASR_NANO_DECODE_POLICY_ID;
 use crate::device::execution_policy::ExecutionPlacement;
+#[cfg(test)]
 use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlDecodeOutputPlan, RequestBackendPreference, request_backend_override,
@@ -181,12 +182,7 @@ fn funasr_nano_unified_runtime_enabled(
     allow_unified_runtime
         && backend == GgmlCpuGraphBackend::Gpu
         && placement == Some(ExecutionPlacement::FullDevice)
-        && matches!(
-            backend_preference,
-            Some(RequestBackendPreference::Exact(route))
-                if route.addressability.is_exactly_addressable()
-                    && matches!(route.provider, ExecutionProvider::Cuda | ExecutionProvider::Vulkan)
-        )
+        && crate::ggml_runtime::exact_discrete_gpu_unified_owner_is_proven(backend_preference)
 }
 
 fn validate_funasr_nano_unified_runtime(
@@ -1081,8 +1077,12 @@ mod tests {
     }
 
     #[test]
-    fn unified_owner_is_limited_to_offline_exact_cuda_and_vulkan_full_device() {
-        for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
+    fn unified_owner_is_limited_to_offline_exact_cuda_hip_and_vulkan_full_device() {
+        for provider in [
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Vulkan,
+        ] {
             let preference = exactly_addressable_preference(provider);
             assert!(funasr_nano_unified_runtime_enabled(
                 true,
@@ -1106,7 +1106,6 @@ mod tests {
         for provider in [
             ExecutionProvider::Cpu,
             ExecutionProvider::Metal,
-            ExecutionProvider::Hip,
             ExecutionProvider::Accelerator,
             ExecutionProvider::Unknown,
         ] {

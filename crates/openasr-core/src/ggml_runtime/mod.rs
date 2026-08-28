@@ -55,8 +55,8 @@ pub use backend::{
 pub(crate) use backend::{
     accelerated_device_rank, activate_attested_qualification_backend,
     activated_backend_execution_identity, activated_backend_execution_provider,
-    ensure_backends_loaded, ggml_backend_dl_build_enabled, preferred_accelerated_device,
-    probe_exact_backend_plugin_candidate,
+    apply_vulkan_device_local_buffer_policy, ensure_backends_loaded, ggml_backend_dl_build_enabled,
+    preferred_accelerated_device, probe_exact_backend_plugin_candidate,
 };
 pub(crate) use backend_memory::{
     BackendMemoryBytes, BackendMemoryLifecyclePoint, BackendMemoryStatsSnapshot,
@@ -74,10 +74,13 @@ pub use cpu_graph::{
 };
 pub(crate) use cpu_graph::{
     GgmlBackendCapabilities, GgmlComputeOutput, GgmlCpuGraphBuilder, GgmlCpuTensor,
-    GgmlFlashAttentionPrecision, GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity,
-    GgmlLoadedWeightContext, GgmlMatmulPrecision, GgmlNativeGqaCapability,
-    GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
-    LoadedWeightOwnerCache, ResidentDeviceCopyCapability, ResidentHostImportCapability,
+    GgmlFlashAttentionPrecision, GgmlGraphShapeKey, GgmlLoadedTensor,
+    GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext, GgmlMatmulPrecision,
+    GgmlNativeGqaCapability, GgmlPersistentGraphSession, GgmlRopeExtParams,
+    GgmlSameShapePersistentGraph, GgmlStaticTensor, GgmlStaticTensorArena, LoadedWeightOwnerCache,
+    ResidentDeviceCopyCapability, ResidentHostImportCapability,
+    encoder_same_shape_reuse_is_enabled, exact_discrete_gpu_unified_owner_is_proven,
+    proven_discrete_gpu_provider,
 };
 pub use decode_conformance::{
     DecodeFirstDivergenceClass, DiagnosticDecodeConformanceSuite, DiagnosticDecodeSelection,
