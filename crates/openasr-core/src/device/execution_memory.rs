@@ -516,7 +516,9 @@ struct PlacementDomainAccount {
 /// consumes the same receipts into Committed. GPU weight buffers never use it.
 #[derive(Debug)]
 struct MappingEnvelope {
+    mapping_bytes: u64,
     pending_bytes: u64,
+    handle_count: u32,
     generation: u64,
     owner_scope_id: Option<NativeExecutionScopeId>,
     owner_placement: RuntimeOwnerPlacement,
@@ -672,9 +674,6 @@ impl DeviceMemoryBrokerSet {
         }
         let snapshot = snapshot.normalized()?;
         let (policy_ceiling, observed_ceiling) = self.policy.limits(snapshot)?;
-        let generation = self
-            .next_mapping_envelope_generation
-            .fetch_add(1, Ordering::Relaxed);
         let mut accounts = self.lock_accounts();
         let empty_account = DomainAccount::default();
         let account = accounts.get(&domain).unwrap_or(&empty_account);
@@ -689,8 +688,32 @@ impl DeviceMemoryBrokerSet {
                 domain: domain.clone(),
             });
         }
-        if account.mapping_envelopes.contains_key(&cohort) {
-            return Err(MemoryPlanningError::ReservationLedgerCorrupted { domain });
+        let existing = account
+            .mapping_envelopes
+            .get(&cohort)
+            .map(|envelope| (envelope.mapping_bytes, envelope.generation));
+        if let Some((mapping_bytes, generation)) = existing {
+            if mapping_bytes != bytes {
+                return Err(MemoryPlanningError::ReservationLedgerCorrupted { domain });
+            }
+            let account = accounts.entry(domain.clone()).or_default();
+            let envelope = account.mapping_envelopes.get_mut(&cohort).ok_or(
+                MemoryPlanningError::ReservationLedgerCorrupted {
+                    domain: domain.clone(),
+                },
+            )?;
+            envelope.handle_count = envelope.handle_count.checked_add(1).ok_or(
+                MemoryPlanningError::ArithmeticOverflow {
+                    operation: "mapping envelope handle count",
+                },
+            )?;
+            drop(accounts);
+            return Ok(MappingEnvelopeHandle {
+                broker: Arc::clone(self),
+                domain,
+                cohort,
+                generation,
+            });
         }
         if account
             .exclusive_pending_cohort
@@ -724,12 +747,18 @@ impl DeviceMemoryBrokerSet {
                 available_bytes: policy_remaining,
             });
         }
+        let generation = self
+            .next_mapping_envelope_generation
+            .fetch_add(1, Ordering::Relaxed);
+        let _ = resource_id;
         let account = accounts.entry(domain.clone()).or_default();
         charge_pending_bytes(account, cohort, bytes, owner_scope_id, owner_placement)?;
         account.mapping_envelopes.insert(
             cohort,
             MappingEnvelope {
+                mapping_bytes: bytes,
                 pending_bytes: bytes,
+                handle_count: 1,
                 generation,
                 owner_scope_id,
                 owner_placement,
@@ -765,7 +794,7 @@ impl DeviceMemoryBrokerSet {
         let Some(envelope) = account.mapping_envelopes.get_mut(&handle.cohort) else {
             return;
         };
-        if envelope.generation != handle.generation {
+        if envelope.generation != handle.generation || envelope.receipt_owner.is_some() {
             return;
         }
         owner_descriptor.placement = envelope.owner_placement;
@@ -843,8 +872,8 @@ impl DeviceMemoryBrokerSet {
         )?;
         add_scoped_committed_bytes(account, &donor, bytes);
         let (receipt_resource, receipt_descriptor, receipt_owner) = if remaining == 0 {
-            match account.mapping_envelopes.remove(&cohort) {
-                Some(mut envelope) => (
+            match account.mapping_envelopes.get_mut(&cohort) {
+                Some(envelope) => (
                     envelope.receipt_resource.take(),
                     envelope.receipt_descriptor.take(),
                     envelope.receipt_owner.take(),
@@ -2397,14 +2426,18 @@ impl MappingEnvelopeHandle {
         let Some(account) = accounts.get_mut(&self.domain) else {
             return;
         };
-        let Some(envelope) = account.mapping_envelopes.remove(&self.cohort) else {
+        let Some(mut envelope) = account.mapping_envelopes.remove(&self.cohort) else {
             return;
         };
         if envelope.generation != self.generation {
             account.mapping_envelopes.insert(self.cohort, envelope);
             return;
         }
-        let mut envelope = envelope;
+        envelope.handle_count = envelope.handle_count.saturating_sub(1);
+        if envelope.handle_count > 0 {
+            account.mapping_envelopes.insert(self.cohort, envelope);
+            return;
+        }
         if envelope.pending_bytes > 0 {
             let donor = ReservationEntry {
                 domain: self.domain.clone(),
@@ -3084,6 +3117,56 @@ mod tests {
         assert_eq!(
             broker.usage(&MemoryDomainKey::SystemMemory).pending_bytes,
             6 * GIB
+        );
+    }
+
+    #[test]
+    fn same_cohort_mapping_envelope_is_shared_by_concurrent_activation_handles() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let snap = DeviceMemorySnapshot {
+            free_bytes: 16 * GIB,
+            total_bytes: 16 * GIB,
+            confidence: MemoryObservationConfidence::DeviceSnapshot,
+        };
+        let cohort = MemoryReservationCohortId::new(7);
+        let first = broker
+            .open_mapping_envelope(
+                snap,
+                4 * GIB,
+                cohort,
+                "candidate-activation-host-import".to_string(),
+                None,
+                RuntimeOwnerPlacement::Unknown,
+            )
+            .expect("first envelope");
+        let second = broker
+            .open_mapping_envelope(
+                snap,
+                4 * GIB,
+                cohort,
+                "candidate-activation-host-import".to_string(),
+                None,
+                RuntimeOwnerPlacement::Unknown,
+            )
+            .expect("same-cohort activation must join the open mapping");
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).pending_bytes,
+            4 * GIB,
+            "one request cohort must not charge the mapping twice"
+        );
+        drop(first);
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).pending_bytes,
+            4 * GIB,
+            "the remaining handle still owns the forecast"
+        );
+        drop(second);
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory),
+            DeviceMemoryUsage::default()
         );
     }
 
