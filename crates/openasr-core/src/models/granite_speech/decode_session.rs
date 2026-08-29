@@ -775,7 +775,7 @@ impl GraniteSpeechDecodeSession {
             self.config.num_kv_heads,
             self.config.head_dim,
         )?;
-        let last_logits = run_prefill_graph(
+        let (last_logits, evidence) = run_prefill_graph(
             &mut self.runner,
             &self.weights,
             &self.config,
@@ -783,6 +783,7 @@ impl GraniteSpeechDecodeSession {
             n_tokens,
             &mut host_kv,
         )?;
+        self.last_step_compute_evidence = evidence;
         self.host_kv = Some(host_kv);
         self.seq_len = n_tokens;
         self.prefilled = true;
@@ -978,7 +979,7 @@ impl GraniteSpeechDecodeSession {
             .ok_or_else(|| GraniteSpeechDecoderError::Shape {
                 reason: "granite CPU decode path has no admitted host KV owner".to_string(),
             })?;
-        let logits = run_decode_step_graph(
+        let (logits, evidence) = run_decode_step_graph(
             &mut self.runner,
             &self.weights,
             &self.config,
@@ -986,6 +987,7 @@ impl GraniteSpeechDecodeSession {
             seq_len,
             host_kv,
         )?;
+        self.last_step_compute_evidence = evidence;
         self.seq_len += 1;
         Ok(logits)
     }
@@ -1348,7 +1350,7 @@ fn run_prefill_graph(
     embeddings: &[f32],
     n_tokens: usize,
     host_kv: &mut GraniteHostKvState,
-) -> Result<Vec<f32>, GraniteSpeechDecoderError> {
+) -> Result<(Vec<f32>, Option<GgmlSelectionEvidenceRef>), GraniteSpeechDecoderError> {
     let head_dim = config.head_dim;
     let kv_heads = config.num_kv_heads;
     let hidden_size = config.hidden_size;
@@ -1542,10 +1544,10 @@ fn run_prefill_graph(
         destinations.push((*k_tap, &mut k_history[..written_len]));
         destinations.push((*v_tap, &mut v_history[..written_len]));
     }
-    graph
-        .compute_outputs_into_f32(destinations.as_mut_slice())
+    let evidence = graph
+        .compute_outputs_into_f32_with_evidence(destinations.as_mut_slice())
         .map_err(map_ggml("session_prefill_compute"))?;
-    Ok(last_logits)
+    Ok((last_logits, evidence))
 }
 
 /// One-shot causal prefill that ALSO seeds the device-resident KV arena
@@ -1896,7 +1898,7 @@ fn run_decode_step_graph(
     embed_row: &[f32],
     seq_len: usize,
     host_kv: &mut GraniteHostKvState,
-) -> Result<Vec<f32>, GraniteSpeechDecoderError> {
+) -> Result<(Vec<f32>, Option<GgmlSelectionEvidenceRef>), GraniteSpeechDecoderError> {
     let head_dim = config.head_dim;
     let kv_heads = config.num_kv_heads;
     let hidden_size = config.hidden_size;
@@ -2144,10 +2146,10 @@ fn run_decode_step_graph(
         destinations.push((*k_tap, &mut k_history[history_len..row_end]));
         destinations.push((*v_tap, &mut v_history[history_len..row_end]));
     }
-    graph
-        .compute_outputs_into_f32(destinations.as_mut_slice())
+    let evidence = graph
+        .compute_outputs_into_f32_with_evidence(destinations.as_mut_slice())
         .map_err(map_ggml("session_step_compute"))?;
-    Ok(logits_row)
+    Ok((logits_row, evidence))
 }
 
 #[cfg(test)]

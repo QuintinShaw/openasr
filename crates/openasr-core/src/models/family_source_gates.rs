@@ -1074,6 +1074,36 @@ fn production_seq2seq_step_executors_mint_compute_evidence() {
             "{} implements Seq2SeqGreedyDecodeStepExecutor without take_compute_evidence; GPU receipts fail closed without a minted selection witness",
             path.display()
         );
+        for (line_no, line) in source.lines().enumerate() {
+            if line.contains("compute_outputs_into_f32(")
+                && !line.contains("compute_outputs_into_f32_with_evidence")
+            {
+                panic!(
+                    "{}:{} discards compute evidence via compute_outputs_into_f32; seq2seq token steps must use compute_outputs_into_f32_with_evidence or compute_greedy_step_output_with_evidence",
+                    path.display(),
+                    line_no + 1
+                );
+            }
+        }
+    }
+    let granite_session = root.join("granite_speech/decode_session.rs");
+    let granite_source = std::fs::read_to_string(&granite_session)
+        .unwrap_or_else(|error| panic!("read {}: {error}", granite_session.display()));
+    assert!(
+        granite_source.contains("compute_outputs_into_f32_with_evidence")
+            && granite_source.contains("compute_greedy_step_output_with_evidence"),
+        "granite growing-KV and reuse decode paths must both mint a compute witness"
+    );
+    for (line_no, line) in granite_source.lines().enumerate() {
+        if line.contains("compute_outputs_into_f32(")
+            && !line.contains("compute_outputs_into_f32_with_evidence")
+        {
+            panic!(
+                "{}:{} growing-KV logits readback drops compute evidence",
+                granite_session.display(),
+                line_no + 1
+            );
+        }
     }
 }
 
