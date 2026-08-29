@@ -115,6 +115,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   role `/usr/bin/afconvert` plays on macOS. AAC-LC and bare ADTS stay
   in-process. If system decoding also fails, the error says so and points at
   ffmpeg.
+- Windows: promoting an installed GPU backend pack retries antivirus directory
+  locks (`os error 5` / sharing / lock violation) and copies the readable
+  staging tree if rename stays locked. A failed copy does not leave a truncated
+  directory that the next install would treat as already complete.
 - HIP decode reuse no longer recaptures every token after the first stable
   capture: uid reuse keys on node count, op, type, and shape, and ignores
   input-pointer churn that HIP writes on each launch.
