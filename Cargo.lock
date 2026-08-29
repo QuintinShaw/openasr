@@ -1686,6 +1686,7 @@ dependencies = [
  "toml",
  "ts-rs",
  "unicode-general-category",
+ "windows",
  "windows-sys 0.61.2",
  "zip",
 ]

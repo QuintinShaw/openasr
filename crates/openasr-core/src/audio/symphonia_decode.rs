@@ -416,19 +416,120 @@ fn decode_opus_track(
 /// Detects explicit-signaling HE-AAC (SBR / PS) from the ISO 14496-3
 /// `AudioSpecificConfig` so callers can fall back to an external converter
 /// instead of silently producing bandwidth-limited audio: the plain AAC-LC
-/// decoder these features enable ignores the SBR high-band extension. This
-/// only recognizes *explicit* backward-compatible signaling (object type 5 =
-/// SBR, 29 = PS), which is how mainstream m4a/mp4 encoders signal HE-AAC;
-/// implicit signaling in raw ADTS streams is not detected here.
+/// decoder these features enable ignores the SBR high-band extension.
+///
+/// Two explicit forms are recognized:
+/// - Hierarchical: the ASC itself starts with object type 5 (SBR) or 29 (PS).
+/// - Backward-compatible: the ASC starts as AAC-LC (object type 2) and then
+///   carries `syncExtensionType` `0x2B7` with `sbrPresentFlag = 1` (and
+///   optionally `0x548` for PS). ffmpeg's HE-AAC m4a encoder writes this
+///   form; AAC-LC often writes the same extension with `sbrPresentFlag = 0`
+///   and must stay in-process.
+///
+/// Implicit SBR in raw ADTS (no ASC extra data) is not detected here.
+/// Neither are unusual ASCs that need `program_config_element()`
+/// (`channelConfiguration == 0`) or extra GASpecificConfig fields
+/// (`extensionFlag == 1`, AOT 6 `layerNr`): those stay on the in-process
+/// AAC-LC path, same class as implicit ADTS SBR.
 fn is_unsupported_aac_extension(codec: &CodecType, extra_data: &[u8]) -> bool {
-    if *codec != CODEC_TYPE_AAC {
-        return false;
-    }
-    let Some(&first_byte) = extra_data.first() else {
+    *codec == CODEC_TYPE_AAC && asc_signals_he_aac(extra_data)
+}
+
+/// ISO 14496-3 `syncExtensionType` for SBR (11 bits).
+const SBR_SYNC_EXTENSION: u32 = 0x2B7;
+/// ISO 14496-3 `syncExtensionType` for Parametric Stereo (11 bits).
+const PS_SYNC_EXTENSION: u32 = 0x548;
+
+fn asc_signals_he_aac(extra_data: &[u8]) -> bool {
+    let mut bits = BitReader::new(extra_data);
+    let Some(audio_object_type) = bits.read_audio_object_type() else {
         return false;
     };
-    let audio_object_type = first_byte >> 3;
-    matches!(audio_object_type, 5 | 29)
+    if matches!(audio_object_type, 5 | 29) {
+        return true;
+    }
+
+    let Some(sampling_frequency_index) = bits.read(4) else {
+        return false;
+    };
+    if sampling_frequency_index == 15 && bits.read(24).is_none() {
+        return false;
+    }
+    if bits.read(4).is_none() {
+        return false;
+    }
+
+    // GASpecificConfig for AAC-LC and the other MPEG-4 General Audio types
+    // that can carry a trailing SBR/PS extension.
+    if matches!(audio_object_type, 1 | 2 | 3 | 4 | 6 | 7) {
+        if bits.read(1).is_none() {
+            return false;
+        }
+        match bits.read(1) {
+            Some(1) if bits.read(14).is_none() => return false,
+            Some(_) => {}
+            None => return false,
+        }
+        if bits.read(1).is_none() {
+            return false;
+        }
+    }
+
+    let Some(sync) = bits.read(11) else {
+        return false;
+    };
+    if sync == SBR_SYNC_EXTENSION {
+        let Some(extension_aot) = bits.read_audio_object_type() else {
+            return false;
+        };
+        if extension_aot == 29 {
+            return true;
+        }
+        if extension_aot == 5 {
+            return bits.read(1) == Some(1);
+        }
+        return false;
+    }
+    sync == PS_SYNC_EXTENSION && bits.read(1) == Some(1)
+}
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    bit: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit: 0 }
+    }
+
+    fn remaining_bits(&self) -> usize {
+        self.data.len().saturating_mul(8).saturating_sub(self.bit)
+    }
+
+    fn read(&mut self, n: u32) -> Option<u32> {
+        let n = n as usize;
+        if n == 0 || n > 32 || self.remaining_bits() < n {
+            return None;
+        }
+        let mut value = 0_u32;
+        for _ in 0..n {
+            let byte = self.data[self.bit / 8];
+            let shift = 7 - (self.bit % 8);
+            value = (value << 1) | u32::from((byte >> shift) & 1);
+            self.bit += 1;
+        }
+        Some(value)
+    }
+
+    fn read_audio_object_type(&mut self) -> Option<u32> {
+        let audio_object_type = self.read(5)?;
+        if audio_object_type == 31 {
+            Some(32 + self.read(6)?)
+        } else {
+            Some(audio_object_type)
+        }
+    }
 }
 
 fn push_downmixed_samples(decoded: &AudioBufferRef<'_>, out: &mut Vec<f32>) {
@@ -555,6 +656,49 @@ mod tests {
     /// `prepare::codec_note`/`missing_converter_hint` name the actual codec
     /// in an error instead of a generic "unsupported format" message (#159:
     /// dictaphone/conferencing-system wav uploads are commonly MS/IMA ADPCM).
+    #[test]
+    fn he_aac_backward_compatible_sbr_flag_is_detected() {
+        // DecoderSpecificInfo from tests/fixtures/tone_heaac.m4a: AAC-LC
+        // (AOT 2) + syncExtensionType 0x2B7 with sbrPresentFlag = 1.
+        assert!(asc_signals_he_aac(&[0x15, 0x88, 0x56, 0xe5, 0xc0]));
+        assert!(is_unsupported_aac_extension(
+            &CODEC_TYPE_AAC,
+            &[0x15, 0x88, 0x56, 0xe5, 0xc0]
+        ));
+    }
+
+    #[test]
+    fn hierarchical_sbr_and_ps_object_types_are_detected() {
+        // First five bits 00101 = AOT 5 (SBR). Remaining bits unused.
+        assert!(asc_signals_he_aac(&[0x28]));
+        // First five bits 11101 = AOT 29 (PS).
+        assert!(asc_signals_he_aac(&[0xe8]));
+    }
+
+    #[test]
+    fn aac_lc_with_sbr_not_present_stays_in_process() {
+        // DecoderSpecificInfo from tests/fixtures/tone_mono.m4a: same 0x2B7
+        // extension as HE-AAC, but sbrPresentFlag = 0.
+        assert!(!asc_signals_he_aac(&[0x14, 0x08, 0x56, 0xe5, 0x00]));
+        assert!(!is_unsupported_aac_extension(
+            &CODEC_TYPE_AAC,
+            &[0x14, 0x08, 0x56, 0xe5, 0x00]
+        ));
+    }
+
+    #[test]
+    fn he_aac_m4a_fixture_is_not_decoded_in_process() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tone_heaac.m4a");
+        assert!(
+            matches!(
+                try_decode_to_pcm16_mono_16k(&fixture, Some("m4a")),
+                SymphoniaOutcome::Unsupported { .. }
+            ),
+            "HE-AAC must fall through to the system converter, not the AAC-LC decoder"
+        );
+    }
+
     #[test]
     fn probe_codec_label_identifies_ms_adpcm_wav() {
         let fixture =

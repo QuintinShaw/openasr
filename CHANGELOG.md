@@ -95,6 +95,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Windows: HE-AAC (and other formats the in-process decoder cannot handle)
+  fall back to Media Foundation to produce 16 kHz mono PCM16 WAV, the same
+  role `/usr/bin/afconvert` plays on macOS. AAC-LC and bare ADTS stay
+  in-process. If system decoding also fails, the error says so and points at
+  ffmpeg.
 - HIP decode reuse no longer recaptures every token after the first stable
   capture: uid reuse keys on node count, op, type, and shape, and ignores
   input-pointer churn that HIP writes on each launch.

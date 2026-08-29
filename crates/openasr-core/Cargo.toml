@@ -104,6 +104,13 @@ objc.workspace = true
 # crashed/killed download's stale lock is reclaimed immediately instead of waiting
 # out the 6h mtime timeout. The unix path uses libc::kill; this is its Windows peer.
 windows-sys.workspace = true
+# System AAC (including HE-AAC SBR/PS) via Media Foundation. Same role as
+# macOS `/usr/bin/afconvert`: no FDK, not linked into the public ABI.
+windows = { version = "0.62", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true

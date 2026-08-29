@@ -6,6 +6,8 @@ mod probe;
 mod symphonia_decode;
 mod types;
 mod validation;
+#[cfg(windows)]
+mod windows_mf;
 
 use std::path::Path;
 
