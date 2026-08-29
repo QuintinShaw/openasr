@@ -25,8 +25,8 @@ use thiserror::Error;
 use crate::device::{
     execution_memory::{
         AllocationLifetime, DeviceMemoryBrokerSet, DeviceMemoryPolicy,
-        DeviceMemoryReservationBatch, MappingEnvelopeHandle, MemoryReservationCohortId, PhaseSet,
-        PhysicalDeviceKey,
+        DeviceMemoryReservationBatch, DeviceMemorySnapshot, MappingEnvelopeHandle, MemoryDomainKey,
+        MemoryReservationCohortId, PhaseSet, PhysicalDeviceKey, QuoteConfidence,
     },
     execution_policy::{
         DefaultExecutionPolicyResolver, ExecutionCandidate, ExecutionCandidateFailure,
@@ -1863,7 +1863,6 @@ pub fn resolve_candidate_activation_lane(
 /// output-plan evidence, or reuse evidence.
 #[derive(Debug, Clone)]
 pub struct ResolvedDefaultModelActivation {
-    candidate: ExecutionCandidate,
     verified_pack: VerifiedPack,
     facts: DefaultModelActivationFacts,
 }
@@ -1874,13 +1873,12 @@ impl ResolvedDefaultModelActivation {
     }
 
     pub fn quote(&self) -> Result<DefaultModelActivationQuote, String> {
-        let (_backends, _mapping, plan) = quote_candidate_activation_plan(
+        let (_backends, _mapping, mapping) = quote_candidate_activation_plan(
             &self.verified_pack,
             self.facts.plan().resident_topology(),
         )?;
         Ok(DefaultModelActivationQuote {
-            plan,
-            candidate: self.candidate.clone(),
+            mapping,
             content_id: self.verified_pack.content_id().to_string(),
         })
     }
@@ -1897,8 +1895,7 @@ impl ResolvedDefaultModelActivation {
 /// or audit checkpoint between quote/stat observation and broker mutation, but
 /// cannot inspect or rewrite physical-domain rows.
 pub struct DefaultModelActivationQuote {
-    plan: NativeMemoryAdmissionPlan,
-    candidate: ExecutionCandidate,
+    mapping: PackMappingQuote,
     content_id: String,
 }
 
@@ -1907,13 +1904,19 @@ impl DefaultModelActivationQuote {
         self,
         services: &NativeExecutionServices,
     ) -> Result<BrokerActivationReservation, String> {
-        reserve_activation_plan(
-            services,
-            &self.plan,
-            &self.candidate,
-            Some(&self.content_id),
-        )
+        reserve_pack_mapping(services, &self.mapping, Some(&self.content_id))
     }
+}
+
+/// Observation-bound host-import of one already-open pack mapping.
+///
+/// This is not a broker reservation batch. Activation opens a mapping
+/// envelope; GPU `pack-weight-buffer` reserves separately.
+struct PackMappingQuote {
+    snapshot: DeviceMemorySnapshot,
+    bytes: u64,
+    resource_id: String,
+    quote_confidence: QuoteConfidence,
 }
 
 fn resolve_resident_topology_plan(
@@ -2006,7 +2009,6 @@ pub fn resolve_default_model_activation(
         resident_topology,
     );
     Ok(ResolvedDefaultModelActivation {
-        candidate,
         verified_pack: pack.clone(),
         facts: ResolvedExecutionFacts::new(plan, lane, identity),
     })
@@ -2109,7 +2111,7 @@ fn quote_candidate_activation_plan(
     (
         Vec<GgmlBackend>,
         std::sync::Arc<memmap2::Mmap>,
-        NativeMemoryAdmissionPlan,
+        PackMappingQuote,
     ),
     String,
 > {
@@ -2148,7 +2150,7 @@ fn quote_pack_activation_plan(
     (
         Vec<GgmlBackend>,
         std::sync::Arc<memmap2::Mmap>,
-        NativeMemoryAdmissionPlan,
+        PackMappingQuote,
     ),
     String,
 > {
@@ -2170,10 +2172,27 @@ fn quote_pack_activation_plan(
     };
     let host_group_id = format!("candidate-activation-host-import:{activation_resource}");
     let host_group = quote_host_activation_group(&host_group_id, &host, host_import)?;
-    let plan = admission_plan_from_quoted_groups(vec![host_group])?
-        .already_open_file_backed()
-        .with_open_mapping_bytes(requested_bytes);
-    Ok((vec![host], mmap, plan))
+    let plan = admission_plan_from_quoted_groups(vec![host_group])?;
+    let request = match plan.reservation_requests() {
+        [request] if request.domain == MemoryDomainKey::SystemMemory && request.peak_bytes > 0 => {
+            request
+        }
+        _ => {
+            return Err(
+                "candidate activation host-import must quote one SystemMemory mapping".to_string(),
+            );
+        }
+    };
+    Ok((
+        vec![host],
+        mmap,
+        PackMappingQuote {
+            snapshot: request.snapshot,
+            bytes: requested_bytes,
+            resource_id: request.resource_id.clone(),
+            quote_confidence: plan.quote_confidence_for_domain(&MemoryDomainKey::SystemMemory),
+        },
+    ))
 }
 
 fn admission_plan_from_quoted_groups(
@@ -2228,6 +2247,53 @@ fn quote_cpu_buffer_plan(
     Ok((host, plan))
 }
 
+fn reserve_pack_mapping(
+    services: &NativeExecutionServices,
+    mapping: &PackMappingQuote,
+    content_id: Option<&str>,
+) -> Result<BrokerActivationReservation, String> {
+    let cohort_id = current_memory_reservation_cohort_id()
+        .unwrap_or_else(|| MemoryReservationCohortId::new(ExecutionCacheAttemptId::next().0));
+    let collector = services.runtime_receipts();
+    let handle = services
+        .memory_broker()
+        .open_mapping_envelope(
+            mapping.snapshot,
+            mapping.bytes,
+            cohort_id,
+            mapping.resource_id.clone(),
+            Some(services.scope_id),
+            RuntimeOwnerPlacement::HostNeutral,
+        )
+        .map_err(|error| format!("candidate activation reserve: {error}"))?;
+    if collector.is_available()
+        && let Some(owner) = collector.host_neutral_owner_descriptor(
+            "mapping-envelope",
+            content_id,
+            Some(mapping.resource_id.as_str()),
+        )
+        && let Some(resource) = collector.resource_descriptor(
+            &mapping.resource_id,
+            &MemoryDomainKey::SystemMemory,
+            mapping.bytes,
+            mapping.bytes,
+            mapping.bytes,
+            mapping.quote_confidence,
+            Some(mapping.snapshot.confidence),
+        )
+    {
+        services.memory_broker().attach_mapping_envelope_receipt(
+            &handle,
+            collector.clone(),
+            owner,
+            resource,
+        );
+    }
+    Ok(BrokerActivationReservation::from_envelope(
+        handle, cohort_id,
+    ))
+}
+
 fn reserve_activation_plan(
     services: &NativeExecutionServices,
     plan: &NativeMemoryAdmissionPlan,
@@ -2241,50 +2307,6 @@ fn reserve_activation_plan(
         request.cohort_id = Some(cohort_id);
     }
     let collector = services.runtime_receipts();
-    let mapping_envelope = requests.len() == 1
-        && requests
-            .iter()
-            .all(|request| request.observed_peak_bytes == Some(0));
-    if mapping_envelope {
-        let request = &requests[0];
-        let handle = services
-            .memory_broker()
-            .open_mapping_envelope(
-                request.snapshot,
-                request.peak_bytes,
-                cohort_id,
-                request.resource_id.clone(),
-                Some(services.scope_id),
-                RuntimeOwnerPlacement::HostNeutral,
-            )
-            .map_err(|error| format!("candidate activation reserve: {error}"))?;
-        if collector.is_available()
-            && let Some(owner) = collector.host_neutral_owner_descriptor(
-                "mapping-envelope",
-                content_id,
-                Some(request.resource_id.as_str()),
-            )
-            && let Some(resource) = collector.resource_descriptor(
-                &request.resource_id,
-                &request.domain,
-                request.peak_bytes,
-                request.peak_bytes,
-                request.retained_bytes,
-                plan.quote_confidence_for_domain(&request.domain),
-                Some(request.snapshot.confidence),
-            )
-        {
-            services.memory_broker().attach_mapping_envelope_receipt(
-                &handle,
-                collector.clone(),
-                owner,
-                resource,
-            );
-        }
-        return Ok(BrokerActivationReservation::from_envelope(
-            handle, cohort_id,
-        ));
-    }
     let backend = match candidate.device.route.provider {
         ExecutionProvider::Cpu => GgmlCpuGraphBackend::Cpu,
         ExecutionProvider::Metal => GgmlCpuGraphBackend::Metal,
@@ -2383,7 +2405,7 @@ pub(crate) fn quote_and_reserve_candidate_activation(
     pack: &VerifiedPack,
 ) -> Result<BrokerActivationReservation, String> {
     let architecture_id = architecture_id_from_pack(pack)?;
-    let (_backends, _mapping, plan) = match pack.route() {
+    let (_backends, _mapping, mapping) = match pack.route() {
         PackRoute::Asr { .. } => {
             let descriptor = crate::arch::OpenAsrArchitectureRegistry::with_builtins()
                 .find_by_model_architecture(architecture_id)
@@ -2429,7 +2451,7 @@ pub(crate) fn quote_and_reserve_candidate_activation(
             quote_pack_activation_plan(pack, &activation_resource)?
         }
     };
-    reserve_activation_plan(services, &plan, candidate, Some(pack.content_id()))
+    reserve_pack_mapping(services, &mapping, Some(pack.content_id()))
 }
 
 /// Runs a complete allocation/execution operation inside one candidate's
@@ -4025,29 +4047,12 @@ mod tests {
                 true,
             )
             .unwrap();
-            let (_backends, _mapping, plan) = quote_candidate_activation_plan(&pack, &topology)
+            let (_backends, _mapping, mapping) = quote_candidate_activation_plan(&pack, &topology)
                 .expect("activation footprint must be quotable");
-            let peak = plan
-                .reservation_requests()
-                .iter()
-                .map(|request| request.peak_bytes)
-                .sum::<u64>();
+            let peak = mapping.bytes;
             assert!(
                 peak > 4096,
                 "quoted activation peak must exceed a placeholder page, got {peak}"
-            );
-            assert!(
-                plan.reservation_requests()
-                    .iter()
-                    .all(|request| request.peak_bytes > 0),
-                "quoted activation domains must not be reserved as zero"
-            );
-            assert!(
-                plan.reservation_requests().iter().all(|request| {
-                    request.domain == MemoryDomainKey::SystemMemory
-                        && request.observed_peak_bytes == Some(0)
-                }),
-                "activation must quote only the already-open host mapping"
             );
             peak
         };

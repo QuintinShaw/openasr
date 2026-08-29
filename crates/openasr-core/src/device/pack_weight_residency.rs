@@ -322,12 +322,12 @@ impl DeviceMemoryBrokerSet {
                         snapshot,
                         peak_bytes: bytes,
                         retained_bytes: bytes,
-                        observed_peak_bytes: Some(0),
+                        observed_peak_bytes: None,
                         requires_reconciliation: false,
                         resource_id: resource_id.clone(),
                         cohort_id,
-                        draws_from_cohort_envelope: false,
-                    };
+                    }
+                    .already_open_file_backed();
                     request.cohort_id = cohort_id;
                     let mut batch = self.try_reserve_batch_for_scope_and_placement(
                         vec![request],
@@ -344,12 +344,12 @@ impl DeviceMemoryBrokerSet {
                 snapshot,
                 peak_bytes: bytes,
                 retained_bytes: bytes,
-                observed_peak_bytes: Some(0),
+                observed_peak_bytes: None,
                 requires_reconciliation: false,
                 resource_id: resource_id.clone(),
                 cohort_id,
-                draws_from_cohort_envelope: false,
-            };
+            }
+            .already_open_file_backed();
             request.cohort_id = cohort_id;
             let mut batch = self.try_reserve_batch_for_scope_and_placement(
                 vec![request],
@@ -466,7 +466,7 @@ impl DeviceMemoryBrokerSet {
             snapshot,
             peak_bytes: bytes,
             retained_bytes: bytes,
-            observed_peak_bytes: Some(0),
+            observed_peak_bytes: None,
             requires_reconciliation: false,
             resource_id: format!(
                 "pack-weight-residency-dead-inject:{}:{:#x}",
@@ -474,8 +474,8 @@ impl DeviceMemoryBrokerSet {
                 key.mapping_identity.as_raw()
             ),
             cohort_id: None,
-            draws_from_cohort_envelope: false,
-        };
+        }
+        .already_open_file_backed();
         request.cohort_id = None;
         let mut batch = self.try_reserve_batch(vec![request])?;
         batch.commit_quoted()?;

@@ -1408,6 +1408,12 @@ fn production_activation_reserve_does_not_use_placeholder_bytes() {
             && !production.contains("resource_id.contains"),
         "activation must not forecast mmap bytes as a discrete GPU buffer: {production}"
     );
+    assert!(
+        production.contains("reserve_pack_mapping")
+            && production.contains("open_mapping_envelope")
+            && !production.contains("observed_peak_bytes == Some(0)"),
+        "pack activation must open the mapping envelope directly: {production}"
+    );
     let pack_plan = source
         .split("fn quote_pack_activation_plan")
         .nth(1)
@@ -1418,9 +1424,10 @@ fn production_activation_reserve_does_not_use_placeholder_bytes() {
     assert!(
         pack_plan.contains("HOST_IMPORT")
             && pack_plan.contains("candidate-activation-host-import")
-            && pack_plan.contains("already_open_file_backed")
-            && pack_plan.contains("with_open_mapping_bytes")
+            && pack_plan.contains("PackMappingQuote")
+            && pack_plan.contains("requested_bytes")
             && !pack_plan.contains("GGML_BACKEND_MEMORY_REQUEST_BUFFER")
+            && !pack_plan.contains("already_open_file_backed")
             && !pack_plan.contains("or_else"),
         "activation must quote only the already-open pack mapping as host-import: {pack_plan}"
     );

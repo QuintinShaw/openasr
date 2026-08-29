@@ -561,12 +561,6 @@ pub struct DomainReservationRequest {
     pub requires_reconciliation: bool,
     pub resource_id: String,
     pub(crate) cohort_id: Option<MemoryReservationCohortId>,
-    /// When set, this request materializes a file-backed mapping already
-    /// quoted on the same cohort (host-import of an open pack). Capacity
-    /// checks then use that envelope instead of adding a second SystemMemory
-    /// charge. Ordinary allocations, including `pack-weight-buffer`, leave
-    /// this unset so they reserve their own bytes.
-    pub draws_from_cohort_envelope: bool,
 }
 
 impl DomainReservationRequest {
@@ -580,7 +574,6 @@ impl DomainReservationRequest {
             requires_reconciliation: footprint.requires_reconciliation,
             resource_id: footprint.resource_ids.join("+"),
             cohort_id: None,
-            draws_from_cohort_envelope: false,
         }
     }
 
@@ -588,13 +581,6 @@ impl DomainReservationRequest {
     /// again because this mapping is already open and reclaimable.
     pub fn already_open_file_backed(mut self) -> Self {
         self.observed_peak_bytes = Some(0);
-        self
-    }
-
-    /// Charge the open mapping size, not native copy-padding extras.
-    pub fn with_open_mapping_bytes(mut self, mapping_bytes: u64) -> Self {
-        self.peak_bytes = mapping_bytes;
-        self.retained_bytes = mapping_bytes;
         self
     }
 
@@ -653,9 +639,12 @@ impl DeviceMemoryBrokerSet {
 
     /// Open a SystemMemory forecast for one already-open pack mapping.
     ///
-    /// Policy still charges `bytes` so two distinct packs fail closed. Live
-    /// free is not required again (`observed_peak = 0`). Consume this lease
-    /// through [`Self::try_consume_mapping_envelope`] when residency binds.
+    /// This is its own lease: policy still charges `bytes` so two distinct
+    /// packs fail closed, but live free is not required again because the
+    /// mapping is already open and reclaimable. Ordinary
+    /// [`Self::try_reserve_batch`] paths never see this object. Consume the
+    /// lease through [`Self::try_consume_mapping_envelope`] when residency
+    /// binds.
     pub(crate) fn open_mapping_envelope(
         self: &Arc<Self>,
         snapshot: DeviceMemorySnapshot,
@@ -665,10 +654,7 @@ impl DeviceMemoryBrokerSet {
         owner_scope_id: Option<NativeExecutionScopeId>,
         owner_placement: RuntimeOwnerPlacement,
     ) -> Result<MappingEnvelopeHandle, MemoryPlanningError> {
-        if bytes == 0 {
-            return Err(MemoryPlanningError::EmptyResourceId);
-        }
-        if resource_id.trim().is_empty() {
+        if bytes == 0 || resource_id.trim().is_empty() {
             return Err(MemoryPlanningError::EmptyResourceId);
         }
         let owner_placement = if owner_scope_id.is_some() {
@@ -678,41 +664,68 @@ impl DeviceMemoryBrokerSet {
         };
         let domain = MemoryDomainKey::SystemMemory;
         let cohort = ReservationCohortKey::Explicit(cohort_id);
-        let mut request = DomainReservationRequest {
-            domain: domain.clone(),
-            snapshot,
-            peak_bytes: bytes,
-            retained_bytes: bytes,
-            observed_peak_bytes: Some(0),
-            requires_reconciliation: false,
-            resource_id,
-            cohort_id: Some(cohort_id),
-            draws_from_cohort_envelope: false,
-        };
-        request.cohort_id = Some(cohort_id);
-        let mut batch = self.try_reserve_batch_for_scope_and_placement(
-            vec![request],
-            owner_scope_id,
-            owner_placement,
-        )?;
+        if snapshot.confidence == MemoryObservationConfidence::Unknown {
+            return Err(MemoryPlanningError::MemoryObservationUnavailable {
+                domain: domain.clone(),
+                resource_id,
+            });
+        }
+        let snapshot = snapshot.normalized()?;
+        let (policy_ceiling, observed_ceiling) = self.policy.limits(snapshot)?;
         let generation = self
             .next_mapping_envelope_generation
             .fetch_add(1, Ordering::Relaxed);
         let mut accounts = self.lock_accounts();
-        let account = accounts.get_mut(&domain).ok_or_else(|| {
-            MemoryPlanningError::ReservationLedgerCorrupted {
+        let empty_account = DomainAccount::default();
+        let account = accounts.get(&domain).unwrap_or(&empty_account);
+        if account.quarantined {
+            return Err(MemoryPlanningError::DeviceQuarantined {
                 domain: domain.clone(),
-            }
-        })?;
+            });
+        }
+        if !domain_account_is_consistent(account) {
+            accounts.entry(domain.clone()).or_default().quarantined = true;
+            return Err(MemoryPlanningError::ReservationLedgerCorrupted {
+                domain: domain.clone(),
+            });
+        }
         if account.mapping_envelopes.contains_key(&cohort) {
-            drop(accounts);
             return Err(MemoryPlanningError::ReservationLedgerCorrupted { domain });
         }
-        let entry = batch.entries.first_mut().ok_or_else(|| {
-            MemoryPlanningError::ReservationLedgerCorrupted {
+        if account
+            .exclusive_pending_cohort
+            .is_some_and(|exclusive| exclusive != cohort)
+        {
+            return Err(MemoryPlanningError::DeviceDomainBusy {
                 domain: domain.clone(),
-            }
-        })?;
+                resource_id,
+                pending_bytes: account.pending_bytes,
+                exclusive_pending_children: account.exclusive_pending_children,
+            });
+        }
+        let policy_remaining = policy_ceiling.saturating_sub(
+            account
+                .committed_bytes
+                .saturating_add(account.pending_bytes)
+                .saturating_add(account.unreclaimable_bytes),
+        );
+        // Observed peak is zero: the mapping is already open. Policy still
+        // charges `bytes` so concurrent distinct packs fail closed.
+        if bytes > policy_remaining {
+            return Err(MemoryPlanningError::DeviceBudgetExceeded {
+                domain: domain.clone(),
+                resource_id,
+                requested_bytes: bytes,
+                pending_bytes: account.pending_bytes,
+                committed_bytes: account.committed_bytes,
+                unreclaimable_bytes: account.unreclaimable_bytes,
+                policy_ceiling,
+                observed_ceiling,
+                available_bytes: policy_remaining,
+            });
+        }
+        let account = accounts.entry(domain.clone()).or_default();
+        charge_pending_bytes(account, cohort, bytes, owner_scope_id, owner_placement)?;
         account.mapping_envelopes.insert(
             cohort,
             MappingEnvelope {
@@ -720,14 +733,12 @@ impl DeviceMemoryBrokerSet {
                 generation,
                 owner_scope_id,
                 owner_placement,
-                receipt_owner: batch.receipt_owner.take(),
-                receipt_resource: entry.receipt_resource.take(),
-                receipt_descriptor: entry.receipt_descriptor.take(),
+                receipt_owner: None,
+                receipt_resource: None,
+                receipt_descriptor: None,
             },
         );
-        entry.ledger_charge_bytes = 0;
         drop(accounts);
-        batch.state = ReservationState::Released;
         Ok(MappingEnvelopeHandle {
             broker: Arc::clone(self),
             domain,
@@ -813,7 +824,6 @@ impl DeviceMemoryBrokerSet {
             resource_id: resource_id.clone(),
             reserved_peak_bytes: bytes,
             ledger_charge_bytes: bytes,
-            draws_from_cohort_envelope: false,
             quoted_retained_bytes: bytes,
             committed_bytes: 0,
             requires_reconciliation: false,
@@ -968,7 +978,6 @@ impl DeviceMemoryBrokerSet {
             requires_reconciliation: bool,
             resource_ids: Vec<String>,
             child_count: u32,
-            draws_from_cohort_envelope: bool,
         }
 
         let mut explicit_cohort = None;
@@ -1052,7 +1061,6 @@ impl DeviceMemoryBrokerSet {
                             operation: "partitioned candidate retained sum",
                         })?;
                     aggregate.requires_reconciliation |= request.requires_reconciliation;
-                    aggregate.draws_from_cohort_envelope &= request.draws_from_cohort_envelope;
                     aggregate.resource_ids.push(request.resource_id.clone());
                     aggregate.child_count = aggregate.child_count.checked_add(1).ok_or(
                         MemoryPlanningError::ArithmeticOverflow {
@@ -1070,7 +1078,6 @@ impl DeviceMemoryBrokerSet {
                             requires_reconciliation: request.requires_reconciliation,
                             resource_ids: vec![request.resource_id.clone()],
                             child_count: 1,
-                            draws_from_cohort_envelope: request.draws_from_cohort_envelope,
                         },
                     );
                 }
@@ -1134,19 +1141,10 @@ impl DeviceMemoryBrokerSet {
                     exclusive_pending_children: account.exclusive_pending_children,
                 });
             }
-            // File-backed residency that joins this candidate's already-pending
-            // host-import envelope must not compete with that envelope. Ordinary
-            // allocations, including GPU `pack-weight-buffer`, still add. Other
-            // cohorts always compete.
-            let pending_holdback = if aggregate.draws_from_cohort_envelope {
-                other_cohort_pending
-            } else {
-                account.pending_bytes
-            };
             let policy_remaining = policy_ceiling.saturating_sub(
                 account
                     .committed_bytes
-                    .saturating_add(pending_holdback)
+                    .saturating_add(account.pending_bytes)
                     .saturating_add(account.unreclaimable_bytes),
             );
             // Pending reservations are not necessarily reflected in the
@@ -1156,11 +1154,9 @@ impl DeviceMemoryBrokerSet {
             // Policy check uses peak_bytes (full ownership charge). Observed
             // check uses observed_peak_bytes so reclaimable already-open
             // file-backed residency can charge policy without requiring live
-            // free == pack size a second time. Same-cohort envelope bytes are
-            // excluded from the observed hold-back for the same reason they
-            // are excluded from policy remaining.
+            // free == pack size a second time.
             let policy_ok = aggregate.peak_bytes <= policy_remaining;
-            let observed_remaining = observed_ceiling.saturating_sub(pending_holdback);
+            let observed_remaining = observed_ceiling.saturating_sub(account.pending_bytes);
             let observed_ok = aggregate.observed_peak_bytes <= observed_remaining;
             if !policy_ok || !observed_ok {
                 let available_bytes = if !policy_ok {
@@ -1180,22 +1176,18 @@ impl DeviceMemoryBrokerSet {
                     available_bytes,
                 });
             }
-            let incremental_peak = if aggregate.draws_from_cohort_envelope {
-                aggregate.peak_bytes.saturating_sub(same_cohort_pending)
-            } else {
-                aggregate.peak_bytes
-            };
-            account.pending_bytes.checked_add(incremental_peak).ok_or(
-                MemoryPlanningError::ArithmeticOverflow {
+            account
+                .pending_bytes
+                .checked_add(aggregate.peak_bytes)
+                .ok_or(MemoryPlanningError::ArithmeticOverflow {
                     operation: "pending reservation sum",
-                },
-            )?;
+                })?;
             if let Some(owner_scope_id) = owner_scope_id {
                 let scoped = account.by_scope.get(&owner_scope_id);
                 scoped
                     .map(|account| account.pending_bytes)
                     .unwrap_or(0)
-                    .checked_add(incremental_peak)
+                    .checked_add(aggregate.peak_bytes)
                     .ok_or(MemoryPlanningError::ArithmeticOverflow {
                         operation: "scoped pending reservation sum",
                     })?;
@@ -1203,18 +1195,11 @@ impl DeviceMemoryBrokerSet {
                     if placement_domain != domain {
                         continue;
                     }
-                    let placement_incremental = if same_cohort_pending == 0 {
-                        *bytes
-                    } else if incremental_peak == 0 {
-                        0
-                    } else {
-                        *bytes
-                    };
                     scoped
                         .and_then(|account| account.by_placement.get(placement))
                         .map(|account| account.pending_bytes)
                         .unwrap_or(0)
-                        .checked_add(placement_incremental)
+                        .checked_add(*bytes)
                         .ok_or(MemoryPlanningError::ArithmeticOverflow {
                             operation: "scoped placement pending reservation sum",
                         })?;
@@ -1233,26 +1218,16 @@ impl DeviceMemoryBrokerSet {
         let mut remaining_incremental = BTreeMap::<MemoryDomainKey, u64>::new();
         for (domain, aggregate) in &aggregates {
             let account = accounts.entry(domain.clone()).or_default();
-            let same_cohort_pending = account
-                .pending_bytes_by_cohort
-                .get(&cohort)
-                .copied()
-                .unwrap_or(0);
-            let incremental_peak = if aggregate.draws_from_cohort_envelope {
-                aggregate.peak_bytes.saturating_sub(same_cohort_pending)
-            } else {
-                aggregate.peak_bytes
-            };
-            remaining_incremental.insert(domain.clone(), incremental_peak);
-            account.pending_bytes += incremental_peak;
+            remaining_incremental.insert(domain.clone(), aggregate.peak_bytes);
+            account.pending_bytes += aggregate.peak_bytes;
             if let Some(owner_scope_id) = owner_scope_id {
                 account
                     .by_scope
                     .entry(owner_scope_id)
                     .or_default()
-                    .pending_bytes += incremental_peak;
+                    .pending_bytes += aggregate.peak_bytes;
             }
-            *account.pending_bytes_by_cohort.entry(cohort).or_default() += incremental_peak;
+            *account.pending_bytes_by_cohort.entry(cohort).or_default() += aggregate.peak_bytes;
             if aggregate.requires_reconciliation {
                 debug_assert!(
                     account
@@ -1295,7 +1270,6 @@ impl DeviceMemoryBrokerSet {
                     resource_id: request.resource_id,
                     reserved_peak_bytes: request.peak_bytes,
                     ledger_charge_bytes,
-                    draws_from_cohort_envelope: request.draws_from_cohort_envelope,
                     quoted_retained_bytes: request.retained_bytes,
                     committed_bytes: 0,
                     requires_reconciliation: request.requires_reconciliation,
@@ -1421,10 +1395,9 @@ struct ReservationEntry {
     domain: MemoryDomainKey,
     resource_id: String,
     reserved_peak_bytes: u64,
-    /// Bytes this child actually added to the domain ledger. Zero when the
-    /// request fits inside a same-cohort activation envelope already pending.
+    /// Bytes this child actually added to the domain ledger. For partitioned
+    /// admission this is the child's share of the domain aggregate.
     ledger_charge_bytes: u64,
-    draws_from_cohort_envelope: bool,
     quoted_retained_bytes: u64,
     committed_bytes: u64,
     requires_reconciliation: bool,
@@ -1772,21 +1745,12 @@ impl DeviceMemoryReservationBatch {
                     domain: entry.domain.clone(),
                 });
             }
-            let same_cohort_pending = account
-                .pending_bytes_by_cohort
-                .get(&entry.cohort)
-                .copied()
-                .unwrap_or(0);
-            let holdback = if entry.draws_from_cohort_envelope {
-                same_cohort_pending
-            } else {
-                entry.ledger_charge_bytes
-            };
-            let other_pending = account.pending_bytes.checked_sub(holdback).ok_or_else(|| {
-                MemoryPlanningError::ReservationLedgerCorrupted {
+            let other_pending = account
+                .pending_bytes
+                .checked_sub(entry.ledger_charge_bytes)
+                .ok_or_else(|| MemoryPlanningError::ReservationLedgerCorrupted {
                     domain: entry.domain.clone(),
-                }
-            })?;
+                })?;
             let available_owned = policy_ceiling.saturating_sub(
                 account
                     .committed_bytes
@@ -2178,6 +2142,65 @@ fn exclusive_entry_is_consistent(account: &DomainAccount, entry: &ReservationEnt
             && account.exclusive_pending_children > 0)
 }
 
+fn charge_pending_bytes(
+    account: &mut DomainAccount,
+    cohort: ReservationCohortKey,
+    bytes: u64,
+    owner_scope_id: Option<NativeExecutionScopeId>,
+    owner_placement: RuntimeOwnerPlacement,
+) -> Result<(), MemoryPlanningError> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let next_pending = account.pending_bytes.checked_add(bytes).ok_or(
+        MemoryPlanningError::ArithmeticOverflow {
+            operation: "pending reservation sum",
+        },
+    )?;
+    let next_cohort = account
+        .pending_bytes_by_cohort
+        .get(&cohort)
+        .copied()
+        .unwrap_or(0)
+        .checked_add(bytes)
+        .ok_or(MemoryPlanningError::ArithmeticOverflow {
+            operation: "pending reservation sum",
+        })?;
+    let scoped_next = if let Some(scope_id) = owner_scope_id {
+        let scoped = account.by_scope.get(&scope_id);
+        let next_scoped = scoped
+            .map(|account| account.pending_bytes)
+            .unwrap_or(0)
+            .checked_add(bytes)
+            .ok_or(MemoryPlanningError::ArithmeticOverflow {
+                operation: "scoped pending reservation sum",
+            })?;
+        let next_placement = scoped
+            .and_then(|account| account.by_placement.get(&owner_placement))
+            .map(|account| account.pending_bytes)
+            .unwrap_or(0)
+            .checked_add(bytes)
+            .ok_or(MemoryPlanningError::ArithmeticOverflow {
+                operation: "scoped placement pending reservation sum",
+            })?;
+        Some((scope_id, next_scoped, next_placement))
+    } else {
+        None
+    };
+    account.pending_bytes = next_pending;
+    account.pending_bytes_by_cohort.insert(cohort, next_cohort);
+    if let Some((scope_id, next_scoped, next_placement)) = scoped_next {
+        let scoped = account.by_scope.entry(scope_id).or_default();
+        scoped.pending_bytes = next_scoped;
+        scoped
+            .by_placement
+            .entry(owner_placement)
+            .or_default()
+            .pending_bytes = next_placement;
+    }
+    Ok(())
+}
+
 fn release_pending_bytes(account: &mut DomainAccount, entry: &ReservationEntry) {
     if entry.ledger_charge_bytes > 0 && !domain_account_is_consistent(account) {
         account.quarantined = true;
@@ -2388,7 +2411,6 @@ impl MappingEnvelopeHandle {
                 resource_id: "mapping-envelope".to_string(),
                 reserved_peak_bytes: envelope.pending_bytes,
                 ledger_charge_bytes: envelope.pending_bytes,
-                draws_from_cohort_envelope: false,
                 quoted_retained_bytes: envelope.pending_bytes,
                 committed_bytes: 0,
                 requires_reconciliation: false,
@@ -2585,7 +2607,6 @@ mod tests {
             requires_reconciliation: false,
             resource_id: resource_id.to_string(),
             cohort_id: None,
-            draws_from_cohort_envelope: false,
         }
     }
 
@@ -2984,9 +3005,86 @@ mod tests {
             footprints.into_iter().next().unwrap(),
             snapshot(7 * GIB),
         );
-        assert!(!request.draws_from_cohort_envelope);
         assert_eq!(request.domain, domain);
         assert_eq!(request.peak_bytes, GIB);
+        assert_eq!(request.observed_peak_bytes, None);
+    }
+
+    #[test]
+    fn mapping_envelope_admits_itself_when_live_free_is_below_pack_size() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let snap = DeviceMemorySnapshot {
+            free_bytes: GIB,
+            total_bytes: 16 * GIB,
+            confidence: MemoryObservationConfidence::DeviceSnapshot,
+        };
+        let envelope = broker
+            .open_mapping_envelope(
+                snap,
+                4 * GIB,
+                MemoryReservationCohortId::new(3),
+                "candidate-activation-host-import".to_string(),
+                None,
+                RuntimeOwnerPlacement::Unknown,
+            )
+            .expect(
+                "already-open mapping must admit on policy even when live free is below pack size",
+            );
+        let usage = broker.usage(&MemoryDomainKey::SystemMemory);
+        assert_eq!(usage.pending_bytes, 4 * GIB);
+        assert_eq!(usage.committed_bytes, 0);
+        drop(envelope);
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory),
+            DeviceMemoryUsage::default()
+        );
+    }
+
+    #[test]
+    fn mapping_envelope_does_not_cover_a_gpu_weight_buffer() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let snap = DeviceMemorySnapshot {
+            free_bytes: 16 * GIB,
+            total_bytes: 16 * GIB,
+            confidence: MemoryObservationConfidence::DeviceSnapshot,
+        };
+        let _envelope = broker
+            .open_mapping_envelope(
+                snap,
+                6 * GIB,
+                MemoryReservationCohortId::new(1),
+                "candidate-activation-host-import".to_string(),
+                None,
+                RuntimeOwnerPlacement::Unknown,
+            )
+            .expect("host mapping envelope");
+        let gpu = domain();
+        let jit = broker
+            .try_reserve_batch(vec![request(
+                gpu.clone(),
+                7 * GIB,
+                6 * GIB,
+                6 * GIB,
+                "pack-weight-buffer-chunk-0",
+            )])
+            .expect("GPU weight buffer must reserve its own device bytes");
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).pending_bytes,
+            6 * GIB
+        );
+        assert_eq!(broker.usage(&gpu).pending_bytes, 6 * GIB);
+        drop(jit);
+        assert_eq!(broker.usage(&gpu), DeviceMemoryUsage::default());
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).pending_bytes,
+            6 * GIB
+        );
     }
 
     #[test]
@@ -3520,7 +3618,6 @@ mod tests {
                     requires_reconciliation: false,
                     resource_id: "incident-committed-owners".to_string(),
                     cohort_id: None,
-                    draws_from_cohort_envelope: false,
                 }],
                 Some(scope_id),
                 RuntimeOwnerPlacement::LaneBound(lane),
@@ -3581,7 +3678,6 @@ mod tests {
             requires_reconciliation: false,
             resource_id: "pack-weight-buffer-chunk-0".to_string(),
             cohort_id: None,
-            draws_from_cohort_envelope: false,
         }]);
         match rejected {
             Err(MemoryPlanningError::DeviceBudgetExceeded {
