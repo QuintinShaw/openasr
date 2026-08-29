@@ -23,10 +23,10 @@ use std::{
 
 use thiserror::Error;
 
-use crate::models::native_execution_services::{NativeExecutionScopeId, current_runtime_receipts};
+use crate::models::native_execution_services::NativeExecutionScopeId;
 use crate::models::runtime_receipts::{
-    RuntimeOwnerDescriptor, RuntimeOwnerPlacement, RuntimeReceiptCollector, RuntimeReceiptMetric,
-    RuntimeResourceDescriptor, RuntimeResourceGuard, RuntimeResourceState,
+    RuntimeOwnerDescriptor, RuntimeOwnerGuard, RuntimeOwnerPlacement, RuntimeReceiptCollector,
+    RuntimeReceiptMetric, RuntimeResourceDescriptor, RuntimeResourceGuard, RuntimeResourceState,
 };
 
 /// Physical budget identity. Multiple APIs exposing the same PCI device must
@@ -488,6 +488,9 @@ struct DomainAccount {
     exclusive_pending_cohort: Option<ReservationCohortKey>,
     quarantined: bool,
     by_scope: HashMap<NativeExecutionScopeId, ScopedDomainAccount>,
+    /// One already-open mapping forecast per execution cohort. Activation
+    /// opens it; pack-weight residency consumes it into a committed owner.
+    mapping_envelopes: HashMap<ReservationCohortKey, MappingEnvelope>,
 }
 
 #[derive(Debug, Default)]
@@ -505,6 +508,30 @@ struct PlacementDomainAccount {
     pending_bytes: u64,
     committed_bytes: u64,
     unreclaimable_bytes: u64,
+}
+
+/// Forecast hold for one already-open pack mapping in one cohort.
+///
+/// This is the SystemMemory lease: activation opens it as Reserved; residency
+/// consumes the same receipts into Committed. GPU weight buffers never use it.
+#[derive(Debug)]
+struct MappingEnvelope {
+    pending_bytes: u64,
+    generation: u64,
+    owner_scope_id: Option<NativeExecutionScopeId>,
+    owner_placement: RuntimeOwnerPlacement,
+    receipt_owner: Option<RuntimeOwnerGuard>,
+    receipt_resource: Option<RuntimeResourceGuard>,
+    receipt_descriptor: Option<RuntimeResourceDescriptor>,
+}
+
+/// RAII handle for [`DeviceMemoryBrokerSet::open_mapping_envelope`]. Drop
+/// refunds any bytes not yet consumed by pack-weight residency.
+pub(crate) struct MappingEnvelopeHandle {
+    broker: Arc<DeviceMemoryBrokerSet>,
+    domain: MemoryDomainKey,
+    cohort: ReservationCohortKey,
+    generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -607,6 +634,7 @@ pub struct DeviceMemoryBrokerSet {
     >,
     /// Monotonic generation for pack-weight residency entries (ABA guard).
     pub(crate) next_pack_weight_residency_generation: AtomicU64,
+    next_mapping_envelope_generation: AtomicU64,
 }
 
 impl DeviceMemoryBrokerSet {
@@ -619,7 +647,225 @@ impl DeviceMemoryBrokerSet {
                 super::pack_weight_residency::empty_pack_weight_residency_table(),
             next_pack_weight_residency_generation:
                 super::pack_weight_residency::new_pack_weight_residency_generation_counter(),
+            next_mapping_envelope_generation: AtomicU64::new(1),
         }
+    }
+
+    /// Open a SystemMemory forecast for one already-open pack mapping.
+    ///
+    /// Policy still charges `bytes` so two distinct packs fail closed. Live
+    /// free is not required again (`observed_peak = 0`). Consume this lease
+    /// through [`Self::try_consume_mapping_envelope`] when residency binds.
+    pub(crate) fn open_mapping_envelope(
+        self: &Arc<Self>,
+        snapshot: DeviceMemorySnapshot,
+        bytes: u64,
+        cohort_id: MemoryReservationCohortId,
+        resource_id: String,
+        owner_scope_id: Option<NativeExecutionScopeId>,
+        owner_placement: RuntimeOwnerPlacement,
+    ) -> Result<MappingEnvelopeHandle, MemoryPlanningError> {
+        if bytes == 0 {
+            return Err(MemoryPlanningError::EmptyResourceId);
+        }
+        if resource_id.trim().is_empty() {
+            return Err(MemoryPlanningError::EmptyResourceId);
+        }
+        let owner_placement = if owner_scope_id.is_some() {
+            owner_placement
+        } else {
+            RuntimeOwnerPlacement::Unknown
+        };
+        let domain = MemoryDomainKey::SystemMemory;
+        let cohort = ReservationCohortKey::Explicit(cohort_id);
+        let mut request = DomainReservationRequest {
+            domain: domain.clone(),
+            snapshot,
+            peak_bytes: bytes,
+            retained_bytes: bytes,
+            observed_peak_bytes: Some(0),
+            requires_reconciliation: false,
+            resource_id,
+            cohort_id: Some(cohort_id),
+            draws_from_cohort_envelope: false,
+        };
+        request.cohort_id = Some(cohort_id);
+        let mut batch = self.try_reserve_batch_for_scope_and_placement(
+            vec![request],
+            owner_scope_id,
+            owner_placement,
+        )?;
+        let generation = self
+            .next_mapping_envelope_generation
+            .fetch_add(1, Ordering::Relaxed);
+        let mut accounts = self.lock_accounts();
+        let account = accounts.get_mut(&domain).ok_or_else(|| {
+            MemoryPlanningError::ReservationLedgerCorrupted {
+                domain: domain.clone(),
+            }
+        })?;
+        if account.mapping_envelopes.contains_key(&cohort) {
+            drop(accounts);
+            return Err(MemoryPlanningError::ReservationLedgerCorrupted { domain });
+        }
+        let entry = batch.entries.first_mut().ok_or_else(|| {
+            MemoryPlanningError::ReservationLedgerCorrupted {
+                domain: domain.clone(),
+            }
+        })?;
+        account.mapping_envelopes.insert(
+            cohort,
+            MappingEnvelope {
+                pending_bytes: bytes,
+                generation,
+                owner_scope_id,
+                owner_placement,
+                receipt_owner: batch.receipt_owner.take(),
+                receipt_resource: entry.receipt_resource.take(),
+                receipt_descriptor: entry.receipt_descriptor.take(),
+            },
+        );
+        entry.ledger_charge_bytes = 0;
+        drop(accounts);
+        batch.state = ReservationState::Released;
+        Ok(MappingEnvelopeHandle {
+            broker: Arc::clone(self),
+            domain,
+            cohort,
+            generation,
+        })
+    }
+
+    /// Attach the live Reserved receipt to an open mapping envelope.
+    pub(crate) fn attach_mapping_envelope_receipt(
+        &self,
+        handle: &MappingEnvelopeHandle,
+        collector: RuntimeReceiptCollector,
+        mut owner_descriptor: RuntimeOwnerDescriptor,
+        resource: RuntimeResourceDescriptor,
+    ) {
+        if handle.generation == 0 || !collector.is_available() {
+            return;
+        }
+        let mut accounts = self.lock_accounts();
+        let Some(account) = accounts.get_mut(&handle.domain) else {
+            return;
+        };
+        let Some(envelope) = account.mapping_envelopes.get_mut(&handle.cohort) else {
+            return;
+        };
+        if envelope.generation != handle.generation {
+            return;
+        }
+        owner_descriptor.placement = envelope.owner_placement;
+        let owner = collector.start_owner(
+            owner_descriptor,
+            crate::models::native_execution_services::current_execution_cache_attempt_id(),
+        );
+        let Some(owner_id) = owner.owner_id() else {
+            return;
+        };
+        let mut descriptor = resource;
+        descriptor.placement = envelope.owner_placement;
+        envelope.receipt_resource = collector.acquire_resource(owner_id, descriptor.clone());
+        envelope.receipt_descriptor = envelope.receipt_resource.as_ref().map(|_| descriptor);
+        envelope.receipt_owner = Some(owner);
+    }
+
+    /// Consume a same-cohort mapping envelope into a committed residency lease.
+    ///
+    /// Returns `Ok(None)` when no covering envelope exists; the caller then
+    /// reserves normally. GPU weight buffers must not call this.
+    pub(crate) fn try_consume_mapping_envelope(
+        self: &Arc<Self>,
+        bytes: u64,
+        cohort_id: Option<MemoryReservationCohortId>,
+        resource_id: String,
+    ) -> Result<Option<DeviceMemoryReservationBatch>, MemoryPlanningError> {
+        let Some(cohort_id) = cohort_id else {
+            return Ok(None);
+        };
+        if bytes == 0 {
+            return Err(MemoryPlanningError::EmptyResourceId);
+        }
+        let domain = MemoryDomainKey::SystemMemory;
+        let cohort = ReservationCohortKey::Explicit(cohort_id);
+        let mut accounts = self.lock_accounts();
+        let Some(account) = accounts.get_mut(&domain) else {
+            return Ok(None);
+        };
+        let (owner_scope_id, owner_placement, remaining) = {
+            let Some(envelope) = account.mapping_envelopes.get_mut(&cohort) else {
+                return Ok(None);
+            };
+            if envelope.pending_bytes < bytes {
+                return Ok(None);
+            }
+            envelope.pending_bytes -= bytes;
+            (
+                envelope.owner_scope_id,
+                envelope.owner_placement,
+                envelope.pending_bytes,
+            )
+        };
+        let donor = ReservationEntry {
+            domain: domain.clone(),
+            resource_id: resource_id.clone(),
+            reserved_peak_bytes: bytes,
+            ledger_charge_bytes: bytes,
+            draws_from_cohort_envelope: false,
+            quoted_retained_bytes: bytes,
+            committed_bytes: 0,
+            requires_reconciliation: false,
+            holds_exclusive_gate: false,
+            cohort,
+            owner_scope_id,
+            owner_placement,
+            quarantine_bytes: bytes,
+            receipt_resource: None,
+            receipt_descriptor: None,
+        };
+        release_pending_bytes(account, &donor);
+        account.committed_bytes = account.committed_bytes.checked_add(bytes).ok_or(
+            MemoryPlanningError::ArithmeticOverflow {
+                operation: "mapping envelope consume",
+            },
+        )?;
+        add_scoped_committed_bytes(account, &donor, bytes);
+        let (receipt_resource, receipt_descriptor, receipt_owner) = if remaining == 0 {
+            match account.mapping_envelopes.remove(&cohort) {
+                Some(mut envelope) => (
+                    envelope.receipt_resource.take(),
+                    envelope.receipt_descriptor.take(),
+                    envelope.receipt_owner.take(),
+                ),
+                None => (None, None, None),
+            }
+        } else {
+            (None, None, None)
+        };
+        drop(accounts);
+        let mut consumed = donor;
+        consumed.committed_bytes = bytes;
+        consumed.ledger_charge_bytes = 0;
+        consumed.receipt_resource = receipt_resource;
+        consumed.receipt_descriptor = receipt_descriptor;
+        if let Some(resource) = consumed.receipt_resource.as_ref() {
+            if let Some(mut descriptor) = consumed.receipt_descriptor.clone() {
+                descriptor.peak = RuntimeReceiptMetric::Known(bytes);
+                descriptor.requested = RuntimeReceiptMetric::Known(bytes);
+                descriptor.retained = RuntimeReceiptMetric::Known(bytes);
+                resource.update_descriptor(descriptor.clone());
+                consumed.receipt_descriptor = Some(descriptor);
+            }
+            resource.set_state(RuntimeResourceState::Committed);
+        }
+        Ok(Some(DeviceMemoryReservationBatch {
+            broker: Arc::clone(self),
+            entries: vec![consumed],
+            state: ReservationState::Committed,
+            receipt_owner,
+        }))
     }
 
     /// Absolute bytes deliberately left outside OpenASR ownership in every
@@ -1388,6 +1634,17 @@ impl DeviceMemoryReservationBatch {
         self.entries.is_empty()
     }
 
+    /// Move envelope receipts onto the consuming residency owner. The batch
+    /// still holds the committed ledger row.
+    pub(crate) fn take_receipt_pair(
+        &mut self,
+    ) -> Option<(RuntimeResourceGuard, RuntimeOwnerGuard)> {
+        let resource = self.entries.first_mut()?.receipt_resource.take()?;
+        let owner = self.receipt_owner.take()?;
+        self.entries[0].receipt_descriptor = None;
+        Some((resource, owner))
+    }
+
     pub fn is_pending(&self) -> bool {
         self.state == ReservationState::Pending
     }
@@ -1580,7 +1837,6 @@ impl DeviceMemoryReservationBatch {
                 .get_mut(&entry.domain)
                 .expect("reservation ledger validated above");
             release_pending_bytes(account, entry);
-            transfer_cohort_envelope(account, entry, *committed_bytes);
             account.committed_bytes += *committed_bytes;
             add_scoped_committed_bytes(account, entry, *committed_bytes);
             release_exclusive_child(account, entry);
@@ -1784,7 +2040,6 @@ impl DeviceMemoryReservationBatch {
                 .expect("validated above");
             let account = accounts.get_mut(&entry.domain).expect("validated above");
             release_pending_bytes(account, entry);
-            transfer_cohort_envelope(account, entry, *committed_bytes);
             account.committed_bytes += *committed_bytes;
             add_scoped_committed_bytes(account, entry, *committed_bytes);
             release_exclusive_child(account, entry);
@@ -1938,34 +2193,6 @@ fn release_pending_bytes(account: &mut DomainAccount, entry: &ReservationEntry) 
         .min(cohort_left)
         .min(account.pending_bytes);
     subtract_pending_bytes(account, entry.cohort, bytes, entry);
-}
-
-/// Convert same-cohort envelope pending into this child's committed bytes.
-/// Activation quoted the already-open mapping; file-backed residency that
-/// joins that envelope charged zero incremental pending, so commit must draw
-/// the envelope down instead of stacking a second SystemMemory copy.
-fn transfer_cohort_envelope(
-    account: &mut DomainAccount,
-    entry: &ReservationEntry,
-    actual_retained: u64,
-) {
-    if !entry.draws_from_cohort_envelope {
-        return;
-    }
-    let want = actual_retained.saturating_sub(entry.ledger_charge_bytes);
-    if want == 0 {
-        return;
-    }
-    let cohort_left = account
-        .pending_bytes_by_cohort
-        .get(&entry.cohort)
-        .copied()
-        .unwrap_or(0);
-    let transfer = want.min(cohort_left).min(account.pending_bytes);
-    subtract_pending_bytes(account, entry.cohort, transfer, entry);
-    if let Some(collector) = current_runtime_receipts() {
-        collector.draw_down_reserved_peak(&entry.domain, transfer);
-    }
 }
 
 fn subtract_pending_bytes(
@@ -2138,6 +2365,52 @@ fn add_scoped_unreclaimable_bytes(
 impl Drop for DeviceMemoryReservationBatch {
     fn drop(&mut self) {
         self.release();
+    }
+}
+
+impl MappingEnvelopeHandle {
+    fn release_remaining(&mut self) {
+        let mut accounts = self.broker.lock_accounts();
+        let Some(account) = accounts.get_mut(&self.domain) else {
+            return;
+        };
+        let Some(envelope) = account.mapping_envelopes.remove(&self.cohort) else {
+            return;
+        };
+        if envelope.generation != self.generation {
+            account.mapping_envelopes.insert(self.cohort, envelope);
+            return;
+        }
+        let mut envelope = envelope;
+        if envelope.pending_bytes > 0 {
+            let donor = ReservationEntry {
+                domain: self.domain.clone(),
+                resource_id: "mapping-envelope".to_string(),
+                reserved_peak_bytes: envelope.pending_bytes,
+                ledger_charge_bytes: envelope.pending_bytes,
+                draws_from_cohort_envelope: false,
+                quoted_retained_bytes: envelope.pending_bytes,
+                committed_bytes: 0,
+                requires_reconciliation: false,
+                holds_exclusive_gate: false,
+                cohort: self.cohort,
+                owner_scope_id: envelope.owner_scope_id,
+                owner_placement: envelope.owner_placement,
+                quarantine_bytes: envelope.pending_bytes,
+                receipt_resource: None,
+                receipt_descriptor: None,
+            };
+            release_pending_bytes(account, &donor);
+        }
+        drop(accounts);
+        envelope.receipt_resource.take();
+        envelope.receipt_owner.take();
+    }
+}
+
+impl Drop for MappingEnvelopeHandle {
+    fn drop(&mut self) {
+        self.release_remaining();
     }
 }
 

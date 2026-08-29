@@ -25,7 +25,8 @@ use thiserror::Error;
 use crate::device::{
     execution_memory::{
         AllocationLifetime, DeviceMemoryBrokerSet, DeviceMemoryPolicy,
-        DeviceMemoryReservationBatch, MemoryReservationCohortId, PhaseSet, PhysicalDeviceKey,
+        DeviceMemoryReservationBatch, MappingEnvelopeHandle, MemoryReservationCohortId, PhaseSet,
+        PhysicalDeviceKey,
     },
     execution_policy::{
         DefaultExecutionPolicyResolver, ExecutionCandidate, ExecutionCandidateFailure,
@@ -1717,6 +1718,7 @@ impl ActivationReservationContext {
 
 pub struct BrokerActivationReservation {
     batch: Option<DeviceMemoryReservationBatch>,
+    envelope: Option<MappingEnvelopeHandle>,
     context: ActivationReservationContext,
 }
 
@@ -1732,8 +1734,20 @@ impl BrokerActivationReservation {
         }
         Ok(Self {
             batch: Some(batch),
+            envelope: None,
             context: ActivationReservationContext { cohort_id },
         })
+    }
+
+    fn from_envelope(
+        envelope: MappingEnvelopeHandle,
+        cohort_id: MemoryReservationCohortId,
+    ) -> Self {
+        Self {
+            batch: None,
+            envelope: Some(envelope),
+            context: ActivationReservationContext { cohort_id },
+        }
     }
 
     pub const fn context(&self) -> ActivationReservationContext {
@@ -1746,6 +1760,7 @@ impl ActivationReservation for BrokerActivationReservation {
 
     fn release(&mut self) -> Result<(), Self::Error> {
         drop(self.batch.take());
+        drop(self.envelope.take());
         Ok(())
     }
 
@@ -1753,6 +1768,7 @@ impl ActivationReservation for BrokerActivationReservation {
         if let Some(mut batch) = self.batch.take() {
             batch.quarantine();
         }
+        drop(self.envelope.take());
         Ok(())
     }
 }
@@ -2225,6 +2241,50 @@ fn reserve_activation_plan(
         request.cohort_id = Some(cohort_id);
     }
     let collector = services.runtime_receipts();
+    let mapping_envelope = requests.len() == 1
+        && requests
+            .iter()
+            .all(|request| request.observed_peak_bytes == Some(0));
+    if mapping_envelope {
+        let request = &requests[0];
+        let handle = services
+            .memory_broker()
+            .open_mapping_envelope(
+                request.snapshot,
+                request.peak_bytes,
+                cohort_id,
+                request.resource_id.clone(),
+                Some(services.scope_id),
+                RuntimeOwnerPlacement::HostNeutral,
+            )
+            .map_err(|error| format!("candidate activation reserve: {error}"))?;
+        if collector.is_available()
+            && let Some(owner) = collector.host_neutral_owner_descriptor(
+                "mapping-envelope",
+                content_id,
+                Some(request.resource_id.as_str()),
+            )
+            && let Some(resource) = collector.resource_descriptor(
+                &request.resource_id,
+                &request.domain,
+                request.peak_bytes,
+                request.peak_bytes,
+                request.retained_bytes,
+                plan.quote_confidence_for_domain(&request.domain),
+                Some(request.snapshot.confidence),
+            )
+        {
+            services.memory_broker().attach_mapping_envelope_receipt(
+                &handle,
+                collector.clone(),
+                owner,
+                resource,
+            );
+        }
+        return Ok(BrokerActivationReservation::from_envelope(
+            handle, cohort_id,
+        ));
+    }
     let backend = match candidate.device.route.provider {
         ExecutionProvider::Cpu => GgmlCpuGraphBackend::Cpu,
         ExecutionProvider::Metal => GgmlCpuGraphBackend::Metal,
