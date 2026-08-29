@@ -61,6 +61,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   live free (for example `firered2-llm:q4` or `mimo-v2.5-asr:q4` on 16 GiB)
   and still admit encoder metadata, prepared-runtime counters, reuse-pass
   weight contexts, and long-form graph workspace.
+- Core: growing-KV seq2seq logits read directly into caller storage now keep
+  the native compute witness. Granite Metal token steps no longer fail
+  short-audio receipts with `token step has no native compute witness`.
 - Core: a discrete CUDA/HIP/Vulkan request now keeps encoder and decoder
   graphs on one unified GPU owner, so weights and KV stay on a single ggml
   actor instead of bouncing between thread-local caches.

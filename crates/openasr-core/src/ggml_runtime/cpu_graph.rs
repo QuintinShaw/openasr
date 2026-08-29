@@ -8544,6 +8544,18 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         &mut self,
         outputs: &mut [(GgmlCpuTensor<'a>, &mut [f32])],
     ) -> Result<(), GgmlCpuGraphError> {
+        let _ = self.compute_outputs_into_f32_with_evidence(outputs)?;
+        Ok(())
+    }
+
+    /// Same direct-into-caller-storage readback as [`Self::compute_outputs_into_f32`],
+    /// but keeps the compute witness minted by a successful output read.
+    /// Seq2seq token-step receipts must use this; dropping the ref is how
+    /// growing-KV Granite steps recorded tokens with `compute: None`.
+    pub(crate) fn compute_outputs_into_f32_with_evidence(
+        &mut self,
+        outputs: &mut [(GgmlCpuTensor<'a>, &mut [f32])],
+    ) -> Result<Option<super::GgmlSelectionEvidenceRef>, GgmlCpuGraphError> {
         self.ensure_not_poisoned()?;
         if outputs.is_empty() {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
@@ -8582,18 +8594,33 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         }
         self.compute_graph_with_memory_gate(graph)?;
 
+        let mut compute_evidence = None;
         for (output, target) in outputs.iter_mut() {
+            let nbytes = target.len() * F32_WIDTH_BYTES;
             let status = unsafe {
                 read_tensor_bytes(
                     output.raw.as_ptr(),
                     target.as_mut_ptr().cast::<c_void>(),
                     0,
-                    target.len() * F32_WIDTH_BYTES,
+                    nbytes,
                 )
             };
-            self.finish_output_read(status, target.len() * F32_WIDTH_BYTES)?;
+            let output_evidence = self.finish_output_read(status, nbytes)?;
+            if self.lifecycle.is_some() && output_evidence.is_none() {
+                return Err(self.fail_output_evidence(
+                    "successful output readback did not produce a compute evidence ref",
+                ));
+            }
+            if let (Some(expected), Some(actual)) = (compute_evidence, output_evidence)
+                && expected != actual
+            {
+                return Err(self.fail_output_evidence(
+                    "one graph compute produced inconsistent output evidence refs",
+                ));
+            }
+            compute_evidence = compute_evidence.or(output_evidence);
         }
-        Ok(())
+        Ok(compute_evidence.and_then(|evidence| evidence.selection(0, 1)))
     }
 
     /// Compatibility surface for existing family graphs. Unlike
@@ -13680,6 +13707,36 @@ mod tests {
             .expect("direct readback into caller storage");
         assert_eq!(sum_target, [5.0, 7.0, 9.0]);
         assert_eq!(product_target, [4.0, 10.0, 18.0]);
+    }
+
+    #[test]
+    fn compute_outputs_into_f32_with_evidence_mints_when_collector_is_installed() {
+        let collector = GgmlGraphLifecycleCollector::new();
+        let _guard = collector.install();
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner");
+        let mut graph = runner.start_graph();
+        let lhs = graph.new_tensor_1d_f32(3, "lhs").expect("lhs");
+        let rhs = graph.new_tensor_1d_f32(3, "rhs").expect("rhs");
+        graph.set_input(lhs).expect("lhs input");
+        graph.set_input(rhs).expect("rhs input");
+        let sum = graph.add(lhs, rhs).expect("sum");
+        graph
+            .set_f32_slice(lhs, &[1.0, 2.0, 3.0], "lhs")
+            .expect("lhs upload");
+        graph
+            .set_f32_slice(rhs, &[4.0, 5.0, 6.0], "rhs")
+            .expect("rhs upload");
+        let mut sum_target = [-1.0_f32; 3];
+        let mut outputs = [(sum, sum_target.as_mut_slice())];
+        let evidence = graph
+            .compute_outputs_into_f32_with_evidence(&mut outputs)
+            .expect("instrumented direct readback");
+        assert_eq!(sum_target, [5.0, 7.0, 9.0]);
+        assert!(
+            evidence.is_some(),
+            "growing-KV seq2seq logits must keep a compute witness"
+        );
     }
 
     #[test]

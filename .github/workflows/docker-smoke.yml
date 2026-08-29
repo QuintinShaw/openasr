@@ -33,8 +33,8 @@ jobs:
           context: .
           load: true
           tags: openasr:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max,ignore-error=true
+          cache-from: type=gha,scope=${{ github.sha }}
+          cache-to: type=gha,mode=max,scope=${{ github.sha }},ignore-error=true
 
       - name: Start container
         # Mock smoke: the image default CMD is the fail-closed native server,
@@ -55,6 +55,7 @@ jobs:
             sleep 1
           done
 
+          docker inspect openasr-docker-smoke --format 'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' || true
           docker logs openasr-docker-smoke
           exit 1
 
