@@ -44,6 +44,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Core: discrete GPU activation no longer forecasts the pack mmap as a second
+  VRAM copy. Weights are reserved once at allocation, so packs near half of
+  card memory (for example `mimo-v2.5-asr:q4` on 12 GiB) admit instead of
+  fail-closed. CUDA FullDevice reuses the ggml graph on the same proven lane
+  as HIP/Vulkan.
 - Core: a discrete CUDA/HIP/Vulkan request now keeps encoder and decoder
   graphs on one unified GPU owner, so weights and KV stay on a single ggml
   actor instead of bouncing between thread-local caches.

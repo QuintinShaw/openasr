@@ -620,8 +620,13 @@ const fn discrete_gpu_reuse_is_proven(provider: ExecutionProvider) -> bool {
     // with capture-on. Vulkan on the same GPU is capture-unsupported, but
     // keeping the ggml graph (ReusableGraph) is still far cheaper than
     // FreshGraph-per-token, which rebuilt FunASR/Qwen decode 3-8x. Compact
-    // first-max stays unproven. CUDA stays FreshGraph.
-    matches!(provider, ExecutionProvider::Hip | ExecutionProvider::Vulkan)
+    // first-max stays unproven. CUDA on sm_86 produced the same JFK/longform
+    // CUDA0 transcripts as the Vulkan reusable lane; leaving it FreshGraph
+    // was a 2-8x RTF regression versus the 0.1.36 reusable CUDA sidecar.
+    matches!(
+        provider,
+        ExecutionProvider::Hip | ExecutionProvider::Vulkan | ExecutionProvider::Cuda
+    )
 }
 
 /// Exact CUDA, HIP, and Vulkan FullDevice lanes already share one encoder+
@@ -1259,9 +1264,8 @@ impl ResolvedFamilyRuntimeInput {
         // Compact native first-max requires both a live `supports_op`
         // declaration for GGML_OP_ARGMAX_FIRST and proven evidence
         // dimensions. Metal stays FullLogits because it does not support the
-        // op. CUDA stays Unknown until that lane has three-layer receipts.
-        // HIP and Vulkan reuse is proven on local-dev qualification, so those
-        // lanes get ReusableGraph under FullLogits. Vulkan remains
+        // op. CUDA, HIP, and Vulkan reuse is proven on local-dev qualification,
+        // so those lanes get ReusableGraph under FullLogits. Vulkan remains
         // capture-unsupported (no native executable cache) but still reuses
         // the ggml graph. Generic first/last-max
         // semantics never authorize the compact result. Phrase bias,
@@ -2634,11 +2638,14 @@ pub(crate) struct GgmlLoadedWeightBindingIdentity {
 
 /// NES-scoped coalescing key for one pack-wide loaded-weight owner.
 ///
-/// Content and already-open mapping identity are required. Lane is always
-/// present so CPU and accelerator (or distinct cards/placements) never share.
-/// Host-import versus copied-buffer is part of the key: a failed host-import
-/// that materializes a copy is a second physical owner and must not hit the
-/// host-import slot.
+/// Content identity is always required. Lane is always present so CPU and
+/// accelerator (or distinct cards/placements) never share. Host-import versus
+/// copied-buffer is part of the key: a failed host-import that materializes a
+/// copy is a second physical owner and must not hit the host-import slot.
+/// Host-import also keys the open mapping Arc so two separately admitted files
+/// cannot alias one mmap. Device-copied GPU buffers do not: they live on the
+/// device, and a later candidate attempt that re-admits the same content must
+/// reuse that copy instead of quoting a second pack-sized VRAM envelope.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct LoadedWeightOwnerKey {
     content_id: String,
@@ -2703,7 +2710,10 @@ impl LoadedWeightOwnerCache {
         LoadedWeightOwnerKey {
             content_id: source.content_id().to_string(),
             source_identity: source.strong_file_identity(),
-            mapping_identity: source.backing_mmap_identity(),
+            mapping_identity: match kind {
+                GgmlWeightMaterializationKind::HostImported => source.backing_mmap_identity(),
+                GgmlWeightMaterializationKind::DeviceCopied => 0,
+            },
             kind,
             lane,
         }
@@ -15228,7 +15238,7 @@ mod tests {
     }
 
     #[test]
-    fn live_hip_or_vulkan_accelerated_authorizes_reusable_full_logits() {
+    fn live_hip_vulkan_or_cuda_accelerated_authorizes_reusable_full_logits() {
         use super::{
             GgmlDecodeOutputContract, GgmlDecodeOutputPlan, GgmlDecodeReuseMode,
             RequestBackendPreference, ResolvedFamilyRuntimeInput,
@@ -15243,7 +15253,7 @@ mod tests {
             .filter(|device| {
                 matches!(
                     ExecutionProvider::from_backend_name(&device.name),
-                    ExecutionProvider::Hip | ExecutionProvider::Vulkan
+                    ExecutionProvider::Hip | ExecutionProvider::Vulkan | ExecutionProvider::Cuda
                 )
             })
             .collect::<Vec<_>>();

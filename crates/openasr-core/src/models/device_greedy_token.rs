@@ -100,6 +100,54 @@ fn suppression_active_for_adapter(adapter_id: &str) -> bool {
         })
 }
 
+/// Shared greedy-step finish for every seq2seq family. The graph output
+/// read mints selection evidence here so `take_compute_evidence` cannot stay
+/// a silent `None` default on a family that actually ran a decode graph.
+pub(crate) fn compute_greedy_step_output_with_evidence<'a>(
+    graph: &mut crate::ggml_runtime::GgmlCpuGraphBuilder<'a>,
+    logits: crate::ggml_runtime::GgmlCpuTensor<'a>,
+    top1: Option<crate::ggml_runtime::GgmlCpuTensor<'a>>,
+    vocab_size: usize,
+) -> Result<
+    (
+        crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeStepLogitsOutput,
+        Option<crate::ggml_runtime::GgmlSelectionEvidenceRef>,
+    ),
+    GgmlCpuGraphError,
+> {
+    match top1 {
+        Some(top1) => {
+            let readback = graph.compute_output_i32_with_evidence(top1, 1)?;
+            let (token_ids, evidence) = readback.into_parts();
+            let token_id =
+                token_ids
+                    .into_iter()
+                    .next()
+                    .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "device top-1 returned no token id",
+                    })?;
+            Ok((
+                crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeStepLogitsOutput {
+                    logits: Vec::new(),
+                    greedy_token_hint: Some(device_top1_token_id(token_id, vocab_size)?),
+                },
+                evidence,
+            ))
+        }
+        None => {
+            let readback = graph.compute_output_f32_with_evidence(logits, vocab_size)?;
+            let (logits, evidence) = readback.into_parts();
+            Ok((
+                crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeStepLogitsOutput {
+                    logits,
+                    greedy_token_hint: None,
+                },
+                evidence,
+            ))
+        }
+    }
+}
+
 pub(crate) fn device_top1_token_id(
     token_id: i32,
     vocab_size: usize,
