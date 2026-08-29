@@ -240,6 +240,16 @@ impl NativeMemoryAdmissionPlan {
         self
     }
 
+    /// Replace native copy-padding extras with the open mapping size.
+    pub(crate) fn with_open_mapping_bytes(mut self, mapping_bytes: u64) -> Self {
+        self.requests = self
+            .requests
+            .into_iter()
+            .map(|request| request.with_open_mapping_bytes(mapping_bytes))
+            .collect();
+        self
+    }
+
     pub(crate) fn evidence(&self) -> &[NativeMemoryQuoteEvidence] {
         &self.evidence
     }

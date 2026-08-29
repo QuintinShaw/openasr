@@ -564,6 +564,13 @@ impl DomainReservationRequest {
         self
     }
 
+    /// Charge the open mapping size, not native copy-padding extras.
+    pub fn with_open_mapping_bytes(mut self, mapping_bytes: u64) -> Self {
+        self.peak_bytes = mapping_bytes;
+        self.retained_bytes = mapping_bytes;
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn with_cohort_id(mut self, cohort_id: Option<MemoryReservationCohortId>) -> Self {
         self.cohort_id = cohort_id;

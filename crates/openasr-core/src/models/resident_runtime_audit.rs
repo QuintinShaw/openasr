@@ -1419,6 +1419,7 @@ fn production_activation_reserve_does_not_use_placeholder_bytes() {
         pack_plan.contains("HOST_IMPORT")
             && pack_plan.contains("candidate-activation-host-import")
             && pack_plan.contains("already_open_file_backed")
+            && pack_plan.contains("with_open_mapping_bytes")
             && !pack_plan.contains("GGML_BACKEND_MEMORY_REQUEST_BUFFER")
             && !pack_plan.contains("or_else"),
         "activation must quote only the already-open pack mapping as host-import: {pack_plan}"
