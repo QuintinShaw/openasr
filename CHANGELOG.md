@@ -49,6 +49,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   card memory (for example `mimo-v2.5-asr:q4` on 12 GiB) admit instead of
   fail-closed. CUDA FullDevice reuses the ggml graph on the same proven lane
   as HIP/Vulkan.
+- Core: already-open file-backed pack mappings still occupy the SystemMemory
+  policy ledger so two distinct packs fail closed, but they no longer consume
+  this candidate's observed-free remainder or crowd out its later anonymous
+  host allocations and graph buffers. UMA hosts can load a pack larger than
+  live free (for example `firered2-llm:q4` or `mimo-v2.5-asr:q4` on 16 GiB)
+  and still admit encoder metadata, prepared-runtime counters, reuse-pass
+  weight contexts, and long-form graph workspace.
 - Core: a discrete CUDA/HIP/Vulkan request now keeps encoder and decoder
   graphs on one unified GPU owner, so weights and KV stay on a single ggml
   actor instead of bouncing between thread-local caches.
