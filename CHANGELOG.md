@@ -44,6 +44,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Core: a DedicatedDevice quarantine from a terminal device failure can
+  recover when a later candidate presents a healthy heap snapshot (new
+  backend generation after the poisoned handle was leaked). Ledger
+  corruption stays sticky until process restart. SystemMemory still never
+  disables the independent CPU fallback.
 - Core: discrete GPU activation no longer forecasts the pack mmap as a second
   VRAM copy. Weights are reserved once at allocation, so packs near half of
   card memory (for example `mimo-v2.5-asr:q4` on 12 GiB) admit instead of

@@ -493,10 +493,22 @@ struct DomainAccount {
     exclusive_pending_children: u32,
     exclusive_pending_cohort: Option<ReservationCohortKey>,
     quarantined: bool,
+    /// Why this domain is quarantined. Device-failure quarantines may recover
+    /// when a later healthy DedicatedDevice snapshot proves a usable heap.
+    /// Ledger corruption stays sticky until process restart.
+    quarantine_kind: DomainQuarantineKind,
     by_scope: HashMap<NativeExecutionScopeId, ScopedDomainAccount>,
     /// One already-open mapping forecast per execution cohort. Activation
     /// opens it; pack-weight residency consumes it into a committed owner.
     mapping_envelopes: HashMap<ReservationCohortKey, MappingEnvelope>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum DomainQuarantineKind {
+    #[default]
+    None,
+    DeviceFailure,
+    LedgerCorruption,
 }
 
 #[derive(Debug, Default)]
@@ -689,7 +701,7 @@ impl DeviceMemoryBrokerSet {
             });
         }
         if !domain_account_is_consistent(account) {
-            accounts.entry(domain.clone()).or_default().quarantined = true;
+            mark_ledger_corruption(accounts.entry(domain.clone()).or_default());
             return Err(MemoryPlanningError::ReservationLedgerCorrupted {
                 domain: domain.clone(),
             });
@@ -1150,14 +1162,23 @@ impl DeviceMemoryBrokerSet {
         // multi-owner candidate fits every physical domain.
         for (domain, aggregate) in &aggregates {
             let (policy_ceiling, observed_ceiling) = self.policy.limits(aggregate.snapshot)?;
-            let account = accounts.get(domain).unwrap_or(&empty_account);
-            if account.quarantined {
+            let quarantined = accounts
+                .get(domain)
+                .is_some_and(|account| account.quarantined);
+            if quarantined
+                && !try_recover_dedicated_device_failure(
+                    accounts.entry(domain.clone()).or_default(),
+                    domain,
+                    aggregate.snapshot,
+                )
+            {
                 return Err(MemoryPlanningError::DeviceQuarantined {
                     domain: domain.clone(),
                 });
             }
+            let account = accounts.get(domain).unwrap_or(&empty_account);
             if !domain_account_is_consistent(account) {
-                accounts.entry(domain.clone()).or_default().quarantined = true;
+                mark_ledger_corruption(accounts.entry(domain.clone()).or_default());
                 return Err(MemoryPlanningError::ReservationLedgerCorrupted {
                     domain: domain.clone(),
                 });
@@ -1819,10 +1840,11 @@ impl DeviceMemoryReservationBatch {
             if !pending_entry_is_consistent(account, entry)
                 || !exclusive_entry_is_consistent(account, entry)
             {
-                accounts
-                    .get_mut(&entry.domain)
-                    .expect("reservation account exists")
-                    .quarantined = true;
+                mark_ledger_corruption(
+                    accounts
+                        .get_mut(&entry.domain)
+                        .expect("reservation account exists"),
+                );
                 return Err(MemoryPlanningError::ReservationLedgerCorrupted {
                     domain: entry.domain.clone(),
                 });
@@ -1914,13 +1936,16 @@ impl DeviceMemoryReservationBatch {
     /// released would allow a guaranteed overcommit.
     ///
     /// A dedicated heap is also quarantined because every consumer of that
-    /// domain addresses the failed physical device. `SystemMemory` is
-    /// different: CPU and unified-memory accelerators share its capacity but
-    /// not their health. A poisoned Metal/UMA backend must leave its
-    /// unreclaimable charge in the ledger without disabling the independent
-    /// CPU fallback. Backend health remains quarantined by the native backend
-    /// owner itself. Ledger corruption still quarantines either domain via the
-    /// consistency checks below.
+    /// domain addresses the failed physical device. A later candidate may
+    /// recover that quarantine when its DedicatedDevice snapshot is a healthy
+    /// device observation of a usable heap (new backend generation after the
+    /// poisoned handle was leaked). `SystemMemory` is different: CPU and
+    /// unified-memory accelerators share its capacity but not their health. A
+    /// poisoned Metal/UMA backend must leave its unreclaimable charge in the
+    /// ledger without disabling the independent CPU fallback. Backend health
+    /// remains quarantined by the native backend owner itself. Ledger
+    /// corruption still quarantines either domain via the consistency checks
+    /// below and does not recover from a snapshot.
     pub fn quarantine(&mut self) {
         if matches!(
             self.state,
@@ -1949,7 +1974,7 @@ impl DeviceMemoryReservationBatch {
                 Self::prepare_receipt_descriptor(entry, bytes, bytes);
             }
             if matches!(entry.domain, MemoryDomainKey::DedicatedDevice { .. }) {
-                account.quarantined = true;
+                mark_device_failure_quarantine(account);
             }
         }
         drop(accounts);
@@ -2069,10 +2094,11 @@ impl DeviceMemoryReservationBatch {
             if !pending_entry_is_consistent(account, entry)
                 || !exclusive_entry_is_consistent(account, entry)
             {
-                accounts
-                    .get_mut(&entry.domain)
-                    .expect("reservation account exists")
-                    .quarantined = true;
+                mark_ledger_corruption(
+                    accounts
+                        .get_mut(&entry.domain)
+                        .expect("reservation account exists"),
+                );
                 return Err(MemoryPlanningError::ReservationLedgerCorrupted {
                     domain: entry.domain.clone(),
                 });
@@ -2131,12 +2157,61 @@ impl DeviceMemoryReservationBatch {
     }
 }
 
+fn mark_ledger_corruption(account: &mut DomainAccount) {
+    account.quarantined = true;
+    account.quarantine_kind = DomainQuarantineKind::LedgerCorruption;
+}
+
+fn mark_device_failure_quarantine(account: &mut DomainAccount) {
+    account.quarantined = true;
+    if account.quarantine_kind != DomainQuarantineKind::LedgerCorruption {
+        account.quarantine_kind = DomainQuarantineKind::DeviceFailure;
+    }
+}
+
+fn try_recover_dedicated_device_failure(
+    account: &mut DomainAccount,
+    domain: &MemoryDomainKey,
+    snapshot: DeviceMemorySnapshot,
+) -> bool {
+    if !matches!(domain, MemoryDomainKey::DedicatedDevice { .. }) {
+        return false;
+    }
+    if account.quarantine_kind != DomainQuarantineKind::DeviceFailure {
+        return false;
+    }
+    if account.pending_bytes != 0
+        || account.committed_bytes != 0
+        || account.exclusive_pending_children != 0
+    {
+        return false;
+    }
+    if !matches!(
+        snapshot.confidence,
+        MemoryObservationConfidence::DeviceSnapshot | MemoryObservationConfidence::WorkingSetBudget
+    ) || snapshot.total_bytes == 0
+        || snapshot.free_bytes == 0
+    {
+        return false;
+    }
+    account.quarantined = false;
+    account.quarantine_kind = DomainQuarantineKind::None;
+    account.unreclaimable_bytes = 0;
+    for scoped in account.by_scope.values_mut() {
+        scoped.unreclaimable_bytes = 0;
+        for placement in scoped.by_placement.values_mut() {
+            placement.unreclaimable_bytes = 0;
+        }
+    }
+    true
+}
+
 fn release_exclusive_child(account: &mut DomainAccount, entry: &ReservationEntry) {
     if entry.holds_exclusive_gate {
         if account.exclusive_pending_cohort != Some(entry.cohort)
             || account.exclusive_pending_children == 0
         {
-            account.quarantined = true;
+            mark_ledger_corruption(account);
             return;
         }
         account.exclusive_pending_children -= 1;
@@ -2374,7 +2449,7 @@ fn charge_pending_bytes(
 
 fn release_pending_bytes(account: &mut DomainAccount, entry: &ReservationEntry) {
     if entry.ledger_charge_bytes > 0 && !domain_account_is_consistent(account) {
-        account.quarantined = true;
+        mark_ledger_corruption(account);
         return;
     }
     let cohort_left = account
@@ -2404,7 +2479,7 @@ fn release_pending_bytes(account: &mut DomainAccount, entry: &ReservationEntry) 
                         .remove(&entry.cohort);
                 }
             }
-            None => account.quarantined = true,
+            None => mark_ledger_corruption(account),
         }
     }
 }
@@ -2419,15 +2494,15 @@ fn subtract_pending_bytes(
         return;
     }
     let Some(next_total) = account.pending_bytes.checked_sub(bytes) else {
-        account.quarantined = true;
+        mark_ledger_corruption(account);
         return;
     };
     let Some(current_cohort) = account.pending_bytes_by_cohort.get(&cohort).copied() else {
-        account.quarantined = true;
+        mark_ledger_corruption(account);
         return;
     };
     let Some(next_cohort) = current_cohort.checked_sub(bytes) else {
-        account.quarantined = true;
+        mark_ledger_corruption(account);
         return;
     };
     account.pending_bytes = next_total;
@@ -2487,31 +2562,31 @@ fn subtract_pending_bytes(
         }
     }
     if left != 0 {
-        account.quarantined = true;
+        mark_ledger_corruption(account);
     }
 }
 
 fn release_committed_bytes(account: &mut DomainAccount, entry: &ReservationEntry) {
     let Some(next) = account.committed_bytes.checked_sub(entry.committed_bytes) else {
-        account.quarantined = true;
+        mark_ledger_corruption(account);
         return;
     };
     let scoped_next = if let Some(scope_id) = entry.owner_scope_id {
         let Some(scoped) = account.by_scope.get(&scope_id) else {
-            account.quarantined = true;
+            mark_ledger_corruption(account);
             return;
         };
         let Some(next_scoped) = scoped.committed_bytes.checked_sub(entry.committed_bytes) else {
-            account.quarantined = true;
+            mark_ledger_corruption(account);
             return;
         };
         let Some(placement) = scoped.by_placement.get(&entry.owner_placement) else {
-            account.quarantined = true;
+            mark_ledger_corruption(account);
             return;
         };
         let Some(next_placement) = placement.committed_bytes.checked_sub(entry.committed_bytes)
         else {
-            account.quarantined = true;
+            mark_ledger_corruption(account);
             return;
         };
         Some((scope_id, next_scoped, next_placement))
@@ -2545,7 +2620,7 @@ fn add_scoped_committed_bytes(account: &mut DomainAccount, entry: &ReservationEn
             scoped.committed_bytes.checked_add(bytes),
             placement.committed_bytes.checked_add(bytes),
         ) else {
-            account.quarantined = true;
+            mark_ledger_corruption(account);
             return;
         };
         scoped.committed_bytes = next_scoped;
@@ -2568,7 +2643,7 @@ fn add_scoped_unreclaimable_bytes(
             scoped.unreclaimable_bytes.checked_add(bytes),
             placement.unreclaimable_bytes.checked_add(bytes),
         ) else {
-            account.quarantined = true;
+            mark_ledger_corruption(account);
             return;
         };
         scoped.unreclaimable_bytes = next_scoped;
@@ -3854,10 +3929,36 @@ mod tests {
         assert_eq!(usage.committed_bytes, 0);
         assert_eq!(usage.unreclaimable_bytes, GIB);
         assert!(usage.quarantined);
+        let recovered = broker
+            .try_reserve_batch(vec![request(domain(), 7 * GIB, 1, 1, "next")])
+            .expect(
+                "a later healthy DedicatedDevice snapshot recovers the device-failure quarantine",
+            );
+        assert!(!broker.usage(&domain()).quarantined);
+        assert_eq!(broker.usage(&domain()).unreclaimable_bytes, 0);
+        drop(recovered);
+    }
+
+    #[test]
+    fn dedicated_device_failure_quarantine_stays_closed_when_heap_is_exhausted() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy::default()));
+        let mut lease = broker
+            .try_reserve_batch(vec![request(
+                domain(),
+                7 * GIB,
+                GIB,
+                GIB,
+                "poisoned-backend",
+            )])
+            .unwrap();
+        lease.commit_quoted().unwrap();
+        lease.quarantine();
+        drop(lease);
         assert!(matches!(
-            broker.try_reserve_batch(vec![request(domain(), 7 * GIB, 1, 1, "next")]),
+            broker.try_reserve_batch(vec![request(domain(), 0, 1, 1, "next")]),
             Err(MemoryPlanningError::DeviceQuarantined { .. })
         ));
+        assert!(broker.usage(&domain()).quarantined);
     }
 
     #[test]
