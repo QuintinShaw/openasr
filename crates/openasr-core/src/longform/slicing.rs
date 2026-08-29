@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 use super::audibility::{AUDIBILITY_CRITERION_LABEL, AudibilityReference, linear_to_dbfs};
+use super::duration::executor_window_limit_samples_checked;
 use super::options::{LongFormMode, LongFormOptions};
 use super::timeline::{TimelineAnchor, TimelineMap};
 use super::vad::EnergyLongFormVadProvider;
@@ -32,6 +33,22 @@ impl AudioSlice {
         self.content_end_sample
             .saturating_sub(self.content_start_sample)
     }
+}
+
+/// Emitted window end: never past the executor ceiling or the timeline.
+fn executor_window_end(
+    start: usize,
+    soft_end: usize,
+    timeline_end: usize,
+    max_samples: usize,
+) -> usize {
+    let hard_end = start.saturating_add(max_samples).min(timeline_end);
+    soft_end.min(hard_end)
+}
+
+fn advance_window_start(start: usize, end: usize, overlap_samples: usize) -> usize {
+    let next = end.saturating_sub(overlap_samples);
+    if next <= start { end } else { next }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,12 +388,15 @@ fn plan_fixed_slices(
     // the encoder-memory guidance span, not just "whatever the executor
     // happens to still tolerate".
     let max_chunk_samples =
-        seconds_to_samples(options.max_chunk_seconds, sample_rate_hz).max(chunk_samples);
-    let step = chunk_samples.saturating_sub(overlap_samples).max(1);
+        executor_window_limit_samples_checked(options.max_chunk_seconds, sample_rate_hz).max(1);
     let mut start = 0usize;
     let mut slices: Vec<AudioSlice> = Vec::new();
     while start < total_samples {
-        let end = (start + chunk_samples).min(total_samples);
+        let soft_end = (start + chunk_samples).min(total_samples);
+        let end = executor_window_end(start, soft_end, total_samples, max_chunk_samples);
+        if end <= start {
+            break;
+        }
         if end.saturating_sub(start) < min_chunk_samples
             && let Some(last) = slices.last()
             && total_samples.saturating_sub(last.content_start_sample) <= max_chunk_samples
@@ -396,12 +416,7 @@ fn plan_fixed_slices(
         if end == total_samples {
             break;
         }
-        let next = start + step;
-        if next <= start {
-            start += 1;
-        } else {
-            start = next;
-        }
+        start = advance_window_start(start, end, overlap_samples);
     }
     slices
 }
@@ -416,7 +431,9 @@ fn plan_auto_slices(
     check_planning_canceled(canceled)?;
     let total_samples = samples.len();
     let chunk_samples = seconds_to_samples(options.chunk_seconds, sample_rate_hz);
-    if total_samples <= chunk_samples {
+    let max_chunk_samples =
+        executor_window_limit_samples_checked(options.max_chunk_seconds, sample_rate_hz);
+    if total_samples <= chunk_samples.min(max_chunk_samples) {
         return Ok(layout_from_identity_slices(vec![full_slice(total_samples)]));
     }
 
@@ -566,9 +583,8 @@ fn plan_packed_layout_from_speech_spans(
     if speech_spans.len() < 2 {
         return None;
     }
-    let chunk_samples = seconds_to_samples(options.chunk_seconds, sample_rate_hz).max(1);
     let max_chunk_samples =
-        seconds_to_samples(options.max_chunk_seconds, sample_rate_hz).max(chunk_samples);
+        executor_window_limit_samples_checked(options.max_chunk_seconds, sample_rate_hz).max(1);
     let min_chunk_samples = seconds_to_samples(options.min_chunk_seconds, sample_rate_hz).max(1);
     let gap_bridge_samples = seconds_to_samples(vad_coalesce_gap_seconds(options), sample_rate_hz);
     // Only genuine long pauses (> the coalesce gap) should end a kept region and
@@ -654,7 +670,8 @@ fn extend_energy_slices_for_span(
         return;
     }
     let chunk_samples = seconds_to_samples(options.chunk_seconds, sample_rate_hz);
-    let max_chunk_samples = seconds_to_samples(options.max_chunk_seconds, sample_rate_hz);
+    let max_chunk_samples =
+        executor_window_limit_samples_checked(options.max_chunk_seconds, sample_rate_hz);
     let overlap_samples = seconds_to_samples(options.overlap_seconds, sample_rate_hz);
     let min_chunk_samples = seconds_to_samples(options.min_chunk_seconds, sample_rate_hz);
     let search_samples = seconds_to_samples(options.energy_split_search_seconds, sample_rate_hz);
@@ -662,18 +679,22 @@ fn extend_energy_slices_for_span(
     let mut start = span_start.min(total_samples);
     let limit = span_end.min(total_samples);
     while start < limit {
-        let desired = (start + chunk_samples).min(limit);
         let hard_end = (start + max_chunk_samples).min(limit);
-        if desired == limit {
+        let desired = (start + chunk_samples).min(hard_end);
+        if desired == hard_end {
             slices.push(AudioSlice {
                 index: slices.len(),
                 kind: AudioSliceKind::Energy,
                 start_sample: start,
-                end_sample: limit,
+                end_sample: hard_end,
                 content_start_sample: start,
-                content_end_sample: limit,
+                content_end_sample: hard_end,
             });
-            break;
+            if hard_end >= limit {
+                break;
+            }
+            start = advance_window_start(start, hard_end, overlap_samples);
+            continue;
         }
         let search_start = desired
             .saturating_sub(search_samples)
@@ -740,9 +761,8 @@ fn plan_vad_slices_from_speech_spans(
     options: &LongFormOptions,
     vad_slices: Vec<LongFormVadSlice>,
 ) -> Vec<AudioSlice> {
-    let chunk_samples = seconds_to_samples(options.chunk_seconds, sample_rate_hz);
     let max_chunk_samples =
-        seconds_to_samples(options.max_chunk_seconds, sample_rate_hz).max(chunk_samples);
+        executor_window_limit_samples_checked(options.max_chunk_seconds, sample_rate_hz);
     let min_chunk_samples = seconds_to_samples(options.min_chunk_seconds, sample_rate_hz);
     let gap_bridge_samples = seconds_to_samples(vad_coalesce_gap_seconds(options), sample_rate_hz);
     // Bridge short breath gaps into continuous-speech regions up to the ceiling,
@@ -801,7 +821,7 @@ fn extend_vad_slices_for_span(
     }
     let chunk_samples = seconds_to_samples(options.chunk_seconds, sample_rate_hz).max(1);
     let max_chunk_samples =
-        seconds_to_samples(options.max_chunk_seconds, sample_rate_hz).max(chunk_samples);
+        executor_window_limit_samples_checked(options.max_chunk_seconds, sample_rate_hz).max(1);
     let min_chunk_samples = seconds_to_samples(options.min_chunk_seconds, sample_rate_hz);
     let search_samples = seconds_to_samples(options.energy_split_search_seconds, sample_rate_hz);
     let base_overlap_samples = seconds_to_samples(options.overlap_seconds, sample_rate_hz);
@@ -810,12 +830,21 @@ fn extend_vad_slices_for_span(
 
     let mut start = span_start;
     while start < span_end {
-        let desired = (start + chunk_samples).min(span_end);
-        if desired >= span_end {
-            slices.push(vad_slice(slices.len(), start, span_end));
-            break;
-        }
         let hard_end = (start + max_chunk_samples).min(span_end);
+        let desired = (start + chunk_samples).min(hard_end);
+        if desired >= hard_end {
+            slices.push(vad_slice(slices.len(), start, hard_end));
+            if hard_end >= span_end {
+                break;
+            }
+            start = advance_window_start(start, hard_end, forced_overlap_samples);
+            if let Some(last) = slices.last()
+                && start <= last.content_start_sample
+            {
+                start = last.content_end_sample;
+            }
+            continue;
+        }
         let floor = (start + min_chunk_samples).min(hard_end);
         let (split, forced) = choose_forced_cut(
             samples,
@@ -1810,13 +1839,11 @@ fn pack_processed_spans_into_windows(
     }
     let target_chunk_samples = seconds_to_samples(options.chunk_seconds, sample_rate_hz).max(1);
     let min_chunk_samples = seconds_to_samples(options.min_chunk_seconds, sample_rate_hz).max(1);
-    // The hard ceiling: unlike `target_chunk_samples` (a soft target the loop
-    // below normally cuts at once `current_len >= min_chunk_samples`), this
-    // must never be crossed regardless of how small `current_len` still is --
-    // mirrors the same `max_chunk_samples` ceiling `subdivide_processed_spans_silence_aware`
-    // just bounded the individual subdivided spans by.
+    // The hard ceiling is the same integer sample count the decoder-state
+    // envelope uses. Soft target (`chunk_seconds`) may still cut on already
+    // subdivided span boundaries; overflow stays on the processed cursor.
     let max_chunk_samples =
-        seconds_to_samples(options.max_chunk_seconds, sample_rate_hz).max(target_chunk_samples);
+        executor_window_limit_samples_checked(options.max_chunk_seconds, sample_rate_hz).max(1);
     let overlap_samples = seconds_to_samples(options.overlap_seconds, sample_rate_hz)
         .min(target_chunk_samples.saturating_sub(1));
     // A single processed span longer than one chunk (a continuous-speech region
@@ -1826,29 +1853,90 @@ fn pack_processed_spans_into_windows(
     // max_chunk-ceiling rules as the identity path.
     let subdivided =
         subdivide_processed_spans_silence_aware(spans, sample_rate_hz, options, samples, timeline);
+    if subdivided.is_empty() {
+        return Vec::new();
+    }
+    let limit = subdivided
+        .last()
+        .expect("non-empty subdivided spans")
+        .end_sample;
+    let mut start = subdivided[0].start_sample;
     let mut windows = Vec::new();
-    let mut current_start = subdivided[0].start_sample;
-    let mut current_end = subdivided[0].end_sample;
-    for span in subdivided.iter().skip(1) {
-        let prospective_end = span.end_sample;
-        let prospective_len = prospective_end.saturating_sub(current_start);
-        let current_len = current_end.saturating_sub(current_start);
-        if prospective_len > target_chunk_samples
-            && (current_len >= min_chunk_samples || prospective_len > max_chunk_samples)
+    while start < limit {
+        let end = packed_window_end(
+            start,
+            limit,
+            target_chunk_samples,
+            max_chunk_samples,
+            min_chunk_samples,
+            &subdivided,
+        );
+        if end <= start {
+            break;
+        }
+        let remaining = limit.saturating_sub(end);
+        let end = if remaining > 0
+            && remaining < min_chunk_samples
+            && limit.saturating_sub(start) <= max_chunk_samples
         {
-            windows.push(LongFormVadSlice {
-                start_sample: current_start,
-                end_sample: current_end,
-            });
-            current_start = current_end.saturating_sub(overlap_samples);
+            limit
+        } else {
+            end
+        };
+        windows.push(LongFormVadSlice {
+            start_sample: start,
+            end_sample: end,
+        });
+        if end >= limit {
+            break;
+        }
+        start = advance_window_start(start, end, overlap_samples);
+    }
+    windows
+}
+
+/// Latest legal processed end for a packed window starting at `start`.
+///
+/// Soft cuts prefer already-subdivided span boundaries at `target_chunk_samples`.
+/// The executor ceiling `start + max_chunk_samples` is never crossed; remainder
+/// stays on the caller cursor. Seam samples between processed spans sit inside
+/// `[start, end)` and count against the ceiling.
+fn packed_window_end(
+    start: usize,
+    limit: usize,
+    target_chunk_samples: usize,
+    max_chunk_samples: usize,
+    min_chunk_samples: usize,
+    subdivided: &[LongFormVadSlice],
+) -> usize {
+    let hard_end = start.saturating_add(max_chunk_samples).min(limit);
+    let desired = (start + target_chunk_samples).min(hard_end);
+    let mut current_end = start;
+    for span in subdivided {
+        if span.end_sample <= start {
+            continue;
+        }
+        let prospective_end = span.end_sample.min(limit);
+        let current_len = current_end.saturating_sub(start);
+        if prospective_end > hard_end {
+            if current_end > start && current_len >= min_chunk_samples {
+                return current_end.min(hard_end);
+            }
+            return hard_end;
+        }
+        if prospective_end > desired && current_len >= min_chunk_samples {
+            return current_end;
         }
         current_end = prospective_end;
+        if current_end >= hard_end {
+            return hard_end;
+        }
     }
-    windows.push(LongFormVadSlice {
-        start_sample: current_start,
-        end_sample: current_end,
-    });
-    windows
+    if current_end > start {
+        current_end.min(hard_end)
+    } else {
+        hard_end
+    }
 }
 
 /// Split each processed span longer than one chunk into chunk-sized sub-spans at
@@ -1865,13 +1953,14 @@ fn subdivide_processed_spans_silence_aware(
 ) -> Vec<LongFormVadSlice> {
     let chunk_samples = seconds_to_samples(options.chunk_seconds, sample_rate_hz).max(1);
     let max_chunk_samples =
-        seconds_to_samples(options.max_chunk_seconds, sample_rate_hz).max(chunk_samples);
+        executor_window_limit_samples_checked(options.max_chunk_seconds, sample_rate_hz).max(1);
     let min_chunk_samples = seconds_to_samples(options.min_chunk_seconds, sample_rate_hz);
     let search_samples = seconds_to_samples(options.energy_split_search_seconds, sample_rate_hz);
     let silence_threshold_linear = 10.0_f32.powf(options.energy_silence_threshold_db / 20.0);
     let mut out = Vec::with_capacity(spans.len());
     for span in spans {
-        if span.end_sample.saturating_sub(span.start_sample) <= chunk_samples {
+        let span_len = span.end_sample.saturating_sub(span.start_sample);
+        if span_len <= chunk_samples.min(max_chunk_samples) {
             out.push(span.clone());
             continue;
         }
@@ -1888,15 +1977,19 @@ fn subdivide_processed_spans_silence_aware(
         };
         let mut start = span.start_sample;
         while start < span.end_sample {
-            let desired = (start + chunk_samples).min(span.end_sample);
-            if desired >= span.end_sample {
+            let hard_end = (start + max_chunk_samples).min(span.end_sample);
+            let desired = (start + chunk_samples).min(hard_end);
+            if desired >= hard_end {
                 out.push(LongFormVadSlice {
                     start_sample: start,
-                    end_sample: span.end_sample,
+                    end_sample: hard_end,
                 });
-                break;
+                if hard_end >= span.end_sample {
+                    break;
+                }
+                start = hard_end;
+                continue;
             }
-            let hard_end = (start + max_chunk_samples).min(span.end_sample);
             let floor = (start + min_chunk_samples).min(hard_end);
             let (original_split, _forced) = choose_forced_cut(
                 samples,
@@ -1906,7 +1999,7 @@ fn subdivide_processed_spans_silence_aware(
                 search_samples,
                 silence_threshold_linear,
             );
-            let split = to_processed(original_split).clamp(start + 1, span.end_sample);
+            let split = to_processed(original_split).clamp(start + 1, hard_end);
             out.push(LongFormVadSlice {
                 start_sample: start,
                 end_sample: split,
@@ -2129,7 +2222,8 @@ fn apply_padding(
     // clamped by `total_samples` down to a 0.2s overshoot when little audio
     // remained past it) even after the content-side merge bug is fixed.
     // Shrink padding, never content, to keep the fed window inside the cap.
-    let max_chunk_samples = seconds_to_samples(max_chunk_seconds, sample_rate_hz).max(1);
+    let max_chunk_samples =
+        executor_window_limit_samples_checked(max_chunk_seconds, sample_rate_hz).max(1);
     for slice in slices.iter_mut() {
         let content_len = slice
             .content_end_sample
@@ -2218,7 +2312,10 @@ pub(super) fn seconds_to_samples(seconds: f32, sample_rate_hz: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::longform::{LongFormMode, LongFormOptions};
+    use crate::longform::{
+        LongFormMode, LongFormOptions, LongFormSlicePlan, executor_window_limit_samples,
+    };
+    use std::num::NonZeroU32;
 
     fn options_with_mode(mode: LongFormMode) -> LongFormOptions {
         LongFormOptions {
@@ -2390,19 +2487,33 @@ mod tests {
         samples.extend(tone(16_000));
         let plan =
             plan_longform_slices(&samples, 16_000, &options, Some(&FixedVadProvider)).unwrap();
-        assert_eq!(plan.slices.len(), 2);
+        let provenance = plan.stats.provenance.join("\n");
         assert!(
-            plan.slices
-                .iter()
-                .all(|slice| slice.kind == AudioSliceKind::Vad)
+            provenance.contains("vad-identity") || provenance.contains("vad-packed"),
+            "custom VAD must participate in Auto, got {provenance}"
         );
+        assert_eq!(plan.slices.len(), 2, "{provenance}");
         // Both real speech regions must survive -- only the true silence
         // between them may be elided.
-        assert_eq!(plan.slices[0].content_start_sample, 0);
-        assert_eq!(
-            plan.slices.last().unwrap().content_end_sample,
-            samples.len()
-        );
+        if let Some(processed) = plan.processed_audio.as_ref() {
+            assert!(
+                processed.len() >= 16_000 * 2,
+                "packed plan dropped a speech island: {} samples ({provenance})",
+                processed.len()
+            );
+        } else {
+            assert!(
+                plan.slices
+                    .iter()
+                    .all(|slice| slice.kind == AudioSliceKind::Vad),
+                "{provenance}"
+            );
+            assert_eq!(plan.slices[0].content_start_sample, 0);
+            assert_eq!(
+                plan.slices.last().unwrap().content_end_sample,
+                samples.len()
+            );
+        }
     }
 
     #[test]
@@ -3877,6 +3988,269 @@ mod tests {
         );
     }
 
+    fn assert_plan_respects_executor_ceiling(plan: &LongFormSlicePlan, options: &LongFormOptions) {
+        let limit = executor_window_limit_samples(
+            options.max_chunk_seconds,
+            NonZeroU32::new(plan.sample_rate_hz).expect("plan sample rate"),
+        )
+        .unwrap_or_else(|error| panic!("executor ceiling: {error}"));
+        for slice in &plan.slices {
+            assert!(
+                slice.duration_samples() <= limit,
+                "slice {slice:?} duration {} exceeds executor ceiling {limit}",
+                slice.duration_samples()
+            );
+        }
+    }
+
+    fn assert_packed_windows_cover_spans(
+        windows: &[LongFormVadSlice],
+        spans: &[LongFormVadSlice],
+        max_samples: usize,
+    ) {
+        assert!(!windows.is_empty(), "expected packed windows");
+        let origin = spans[0].start_sample;
+        let limit = spans.last().expect("spans").end_sample;
+        let mut covered_to = origin;
+        for window in windows {
+            let duration = window.end_sample.saturating_sub(window.start_sample);
+            assert!(
+                duration <= max_samples,
+                "window {window:?} duration {duration} exceeds {max_samples}"
+            );
+            assert!(
+                window.start_sample <= covered_to,
+                "packed coverage gap before {window:?} (covered_to={covered_to})"
+            );
+            covered_to = covered_to.max(window.end_sample);
+        }
+        assert_eq!(
+            covered_to, limit,
+            "packed windows dropped samples before processed end {limit}"
+        );
+    }
+
+    #[test]
+    fn packed_windows_never_exceed_zero_margin_ceiling_with_overlap() {
+        let mut options = options_with_mode(LongFormMode::Auto);
+        options.chunk_seconds = 30.0;
+        options.max_chunk_seconds = 30.0;
+        options.overlap_seconds = 0.5;
+        options.min_chunk_seconds = 1.0;
+        options.padding_seconds = 0.0;
+        let rate = 16_000u32;
+        let cap = 30 * rate as usize;
+        let spans = vec![
+            LongFormVadSlice {
+                start_sample: 0,
+                end_sample: cap,
+            },
+            LongFormVadSlice {
+                start_sample: cap,
+                end_sample: cap * 2,
+            },
+            LongFormVadSlice {
+                start_sample: cap * 2,
+                end_sample: cap * 3,
+            },
+        ];
+        let windows = pack_processed_spans_into_windows(
+            &spans,
+            rate,
+            &options,
+            &[],
+            &TimelineMap::identity(),
+        );
+        let max_samples = executor_window_limit_samples(
+            options.max_chunk_seconds,
+            NonZeroU32::new(rate).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(max_samples, 480_000);
+        assert_packed_windows_cover_spans(&windows, &spans, max_samples);
+        for pair in windows.windows(2) {
+            assert!(
+                pair[1].start_sample < pair[0].end_sample,
+                "configured overlap must still rewind the next window: {windows:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packed_windows_apply_configured_overlap_not_forced_cut_widening() {
+        let mut options = options_with_mode(LongFormMode::Auto);
+        options.chunk_seconds = 30.0;
+        options.max_chunk_seconds = 30.0;
+        options.overlap_seconds = 0.5;
+        options.min_chunk_seconds = 1.0;
+        let rate = 16_000u32;
+        let cap = 30 * rate as usize;
+        let spans = vec![
+            LongFormVadSlice {
+                start_sample: 0,
+                end_sample: cap,
+            },
+            LongFormVadSlice {
+                start_sample: cap,
+                end_sample: cap * 2,
+            },
+        ];
+        let windows = pack_processed_spans_into_windows(
+            &spans,
+            rate,
+            &options,
+            &[],
+            &TimelineMap::identity(),
+        );
+        assert!(windows.len() >= 2, "{windows:#?}");
+        let overlap = windows[0]
+            .end_sample
+            .saturating_sub(windows[1].start_sample);
+        assert_eq!(
+            overlap,
+            rate as usize / 2,
+            "packed overlap must stay at the configured 0.5s, got {overlap} ({windows:#?})"
+        );
+    }
+
+    struct CeilingFilledVad {
+        total_samples: usize,
+        rate: u32,
+    }
+
+    impl LongFormVadProvider for CeilingFilledVad {
+        fn compute_speech_slices(
+            &self,
+            _samples: &[f32],
+            _sample_rate_hz: u32,
+            _options: &LongFormOptions,
+        ) -> Result<Vec<LongFormVadSlice>, String> {
+            let dropped = ((2.91 * self.rate as f32).round() as usize).min(self.total_samples);
+            let gap = dropped / 10;
+            let remainder_gap = dropped - gap * 10;
+            let kept = self.total_samples.saturating_sub(dropped);
+            let full = self.rate as usize * 30;
+            let mut spans = Vec::new();
+            let mut cursor = 0usize;
+            let mut remaining = kept;
+            let mut gaps_left = 10usize;
+            while remaining > 0 {
+                let take = remaining.min(full);
+                spans.push(LongFormVadSlice {
+                    start_sample: cursor,
+                    end_sample: cursor + take,
+                });
+                cursor += take;
+                remaining -= take;
+                if remaining > 0 && gaps_left > 0 {
+                    let this_gap = gap + if gaps_left == 1 { remainder_gap } else { 0 };
+                    cursor += this_gap;
+                    gaps_left -= 1;
+                }
+            }
+            Ok(spans)
+        }
+    }
+
+    #[test]
+    fn auto_packed_plan_stays_inside_executor_ceiling_on_holey_speech() {
+        let sample_rate_hz = 16_000u32;
+        let mut options = options_with_mode(LongFormMode::Auto);
+        options.chunk_seconds = 30.0;
+        options.max_chunk_seconds = 30.0;
+        options.overlap_seconds = 0.5;
+        options.padding_seconds = 0.0;
+        let total_samples = (265.45 * sample_rate_hz as f32).round() as usize;
+        let vad = CeilingFilledVad {
+            total_samples,
+            rate: sample_rate_hz,
+        };
+        let spans = vad
+            .compute_speech_slices(&[], sample_rate_hz, &options)
+            .expect("ceiling-filled spans");
+        let mut samples = vec![0.0_f32; total_samples];
+        let voiced = tone(total_samples);
+        for span in &spans {
+            samples[span.start_sample..span.end_sample]
+                .copy_from_slice(&voiced[span.start_sample..span.end_sample]);
+        }
+        let mut processed_spans = Vec::new();
+        let mut cursor = 0usize;
+        for span in &spans {
+            let len = span.end_sample.saturating_sub(span.start_sample);
+            processed_spans.push(LongFormVadSlice {
+                start_sample: cursor,
+                end_sample: cursor + len,
+            });
+            cursor += len;
+        }
+        let packed_windows = pack_processed_spans_into_windows(
+            &processed_spans,
+            sample_rate_hz,
+            &options,
+            &samples,
+            &TimelineMap::identity(),
+        );
+        let max_samples = executor_window_limit_samples(
+            options.max_chunk_seconds,
+            NonZeroU32::new(sample_rate_hz).unwrap(),
+        )
+        .unwrap();
+        assert_packed_windows_cover_spans(&packed_windows, &processed_spans, max_samples);
+
+        let plan = plan_longform_slices(&samples, sample_rate_hz, &options, Some(&vad)).unwrap();
+        assert!(
+            plan.stats
+                .provenance
+                .iter()
+                .any(|entry| { entry.contains("vad-packed") || entry.contains("selected:vad-") }),
+            "non-EnergyLike VAD must participate, got {:?}",
+            plan.stats.provenance
+        );
+        assert_plan_respects_executor_ceiling(&plan, &options);
+    }
+
+    #[test]
+    fn plan_longform_slices_tenth_second_ceiling_matches_envelope_for_fixed_and_packed() {
+        let sample_rate_hz = 16_000u32;
+        let limit =
+            executor_window_limit_samples(0.1, NonZeroU32::new(sample_rate_hz).unwrap()).unwrap();
+        assert_eq!(limit, 1_601);
+        assert_eq!(seconds_to_samples(0.1, sample_rate_hz), 1_600);
+
+        let mut fixed = options_with_mode(LongFormMode::Fixed);
+        fixed.chunk_seconds = 0.1;
+        fixed.max_chunk_seconds = 0.1;
+        fixed.min_chunk_seconds = 0.05;
+        fixed.overlap_seconds = 0.0;
+        fixed.padding_seconds = 0.0;
+        let samples = tone(sample_rate_hz as usize);
+        let fixed_plan = plan_longform_slices(&samples, sample_rate_hz, &fixed, None).unwrap();
+        assert_plan_respects_executor_ceiling(&fixed_plan, &fixed);
+
+        let mut packed = options_with_mode(LongFormMode::Auto);
+        packed.chunk_seconds = 0.1;
+        packed.max_chunk_seconds = 0.1;
+        packed.min_chunk_seconds = 0.05;
+        packed.overlap_seconds = 0.0;
+        packed.padding_seconds = 0.0;
+        let packed_samples = tone(sample_rate_hz as usize * 3);
+        let vad = FixedVadProvider;
+        let packed_plan =
+            plan_longform_slices(&packed_samples, sample_rate_hz, &packed, Some(&vad)).unwrap();
+        assert!(
+            packed_plan.processed_audio.is_some()
+                || packed_plan
+                    .stats
+                    .provenance
+                    .iter()
+                    .any(|entry| entry.contains("-packed")),
+            "0.1s Auto+VAD must exercise a packed plan, got {:?}",
+            packed_plan.stats.provenance
+        );
+        assert_plan_respects_executor_ceiling(&packed_plan, &packed);
+    }
+
     #[test]
     fn packed_layout_processed_samples_include_window_overlap_cost() {
         let layout = LongFormPlanningLayout {
@@ -4107,14 +4481,7 @@ mod tests {
             let total_samples = (total_seconds * sample_rate_hz as f32).round() as usize;
             let samples = tone(total_samples);
             let plan = plan_longform_slices(&samples, sample_rate_hz, &options, None).unwrap();
-            let max_chunk_samples = (max_chunk_seconds * sample_rate_hz as f32).round() as usize;
-            for slice in &plan.slices {
-                assert!(
-                    slice.duration_samples() <= max_chunk_samples,
-                    "total_seconds={total_seconds}: slice {slice:?} exceeds the \
-                     {max_chunk_seconds}s zero-margin cap"
-                );
-            }
+            assert_plan_respects_executor_ceiling(&plan, &options);
             // Full coverage must still hold: nothing gets silently dropped by
             // refusing to merge the short tail into the previous chunk.
             assert_eq!(
@@ -4144,13 +4511,7 @@ mod tests {
         let total_samples = (30.2f32 * sample_rate_hz as f32).round() as usize;
         let samples = tone(total_samples);
         let plan = plan_longform_slices(&samples, sample_rate_hz, &options, None).unwrap();
-        let max_chunk_samples = (max_chunk_seconds * sample_rate_hz as f32).round() as usize;
-        for slice in &plan.slices {
-            assert!(
-                slice.duration_samples() <= max_chunk_samples,
-                "auto-selected slice {slice:?} exceeds the {max_chunk_seconds}s zero-margin cap"
-            );
-        }
+        assert_plan_respects_executor_ceiling(&plan, &options);
         assert_eq!(
             plan.slices
                 .last()
