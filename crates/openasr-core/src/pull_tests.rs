@@ -5538,3 +5538,106 @@ fn model_store_lifecycle_converts_and_reclaims_a_leaking_store() {
         "the store must shrink (before {before}, after {after})"
     );
 }
+
+#[test]
+fn retry_transient_io_succeeds_on_the_first_ok() {
+    let mut calls = 0;
+    let value = retry_transient_io(|| {
+        calls += 1;
+        Ok::<_, io::Error>(7)
+    })
+    .unwrap();
+    assert_eq!(value, 7);
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn retry_transient_io_does_not_retry_a_non_transient_error() {
+    let mut calls = 0;
+    let error = retry_transient_io(|| {
+        calls += 1;
+        Err::<(), _>(io::Error::from_raw_os_error(1))
+    })
+    .unwrap_err();
+    assert_eq!(calls, 1);
+    assert_eq!(error.raw_os_error(), Some(1));
+}
+
+#[cfg(windows)]
+#[test]
+fn retry_transient_io_gives_up_after_the_lock_budget() {
+    let mut calls = 0;
+    let error = retry_transient_io(|| {
+        calls += 1;
+        Err::<(), _>(io::Error::from_raw_os_error(32))
+    })
+    .unwrap_err();
+    assert_eq!(calls, 7);
+    assert_eq!(error.raw_os_error(), Some(32));
+}
+
+#[cfg(windows)]
+#[test]
+fn promote_backend_directory_copies_when_rename_stays_locked() {
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join("staging");
+    let dest = temp.path().join("final");
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join("ggml-cuda.dll"), b"plugin").unwrap();
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(dest.join("stale.dll"), b"stale").unwrap();
+
+    promote_backend_directory_with(
+        &staging,
+        &dest,
+        "fp",
+        |from, to| {
+            if from.ends_with("staging") {
+                return Err(io::Error::from_raw_os_error(5));
+            }
+            fs::rename(from, to)
+        },
+        super::fs_remove_dir_all,
+    )
+    .expect("locked rename must still promote by copying the readable staging tree");
+
+    assert_eq!(fs::read(dest.join("ggml-cuda.dll")).unwrap(), b"plugin");
+    assert!(!dest.join("stale.dll").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn promote_backend_directory_clears_dest_when_copy_fallback_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join("staging");
+    let dest = temp.path().join("final");
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join("ggml-cuda.dll"), b"plugin").unwrap();
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(dest.join("prior.dll"), b"prior").unwrap();
+
+    let error = promote_backend_directory_with(
+        &staging,
+        &dest,
+        "fp",
+        |from, to| {
+            if from.ends_with("staging") {
+                fs::create_dir_all(to.join("ggml-cuda.dll")).unwrap();
+                return Err(io::Error::from_raw_os_error(5));
+            }
+            fs::rename(from, to)
+        },
+        super::fs_remove_dir_all,
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("antivirus") && message.contains("Retry the install"),
+        "{message}"
+    );
+    assert_eq!(
+        fs::read(dest.join("prior.dll")).unwrap(),
+        b"prior",
+        "the previous install must be restored after a failed copy fallback"
+    );
+}

@@ -6308,16 +6308,104 @@ fn install_backend_pack_with_client_locked<C: DownloadClient>(
     read_and_verify_installed_backend(&dir, resolved)
 }
 
+fn is_transient_lock_error(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(error.raw_os_error(), Some(5 | 32 | 33))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+fn retry_transient_io<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    const DELAYS_MS: [u64; 6] = [200, 400, 800, 1600, 3200, 6400];
+    let mut attempt = 0usize;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt < DELAYS_MS.len() && is_transient_lock_error(&error) => {
+                std::thread::sleep(Duration::from_millis(DELAYS_MS[attempt]));
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn copy_dir_all_retry(from: &Path, to: &Path) -> io::Result<()> {
+    retry_transient_io(|| fs::create_dir_all(to))?;
+    for entry in retry_transient_io(|| fs::read_dir(from))? {
+        let entry = entry?;
+        let source = entry.path();
+        reject_symlink(&source).map_err(|error| io::Error::other(error.to_string()))?;
+        let destination = to.join(entry.file_name());
+        let file_type = retry_transient_io(|| entry.file_type())?;
+        if file_type.is_dir() {
+            copy_dir_all_retry(&source, &destination)?;
+        } else if file_type.is_file() {
+            retry_transient_io(|| {
+                fs::copy(&source, &destination)?;
+                Ok(())
+            })?;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "backend tree contains a non-file object",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn lock_exhausted_io(path: PathBuf, source: io::Error) -> PullError {
+    PullError::Io {
+        path,
+        source: io::Error::new(
+            source.kind(),
+            format!(
+                "{source}. Windows had the files open (antivirus real-time scanning is the usual cause). Retry the install. If it keeps failing, exclude the OpenASR backends folder from scanning. OpenASR does not change folder permissions."
+            ),
+        ),
+    }
+}
+
+fn fs_rename(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+fn fs_remove_dir_all(path: &Path) -> io::Result<()> {
+    fs::remove_dir_all(path)
+}
+
 fn promote_backend_directory(
     staging_dir: &Path,
     final_dir: &Path,
     fingerprint: &str,
 ) -> Result<(), PullError> {
+    promote_backend_directory_with(
+        staging_dir,
+        final_dir,
+        fingerprint,
+        fs_rename,
+        fs_remove_dir_all,
+    )
+}
+
+fn promote_backend_directory_with(
+    staging_dir: &Path,
+    final_dir: &Path,
+    fingerprint: &str,
+    rename: impl Fn(&Path, &Path) -> io::Result<()>,
+    remove_dir_all: impl Fn(&Path) -> io::Result<()>,
+) -> Result<(), PullError> {
     let final_parent = final_dir.parent().ok_or_else(|| PullError::InvalidTarget {
         field: "backend install path",
         reason: "final backend directory has no parent".to_string(),
     })?;
-    fs::create_dir_all(final_parent).map_err(|source| PullError::Io {
+    retry_transient_io(|| fs::create_dir_all(final_parent)).map_err(|source| PullError::Io {
         path: final_parent.to_path_buf(),
         source,
     })?;
@@ -6327,22 +6415,35 @@ fn promote_backend_directory(
         .join(format!(".replaced-{fingerprint}-{}", unix_seconds_now()));
     let had_previous = final_dir.exists();
     if had_previous {
-        fs::rename(final_dir, &displaced).map_err(|source| PullError::Io {
+        retry_transient_io(|| rename(final_dir, &displaced)).map_err(|source| PullError::Io {
             path: final_dir.to_path_buf(),
             source,
         })?;
     }
-    if let Err(source) = fs::rename(staging_dir, final_dir) {
-        if had_previous {
-            let _ = fs::rename(&displaced, final_dir);
+    match retry_transient_io(|| rename(staging_dir, final_dir)) {
+        Ok(()) => {}
+        Err(source) if is_transient_lock_error(&source) => {
+            if let Err(copy_error) = copy_dir_all_retry(staging_dir, final_dir) {
+                let _ = retry_transient_io(|| remove_dir_all(final_dir));
+                if had_previous {
+                    let _ = rename(&displaced, final_dir);
+                }
+                return Err(lock_exhausted_io(final_dir.to_path_buf(), copy_error));
+            }
+            let _ = retry_transient_io(|| remove_dir_all(staging_dir));
         }
-        return Err(PullError::Io {
-            path: final_dir.to_path_buf(),
-            source,
-        });
+        Err(source) => {
+            if had_previous {
+                let _ = rename(&displaced, final_dir);
+            }
+            return Err(PullError::Io {
+                path: final_dir.to_path_buf(),
+                source,
+            });
+        }
     }
     if had_previous {
-        let _ = fs::remove_dir_all(displaced);
+        let _ = retry_transient_io(|| remove_dir_all(&displaced));
     }
     Ok(())
 }
