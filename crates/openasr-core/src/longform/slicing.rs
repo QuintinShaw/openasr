@@ -680,20 +680,24 @@ fn extend_energy_slices_for_span(
     let limit = span_end.min(total_samples);
     while start < limit {
         let hard_end = (start + max_chunk_samples).min(limit);
-        let desired = (start + chunk_samples).min(hard_end);
-        if desired == hard_end {
+        let desired = (start + chunk_samples).min(limit);
+        if desired == limit {
+            let end = executor_window_end(start, desired, limit, max_chunk_samples);
+            if end <= start {
+                break;
+            }
             slices.push(AudioSlice {
                 index: slices.len(),
                 kind: AudioSliceKind::Energy,
                 start_sample: start,
-                end_sample: hard_end,
+                end_sample: end,
                 content_start_sample: start,
-                content_end_sample: hard_end,
+                content_end_sample: end,
             });
-            if hard_end >= limit {
+            if end >= limit {
                 break;
             }
-            start = advance_window_start(start, hard_end, overlap_samples);
+            start = advance_window_start(start, end, overlap_samples);
             continue;
         }
         let search_start = desired
@@ -831,13 +835,17 @@ fn extend_vad_slices_for_span(
     let mut start = span_start;
     while start < span_end {
         let hard_end = (start + max_chunk_samples).min(span_end);
-        let desired = (start + chunk_samples).min(hard_end);
-        if desired >= hard_end {
-            slices.push(vad_slice(slices.len(), start, hard_end));
-            if hard_end >= span_end {
+        let desired = (start + chunk_samples).min(span_end);
+        if desired >= span_end {
+            let end = executor_window_end(start, desired, span_end, max_chunk_samples);
+            if end <= start {
                 break;
             }
-            start = advance_window_start(start, hard_end, forced_overlap_samples);
+            slices.push(vad_slice(slices.len(), start, end));
+            if end >= span_end {
+                break;
+            }
+            start = advance_window_start(start, end, forced_overlap_samples);
             if let Some(last) = slices.last()
                 && start <= last.content_start_sample
             {
@@ -1978,16 +1986,20 @@ fn subdivide_processed_spans_silence_aware(
         let mut start = span.start_sample;
         while start < span.end_sample {
             let hard_end = (start + max_chunk_samples).min(span.end_sample);
-            let desired = (start + chunk_samples).min(hard_end);
-            if desired >= hard_end {
-                out.push(LongFormVadSlice {
-                    start_sample: start,
-                    end_sample: hard_end,
-                });
-                if hard_end >= span.end_sample {
+            let desired = (start + chunk_samples).min(span.end_sample);
+            if desired >= span.end_sample {
+                let end = executor_window_end(start, desired, span.end_sample, max_chunk_samples);
+                if end <= start {
                     break;
                 }
-                start = hard_end;
+                out.push(LongFormVadSlice {
+                    start_sample: start,
+                    end_sample: end,
+                });
+                if end >= span.end_sample {
+                    break;
+                }
+                start = end;
                 continue;
             }
             let floor = (start + min_chunk_samples).min(hard_end);
@@ -4203,8 +4215,8 @@ mod tests {
             plan.stats
                 .provenance
                 .iter()
-                .any(|entry| { entry.contains("vad-packed") || entry.contains("selected:vad-") }),
-            "non-EnergyLike VAD must participate, got {:?}",
+                .any(|entry| entry.contains("core.longform.auto.selected:vad-")),
+            "non-EnergyLike VAD must win Auto, got {:?}",
             plan.stats.provenance
         );
         assert_plan_respects_executor_ceiling(&plan, &options);
@@ -4234,21 +4246,40 @@ mod tests {
         packed.min_chunk_seconds = 0.05;
         packed.overlap_seconds = 0.0;
         packed.padding_seconds = 0.0;
-        let packed_samples = tone(sample_rate_hz as usize * 3);
+        let island = sample_rate_hz as usize;
+        let mut packed_samples = tone(island);
+        packed_samples.extend(vec![0.0; island]);
+        packed_samples.extend(tone(island));
         let vad = FixedVadProvider;
         let packed_plan =
             plan_longform_slices(&packed_samples, sample_rate_hz, &packed, Some(&vad)).unwrap();
         assert!(
-            packed_plan.processed_audio.is_some()
-                || packed_plan
-                    .stats
-                    .provenance
-                    .iter()
-                    .any(|entry| entry.contains("-packed")),
-            "0.1s Auto+VAD must exercise a packed plan, got {:?}",
+            packed_plan.processed_audio.is_some(),
+            "0.1s Auto+VAD with a silent hole must select a packed plan, got {:?}",
             packed_plan.stats.provenance
         );
         assert_plan_respects_executor_ceiling(&packed_plan, &packed);
+
+        let mut processed = tone(island);
+        processed.extend(tone(island));
+        let processed_spans = vec![
+            LongFormVadSlice {
+                start_sample: 0,
+                end_sample: island,
+            },
+            LongFormVadSlice {
+                start_sample: island,
+                end_sample: island * 2,
+            },
+        ];
+        let packed_windows = pack_processed_spans_into_windows(
+            &processed_spans,
+            sample_rate_hz,
+            &packed,
+            &processed,
+            &TimelineMap::identity(),
+        );
+        assert_packed_windows_cover_spans(&packed_windows, &processed_spans, limit);
     }
 
     #[test]
@@ -4359,6 +4390,7 @@ mod tests {
     fn vad_force_cut_lands_on_low_energy_dip_not_arithmetic_boundary() {
         let mut options = options_with_mode(LongFormMode::Vad);
         options.chunk_seconds = 30.0;
+        options.max_chunk_seconds = 30.0;
         options.overlap_seconds = 0.5;
         options.energy_split_search_seconds = 5.0;
         // 45s of tone with a 1s silent dip at 27s: inside the [25s, 35s] search
@@ -4381,6 +4413,55 @@ mod tests {
             slices[1].content_start_sample,
             cut - 16_000 / 2,
             "{slices:#?}"
+        );
+    }
+
+    #[test]
+    fn energy_cut_lands_on_pause_when_chunk_equals_max() {
+        let mut options = options_with_mode(LongFormMode::Energy);
+        options.chunk_seconds = 30.0;
+        options.max_chunk_seconds = 30.0;
+        options.overlap_seconds = 0.5;
+        options.energy_split_search_seconds = 5.0;
+        options.padding_seconds = 0.0;
+        let mut samples = tone(16_000 * 45);
+        for sample in samples.iter_mut().take(16_000 * 28).skip(16_000 * 27) {
+            *sample = 0.0;
+        }
+        let slices = plan_energy_slices(&samples, 16_000, &options);
+        assert!(slices.len() >= 2, "{slices:#?}");
+        let cut = slices[0].content_end_sample;
+        assert!(
+            cut > 16_000 * 27 && cut < 16_000 * 28,
+            "cut {cut} did not land on the 27s dip"
+        );
+    }
+
+    #[test]
+    fn packed_subdivide_lands_on_pause_when_chunk_equals_max() {
+        let mut options = options_with_mode(LongFormMode::Auto);
+        options.chunk_seconds = 30.0;
+        options.max_chunk_seconds = 30.0;
+        options.overlap_seconds = 0.5;
+        options.energy_split_search_seconds = 5.0;
+        options.padding_seconds = 0.0;
+        let mut samples = tone(16_000 * 45);
+        for sample in samples.iter_mut().take(16_000 * 28).skip(16_000 * 27) {
+            *sample = 0.0;
+        }
+        let spans = single_span(&samples);
+        let windows = pack_processed_spans_into_windows(
+            &spans,
+            16_000,
+            &options,
+            &samples,
+            &TimelineMap::identity(),
+        );
+        assert!(windows.len() >= 2, "{windows:#?}");
+        let cut = windows[0].end_sample;
+        assert!(
+            cut > 16_000 * 27 && cut < 16_000 * 28,
+            "packed subdivide cut {cut} did not land on the 27s dip"
         );
     }
 
