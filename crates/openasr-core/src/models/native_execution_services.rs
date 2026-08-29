@@ -2252,30 +2252,7 @@ fn reserve_activation_plan(
             owner_placement,
         )
         .map_err(|error| format!("candidate activation reserve: {error}"))?;
-    // Already-open host-import is a same-cohort envelope, not a distinct
-    // owner. Pack-weight-residency publishes the live SystemMemory receipt
-    // after native import; attaching a Reserved row here would stay at the
-    // quoted peak after the envelope is transferred into that owner.
-    let owner_resources = plan
-        .reservation_requests()
-        .iter()
-        .filter(|request| request.observed_peak_bytes != Some(0))
-        .filter_map(|request| {
-            collector
-                .resource_descriptor(
-                    &request.resource_id,
-                    &request.domain,
-                    request.peak_bytes,
-                    request.peak_bytes,
-                    request.retained_bytes,
-                    plan.quote_confidence_for_domain(&request.domain),
-                    Some(request.snapshot.confidence),
-                )
-                .map(|descriptor| (request.domain.clone(), descriptor))
-        })
-        .collect::<Vec<_>>();
-    if !owner_resources.is_empty()
-        && let Some(lane) = lane
+    if let Some(lane) = lane
         && let Some(owner) = collector.owner_descriptor(
             "candidate-activation-reservation",
             content_id,
@@ -2285,7 +2262,24 @@ fn reserve_activation_plan(
             Some(lane),
         )
     {
-        batch.attach_receipt(collector.clone(), owner, owner_resources);
+        let resources = plan
+            .reservation_requests()
+            .iter()
+            .filter_map(|request| {
+                collector
+                    .resource_descriptor(
+                        &request.resource_id,
+                        &request.domain,
+                        request.peak_bytes,
+                        request.peak_bytes,
+                        request.retained_bytes,
+                        plan.quote_confidence_for_domain(&request.domain),
+                        Some(request.snapshot.confidence),
+                    )
+                    .map(|descriptor| (request.domain.clone(), descriptor))
+            })
+            .collect();
+        batch.attach_receipt(collector.clone(), owner, resources);
     }
     BrokerActivationReservation::from_batch(batch, cohort_id)
 }

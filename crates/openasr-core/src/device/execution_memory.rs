@@ -23,7 +23,7 @@ use std::{
 
 use thiserror::Error;
 
-use crate::models::native_execution_services::NativeExecutionScopeId;
+use crate::models::native_execution_services::{NativeExecutionScopeId, current_runtime_receipts};
 use crate::models::runtime_receipts::{
     RuntimeOwnerDescriptor, RuntimeOwnerPlacement, RuntimeReceiptCollector, RuntimeReceiptMetric,
     RuntimeResourceDescriptor, RuntimeResourceGuard, RuntimeResourceState,
@@ -1963,6 +1963,9 @@ fn transfer_cohort_envelope(
         .unwrap_or(0);
     let transfer = want.min(cohort_left).min(account.pending_bytes);
     subtract_pending_bytes(account, entry.cohort, transfer, entry);
+    if let Some(collector) = current_runtime_receipts() {
+        collector.draw_down_reserved_peak(&entry.domain, transfer);
+    }
 }
 
 fn subtract_pending_bytes(

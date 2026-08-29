@@ -936,6 +936,58 @@ impl RuntimeReceiptCollector {
         true
     }
 
+    /// After a same-cohort envelope is transferred into a later owner, Reserved
+    /// rows that still quote the original peak would fail live reconciliation.
+    /// Draw those peaks down by the transferred bytes, largest first.
+    pub(crate) fn draw_down_reserved_peak(&self, domain: &MemoryDomainKey, draw_bytes: u64) {
+        if draw_bytes == 0 {
+            return;
+        }
+        let Some(projection) = self.domain_projection(domain) else {
+            return;
+        };
+        let mut state = self.lock_state();
+        if !self.state_is_available(&state) {
+            return;
+        }
+        let mut targets = Vec::new();
+        for (owner_id, owner) in &state.live_owners {
+            for (resource_id, resource) in &owner.resources {
+                if resource.state != RuntimeResourceState::Reserved {
+                    continue;
+                }
+                if resource.descriptor.domain != Some(projection) {
+                    continue;
+                }
+                let RuntimeReceiptMetric::Known(peak) = resource.descriptor.peak else {
+                    continue;
+                };
+                if peak == 0 {
+                    continue;
+                }
+                targets.push((*owner_id, *resource_id, peak));
+            }
+        }
+        targets.sort_by(|left, right| right.2.cmp(&left.2));
+        let mut remaining = draw_bytes;
+        for (owner_id, resource_id, peak) in targets {
+            if remaining == 0 {
+                break;
+            }
+            let Some(owner) = state.live_owners.get_mut(&owner_id) else {
+                continue;
+            };
+            let Some(resource) = owner.resources.get_mut(&resource_id) else {
+                continue;
+            };
+            let take = remaining.min(peak);
+            resource.descriptor.peak = RuntimeReceiptMetric::Known(peak - take);
+            resource.descriptor.requested = RuntimeReceiptMetric::Known(peak - take);
+            resource.descriptor.retained = RuntimeReceiptMetric::Known(peak - take);
+            remaining -= take;
+        }
+    }
+
     fn release_resource(
         &self,
         owner_id: RuntimeOwnerId,
