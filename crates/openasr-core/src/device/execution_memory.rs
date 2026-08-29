@@ -74,10 +74,17 @@ impl PhysicalDeviceKey {
 }
 
 /// Identity shared by every nested memory transaction in one execution
-/// candidate attempt. It is not a budget namespace: all cohorts still charge
-/// the same physical-domain ledger. The identity only proves that a nested
-/// reservation belongs to the provisional transaction currently holding that
-/// domain's exclusive reconciliation gate.
+/// candidate attempt.
+///
+/// It is not a separate budget namespace: every cohort still charges the same
+/// physical-domain ledger. It proves two things:
+///
+/// - a nested reservation may enter a provisional domain already held by this
+///   candidate's exclusive reconciliation gate;
+/// - a later file-backed residency request that fits inside this candidate's
+///   already-pending host-import envelope does not add a second SystemMemory
+///   charge for the same open mapping. GPU weight buffers reserve their own
+///   VRAM at allocation time and do not consume an activation forecast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct MemoryReservationCohortId(u64);
 
@@ -527,6 +534,12 @@ pub struct DomainReservationRequest {
     pub requires_reconciliation: bool,
     pub resource_id: String,
     pub(crate) cohort_id: Option<MemoryReservationCohortId>,
+    /// When set, this request materializes a file-backed mapping already
+    /// quoted on the same cohort (host-import of an open pack). Capacity
+    /// checks then use that envelope instead of adding a second SystemMemory
+    /// charge. Ordinary allocations, including `pack-weight-buffer`, leave
+    /// this unset so they reserve their own bytes.
+    pub draws_from_cohort_envelope: bool,
 }
 
 impl DomainReservationRequest {
@@ -540,7 +553,15 @@ impl DomainReservationRequest {
             requires_reconciliation: footprint.requires_reconciliation,
             resource_id: footprint.resource_ids.join("+"),
             cohort_id: None,
+            draws_from_cohort_envelope: false,
         }
+    }
+
+    /// Policy still charges [`Self::peak_bytes`]; live free is not required
+    /// again because this mapping is already open and reclaimable.
+    pub fn already_open_file_backed(mut self) -> Self {
+        self.observed_peak_bytes = Some(0);
+        self
     }
 
     #[cfg(test)]
@@ -694,6 +715,7 @@ impl DeviceMemoryBrokerSet {
             requires_reconciliation: bool,
             resource_ids: Vec<String>,
             child_count: u32,
+            draws_from_cohort_envelope: bool,
         }
 
         let mut explicit_cohort = None;
@@ -777,6 +799,7 @@ impl DeviceMemoryBrokerSet {
                             operation: "partitioned candidate retained sum",
                         })?;
                     aggregate.requires_reconciliation |= request.requires_reconciliation;
+                    aggregate.draws_from_cohort_envelope &= request.draws_from_cohort_envelope;
                     aggregate.resource_ids.push(request.resource_id.clone());
                     aggregate.child_count = aggregate.child_count.checked_add(1).ok_or(
                         MemoryPlanningError::ArithmeticOverflow {
@@ -794,6 +817,7 @@ impl DeviceMemoryBrokerSet {
                             requires_reconciliation: request.requires_reconciliation,
                             resource_ids: vec![request.resource_id.clone()],
                             child_count: 1,
+                            draws_from_cohort_envelope: request.draws_from_cohort_envelope,
                         },
                     );
                 }
@@ -857,10 +881,19 @@ impl DeviceMemoryBrokerSet {
                     exclusive_pending_children: account.exclusive_pending_children,
                 });
             }
+            // File-backed residency that joins this candidate's already-pending
+            // host-import envelope must not compete with that envelope. Ordinary
+            // allocations, including GPU `pack-weight-buffer`, still add. Other
+            // cohorts always compete.
+            let pending_holdback = if aggregate.draws_from_cohort_envelope {
+                other_cohort_pending
+            } else {
+                account.pending_bytes
+            };
             let policy_remaining = policy_ceiling.saturating_sub(
                 account
                     .committed_bytes
-                    .saturating_add(account.pending_bytes)
+                    .saturating_add(pending_holdback)
                     .saturating_add(account.unreclaimable_bytes),
             );
             // Pending reservations are not necessarily reflected in the
@@ -870,9 +903,11 @@ impl DeviceMemoryBrokerSet {
             // Policy check uses peak_bytes (full ownership charge). Observed
             // check uses observed_peak_bytes so reclaimable already-open
             // file-backed residency can charge policy without requiring live
-            // free == pack size a second time.
+            // free == pack size a second time. Same-cohort envelope bytes are
+            // excluded from the observed hold-back for the same reason they
+            // are excluded from policy remaining.
             let policy_ok = aggregate.peak_bytes <= policy_remaining;
-            let observed_remaining = observed_ceiling.saturating_sub(account.pending_bytes);
+            let observed_remaining = observed_ceiling.saturating_sub(pending_holdback);
             let observed_ok = aggregate.observed_peak_bytes <= observed_remaining;
             if !policy_ok || !observed_ok {
                 let available_bytes = if !policy_ok {
@@ -892,18 +927,22 @@ impl DeviceMemoryBrokerSet {
                     available_bytes,
                 });
             }
-            account
-                .pending_bytes
-                .checked_add(aggregate.peak_bytes)
-                .ok_or(MemoryPlanningError::ArithmeticOverflow {
+            let incremental_peak = if aggregate.draws_from_cohort_envelope {
+                aggregate.peak_bytes.saturating_sub(same_cohort_pending)
+            } else {
+                aggregate.peak_bytes
+            };
+            account.pending_bytes.checked_add(incremental_peak).ok_or(
+                MemoryPlanningError::ArithmeticOverflow {
                     operation: "pending reservation sum",
-                })?;
+                },
+            )?;
             if let Some(owner_scope_id) = owner_scope_id {
                 let scoped = account.by_scope.get(&owner_scope_id);
                 scoped
                     .map(|account| account.pending_bytes)
                     .unwrap_or(0)
-                    .checked_add(aggregate.peak_bytes)
+                    .checked_add(incremental_peak)
                     .ok_or(MemoryPlanningError::ArithmeticOverflow {
                         operation: "scoped pending reservation sum",
                     })?;
@@ -911,11 +950,18 @@ impl DeviceMemoryBrokerSet {
                     if placement_domain != domain {
                         continue;
                     }
+                    let placement_incremental = if same_cohort_pending == 0 {
+                        *bytes
+                    } else if incremental_peak == 0 {
+                        0
+                    } else {
+                        *bytes
+                    };
                     scoped
                         .and_then(|account| account.by_placement.get(placement))
                         .map(|account| account.pending_bytes)
                         .unwrap_or(0)
-                        .checked_add(*bytes)
+                        .checked_add(placement_incremental)
                         .ok_or(MemoryPlanningError::ArithmeticOverflow {
                             operation: "scoped placement pending reservation sum",
                         })?;
@@ -931,17 +977,29 @@ impl DeviceMemoryBrokerSet {
             }
         }
 
+        let mut remaining_incremental = BTreeMap::<MemoryDomainKey, u64>::new();
         for (domain, aggregate) in &aggregates {
             let account = accounts.entry(domain.clone()).or_default();
-            account.pending_bytes += aggregate.peak_bytes;
+            let same_cohort_pending = account
+                .pending_bytes_by_cohort
+                .get(&cohort)
+                .copied()
+                .unwrap_or(0);
+            let incremental_peak = if aggregate.draws_from_cohort_envelope {
+                aggregate.peak_bytes.saturating_sub(same_cohort_pending)
+            } else {
+                aggregate.peak_bytes
+            };
+            remaining_incremental.insert(domain.clone(), incremental_peak);
+            account.pending_bytes += incremental_peak;
             if let Some(owner_scope_id) = owner_scope_id {
                 account
                     .by_scope
                     .entry(owner_scope_id)
                     .or_default()
-                    .pending_bytes += aggregate.peak_bytes;
+                    .pending_bytes += incremental_peak;
             }
-            *account.pending_bytes_by_cohort.entry(cohort).or_default() += aggregate.peak_bytes;
+            *account.pending_bytes_by_cohort.entry(cohort).or_default() += incremental_peak;
             if aggregate.requires_reconciliation {
                 debug_assert!(
                     account
@@ -953,22 +1011,6 @@ impl DeviceMemoryBrokerSet {
             }
         }
 
-        if let Some(owner_scope_id) = owner_scope_id {
-            for ((domain, placement), bytes) in &placement_peaks {
-                let scoped = accounts
-                    .entry(domain.clone())
-                    .or_default()
-                    .by_scope
-                    .entry(owner_scope_id)
-                    .or_default();
-                scoped
-                    .by_placement
-                    .entry(*placement)
-                    .or_default()
-                    .pending_bytes += *bytes;
-            }
-        }
-
         let mut batches = Vec::with_capacity(partitions.len());
         for (partition, owner_placement) in partitions.into_iter().zip(owner_placements) {
             let mut entries = Vec::with_capacity(partition.len());
@@ -977,10 +1019,30 @@ impl DeviceMemoryBrokerSet {
                     .get(&request.domain)
                     .expect("partition domains were aggregated above")
                     .requires_reconciliation;
+                let leftover = remaining_incremental
+                    .get_mut(&request.domain)
+                    .expect("partition domains were aggregated above");
+                let ledger_charge_bytes = request.peak_bytes.min(*leftover);
+                *leftover -= ledger_charge_bytes;
+                if let Some(owner_scope_id) = owner_scope_id {
+                    let scoped = accounts
+                        .entry(request.domain.clone())
+                        .or_default()
+                        .by_scope
+                        .entry(owner_scope_id)
+                        .or_default();
+                    scoped
+                        .by_placement
+                        .entry(owner_placement)
+                        .or_default()
+                        .pending_bytes += ledger_charge_bytes;
+                }
                 entries.push(ReservationEntry {
                     domain: request.domain,
                     resource_id: request.resource_id,
                     reserved_peak_bytes: request.peak_bytes,
+                    ledger_charge_bytes,
+                    draws_from_cohort_envelope: request.draws_from_cohort_envelope,
                     quoted_retained_bytes: request.retained_bytes,
                     committed_bytes: 0,
                     requires_reconciliation: request.requires_reconciliation,
@@ -1106,6 +1168,10 @@ struct ReservationEntry {
     domain: MemoryDomainKey,
     resource_id: String,
     reserved_peak_bytes: u64,
+    /// Bytes this child actually added to the domain ledger. Zero when the
+    /// request fits inside a same-cohort activation envelope already pending.
+    ledger_charge_bytes: u64,
+    draws_from_cohort_envelope: bool,
     quoted_retained_bytes: u64,
     committed_bytes: u64,
     requires_reconciliation: bool,
@@ -1442,12 +1508,21 @@ impl DeviceMemoryReservationBatch {
                     domain: entry.domain.clone(),
                 });
             }
-            let other_pending = account
-                .pending_bytes
-                .checked_sub(entry.reserved_peak_bytes)
-                .ok_or_else(|| MemoryPlanningError::ReservationLedgerCorrupted {
+            let same_cohort_pending = account
+                .pending_bytes_by_cohort
+                .get(&entry.cohort)
+                .copied()
+                .unwrap_or(0);
+            let holdback = if entry.draws_from_cohort_envelope {
+                same_cohort_pending
+            } else {
+                entry.ledger_charge_bytes
+            };
+            let other_pending = account.pending_bytes.checked_sub(holdback).ok_or_else(|| {
+                MemoryPlanningError::ReservationLedgerCorrupted {
                     domain: entry.domain.clone(),
-                })?;
+                }
+            })?;
             let available_owned = policy_ceiling.saturating_sub(
                 account
                     .committed_bytes
@@ -1498,6 +1573,7 @@ impl DeviceMemoryReservationBatch {
                 .get_mut(&entry.domain)
                 .expect("reservation ledger validated above");
             release_pending_bytes(account, entry);
+            transfer_cohort_envelope(account, entry, *committed_bytes);
             account.committed_bytes += *committed_bytes;
             add_scoped_committed_bytes(account, entry, *committed_bytes);
             release_exclusive_child(account, entry);
@@ -1701,6 +1777,7 @@ impl DeviceMemoryReservationBatch {
                 .expect("validated above");
             let account = accounts.get_mut(&entry.domain).expect("validated above");
             release_pending_bytes(account, entry);
+            transfer_cohort_envelope(account, entry, *committed_bytes);
             account.committed_bytes += *committed_bytes;
             add_scoped_committed_bytes(account, entry, *committed_bytes);
             release_exclusive_child(account, entry);
@@ -1814,23 +1891,23 @@ fn domain_account_is_consistent(account: &DomainAccount) -> bool {
 }
 
 fn pending_entry_is_consistent(account: &DomainAccount, entry: &ReservationEntry) -> bool {
-    let scope_consistent = entry.owner_scope_id.is_none_or(|scope_id| {
-        account.by_scope.get(&scope_id).is_some_and(|scope| {
-            scope.pending_bytes >= entry.reserved_peak_bytes
-                && scope
-                    .by_placement
-                    .get(&entry.owner_placement)
-                    .is_some_and(|placement| placement.pending_bytes >= entry.reserved_peak_bytes)
-        })
-    });
+    let charge = entry.ledger_charge_bytes;
+    let scope_consistent = charge == 0
+        || entry.owner_scope_id.is_none_or(|scope_id| {
+            account.by_scope.get(&scope_id).is_some_and(|scope| {
+                scope.pending_bytes >= charge
+                    && scope
+                        .by_placement
+                        .get(&entry.owner_placement)
+                        .is_some_and(|placement| placement.pending_bytes >= charge)
+            })
+        });
     scope_consistent
-        && account.pending_bytes >= entry.reserved_peak_bytes
+        && account.pending_bytes >= charge
         && account
             .pending_bytes_by_cohort
             .get(&entry.cohort)
-            .map_or(entry.reserved_peak_bytes == 0, |bytes| {
-                *bytes >= entry.reserved_peak_bytes
-            })
+            .map_or(charge == 0, |bytes| *bytes >= charge)
 }
 
 fn exclusive_entry_is_consistent(account: &DomainAccount, entry: &ReservationEntry) -> bool {
@@ -1840,66 +1917,126 @@ fn exclusive_entry_is_consistent(account: &DomainAccount, entry: &ReservationEnt
 }
 
 fn release_pending_bytes(account: &mut DomainAccount, entry: &ReservationEntry) {
-    let Some(next_total) = account.pending_bytes.checked_sub(entry.reserved_peak_bytes) else {
+    if entry.ledger_charge_bytes > 0 && !domain_account_is_consistent(account) {
         account.quarantined = true;
         return;
-    };
-    let Some(current_cohort) = account.pending_bytes_by_cohort.get(&entry.cohort).copied() else {
-        if entry.reserved_peak_bytes == 0 {
-            return;
-        }
-        account.quarantined = true;
-        return;
-    };
-    let Some(next_cohort) = current_cohort.checked_sub(entry.reserved_peak_bytes) else {
-        account.quarantined = true;
-        return;
-    };
-    let scoped_next = if let Some(scope_id) = entry.owner_scope_id {
-        let Some(scoped) = account.by_scope.get(&scope_id) else {
-            account.quarantined = true;
-            return;
-        };
-        let Some(next_scoped) = scoped.pending_bytes.checked_sub(entry.reserved_peak_bytes) else {
-            account.quarantined = true;
-            return;
-        };
-        let Some(placement) = scoped.by_placement.get(&entry.owner_placement) else {
-            account.quarantined = true;
-            return;
-        };
-        let Some(next_placement) = placement
-            .pending_bytes
-            .checked_sub(entry.reserved_peak_bytes)
-        else {
-            account.quarantined = true;
-            return;
-        };
-        Some((scope_id, next_scoped, next_placement))
-    } else {
-        None
-    };
-
-    account.pending_bytes = next_total;
-    if let Some((scope_id, next_scoped, next_placement)) = scoped_next {
-        let scoped = account
-            .by_scope
-            .get_mut(&scope_id)
-            .expect("scoped reservation validated above");
-        scoped.pending_bytes = next_scoped;
-        scoped
-            .by_placement
-            .get_mut(&entry.owner_placement)
-            .expect("placement reservation validated above")
-            .pending_bytes = next_placement;
     }
+    let cohort_left = account
+        .pending_bytes_by_cohort
+        .get(&entry.cohort)
+        .copied()
+        .unwrap_or(0);
+    let bytes = entry
+        .ledger_charge_bytes
+        .min(cohort_left)
+        .min(account.pending_bytes);
+    subtract_pending_bytes(account, entry.cohort, bytes, entry);
+}
+
+/// Convert same-cohort envelope pending into this child's committed bytes.
+/// Activation quoted the already-open mapping; file-backed residency that
+/// joins that envelope charged zero incremental pending, so commit must draw
+/// the envelope down instead of stacking a second SystemMemory copy.
+fn transfer_cohort_envelope(
+    account: &mut DomainAccount,
+    entry: &ReservationEntry,
+    actual_retained: u64,
+) {
+    if !entry.draws_from_cohort_envelope {
+        return;
+    }
+    let want = actual_retained.saturating_sub(entry.ledger_charge_bytes);
+    if want == 0 {
+        return;
+    }
+    let cohort_left = account
+        .pending_bytes_by_cohort
+        .get(&entry.cohort)
+        .copied()
+        .unwrap_or(0);
+    let transfer = want.min(cohort_left).min(account.pending_bytes);
+    subtract_pending_bytes(account, entry.cohort, transfer, entry);
+}
+
+fn subtract_pending_bytes(
+    account: &mut DomainAccount,
+    cohort: ReservationCohortKey,
+    bytes: u64,
+    prefer: &ReservationEntry,
+) {
+    if bytes == 0 {
+        return;
+    }
+    let Some(next_total) = account.pending_bytes.checked_sub(bytes) else {
+        account.quarantined = true;
+        return;
+    };
+    let Some(current_cohort) = account.pending_bytes_by_cohort.get(&cohort).copied() else {
+        account.quarantined = true;
+        return;
+    };
+    let Some(next_cohort) = current_cohort.checked_sub(bytes) else {
+        account.quarantined = true;
+        return;
+    };
+    account.pending_bytes = next_total;
     if next_cohort == 0 {
-        account.pending_bytes_by_cohort.remove(&entry.cohort);
+        account.pending_bytes_by_cohort.remove(&cohort);
     } else {
         *account
             .pending_bytes_by_cohort
-            .get_mut(&entry.cohort)
+            .get_mut(&cohort)
             .expect("cohort reservation validated above") = next_cohort;
+    }
+
+    if account.by_scope.is_empty() {
+        return;
+    }
+
+    let mut left = bytes;
+    let mut order = Vec::new();
+    if let Some(scope_id) = prefer.owner_scope_id {
+        order.push(scope_id);
+    }
+    for scope_id in account.by_scope.keys().copied() {
+        if !order.contains(&scope_id) {
+            order.push(scope_id);
+        }
+    }
+    for scope_id in order {
+        if left == 0 {
+            break;
+        }
+        let Some(scoped) = account.by_scope.get_mut(&scope_id) else {
+            continue;
+        };
+        let mut placements = Vec::new();
+        if prefer.owner_scope_id == Some(scope_id) {
+            placements.push(prefer.owner_placement);
+        }
+        for placement in scoped.by_placement.keys().copied() {
+            if !placements.contains(&placement) {
+                placements.push(placement);
+            }
+        }
+        for placement in placements {
+            if left == 0 {
+                break;
+            }
+            let Some(placement_account) = scoped.by_placement.get_mut(&placement) else {
+                continue;
+            };
+            let take = left.min(placement_account.pending_bytes);
+            if take == 0 {
+                continue;
+            }
+            placement_account.pending_bytes -= take;
+            scoped.pending_bytes = scoped.pending_bytes.saturating_sub(take);
+            left -= take;
+        }
+    }
+    if left != 0 {
+        account.quarantined = true;
     }
 }
 
@@ -2165,6 +2302,7 @@ mod tests {
             requires_reconciliation: false,
             resource_id: resource_id.to_string(),
             cohort_id: None,
+            draws_from_cohort_envelope: false,
         }
     }
 
@@ -2480,6 +2618,130 @@ mod tests {
         assert!(broker.usage(&domain()).exclusive_pending);
         drop(nested);
         assert!(!broker.usage(&domain()).exclusive_pending);
+    }
+
+    #[test]
+    fn pack_weight_buffer_is_the_only_gpu_copy_and_admits_when_one_fits() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let gpu = domain();
+        let tensors = 6 * GIB;
+        let mut jit = broker
+            .try_reserve_batch(vec![request(
+                gpu.clone(),
+                7 * GIB,
+                tensors,
+                tensors,
+                "pack-weight-buffer-chunk-0",
+            )])
+            .expect("one device copy must admit against an empty GPU ledger");
+        assert_eq!(broker.usage(&gpu).pending_bytes, tensors);
+        assert_eq!(broker.usage(&gpu).committed_bytes, 0);
+        jit.commit_quoted().unwrap();
+        assert_eq!(broker.usage(&gpu).pending_bytes, 0);
+        assert_eq!(broker.usage(&gpu).committed_bytes, tensors);
+        drop(jit);
+        assert_eq!(broker.usage(&gpu), DeviceMemoryUsage::default());
+    }
+
+    #[test]
+    fn unload_refunds_so_a_later_pack_sized_load_is_not_blocked() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let gpu = domain();
+        let pack = 6 * GIB;
+        let mut first = broker
+            .try_reserve_batch(vec![request(
+                gpu.clone(),
+                7 * GIB,
+                pack,
+                pack,
+                "pack-weight-buffer-chunk-0",
+            )])
+            .unwrap();
+        first.commit_quoted().unwrap();
+        drop(first);
+        assert_eq!(broker.usage(&gpu), DeviceMemoryUsage::default());
+
+        let reloaded = broker.try_reserve_batch(vec![request(
+            gpu.clone(),
+            7 * GIB,
+            pack,
+            pack,
+            "pack-weight-buffer-chunk-0",
+        )]);
+        assert!(
+            reloaded.is_ok(),
+            "a later load must not see a ghost second charge after owners drop"
+        );
+        drop(reloaded);
+        assert_eq!(broker.usage(&gpu), DeviceMemoryUsage::default());
+    }
+
+    #[test]
+    fn pack_weight_buffer_footprint_is_a_real_allocation_not_an_envelope_draw() {
+        let domain = domain();
+        let footprints = AllocationFootprint::new(vec![MemoryClaim {
+            resource_id: "pack-weight-buffer-chunk-0".to_string(),
+            domain: domain.clone(),
+            requested_bytes: GIB,
+            incremental_peak_bytes: Some(GIB),
+            incremental_retained_bytes: Some(GIB),
+            confidence: QuoteConfidence::CommittedUpperBound,
+            lifetime: AllocationLifetime::PackShared,
+            phases: PhaseSet::ALL,
+        }])
+        .domain_footprints()
+        .unwrap();
+        let request = DomainReservationRequest::from_footprint(
+            footprints.into_iter().next().unwrap(),
+            snapshot(7 * GIB),
+        );
+        assert!(!request.draws_from_cohort_envelope);
+        assert_eq!(request.domain, domain);
+        assert_eq!(request.peak_bytes, GIB);
+    }
+
+    #[test]
+    fn two_gpu_weight_copies_fail_closed_when_they_exceed_the_card() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let gpu = domain();
+        let pack = 6 * GIB;
+        let first = broker
+            .try_reserve_batch(vec![
+                request(
+                    gpu.clone(),
+                    7 * GIB,
+                    pack,
+                    pack,
+                    "pack-weight-buffer-chunk-0",
+                )
+                .with_cohort_id(Some(MemoryReservationCohortId::new(1))),
+            ])
+            .unwrap();
+        let other = broker.try_reserve_batch(vec![
+            request(
+                gpu.clone(),
+                7 * GIB,
+                pack,
+                pack,
+                "pack-weight-buffer-chunk-0",
+            )
+            .with_cohort_id(Some(MemoryReservationCohortId::new(2))),
+        ]);
+        assert!(matches!(
+            other,
+            Err(MemoryPlanningError::DeviceBudgetExceeded { .. })
+        ));
+        assert_eq!(broker.usage(&gpu).pending_bytes, pack);
+        drop(first);
     }
 
     #[test]
@@ -2975,6 +3237,7 @@ mod tests {
                     requires_reconciliation: false,
                     resource_id: "incident-committed-owners".to_string(),
                     cohort_id: None,
+                    draws_from_cohort_envelope: false,
                 }],
                 Some(scope_id),
                 RuntimeOwnerPlacement::LaneBound(lane),
@@ -3035,6 +3298,7 @@ mod tests {
             requires_reconciliation: false,
             resource_id: "pack-weight-buffer-chunk-0".to_string(),
             cohort_id: None,
+            draws_from_cohort_envelope: false,
         }]);
         match rejected {
             Err(MemoryPlanningError::DeviceBudgetExceeded {

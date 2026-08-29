@@ -46,7 +46,7 @@ use crate::ggml_runtime::{
     BackendMemoryUnknownReason, SafeBackendMemoryReceipt,
 };
 use crate::ggml_runtime::{
-    GgmlBackend, GgmlBackendDevice, GgmlBackendKind, GgmlCpuGraphBackend, GgmlDeviceMemory,
+    GgmlBackend, GgmlBackendKind, GgmlCpuGraphBackend, GgmlDeviceMemory,
     GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector, GgmlExecutionTelemetryGuard,
     GgmlGraphLifecycleGuard, RequestBackendOverrideGuard, RequestBackendPreference,
     current_execution_telemetry_collector, ensure_backends_loaded, ggml_available_devices,
@@ -1860,7 +1860,6 @@ impl ResolvedDefaultModelActivation {
     pub fn quote(&self) -> Result<DefaultModelActivationQuote, String> {
         let (_backends, _mapping, plan) = quote_candidate_activation_plan(
             &self.verified_pack,
-            &self.candidate,
             self.facts.plan().resident_topology(),
         )?;
         Ok(DefaultModelActivationQuote {
@@ -2050,28 +2049,6 @@ fn host_backend_for_activation() -> Result<GgmlBackend, String> {
     GgmlBackend::cpu().map_err(|error| error.to_string())
 }
 
-fn discrete_device_for_candidate(
-    candidate: &ExecutionCandidate,
-) -> Result<Option<GgmlBackendDevice>, String> {
-    match candidate.device.route.provider {
-        ExecutionProvider::Cuda | ExecutionProvider::Hip | ExecutionProvider::Vulkan
-            if candidate.placement != ExecutionPlacement::CpuOnly => {}
-        _ => return Ok(None),
-    }
-    ensure_backends_loaded();
-    let devices = ggml_available_devices();
-    let wanted = candidate.device.route.provider;
-    let stable = candidate.device.route.stable_id.as_str();
-    Ok(devices.into_iter().find(|device| {
-        ExecutionProvider::from_backend_name(&device.name) == wanted
-            && (device.name == stable
-                || device
-                    .device_id
-                    .as_deref()
-                    .is_some_and(|id| id.eq_ignore_ascii_case(stable)))
-    }))
-}
-
 fn quote_activation_group(
     group_id: &str,
     identity: PhysicalDeviceKey,
@@ -2109,60 +2086,8 @@ fn quote_host_activation_group(
     )
 }
 
-fn quote_discrete_activation_group(
-    device: &GgmlBackendDevice,
-    activation_resource: &str,
-    requested_bytes: u64,
-) -> Result<(NativeQuotedBackendGroup, Option<GgmlBackend>), String> {
-    let device_raw = device.as_ptr();
-    let buft = unsafe { ffi::ggml_backend_dev_buffer_type(device_raw) };
-    if buft.is_null() {
-        return Err("discrete activation device has no buffer type to quote".to_string());
-    }
-    let group_id = format!("candidate-activation-device-copy:{activation_resource}");
-    let identity = ggml_device_physical_identity(device_raw)?;
-    // Vulkan BUFFER quotes accept a registry `buft` with a null backend. CUDA
-    // and HIP still require a live backend context to mint the quote token.
-    if ExecutionProvider::from_backend_name(&device.name) == ExecutionProvider::Vulkan {
-        let request = ffi::GgmlBackendMemoryRequestV1 {
-            kind: ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER,
-            usage: ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS as u32,
-            request_id: 1,
-            backend: std::ptr::null_mut(),
-            buft,
-            requested_bytes,
-            currently_allocated_bytes: 0,
-            ..Default::default()
-        };
-        let abi = unsafe { BackendMemoryAbi::from_device(device_raw) }
-            .map_err(|error| format!("candidate activation device ABI: {error}"))?;
-        return Ok((
-            quote_activation_group(&group_id, identity, abi, request)?,
-            None,
-        ));
-    }
-    let backend = device.initialize().map_err(|error| error.to_string())?;
-    let request = ffi::GgmlBackendMemoryRequestV1 {
-        kind: ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER,
-        usage: ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS as u32,
-        request_id: 1,
-        backend: backend.as_ptr(),
-        buft,
-        requested_bytes,
-        currently_allocated_bytes: 0,
-        ..Default::default()
-    };
-    let abi = unsafe { BackendMemoryAbi::from_backend(backend.as_ptr()) }
-        .map_err(|error| format!("candidate activation ABI: {error}"))?;
-    Ok((
-        quote_activation_group(&group_id, identity, abi, request)?,
-        Some(backend),
-    ))
-}
-
 fn quote_candidate_activation_plan(
     pack: &VerifiedPack,
-    candidate: &ExecutionCandidate,
     resident_topology: &DefaultModelResidentTopologyPlan,
 ) -> Result<
     (
@@ -2194,16 +2119,14 @@ fn quote_candidate_activation_plan(
         resident_topology.architecture,
         prepared_components.join(",")
     );
-    quote_pack_activation_plan(pack, candidate, &topology_resource)
+    quote_pack_activation_plan(pack, &topology_resource)
 }
 
-/// Quote the verified pack bytes for one already-resolved activation resource.
-/// ASR callers derive that identity from their resident topology. Auxiliary
-/// callers derive it from the canonical aux registry instead of masquerading
-/// as an ASR architecture descriptor.
+/// Quote the already-open pack mapping as host-import for one activation
+/// resource. Discrete GPU VRAM is reserved later at `pack-weight-buffer`
+/// allocation, never as a mmap-sized device-copy forecast of this mapping.
 fn quote_pack_activation_plan(
     pack: &VerifiedPack,
-    candidate: &ExecutionCandidate,
     activation_resource: &str,
 ) -> Result<
     (
@@ -2230,44 +2153,9 @@ fn quote_pack_activation_plan(
         ..Default::default()
     };
     let host_group_id = format!("candidate-activation-host-import:{activation_resource}");
-    let host_group =
-        quote_host_activation_group(&host_group_id, &host, host_import).or_else(|_| {
-            let device = unsafe { ffi::ggml_backend_get_device(host.as_ptr()) };
-            if device.is_null() {
-                return Err("host activation backend has no device".to_string());
-            }
-            let buft = unsafe { ffi::ggml_backend_dev_buffer_type(device) };
-            if buft.is_null() {
-                return Err("host activation backend has no buffer type to quote".to_string());
-            }
-            let host_copy = ffi::GgmlBackendMemoryRequestV1 {
-                kind: ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER,
-                usage: ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS as u32,
-                request_id: 1,
-                backend: host.as_ptr(),
-                buft,
-                requested_bytes,
-                currently_allocated_bytes: 0,
-                ..Default::default()
-            };
-            quote_host_activation_group(
-                &format!("candidate-activation-host-copy:{activation_resource}"),
-                &host,
-                host_copy,
-            )
-        })?;
-    let mut groups = vec![host_group];
-    let mut backends = vec![host];
-    if let Some(device) = discrete_device_for_candidate(candidate)? {
-        let (group, live_backend) =
-            quote_discrete_activation_group(&device, activation_resource, requested_bytes)?;
-        groups.push(group);
-        if let Some(live_backend) = live_backend {
-            backends.push(live_backend);
-        }
-    }
-    let plan = admission_plan_from_quoted_groups(groups)?;
-    Ok((backends, mmap, plan))
+    let host_group = quote_host_activation_group(&host_group_id, &host, host_import)?;
+    let plan = admission_plan_from_quoted_groups(vec![host_group])?.already_open_file_backed();
+    Ok((vec![host], mmap, plan))
 }
 
 fn admission_plan_from_quoted_groups(
@@ -2450,7 +2338,7 @@ pub(crate) fn quote_and_reserve_candidate_activation(
             );
             let topology =
                 resolve_resident_topology_plan(descriptor, pack, candidate, &intent, true)?;
-            quote_candidate_activation_plan(pack, candidate, &topology)?
+            quote_candidate_activation_plan(pack, &topology)?
         }
         PackRoute::Aux { .. } => {
             let policy = super::aux_pack_registry::auxiliary_execution_policy(architecture_id)
@@ -2476,7 +2364,7 @@ pub(crate) fn quote_and_reserve_candidate_activation(
                         )
                     })?;
             let activation_resource = format!("aux:{architecture_id}:{}", ownership.as_str());
-            quote_pack_activation_plan(pack, candidate, &activation_resource)?
+            quote_pack_activation_plan(pack, &activation_resource)?
         }
     };
     reserve_activation_plan(services, &plan, candidate, Some(pack.content_id()))
@@ -4075,9 +3963,8 @@ mod tests {
                 true,
             )
             .unwrap();
-            let (_backends, _mapping, plan) =
-                quote_candidate_activation_plan(&pack, &candidate, &topology)
-                    .expect("activation footprint must be quotable");
+            let (_backends, _mapping, plan) = quote_candidate_activation_plan(&pack, &topology)
+                .expect("activation footprint must be quotable");
             let peak = plan
                 .reservation_requests()
                 .iter()
@@ -4092,6 +3979,13 @@ mod tests {
                     .iter()
                     .all(|request| request.peak_bytes > 0),
                 "quoted activation domains must not be reserved as zero"
+            );
+            assert!(
+                plan.reservation_requests().iter().all(|request| {
+                    request.domain == MemoryDomainKey::SystemMemory
+                        && request.observed_peak_bytes == Some(0)
+                }),
+                "activation must quote only the already-open host mapping"
             );
             peak
         };

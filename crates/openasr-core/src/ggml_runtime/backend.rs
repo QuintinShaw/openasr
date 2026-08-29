@@ -191,6 +191,7 @@ impl GgmlBackendDevice {
         GgmlBackend::from_raw(raw, "device")
     }
 
+    #[cfg(test)]
     pub(crate) fn as_ptr(&self) -> ffi::GgmlBackendDevRaw {
         self.raw.as_ptr()
     }

@@ -229,6 +229,17 @@ impl NativeMemoryAdmissionPlan {
         &self.requests
     }
 
+    /// The quoted mapping is already open. Policy still charges peak bytes so
+    /// concurrent distinct packs fail closed; live free is not required again.
+    pub(crate) fn already_open_file_backed(mut self) -> Self {
+        self.requests = self
+            .requests
+            .into_iter()
+            .map(DomainReservationRequest::already_open_file_backed)
+            .collect();
+        self
+    }
+
     pub(crate) fn evidence(&self) -> &[NativeMemoryQuoteEvidence] {
         &self.evidence
     }
@@ -2492,6 +2503,7 @@ mod tests {
                 requires_reconciliation: true,
                 resource_id: resource_id.to_owned(),
                 cohort_id: None,
+                draws_from_cohort_envelope: false,
             }])
             .unwrap()
     }
@@ -2603,6 +2615,7 @@ mod tests {
             requires_reconciliation: false,
             resource_id: resource_id.to_owned(),
             cohort_id: None,
+            draws_from_cohort_envelope: false,
         }
     }
 
@@ -3467,6 +3480,7 @@ mod tests {
             requires_reconciliation: true,
             resource_id: "cuda-private".to_owned(),
             cohort_id: None,
+            draws_from_cohort_envelope: false,
         };
 
         let reconciled =
@@ -3527,6 +3541,7 @@ mod tests {
                 requires_reconciliation: false,
                 resource_id: "native-owner-order".to_owned(),
                 cohort_id: None,
+                draws_from_cohort_envelope: false,
             }])
             .unwrap();
         lease.commit_quoted().unwrap();
@@ -3567,6 +3582,7 @@ mod tests {
                 requires_reconciliation: false,
                 resource_id: "cross-backend-private".to_owned(),
                 cohort_id: None,
+                draws_from_cohort_envelope: false,
             }])
             .unwrap();
         reservation.commit_quoted().unwrap();
@@ -3612,6 +3628,7 @@ mod tests {
                 requires_reconciliation: false,
                 resource_id: "exact-no-post-stats".to_owned(),
                 cohort_id: None,
+                draws_from_cohort_envelope: false,
             }])
             .unwrap();
         let stats_called = Cell::new(false);

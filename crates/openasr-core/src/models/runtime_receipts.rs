@@ -1909,6 +1909,7 @@ mod tests {
             requires_reconciliation: false,
             resource_id: resource_id.to_string(),
             cohort_id: None,
+            draws_from_cohort_envelope: false,
         };
         let mut leases = broker
             .try_reserve_partitioned_for_scope_and_placements(

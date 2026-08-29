@@ -1046,6 +1046,38 @@ fn decode_drivers_forward_request_scoped_work_progress() {
 }
 
 #[test]
+fn production_seq2seq_step_executors_mint_compute_evidence() {
+    let root = models_root();
+    let mut files = Vec::new();
+    rust_files_below(&root, &mut files);
+    for path in files {
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        if !source.contains("impl Seq2SeqGreedyDecodeStepExecutor for") {
+            continue;
+        }
+        let production_impl = source.lines().any(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("impl Seq2SeqGreedyDecodeStepExecutor for")
+                && !trimmed.contains("Synthetic")
+                && !trimmed.contains("Recording")
+                && !trimmed.contains("FixedLogits")
+                && !trimmed.contains("Hinting")
+                && !trimmed.contains("Counting")
+                && !trimmed.contains("Publishing")
+        });
+        if !production_impl {
+            continue;
+        }
+        assert!(
+            source.contains("fn take_compute_evidence"),
+            "{} implements Seq2SeqGreedyDecodeStepExecutor without take_compute_evidence; GPU receipts fail closed without a minted selection witness",
+            path.display()
+        );
+    }
+}
+
+#[test]
 fn auxiliary_progress_is_explicit_and_request_scoped() {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/diarize");
     for relative in ["segment/mod.rs", "external.rs", "voice_id/identity.rs"] {

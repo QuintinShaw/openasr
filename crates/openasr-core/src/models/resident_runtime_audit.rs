@@ -1375,9 +1375,9 @@ fn production_activation_reserve_does_not_use_placeholder_bytes() {
         .next()
         .expect("quote function body");
     let production = source
-        .split("pub fn quote_and_reserve_candidate_activation")
+        .split("pub(crate) fn quote_and_reserve_candidate_activation")
         .next()
-        .expect("production quote helpers precede the public function");
+        .expect("production quote helpers precede the candidate activation function");
     assert!(
         !quote.contains("4096") && !quote.contains("HOST_IMPORT_GATE"),
         "activation quote must not use a placeholder page: {quote}"
@@ -1390,7 +1390,7 @@ fn production_activation_reserve_does_not_use_placeholder_bytes() {
         .split("fn quote_activation_group")
         .nth(1)
         .expect("quote_activation_group")
-        .split("pub fn quote_and_reserve_candidate_activation")
+        .split("pub(crate) fn quote_and_reserve_candidate_activation")
         .next()
         .expect("plan body");
     assert!(
@@ -1401,20 +1401,31 @@ fn production_activation_reserve_does_not_use_placeholder_bytes() {
         !plan.contains("peak_bytes: 0,"),
         "activation plan must not emit zero-byte domain rows: {plan}"
     );
-    let discrete = production
-        .split("fn discrete_device_for_candidate")
-        .nth(1)
-        .expect("discrete_device_for_candidate")
-        .split("fn quote_activation_group")
-        .next()
-        .expect("discrete device body");
     assert!(
-        !discrete.contains("initialize"),
-        "Vulkan admission quote must not construct a throwaway ggml backend: {discrete}"
+        !production.contains("candidate-activation-device-copy")
+            && !production.contains("quote_discrete_activation_group")
+            && !production.contains("candidate-activation-host-copy")
+            && !production.contains("resource_id.contains"),
+        "activation must not forecast mmap bytes as a discrete GPU buffer: {production}"
+    );
+    let pack_plan = source
+        .split("fn quote_pack_activation_plan")
+        .nth(1)
+        .expect("quote_pack_activation_plan")
+        .split("fn admission_plan_from_quoted_groups")
+        .next()
+        .expect("pack plan body");
+    assert!(
+        pack_plan.contains("HOST_IMPORT")
+            && pack_plan.contains("candidate-activation-host-import")
+            && pack_plan.contains("already_open_file_backed")
+            && !pack_plan.contains("GGML_BACKEND_MEMORY_REQUEST_BUFFER")
+            && !pack_plan.contains("or_else"),
+        "activation must quote only the already-open pack mapping as host-import: {pack_plan}"
     );
     assert!(
-        plan.contains("from_device") && plan.contains("ExecutionProvider::Vulkan"),
-        "Vulkan activation quote must use the device-only memory ABI: {plan}"
+        plan.contains("HOST_IMPORT") && plan.contains("candidate-activation-host-import"),
+        "activation must quote the already-open pack mapping as host-import: {plan}"
     );
     assert!(
         !quote.contains("verified_pack_from_preflight_for_test")

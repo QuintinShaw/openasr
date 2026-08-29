@@ -5,7 +5,8 @@ use thiserror::Error;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
     GgmlDecodeReuseMode, GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity,
-    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
+    GgmlLoadedWeightContext, GgmlSelectionEvidenceRef, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgufRuntimeSourcePreflight,
 };
 use crate::{Segment, Transcription};
 
@@ -23,7 +24,9 @@ use crate::PhraseBiasConfig;
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, BuiltinSeq2SeqDecodePolicyConfigInput,
 };
-use crate::models::device_greedy_token::{DeviceGreedyStepOutputMode, device_top1_token_id};
+use crate::models::device_greedy_token::{
+    DeviceGreedyStepOutputMode, compute_greedy_step_output_with_evidence,
+};
 use crate::models::seq2seq_decoder_state::Seq2SeqDecoderState;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
@@ -502,6 +505,7 @@ pub(crate) struct CohereDecoderGraphRuntime {
     /// graph's topology at build time.
     reuse_cross_frame_count: usize,
     cached_positions: usize,
+    last_step_compute_evidence: Option<GgmlSelectionEvidenceRef>,
     n_seq: usize,
     // Every graph-visible handle and persistent session above must drop before
     // its metadata/state arena, loaded roots, and backend runner.
@@ -631,6 +635,10 @@ impl Seq2SeqGreedyDecodeStepExecutor for CohereDecoderGraphStepExecutor<'_> {
                 reason: error.to_string(),
             }
         })
+    }
+
+    fn take_compute_evidence(&mut self) -> Option<GgmlSelectionEvidenceRef> {
+        self.runtime.last_step_compute_evidence.take()
     }
 }
 
@@ -895,6 +903,7 @@ impl CohereDecoderGraphRuntime {
             cross_capacity_frames: cross_alloc_frames,
             reuse_cross_frame_count: 0,
             cached_positions: 0,
+            last_step_compute_evidence: None,
             n_seq,
         })
     }
@@ -1900,6 +1909,7 @@ impl CohereDecoderGraphRuntime {
                 logits,
                 top1,
                 self.metadata.vocab_size,
+                &mut self.last_step_compute_evidence,
             )?
         };
         emit_cohere_debug_step_logits_if_enabled(
@@ -2017,8 +2027,13 @@ impl CohereDecoderGraphRuntime {
                 source,
             })?;
 
-        let output =
-            compute_greedy_step_output_for_graph(graph, logits, top1, self.metadata.vocab_size)?;
+        let output = compute_greedy_step_output_for_graph(
+            graph,
+            logits,
+            top1,
+            self.metadata.vocab_size,
+            &mut self.last_step_compute_evidence,
+        )?;
         self.cached_positions = total_tokens;
         Ok(output)
     }
@@ -2609,46 +2624,21 @@ fn device_top1_construction_transient_bytes() -> u64 {
     0
 }
 
-fn map_device_top1_token(token_id: i32, vocab_size: usize) -> Result<u32, CohereDecoderGraphError> {
-    device_top1_token_id(token_id, vocab_size).map_err(|error| {
-        CohereDecoderGraphError::GraphExecutionFailed {
-            reason: error.to_string(),
-        }
-    })
-}
-
 fn compute_greedy_step_output_for_graph<'a>(
     graph: &mut crate::ggml_runtime::GgmlCpuGraphBuilder<'a>,
     logits: GgmlCpuTensor<'a>,
     top1: Option<GgmlCpuTensor<'a>>,
     vocab_size: usize,
+    last_step_compute_evidence: &mut Option<GgmlSelectionEvidenceRef>,
 ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, CohereDecoderGraphError> {
-    match top1 {
-        Some(top1) => {
-            let token_id = graph
-                .compute_output_i32(top1, 1)
-                .map_err(|error| CohereDecoderGraphError::GraphExecutionFailed {
-                    reason: error.to_string(),
-                })?
-                .into_iter()
-                .next()
-                .ok_or_else(|| CohereDecoderGraphError::GraphExecutionFailed {
-                    reason: "cohere device top-1 returned no token id".to_string(),
-                })?;
-            Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits: Vec::new(),
-                greedy_token_hint: Some(map_device_top1_token(token_id, vocab_size)?),
-            })
-        }
-        None => Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-            logits: graph
-                .compute_output_f32(logits, vocab_size)
-                .map_err(|error| CohereDecoderGraphError::GraphExecutionFailed {
-                    reason: error.to_string(),
-                })?,
-            greedy_token_hint: None,
-        }),
-    }
+    let (output, evidence) = compute_greedy_step_output_with_evidence(
+        graph, logits, top1, vocab_size,
+    )
+    .map_err(|error| CohereDecoderGraphError::GraphExecutionFailed {
+        reason: error.to_string(),
+    })?;
+    *last_step_compute_evidence = evidence;
+    Ok(output)
 }
 
 #[derive(Clone)]

@@ -1865,11 +1865,15 @@ fn observed_graph_built_for_compute(
         return Ok(origin_at_this_compute == Some(true)
             && first_compute_at_this_compute == Some(compute_sequence));
     }
-    // HIP/Vulkan capture-unsupported graphs stop appending per-compute events
-    // after the first few sequences so Zipformer/longform receipts do not
-    // overflow. Later token steps still consume the same persistent graph:
-    // Created/ExistingGraphObserved plus an earlier attested compute is
-    // enough to project graph_rebuilt=false.
+    // Capture-unsupported CUDA/HIP/Vulkan graphs stop appending per-compute
+    // events after the first few sequences so Zipformer/longform receipts do
+    // not overflow. Later token steps still consume the same persistent graph.
+    // A later request may already be past that watermark, so this snapshot can
+    // carry only Created/ExistingGraphObserved and no ComputeStarted at all:
+    // origin in this snapshot is enough to project graph_rebuilt=false.
+    if !lifecycle.overflowed && last_origin_created.is_some() && !started {
+        return Ok(false);
+    }
     if !lifecycle.overflowed
         && last_origin_created.is_some()
         && first_compute_after_origin.is_some_and(|first| compute_sequence > first)
@@ -3017,6 +3021,50 @@ mod tests {
         assert!(
             !super::observed_graph_built_for_compute(&step, Some(&lifecycle))
                 .expect("later HIP/Vulkan token steps must bind as reuse after hot-path throttle")
+        );
+    }
+
+    #[test]
+    fn throttled_request_with_origin_only_projects_as_reuse() {
+        use std::sync::Arc;
+
+        use crate::ggml_runtime::{
+            GgmlGraphLifecycleEvent, GgmlGraphLifecycleEventKind, GgmlGraphLifecycleSnapshot,
+            GgmlSelectionEvidenceRef,
+        };
+
+        // CUDA (and any capture-unsupported discrete GPU) can enter a later
+        // request with compute_sequence already past the hot-path watermark, so
+        // the snapshot has origin and no ComputeStarted.
+        let lifecycle = GgmlGraphLifecycleSnapshot {
+            events: vec![GgmlGraphLifecycleEvent {
+                schema: Arc::from("openasr.graph-lifecycle.v1"),
+                sequence: 1,
+                provider: Arc::from("cuda"),
+                device: Arc::from("CUDA0"),
+                graph_instance: 11,
+                graph_generation: 22,
+                kind: GgmlGraphLifecycleEventKind::ExistingGraphObserved {
+                    scheduler_enabled: false,
+                    prepare_generation: None,
+                },
+            }],
+            overflowed: false,
+        };
+        let step = crate::NativeExecutionTokenStep {
+            step_index: 8,
+            token_id: 3,
+            is_eot: false,
+            top2_margin: None,
+            logits_sha256: None,
+            compute: Some(GgmlSelectionEvidenceRef::from_parts_for_test(
+                11, 22, 50, 99,
+            )),
+        };
+        assert!(
+            !super::observed_graph_built_for_compute(&step, Some(&lifecycle)).expect(
+                "origin-only CUDA/HIP/Vulkan snapshots after hot-path throttle bind as reuse"
+            )
         );
     }
 

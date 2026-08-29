@@ -315,6 +315,7 @@ impl<T> SystemMemoryOwner<T> {
                     requires_reconciliation: true,
                     resource_id: resource_id.clone(),
                     cohort_id: reservation_cohort,
+                    draws_from_cohort_envelope: false,
                 }],
                 owner_scope_id,
                 owner_placement,
@@ -561,6 +562,7 @@ mod tests {
                     requires_reconciliation: true,
                     resource_id: "test.competing".to_string(),
                     cohort_id: None,
+                    draws_from_cohort_envelope: false,
                 }]);
                 assert!(matches!(
                     rejected,
@@ -741,6 +743,7 @@ mod tests {
             requires_reconciliation: true,
             resource_id: "test.concurrent-competing".to_string(),
             cohort_id: None,
+            draws_from_cohort_envelope: false,
         }]);
         assert!(matches!(
             rejected,

@@ -77,9 +77,11 @@ use std::collections::HashMap;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
     GgmlDecodeReuseMode, GgmlKvElementType, GgmlLoadedTensor, GgmlLoadedWeightContext,
-    GgmlPersistentGraphSession, GgmlRopeExtParams,
+    GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlSelectionEvidenceRef,
 };
-use crate::models::device_greedy_token::{DeviceGreedyStepOutputMode, device_top1_token_id};
+use crate::models::device_greedy_token::{
+    DeviceGreedyStepOutputMode, compute_greedy_step_output_with_evidence, device_top1_token_id,
+};
 use crate::models::mapped_token_embedding::MappedTokenEmbeddingDeviceSpec;
 use crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeStepLogitsOutput;
 use crate::models::system_memory_owner::{
@@ -465,6 +467,7 @@ pub(crate) struct GraniteSpeechDecodeSession {
     /// request-scoped even when the resident arena/graph survives in the
     /// cross-request cache.
     logical_capacity: usize,
+    last_step_compute_evidence: Option<GgmlSelectionEvidenceRef>,
 }
 
 /// Build-once/re-run persistent single-token Granite decode graph plus its
@@ -657,6 +660,7 @@ impl GraniteSpeechDecodeSession {
             resident_kv: None,
             resident_capacity: 0,
             logical_capacity: 0,
+            last_step_compute_evidence: None,
         })
     }
 
@@ -679,6 +683,11 @@ impl GraniteSpeechDecodeSession {
         self.seq_len = 0;
         self.prefilled = false;
         self.logical_capacity = 0;
+        self.last_step_compute_evidence = None;
+    }
+
+    pub(crate) fn take_compute_evidence(&mut self) -> Option<GgmlSelectionEvidenceRef> {
+        self.last_step_compute_evidence.take()
     }
 
     pub(crate) fn is_prefilled(&self) -> bool {
@@ -737,7 +746,7 @@ impl GraniteSpeechDecodeSession {
             // Metal reuse path: seed the resident KV arena directly from the
             // prefill graph (rows `0..n_tokens` via `set_rows`), no host copy.
             self.ensure_resident_arena(capacity.resident_positions())?;
-            let output = run_prefill_graph_seeding_resident(
+            let (output, evidence) = run_prefill_graph_seeding_resident(
                 &mut self.runner,
                 &self.weights,
                 &self.config,
@@ -748,6 +757,7 @@ impl GraniteSpeechDecodeSession {
                 n_tokens,
                 DeviceGreedyStepOutputMode::FullLogits,
             )?;
+            self.last_step_compute_evidence = evidence;
             debug_assert!(output.greedy_token_hint.is_none());
             self.seq_len = n_tokens;
             self.prefilled = true;
@@ -835,7 +845,7 @@ impl GraniteSpeechDecodeSession {
             });
         }
         self.ensure_resident_arena(capacity.resident_positions())?;
-        let output = run_prefill_graph_seeding_resident(
+        let (output, evidence) = run_prefill_graph_seeding_resident(
             &mut self.runner,
             &self.weights,
             &self.config,
@@ -851,6 +861,7 @@ impl GraniteSpeechDecodeSession {
             n_tokens,
             self.greedy_step_output_mode,
         )?;
+        self.last_step_compute_evidence = evidence;
         self.seq_len = n_tokens;
         self.prefilled = true;
         self.logical_capacity = capacity.logical_positions();
@@ -1112,28 +1123,10 @@ impl GraniteSpeechDecodeSession {
                 )
                 .map_err(map_ggml("reuse_upload_mask"))?;
         }
-        let output = match top1 {
-            Some(top1) => {
-                let token_id = graph
-                    .compute_output_i32(top1, 1)
-                    .map_err(map_ggml("reuse_compute_top1"))?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| GraniteSpeechDecoderError::Shape {
-                        reason: "granite reused device top-1 returned no token id".to_string(),
-                    })?;
-                Seq2SeqGreedyDecodeStepLogitsOutput {
-                    logits: Vec::new(),
-                    greedy_token_hint: Some(map_device_top1_token(token_id, vocab_size)?),
-                }
-            }
-            None => Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits: graph
-                    .compute_output_f32(logits, vocab_size)
-                    .map_err(map_ggml("reuse_compute"))?,
-                greedy_token_hint: None,
-            },
-        };
+        let (output, evidence) =
+            compute_greedy_step_output_with_evidence(graph, logits, top1, vocab_size)
+                .map_err(map_ggml("reuse_compute"))?;
+        self.last_step_compute_evidence = evidence;
         self.seq_len = position + 1;
         Ok(output)
     }
@@ -1592,7 +1585,13 @@ fn run_prefill_graph_seeding_resident(
     input: GraniteResidentPrefillInput<'_>,
     n_tokens: usize,
     output_mode: DeviceGreedyStepOutputMode,
-) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, GraniteSpeechDecoderError> {
+) -> Result<
+    (
+        Seq2SeqGreedyDecodeStepLogitsOutput,
+        Option<GgmlSelectionEvidenceRef>,
+    ),
+    GraniteSpeechDecoderError,
+> {
     let head_dim = config.head_dim;
     let hidden_size = config.hidden_size;
     let vocab_size = config.vocab_size;
@@ -1879,28 +1878,8 @@ fn run_prefill_graph_seeding_resident(
     graph
         .set_i32_slice(seed_indices, &position_ids, "granite_seed_prefill_rows")
         .map_err(map_ggml("seed_prefill_upload_rows"))?;
-    match top1 {
-        Some(top1) => {
-            let token_id = graph
-                .compute_output_i32(top1, 1)
-                .map_err(map_ggml("seed_prefill_compute_top1"))?
-                .into_iter()
-                .next()
-                .ok_or_else(|| GraniteSpeechDecoderError::Shape {
-                    reason: "granite prefill device top-1 returned no token id".to_string(),
-                })?;
-            Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits: Vec::new(),
-                greedy_token_hint: Some(map_device_top1_token(token_id, vocab_size)?),
-            })
-        }
-        None => Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-            logits: graph
-                .compute_output_f32(logits, vocab_size)
-                .map_err(map_ggml("seed_prefill_compute"))?,
-            greedy_token_hint: None,
-        }),
-    }
+    compute_greedy_step_output_with_evidence(&mut graph, logits, top1, vocab_size)
+        .map_err(map_ggml("seed_prefill_compute"))
 }
 
 /// One incremental single-token step. Each admitted history layer is a

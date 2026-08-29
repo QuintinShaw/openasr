@@ -317,6 +317,9 @@ impl DeviceMemoryBrokerSet {
                 key.mapping_identity.as_raw()
             ),
             cohort_id: None,
+            // Same-cohort host activation already quoted this mapping. Joining
+            // that envelope keeps one SystemMemory charge for one open mmap.
+            draws_from_cohort_envelope: true,
         };
         request.cohort_id = cohort_id;
         let owner_scope_id = current_native_execution_scope_id();
@@ -445,6 +448,7 @@ impl DeviceMemoryBrokerSet {
                 key.mapping_identity.as_raw()
             ),
             cohort_id: None,
+            draws_from_cohort_envelope: true,
         };
         request.cohort_id = None;
         let mut batch = self.try_reserve_batch(vec![request])?;
@@ -480,7 +484,8 @@ pub(crate) fn new_pack_weight_residency_generation_counter() -> AtomicU64 {
 mod tests {
     use super::*;
     use crate::device::execution_memory::{
-        DeviceMemoryPolicy, DeviceMemorySnapshot, MemoryDomainKey, MemoryObservationConfidence,
+        DeviceMemoryPolicy, DeviceMemorySnapshot, DomainReservationRequest, MemoryDomainKey,
+        MemoryObservationConfidence, MemoryReservationCohortId,
     };
     use std::sync::Barrier;
     use std::thread;
@@ -668,6 +673,44 @@ mod tests {
             err,
             MemoryPlanningError::DeviceBudgetExceeded { .. }
         ));
+    }
+
+    #[test]
+    fn residency_joins_same_cohort_host_activation_envelope() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            minimum_headroom_bytes: 0,
+            maximum_owned_basis_points: 10_000,
+        }));
+        let snap = snapshot(16 * GIB, 16 * GIB);
+        let cohort = MemoryReservationCohortId::new(9);
+        let _activation = broker
+            .try_reserve_batch(vec![DomainReservationRequest {
+                domain: MemoryDomainKey::SystemMemory,
+                snapshot: snap,
+                peak_bytes: 4 * GIB,
+                retained_bytes: 4 * GIB,
+                observed_peak_bytes: None,
+                requires_reconciliation: false,
+                resource_id: "candidate-activation-host-import".to_string(),
+                cohort_id: Some(cohort),
+                draws_from_cohort_envelope: false,
+            }])
+            .expect("host activation envelope");
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).pending_bytes,
+            4 * GIB
+        );
+        let (_handle, charged) = broker
+            .acquire_pack_weight_residency(key(1), 4 * GIB, snap, Some(cohort))
+            .expect("residency");
+        assert_eq!(charged, 4 * GIB);
+        let usage = broker.usage(&MemoryDomainKey::SystemMemory);
+        assert_eq!(
+            usage.pending_bytes + usage.committed_bytes,
+            4 * GIB,
+            "one open mapping must not occupy two SystemMemory copies"
+        );
+        assert!(!usage.quarantined);
     }
 
     #[test]
