@@ -3732,10 +3732,22 @@ mod tests {
         assert_eq!(usage.pending_bytes, 0);
         assert_eq!(usage.unreclaimable_bytes, GIB);
         assert!(usage.quarantined);
+        let mut exhausted = dedicated_request(dedicated.clone(), 1, "scheduler-blocked");
+        exhausted.snapshot.free_bytes = 0;
         assert!(matches!(
-            broker.try_reserve_batch(vec![dedicated_request(dedicated, 1, "scheduler-blocked")]),
+            broker.try_reserve_batch(vec![exhausted]),
             Err(MemoryPlanningError::DeviceQuarantined { .. })
         ));
+        assert!(
+            broker
+                .try_reserve_batch(vec![dedicated_request(
+                    dedicated.clone(),
+                    1,
+                    "scheduler-recovered"
+                )])
+                .is_ok()
+        );
+        assert!(!broker.usage(&dedicated).quarantined);
     }
 
     #[derive(Debug)]
