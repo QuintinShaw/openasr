@@ -110,6 +110,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Core: long-form slices no longer exceed the decoder-state `max_chunk`
+  envelope after overlap, packing, or a short-tail remainder. A request that
+  previously failed closed with `decoder invocation lies outside its declared
+  session envelope` and no partial transcript now emits windows at or under
+  the same integer ceiling the executor already declared, while still cutting
+  on a nearby pause when one exists.
 - Windows: HE-AAC (and other formats the in-process decoder cannot handle)
   fall back to Media Foundation to produce 16 kHz mono PCM16 WAV, the same
   role `/usr/bin/afconvert` plays on macOS. AAC-LC and bare ADTS stay
