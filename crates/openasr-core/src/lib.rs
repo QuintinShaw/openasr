@@ -58,8 +58,10 @@ pub use backend_distribution::{
     activate_installed_backend_pack_auto, activated_backend_path, backend_plugin_status,
     clear_backend_qualification, deactivate_backend_pack, describe_backend_provider,
     install_and_activate_backend_pack, install_and_activate_backend_provider,
-    install_backend_pack_from_catalog, prepare_backend_pack_for_qualification,
+    install_backend_pack_from_catalog, import_backend_provider_from_local_path,
+    prepare_backend_pack_for_qualification,
     prepare_backend_provider_for_live_device, qualification_backend_from_environment,
+    uninstall_backend_library_vendor,
     qualification_backend_path, read_activated_backend, read_qualification_backend,
 };
 pub(crate) mod audio;
@@ -446,6 +448,8 @@ pub use pull::{
     ModelPackPreflightReceipt, PullError, PullModelPackRequest, PullProgress,
     available_disk_space_bytes, backend_artifact_fingerprint, backend_pack_download_plan,
     default_pack_pointer_path, gc_backend_store, install_backend_pack,
+    install_backend_pack_from_local_path, list_installed_backend_packs,
+    uninstall_backend_packs_for_vendor,
     install_catalog_model_pack_from_path,
     install_catalog_model_pack_from_path_with_execution_services, install_model_pack_from_path,
     install_model_pack_from_path_with_execution_services, installed_backend_protected_bytes,

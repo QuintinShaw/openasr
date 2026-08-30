@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -307,6 +307,10 @@ pub enum PullError {
     RuntimeValidation { path: PathBuf, reason: String },
     #[error("Installed model pack not found: {reference}")]
     NotInstalled { reference: String },
+    #[error("Cannot delete the in-use '{vendor}' GPU acceleration pack; switch away first")]
+    BackendPackInUse { vendor: String },
+    #[error("Local GPU acceleration pack import rejected: {reason}")]
+    BackendImportRejected { reason: String },
     #[error("Model pack pull was canceled: {reference}")]
     Canceled { reference: String },
     #[error("Model pack pull was paused: {reference}")]
@@ -5815,6 +5819,167 @@ pub(crate) fn install_backend_pack_locked(
     install_backend_pack_with_client_locked(resolved, home, &mut client, progress, Some(&parallel))
 }
 
+/// Install one already-resolved signed pack from a local file or folder,
+/// using the same verification as a network install. Does not activate.
+pub fn install_backend_pack_from_local_path(
+    resolved: &ResolvedCatalogBackendPull,
+    source: impl AsRef<Path>,
+    home: impl AsRef<Path>,
+    progress: impl FnMut(PullProgress),
+) -> Result<InstalledBackend, PullError> {
+    let home = home.as_ref();
+    let local_files = collect_local_backend_import_files(source.as_ref())?;
+    let mut files_by_url = BTreeMap::new();
+    for file in &resolved.files {
+        if let Some(path) = local_files.get(&file.sha256.to_ascii_lowercase()) {
+            files_by_url.insert(file.url.clone(), path.clone());
+            continue;
+        }
+        if matches!(
+            file.role,
+            CatalogBackendFileRole::Runtime | CatalogBackendFileRole::Archive
+        ) && verify_backend_content_object(&backend_content_object_dir(home, file), file).is_ok()
+        {
+            continue;
+        }
+        let reason = if file.role == CatalogBackendFileRole::Plugin {
+            "not an official pack for this GPU vendor, or the plugin file is missing"
+        } else {
+            "the official pack is incomplete"
+        };
+        return Err(PullError::BackendImportRejected {
+            reason: reason.to_string(),
+        });
+    }
+    if !resolved
+        .files
+        .iter()
+        .any(|file| file.role == CatalogBackendFileRole::Plugin && files_by_url.contains_key(&file.url))
+    {
+        return Err(PullError::BackendImportRejected {
+            reason: "not an official pack for this GPU vendor, or the plugin file is missing"
+                .to_string(),
+        });
+    }
+    let mut client = LocalFileClient { files_by_url };
+    let _store_lock = BackendStoreMutationLock::acquire(home)?;
+    install_backend_pack_with_client_locked(resolved, home, &mut client, progress, None)
+}
+
+fn collect_local_backend_import_files(
+    source: &Path,
+) -> Result<BTreeMap<String, PathBuf>, PullError> {
+    let root = if source.is_file() {
+        source.parent().unwrap_or(source)
+    } else {
+        source
+    };
+    if !root.exists() {
+        return Err(PullError::BackendImportRejected {
+            reason: "the selected path does not exist".to_string(),
+        });
+    }
+    let mut files = BTreeMap::new();
+    collect_local_backend_import_files_at(root, 0, &mut files)?;
+    if files.is_empty() {
+        return Err(PullError::BackendImportRejected {
+            reason: "no importable files were found".to_string(),
+        });
+    }
+    Ok(files)
+}
+
+fn collect_local_backend_import_files_at(
+    path: &Path,
+    depth: u8,
+    files: &mut BTreeMap<String, PathBuf>,
+) -> Result<(), PullError> {
+    if depth > 6 {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|source| PullError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_file() {
+        if let Ok((_, sha)) = file_size_and_sha256(path) {
+            files.entry(sha).or_insert_with(|| path.to_path_buf());
+        }
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    let entries = fs::read_dir(path).map_err(|source| PullError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| PullError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        collect_local_backend_import_files_at(&entry.path(), depth.saturating_add(1), files)?;
+    }
+    Ok(())
+}
+
+struct LocalFileClient {
+    files_by_url: BTreeMap<String, PathBuf>,
+}
+
+impl DownloadClient for LocalFileClient {
+    fn open(&mut self, url: &str, range: Option<ByteRange>) -> Result<DownloadResponse, PullError> {
+        let path = self
+            .files_by_url
+            .get(url)
+            .ok_or_else(|| PullError::BackendImportRejected {
+                reason: "local files do not contain this official pack file".to_string(),
+            })?
+            .clone();
+        let mut file = File::open(&path).map_err(|source| PullError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let total = file
+            .metadata()
+            .map_err(|source| PullError::Io {
+                path: path.clone(),
+                source,
+            })?
+            .len();
+        let start = range.map(|range| range.start).unwrap_or(0);
+        if start > total {
+            return Err(PullError::BackendImportRejected {
+                reason: "local file is smaller than the official pack".to_string(),
+            });
+        }
+        if start > 0 {
+            file.seek(SeekFrom::Start(start)).map_err(|source| PullError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        }
+        let remaining = total.saturating_sub(start);
+        let (status, content_range) = if range.is_some() {
+            let end = start.saturating_add(remaining).saturating_sub(1);
+            (206, Some(format!("bytes {start}-{end}/{total}")))
+        } else {
+            (200, None)
+        };
+        Ok(DownloadResponse {
+            status,
+            content_length: Some(remaining),
+            content_range,
+            etag: Some("local-import".to_string()),
+            reader: Box::new(file),
+        })
+    }
+}
+
 /// Conservative logical bytes that must remain reachable while `resolved` is
 /// installed.  The count is owned by open-core because only the content store
 /// knows which shared runtime objects back a pack.  Directory entries are
@@ -6448,12 +6613,13 @@ fn promote_backend_directory_with(
     Ok(())
 }
 
-/// Reclaims backend-pack generations and shared runtime objects that are no
-/// longer selected or explicitly retained by a caller (for example Desktop's
-/// future-core pending candidate). The mutation lock makes this safe against
-/// a concurrent installer or activation commit. Young artifacts are retained
-/// for a bounded rollback/resume window; corrupt metadata never broadens a
-/// deletion target and causes shared objects to be retained conservatively.
+/// Reclaims *replaced generations* of backend packs and unreferenced shared
+/// objects. Every currently installed pack remains a library member until the
+/// user explicitly uninstalls it: being unselected / deactivated is not a
+/// deletion. `keep_backend_ids` is extra protection (for example a future-core
+/// pending candidate). Young artifacts are retained for a bounded
+/// rollback/resume window; corrupt metadata never broadens a deletion target
+/// and causes shared objects to be retained conservatively.
 pub fn gc_backend_store(
     home: impl AsRef<Path>,
     keep_backend_ids: impl IntoIterator<Item = String>,
@@ -6467,6 +6633,144 @@ pub fn gc_backend_store(
         min_age.unwrap_or(DEFAULT_BACKEND_GC_MIN_AGE),
         unix_seconds_now(),
     )
+}
+
+/// Installed optional GPU packs currently on disk. Library membership is
+/// independent of which pack `active.json` names.
+pub fn list_installed_backend_packs(
+    home: impl AsRef<Path>,
+) -> Result<Vec<InstalledBackend>, PullError> {
+    let home = home.as_ref();
+    let mut deferred = Vec::new();
+    let packs = discover_installed_backend_packs(home, &mut deferred)?;
+    Ok(packs
+        .into_iter()
+        .map(|discovered| discovered.installed)
+        .collect())
+}
+
+/// Explicit user delete of one vendor's library packs (CUDA or HIP). Fails if
+/// that vendor is the currently activated kernel. Reclaims the vendor's pack
+/// directories and then runs GC so unreferenced shared objects can go.
+pub fn uninstall_backend_packs_for_vendor(
+    home: impl AsRef<Path>,
+    vendor: CatalogBackendVendor,
+) -> Result<BackendStoreGcReport, PullError> {
+    let home = home.as_ref();
+    let vendor_name = backend_vendor_dirname(vendor)?.to_string();
+    let _store_lock = BackendStoreMutationLock::acquire(home)?;
+    let active = crate::backend_distribution::read_activated_backend(home).map_err(|error| {
+        PullError::InvalidTarget {
+            field: "backends/active.json",
+            reason: error.to_string(),
+        }
+    })?;
+    if active
+        .as_ref()
+        .is_some_and(|active| active.vendor == vendor)
+    {
+        return Err(PullError::BackendPackInUse { vendor: vendor_name });
+    }
+    let mut deferred = Vec::new();
+    let mut report = BackendStoreGcReport {
+        schema_version: BACKEND_STORE_SCHEMA_VERSION,
+        retained_backend_ids: Vec::new(),
+        removed_pack_directories: 0,
+        removed_staging_directories: 0,
+        removed_content_objects: 0,
+        reclaimed_bytes: 0,
+        deferred_paths: Vec::new(),
+    };
+    for discovered in discover_installed_backend_packs(home, &mut deferred)? {
+        if discovered.installed.vendor == vendor_name
+            && let Some(bytes) = remove_backend_gc_directory(&discovered.path, &mut report)
+        {
+            report.removed_pack_directories = report.removed_pack_directories.saturating_add(1);
+            report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(bytes);
+        }
+    }
+    let leftover = gc_backend_store_locked(home, BTreeSet::new(), Duration::ZERO, unix_seconds_now())?;
+    report.removed_staging_directories = leftover.removed_staging_directories;
+    report.removed_content_objects = leftover.removed_content_objects;
+    report.reclaimed_bytes = report
+        .reclaimed_bytes
+        .saturating_add(leftover.reclaimed_bytes);
+    report.retained_backend_ids = leftover.retained_backend_ids;
+    report.deferred_paths.extend(deferred);
+    report.deferred_paths.extend(leftover.deferred_paths);
+    report.deferred_paths.sort();
+    report.deferred_paths.dedup();
+    Ok(report)
+}
+
+struct DiscoveredBackendPack {
+    installed: InstalledBackend,
+    path: PathBuf,
+}
+
+fn discover_installed_backend_packs(
+    home: &Path,
+    deferred: &mut Vec<PathBuf>,
+) -> Result<Vec<DiscoveredBackendPack>, PullError> {
+    let backends_root = home.join("backends");
+    if !backends_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut packs = Vec::new();
+    for vendor in ["cpu", "vulkan", "cuda", "hip"] {
+        let vendor_dir = backends_root.join(vendor);
+        for version_dir in safe_child_directories(&vendor_dir, deferred)? {
+            for pack_dir in safe_child_directories(&version_dir, deferred)? {
+                let marker_path = pack_dir.join("backend.json");
+                let Some(mut installed) = fs::read_to_string(&marker_path)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<InstalledBackend>(&text).ok())
+                    .filter(|installed| {
+                        installed.schema_version == INSTALLED_BACKEND_SCHEMA_VERSION
+                            && installed.vendor == vendor
+                            && installed.version
+                                == version_dir
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or_default()
+                            && installed.artifact_fingerprint
+                                == pack_dir
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or_default()
+                    })
+                else {
+                    continue;
+                };
+                installed.dir = pack_dir.clone();
+                packs.push(DiscoveredBackendPack {
+                    installed,
+                    path: pack_dir,
+                });
+            }
+        }
+    }
+    Ok(packs)
+}
+
+fn newest_generation_fingerprints(
+    packs: &[DiscoveredBackendPack],
+) -> BTreeMap<String, (u64, String)> {
+    let mut newest = BTreeMap::new();
+    for pack in packs {
+        let stamp = pack.installed.installed_at_unix_seconds;
+        let fingerprint = pack.installed.artifact_fingerprint.clone();
+        newest
+            .entry(pack.installed.backend_id.clone())
+            .and_modify(|(installed_at, current)| {
+                if stamp >= *installed_at {
+                    *installed_at = stamp;
+                    *current = fingerprint.clone();
+                }
+            })
+            .or_insert((stamp, fingerprint));
+    }
+    newest
 }
 
 fn gc_backend_store_locked(
@@ -6490,9 +6794,15 @@ fn gc_backend_store_locked(
         keep_backend_ids.insert(active.backend_id.clone());
     }
     let cutoff = now.saturating_sub(min_age.as_secs());
+    let discovered = discover_installed_backend_packs(home, &mut Vec::new())?;
+    let newest = newest_generation_fingerprints(&discovered);
+    let mut retained_ids = keep_backend_ids.clone();
+    for backend_id in newest.keys() {
+        retained_ids.insert(backend_id.clone());
+    }
     let mut report = BackendStoreGcReport {
         schema_version: BACKEND_STORE_SCHEMA_VERSION,
-        retained_backend_ids: keep_backend_ids.iter().cloned().collect(),
+        retained_backend_ids: retained_ids.into_iter().collect(),
         removed_pack_directories: 0,
         removed_staging_directories: 0,
         removed_content_objects: 0,
@@ -6533,6 +6843,11 @@ fn gc_backend_store_locked(
                 let caller_kept = installed
                     .as_ref()
                     .is_some_and(|installed| keep_backend_ids.contains(&installed.backend_id));
+                let library_current = installed.as_ref().is_some_and(|installed| {
+                    newest.get(&installed.backend_id).is_some_and(|(_, fingerprint)| {
+                        fingerprint == &installed.artifact_fingerprint
+                    })
+                });
                 let modified = safe_tree_stats(&pack_dir)
                     .map(|stats| stats.newest_modified_unix_seconds)
                     .unwrap_or(now);
@@ -6541,7 +6856,7 @@ fn gc_backend_store_locked(
                     .map(|installed| installed.installed_at_unix_seconds.max(modified))
                     .unwrap_or(modified)
                     > cutoff;
-                if active_match || caller_kept || young {
+                if active_match || caller_kept || young || library_current {
                     if let Some(installed) = installed {
                         for file in installed.files {
                             if matches!(

@@ -744,13 +744,26 @@ pub(crate) enum BackendPluginCommand {
     },
     /// Remove the optional GPU selector; bundled CPU remains.
     Deactivate,
-    /// Reclaim unselected backend-pack generations and shared vendor objects.
-    /// Active and explicitly retained backend ids are never removed.
+    /// Reclaim replaced backend-pack generations and unreferenced vendor objects.
+    /// Installed library packs stay until explicitly uninstalled.
     Gc {
         #[arg(long = "keep-backend-id")]
         keep_backend_ids: Vec<String>,
         #[arg(long, default_value_t = 7 * 24 * 60 * 60)]
         min_age_seconds: u64,
+    },
+    /// List installed optional GPU packs (library membership, not the active kernel).
+    List,
+    /// Delete one vendor's installed library pack. Refuses if that pack is in use.
+    Uninstall {
+        #[arg(value_parser = ["cuda", "hip"])]
+        provider: String,
+    },
+    /// Import an official CUDA/HIP pack from a local file or folder. Does not activate.
+    Import {
+        #[arg(value_parser = ["cuda", "hip"])]
+        provider: String,
+        path: PathBuf,
     },
 }
 
