@@ -1563,8 +1563,7 @@ async fn native_streaming_same_key_preemption_frees_new_attach_after_client_disc
         .remote_policy()
         .set_reconnect_grace(Duration::from_millis(20));
     let (event_sender, _event_receiver) = mpsc::channel(8);
-    let mut abandoned_session =
-        WsSession::new(runtime.clone(), test_distribution(), event_sender);
+    let mut abandoned_session = WsSession::new(runtime.clone(), test_distribution(), event_sender);
     let (started_sender, started_receiver) = std::sync::mpsc::channel();
     let (release_sender, release_receiver) = std::sync::mpsc::channel();
     abandoned_session
@@ -4210,12 +4209,95 @@ async fn finish_transport_closed_holds_session_for_reconnect_grace() {
         .expect("client rebind must resume the held session");
     assert!(!runtime.native_execution.remote_policy().has_held_realtime());
     assert!(!control.is_canceled());
-    assert!(resumed.controller.is_some(), "resume must restore the running controller");
-    let started = event_receiver2.recv().await.expect("resume handshake event");
+    assert!(
+        resumed.controller.is_some(),
+        "resume must restore the running controller"
+    );
+    let started = event_receiver2
+        .recv()
+        .await
+        .expect("resume handshake event");
     assert_eq!(
         started.event_type, "audio.input.started",
-        "Desktop startRealtimeSession waits on audio.input.started after session.start session_id"
+        "a resumed Running session must emit audio.input.started so the client handshake can complete"
     );
+}
+
+#[tokio::test]
+async fn held_realtime_resume_rejects_a_different_device() {
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .set_reconnect_grace(Duration::from_secs(30));
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new_with_remote_identity(
+        runtime.clone(),
+        test_distribution(),
+        event_sender,
+        false,
+        Some("device-a".to_string()),
+        false,
+        true,
+    );
+    let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
+        "test_session",
+        "whisper-large-v3-turbo",
+        timestamp_now(),
+    ))
+    .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::Configure, timestamp_now())
+        .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::StartAudio, timestamp_now())
+        .unwrap();
+    session.controller = Some(controller);
+    let session_id = session.session_id.0.clone();
+    session.finish("transport_closed", true).await.unwrap();
+    assert!(runtime.native_execution.remote_policy().has_held_realtime());
+
+    let (event_sender2, mut event_receiver2) = mpsc::channel(8);
+    let mut other = WsSession::new_with_remote_identity(
+        runtime.clone(),
+        test_distribution(),
+        event_sender2,
+        false,
+        Some("device-b".to_string()),
+        false,
+        true,
+    );
+    assert!(
+        other
+            .start_session(StartSession {
+                session_id: Some(session_id.clone()),
+                ..StartSession::default()
+            })
+            .await
+            .is_err()
+    );
+    let denied = event_receiver2.recv().await.expect("deny event");
+    assert_eq!(denied.event_type, "error");
+    assert!(runtime.native_execution.remote_policy().has_held_realtime());
+
+    let (event_sender3, _event_receiver3) = mpsc::channel(8);
+    let mut owner = WsSession::new_with_remote_identity(
+        runtime.clone(),
+        test_distribution(),
+        event_sender3,
+        false,
+        Some("device-a".to_string()),
+        false,
+        true,
+    );
+    owner
+        .start_session(StartSession {
+            session_id: Some(session_id),
+            ..StartSession::default()
+        })
+        .await
+        .expect("the owning device must resume its held session");
+    assert!(!runtime.native_execution.remote_policy().has_held_realtime());
 }
 
 #[tokio::test]
@@ -4509,6 +4591,50 @@ async fn session_start_uses_request_execution_target() {
         session.execution_target,
         Some(openasr_core::ExecutionTarget::Cpu)
     );
+}
+
+#[tokio::test]
+async fn remote_compute_session_ignores_client_hardware_fields() {
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new_with_remote_identity(
+        ServerRuntime::default(),
+        test_distribution(),
+        event_sender,
+        false,
+        Some("device-a".to_string()),
+        false,
+        true,
+    );
+
+    session
+        .start_session(StartSession {
+            model: Some("whisper-large-v3-turbo".to_string()),
+            inference_threads: Some(8),
+            execution_target: Some(openasr_core::ExecutionTarget::Cpu),
+            ..StartSession::default()
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        session.inference_threads.is_none(),
+        "pairing-mode sockets must not honor client inference_threads"
+    );
+    assert_eq!(
+        session.execution_target,
+        Some(openasr_core::ExecutionTarget::Auto),
+        "pairing-mode sockets must ignore client execution_target and use the operator preference"
+    );
+}
+
+#[test]
+fn realtime_session_ids_are_unguessable() {
+    let first = next_session_id("rt_ws");
+    let second = next_session_id("rt_ws");
+    assert_ne!(first.0, second.0);
+    assert!(first.0.starts_with("rt_ws_"));
+    assert_eq!(first.0.len(), "rt_ws_".len() + 32);
+    assert!(!first.0.contains("000001"));
 }
 
 #[tokio::test]

@@ -2389,6 +2389,7 @@ fn run_native_transcription_impl(
                 .as_deref()
                 .expect("external speaker plan has a resolved embedder"),
             hint,
+            request.voice_id,
             &execution_context,
             progress,
         )?
@@ -3366,14 +3367,16 @@ struct SpeakerAttribution {
 }
 
 /// Diarize the prepared audio into recording-local speaker turns, then match
-/// enrolled people from those turns. All external protocol details stay
-/// behind `ExternalDiarizer`; this layer only consumes normalized turns and
-/// centroids.
+/// enrolled people from those turns when enrolled naming is on. Anonymous
+/// diarize (`!name_enrolled`) keeps `SPEAKER_XX` labels and never opens the
+/// operator person store. All external protocol details stay behind
+/// `ExternalDiarizer`; this layer only consumes normalized turns and centroids.
 fn compute_speaker_attribution(
     diarizer: &crate::diarize::external::ExternalDiarizer,
     samples: PcmSlice,
     embedder: &dyn crate::diarize::embed::SpeakerEmbedder,
     hint: crate::diarize::contract::DiarizeHint,
+    name_enrolled: bool,
     execution_context: &crate::RequestExecutionContext,
     progress: &ProgressReporter,
 ) -> Result<SpeakerAttribution, BackendError> {
@@ -3439,6 +3442,22 @@ fn compute_speaker_attribution(
                 turn.overlap
             );
         }
+    }
+    if !name_enrolled {
+        crate::stage_timing::log_detail_event(
+            "speaker_attribution",
+            format_args!(
+                "stage=complete speakers={} named=0 unnamed={} duration_ms={:.3}",
+                timeline.centroids.len(),
+                timeline.centroids.len(),
+                total_started.elapsed().as_secs_f64() * 1000.0,
+            ),
+        );
+        return Ok(SpeakerAttribution {
+            timeline,
+            identities: BTreeMap::new(),
+            unnamed_speakers: Vec::new(),
+        });
     }
     progress.enter_stage(TranscriptionStage::IdentifySpeakers);
     let identity_progress = progress.clone();

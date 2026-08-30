@@ -610,7 +610,19 @@ pub(crate) async fn transcription_progress() -> Result<Response, ApiError> {
 /// names exactly one run. A live duplicate id is rejected at registration.
 pub(crate) async fn transcription_progress_by_id(
     AxumPath(id): AxumPath<String>,
+    Extension(auth): Extension<crate::ServerAuth>,
+    Extension(distribution): Extension<DistributionContext>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    let owner = distribution.transcription_owner(&id);
+    let caller = auth.pairing_device_id_for_headers(&headers);
+    if !caller_may_control_transcription(
+        owner.as_deref(),
+        caller.as_deref(),
+        auth.authorizes_pairing_admin(&headers),
+    ) {
+        return Ok(Json(TranscriptionProgressBody::idle()).into_response());
+    }
     let body = match openasr_core::api::backend::native_transcription_progress_for_id(&id) {
         Some(progress) => TranscriptionProgressBody::from_progress(progress),
         None => TranscriptionProgressBody::idle(),
@@ -648,6 +660,7 @@ pub(crate) struct TranscriptionControlBody {
 /// more worker thread to protect, so a normal completion must never also
 /// fire a spurious cancel.
 struct ActiveTranscriptionCleanup {
+    runtime: Option<ServerRuntime>,
     distribution: DistributionContext,
     policy: RemoteRuntimePolicy,
     transcription_id: String,
@@ -657,18 +670,50 @@ struct ActiveTranscriptionCleanup {
 
 impl ActiveTranscriptionCleanup {
     fn new(
+        runtime: Option<ServerRuntime>,
         distribution: DistributionContext,
         policy: RemoteRuntimePolicy,
         transcription_id: String,
         control: Arc<openasr_core::TranscriptionControl>,
     ) -> Self {
         Self {
+            runtime,
             distribution,
             policy,
             transcription_id,
             control,
             armed: true,
         }
+    }
+
+    fn observe_idle(&self) {
+        if let Some(runtime) = self.runtime.clone() {
+            schedule_apply_pending_idle_switch_when_native_idle(runtime, self.distribution.clone());
+        }
+    }
+
+    fn schedule_finish_after_native_idle(&self) {
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let policy = self.policy.clone();
+        let id = self.transcription_id.clone();
+        let distribution = self.distribution.clone();
+        handle.spawn(async move {
+            for _ in 0..500 {
+                if !runtime.native_rebind_blocked() {
+                    policy.finish_file(&id);
+                    apply_pending_idle_switch_if_idle(&runtime, &distribution);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            policy.finish_file(&id);
+            apply_pending_idle_switch_if_idle(&runtime, &distribution);
+        });
     }
 
     /// Disarms the disconnect-cancel safety net. Call this once the decode
@@ -683,9 +728,18 @@ impl Drop for ActiveTranscriptionCleanup {
     fn drop(&mut self) {
         if self.armed {
             self.control.request_cancel();
-            self.policy.cancel_file(&self.transcription_id);
+            if self.policy.is_file_queued(&self.transcription_id) {
+                self.policy.cancel_file(&self.transcription_id);
+                self.observe_idle();
+            } else if self.policy.file_running().as_deref() == Some(self.transcription_id.as_str())
+            {
+                self.schedule_finish_after_native_idle();
+            } else {
+                self.observe_idle();
+            }
         } else {
             self.policy.finish_file(&self.transcription_id);
+            self.observe_idle();
         }
         self.distribution
             .clear_transcription_if_current(&self.transcription_id, &self.control);
@@ -716,9 +770,7 @@ fn file_slot_occupied(runtime: &ServerRuntime, except_id: Option<&str>) -> bool 
     let other_file = policy
         .file_running()
         .is_some_and(|running| except_id != Some(running.as_str()));
-    other_file
-        || runtime.native_execution.has_active_sessions()
-        || policy.has_held_realtime()
+    other_file || runtime.native_execution.has_active_sessions() || policy.has_held_realtime()
 }
 
 async fn wait_for_file_admission(
@@ -776,7 +828,7 @@ fn record_file_operator_run(
             success,
             error_type: error_type.map(str::to_string),
         });
-    apply_pending_idle_switch_if_idle(runtime, distribution);
+    schedule_apply_pending_idle_switch_when_native_idle(runtime.clone(), distribution.clone());
 }
 
 fn register_active_transcription(
@@ -804,9 +856,12 @@ pub(crate) fn caller_may_control_transcription(
         return true;
     }
     match (owner_device_id, caller_device_id) {
-        (None, _) => true,
         (Some(owner), Some(caller)) => owner == caller,
-        (Some(_), None) => false,
+        // Missing owner is an operator-local job. A caller with no device id
+        // is the local operator path (pairing disabled). A paired device
+        // cannot control it.
+        (None, None) => true,
+        (None, Some(_)) | (Some(_), None) => false,
     }
 }
 
@@ -907,11 +962,8 @@ async fn run_offline_transcription(
             upload_ingest_duration,
         );
     }
-    if is_remote_compute_client_request(&headers, &auth) && parsed.request.voice_id {
-        // Remote clients may request anonymous speaker separation. Enrolled
-        // Voice ID matching stays on the originating device.
-        parsed.request.voice_id = false;
-        parsed.request.anonymous_diarize = true;
+    if is_remote_compute_client_request(&headers, &auth) {
+        apply_remote_compute_client_request_policy(&mut parsed.request);
     }
     if parsed.stream_form_field {
         // Fail closed instead of silently returning a JSON body an OpenAI SDK
@@ -979,6 +1031,7 @@ async fn run_offline_transcription(
     // of leaking. Disarmed immediately after that call returns, either way.
     let mut control_cleanup = control.as_ref().map(|(id, control)| {
         ActiveTranscriptionCleanup::new(
+            Some(runtime.clone()),
             distribution.clone(),
             runtime.native_execution.remote_policy().clone(),
             id.clone(),
@@ -1004,11 +1057,7 @@ async fn run_offline_transcription(
             }
             return Err(error);
         }
-    } else if !runtime
-        .native_execution
-        .remote_policy()
-        .admits_new_tasks()
-    {
+    } else if !runtime.native_execution.remote_policy().admits_new_tasks() {
         return Err(ApiError::Conflict(PENDING_IDLE_SWITCH_MESSAGE.to_string()));
     } else if file_slot_occupied(&runtime, None) {
         return Err(ApiError::Busy(SERVER_BUSY_MESSAGE.to_string()));
@@ -1283,6 +1332,18 @@ pub(crate) fn is_remote_compute_client_request(headers: &HeaderMap, auth: &Serve
     // security switch: a paired device that accidentally or deliberately
     // omits the header must still be isolated from local history and Voice ID.
     auth.authorizes_remote_compute_client(headers)
+}
+
+/// Remote clients never send enrolled Voice ID or local hardware policy.
+/// Speaker separation becomes anonymous labels; threads/target come from the
+/// operator machine preference (filled later) or Auto.
+pub(crate) fn apply_remote_compute_client_request_policy(request: &mut TranscriptionRequest) {
+    if request.voice_id {
+        request.voice_id = false;
+        request.anonymous_diarize = true;
+    }
+    request.inference_threads = None;
+    request.execution_target = None;
 }
 
 pub(crate) fn record_file_transcription_history(
@@ -1998,6 +2059,7 @@ mod active_transcription_cleanup_tests {
 
         {
             let _cleanup = ActiveTranscriptionCleanup::new(
+                None,
                 distribution.clone(),
                 RemoteRuntimePolicy::new(),
                 "txn-disconnect".to_string(),
@@ -2028,6 +2090,7 @@ mod active_transcription_cleanup_tests {
 
         {
             let mut cleanup = ActiveTranscriptionCleanup::new(
+                None,
                 distribution.clone(),
                 RemoteRuntimePolicy::new(),
                 "txn-normal".to_string(),
@@ -2076,7 +2139,32 @@ mod active_transcription_cleanup_tests {
             Some("device-b"),
             true
         ));
-        assert!(super::caller_may_control_transcription(None, Some("device-b"), false));
+        assert!(
+            !super::caller_may_control_transcription(None, Some("device-b"), false),
+            "a paired device must not control an operator-local job"
+        );
+        assert!(super::caller_may_control_transcription(None, None, false));
+        assert!(super::caller_may_control_transcription(
+            None,
+            Some("device-b"),
+            true
+        ));
+    }
+
+    #[test]
+    fn remote_compute_client_policy_remaps_diarize_and_drops_local_hardware() {
+        let mut request =
+            openasr_core::TranscriptionRequest::new("fixtures/jfk.wav", "whisper-tiny")
+                .with_voice_id(true)
+                .with_diarize_speakers(Some(2))
+                .with_inference_threads(Some(8))
+                .with_execution_target(Some(openasr_core::ExecutionTarget::Cpu));
+        super::apply_remote_compute_client_request_policy(&mut request);
+        assert!(!request.voice_id);
+        assert!(request.anonymous_diarize);
+        assert_eq!(request.diarize_speakers, Some(2));
+        assert!(request.inference_threads.is_none());
+        assert!(request.execution_target.is_none());
     }
 
     #[test]
@@ -2464,6 +2552,7 @@ pub(crate) async fn transcribe_with_runtime(
                         &model_session_key,
                         resolved_route.as_ref(),
                         NativeAdmissionKind::File,
+                        execution_context.request_id.as_deref(),
                     );
                 let admission_wait_duration = admission_wait_started.elapsed();
                 openasr_core::stage_timing::log_stage(
@@ -2501,6 +2590,8 @@ pub(crate) async fn transcribe_with_runtime(
                                 .with_phrase_bias(request.phrase_bias.clone())
                                 .with_inference_threads(request.inference_threads)
                                 .with_voice_id(request.voice_id)
+                                .with_anonymous_diarize(request.anonymous_diarize)
+                                .with_diarize_speakers(request.diarize_speakers)
                                 .with_word_timestamps(request.word_timestamps)
                                 .with_word_timestamps_refine(request.word_timestamps_refine),
                         )
@@ -2787,8 +2878,9 @@ mod native_runtime_tests {
     use std::fs;
 
     use axum::{
+        Extension,
         extract::{FromRequest, Path as AxumPath},
-        http::StatusCode,
+        http::{HeaderMap, StatusCode},
         response::{IntoResponse, Response},
     };
 
@@ -3091,9 +3183,17 @@ mod native_runtime_tests {
     /// "fall back to a time estimate."
     #[tokio::test]
     async fn transcription_progress_by_id_defaults_to_idle_body_for_unknown_id() {
-        let response = super::transcription_progress_by_id(AxumPath(
-            "transcription-progress-by-id-unknown-probe".to_string(),
-        ))
+        let distribution = crate::DistributionContext::new(crate::DistributionRuntime {
+            openasr_home: None,
+            catalog_url: None,
+            catalog_local_override: None,
+        });
+        let response = super::transcription_progress_by_id(
+            AxumPath("transcription-progress-by-id-unknown-probe".to_string()),
+            Extension(crate::ServerAuth::disabled()),
+            Extension(distribution),
+            HeaderMap::new(),
+        )
         .await
         .expect("unknown id must not error");
         let value = response_json_body(response).await;
@@ -3101,6 +3201,14 @@ mod native_runtime_tests {
         assert_eq!(value["fraction"], serde_json::json!(0.0));
         assert_eq!(value["done"], serde_json::json!(0));
         assert_eq!(value["total"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn device_cannot_read_operator_local_progress() {
+        assert!(
+            !super::caller_may_control_transcription(None, Some("device-a"), false),
+            "missing owner is operator-local; device tokens must see idle, not the live job"
+        );
     }
 
     #[tokio::test]

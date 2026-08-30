@@ -1785,6 +1785,56 @@ fn rebind_native_model_pack_returns_conflict_while_session_is_active() {
 }
 
 #[tokio::test]
+async fn scheduled_idle_switch_waits_while_native_slot_is_occupied() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack_a = temp.path().join("pack-a.oasr");
+    write_mock_gguf_runtime_source(&pack_a, Some("whisper-tiny"));
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_a.clone()).into(),
+    };
+    let permit = runtime
+        .acquire_native_execution("native:whisper-tiny@idle-switch-wait", None)
+        .unwrap();
+    runtime
+        .native_execution
+        .remote_policy()
+        .request_idle_switch("whisper-tiny:fp16");
+    assert!(runtime.native_rebind_blocked());
+    assert!(!idle_switch_slot_is_clear(&runtime));
+    let dist = DistributionContext::new(DistributionRuntime {
+        openasr_home: Some(temp.path().join("home")),
+        catalog_url: None,
+        catalog_local_override: None,
+    });
+    schedule_apply_pending_idle_switch_when_native_idle(runtime.clone(), dist);
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    assert_eq!(
+        runtime
+            .native_execution
+            .remote_policy()
+            .pending_idle_switch()
+            .as_deref(),
+        Some("whisper-tiny:fp16"),
+        "must not apply while the native permit is still held"
+    );
+    drop(permit);
+    for _ in 0..50 {
+        if idle_switch_slot_is_clear(&runtime) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        idle_switch_slot_is_clear(&runtime),
+        "dropping the permit must clear the native slot so idle-switch can apply"
+    );
+}
+
+#[tokio::test]
 async fn set_default_model_http_returns_conflict_when_native_session_is_busy() {
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
@@ -2702,6 +2752,7 @@ fn stale_active_runtime_snapshot_cannot_start_after_republication() {
             "stale-snapshot",
             None,
             NativeAdmissionKind::Realtime,
+            None,
         ),
         Err(ApiError::Conflict(_))
     ));
@@ -2717,6 +2768,7 @@ fn stale_active_runtime_snapshot_cannot_start_after_republication() {
             "fresh-snapshot",
             None,
             NativeAdmissionKind::Realtime,
+            None,
         )
         .expect("the current publication may be admitted");
     drop(permit);
@@ -4151,6 +4203,71 @@ fn policy_test_app(runtime: ServerRuntime, home: std::path::PathBuf) -> axum::Ro
             catalog_local_override: None,
         },
     )
+}
+
+#[tokio::test]
+async fn pairing_mode_file_diarize_returns_anonymous_speaker_labels() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let auth = ServerAuth::pairing("admin-secret");
+    let request = auth.create_pairing_request("Phone").unwrap();
+    auth.approve_pairing_request(&request.request_id).unwrap();
+    let PairingCredentialState::Ready(credential) =
+        auth.pairing_credential(&request.request_id).unwrap()
+    else {
+        panic!("expected approved pairing credential");
+    };
+
+    let app = app_with_runtime_and_distribution_and_launch_options(
+        ServerRuntime::default(),
+        DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+        ServerLaunchOptions {
+            auth,
+            ..ServerLaunchOptions::default()
+        },
+    );
+
+    let boundary = "openasr-pairing-diarize";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.wav\"\r\nContent-Type: audio/wav\r\n\r\nnot a real wav\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"diarize\"\r\n\r\ntrue\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"inference_threads\"\r\n\r\n8\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"execution_target\"\r\n\r\ncpu\r\n--{boundary}--\r\n"
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", credential.bearer_token),
+                )
+                .header(REMOTE_COMPUTE_HEADER, REMOTE_COMPUTE_CLIENT_VALUE)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let segment = &json["segments"][0];
+    assert_eq!(segment["speaker"].as_str(), Some("SPEAKER_00"));
+    assert_eq!(segment["speaker_label"].as_str(), Some("SPEAKER_00"));
+    assert!(
+        segment.get("speaker_person_id").is_none() || segment["speaker_person_id"].is_null(),
+        "remote file diarize must not leak enrolled person ids: {segment}"
+    );
 }
 
 #[tokio::test]

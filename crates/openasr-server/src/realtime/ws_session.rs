@@ -189,6 +189,9 @@ pub(crate) struct WsSession {
     pub(crate) history_duration_ms: u64,
     pub(crate) history_recorded: bool,
     pub(crate) record_history: bool,
+    pub(crate) pairing_device_id: Option<String>,
+    pub(crate) caller_is_operator: bool,
+    pub(crate) remote_compute_client: bool,
     pub(crate) backend_failed: bool,
     pub(crate) closed: bool,
     pub(crate) captured_audio_frames: VecDeque<RealtimeAudioFrame>,
@@ -489,14 +492,35 @@ impl WsSession {
         distribution: DistributionContext,
         event_sender: mpsc::Sender<RealtimeEventEnvelope>,
     ) -> Self {
-        Self::new_with_history(runtime, distribution, event_sender, true)
+        Self::new_with_remote_identity(runtime, distribution, event_sender, true, None, true, false)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_history(
         runtime: ServerRuntime,
         distribution: DistributionContext,
         event_sender: mpsc::Sender<RealtimeEventEnvelope>,
         record_history: bool,
+    ) -> Self {
+        Self::new_with_remote_identity(
+            runtime,
+            distribution,
+            event_sender,
+            record_history,
+            None,
+            true,
+            false,
+        )
+    }
+
+    pub(crate) fn new_with_remote_identity(
+        runtime: ServerRuntime,
+        distribution: DistributionContext,
+        event_sender: mpsc::Sender<RealtimeEventEnvelope>,
+        record_history: bool,
+        pairing_device_id: Option<String>,
+        caller_is_operator: bool,
+        remote_compute_client: bool,
     ) -> Self {
         let (audio_frames, audio_frame_receiver) = mpsc::channel(AUDIO_FRAME_QUEUE_CAPACITY);
         let format = RealtimeAudioFormat::pcm16_mono_16khz();
@@ -544,6 +568,9 @@ impl WsSession {
             history_duration_ms: 0,
             history_recorded: false,
             record_history,
+            pairing_device_id,
+            caller_is_operator,
+            remote_compute_client,
             backend_failed: false,
             closed: false,
             captured_audio_frames: VecDeque::new(),
@@ -754,6 +781,7 @@ impl WsSession {
         policy.hold_realtime(
             self.session_id.0.clone(),
             Arc::clone(&self.backend_control),
+            self.pairing_device_id.clone(),
         );
         super::park_realtime_control(
             self.session_id.0.clone(),
@@ -763,12 +791,22 @@ impl WsSession {
                 native_speaker_change_detector: self.native_speaker_change_detector.take(),
             },
         );
-        super::spawn_held_realtime_expiry(policy.clone(), self.session_id.0.clone());
+        super::spawn_held_realtime_expiry(
+            policy.clone(),
+            self.runtime.clone(),
+            self.distribution.clone(),
+            self.session_id.0.clone(),
+        );
     }
 
     async fn resume_held_realtime(&mut self, resume_id: &str) -> Result<(), ()> {
         let policy = self.runtime.native_execution.remote_policy();
-        let Some(control) = policy.resume_realtime(resume_id, SystemTime::now()) else {
+        let Some(control) = policy.resume_realtime(
+            resume_id,
+            SystemTime::now(),
+            self.pairing_device_id.as_deref(),
+            self.caller_is_operator,
+        ) else {
             self.emit_error(
                 RealtimeErrorCode::BackendNotReady,
                 "The remote session is no longer available.",
@@ -789,8 +827,8 @@ impl WsSession {
             self.streaming_diarizer = parked.streaming_diarizer;
             self.native_speaker_change_detector = parked.native_speaker_change_detector;
         }
-        // Desktop startRealtimeSession waits on this event after session.start.
-        // The restored controller is already Running, so emit it directly.
+        // A resumed Running session must emit audio.input.started so the
+        // client handshake can complete.
         self.emit_event(RealtimeEvent::AudioInput(
             openasr_core::RealtimeAudioInputEvent::Started(
                 openasr_core::realtime::events::AudioInputStartedEvent {},
@@ -798,6 +836,13 @@ impl WsSession {
         ))
         .await?;
         Ok(())
+    }
+
+    pub(crate) fn observe_idle_for_pending_switch(&self) {
+        crate::schedule_apply_pending_idle_switch_when_native_idle(
+            self.runtime.clone(),
+            self.distribution.clone(),
+        );
     }
 
     fn attach_anonymous_streaming_diarizer(&mut self) -> Result<(), String> {
@@ -813,7 +858,7 @@ impl WsSession {
                 #[cfg(test)]
                 {
                     self.attach_test_anonymous_diarizer();
-                    return Ok(());
+                    Ok(())
                 }
                 #[cfg(not(test))]
                 Err(
@@ -826,7 +871,7 @@ impl WsSession {
                 {
                     let _ = error;
                     self.attach_test_anonymous_diarizer();
-                    return Ok(());
+                    Ok(())
                 }
                 #[cfg(not(test))]
                 Err(format!(
@@ -944,14 +989,17 @@ impl WsSession {
         // Voice ID matching and does not require the speaker-identity stage.
         let anonymous_diarize = session.diarize.unwrap_or(false);
         self.required_stage_readiness = RequiredStageReadinessBarrier::for_session(false);
-        if anonymous_diarize {
-            if let Err(message) = self.attach_anonymous_streaming_diarizer() {
-                self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
-                    .await?;
-                return Err(());
-            }
+        if anonymous_diarize && let Err(message) = self.attach_anonymous_streaming_diarizer() {
+            self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
+                .await?;
+            return Err(());
         }
-        let execution_target = session.execution_target.or_else(|| {
+        let client_execution_target = if self.remote_compute_client {
+            None
+        } else {
+            session.execution_target
+        };
+        let execution_target = client_execution_target.or_else(|| {
             self.distribution
                 .openasr_home()
                 .ok()
@@ -1043,20 +1091,25 @@ impl WsSession {
         self.task = session.task;
         self.prompt = session.prompt;
         self.phrase_bias = phrase_bias;
-        self.inference_threads =
-            match validate_realtime_inference_threads(session.inference_threads) {
-                Ok(inference_threads) => inference_threads.or_else(|| {
-                    self.distribution
-                        .openasr_home()
-                        .ok()
-                        .and_then(|home| realtime_inference_threads_preference(&home))
-                }),
-                Err(message) => {
-                    self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
-                        .await?;
-                    return Err(());
-                }
-            };
+        let client_inference_threads = if self.remote_compute_client {
+            None
+        } else {
+            session.inference_threads
+        };
+        self.inference_threads = match validate_realtime_inference_threads(client_inference_threads)
+        {
+            Ok(inference_threads) => inference_threads.or_else(|| {
+                self.distribution
+                    .openasr_home()
+                    .ok()
+                    .and_then(|home| realtime_inference_threads_preference(&home))
+            }),
+            Err(message) => {
+                self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
+                    .await?;
+                return Err(());
+            }
+        };
         self.execution_target = execution_target;
         self.word_timestamps = word_timestamps;
         self.source_name = source_name;
@@ -1209,6 +1262,7 @@ impl WsSession {
             &model_session_key,
             resolved_route.as_ref(),
             crate::NativeAdmissionKind::Realtime,
+            None,
         ) {
             Ok(permit) => permit,
             Err(error) => {
@@ -2795,9 +2849,11 @@ impl WsSession {
                     BackendResult::Error(error) => {
                         self.pending_backend_jobs = self.pending_backend_jobs.saturating_sub(1);
                         let recoverable = matches!(
-                    error,
-                    ApiError::ModelSessionCapacity(_) | ApiError::Busy(_) | ApiError::Conflict(_)
-                );
+                            error,
+                            ApiError::ModelSessionCapacity(_)
+                                | ApiError::Busy(_)
+                                | ApiError::Conflict(_)
+                        );
                         if !self.backend_failed {
                             self.emit_error(
                                 realtime_error_code_for_api_error(&error),
@@ -2868,6 +2924,7 @@ impl WsSession {
             self.emit_envelope(closed).await?;
             self.closed = true;
         }
+        self.observe_idle_for_pending_switch();
         if self.backend_failed { Err(()) } else { Ok(()) }
     }
 
@@ -2920,6 +2977,7 @@ impl WsSession {
             self.record_history_entry().await?;
         }
         self.closed = true;
+        self.observe_idle_for_pending_switch();
         Ok(())
     }
 
@@ -2937,6 +2995,7 @@ impl WsSession {
                 self.emit_envelope(closed).await?;
             }
             self.closed = true;
+            self.observe_idle_for_pending_switch();
             return Err(());
         }
         self.cancel_backend_jobs();
@@ -2949,6 +3008,7 @@ impl WsSession {
             self.emit_envelope(closed).await?;
         }
         self.closed = true;
+        self.observe_idle_for_pending_switch();
         Err(())
     }
 

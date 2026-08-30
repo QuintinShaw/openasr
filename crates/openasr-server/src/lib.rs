@@ -1725,6 +1725,7 @@ impl ServerRuntime {
             verified_model_identity,
             route,
             NativeAdmissionKind::Realtime,
+            None,
         )
     }
 
@@ -1738,6 +1739,7 @@ impl ServerRuntime {
         verified_model_identity: &str,
         route: Option<&openasr_core::ResolvedExecutionRoute>,
         kind: NativeAdmissionKind,
+        admitted_file_id: Option<&str>,
     ) -> Result<AdmittedNativeExecution, ApiError> {
         let _activation_gate = match self.model_pack_path.activation_barrier.try_lock() {
             Ok(guard) => guard,
@@ -1759,7 +1761,12 @@ impl ServerRuntime {
         // runtime/session construction cannot begin in the gap after the
         // reaper observed zero activity but before it tears owners down.
         let activity = NativeActivityGuard::enter();
-        let permit = self.try_acquire_native_execution(verified_model_identity, route, kind)?;
+        let permit = self.try_acquire_native_execution(
+            verified_model_identity,
+            route,
+            kind,
+            admitted_file_id,
+        )?;
         Ok(AdmittedNativeExecution { permit, activity })
     }
 
@@ -1768,9 +1775,12 @@ impl ServerRuntime {
         verified_model_identity: &str,
         route: Option<&openasr_core::ResolvedExecutionRoute>,
         kind: NativeAdmissionKind,
+        admitted_file_id: Option<&str>,
     ) -> Result<ModelSessionPermit, ApiError> {
         let policy = self.native_execution.remote_policy();
-        if !policy.admits_new_tasks() {
+        let already_admitted_file =
+            admitted_file_id.is_some_and(|id| policy.file_already_admitted(id));
+        if !already_admitted_file && !policy.admits_new_tasks() {
             return Err(ApiError::Conflict(PENDING_IDLE_SWITCH_MESSAGE.to_string()));
         }
         if kind == NativeAdmissionKind::Realtime
@@ -2716,7 +2726,11 @@ async fn models(
                         .map_err(ApiError::Backend)?;
                     let identity = resolve_verified_native_runtime_model_identity(&adapter, None)
                         .map_err(ApiError::Backend)?;
-                    let pull = bound_pack_display_pull(&distribution, &model_pack_path, &identity.model_id);
+                    let pull = bound_pack_display_pull(
+                        &distribution,
+                        &model_pack_path,
+                        &identity.model_id,
+                    );
                     vec![served_model_item(identity.model_id, pull)]
                 }
             }

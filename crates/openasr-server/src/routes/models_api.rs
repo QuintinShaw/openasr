@@ -1,7 +1,7 @@
 //! Model-management endpoints (local list, default get/set, delete, import)
 //! and installed-pack/default-pack resolution. Pure code-motion from `lib.rs`.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -107,18 +107,55 @@ pub(crate) async fn cancel_idle_switch(
     )?))
 }
 
+pub(crate) fn idle_switch_slot_is_clear(runtime: &ServerRuntime) -> bool {
+    let policy = runtime.native_execution.remote_policy();
+    !runtime.native_rebind_blocked() && policy.files_idle() && !policy.has_held_realtime()
+}
+
+/// Native realtime `join`/`detach_cancel` drop the command channel but leave
+/// the model permit on the worker until it actually exits. Callers must not
+/// apply on the next line after `drop(commands)`.
+pub(crate) fn schedule_apply_pending_idle_switch_when_native_idle(
+    runtime: ServerRuntime,
+    distribution: DistributionContext,
+) {
+    if idle_switch_slot_is_clear(&runtime) {
+        apply_pending_idle_switch_if_idle(&runtime, &distribution);
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        apply_pending_idle_switch_if_idle(&runtime, &distribution);
+        return;
+    };
+    handle.spawn(async move {
+        for _ in 0..500 {
+            if runtime
+                .native_execution
+                .remote_policy()
+                .pending_idle_switch()
+                .is_none()
+            {
+                return;
+            }
+            if idle_switch_slot_is_clear(&runtime) {
+                apply_pending_idle_switch_if_idle(&runtime, &distribution);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        apply_pending_idle_switch_if_idle(&runtime, &distribution);
+    });
+}
+
 pub(crate) fn apply_pending_idle_switch_if_idle(
     runtime: &ServerRuntime,
     distribution: &DistributionContext,
 ) {
-    if runtime.native_rebind_blocked() {
+    if !idle_switch_slot_is_clear(runtime) {
         return;
     }
-    let Some(pull) = runtime
-        .native_execution
-        .remote_policy()
-        .pending_idle_switch()
-    else {
+    let policy = runtime.native_execution.remote_policy();
+    let Some(pull) = policy.pending_idle_switch() else {
         return;
     };
     let Ok(home) = distribution.openasr_home() else {
@@ -129,7 +166,8 @@ pub(crate) fn apply_pending_idle_switch_if_idle(
         id: None,
         quant: None,
     };
-    let Ok(pack) = resolve_installed_pack_for_default(&home, distribution.catalog_source(), &request)
+    let Ok(pack) =
+        resolve_installed_pack_for_default(&home, distribution.catalog_source(), &request)
     else {
         return;
     };
@@ -785,7 +823,10 @@ pub(crate) async fn submit_capability_request(
     let device_id = auth
         .pairing_device_id_for_headers(&headers)
         .unwrap_or_else(|| "operator".to_string());
-    let intent = CapabilityIntent { device_id, features };
+    let intent = CapabilityIntent {
+        device_id,
+        features,
+    };
     runtime
         .native_execution
         .remote_policy()

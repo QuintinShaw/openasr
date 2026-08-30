@@ -47,7 +47,9 @@ impl FileTaskFifo {
 
     pub fn cancel(&mut self, id: &str) -> bool {
         if self.running.as_deref() == Some(id) {
-            self.running = self.queued.pop_front();
+            // Keep the running slot until `finish`. Promoting here would let
+            // the next id acquire while the cancelled worker still holds the
+            // native permit.
             return true;
         }
         let before = self.queued.len();
@@ -74,6 +76,10 @@ impl FileTaskFifo {
 
     pub fn is_queued(&self, id: &str) -> bool {
         self.queued.iter().any(|queued| queued == id)
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.running.is_none() && self.queued.is_empty()
     }
 
     #[allow(dead_code)]
@@ -200,6 +206,20 @@ impl CapabilityRequestQueue {
     }
 }
 
+pub fn caller_may_resume_held_realtime(
+    owner_device_id: Option<&str>,
+    caller_device_id: Option<&str>,
+    caller_is_operator: bool,
+) -> bool {
+    if caller_is_operator {
+        return true;
+    }
+    match (owner_device_id, caller_device_id) {
+        (Some(owner), Some(caller)) => owner == caller,
+        _ => false,
+    }
+}
+
 pub fn reconnect_expired(disconnected_at: SystemTime, now: SystemTime) -> bool {
     reconnect_expired_after(disconnected_at, now, REMOTE_RECONNECT_GRACE)
 }
@@ -226,6 +246,7 @@ pub fn recommended_catalog_id_for_feature(feature: &str) -> Option<&'static str>
 struct HeldRealtimeSession {
     disconnected_at: SystemTime,
     control: Arc<openasr_core::TranscriptionControl>,
+    owner_device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,18 +348,35 @@ impl RemoteRuntimePolicy {
         self.lock().files.is_queued(id)
     }
 
+    pub fn files_idle(&self) -> bool {
+        self.lock().files.is_idle()
+    }
+
+    pub fn file_already_admitted(&self, id: &str) -> bool {
+        let inner = self.lock();
+        inner.files.running() == Some(id) || inner.files.is_queued(id)
+    }
+
     /// Admit a file job: run now, queue behind the occupant, or reject when an
     /// idle-after-busy ASR switch is pending. Idempotent for an already
-    /// tracked id so HTTP waiters can re-poll.
+    /// tracked id so HTTP waiters can re-poll. A FIFO id that is already
+    /// `running` still waits when `occupied` is true: the previous worker may
+    /// still hold the native permit.
     pub fn admit_file(&self, id: &str, occupied: bool) -> Result<FileAdmit, RemoteAdmitError> {
         let mut inner = self.lock();
         if inner.files.running() == Some(id) {
+            if occupied {
+                return Ok(FileAdmit::Queued);
+            }
             return Ok(FileAdmit::Running);
         }
         if !occupied {
             inner.files.promote_head_if_idle();
         }
         if inner.files.running() == Some(id) {
+            if occupied {
+                return Ok(FileAdmit::Queued);
+            }
             return Ok(FileAdmit::Running);
         }
         if inner.files.is_queued(id) {
@@ -407,14 +445,16 @@ impl RemoteRuntimePolicy {
         &self,
         session_id: impl Into<String>,
         control: Arc<openasr_core::TranscriptionControl>,
+        owner_device_id: Option<String>,
     ) {
-        self.hold_realtime_at(session_id, control, SystemTime::now());
+        self.hold_realtime_at(session_id, control, owner_device_id, SystemTime::now());
     }
 
     pub fn hold_realtime_at(
         &self,
         session_id: impl Into<String>,
         control: Arc<openasr_core::TranscriptionControl>,
+        owner_device_id: Option<String>,
         now: SystemTime,
     ) {
         let mut inner = self.lock();
@@ -423,6 +463,7 @@ impl RemoteRuntimePolicy {
             HeldRealtimeSession {
                 disconnected_at: now,
                 control,
+                owner_device_id,
             },
         );
         self.inner.notify.notify_waiters();
@@ -432,13 +473,25 @@ impl RemoteRuntimePolicy {
         &self,
         session_id: &str,
         now: SystemTime,
+        caller_device_id: Option<&str>,
+        caller_is_operator: bool,
     ) -> Option<Arc<openasr_core::TranscriptionControl>> {
         let mut inner = self.lock();
         let held = inner.held_realtime.get(session_id)?;
         if reconnect_expired_after(held.disconnected_at, now, inner.reconnect_grace) {
             return None;
         }
-        inner.held_realtime.remove(session_id).map(|held| held.control)
+        if !caller_may_resume_held_realtime(
+            held.owner_device_id.as_deref(),
+            caller_device_id,
+            caller_is_operator,
+        ) {
+            return None;
+        }
+        inner
+            .held_realtime
+            .remove(session_id)
+            .map(|held| held.control)
     }
 
     pub fn has_held_realtime(&self) -> bool {
@@ -501,8 +554,27 @@ mod tests {
         idle.cancel();
         assert!(idle.admits_new_tasks());
         idle.request("moss-transcribe-diarize:q8");
-        assert_eq!(idle.apply_if_idle(false).as_deref(), Some("moss-transcribe-diarize:q8"));
+        assert_eq!(
+            idle.apply_if_idle(false).as_deref(),
+            Some("moss-transcribe-diarize:q8")
+        );
         assert!(idle.admits_new_tasks());
+    }
+
+    #[test]
+    fn pending_idle_switch_keeps_queued_files_until_fifo_is_empty() {
+        let policy = RemoteRuntimePolicy::new();
+        assert_eq!(policy.admit_file("a", false).unwrap(), FileAdmit::Running);
+        assert_eq!(policy.admit_file("b", true).unwrap(), FileAdmit::Queued);
+        policy.request_idle_switch("xasr-zh-en:fp16");
+        assert!(!policy.files_idle());
+        assert!(policy.file_already_admitted("b"));
+        assert_eq!(policy.admit_file("b", true).unwrap(), FileAdmit::Queued);
+        policy.finish_file("a");
+        assert!(!policy.files_idle());
+        policy.finish_file("b");
+        assert!(policy.files_idle());
+        assert!(!policy.admits_new_tasks());
     }
 
     #[test]
@@ -563,7 +635,8 @@ mod tests {
     fn admit_file_is_idempotent_and_blocks_new_work_during_idle_switch() {
         let policy = RemoteRuntimePolicy::new();
         assert_eq!(policy.admit_file("a", false).unwrap(), FileAdmit::Running);
-        assert_eq!(policy.admit_file("a", true).unwrap(), FileAdmit::Running);
+        assert_eq!(policy.admit_file("a", true).unwrap(), FileAdmit::Queued);
+        assert_eq!(policy.admit_file("a", false).unwrap(), FileAdmit::Running);
         assert_eq!(policy.admit_file("b", true).unwrap(), FileAdmit::Queued);
         policy.request_idle_switch("xasr-zh-en:fp16");
         assert_eq!(
@@ -572,7 +645,24 @@ mod tests {
         );
         assert_eq!(policy.admit_file("b", true).unwrap(), FileAdmit::Queued);
         policy.cancel_file("a");
+        assert_eq!(policy.file_running().as_deref(), Some("a"));
+        assert_eq!(policy.admit_file("b", true).unwrap(), FileAdmit::Queued);
+        policy.finish_file("a");
         policy.cancel_idle_switch();
+        assert_eq!(policy.admit_file("b", false).unwrap(), FileAdmit::Running);
+    }
+
+    #[test]
+    fn cancel_running_does_not_promote_until_finish() {
+        let policy = RemoteRuntimePolicy::new();
+        assert_eq!(policy.admit_file("a", false).unwrap(), FileAdmit::Running);
+        assert_eq!(policy.admit_file("b", true).unwrap(), FileAdmit::Queued);
+        assert!(policy.cancel_file("a"));
+        assert_eq!(policy.file_running().as_deref(), Some("a"));
+        assert_eq!(policy.admit_file("b", true).unwrap(), FileAdmit::Queued);
+        assert!(policy.file_already_admitted("b"));
+        assert_eq!(policy.finish_file("a").as_deref(), Some("b"));
+        assert_eq!(policy.file_running().as_deref(), Some("b"));
         assert_eq!(policy.admit_file("b", false).unwrap(), FileAdmit::Running);
     }
 
@@ -581,25 +671,71 @@ mod tests {
         let policy = RemoteRuntimePolicy::new();
         let control = Arc::new(openasr_core::TranscriptionControl::new());
         let start = SystemTime::UNIX_EPOCH;
-        policy.hold_realtime_at("rt_ws_1", Arc::clone(&control), start);
+        policy.hold_realtime_at(
+            "rt_ws_1",
+            Arc::clone(&control),
+            Some("device-a".to_string()),
+            start,
+        );
         assert!(policy.has_held_realtime());
         assert!(
             policy
-                .resume_realtime("rt_ws_1", start + Duration::from_secs(29))
+                .resume_realtime(
+                    "rt_ws_1",
+                    start + Duration::from_secs(29),
+                    Some("device-a"),
+                    false,
+                )
                 .is_some()
         );
         assert!(!policy.has_held_realtime());
         assert!(!control.is_canceled());
 
-        policy.hold_realtime_at("rt_ws_2", Arc::clone(&control), start);
+        policy.hold_realtime_at(
+            "rt_ws_2",
+            Arc::clone(&control),
+            Some("device-a".to_string()),
+            start,
+        );
         let expired = policy.expire_held_realtime(start + Duration::from_secs(30));
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].0, "rt_ws_2");
         assert!(
             policy
-                .resume_realtime("rt_ws_2", start + Duration::from_secs(31))
+                .resume_realtime(
+                    "rt_ws_2",
+                    start + Duration::from_secs(31),
+                    Some("device-a"),
+                    false,
+                )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn held_realtime_resume_requires_matching_device() {
+        let policy = RemoteRuntimePolicy::new();
+        let control = Arc::new(openasr_core::TranscriptionControl::new());
+        let start = SystemTime::UNIX_EPOCH;
+        policy.hold_realtime_at(
+            "rt_ws_1",
+            Arc::clone(&control),
+            Some("device-a".to_string()),
+            start,
+        );
+        assert!(
+            policy
+                .resume_realtime("rt_ws_1", start, Some("device-b"), false)
+                .is_none()
+        );
+        assert!(policy.has_held_realtime());
+        assert!(
+            policy
+                .resume_realtime("rt_ws_1", start, Some("device-b"), true)
+                .is_some(),
+            "operator admin may still pre-empt a held session"
+        );
+        assert!(!policy.has_held_realtime());
     }
 
     #[test]
