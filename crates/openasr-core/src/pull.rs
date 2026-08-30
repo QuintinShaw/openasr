@@ -6689,7 +6689,16 @@ pub fn uninstall_backend_packs_for_vendor(
             report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(bytes);
         }
     }
-    let leftover = gc_backend_store_locked(home, BTreeSet::new(), Duration::ZERO, unix_seconds_now())?;
+    let leftover_keep = discover_installed_backend_packs(home, &mut Vec::new())?
+        .into_iter()
+        .map(|discovered| discovered.installed.backend_id)
+        .collect();
+    let leftover = gc_backend_store_locked(
+        home,
+        leftover_keep,
+        DEFAULT_BACKEND_GC_MIN_AGE,
+        unix_seconds_now(),
+    )?;
     report.removed_staging_directories = leftover.removed_staging_directories;
     report.removed_content_objects = leftover.removed_content_objects;
     report.reclaimed_bytes = report
@@ -6755,20 +6764,23 @@ fn discover_installed_backend_packs(
 
 fn newest_generation_fingerprints(
     packs: &[DiscoveredBackendPack],
-) -> BTreeMap<String, (u64, String)> {
+) -> BTreeMap<String, (u64, BTreeSet<String>)> {
     let mut newest = BTreeMap::new();
     for pack in packs {
         let stamp = pack.installed.installed_at_unix_seconds;
         let fingerprint = pack.installed.artifact_fingerprint.clone();
         newest
             .entry(pack.installed.backend_id.clone())
-            .and_modify(|(installed_at, current)| {
-                if stamp >= *installed_at {
+            .and_modify(|(installed_at, fingerprints): &mut (u64, BTreeSet<String>)| {
+                if stamp > *installed_at {
                     *installed_at = stamp;
-                    *current = fingerprint.clone();
+                    fingerprints.clear();
+                    fingerprints.insert(fingerprint.clone());
+                } else if stamp == *installed_at {
+                    fingerprints.insert(fingerprint.clone());
                 }
             })
-            .or_insert((stamp, fingerprint));
+            .or_insert_with(|| (stamp, BTreeSet::from([fingerprint])));
     }
     newest
 }
@@ -6817,9 +6829,16 @@ fn gc_backend_store_locked(
         for version_dir in safe_child_directories(&vendor_dir, &mut report.deferred_paths)? {
             for pack_dir in safe_child_directories(&version_dir, &mut report.deferred_paths)? {
                 let marker_path = pack_dir.join("backend.json");
-                let installed = fs::read_to_string(&marker_path)
+                let marker = match fs::read_to_string(&marker_path) {
+                    Ok(text) => text,
+                    Err(_) => {
+                        report.deferred_paths.push(pack_dir);
+                        retain_all_objects = true;
+                        continue;
+                    }
+                };
+                let installed = serde_json::from_str::<InstalledBackend>(&marker)
                     .ok()
-                    .and_then(|text| serde_json::from_str::<InstalledBackend>(&text).ok())
                     .filter(|installed| {
                         installed.schema_version == INSTALLED_BACKEND_SCHEMA_VERSION
                             && installed.vendor == vendor
@@ -6844,9 +6863,11 @@ fn gc_backend_store_locked(
                     .as_ref()
                     .is_some_and(|installed| keep_backend_ids.contains(&installed.backend_id));
                 let library_current = installed.as_ref().is_some_and(|installed| {
-                    newest.get(&installed.backend_id).is_some_and(|(_, fingerprint)| {
-                        fingerprint == &installed.artifact_fingerprint
-                    })
+                    newest
+                        .get(&installed.backend_id)
+                        .is_some_and(|(_, fingerprints)| {
+                            fingerprints.contains(&installed.artifact_fingerprint)
+                        })
                 });
                 let modified = safe_tree_stats(&pack_dir)
                     .map(|stats| stats.newest_modified_unix_seconds)

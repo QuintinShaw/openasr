@@ -3827,7 +3827,7 @@ fn backend_store_gc_reclaims_replaced_generation_of_the_same_pack() {
             body: archive,
         },
     ]);
-    std::thread::sleep(Duration::from_millis(20));
+    std::thread::sleep(Duration::from_millis(1100));
     install_backend_pack_with_client(&second, home.path(), &mut second_client, |_| {}).unwrap();
 
     let first_dir = backend_pack_install_dir(home.path(), &first).unwrap();
