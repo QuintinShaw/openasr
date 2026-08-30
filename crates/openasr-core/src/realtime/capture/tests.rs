@@ -109,6 +109,68 @@ mod tests {
     }
 
     #[test]
+    fn resample_consumed_len_never_exceeds_held_samples() {
+        assert_eq!(resample_consumed_len(513.3, 512), 512);
+        assert_eq!(resample_consumed_len(512.0, 512), 512);
+        assert_eq!(resample_consumed_len(100.2, 512), 100);
+        assert_eq!(resample_consumed_len(0.9, 512), 0);
+    }
+
+    fn collect_pcm(frames: &[RealtimeAudioFrame]) -> Vec<i16> {
+        frames
+            .iter()
+            .flat_map(|frame| frame.samples().iter().copied())
+            .collect()
+    }
+
+    fn tone_interleaved(sample_rate_hz: u32, channels: u16, frames: usize) -> Vec<f32> {
+        let channels = channels as usize;
+        (0..frames * channels)
+            .map(|index| {
+                let frame = index / channels;
+                (frame as f32 / sample_rate_hz as f32 * std::f32::consts::TAU * 440.0).sin() * 0.5
+            })
+            .collect()
+    }
+
+    fn chunked_resample_matches_oneshot(
+        sample_rate_hz: u32,
+        channels: u16,
+        frames_per_chunk: usize,
+        chunks: usize,
+    ) {
+        let tone = tone_interleaved(sample_rate_hz, channels, frames_per_chunk * chunks);
+        let mut oneshot = engine(sample_rate_hz, channels, 20);
+        let oneshot_pcm = collect_pcm(&oneshot.push_f32_interleaved(&tone).unwrap());
+
+        let mut chunked = engine(sample_rate_hz, channels, 20);
+        let mut chunked_pcm = Vec::new();
+        let stride = frames_per_chunk * channels as usize;
+        for chunk in tone.chunks(stride) {
+            chunked_pcm.extend(collect_pcm(&chunked.push_f32_interleaved(chunk).unwrap()));
+        }
+
+        assert_eq!(
+            chunked_pcm, oneshot_pcm,
+            "chunked resample diverged from oneshot at {sample_rate_hz} Hz / {channels} ch / {frames_per_chunk}-frame callbacks"
+        );
+        assert!(
+            !chunked_pcm.is_empty(),
+            "expected at least one 16 kHz frame from {chunks} chunks"
+        );
+    }
+
+    #[test]
+    fn downsampling_read_head_may_overshoot_a_512_sample_chunk() {
+        // Live capture commonly delivers 512 frames. After the first 44.1 kHz
+        // chunk the leftover pos plus step>1 puts floor(pos) past the buffer
+        // (513 vs 512). 48 kHz / 512 is the same class (step = 3).
+        chunked_resample_matches_oneshot(44_100, 2, 512, 8);
+        chunked_resample_matches_oneshot(44_100, 1, 512, 8);
+        chunked_resample_matches_oneshot(48_000, 1, 512, 8);
+    }
+
+    #[test]
     fn downmixes_stereo_and_converts_i16_u16() {
         let mut i16_capture = engine(16_000, 2, 20);
         let i16_samples = (0..320)

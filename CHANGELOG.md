@@ -110,6 +110,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Core: live capture no longer panics when a downsampled mic callback (for
+  example 44.1 kHz stereo in 512-frame chunks) leaves the resampler read head
+  past the current buffer. The leftover position continues in the next chunk
+  instead of draining past the held samples.
 - Core: long-form slices no longer exceed the decoder-state `max_chunk`
   envelope after overlap, packing, or a short-tail remainder. A request that
   previously failed closed with `decoder invocation lies outside its declared
