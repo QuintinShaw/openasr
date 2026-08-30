@@ -2810,7 +2810,7 @@ impl WsSession {
         }
         if transport_closed {
             self.carry.clear();
-            if self.controller.is_some() {
+            if !self.backend_failed && self.controller.is_some() {
                 self.park_for_reconnect();
                 self.closed = true;
                 return Ok(());
@@ -2935,6 +2935,14 @@ impl WsSession {
     ) -> Result<(), ()> {
         if transport_closed {
             self.carry.clear();
+            if self.backend_failed {
+                if let Some(worker) = self.native_streaming.take() {
+                    worker.detach_cancel();
+                }
+                self.closed = true;
+                self.observe_idle_for_pending_switch();
+                return Ok(());
+            }
             if let Some(worker) = self.native_streaming.take() {
                 super::park_native_realtime_worker(self.session_id.0.clone(), worker);
             }
