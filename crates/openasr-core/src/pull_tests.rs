@@ -3887,6 +3887,60 @@ fn uninstall_backend_vendor_leaves_the_other_library_pack() {
 }
 
 #[test]
+fn uninstall_backend_vendor_refuses_while_in_use() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let hip = hip_pack_resolved(&plugin, &archive);
+    let mut hip_client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: plugin.clone(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+    install_backend_pack_with_client(&hip, home.path(), &mut hip_client, |_| {}).unwrap();
+    let hip_dir = backend_pack_install_dir(home.path(), &hip).unwrap();
+    fs::create_dir_all(home.path().join("backends")).unwrap();
+    let sha = "a".repeat(64);
+    let active = crate::backend_distribution::ActivatedBackendPack {
+        schema_version: crate::backend_distribution::ACTIVATED_BACKEND_SCHEMA_VERSION,
+        backend_id: hip.backend_id.clone(),
+        vendor: CatalogBackendVendor::Hip,
+        version: hip.version.clone(),
+        artifact_fingerprint: "b".repeat(64),
+        host_abi_fingerprint: hip.host_abi.fingerprint.clone(),
+        device_target: "gfx1200".to_string(),
+        driver_version: "7.1.0".to_string(),
+        qualification_source_catalog_sha256: sha.clone(),
+        hardware_evidence_sha256: sha.clone(),
+        correctness_matrix_sha256: sha.clone(),
+        correctness_receipts_sha256: sha,
+        activated_at_unix_seconds: 1,
+    };
+    fs::write(
+        home.path().join("backends").join("active.json"),
+        serde_json::to_string(&active).unwrap(),
+    )
+    .unwrap();
+
+    let error =
+        uninstall_backend_packs_for_vendor(home.path(), CatalogBackendVendor::Hip).unwrap_err();
+    assert!(matches!(
+        error,
+        PullError::BackendPackInUse { vendor } if vendor == "hip"
+    ));
+    assert!(hip_dir.is_dir(), "in-use pack must stay installed");
+
+    crate::backend_distribution::deactivate_backend_pack(home.path()).unwrap();
+    uninstall_backend_packs_for_vendor(home.path(), CatalogBackendVendor::Hip).unwrap();
+    assert!(!hip_dir.exists());
+}
+
+#[test]
 fn install_backend_pack_from_local_path_does_not_activate() {
     let home = tempfile::tempdir().unwrap();
     let plugin = minimal_pe_bytes();
