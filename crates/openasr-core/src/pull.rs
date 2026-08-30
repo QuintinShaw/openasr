@@ -5832,7 +5832,7 @@ pub fn install_backend_pack_from_local_path(
     let mut files_by_url = BTreeMap::new();
     for file in &resolved.files {
         if let Some(path) = local_files.get(&file.sha256.to_ascii_lowercase()) {
-            files_by_url.insert(file.url.clone(), path.clone());
+            index_local_backend_import_urls(&mut files_by_url, file, path.clone());
             continue;
         }
         if matches!(
@@ -5864,6 +5864,21 @@ pub fn install_backend_pack_from_local_path(
     let mut client = LocalFileClient { files_by_url };
     let _store_lock = BackendStoreMutationLock::acquire(home)?;
     install_backend_pack_with_client_locked(resolved, home, &mut client, progress, None)
+}
+
+fn index_local_backend_import_urls(
+    files_by_url: &mut BTreeMap<String, PathBuf>,
+    file: &CatalogBackendFile,
+    path: PathBuf,
+) {
+    files_by_url.insert(file.url.clone(), path.clone());
+    // Local import is keyed by sha256, but the download client later fetches
+    // through `artifact_fetch_urls` (GitHub first, then the catalog URL).
+    // Index every rewritten origin so a USB/folder import does not fail closed
+    // on the first alternate URL.
+    for url in crate::transport::artifact_fetch_urls(&file.url) {
+        files_by_url.entry(url).or_insert_with(|| path.clone());
+    }
 }
 
 fn collect_local_backend_import_files(
@@ -6359,7 +6374,7 @@ pub(crate) fn prepare_backend_runtime_objects_from_local_path(
             CatalogBackendFileRole::Runtime | CatalogBackendFileRole::Archive
         ) {
             if let Some(path) = local_files.get(&file.sha256.to_ascii_lowercase()) {
-                files_by_url.insert(file.url.clone(), path.clone());
+                index_local_backend_import_urls(&mut files_by_url, file, path.clone());
             } else if verify_backend_content_object(&backend_content_object_dir(home, file), file)
                 .is_err()
             {
