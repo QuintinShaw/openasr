@@ -198,7 +198,7 @@ impl BackendActivationError {
                 "unsupported_device"
             }
             Self::ImportRejected { .. } => "verification",
-            Self::PackInUse { .. } => "io",
+            Self::PackInUse { .. } => "pack_in_use",
             Self::Install(_) | Self::Store(_) => "download",
             Self::InstalledPack(_)
             | Self::Resolution(_)
@@ -426,13 +426,7 @@ fn prepare_backend_provider_for_live_device_locked(
     let host_abi = BackendHostAbi::current();
     let (resolved, device_target, driver_version) = match vendor {
         CatalogBackendVendor::Cuda | CatalogBackendVendor::Hip => {
-            let runtime = prepare_discovery_runtime(
-                catalog,
-                vendor,
-                home,
-                None,
-                &mut *progress,
-            )?;
+            let runtime = prepare_discovery_runtime(catalog, vendor, home, None, &mut *progress)?;
             let device = probe_provider_device(vendor, &runtime).map_err(|error| {
                 BackendActivationError::DeviceProbe {
                     code: error.code(),
@@ -688,7 +682,10 @@ pub fn import_backend_provider_from_local_path(
     home: &Path,
     mut progress: impl FnMut(crate::PullProgress),
 ) -> Result<PreparedBackendPack, BackendActivationError> {
-    if !matches!(vendor, CatalogBackendVendor::Cuda | CatalogBackendVendor::Hip) {
+    if !matches!(
+        vendor,
+        CatalogBackendVendor::Cuda | CatalogBackendVendor::Hip
+    ) {
         return Err(BackendActivationError::ImportRejected {
             reason: "Vulkan is built-in and cannot be imported".to_string(),
         });
@@ -696,18 +693,14 @@ pub fn import_backend_provider_from_local_path(
     let host_abi = BackendHostAbi::current();
     let (resolved, device_target, driver_version) = match vendor {
         CatalogBackendVendor::Cuda | CatalogBackendVendor::Hip => {
-            let runtime = prepare_discovery_runtime(
-                catalog,
-                vendor,
-                home,
-                Some(source),
-                &mut progress,
-            )?;
-            let device = probe_provider_device(vendor, &runtime)
-                .map_err(|error| BackendActivationError::DeviceProbe {
+            let runtime =
+                prepare_discovery_runtime(catalog, vendor, home, Some(source), &mut progress)?;
+            let device = probe_provider_device(vendor, &runtime).map_err(|error| {
+                BackendActivationError::DeviceProbe {
                     code: error.code(),
                     message: error.to_string(),
-                })?;
+                }
+            })?;
             let resolved = resolve_compatible_catalog_backend_pull_for_driver(
                 catalog,
                 vendor,
@@ -721,20 +714,18 @@ pub fn import_backend_provider_from_local_path(
             })?;
             (resolved, device.target, device.driver_api_version)
         }
-        CatalogBackendVendor::Vulkan | CatalogBackendVendor::Cpu | CatalogBackendVendor::Unknown => {
+        CatalogBackendVendor::Vulkan
+        | CatalogBackendVendor::Cpu
+        | CatalogBackendVendor::Unknown => {
             return Err(BackendActivationError::ImportRejected {
                 reason: "Vulkan is built-in and cannot be imported".to_string(),
             });
         }
     };
     require_catalog_backend_activated(&resolved)?;
-    let installed = crate::install_backend_pack_from_local_path(
-        &resolved,
-        source,
-        home,
-        &mut progress,
-    )
-    .map_err(map_import_pull_error)?;
+    let installed =
+        crate::install_backend_pack_from_local_path(&resolved, source, home, &mut progress)
+            .map_err(map_import_pull_error)?;
     let size_bytes: u64 = resolved.files.iter().map(|file| file.size_bytes).sum();
     let plugin_size_bytes: u64 = resolved
         .files

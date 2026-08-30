@@ -147,6 +147,7 @@ pub(crate) fn backend_plugin_command(command: BackendPluginCommand) -> Result<()
                         "vendor": pack.vendor,
                         "version": pack.version,
                         "artifact_fingerprint": pack.artifact_fingerprint,
+                        "host_abi_fingerprint": pack.host_abi.fingerprint,
                         "size_bytes": pack.files.iter().map(|file| file.size_bytes).sum::<u64>(),
                     })).collect::<Vec<_>>(),
                 })
