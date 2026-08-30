@@ -3954,10 +3954,12 @@ fn install_backend_pack_from_local_path_does_not_activate() {
     let installed =
         install_backend_pack_from_local_path(&resolved, &source, home.path(), |_| {}).unwrap();
     assert_eq!(installed.backend_id, "hip-radeon");
-    assert!(backend_pack_install_dir(home.path(), &resolved)
-        .unwrap()
-        .join("ggml-hip.dll")
-        .is_file());
+    assert!(
+        backend_pack_install_dir(home.path(), &resolved)
+            .unwrap()
+            .join("ggml-hip.dll")
+            .is_file()
+    );
     assert!(!home.path().join("backends").join("active.json").exists());
 }
 
@@ -3973,7 +3975,11 @@ fn install_backend_pack_from_local_path_rejects_garbage() {
     let error =
         install_backend_pack_from_local_path(&resolved, &source, home.path(), |_| {}).unwrap_err();
     assert!(matches!(error, PullError::BackendImportRejected { .. }));
-    assert!(list_installed_backend_packs(home.path()).unwrap().is_empty());
+    assert!(
+        list_installed_backend_packs(home.path())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

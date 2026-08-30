@@ -5851,11 +5851,9 @@ pub fn install_backend_pack_from_local_path(
             reason: reason.to_string(),
         });
     }
-    if !resolved
-        .files
-        .iter()
-        .any(|file| file.role == CatalogBackendFileRole::Plugin && files_by_url.contains_key(&file.url))
-    {
+    if !resolved.files.iter().any(|file| {
+        file.role == CatalogBackendFileRole::Plugin && files_by_url.contains_key(&file.url)
+    }) {
         return Err(PullError::BackendImportRejected {
             reason: "not an official pack for this GPU vendor, or the plugin file is missing"
                 .to_string(),
@@ -5973,10 +5971,11 @@ impl DownloadClient for LocalFileClient {
             });
         }
         if start > 0 {
-            file.seek(SeekFrom::Start(start)).map_err(|source| PullError::Io {
-                path: path.clone(),
-                source,
-            })?;
+            file.seek(SeekFrom::Start(start))
+                .map_err(|source| PullError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
         }
         let remaining = total.saturating_sub(start);
         let (status, content_range) = if range.is_some() {
@@ -6761,7 +6760,9 @@ pub fn uninstall_backend_packs_for_vendor(
         .as_ref()
         .is_some_and(|active| active.vendor == vendor)
     {
-        return Err(PullError::BackendPackInUse { vendor: vendor_name });
+        return Err(PullError::BackendPackInUse {
+            vendor: vendor_name,
+        });
     }
     let mut deferred = Vec::new();
     let mut report = BackendStoreGcReport {
@@ -6863,15 +6864,17 @@ fn newest_generation_fingerprints(
         let fingerprint = pack.installed.artifact_fingerprint.clone();
         newest
             .entry(pack.installed.backend_id.clone())
-            .and_modify(|(installed_at, fingerprints): &mut (u64, BTreeSet<String>)| {
-                if stamp > *installed_at {
-                    *installed_at = stamp;
-                    fingerprints.clear();
-                    fingerprints.insert(fingerprint.clone());
-                } else if stamp == *installed_at {
-                    fingerprints.insert(fingerprint.clone());
-                }
-            })
+            .and_modify(
+                |(installed_at, fingerprints): &mut (u64, BTreeSet<String>)| {
+                    if stamp > *installed_at {
+                        *installed_at = stamp;
+                        fingerprints.clear();
+                        fingerprints.insert(fingerprint.clone());
+                    } else if stamp == *installed_at {
+                        fingerprints.insert(fingerprint.clone());
+                    }
+                },
+            )
             .or_insert_with(|| (stamp, BTreeSet::from([fingerprint])));
     }
     newest
