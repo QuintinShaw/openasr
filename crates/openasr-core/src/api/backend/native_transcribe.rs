@@ -1013,6 +1013,8 @@ struct SpeakerFinalizationContext {
     /// Word stripping after projection is decided from request keep-words policy.
     #[allow(dead_code)]
     strip_forced_word_timestamps: bool,
+    /// Enrolled-person naming. Anonymous remote diarize leaves this off.
+    name_enrolled: bool,
 }
 
 impl SpeakerFinalizationContext {
@@ -2194,11 +2196,14 @@ fn run_native_transcription_impl(
     // Resolve the one segmentation source for this request. Exactly one runs:
     // the family's own decode, or the external segment/embed/cluster pass --
     // never both, so nothing can overwrite the other's labels downstream.
-    let speaker_plan = SpeakerPlan::resolve(request.voice_id, selected_family.speaker_segmentation);
+    let speaker_plan = SpeakerPlan::resolve(
+        request.voice_id || request.anonymous_diarize,
+        selected_family.speaker_segmentation,
+    );
     if request.diarize_speakers.is_some() {
         // Fail closed instead of silently ignoring the clustering hint: it
         // needs Voice ID on, and only the external clustering path clusters.
-        if !request.voice_id {
+        if !request.voice_id && !request.anonymous_diarize {
             return Err(BackendError::DiarizeSpeakersRequiresDiarization);
         }
         if speaker_plan == SpeakerPlan::InDecoder {
@@ -2631,6 +2636,7 @@ fn run_native_transcription_impl(
                     plan: speaker_plan,
                     scope_by_segment: Vec::new(),
                     strip_forced_word_timestamps,
+                    name_enrolled: request.voice_id,
                 },
                 progress_backend: backend_class,
                 progress_segmenter: segmenter_kind,
@@ -2976,6 +2982,7 @@ fn run_native_transcription_impl(
                         plan: speaker_plan,
                         scope_by_segment: Vec::new(),
                         strip_forced_word_timestamps,
+                        name_enrolled: request.voice_id,
                     },
                     progress_backend: backend_class,
                     progress_segmenter: segmenter_kind,
@@ -2998,6 +3005,7 @@ fn run_native_transcription_impl(
                     plan: speaker_plan,
                     scope_by_segment: speaker_scope_by_segment,
                     strip_forced_word_timestamps,
+                    name_enrolled: request.voice_id,
                 },
                 progress_backend: backend_class,
                 progress_segmenter: segmenter_kind,
@@ -3082,6 +3090,7 @@ fn run_native_transcription_impl(
             plan: speaker_plan,
             scope_by_segment: Vec::new(),
             strip_forced_word_timestamps,
+            name_enrolled: request.voice_id,
         },
         progress_backend: backend_class,
         progress_segmenter: segmenter_kind,
@@ -3174,7 +3183,7 @@ fn finalize_native_transcription(
         transcription = apply_speaker_attribution(transcription, &speaker.attribution)?;
     }
     match speaker.plan {
-        SpeakerPlan::InDecoder => {
+        SpeakerPlan::InDecoder if speaker.name_enrolled => {
             // Each independently decoded slice is a label scope. The shared
             // identity stage disambiguates those local counters, gathers
             // acoustic evidence, stitches matching voices, and names enrolled
@@ -3218,6 +3227,7 @@ fn finalize_native_transcription(
         SpeakerPlan::Off => {
             transcription.unnamed_speakers.clear();
         }
+        SpeakerPlan::InDecoder => {}
     }
     // Identity runs before reading/cue projection. Besides avoiding redundant
     // embedding work over presentation-only cue fragments, this preserves the

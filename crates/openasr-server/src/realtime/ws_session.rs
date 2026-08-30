@@ -749,12 +749,140 @@ impl WsSession {
         Ok(())
     }
 
+    fn park_for_reconnect(&mut self) {
+        let policy = self.runtime.native_execution.remote_policy();
+        policy.hold_realtime(
+            self.session_id.0.clone(),
+            Arc::clone(&self.backend_control),
+        );
+        super::park_realtime_control(
+            self.session_id.0.clone(),
+            super::ParkedRealtimeControl {
+                controller: self.controller.take(),
+                streaming_diarizer: self.streaming_diarizer.take(),
+                native_speaker_change_detector: self.native_speaker_change_detector.take(),
+            },
+        );
+        super::spawn_held_realtime_expiry(policy.clone(), self.session_id.0.clone());
+    }
+
+    async fn resume_held_realtime(&mut self, resume_id: &str) -> Result<(), ()> {
+        let policy = self.runtime.native_execution.remote_policy();
+        let Some(control) = policy.resume_realtime(resume_id, SystemTime::now()) else {
+            self.emit_error(
+                RealtimeErrorCode::BackendNotReady,
+                "The remote session is no longer available.",
+                false,
+            )
+            .await?;
+            return Err(());
+        };
+        self.session_id = RealtimeSessionId(resume_id.to_string());
+        self.sequencer = RealtimeEventSequencer::new(self.session_id.clone());
+        self.backend_control = control;
+        self.closed = false;
+        if let Some(worker) = super::take_parked_native_realtime_worker(resume_id) {
+            self.native_streaming = Some(worker);
+        }
+        if let Some(parked) = super::take_parked_realtime_control(resume_id) {
+            self.controller = parked.controller;
+            self.streaming_diarizer = parked.streaming_diarizer;
+            self.native_speaker_change_detector = parked.native_speaker_change_detector;
+        }
+        // Desktop startRealtimeSession waits on this event after session.start.
+        // The restored controller is already Running, so emit it directly.
+        self.emit_event(RealtimeEvent::AudioInput(
+            openasr_core::RealtimeAudioInputEvent::Started(
+                openasr_core::realtime::events::AudioInputStartedEvent {},
+            ),
+        ))
+        .await?;
+        Ok(())
+    }
+
+    fn attach_anonymous_streaming_diarizer(&mut self) -> Result<(), String> {
+        match openasr_core::diarize::embed::PolicyResolvedSpeakerRuntime::load(Arc::clone(
+            self.runtime.native_execution.execution_services(),
+        )) {
+            Ok(Some(runtime)) => {
+                self.streaming_diarizer = Some(runtime.anonymous_diarizer(16_000));
+                self.native_speaker_change_detector = Some(runtime.speaker_change_detector(16_000));
+                Ok(())
+            }
+            Ok(None) => {
+                #[cfg(test)]
+                {
+                    self.attach_test_anonymous_diarizer();
+                    return Ok(());
+                }
+                #[cfg(not(test))]
+                Err(
+                    openasr_core::diarize::embed::REALTIME_DIARIZATION_EMBEDDER_MISSING_REASON
+                        .to_string(),
+                )
+            }
+            Err(error) => {
+                #[cfg(test)]
+                {
+                    let _ = error;
+                    self.attach_test_anonymous_diarizer();
+                    return Ok(());
+                }
+                #[cfg(not(test))]
+                Err(format!(
+                    "{} ({error})",
+                    openasr_core::diarize::embed::DIARIZATION_EMBEDDER_LOAD_FAILED_REASON
+                ))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn attach_test_anonymous_diarizer(&mut self) {
+        self.streaming_diarizer = Some(
+            openasr_core::diarize::streaming::StreamingDiarizer::with_embedder(
+                &TEST_ANONYMOUS_EMBEDDER,
+                16_000,
+            ),
+        );
+    }
+
     pub(crate) async fn start_session(&mut self, session: StartSession) -> Result<(), ()> {
         if self.controller.is_some() {
             self.emit_error(
                 RealtimeErrorCode::StartupConfigError,
                 "Realtime session.start was received after a session was already started.",
                 false,
+            )
+            .await?;
+            return Err(());
+        }
+        if let Some(resume_id) = session
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            return self.resume_held_realtime(resume_id).await;
+        }
+        let policy = self.runtime.native_execution.remote_policy();
+        if !policy.admits_new_tasks() {
+            self.emit_error(
+                RealtimeErrorCode::BackendNotReady,
+                crate::PENDING_IDLE_SWITCH_MESSAGE,
+                true,
+            )
+            .await?;
+            return Err(());
+        }
+        if policy.file_running().is_some()
+            || self.runtime.native_execution.has_active_sessions()
+            || policy.has_held_realtime()
+        {
+            self.emit_error(
+                RealtimeErrorCode::BackendNotReady,
+                crate::SERVER_BUSY_MESSAGE,
+                true,
             )
             .await?;
             return Err(());
@@ -803,8 +931,7 @@ impl WsSession {
             .await?;
             return Err(());
         }
-        let diarize = session.diarize.unwrap_or(false);
-        if diarize {
+        if session.voice_id == Some(true) {
             self.emit_error(
                 RealtimeErrorCode::StartupConfigError,
                 REALTIME_VOICE_ID_UNSUPPORTED_REASON,
@@ -813,7 +940,17 @@ impl WsSession {
             .await?;
             return Err(());
         }
-        self.required_stage_readiness = RequiredStageReadinessBarrier::for_session(diarize);
+        // Anonymous speaker separation (SPEAKER_00) is independent of enrolled
+        // Voice ID matching and does not require the speaker-identity stage.
+        let anonymous_diarize = session.diarize.unwrap_or(false);
+        self.required_stage_readiness = RequiredStageReadinessBarrier::for_session(false);
+        if anonymous_diarize {
+            if let Err(message) = self.attach_anonymous_streaming_diarizer() {
+                self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
+                    .await?;
+                return Err(());
+            }
+        }
         let execution_target = session.execution_target.or_else(|| {
             self.distribution
                 .openasr_home()
@@ -882,6 +1019,7 @@ impl WsSession {
         );
         config.partial_results = effective_partial_results;
         config.word_timestamps = word_timestamps;
+        config.diarize = anonymous_diarize;
         config.vad = vad;
         config.buffer = buffer;
         let mut controller = match RealtimeSessionController::new_with_execution(
@@ -1070,10 +1208,14 @@ impl WsSession {
             &active_model,
             &model_session_key,
             resolved_route.as_ref(),
+            crate::NativeAdmissionKind::Realtime,
         ) {
             Ok(permit) => permit,
             Err(error) => {
-                let recoverable = matches!(error, ApiError::ModelSessionCapacity(_));
+                let recoverable = matches!(
+                    error,
+                    ApiError::ModelSessionCapacity(_) | ApiError::Busy(_) | ApiError::Conflict(_)
+                );
                 let code = realtime_error_code_for_api_error(&error);
                 self.emit_error(code, &error.to_string(), recoverable)
                     .await?;
@@ -2585,7 +2727,10 @@ impl WsSession {
                 Ok(())
             }
             BackendResult::Error(error) => {
-                let recoverable = matches!(error, ApiError::ModelSessionCapacity(_));
+                let recoverable = matches!(
+                    error,
+                    ApiError::ModelSessionCapacity(_) | ApiError::Busy(_) | ApiError::Conflict(_)
+                );
                 let code = realtime_error_code_for_api_error(&error);
                 self.emit_error(code, &error.to_string(), recoverable)
                     .await?;
@@ -2611,6 +2756,11 @@ impl WsSession {
         }
         if transport_closed {
             self.carry.clear();
+            if self.controller.is_some() {
+                self.park_for_reconnect();
+                self.closed = true;
+                return Ok(());
+            }
             self.cancel_backend_jobs();
         }
         if !self.backend_failed && !transport_closed {
@@ -2644,7 +2794,10 @@ impl WsSession {
                     }
                     BackendResult::Error(error) => {
                         self.pending_backend_jobs = self.pending_backend_jobs.saturating_sub(1);
-                        let recoverable = matches!(error, ApiError::ModelSessionCapacity(_));
+                        let recoverable = matches!(
+                    error,
+                    ApiError::ModelSessionCapacity(_) | ApiError::Busy(_) | ApiError::Conflict(_)
+                );
                         if !self.backend_failed {
                             self.emit_error(
                                 realtime_error_code_for_api_error(&error),
@@ -2726,8 +2879,9 @@ impl WsSession {
         if transport_closed {
             self.carry.clear();
             if let Some(worker) = self.native_streaming.take() {
-                worker.detach_cancel();
+                super::park_native_realtime_worker(self.session_id.0.clone(), worker);
             }
+            self.park_for_reconnect();
             self.closed = true;
             return Ok(());
         } else if !self.carry.is_empty() {
@@ -2953,5 +3107,29 @@ impl WsSession {
         self.backend_jobs = Some(realtime_backend_worker_for_runtime(self.runtime.clone()));
         self.backend_results = Some(result_receiver);
         self.backend_result_sender = Some(result_sender);
+    }
+}
+
+#[cfg(test)]
+struct TestAnonymousEmbedder;
+
+#[cfg(test)]
+static TEST_ANONYMOUS_EMBEDDER: TestAnonymousEmbedder = TestAnonymousEmbedder;
+
+#[cfg(test)]
+impl openasr_core::diarize::embed::SpeakerEmbedder for TestAnonymousEmbedder {
+    fn embed(
+        &self,
+        _samples: &[f32],
+        _sample_rate_hz: u32,
+    ) -> Result<
+        openasr_core::diarize::contract::SpeakerEmbedding,
+        openasr_core::diarize::embed::EmbedError,
+    > {
+        Ok(openasr_core::diarize::contract::SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]))
+    }
+
+    fn embedding_dim(&self) -> usize {
+        2
     }
 }

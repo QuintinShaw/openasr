@@ -155,13 +155,10 @@ pub(crate) async fn stream_transcription(
 ) -> Result<Response, ApiError> {
     let home = distribution.openasr_home()?;
     let catalog = super::load_runtime_model_catalog(distribution.catalog_source(), &home)?;
-    let parsed =
+    let mut parsed =
         parse_transcription_multipart(multipart, runtime.backend, catalog.as_ref()).await?;
     if !voice_id_allowed && parsed.request.voice_id {
-        return Err(ApiError::BadRequest(
-            "Voice ID is available only for local file transcription; remote-compute requests must omit diarize=true."
-                .to_string(),
-        ));
+        parsed.request.voice_id = false;
     }
     if matches!(
         parsed.response_format,
@@ -309,7 +306,12 @@ pub(crate) async fn stream_transcription(
                     RealtimeErrorEvent {
                         code: realtime_error_code_for_api_error(&error),
                         message: error.to_string(),
-                        recoverable: matches!(error, ApiError::ModelSessionCapacity(_)),
+                        recoverable: matches!(
+                            error,
+                            ApiError::ModelSessionCapacity(_)
+                                | ApiError::Busy(_)
+                                | ApiError::Conflict(_)
+                        ),
                     },
                     timestamp_now(),
                 ) {
@@ -478,6 +480,73 @@ async fn handle_websocket(
     let _ = writer.await;
 }
 
+fn held_native_realtime() -> &'static Mutex<HashMap<String, NativeStreamingDecodeWorker>> {
+    static HELD: OnceLock<Mutex<HashMap<String, NativeStreamingDecodeWorker>>> = OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) struct ParkedRealtimeControl {
+    pub(crate) controller: Option<RealtimeSessionController>,
+    pub(crate) streaming_diarizer: Option<openasr_core::diarize::streaming::StreamingDiarizer>,
+    pub(crate) native_speaker_change_detector:
+        Option<openasr_core::diarize::streaming::StreamingSpeakerChangeDetector>,
+}
+
+fn parked_realtime_control() -> &'static Mutex<HashMap<String, ParkedRealtimeControl>> {
+    static HELD: OnceLock<Mutex<HashMap<String, ParkedRealtimeControl>>> = OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn park_realtime_control(session_id: String, parked: ParkedRealtimeControl) {
+    parked_realtime_control()
+        .lock()
+        .expect("parked realtime control mutex poisoned")
+        .insert(session_id, parked);
+}
+
+pub(crate) fn take_parked_realtime_control(session_id: &str) -> Option<ParkedRealtimeControl> {
+    parked_realtime_control()
+        .lock()
+        .expect("parked realtime control mutex poisoned")
+        .remove(session_id)
+}
+
+pub(crate) fn park_native_realtime_worker(
+    session_id: String,
+    worker: NativeStreamingDecodeWorker,
+) {
+    held_native_realtime()
+        .lock()
+        .expect("held native realtime registry mutex poisoned")
+        .insert(session_id, worker);
+}
+
+pub(crate) fn take_parked_native_realtime_worker(
+    session_id: &str,
+) -> Option<NativeStreamingDecodeWorker> {
+    held_native_realtime()
+        .lock()
+        .expect("held native realtime registry mutex poisoned")
+        .remove(session_id)
+}
+
+pub(crate) fn spawn_held_realtime_expiry(
+    policy: crate::RemoteRuntimePolicy,
+    _session_id: String,
+) {
+    let grace = policy.reconnect_grace();
+    tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+        for (id, control) in policy.expire_held_realtime(SystemTime::now()) {
+            control.request_cancel();
+            if let Some(worker) = take_parked_native_realtime_worker(&id) {
+                worker.detach_cancel();
+            }
+            let _ = take_parked_realtime_control(&id);
+        }
+    });
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum ClientMessage {
@@ -497,6 +566,8 @@ enum ClientMessage {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StartSession {
+    #[serde(default)]
+    session_id: Option<String>,
     model: Option<String>,
     language: Option<String>,
     task: Option<openasr_core::TranscriptionTask>,
@@ -511,6 +582,10 @@ pub(crate) struct StartSession {
     partial_results: Option<bool>,
     word_timestamps: Option<bool>,
     diarize: Option<bool>,
+    /// Enrolled Voice ID matching. Realtime never supports this; anonymous
+    /// speaker separation is `diarize`.
+    #[serde(default)]
+    voice_id: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -877,7 +952,9 @@ fn resolve_model(
 
 fn realtime_error_code_for_api_error(error: &ApiError) -> RealtimeErrorCode {
     match error {
-        ApiError::ModelSessionCapacity(_) => RealtimeErrorCode::BackendNotReady,
+        ApiError::ModelSessionCapacity(_) | ApiError::Busy(_) | ApiError::Conflict(_) => {
+            RealtimeErrorCode::BackendNotReady
+        }
         ApiError::Backend(_) | ApiError::BackendJoin(_) => RealtimeErrorCode::BackendCrashed,
         ApiError::AudioPreparation(_) => RealtimeErrorCode::UnsupportedAudioFormat,
         _ => RealtimeErrorCode::StartupConfigError,

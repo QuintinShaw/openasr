@@ -394,6 +394,9 @@ pub struct TranscriptionRequest {
     /// and enrolled-person matcher, so an explicit request fails closed when
     /// that embedder is unavailable.
     pub voice_id: bool,
+    /// Anonymous speaker separation without enrolled-person matching.
+    /// Remote compute uses this so `diarize=true` does not open Voice ID.
+    pub anonymous_diarize: bool,
     /// Persisted recording-level segmenter preference copied into the request
     /// by the host configuration layer. This is internal execution plumbing,
     /// not a multipart/per-job picker.
@@ -479,6 +482,7 @@ impl TranscriptionRequest {
             longform: None,
             display_file_name: None,
             voice_id: false,
+            anonymous_diarize: false,
             voice_id_segmenter: crate::config::VoiceIdSegmenterPreference::Auto,
             diarize_speakers: None,
             punctuate: true,
@@ -623,6 +627,11 @@ impl TranscriptionRequest {
 
     pub fn with_voice_id(mut self, voice_id: bool) -> Self {
         self.voice_id = voice_id;
+        self
+    }
+
+    pub fn with_anonymous_diarize(mut self, anonymous_diarize: bool) -> Self {
+        self.anonymous_diarize = anonymous_diarize;
         self
     }
 
