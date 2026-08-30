@@ -1288,6 +1288,53 @@ fn serve_model_pack_loose_file_does_not_listen() {
         ));
 }
 
+#[test]
+fn serve_model_pack_migrates_legacy_default_and_listens() {
+    let temp = tempfile::tempdir().unwrap();
+    install_default_fixture_pack(
+        temp.path(),
+        "whisper-runtime",
+        "q8_0",
+        "q8",
+        &TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed(
+            "whisper-runtime",
+        ),
+    );
+    let pack = openasr_core::list_installed_packs(temp.path())
+        .expect("list installed whisper fixture")
+        .into_iter()
+        .next()
+        .expect("installed whisper fixture");
+    assert!(
+        openasr_core::default_selection::read_active_model_selection_v2(temp.path())
+            .unwrap()
+            .is_none(),
+        "fixture must start as a pre-V2 home"
+    );
+
+    let pack_path = pack.path.display().to_string();
+    let (mut child, _addr) = spawn_serve_with_extra_args_and_wait_until_listening(
+        temp.path(),
+        &["--model-pack", &pack_path],
+    );
+    let record = openasr_core::default_selection::read_active_model_selection_v2(temp.path())
+        .unwrap()
+        .expect("legacy default must migrate to V2 before --model-pack binds");
+    assert_eq!(
+        record.status,
+        openasr_core::default_selection::ActiveModelSelectionStatus::Installed
+    );
+    assert_eq!(
+        record
+            .expected_pack
+            .as_ref()
+            .map(|expected| expected.sha256.as_str()),
+        Some(pack.sha256.as_str())
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Spawns the real `openasr serve` binary against `home` and blocks until it
 /// prints its "listening on http://<addr>" line, returning the bound address.
 /// Panics with the child's stderr if it exits before ever reporting ready --

@@ -645,7 +645,21 @@ pub(super) async fn serve(
         // reactivation only attests an InstalledModelStore object that a
         // durable V2 record already names. A loose file would leave
         // `active=None` while the listener reports ready.
+        //
+        // Desktop always passes `--model-pack` when resolve() finds a pack via
+        // legacy `default.json`. Server boot also migrates that two-file state,
+        // but this gate currently runs first — a pre-V2 home then exits before
+        // bind and the UI stays daemon-offline. Migrate first; the gate still
+        // rejects a missing/mismatched V2 and any loose file.
         if model_pack.is_some() {
+            if openasr_core::default_selection::read_active_model_selection_v2(&home)
+                .context("Could not read durable V2 default-selection")?
+                .is_none()
+            {
+                openasr_core::default_selection::migrate_legacy_to_v2(&home).context(
+                    "Could not migrate legacy default-selection before native serve --model-pack",
+                )?;
+            }
             let _ = require_installed_durable_pack_for_serve(&home, model_pack_path)?;
         }
     } else if backend == BackendKind::Native && no_model {
