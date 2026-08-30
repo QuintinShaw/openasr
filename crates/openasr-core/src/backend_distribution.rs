@@ -426,13 +426,13 @@ fn prepare_backend_provider_for_live_device_locked(
     let host_abi = BackendHostAbi::current();
     let (resolved, device_target, driver_version) = match vendor {
         CatalogBackendVendor::Cuda | CatalogBackendVendor::Hip => {
-            let runtime = if vendor == CatalogBackendVendor::Hip {
-                let bootstrap = shared_provider_runtime_bootstrap(catalog, vendor, &host_abi)?;
-                prepare_backend_runtime_objects_locked(&bootstrap, home, &mut *progress)
-                    .map_err(|error| BackendActivationError::Install(error.to_string()))?
-            } else {
-                PreparedBackendRuntimeObjects::default()
-            };
+            let runtime = prepare_discovery_runtime(
+                catalog,
+                vendor,
+                home,
+                None,
+                &mut *progress,
+            )?;
             let device = probe_provider_device(vendor, &runtime).map_err(|error| {
                 BackendActivationError::DeviceProbe {
                     code: error.code(),
@@ -541,9 +541,7 @@ pub fn describe_backend_provider(
             "no host-compatible provider pack is available".to_string(),
         ));
     }
-    if vendor == CatalogBackendVendor::Hip {
-        shared_provider_runtime_bootstrap(catalog, vendor, &host_abi)?;
-    }
+    let _ = optional_shared_runtime_bootstrap(catalog, vendor, &host_abi)?;
     let mut result = BackendProviderDescription {
         schema_version: 1,
         vendor,
@@ -575,11 +573,40 @@ pub fn describe_backend_provider(
     Ok(result)
 }
 
+fn prepare_discovery_runtime(
+    catalog: &ModelCatalog,
+    vendor: CatalogBackendVendor,
+    home: &Path,
+    local_source: Option<&Path>,
+    progress: &mut impl FnMut(PullProgress),
+) -> Result<PreparedBackendRuntimeObjects, BackendActivationError> {
+    let host_abi = BackendHostAbi::current();
+    let Some(bootstrap) = optional_shared_runtime_bootstrap(catalog, vendor, &host_abi)? else {
+        return Ok(PreparedBackendRuntimeObjects::default());
+    };
+    match local_source {
+        Some(source) => crate::pull::prepare_backend_runtime_objects_from_local_path(
+            &bootstrap, source, home, progress,
+        )
+        .map_err(|error| BackendActivationError::Install(error.to_string())),
+        None => prepare_backend_runtime_objects_locked(&bootstrap, home, progress)
+            .map_err(|error| BackendActivationError::Install(error.to_string())),
+    }
+}
+
+fn optional_shared_runtime_bootstrap(
+    catalog: &ModelCatalog,
+    vendor: CatalogBackendVendor,
+    host_abi: &BackendHostAbi,
+) -> Result<Option<crate::ResolvedCatalogBackendPull>, BackendActivationError> {
+    shared_provider_runtime_bootstrap(catalog, vendor, host_abi)
+}
+
 fn shared_provider_runtime_bootstrap(
     catalog: &ModelCatalog,
     vendor: CatalogBackendVendor,
     host_abi: &BackendHostAbi,
-) -> Result<crate::ResolvedCatalogBackendPull, BackendActivationError> {
+) -> Result<Option<crate::ResolvedCatalogBackendPull>, BackendActivationError> {
     let mut variants = catalog
         .backends
         .iter()
@@ -596,9 +623,7 @@ fn shared_provider_runtime_bootstrap(
     };
     let expected = shared_runtime_identity(first);
     if expected.is_empty() {
-        return Err(BackendActivationError::Resolution(
-            "provider packs omit the signed shared discovery runtime".to_string(),
-        ));
+        return Ok(None);
     }
     if variants
         .iter()
@@ -613,7 +638,7 @@ fn shared_provider_runtime_bootstrap(
     bootstrap
         .files
         .retain(|file| file.role != CatalogBackendFileRole::Plugin);
-    Ok(bootstrap)
+    Ok(Some(bootstrap))
 }
 
 fn shared_runtime_identity(
@@ -671,7 +696,14 @@ pub fn import_backend_provider_from_local_path(
     let host_abi = BackendHostAbi::current();
     let (resolved, device_target, driver_version) = match vendor {
         CatalogBackendVendor::Cuda | CatalogBackendVendor::Hip => {
-            let device = probe_provider_device(vendor, &PreparedBackendRuntimeObjects::default())
+            let runtime = prepare_discovery_runtime(
+                catalog,
+                vendor,
+                home,
+                Some(source),
+                &mut progress,
+            )?;
+            let device = probe_provider_device(vendor, &runtime)
                 .map_err(|error| BackendActivationError::DeviceProbe {
                     code: error.code(),
                     message: error.to_string(),

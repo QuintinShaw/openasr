@@ -6344,6 +6344,83 @@ pub(crate) fn prepare_backend_runtime_objects_locked(
     })
 }
 
+pub(crate) fn prepare_backend_runtime_objects_from_local_path(
+    resolved: &ResolvedCatalogBackendPull,
+    source: impl AsRef<Path>,
+    home: impl AsRef<Path>,
+    mut progress: impl FnMut(PullProgress),
+) -> Result<PreparedBackendRuntimeObjects, PullError> {
+    let home = home.as_ref();
+    let local_files = collect_local_backend_import_files(source.as_ref())?;
+    let mut files_by_url = BTreeMap::new();
+    for file in &resolved.files {
+        if matches!(
+            file.role,
+            CatalogBackendFileRole::Runtime | CatalogBackendFileRole::Archive
+        ) {
+            if let Some(path) = local_files.get(&file.sha256.to_ascii_lowercase()) {
+                files_by_url.insert(file.url.clone(), path.clone());
+            } else if verify_backend_content_object(&backend_content_object_dir(home, file), file)
+                .is_err()
+            {
+                return Err(PullError::BackendImportRejected {
+                    reason: "the official pack is incomplete".to_string(),
+                });
+            }
+        }
+    }
+    let mut client = LocalFileClient { files_by_url };
+    prepare_backend_runtime_objects_with_client(resolved, home, &mut client, &mut progress)
+}
+
+fn prepare_backend_runtime_objects_with_client<C: DownloadClient>(
+    resolved: &ResolvedCatalogBackendPull,
+    home: &Path,
+    client: &mut C,
+    progress: &mut impl FnMut(PullProgress),
+) -> Result<PreparedBackendRuntimeObjects, PullError> {
+    let mut dependency_dirs = BTreeSet::new();
+    let mut verified_files = Vec::new();
+    let mut saw_runtime = false;
+    for file in &resolved.files {
+        match file.role {
+            CatalogBackendFileRole::Runtime | CatalogBackendFileRole::Archive => {
+                saw_runtime = true;
+                let object = ensure_backend_content_object(client, file, home, progress, None)?;
+                let payload = backend_content_object_dir(home, file).join("payload");
+                for materialized in &object.files {
+                    let relative = Path::new(&materialized.relative_path);
+                    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+                    dependency_dirs.insert(payload.join(parent));
+                    verified_files.push(PreparedBackendRuntimeFile {
+                        path: payload.join(relative),
+                        size_bytes: materialized.size_bytes,
+                        sha256: materialized.sha256.clone(),
+                    });
+                }
+            }
+            CatalogBackendFileRole::Plugin => {}
+            CatalogBackendFileRole::Unknown => {
+                return Err(PullError::InvalidTarget {
+                    field: "backend.files.role",
+                    reason: "unknown backend file role".to_string(),
+                });
+            }
+        }
+    }
+    if !saw_runtime {
+        return Err(PullError::InvalidTarget {
+            field: "backend.files",
+            reason: "provider discovery requires a signed shared runtime".to_string(),
+        });
+    }
+    verified_files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(PreparedBackendRuntimeObjects {
+        dependency_dirs: dependency_dirs.into_iter().collect(),
+        files: verified_files,
+    })
+}
+
 #[cfg(test)]
 fn install_backend_pack_with_client<C: DownloadClient>(
     resolved: &ResolvedCatalogBackendPull,
