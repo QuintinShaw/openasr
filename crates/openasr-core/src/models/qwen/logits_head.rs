@@ -807,11 +807,13 @@ struct Qwen3AsrLlmLogitsHeadGraphExecutor {
     d_model: usize,
     vocab_size: usize,
     rms_norm_epsilon: f32,
-    runner: GgmlCpuGraphRunner,
+    // `reuse` holds raw graph/scheduler pointers into `runner` and `arena`,
+    // so it MUST drop first. Rust drops fields in declaration order.
+    reuse: Option<QwenReusableLogitsGraph>,
     arena: GgmlStaticTensorArena,
     output_norm_weight: GgmlStaticTensor,
     output_weight: GgmlStaticTensor,
-    reuse: Option<QwenReusableLogitsGraph>,
+    runner: GgmlCpuGraphRunner,
 }
 
 impl fmt::Debug for Qwen3AsrLlmLogitsHeadGraphExecutor {
@@ -880,11 +882,11 @@ impl Qwen3AsrLlmLogitsHeadGraphExecutor {
             d_model,
             vocab_size,
             rms_norm_epsilon,
-            runner,
+            reuse: None,
             arena,
             output_norm_weight: norm,
             output_weight: weight,
-            reuse: None,
+            runner,
         })
     }
 
@@ -1153,6 +1155,31 @@ mod tests {
     use crate::testing::{TinyGgufFixtureSpec, write_tiny_gguf_runtime_source};
 
     use super::*;
+
+    #[test]
+    fn logits_executor_drops_reusable_session_before_runner() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/models/qwen/logits_head.rs"),
+        )
+        .expect("read logits_head.rs");
+        let struct_body = source
+            .split("struct Qwen3AsrLlmLogitsHeadGraphExecutor {")
+            .nth(1)
+            .expect("executor struct")
+            .split('}')
+            .next()
+            .expect("struct body");
+        let reuse = struct_body
+            .find("reuse: Option<QwenReusableLogitsGraph>")
+            .expect("reuse field");
+        let runner = struct_body
+            .find("runner: GgmlCpuGraphRunner")
+            .expect("runner field");
+        assert!(
+            reuse < runner,
+            "logits persistent session must drop before the runner it aliases, got reuse@{reuse} runner@{runner}"
+        );
+    }
 
     #[test]
     fn tied_embedding_and_logits_share_one_mmap_payload_range() {
