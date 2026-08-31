@@ -119,6 +119,7 @@ for entry_path in sorted(root.glob("backend-pack-*.json")):
             [
                 "curl",
                 "-fsSL",
+                "--http1.1",
                 "--retry",
                 "5",
                 "--retry-all-errors",
