@@ -89,7 +89,7 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         )[0]
         self.assertIn("contents: write", family_caller)
         self.assertIn("contents: write", deploy_caller)
-        self.assertIn("gh release download", completeness)
+        self.assertIn("gh_release.download_asset", completeness)
         self.assertIn("gh release view", completeness)
     def test_reusable_release_declares_every_referenced_input(self) -> None:
         binaries = (ROOT / ".github/workflows/release-binaries.yml").read_text(
