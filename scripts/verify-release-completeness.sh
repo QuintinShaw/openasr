@@ -29,10 +29,18 @@ cleanup() { rm -rf -- "$pack_names" "$pack_dir" "$actual_file"; }
 trap cleanup EXIT
 
 python3 tooling/release-manifest/release_completeness.py pack-names > "$pack_names"
-while IFS= read -r pack_name; do
-  [ -n "$pack_name" ] || continue
-  gh release download "$tag" --repo "$repository" -p "$pack_name" -D "$pack_dir"
-done < "$pack_names"
+python3 - "$tag" "$repository" "$pack_names" "$pack_dir" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "tooling/release-manifest")
+import gh_release
+
+tag, repository, pack_names, pack_dir = sys.argv[1:5]
+for pack_name in Path(pack_names).read_text(encoding="utf-8").splitlines():
+    if pack_name:
+        gh_release.download_asset(tag, pack_name, Path(pack_dir), repository=repository)
+PY
 gh release view "$tag" --repo "$repository" --json assets \
   --jq '.assets[].name' | sort > "$actual_file"
 python3 tooling/release-manifest/release_completeness.py compare \

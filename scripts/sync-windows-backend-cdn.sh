@@ -62,9 +62,11 @@ echo "==> downloading all signed release bytes (qualification remains separate)"
 python3 - "$workdir" "${backend_entries[@]}" <<'PY'
 import hashlib
 import json
-import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, "tooling/release-manifest")
+import gh_release
 
 root = Path(sys.argv[1])
 downloaded: set[str] = set()
@@ -76,20 +78,7 @@ for entry_path in sys.argv[2:]:
             raise SystemExit(f"unsafe backend release filename: {name!r}")
         dest = root / name
         if name not in downloaded:
-            subprocess.run(
-                [
-                    "gh",
-                    "release",
-                    "download",
-                    f"v{entry['version']}",
-                    "-p",
-                    name,
-                    "-D",
-                    str(root),
-                    "--clobber",
-                ],
-                check=True,
-            )
+            gh_release.download_asset(f"v{entry['version']}", name, root)
             downloaded.add(name)
         digest = hashlib.sha256()
         size = 0
