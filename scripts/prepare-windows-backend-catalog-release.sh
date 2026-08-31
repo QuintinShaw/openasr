@@ -63,9 +63,19 @@ for name in catalog.json catalog.signature.json catalog.public.json catalog.publ
 done
 
 echo "==> downloading backend entries for ${tag}"
-gh release download "$tag" \
-  -p 'backend-pack-*.json' \
-  -D "$workdir" --clobber
+python3 - "$tag" "$workdir" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "tooling/release-manifest")
+import gh_release
+import release_completeness
+
+tag, root = sys.argv[1], Path(sys.argv[2])
+for pack_name in release_completeness.backend_pack_names(release_completeness.load_matrix()):
+    print(f"downloading {pack_name}", flush=True)
+    gh_release.download_asset(tag, pack_name, root)
+PY
 
 shopt -s nullglob
 backend_entries=("$workdir"/backend-pack-*.json)
@@ -84,26 +94,29 @@ for entry in "${backend_entries[@]}"; do
   backend_entry_args+=(--entry "$entry")
 done
 
+echo "==> downloading signed plugin and vendor payloads from CDN"
 python3 - "$workdir" <<'PY'
 import json
-import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, "tooling/release-manifest")
+import gh_release
 
 root = Path(sys.argv[1])
 downloaded = set()
 for entry_path in sorted(root.glob("backend-pack-*.json")):
     entry = json.loads(entry_path.read_text(encoding="utf-8"))
+    version = entry["version"]
     for file in entry.get("files", []):
         name = file.get("filename")
         if not isinstance(name, str) or not name or Path(name).name != name:
             raise SystemExit(f"unsafe backend release filename: {name!r}")
         if name in downloaded:
             continue
-        subprocess.run(
-            ["gh", "release", "download", f"v{entry['version']}", "-p", name, "-D", str(root), "--clobber"],
-            check=True,
-        )
+        url = f"https://dl.openasr.org/core/v{version}/{name}"
+        print(f"downloading {url}", flush=True)
+        gh_release.download_url(url, root / name)
         downloaded.add(name)
 PY
 

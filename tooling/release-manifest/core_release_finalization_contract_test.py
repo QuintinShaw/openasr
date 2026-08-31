@@ -89,8 +89,37 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         )[0]
         self.assertIn("contents: write", family_caller)
         self.assertIn("contents: write", deploy_caller)
-        self.assertIn("gh_release.download_asset", completeness)
+        self.assertIn("gh_release.py download-packs", completeness)
         self.assertIn("gh release view", completeness)
+
+    def test_release_readers_do_not_call_gh_release_download(self) -> None:
+        offenders: list[str] = []
+        roots = (
+            ROOT / "scripts",
+            ROOT / ".github" / "workflows",
+            ROOT / "tooling" / "release-manifest",
+        )
+        skip_names = {
+            "gh_release.py",
+            "gh_release_test.py",
+            "core_release_finalization_contract_test.py",
+            # 64-hex lock token; fake-gh mutex test intercepts this argv.
+            "qualification-release-lock.sh",
+        }
+        for root in roots:
+            for path in root.rglob("*"):
+                if not path.is_file() or path.name in skip_names:
+                    continue
+                if path.suffix not in {".sh", ".py", ".yml", ".yaml"}:
+                    continue
+                for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                    stripped = line.lstrip()
+                    if stripped.startswith("#") or stripped.startswith("//"):
+                        continue
+                    if "gh release download" in line:
+                        offenders.append(f"{path.relative_to(ROOT)}:{line_number}:{stripped}")
+        self.assertEqual(offenders, [])
+
     def test_reusable_release_declares_every_referenced_input(self) -> None:
         binaries = (ROOT / ".github/workflows/release-binaries.yml").read_text(
             encoding="utf-8"
@@ -151,6 +180,8 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("activation_transition: published-inert", release)
         self.assertIn("needs: [resolve, prepublication-family]", release)
         self.assertIn("verify-assets", prepare)
+        self.assertIn("gh_release.download_asset", prepare)
+        self.assertIn("gh_release.download_url", prepare)
         self.assertIn("publish_catalog.sh", prepare)
         self.assertIn("verify-catalog", prepare)
         self.assertIn("verify-cdn", prepare)
@@ -292,7 +323,9 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("releases/latest", family)
         self.assertIn("refusing a duplicate local build", family)
         self.assertEqual(family.count("release_asset_verifier.py"), 3)
-        self.assertEqual(family.count("--pattern SHA256SUMS"), 2)
+        self.assertEqual(family.count("gh_release.py download"), 3)
+        self.assertGreaterEqual(family.count("SHA256SUMS"), 3)
+        self.assertNotIn("--pattern", family)
         self.assertEqual(family.count("gh attestation verify"), 3)
         self.assertEqual(family.count("--signer-workflow"), 3)
         self.assertIn("attestations: read", family)
@@ -342,10 +375,10 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
             "qualification may consume only already-public PublishedInert release bytes",
             qualify,
         )
-        self.assertIn("gh release download $tag", qualify)
+        self.assertIn("gh_release.py", qualify)
         self.assertLess(
             qualify.index("qualification may consume only already-public PublishedInert release bytes"),
-            qualify.index("gh release download $tag"),
+            qualify.index("gh_release.py"),
         )
         self.assertIn('"backend-pack-*.json"', qualify)
         self.assertIn('"catalog.backends.candidate.json"', qualify)
@@ -372,7 +405,7 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("--json isDraft,isPrerelease,tagName,publishedAt", prepare)
         self.assertIn("already-public stable PublishedInert bytes", prepare)
         self.assertLess(prepare.index("already-public stable PublishedInert bytes"), prepare.index("gh run download"))
-        self.assertIn('gh release download "$tag" --repo "$repository"', prepare)
+        self.assertIn("gh_release.py download-packs", prepare)
         self.assertIn("qualification-signer-workflow", prepare)
         self.assertIn("must be independently qualified", gate)
 

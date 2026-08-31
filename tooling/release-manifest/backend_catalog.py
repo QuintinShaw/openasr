@@ -643,6 +643,7 @@ def head_cdn_url(url: str) -> tuple[int, int | None]:
             "curl",
             "-sS",
             "-I",
+            "--http1.1",
             "--connect-timeout",
             "5",
             "--max-time",

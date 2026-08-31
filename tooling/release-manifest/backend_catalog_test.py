@@ -481,6 +481,7 @@ class BackendCatalogTest(unittest.TestCase):
             self.assertEqual(backend_catalog.head_cdn_url("https://example.invalid/file"), (200, 42))
 
         command = run.call_args.args[0]
+        self.assertIn("--http1.1", command)
         self.assertIn("--connect-timeout", command)
         self.assertIn("--max-time", command)
         self.assertIn("--retry", command)

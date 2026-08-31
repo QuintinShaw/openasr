@@ -89,14 +89,11 @@ resolve_binary() {
   echo "==> latest stable CLI release: ${tag}" >&2
 
   local asset_dir="$work/release-asset"
+  local version="${tag#v}"
+  local asset="openasr-${version}-linux-x86_64.tar.gz"
   mkdir -p "$asset_dir"
-  # Pattern match (not a hardcoded filename) so this survives a version bump
-  # without edits. Anchored to the plain (non-CUDA/Vulkan/ROCm/musl) Linux
-  # x86_64 CPU build: the runner is native linux-x86_64, so this is the one
-  # build we can execute directly with no extra toolchain.
-  if ! gh release download "$tag" --repo "$repo" \
-        --pattern 'openasr-*-linux-x86_64.tar.gz' \
-        --dir "$asset_dir" --clobber; then
+  if ! python3 tooling/release-manifest/gh_release.py download \
+        "$tag" "$asset_dir" "$asset" --repo "$repo"; then
     echo "::error::failed to download the ${tag} linux-x86_64 CLI release asset from ${repo}. Fail-closed: refusing to bless a catalog without exercising a real released binary against it." >&2
     exit 1
   fi

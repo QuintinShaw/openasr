@@ -82,7 +82,8 @@ jobs:
           [ -f "$activation_catalog" ] || { echo "committed public catalog is missing" >&2; exit 1; }
           version="${{ inputs.release_tag }}"; version="${version#v}"
           mkdir -p staging/release
-          gh release download "${{ inputs.release_tag }}" -p 'backend-pack-*.json' -D staging/release
+          python3 tooling/release-manifest/gh_release.py download-packs \
+            "${{ inputs.release_tag }}" staging/release
           mapfile -t entries < <(find staging/release -name 'backend-pack-*.json' -type f | sort)
           [ "${#entries[@]}" -eq 21 ] || {
             echo "expected 21 exact release backend entries, found ${#entries[@]}" >&2; exit 1;
@@ -166,8 +167,10 @@ jobs:
           done
           [ "${#receipts[@]}" -ge 4 ] && [ "${#traces[@]}" -ge 2 ]
 
-          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            -p 'backend-pack-*.json' -p SHA256SUMS -D "$workdir/release"
+          python3 tooling/release-manifest/gh_release.py download-packs \
+            "$RELEASE_TAG" "$workdir/release" --repo "$GITHUB_REPOSITORY"
+          python3 tooling/release-manifest/gh_release.py download \
+            "$RELEASE_TAG" "$workdir/release" SHA256SUMS --repo "$GITHUB_REPOSITORY"
           mapfile -t entries < <(find "$workdir/release" -type f -name 'backend-pack-*.json' -print | sort)
           [ "${#entries[@]}" -eq 21 ]
           python3 - "$hardware_raw" > "$workdir/subject-names.txt" <<'PY'
@@ -180,10 +183,15 @@ jobs:
               names.add(name)
           print("\n".join(sorted(names)))
           PY
-          while IFS= read -r name; do
-            [ -n "$name" ] && gh release download "$RELEASE_TAG" \
-              --repo "$GITHUB_REPOSITORY" -p "$name" -D "$workdir/release" --clobber
-          done < "$workdir/subject-names.txt"
+          python3 - "$RELEASE_TAG" "$GITHUB_REPOSITORY" "$workdir/release" "$workdir/subject-names.txt" <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, "tooling/release-manifest")
+          import gh_release
+          tag, repository, dest, names_file = sys.argv[1:5]
+          names = [line.strip() for line in Path(names_file).read_text(encoding="utf-8").splitlines() if line.strip()]
+          gh_release.download_assets(tag, names, Path(dest), repository=repository)
+          PY
           entry_args=(); for path in "${entries[@]}"; do entry_args+=(--entry "$path"); done
           subject_args=(); while IFS= read -r name; do [ -n "$name" ] && subject_args+=(--release-subject "$workdir/release/$name"); done < "$workdir/subject-names.txt"
           release_signer="${GITHUB_REPOSITORY}/.github/workflows/release-binaries.yml"

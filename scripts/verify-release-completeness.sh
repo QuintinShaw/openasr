@@ -22,25 +22,12 @@ repository="${2:-${GITHUB_REPOSITORY:-QuintinShaw/openasr}}"
 command -v gh >/dev/null 2>&1 || { echo "gh is required" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 1; }
 
-pack_names="$(mktemp)"
 pack_dir="$(mktemp -d)"
 actual_file="$(mktemp)"
-cleanup() { rm -rf -- "$pack_names" "$pack_dir" "$actual_file"; }
+cleanup() { rm -rf -- "$pack_dir" "$actual_file"; }
 trap cleanup EXIT
 
-python3 tooling/release-manifest/release_completeness.py pack-names > "$pack_names"
-python3 - "$tag" "$repository" "$pack_names" "$pack_dir" <<'PY'
-import sys
-from pathlib import Path
-
-sys.path.insert(0, "tooling/release-manifest")
-import gh_release
-
-tag, repository, pack_names, pack_dir = sys.argv[1:5]
-for pack_name in Path(pack_names).read_text(encoding="utf-8").splitlines():
-    if pack_name:
-        gh_release.download_asset(tag, pack_name, Path(pack_dir), repository=repository)
-PY
+python3 tooling/release-manifest/gh_release.py download-packs "$tag" "$pack_dir" --repo "$repository"
 gh release view "$tag" --repo "$repository" --json assets \
   --jq '.assets[].name' | sort > "$actual_file"
 python3 tooling/release-manifest/release_completeness.py compare \
