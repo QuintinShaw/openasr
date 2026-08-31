@@ -151,6 +151,7 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("activation_transition: published-inert", release)
         self.assertIn("needs: [resolve, prepublication-family]", release)
         self.assertIn("verify-assets", prepare)
+        self.assertIn("gh_release.download_asset", prepare)
         self.assertIn("publish_catalog.sh", prepare)
         self.assertIn("verify-catalog", prepare)
         self.assertIn("verify-cdn", prepare)
