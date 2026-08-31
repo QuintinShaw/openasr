@@ -142,9 +142,11 @@ bytes without exposing an unqualified provider to users.
    the epoch, and signs the full/public catalogs. It consumes no hardware or
    token-correctness receipt. Review, commit, and push the five catalog/epoch
    files.
-4. Dispatch `Release core` again. Its reusable pre-publication family contract
-   verifies the immutable draft CLI and runs the real-pack CPU family gate. The
-   orchestrator then calls the sole deployment entrypoint,
+4. Dispatch `Release core` again. It re-verifies the draft's complete attested
+   subject set (the same completeness gate as the original matrix, so a later
+   CI-only fix can still see the draft), then runs the reusable pre-publication
+   family contract against the immutable draft CLI and the real-pack CPU family
+   gate. The orchestrator then calls the sole deployment entrypoint,
    `.github/workflows/deploy-catalog.yml`, with
    `activation_transition: published-inert`. The deploy job checks the signed
    catalog, CDN payloads, and released-binary compatibility before writing it.

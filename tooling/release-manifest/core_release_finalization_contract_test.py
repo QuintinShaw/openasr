@@ -17,31 +17,80 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
 
     def test_release_caller_grants_every_permission_requested_by_reusable_jobs(self) -> None:
         release = (ROOT / ".github/workflows/release-core.yml").read_text(encoding="utf-8")
+        permission_rank = {"read": 1, "write": 2}
+        cases = (
+            (
+                "binaries",
+                "\n  binaries:\n",
+                "\n  verify-draft-completeness:\n",
+                ROOT / ".github/workflows/release-binaries.yml",
+            ),
+            (
+                "prepublication-family",
+                "\n  prepublication-family:\n",
+                "\n  deploy-catalog:\n",
+                ROOT / ".github/workflows/family-regression.yml",
+            ),
+            (
+                "deploy-catalog",
+                "\n  deploy-catalog:\n",
+                "\n  finalize-notes:\n",
+                ROOT / ".github/workflows/deploy-catalog.yml",
+            ),
+        )
+        for name, start, end, path in cases:
+            caller = release.split(start, maxsplit=1)[1].split(end, maxsplit=1)[0]
+            called = path.read_text(encoding="utf-8")
+            caller_permissions = dict(
+                re.findall(r"(?m)^      ([a-z-]+): (read|write)$", caller)
+            )
+            requested_permissions = re.findall(
+                r"(?m)^(?:  |      )([a-z-]+): (read|write)$", called
+            )
+            for scope, requested in requested_permissions:
+                granted = caller_permissions.get(scope)
+                self.assertIsNotNone(
+                    granted,
+                    f"{name} caller does not grant requested {scope}: {requested}",
+                )
+                self.assertGreaterEqual(
+                    permission_rank[granted],
+                    permission_rank[requested],
+                    f"{name} caller grants {scope}: {granted}, below {requested}",
+                )
+
+    def test_draft_release_readers_request_contents_write(self) -> None:
+        release = (ROOT / ".github/workflows/release-core.yml").read_text(encoding="utf-8")
+        family = (ROOT / ".github/workflows/family-regression.yml").read_text(
+            encoding="utf-8"
+        )
+        deploy = (ROOT / ".github/workflows/deploy-catalog.yml").read_text(
+            encoding="utf-8"
+        )
         binaries = (ROOT / ".github/workflows/release-binaries.yml").read_text(
             encoding="utf-8"
         )
-        caller = release.split("\n  binaries:\n", maxsplit=1)[1].split(
-            "\n  prepublication-family:\n", maxsplit=1
+        completeness = (ROOT / "scripts/verify-release-completeness.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("scripts/verify-release-completeness.sh", release)
+        self.assertIn("scripts/verify-release-completeness.sh", binaries)
+        self.assertIn("verify-draft-completeness:", release)
+        self.assertIn("needs: [resolve, verify-draft-completeness]", release)
+        completeness_job = binaries.split("\n  verify-completeness:\n", 1)[1]
+        self.assertIn("contents: write", completeness_job.split("\n    steps:", 1)[0])
+        self.assertIn("contents: write", family.split("jobs:", 1)[0])
+        self.assertIn("contents: write", deploy.split("jobs:", 1)[0])
+        family_caller = release.split("\n  prepublication-family:\n", 1)[1].split(
+            "\n  deploy-catalog:\n", 1
         )[0]
-        caller_permissions = dict(
-            re.findall(r"(?m)^      ([a-z-]+): (read|write)$", caller)
-        )
-        requested_permissions = re.findall(
-            r"(?m)^(?:  |      )([a-z-]+): (read|write)$", binaries
-        )
-        permission_rank = {"read": 1, "write": 2}
-
-        for scope, requested in requested_permissions:
-            granted = caller_permissions.get(scope)
-            self.assertIsNotNone(
-                granted,
-                f"release-core reusable caller does not grant requested {scope}: {requested}",
-            )
-            self.assertGreaterEqual(
-                permission_rank[granted],
-                permission_rank[requested],
-                f"release-core reusable caller grants {scope}: {granted}, below {requested}",
-            )
+        deploy_caller = release.split("\n  deploy-catalog:\n", 1)[1].split(
+            "\n  finalize-notes:\n", 1
+        )[0]
+        self.assertIn("contents: write", family_caller)
+        self.assertIn("contents: write", deploy_caller)
+        self.assertIn("gh release download", completeness)
+        self.assertIn("gh release view", completeness)
     def test_reusable_release_declares_every_referenced_input(self) -> None:
         binaries = (ROOT / ".github/workflows/release-binaries.yml").read_text(
             encoding="utf-8"
@@ -94,6 +143,8 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("release ${tag} is a draft", release)
         self.assertIn("uses: ./.github/workflows/family-regression.yml", release)
         self.assertIn("uses: ./.github/workflows/deploy-catalog.yml", release)
+        self.assertIn("verify-draft-completeness:", release)
+        self.assertIn("scripts/verify-release-completeness.sh", release)
         self.assertNotIn("correctness_sources_artifact", release)
         self.assertNotIn("correctness_matrix_artifact", release)
         self.assertIn("orchestrator_run_id: ${{ github.run_id }}", release)

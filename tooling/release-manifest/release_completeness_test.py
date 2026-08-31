@@ -169,7 +169,7 @@ class CompletenessWorkflowContractTests(unittest.TestCase):
         job = WORKFLOW.split("\n  verify-completeness:\n", 1)[1]
         header = job.split("\n    steps:", 1)[0]
         self.assertIn("contents: write", header)
-        self.assertIn("tooling/release-manifest/release_completeness.py", job)
+        self.assertIn("scripts/verify-release-completeness.sh", job)
         self.assertNotIn("qualification-vulkan-windows-x86_64", job)
         self.assertNotIn("is not an exact CUDA/HIP target entry", job)
 

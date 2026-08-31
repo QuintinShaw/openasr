@@ -61,7 +61,9 @@ concurrency:
 permissions:
   actions: read
   attestations: read
-  contents: read
+  # PublishedInert deploy runs against a GitHub *draft* release. Drafts are
+  # invisible to contents:read, so this workflow needs write to see them.
+  contents: write
 
 jobs:
   gate-activation:

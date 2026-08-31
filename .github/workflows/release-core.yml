@@ -10,8 +10,9 @@ name: Release core
 #      the pin; they never override it.
 #   2. If no GitHub Release exists yet: create the empty draft, then call
 #      release-binaries.yml with `formal_release: true`.
-#   3. If the matching release is still a draft: run the pre-publication
-#      family gate and deploy the committed PublishedInert catalog.
+#   3. If the matching release is still a draft: re-verify completeness,
+#      run the pre-publication family gate, and deploy the committed
+#      PublishedInert catalog.
 #
 # The GitHub Release stays a draft until `scripts/finalize-core-release.sh`
 # runs locally after the signed catalog + CDN plane is live. Agents do not
@@ -227,14 +228,28 @@ jobs:
     # ship an unsigned Windows release binary" gate.
     secrets: inherit
 
+  verify-draft-completeness:
+    name: Verify draft release completeness
+    needs: [resolve]
+    if: needs.resolve.outputs.should_finalize == 'true' && success()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Assert the draft still has the complete attested subject set
+        run: scripts/verify-release-completeness.sh "${{ needs.resolve.outputs.tag }}" "${{ github.repository }}"
+
   prepublication-family:
     name: Pre-publication family correctness gate
-    needs: [resolve]
+    needs: [resolve, verify-draft-completeness]
     if: needs.resolve.outputs.should_finalize == 'true' && success()
     permissions:
       actions: read
       attestations: read
-      contents: read
+      contents: write
       packages: read
     uses: ./.github/workflows/family-regression.yml
     with:
@@ -249,7 +264,7 @@ jobs:
     permissions:
       actions: read
       attestations: read
-      contents: read
+      contents: write
     uses: ./.github/workflows/deploy-catalog.yml
     with:
       orchestrator_run_id: ${{ github.run_id }}
