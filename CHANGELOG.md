@@ -44,6 +44,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Core: `--diarize` / Voice ID now installs the native execution broker
+  before Stream-VAD and ReDimNet admission. 0.1.37 failed closed with
+  `could not load the vendored FireRed Stream-VAD` because those weights
+  started requiring the process-wide broker after GPU ownership work, but
+  NES was only installed around speaker-turn computation.
 - Core: a DedicatedDevice quarantine from a terminal device failure can
   recover when a later candidate presents a healthy heap snapshot (new
   backend generation after the poisoned handle was leaked). Ledger
