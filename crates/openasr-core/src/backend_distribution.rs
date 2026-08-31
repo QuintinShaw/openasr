@@ -185,6 +185,10 @@ pub enum BackendActivationError {
     DeviceProbe { code: &'static str, message: String },
     #[error("no signed backend pack matches live target '{target}': {message}")]
     NoCatalogMatch { target: String, message: String },
+    #[error("local GPU acceleration pack import rejected: {reason}")]
+    ImportRejected { reason: String },
+    #[error("cannot delete the in-use '{vendor}' GPU acceleration pack; switch away first")]
+    PackInUse { vendor: String },
 }
 
 impl BackendActivationError {
@@ -193,6 +197,8 @@ impl BackendActivationError {
             Self::UnsupportedDevice(_) | Self::DeviceProbe { .. } | Self::NoCatalogMatch { .. } => {
                 "unsupported_device"
             }
+            Self::ImportRejected { .. } => "verification",
+            Self::PackInUse { .. } => "pack_in_use",
             Self::Install(_) | Self::Store(_) => "download",
             Self::InstalledPack(_)
             | Self::Resolution(_)
@@ -221,6 +227,8 @@ impl BackendActivationError {
             Self::Parse { .. } => "state_parse_failed",
             Self::Read { .. } => "state_read_failed",
             Self::Write { .. } => "state_write_failed",
+            Self::ImportRejected { .. } => "import_rejected",
+            Self::PackInUse { .. } => "pack_in_use",
         }
     }
 }
@@ -418,13 +426,7 @@ fn prepare_backend_provider_for_live_device_locked(
     let host_abi = BackendHostAbi::current();
     let (resolved, device_target, driver_version) = match vendor {
         CatalogBackendVendor::Cuda | CatalogBackendVendor::Hip => {
-            let runtime = if vendor == CatalogBackendVendor::Hip {
-                let bootstrap = shared_provider_runtime_bootstrap(catalog, vendor, &host_abi)?;
-                prepare_backend_runtime_objects_locked(&bootstrap, home, &mut *progress)
-                    .map_err(|error| BackendActivationError::Install(error.to_string()))?
-            } else {
-                PreparedBackendRuntimeObjects::default()
-            };
+            let runtime = prepare_discovery_runtime(catalog, vendor, home, None, &mut *progress)?;
             let device = probe_provider_device(vendor, &runtime).map_err(|error| {
                 BackendActivationError::DeviceProbe {
                     code: error.code(),
@@ -533,9 +535,7 @@ pub fn describe_backend_provider(
             "no host-compatible provider pack is available".to_string(),
         ));
     }
-    if vendor == CatalogBackendVendor::Hip {
-        shared_provider_runtime_bootstrap(catalog, vendor, &host_abi)?;
-    }
+    let _ = optional_shared_runtime_bootstrap(catalog, vendor, &host_abi)?;
     let mut result = BackendProviderDescription {
         schema_version: 1,
         vendor,
@@ -567,11 +567,40 @@ pub fn describe_backend_provider(
     Ok(result)
 }
 
+fn prepare_discovery_runtime(
+    catalog: &ModelCatalog,
+    vendor: CatalogBackendVendor,
+    home: &Path,
+    local_source: Option<&Path>,
+    progress: &mut impl FnMut(PullProgress),
+) -> Result<PreparedBackendRuntimeObjects, BackendActivationError> {
+    let host_abi = BackendHostAbi::current();
+    let Some(bootstrap) = optional_shared_runtime_bootstrap(catalog, vendor, &host_abi)? else {
+        return Ok(PreparedBackendRuntimeObjects::default());
+    };
+    match local_source {
+        Some(source) => crate::pull::prepare_backend_runtime_objects_from_local_path(
+            &bootstrap, source, home, progress,
+        )
+        .map_err(|error| BackendActivationError::Install(error.to_string())),
+        None => prepare_backend_runtime_objects_locked(&bootstrap, home, progress)
+            .map_err(|error| BackendActivationError::Install(error.to_string())),
+    }
+}
+
+fn optional_shared_runtime_bootstrap(
+    catalog: &ModelCatalog,
+    vendor: CatalogBackendVendor,
+    host_abi: &BackendHostAbi,
+) -> Result<Option<crate::ResolvedCatalogBackendPull>, BackendActivationError> {
+    shared_provider_runtime_bootstrap(catalog, vendor, host_abi)
+}
+
 fn shared_provider_runtime_bootstrap(
     catalog: &ModelCatalog,
     vendor: CatalogBackendVendor,
     host_abi: &BackendHostAbi,
-) -> Result<crate::ResolvedCatalogBackendPull, BackendActivationError> {
+) -> Result<Option<crate::ResolvedCatalogBackendPull>, BackendActivationError> {
     let mut variants = catalog
         .backends
         .iter()
@@ -588,9 +617,7 @@ fn shared_provider_runtime_bootstrap(
     };
     let expected = shared_runtime_identity(first);
     if expected.is_empty() {
-        return Err(BackendActivationError::Resolution(
-            "provider packs omit the signed shared discovery runtime".to_string(),
-        ));
+        return Ok(None);
     }
     if variants
         .iter()
@@ -605,7 +632,7 @@ fn shared_provider_runtime_bootstrap(
     bootstrap
         .files
         .retain(|file| file.role != CatalogBackendFileRole::Plugin);
-    Ok(bootstrap)
+    Ok(Some(bootstrap))
 }
 
 fn shared_runtime_identity(
@@ -643,6 +670,108 @@ pub fn install_backend_pack_from_catalog(
     // the old process during an NSIS hand-off.
     install_backend_pack(&requested, home, progress)
         .map_err(|error| BackendActivationError::Install(error.to_string()))
+}
+
+/// Import an official CUDA/HIP pack from a local file or folder. Uses the
+/// same signed-catalog verification as a download. Does not change the
+/// activation selector.
+pub fn import_backend_provider_from_local_path(
+    catalog: &ModelCatalog,
+    vendor: CatalogBackendVendor,
+    source: &Path,
+    home: &Path,
+    mut progress: impl FnMut(crate::PullProgress),
+) -> Result<PreparedBackendPack, BackendActivationError> {
+    if !matches!(
+        vendor,
+        CatalogBackendVendor::Cuda | CatalogBackendVendor::Hip
+    ) {
+        return Err(BackendActivationError::ImportRejected {
+            reason: "Vulkan is built-in and cannot be imported".to_string(),
+        });
+    }
+    let host_abi = BackendHostAbi::current();
+    let (resolved, device_target, driver_version) = match vendor {
+        CatalogBackendVendor::Cuda | CatalogBackendVendor::Hip => {
+            let runtime =
+                prepare_discovery_runtime(catalog, vendor, home, Some(source), &mut progress)?;
+            let device = probe_provider_device(vendor, &runtime).map_err(|error| {
+                BackendActivationError::DeviceProbe {
+                    code: error.code(),
+                    message: error.to_string(),
+                }
+            })?;
+            let resolved = resolve_compatible_catalog_backend_pull_for_driver(
+                catalog,
+                vendor,
+                &host_abi,
+                Some(&device.target),
+                Some(&device.driver_api_version),
+            )
+            .map_err(|error| BackendActivationError::NoCatalogMatch {
+                target: device.target.clone(),
+                message: error.to_string(),
+            })?;
+            (resolved, device.target, device.driver_api_version)
+        }
+        CatalogBackendVendor::Vulkan
+        | CatalogBackendVendor::Cpu
+        | CatalogBackendVendor::Unknown => {
+            return Err(BackendActivationError::ImportRejected {
+                reason: "Vulkan is built-in and cannot be imported".to_string(),
+            });
+        }
+    };
+    require_catalog_backend_activated(&resolved)?;
+    let installed =
+        crate::install_backend_pack_from_local_path(&resolved, source, home, &mut progress)
+            .map_err(map_import_pull_error)?;
+    let size_bytes: u64 = resolved.files.iter().map(|file| file.size_bytes).sum();
+    let plugin_size_bytes: u64 = resolved
+        .files
+        .iter()
+        .filter(|file| file.role == CatalogBackendFileRole::Plugin)
+        .map(|file| file.size_bytes)
+        .sum();
+    let vendor_size_bytes = size_bytes.saturating_sub(plugin_size_bytes);
+    let protected_bytes = installed_backend_protected_bytes(&resolved, home)
+        .map_err(|error| BackendActivationError::Install(error.to_string()))?;
+    Ok(PreparedBackendPack {
+        schema_version: 1,
+        backend_id: installed.backend_id,
+        vendor,
+        version: installed.version,
+        artifact_fingerprint: installed.artifact_fingerprint,
+        host_abi_fingerprint: resolved.host_abi.fingerprint,
+        device_target,
+        driver_version,
+        size_bytes,
+        plugin_size_bytes,
+        vendor_size_bytes,
+        protected_bytes,
+    })
+}
+
+fn map_import_pull_error(error: crate::PullError) -> BackendActivationError {
+    match error {
+        crate::PullError::BackendImportRejected { reason } => {
+            BackendActivationError::ImportRejected { reason }
+        }
+        crate::PullError::BackendPackInUse { vendor } => {
+            BackendActivationError::PackInUse { vendor }
+        }
+        crate::PullError::ShaMismatch { .. } => BackendActivationError::ImportRejected {
+            reason: "checksum verification failed".to_string(),
+        },
+        other => BackendActivationError::Install(other.to_string()),
+    }
+}
+
+pub fn uninstall_backend_library_vendor(
+    home: &Path,
+    vendor: CatalogBackendVendor,
+) -> Result<crate::BackendStoreGcReport, BackendActivationError> {
+    crate::uninstall_backend_packs_for_vendor(home, vendor).map_err(map_import_pull_error)
 }
 
 pub fn activate_installed_backend_pack_auto(

@@ -9,6 +9,7 @@ use std::{
         Arc, Barrier, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use crate::{
@@ -3775,17 +3776,210 @@ fn backend_store_gc_retains_requested_pack_and_its_shared_vendor_object() {
         Some(Duration::ZERO),
     )
     .unwrap();
-    assert!(!first_dir.exists());
+    assert!(
+        first_dir.is_dir(),
+        "unselected library packs must survive GC"
+    );
     assert!(second_dir.is_dir());
     assert!(object_dir.is_dir());
-    assert_eq!(report.removed_pack_directories, 1);
+    assert_eq!(report.removed_pack_directories, 0);
     assert_eq!(report.removed_content_objects, 0);
 
     let report = gc_backend_store(home.path(), Vec::new(), Some(Duration::ZERO)).unwrap();
-    assert!(!second_dir.exists());
-    assert!(!object_dir.exists());
+    assert!(first_dir.is_dir());
+    assert!(second_dir.is_dir());
+    assert!(object_dir.is_dir());
+    assert_eq!(report.removed_pack_directories, 0);
+    assert_eq!(report.removed_content_objects, 0);
+}
+
+#[test]
+fn backend_store_gc_reclaims_replaced_generation_of_the_same_pack() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let first = hip_pack_resolved(&plugin, &archive);
+    let mut first_client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: plugin.clone(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive.clone(),
+        },
+    ]);
+    install_backend_pack_with_client(&first, home.path(), &mut first_client, |_| {}).unwrap();
+
+    let mut second = first.clone();
+    second.version = "0.13.2".to_string();
+    let mut second_plugin = plugin.clone();
+    second_plugin.push(0x11);
+    second.files[0].sha256 = sha256_hex(&second_plugin);
+    second.files[0].size_bytes = second_plugin.len() as u64;
+    let mut second_client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: second_plugin,
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+    std::thread::sleep(Duration::from_millis(1100));
+    install_backend_pack_with_client(&second, home.path(), &mut second_client, |_| {}).unwrap();
+
+    let first_dir = backend_pack_install_dir(home.path(), &first).unwrap();
+    let second_dir = backend_pack_install_dir(home.path(), &second).unwrap();
+    let report = gc_backend_store(home.path(), Vec::new(), Some(Duration::ZERO)).unwrap();
+    assert!(!first_dir.exists(), "replaced generation must be reclaimed");
+    assert!(second_dir.is_dir(), "current generation must remain");
     assert_eq!(report.removed_pack_directories, 1);
-    assert_eq!(report.removed_content_objects, 1);
+}
+
+#[test]
+fn uninstall_backend_vendor_leaves_the_other_library_pack() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let hip = hip_pack_resolved(&plugin, &archive);
+    let mut hip_client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: plugin.clone(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive.clone(),
+        },
+    ]);
+    install_backend_pack_with_client(&hip, home.path(), &mut hip_client, |_| {}).unwrap();
+
+    let mut cuda = hip.clone();
+    cuda.backend_id = "cuda-ampere".to_string();
+    cuda.vendor = CatalogBackendVendor::Cuda;
+    cuda.files[0].filename = "ggml-cuda.dll".to_string();
+    let mut cuda_plugin = plugin.clone();
+    cuda_plugin.push(0x22);
+    cuda.files[0].sha256 = sha256_hex(&cuda_plugin);
+    cuda.files[0].size_bytes = cuda_plugin.len() as u64;
+    let mut cuda_client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: cuda_plugin,
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+    install_backend_pack_with_client(&cuda, home.path(), &mut cuda_client, |_| {}).unwrap();
+
+    let hip_dir = backend_pack_install_dir(home.path(), &hip).unwrap();
+    let cuda_dir = backend_pack_install_dir(home.path(), &cuda).unwrap();
+    uninstall_backend_packs_for_vendor(home.path(), CatalogBackendVendor::Cuda).unwrap();
+    assert!(hip_dir.is_dir());
+    assert!(!cuda_dir.exists());
+    let leftover = list_installed_backend_packs(home.path()).unwrap();
+    assert_eq!(leftover.len(), 1);
+    assert_eq!(leftover[0].vendor, "hip");
+}
+
+#[test]
+fn uninstall_backend_vendor_refuses_while_in_use() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let hip = hip_pack_resolved(&plugin, &archive);
+    let mut hip_client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: plugin.clone(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+    install_backend_pack_with_client(&hip, home.path(), &mut hip_client, |_| {}).unwrap();
+    let hip_dir = backend_pack_install_dir(home.path(), &hip).unwrap();
+    fs::create_dir_all(home.path().join("backends")).unwrap();
+    let sha = "a".repeat(64);
+    let active = crate::backend_distribution::ActivatedBackendPack {
+        schema_version: crate::backend_distribution::ACTIVATED_BACKEND_SCHEMA_VERSION,
+        backend_id: hip.backend_id.clone(),
+        vendor: CatalogBackendVendor::Hip,
+        version: hip.version.clone(),
+        artifact_fingerprint: "b".repeat(64),
+        host_abi_fingerprint: hip.host_abi.fingerprint.clone(),
+        device_target: "gfx1200".to_string(),
+        driver_version: "7.1.0".to_string(),
+        qualification_source_catalog_sha256: sha.clone(),
+        hardware_evidence_sha256: sha.clone(),
+        correctness_matrix_sha256: sha.clone(),
+        correctness_receipts_sha256: sha,
+        activated_at_unix_seconds: 1,
+    };
+    fs::write(
+        home.path().join("backends").join("active.json"),
+        serde_json::to_string(&active).unwrap(),
+    )
+    .unwrap();
+
+    let error =
+        uninstall_backend_packs_for_vendor(home.path(), CatalogBackendVendor::Hip).unwrap_err();
+    assert!(matches!(
+        error,
+        PullError::BackendPackInUse { vendor } if vendor == "hip"
+    ));
+    assert!(hip_dir.is_dir(), "in-use pack must stay installed");
+
+    crate::backend_distribution::deactivate_backend_pack(home.path()).unwrap();
+    uninstall_backend_packs_for_vendor(home.path(), CatalogBackendVendor::Hip).unwrap();
+    assert!(!hip_dir.exists());
+}
+
+#[test]
+fn install_backend_pack_from_local_path_does_not_activate() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let resolved = hip_pack_resolved(&plugin, &archive);
+    let source = home.path().join("usb");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("ggml-hip.dll"), &plugin).unwrap();
+    fs::write(source.join("rocblas-library.zip"), &archive).unwrap();
+
+    let installed =
+        install_backend_pack_from_local_path(&resolved, &source, home.path(), |_| {}).unwrap();
+    assert_eq!(installed.backend_id, "hip-radeon");
+    assert!(
+        backend_pack_install_dir(home.path(), &resolved)
+            .unwrap()
+            .join("ggml-hip.dll")
+            .is_file()
+    );
+    assert!(!home.path().join("backends").join("active.json").exists());
+}
+
+#[test]
+fn install_backend_pack_from_local_path_rejects_garbage() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let resolved = hip_pack_resolved(&plugin, &archive);
+    let source = home.path().join("usb");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("readme.txt"), b"not a pack").unwrap();
+    let error =
+        install_backend_pack_from_local_path(&resolved, &source, home.path(), |_| {}).unwrap_err();
+    assert!(matches!(error, PullError::BackendImportRejected { .. }));
+    assert!(
+        list_installed_backend_packs(home.path())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
