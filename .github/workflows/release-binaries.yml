@@ -236,13 +236,9 @@ jobs:
     # published-inert provider packs with content-addressed runtimes.
     # Legacy whole-engine Vulkan/CUDA/HIP sidecars ended with core 0.1.33.
     #
-    # NOTE: jobs.verify-completeness below hardcodes this same asset/ext list
-    # (TARGETS, now friendly asset names) to assert the release ends up with
-    # every archive. Keep both in sync when adding/removing a leg. The
-    # xcframework job further below is a separate, non-matrix leg (macOS/iOS
-    # SDK, not a CLI binary) but its asset is folded into the same TARGETS list
-    # -- keep that in sync too. Legs marked `experimental: true` are NOT in
-    # TARGETS (they may drop out until proven green), so keep them out of it.
+    # NOTE: jobs.verify-completeness derives the required asset set from this
+    # matrix via tooling/release-manifest/release_completeness.py. Experimental
+    # legs may appear when they succeed; they are optional, never required.
     strategy:
       fail-fast: false
       # Include rows live in tooling/release-manifest/release_binaries_matrix.json
@@ -1693,6 +1689,8 @@ jobs:
     needs: [checksums, upload-to-release]
     if: ${{ always() && !cancelled() && inputs.formal_release == true && needs.checksums.result == 'success' && needs.upload-to-release.result == 'success' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ needs.upload-to-release.outputs.tag }}
@@ -1708,136 +1706,28 @@ jobs:
           echo "OPENASR_VERSION=${version}" >> "${GITHUB_ENV}"
 
       - name: Assert the release has every expected matrix asset
-        # Keep this TARGETS list (friendly asset names, matching each matrix
-        # leg's `asset:` field) in sync with jobs.build.strategy.matrix.include
-        # above, plus jobs.xcframework's asset -- this is the release-integrity
-        # gate: a release "shipped" but missing a platform's archive (e.g. one
-        # matrix leg failed and `checksums` silently dropped it, per its
-        # `!cancelled()` condition)
-        # must fail loudly here instead of quietly shipping partial coverage.
-        # `experimental: true` legs (e.g. windows-arm64) are deliberately NOT
-        # listed: they may fail without failing the run, so requiring their
-        # asset here would defeat the escape hatch. Promote such a leg (drop
-        # `experimental`, add its asset:ext here) once it proves green.
+        # Draft GitHub Releases are invisible to contents:read. This job only
+        # reads the draft, but it still needs contents:write to see it.
+        # Qualification filenames come from qualification_manifest.artifact_cell
+        # so Vulkan stays generic, not a retired windows-x86_64 sidecar name.
         run: |
           set -euo pipefail
           tag="${RELEASE_TAG}"
           [ -n "$tag" ] || { echo "release tag is empty" >&2; exit 1; }
           version="${OPENASR_VERSION}"
-
-          TARGETS=(
-            "linux-x86_64:tar.gz"
-            "linux-arm64:tar.gz"
-            "macos-x86_64:tar.gz"
-            "macos-arm64:tar.gz"
-            "windows-x86_64:zip"
-            "windows-x86_64-neutral:zip"
-            "linux-x86_64-vulkan:tar.gz"
-            "linux-x86_64-cuda:tar.gz"
-            "linux-x86_64-rocm:tar.gz"
-            # Not a CLI binary leg (see jobs.xcframework above), but still a
-            # released, version-named asset -- keep it in this same
-            # completeness gate so a broken xcframework build fails loudly
-            # instead of quietly shipping a release without the SDK.
-            "xcframework:zip"
-          )
-
-          expected_file="$(mktemp)"
-          base_expected="$(mktemp)"
-          {
-            for entry in "${TARGETS[@]}"; do
-              target="${entry%%:*}"
-              ext="${entry##*:}"
-              echo "openasr-${version}-${target}.${ext}"
-            done
-            echo "openasr-${version}-xcframework.zip.sha256"
-          } > "$base_expected"
           pack_names="$(mktemp)"
-          python3 - "$pack_names" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          matrix = json.loads(Path("tooling/release-manifest/release_binaries_matrix.json").read_text())
-          names = []
-          for row in matrix:
-              provider = row.get("provider")
-              if provider == "cuda" and not row.get("experimental", False):
-                  names.append(f"backend-pack-cuda-sm_{row['cuda_gpu_target']}.json")
-              elif provider == "hip" and not row.get("experimental", False):
-                  names.append(f"backend-pack-hip-{row['hip_gpu_target']}.json")
-              elif provider == "vulkan" and row.get("distribution") == "plugin":
-                  names.append("backend-pack-vulkan-generic.json")
-          Path(sys.argv[1]).write_text("\n".join(names) + "\n", encoding="utf-8")
-          PY
+          python3 tooling/release-manifest/release_completeness.py pack-names \
+            > "$pack_names"
           pack_dir="$(mktemp -d)"
           while IFS= read -r pack_name; do
             [ -n "$pack_name" ] || continue
             gh release download "$tag" --repo "${{ github.repository }}" \
               -p "$pack_name" -D "$pack_dir"
           done < "$pack_names"
-          pack_payload_names="$(mktemp)"
-          python3 - "$pack_dir" "$version" > "$pack_payload_names" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          root = Path(sys.argv[1])
-          version = sys.argv[2]
-          for entry_path in sorted(root.glob("backend-pack-*.json")):
-              entry = json.loads(entry_path.read_text(encoding="utf-8"))
-              provider = entry.get("vendor")
-              targets = entry.get("targets")
-              if provider not in {"cuda", "hip"} or not isinstance(targets, list) or len(targets) != 1:
-                  raise SystemExit(f"{entry_path.name} is not an exact CUDA/HIP target entry")
-              print(f"openasr-{version}-qualification-{provider}-{targets[0]}.json")
-              files = entry.get("files")
-              if not isinstance(files, list) or not files:
-                  raise SystemExit(f"{entry_path.name} has no files")
-              for file in files:
-                  name = file.get("filename") if isinstance(file, dict) else None
-                  if not isinstance(name, str) or not name or Path(name).name != name:
-                      raise SystemExit(f"{entry_path.name} has unsafe filename {name!r}")
-                  print(name)
-          PY
-          {
-            cat "$base_expected"
-            cat "$pack_names"
-            cat "$pack_payload_names"
-            echo "backend-plugin-hints.json"
-            echo "catalog.backends.candidate.json"
-            echo "openasr-${version}-build-provenance.bundle.json"
-            echo "openasr-${version}-qualification-vulkan-windows-x86_64.json"
-            echo "SHA256SUMS"
-          } > "$expected_file"
-          sort -u -o "$expected_file" "$expected_file"
-
           actual_file="$(mktemp)"
           gh release view "$tag" --repo "${{ github.repository }}" --json assets \
             --jq '.assets[].name' | sort > "$actual_file"
-          lock_asset="openasr-${version}-qualification-mutation.lock"
-          if grep -Fqx "$lock_asset" "$actual_file"; then
-            echo "::error::release ${tag} still has qualification mutation lock ${lock_asset}" >&2
-            exit 1
-          fi
-
-          echo "== expected =="
-          cat "$expected_file"
-          echo "== actual =="
-          cat "$actual_file"
-
-          missing="$(comm -23 "$expected_file" "$actual_file")"
-          extra="$(comm -13 "$expected_file" "$actual_file")"
-          if [ -n "$missing" ]; then
-            echo "::error::release ${tag} is missing expected asset(s):"
-            echo "$missing"
-            exit 1
-          fi
-          if [ -n "$extra" ]; then
-            echo "::error::release ${tag} contains unexpected asset(s):"
-            echo "$extra"
-            exit 1
-          fi
-          echo "release ${tag} has all $(wc -l < "$expected_file" | tr -d ' ') expected assets."
-
-          echo "release ${tag} has every plugin and content-addressed vendor archive declared by its required backend packs."
+          python3 tooling/release-manifest/release_completeness.py compare \
+            --version "$version" \
+            --pack-dir "$pack_dir" \
+            --actual-file "$actual_file"

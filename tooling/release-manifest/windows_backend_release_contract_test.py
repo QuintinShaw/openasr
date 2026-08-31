@@ -122,15 +122,18 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             "--require-single-target",
             "--out dist/catalog.backends.candidate.json",
             "--out dist/backend-plugin-hints.json",
-            'names.append(f"backend-pack-cuda-sm_{row[\'cuda_gpu_target\']}.json")',
-            'names.append(f"backend-pack-hip-{row[\'hip_gpu_target\']}.json")',
-            'names.append("backend-pack-vulkan-generic.json")',
-            'echo "backend-plugin-hints.json"',
-            'echo "catalog.backends.candidate.json"',
             "staging/catalog.backends.candidate.json",
         )
         for fragment in required:
             self.assertIn(fragment, self.workflow)
+        completeness = (ROOT / "tooling" / "release-manifest" / "release_completeness.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('f"backend-pack-cuda-sm_{row[\'cuda_gpu_target\']}.json"', completeness)
+        self.assertIn('f"backend-pack-hip-{row[\'hip_gpu_target\']}.json"', completeness)
+        self.assertIn('"backend-pack-vulkan-generic.json"', completeness)
+        self.assertIn('"backend-plugin-hints.json"', completeness)
+        self.assertIn('"catalog.backends.candidate.json"', completeness)
 
     def test_plugin_vendor_and_signing_steps_cover_all_gpu_providers(self) -> None:
         self.assertIn(
@@ -289,7 +292,11 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         self.assertIn("refusing to overwrite assets on a public release", self.workflow)
         self.assertIn("release tag and checked-out source commit differ", self.workflow)
         self.assertIn("formal release assets may be uploaded only to an existing draft", self.workflow)
-        self.assertIn("contains unexpected asset(s)", self.workflow)
+        completeness = (ROOT / "tooling" / "release-manifest" / "release_completeness.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("contains unexpected asset(s)", completeness)
+        self.assertIn("tooling/release-manifest/release_completeness.py", self.workflow)
         self.assertIn("staging/*.sha256", self.workflow)
     def test_qualification_manifests_bind_the_successful_attestation_bundle(self) -> None:
         checksums = self.workflow.split("\n  checksums:\n", 1)[1].split(
@@ -404,10 +411,10 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             ),
             2,
         )
-        self.assertIn(
-            'lock_asset="openasr-${version}-qualification-mutation.lock"',
-            self.workflow,
+        completeness = (ROOT / "tooling" / "release-manifest" / "release_completeness.py").read_text(
+            encoding="utf-8"
         )
+        self.assertIn('LOCK_ASSET_SUFFIX = "-qualification-mutation.lock"', completeness)
         self.assertIn("stopped being a draft before asset upload", self.workflow)
 
     def test_qualification_release_lock_is_exclusive_and_nonce_owned(self) -> None:
