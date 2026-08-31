@@ -44,6 +44,8 @@ case "$action" in
     ;;
   release)
     [ -s "$token_file" ] || fail "ownership token is missing: $token_file"
+    # Tiny 64-hex ownership token. The local mutex contract test intercepts
+    # `gh release download`; this is not a payload-hang path.
     gh release download "$tag" --repo "$repository" -p "$asset_name" \
       -D "$temporary" --clobber >/dev/null
     cmp -s -- "$token_file" "$temporary/$asset_name" \

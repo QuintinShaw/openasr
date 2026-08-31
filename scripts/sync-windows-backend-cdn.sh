@@ -46,9 +46,7 @@ workdir="$(mktemp -d "${TMPDIR:-/tmp}/openasr-backend-cdn.XXXXXX")"
 trap 'rm -rf "$workdir"' EXIT
 
 echo "==> downloading backend entries for ${tag}"
-gh release download "$tag" \
-  -p 'backend-pack-*.json' \
-  -D "$workdir" --clobber
+python3 tooling/release-manifest/gh_release.py download-packs "$tag" "$workdir"
 
 shopt -s nullglob
 backend_entries=("$workdir"/backend-pack-*.json)

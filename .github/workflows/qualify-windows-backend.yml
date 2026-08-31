@@ -114,12 +114,13 @@ jobs:
           }
           $releaseDir = Join-Path $env:RUNNER_TEMP "openasr-release-inputs"
           New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
-          gh release download $tag --repo $env:GITHUB_REPOSITORY `
-            --pattern "backend-pack-*.json" `
-            --pattern "catalog.backends.candidate.json" `
-            --pattern "SHA256SUMS" `
-            --pattern "openasr-$version-windows-x86_64-neutral.zip" `
-            --dir $releaseDir
+          & python tooling/release-manifest/gh_release.py download-packs $tag $releaseDir --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw "could not download backend-pack metadata" }
+          & python tooling/release-manifest/gh_release.py download $tag $releaseDir `
+            "catalog.backends.candidate.json" `
+            "SHA256SUMS" `
+            "openasr-$version-windows-x86_64-neutral.zip" `
+            --repo $env:GITHUB_REPOSITORY
           if ($LASTEXITCODE -ne 0) { throw "could not download exact release inputs" }
 
           $entries = @(Get-ChildItem -LiteralPath $releaseDir -Filter "backend-pack-*.json" -File)
@@ -137,7 +138,7 @@ jobs:
             throw "Vulkan release entry is not artifact-generic"
           }
           foreach ($file in $entry.files) {
-            gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern $file.filename --dir $releaseDir
+            & python tooling/release-manifest/gh_release.py download $tag $releaseDir $file.filename --repo $env:GITHUB_REPOSITORY
             if ($LASTEXITCODE -ne 0) { throw "could not download $($file.filename)" }
           }
           $pluginRows = @($entry.files | Where-Object { $_.role -eq "plugin" })

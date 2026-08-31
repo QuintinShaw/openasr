@@ -79,9 +79,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-metadata
-          gh release download "$TAG" \
-            --pattern 'backend-pack-*.json' \
-            --dir release-metadata
+          python3 tooling/release-manifest/gh_release.py download-packs \
+            "$TAG" release-metadata
       - name: Require the finalizer's live distribution invariants
         env:
           GH_TOKEN: ${{ github.token }}

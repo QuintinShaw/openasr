@@ -97,9 +97,11 @@ done
 echo "==> downloading signed plugin and vendor payloads from CDN"
 python3 - "$workdir" <<'PY'
 import json
-import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, "tooling/release-manifest")
+import gh_release
 
 root = Path(sys.argv[1])
 downloaded = set()
@@ -113,24 +115,8 @@ for entry_path in sorted(root.glob("backend-pack-*.json")):
         if name in downloaded:
             continue
         url = f"https://dl.openasr.org/core/v{version}/{name}"
-        dest = root / name
         print(f"downloading {url}", flush=True)
-        subprocess.run(
-            [
-                "curl",
-                "-fsSL",
-                "--http1.1",
-                "--retry",
-                "5",
-                "--retry-all-errors",
-                "--connect-timeout",
-                "20",
-                "-o",
-                str(dest),
-                url,
-            ],
-            check=True,
-        )
+        gh_release.download_url(url, root / name)
         downloaded.add(name)
 PY
 

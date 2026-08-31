@@ -84,11 +84,25 @@ lock_acquired=true
   || fail "${tag} stopped being a draft while acquiring the qualification lock"
 
 echo "==> downloading inert qualification assets for ${tag}"
-gh release download "$tag" --repo "$repository" \
-  -p "openasr-${version}-qualification-*.json" \
-  -p "openasr-${version}-build-provenance.bundle.json" \
-  -p "openasr-${version}-windows-x86_64-neutral.zip" \
-  -D "$workdir" --clobber
+python3 - "$tag" "$repository" "$workdir" "$version" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "tooling/release-manifest")
+import gh_release
+
+tag, repository, dest, version = sys.argv[1], sys.argv[2], Path(sys.argv[3]), sys.argv[4]
+names = [
+    f"openasr-{version}-windows-x86_64-neutral.zip",
+    f"openasr-{version}-build-provenance.bundle.json",
+]
+for name in gh_release.list_asset_names(tag, repository):
+    if name.endswith(".lock"):
+        continue
+    if name.startswith(f"openasr-{version}-qualification-") and name.endswith(".json"):
+        names.append(name)
+gh_release.download_assets(tag, names, dest, repository=repository)
+PY
 
 python3 - "$workdir" "$version" "$tag_commit" "$promote_cuda_targets" <<'PY'
 import json
@@ -202,11 +216,21 @@ if len(sources) != 1 or len(bundles) != 1:
 )
 PY
 
-while IFS= read -r asset_name || [ -n "$asset_name" ]; do
-  [ -n "$asset_name" ] || continue
-  [ -f "$workdir/$asset_name" ] || gh release download "$tag" --repo "$repository" \
-    -p "$asset_name" -D "$workdir" --clobber
-done < "$workdir/release-subjects.txt"
+python3 - "$tag" "$repository" "$workdir" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "tooling/release-manifest")
+import gh_release
+
+tag, repository, dest = sys.argv[1], sys.argv[2], Path(sys.argv[3])
+names = []
+for line in (dest / "release-subjects.txt").read_text(encoding="utf-8").splitlines():
+    name = line.strip()
+    if name and not (dest / name).is_file():
+        names.append(name)
+gh_release.download_assets(tag, names, dest, repository=repository)
+PY
 
 echo "==> verifying release bytes and Sigstore provenance before signing"
 python3 - "$workdir" <<'PY'
@@ -309,9 +333,23 @@ echo "==> uploading detached signatures to draft ${tag}"
 gh release upload "$tag" --repo "$repository" "${signature_paths[@]}" --clobber
 
 echo "==> re-downloading and verifying published manifest/signature pairs"
-gh release download "$tag" --repo "$repository" \
-  -p "openasr-${version}-qualification-*.json" \
-  -D "$verify_dir" --clobber
+python3 - "$tag" "$repository" "$verify_dir" "$version" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "tooling/release-manifest")
+import gh_release
+
+tag, repository, dest, version = sys.argv[1], sys.argv[2], Path(sys.argv[3]), sys.argv[4]
+names = [
+    name
+    for name in gh_release.list_asset_names(tag, repository)
+    if name.startswith(f"openasr-{version}-qualification-")
+    and name.endswith(".json")
+    and not name.endswith(".lock")
+]
+gh_release.download_assets(tag, names, dest, repository=repository)
+PY
 while IFS=$'\t' read -r manifest_name manifest_url signature_name; do
   [ -s "$verify_dir/$manifest_name" ] || fail "published manifest is missing: $manifest_name"
   [ -s "$verify_dir/$signature_name" ] || fail "published signature is missing: $signature_name"

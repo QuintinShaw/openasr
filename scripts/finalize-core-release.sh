@@ -74,13 +74,42 @@ scripts/qualification-release-lock.sh acquire "$tag" "$lock_token"
 lock_acquired=true
 [ "$(gh release view "$tag" --repo "$repository" --json isDraft --jq .isDraft)" = "true" ] \
   || fail "release ${tag} stopped being a draft while acquiring the finalization lock"
-gh release download "$tag" --repo "$repository" \
-  -p 'backend-pack-*.json' \
-  -p 'backend-plugin-hints.json' \
-  -p 'catalog.backends.candidate.json' \
-  -p 'openasr-*' \
-  -p 'SHA256SUMS' \
-  -D "$workdir" --clobber
+python3 - "$tag" "$repository" "$workdir" "$version" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "tooling/release-manifest")
+import gh_release
+import release_completeness
+
+tag, repository, dest, version = sys.argv[1], sys.argv[2], Path(sys.argv[3]), sys.argv[4]
+metadata = [
+    "SHA256SUMS",
+    "backend-plugin-hints.json",
+    "catalog.backends.candidate.json",
+    *release_completeness.backend_pack_names(release_completeness.load_matrix()),
+]
+gh_release.download_assets(tag, metadata, dest, repository=repository)
+subjects = []
+for line in (dest / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    asset_name = line.split(None, 1)[-1].lstrip("*")
+    if Path(asset_name).name != asset_name:
+        raise SystemExit(f"SHA256SUMS contains an unsafe release basename: {asset_name}")
+    subjects.append(asset_name)
+gh_release.download_assets(tag, subjects, dest, repository=repository)
+qualification = []
+for name in gh_release.list_asset_names(tag, repository):
+    if name.endswith(".lock"):
+        continue
+    if name.startswith(f"openasr-{version}-qualification-") or name == (
+        f"openasr-{version}-build-provenance.bundle.json"
+    ):
+        qualification.append(name)
+gh_release.download_assets(tag, qualification, dest, repository=repository)
+PY
 
 shopt -s nullglob
 backend_entries=("$workdir"/backend-pack-*.json)

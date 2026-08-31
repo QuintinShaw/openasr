@@ -67,7 +67,8 @@ jobs:
           version="${RELEASE_TAG#v}"
           mkdir -p staging/candidate
           asset="openasr-${version}-linux-x86_64.tar.gz"
-          gh release download "$RELEASE_TAG" -p "$asset" -p SHA256SUMS -D staging/candidate
+          python3 tooling/release-manifest/gh_release.py download \
+            "$RELEASE_TAG" staging/candidate "$asset" SHA256SUMS
           python3 tooling/release-manifest/release_asset_verifier.py \
             --asset "staging/candidate/$asset" --checksums staging/candidate/SHA256SUMS
           git fetch --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
@@ -112,8 +113,8 @@ jobs:
           asset="openasr-${version}-${ASSET_SUFFIX}.tar.gz"
           workdir="${RUNNER_TEMP}/published-cli"
           mkdir -p "${workdir}"
-          if gh release download "${tag}" --repo "${GITHUB_REPOSITORY}" \
-              --dir "${workdir}" --pattern "${asset}" --pattern SHA256SUMS; then
+          if python3 tooling/release-manifest/gh_release.py download \
+              "${tag}" "${workdir}" "${asset}" SHA256SUMS --repo "${GITHUB_REPOSITORY}"; then
             python3 tooling/release-manifest/release_asset_verifier.py \
               --asset "${workdir}/${asset}" --checksums "${workdir}/SHA256SUMS" || exit 1
             gh attestation verify "${workdir}/${asset}" \
@@ -194,8 +195,8 @@ jobs:
           asset="openasr-${version}-${ASSET_SUFFIX}.tar.gz"
           workdir="${RUNNER_TEMP}/published-cli"
           mkdir -p "${workdir}"
-          if gh release download "${tag}" --repo "${GITHUB_REPOSITORY}" \
-              --dir "${workdir}" --pattern "${asset}" --pattern SHA256SUMS; then
+          if python3 tooling/release-manifest/gh_release.py download \
+              "${tag}" "${workdir}" "${asset}" SHA256SUMS --repo "${GITHUB_REPOSITORY}"; then
             python3 tooling/release-manifest/release_asset_verifier.py \
               --asset "${workdir}/${asset}" --checksums "${workdir}/SHA256SUMS" || exit 1
             gh attestation verify "${workdir}/${asset}" \
