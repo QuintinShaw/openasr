@@ -634,7 +634,7 @@ jobs:
       # runner cannot execute, so they skip every smoke step (build + package
       # validation only).
       - name: Smoke release binary
-        if: runner.os != 'Windows' && !contains(matrix.features, 'cuda') && !contains(matrix.features, 'hip') && !matrix.rust_target
+        if: runner.os != 'Windows' && matrix.distribution != 'plugin' && !contains(matrix.features, 'cuda') && !contains(matrix.features, 'hip') && !matrix.rust_target
         run: |
           "${RELEASE_DIR}/openasr" --version
           "${RELEASE_DIR}/openasr" --help
@@ -644,14 +644,16 @@ jobs:
       # import-links amdhip64.dll (AMD driver), neither of which this GPU-less
       # runner has, so those cannot launch here: build + package only. The
       # Vulkan exe resolves against the SDK loader installed above, so it
-      # launches and runs CPU paths here.
+      # launches and runs CPU paths here. Plugin rows compile openasr-core
+      # only and never emit openasr.exe, so they must not smoke the CLI.
       - name: Smoke release binary
-        if: runner.os == 'Windows' && !contains(matrix.features, 'cuda') && !contains(matrix.features, 'hip') && !matrix.rust_target
+        if: runner.os == 'Windows' && matrix.distribution != 'plugin' && !contains(matrix.features, 'cuda') && !contains(matrix.features, 'hip') && !matrix.rust_target
         shell: pwsh
         run: |
-          & "$env:RELEASE_DIR\openasr.exe" --version
-          & "$env:RELEASE_DIR\openasr.exe" --help
-          & "$env:RELEASE_DIR\openasr.exe" list
+          $cli = Join-Path $env:RELEASE_DIR "openasr.exe"
+          & $cli --version
+          & $cli --help
+          & $cli list
 
       - name: Restore model pack cache
         if: matrix.target == 'x86_64-pc-windows-msvc'
