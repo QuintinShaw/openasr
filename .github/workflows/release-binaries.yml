@@ -1708,26 +1708,7 @@ jobs:
       - name: Assert the release has every expected matrix asset
         # Draft GitHub Releases are invisible to contents:read. This job only
         # reads the draft, but it still needs contents:write to see it.
-        # Qualification filenames come from qualification_manifest.artifact_cell
-        # so Vulkan stays generic, not a retired windows-x86_64 sidecar name.
         run: |
           set -euo pipefail
-          tag="${RELEASE_TAG}"
-          [ -n "$tag" ] || { echo "release tag is empty" >&2; exit 1; }
-          version="${OPENASR_VERSION}"
-          pack_names="$(mktemp)"
-          python3 tooling/release-manifest/release_completeness.py pack-names \
-            > "$pack_names"
-          pack_dir="$(mktemp -d)"
-          while IFS= read -r pack_name; do
-            [ -n "$pack_name" ] || continue
-            gh release download "$tag" --repo "${{ github.repository }}" \
-              -p "$pack_name" -D "$pack_dir"
-          done < "$pack_names"
-          actual_file="$(mktemp)"
-          gh release view "$tag" --repo "${{ github.repository }}" --json assets \
-            --jq '.assets[].name' | sort > "$actual_file"
-          python3 tooling/release-manifest/release_completeness.py compare \
-            --version "$version" \
-            --pack-dir "$pack_dir" \
-            --actual-file "$actual_file"
+          [ -n "${RELEASE_TAG}" ] || { echo "release tag is empty" >&2; exit 1; }
+          scripts/verify-release-completeness.sh "${RELEASE_TAG}" "${{ github.repository }}"

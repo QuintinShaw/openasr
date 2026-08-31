@@ -38,7 +38,9 @@ concurrency:
 
 permissions:
   attestations: read
-  contents: read
+  # Pre-publication runs download a GitHub *draft* release. Drafts are
+  # invisible to contents:read, so this workflow needs write to see them.
+  contents: write
   packages: read
 
 defaults:

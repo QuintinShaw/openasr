@@ -135,6 +135,10 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         self.assertIn('"backend-plugin-hints.json"', completeness)
         self.assertIn('"catalog.backends.candidate.json"', completeness)
 
+    def test_plugin_rows_skip_cli_smoke(self) -> None:
+        self.assertIn("crate=\"openasr-core\"", self.workflow)
+        self.assertGreaterEqual(self.workflow.count("matrix.distribution != 'plugin'"), 2)
+
     def test_plugin_vendor_and_signing_steps_cover_all_gpu_providers(self) -> None:
         self.assertIn(
             "matrix.distribution == 'plugin'", self.workflow
@@ -296,7 +300,7 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("contains unexpected asset(s)", completeness)
-        self.assertIn("tooling/release-manifest/release_completeness.py", self.workflow)
+        self.assertIn("scripts/verify-release-completeness.sh", self.workflow)
         self.assertIn("staging/*.sha256", self.workflow)
     def test_qualification_manifests_bind_the_successful_attestation_bundle(self) -> None:
         checksums = self.workflow.split("\n  checksums:\n", 1)[1].split(
