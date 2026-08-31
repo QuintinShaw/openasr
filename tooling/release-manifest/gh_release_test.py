@@ -16,12 +16,13 @@ class GhReleaseDownloadTests(unittest.TestCase):
         ) as sleep:
             run.side_effect = [
                 subprocess.CalledProcessError(1, ["gh"]),
-                subprocess.CalledProcessError(1, ["gh"]),
+                subprocess.TimeoutExpired(["gh"], 600),
                 None,
             ]
             gh_release.download_asset("v0.1.37", "backend-pack-vulkan-generic.json", dest)
             self.assertEqual(run.call_count, 3)
             self.assertEqual(sleep.call_count, 2)
+            self.assertEqual(run.call_args.kwargs.get("timeout"), 600)
 
     def test_refuses_unsafe_asset_names(self) -> None:
         with self.assertRaises(ValueError):

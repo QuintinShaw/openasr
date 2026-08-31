@@ -15,6 +15,7 @@ def download_asset(
     *,
     repository: str | None = None,
     attempts: int = 6,
+    timeout_seconds: int = 600,
 ) -> None:
     if Path(name).name != name:
         raise ValueError(f"unsafe release asset name: {name!r}")
@@ -31,12 +32,13 @@ def download_asset(
     ]
     if repository:
         command.extend(["--repo", repository])
-    last_error: subprocess.CalledProcessError | None = None
+    last_error: BaseException | None = None
     for attempt in range(1, attempts + 1):
+        print(f"gh release download {tag} {name} (attempt {attempt}/{attempts})", flush=True)
         try:
-            subprocess.run(command, check=True)
+            subprocess.run(command, check=True, timeout=timeout_seconds)
             return
-        except subprocess.CalledProcessError as error:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
             last_error = error
             if attempt == attempts:
                 break
