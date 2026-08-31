@@ -3402,6 +3402,15 @@ impl GgmlCpuGraphRunner {
     }
 
     fn park_idle_runner_graph_context(&mut self) {
+        // Same contract as `start_graph`: detach scheduler bindings while the
+        // idle cgraph and its tensors are still alive, then drop the context.
+        // Persistent sessions allocate a replacement metadata arena immediately
+        // after this park; leaving `allocated_graph` aimed at the freed context
+        // makes the later session Drop's `ggml_backend_sched_reset` UAF.
+        if let Some(scheduler) = self.scheduler.as_ref() {
+            unsafe { ffi::ggml_backend_sched_reset(scheduler.raw.as_ptr()) };
+            scheduler.memory_owner.active_graph_address.set(None);
+        }
         self.context = None;
     }
 
@@ -17180,6 +17189,106 @@ mod tests {
                 .expect("rebound first graph should compute"),
             vec![16.0, 36.0]
         );
+    }
+
+    #[test]
+    fn persistent_graph_session_drops_builder_before_context() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ggml_runtime/cpu_graph.rs"),
+        )
+        .expect("read cpu_graph.rs");
+        let struct_body = source
+            .split("pub(crate) struct GgmlPersistentGraphSession {")
+            .nth(1)
+            .expect("session struct")
+            .split('}')
+            .next()
+            .expect("struct body");
+        let builder = struct_body
+            .find("builder: GgmlCpuGraphBuilder")
+            .expect("builder");
+        let context = struct_body
+            .find("_context: GgmlContextGuard")
+            .expect("context");
+        let scheduler = struct_body
+            .find("_scheduler: Option<GgmlBackendSchedulerGuard>")
+            .expect("scheduler");
+        assert!(
+            builder < context && context < scheduler,
+            "builder must drop before the context/scheduler it aliases, got builder@{builder} context@{context} scheduler@{scheduler}"
+        );
+
+        let park = source
+            .split("fn park_idle_runner_graph_context(")
+            .nth(1)
+            .expect("park_idle_runner_graph_context")
+            .split("\n    fn ")
+            .next()
+            .expect("park body");
+        let reset = park
+            .find("ggml_backend_sched_reset")
+            .expect("park must reset the scheduler");
+        let drop_context = park
+            .find("self.context = None")
+            .expect("park drops context");
+        assert!(
+            reset < drop_context,
+            "idle runner context must be detached from the scheduler before it is freed, got reset@{reset} drop@{drop_context}"
+        );
+    }
+
+    fn scheduler_start_graph_then_persistent_session_drop(config: GgmlCpuGraphConfig) {
+        let mut runner =
+            GgmlCpuGraphRunner::new(config).expect("scheduler runner should initialize");
+        {
+            let output = runner
+                .compute_add_f32(&[1.0, 2.0], &[3.0, 4.0])
+                .expect("one-shot start_graph compute");
+            assert_eq!(output, vec![4.0, 6.0]);
+        }
+        let mut session = runner
+            .start_persistent_graph_session(1024 * 1024)
+            .expect("persistent session after start_graph");
+        let graph = session.builder();
+        let input = graph
+            .new_tensor_1d_f32(2, "persistent_input")
+            .expect("input");
+        graph.set_input(input).expect("input flag");
+        let output = graph.mul(input, input).expect("square");
+        graph.set_output(output).expect("output flag");
+        graph
+            .prepare_outputs_for_upload(&[output])
+            .expect("prepare persistent graph");
+        graph
+            .set_f32_slice(input, &[2.0, 3.0], "persistent_input")
+            .expect("upload");
+        assert_eq!(
+            graph
+                .compute_output_f32(output, 2)
+                .expect("persistent compute"),
+            vec![4.0, 9.0]
+        );
+        drop(session);
+        drop(runner);
+    }
+
+    #[test]
+    fn scheduler_start_graph_then_persistent_session_drop_does_not_segfault() {
+        let mut config = GgmlCpuGraphConfig::conservative_default();
+        config.use_scheduler = true;
+        scheduler_start_graph_then_persistent_session_drop(config);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_scheduler_start_graph_then_persistent_session_drop_does_not_segfault() {
+        let mut config = GgmlCpuGraphConfig::conservative_default();
+        config.backend = GgmlCpuGraphBackend::Metal;
+        config.use_scheduler = true;
+        if GgmlCpuGraphRunner::new(config).is_err() {
+            return;
+        }
+        scheduler_start_graph_then_persistent_session_drop(config);
     }
 
     #[test]

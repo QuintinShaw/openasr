@@ -44,6 +44,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Core: `--diarize` / Voice ID now installs the native execution broker
+  before Stream-VAD and ReDimNet admission. 0.1.37 failed closed with
+  `could not load the vendored FireRed Stream-VAD` because those weights
+  started requiring the process-wide broker after GPU ownership work, but
+  NES was only installed around speaker-turn computation.
+- Core: tearing down a scheduler-backed persistent graph (MOSS decode on
+  macOS, and any `start_graph` then persistent-session handoff) no longer
+  use-after-frees inside `ggml_backend_sched_reset`. Reset detaches the
+  scheduler-owned split graph instead of a caller cgraph that may already
+  have been parked, and the idle runner context is reset before it is
+  freed. 0.1.37 exited 139 after a successful moss-transcribe-diarize
+  CPU/Metal run.
 - Core: a DedicatedDevice quarantine from a terminal device failure can
   recover when a later candidate presents a healthy heap snapshot (new
   backend generation after the poisoned handle was leaked). Ledger

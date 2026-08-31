@@ -364,8 +364,6 @@ fn bytes_for_count(count: usize, element_bytes: usize) -> u64 {
 pub enum ExternalDiarizationError {
     #[error(transparent)]
     Segmenter(#[from] SegmentError),
-    #[error("external Voice ID could not load the vendored FireRed Stream-VAD")]
-    VadUnavailable,
     #[error("external Voice ID FireRed VAD failed: {0}")]
     Vad(String),
     #[error("external Voice ID ReDim embedding failed: {0}")]
@@ -414,8 +412,7 @@ impl PreparedExternalDiarizer {
             Arc::clone(&execution_services),
             execution_intent.clone(),
         )
-        .map_err(|error| ExternalDiarizationError::Vad(error.to_string()))?
-        .ok_or(ExternalDiarizationError::VadUnavailable)?;
+        .map_err(|error| ExternalDiarizationError::Vad(error.to_string()))?;
         let segmenter = PolicyResolvedSegmenterRuntime::load_prepared(
             execution_services,
             execution_intent,

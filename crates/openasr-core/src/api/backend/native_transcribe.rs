@@ -2319,6 +2319,15 @@ fn run_native_transcription_impl(
     }
 
     let audio_duration_seconds = prepared_audio.len() as f32 / 16_000.0;
+    // Stream-VAD, ReDimNet, and the segmenter admit through SystemMemoryOwner,
+    // which requires the process-wide broker. Install NES before materialize,
+    // not only around compute_speaker_attribution: 0.1.37 --diarize failed
+    // closed with VadUnavailable because admission ran with no broker.
+    let _voice_id_memory_context = (speaker_plan != SpeakerPlan::Off).then(|| {
+        crate::models::native_execution_services::install_native_execution_services(
+            execution_services.as_ref(),
+        )
+    });
     let speaker_runtime = if speaker_plan == SpeakerPlan::Off {
         None
     } else {
@@ -2361,15 +2370,6 @@ fn run_native_transcription_impl(
     // be attributed onto whichever transcription path runs below.
     let voice_id_audio = voice_id_audio_view(&prepared_audio, speaker_plan);
     let speaker_turns = if let Some(diarizer) = external_diarizer.as_ref() {
-        // External diarization runs outside the ASR candidate attempt, but its
-        // invocation-local scratch still belongs to this process-wide broker.
-        // Install only the service context for this phase: the scratch owner
-        // below creates and drops its own reservation, while persistent
-        // segmenter/embedder owners keep their independent candidate leases.
-        let _memory_context =
-            crate::models::native_execution_services::install_native_execution_services(
-                execution_services.as_ref(),
-            );
         let hint = match request.diarize_speakers {
             Some(speakers) => crate::diarize::contract::DiarizeHint::NumSpeakers(speakers),
             None => crate::diarize::contract::DiarizeHint::Auto,
@@ -5080,6 +5080,32 @@ mod tests {
         assert!(
             installed.load(std::sync::atomic::Ordering::SeqCst),
             "run_auxiliary_stage_with_policy must install CandidateActivationQuoteSource before the attempt"
+        );
+    }
+
+    #[test]
+    fn voice_id_installs_nes_before_vad_materialize() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/api/backend/native_transcribe.rs"),
+        )
+        .expect("read native_transcribe.rs");
+        let impl_body = source
+            .split("fn run_native_transcription_impl(")
+            .nth(1)
+            .expect("run_native_transcription_impl")
+            .split("\nfn ")
+            .next()
+            .expect("impl body");
+        let install = impl_body
+            .find("install_native_execution_services")
+            .expect("Voice ID must install NES");
+        let materialize = impl_body
+            .find(".materialize(")
+            .expect("external diarizer materialize");
+        assert!(
+            install < materialize,
+            "Stream-VAD admission requires NES before ExternalDiarizer::materialize, got install@{install} materialize@{materialize}"
         );
     }
 
