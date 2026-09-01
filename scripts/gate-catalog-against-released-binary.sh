@@ -92,8 +92,10 @@ resolve_binary() {
   local version="${tag#v}"
   local asset="openasr-${version}-linux-x86_64.tar.gz"
   mkdir -p "$asset_dir"
+  # Progress from gh_release.py must not land on stdout: this function's
+  # stdout is captured as the CLI path.
   if ! python3 tooling/release-manifest/gh_release.py download \
-        "$tag" "$asset_dir" "$asset" --repo "$repo"; then
+        "$tag" "$asset_dir" "$asset" --repo "$repo" >&2; then
     echo "::error::failed to download the ${tag} linux-x86_64 CLI release asset from ${repo}. Fail-closed: refusing to bless a catalog without exercising a real released binary against it." >&2
     exit 1
   fi

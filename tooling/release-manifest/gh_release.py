@@ -124,7 +124,11 @@ def curl_download(
     command.append(url)
     last_error: BaseException | None = None
     for attempt in range(1, attempts + 1):
-        print(f"download {url} -> {dest.name} (attempt {attempt}/{attempts})", flush=True)
+        print(
+            f"download {url} -> {dest.name} (attempt {attempt}/{attempts})",
+            file=sys.stderr,
+            flush=True,
+        )
         dest.unlink(missing_ok=True)
         try:
             subprocess.run(command, check=True, timeout=timeout_seconds + 60)
