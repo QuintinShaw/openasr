@@ -347,20 +347,39 @@ pub(crate) async fn start_pull_job(
     Extension(distribution): Extension<DistributionContext>,
     Json(request): Json<StartPullRequest>,
 ) -> Result<Response, ApiError> {
+    let (status, snapshot) = queue_catalog_pull(
+        distribution,
+        id,
+        request.quant,
+        request.size,
+        request.from,
+        request.accept_license == Some(true),
+    )
+    .await?;
+    Ok((status, Json(snapshot)).into_response())
+}
+
+pub(crate) async fn queue_catalog_pull(
+    distribution: DistributionContext,
+    reference: String,
+    quant: Option<String>,
+    size: Option<String>,
+    from: Option<PathBuf>,
+    license_accepted: bool,
+) -> Result<(StatusCode, PullJobSnapshot), ApiError> {
     let home = distribution.openasr_home()?;
     let catalog = load_catalog_for_optional_source(distribution.catalog_source(), &home)
         .map_err(ApiError::Catalog)?;
     let resolved = resolve_catalog_pull(
         &catalog,
         &CatalogPullRequest {
-            reference: id,
-            quant: request.quant,
-            size: request.size,
+            reference,
+            quant,
+            size,
         },
     )
     .map_err(ApiError::Catalog)?;
 
-    let license_accepted = request.accept_license == Some(true);
     ensure_explicit_model_license_acceptance(&resolved, license_accepted)?;
 
     if let Some(snapshot) = distribution.nonterminal_snapshot_for_pull(&resolved) {
@@ -373,7 +392,7 @@ pub(crate) async fn start_pull_job(
         if snapshot.state == PullJobState::Queued && !distribution.is_job_active(&snapshot.job_id) {
             distribution.spawn_restart_resume_job(snapshot.clone())?;
         }
-        return Ok((StatusCode::ACCEPTED, Json(snapshot)).into_response());
+        return Ok((StatusCode::ACCEPTED, snapshot));
     }
 
     let job_id = distribution.next_job_id();
@@ -381,13 +400,10 @@ pub(crate) async fn start_pull_job(
         let snapshot =
             PullJobSnapshot::already_installed(job_id, &resolved, pack, license_accepted);
         distribution.insert_job(snapshot.clone())?;
-        return Ok((StatusCode::OK, Json(snapshot)).into_response());
+        return Ok((StatusCode::OK, snapshot));
     }
 
-    let source_path = request
-        .from
-        .map(resolve_local_pull_source_path)
-        .transpose()?;
+    let source_path = from.map(resolve_local_pull_source_path).transpose()?;
     let snapshot = PullJobSnapshot::queued(
         job_id.clone(),
         &resolved,
@@ -406,7 +422,7 @@ pub(crate) async fn start_pull_job(
         cancel_flag,
         pause_flag,
     );
-    Ok((StatusCode::ACCEPTED, Json(snapshot)).into_response())
+    Ok((StatusCode::ACCEPTED, snapshot))
 }
 
 pub(crate) fn ensure_explicit_model_license_acceptance(

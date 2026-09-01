@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant, SystemTime},
 };
 
 use axum::http::HeaderValue;
@@ -610,7 +610,19 @@ pub(crate) async fn transcription_progress() -> Result<Response, ApiError> {
 /// names exactly one run. A live duplicate id is rejected at registration.
 pub(crate) async fn transcription_progress_by_id(
     AxumPath(id): AxumPath<String>,
+    Extension(auth): Extension<crate::ServerAuth>,
+    Extension(distribution): Extension<DistributionContext>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    let owner = distribution.transcription_owner(&id);
+    let caller = auth.pairing_device_id_for_headers(&headers);
+    if !caller_may_control_transcription(
+        owner.as_deref(),
+        caller.as_deref(),
+        auth.authorizes_pairing_admin(&headers),
+    ) {
+        return Ok(Json(TranscriptionProgressBody::idle()).into_response());
+    }
     let body = match openasr_core::api::backend::native_transcription_progress_for_id(&id) {
         Some(progress) => TranscriptionProgressBody::from_progress(progress),
         None => TranscriptionProgressBody::idle(),
@@ -648,7 +660,9 @@ pub(crate) struct TranscriptionControlBody {
 /// more worker thread to protect, so a normal completion must never also
 /// fire a spurious cancel.
 struct ActiveTranscriptionCleanup {
+    runtime: Option<ServerRuntime>,
     distribution: DistributionContext,
+    policy: RemoteRuntimePolicy,
     transcription_id: String,
     control: Arc<openasr_core::TranscriptionControl>,
     armed: bool,
@@ -656,16 +670,50 @@ struct ActiveTranscriptionCleanup {
 
 impl ActiveTranscriptionCleanup {
     fn new(
+        runtime: Option<ServerRuntime>,
         distribution: DistributionContext,
+        policy: RemoteRuntimePolicy,
         transcription_id: String,
         control: Arc<openasr_core::TranscriptionControl>,
     ) -> Self {
         Self {
+            runtime,
             distribution,
+            policy,
             transcription_id,
             control,
             armed: true,
         }
+    }
+
+    fn observe_idle(&self) {
+        if let Some(runtime) = self.runtime.clone() {
+            schedule_apply_pending_idle_switch_when_native_idle(runtime, self.distribution.clone());
+        }
+    }
+
+    fn schedule_finish_after_native_idle(&self) {
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let policy = self.policy.clone();
+        let id = self.transcription_id.clone();
+        let distribution = self.distribution.clone();
+        handle.spawn(async move {
+            for _ in 0..500 {
+                if !runtime.native_rebind_blocked() {
+                    policy.finish_file(&id);
+                    apply_pending_idle_switch_if_idle(&runtime, &distribution);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            policy.finish_file(&id);
+            apply_pending_idle_switch_if_idle(&runtime, &distribution);
+        });
     }
 
     /// Disarms the disconnect-cancel safety net. Call this once the decode
@@ -680,6 +728,18 @@ impl Drop for ActiveTranscriptionCleanup {
     fn drop(&mut self) {
         if self.armed {
             self.control.request_cancel();
+            if self.policy.is_file_queued(&self.transcription_id) {
+                self.policy.cancel_file(&self.transcription_id);
+                self.observe_idle();
+            } else if self.policy.file_running().as_deref() == Some(self.transcription_id.as_str())
+            {
+                self.schedule_finish_after_native_idle();
+            } else {
+                self.observe_idle();
+            }
+        } else {
+            self.policy.finish_file(&self.transcription_id);
+            self.observe_idle();
         }
         self.distribution
             .clear_transcription_if_current(&self.transcription_id, &self.control);
@@ -705,12 +765,80 @@ fn active_transcription_control(
     })
 }
 
+fn file_slot_occupied(runtime: &ServerRuntime, except_id: Option<&str>) -> bool {
+    let policy = runtime.native_execution.remote_policy();
+    let other_file = policy
+        .file_running()
+        .is_some_and(|running| except_id != Some(running.as_str()));
+    other_file || runtime.native_execution.has_active_sessions() || policy.has_held_realtime()
+}
+
+async fn wait_for_file_admission(
+    runtime: &ServerRuntime,
+    id: &str,
+    control: &openasr_core::TranscriptionControl,
+) -> Result<(), ApiError> {
+    let policy = runtime.native_execution.remote_policy();
+    loop {
+        if control.is_canceled() {
+            policy.cancel_file(id);
+            return Err(ApiError::Backend(
+                openasr_core::BackendError::TranscriptionCanceled,
+            ));
+        }
+        let occupied = file_slot_occupied(runtime, Some(id));
+        match policy.admit_file(id, occupied) {
+            Err(RemoteAdmitError::PendingIdleSwitch) => {
+                return Err(ApiError::Conflict(PENDING_IDLE_SWITCH_MESSAGE.to_string()));
+            }
+            Ok(FileAdmit::Running) => return Ok(()),
+            Ok(FileAdmit::Queued) => {
+                tokio::select! {
+                    _ = policy.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+            }
+        }
+    }
+}
+
+fn record_file_operator_run(
+    runtime: &ServerRuntime,
+    distribution: &DistributionContext,
+    auth: &ServerAuth,
+    headers: &HeaderMap,
+    started: Instant,
+    success: bool,
+    error_type: Option<&str>,
+) {
+    let device_name = auth
+        .pairing_device_id_for_headers(headers)
+        .unwrap_or_else(|| "operator".to_string());
+    let started_at = SystemTime::now()
+        .checked_sub(started.elapsed())
+        .unwrap_or_else(SystemTime::now);
+    runtime
+        .native_execution
+        .remote_policy()
+        .record_run(OperatorRunRecord {
+            device_name,
+            started_at,
+            duration: started.elapsed(),
+            kind: "file".to_string(),
+            success,
+            error_type: error_type.map(str::to_string),
+        });
+    schedule_apply_pending_idle_switch_when_native_idle(runtime.clone(), distribution.clone());
+}
+
 fn register_active_transcription(
     distribution: &DistributionContext,
     id: &str,
+    owner_device_id: Option<&str>,
 ) -> Result<Arc<openasr_core::TranscriptionControl>, ApiError> {
     let control = Arc::new(openasr_core::TranscriptionControl::new());
     if distribution.try_register_transcription(id, Arc::clone(&control)) {
+        distribution.set_transcription_owner(id, owner_device_id);
         Ok(control)
     } else {
         Err(ApiError::Conflict(format!(
@@ -719,15 +847,61 @@ fn register_active_transcription(
     }
 }
 
+pub(crate) fn caller_may_control_transcription(
+    owner_device_id: Option<&str>,
+    caller_device_id: Option<&str>,
+    caller_is_operator: bool,
+) -> bool {
+    if caller_is_operator {
+        return true;
+    }
+    match (owner_device_id, caller_device_id) {
+        (Some(owner), Some(caller)) => owner == caller,
+        // Missing owner is an operator-local job. A caller with no device id
+        // is the local operator path (pairing disabled). A paired device
+        // cannot control it.
+        (None, None) => true,
+        (None, Some(_)) | (Some(_), None) => false,
+    }
+}
+
+fn require_transcription_control(
+    distribution: &DistributionContext,
+    auth: &crate::ServerAuth,
+    headers: &HeaderMap,
+    id: &str,
+) -> Result<Arc<openasr_core::TranscriptionControl>, ApiError> {
+    let control = active_transcription_control(distribution, id)?;
+    let owner = distribution.transcription_owner(id);
+    let caller = auth.pairing_device_id_for_headers(headers);
+    if !caller_may_control_transcription(
+        owner.as_deref(),
+        caller.as_deref(),
+        auth.authorizes_pairing_admin(headers),
+    ) {
+        return Err(ApiError::Forbidden(
+            "Only the device that started this transcription can control it.".to_string(),
+        ));
+    }
+    Ok(control)
+}
+
 /// `POST /v1/audio/transcriptions/{id}/cancel`: cancel an in-flight file
 /// transcription. The decode stops at the next long-form slice boundary and the
 /// original transcription request fails closed with a canceled status; the
 /// already-decoded portion is discarded (see `BackendError::TranscriptionCanceled`).
 pub(crate) async fn cancel_transcription_job(
+    State(runtime): State<ServerRuntime>,
     AxumPath(id): AxumPath<String>,
+    Extension(auth): Extension<crate::ServerAuth>,
     Extension(distribution): Extension<DistributionContext>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    active_transcription_control(&distribution, &id)?.request_cancel();
+    let control = require_transcription_control(&distribution, &auth, &headers, &id)?;
+    control.request_cancel();
+    if runtime.native_execution.remote_policy().is_file_queued(&id) {
+        runtime.native_execution.remote_policy().cancel_file(&id);
+    }
     control_body_response(id, "canceled")
 }
 
@@ -736,9 +910,11 @@ pub(crate) async fn cancel_transcription_job(
 /// the original request) block until a matching resume or cancel arrives.
 pub(crate) async fn pause_transcription_job(
     AxumPath(id): AxumPath<String>,
+    Extension(auth): Extension<crate::ServerAuth>,
     Extension(distribution): Extension<DistributionContext>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    active_transcription_control(&distribution, &id)?.request_pause();
+    require_transcription_control(&distribution, &auth, &headers, &id)?.request_pause();
     control_body_response(id, "paused")
 }
 
@@ -747,9 +923,11 @@ pub(crate) async fn pause_transcription_job(
 /// in-flight run, keeping the already-accumulated segments.
 pub(crate) async fn resume_transcription_job(
     AxumPath(id): AxumPath<String>,
+    Extension(auth): Extension<crate::ServerAuth>,
     Extension(distribution): Extension<DistributionContext>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    active_transcription_control(&distribution, &id)?.request_resume();
+    require_transcription_control(&distribution, &auth, &headers, &id)?.request_resume();
     control_body_response(id, "running")
 }
 
@@ -784,11 +962,8 @@ async fn run_offline_transcription(
             upload_ingest_duration,
         );
     }
-    if is_remote_compute_client_request(&headers, &auth) && parsed.request.voice_id {
-        return Err(ApiError::BadRequest(
-            "Voice ID is available only for local file transcription; remote-compute requests must omit diarize=true."
-                .to_string(),
-        ));
+    if is_remote_compute_client_request(&headers, &auth) {
+        apply_remote_compute_client_request_policy(&mut parsed.request);
     }
     if parsed.stream_form_field {
         // Fail closed instead of silently returning a JSON body an OpenAI SDK
@@ -843,13 +1018,10 @@ async fn run_offline_transcription(
     // long-form slice boundaries; the mock backend has no such loop). The
     // cleanup guard removes the registry entry on every exit -- success, error,
     // or cancel.
-    let control = if runtime.backend == BackendKind::Native {
-        if let Some(id) = parsed.transcription_id.clone() {
-            let control = register_active_transcription(&distribution, &id)?;
-            Some((id, control))
-        } else {
-            None
-        }
+    let control = if let Some(id) = parsed.transcription_id.clone() {
+        let owner = auth.pairing_device_id_for_headers(&headers);
+        let control = register_active_transcription(&distribution, &id, owner.as_deref())?;
+        Some((id, control))
     } else {
         None
     };
@@ -858,8 +1030,38 @@ async fn run_offline_transcription(
     // control so the (possibly paused) worker thread wakes and exits instead
     // of leaking. Disarmed immediately after that call returns, either way.
     let mut control_cleanup = control.as_ref().map(|(id, control)| {
-        ActiveTranscriptionCleanup::new(distribution.clone(), id.clone(), Arc::clone(control))
+        ActiveTranscriptionCleanup::new(
+            Some(runtime.clone()),
+            distribution.clone(),
+            runtime.native_execution.remote_policy().clone(),
+            id.clone(),
+            Arc::clone(control),
+        )
     });
+    let run_started = Instant::now();
+    if let Some((id, control)) = &control {
+        if let Err(error) = wait_for_file_admission(&runtime, id, control).await {
+            if matches!(
+                error,
+                ApiError::Backend(openasr_core::BackendError::TranscriptionCanceled)
+            ) {
+                record_file_operator_run(
+                    &runtime,
+                    &distribution,
+                    &auth,
+                    &headers,
+                    run_started,
+                    false,
+                    Some("canceled"),
+                );
+            }
+            return Err(error);
+        }
+    } else if !runtime.native_execution.remote_policy().admits_new_tasks() {
+        return Err(ApiError::Conflict(PENDING_IDLE_SWITCH_MESSAGE.to_string()));
+    } else if file_slot_occupied(&runtime, None) {
+        return Err(ApiError::Busy(SERVER_BUSY_MESSAGE.to_string()));
+    }
     // Explicit per-request context threaded all the way to the decode
     // dispatch -- never a thread-local. A client that never registered a
     // transcription id still gets a concrete (uncancellable) context: there
@@ -878,7 +1080,7 @@ async fn run_offline_transcription(
     }
     let execution_context = Arc::new(execution_context);
     let transcription = match transcribe_with_runtime(
-        runtime,
+        runtime.clone(),
         parsed.request,
         Arc::clone(&execution_context),
     )
@@ -891,6 +1093,15 @@ async fn run_offline_transcription(
             if let Some(cleanup) = control_cleanup.as_mut() {
                 cleanup.disarm();
             }
+            record_file_operator_run(
+                &runtime,
+                &distribution,
+                &auth,
+                &headers,
+                run_started,
+                true,
+                None,
+            );
             transcription
         }
         Err(error) => {
@@ -905,6 +1116,15 @@ async fn run_offline_transcription(
                 if let Some(receipt) = request_receipt.as_ref() {
                     receipt.record_terminal(openasr_core::RequestExecutionTerminal::Canceled);
                 }
+                record_file_operator_run(
+                    &runtime,
+                    &distribution,
+                    &auth,
+                    &headers,
+                    run_started,
+                    false,
+                    Some("canceled"),
+                );
                 return Err(ApiError::Backend(
                     openasr_core::BackendError::TranscriptionCanceled,
                 ));
@@ -912,6 +1132,15 @@ async fn run_offline_transcription(
             if let Some(receipt) = request_receipt.as_ref() {
                 receipt.record_terminal(openasr_core::RequestExecutionTerminal::Failed);
             }
+            record_file_operator_run(
+                &runtime,
+                &distribution,
+                &auth,
+                &headers,
+                run_started,
+                false,
+                Some("error"),
+            );
             return Err(error);
         }
     };
@@ -1103,6 +1332,18 @@ pub(crate) fn is_remote_compute_client_request(headers: &HeaderMap, auth: &Serve
     // security switch: a paired device that accidentally or deliberately
     // omits the header must still be isolated from local history and Voice ID.
     auth.authorizes_remote_compute_client(headers)
+}
+
+/// Remote clients never send enrolled Voice ID or local hardware policy.
+/// Speaker separation becomes anonymous labels; threads/target come from the
+/// operator machine preference (filled later) or Auto.
+pub(crate) fn apply_remote_compute_client_request_policy(request: &mut TranscriptionRequest) {
+    if request.voice_id {
+        request.voice_id = false;
+        request.anonymous_diarize = true;
+    }
+    request.inference_threads = None;
+    request.execution_target = None;
 }
 
 pub(crate) fn record_file_transcription_history(
@@ -1798,7 +2039,7 @@ mod active_transcription_cleanup_tests {
     use std::sync::Arc;
 
     use super::{
-        ActiveTranscriptionCleanup, DistributionContext, DistributionRuntime,
+        ActiveTranscriptionCleanup, DistributionContext, DistributionRuntime, RemoteRuntimePolicy,
         register_active_transcription,
     };
 
@@ -1818,7 +2059,9 @@ mod active_transcription_cleanup_tests {
 
         {
             let _cleanup = ActiveTranscriptionCleanup::new(
+                None,
                 distribution.clone(),
+                RemoteRuntimePolicy::new(),
                 "txn-disconnect".to_string(),
                 Arc::clone(&control),
             );
@@ -1847,7 +2090,9 @@ mod active_transcription_cleanup_tests {
 
         {
             let mut cleanup = ActiveTranscriptionCleanup::new(
+                None,
                 distribution.clone(),
+                RemoteRuntimePolicy::new(),
                 "txn-normal".to_string(),
                 Arc::clone(&control),
             );
@@ -1866,15 +2111,60 @@ mod active_transcription_cleanup_tests {
     #[test]
     fn duplicate_live_transcription_id_is_rejected_without_replacing_its_owner() {
         let distribution = distribution_for_test();
-        let first = register_active_transcription(&distribution, "txn-duplicate").unwrap();
+        let first = register_active_transcription(&distribution, "txn-duplicate", None).unwrap();
 
-        let error = register_active_transcription(&distribution, "txn-duplicate")
+        let error = register_active_transcription(&distribution, "txn-duplicate", None)
             .expect_err("a live client id must have exactly one owner");
         assert!(matches!(error, super::ApiError::Conflict(_)));
         let registered = distribution
             .transcription_control("txn-duplicate")
             .expect("the original owner must remain registered");
         assert!(Arc::ptr_eq(&registered, &first));
+    }
+
+    #[test]
+    fn paired_device_cannot_control_another_device_transcription() {
+        assert!(super::caller_may_control_transcription(
+            Some("device-a"),
+            Some("device-a"),
+            false
+        ));
+        assert!(!super::caller_may_control_transcription(
+            Some("device-a"),
+            Some("device-b"),
+            false
+        ));
+        assert!(super::caller_may_control_transcription(
+            Some("device-a"),
+            Some("device-b"),
+            true
+        ));
+        assert!(
+            !super::caller_may_control_transcription(None, Some("device-b"), false),
+            "a paired device must not control an operator-local job"
+        );
+        assert!(super::caller_may_control_transcription(None, None, false));
+        assert!(super::caller_may_control_transcription(
+            None,
+            Some("device-b"),
+            true
+        ));
+    }
+
+    #[test]
+    fn remote_compute_client_policy_remaps_diarize_and_drops_local_hardware() {
+        let mut request =
+            openasr_core::TranscriptionRequest::new("fixtures/jfk.wav", "whisper-tiny")
+                .with_voice_id(true)
+                .with_diarize_speakers(Some(2))
+                .with_inference_threads(Some(8))
+                .with_execution_target(Some(openasr_core::ExecutionTarget::Cpu));
+        super::apply_remote_compute_client_request_policy(&mut request);
+        assert!(!request.voice_id);
+        assert!(request.anonymous_diarize);
+        assert_eq!(request.diarize_speakers, Some(2));
+        assert!(request.inference_threads.is_none());
+        assert!(request.execution_target.is_none());
     }
 
     #[test]
@@ -2261,6 +2551,8 @@ pub(crate) async fn transcribe_with_runtime(
                         &active_model,
                         &model_session_key,
                         resolved_route.as_ref(),
+                        NativeAdmissionKind::File,
+                        execution_context.request_id.as_deref(),
                     );
                 let admission_wait_duration = admission_wait_started.elapsed();
                 openasr_core::stage_timing::log_stage(
@@ -2298,6 +2590,8 @@ pub(crate) async fn transcribe_with_runtime(
                                 .with_phrase_bias(request.phrase_bias.clone())
                                 .with_inference_threads(request.inference_threads)
                                 .with_voice_id(request.voice_id)
+                                .with_anonymous_diarize(request.anonymous_diarize)
+                                .with_diarize_speakers(request.diarize_speakers)
                                 .with_word_timestamps(request.word_timestamps)
                                 .with_word_timestamps_refine(request.word_timestamps_refine),
                         )
@@ -2584,8 +2878,9 @@ mod native_runtime_tests {
     use std::fs;
 
     use axum::{
+        Extension,
         extract::{FromRequest, Path as AxumPath},
-        http::StatusCode,
+        http::{HeaderMap, StatusCode},
         response::{IntoResponse, Response},
     };
 
@@ -2888,9 +3183,17 @@ mod native_runtime_tests {
     /// "fall back to a time estimate."
     #[tokio::test]
     async fn transcription_progress_by_id_defaults_to_idle_body_for_unknown_id() {
-        let response = super::transcription_progress_by_id(AxumPath(
-            "transcription-progress-by-id-unknown-probe".to_string(),
-        ))
+        let distribution = crate::DistributionContext::new(crate::DistributionRuntime {
+            openasr_home: None,
+            catalog_url: None,
+            catalog_local_override: None,
+        });
+        let response = super::transcription_progress_by_id(
+            AxumPath("transcription-progress-by-id-unknown-probe".to_string()),
+            Extension(crate::ServerAuth::disabled()),
+            Extension(distribution),
+            HeaderMap::new(),
+        )
         .await
         .expect("unknown id must not error");
         let value = response_json_body(response).await;
@@ -2898,6 +3201,14 @@ mod native_runtime_tests {
         assert_eq!(value["fraction"], serde_json::json!(0.0));
         assert_eq!(value["done"], serde_json::json!(0));
         assert_eq!(value["total"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn device_cannot_read_operator_local_progress() {
+        assert!(
+            !super::caller_may_control_transcription(None, Some("device-a"), false),
+            "missing owner is operator-local; device tokens must see idle, not the live job"
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,11 @@
 //! Model-management endpoints (local list, default get/set, delete, import)
 //! and installed-pack/default-pack resolution. Pure code-motion from `lib.rs`.
 
+use std::time::{Duration, SystemTime};
+
+use axum::http::HeaderMap;
+use serde::{Deserialize, Serialize};
+
 use crate::*;
 
 pub(crate) async fn local_models(
@@ -27,24 +32,46 @@ pub(crate) async fn default_model(
     Extension(distribution): Extension<DistributionContext>,
 ) -> Result<Json<DefaultModelResponse>, ApiError> {
     let home = distribution.openasr_home()?;
-    Ok(Json(default_model_response(
+    let mut response = default_model_response(
         &home,
         distribution.catalog_source(),
         runtime.model_pack_path.current().as_deref(),
-    )?))
+    )?;
+    response.idle_switch_pending = runtime
+        .native_execution
+        .remote_policy()
+        .pending_idle_switch();
+    Ok(Json(response))
 }
 
 pub(crate) async fn set_default_model(
     State(runtime): State<ServerRuntime>,
     Extension(distribution): Extension<DistributionContext>,
     Json(request): Json<SetDefaultRequest>,
-) -> Result<Json<DefaultModelResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let home = distribution.openasr_home()?;
     let pack = resolve_installed_pack_for_default(&home, distribution.catalog_source(), &request)?;
     let preference = request.quant_preference_for_pack(&pack);
     let intent = crate::realtime::realtime_execution_target_preference(&home)
         .map(openasr_core::device::execution_policy::ExecutionIntent::from)
         .unwrap_or(openasr_core::device::execution_policy::ExecutionIntent::Auto);
+    if runtime.backend == BackendKind::Native && runtime.native_rebind_blocked() {
+        runtime
+            .native_execution
+            .remote_policy()
+            .request_idle_switch(pack.pull.clone());
+        let body = default_model_response_with_idle_switch(
+            &home,
+            distribution.catalog_source(),
+            runtime.model_pack_path.current().as_deref(),
+            Some(pack.pull),
+        )?;
+        return Ok((StatusCode::ACCEPTED, Json(body)).into_response());
+    }
+    runtime
+        .native_execution
+        .remote_policy()
+        .cancel_idle_switch();
     activate_default_model_blocking(
         &runtime,
         &home,
@@ -54,11 +81,115 @@ pub(crate) async fn set_default_model(
         DefaultModelActivationMode::PersistSelection,
     )?;
 
-    Ok(Json(default_model_response(
+    Ok(Json(default_model_response_with_idle_switch(
         &home,
         distribution.catalog_source(),
         runtime.model_pack_path.current().as_deref(),
+        None,
+    )?)
+    .into_response())
+}
+
+pub(crate) async fn cancel_idle_switch(
+    State(runtime): State<ServerRuntime>,
+    Extension(distribution): Extension<DistributionContext>,
+) -> Result<Json<DefaultModelResponse>, ApiError> {
+    runtime
+        .native_execution
+        .remote_policy()
+        .cancel_idle_switch();
+    let home = distribution.openasr_home()?;
+    Ok(Json(default_model_response_with_idle_switch(
+        &home,
+        distribution.catalog_source(),
+        runtime.model_pack_path.current().as_deref(),
+        None,
     )?))
+}
+
+pub(crate) fn idle_switch_slot_is_clear(runtime: &ServerRuntime) -> bool {
+    let policy = runtime.native_execution.remote_policy();
+    !runtime.native_rebind_blocked() && policy.files_idle() && !policy.has_held_realtime()
+}
+
+/// Native realtime `join`/`detach_cancel` drop the command channel but leave
+/// the model permit on the worker until it actually exits. Callers must not
+/// apply on the next line after `drop(commands)`.
+pub(crate) fn schedule_apply_pending_idle_switch_when_native_idle(
+    runtime: ServerRuntime,
+    distribution: DistributionContext,
+) {
+    if idle_switch_slot_is_clear(&runtime) {
+        apply_pending_idle_switch_if_idle(&runtime, &distribution);
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        apply_pending_idle_switch_if_idle(&runtime, &distribution);
+        return;
+    };
+    handle.spawn(async move {
+        for _ in 0..500 {
+            if runtime
+                .native_execution
+                .remote_policy()
+                .pending_idle_switch()
+                .is_none()
+            {
+                return;
+            }
+            if idle_switch_slot_is_clear(&runtime) {
+                apply_pending_idle_switch_if_idle(&runtime, &distribution);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        apply_pending_idle_switch_if_idle(&runtime, &distribution);
+    });
+}
+
+pub(crate) fn apply_pending_idle_switch_if_idle(
+    runtime: &ServerRuntime,
+    distribution: &DistributionContext,
+) {
+    if !idle_switch_slot_is_clear(runtime) {
+        return;
+    }
+    let policy = runtime.native_execution.remote_policy();
+    let Some(pull) = policy.pending_idle_switch() else {
+        return;
+    };
+    let Ok(home) = distribution.openasr_home() else {
+        return;
+    };
+    let request = SetDefaultRequest {
+        pull: Some(pull),
+        id: None,
+        quant: None,
+    };
+    let Ok(pack) =
+        resolve_installed_pack_for_default(&home, distribution.catalog_source(), &request)
+    else {
+        return;
+    };
+    let preference = request.quant_preference_for_pack(&pack);
+    let intent = crate::realtime::realtime_execution_target_preference(&home)
+        .map(openasr_core::device::execution_policy::ExecutionIntent::from)
+        .unwrap_or(openasr_core::device::execution_policy::ExecutionIntent::Auto);
+    if activate_default_model_blocking(
+        runtime,
+        &home,
+        &pack,
+        preference,
+        intent,
+        DefaultModelActivationMode::PersistSelection,
+    )
+    .is_ok()
+    {
+        runtime
+            .native_execution
+            .remote_policy()
+            .cancel_idle_switch();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -510,6 +641,25 @@ pub(crate) fn default_model_response(
     catalog_source: Option<CatalogSource<'_>>,
     active_pack_path: Option<&Path>,
 ) -> Result<DefaultModelResponse, ApiError> {
+    default_model_response_with_idle_switch(home, catalog_source, active_pack_path, None)
+}
+
+pub(crate) fn default_model_response_with_idle_switch(
+    home: &Path,
+    catalog_source: Option<CatalogSource<'_>>,
+    active_pack_path: Option<&Path>,
+    idle_switch_pending: Option<String>,
+) -> Result<DefaultModelResponse, ApiError> {
+    let mut response = default_model_response_inner(home, catalog_source, active_pack_path)?;
+    response.idle_switch_pending = idle_switch_pending;
+    Ok(response)
+}
+
+fn default_model_response_inner(
+    home: &Path,
+    catalog_source: Option<CatalogSource<'_>>,
+    active_pack_path: Option<&Path>,
+) -> Result<DefaultModelResponse, ApiError> {
     let catalog = catalog_source
         .map(|source| load_catalog_for_source(source, home))
         .transpose()
@@ -520,9 +670,6 @@ pub(crate) fn default_model_response(
         openasr_core::default_selection::DefaultModelResolution::NotInstalled(_) => "not_installed",
         openasr_core::default_selection::DefaultModelResolution::Unset => "unset",
     };
-    // The `default_model` field reports the bare model identity; the quant lives in
-    // `default_pull`/`pack.pull`. Appending the quant here would duplicate it (with a
-    // different spelling) and diverge from the persisted bare `config.default_model`.
     let default_model = match &resolution {
         openasr_core::default_selection::DefaultModelResolution::Installed(pack) => {
             Some(pack.model_id.clone())
@@ -549,6 +696,7 @@ pub(crate) fn default_model_response(
         default_pull: pack.as_ref().map(|pack| pack.pull.clone()),
         pack,
         activation,
+        idle_switch_pending: None,
     })
 }
 
@@ -592,6 +740,149 @@ pub(crate) fn resolve_installed_pack_for_default(
     }
     find_installed_pack_reference(home, catalog_source, &reference)?
         .ok_or_else(|| ApiError::BadRequest(format!("Installed model pack not found: {reference}")))
+}
+
+fn unix_ms(time: SystemTime) -> u64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+#[derive(Serialize)]
+pub(crate) struct OperatorRunView {
+    device_name: String,
+    started_at_unix_ms: u64,
+    duration_ms: u64,
+    kind: String,
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_type: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct OperatorRunLogResponse {
+    object: &'static str,
+    data: Vec<OperatorRunView>,
+}
+
+pub(crate) async fn list_operator_runs(
+    State(runtime): State<ServerRuntime>,
+) -> Json<OperatorRunLogResponse> {
+    let policy = runtime.native_execution.remote_policy();
+    policy.prune_runs(SystemTime::now());
+    Json(OperatorRunLogResponse {
+        object: "runtime.runs",
+        data: policy
+            .run_records()
+            .into_iter()
+            .map(|record| OperatorRunView {
+                device_name: record.device_name,
+                started_at_unix_ms: unix_ms(record.started_at),
+                duration_ms: record.duration.as_millis() as u64,
+                kind: record.kind,
+                success: record.success,
+                error_type: record.error_type,
+            })
+            .collect(),
+    })
+}
+
+pub(crate) async fn clear_operator_runs(State(runtime): State<ServerRuntime>) -> StatusCode {
+    runtime.native_execution.remote_policy().clear_runs();
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+pub(crate) struct CapabilityRequestBody {
+    features: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CapabilityRequestsResponse {
+    object: &'static str,
+    data: Vec<CapabilityIntent>,
+}
+
+pub(crate) async fn submit_capability_request(
+    State(runtime): State<ServerRuntime>,
+    Extension(auth): Extension<ServerAuth>,
+    headers: HeaderMap,
+    Json(body): Json<CapabilityRequestBody>,
+) -> Result<(StatusCode, Json<CapabilityIntent>), ApiError> {
+    let features: Vec<String> = body
+        .features
+        .into_iter()
+        .map(|feature| feature.trim().to_string())
+        .filter(|feature| !feature.is_empty())
+        .collect();
+    if features.is_empty() {
+        return Err(ApiError::BadRequest(
+            "Capability request requires at least one feature name.".to_string(),
+        ));
+    }
+    let device_id = auth
+        .pairing_device_id_for_headers(&headers)
+        .unwrap_or_else(|| "operator".to_string());
+    let intent = CapabilityIntent {
+        device_id,
+        features,
+    };
+    runtime
+        .native_execution
+        .remote_policy()
+        .submit_capability(intent.clone());
+    Ok((StatusCode::ACCEPTED, Json(intent)))
+}
+
+pub(crate) async fn list_capability_requests(
+    State(runtime): State<ServerRuntime>,
+) -> Json<CapabilityRequestsResponse> {
+    Json(CapabilityRequestsResponse {
+        object: "capabilities.requests",
+        data: runtime
+            .native_execution
+            .remote_policy()
+            .pending_capabilities(),
+    })
+}
+
+#[derive(Serialize)]
+pub(crate) struct CapabilityApproval {
+    request: CapabilityIntent,
+    pulls: Vec<PullJobSnapshot>,
+}
+
+pub(crate) async fn approve_capability_request(
+    State(runtime): State<ServerRuntime>,
+    Extension(distribution): Extension<DistributionContext>,
+) -> Result<Json<CapabilityApproval>, ApiError> {
+    let intent = runtime
+        .native_execution
+        .remote_policy()
+        .approve_next_capability()
+        .ok_or_else(|| ApiError::NotFound("No pending capability requests.".to_string()))?;
+    let mut pulls = Vec::new();
+    for feature in &intent.features {
+        let Some(reference) = recommended_catalog_id_for_feature(feature) else {
+            return Err(ApiError::BadRequest(format!(
+                "No recommended install for capability '{feature}'."
+            )));
+        };
+        let (_status, snapshot) = queue_catalog_pull(
+            distribution.clone(),
+            reference.to_string(),
+            None,
+            None,
+            None,
+            true,
+        )
+        .await?;
+        pulls.push(snapshot);
+    }
+    Ok(Json(CapabilityApproval {
+        request: intent,
+        pulls,
+    }))
 }
 
 pub(crate) fn find_installed_pack_reference(

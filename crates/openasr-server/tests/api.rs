@@ -4786,15 +4786,12 @@ async fn paired_device_cannot_enable_voice_id_on_remote_compute_routes() {
         }
 
         let response = app.clone().oneshot(request).await.unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
-            "paired device Voice ID must fail closed for {uri} (marker={include_remote_marker})"
-        );
         let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
         let body = String::from_utf8_lossy(&body);
-        assert!(body.contains("available only for local file transcription"));
-        assert!(body.contains("omit diarize=true"));
+        assert!(
+            !body.contains("omit diarize=true"),
+            "remote anonymous speaker separation must not be rejected as Voice ID for {uri} (marker={include_remote_marker}): {body}"
+        );
     }
 }
 
@@ -5708,6 +5705,7 @@ async fn models_with_native_backend_lists_loaded_local_pack_id() {
     let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
     let parsed: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(parsed["data"][0]["id"], "native-pack");
+    assert!(parsed["data"][0].get("pull").is_none());
 }
 
 #[tokio::test]

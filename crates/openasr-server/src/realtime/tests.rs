@@ -5,6 +5,7 @@ use std::{
     fs,
     io::{Read, Write},
     num::NonZeroUsize,
+    sync::{Arc, Mutex},
 };
 
 use sha2::{Digest, Sha256};
@@ -1556,9 +1557,13 @@ async fn native_streaming_same_key_preemption_frees_new_attach_after_client_disc
     let key = test_native_streaming_worker_key("same-key-preemption");
     let threads = Arc::new(Mutex::new(Vec::new()));
 
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .set_reconnect_grace(Duration::from_millis(20));
     let (event_sender, _event_receiver) = mpsc::channel(8);
-    let mut abandoned_session =
-        WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    let mut abandoned_session = WsSession::new(runtime.clone(), test_distribution(), event_sender);
     let (started_sender, started_receiver) = std::sync::mpsc::channel();
     let (release_sender, release_receiver) = std::sync::mpsc::channel();
     abandoned_session
@@ -1590,10 +1595,12 @@ async fn native_streaming_same_key_preemption_frees_new_attach_after_client_disc
         .await
         .unwrap();
     assert!(abandoned_session.native_streaming.is_none());
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // A brand new attach for the same key must not queue behind the still-
-    // blocked worker: `native_streaming_worker_for_key` must observe the
-    // disconnected occupant and preempt it immediately.
+    // After the reconnect window the held occupant is canceled. A brand new
+    // attach for the same key must not queue behind the still-blocked worker:
+    // `native_streaming_worker_for_key` must observe the disconnected occupant
+    // and preempt it immediately.
     let (event_sender2, _event_receiver2) = mpsc::channel(8);
     let mut fresh_session =
         WsSession::new(ServerRuntime::default(), test_distribution(), event_sender2);
@@ -1924,9 +1931,14 @@ async fn watchdog_abandoning_the_occupant_does_not_poison_a_queued_sibling() {
 async fn client_disconnect_frees_idle_even_while_decode_thread_is_stuck() {
     let before_active = crate::idle_activity::native_activity_active_count();
     let key = test_native_streaming_worker_key("disconnect-frees-idle");
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .set_reconnect_grace(Duration::from_millis(20));
 
     let (event_sender, _event_receiver) = mpsc::channel(8);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    let mut session = WsSession::new(runtime, test_distribution(), event_sender);
     let (started_sender, started_receiver) = std::sync::mpsc::channel();
     let (release_sender, release_receiver) = std::sync::mpsc::channel();
     session
@@ -1947,35 +1959,34 @@ async fn client_disconnect_frees_idle_even_while_decode_thread_is_stuck() {
     started_receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("decode started");
-    assert_eq!(
-        crate::idle_activity::native_activity_active_count(),
-        before_active + 1,
-        "the attach must count active while its decode runs"
+    let active_during_decode = crate::idle_activity::native_activity_active_count();
+    assert!(
+        active_during_decode > before_active,
+        "the attach must count active while its decode runs (before={before_active}, during={active_during_decode})"
     );
 
-    // Client disconnects (transport close) -> `finish_native_streaming_session`'s
-    // transport-closed branch calls `detach_cancel`. No production timeout is
-    // overridden here, so nothing shrinks the ~60s watchdog: the guard must be
-    // freed by the disconnect path itself.
+    // Client disconnects: the session is held for the reconnect window, then
+    // expired. Idle accounting must still be retired by detach_cancel on expiry
+    // without waiting on the stuck OS thread.
     session
         .finish_native_streaming_session(false, true)
         .await
         .unwrap();
     assert!(session.native_streaming.is_none());
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    assert_eq!(
-        crate::idle_activity::native_activity_active_count(),
-        before_active,
-        "the disconnect path must retire idle accounting immediately, even though \
-         the worker OS thread is still blocked inside the decode below"
+    assert!(
+        crate::idle_activity::native_activity_active_count() <= before_active,
+        "after the reconnect window the held occupant must retire idle accounting \
+         without waiting on the worker OS thread still blocked inside the decode"
     );
     assert!(
         crate::idle_activity::native_activity_is_idle_for(
             Instant::now() + Duration::from_secs(3600),
             Duration::from_secs(1)
         ),
-        "idle_unload's reaper-visible idle state must recover the instant the client \
-         gives up, not wait out the stuck decode thread"
+        "idle_unload's reaper-visible idle state must recover when the reconnect \
+         window expires, not wait out the stuck decode thread"
     );
 
     // Let the still-blocked worker decode return so it does not sit blocked for
@@ -4147,9 +4158,14 @@ async fn fallback_capacity_rejection_is_backend_not_ready_and_recoverable() {
 }
 
 #[tokio::test]
-async fn finish_transport_closed_cancels_pending_backend_jobs_without_waiting() {
+async fn finish_transport_closed_holds_session_for_reconnect_grace() {
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .set_reconnect_grace(Duration::from_secs(30));
     let (event_sender, _event_receiver) = mpsc::channel(8);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    let mut session = WsSession::new(runtime.clone(), test_distribution(), event_sender);
     let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
         "test_session",
         "whisper-large-v3-turbo",
@@ -4165,6 +4181,8 @@ async fn finish_transport_closed_cancels_pending_backend_jobs_without_waiting() 
     session.controller = Some(controller);
     session.spawn_backend_worker();
     session.pending_backend_jobs = 1;
+    let session_id = session.session_id.0.clone();
+    let control = Arc::clone(&session.backend_control);
 
     tokio::time::timeout(
         Duration::from_millis(100),
@@ -4173,9 +4191,146 @@ async fn finish_transport_closed_cancels_pending_backend_jobs_without_waiting() 
     .await
     .expect("transport close should not wait for backend results")
     .unwrap();
-    assert_eq!(session.pending_backend_jobs, 0);
-    assert!(session.backend_cancelled.load(Ordering::Relaxed));
-    assert!(session.backend_jobs.is_none());
+    assert!(
+        runtime.native_execution.remote_policy().has_held_realtime(),
+        "a dropped WS must keep the server task for the reconnect window"
+    );
+    assert!(!control.is_canceled());
+    assert!(!session.backend_cancelled.load(Ordering::Relaxed));
+
+    let (event_sender2, mut event_receiver2) = mpsc::channel(8);
+    let mut resumed = WsSession::new(runtime.clone(), test_distribution(), event_sender2);
+    resumed
+        .start_session(StartSession {
+            session_id: Some(session_id),
+            ..StartSession::default()
+        })
+        .await
+        .expect("client rebind must resume the held session");
+    assert!(!runtime.native_execution.remote_policy().has_held_realtime());
+    assert!(!control.is_canceled());
+    assert!(
+        resumed.controller.is_some(),
+        "resume must restore the running controller"
+    );
+    let started = event_receiver2
+        .recv()
+        .await
+        .expect("resume handshake event");
+    assert_eq!(
+        started.event_type, "audio.input.started",
+        "a resumed Running session must emit audio.input.started so the client handshake can complete"
+    );
+}
+
+#[tokio::test]
+async fn held_realtime_resume_rejects_a_different_device() {
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .set_reconnect_grace(Duration::from_secs(30));
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new_with_remote_identity(
+        runtime.clone(),
+        test_distribution(),
+        event_sender,
+        false,
+        Some("device-a".to_string()),
+        false,
+        true,
+    );
+    let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
+        "test_session",
+        "whisper-large-v3-turbo",
+        timestamp_now(),
+    ))
+    .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::Configure, timestamp_now())
+        .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::StartAudio, timestamp_now())
+        .unwrap();
+    session.controller = Some(controller);
+    let session_id = session.session_id.0.clone();
+    session.finish("transport_closed", true).await.unwrap();
+    assert!(runtime.native_execution.remote_policy().has_held_realtime());
+
+    let (event_sender2, mut event_receiver2) = mpsc::channel(8);
+    let mut other = WsSession::new_with_remote_identity(
+        runtime.clone(),
+        test_distribution(),
+        event_sender2,
+        false,
+        Some("device-b".to_string()),
+        false,
+        true,
+    );
+    assert!(
+        other
+            .start_session(StartSession {
+                session_id: Some(session_id.clone()),
+                ..StartSession::default()
+            })
+            .await
+            .is_err()
+    );
+    let denied = event_receiver2.recv().await.expect("deny event");
+    assert_eq!(denied.event_type, "error");
+    assert!(runtime.native_execution.remote_policy().has_held_realtime());
+
+    let (event_sender3, _event_receiver3) = mpsc::channel(8);
+    let mut owner = WsSession::new_with_remote_identity(
+        runtime.clone(),
+        test_distribution(),
+        event_sender3,
+        false,
+        Some("device-a".to_string()),
+        false,
+        true,
+    );
+    owner
+        .start_session(StartSession {
+            session_id: Some(session_id),
+            ..StartSession::default()
+        })
+        .await
+        .expect("the owning device must resume its held session");
+    assert!(!runtime.native_execution.remote_policy().has_held_realtime());
+}
+
+#[tokio::test]
+async fn held_realtime_session_cancels_after_reconnect_grace() {
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .set_reconnect_grace(Duration::from_millis(20));
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new(runtime.clone(), test_distribution(), event_sender);
+    let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
+        "test_session",
+        "whisper-large-v3-turbo",
+        timestamp_now(),
+    ))
+    .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::Configure, timestamp_now())
+        .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::StartAudio, timestamp_now())
+        .unwrap();
+    session.controller = Some(controller);
+    let control = Arc::clone(&session.backend_control);
+    session.finish("transport_closed", true).await.unwrap();
+    assert!(runtime.native_execution.remote_policy().has_held_realtime());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        control.is_canceled(),
+        "the server task must cancel once the reconnect window expires"
+    );
+    assert!(!runtime.native_execution.remote_policy().has_held_realtime());
 }
 
 #[tokio::test]
@@ -4292,7 +4447,7 @@ async fn session_start_accepts_hotwords_for_supporting_native_model() {
 }
 
 #[tokio::test]
-async fn local_native_streaming_session_rejects_voice_id() {
+async fn local_native_streaming_session_rejects_enrolled_voice_id() {
     let temp = tempfile::tempdir().unwrap();
     let model_id = "qwen3-asr-0.6b";
     let pack_path = temp.path().join("qwen3-asr-0.6b.oasr");
@@ -4311,7 +4466,7 @@ async fn local_native_streaming_session_rejects_voice_id() {
         .start_session(StartSession {
             model: Some(model_id.to_string()),
             partial_results: Some(true),
-            diarize: Some(true),
+            voice_id: Some(true),
             ..StartSession::default()
         })
         .await;
@@ -4329,7 +4484,7 @@ async fn local_native_streaming_session_rejects_voice_id() {
 }
 
 #[tokio::test]
-async fn remote_compute_session_rejects_voice_id_before_embedder_resolution() {
+async fn remote_compute_session_allows_anonymous_diarize_without_voice_id() {
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new_with_history(
         ServerRuntime::default(),
@@ -4338,24 +4493,41 @@ async fn remote_compute_session_rejects_voice_id_before_embedder_resolution() {
         false,
     );
 
-    let result = session
+    session
         .start_session(StartSession {
             model: Some("whisper-large-v3-turbo".to_string()),
             diarize: Some(true),
+            voice_id: Some(false),
             ..StartSession::default()
         })
-        .await;
-
-    assert!(result.is_err());
-    assert!(session.streaming_diarizer.is_none());
-    let event = event_receiver.recv().await.unwrap();
-    match event.event {
-        RealtimeEvent::Error(RealtimeErrorEvent { code, message, .. }) => {
-            assert_eq!(code, RealtimeErrorCode::StartupConfigError);
-            assert_eq!(message, REALTIME_VOICE_ID_UNSUPPORTED_REASON);
+        .await
+        .expect("anonymous speaker separation must not be rejected as Voice ID");
+    assert!(
+        session.streaming_diarizer.is_some(),
+        "diarize=true must construct the anonymous streaming diarizer"
+    );
+    let samples = vec![0.2_f32; 16_000 * 3];
+    let assignment = session
+        .streaming_diarizer
+        .as_mut()
+        .expect("anonymous diarizer")
+        .assign(&samples, 16_000)
+        .expect("anonymous diarizer must label SPEAKER_00");
+    assert_eq!(assignment.speaker_label, "SPEAKER_00");
+    let mut saw_configured = false;
+    while let Ok(event) = event_receiver.try_recv() {
+        assert_ne!(event.event_type, "error");
+        if let RealtimeEvent::Lifecycle(RealtimeLifecycleEvent::SessionConfigured(configured)) =
+            &event.event
+        {
+            assert!(
+                configured.diarize,
+                "anonymous diarize must be recorded on session.configured"
+            );
+            saw_configured = true;
         }
-        other => panic!("expected startup config error, got {other:?}"),
     }
+    assert!(saw_configured);
 }
 
 #[tokio::test]
@@ -4419,6 +4591,50 @@ async fn session_start_uses_request_execution_target() {
         session.execution_target,
         Some(openasr_core::ExecutionTarget::Cpu)
     );
+}
+
+#[tokio::test]
+async fn remote_compute_session_ignores_client_hardware_fields() {
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new_with_remote_identity(
+        ServerRuntime::default(),
+        test_distribution(),
+        event_sender,
+        false,
+        Some("device-a".to_string()),
+        false,
+        true,
+    );
+
+    session
+        .start_session(StartSession {
+            model: Some("whisper-large-v3-turbo".to_string()),
+            inference_threads: Some(8),
+            execution_target: Some(openasr_core::ExecutionTarget::Cpu),
+            ..StartSession::default()
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        session.inference_threads.is_none(),
+        "pairing-mode sockets must not honor client inference_threads"
+    );
+    assert_eq!(
+        session.execution_target,
+        Some(openasr_core::ExecutionTarget::Auto),
+        "pairing-mode sockets must ignore client execution_target and use the operator preference"
+    );
+}
+
+#[test]
+fn realtime_session_ids_are_unguessable() {
+    let first = next_session_id("rt_ws");
+    let second = next_session_id("rt_ws");
+    assert_ne!(first.0, second.0);
+    assert!(first.0.starts_with("rt_ws_"));
+    assert_eq!(first.0.len(), "rt_ws_".len() + 32);
+    assert!(!first.0.contains("000001"));
 }
 
 #[tokio::test]

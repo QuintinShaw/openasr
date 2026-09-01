@@ -5,7 +5,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -50,7 +50,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
-    ApiError, DistributionContext, ServerAuth, ServerRuntime, is_remote_compute_client_request,
+    ApiError, DistributionContext, ServerAuth, ServerRuntime,
+    apply_remote_compute_client_request_policy, is_remote_compute_client_request,
     native_hardware_target_from_execution_target, parse_transcription_multipart,
     realtime_capabilities_for_runtime_and_distribution, record_file_transcription_history,
     transcribe_with_runtime,
@@ -121,7 +122,6 @@ const DICTATION_SOURCE_NAME: &str = "Dictation";
 const DICTATION_FALLBACK_RMS_THRESHOLD: f32 = 0.001;
 const DICTATION_FALLBACK_PEAK_THRESHOLD: f32 = 0.006;
 
-static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static SHARED_BACKEND_WORKERS: OnceLock<
     Mutex<HashMap<RealtimeBackendWorkerKey, mpsc::Sender<RealtimeBackendWorkerMessage>>>,
 > = OnceLock::new();
@@ -139,11 +139,23 @@ pub(crate) async fn websocket(
 ) -> Response {
     let remote_compute_client = is_remote_compute_client_request(&headers, &auth);
     let record_history = !remote_compute_client;
+    let pairing_device_id = auth.pairing_device_id_for_headers(&headers);
+    let caller_is_operator = auth.authorizes_pairing_admin(&headers) || !remote_compute_client;
     ws.max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
         .write_buffer_size(MAX_WS_MESSAGE_BYTES)
         .max_write_buffer_size(MAX_WS_MESSAGE_BYTES * 2)
-        .on_upgrade(move |socket| handle_websocket(socket, runtime, distribution, record_history))
+        .on_upgrade(move |socket| {
+            handle_websocket(
+                socket,
+                runtime,
+                distribution,
+                record_history,
+                pairing_device_id,
+                caller_is_operator,
+                remote_compute_client,
+            )
+        })
 }
 
 pub(crate) async fn stream_transcription(
@@ -155,13 +167,10 @@ pub(crate) async fn stream_transcription(
 ) -> Result<Response, ApiError> {
     let home = distribution.openasr_home()?;
     let catalog = super::load_runtime_model_catalog(distribution.catalog_source(), &home)?;
-    let parsed =
+    let mut parsed =
         parse_transcription_multipart(multipart, runtime.backend, catalog.as_ref()).await?;
-    if !voice_id_allowed && parsed.request.voice_id {
-        return Err(ApiError::BadRequest(
-            "Voice ID is available only for local file transcription; remote-compute requests must omit diarize=true."
-                .to_string(),
-        ));
+    if !voice_id_allowed {
+        apply_remote_compute_client_request_policy(&mut parsed.request);
     }
     if matches!(
         parsed.response_format,
@@ -309,7 +318,12 @@ pub(crate) async fn stream_transcription(
                     RealtimeErrorEvent {
                         code: realtime_error_code_for_api_error(&error),
                         message: error.to_string(),
-                        recoverable: matches!(error, ApiError::ModelSessionCapacity(_)),
+                        recoverable: matches!(
+                            error,
+                            ApiError::ModelSessionCapacity(_)
+                                | ApiError::Busy(_)
+                                | ApiError::Conflict(_)
+                        ),
                     },
                     timestamp_now(),
                 ) {
@@ -372,6 +386,9 @@ async fn handle_websocket(
     runtime: ServerRuntime,
     distribution: DistributionContext,
     record_history: bool,
+    pairing_device_id: Option<String>,
+    caller_is_operator: bool,
+    remote_compute_client: bool,
 ) {
     let (mut socket_sender, mut socket_receiver) = socket.split();
     let (event_sender, mut event_receiver) =
@@ -402,8 +419,15 @@ async fn handle_websocket(
         let _ = socket_sender.send(ws_close(close_code)).await;
     });
 
-    let mut session =
-        WsSession::new_with_history(runtime, distribution, event_sender, record_history);
+    let mut session = WsSession::new_with_remote_identity(
+        runtime,
+        distribution,
+        event_sender,
+        record_history,
+        pairing_device_id,
+        caller_is_operator,
+        remote_compute_client,
+    );
     if session.emit_capabilities().await.is_err() {
         return;
     }
@@ -474,8 +498,76 @@ async fn handle_websocket(
     }
 
     let _ = session.finish("transport_closed", true).await;
+    session.observe_idle_for_pending_switch();
     drop(session.event_sender);
     let _ = writer.await;
+}
+
+fn held_native_realtime() -> &'static Mutex<HashMap<String, NativeStreamingDecodeWorker>> {
+    static HELD: OnceLock<Mutex<HashMap<String, NativeStreamingDecodeWorker>>> = OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) struct ParkedRealtimeControl {
+    pub(crate) controller: Option<RealtimeSessionController>,
+    pub(crate) streaming_diarizer: Option<openasr_core::diarize::streaming::StreamingDiarizer>,
+    pub(crate) native_speaker_change_detector:
+        Option<openasr_core::diarize::streaming::StreamingSpeakerChangeDetector>,
+}
+
+fn parked_realtime_control() -> &'static Mutex<HashMap<String, ParkedRealtimeControl>> {
+    static HELD: OnceLock<Mutex<HashMap<String, ParkedRealtimeControl>>> = OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn park_realtime_control(session_id: String, parked: ParkedRealtimeControl) {
+    parked_realtime_control()
+        .lock()
+        .expect("parked realtime control mutex poisoned")
+        .insert(session_id, parked);
+}
+
+pub(crate) fn take_parked_realtime_control(session_id: &str) -> Option<ParkedRealtimeControl> {
+    parked_realtime_control()
+        .lock()
+        .expect("parked realtime control mutex poisoned")
+        .remove(session_id)
+}
+
+pub(crate) fn park_native_realtime_worker(session_id: String, worker: NativeStreamingDecodeWorker) {
+    held_native_realtime()
+        .lock()
+        .expect("held native realtime registry mutex poisoned")
+        .insert(session_id, worker);
+}
+
+pub(crate) fn take_parked_native_realtime_worker(
+    session_id: &str,
+) -> Option<NativeStreamingDecodeWorker> {
+    held_native_realtime()
+        .lock()
+        .expect("held native realtime registry mutex poisoned")
+        .remove(session_id)
+}
+
+pub(crate) fn spawn_held_realtime_expiry(
+    policy: crate::RemoteRuntimePolicy,
+    runtime: ServerRuntime,
+    distribution: DistributionContext,
+    _session_id: String,
+) {
+    let grace = policy.reconnect_grace();
+    tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+        for (id, control) in policy.expire_held_realtime(SystemTime::now()) {
+            control.request_cancel();
+            if let Some(worker) = take_parked_native_realtime_worker(&id) {
+                worker.detach_cancel();
+            }
+            let _ = take_parked_realtime_control(&id);
+        }
+        crate::schedule_apply_pending_idle_switch_when_native_idle(runtime, distribution);
+    });
 }
 
 #[derive(Debug, Deserialize)]
@@ -497,6 +589,8 @@ enum ClientMessage {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StartSession {
+    #[serde(default)]
+    session_id: Option<String>,
     model: Option<String>,
     language: Option<String>,
     task: Option<openasr_core::TranscriptionTask>,
@@ -511,6 +605,10 @@ pub(crate) struct StartSession {
     partial_results: Option<bool>,
     word_timestamps: Option<bool>,
     diarize: Option<bool>,
+    /// Enrolled Voice ID matching. Realtime never supports this; anonymous
+    /// speaker separation is `diarize`.
+    #[serde(default)]
+    voice_id: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -877,7 +975,9 @@ fn resolve_model(
 
 fn realtime_error_code_for_api_error(error: &ApiError) -> RealtimeErrorCode {
     match error {
-        ApiError::ModelSessionCapacity(_) => RealtimeErrorCode::BackendNotReady,
+        ApiError::ModelSessionCapacity(_) | ApiError::Busy(_) | ApiError::Conflict(_) => {
+            RealtimeErrorCode::BackendNotReady
+        }
         ApiError::Backend(_) | ApiError::BackendJoin(_) => RealtimeErrorCode::BackendCrashed,
         ApiError::AudioPreparation(_) => RealtimeErrorCode::UnsupportedAudioFormat,
         _ => RealtimeErrorCode::StartupConfigError,
@@ -998,8 +1098,19 @@ fn write_pcm16_mono_16khz_wav(mut writer: impl Write, samples: &[i16]) -> io::Re
 }
 
 fn next_session_id(prefix: &str) -> RealtimeSessionId {
-    let index = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    RealtimeSessionId(format!("{prefix}_{index:06}"))
+    let mut bytes = [0u8; 16];
+    if getrandom::fill(&mut bytes).is_err() {
+        let pid = std::process::id().to_le_bytes();
+        let nanos = std::time::Instant::now().elapsed().as_nanos().to_le_bytes();
+        for (index, slot) in bytes.iter_mut().enumerate() {
+            *slot = pid[index % pid.len()] ^ nanos[index % nanos.len()] ^ (index as u8);
+        }
+    }
+    let mut hex = String::with_capacity(32);
+    for byte in bytes {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    RealtimeSessionId(format!("{prefix}_{hex}"))
 }
 
 fn timestamp_now() -> String {

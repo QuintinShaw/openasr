@@ -1,11 +1,18 @@
 mod idle_activity;
 mod model_admission;
 mod realtime;
+mod remote_runtime_policy;
 mod routes;
 
 pub(crate) use idle_activity::{NativeActivityGuard, spawn_idle_unload_reaper};
 pub use model_admission::NativeExecutionSupervisor;
-pub(crate) use model_admission::{ModelSessionAdmissionError, ModelSessionPermit};
+pub(crate) use model_admission::{
+    ModelSessionAdmissionError, ModelSessionPermit, NativeAdmissionKind,
+};
+pub(crate) use remote_runtime_policy::{
+    CapabilityIntent, FileAdmit, OperatorRunRecord, PENDING_IDLE_SWITCH_MESSAGE, RemoteAdmitError,
+    RemoteRuntimePolicy, SERVER_BUSY_MESSAGE, recommended_catalog_id_for_feature,
+};
 pub(crate) use routes::config::*;
 pub(crate) use routes::history::*;
 pub(crate) use routes::models_api::*;
@@ -191,6 +198,22 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
             get(default_model)
                 .post(set_default_model)
                 .put(set_default_model),
+        )
+        .route(
+            "/v1/models/default/idle-switch/cancel",
+            post(cancel_idle_switch),
+        )
+        .route(
+            "/v1/runtime/runs",
+            get(list_operator_runs).delete(clear_operator_runs),
+        )
+        .route(
+            "/v1/capabilities/requests",
+            get(list_capability_requests).post(submit_capability_request),
+        )
+        .route(
+            "/v1/capabilities/requests/approve",
+            post(approve_capability_request),
         )
         .route("/v1/models/{id}", delete(delete_model))
         .route("/v1/models/{id}/pull", post(start_pull_job))
@@ -1226,6 +1249,20 @@ impl ServerAuth {
         credential.last_seen_unix_secs = Some(unix_now_secs());
         true
     }
+
+    fn pairing_device_id_for_headers(&self, headers: &axum::http::HeaderMap) -> Option<String> {
+        if !self.is_pairing_enabled() || self.authorizes_pairing_admin(headers) {
+            return None;
+        }
+        let token = header_bearer_token(headers)?;
+        let token_hash = bearer_token_hash(token);
+        let pairing = self.lock_pairing();
+        pairing
+            .credentials
+            .values()
+            .find(|credential| !credential.revoked && credential.token_hash == token_hash)
+            .map(|credential| credential.device_id.clone())
+    }
 }
 
 fn header_bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
@@ -1684,7 +1721,12 @@ impl ServerRuntime {
                 ));
             }
         };
-        self.try_acquire_native_execution(verified_model_identity, route)
+        self.try_acquire_native_execution(
+            verified_model_identity,
+            route,
+            NativeAdmissionKind::Realtime,
+            None,
+        )
     }
 
     /// Admits a request only if the active model inspected before preparation
@@ -1696,6 +1738,8 @@ impl ServerRuntime {
         snapshot: &ActiveRuntimeSnapshot,
         verified_model_identity: &str,
         route: Option<&openasr_core::ResolvedExecutionRoute>,
+        kind: NativeAdmissionKind,
+        admitted_file_id: Option<&str>,
     ) -> Result<AdmittedNativeExecution, ApiError> {
         let _activation_gate = match self.model_pack_path.activation_barrier.try_lock() {
             Ok(guard) => guard,
@@ -1717,7 +1761,12 @@ impl ServerRuntime {
         // runtime/session construction cannot begin in the gap after the
         // reaper observed zero activity but before it tears owners down.
         let activity = NativeActivityGuard::enter();
-        let permit = self.try_acquire_native_execution(verified_model_identity, route)?;
+        let permit = self.try_acquire_native_execution(
+            verified_model_identity,
+            route,
+            kind,
+            admitted_file_id,
+        )?;
         Ok(AdmittedNativeExecution { permit, activity })
     }
 
@@ -1725,11 +1774,27 @@ impl ServerRuntime {
         &self,
         verified_model_identity: &str,
         route: Option<&openasr_core::ResolvedExecutionRoute>,
+        kind: NativeAdmissionKind,
+        admitted_file_id: Option<&str>,
     ) -> Result<ModelSessionPermit, ApiError> {
+        let policy = self.native_execution.remote_policy();
+        let already_admitted_file =
+            admitted_file_id.is_some_and(|id| policy.file_already_admitted(id));
+        if !already_admitted_file && !policy.admits_new_tasks() {
+            return Err(ApiError::Conflict(PENDING_IDLE_SWITCH_MESSAGE.to_string()));
+        }
+        if kind == NativeAdmissionKind::Realtime
+            && (policy.file_running().is_some() || policy.has_held_realtime())
+        {
+            return Err(ApiError::Busy(SERVER_BUSY_MESSAGE.to_string()));
+        }
         let identity = openasr_core::admission_identity_for_route(verified_model_identity, route);
         self.native_execution
             .try_acquire(identity)
-            .map_err(ApiError::ModelSessionCapacity)
+            .map_err(|error| match kind {
+                NativeAdmissionKind::Realtime => ApiError::Busy(SERVER_BUSY_MESSAGE.to_string()),
+                NativeAdmissionKind::File => ApiError::ModelSessionCapacity(error),
+            })
     }
 
     pub(crate) fn begin_native_activation(
@@ -2014,6 +2079,7 @@ pub(crate) struct DistributionContext {
     // worker. In-session only: an entry lives just for one transcription's
     // lifetime and is cleared when the request returns.
     transcriptions: Arc<Mutex<HashMap<String, Arc<openasr_core::TranscriptionControl>>>>,
+    transcription_owners: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl DistributionContext {
@@ -2024,6 +2090,7 @@ impl DistributionContext {
         Self {
             jobs: Arc::new(DistributionJobs::new(load_persisted_pull_jobs(&runtime))),
             transcriptions: Arc::new(Mutex::new(HashMap::new())),
+            transcription_owners: Arc::new(Mutex::new(HashMap::new())),
             native_execution_services,
             runtime,
         }
@@ -2055,6 +2122,26 @@ impl DistributionContext {
         true
     }
 
+    fn set_transcription_owner(&self, transcription_id: &str, owner_device_id: Option<&str>) {
+        let mut owners = self
+            .transcription_owners
+            .lock()
+            .expect("active transcription owner registry mutex poisoned");
+        if let Some(owner) = owner_device_id.filter(|id| !id.is_empty()) {
+            owners.insert(transcription_id.to_string(), owner.to_string());
+        } else {
+            owners.remove(transcription_id);
+        }
+    }
+
+    pub(crate) fn transcription_owner(&self, transcription_id: &str) -> Option<String> {
+        self.transcription_owners
+            .lock()
+            .expect("active transcription owner registry mutex poisoned")
+            .get(transcription_id)
+            .cloned()
+    }
+
     /// Releases an id only when `control` still owns it. The pointer fence is
     /// defensive against future registration changes: a stale guard can never
     /// clear a newer request that reused the same string id.
@@ -2072,6 +2159,10 @@ impl DistributionContext {
             .is_some_and(|registered| Arc::ptr_eq(registered, control));
         if owns_entry {
             transcriptions.remove(transcription_id);
+            self.transcription_owners
+                .lock()
+                .expect("active transcription owner registry mutex poisoned")
+                .remove(transcription_id);
         }
         owns_entry
     }
@@ -2614,12 +2705,15 @@ fn catalog_degraded_reason(distribution: &DistributionContext) -> Option<String>
     openasr_core::read_catalog_degraded_status(home).map(|status| status.reason)
 }
 
-async fn models(State(runtime): State<ServerRuntime>) -> Result<Json<ModelsResponse>, ApiError> {
-    let ids: Vec<String> = match runtime.backend {
+async fn models(
+    State(runtime): State<ServerRuntime>,
+    Extension(distribution): Extension<DistributionContext>,
+) -> Result<Json<ModelsResponse>, ApiError> {
+    let items: Vec<ModelResponse> = match runtime.backend {
         BackendKind::Mock => runtime_registry(None)
             .map_err(ApiError::from)?
             .into_iter()
-            .map(|card| card.id)
+            .map(|card| served_model_item(card.id, None))
             .collect(),
         BackendKind::Native => {
             // No model bound is a normal fresh-install state, not an error:
@@ -2632,22 +2726,43 @@ async fn models(State(runtime): State<ServerRuntime>) -> Result<Json<ModelsRespo
                         .map_err(ApiError::Backend)?;
                     let identity = resolve_verified_native_runtime_model_identity(&adapter, None)
                         .map_err(ApiError::Backend)?;
-                    vec![identity.model_id]
+                    let pull = bound_pack_display_pull(
+                        &distribution,
+                        &model_pack_path,
+                        &identity.model_id,
+                    );
+                    vec![served_model_item(identity.model_id, pull)]
                 }
             }
         }
     };
     Ok(Json(ModelsResponse {
         object: "list",
-        data: ids
-            .into_iter()
-            .map(|id| ModelResponse {
-                id,
-                object: "model",
-                owned_by: "openasr",
-            })
-            .collect(),
+        data: items,
     }))
+}
+
+fn served_model_item(id: String, pull: Option<String>) -> ModelResponse {
+    ModelResponse {
+        pull: pull.filter(|value| !value.is_empty() && value != &id),
+        id,
+        object: "model",
+        owned_by: "openasr",
+    }
+}
+
+fn bound_pack_display_pull(
+    distribution: &DistributionContext,
+    pack_path: &Path,
+    model_id: &str,
+) -> Option<String> {
+    let home = distribution.openasr_home().ok()?;
+    let packs = list_installed_packs(&home).ok()?;
+    packs
+        .into_iter()
+        .find(|pack| pack.path == pack_path)
+        .map(|pack| pack.pull)
+        .filter(|pull| pull != model_id)
 }
 
 async fn catalog(
@@ -2883,6 +2998,10 @@ struct ModelResponse {
     id: String,
     object: &'static str,
     owned_by: &'static str,
+    /// Catalog pull (`family:quant`) when it differs from handshake `id`.
+    /// Clients display this; they must still send `id` on session.start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pull: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -3059,6 +3178,11 @@ pub(crate) struct DefaultModelResponse {
     /// durable selection resolves to the same pack currently bound by the
     /// daemon; every other state is fail-closed as `unavailable`.
     activation: DefaultModelActivationState,
+    /// Operator idle-after-busy ASR switch. Present only while a pending
+    /// rebind is waiting for the current tasks to finish.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    idle_switch_pending: Option<String>,
 }
 
 #[derive(Debug)]
@@ -3066,6 +3190,8 @@ pub(crate) enum ApiError {
     BadRequest(String),
     NotFound(String),
     Conflict(String),
+    Forbidden(String),
+    Busy(String),
     Catalog(CatalogError),
     Config(openasr_core::ConfigError),
     Format(String),
@@ -3128,7 +3254,9 @@ impl std::fmt::Display for ApiError {
         match self {
             Self::BadRequest(message) | Self::Format(message) => f.write_str(message),
             Self::NotFound(message) => f.write_str(message),
-            Self::Conflict(message) => f.write_str(message),
+            Self::Conflict(message) | Self::Forbidden(message) | Self::Busy(message) => {
+                f.write_str(message)
+            }
             Self::Catalog(error) => write!(f, "Could not load model catalog: {error}"),
             Self::Config(error) => write!(f, "Could not read or update OpenASR config: {error}"),
             Self::Home(error) => write!(f, "Could not resolve OpenASR home: {error}"),
@@ -3174,6 +3302,8 @@ impl IntoResponse for ApiError {
             Self::BadRequest(message) | Self::Format(message) => (StatusCode::BAD_REQUEST, message),
             Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
             Self::Conflict(message) => (StatusCode::CONFLICT, message),
+            Self::Forbidden(message) => (StatusCode::FORBIDDEN, message),
+            Self::Busy(message) => (StatusCode::TOO_MANY_REQUESTS, message),
             Self::Catalog(error) => {
                 let status = if matches!(
                     &error,

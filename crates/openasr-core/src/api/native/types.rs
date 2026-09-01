@@ -313,6 +313,14 @@ pub struct NativeAsrRequestOptions {
     /// `arch::SpeakerSegmentationSource`, and whether the turns can be matched
     /// to known people additionally depends on an installed speaker embedder.
     pub voice_id: bool,
+    /// Anonymous speaker separation without enrolled-person matching. Remote
+    /// compute carries this across the native offline round-trip so file
+    /// `diarize=true` does not collapse to `SpeakerPlan::Off`.
+    pub anonymous_diarize: bool,
+    /// Exact speaker-count hint for the external clustering path. Carried with
+    /// the Voice ID / anonymous-diarize flags so the server rebuild does not
+    /// drop `speakers`.
+    pub diarize_speakers: Option<u8>,
     pub partial_results: bool,
     pub word_timestamps: bool,
     /// Opt-in `--word-timestamps=aligned` / `word_aligned` refinement tier;
@@ -353,6 +361,16 @@ impl NativeAsrRequestOptions {
 
     pub fn with_voice_id(mut self, voice_id: bool) -> Self {
         self.voice_id = voice_id;
+        self
+    }
+
+    pub fn with_anonymous_diarize(mut self, anonymous_diarize: bool) -> Self {
+        self.anonymous_diarize = anonymous_diarize;
+        self
+    }
+
+    pub fn with_diarize_speakers(mut self, diarize_speakers: Option<u8>) -> Self {
+        self.diarize_speakers = diarize_speakers;
         self
     }
 

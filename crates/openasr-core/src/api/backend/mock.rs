@@ -26,6 +26,14 @@ impl TranscriptionBackend for MockBackend {
             "OpenASR mock transcription for {file_name} using {}.",
             request.model_id
         );
+        let (speaker, speaker_label) = if request.anonymous_diarize {
+            (
+                Some("SPEAKER_00".to_string()),
+                Some("SPEAKER_00".to_string()),
+            )
+        } else {
+            (None, None)
+        };
 
         Ok(Transcription {
             truncated_decodes: Vec::new(),
@@ -35,8 +43,8 @@ impl TranscriptionBackend for MockBackend {
                 start: 0.0,
                 end: 2.5,
                 text,
-                speaker: None,
-                speaker_label: None,
+                speaker,
+                speaker_label,
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
                 words: Vec::new(),
@@ -88,6 +96,24 @@ mod tests {
         assert!(error.contains("redimnet2-b6-cn"));
         assert!(error.contains("mock backend"));
         assert!(error.contains("omit --diarize / diarize=true"));
+    }
+
+    #[test]
+    fn mock_backend_anonymous_diarize_labels_speaker_without_person_id() {
+        let backend = MockBackend;
+        let request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-tiny")
+            .with_anonymous_diarize(true);
+
+        let transcription = backend.transcribe(request).unwrap();
+        assert_eq!(
+            transcription.segments[0].speaker_label.as_deref(),
+            Some("SPEAKER_00")
+        );
+        assert_eq!(
+            transcription.segments[0].speaker.as_deref(),
+            Some("SPEAKER_00")
+        );
+        assert!(transcription.segments[0].speaker_person_id.is_none());
     }
 
     #[test]

@@ -1511,6 +1511,8 @@ fn native_offline_request_to_transcription_request(
         .with_word_timestamps(request.options.word_timestamps)
         .with_word_timestamps_refine(request.options.word_timestamps_refine)
         .with_voice_id(request.options.voice_id)
+        .with_anonymous_diarize(request.options.anonymous_diarize)
+        .with_diarize_speakers(request.options.diarize_speakers)
         .with_longform(request.longform)
         .with_display_file_name(request.display_file_name)
         .with_source(request.source)
@@ -2096,6 +2098,25 @@ mod tests {
             NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav")),
         );
         assert_eq!(rebuilt_default.serve_batch_max_native_sessions, None);
+    }
+
+    #[test]
+    fn native_offline_request_conversion_preserves_anonymous_diarize() {
+        let pack =
+            NativeAsrModelPackRef::new("moonshine-tiny", "moonshine", PathBuf::from("/tmp/pack"));
+        let rebuilt = native_offline_request_to_transcription_request(
+            &pack,
+            ExecutionTarget::Auto,
+            NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav")).with_options(
+                NativeAsrRequestOptions::new()
+                    .with_voice_id(false)
+                    .with_anonymous_diarize(true)
+                    .with_diarize_speakers(Some(3)),
+            ),
+        );
+        assert!(!rebuilt.voice_id);
+        assert!(rebuilt.anonymous_diarize);
+        assert_eq!(rebuilt.diarize_speakers, Some(3));
     }
 
     fn write_mono_pcm16_wav(path: &Path, sample_rate_hz: u32, frames: u32) {
@@ -3730,6 +3751,8 @@ mod tests {
                     .with_phrase_bias(Some(phrase_bias.clone()))
                     .with_inference_threads(Some(6))
                     .with_voice_id(true)
+                    .with_anonymous_diarize(true)
+                    .with_diarize_speakers(Some(2))
                     .with_word_timestamps(true),
             )
             .with_voice_id_segmenter(crate::config::VoiceIdSegmenterPreference::Segmentation3_0)
@@ -3762,6 +3785,8 @@ mod tests {
         );
         assert!(converted.word_timestamps);
         assert!(converted.voice_id);
+        assert!(converted.anonymous_diarize);
+        assert_eq!(converted.diarize_speakers, Some(2));
         assert_eq!(converted.longform, Some(longform));
         assert_eq!(converted.display_file_name.as_deref(), Some("meeting.wav"));
     }

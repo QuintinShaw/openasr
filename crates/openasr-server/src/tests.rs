@@ -1057,6 +1057,50 @@ async fn loopback_tls_pairing_device_transcription_skips_server_history() {
 }
 
 #[tokio::test]
+async fn loopback_tls_pairing_device_reads_bound_models_not_installed_inventory() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = spawn_loopback_pairing_server(temp.path()).await;
+    let credential = approve_loopback_pairing(&server).await;
+    let bearer_auth = bearer_auth_header(&credential.bearer_token);
+
+    let models = https_request(
+        server.addr,
+        "GET",
+        "/v1/models",
+        &[("Authorization", bearer_auth.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(models.status, 200);
+    let models_json: serde_json::Value = serde_json::from_slice(&models.body).unwrap();
+    assert_eq!(models_json["object"], "list");
+    assert!(models_json["data"].as_array().is_some());
+
+    let local = https_request(
+        server.addr,
+        "GET",
+        "/v1/models/local",
+        &[("Authorization", bearer_auth.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(local.status, 403);
+
+    let set_default = https_request(
+        server.addr,
+        "POST",
+        "/v1/models/default",
+        &[
+            ("Authorization", bearer_auth.as_str()),
+            ("Content-Type", "application/json"),
+        ],
+        br#"{"model":"xasr-zh-en:fp16"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(set_default.status, 403);
+}
+
+#[tokio::test]
 async fn loopback_tls_pairing_device_realtime_skips_server_history() {
     let temp = tempfile::tempdir().unwrap();
     let server = spawn_loopback_pairing_server(temp.path()).await;
@@ -1310,11 +1354,30 @@ fn operator_only_paths_cover_history_config_and_model_mutations() {
         &Method::DELETE,
         "/v1/voice-id/samples/sample_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     ));
+    // Installed inventory is operator-local; handshake identity is GET /v1/models.
+    assert!(is_operator_only_path(&Method::GET, "/v1/models/local"));
+    assert!(is_operator_only_path(
+        &Method::POST,
+        "/v1/models/default/idle-switch/cancel"
+    ));
+    assert!(is_operator_only_path(&Method::GET, "/v1/runtime/runs"));
+    assert!(is_operator_only_path(&Method::DELETE, "/v1/runtime/runs"));
+    assert!(is_operator_only_path(
+        &Method::GET,
+        "/v1/capabilities/requests"
+    ));
+    assert!(is_operator_only_path(
+        &Method::POST,
+        "/v1/capabilities/requests/approve"
+    ));
     // Open to paired compute clients:
     assert!(!is_operator_only_path(&Method::GET, "/v1/models/default"));
     assert!(!is_operator_only_path(&Method::GET, "/v1/models"));
-    assert!(!is_operator_only_path(&Method::GET, "/v1/models/local"));
     assert!(!is_operator_only_path(&Method::GET, "/v1/capabilities"));
+    assert!(!is_operator_only_path(
+        &Method::POST,
+        "/v1/capabilities/requests"
+    ));
     assert!(!is_operator_only_path(
         &Method::POST,
         "/v1/audio/transcriptions"
@@ -1722,6 +1785,56 @@ fn rebind_native_model_pack_returns_conflict_while_session_is_active() {
 }
 
 #[tokio::test]
+async fn scheduled_idle_switch_waits_while_native_slot_is_occupied() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack_a = temp.path().join("pack-a.oasr");
+    write_mock_gguf_runtime_source(&pack_a, Some("whisper-tiny"));
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_a.clone()).into(),
+    };
+    let permit = runtime
+        .acquire_native_execution("native:whisper-tiny@idle-switch-wait", None)
+        .unwrap();
+    runtime
+        .native_execution
+        .remote_policy()
+        .request_idle_switch("whisper-tiny:fp16");
+    assert!(runtime.native_rebind_blocked());
+    assert!(!idle_switch_slot_is_clear(&runtime));
+    let dist = DistributionContext::new(DistributionRuntime {
+        openasr_home: Some(temp.path().join("home")),
+        catalog_url: None,
+        catalog_local_override: None,
+    });
+    schedule_apply_pending_idle_switch_when_native_idle(runtime.clone(), dist);
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    assert_eq!(
+        runtime
+            .native_execution
+            .remote_policy()
+            .pending_idle_switch()
+            .as_deref(),
+        Some("whisper-tiny:fp16"),
+        "must not apply while the native permit is still held"
+    );
+    drop(permit);
+    for _ in 0..50 {
+        if idle_switch_slot_is_clear(&runtime) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        idle_switch_slot_is_clear(&runtime),
+        "dropping the permit must clear the native slot so idle-switch can apply"
+    );
+}
+
+#[tokio::test]
 async fn set_default_model_http_returns_conflict_when_native_session_is_busy() {
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
@@ -1787,14 +1900,12 @@ async fn set_default_model_http_returns_conflict_when_native_session_is_busy() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
     let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert!(
-        parsed["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("native transcription or realtime session is running")
+    assert_eq!(
+        parsed["idle_switch_pending"].as_str(),
+        Some("whisper-base:q4")
     );
     assert_eq!(
         runtime.model_pack_path.current().as_deref(),
@@ -1803,6 +1914,14 @@ async fn set_default_model_http_returns_conflict_when_native_session_is_busy() {
     assert_eq!(
         openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap(),
         previous_v2
+    );
+    assert_eq!(
+        runtime
+            .native_execution
+            .remote_policy()
+            .pending_idle_switch()
+            .as_deref(),
+        Some("whisper-base:q4")
     );
 }
 
@@ -2628,7 +2747,13 @@ fn stale_active_runtime_snapshot_cannot_start_after_republication() {
         .set_legacy_binding(Some(pack.clone()));
 
     assert!(matches!(
-        runtime.acquire_native_execution_for_snapshot(&snapshot, "stale-snapshot", None),
+        runtime.acquire_native_execution_for_snapshot(
+            &snapshot,
+            "stale-snapshot",
+            None,
+            NativeAdmissionKind::Realtime,
+            None,
+        ),
         Err(ApiError::Conflict(_))
     ));
     assert!(!runtime.native_execution.has_active_sessions());
@@ -2638,7 +2763,13 @@ fn stale_active_runtime_snapshot_cannot_start_after_republication() {
         .current_snapshot()
         .expect("republished active runtime snapshot");
     let permit = runtime
-        .acquire_native_execution_for_snapshot(&fresh, "fresh-snapshot", None)
+        .acquire_native_execution_for_snapshot(
+            &fresh,
+            "fresh-snapshot",
+            None,
+            NativeAdmissionKind::Realtime,
+            None,
+        )
         .expect("the current publication may be admitted");
     drop(permit);
 }
@@ -3280,9 +3411,13 @@ async fn transcription_control_endpoints_flip_pause_resume_cancel_flags() {
     let control = Arc::new(openasr_core::TranscriptionControl::new());
     assert!(distribution.try_register_transcription("txn-1", Arc::clone(&control)));
 
+    let auth = crate::ServerAuth::disabled();
+    let headers = HeaderMap::new();
     pause_transcription_job(
         AxumPath("txn-1".to_string()),
+        Extension(auth.clone()),
         Extension(distribution.clone()),
+        headers.clone(),
     )
     .await
     .unwrap();
@@ -3290,15 +3425,20 @@ async fn transcription_control_endpoints_flip_pause_resume_cancel_flags() {
 
     resume_transcription_job(
         AxumPath("txn-1".to_string()),
+        Extension(auth.clone()),
         Extension(distribution.clone()),
+        headers.clone(),
     )
     .await
     .unwrap();
     assert!(!control.is_paused());
 
     cancel_transcription_job(
+        State(ServerRuntime::default()),
         AxumPath("txn-1".to_string()),
+        Extension(auth.clone()),
         Extension(distribution.clone()),
+        headers.clone(),
     )
     .await
     .unwrap();
@@ -3308,8 +3448,11 @@ async fn transcription_control_endpoints_flip_pause_resume_cancel_flags() {
     assert!(distribution.clear_transcription_if_current("txn-1", &control));
     assert!(distribution.transcription_control("txn-1").is_none());
     let error = cancel_transcription_job(
+        State(ServerRuntime::default()),
         AxumPath("txn-1".to_string()),
+        Extension(auth),
         Extension(distribution.clone()),
+        headers,
     )
     .await
     .unwrap_err();
@@ -4032,4 +4175,441 @@ fn build_native_longform_options_override_keeps_explicit_fields() {
     assert_eq!(options.energy_silence_threshold_db, -42.0);
     assert_eq!(options.min_chunk_seconds, 1.0);
     assert!(options.suppress_silent_slices);
+}
+
+fn policy_transcription_multipart(transcription_id: Option<&str>) -> (String, Vec<u8>) {
+    let boundary = "openasr-policy-boundary";
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.wav\"\r\nContent-Type: audio/wav\r\n\r\nnot a real wav\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n"
+    );
+    if let Some(id) = transcription_id {
+        body.push_str(&format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"transcription_id\"\r\n\r\n{id}\r\n"
+        ));
+    }
+    body.push_str(&format!("--{boundary}--\r\n"));
+    (
+        format!("multipart/form-data; boundary={boundary}"),
+        body.into_bytes(),
+    )
+}
+
+fn policy_test_app(runtime: ServerRuntime, home: std::path::PathBuf) -> axum::Router {
+    app_with_runtime_and_distribution(
+        runtime,
+        DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    )
+}
+
+#[tokio::test]
+async fn pairing_mode_file_diarize_returns_anonymous_speaker_labels() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let auth = ServerAuth::pairing("admin-secret");
+    let request = auth.create_pairing_request("Phone").unwrap();
+    auth.approve_pairing_request(&request.request_id).unwrap();
+    let PairingCredentialState::Ready(credential) =
+        auth.pairing_credential(&request.request_id).unwrap()
+    else {
+        panic!("expected approved pairing credential");
+    };
+
+    let app = app_with_runtime_and_distribution_and_launch_options(
+        ServerRuntime::default(),
+        DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+        ServerLaunchOptions {
+            auth,
+            ..ServerLaunchOptions::default()
+        },
+    );
+
+    let boundary = "openasr-pairing-diarize";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.wav\"\r\nContent-Type: audio/wav\r\n\r\nnot a real wav\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"diarize\"\r\n\r\ntrue\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"inference_threads\"\r\n\r\n8\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"execution_target\"\r\n\r\ncpu\r\n--{boundary}--\r\n"
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", credential.bearer_token),
+                )
+                .header(REMOTE_COMPUTE_HEADER, REMOTE_COMPUTE_CLIENT_VALUE)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let segment = &json["segments"][0];
+    assert_eq!(segment["speaker"].as_str(), Some("SPEAKER_00"));
+    assert_eq!(segment["speaker_label"].as_str(), Some("SPEAKER_00"));
+    assert!(
+        segment.get("speaker_person_id").is_none() || segment["speaker_person_id"].is_null(),
+        "remote file diarize must not leak enrolled person ids: {segment}"
+    );
+}
+
+#[tokio::test]
+async fn busy_server_queues_file_jobs_and_rejects_uncancellable_ones() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let runtime = ServerRuntime::default();
+    let _permit = runtime
+        .native_execution
+        .try_acquire("hold-native-slot")
+        .unwrap();
+    let app = policy_test_app(runtime.clone(), home);
+
+    let (content_type, body) = policy_transcription_multipart(None);
+    let immediate = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(immediate.status(), StatusCode::TOO_MANY_REQUESTS);
+    let immediate_body = to_bytes(immediate.into_body(), 1024 * 64).await.unwrap();
+    let immediate_json: serde_json::Value = serde_json::from_slice(&immediate_body).unwrap();
+    assert_eq!(
+        immediate_json["error"]["message"].as_str(),
+        Some(SERVER_BUSY_MESSAGE)
+    );
+
+    let (content_type, body) = policy_transcription_multipart(Some("file-queued"));
+    let queued = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/audio/transcriptions")
+                    .header(header::CONTENT_TYPE, content_type)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    });
+
+    let queued_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !runtime
+        .native_execution
+        .remote_policy()
+        .is_file_queued("file-queued")
+    {
+        assert!(
+            std::time::Instant::now() < queued_deadline,
+            "busy file job must enter the cancelable FIFO"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let cancel = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions/file-queued/cancel")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancel.status(), StatusCode::ACCEPTED);
+
+    let queued_response = queued.await.unwrap();
+    assert_eq!(queued_response.status(), StatusCode::CONFLICT);
+    let queued_body = to_bytes(queued_response.into_body(), 1024 * 64)
+        .await
+        .unwrap();
+    let queued_json: serde_json::Value = serde_json::from_slice(&queued_body).unwrap();
+    assert!(
+        queued_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("cancel"),
+        "queued file cancel must fail closed as canceled: {queued_json}"
+    );
+}
+
+#[tokio::test]
+async fn pending_idle_switch_rejects_new_file_jobs_until_canceled() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .request_idle_switch("whisper-base:q4");
+    let app = policy_test_app(runtime.clone(), home);
+
+    let (content_type, body) = policy_transcription_multipart(Some("blocked-by-switch"));
+    let blocked = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::CONFLICT);
+    let blocked_body = to_bytes(blocked.into_body(), 1024 * 64).await.unwrap();
+    let blocked_json: serde_json::Value = serde_json::from_slice(&blocked_body).unwrap();
+    assert_eq!(
+        blocked_json["error"]["message"].as_str(),
+        Some(PENDING_IDLE_SWITCH_MESSAGE)
+    );
+
+    let cancel = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/default/idle-switch/cancel")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancel.status(), StatusCode::OK);
+    assert!(
+        runtime
+            .native_execution
+            .remote_policy()
+            .pending_idle_switch()
+            .is_none()
+    );
+
+    let (content_type, body) = policy_transcription_multipart(Some("after-cancel"));
+    let admitted = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admitted.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn operator_run_log_records_file_jobs_without_content_fields() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let app = policy_test_app(ServerRuntime::default(), home);
+
+    let (content_type, body) = policy_transcription_multipart(Some("run-log"));
+    let transcribed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(transcribed.status(), StatusCode::OK);
+
+    let runs = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/runtime/runs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(runs.status(), StatusCode::OK);
+    let runs_body = to_bytes(runs.into_body(), 1024 * 64).await.unwrap();
+    let runs_json: serde_json::Value = serde_json::from_slice(&runs_body).unwrap();
+    let rendered = runs_json.to_string();
+    assert!(!rendered.contains("audio"));
+    assert!(!rendered.contains("hotword"));
+    assert!(!rendered.contains("transcript"));
+    assert_eq!(runs_json["object"], "runtime.runs");
+    assert_eq!(runs_json["data"][0]["kind"], "file");
+    assert_eq!(runs_json["data"][0]["success"], true);
+    assert!(runs_json["data"][0]["device_name"].is_string());
+    assert!(runs_json["data"][0]["started_at_unix_ms"].is_number());
+    assert!(runs_json["data"][0]["duration_ms"].is_number());
+
+    let cleared = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/runtime/runs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleared.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn capability_requests_are_device_submittable_and_operator_confirmed() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let catalog_path = copy_bundled_production_catalog_to(temp.path());
+    let app = app_with_runtime_and_distribution(
+        ServerRuntime::default(),
+        DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+            catalog_local_override: Some(openasr_core::LocalCatalogEnvOverride {
+                path: catalog_path,
+                identity: openasr_core::default_catalog_url().to_string(),
+            }),
+        },
+    );
+
+    let submitted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/capabilities/requests")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"features":["speakers"]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+
+    let listed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/capabilities/requests")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed_body = to_bytes(listed.into_body(), 1024 * 64).await.unwrap();
+    let listed_json: serde_json::Value = serde_json::from_slice(&listed_body).unwrap();
+    assert_eq!(listed_json["data"][0]["features"][0], "speakers");
+
+    let approved = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/capabilities/requests/approve")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(approved.status(), StatusCode::OK);
+    let approved_body = to_bytes(approved.into_body(), 1024 * 64).await.unwrap();
+    let approved_json: serde_json::Value = serde_json::from_slice(&approved_body).unwrap();
+    assert_eq!(approved_json["request"]["features"][0], "speakers");
+    assert_eq!(
+        approved_json["pulls"][0]["model_id"].as_str(),
+        Some("diarizen-large-s80-v2")
+    );
+    let job_id = approved_json["pulls"][0]["job_id"]
+        .as_str()
+        .expect("capability approval must start a pull job")
+        .to_string();
+    let cancel = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/models/pull/{job_id}/cancel"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        cancel.status().is_success() || cancel.status() == StatusCode::ACCEPTED,
+        "capability pull {job_id} must be cancelable"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let job = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/models/pull/{job_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let job_body = to_bytes(job.into_body(), 1024 * 64).await.unwrap();
+        let job_json: serde_json::Value = serde_json::from_slice(&job_body).unwrap();
+        let state = job_json["state"].as_str().unwrap_or("");
+        if matches!(state, "canceled" | "failed" | "cancelled") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "capability pull {job_id} did not settle after cancel: {job_json}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }

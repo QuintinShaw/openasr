@@ -49,7 +49,7 @@ use crate::diarize::{
     calibration::{REDIMNET_CALIBRATION, SpeakerCalibrationProfile},
     contract::SpeakerEmbedding,
     streaming::{StreamingDiarizer, StreamingSpeakerChangeDetector},
-    voice_id::load_person_matcher_for_embedder,
+    voice_id::{EmbeddingSpace, PersonMatcher, load_person_matcher_for_embedder},
 };
 
 const STREAMING_SPEAKER_STAGE: &str = "redimnet2-streaming-speaker-stage-v1";
@@ -538,6 +538,20 @@ impl PolicyResolvedSpeakerRuntime {
             sample_rate_hz,
             persons,
         ))
+    }
+
+    /// Anonymous SPEAKER_00 clustering. Enrolled Voice ID names stay on the
+    /// originating client; this matcher is intentionally empty.
+    pub fn anonymous_diarizer(&self, sample_rate_hz: u32) -> StreamingDiarizer {
+        let space = EmbeddingSpace::for_active_embedder(
+            &self.identity,
+            self.embedder.calibration_profile(),
+        );
+        StreamingDiarizer::with_shared_embedder_and_persons(
+            Arc::clone(&self.embedder),
+            sample_rate_hz,
+            PersonMatcher::new(space, Vec::new(), 1.0, 0.0),
+        )
     }
 
     pub fn speaker_change_detector(&self, sample_rate_hz: u32) -> StreamingSpeakerChangeDetector {
