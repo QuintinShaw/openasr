@@ -312,6 +312,16 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("verify-cdn", channels)
         self.assertIn("needs: [resolve, distribution-gate]", channels)
         self.assertIn("git push origin main", channels)
+        gate = channels.split("\n  distribution-gate:\n", 1)[1].split(
+            "\n  docker-images:\n", 1
+        )[0]
+        self.assertIn("github.event.repository.default_branch", gate)
+        self.assertNotIn("needs.resolve.outputs.tag", gate.split("Download release trust metadata", 1)[0])
+        brew = channels.split("\n  update-homebrew-tap:\n", 1)[1]
+        brew_checkout = brew.split("\n      - name: Check for tap credentials\n", 1)[0]
+        self.assertIn("github.event.repository.default_branch", brew_checkout)
+        self.assertNotIn("needs.resolve.outputs.tag", brew_checkout)
+        self.assertIn("ref: ${{ needs.resolve.outputs.tag }}", channels)
 
     def test_family_regression_reuses_published_assets_instead_of_racing_raw_tag(self) -> None:
         family = (ROOT / ".github/workflows/family-regression.yml").read_text(
