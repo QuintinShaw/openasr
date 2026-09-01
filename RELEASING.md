@@ -261,9 +261,15 @@ secret is not set, the job prints a `::notice::` and builds without pushing
 A red Docker job fails that leg of the workflow only and does not delete or
 roll back the already-published Release.
 
+The distribution gate and Homebrew formula updater check out helper scripts
+from the repository default branch, not the release tag, so a later CI-only
+fix still applies when repairing an already-public tag. Docker images still
+build from the tag's Dockerfiles and the published Linux tarballs.
+
 Manual dry-run / re-publish against an existing tag:
 
 ```bash
+gh workflow run publish-core-channels.yml -f tag=vX.Y.Z
 gh workflow run docker-release.yml \
   -f version=X.Y.Z -f tag=vX.Y.Z -f push=false -f mark_latest=false -f variants=all
 ```
