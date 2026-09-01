@@ -69,9 +69,15 @@ jobs:
     needs: resolve
     runs-on: ubuntu-latest
     steps:
+      # Helper scripts must come from the live default branch. A release:
+      # published event checks out the tag by default, so a later CI-only fix
+      # (for example gh_release.py writing progress to stderr) would otherwise
+      # be invisible and skip Docker/Homebrew. Release bytes still come from
+      # the published tag via download-packs, SHA256SUMS, and the live catalog.
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.resolve.outputs.tag }}
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
       - name: Download release trust metadata
         env:
           GH_TOKEN: ${{ github.token }}
@@ -145,7 +151,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.resolve.outputs.tag }}
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
       - name: Check for tap credentials
         id: check
         run: |

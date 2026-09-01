@@ -315,6 +315,16 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("needs: [resolve, distribution-gate]", channels)
         self.assertIn("git push origin main", channels)
         self.assertNotIn("sync-release-to-cnb.sh", channels)
+        gate = channels.split("\n  distribution-gate:\n", 1)[1].split(
+            "\n  docker-images:\n", 1
+        )[0]
+        self.assertIn("github.event.repository.default_branch", gate)
+        self.assertNotIn("needs.resolve.outputs.tag", gate.split("Download release trust metadata", 1)[0])
+        brew = channels.split("\n  update-homebrew-tap:\n", 1)[1]
+        brew_checkout = brew.split("\n      - name: Check for tap credentials\n", 1)[0]
+        self.assertIn("github.event.repository.default_branch", brew_checkout)
+        self.assertNotIn("needs.resolve.outputs.tag", brew_checkout)
+        self.assertIn("ref: ${{ needs.resolve.outputs.tag }}", channels)
 
     def test_china_asset_mirror_runs_on_github_after_publish_not_on_the_finalizer_host(self) -> None:
         cnb = (ROOT / ".github/workflows/sync-release-to-cnb.yml").read_text(
