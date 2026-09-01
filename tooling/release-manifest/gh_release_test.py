@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -104,6 +105,28 @@ class GhReleaseDownloadTests(unittest.TestCase):
             self.assertIn("--http1.1", curl)
             self.assertNotIn("Authorization", " ".join(curl))
             self.assertEqual(dest.read_bytes(), b"payload")
+
+    def test_download_progress_goes_to_stderr_not_stdout(self) -> None:
+        view = json.dumps({"assets": [_asset("SHA256SUMS")]})
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "SHA256SUMS"
+
+            def run(command, check=True, timeout=None):
+                del check, timeout
+                dest.write_text("sums\n", encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.dict(os.environ, {"GH_TOKEN": "test-token"}, clear=False), mock.patch(
+                "gh_release.subprocess.check_output", return_value=view
+            ), mock.patch("gh_release.subprocess.run", side_effect=run), mock.patch(
+                "sys.stdout", new_callable=io.StringIO
+            ) as stdout, mock.patch(
+                "sys.stderr", new_callable=io.StringIO
+            ) as stderr:
+                gh_release.download_asset("v0.1.36", "SHA256SUMS", Path(tmp))
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("download ", stderr.getvalue())
+            self.assertIn("SHA256SUMS", stderr.getvalue())
 
     def test_download_assets_lists_the_release_once(self) -> None:
         view = json.dumps(
