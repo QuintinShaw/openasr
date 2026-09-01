@@ -2,7 +2,8 @@ name: Sync main to CNB
 
 # One-way fast-forward of GitHub main onto cnb.cool/openasr/openasr.
 # Never --mirror / --prune: CNB also stores desktop-v* tags that GitHub does
-# not have. Release assets still go through scripts/sync-release-to-cnb.sh.
+# not have. Core release assets go through sync-release-to-cnb.yml after the
+# GitHub draft is published. Do not download them onto a maintainer laptop.
 on:
   push:
     branches: [main]

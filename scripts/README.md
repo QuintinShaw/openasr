@@ -28,6 +28,12 @@ Local engineering scripts for validation and iteration.
     by `.github/workflows/publish-core-channels.yml` after the release is public
     against a checkout of `QuintinShaw/homebrew-tap`). See `RELEASING.md`'s
     "Homebrew tap" section.
+- `sync-release-to-cnb.sh`
+  - Idempotent GitHub → cnb.cool asset mirror. Core releases call it from
+    `.github/workflows/sync-release-to-cnb.yml` after the draft is published.
+    Do not invoke it from `finalize-core-release.sh`. Desktop packaging may
+    still pass extra local files that are not GitHub assets. See
+    `RELEASING.md`'s "China mirror (CNB)" section.
 - `generate_longform_pause_probe.py`
   - Generate a deterministic longform pause probe from a local speech WAV — a
     test-data generator for longform planner validation.
