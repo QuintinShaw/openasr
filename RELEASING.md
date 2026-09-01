@@ -157,9 +157,19 @@ bytes without exposing an unqualified provider to users.
    source commit, deploy run, catalog SHA, signature SHA, release subjects, and
    live CDN bytes before removing the GitHub draft flag.
 
-Publishing the release triggers `publish-core-channels.yml`, which moves
-Docker/Homebrew only after the canonical catalog/CDN plane is complete. Any
-failure in this pre-publication sequence leaves the GitHub release as a draft.
+Publishing the release triggers two independent GitHub Actions workflows:
+
+- `publish-core-channels.yml` moves Docker/Homebrew only after the canonical
+  catalog/CDN plane is complete.
+- `sync-release-to-cnb.yml` mirrors the published GitHub assets to
+  [cnb.cool/openasr/openasr](https://cnb.cool/openasr/openasr). GitHub stays
+  the signed source; CI downloads each public asset and uploads it. Local
+  `finalize-core-release.sh` must not pull the matrix onto a maintainer
+  laptop for this. Missing `CNB_TOKEN` skips; a token present with a failed
+  upload fails that workflow only and does not roll back GitHub.
+
+Any failure in the pre-publication sequence leaves the GitHub release as a
+draft.
 
 ### Qualify and activate one exact backend after publication
 
@@ -270,3 +280,20 @@ gh workflow run docker-release.yml \
 
 Local source-build Dockerfiles (`Dockerfile`, `Dockerfile.cuda`) remain for
 development and `docker-smoke.yml`; they are not the release path.
+
+## China mirror (CNB)
+
+`sync-release-to-cnb.yml` runs on `release: published` for a stable `vX.Y.Z`
+core tag (not `desktop-v*`). It does not require the tag to be GitHub
+`latest`, so a later repair of an older tag is still valid. The job streams
+one GitHub asset at a time through `scripts/sync-release-to-cnb.sh` and is
+idempotent: already-mirrored names with a matching size are skipped.
+
+Repair or finish a partial mirror:
+
+```bash
+gh workflow run sync-release-to-cnb.yml -f tag=vX.Y.Z
+```
+
+`sync-main-to-cnb.yml` only fast-forwards git `main`. It never copies release
+assets.

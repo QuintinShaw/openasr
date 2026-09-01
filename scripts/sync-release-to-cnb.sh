@@ -2,8 +2,11 @@
 # Idempotent GitHub Release → CNB (cnb.cool) asset sync.
 #
 # GitHub + B2 remain the only build/sign sources. CNB is a read-only China
-# mirror. Missing CNB_TOKEN skips (exit 0) so overseas publish stays green.
-# A CNB failure after auth is a notice unless OPENASR_CNB_STRICT=1.
+# mirror. Core releases are mirrored by .github/workflows/sync-release-to-cnb.yml
+# after the GitHub draft is published; local finalize must not pull the matrix
+# onto disk for this. Missing CNB_TOKEN skips (exit 0) so overseas publish
+# stays green. A CNB failure after auth is a notice unless OPENASR_CNB_STRICT=1.
+# CI sets OPENASR_CNB_STRICT=1 so a partial mirror is red.
 #
 # Usage:
 #   scripts/sync-release-to-cnb.sh <tag> [file ...]

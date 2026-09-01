@@ -278,6 +278,8 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertLess(
             finalize.index("stopped being a draft before publication"), publish
         )
+        self.assertNotIn("scripts/sync-release-to-cnb.sh", finalize)
+        self.assertIn("sync-release-to-cnb.yml", finalize)
 
     def test_finalizer_never_publishes_before_all_gpu_provider_entries(self) -> None:
         finalize = (ROOT / "scripts/finalize-core-release.sh").read_text(encoding="utf-8")
@@ -312,6 +314,34 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("verify-cdn", channels)
         self.assertIn("needs: [resolve, distribution-gate]", channels)
         self.assertIn("git push origin main", channels)
+        self.assertNotIn("sync-release-to-cnb.sh", channels)
+
+    def test_china_asset_mirror_runs_on_github_after_publish_not_on_the_finalizer_host(self) -> None:
+        cnb = (ROOT / ".github/workflows/sync-release-to-cnb.yml").read_text(
+            encoding="utf-8"
+        )
+        main_sync = (ROOT / ".github/workflows/sync-main-to-cnb.yml").read_text(
+            encoding="utf-8"
+        )
+        script = (ROOT / "scripts/sync-release-to-cnb.sh").read_text(encoding="utf-8")
+        finalize = (ROOT / "scripts/finalize-core-release.sh").read_text(encoding="utf-8")
+
+        self.assertIn("types: [published]", cnb)
+        self.assertIn("workflow_dispatch:", cnb)
+        self.assertIn("scripts/sync-release-to-cnb.sh", cnb)
+        self.assertIn("OPENASR_CNB_STRICT", cnb)
+        self.assertIn("timeout-minutes: 360", cnb)
+        self.assertNotIn("releases/latest", cnb)
+        self.assertIn("secrets.CNB_TOKEN", cnb)
+        guard = (
+            "github.event_name != 'release' || "
+            "startsWith(github.event.release.tag_name, 'v')"
+        )
+        self.assertIn(guard, cnb)
+        self.assertNotIn("scripts/sync-release-to-cnb.sh", finalize)
+        self.assertIn("sync-release-to-cnb.yml", main_sync)
+        self.assertIn("Do not download them onto a maintainer laptop", main_sync)
+        self.assertIn(".github/workflows/sync-release-to-cnb.yml", script)
 
     def test_family_regression_reuses_published_assets_instead_of_racing_raw_tag(self) -> None:
         family = (ROOT / ".github/workflows/family-regression.yml").read_text(
