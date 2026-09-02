@@ -16,6 +16,7 @@ use tempfile::TempDir;
 const TMP_ROOT: &str = "/Volumes/QuintinDocument/tmp";
 const PACK_SOURCE: &str = "/Users/quintinshaw/.openasr/models/objects/sha256/5b36662d373cbee279f168c2f88700a59a93246584bf3a5ade9e800e41c7807b/content";
 const KANJI_ONLY_JAPANESE: &str = "日本国民";
+const UNRELATED_ENGLISH: &str = "Preheat the oven to 425 degrees and roast the vegetables with olive oil, salt, and thyme until caramelized.";
 const HTTP_TIMEOUT_ALIGN: Duration = Duration::from_secs(300);
 
 fn jfk_wav() -> PathBuf {
@@ -347,6 +348,87 @@ fn rt_378_kanji_only_japanese_tagged_en_or_auto_fails_closed() {
     assert!(
         leaks.is_empty(),
         "kanji-only Japanese tagged en/auto must fail closed (FAQ: language tag or script); leaked timelines:\n{}",
+        leaks.join("\n")
+    );
+}
+
+#[test]
+#[ignore = "redteam: pr-378"]
+fn rt_378_unrelated_manuscript_fails_closed() {
+    let home = isolated_home();
+    let pack = copy_pack_into(home.path());
+    isolate_process_env(home.path(), &pack);
+    let samples = load_native_wav_16khz_mono_f32_v0(&jfk_wav(), "rt-378", "rt-378")
+        .expect("load jfk.wav samples");
+    let services = NativeExecutionServices::for_local_process().expect("native execution services");
+
+    let mut leaks = Vec::new();
+    match align_plain_transcript_to_audio(
+        UNRELATED_ENGLISH.to_string(),
+        &samples,
+        &services,
+        ExecutionTarget::Cpu,
+        Some("en"),
+        true,
+    ) {
+        Ok(transcription) => {
+            let words: Vec<&str> = transcription
+                .segments
+                .iter()
+                .flat_map(|segment| segment.words.iter().map(|word| word.word.as_str()))
+                .collect();
+            leaks.push(format!(
+                "public API returned text={:?} words={words:?} quality={:?}",
+                transcription.text, transcription.timeline_quality
+            ));
+        }
+        Err(error) => {
+            let message = error.to_string();
+            if !message.to_ascii_lowercase().contains("mismatch")
+                && !message.to_ascii_lowercase().contains("degenerate")
+            {
+                leaks.push(format!(
+                    "public API failed with a non-mismatch error: {message}"
+                ));
+            }
+        }
+    }
+
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_openasr"));
+    let transcript_path = home.path().join("unrelated.txt");
+    std::fs::write(&transcript_path, UNRELATED_ENGLISH).expect("write unrelated transcript");
+    command
+        .env("OPENASR_HOME", home.path())
+        .env("OPENASR_FORCED_ALIGNER_PACK", &pack)
+        .env("OPENASR_OFFLINE", "1")
+        .env_remove("OPENASR_MODEL")
+        .env_remove("OPENASR_ADDR")
+        .env_remove("OPENASR_ASSUME_YES")
+        .env_remove("OPENASR_MODELS_DIR")
+        .args([
+            "align",
+            jfk_wav().to_str().expect("utf8 wav path"),
+            "--transcript",
+            transcript_path.to_str().expect("utf8 transcript path"),
+            "--offline",
+            "-f",
+            "json",
+            "--execution-target",
+            "cpu",
+        ]);
+    let output = command.output().expect("run openasr align");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() || looks_like_aligned_timeline(&stdout) {
+        leaks.push(format!(
+            "CLI exit={:?} stdout={stdout} stderr={stderr}",
+            output.status.code()
+        ));
+    }
+
+    assert!(
+        leaks.is_empty(),
+        "unrelated manuscript vs JFK audio must fail closed as severe transcript/audio mismatch; leaked timelines:\n{}",
         leaks.join("\n")
     );
 }
