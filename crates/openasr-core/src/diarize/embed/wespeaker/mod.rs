@@ -191,7 +191,7 @@ mod tests {
 
     fn golden_cases(dir: &Path) -> Vec<String> {
         let mut names = Vec::new();
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Ok(entries) = std::fs::read_dir(dir) else {
             return names;
         };
         for entry in entries.flatten() {
