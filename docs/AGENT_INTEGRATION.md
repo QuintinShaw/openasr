@@ -159,7 +159,9 @@ local equivalent (`temperature`, `include[]`, `chunking_strategy`,
 `known_speaker_*`) are accepted and ignored. SDK `stream=True` (the `stream`
 form field) is rejected with an actionable 400: SSE streaming is the
 OpenASR realtime protocol behind the `?stream=true` query parameter, not
-OpenAI `transcript.text.*` events.
+OpenAI `transcript.text.*` events. When that query-parameter stream is used
+for a file job, a busy server returns HTTP 429 instead of joining the
+cancelable JSON file FIFO; see [Known Limitations](KNOWN_LIMITATIONS.md).
 
 ### Incomplete transcripts
 
