@@ -73,6 +73,9 @@ openasr live
 
 # SRT subtitles with speaker labels
 openasr transcribe meeting.wav -f srt --diarize
+
+# Align an existing manuscript onto audio (SRT/VTT/JSON)
+openasr align recording.wav --transcript script.txt -f srt -o recording.srt
 ```
 
 See [Quickstart](docs/QUICKSTART.md) for a guided walkthrough, or run `openasr --help`.
@@ -86,7 +89,7 @@ curl http://127.0.0.1:8080/v1/audio/transcriptions \
   -F file=@audio.wav -F model=qwen3-asr-0.6b
 ```
 
-Drop-in compatible with OpenAI SDKs (`base_url="http://127.0.0.1:8080/v1"`). Offline native requests are serial by default. Operators can set `--max-native-sessions-per-model N`; `N` is both the admission limit and, for eligible direct-GPU Cohere, Moonshine, Qwen, and Whisper jobs, the source for an internal batch width capped at 8. CPU, scheduler, adapter, realtime, FireRed-AED, and FireRed2 paths remain serial; translations follow the offline policy. See [Agent Integration](docs/AGENT_INTEGRATION.md) for API key setup and agent workflows.
+Drop-in compatible with OpenAI SDKs (`base_url="http://127.0.0.1:8080/v1"`) for transcription. Forced alignment of a user-supplied manuscript is OpenASR-native: `POST /v1/audio/precise-timeline` with `file` + `transcript` (not an OpenAI endpoint). Offline native requests are serial by default. Operators can set `--max-native-sessions-per-model N`; `N` is both the admission limit and, for eligible direct-GPU Cohere, Moonshine, Qwen, and Whisper jobs, the source for an internal batch width capped at 8. CPU, scheduler, adapter, realtime, FireRed-AED, and FireRed2 paths remain serial; translations follow the offline policy. See [Agent Integration](docs/AGENT_INTEGRATION.md) for API key setup and agent workflows.
 
 ### Docker
 

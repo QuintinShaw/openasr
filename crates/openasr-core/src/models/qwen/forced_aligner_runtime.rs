@@ -29,7 +29,7 @@ use crate::models::{
 
 use super::audio_encoder::{
     Qwen3AsrAudioEncoderError, Qwen3AsrAudioEncoderRuntime, Qwen3AsrAudioEncoderWeights,
-    load_qwen3_audio_encoder_weights_from_reader,
+    load_qwen3_audio_encoder_weights_from_reader, qwen3_audio_token_count_for_mel_frames,
 };
 use super::decode_prompt::Qwen3AsrDecodePrompt;
 use super::forced_aligner_align_text::{
@@ -70,6 +70,53 @@ const OPENASR_MODEL_ID_KEY: &str = "openasr.model.id";
 /// still amortizing graph construction and GPU submission across many words.
 /// The bound is independent of transcript length.
 const FORCED_ALIGNER_LOGITS_BATCH_ROWS: usize = 64;
+
+/// Exclusive upper bound of the classify-head timestamp grid, in seconds.
+pub(crate) fn timestamp_grid_limit_s(classify_num: usize, timestamp_segment_time_ms: u32) -> f64 {
+    classify_num as f64 * f64::from(timestamp_segment_time_ms) / 1000.0
+}
+
+/// Mel frames implied by the Forced Aligner frontend: zero-center STFT then
+/// drop the trailing pad frame, which is `samples / hop`.
+pub(crate) fn estimated_mel_frames(sample_count: usize, hop_length: usize) -> usize {
+    sample_count.checked_div(hop_length).unwrap_or(0)
+}
+
+fn reject_forced_aligner_prompt_length(
+    token_count: usize,
+    max_positions: usize,
+) -> Result<(), Qwen3ForcedAlignerRuntimeError> {
+    if token_count > max_positions {
+        return Err(
+            Qwen3ForcedAlignerRuntimeError::PromptExceedsDecoderContext {
+                token_count,
+                max_positions,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn admit_forced_aligner_prompt_length(
+    metadata: &Qwen3ForcedAlignerRuntimeMetadata,
+    token_to_id: &std::collections::BTreeMap<String, u32>,
+    merge_rank: &std::collections::BTreeMap<String, usize>,
+    word_list: &[String],
+    sample_count: usize,
+) -> Result<(), Qwen3ForcedAlignerRuntimeError> {
+    let audio_tokens = qwen3_audio_token_count_for_mel_frames(estimated_mel_frames(
+        sample_count,
+        metadata.hop_length,
+    ));
+    let (prompt, _) = build_forced_aligner_decode_prompt(
+        metadata,
+        token_to_id,
+        merge_rank,
+        word_list,
+        audio_tokens,
+    )?;
+    reject_forced_aligner_prompt_length(prompt.token_ids.len(), metadata.llm_max_positions)
+}
 // A <=2% odds advantage is below the cross-backend reduction-order envelope
 // measured for this Q8 classification head. Treat such candidates as a
 // numerical tie and choose the later timestamp bin deterministically. The
@@ -155,6 +202,26 @@ pub(crate) enum Qwen3ForcedAlignerRuntimeError {
     LlmTransformerFailed(#[from] super::llm_transformer::Qwen3AsrLlmTransformerError),
     #[error("qwen3-forced-aligner prepared assets admission failed: {reason}")]
     PreparedAssetsAdmissionFailed { reason: String },
+    #[error(
+        "qwen3-forced-aligner transcript is empty after normalization (letters, numbers, and apostrophes are kept; other punctuation is stripped)"
+    )]
+    EmptyNormalizedTranscript,
+    #[error(
+        "qwen3-forced-aligner audio is {duration_s:.3}s which exceeds the timestamp grid of {max_s:.3}s ({classify_num} bins x {bin_ms}ms); split the audio rather than wrapping timestamps"
+    )]
+    AudioExceedsTimestampGrid {
+        duration_s: f64,
+        max_s: f64,
+        classify_num: usize,
+        bin_ms: u32,
+    },
+    #[error(
+        "qwen3-forced-aligner prompt is {token_count} tokens which exceeds decoder context {max_positions}; split the audio or shorten the transcript"
+    )]
+    PromptExceedsDecoderContext {
+        token_count: usize,
+        max_positions: usize,
+    },
 }
 
 /// Parsed `qwen3_forced_aligner.*` GGUF metadata, with the embedding-table
@@ -715,6 +782,29 @@ fn align_forced_with_stage_backends(
         }
     };
     let word_list = word_list_for_language(text, language)?;
+    if word_list.is_empty() {
+        return Err(Qwen3ForcedAlignerRuntimeError::EmptyNormalizedTranscript);
+    }
+    let audio_duration_s = audio_samples_16khz_mono.len() as f64 / 16_000.0;
+    let max_s = timestamp_grid_limit_s(
+        assets.metadata.classify_num,
+        assets.metadata.timestamp_segment_time_ms,
+    );
+    if audio_duration_s > max_s {
+        return Err(Qwen3ForcedAlignerRuntimeError::AudioExceedsTimestampGrid {
+            duration_s: audio_duration_s,
+            max_s,
+            classify_num: assets.metadata.classify_num,
+            bin_ms: assets.metadata.timestamp_segment_time_ms,
+        });
+    }
+    admit_forced_aligner_prompt_length(
+        &assets.metadata,
+        &assets.token_to_id,
+        &assets.merge_rank,
+        &word_list,
+        audio_samples_16khz_mono.len(),
+    )?;
 
     let embedding_metadata = assets.metadata.as_embedding_execution_metadata();
     let prepared_audio = forced_aligner_prepared_audio(audio_samples_16khz_mono);
@@ -768,6 +858,10 @@ fn align_forced_with_stage_backends(
         &assets.merge_rank,
         &word_list,
         audio_embeddings.row_count,
+    )?;
+    reject_forced_aligner_prompt_length(
+        decode_prompt.token_ids.len(),
+        assets.metadata.llm_max_positions,
     )?;
 
     report(ForcedAlignerProgressEvent::DecoderPrefillStarted);
@@ -1262,6 +1356,37 @@ impl Qwen3ForcedAlignerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_grid_limit_matches_catalog_5000_by_80ms() {
+        assert_eq!(timestamp_grid_limit_s(5_000, 80), 400.0);
+    }
+
+    #[test]
+    fn estimated_mel_frames_are_samples_over_hop() {
+        assert_eq!(estimated_mel_frames(16_000, 160), 100);
+        assert_eq!(estimated_mel_frames(0, 160), 0);
+        assert_eq!(estimated_mel_frames(16_000, 0), 0);
+    }
+
+    #[test]
+    fn one_second_of_qwen3_audio_is_thirteen_decoder_tokens() {
+        assert_eq!(qwen3_audio_token_count_for_mel_frames(100), 13);
+    }
+
+    #[test]
+    fn prompt_length_admission_rejects_over_decoder_context() {
+        let error = reject_forced_aligner_prompt_length(8193, 8192)
+            .expect_err("over-budget prompt must fail closed");
+        assert!(matches!(
+            error,
+            Qwen3ForcedAlignerRuntimeError::PromptExceedsDecoderContext {
+                token_count: 8193,
+                max_positions: 8192
+            }
+        ));
+        reject_forced_aligner_prompt_length(8192, 8192).expect("exact budget is admitted");
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ForcedAlignerTestBackend {

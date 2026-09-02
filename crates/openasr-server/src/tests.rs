@@ -521,6 +521,15 @@ fn remote_transcription_multipart_body() -> (String, Vec<u8>) {
     (format!("multipart/form-data; boundary={boundary}"), body)
 }
 
+fn remote_precise_timeline_multipart_body() -> (String, Vec<u8>) {
+    let boundary = "openasr-loopback-boundary";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.wav\"\r\nContent-Type: audio/wav\r\n\r\nnot a real wav\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"transcript\"\r\n\r\nhello world\r\n--{boundary}--\r\n"
+    )
+    .into_bytes();
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
 async fn connect_loopback_realtime_websocket(
     server: &LoopbackTlsServer,
     bearer_token: &str,
@@ -1057,6 +1066,44 @@ async fn loopback_tls_pairing_device_transcription_skips_server_history() {
 }
 
 #[tokio::test]
+async fn loopback_tls_pairing_device_can_call_precise_timeline() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = spawn_loopback_pairing_server(temp.path()).await;
+    let credential = approve_loopback_pairing(&server).await;
+    let bearer_auth = bearer_auth_header(&credential.bearer_token);
+
+    let (content_type, body) = remote_precise_timeline_multipart_body();
+    let response = https_request(
+        server.addr,
+        "POST",
+        "/v1/audio/precise-timeline",
+        &[
+            ("Authorization", bearer_auth.as_str()),
+            ("X-OpenASR-Remote-Compute", "client"),
+            ("Content-Type", &content_type),
+        ],
+        body,
+    )
+    .await;
+    assert_eq!(
+        response.status,
+        400,
+        "device tokens may call forced alignment; invalid WAV is 400 not 401/403: {}",
+        String::from_utf8_lossy(&response.body)
+    );
+
+    let device_history = https_request(
+        server.addr,
+        "GET",
+        "/v1/history",
+        &[("Authorization", bearer_auth.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(device_history.status, 403);
+}
+
+#[tokio::test]
 async fn loopback_tls_pairing_device_reads_bound_models_not_installed_inventory() {
     let temp = tempfile::tempdir().unwrap();
     let server = spawn_loopback_pairing_server(temp.path()).await;
@@ -1177,6 +1224,21 @@ async fn loopback_tls_revoked_pairing_device_cannot_access_remote_compute() {
     )
     .await;
     assert_eq!(transcription.status, 401);
+
+    let (align_content_type, align_body) = remote_precise_timeline_multipart_body();
+    let align = https_request(
+        server.addr,
+        "POST",
+        "/v1/audio/precise-timeline",
+        &[
+            ("Authorization", bearer_auth.as_str()),
+            ("X-OpenASR-Remote-Compute", "client"),
+            ("Content-Type", &align_content_type),
+        ],
+        align_body,
+    )
+    .await;
+    assert_eq!(align.status, 401);
 
     let error =
         match try_connect_loopback_realtime_websocket(&server, &credential.bearer_token).await {
@@ -1386,6 +1448,12 @@ fn operator_only_paths_cover_history_config_and_model_mutations() {
     assert!(!is_operator_only_path(
         &Method::POST,
         "/v1/audio/translations"
+    ));
+    // Forced alignment is a compute capability (SSOT remote-compute §1/§2/§4.24),
+    // not an operator mutation. Paired device tokens may call it.
+    assert!(!is_operator_only_path(
+        &Method::POST,
+        "/v1/audio/precise-timeline"
     ));
     assert!(!is_operator_only_path(&Method::GET, "/v1/models/pull/job1"));
 }

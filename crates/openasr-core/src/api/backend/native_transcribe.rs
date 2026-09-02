@@ -59,6 +59,7 @@ use crate::models::firered_punc::runtime::FireRedPuncRuntime;
 use crate::models::policy_resolved_aux_runtime::PolicyResolvedAuxRuntimeError;
 use crate::models::qwen::{
     ForcedAlignItem, Qwen3ForcedAlignerSession, forced_aligner_pack, verify_forced_aligner_pack,
+    word_list_for_language,
 };
 use crate::models::{
     aux_pack_registry::AuxPackKind,
@@ -1697,6 +1698,89 @@ pub fn refine_existing_transcription_timeline(
     ))
 }
 
+/// Align a user-provided plain-text transcript onto audio.
+///
+/// Does **not** run ASR. Builds a single full-span segment from `transcript`
+/// and reuses [`refine_existing_transcription_timeline`] / the Qwen3 Forced
+/// Aligner pack. Text normalization matches the aligner's tokenizer:
+///
+/// - split on ASCII whitespace
+/// - keep letters, numbers, and apostrophes; strip other punctuation
+/// - case is preserved
+/// - each CJK ideograph becomes its own token
+/// - Japanese and Korean fail closed (morphological segmenters are not ported)
+///
+/// Missing pack, unsupported language or Japanese/Korean script, empty
+/// normalized text, audio past the timestamp grid, a prompt past decoder
+/// context, or a degenerate (collapsed) alignment fail closed instead of
+/// returning a fabricated timeline.
+pub fn align_plain_transcript_to_audio(
+    transcript: String,
+    prepared_audio_16khz_mono: &[f32],
+    execution_services: &NativeExecutionServices,
+    execution_target: crate::ExecutionTarget,
+    language_hint: Option<&str>,
+    keep_word_timestamps: bool,
+) -> Result<Transcription, BackendError> {
+    if prepared_audio_16khz_mono.is_empty() {
+        return Err(BackendError::WordTimestampAlignmentFailed {
+            reason: "audio is empty; cannot align a transcript without PCM samples".into(),
+        });
+    }
+    let transcript = transcript.trim().to_string();
+    if transcript.is_empty() {
+        return Err(BackendError::WordTimestampAlignmentFailed {
+            reason: "transcript is empty".into(),
+        });
+    }
+    let language = language_hint
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("auto"))
+        .unwrap_or("en")
+        .to_string();
+    let normalized_words = word_list_for_language(&transcript, &language).map_err(|error| {
+        BackendError::WordTimestampAlignmentFailed {
+            reason: error.to_string(),
+        }
+    })?;
+    if normalized_words.is_empty() {
+        return Err(BackendError::WordTimestampAlignmentFailed {
+            reason: crate::subtitle::ForcedAlignmentMismatch::EmptyWordList.to_string(),
+        });
+    }
+    let audio_duration_s = prepared_audio_16khz_mono.len() as f32 / 16_000.0;
+    let transcription = Transcription {
+        text: transcript.clone(),
+        language: Some(language.clone()),
+        segments: vec![crate::Segment {
+            start: 0.0,
+            end: audio_duration_s,
+            text: transcript,
+            speaker: None,
+            speaker_label: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
+            words: Vec::new(),
+        }],
+        ..Default::default()
+    };
+    let refined = refine_existing_transcription_timeline(
+        transcription,
+        prepared_audio_16khz_mono,
+        execution_services,
+        execution_target,
+        Some(language.as_str()),
+        true,
+    )?;
+    if keep_word_timestamps {
+        Ok(refined)
+    } else {
+        let mut stripped = refined;
+        crate::subtitle::strip_unrequested_word_timestamps(&mut stripped);
+        Ok(stripped)
+    }
+}
+
 /// Maps a resolved provider/placement pair to one measured aligner topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForcedAlignerSessionPlan {
@@ -1902,6 +1986,12 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
     if let Some(progress) = progress {
         progress.complete_stage();
     }
+    let audio_duration_s = prepared_audio.as_slice().len() as f32 / 16_000.0;
+    crate::subtitle::reject_degenerate_forced_alignment(&result, audio_duration_s).map_err(
+        |mismatch| BackendError::WordTimestampAlignmentFailed {
+            reason: mismatch.to_string(),
+        },
+    )?;
     Ok(result)
 }
 

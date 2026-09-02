@@ -54,8 +54,8 @@ pub use native_model_id::{
     NativeRuntimeModelIdSource, NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError,
 };
 pub use native_transcribe::{
-    describe_native_runtime_model_mismatch, native_runtime_model_refs_match,
-    refine_existing_transcription_timeline,
+    align_plain_transcript_to_audio, describe_native_runtime_model_mismatch,
+    native_runtime_model_refs_match, refine_existing_transcription_timeline,
 };
 pub use request_execution_context::{
     RequestAttemptId, RequestAttemptIdError, RequestExecutionContext,

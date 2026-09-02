@@ -18,9 +18,9 @@ pub use native::{
     NativeTranscriptionProgress, ProgressBackendClass, ProgressPlan, ProgressPlanInput,
     ProgressReporter, ProgressSegmenterKind, RequestAttemptId, RequestAttemptIdError,
     RequestExecutionContext, SliceBoundaryControl, TranscriptionControl, TranscriptionStage,
-    describe_native_runtime_model_mismatch, duration_weighted_fraction,
-    native_runtime_model_adapter_for_path, native_runtime_model_refs_match,
-    native_runtime_realtime_capabilities_for_path,
+    align_plain_transcript_to_audio, describe_native_runtime_model_mismatch,
+    duration_weighted_fraction, native_runtime_model_adapter_for_path,
+    native_runtime_model_refs_match, native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, native_transcription_progress,
     native_transcription_progress_for_id, refine_existing_transcription_timeline,
     resolve_local_native_runtime_model_identity, validate_local_native_model_pack_path,
@@ -1056,11 +1056,11 @@ pub enum BackendError {
     )]
     WordTimestampAlignmentRequiresWordTimestamps,
     #[error(
-        "Word-timestamp alignment refinement (--word-timestamps=aligned) is not available for the {backend} backend: the Qwen3-ForcedAligner-0.6B capability pack is not installed.\nInstall it, or use --word-timestamps for the model's own approximate timestamps."
+        "Forced alignment is not available for the {backend} backend: the Qwen3-ForcedAligner-0.6B capability pack is not installed.\nInstall it with `openasr pull qwen3-forced-aligner-0.6b`. Transcription can still use --word-timestamps for the model's own approximate timestamps."
     )]
     WordTimestampAlignmentPackMissing { backend: &'static str },
     #[error(
-        "Word-timestamp alignment refinement failed: {reason}\nThe request was rejected instead of returning approximate timestamps silently relabeled as aligned."
+        "Forced alignment failed: {reason}\nThe request was rejected instead of returning a fabricated timeline."
     )]
     WordTimestampAlignmentFailed { reason: String },
     #[error(

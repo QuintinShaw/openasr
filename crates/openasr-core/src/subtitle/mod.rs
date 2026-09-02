@@ -13,6 +13,7 @@
 
 mod anchors;
 pub mod cues;
+mod mismatch;
 mod reading;
 mod refine;
 mod timeline;
@@ -21,6 +22,7 @@ pub use anchors::{
     WordAnchorIssue, WordAnchorQuality, WordAnchorValidation, validate_word_anchors,
 };
 pub use cues::{resegment_segments_into_cues, resegment_transcription_cues, segment_into_cues};
+pub(crate) use mismatch::{ForcedAlignmentMismatch, reject_degenerate_forced_alignment};
 pub use reading::merge_reading_segments;
 pub use timeline::{
     ForcedAlignmentDecision, TimelinePrecisionPolicy, TimelineProjectOptions, TimelineQuality,

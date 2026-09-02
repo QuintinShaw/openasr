@@ -23,6 +23,10 @@ pub(crate) enum Qwen3ForcedAlignerTextError {
         "qwen3-forced-aligner word tokenizer does not yet support language '{language}' (only the space/CJK-character path used for non-Japanese/Korean languages is ported)"
     )]
     UnsupportedLanguage { language: String },
+    #[error(
+        "qwen3-forced-aligner word tokenizer does not yet support Japanese or Korean text (the reference routes those through nagisa/soynlp, which have not been ported)"
+    )]
+    UnsupportedMorphologyScript,
     #[error("qwen3-forced-aligner fix_timestamp requires a non-empty timestamp sequence")]
     EmptyTimestampSequence,
 }
@@ -116,13 +120,39 @@ pub(crate) fn word_list_for_language(
     // codes callers thread through from `Transcription::language` /
     // `--language` (e.g. "ja"/"ko"), so a real caller's short codes trigger
     // the same fail-closed guard as the reference's own "japanese"/"korean".
-    let normalized = language.to_ascii_lowercase();
-    if matches!(normalized.as_str(), "japanese" | "ja" | "korean" | "ko") {
+    if language_requires_unported_morphology(language) {
         return Err(Qwen3ForcedAlignerTextError::UnsupportedLanguage {
             language: language.to_string(),
         });
     }
+    if text_contains_unported_morphology_script(text) {
+        return Err(Qwen3ForcedAlignerTextError::UnsupportedMorphologyScript);
+    }
     Ok(tokenize_space_lang(text))
+}
+
+fn language_requires_unported_morphology(language: &str) -> bool {
+    matches!(
+        language.to_ascii_lowercase().as_str(),
+        "japanese" | "ja" | "jp" | "jpn" | "korean" | "ko" | "kr" | "kor"
+    )
+}
+
+fn text_contains_unported_morphology_script(text: &str) -> bool {
+    text.chars().any(is_unported_morphology_char)
+}
+
+fn is_unported_morphology_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{3040}'..='\u{309F}' // Hiragana
+            | '\u{30A0}'..='\u{30FF}' // Katakana
+            | '\u{31F0}'..='\u{31FF}' // Katakana phonetic extensions
+            | '\u{FF65}'..='\u{FF9F}' // Halfwidth katakana
+            | '\u{AC00}'..='\u{D7AF}' // Hangul syllables
+            | '\u{1100}'..='\u{11FF}' // Hangul Jamo
+            | '\u{3130}'..='\u{318F}' // Hangul compatibility jamo
+    )
 }
 
 /// Port of `Qwen3ForceAlignProcessor.fix_timestamp`: repairs local
@@ -311,6 +341,30 @@ mod tests {
         assert!(matches!(
             error,
             Qwen3ForcedAlignerTextError::UnsupportedLanguage { .. }
+        ));
+        let error = word_list_for_language("hello", "jp").expect_err("jp alias");
+        assert!(matches!(
+            error,
+            Qwen3ForcedAlignerTextError::UnsupportedLanguage { .. }
+        ));
+        let error = word_list_for_language("hello", "kor").expect_err("kor alias");
+        assert!(matches!(
+            error,
+            Qwen3ForcedAlignerTextError::UnsupportedLanguage { .. }
+        ));
+    }
+
+    #[test]
+    fn word_list_rejects_japanese_or_korean_script_even_when_tagged_english() {
+        let error = word_list_for_language("こんにちは", "en").expect_err("hiragana");
+        assert!(matches!(
+            error,
+            Qwen3ForcedAlignerTextError::UnsupportedMorphologyScript
+        ));
+        let error = word_list_for_language("안녕하세요", "en").expect_err("hangul");
+        assert!(matches!(
+            error,
+            Qwen3ForcedAlignerTextError::UnsupportedMorphologyScript
         ));
     }
 
