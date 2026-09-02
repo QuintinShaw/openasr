@@ -1902,6 +1902,93 @@ async fn scheduled_idle_switch_waits_while_native_slot_is_occupied() {
     );
 }
 
+#[test]
+fn try_acquire_native_execution_rejects_pending_idle_switch() {
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .request_idle_switch("whisper-base:q4");
+    let error = runtime
+        .acquire_native_execution("native:whisper-tiny@pending-switch", None)
+        .expect_err("pending idle switch must reject new native slots");
+    assert!(
+        matches!(error, ApiError::Conflict(ref message) if message == PENDING_IDLE_SWITCH_MESSAGE),
+        "expected pending-idle-switch conflict, got {error}"
+    );
+}
+
+#[test]
+fn try_acquire_native_execution_succeeds_when_no_idle_switch_is_pending() {
+    let runtime = ServerRuntime::default();
+    runtime
+        .acquire_native_execution("native:whisper-tiny@idle", None)
+        .expect("idle runtime must admit a native slot");
+}
+
+#[tokio::test]
+async fn apply_pending_idle_switch_if_idle_rebounds_to_the_bound_pack() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let pack_a = write_installed_pack_ref(
+        &home,
+        "whisper-tiny",
+        "whisper-tiny:q4",
+        "q4_0",
+        "q4",
+        "whisper-tiny",
+    );
+    let pack_b = write_installed_pack_ref(
+        &home,
+        "whisper-base",
+        "whisper-base:q4",
+        "q4_0",
+        "q4",
+        "whisper-base",
+    );
+    let pack_a_installed = installed_pack_by_pull(&home, "whisper-tiny:q4");
+    persist_default_pack(
+        &home,
+        &pack_a_installed,
+        QuantPreference::pinned(&pack_a_installed.quant),
+    )
+    .unwrap();
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_a.clone()).into(),
+    };
+    runtime
+        .model_pack_path
+        .set_activation_probe_failpoint(Some(activation_probe_ok()));
+    runtime
+        .native_execution
+        .remote_policy()
+        .request_idle_switch("whisper-base:q4");
+    let dist = DistributionContext::new(DistributionRuntime {
+        openasr_home: Some(home),
+        catalog_url: None,
+        catalog_local_override: None,
+    });
+    apply_pending_idle_switch_if_idle(&runtime, &dist);
+    assert!(
+        runtime
+            .native_execution
+            .remote_policy()
+            .pending_idle_switch()
+            .is_none(),
+        "idle apply must consume the pending switch"
+    );
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(pack_b.as_path()),
+        "idle apply must rebind onto the requested pack"
+    );
+}
+
 #[tokio::test]
 async fn set_default_model_http_returns_conflict_when_native_session_is_busy() {
     use axum::body::{Body, to_bytes};

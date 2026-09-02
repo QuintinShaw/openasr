@@ -987,7 +987,24 @@ impl WsSession {
         }
         // Anonymous speaker separation (SPEAKER_00) is independent of enrolled
         // Voice ID matching and does not require the speaker-identity stage.
+        // Dictation is single-speaker text: reject the request instead of
+        // computing labels and hiding them later.
+        let source_name = session
+            .source_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
         let anonymous_diarize = session.diarize.unwrap_or(false);
+        if anonymous_diarize && source_name.as_deref() == Some(DICTATION_SOURCE_NAME) {
+            self.emit_error(
+                RealtimeErrorCode::StartupConfigError,
+                DICTATION_SPEAKERS_UNSUPPORTED_MESSAGE,
+                false,
+            )
+            .await?;
+            return Err(());
+        }
         self.required_stage_readiness = RequiredStageReadinessBarrier::for_session(false);
         if anonymous_diarize && let Err(message) = self.attach_anonymous_streaming_diarizer() {
             self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
@@ -1047,12 +1064,6 @@ impl WsSession {
             }
         };
 
-        let source_name = session
-            .source_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
         let use_native_streaming =
             should_use_native_streaming_session(source_name.as_deref(), capabilities);
         let effective_partial_results = effective_session_partial_results(

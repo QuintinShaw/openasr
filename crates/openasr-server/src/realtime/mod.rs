@@ -50,11 +50,11 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
-    ApiError, DistributionContext, ServerAuth, ServerRuntime,
-    apply_remote_compute_client_request_policy, is_remote_compute_client_request,
-    native_hardware_target_from_execution_target, parse_transcription_multipart,
-    realtime_capabilities_for_runtime_and_distribution, record_file_transcription_history,
-    transcribe_with_runtime,
+    ApiError, DistributionContext, PENDING_IDLE_SWITCH_MESSAGE, SERVER_BUSY_MESSAGE, ServerAuth,
+    ServerRuntime, apply_remote_compute_client_request_policy, file_slot_occupied,
+    is_remote_compute_client_request, native_hardware_target_from_execution_target,
+    parse_transcription_multipart, realtime_capabilities_for_runtime_and_distribution,
+    record_file_transcription_history, transcribe_parsed_file, transcribe_with_runtime,
 };
 
 mod native_worker;
@@ -119,6 +119,7 @@ const MAX_VAD_BUFFER_WINDOW_MS: u32 = 120_000;
 const DEFAULT_REALTIME_HOTWORD_BOOST: f32 = openasr_core::DEFAULT_PHRASE_BIAS_BOOST;
 const WS_TEMP_PREFIX: &str = "openasr-ws-utterance-";
 const DICTATION_SOURCE_NAME: &str = "Dictation";
+const DICTATION_SPEAKERS_UNSUPPORTED_MESSAGE: &str = "Dictation does not support speaker labels. Use Live or Meeting for anonymous speaker separation.";
 const DICTATION_FALLBACK_RMS_THRESHOLD: f32 = 0.001;
 const DICTATION_FALLBACK_PEAK_THRESHOLD: f32 = 0.006;
 
@@ -161,6 +162,8 @@ pub(crate) async fn websocket(
 pub(crate) async fn stream_transcription(
     runtime: ServerRuntime,
     distribution: DistributionContext,
+    headers: HeaderMap,
+    auth: ServerAuth,
     multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
     remote_compute_client: bool,
 ) -> Result<Response, ApiError> {
@@ -182,205 +185,239 @@ pub(crate) async fn stream_transcription(
         ));
     }
     let record_history = !remote_compute_client;
+    if !runtime.native_execution.remote_policy().admits_new_tasks() {
+        return Err(ApiError::Conflict(PENDING_IDLE_SWITCH_MESSAGE.to_string()));
+    }
+    if file_slot_occupied(&runtime, None) {
+        return Err(ApiError::Busy(SERVER_BUSY_MESSAGE.to_string()));
+    }
+    let model_id = parsed.request.model_id.clone();
+    let stream_started_at = Instant::now();
+    let outcome = match transcribe_parsed_file(
+        runtime,
+        headers,
+        auth,
+        distribution.clone(),
+        parsed,
+        None,
+        None,
+    )
+    .await
+    {
+        Err(error) if stream_file_job_returns_http_error(&error) => return Err(error),
+        outcome => outcome,
+    };
+
     let (sender, receiver) =
         mpsc::channel::<Result<Event, Infallible>>(OUTGOING_EVENT_QUEUE_CAPACITY);
-
-    tokio::spawn(async move {
-        let stream_started_at = std::time::Instant::now();
-        let model_id = parsed.request.model_id.clone();
-        let history_request = parsed.request.clone();
-        let request = parsed.request;
-        let _uploaded_file = parsed._uploaded_file;
-        let mut controller = one_shot_controller(&model_id);
-        let mut protocol_event_seq = 1_u64;
-        let mut protocol_status = "ok";
-        let mut first_final_latency_ms: Option<u64> = None;
-        send_sse(&sender, controller.session_created_event(timestamp_now())).await;
-        if let Ok(configured) =
-            controller.lifecycle(RealtimeLifecycleAction::Configure, timestamp_now())
-        {
-            send_sse(&sender, configured).await;
-        }
-        if let Ok(started) =
-            controller.lifecycle(RealtimeLifecycleAction::StartAudio, timestamp_now())
-        {
-            send_sse(&sender, started).await;
-        }
-
-        // One-shot SSE transcription has no existing disconnect-tracking
-        // structure to source a real cancel control from (unlike the
-        // WebSocket realtime session's `backend_control` / the file-upload
-        // route's client-registered transcription id) -- an uncancellable
-        // context is a real, well-formed one that simply has no other
-        // holder.
-        let execution_context = Arc::new(openasr_core::RequestExecutionContext::uncancellable(
-            "one-shot SSE file-transcription response path has no client-disconnect \
-             signal to observe yet",
-        ));
-        match transcribe_with_runtime(runtime, request, execution_context).await {
-            Ok(transcription) => {
-                let end_ms = transcription_end_ms(&transcription);
-                let history_transcription = transcription.clone();
-                let words = realtime_words_from_transcription(&transcription);
-                let update = TranscriptUpdate {
-                    utterance_id: TranscriptUtteranceId("utt_file_000001".to_string()),
-                    segment_id: TranscriptSegmentId("seg_file_000001".to_string()),
-                    revision: 1,
-                    text: transcription.text,
-                    start_ms: 0,
-                    end_ms,
-                    language: None,
-                    speaker: None,
-                    speaker_label: None,
-                    speaker_person_id: None,
-                    speaker_snapshot_label: None,
-                    words,
-                    revises_event_id: None,
-                };
-                send_sse_named(
-                    &sender,
-                    "segment_start",
-                    protocol_event_id(protocol_event_seq),
-                    json!({
-                        "utteranceId": update.utterance_id.0,
-                        "segmentId": update.segment_id.0,
-                        "startMs": update.start_ms
-                    }),
-                )
-                .await;
-                protocol_event_seq += 1;
-                if let TranscriptLifecycleResult::Event(event) =
-                    controller.transcript.apply_final(update, None)
-                {
-                    let final_segment = match &event {
-                        RealtimeTranscriptEvent::Final(final_event) => Some((
-                            final_event.utterance_id.clone(),
-                            final_event.segment_id.clone(),
-                            final_event.revision,
-                        )),
-                        _ => None,
-                    };
-                    if let Ok(envelope) = controller.transcript_event(event, timestamp_now()) {
-                        if let Some((utterance_id, segment_id, revision)) = final_segment {
-                            controller.transcript.record_final_event_id(
-                                &utterance_id,
-                                &segment_id,
-                                revision,
-                                envelope.event_id.clone(),
-                            );
-                        }
-                        send_sse(&sender, envelope).await;
-                        send_sse_named(
-                            &sender,
-                            "final",
-                            protocol_event_id(protocol_event_seq),
-                            json!({
-                                "utteranceId": "utt_file_000001",
-                                "segmentId": "seg_file_000001",
-                                "startMs": 0,
-                                "endMs": end_ms
-                            }),
-                        )
-                        .await;
-                        if first_final_latency_ms.is_none() {
-                            first_final_latency_ms =
-                                Some(stream_started_at.elapsed().as_millis() as u64);
-                        }
-                        protocol_event_seq += 1;
-                        send_sse_named(
-                            &sender,
-                            "segment_end",
-                            protocol_event_id(protocol_event_seq),
-                            json!({
-                                "utteranceId": "utt_file_000001",
-                                "segmentId": "seg_file_000001",
-                                "endMs": end_ms
-                            }),
-                        )
-                        .await;
-                        protocol_event_seq += 1;
-                    }
-                }
-                if record_history
-                    && let Err(error) = record_file_transcription_history(
-                        &distribution,
-                        &history_request,
-                        &history_transcription,
-                        ResponseFormat::Text,
-                    )
-                {
-                    eprintln!(
-                        "openasr-server: could not record streaming transcription history (continuing): {error}"
-                    );
-                }
-            }
-            Err(error) => {
-                protocol_status = "error";
-                if let Ok(envelope) = controller.error_event(
-                    RealtimeErrorEvent {
-                        code: realtime_error_code_for_api_error(&error),
-                        message: error.to_string(),
-                        recoverable: matches!(
-                            error,
-                            ApiError::ModelSessionCapacity(_)
-                                | ApiError::Busy(_)
-                                | ApiError::Conflict(_)
-                        ),
-                    },
-                    timestamp_now(),
-                ) {
-                    send_sse(&sender, envelope).await;
-                }
-                send_sse_named(
-                    &sender,
-                    "error",
-                    protocol_event_id(protocol_event_seq),
-                    json!({
-                        "message": error.to_string()
-                    }),
-                )
-                .await;
-                protocol_event_seq += 1;
-            }
-        }
-
-        if controller.state() == RealtimeSessionState::Running
-            && let Ok(stopped) = controller.lifecycle(
-                RealtimeLifecycleAction::StopAudio {
-                    reason: "file_complete".to_string(),
-                },
-                timestamp_now(),
-            )
-        {
-            send_sse(&sender, stopped).await;
-        }
-        if !matches!(
-            controller.state(),
-            RealtimeSessionState::Closed | RealtimeSessionState::Cancelled
-        ) && let Ok(closed) = controller.lifecycle(
-            RealtimeLifecycleAction::Close {
-                reason: "file_complete".to_string(),
-            },
-            timestamp_now(),
-        ) {
-            send_sse(&sender, closed).await;
-        }
-        send_sse_named(
-            &sender,
-            "done",
-            protocol_event_id(protocol_event_seq),
-            json!({
-                "status": protocol_status,
-                "firstFinalLatencyMs": first_final_latency_ms,
-                "totalLatencyMs": stream_started_at.elapsed().as_millis() as u64
-            }),
-        )
-        .await;
-    });
+    emit_one_shot_file_stream_events(
+        &sender,
+        &distribution,
+        record_history,
+        model_id,
+        stream_started_at,
+        outcome,
+    )
+    .await;
 
     Ok(Sse::new(ReceiverStream::new(receiver))
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response())
+}
+
+fn stream_file_job_returns_http_error(error: &ApiError) -> bool {
+    matches!(
+        error,
+        ApiError::Busy(_)
+            | ApiError::Conflict(_)
+            | ApiError::Forbidden(_)
+            | ApiError::Backend(openasr_core::BackendError::TranscriptionCanceled)
+    )
+}
+
+async fn emit_one_shot_file_stream_events(
+    sender: &mpsc::Sender<Result<Event, Infallible>>,
+    distribution: &DistributionContext,
+    record_history: bool,
+    model_id: String,
+    stream_started_at: Instant,
+    outcome: Result<super::FileTranscriptionOutcome, ApiError>,
+) {
+    let mut controller = one_shot_controller(&model_id);
+    let mut protocol_event_seq = 1_u64;
+    let mut protocol_status = "ok";
+    let mut first_final_latency_ms: Option<u64> = None;
+    send_sse(sender, controller.session_created_event(timestamp_now())).await;
+    if let Ok(configured) =
+        controller.lifecycle(RealtimeLifecycleAction::Configure, timestamp_now())
+    {
+        send_sse(sender, configured).await;
+    }
+    if let Ok(started) = controller.lifecycle(RealtimeLifecycleAction::StartAudio, timestamp_now())
+    {
+        send_sse(sender, started).await;
+    }
+
+    match outcome {
+        Ok(outcome) => {
+            let transcription = outcome.transcription;
+            let end_ms = transcription_end_ms(&transcription);
+            let history_transcription = transcription.clone();
+            let words = realtime_words_from_transcription(&transcription);
+            let update = TranscriptUpdate {
+                utterance_id: TranscriptUtteranceId("utt_file_000001".to_string()),
+                segment_id: TranscriptSegmentId("seg_file_000001".to_string()),
+                revision: 1,
+                text: transcription.text,
+                start_ms: 0,
+                end_ms,
+                language: None,
+                speaker: None,
+                speaker_label: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
+                words,
+                revises_event_id: None,
+            };
+            send_sse_named(
+                sender,
+                "segment_start",
+                protocol_event_id(protocol_event_seq),
+                json!({
+                    "utteranceId": update.utterance_id.0,
+                    "segmentId": update.segment_id.0,
+                    "startMs": update.start_ms
+                }),
+            )
+            .await;
+            protocol_event_seq += 1;
+            if let TranscriptLifecycleResult::Event(event) =
+                controller.transcript.apply_final(update, None)
+            {
+                let final_segment = match &event {
+                    RealtimeTranscriptEvent::Final(final_event) => Some((
+                        final_event.utterance_id.clone(),
+                        final_event.segment_id.clone(),
+                        final_event.revision,
+                    )),
+                    _ => None,
+                };
+                if let Ok(envelope) = controller.transcript_event(event, timestamp_now()) {
+                    if let Some((utterance_id, segment_id, revision)) = final_segment {
+                        controller.transcript.record_final_event_id(
+                            &utterance_id,
+                            &segment_id,
+                            revision,
+                            envelope.event_id.clone(),
+                        );
+                    }
+                    send_sse(sender, envelope).await;
+                    send_sse_named(
+                        sender,
+                        "final",
+                        protocol_event_id(protocol_event_seq),
+                        json!({
+                            "utteranceId": "utt_file_000001",
+                            "segmentId": "seg_file_000001",
+                            "startMs": 0,
+                            "endMs": end_ms
+                        }),
+                    )
+                    .await;
+                    if first_final_latency_ms.is_none() {
+                        first_final_latency_ms =
+                            Some(stream_started_at.elapsed().as_millis() as u64);
+                    }
+                    protocol_event_seq += 1;
+                    send_sse_named(
+                        sender,
+                        "segment_end",
+                        protocol_event_id(protocol_event_seq),
+                        json!({
+                            "utteranceId": "utt_file_000001",
+                            "segmentId": "seg_file_000001",
+                            "endMs": end_ms
+                        }),
+                    )
+                    .await;
+                    protocol_event_seq += 1;
+                }
+            }
+            if record_history
+                && let Err(error) = record_file_transcription_history(
+                    distribution,
+                    &outcome.history_request,
+                    &history_transcription,
+                    ResponseFormat::Text,
+                )
+            {
+                eprintln!(
+                    "openasr-server: could not record streaming transcription history (continuing): {error}"
+                );
+            }
+        }
+        Err(error) => {
+            protocol_status = "error";
+            if let Ok(envelope) = controller.error_event(
+                RealtimeErrorEvent {
+                    code: realtime_error_code_for_api_error(&error),
+                    message: error.to_string(),
+                    recoverable: matches!(
+                        error,
+                        ApiError::ModelSessionCapacity(_)
+                            | ApiError::Busy(_)
+                            | ApiError::Conflict(_)
+                    ),
+                },
+                timestamp_now(),
+            ) {
+                send_sse(sender, envelope).await;
+            }
+            send_sse_named(
+                sender,
+                "error",
+                protocol_event_id(protocol_event_seq),
+                json!({
+                    "message": error.to_string()
+                }),
+            )
+            .await;
+            protocol_event_seq += 1;
+        }
+    }
+
+    if controller.state() == RealtimeSessionState::Running
+        && let Ok(stopped) = controller.lifecycle(
+            RealtimeLifecycleAction::StopAudio {
+                reason: "file_complete".to_string(),
+            },
+            timestamp_now(),
+        )
+    {
+        send_sse(sender, stopped).await;
+    }
+    if !matches!(
+        controller.state(),
+        RealtimeSessionState::Closed | RealtimeSessionState::Cancelled
+    ) && let Ok(closed) = controller.lifecycle(
+        RealtimeLifecycleAction::Close {
+            reason: "file_complete".to_string(),
+        },
+        timestamp_now(),
+    ) {
+        send_sse(sender, closed).await;
+    }
+    send_sse_named(
+        sender,
+        "done",
+        protocol_event_id(protocol_event_seq),
+        json!({
+            "status": protocol_status,
+            "firstFinalLatencyMs": first_final_latency_ms,
+            "totalLatencyMs": stream_started_at.elapsed().as_millis() as u64
+        }),
+    )
+    .await;
 }
 
 async fn handle_websocket(
