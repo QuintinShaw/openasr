@@ -1,0 +1,47 @@
+# Per-model card prose for OpenASR/wespeaker-voxceleb-resnet34-lm.
+# Distilled from Wespeaker/wespeaker-voxceleb-resnet34-LM and the WeSpeaker paper.
+
+pipeline_tag = "feature-extraction"
+
+tagline = "WeSpeaker ResNet34 — optional 256-d VoxCeleb English speaker embeddings"
+
+highlights = [
+  "🎙️ **Optional Voice ID space** — 256-d WeSpeaker ResNet, loaded only when you set `voice_id_embedder=wespeaker`; ReDimNet2-B6 stays the default",
+  "🧬 **ResNet34-TSTP-emb256** — 6.63M-param r-vector with large-margin finetune on VoxCeleb2 Dev (5994 speakers)",
+  "📏 **Same family, four sizes** — 34/152/221/293 share one ggml graph; this is the smallest pack",
+  "🎯 **Parity-gated packaging** — ggml-graph forward matches official PyTorch at cosine ≥ 0.999 on held-out fixtures (CPU and Metal)",
+]
+
+intro = """
+WeSpeaker ResNet34 is the smallest member of Wenet's VoxCeleb English LM r-vector
+family: a 6.63M-parameter ResNet34 with temporal statistics pooling to a 256-d
+embedding, large-margin finetuned on VoxCeleb2 Dev. OpenASR packages the
+CC BY 4.0 checkpoint as a local fp16 `.oasr` capability pack and runs it through
+a ggml graph. It is an explicit optional speaker-embedding space beside the
+default ReDimNet2-B6 pack — there is no Auto fallback, and enrollments do not
+transfer across the two spaces. Languages are English-only (`en`); this is not
+a Chinese-enhanced embedder. Use this size when you want the WeSpeaker 256-d
+space at the lowest footprint.
+"""
+
+acknowledgement = """
+This pack redistributes **Wespeaker/wespeaker-voxceleb-resnet34-LM** (`avg_model`)
+in OpenASR's `.oasr` runtime format. Credit for the architecture, training, and
+original weights belongs to the WeSpeaker authors (Wenet; paper: Wespeaker: A
+research and production oriented speaker embedding learning toolkit, ICASSP 2023,
+https://arxiv.org/abs/2210.17016). The upstream model is licensed under
+**CC BY 4.0**; OpenASR packaging retains that license and attribution, with the
+only modification being format conversion for local ggml-graph loading.
+"""
+
+[prose_locales."zh-CN"]
+tagline = "WeSpeaker ResNet34：可选的 256 维 VoxCeleb 英语声纹"
+
+highlights = [
+  "🎙️ **可选 Voice ID 空间** — 256 维 WeSpeaker ResNet，仅在设置 `voice_id_embedder=wespeaker` 时加载；默认仍是 ReDimNet2-B6",
+  "🧬 **ResNet34-TSTP-emb256** — 约 6.63M 参数的 r-vector，在 VoxCeleb2 Dev（5994 说话人）上做 large-margin 微调",
+  "📏 **同一家族四种尺寸** — 34/152/221/293 共用一张 ggml 计算图；这是体积最小的一档",
+  "🎯 **精度严格校验** — ggml 计算图前向与官方 PyTorch 在固定样本上的余弦相似度 ≥ 0.999（CPU 与 Metal）",
+]
+
+source_sha256 = "690334df899acad7dc28daf66a4dc3b1203475a556e32c20a3ba850d1423fdff"

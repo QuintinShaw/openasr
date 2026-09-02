@@ -1,0 +1,48 @@
+# Per-model card prose for OpenASR/wespeaker-voxceleb-resnet152-lm.
+# Distilled from Wespeaker/wespeaker-voxceleb-resnet152-LM and the WeSpeaker paper.
+
+pipeline_tag = "feature-extraction"
+
+tagline = "WeSpeaker ResNet152 — deeper 256-d VoxCeleb English speaker embeddings"
+
+highlights = [
+  "🎙️ **Optional Voice ID space** — 256-d WeSpeaker ResNet, loaded only when you set `voice_id_embedder=wespeaker`; ReDimNet2-B6 stays the default",
+  "🧬 **ResNet152 Bottleneck-TSTP-emb256** — VoxCeleb2 English LM r-vector; same 256-d space as the rest of the family",
+  "📏 **Same family, four sizes** — 34/152/221/293 share one ggml graph; this is the mid-size Bottleneck pack",
+  "🎯 **Parity-gated packaging** — ggml-graph forward matches official PyTorch at cosine ≥ 0.999 on held-out fixtures (CPU and Metal)",
+]
+
+intro = """
+WeSpeaker ResNet152 is a Bottleneck-block r-vector from Wenet's VoxCeleb English
+LM family: temporal statistics pooling to a 256-d embedding, large-margin
+finetuned on VoxCeleb2 Dev. OpenASR packages the CC BY 4.0 checkpoint as a local
+fp16 `.oasr` capability pack and runs it through the same parameterized ggml
+graph as ResNet34/221/293. It is an explicit optional speaker-embedding space
+beside the default ReDimNet2-B6 pack — there is no Auto fallback, and
+enrollments do not transfer across the two spaces. Languages are English-only
+(`en`). Pick this size when you want more capacity than ResNet34 without the
+221/293 footprint.
+"""
+
+acknowledgement = """
+This pack redistributes **Wespeaker/wespeaker-voxceleb-resnet152-LM**
+(`voxceleb_resnet152_LM.pt`) in OpenASR's `.oasr` runtime format. Credit for the
+architecture, training, and original weights belongs to the WeSpeaker authors
+(Wenet; paper: Wespeaker: A research and production oriented speaker embedding
+learning toolkit, ICASSP 2023, https://arxiv.org/abs/2210.17016). The upstream
+model is licensed under **CC BY 4.0**; OpenASR packaging retains that license
+and attribution, with the only modification being format conversion for local
+ggml-graph loading.
+"""
+
+[prose_locales."zh-CN"]
+tagline = "WeSpeaker ResNet152：更深的 256 维 VoxCeleb 英语声纹"
+
+highlights = [
+  "🎙️ **可选 Voice ID 空间** — 256 维 WeSpeaker ResNet，仅在设置 `voice_id_embedder=wespeaker` 时加载；默认仍是 ReDimNet2-B6",
+  "🧬 **ResNet152 Bottleneck-TSTP-emb256** — VoxCeleb2 英语 LM r-vector，与同家族其他尺寸共用 256 维空间",
+  "📏 **同一家族四种尺寸** — 34/152/221/293 共用一张 ggml 计算图；这是中等体积的 Bottleneck 档",
+  "🎯 **精度严格校验** — ggml 计算图前向与官方 PyTorch 在固定样本上的余弦相似度 ≥ 0.999（CPU 与 Metal）",
+]
+
+source_sha256 = "2e68d17d73d57df15b0f5779f8113bfe7b9a75fd3f52a024fbbc31f54780c656"
