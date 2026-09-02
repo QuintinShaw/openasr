@@ -162,17 +162,16 @@ pub(crate) async fn stream_transcription(
     runtime: ServerRuntime,
     distribution: DistributionContext,
     multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
-    record_history: bool,
-    voice_id_allowed: bool,
+    remote_compute_client: bool,
 ) -> Result<Response, ApiError> {
     let home = distribution.openasr_home()?;
     let catalog = super::load_runtime_model_catalog(distribution.catalog_source(), &home)?;
     let mut parsed =
         parse_transcription_multipart(multipart, runtime.backend, catalog.as_ref()).await?;
-    if !voice_id_allowed {
+    if remote_compute_client {
         apply_remote_compute_client_request_policy(&mut parsed.request);
     }
-    super::reject_device_token_speaker_embeddings(&parsed.request, !voice_id_allowed)?;
+    super::reject_device_token_speaker_embeddings(&parsed.request, remote_compute_client)?;
     super::reject_streaming_speaker_embeddings(&parsed.request)?;
     if matches!(
         parsed.response_format,
@@ -182,6 +181,7 @@ pub(crate) async fn stream_transcription(
             "Streaming transcription does not support SRT/VTT response_format. Use the non-streaming transcription endpoint for subtitle output.".to_string(),
         ));
     }
+    let record_history = !remote_compute_client;
     let (sender, receiver) =
         mpsc::channel::<Result<Event, Infallible>>(OUTGOING_EVENT_QUEUE_CAPACITY);
 

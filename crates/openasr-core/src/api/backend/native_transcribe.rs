@@ -1024,6 +1024,26 @@ struct SpeakerFinalizationContext {
 }
 
 impl SpeakerFinalizationContext {
+    fn new(
+        attribution: SpeakerAttribution,
+        embedder: Option<Arc<dyn crate::diarize::embed::SpeakerEmbedder>>,
+        plan: SpeakerPlan,
+        scope_by_segment: Vec<Option<usize>>,
+        strip_forced_word_timestamps: bool,
+        name_enrolled: bool,
+        speaker_embeddings: Option<SpeakerEmbeddingPayload>,
+    ) -> Self {
+        Self {
+            attribution,
+            embedder,
+            plan,
+            scope_by_segment,
+            strip_forced_word_timestamps,
+            name_enrolled,
+            speaker_embeddings,
+        }
+    }
+
     /// External Voice ID needs word anchors when a multi-speaker segment must
     /// be split for text ownership. Empty words or present-but-unreliable
     /// anchors both force FA / fail-closed; single-speaker identity alone does not.
@@ -2765,15 +2785,15 @@ fn run_native_transcription_impl(
                 },
                 prepared_audio,
                 emits_punctuation,
-                speaker_finalization: SpeakerFinalizationContext {
-                    attribution: speaker_turns,
-                    embedder: voice_id_embedder,
-                    plan: speaker_plan,
-                    scope_by_segment: Vec::new(),
+                speaker_finalization: SpeakerFinalizationContext::new(
+                    speaker_turns,
+                    voice_id_embedder,
+                    speaker_plan,
+                    Vec::new(),
                     strip_forced_word_timestamps,
-                    name_enrolled: request.voice_id,
-                    speaker_embeddings: speaker_embeddings.clone(),
-                },
+                    request.voice_id,
+                    speaker_embeddings,
+                ),
                 progress_backend: backend_class,
                 progress_segmenter: segmenter_kind,
             });
@@ -3112,15 +3132,15 @@ fn run_native_transcription_impl(
                     transcription,
                     prepared_audio,
                     emits_punctuation,
-                    speaker_finalization: SpeakerFinalizationContext {
-                        attribution: speaker_turns,
-                        embedder: voice_id_embedder,
-                        plan: speaker_plan,
-                        scope_by_segment: Vec::new(),
+                    speaker_finalization: SpeakerFinalizationContext::new(
+                        speaker_turns,
+                        voice_id_embedder,
+                        speaker_plan,
+                        Vec::new(),
                         strip_forced_word_timestamps,
-                        name_enrolled: request.voice_id,
-                        speaker_embeddings: speaker_embeddings.clone(),
-                    },
+                        request.voice_id,
+                        speaker_embeddings,
+                    ),
                     progress_backend: backend_class,
                     progress_segmenter: segmenter_kind,
                 });
@@ -3136,15 +3156,15 @@ fn run_native_transcription_impl(
                 transcription,
                 prepared_audio,
                 emits_punctuation,
-                speaker_finalization: SpeakerFinalizationContext {
-                    attribution: speaker_turns,
-                    embedder: voice_id_embedder,
-                    plan: speaker_plan,
-                    scope_by_segment: speaker_scope_by_segment,
+                speaker_finalization: SpeakerFinalizationContext::new(
+                    speaker_turns,
+                    voice_id_embedder,
+                    speaker_plan,
+                    speaker_scope_by_segment,
                     strip_forced_word_timestamps,
-                    name_enrolled: request.voice_id,
-                    speaker_embeddings: speaker_embeddings.clone(),
-                },
+                    request.voice_id,
+                    speaker_embeddings,
+                ),
                 progress_backend: backend_class,
                 progress_segmenter: segmenter_kind,
             });
@@ -3222,15 +3242,15 @@ fn run_native_transcription_impl(
         transcription,
         prepared_audio,
         emits_punctuation,
-        speaker_finalization: SpeakerFinalizationContext {
-            attribution: speaker_turns,
-            embedder: voice_id_embedder,
-            plan: speaker_plan,
-            scope_by_segment: Vec::new(),
+        speaker_finalization: SpeakerFinalizationContext::new(
+            speaker_turns,
+            voice_id_embedder,
+            speaker_plan,
+            Vec::new(),
             strip_forced_word_timestamps,
-            name_enrolled: request.voice_id,
+            request.voice_id,
             speaker_embeddings,
-        },
+        ),
         progress_backend: backend_class,
         progress_segmenter: segmenter_kind,
     })

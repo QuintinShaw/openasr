@@ -159,8 +159,7 @@ pub(crate) async fn transcriptions(
             runtime,
             distribution,
             multipart,
-            !remote_compute_client,
-            !remote_compute_client,
+            remote_compute_client,
         )
         .await;
     }
