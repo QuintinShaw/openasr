@@ -83,6 +83,8 @@ Published release images live on Docker Hub (`quintinshaw/openasr`,
 `quintinshaw/openasr:cuda-*`) and are assembled from GitHub Release assets by
 `.github/workflows/docker-release.yml` via `Dockerfile.release` /
 `Dockerfile.cuda.release`. See [RELEASING.md](RELEASING.md#docker-hub-images).
+Runtime images contain the binary and model-registry metadata only; they do
+not include `perf/` bench-suite fixtures or baselines.
 
 ## Formatting and linting
 

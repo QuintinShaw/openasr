@@ -199,8 +199,10 @@ amd64). The separate macOS/Windows desktop apps ship from
 Yes. `quintinshaw/openasr` on Docker Hub. Images contain the release binary and
 model-registry metadata only — mount a volume at `/data`, then
 `docker exec … openasr pull <model> --yes` before calling the HTTP API. The
-server never auto-pulls. CUDA tags require the NVIDIA Container Toolkit and
-refuse to start if no GPU is visible. Longer guide:
+server never auto-pulls. They do not ship `perf/` bench-suite fixtures or
+baselines, so `openasr bench-suite` inside the container will fail looking for
+those files; run benchmarks from a git checkout. CUDA tags require the NVIDIA
+Container Toolkit and refuse to start if no GPU is visible. Longer guide:
 [openasr.org/docs/docker](https://openasr.org/docs/docker/).
 
 ## Is ffmpeg required?

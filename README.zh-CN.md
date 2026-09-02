@@ -94,9 +94,10 @@ curl http://127.0.0.1:8080/v1/audio/transcriptions \
 ### Docker
 
 每个 core release 会同步发布到
-[Docker Hub](https://hub.docker.com/r/quintinshaw/openasr)(仅二进制 +
-model-registry 元数据;模型权重在运行时拉取到挂载在 `/data` 的卷)。HTTP 服务
-**不会**自动下载模型——先显式安装:
+[Docker Hub](https://hub.docker.com/r/quintinshaw/openasr)(仅运行时二进制 +
+model-registry 元数据;模型权重在运行时拉取到挂载在 `/data` 的卷)。镜像不含
+`perf/` 下的 bench-suite 夹具与基线，容器里直接跑 `openasr bench-suite`
+会找不到文件；基准请在 git 检出里跑。HTTP 服务 **不会**自动下载模型——先显式安装:
 
 ```bash
 docker pull quintinshaw/openasr:latest
