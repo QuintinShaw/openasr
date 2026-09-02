@@ -419,6 +419,34 @@ mod tests {
     }
 
     #[test]
+    fn unpublished_wespeaker_pack_still_resolves_from_installed_layouts() {
+        let preference = crate::diarize::embed::WESPEAKER_PACK_PREFERENCE;
+        let home = tempfile::tempdir().unwrap();
+        let object = install_content_addressed(
+            home.path(),
+            preference.model_id,
+            preference.preferred_quant,
+            b"GGUFwespeaker-cas",
+        );
+        assert_eq!(
+            resolve_installed_capability_pack_in(home.path(), preference).as_deref(),
+            Some(object.as_path()),
+        );
+
+        let legacy_home = tempfile::tempdir().unwrap();
+        let legacy = install_legacy(
+            legacy_home.path(),
+            preference.model_id,
+            preference.preferred_quant,
+            b"GGUFwespeaker-legacy",
+        );
+        assert_eq!(
+            resolve_installed_capability_pack_in(legacy_home.path(), preference).as_deref(),
+            Some(legacy.as_path()),
+        );
+    }
+
+    #[test]
     fn content_store_prefers_the_catalog_model_and_quant() {
         let home = tempfile::tempdir().unwrap();
         let stale_fp16 = install_content_addressed(

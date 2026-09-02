@@ -17,8 +17,6 @@ mod wespeaker;
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
-pub(crate) use pack::REDIMNET_PACK_PREFERENCE;
 pub use pack::{
     DIARIZATION_EMBEDDER_LOAD_FAILED_REASON, REALTIME_DIARIZATION_EMBEDDER_MISSING_REASON,
     SPEAKER_EMBEDDER_PACK_ID, SPEAKER_EMBEDDER_PACK_LABEL, SpeakerEmbedderFamily,
@@ -26,6 +24,8 @@ pub use pack::{
     VOICE_ID_NAMING_EMBEDDER_MISSING_REASON, VOICE_MATCH_EMBEDDER_PACK_MISSING_REASON,
     WESPEAKER_EMBEDDER_PACK_ID, embedder_pack_installed,
 };
+#[cfg(test)]
+pub(crate) use pack::{REDIMNET_PACK_PREFERENCE, WESPEAKER_PACK_PREFERENCE};
 pub use policy_runtime::PolicyResolvedSpeakerRuntime;
 pub(crate) use redimnet::backbone::RedimNetResidentRuntime;
 pub(crate) use wespeaker::{WeSpeakerEmbedder, WeSpeakerResidentRuntime};

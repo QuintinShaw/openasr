@@ -1,7 +1,8 @@
 //! Offline PLDA diarization refinement.
 //!
 //! This module implements license-clean PLDA-based diarization refinement over
-//! OpenASR's own ReDimNet2-B6 embeddings. The dense resegmentation default is an
+//! WeSpeaker ResNet 256-d embeddings (the community-1 PLDA/LDA training space).
+//! ReDimNet2-B6 is 192-d and is skipped. The dense resegmentation default is an
 //! honest PLDA mixture update, while a separate HMM VBx variant runs log-domain
 //! forward-backward over adjacent dense windows when explicitly selected. Both
 //! use the CC-BY-4.0 PLDA/LDA parameters distributed with the public

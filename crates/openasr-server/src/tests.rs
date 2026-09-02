@@ -1568,6 +1568,10 @@ fn transcription_preferences_fill_missing_thread_request_only() {
         request.voice_id_segmenter,
         openasr_core::config::VoiceIdSegmenterPreference::Segmentation3_0
     );
+    assert_eq!(
+        request.voice_id_embedder,
+        openasr_core::config::VoiceIdEmbedderPreference::ReDimNet2
+    );
 
     request.inference_threads = Some(2);
     apply_transcription_preferences(&mut request, &preferences);

@@ -744,7 +744,7 @@ impl PolicyResolvedSpeakerRuntime {
         Self::load_with_preference(
             execution_services,
             execution_intent,
-            VoiceIdEmbedderPreference::default(),
+            persisted_embedder_preference(),
         )
     }
 
@@ -1151,6 +1151,14 @@ fn deterministic_warmup_audio() -> Vec<f32> {
         .collect()
 }
 
+fn persisted_embedder_preference() -> VoiceIdEmbedderPreference {
+    crate::openasr_home()
+        .ok()
+        .and_then(|home| crate::config::load_config_document(home).ok())
+        .map(|document| document.preferences.voice_id_embedder)
+        .unwrap_or_default()
+}
+
 fn policy_runtime_error(error: PolicyResolvedAuxRuntimeError<EmbedError>) -> EmbedError {
     EmbedError::Unavailable(error.to_string())
 }
@@ -1158,6 +1166,30 @@ fn policy_runtime_error(error: PolicyResolvedAuxRuntimeError<EmbedError>) -> Emb
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_with_intent_reads_persisted_wespeaker_preference() {
+        assert_eq!(
+            persisted_embedder_preference(),
+            VoiceIdEmbedderPreference::ReDimNet2
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{"preferences":{"voice_id_embedder":"wespeaker"}}"#,
+        )
+        .expect("write config");
+        crate::test_process_env::with_test_process_env(
+            [("OPENASR_HOME", Some(dir.path().as_os_str().to_os_string()))],
+            || {
+                assert_eq!(
+                    persisted_embedder_preference(),
+                    VoiceIdEmbedderPreference::WeSpeaker
+                );
+            },
+        );
+    }
 
     #[test]
     fn redimnet_host_receipt_releases_without_leaking_across_cache_lifecycle() {

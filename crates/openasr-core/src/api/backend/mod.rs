@@ -634,6 +634,14 @@ impl TranscriptionRequest {
         self
     }
 
+    pub fn with_voice_id_embedder(
+        mut self,
+        preference: crate::config::VoiceIdEmbedderPreference,
+    ) -> Self {
+        self.voice_id_embedder = preference;
+        self
+    }
+
     pub fn with_anonymous_diarize(mut self, anonymous_diarize: bool) -> Self {
         self.anonymous_diarize = anonymous_diarize;
         self

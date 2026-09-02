@@ -48,6 +48,11 @@ pub(super) fn transcribe_many(
         ffmpeg_bin_explicit: prepared_run.ffmpeg_bin_explicit,
         longform,
         diarize: options.diarize,
+        voice_id_embedder: openasr_core::openasr_home()
+            .ok()
+            .and_then(|home| openasr_core::load_config_document(home).ok())
+            .map(|document| document.preferences.voice_id_embedder)
+            .unwrap_or_default(),
         speakers: options.speakers,
         language: options.language.clone(),
         task: options.task,
@@ -168,6 +173,7 @@ fn batch_item_transcription_request(
                 .map(str::to_string),
         )
         .with_voice_id(context.diarize)
+        .with_voice_id_embedder(context.voice_id_embedder)
         .with_diarize_speakers(context.speakers)
         // Match single-file `transcribe`: SRT/VTT export requests a precise
         // timeline under TimelinePrecisionPolicy::Auto.
@@ -1667,6 +1673,7 @@ mod tests {
             ffmpeg_bin_explicit: false,
             longform: None,
             diarize: false,
+            voice_id_embedder: openasr_core::config::VoiceIdEmbedderPreference::ReDimNet2,
             speakers: None,
             language: None,
             task: None,
@@ -1695,6 +1702,7 @@ mod tests {
                 ffmpeg_bin_explicit: false,
                 longform: None,
                 diarize: false,
+                voice_id_embedder: openasr_core::config::VoiceIdEmbedderPreference::ReDimNet2,
                 speakers: None,
                 language: None,
                 task: None,

@@ -144,6 +144,7 @@ pub(crate) struct BatchRunContext<'a> {
     pub(crate) ffmpeg_bin_explicit: bool,
     pub(crate) longform: Option<openasr_core::LongFormOptions>,
     pub(crate) diarize: bool,
+    pub(crate) voice_id_embedder: openasr_core::config::VoiceIdEmbedderPreference,
     pub(crate) speakers: Option<u8>,
     pub(crate) language: Option<String>,
     pub(crate) task: Option<TranscriptionTask>,

@@ -1337,7 +1337,8 @@ fn transcribe(
     options: TranscribeCommandOptions<'_>,
 ) -> Result<()> {
     let home = openasr_home()?;
-    let config = load_config(&home)?;
+    let document = openasr_core::load_config_document(&home)?;
+    let config = document.config;
     // `--benchmark` measures plain transcription timing; run_benchmark does not
     // thread the request-shaping flags, so reject them rather than silently
     // ignoring them (fail-closed). Checked before any pack install or network.
@@ -1541,6 +1542,7 @@ fn transcribe(
         })
         .with_phrase_bias(phrase_bias)
         .with_voice_id(options.diarize)
+        .with_voice_id_embedder(document.preferences.voice_id_embedder)
         .with_diarize_speakers(options.speakers)
         .with_punctuation(options.punctuate)
         .with_word_timestamps(options.word_timestamps_mode.is_some())
