@@ -38,6 +38,62 @@ pub(crate) struct QualifyFamilyDecodeArgs {
     pub ffmpeg_bin: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Args)]
+pub(crate) struct AlignCliArgs {
+    /// Source audio (or `-` for a WAV stream on stdin).
+    #[arg(value_name = "AUDIO")]
+    pub(crate) audio: PathBuf,
+    /// Plain-text transcript file (`-` reads stdin). Cannot be `-` when
+    /// AUDIO is also `-`.
+    #[arg(long)]
+    pub(crate) transcript: PathBuf,
+    /// Output format(s): text, json, srt, vtt, verbose_json, markdown.
+    /// Repeat `-f` to write several sidecar files.
+    #[arg(long = "format", short = 'f', value_name = "FORMAT", default_value = "json", value_parser = parse_response_format)]
+    pub(crate) formats: Vec<ResponseFormat>,
+    /// Language hint (e.g. en, zh, English). Omit or `auto` defaults to en.
+    /// Japanese and Korean fail closed.
+    #[arg(long, short = 'l', value_name = "LANG")]
+    pub(crate) language: Option<String>,
+    /// Write output to this file. Defaults to stdout.
+    #[arg(long, short = 'o')]
+    pub(crate) output: Option<PathBuf>,
+    /// Transcription backend: mock or native. Align is native-only.
+    #[arg(long, value_parser = parse_backend_kind, hide = true)]
+    pub(crate) backend: Option<BackendKind>,
+    /// Path to an existing ffmpeg binary for preparing recognized non-WAV inputs.
+    #[arg(long)]
+    pub(crate) ffmpeg_bin: Option<PathBuf>,
+    /// Hardware target: auto, cpu, or accelerated.
+    #[arg(long, value_name = "TARGET")]
+    pub(crate) execution_target: Option<String>,
+    /// Strip per-word arrays from the JSON result (segment/cue times stay).
+    #[arg(long)]
+    pub(crate) no_word_timestamps: bool,
+    /// Download a missing Forced Aligner pack without the interactive
+    /// confirmation (also set by OPENASR_ASSUME_YES).
+    #[arg(long, short = 'y')]
+    pub(crate) yes: bool,
+    /// Never download: fail closed if the Forced Aligner pack is not installed
+    /// (also set by OPENASR_OFFLINE).
+    #[arg(long, visible_alias = "no-pull")]
+    pub(crate) offline: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AlignCommandOptions<'a> {
+    pub(crate) audio: &'a Path,
+    pub(crate) transcript: &'a Path,
+    pub(crate) formats: &'a [ResponseFormat],
+    pub(crate) language: Option<String>,
+    pub(crate) output: Option<&'a Path>,
+    pub(crate) backend_kind: Option<BackendKind>,
+    pub(crate) runtime_paths: RuntimePathOverrides,
+    pub(crate) execution_target: Option<&'a str>,
+    pub(crate) keep_word_timestamps: bool,
+    pub(crate) consent: crate::consent::PullConsent,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TranscribeCommandOptions<'a> {
     pub(crate) inputs: &'a [PathBuf],
@@ -479,6 +535,10 @@ pub(crate) enum Command {
         #[command(flatten)]
         language_task: LanguageTaskCliOptions,
     },
+    /// Force-align a user-provided plain-text transcript onto audio and emit a
+    /// timed timeline (JSON / SRT / VTT). Requires the Qwen3-ForcedAligner
+    /// pack; this command is itself the consent to install it unless `--offline`.
+    Align(AlignCliArgs),
     /// Run the committed performance suite (RTF + peak RSS + WER) and gate
     /// against a baseline.
     BenchSuite {

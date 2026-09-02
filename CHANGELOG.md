@@ -11,7 +11,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   short subtitle cues. JSON responses expose `subtitle_cues` and
   `timeline_quality`; SRT/VTT render the cue view. The server also provides
   `POST /v1/audio/precise-timeline` to refine an existing transcript against
-  its source audio when the Qwen3 Forced Aligner capability pack is installed.
+  its source audio, or to force-align a user-supplied plain-text manuscript
+  (`transcript` form field) onto the audio, when the Qwen3 Forced Aligner
+  capability pack is installed. `openasr align` is the matching CLI.
+- Forced alignment of an external transcript fails closed when the aligner
+  pack is missing, the language is Japanese/Korean, the normalized text is
+  empty, the audio exceeds the aligner's timestamp grid, or the resulting
+  timeline is degenerate (collapsed bins / zero-duration words).
 - CLI: `openasr bench-receipt short-audio` writes a machine-readable receipt
   for a measured short-audio run, binding the report to the selected pack,
   source audio, runtime settings, and recorded measurements.

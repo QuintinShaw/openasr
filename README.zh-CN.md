@@ -73,6 +73,9 @@ openasr live
 
 # SRT 字幕 + 说话人分离
 openasr transcribe meeting.wav -f srt --diarize
+
+# 把已有逐字稿对齐到音频（SRT/VTT/JSON）
+openasr align recording.wav --transcript script.txt -f srt -o recording.srt
 ```
 
 详细步骤见 [Quickstart](docs/QUICKSTART.md),或 `openasr --help` 查看完整命令。
@@ -86,7 +89,7 @@ curl http://127.0.0.1:8080/v1/audio/transcriptions \
   -F file=@audio.wav -F model=qwen3-asr-0.6b
 ```
 
-与 OpenAI SDK 直接兼容(`base_url="http://127.0.0.1:8080/v1"`)。API Key 和 Agent 集成见 [Agent Integration](docs/AGENT_INTEGRATION.md)。
+转写与 OpenAI SDK 直接兼容(`base_url="http://127.0.0.1:8080/v1"`)。把已有逐字稿打轴是 OpenASR 原生命名：`POST /v1/audio/precise-timeline`（`file` + `transcript`），OpenAI 没有对应端点。API Key 和 Agent 集成见 [Agent Integration](docs/AGENT_INTEGRATION.md)。
 
 ### Docker
 

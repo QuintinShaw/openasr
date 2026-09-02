@@ -21,10 +21,10 @@ use openasr_core::{
     NativeAsrHardwareTarget, NativeAsrOfflineRequest, NativeAsrRequestOptions,
     NativeBackendExecutor, NativeRuntimeModelIdSource, PhraseBiasConfig, ResponseFormat,
     RuntimeModelResolutionError, Transcription, TranscriptionRequest, TranscriptionTask,
-    add_segment_word_timestamps, config::MAX_INFERENCE_THREADS, load_native_wav_16khz_mono_f32_v0,
-    native_runtime_model_adapter_for_path, parse_model_ref, prepare_audio_input,
-    refine_existing_transcription_timeline, render_transcription, resolve_runtime_model_ref,
-    runtime_registry,
+    add_segment_word_timestamps, align_plain_transcript_to_audio, config::MAX_INFERENCE_THREADS,
+    load_native_wav_16khz_mono_f32_v0, native_runtime_model_adapter_for_path, parse_model_ref,
+    prepare_audio_input, refine_existing_transcription_timeline, render_transcription,
+    resolve_runtime_model_ref, runtime_registry,
 };
 
 use crate::*;
@@ -169,20 +169,32 @@ pub(crate) async fn transcriptions(
         .await
 }
 
-/// `POST /v1/audio/precise-timeline`: re-align word timestamps on an existing
-/// finished transcript without re-running ASR.
+/// `POST /v1/audio/precise-timeline`: produce a precise word/segment timeline
+/// without re-running ASR.
 ///
 /// Multipart fields:
 /// - `file` (required): source audio for forced alignment
-/// - `transcript_json` (required): verbose/json-style body with `text` + timed
-///   `segments` (and optional `subtitle_cues` / `timeline_quality` / `language`)
+/// - exactly one of:
+///   - `transcript`: plain-text manuscript (punctuation/case preserved in the
+///     returned `text`; the aligner tokenizes by stripping punctuation except
+///     letters, numbers, and apostrophes, splitting on ASCII whitespace, and
+///     treating each CJK ideograph as its own token)
+///   - `transcript_json`: verbose/json-style body with `text` + timed
+///     `segments` (and optional `subtitle_cues` / `timeline_quality` /
+///     `language`) used to refine an existing transcript
 /// - `word_timestamps` (optional, default true): keep per-word arrays on the
-///   refined dual-view result
-/// - `language` (optional): language hint when the transcript body omits one
+///   dual-view result
+/// - `language` (optional): ISO 639-1 or full name (`en` / `English`). Omitted
+///   or `auto` defaults to `en`. Japanese and Korean fail closed.
 /// - `execution_target` (optional): `auto` / `cpu` / `accelerated`
+/// - `response_format` (optional): `json`, `verbose_json` (default), `text`,
+///   `srt`, `vtt`, `markdown` — SRT/VTT reuse the shared subtitle exporter
 ///
-/// Returns the refined [`Transcription`] as verbose JSON. History persistence
-/// is left to the caller (`POST /v1/history/{id}/transcript` with If-Match).
+/// Returns the aligned [`Transcription`]. History persistence is left to the
+/// caller (`POST /v1/history/{id}/transcript` with If-Match). Missing Forced
+/// Aligner pack, unsupported language, empty normalized text, or a degenerate
+/// alignment fail closed. This is a compute route: paired device tokens may
+/// call it; it is not operator-only.
 pub(crate) async fn precise_timeline(
     State(runtime): State<ServerRuntime>,
     Extension(distribution): Extension<DistributionContext>,
@@ -193,6 +205,7 @@ pub(crate) async fn precise_timeline(
     let backend = runtime.backend;
     let ffmpeg_bin = runtime.ffmpeg_bin.clone();
     let ffmpeg_bin_explicit = runtime.ffmpeg_bin_explicit;
+    let response_format = parsed.response_format;
     let refined = tokio::task::spawn_blocking(move || {
         let prepared = prepare_audio_input(
             &parsed.audio_path,
@@ -227,25 +240,41 @@ pub(crate) async fn precise_timeline(
         let _activity_guard = NativeActivityGuard::enter();
         // Keep the upload temp path alive across prepare + load.
         let _audio_keepalive = parsed.audio_temp;
-        refine_existing_transcription_timeline(
-            parsed.transcription,
-            samples.as_slice(),
-            execution_services.as_ref(),
-            parsed.execution_target.unwrap_or_default(),
-            parsed.language_hint.as_deref(),
-            parsed.keep_word_timestamps,
-        )
-        .map_err(ApiError::Backend)
+        match parsed.transcript {
+            PreciseTimelineTranscript::Timed(transcription) => {
+                refine_existing_transcription_timeline(
+                    transcription,
+                    samples.as_slice(),
+                    execution_services.as_ref(),
+                    parsed.execution_target.unwrap_or_default(),
+                    parsed.language_hint.as_deref(),
+                    parsed.keep_word_timestamps,
+                )
+                .map_err(ApiError::Backend)
+            }
+            PreciseTimelineTranscript::Plain(text) => align_plain_transcript_to_audio(
+                text,
+                samples.as_slice(),
+                execution_services.as_ref(),
+                parsed.execution_target.unwrap_or_default(),
+                parsed.language_hint.as_deref(),
+                parsed.keep_word_timestamps,
+            )
+            .map_err(ApiError::Backend),
+        }
     })
     .await
     .map_err(ApiError::BackendJoin)??;
-    let rendered =
-        render_transcription(&refined, ResponseFormat::VerboseJson).map_err(ApiError::Serialize)?;
+    let rendered = render_transcription(&refined, response_format).map_err(ApiError::Serialize)?;
+    let content_type = match response_format {
+        ResponseFormat::Json | ResponseFormat::VerboseJson => mime::APPLICATION_JSON.as_ref(),
+        ResponseFormat::Text
+        | ResponseFormat::Srt
+        | ResponseFormat::Vtt
+        | ResponseFormat::Markdown => mime::TEXT_PLAIN_UTF_8.as_ref(),
+    };
     let mut response_headers = HeaderMap::new();
-    response_headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(mime::APPLICATION_JSON.as_ref()),
-    );
+    response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     Ok((response_headers, rendered).into_response())
 }
 
@@ -254,10 +283,17 @@ struct PreciseTimelineUpload {
     audio_path: PathBuf,
     /// Keeps the uploaded temp file alive until prepare/load finish.
     audio_temp: tempfile::TempPath,
-    transcription: Transcription,
+    transcript: PreciseTimelineTranscript,
     language_hint: Option<String>,
     keep_word_timestamps: bool,
     execution_target: Option<ExecutionTarget>,
+    response_format: ResponseFormat,
+}
+
+#[derive(Debug)]
+enum PreciseTimelineTranscript {
+    Timed(Transcription),
+    Plain(String),
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -292,9 +328,11 @@ async fn parse_precise_timeline_multipart(
     let mut multipart = multipart.map_err(ApiError::MultipartRejection)?;
     let mut audio_temp: Option<tempfile::TempPath> = None;
     let mut transcript_json: Option<String> = None;
+    let mut transcript_plain: Option<String> = None;
     let mut language_hint: Option<String> = None;
     let mut keep_word_timestamps = true;
     let mut execution_target: Option<ExecutionTarget> = None;
+    let mut response_format = ResponseFormat::VerboseJson;
 
     while let Some(field) = multipart.next_field().await.map_err(ApiError::Multipart)? {
         let name = field.name().unwrap_or_default().to_string();
@@ -310,6 +348,9 @@ async fn parse_precise_timeline_multipart(
             "transcript_json" => {
                 transcript_json = Some(field.text().await.map_err(ApiError::Multipart)?);
             }
+            "transcript" => {
+                transcript_plain = Some(field.text().await.map_err(ApiError::Multipart)?);
+            }
             "language" => {
                 let value = field.text().await.map_err(ApiError::Multipart)?;
                 let trimmed = value.trim();
@@ -323,6 +364,10 @@ async fn parse_precise_timeline_multipart(
                 let value = field.text().await.map_err(ApiError::Multipart)?;
                 execution_target = Some(parse_execution_target_field(&value)?);
             }
+            "response_format" => {
+                let value = field.text().await.map_err(ApiError::Multipart)?;
+                response_format = ResponseFormat::from_str(&value).map_err(ApiError::Format)?;
+            }
             _ => {
                 // Ignore unknown fields for forward compatibility.
                 let _ = field.bytes().await.map_err(ApiError::Multipart)?;
@@ -330,21 +375,22 @@ async fn parse_precise_timeline_multipart(
         }
     }
 
-    let (audio_temp, body) =
-        finalize_precise_timeline_fields(audio_temp, transcript_json.as_deref())?;
+    let (audio_temp, transcript) = finalize_precise_timeline_fields(
+        audio_temp,
+        transcript_json.as_deref(),
+        transcript_plain.as_deref(),
+        language_hint.clone(),
+    )?;
     let audio_path = audio_temp.to_path_buf();
-    let mut transcription = body.into_transcription();
-    if transcription.language.is_none() {
-        transcription.language = language_hint.clone();
-    }
 
     Ok(PreciseTimelineUpload {
         audio_path,
         audio_temp,
-        transcription,
+        transcript,
         language_hint,
         keep_word_timestamps,
         execution_target,
+        response_format,
     })
 }
 
@@ -354,30 +400,49 @@ async fn parse_precise_timeline_multipart(
 fn finalize_precise_timeline_fields(
     audio_temp: Option<tempfile::TempPath>,
     transcript_json: Option<&str>,
-) -> Result<(tempfile::TempPath, PreciseTimelineTranscriptBody), ApiError> {
+    transcript_plain: Option<&str>,
+    language_hint: Option<String>,
+) -> Result<(tempfile::TempPath, PreciseTimelineTranscript), ApiError> {
     let audio_temp = audio_temp.ok_or_else(|| {
         ApiError::BadRequest(
-            "Missing required form field: file (source audio for precise timeline refine)".into(),
+            "Missing required form field: file (source audio for precise timeline)".into(),
         )
     })?;
-    let transcript_raw = transcript_json.ok_or_else(|| {
-        ApiError::BadRequest(
-            "Missing required form field: transcript_json (finished transcript body)".into(),
-        )
-    })?;
-    let body: PreciseTimelineTranscriptBody = serde_json::from_str(transcript_raw)
-        .map_err(|error| ApiError::BadRequest(format!("Invalid transcript_json: {error}")))?;
-    if body.segments.is_empty() {
-        return Err(ApiError::BadRequest(
-            "transcript_json.segments must contain at least one timed segment".into(),
-        ));
+    match (transcript_json, transcript_plain) {
+        (Some(_), Some(_)) => Err(ApiError::BadRequest(
+            "Provide exactly one of transcript (plain text) or transcript_json (timed transcript body)".into(),
+        )),
+        (None, None) => Err(ApiError::BadRequest(
+            "Missing required form field: transcript (plain text) or transcript_json (timed transcript body)".into(),
+        )),
+        (None, Some(plain)) => {
+            if plain.trim().is_empty() {
+                return Err(ApiError::BadRequest(
+                    "transcript must contain at least one non-whitespace character".into(),
+                ));
+            }
+            Ok((audio_temp, PreciseTimelineTranscript::Plain(plain.to_string())))
+        }
+        (Some(transcript_raw), None) => {
+            let body: PreciseTimelineTranscriptBody = serde_json::from_str(transcript_raw)
+                .map_err(|error| ApiError::BadRequest(format!("Invalid transcript_json: {error}")))?;
+            if body.segments.is_empty() {
+                return Err(ApiError::BadRequest(
+                    "transcript_json.segments must contain at least one timed segment".into(),
+                ));
+            }
+            let mut transcription = body.into_transcription();
+            if transcription.language.is_none() {
+                transcription.language = language_hint;
+            }
+            Ok((audio_temp, PreciseTimelineTranscript::Timed(transcription)))
+        }
     }
-    Ok((audio_temp, body))
 }
 
 #[cfg(test)]
 mod precise_timeline_parse_tests {
-    use super::{ApiError, finalize_precise_timeline_fields};
+    use super::{ApiError, PreciseTimelineTranscript, finalize_precise_timeline_fields};
 
     fn sample_transcript_json() -> String {
         serde_json::json!({
@@ -394,39 +459,78 @@ mod precise_timeline_parse_tests {
 
     #[test]
     fn missing_file_is_bad_request() {
-        let err = finalize_precise_timeline_fields(None, Some(&sample_transcript_json()))
-            .expect_err("file is required");
+        let err =
+            finalize_precise_timeline_fields(None, Some(&sample_transcript_json()), None, None)
+                .expect_err("file is required");
         assert!(matches!(err, ApiError::BadRequest(message) if message.contains("file")));
     }
 
     #[test]
-    fn missing_transcript_json_is_bad_request() {
+    fn missing_transcript_is_bad_request() {
         let audio = super::write_upload_temp_file(b"RIFF", ".wav").expect("temp");
-        let err = finalize_precise_timeline_fields(Some(audio), None)
-            .expect_err("transcript_json is required");
-        assert!(
-            matches!(err, ApiError::BadRequest(message) if message.contains("transcript_json"))
-        );
+        let err = finalize_precise_timeline_fields(Some(audio), None, None, None)
+            .expect_err("transcript is required");
+        assert!(matches!(err, ApiError::BadRequest(message) if message.contains("transcript")));
+    }
+
+    #[test]
+    fn both_transcript_forms_are_bad_request() {
+        let audio = super::write_upload_temp_file(b"RIFF", ".wav").expect("temp");
+        let err = finalize_precise_timeline_fields(
+            Some(audio),
+            Some(&sample_transcript_json()),
+            Some("hello"),
+            None,
+        )
+        .expect_err("exactly one transcript form");
+        assert!(matches!(err, ApiError::BadRequest(message) if message.contains("exactly one")));
+    }
+
+    #[test]
+    fn empty_plain_transcript_is_bad_request() {
+        let audio = super::write_upload_temp_file(b"RIFF", ".wav").expect("temp");
+        let err = finalize_precise_timeline_fields(Some(audio), None, Some("  \n"), None)
+            .expect_err("empty plain transcript must fail closed");
+        assert!(matches!(err, ApiError::BadRequest(message) if message.contains("transcript")));
     }
 
     #[test]
     fn empty_segments_is_bad_request() {
         let audio = super::write_upload_temp_file(b"RIFF", ".wav").expect("temp");
         let body = r#"{"text":"","segments":[]}"#;
-        let err = finalize_precise_timeline_fields(Some(audio), Some(body))
+        let err = finalize_precise_timeline_fields(Some(audio), Some(body), None, None)
             .expect_err("empty segments must fail closed");
         assert!(matches!(err, ApiError::BadRequest(message) if message.contains("segments")));
     }
 
     #[test]
-    fn valid_fields_parse() {
+    fn valid_json_fields_parse() {
         let audio = super::write_upload_temp_file(b"RIFF", ".wav").expect("temp");
-        let (temp, body) =
-            finalize_precise_timeline_fields(Some(audio), Some(&sample_transcript_json()))
-                .expect("valid multipart fields");
+        let (temp, transcript) = finalize_precise_timeline_fields(
+            Some(audio),
+            Some(&sample_transcript_json()),
+            None,
+            None,
+        )
+        .expect("valid multipart fields");
+        let PreciseTimelineTranscript::Timed(body) = transcript else {
+            panic!("expected timed transcript");
+        };
         assert_eq!(body.text, "hello");
         assert_eq!(body.segments.len(), 1);
         assert!(temp.to_path_buf().exists() || !temp.to_path_buf().as_os_str().is_empty());
+    }
+
+    #[test]
+    fn valid_plain_transcript_parses() {
+        let audio = super::write_upload_temp_file(b"RIFF", ".wav").expect("temp");
+        let (_temp, transcript) =
+            finalize_precise_timeline_fields(Some(audio), None, Some("hello world"), None)
+                .expect("plain transcript");
+        let PreciseTimelineTranscript::Plain(text) = transcript else {
+            panic!("expected plain transcript");
+        };
+        assert_eq!(text, "hello world");
     }
 }
 

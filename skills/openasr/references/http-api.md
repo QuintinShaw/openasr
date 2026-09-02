@@ -44,6 +44,16 @@ pack that is being served.
   no `created` field).
 - `POST /v1/audio/transcriptions` -- OpenAI-compatible transcription
   (multipart form).
+- `POST /v1/audio/precise-timeline` -- OpenASR-native forced alignment
+  (multipart form). Does not run ASR. Accepts source `file` plus exactly one
+  of `transcript` (plain text) or `transcript_json` (timed verbose/json body).
+  Optional: `language`, `word_timestamps` (default true), `execution_target`,
+  `response_format` (`verbose_json` default; `json`/`text`/`srt`/`vtt`/`markdown`).
+  SRT/VTT reuse the shared subtitle exporter. Missing Forced Aligner pack,
+  unsupported language (`ja`/`ko`), empty normalized text, audio past the
+  timestamp grid, or a degenerate alignment fail closed. Paired device tokens
+  may call this compute route; it is not operator-only. The server never
+  downloads the pack.
 - `POST /v1/audio/translations` -- OpenAI-compatible X->English speech
   translation (non-streaming; model families without a translate task reject
   it explicitly).

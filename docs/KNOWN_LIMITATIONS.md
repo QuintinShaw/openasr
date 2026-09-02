@@ -105,6 +105,18 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   timestamps unchanged. Explicit `aligned` only refines words; the automatic
   Voice ID path additionally consumes those words to assign each text run to
   the canonical speaker timeline.
+- External manuscript alignment (`openasr align` / `POST /v1/audio/precise-timeline`
+  with `transcript=`) reuses the same Forced Aligner pack and tokenizer. The
+  returned `text` keeps the caller's punctuation and casing. Internally the
+  aligner: splits on ASCII whitespace; keeps letters, numbers, and apostrophes;
+  strips other punctuation; treats each CJK ideograph as its own token; defaults
+  omitted/`auto` language to `en`. Japanese and Korean fail closed. Audio longer
+  than the classify-head grid (5000 × 80 ms = 400 s for the shipped pack) fails
+  closed rather than wrapping timestamps. A collapsed or zero-duration timeline
+  is treated as a severe transcript/audio mismatch and rejected instead of being
+  exported as SRT/VTT. The server never downloads the pack; paired device tokens
+  may call the endpoint (it is a compute route, not operator-only). CLI `align`
+  is itself consent to install the pack unless `--offline`.
 - Hardware execution target selection is generic: Desktop/server requests support
   `auto`, `cpu`, and `accelerated` when the native runtime reports an accelerated
   device. There is no public per-provider/per-device pinning surface such as

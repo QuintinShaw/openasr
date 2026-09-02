@@ -70,6 +70,11 @@ const OPENASR_MODEL_ID_KEY: &str = "openasr.model.id";
 /// still amortizing graph construction and GPU submission across many words.
 /// The bound is independent of transcript length.
 const FORCED_ALIGNER_LOGITS_BATCH_ROWS: usize = 64;
+
+/// Exclusive upper bound of the classify-head timestamp grid, in seconds.
+pub(crate) fn timestamp_grid_limit_s(classify_num: usize, timestamp_segment_time_ms: u32) -> f64 {
+    classify_num as f64 * f64::from(timestamp_segment_time_ms) / 1000.0
+}
 // A <=2% odds advantage is below the cross-backend reduction-order envelope
 // measured for this Q8 classification head. Treat such candidates as a
 // numerical tie and choose the later timestamp bin deterministically. The
@@ -155,6 +160,19 @@ pub(crate) enum Qwen3ForcedAlignerRuntimeError {
     LlmTransformerFailed(#[from] super::llm_transformer::Qwen3AsrLlmTransformerError),
     #[error("qwen3-forced-aligner prepared assets admission failed: {reason}")]
     PreparedAssetsAdmissionFailed { reason: String },
+    #[error(
+        "qwen3-forced-aligner transcript is empty after normalization (letters, numbers, and apostrophes are kept; other punctuation is stripped)"
+    )]
+    EmptyNormalizedTranscript,
+    #[error(
+        "qwen3-forced-aligner audio is {duration_s:.3}s which exceeds the timestamp grid of {max_s:.3}s ({classify_num} bins x {bin_ms}ms); split the audio rather than wrapping timestamps"
+    )]
+    AudioExceedsTimestampGrid {
+        duration_s: f64,
+        max_s: f64,
+        classify_num: usize,
+        bin_ms: u32,
+    },
 }
 
 /// Parsed `qwen3_forced_aligner.*` GGUF metadata, with the embedding-table
@@ -715,6 +733,22 @@ fn align_forced_with_stage_backends(
         }
     };
     let word_list = word_list_for_language(text, language)?;
+    if word_list.is_empty() {
+        return Err(Qwen3ForcedAlignerRuntimeError::EmptyNormalizedTranscript);
+    }
+    let audio_duration_s = audio_samples_16khz_mono.len() as f64 / 16_000.0;
+    let max_s = timestamp_grid_limit_s(
+        assets.metadata.classify_num,
+        assets.metadata.timestamp_segment_time_ms,
+    );
+    if audio_duration_s > max_s {
+        return Err(Qwen3ForcedAlignerRuntimeError::AudioExceedsTimestampGrid {
+            duration_s: audio_duration_s,
+            max_s,
+            classify_num: assets.metadata.classify_num,
+            bin_ms: assets.metadata.timestamp_segment_time_ms,
+        });
+    }
 
     let embedding_metadata = assets.metadata.as_embedding_execution_metadata();
     let prepared_audio = forced_aligner_prepared_audio(audio_samples_16khz_mono);
@@ -1262,6 +1296,11 @@ impl Qwen3ForcedAlignerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_grid_limit_matches_catalog_5000_by_80ms() {
+        assert_eq!(timestamp_grid_limit_s(5_000, 80), 400.0);
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ForcedAlignerTestBackend {

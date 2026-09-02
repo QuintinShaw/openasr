@@ -46,3 +46,18 @@ once), `-o/--output`, `-l/--language` (`auto` or a hint like `en`). `openasr t`
 is an alias for `transcribe`. Run `openasr --help` for the full command set, and
 see [FAQ](FAQ.md) and [Known Limitations](KNOWN_LIMITATIONS.md) for current
 scope.
+
+## 4. Align an existing transcript
+
+When you already have a verbatim manuscript and want a timeline / subtitles:
+
+```bash
+openasr align audio.wav --transcript script.txt -f srt -o audio.srt
+```
+
+This does not run ASR. It force-aligns the text onto the audio with the
+Qwen3-ForcedAligner pack (`openasr pull qwen3-forced-aligner-0.6b` if it is
+not installed; `align` itself is consent to install unless `--offline`).
+Japanese and Korean fail closed. Formats: `json` (default), `verbose_json`,
+`srt`, `vtt`, `text`, `markdown`. The HTTP equivalent is
+`POST /v1/audio/precise-timeline` with form fields `file` + `transcript`.

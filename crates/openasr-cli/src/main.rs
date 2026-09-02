@@ -157,6 +157,7 @@ fn command_reads_the_model_store(command: &Command) -> bool {
             | Command::Show { .. }
             | Command::ModelPack { .. }
             | Command::Transcribe { .. }
+            | Command::Align(_)
             | Command::BenchSuite { .. }
             | Command::BenchReceipt { .. }
             | Command::Live { .. }
@@ -438,6 +439,27 @@ async fn run() -> Result<()> {
         })
         .await
         .context("openasr transcribe worker task failed")?,
+        Command::Align(args) => tokio::task::spawn_blocking(move || {
+            align_plain_transcript_command(
+                &native_execution_services,
+                AlignCommandOptions {
+                    audio: &args.audio,
+                    transcript: &args.transcript,
+                    formats: &args.formats,
+                    language: normalize_language_hint(args.language),
+                    output: args.output.as_deref(),
+                    backend_kind: args.backend,
+                    runtime_paths: RuntimePathOverrides {
+                        ffmpeg_bin: args.ffmpeg_bin,
+                    },
+                    execution_target: args.execution_target.as_deref(),
+                    keep_word_timestamps: !args.no_word_timestamps,
+                    consent: consent::PullConsent::resolve(args.yes, args.offline),
+                },
+            )
+        })
+        .await
+        .context("openasr align worker task failed")?,
         Command::Apikey { command } => apikey_command(command),
         Command::BenchSuite {
             config,
@@ -1282,7 +1304,9 @@ fn print_model_language_details(target: &str) {
 /// `transcribe -` reads a WAV stream from stdin into a temp file used as the sole
 /// input (audio prep is extension-based, so stdin is treated as WAV). Returns the
 /// temp file to keep alive for the run; `-` must be the only input.
-fn maybe_read_stdin_to_temp(inputs: &[PathBuf]) -> Result<Option<tempfile::NamedTempFile>> {
+pub(crate) fn maybe_read_stdin_to_temp(
+    inputs: &[PathBuf],
+) -> Result<Option<tempfile::NamedTempFile>> {
     let dash = Path::new("-");
     if !inputs.iter().any(|input| input == dash) {
         return Ok(None);
@@ -1958,6 +1982,33 @@ mod tests {
         assert_eq!(backend, Some(BackendKind::Native));
         assert_eq!(model_pack, Some(PathBuf::from("model.gguf")));
         assert_eq!(inputs, vec![PathBuf::from("audio.wav")]);
+    }
+
+    #[test]
+    fn align_command_parses_transcript_and_srt_format() {
+        let cli = Cli::try_parse_from([
+            "openasr",
+            "align",
+            "audio.wav",
+            "--transcript",
+            "script.txt",
+            "-f",
+            "srt",
+            "-l",
+            "en",
+            "-o",
+            "out.srt",
+        ])
+        .expect("align parses");
+        let Command::Align(args) = cli.command else {
+            panic!("expected align command");
+        };
+        assert_eq!(args.audio, PathBuf::from("audio.wav"));
+        assert_eq!(args.transcript, PathBuf::from("script.txt"));
+        assert_eq!(args.formats, vec![ResponseFormat::Srt]);
+        assert_eq!(args.language.as_deref(), Some("en"));
+        assert_eq!(args.output, Some(PathBuf::from("out.srt")));
+        assert!(!args.no_word_timestamps);
     }
 
     #[test]

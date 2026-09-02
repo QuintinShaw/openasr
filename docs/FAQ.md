@@ -72,6 +72,16 @@ caller-provided local `.oasr` file via ggml. They reject remote URLs, missing
 paths, and directory paths, and
 do not run inference.
 
+## Can I align an existing transcript onto audio?
+
+Yes. `openasr align audio.wav --transcript script.txt -f srt` force-aligns a
+plain-text manuscript onto the audio with the Qwen3-ForcedAligner pack (no ASR).
+The HTTP equivalent is `POST /v1/audio/precise-timeline` with `file` +
+`transcript`. Japanese and Korean fail closed; a missing pack, empty normalized
+text, or a degenerate timeline is an error rather than a fabricated SRT.
+See [Known Limitations](KNOWN_LIMITATIONS.md) for normalization rules and the
+400 s timestamp-grid ceiling.
+
 ## Can I transcribe with a local native pack?
 
 Yes. `openasr transcribe <audio>` uses the native backend by default and runs an

@@ -54,6 +54,10 @@ These were prior roadmap goals and are now shipped on the native runtime path:
   transcription routing, realtime routing, revocation, and server-history
   isolation for paired device-token compute requests. The remaining release
   gate is end-to-end multi-device Desktop UI validation evidence.
+- External transcript-guided forced alignment is a public compute path:
+  `openasr align` and `POST /v1/audio/precise-timeline` (`transcript` or
+  `transcript_json`) reuse the Qwen3-ForcedAligner pack, project dual-view
+  segments/subtitle cues, and export SRT/VTT through the shared renderer.
 
 ## Active priorities
 
