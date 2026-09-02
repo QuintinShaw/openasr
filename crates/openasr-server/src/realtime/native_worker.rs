@@ -1345,7 +1345,7 @@ async fn warm_up_native_pack(
                 let _activation_barrier = runtime
                     .begin_native_activation()
                     .map_err(|error| error.to_string())?;
-                let Some(active_model) = runtime.model_pack_path.current_snapshot() else {
+                let Some(active_model) = runtime.model_pack_path.served_snapshot() else {
                     // Fresh install / no model installed yet: nothing to warm.
                     // The daemon still serves `/health`; a later activation
                     // binds and probes a verified pack transactionally.
@@ -1536,7 +1536,7 @@ impl RealtimeBackendWorkerKey {
         Self {
             backend: runtime.backend.to_string(),
             ffmpeg_bin: runtime.ffmpeg_bin.clone(),
-            model_pack_path: runtime.model_pack_path.current(),
+            model_pack_path: runtime.model_pack_path.served_pack_path(),
         }
     }
 }
