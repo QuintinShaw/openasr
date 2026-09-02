@@ -17,6 +17,8 @@ pub(crate) mod weights;
 mod wespeaker;
 
 #[cfg(test)]
+mod rt_380_redteam;
+#[cfg(test)]
 mod tests;
 
 pub use pack::{
