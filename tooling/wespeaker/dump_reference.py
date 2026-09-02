@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Dump WeSpeaker ResNet34 fbank + embedding goldens aligned with official
+"""Dump WeSpeaker ResNet fbank + embedding goldens aligned with official
 WeSpeaker forward (TSTP = sqrt(var(unbiased) + 1e-7)).
 
-Writes numpy arrays under ``--out`` (not committed). Typical layout::
+Depth 34/152/221/293 share this dump; pass ``--depth`` or infer from the
+checkpoint topology. Writes numpy arrays under ``--out`` (not committed)::
 
-    golden/jfk.wav.npy
-    golden/jfk.fbank.npy
-    golden/jfk.embedding.npy
-    golden/synthetic_sine_mix.{wav,fbank,embedding}.npy
-    manifest.json
+    golden/            # depth 34
+    golden-{depth}/    # 152/221/293
+    manifest.json      # depth 34
+    manifest-{depth}.json
 """
 
 from __future__ import annotations
@@ -77,6 +77,14 @@ class TSTP(nn.Module):
         return torch.cat([mean, std], dim=-1)
 
 
+DEPTH_TABLE = {
+    34: {"block": "basic", "num_blocks": [3, 4, 6, 3]},
+    152: {"block": "bottleneck", "num_blocks": [3, 8, 36, 3]},
+    221: {"block": "bottleneck", "num_blocks": [6, 16, 48, 3]},
+    293: {"block": "bottleneck", "num_blocks": [10, 20, 64, 3]},
+}
+
+
 class BasicBlock(nn.Module):
     expansion = 1
 
@@ -108,26 +116,69 @@ class BasicBlock(nn.Module):
         return F.relu(out)
 
 
-class ResNet34(nn.Module):
-    def __init__(self, feat_dim: int = 80, embed_dim: int = 256, m_channels: int = 32):
+class Bottleneck(nn.Module):
+    expansion = 4
+
+    def __init__(self, in_planes: int, planes: int, stride: int = 1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(
+            planes, planes, kernel_size=3, stride=stride, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv3 = nn.Conv2d(planes, planes * self.expansion, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes * self.expansion)
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes * self.expansion:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(
+                    in_planes,
+                    planes * self.expansion,
+                    kernel_size=1,
+                    stride=stride,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(planes * self.expansion),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = F.relu(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
+        out = out + self.shortcut(x)
+        return F.relu(out)
+
+
+class ResNet(nn.Module):
+    def __init__(
+        self,
+        block: type[nn.Module],
+        num_blocks: list[int],
+        feat_dim: int = 80,
+        embed_dim: int = 256,
+        m_channels: int = 32,
+    ):
         super().__init__()
         self.in_planes = m_channels
-        self.stats_dim = int(feat_dim / 8) * m_channels * 8
+        stats_dim = int(feat_dim / 8) * m_channels * 8
         self.conv1 = nn.Conv2d(1, m_channels, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(m_channels)
-        self.layer1 = self._make_layer(m_channels, 3, stride=1)
-        self.layer2 = self._make_layer(m_channels * 2, 4, stride=2)
-        self.layer3 = self._make_layer(m_channels * 4, 6, stride=2)
-        self.layer4 = self._make_layer(m_channels * 8, 3, stride=2)
+        self.layer1 = self._make_layer(block, m_channels, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, m_channels * 2, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, m_channels * 4, num_blocks[2], stride=2)
+        self.layer4 = self._make_layer(block, m_channels * 8, num_blocks[3], stride=2)
         self.pool = TSTP()
-        self.seg_1 = nn.Linear(self.stats_dim * 2, embed_dim)
+        self.seg_1 = nn.Linear(stats_dim * block.expansion * 2, embed_dim)
 
-    def _make_layer(self, planes: int, num_blocks: int, stride: int) -> nn.Sequential:
+    def _make_layer(
+        self, block: type[nn.Module], planes: int, num_blocks: int, stride: int
+    ) -> nn.Sequential:
         strides = [stride] + [1] * (num_blocks - 1)
         layers = []
         for block_stride in strides:
-            layers.append(BasicBlock(self.in_planes, planes, block_stride))
-            self.in_planes = planes * BasicBlock.expansion
+            layers.append(block(self.in_planes, planes, block_stride))
+            self.in_planes = planes * block.expansion
         return nn.Sequential(*layers)
 
     def forward(self, fbank: torch.Tensor) -> torch.Tensor:
@@ -137,8 +188,27 @@ class ResNet34(nn.Module):
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.layer4(out)
-        stats = self.pool(out)
-        return self.seg_1(stats)
+        return self.seg_1(self.pool(out))
+
+
+def infer_depth(state: OrderedDict[str, torch.Tensor]) -> int:
+    counts = []
+    for stage in range(1, 5):
+        n = 0
+        while f"layer{stage}.{n}.conv1.weight" in state:
+            n += 1
+        counts.append(n)
+    kind = "bottleneck" if "layer1.0.conv3.weight" in state else "basic"
+    for depth, spec in DEPTH_TABLE.items():
+        if spec["num_blocks"] == counts and spec["block"] == kind:
+            return depth
+    raise SystemExit(f"unrecognized WeSpeaker topology: blocks={counts} kind={kind}")
+
+
+def build_model(depth: int) -> ResNet:
+    spec = DEPTH_TABLE[depth]
+    block = BasicBlock if spec["block"] == "basic" else Bottleneck
+    return ResNet(block, spec["num_blocks"])
 
 
 def load_state_dict(path: Path) -> OrderedDict[str, torch.Tensor]:
@@ -217,10 +287,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--wav", action="append", default=[], type=Path)
+    parser.add_argument("--depth", type=int, choices=sorted(DEPTH_TABLE.keys()))
     args = parser.parse_args(argv)
 
     state = load_state_dict(args.checkpoint)
-    model = ResNet34()
+    depth = args.depth if args.depth is not None else infer_depth(state)
+    model = build_model(depth)
     missing, unexpected = model.load_state_dict(state, strict=False)
     unexpected = [name for name in unexpected if not name.startswith("projection")]
     if missing or unexpected:
@@ -231,7 +303,8 @@ def main(argv: list[str] | None = None) -> int:
     for wav_path in args.wav:
         named_waveforms.append((wav_path.stem, read_wav(wav_path)))
 
-    out_dir = args.out / "golden"
+    golden_name = "golden" if depth == 34 else f"golden-{depth}"
+    out_dir = args.out / golden_name
     out_dir.mkdir(parents=True, exist_ok=True)
     cases = []
     with torch.no_grad():
@@ -259,14 +332,15 @@ def main(argv: list[str] | None = None) -> int:
 
     manifest = {
         "architecture": "wespeaker-resnet",
-        "depth": 34,
+        "depth": depth,
         "pooling": "TSTP",
         "tstp_eps": 1e-7,
         "unbiased_var": True,
         "window": "hamming",
         "cases": cases,
     }
-    (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    manifest_name = "manifest.json" if depth == 34 else f"manifest-{depth}.json"
+    (args.out / manifest_name).write_text(json.dumps(manifest, indent=2) + "\n")
     return 0
 
 

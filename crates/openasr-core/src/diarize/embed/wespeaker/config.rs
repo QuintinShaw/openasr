@@ -1,7 +1,7 @@
 //! WeSpeaker ResNet size table.
 //!
-//! Four depths share one ggml builder. Stage-1 ships ResNet34 weights; the
-//! remaining rows exist so 152/221/293 do not grow a copied graph.
+//! Four depths share one ggml builder. Depth and block kind are pack metadata;
+//! 152/221/293 do not grow a copied graph.
 
 use crate::ggml_runtime::GgufMetadata;
 

@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -38,6 +40,9 @@ ARCH = "wespeaker-resnet"
 FAMILY = "wespeaker"
 LICENSE_NAME = "CC-BY-4.0"
 PACKAGE_VERSION = "1"
+BUILD_COMMIT_ENV = "OPENASR_BUILD_COMMIT"
+BUILD_COMMIT_KEY = "openasr.build.commit"
+BUILD_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
 DEPTH_TABLE = {
     34: {"block_kind": "basic", "num_blocks": [3, 4, 6, 3]},
@@ -53,6 +58,20 @@ DROP_SUFFIXES = ("num_batches_tracked",)
 
 class ConversionError(RuntimeError):
     pass
+
+
+def build_provenance_from_env() -> Optional[str]:
+    raw = os.environ.get(BUILD_COMMIT_ENV)
+    if raw is None:
+        return None
+    commit = raw.strip().lower()
+    if not commit:
+        return None
+    if BUILD_COMMIT_RE.fullmatch(commit) is None:
+        raise ConversionError(
+            f"{BUILD_COMMIT_ENV} must be a 40-hex git commit sha, got {raw!r}"
+        )
+    return commit
 
 
 def remap_tensor(name: str) -> Optional[str]:
@@ -196,6 +215,9 @@ def write_pack(
     quant_label = {"f16": "fp16", "f32": "f32"}.get(quant, quant)
     writer.add_string("openasr.quantization", quant_label)
     writer.add_string("openasr.license.name", LICENSE_NAME)
+    build_commit = build_provenance_from_env()
+    if build_commit is not None:
+        writer.add_string(BUILD_COMMIT_KEY, build_commit)
 
     writer.add_uint32("wespeaker.embed_dim", 256)
     writer.add_uint32("wespeaker.n_mels", 80)
@@ -222,6 +244,13 @@ def write_pack(
     writer.close()
 
 
+def normalize_quant(quant: str) -> str:
+    """Catalog `fp16` and converter `f16` are the same pack dtype."""
+    if quant == "fp16":
+        return "f16"
+    return quant
+
+
 def convert(
     in_path: Path,
     out_path: Path,
@@ -229,6 +258,7 @@ def convert(
     model_id: str,
     depth: Optional[int] = None,
 ) -> int:
+    quant = normalize_quant(quant)
     state = load_state_dict(in_path)
     canonical = canonicalize_state(state)
     inferred = infer_depth(canonical)
@@ -264,7 +294,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--in", dest="in_path", required=True, type=Path)
     ap.add_argument("--out", dest="out_path", required=True, type=Path)
-    ap.add_argument("--quant", choices=["f32", "f16"], default="f32")
+    ap.add_argument(
+        "--quant",
+        choices=["f32", "f16", "fp16"],
+        default="f32",
+        help="f16 and fp16 are the same pack dtype",
+    )
     ap.add_argument("--model-id", default="wespeaker-voxceleb-resnet34-lm")
     ap.add_argument("--depth", type=int, choices=sorted(DEPTH_TABLE.keys()))
     args = ap.parse_args(argv)

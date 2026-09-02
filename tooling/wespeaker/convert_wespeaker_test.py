@@ -8,9 +8,11 @@ tensor set, dims (ggml ne order), metadata, and f32 payload fidelity.
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -89,6 +91,50 @@ class TopologyInferTest(unittest.TestCase):
         self.assertEqual(C.infer_num_blocks(state), [3, 4, 6, 3])
         self.assertEqual(C.infer_block_kind(state), "basic")
         self.assertEqual(C.infer_depth(state), 34)
+
+    def test_bottleneck_depths_from_official_keys(self):
+        for depth, num_blocks in (
+            (152, [3, 8, 36, 3]),
+            (221, [6, 16, 48, 3]),
+            (293, [10, 20, 64, 3]),
+        ):
+            with self.subTest(depth=depth):
+                state = {
+                    "conv1.weight": np.zeros((32, 1, 3, 3), np.float32),
+                    "layer1.0.conv3.weight": np.zeros((1,), np.float32),
+                    **{
+                        f"layer{stage}.{block}.conv1.weight": np.zeros((1,), np.float32)
+                        for stage, n in enumerate(num_blocks, start=1)
+                        for block in range(n)
+                    },
+                }
+                self.assertEqual(C.infer_num_blocks(state), num_blocks)
+                self.assertEqual(C.infer_block_kind(state), "bottleneck")
+                self.assertEqual(C.infer_depth(state), depth)
+
+
+class QuantAliasTest(unittest.TestCase):
+    def test_catalog_fp16_maps_to_converter_f16(self):
+        self.assertEqual(C.normalize_quant("fp16"), "f16")
+        self.assertEqual(C.normalize_quant("f16"), "f16")
+        self.assertEqual(C.normalize_quant("f32"), "f32")
+
+
+class BuildProvenanceTest(unittest.TestCase):
+    def test_missing_env_is_optional(self):
+        with mock.patch.dict("os.environ", {}, clear=False):
+            os.environ.pop(C.BUILD_COMMIT_ENV, None)
+            self.assertIsNone(C.build_provenance_from_env())
+
+    def test_rejects_non_sha(self):
+        with mock.patch.dict("os.environ", {C.BUILD_COMMIT_ENV: "not-a-commit"}):
+            with self.assertRaises(C.ConversionError):
+                C.build_provenance_from_env()
+
+    def test_accepts_40_hex(self):
+        commit = "a" * 40
+        with mock.patch.dict("os.environ", {C.BUILD_COMMIT_ENV: commit}):
+            self.assertEqual(C.build_provenance_from_env(), commit)
 
 
 class RoundTripTest(unittest.TestCase):

@@ -920,16 +920,26 @@ impl GgmlCpuGraphConfig {
     /// initialized context or loaded backend, so this is safe to call at config
     /// time.
     pub fn metadata_context_bytes(graph_size: usize) -> usize {
-        let per_tensor = unsafe { ffi::ggml_tensor_overhead() };
-        let graph = unsafe { ffi::ggml_graph_overhead_custom(graph_size, false) };
-        let full = graph_size.saturating_mul(per_tensor).saturating_add(graph);
+        let full = Self::metadata_context_bytes_exact(graph_size);
         if full <= DEFAULT_CONTEXT_BYTES {
             return full;
         }
+        let graph = unsafe { ffi::ggml_graph_overhead_custom(graph_size, false) };
         if graph_size <= DEFAULT_GRAPH_SIZE && graph <= DEFAULT_CONTEXT_BYTES / 2 {
             return DEFAULT_CONTEXT_BYTES;
         }
         full
+    }
+
+    /// Llama.cpp compute-meta formula with no 1 MiB headroom cap. Families whose
+    /// *live* graph objects exceed that bump (deep WeSpeaker ResNets) must use
+    /// this instead of passing a 4096-slot capacity into
+    /// [`Self::metadata_context_bytes`].
+    pub fn metadata_context_bytes_exact(graph_size: usize) -> usize {
+        let graph_size = graph_size.max(1);
+        let per_tensor = unsafe { ffi::ggml_tensor_overhead() };
+        let graph = unsafe { ffi::ggml_graph_overhead_custom(graph_size, false) };
+        graph_size.saturating_mul(per_tensor).saturating_add(graph)
     }
 
     /// Keep the cgraph node capacity and its `no_alloc` metadata backing in

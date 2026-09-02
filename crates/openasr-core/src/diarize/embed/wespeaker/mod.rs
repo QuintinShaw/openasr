@@ -175,9 +175,22 @@ mod tests {
         (shape, values)
     }
 
-    fn golden_cases(root: &Path) -> Vec<String> {
+    const GOLDEN_DEPTHS: [u32; 4] = [34, 152, 221, 293];
+
+    fn golden_dir(root: &Path, depth: u32) -> PathBuf {
+        if depth == 34 {
+            root.join("golden")
+        } else {
+            root.join(format!("golden-{depth}"))
+        }
+    }
+
+    fn pack_path(root: &Path, depth: u32) -> PathBuf {
+        root.join(format!("wespeaker-resnet{depth}-f32.oasr"))
+    }
+
+    fn golden_cases(dir: &Path) -> Vec<String> {
         let mut names = Vec::new();
-        let dir = root.join("golden");
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return names;
         };
@@ -196,79 +209,96 @@ mod tests {
         let Some(root) = spike_root() else {
             return;
         };
-        let pack = root.join("wespeaker-resnet34-f32.oasr");
-        if !pack.exists() {
-            eprintln!("skipping: missing {}", pack.display());
-            return;
-        }
-        let embedder = WeSpeakerEmbedder::from_oasr(&pack).expect("load wespeaker pack");
         let placement = if backend == GgmlCpuGraphBackend::Cpu {
             ExecutionPlacement::CpuOnly
         } else {
             ExecutionPlacement::FullDevice
         };
-        let mut runtime = WeSpeakerResidentRuntime::new(
-            embedder.shared_weights(),
-            embedder.config(),
-            Some(1),
-            backend,
-            placement,
-        )
-        .expect("construct wespeaker resident runtime");
         let mut ran = 0usize;
-        for name in golden_cases(&root) {
-            let wav_path = root.join("golden").join(format!("{name}.wav.npy"));
-            let fbank_path = root.join("golden").join(format!("{name}.fbank.npy"));
-            let emb_path = root.join("golden").join(format!("{name}.embedding.npy"));
-            if !wav_path.exists() || !fbank_path.exists() || !emb_path.exists() {
+        for depth in GOLDEN_DEPTHS {
+            let pack = pack_path(&root, depth);
+            let golden = golden_dir(&root, depth);
+            if !pack.exists() || !golden.is_dir() {
+                eprintln!("skipping depth {depth}: missing pack or goldens");
                 continue;
             }
-            let (_, wav) = load_npy_f32(&wav_path);
-            let (fbank_shape, fbank_ref) = load_npy_f32(&fbank_path);
-            let (_, emb_ref) = load_npy_f32(&emb_path);
-            let (fbank, frames) = embedder.compute_fbank(&wav);
+            let embedder = WeSpeakerEmbedder::from_oasr(&pack).expect("load wespeaker pack");
             assert_eq!(
-                frames,
-                fbank_shape.first().copied().unwrap_or(0),
-                "{name} frames"
+                embedder.config().depth,
+                depth,
+                "pack depth must match spike layout"
             );
-            let fbank_cos = cosine(&fbank, &fbank_ref);
-            let fbank_max = max_abs_diff(&fbank, &fbank_ref);
-            println!("wespeaker frontend {name} cosine={fbank_cos:.8} max_abs={fbank_max:.6e}");
+            let mut runtime = WeSpeakerResidentRuntime::new(
+                embedder.shared_weights(),
+                embedder.config(),
+                Some(1),
+                backend,
+                placement,
+            )
+            .expect("construct wespeaker resident runtime");
+            let mut depth_ran = 0usize;
+            for name in golden_cases(&golden) {
+                let wav_path = golden.join(format!("{name}.wav.npy"));
+                let fbank_path = golden.join(format!("{name}.fbank.npy"));
+                let emb_path = golden.join(format!("{name}.embedding.npy"));
+                if !wav_path.exists() || !fbank_path.exists() || !emb_path.exists() {
+                    continue;
+                }
+                let (_, wav) = load_npy_f32(&wav_path);
+                let (fbank_shape, fbank_ref) = load_npy_f32(&fbank_path);
+                let (_, emb_ref) = load_npy_f32(&emb_path);
+                let (fbank, frames) = embedder.compute_fbank(&wav);
+                assert_eq!(
+                    frames,
+                    fbank_shape.first().copied().unwrap_or(0),
+                    "depth {depth} {name} frames"
+                );
+                let fbank_cos = cosine(&fbank, &fbank_ref);
+                let fbank_max = max_abs_diff(&fbank, &fbank_ref);
+                println!(
+                    "wespeaker frontend depth={depth} {name} cosine={fbank_cos:.8} max_abs={fbank_max:.6e}"
+                );
+                assert!(
+                    fbank_cos >= 0.999 && fbank_max < 1e-3,
+                    "depth {depth} {name} frontend cosine={fbank_cos} max_abs={fbank_max}"
+                );
+                let (features, frames) = embedder
+                    .prepare_embedding_input(&wav, 16_000)
+                    .expect("prepare");
+                let raw = runtime
+                    .forward(&features, frames, Some(1))
+                    .expect("wespeaker forward");
+                let embedding = SpeakerEmbedding::l2_normalized(raw);
+                let cos = cosine(&embedding.0, &emb_ref);
+                println!(
+                    "wespeaker e2e depth={depth} {name} backend={backend:?} cosine={cos:.8} dim={}",
+                    embedding.dim()
+                );
+                assert!(
+                    cos >= 0.999,
+                    "depth {depth} {name} backend={backend:?} cosine {cos} below 0.999"
+                );
+                depth_ran += 1;
+                ran += 1;
+            }
             assert!(
-                fbank_cos >= 0.999 && fbank_max < 1e-3,
-                "{name} frontend cosine={fbank_cos} max_abs={fbank_max}"
+                depth_ran > 0,
+                "no golden cases for depth {depth} under {}",
+                golden.display()
             );
-            let (features, frames) = embedder
-                .prepare_embedding_input(&wav, 16_000)
-                .expect("prepare");
-            let raw = runtime
-                .forward(&features, frames, Some(1))
-                .expect("wespeaker forward");
-            let embedding = SpeakerEmbedding::l2_normalized(raw);
-            let cos = cosine(&embedding.0, &emb_ref);
-            println!(
-                "wespeaker e2e {name} backend={backend:?} cosine={cos:.8} dim={}",
-                embedding.dim()
-            );
-            assert!(
-                cos >= 0.999,
-                "{name} backend={backend:?} cosine {cos} below 0.999"
-            );
-            ran += 1;
         }
         assert!(ran > 0, "no golden cases under {}", root.display());
     }
 
     #[test]
-    #[ignore = "host-local: needs OPENASR_WESPEAKER_SPIKE_ROOT with converted f32 pack and dump_reference goldens"]
-    fn wespeaker_resnet34_matches_pytorch_on_cpu() {
+    #[ignore = "host-local: needs OPENASR_WESPEAKER_SPIKE_ROOT with converted f32 packs and dump_reference goldens"]
+    fn wespeaker_resnet_matches_pytorch_on_cpu() {
         run_backend(GgmlCpuGraphBackend::Cpu);
     }
 
     #[test]
     #[ignore = "host-local: needs OPENASR_WESPEAKER_SPIKE_ROOT; Metal correctness not a perf gate"]
-    fn wespeaker_resnet34_matches_pytorch_on_metal() {
+    fn wespeaker_resnet_matches_pytorch_on_metal() {
         run_backend(GgmlCpuGraphBackend::Gpu);
     }
 }

@@ -463,25 +463,36 @@ fn forward<'a>(
     )?)
 }
 
-const WESPEAKER_GRAPH_NODE_CAPACITY: usize = 1usize << 12;
+fn graph_node_capacity(config: ResNetConfig) -> usize {
+    let blocks: usize = config.num_blocks.iter().sum();
+    let per_block = match config.block_kind {
+        BlockKind::Basic => 32,
+        BlockKind::Bottleneck => 48,
+    };
+    128usize
+        .saturating_add(blocks.saturating_mul(per_block))
+        .next_power_of_two()
+        .clamp(256, 1 << 14)
+}
 
 fn runner_config_with_threads(
     n_threads: Option<usize>,
     backend: GgmlCpuGraphBackend,
     placement: crate::device::execution_policy::ExecutionPlacement,
+    topology: ResNetConfig,
 ) -> GgmlCpuGraphConfig {
-    let graph_size = WESPEAKER_GRAPH_NODE_CAPACITY;
+    let graph_size = graph_node_capacity(topology);
     let mut config = GgmlCpuGraphConfig::runtime_default_for_resolved_backend(backend);
-    config.context_bytes = GgmlCpuGraphConfig::metadata_context_bytes(graph_size);
     config.graph_size = graph_size;
+    config.context_bytes = GgmlCpuGraphConfig::metadata_context_bytes_exact(graph_size);
     if n_threads.is_some() {
         config.n_threads = n_threads;
     }
     crate::models::graph_runtime_config::apply_execution_placement(config, placement)
 }
 
-fn graph_context_bytes() -> usize {
-    GgmlCpuGraphConfig::metadata_context_bytes(WESPEAKER_GRAPH_NODE_CAPACITY)
+fn graph_context_bytes(topology: ResNetConfig) -> usize {
+    GgmlCpuGraphConfig::metadata_context_bytes_exact(graph_node_capacity(topology))
 }
 
 fn arena_context_bytes(static_tensors: usize) -> usize {
@@ -519,8 +530,9 @@ impl WeSpeakerResidentRuntime {
         placement: crate::device::execution_policy::ExecutionPlacement,
     ) -> Result<Self, WeSpeakerBackboneError> {
         let expected = expected_static_tensor_count(config);
-        let runner =
-            GgmlCpuGraphRunner::new(runner_config_with_threads(n_threads, backend, placement))?;
+        let runner = GgmlCpuGraphRunner::new(runner_config_with_threads(
+            n_threads, backend, placement, config,
+        ))?;
         let arena = runner.start_static_tensor_arena(arena_context_bytes(expected))?;
         let mut builder = WBuilder::new(&weights);
         let loaded = load_weights(&mut builder, &arena, config)?;
@@ -575,7 +587,9 @@ impl WeSpeakerResidentRuntime {
             self.graph = None;
             let mut session = self
                 .runner
-                .start_persistent_graph_session(graph_context_bytes())?;
+                .start_persistent_graph_session(graph_context_bytes(
+                    self.resident.weights.config,
+                ))?;
             let graph = session.builder();
             let input = graph.new_tensor_2d_f32(frames, N_MELS, "wespeaker_fbank_input")?;
             let output = forward(graph, input, frames, &self.resident.weights)?;
@@ -666,5 +680,26 @@ mod tests {
     #[test]
     fn resnet34_static_tensor_count_is_stable() {
         assert_eq!(expected_static_tensor_count(config::RESNET34), 111);
+    }
+
+    #[test]
+    fn bottleneck_depths_reserve_metadata_beyond_the_1mib_bump() {
+        let bump = 1024 * 1024;
+        assert!(graph_context_bytes(config::RESNET34) <= bump);
+        for topology in [config::RESNET152, config::RESNET221, config::RESNET293] {
+            let bytes = graph_context_bytes(topology);
+            assert!(
+                bytes > bump,
+                "depth {} metadata {bytes} must exceed the 1 MiB capacity cap that SIGSEGV'd ResNet221",
+                topology.depth
+            );
+            assert!(
+                graph_node_capacity(topology) >= expected_static_tensor_count(topology),
+                "depth {} node capacity must cover static tensors",
+                topology.depth
+            );
+        }
+        assert!(graph_node_capacity(config::RESNET293) > graph_node_capacity(config::RESNET221));
+        assert!(graph_context_bytes(config::RESNET293) > graph_context_bytes(config::RESNET221));
     }
 }
