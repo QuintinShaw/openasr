@@ -238,6 +238,12 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   are retained. See
   [Graph cancellation contract](design/graph-cancellation.md).
   Pause still only blocks at slice boundaries and never arms graph cancellation.
+- `POST /v1/audio/transcriptions?stream=true` shares owner checks, cancel
+  control, and `finish_file` cleanup with JSON file jobs, but a busy server
+  rejects the stream with HTTP 429 instead of enqueueing it on the cancelable
+  file FIFO. JSON `POST /v1/audio/transcriptions` still queues. Desktop remote
+  file transcription uses the JSON endpoint. A later change can emit a queued
+  SSE event and then stream the result.
 
 ## What works now
 
