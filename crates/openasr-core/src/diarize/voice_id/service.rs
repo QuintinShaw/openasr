@@ -282,6 +282,7 @@ mod tests {
 
         fn identity(&self) -> Option<SpeakerEmbedderIdentity> {
             Some(SpeakerEmbedderIdentity {
+                family: crate::diarize::embed::SpeakerEmbedderFamily::ReDimNet2,
                 embedding_dim: 192,
                 pack_fingerprint: "test-pack".to_string(),
             })

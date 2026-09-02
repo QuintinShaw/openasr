@@ -43,11 +43,12 @@ pub(crate) fn refine_labels(
     embeddings: &[SpeakerEmbedding],
     context: &[ClusterContext],
     initial: &[SpeakerId],
+    embedder: &dyn SpeakerEmbedder,
 ) -> Option<Vec<SpeakerId>> {
     if embeddings.len() != context.len() || embeddings.len() != initial.len() {
         return None;
     }
-    if !vbx_enabled() || !should_refine(embeddings, context, initial) {
+    if !vbx_enabled() || !should_refine(embedder, embeddings, context, initial) {
         return None;
     }
 
@@ -145,14 +146,23 @@ fn plda_merge_threshold() -> f32 {
         .unwrap_or(PLDA_MERGE_THRESHOLD)
 }
 
+fn wespeaker_256d_space(embedder: &dyn SpeakerEmbedder) -> bool {
+    embedder.identity().is_some_and(|identity| {
+        identity.family == crate::diarize::embed::SpeakerEmbedderFamily::WeSpeakerResNet
+            && identity.embedding_dim == INPUT_DIM
+    })
+}
+
 fn should_refine(
+    embedder: &dyn SpeakerEmbedder,
     embeddings: &[SpeakerEmbedding],
     context: &[ClusterContext],
     initial: &[SpeakerId],
 ) -> bool {
-    embeddings
-        .first()
-        .is_some_and(|embedding| embedding.dim() == INPUT_DIM)
+    wespeaker_256d_space(embedder)
+        && embeddings
+            .first()
+            .is_some_and(|embedding| embedding.dim() == INPUT_DIM)
         && embeddings.len() >= DENSE_MIN_EMBEDDINGS
         && speaker_count(initial) >= DENSE_MIN_INITIAL_SPEAKERS
         && context
@@ -165,7 +175,7 @@ fn should_refine_dense(
     context: &[ClusterContext],
     initial: &[SpeakerId],
 ) -> bool {
-    embedder.embedding_dim() == INPUT_DIM
+    wespeaker_256d_space(embedder)
         && context.len() == initial.len()
         && context.len() >= DENSE_MIN_EMBEDDINGS
         && speaker_count(initial) >= DENSE_MIN_INITIAL_SPEAKERS
@@ -1225,14 +1235,61 @@ mod tests {
     }
 
     #[test]
-    fn vbx_gate_is_dense_redimnet_context_only() {
+    fn vbx_gate_requires_wespeaker_family_and_256d() {
+        struct FamilyEmbedder {
+            family: crate::diarize::embed::SpeakerEmbedderFamily,
+            dim: usize,
+        }
+        impl SpeakerEmbedder for FamilyEmbedder {
+            fn embed(
+                &self,
+                _samples: &[f32],
+                _sample_rate_hz: u32,
+            ) -> Result<crate::diarize::contract::SpeakerEmbedding, crate::diarize::embed::EmbedError>
+            {
+                unreachable!("vbx gate must not embed")
+            }
+            fn embedding_dim(&self) -> usize {
+                self.dim
+            }
+            fn identity(&self) -> Option<crate::diarize::embed::SpeakerEmbedderIdentity> {
+                Some(crate::diarize::embed::SpeakerEmbedderIdentity {
+                    family: self.family,
+                    embedding_dim: self.dim,
+                    pack_fingerprint: "vbx-gate".to_string(),
+                })
+            }
+        }
         let embedding = SpeakerEmbedding(vec![0.0; INPUT_DIM]);
         let context = ClusterContext {
             range: TimeRange::new(0.0, 1.0),
             local_speaker: Some(SpeakerId(0)),
             overlap: false,
         };
+        let contexts = vec![context; DENSE_MIN_EMBEDDINGS];
+        let embeddings = vec![embedding.clone(); DENSE_MIN_EMBEDDINGS];
+        let labels = vec![SpeakerId(0); DENSE_MIN_EMBEDDINGS]
+            .into_iter()
+            .enumerate()
+            .map(|(i, _)| SpeakerId(i as u32 % DENSE_MIN_INITIAL_SPEAKERS as u32))
+            .collect::<Vec<_>>();
+        let redimnet = FamilyEmbedder {
+            family: crate::diarize::embed::SpeakerEmbedderFamily::ReDimNet2,
+            dim: 192,
+        };
+        assert!(!should_refine(&redimnet, &embeddings, &contexts, &labels));
+        let dim_only = FamilyEmbedder {
+            family: crate::diarize::embed::SpeakerEmbedderFamily::ReDimNet2,
+            dim: INPUT_DIM,
+        };
+        assert!(!should_refine(&dim_only, &embeddings, &contexts, &labels));
+        let wespeaker = FamilyEmbedder {
+            family: crate::diarize::embed::SpeakerEmbedderFamily::WeSpeakerResNet,
+            dim: INPUT_DIM,
+        };
+        assert!(should_refine(&wespeaker, &embeddings, &contexts, &labels));
         assert!(!should_refine(
+            &wespeaker,
             &[embedding.clone(), embedding],
             &[context, context],
             &[SpeakerId(0), SpeakerId(1)]

@@ -8,11 +8,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::diarize::calibration::{
-    REDIMNET_CALIBRATION, REDIMNET_CALIBRATION_VERSION, SpeakerCalibrationProfile,
+    REDIMNET_CALIBRATION_VERSION, SpeakerCalibrationProfile, WESPEAKER_CALIBRATION_VERSION,
 };
-use crate::diarize::embed::SpeakerEmbedderIdentity;
+use crate::diarize::embed::{SpeakerEmbedderFamily, SpeakerEmbedderIdentity};
 
 const REDIMNET_MODEL_VERSION: &str = "redimnet2-b6-cn-v1";
+const WESPEAKER_MODEL_VERSION: &str = "wespeaker-resnet-v1";
+const WESPEAKER_FRONTEND_VERSION: &str = "wespeaker-kaldi-hamming-v1";
 
 /// Matcher policy version for quality-aware medoid prototypes + person-level
 /// margin. Bump when scoring, clustering distance, prototype cap, or support
@@ -77,7 +79,7 @@ impl EmbeddingSpace {
         calibration: SpeakerCalibrationProfile,
     ) -> Self {
         let (family, model_id, model_version, frontend, cal_version) =
-            describe_embedder(identity.embedding_dim, calibration);
+            describe_embedder(identity, calibration);
         Self::from_parts(
             identity.embedding_dim,
             identity.pack_fingerprint.clone(),
@@ -155,8 +157,8 @@ impl EmbeddingSpace {
 }
 
 fn describe_embedder(
-    embedding_dim: usize,
-    calibration: SpeakerCalibrationProfile,
+    identity: &SpeakerEmbedderIdentity,
+    _calibration: SpeakerCalibrationProfile,
 ) -> (
     &'static str,
     &'static str,
@@ -164,22 +166,21 @@ fn describe_embedder(
     &'static str,
     &'static str,
 ) {
-    // Only ReDimNet2-B6 is a supported live embedder. Anything else still forms
-    // a space so fail-closed comparison works, but uses explicit unknown markers.
-    let is_redimnet = calibration.enrollment_default_match_similarity
-        == REDIMNET_CALIBRATION.enrollment_default_match_similarity
-        && calibration.enrollment_match_margin == REDIMNET_CALIBRATION.enrollment_match_margin
-        && embedding_dim == 192;
-    if is_redimnet {
-        (
+    match identity.family {
+        SpeakerEmbedderFamily::ReDimNet2 => (
             "redimnet",
             "redimnet2-b6",
             REDIMNET_MODEL_VERSION,
             REDIMNET_FRONTEND_VERSION,
             REDIMNET_CALIBRATION_VERSION,
-        )
-    } else {
-        ("unknown", "unknown", "unknown", "unknown", "unknown")
+        ),
+        SpeakerEmbedderFamily::WeSpeakerResNet => (
+            "wespeaker",
+            "wespeaker-resnet",
+            WESPEAKER_MODEL_VERSION,
+            WESPEAKER_FRONTEND_VERSION,
+            WESPEAKER_CALIBRATION_VERSION,
+        ),
     }
 }
 
@@ -245,5 +246,29 @@ mod tests {
             MATCHER_POLICY_VERSION,
         );
         assert!(!legacy.is_comparable_to(&modern));
+    }
+
+    #[test]
+    fn for_active_embedder_uses_identity_family_not_calibration_heuristic() {
+        let wespeaker = EmbeddingSpace::for_active_embedder(
+            &SpeakerEmbedderIdentity {
+                family: SpeakerEmbedderFamily::WeSpeakerResNet,
+                embedding_dim: 256,
+                pack_fingerprint: "sha256:ws".to_string(),
+            },
+            crate::diarize::calibration::WESPEAKER_CALIBRATION,
+        );
+        assert_eq!(wespeaker.embedder_family, "wespeaker");
+        assert_eq!(wespeaker.dimension, 256);
+        let redimnet = EmbeddingSpace::for_active_embedder(
+            &SpeakerEmbedderIdentity {
+                family: SpeakerEmbedderFamily::ReDimNet2,
+                embedding_dim: 192,
+                pack_fingerprint: "sha256:rd".to_string(),
+            },
+            crate::diarize::calibration::REDIMNET_CALIBRATION,
+        );
+        assert_eq!(redimnet.embedder_family, "redimnet");
+        assert_ne!(wespeaker.space_id, redimnet.space_id);
     }
 }

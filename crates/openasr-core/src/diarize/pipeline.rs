@@ -184,7 +184,9 @@ impl<'a> BatchDiarizer<'a> {
         let mut labels = self
             .clusterer
             .cluster_with_context(&embeddings, &context, hint);
-        if let Some(refined) = super::vbx::refine_labels(&embeddings, &context, &labels) {
+        if let Some(refined) =
+            super::vbx::refine_labels(&embeddings, &context, &labels, self.embedder)
+        {
             labels = refined;
         }
         if let Some(refined) = super::vbx::refine_dense_labels(

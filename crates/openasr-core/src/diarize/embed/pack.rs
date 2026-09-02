@@ -1,26 +1,47 @@
 //! Runtime resolution of the speaker-embedder weight pack.
 //!
-//! Only ReDimNet2-B6 is supported (`OPENASR_REDIMNET_PACK` / installed model-id
-//! hint `redimnet`, 192-d, ggml graph). When the pack is absent, resolution returns
-//! `None` and callers fail closed with a clear "install redimnet2-b6-cn" error
-//! rather than falling back to any other embedder.
+//! Default capability and catalog required pack remain ReDimNet2-B6
+//! (`OPENASR_REDIMNET_PACK` / installed model-id hint `redimnet2-b6-cn`).
+//! WeSpeaker ResNet loads only on an explicit preference or
+//! `OPENASR_WESPEAKER_PACK`. A broken override fails closed and never falls
+//! back.
 
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::arch::GENERAL_ARCHITECTURE_KEY;
+use crate::config::VoiceIdEmbedderPreference;
+use crate::models::{
+    aux_pack_registry::{AuxPackKind, REDIMNET2_GGML_ARCHITECTURE_ID},
+    pack_verifier::{PackCandidate, PackRoute, PackVerifier},
+};
+
+use super::EmbedError;
+
 const REDIMNET_PACK_ENV: &str = "OPENASR_REDIMNET_PACK";
 const REDIMNET_INSTALLED_MODEL_ID_HINT: &str = "redimnet2-b6-cn";
 const REDIMNET_PREFERRED_QUANT: &str = "fp16";
+const WESPEAKER_PACK_ENV: &str = "OPENASR_WESPEAKER_PACK";
+const WESPEAKER_INSTALLED_MODEL_ID_HINT: &str = "wespeaker";
+const WESPEAKER_PREFERRED_QUANT: &str = "fp16";
 pub(crate) const REDIMNET_PACK_PREFERENCE: crate::capability_pack::CapabilityPackPreference =
     crate::capability_pack::CapabilityPackPreference::new(
         SPEAKER_EMBEDDER_PACK_ID,
         REDIMNET_INSTALLED_MODEL_ID_HINT,
         REDIMNET_PREFERRED_QUANT,
     );
+pub(crate) const WESPEAKER_PACK_PREFERENCE: crate::capability_pack::CapabilityPackPreference =
+    crate::capability_pack::CapabilityPackPreference::new(
+        WESPEAKER_EMBEDDER_PACK_ID,
+        WESPEAKER_INSTALLED_MODEL_ID_HINT,
+        WESPEAKER_PREFERRED_QUANT,
+    );
 
-/// Catalog / pull id of the only supported speaker-embedder pack.
+/// Catalog / pull id of the default speaker-embedder pack.
 pub const SPEAKER_EMBEDDER_PACK_ID: &str = "redimnet2-b6-cn";
+/// Catalog / pull id of the optional WeSpeaker ResNet34 pack.
+pub const WESPEAKER_EMBEDDER_PACK_ID: &str = "wespeaker-voxceleb-resnet34-lm";
 
 /// User-facing label for the only supported speaker-embedder pack.
 pub const SPEAKER_EMBEDDER_PACK_LABEL: &str =
@@ -57,21 +78,140 @@ pub const VOICE_ID_NAMING_EMBEDDER_MISSING_REASON: &str = "Voice ID needs the Re
 /// fingerprint and stays compatible even if this label changes.
 pub(crate) const REDIMNET_EMBEDDING_SPACE_VERSION: &str = "redimnet2-b6-cn-v1";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeakerEmbedderFamily {
+    ReDimNet2,
+    WeSpeakerResNet,
+}
+
+impl SpeakerEmbedderFamily {
+    pub fn architecture_id(self) -> &'static str {
+        match self {
+            Self::ReDimNet2 => REDIMNET2_GGML_ARCHITECTURE_ID,
+            Self::WeSpeakerResNet => {
+                crate::models::aux_pack_registry::WESPEAKER_RESNET_ARCHITECTURE_ID
+            }
+        }
+    }
+
+    pub fn pack_id(self) -> &'static str {
+        match self {
+            Self::ReDimNet2 => SPEAKER_EMBEDDER_PACK_ID,
+            Self::WeSpeakerResNet => WESPEAKER_EMBEDDER_PACK_ID,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpeakerEmbedderIdentity {
+    pub family: SpeakerEmbedderFamily,
     pub embedding_dim: usize,
     pub pack_fingerprint: String,
+}
+
+pub(crate) struct PreparedSelectedEmbedder {
+    pub(crate) family: SpeakerEmbedderFamily,
+    pub(crate) source: PreparedEmbedderSource,
+}
+
+pub(crate) struct PreparedEmbedderSource {
+    verified_pack: crate::models::pack_verifier::VerifiedPack,
+    content_id: String,
+}
+
+impl PreparedEmbedderSource {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        crate::models::pack_verifier::VerifiedPack,
+        crate::ggml_runtime::GgufRuntimeSourcePreflight,
+        String,
+    ) {
+        let preflight = self.verified_pack.preflight().clone();
+        (self.verified_pack, preflight, self.content_id)
+    }
 }
 
 pub(crate) fn redimnet_pack_path() -> Option<PathBuf> {
     crate::diarize::pack::resolve_pack(REDIMNET_PACK_ENV, REDIMNET_PACK_PREFERENCE)
 }
 
-/// Whether the ReDimNet2-B6 embedder pack is resolvable right now (env override
-/// or installed location), without loading the weights. The actual load is
-/// always performed by the injected policy-owned runtime.
+pub(crate) fn wespeaker_pack_path() -> Option<PathBuf> {
+    crate::diarize::pack::resolve_pack(WESPEAKER_PACK_ENV, WESPEAKER_PACK_PREFERENCE)
+}
+
+/// Default capability probe: whether the ReDimNet2-B6 pack is resolvable.
+/// WeSpeaker presence does not flip diarization capability on.
 pub fn embedder_pack_installed() -> bool {
     redimnet_pack_path().is_some()
+}
+
+fn wespeaker_env_override_set() -> bool {
+    std::env::var_os(WESPEAKER_PACK_ENV).is_some_and(|value| !value.is_empty())
+}
+
+/// Select the embedder family and pin its pack identity without constructing a
+/// runtime. `OPENASR_WESPEAKER_PACK` forces WeSpeaker. Explicit WeSpeaker
+/// preference never falls back to ReDimNet. A present-but-invalid pack fails
+/// closed.
+pub(crate) fn prepare_embedder(
+    preference: VoiceIdEmbedderPreference,
+) -> Result<Option<PreparedSelectedEmbedder>, EmbedError> {
+    let (family, path) =
+        if wespeaker_env_override_set() || preference == VoiceIdEmbedderPreference::WeSpeaker {
+            (
+                SpeakerEmbedderFamily::WeSpeakerResNet,
+                wespeaker_pack_path(),
+            )
+        } else {
+            (SpeakerEmbedderFamily::ReDimNet2, redimnet_pack_path())
+        };
+    let Some(path) = path else {
+        if family == SpeakerEmbedderFamily::WeSpeakerResNet {
+            return Err(EmbedError::Unavailable(format!(
+                "WeSpeaker speaker-embedder pack ({WESPEAKER_EMBEDDER_PACK_ID}) is not installed; install it or unset OPENASR_WESPEAKER_PACK"
+            )));
+        }
+        return Ok(None);
+    };
+    let verified_pack = PackVerifier
+        .verify_candidate(PackCandidate::new(&path))
+        .map_err(|error| EmbedError::Unavailable(format!("{}: {error}", path.display())))?;
+    if !matches!(
+        verified_pack.route(),
+        PackRoute::Aux {
+            kind: AuxPackKind::Diarization,
+            ..
+        }
+    ) {
+        return Err(EmbedError::Unavailable(format!(
+            "{}: pack route is not auxiliary diarization: {:?}",
+            path.display(),
+            verified_pack.route()
+        )));
+    }
+    let architecture = verified_pack
+        .preflight()
+        .metadata()
+        .get_string(GENERAL_ARCHITECTURE_KEY)
+        .map(str::trim)
+        .unwrap_or("");
+    if architecture != family.architecture_id() {
+        return Err(EmbedError::Unavailable(format!(
+            "{}: general.architecture is '{architecture}', expected '{}' for {}",
+            path.display(),
+            family.architecture_id(),
+            family.pack_id()
+        )));
+    }
+    let content_id = verified_pack.content_id().to_string();
+    Ok(Some(PreparedSelectedEmbedder {
+        family,
+        source: PreparedEmbedderSource {
+            verified_pack,
+            content_id,
+        },
+    }))
 }
 /// Content fingerprint of the embedder pack: `sha256:<hex>`.
 ///
@@ -125,6 +265,8 @@ mod tests {
     fn redimnet_pack_env_name_is_stable() {
         assert_eq!(REDIMNET_PACK_ENV, "OPENASR_REDIMNET_PACK");
         assert_eq!(REDIMNET_INSTALLED_MODEL_ID_HINT, "redimnet2-b6-cn");
+        assert_eq!(WESPEAKER_PACK_ENV, "OPENASR_WESPEAKER_PACK");
+        assert_eq!(WESPEAKER_EMBEDDER_PACK_ID, "wespeaker-voxceleb-resnet34-lm");
     }
 
     #[test]
@@ -294,5 +436,14 @@ mod tests {
                 "reason must not use the retired dual-path wording: {reason}"
             );
         }
+    }
+
+    #[test]
+    fn selected_wespeaker_reason_names_its_pack_id() {
+        let reason = format!(
+            "WeSpeaker speaker-embedder pack ({WESPEAKER_EMBEDDER_PACK_ID}) is not installed; install it or unset OPENASR_WESPEAKER_PACK"
+        );
+        assert!(reason.contains(WESPEAKER_EMBEDDER_PACK_ID));
+        assert!(reason.to_ascii_lowercase().contains("wespeaker"));
     }
 }

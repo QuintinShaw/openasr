@@ -402,6 +402,9 @@ pub struct TranscriptionRequest {
     /// not a multipart/per-job picker.
     #[doc(hidden)]
     pub voice_id_segmenter: crate::config::VoiceIdSegmenterPreference,
+    /// Persisted speaker-embedder preference. Default remains ReDimNet2.
+    #[doc(hidden)]
+    pub voice_id_embedder: crate::config::VoiceIdEmbedderPreference,
     /// Exact speaker count to force during diarization clustering (the
     /// `DiarizeHint::NumSpeakers` hint), in
     /// `1..=crate::diarize::contract::MAX_DIARIZATION_SPEAKERS`; `None` lets
@@ -484,6 +487,7 @@ impl TranscriptionRequest {
             voice_id: false,
             anonymous_diarize: false,
             voice_id_segmenter: crate::config::VoiceIdSegmenterPreference::Auto,
+            voice_id_embedder: crate::config::VoiceIdEmbedderPreference::ReDimNet2,
             diarize_speakers: None,
             punctuate: true,
             source: RequestSource::default(),

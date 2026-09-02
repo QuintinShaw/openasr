@@ -2637,6 +2637,11 @@ pub struct NativeExecutionServices {
             super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
             crate::diarize::embed::RedimNetResidentRuntime,
         >,
+    wespeaker_runtime_actors:
+        super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool<
+            super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
+            crate::diarize::embed::WeSpeakerResidentRuntime,
+        >,
     firered_stream_vad_realtime_actors:
         super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool<
             super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
@@ -2735,6 +2740,15 @@ impl NativeExecutionServices {
                         crate::diarize::embed::REDIMNET_MAX_BATCH_WORKERS,
                     ),
                 ),
+            wespeaker_runtime_actors:
+                super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool::new(
+                    "openasr-wespeaker-owner",
+                    super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+                        crate::diarize::embed::REDIMNET_MAX_BATCH_WORKERS,
+                        crate::host::host_available_memory_bytes().unwrap_or(u64::MAX),
+                        crate::diarize::embed::REDIMNET_MAX_BATCH_WORKERS,
+                    ),
+                ),
             firered_stream_vad_realtime_actors:
                 super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool::new(
                     "openasr-firered-vad-realtime-owner",
@@ -2808,6 +2822,15 @@ impl NativeExecutionServices {
         &self.redimnet_runtime_actors
     }
 
+    pub(crate) fn wespeaker_runtime_actors(
+        &self,
+    ) -> &super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool<
+        super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
+        crate::diarize::embed::WeSpeakerResidentRuntime,
+    > {
+        &self.wespeaker_runtime_actors
+    }
+
     pub(crate) fn firered_stream_vad_realtime_actors(
         &self,
     ) -> &super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool<
@@ -2835,6 +2858,7 @@ impl NativeExecutionServices {
         self.diarizen_segmenter_actors.clear();
         self.pyannote_segmenter_actors.clear();
         self.redimnet_runtime_actors.clear();
+        self.wespeaker_runtime_actors.clear();
         self.firered_stream_vad_realtime_actors.clear();
         *self
             .firered_stream_vad_embedded
@@ -2859,6 +2883,8 @@ impl NativeExecutionServices {
         self.pyannote_segmenter_actors
             .evict_where(|key| key.has_content_id(pack_content_id));
         self.redimnet_runtime_actors
+            .evict_where(|key| key.has_content_id(pack_content_id));
+        self.wespeaker_runtime_actors
             .evict_where(|key| key.has_content_id(pack_content_id));
         self.loaded_weight_owners.evict_content_id(pack_content_id);
     }

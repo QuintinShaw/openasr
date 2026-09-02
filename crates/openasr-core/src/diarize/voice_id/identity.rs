@@ -1449,6 +1449,7 @@ mod tests {
 
     fn deterministic_test_embedder_identity() -> crate::diarize::embed::SpeakerEmbedderIdentity {
         crate::diarize::embed::SpeakerEmbedderIdentity {
+            family: crate::diarize::embed::SpeakerEmbedderFamily::ReDimNet2,
             embedding_dim: 2,
             pack_fingerprint: "voice-id-identity-tests-v1".to_string(),
         }

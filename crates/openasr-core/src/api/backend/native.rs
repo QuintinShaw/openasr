@@ -1500,6 +1500,7 @@ fn native_offline_request_to_transcription_request(
     request: NativeAsrOfflineRequest,
 ) -> TranscriptionRequest {
     let segmenter = request.voice_id_segmenter;
+    let embedder = request.voice_id_embedder;
     let mut converted = TranscriptionRequest::new(request.input_path, model_pack.id.clone())
         .with_model_pack_path(Some(model_pack.root.clone()))
         .with_language(request.options.language)
@@ -1522,6 +1523,7 @@ fn native_offline_request_to_transcription_request(
         .with_execution_context(request.execution_context)
         .with_serve_batch_max_native_sessions(request.serve_batch_max_native_sessions);
     converted.voice_id_segmenter = segmenter;
+    converted.voice_id_embedder = embedder;
     converted
 }
 

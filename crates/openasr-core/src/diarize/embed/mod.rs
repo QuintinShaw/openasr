@@ -1,8 +1,10 @@
 //! Speaker embedding.
 //!
-//! The only supported speaker embedder is ReDimNet2-B6 (192-d, ggml graph,
-//! Chinese-enhanced). Weights load from a pulled/local `.oasr` pack and are not
-//! vendored. When the pack is missing, diarization and Voice ID fail closed.
+//! Default speaker embedder is ReDimNet2-B6 (192-d, ggml graph). WeSpeaker
+//! ResNet (256-d, ggml graph) is a parallel family loaded only on explicit
+//! preference or `OPENASR_WESPEAKER_PACK`. Weights load from a pulled/local
+//! `.oasr` pack and are not vendored. When the selected pack is missing,
+//! diarization and Voice ID fail closed.
 
 mod pack;
 mod policy_runtime;
@@ -10,6 +12,7 @@ mod policy_runtime;
 pub(crate) mod ops;
 mod redimnet;
 pub(crate) mod weights;
+mod wespeaker;
 
 #[cfg(test)]
 mod tests;
@@ -18,12 +21,14 @@ mod tests;
 pub(crate) use pack::REDIMNET_PACK_PREFERENCE;
 pub use pack::{
     DIARIZATION_EMBEDDER_LOAD_FAILED_REASON, REALTIME_DIARIZATION_EMBEDDER_MISSING_REASON,
-    SPEAKER_EMBEDDER_PACK_ID, SPEAKER_EMBEDDER_PACK_LABEL, SpeakerEmbedderIdentity,
-    VOICE_ID_EMBEDDER_PACK_MISSING_REASON, VOICE_ID_NAMING_EMBEDDER_MISSING_REASON,
-    VOICE_MATCH_EMBEDDER_PACK_MISSING_REASON, embedder_pack_installed,
+    SPEAKER_EMBEDDER_PACK_ID, SPEAKER_EMBEDDER_PACK_LABEL, SpeakerEmbedderFamily,
+    SpeakerEmbedderIdentity, VOICE_ID_EMBEDDER_PACK_MISSING_REASON,
+    VOICE_ID_NAMING_EMBEDDER_MISSING_REASON, VOICE_MATCH_EMBEDDER_PACK_MISSING_REASON,
+    WESPEAKER_EMBEDDER_PACK_ID, embedder_pack_installed,
 };
 pub use policy_runtime::PolicyResolvedSpeakerRuntime;
 pub(crate) use redimnet::backbone::RedimNetResidentRuntime;
+pub(crate) use wespeaker::{WeSpeakerEmbedder, WeSpeakerResidentRuntime};
 
 #[cfg(test)]
 use std::sync::OnceLock;
@@ -123,11 +128,13 @@ pub trait SpeakerEmbedder: Send + Sync {
             .collect()
     }
 
-    /// Embedding dimensionality (ReDimNet2-B6 = 192).
+    /// Embedding dimensionality (ReDimNet2-B6 = 192, WeSpeaker ResNet = 256).
     fn embedding_dim(&self) -> usize;
 
     /// Calibration profile for clustering and streaming gates in this embedder's
-    /// cosine space. Defaults to the ReDimNet2-B6 profile.
+    /// cosine space. Production pack-backed impls override this; test mocks may
+    /// keep the ReDimNet2-B6 default. `EmbeddingSpace::for_active_embedder`
+    /// must not guess family from this default.
     fn calibration_profile(&self) -> SpeakerCalibrationProfile {
         REDIMNET_CALIBRATION
     }

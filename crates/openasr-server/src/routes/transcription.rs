@@ -2348,6 +2348,7 @@ pub(crate) fn apply_transcription_preferences(
     preferences: &openasr_core::config::Preferences,
 ) {
     request.voice_id_segmenter = preferences.voice_id_segmenter;
+    request.voice_id_embedder = preferences.voice_id_embedder;
     if request.inference_threads.is_none() {
         request.inference_threads = preferences.inference_threads;
     }
