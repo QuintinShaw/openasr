@@ -3603,3 +3603,7 @@ pub mod testing;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ssot_redteam_tests.rs"]
+mod ssot_redteam_tests;

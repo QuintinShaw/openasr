@@ -202,6 +202,74 @@ pub async fn https_request(
     parse_test_http_response(&response, certificate_fingerprint)
 }
 
+/// Like [`https_request`], but websocket/SSE peers that close TLS without
+/// `close_notify` still yield a status code so a route matrix can finish.
+pub async fn https_request_status(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+) -> u16 {
+    let fingerprint = Arc::new(Mutex::new(None));
+    let verifier = Arc::new(TestTofuVerifier {
+        fingerprint: fingerprint.clone(),
+    });
+    let config =
+        ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let server_name = ServerName::try_from("localhost").unwrap().to_owned();
+    let mut tls = TlsConnector::from(Arc::new(config))
+        .connect(server_name, stream)
+        .await
+        .unwrap();
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\nContent-Length: {}\r\n",
+        addr.port(),
+        body.len()
+    );
+    for (name, value) in headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    tls.write_all(request.as_bytes()).await.unwrap();
+    if !body.is_empty() {
+        tls.write_all(&body).await.unwrap();
+    }
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut buf = [0u8; 2048];
+        loop {
+            match tls.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    response.extend_from_slice(&buf[..n]);
+                    if response.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+    .await;
+    status_from_http_bytes(&response).unwrap_or(400)
+}
+
+fn status_from_http_bytes(response: &[u8]) -> Option<u16> {
+    let header_text = std::str::from_utf8(response).ok()?;
+    let first = header_text.lines().next()?;
+    first.split_whitespace().nth(1)?.parse().ok()
+}
+
 fn parse_test_http_response(response: &[u8], certificate_fingerprint: String) -> TestHttpResponse {
     let header_end = response
         .windows(4)

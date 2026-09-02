@@ -2,6 +2,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
 #[cfg(test)]
@@ -25,6 +27,42 @@ use crate::models::{
     cohere::COHERE_TRANSCRIBE_MODEL_FAMILY,
     whisper::{WHISPER_MODEL_FAMILY, whisper_log_mel_spectrogram_16khz_mono_v0},
 };
+
+static MOCK_TRANSCRIBE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Test-only mock backend delay. Production `MockBackend` return bodies stay
+/// unchanged; server tests enable this through the `testing` feature.
+pub fn set_mock_transcribe_delay(duration: Duration) {
+    MOCK_TRANSCRIBE_DELAY_MS.store(duration.as_millis() as u64, Ordering::SeqCst);
+}
+
+pub fn clear_mock_transcribe_delay() {
+    MOCK_TRANSCRIBE_DELAY_MS.store(0, Ordering::SeqCst);
+}
+
+pub struct MockTranscribeDelayGuard {
+    previous: u64,
+}
+
+impl MockTranscribeDelayGuard {
+    pub fn new(duration: Duration) -> Self {
+        let previous = MOCK_TRANSCRIBE_DELAY_MS.swap(duration.as_millis() as u64, Ordering::SeqCst);
+        Self { previous }
+    }
+}
+
+impl Drop for MockTranscribeDelayGuard {
+    fn drop(&mut self) {
+        MOCK_TRANSCRIBE_DELAY_MS.store(self.previous, Ordering::SeqCst);
+    }
+}
+
+pub fn apply_mock_transcribe_delay() {
+    let ms = MOCK_TRANSCRIBE_DELAY_MS.load(Ordering::SeqCst);
+    if ms > 0 {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
 
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const RESERVED_OASR_MAGIC: &[u8; 4] = b"OASR";
