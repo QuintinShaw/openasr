@@ -172,6 +172,8 @@ pub(crate) async fn stream_transcription(
     if !voice_id_allowed {
         apply_remote_compute_client_request_policy(&mut parsed.request);
     }
+    super::reject_device_token_speaker_embeddings(&parsed.request, !voice_id_allowed)?;
+    super::reject_streaming_speaker_embeddings(&parsed.request)?;
     if matches!(
         parsed.response_format,
         ResponseFormat::Srt | ResponseFormat::Vtt
