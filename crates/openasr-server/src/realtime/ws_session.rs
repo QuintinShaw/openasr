@@ -469,7 +469,7 @@ fn realtime_phrase_bias_rejection_message(
     capability: openasr_core::api::backend::BackendFeatureCapability,
 ) -> String {
     if runtime.backend == openasr_core::BackendKind::Native
-        && let Some(path) = runtime.model_pack_path.current()
+        && let Some(path) = runtime.model_pack_path.served_pack_path()
         && let Some(adapter) = native_runtime_model_adapter_for_path(&path)
     {
         return format!(
@@ -1203,7 +1203,7 @@ impl WsSession {
         partial_results: bool,
         word_timestamps: bool,
     ) -> Result<(), ()> {
-        let Some(active_model) = self.runtime.model_pack_path.current_snapshot() else {
+        let Some(active_model) = self.runtime.model_pack_path.served_snapshot() else {
             self.emit_error(
                 RealtimeErrorCode::StartupConfigError,
                 "Native realtime streaming requires an explicit local runtime pack path.",

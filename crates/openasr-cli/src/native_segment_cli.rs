@@ -712,6 +712,7 @@ pub(super) async fn serve(
             ),
             ffmpeg_bin,
             ffmpeg_bin_explicit,
+            // Launch path is served identity; current() waits for attestation.
             model_pack_path: openasr_server::ActiveRuntimeSlot::requested(
                 model_source.model_pack_path,
             ),

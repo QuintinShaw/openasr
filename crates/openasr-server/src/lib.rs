@@ -1496,7 +1496,11 @@ impl From<Option<PathBuf>> for ActiveRuntimeSlot {
 
 impl ActiveRuntimeSlot {
     /// Constructs the daemon's startup state from durable requested intent.
-    /// The path is not returned by [`Self::current`] until reactivation passes.
+    ///
+    /// [`Self::current`] stays empty until reactivation attests the live
+    /// runtime. [`Self::served_pack_path`] still returns this path: served
+    /// identity is the verified pack this process will run, not whether
+    /// weights are resident. Idle unload must not clear it.
     pub fn requested(path: Option<PathBuf>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(ActiveRuntimeSlotState {
@@ -1526,6 +1530,13 @@ impl ActiveRuntimeSlot {
         self.current_snapshot().map(|snapshot| snapshot.path)
     }
 
+    /// Pack this process is serving. Prefers the attested live binding, then
+    /// the launch/durable requested path. Distinct from residency: idle unload
+    /// clears warm markers, not this path. Empty only when no pack is bound.
+    pub fn served_pack_path(&self) -> Option<PathBuf> {
+        self.served_snapshot().map(|snapshot| snapshot.path)
+    }
+
     pub(crate) fn current_snapshot(&self) -> Option<ActiveRuntimeSnapshot> {
         let state = self.lock_read();
         state.active.as_ref().map(|binding| ActiveRuntimeSnapshot {
@@ -1535,13 +1546,34 @@ impl ActiveRuntimeSlot {
         })
     }
 
+    pub(crate) fn served_snapshot(&self) -> Option<ActiveRuntimeSnapshot> {
+        let state = self.lock_read();
+        if let Some(binding) = state.active.as_ref() {
+            return Some(ActiveRuntimeSnapshot {
+                generation: state.generation,
+                path: binding.path.clone(),
+                residency_key: binding.residency_key(),
+            });
+        }
+        state
+            .requested_path
+            .as_ref()
+            .map(|path| ActiveRuntimeSnapshot {
+                generation: state.generation,
+                path: path.clone(),
+                residency_key: idle_activity::NativeRuntimeResidencyKey::legacy_path(path),
+            })
+    }
+
     fn snapshot_is_current(&self, snapshot: &ActiveRuntimeSnapshot) -> bool {
         let state = self.lock_read();
-        state.generation == snapshot.generation
-            && state
-                .active
-                .as_ref()
-                .is_some_and(|binding| binding.path == snapshot.path)
+        if state.generation != snapshot.generation {
+            return false;
+        }
+        if let Some(binding) = state.active.as_ref() {
+            return binding.path == snapshot.path;
+        }
+        state.requested_path.as_ref() == Some(&snapshot.path)
     }
 
     pub fn requested_path(&self) -> Option<PathBuf> {
@@ -1821,7 +1853,7 @@ impl ServerRuntime {
         match self.backend {
             BackendKind::Mock => Ok(()),
             BackendKind::Native => {
-                let Some(model_pack_path) = self.model_pack_path.current() else {
+                let Some(model_pack_path) = self.model_pack_path.served_pack_path() else {
                     return Ok(());
                 };
                 let _ = validate_native_runtime_pack(&model_pack_path)?;
@@ -1832,11 +1864,12 @@ impl ServerRuntime {
 
     /// Whether a native model pack is currently bound (surfaced by `/health` so
     /// clients can distinguish "daemon not reachable" from "daemon ready, no
-    /// model installed" without racing a separate models-list call).
+    /// model installed" without racing a separate models-list call). Bound
+    /// means this process has a served identity, not that weights are resident.
     fn has_model_bound(&self) -> bool {
         match self.backend {
             BackendKind::Mock => true,
-            BackendKind::Native => self.model_pack_path.is_some(),
+            BackendKind::Native => self.model_pack_path.served_pack_path().is_some(),
         }
     }
 
@@ -1955,13 +1988,12 @@ impl ServerRuntime {
     fn model_is_resident(&self) -> bool {
         match self.backend {
             BackendKind::Mock => true,
-            BackendKind::Native => {
-                self.model_pack_path
-                    .current_snapshot()
-                    .is_some_and(|snapshot| {
-                        idle_activity::native_model_is_resident(snapshot.residency_key())
-                    })
-            }
+            BackendKind::Native => self
+                .model_pack_path
+                .served_snapshot()
+                .is_some_and(|snapshot| {
+                    idle_activity::native_model_is_resident(snapshot.residency_key())
+                }),
         }
     }
 }
@@ -2716,10 +2748,9 @@ async fn models(
             .map(|card| served_model_item(card.id, None))
             .collect(),
         BackendKind::Native => {
-            // No model bound is a normal fresh-install state, not an error:
-            // report an empty model list rather than fail-closed here (the
-            // transcription path is the fail-closed boundary for "no model").
-            match runtime.model_pack_path.current() {
+            // Empty list is the no-pack state, not an error. Re-verify the
+            // served pack on every read so listing cannot follow a config string.
+            match runtime.model_pack_path.served_pack_path() {
                 None => Vec::new(),
                 Some(model_pack_path) => {
                     let adapter = validate_native_runtime_pack(&model_pack_path)
@@ -2781,7 +2812,7 @@ async fn capabilities(
     let transcription = if runtime.backend == BackendKind::Native {
         runtime
             .model_pack_path
-            .current()
+            .served_pack_path()
             .as_deref()
             .map(native_runtime_transcription_capabilities_for_path)
             .unwrap_or_else(|| TranscriptionBackendCapabilities::for_backend_kind(runtime.backend))
@@ -2818,7 +2849,7 @@ pub(crate) fn realtime_capabilities_for_runtime(
     let mut capabilities = if runtime.backend == BackendKind::Native {
         runtime
             .model_pack_path
-            .current()
+            .served_pack_path()
             .as_deref()
             .map(cached_native_realtime_capabilities_for_path)
             .unwrap_or_else(|| RealtimeBackendCapabilities::for_backend_kind(runtime.backend))

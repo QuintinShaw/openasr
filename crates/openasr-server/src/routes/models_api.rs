@@ -35,7 +35,7 @@ pub(crate) async fn default_model(
     let mut response = default_model_response(
         &home,
         distribution.catalog_source(),
-        runtime.model_pack_path.current().as_deref(),
+        runtime.model_pack_path.served_pack_path().as_deref(),
     )?;
     response.idle_switch_pending = runtime
         .native_execution
@@ -63,7 +63,7 @@ pub(crate) async fn set_default_model(
         let body = default_model_response_with_idle_switch(
             &home,
             distribution.catalog_source(),
-            runtime.model_pack_path.current().as_deref(),
+            runtime.model_pack_path.served_pack_path().as_deref(),
             Some(pack.pull),
         )?;
         return Ok((StatusCode::ACCEPTED, Json(body)).into_response());
@@ -84,7 +84,7 @@ pub(crate) async fn set_default_model(
     Ok(Json(default_model_response_with_idle_switch(
         &home,
         distribution.catalog_source(),
-        runtime.model_pack_path.current().as_deref(),
+        runtime.model_pack_path.served_pack_path().as_deref(),
         None,
     )?)
     .into_response())
@@ -102,7 +102,7 @@ pub(crate) async fn cancel_idle_switch(
     Ok(Json(default_model_response_with_idle_switch(
         &home,
         distribution.catalog_source(),
-        runtime.model_pack_path.current().as_deref(),
+        runtime.model_pack_path.served_pack_path().as_deref(),
         None,
     )?))
 }
