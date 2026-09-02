@@ -46,7 +46,9 @@ use crate::{
     NativeExecutionServices, OasrV1MetadataError, PcmBuffer, PcmSlice, parse_model_ref,
 };
 
-use crate::api::backend::{FailureCategory, log_failure_context, log_request_context};
+use crate::api::backend::{
+    FailureCategory, SpeakerEmbeddingPayload, log_failure_context, log_request_context,
+};
 
 use super::{BackendError, Transcription, TranscriptionRequest};
 use crate::Segment;
@@ -1016,9 +1018,32 @@ struct SpeakerFinalizationContext {
     strip_forced_word_timestamps: bool,
     /// Enrolled-person naming. Anonymous remote diarize leaves this off.
     name_enrolled: bool,
+    /// Built from clustering centroids while the embedder is still live, then
+    /// attached after attribution. `None` unless the caller opted in.
+    speaker_embeddings: Option<SpeakerEmbeddingPayload>,
 }
 
 impl SpeakerFinalizationContext {
+    fn new(
+        attribution: SpeakerAttribution,
+        embedder: Option<Arc<dyn crate::diarize::embed::SpeakerEmbedder>>,
+        plan: SpeakerPlan,
+        scope_by_segment: Vec<Option<usize>>,
+        strip_forced_word_timestamps: bool,
+        name_enrolled: bool,
+        speaker_embeddings: Option<SpeakerEmbeddingPayload>,
+    ) -> Self {
+        Self {
+            attribution,
+            embedder,
+            plan,
+            scope_by_segment,
+            strip_forced_word_timestamps,
+            name_enrolled,
+            speaker_embeddings,
+        }
+    }
+
     /// External Voice ID needs word anchors when a multi-speaker segment must
     /// be split for text ownership. Empty words or present-but-unreliable
     /// anchors both force FA / fail-closed; single-speaker identity alone does not.
@@ -1117,6 +1142,7 @@ fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCatego
         | BackendError::DiarizationSegmenterUnavailable
         | BackendError::VoiceIdIdentityFailed(_)
         | BackendError::DiarizeSpeakersRequiresDiarization
+        | BackendError::SpeakerEmbeddingsRequireDiarization
         | BackendError::PhraseBiasNotSupported { .. }
         | BackendError::AdapterNotSupported { .. }
         | BackendError::PhraseBiasUnsupportedByModel { .. }
@@ -1171,6 +1197,9 @@ fn run_native_transcription_fallible_with_input(
         return Err(BackendError::VoiceIdUnsupportedForRealtime {
             request_source: request.source.as_log_label(),
         });
+    }
+    if request.return_speaker_embeddings && !request.voice_id && !request.anonymous_diarize {
+        return Err(BackendError::SpeakerEmbeddingsRequireDiarization);
     }
     let refine = request.word_timestamps_refine;
     if refine && !request.word_timestamps {
@@ -2171,6 +2200,25 @@ impl SpeakerPlan {
     }
 }
 
+fn reject_return_speaker_embeddings_for_plan(
+    return_speaker_embeddings: bool,
+    speaker_plan: SpeakerPlan,
+    adapter_id: &'static str,
+) -> Result<(), BackendError> {
+    if !return_speaker_embeddings {
+        return Ok(());
+    }
+    match speaker_plan {
+        SpeakerPlan::Off => Err(BackendError::SpeakerEmbeddingsRequireDiarization),
+        SpeakerPlan::InDecoder => Err(BackendError::RequestOptionUnsupportedByModel {
+            adapter: adapter_id,
+            option: "return_speaker_embeddings",
+            reason: "The model separates speakers in-decoder and does not produce clustering centroids; this request does not compute embeddings.",
+        }),
+        SpeakerPlan::External => Ok(()),
+    }
+}
+
 fn voice_id_audio_view(audio: &PcmBuffer, speaker_plan: SpeakerPlan) -> Option<PcmSlice> {
     (speaker_plan != SpeakerPlan::Off).then(|| audio.full_slice())
 }
@@ -2304,6 +2352,11 @@ fn run_native_transcription_impl(
             });
         }
     }
+    reject_return_speaker_embeddings_for_plan(
+        request.return_speaker_embeddings,
+        speaker_plan,
+        selected_family.adapter_id,
+    )?;
     // OPENASR_TIMING=1 detail: model-pack path validation + gguf metadata/
     // tensor-index preflight + family/adapter selection, i.e. everything
     // above this point in the request path. Nested inside the coarse
@@ -2486,6 +2539,17 @@ fn run_native_transcription_impl(
     } else {
         SpeakerAttribution::default()
     };
+    // Copy centroids while the embedder is still live. External plans drop the
+    // ReDimNet lease before ASR admission; the payload is then just data.
+    let speaker_embeddings =
+        if request.return_speaker_embeddings && speaker_plan == SpeakerPlan::External {
+            let embedder = voice_id_embedder
+                .as_deref()
+                .expect("external speaker plan has a resolved embedder");
+            SpeakerEmbeddingPayload::from_timeline(&speaker_turns.timeline, embedder)?
+        } else {
+            None
+        };
     // External attribution is pure data at this point: both the timeline and
     // enrolled-person assignments have been copied out of the auxiliary
     // runtimes. Do not retain the segmenter/ReDimNet candidate leases while
@@ -2721,14 +2785,15 @@ fn run_native_transcription_impl(
                 },
                 prepared_audio,
                 emits_punctuation,
-                speaker_finalization: SpeakerFinalizationContext {
-                    attribution: speaker_turns,
-                    embedder: voice_id_embedder,
-                    plan: speaker_plan,
-                    scope_by_segment: Vec::new(),
+                speaker_finalization: SpeakerFinalizationContext::new(
+                    speaker_turns,
+                    voice_id_embedder,
+                    speaker_plan,
+                    Vec::new(),
                     strip_forced_word_timestamps,
-                    name_enrolled: request.voice_id,
-                },
+                    request.voice_id,
+                    speaker_embeddings,
+                ),
                 progress_backend: backend_class,
                 progress_segmenter: segmenter_kind,
             });
@@ -3067,14 +3132,15 @@ fn run_native_transcription_impl(
                     transcription,
                     prepared_audio,
                     emits_punctuation,
-                    speaker_finalization: SpeakerFinalizationContext {
-                        attribution: speaker_turns,
-                        embedder: voice_id_embedder,
-                        plan: speaker_plan,
-                        scope_by_segment: Vec::new(),
+                    speaker_finalization: SpeakerFinalizationContext::new(
+                        speaker_turns,
+                        voice_id_embedder,
+                        speaker_plan,
+                        Vec::new(),
                         strip_forced_word_timestamps,
-                        name_enrolled: request.voice_id,
-                    },
+                        request.voice_id,
+                        speaker_embeddings,
+                    ),
                     progress_backend: backend_class,
                     progress_segmenter: segmenter_kind,
                 });
@@ -3090,14 +3156,15 @@ fn run_native_transcription_impl(
                 transcription,
                 prepared_audio,
                 emits_punctuation,
-                speaker_finalization: SpeakerFinalizationContext {
-                    attribution: speaker_turns,
-                    embedder: voice_id_embedder,
-                    plan: speaker_plan,
-                    scope_by_segment: speaker_scope_by_segment,
+                speaker_finalization: SpeakerFinalizationContext::new(
+                    speaker_turns,
+                    voice_id_embedder,
+                    speaker_plan,
+                    speaker_scope_by_segment,
                     strip_forced_word_timestamps,
-                    name_enrolled: request.voice_id,
-                },
+                    request.voice_id,
+                    speaker_embeddings,
+                ),
                 progress_backend: backend_class,
                 progress_segmenter: segmenter_kind,
             });
@@ -3175,14 +3242,15 @@ fn run_native_transcription_impl(
         transcription,
         prepared_audio,
         emits_punctuation,
-        speaker_finalization: SpeakerFinalizationContext {
-            attribution: speaker_turns,
-            embedder: voice_id_embedder,
-            plan: speaker_plan,
-            scope_by_segment: Vec::new(),
+        speaker_finalization: SpeakerFinalizationContext::new(
+            speaker_turns,
+            voice_id_embedder,
+            speaker_plan,
+            Vec::new(),
             strip_forced_word_timestamps,
-            name_enrolled: request.voice_id,
-        },
+            request.voice_id,
+            speaker_embeddings,
+        ),
         progress_backend: backend_class,
         progress_segmenter: segmenter_kind,
     })
@@ -3314,6 +3382,7 @@ fn finalize_native_transcription(
             // evidence from transcript segments: coarse ASR segments can span
             // several speakers even when the timeline is correct.
             transcription.unnamed_speakers = speaker.attribution.unnamed_speakers.clone();
+            transcription.speaker_embeddings = speaker.speaker_embeddings.clone();
         }
         SpeakerPlan::Off => {
             transcription.unnamed_speakers.clear();
@@ -5229,6 +5298,17 @@ mod tests {
     }
 
     #[test]
+    fn native_boundary_rejects_speaker_embeddings_without_diarization() {
+        let services = native_execution_services_for_test();
+        let mut request = TranscriptionRequest::new("unused.wav", "unused-model");
+        request.return_speaker_embeddings = true;
+        assert!(matches!(
+            run_native_transcription_fallible(request, &services, None),
+            Err(BackendError::SpeakerEmbeddingsRequireDiarization)
+        ));
+    }
+
+    #[test]
     fn native_boundary_rejects_voice_id_before_any_realtime_model_load() {
         let services = native_execution_services_for_test();
         for source in [
@@ -6569,6 +6649,34 @@ mod tests {
             SpeakerPlan::InDecoder
         );
         assert_eq!(SpeakerPlan::resolve(true, External), SpeakerPlan::External);
+    }
+
+    #[test]
+    fn return_speaker_embeddings_fail_closed_for_off_and_in_decoder_plans() {
+        assert!(matches!(
+            reject_return_speaker_embeddings_for_plan(false, SpeakerPlan::Off, "unused"),
+            Ok(())
+        ));
+        assert!(matches!(
+            reject_return_speaker_embeddings_for_plan(true, SpeakerPlan::Off, "unused"),
+            Err(BackendError::SpeakerEmbeddingsRequireDiarization)
+        ));
+        assert!(matches!(
+            reject_return_speaker_embeddings_for_plan(
+                true,
+                SpeakerPlan::InDecoder,
+                "moss-transcribe-diarize"
+            ),
+            Err(BackendError::RequestOptionUnsupportedByModel {
+                option: "return_speaker_embeddings",
+                adapter: "moss-transcribe-diarize",
+                ..
+            })
+        ));
+        assert!(matches!(
+            reject_return_speaker_embeddings_for_plan(true, SpeakerPlan::External, "whisper"),
+            Ok(())
+        ));
     }
 
     #[test]

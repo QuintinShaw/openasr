@@ -1,6 +1,10 @@
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
-use crate::api::backend::{Transcription, TranscriptionLongFormMetadata, TruncatedDecode};
+use crate::api::backend::{
+    SpeakerEmbeddingSpace, Transcription, TranscriptionLongFormMetadata, TruncatedDecode,
+};
 use crate::diarize::voice_id::SpeakerNamingRefusal;
 use crate::subtitle::TimelineQuality;
 
@@ -68,6 +72,14 @@ pub(super) struct VerboseJsonTranscription<'a> {
     /// See [`JsonTranscription::unnamed_speakers`].
     #[serde(skip_serializing_if = "Vec::is_empty")]
     unnamed_speakers: Vec<JsonUnnamedSpeaker<'a>>,
+    /// WhisperX/Speakr-compatible `SPEAKER_NN` -> vector map. Omitted when the
+    /// caller did not opt in or no centroids were produced.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    speaker_embeddings: BTreeMap<&'a str, &'a [f32]>,
+    /// Comparability metadata for `speaker_embeddings`. Sibling field, not
+    /// nested under the map, so Speakr can keep reading the map as-is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speaker_embedding_space: Option<&'a SpeakerEmbeddingSpace>,
 }
 
 #[derive(Serialize)]
@@ -302,6 +314,7 @@ impl<'a> From<&'a Transcription> for JsonTranscription<'a> {
 
 impl<'a> From<&'a Transcription> for VerboseJsonTranscription<'a> {
     fn from(transcription: &'a Transcription) -> Self {
+        let (speaker_embeddings, speaker_embedding_space) = json_speaker_embeddings(transcription);
         Self {
             language: transcription
                 .language
@@ -319,7 +332,25 @@ impl<'a> From<&'a Transcription> for VerboseJsonTranscription<'a> {
                 .map(verbose_longform_metadata),
             truncated: json_truncated_decodes(transcription),
             unnamed_speakers: json_unnamed_speakers(transcription),
+            speaker_embeddings,
+            speaker_embedding_space,
         }
+    }
+}
+
+fn json_speaker_embeddings(
+    transcription: &Transcription,
+) -> (BTreeMap<&str, &[f32]>, Option<&SpeakerEmbeddingSpace>) {
+    match transcription.speaker_embeddings.as_ref() {
+        Some(payload) if !payload.vectors.is_empty() => (
+            payload
+                .vectors
+                .iter()
+                .map(|(label, vector)| (label.as_str(), vector.as_slice()))
+                .collect(),
+            Some(&payload.space),
+        ),
+        _ => (BTreeMap::new(), None),
     }
 }
 

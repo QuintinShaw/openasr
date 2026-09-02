@@ -4796,6 +4796,246 @@ async fn paired_device_cannot_enable_voice_id_on_remote_compute_routes() {
 }
 
 #[tokio::test]
+async fn return_speaker_embeddings_without_diarize_is_invalid_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+    let request = multipart_request_with_extra_fields(
+        "/v1/audio/transcriptions",
+        "whisper-large-v3-turbo",
+        "sample.wav",
+        b"not a real wav",
+        &[
+            ("return_speaker_embeddings", "true"),
+            ("response_format", "verbose_json"),
+        ],
+    );
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("return_speaker_embeddings requires diarize=true"),
+        "unexpected message: {message}"
+    );
+}
+
+#[tokio::test]
+async fn return_speaker_embeddings_requires_verbose_json() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+    let request = multipart_request_with_extra_fields(
+        "/v1/audio/transcriptions",
+        "whisper-large-v3-turbo",
+        "sample.wav",
+        b"not a real wav",
+        &[
+            ("diarize", "true"),
+            ("return_speaker_embeddings", "true"),
+            ("response_format", "json"),
+        ],
+    );
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("return_speaker_embeddings requires response_format=verbose_json"),
+        "unexpected message: {message}"
+    );
+}
+
+#[tokio::test]
+async fn paired_device_cannot_request_speaker_embeddings() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+        openasr_server::ServerLaunchOptions {
+            auth: openasr_server::ServerAuth::pairing("admin-secret"),
+            ..Default::default()
+        },
+    );
+    let (_device_id, bearer_token) =
+        create_approved_pairing_credential(&app, "Remote Compute Mac").await;
+
+    for (uri, include_remote_marker) in [
+        ("/v1/audio/transcriptions", true),
+        ("/v1/audio/transcriptions", false),
+        ("/v1/audio/transcriptions?stream=true", true),
+        ("/v1/audio/translations", true),
+    ] {
+        let mut request = multipart_request_with_extra_fields(
+            uri,
+            "whisper-large-v3-turbo",
+            "sample.wav",
+            b"not a real wav",
+            &[
+                ("diarize", "true"),
+                ("return_speaker_embeddings", "true"),
+                ("response_format", "verbose_json"),
+            ],
+        );
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {bearer_token}").parse().unwrap(),
+        );
+        if include_remote_marker {
+            request
+                .headers_mut()
+                .insert("x-openasr-remote-compute", "client".parse().unwrap());
+        }
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "device token must be 403 for {uri} (marker={include_remote_marker})"
+        );
+        let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["error"]["type"], "authorization_error",
+            "{uri} marker={include_remote_marker}"
+        );
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.to_ascii_lowercase().contains("biometric"),
+            "403 must name biometric-derived data for {uri}: {message}"
+        );
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            !body.contains("SPEAKER_00") || !body.contains('['),
+            "403 body must not leak embedding vectors for {uri}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn operator_and_loopback_may_request_speaker_embeddings_without_403() {
+    let temp = tempfile::tempdir().unwrap();
+    let pairing_app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+        openasr_server::ServerLaunchOptions {
+            auth: openasr_server::ServerAuth::pairing("admin-secret"),
+            ..Default::default()
+        },
+    );
+    let operator_request = {
+        let mut request = multipart_request_with_extra_fields(
+            "/v1/audio/transcriptions",
+            "whisper-large-v3-turbo",
+            "sample.wav",
+            b"not a real wav",
+            &[
+                ("diarize", "true"),
+                ("return_speaker_embeddings", "true"),
+                ("response_format", "verbose_json"),
+            ],
+        );
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Bearer admin-secret".parse().unwrap(),
+        );
+        request
+    };
+    let operator = pairing_app.oneshot(operator_request).await.unwrap();
+    assert_ne!(
+        operator.status(),
+        StatusCode::FORBIDDEN,
+        "operator must not be 403 for return_speaker_embeddings"
+    );
+
+    let loopback_app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home-loopback")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+    let loopback = loopback_app
+        .oneshot(multipart_request_with_extra_fields(
+            "/v1/audio/transcriptions",
+            "whisper-large-v3-turbo",
+            "sample.wav",
+            b"not a real wav",
+            &[
+                ("diarize", "true"),
+                ("return_speaker_embeddings", "true"),
+                ("response_format", "verbose_json"),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_ne!(
+        loopback.status(),
+        StatusCode::FORBIDDEN,
+        "loopback must not be 403 for return_speaker_embeddings"
+    );
+}
+
+#[tokio::test]
+async fn streaming_return_speaker_embeddings_is_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+    let request = multipart_request_with_extra_fields(
+        "/v1/audio/transcriptions?stream=true",
+        "whisper-large-v3-turbo",
+        "sample.wav",
+        b"not a real wav",
+        &[
+            ("diarize", "true"),
+            ("return_speaker_embeddings", "true"),
+            ("response_format", "verbose_json"),
+        ],
+    );
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("not supported on streaming"),
+        "unexpected message: {message}"
+    );
+}
+
+#[tokio::test]
 async fn remote_compute_header_without_auth_still_records_server_history() {
     let temp = tempfile::tempdir().unwrap();
     enable_history(&temp);

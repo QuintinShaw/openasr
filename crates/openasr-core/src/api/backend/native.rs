@@ -1513,6 +1513,7 @@ fn native_offline_request_to_transcription_request(
         .with_voice_id(request.options.voice_id)
         .with_anonymous_diarize(request.options.anonymous_diarize)
         .with_diarize_speakers(request.options.diarize_speakers)
+        .with_return_speaker_embeddings(request.options.return_speaker_embeddings)
         .with_longform(request.longform)
         .with_display_file_name(request.display_file_name)
         .with_source(request.source)
@@ -2117,6 +2118,30 @@ mod tests {
         assert!(!rebuilt.voice_id);
         assert!(rebuilt.anonymous_diarize);
         assert_eq!(rebuilt.diarize_speakers, Some(3));
+    }
+
+    #[test]
+    fn native_offline_request_conversion_preserves_return_speaker_embeddings() {
+        let pack =
+            NativeAsrModelPackRef::new("moonshine-tiny", "moonshine", PathBuf::from("/tmp/pack"));
+        let rebuilt = native_offline_request_to_transcription_request(
+            &pack,
+            ExecutionTarget::Auto,
+            NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav")).with_options(
+                NativeAsrRequestOptions::new()
+                    .with_anonymous_diarize(true)
+                    .with_return_speaker_embeddings(true),
+            ),
+        );
+        assert!(rebuilt.anonymous_diarize);
+        assert!(rebuilt.return_speaker_embeddings);
+
+        let rebuilt_default = native_offline_request_to_transcription_request(
+            &pack,
+            ExecutionTarget::Auto,
+            NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav")),
+        );
+        assert!(!rebuilt_default.return_speaker_embeddings);
     }
 
     fn write_mono_pcm16_wav(path: &Path, sample_rate_hz: u32, frames: u32) {
@@ -3753,6 +3778,7 @@ mod tests {
                     .with_voice_id(true)
                     .with_anonymous_diarize(true)
                     .with_diarize_speakers(Some(2))
+                    .with_return_speaker_embeddings(true)
                     .with_word_timestamps(true),
             )
             .with_voice_id_segmenter(crate::config::VoiceIdSegmenterPreference::Segmentation3_0)
@@ -3787,6 +3813,7 @@ mod tests {
         assert!(converted.voice_id);
         assert!(converted.anonymous_diarize);
         assert_eq!(converted.diarize_speakers, Some(2));
+        assert!(converted.return_speaker_embeddings);
         assert_eq!(converted.longform, Some(longform));
         assert_eq!(converted.display_file_name.as_deref(), Some("meeting.wav"));
     }
