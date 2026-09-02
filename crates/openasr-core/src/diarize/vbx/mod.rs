@@ -1254,11 +1254,13 @@ mod tests {
                 self.dim
             }
             fn identity(&self) -> Option<crate::diarize::embed::SpeakerEmbedderIdentity> {
-                Some(crate::diarize::embed::SpeakerEmbedderIdentity {
-                    family: self.family,
-                    embedding_dim: self.dim,
-                    pack_fingerprint: "vbx-gate".to_string(),
-                })
+                Some(
+                    crate::diarize::embed::SpeakerEmbedderIdentity::unlabeled_fixture(
+                        self.family,
+                        self.dim,
+                        "vbx-gate",
+                    ),
+                )
             }
         }
         let embedding = SpeakerEmbedding(vec![0.0; INPUT_DIM]);

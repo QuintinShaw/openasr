@@ -526,7 +526,7 @@ fn collect_label_evidence(
     if let Some(progress) = progress {
         progress.report(0, total_windows.max(1));
     }
-    for batch in pending.chunks(crate::diarize::embed::REDIMNET_BOUNDED_BATCH_SIZE) {
+    for batch in pending.chunks(crate::diarize::embed::EMBEDDER_BOUNDED_BATCH_SIZE) {
         let clips = batch.iter().map(|window| window.clip).collect::<Vec<_>>();
         let results = embedder.embed_batch(&clips, EMBEDDER_SAMPLE_RATE_HZ as u32);
         if results.len() != batch.len() {
@@ -1448,11 +1448,11 @@ mod tests {
     struct OneVoiceEmbedder;
 
     fn deterministic_test_embedder_identity() -> crate::diarize::embed::SpeakerEmbedderIdentity {
-        crate::diarize::embed::SpeakerEmbedderIdentity {
-            family: crate::diarize::embed::SpeakerEmbedderFamily::ReDimNet2,
-            embedding_dim: 2,
-            pack_fingerprint: "voice-id-identity-tests-v1".to_string(),
-        }
+        crate::diarize::embed::SpeakerEmbedderIdentity::unlabeled_fixture(
+            crate::diarize::embed::SpeakerEmbedderFamily::ReDimNet2,
+            2,
+            "voice-id-identity-tests-v1",
+        )
     }
 
     impl crate::diarize::embed::SpeakerEmbedder for OneVoiceEmbedder {
@@ -1534,10 +1534,7 @@ mod tests {
         let embedder = SignedVoiceEmbedder;
         let identity = embedder.identity().expect("test embedder identity");
         let matcher = super::super::PersonMatcher::new(
-            super::super::EmbeddingSpace::for_active_embedder(
-                &identity,
-                embedder.calibration_profile(),
-            ),
+            super::super::EmbeddingSpace::for_active_embedder(&identity),
             Vec::new(),
             0.5,
             0.15,

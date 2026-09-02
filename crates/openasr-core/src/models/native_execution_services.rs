@@ -2735,18 +2735,18 @@ impl NativeExecutionServices {
                 super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool::new(
                     "openasr-redimnet-owner",
                     super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
-                        crate::diarize::embed::REDIMNET_MAX_BATCH_WORKERS,
+                        crate::diarize::embed::EMBEDDER_MAX_BATCH_WORKERS,
                         crate::host::host_available_memory_bytes().unwrap_or(u64::MAX),
-                        crate::diarize::embed::REDIMNET_MAX_BATCH_WORKERS,
+                        crate::diarize::embed::EMBEDDER_MAX_BATCH_WORKERS,
                     ),
                 ),
             wespeaker_runtime_actors:
                 super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool::new(
                     "openasr-wespeaker-owner",
                     super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
-                        crate::diarize::embed::REDIMNET_MAX_BATCH_WORKERS,
+                        crate::diarize::embed::EMBEDDER_MAX_BATCH_WORKERS,
                         crate::host::host_available_memory_bytes().unwrap_or(u64::MAX),
-                        crate::diarize::embed::REDIMNET_MAX_BATCH_WORKERS,
+                        crate::diarize::embed::EMBEDDER_MAX_BATCH_WORKERS,
                     ),
                 ),
             firered_stream_vad_realtime_actors:

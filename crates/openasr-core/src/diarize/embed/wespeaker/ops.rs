@@ -12,39 +12,7 @@ fn map_err(_stage: &'static str) -> impl Fn(GgmlCpuGraphError) -> GgmlCpuGraphEr
     |source| source
 }
 
-/// Precomputed per-channel affine for eval-mode BatchNorm:
-/// `y = gamma*(x-mean)/sqrt(var+eps) + beta = x*scale + shift`.
-pub(super) fn batchnorm_affine(
-    gamma: &[f32],
-    beta: &[f32],
-    running_mean: &[f32],
-    running_var: &[f32],
-    eps: f32,
-) -> (Vec<f32>, Vec<f32>) {
-    let n = gamma.len();
-    let mut scale = vec![0.0f32; n];
-    let mut shift = vec![0.0f32; n];
-    for i in 0..n {
-        let s = gamma[i] / (running_var[i] + eps).sqrt();
-        scale[i] = s;
-        shift[i] = beta[i] - running_mean[i] * s;
-    }
-    (scale, shift)
-}
-
-pub(super) fn apply_channel_affine_2d<'a>(
-    graph: &GgmlCpuGraphBuilder<'a>,
-    x2d: GgmlCpuTensor<'a>,
-    c: usize,
-    scale: GgmlCpuTensor<'a>,
-    shift: GgmlCpuTensor<'a>,
-) -> OpResult<'a> {
-    let m = map_err("channel_affine_2d");
-    let scale4d = graph.reshape_4d(scale, 1, 1, c, 1).map_err(m)?;
-    let shift4d = graph.reshape_4d(shift, 1, 1, c, 1).map_err(m)?;
-    let scaled = graph.mul(x2d, scale4d).map_err(m)?;
-    graph.add(scaled, shift4d).map_err(m)
-}
+pub(super) use super::super::ggml_affine::{apply_channel_affine_2d, batchnorm_affine};
 
 pub(super) fn conv2d<'a>(
     graph: &GgmlCpuGraphBuilder<'a>,
@@ -259,18 +227,6 @@ pub(super) fn linear_1d<'a>(
 mod tests {
     use super::*;
     use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphRunner};
-
-    #[test]
-    fn batchnorm_affine_matches_eval_formula() {
-        let gamma = [2.0f32];
-        let beta = [0.5f32];
-        let mean = [1.0f32];
-        let var = [3.0f32];
-        let (scale, shift) = batchnorm_affine(&gamma, &beta, &mean, &var, 1.0);
-        let s = 2.0 / 2.0;
-        assert!((scale[0] - s).abs() < 1e-6);
-        assert!((shift[0] - (0.5 - 1.0 * s)).abs() < 1e-6);
-    }
 
     #[test]
     fn bottleneck_output_channels_match_expansion() {
