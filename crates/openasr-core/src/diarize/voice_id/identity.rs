@@ -1455,6 +1455,31 @@ mod tests {
         )
     }
 
+    fn with_fresh_voice_id_home<T>(run: impl FnOnce() -> T) -> T {
+        let dir = tempfile::tempdir().expect("isolated voice-id home");
+        crate::test_process_env::with_test_process_env(
+            [("OPENASR_HOME", Some(dir.path().as_os_str().to_os_string()))],
+            run,
+        )
+    }
+
+    fn naming_with(
+        embedder: Option<&dyn crate::diarize::embed::SpeakerEmbedder>,
+        scopes: &mut [SpeakerScope<'_>],
+    ) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
+        with_fresh_voice_id_home(|| name_speakers_across_scopes_with(embedder, scopes))
+    }
+
+    fn naming_with_progress(
+        embedder: Option<&dyn crate::diarize::embed::SpeakerEmbedder>,
+        scopes: &mut [SpeakerScope<'_>],
+        progress: Option<&crate::api::backend::WorkProgressObserver>,
+    ) -> Result<Vec<UnnamedSpeaker>, SpeakerIdentityError> {
+        with_fresh_voice_id_home(|| {
+            name_speakers_across_scopes_with_progress(embedder, scopes, progress)
+        })
+    }
+
     impl crate::diarize::embed::SpeakerEmbedder for OneVoiceEmbedder {
         fn embed(
             &self,
@@ -1654,7 +1679,7 @@ mod tests {
         let sample_count = (seconds * EMBEDDER_SAMPLE_RATE_HZ as f32) as usize;
         let samples: Vec<f32> = (0..sample_count).map(|index| index as f32).collect();
         let mut single_segments = vec![labeled(0.0, seconds, Some("SPEAKER_01"))];
-        let single = name_speakers_across_scopes_with(
+        let single = naming_with(
             Some(one_voice_embedder()),
             &mut [SpeakerScope {
                 segments: &mut single_segments,
@@ -1673,7 +1698,7 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push((done, total));
         });
-        let batch = name_speakers_across_scopes_with_progress(
+        let batch = naming_with_progress(
             Some(&batch_embedder),
             &mut [SpeakerScope {
                 segments: &mut batch_segments,
@@ -1732,7 +1757,7 @@ mod tests {
             .collect::<Vec<_>>();
         let embedder = BatchProbeEmbedder::new();
 
-        name_speakers_across_scopes_with(
+        naming_with(
             Some(&embedder),
             &mut [SpeakerScope {
                 segments: &mut segments,
@@ -1767,7 +1792,7 @@ mod tests {
         samples[first_window_start] = -1.0;
 
         let mut single_segments = vec![labeled(0.0, seconds, Some("SPEAKER_01"))];
-        let single = name_speakers_across_scopes_with(
+        let single = naming_with(
             Some(&DefaultMarkedTooShortEmbedder),
             &mut [SpeakerScope {
                 segments: &mut single_segments,
@@ -1778,7 +1803,7 @@ mod tests {
 
         let batch_embedder = BatchProbeEmbedder::new();
         let mut batch_segments = vec![labeled(0.0, seconds, Some("SPEAKER_01"))];
-        let batch = name_speakers_across_scopes_with(
+        let batch = naming_with(
             Some(&batch_embedder),
             &mut [SpeakerScope {
                 segments: &mut batch_segments,
@@ -1836,7 +1861,7 @@ mod tests {
     #[test]
     fn voice_id_evidence_runtime_failure_is_not_misreported_as_thin_evidence() {
         let (mut segments, samples) = one_speaker_scope(12.0);
-        let error = name_speakers_across_scopes_with(
+        let error = naming_with(
             Some(&RuntimeFailureEmbedder { canceled: false }),
             &mut [SpeakerScope {
                 segments: &mut segments,
@@ -1854,7 +1879,7 @@ mod tests {
     #[test]
     fn voice_id_evidence_cancellation_stays_typed() {
         let (mut segments, samples) = one_speaker_scope(12.0);
-        let error = name_speakers_across_scopes_with(
+        let error = naming_with(
             Some(&RuntimeFailureEmbedder { canceled: true }),
             &mut [SpeakerScope {
                 segments: &mut segments,
@@ -1920,7 +1945,7 @@ mod tests {
     #[test]
     fn a_clip_too_short_to_judge_reports_how_short_it_was() {
         let (mut segments, samples) = one_speaker_scope(3.6);
-        let unnamed = name_speakers_across_scopes_with(
+        let unnamed = naming_with(
             Some(one_voice_embedder()),
             &mut [SpeakerScope {
                 segments: &mut segments,
@@ -1968,7 +1993,7 @@ mod tests {
     #[test]
     fn a_long_clip_with_an_empty_library_reports_that_nobody_matched() {
         let (mut segments, samples) = one_speaker_scope(30.0);
-        let unnamed = name_speakers_across_scopes_with(
+        let unnamed = naming_with(
             Some(one_voice_embedder()),
             &mut [SpeakerScope {
                 segments: &mut segments,
@@ -2029,7 +2054,7 @@ mod tests {
         // One continuous turn of exactly the advertised length must survive
         // every gate, through the real windowing.
         let (mut segments, samples) = one_speaker_scope(advertised as f32);
-        let unnamed = name_speakers_across_scopes_with(
+        let unnamed = naming_with(
             Some(one_voice_embedder()),
             &mut [SpeakerScope {
                 segments: &mut segments,
@@ -2068,7 +2093,7 @@ mod tests {
             (evidence::SEGMENT_EDGE_TRIM_SECONDS * EMBEDDER_SAMPLE_RATE_HZ as f64) as usize;
         samples[marker_sample] = 1.0;
 
-        let unnamed = name_speakers_across_scopes_with(
+        let unnamed = naming_with(
             Some(&OneVoiceWithOneUnreclaimedOutlierWindow),
             &mut [SpeakerScope {
                 segments: &mut segments,
