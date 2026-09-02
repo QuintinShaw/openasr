@@ -24,8 +24,24 @@ loads only on an explicit `voice_id_embedder=wespeaker` preference or
 - **Calibration** is the restored WeSpeaker 256-d profile (`wespeaker-cal-v1`),
   not a copy of ReDimNet thresholds.
 
-ResNet34 is the first shipped size. 152/221/293 share the same parameterized
-ggml builder and config table; they do not get copied graphs.
+All four VoxCeleb LM sizes share the same parameterized ggml builder and
+config table; they do not get copied graphs.
 
-Converter: `tooling/wespeaker/convert_wespeaker.py`. Reference dump:
-`tooling/wespeaker/dump_reference.py`.
+| Depth | Block | `num_blocks` | Linear in-dim (TSTP) |
+| ---: | --- | --- | ---: |
+| 34 | BasicBlock | `[3, 4, 6, 3]` | 5120 |
+| 152 | Bottleneck | `[3, 8, 36, 3]` | 20480 |
+| 221 | Bottleneck | `[6, 16, 48, 3]` | 20480 |
+| 293 | Bottleneck | `[10, 20, 64, 3]` | 20480 |
+
+`m_channels=32`, `feat_dim=80`, `embed_dim=256`, TSTP, `two_emb_layer=false`.
+Catalog ids: `wespeaker-voxceleb-resnet{34,152,221,293}-lm`. Languages are
+honest `["en"]` (VoxCeleb English); do not copy ReDimNet's `en`/`zh` claim.
+Persistent-graph metadata is sized from the live topology
+(`metadata_context_bytes_exact`); the shared 1 MiB 4096-slot bump is not
+enough for ResNet221/293.
+
+Converter: `tooling/wespeaker/convert_wespeaker.py` (`fp16` is an alias of
+`f16`). Reference dump: `tooling/wespeaker/dump_reference.py` (depth 34 writes
+`golden/`; 152/221/293 write `golden-{depth}/`). Host-local cosine tests skip
+missing depths under `OPENASR_WESPEAKER_SPIKE_ROOT`.

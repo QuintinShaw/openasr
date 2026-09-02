@@ -11,15 +11,23 @@ from the architecture registry:
 
 | Speaker source | Families | Recording-local speaker path | Identity path |
 | --- | --- | --- | --- |
-| `native` | `moss-transcribe-diarize` | Decoder `[Sxx]` turns | ReDimNet2-B6 + shared Voice ID evidence/matching |
-| `external` | Every other built-in ASR family | FireRed Stream-VAD + selected segmenter + ReDimNet2-B6 + automatic AHC/spectral clustering + overlap reconstruction | Shared Voice ID evidence/matching |
+| `native` | `moss-transcribe-diarize` | Decoder `[Sxx]` turns | Selected speaker embedder + shared Voice ID evidence/matching |
+| `external` | Every other built-in ASR family | FireRed Stream-VAD + selected segmenter + selected speaker embedder + automatic AHC/spectral clustering + overlap reconstruction | Shared Voice ID evidence/matching |
 
 Exactly one recording-local source runs for a request. Native turns do not run
-the external segmenter/clusterer, but they do not bypass ReDimNet2-B6: speaker
-labels answer "who spoke when"; acoustic embeddings are what reconcile scopes
-and match an enrolled person. Both sources normalize into the same transcript
-attribution contract, and an unknown or under-evidenced voice remains a
-session-relative `SPEAKER_NN` label.
+the external segmenter/clusterer, but they do not bypass the speaker embedder:
+speaker labels answer "who spoke when"; acoustic embeddings are what reconcile
+scopes and match an enrolled person. Both sources normalize into the same
+transcript attribution contract, and an unknown or under-evidenced voice remains
+a session-relative `SPEAKER_NN` label.
+
+The default embedder is ReDimNet2-B6. Default diarization capability still
+probes only that pack (`embedder_pack_installed()`). An explicit
+`voice_id_embedder=wespeaker` preference or `OPENASR_WESPEAKER_PACK` loads the
+optional WeSpeaker ResNet family instead. There is no Auto "use whatever is
+installed": a selected WeSpeaker pack that is missing or broken fails closed
+rather than falling back to ReDimNet. ReDimNet and WeSpeaker occupy different identity
+spaces (192-d vs 256-d); enrollments and resident runtimes do not transfer.
 
 This document qualifies the universal path for local file transcription only.
 Realtime and remote-compute diarization have separate output/privacy contracts;
@@ -30,7 +38,8 @@ file-pipeline design.
 
 | Pack | Role | Quantization | License/distribution state |
 | --- | --- | --- | --- |
-| `redimnet2-b6-cn` | Sole speaker embedder and identity space | fp16 | MIT, published |
+| `redimnet2-b6-cn` | Default speaker embedder and identity space; required for the default capability probe | fp16 | MIT, published |
+| `wespeaker-voxceleb-resnet{34,152,221,293}-lm` | Optional speaker embedder and identity space (explicit `voice_id_embedder=wespeaker`) | fp16 | CC BY 4.0; not the default capability pack |
 | `pyannote-segmentation-3.0` | Default external local-activity segmenter | f32 | MIT, published |
 | `diarizen-large-s80-v2` | Optional external local-activity segmenter | fp16 | CC BY-NC 4.0, published; explicit non-commercial acceptance required |
 
@@ -40,8 +49,26 @@ user-installed capability pack.
 `auto` uses segmentation-3.0 in the default installation. An explicitly
 consented DiariZen installation may take precedence; removing or disabling it
 returns to segmentation-3.0. Request preflight freezes the chosen segmenter and
-the exact ReDimNet pack content for the whole job. A provider that is present but
-broken fails closed instead of silently changing algorithms mid-request.
+the exact selected embedder pack content for the whole job. A provider that is
+present but broken fails closed instead of silently changing algorithms
+mid-request.
+
+## Embedder families
+
+| | ReDimNet2-B6 | WeSpeaker ResNet |
+| --- | --- | --- |
+| Selection | Default | Explicit `voice_id_embedder=wespeaker` or `OPENASR_WESPEAKER_PACK` |
+| Default capability probe | Required | Not a substitute; missing ReDimNet still fails the default probe |
+| Dimension | 192 | 256 |
+| Frontend | TFMelBanks | Hamming Kaldi fbank + utterance CMN |
+| Training claim | VoxBlink2 + VoxCeleb2 + CN-Celeb2 (`en`, `zh`) | VoxCeleb English LM (`en` only) |
+| License | MIT | CC BY 4.0 |
+| VBx community-1 PLDA | Not eligible | Gated on WeSpeaker family **and** 256-d |
+| Calibration | ReDimNet profile | `wespeaker-cal-v1` |
+| Sizes | B6 only | ResNet 34 / 152 / 221 / 293, one parameterized ggml graph |
+
+See [WeSpeaker ResNet embedder](design/wespeaker-resnet-embedder.md) and
+[ReDimNet2-B6 embedder](design/redimnet2-b6-embedder.md).
 
 DiariZen is a public but non-commercial capability pack. Catalog discovery does
 not grant permission to use it: pull surfaces must show the checkpoint license
@@ -99,6 +126,39 @@ Runtime override for a local development pack:
 ```bash
 export OPENASR_REDIMNET_PACK=/path/to/redimnet2-b6-cn-fp16.oasr
 ```
+
+### WeSpeaker ResNet (optional)
+
+One converter and one ggml builder cover ResNet 34/152/221/293. Depth and block
+kind are pack metadata, not copied graphs. Catalog `{quant}` is `fp16`; the
+converter accepts `fp16` as an alias of `f16`.
+
+```bash
+python3 tooling/wespeaker/convert_wespeaker.py \
+    --in /path/to/checkpoint \
+    --out /path/to/wespeaker-voxceleb-resnet34-lm-fp16.oasr \
+    --quant fp16 \
+    --model-id wespeaker-voxceleb-resnet34-lm \
+    --depth 34
+```
+
+Official Hugging Face checkpoint filenames are not uniform:
+
+| Size | Upstream repo | Checkpoint file |
+| --- | --- | --- |
+| 34 | `Wespeaker/wespeaker-voxceleb-resnet34-LM` | `avg_model` |
+| 152 | `Wespeaker/wespeaker-voxceleb-resnet152-LM` | `voxceleb_resnet152_LM.pt` |
+| 221 | `Wespeaker/wespeaker-voxceleb-resnet221-LM` | `voxceleb_resnet221_LM.pt` |
+| 293 | `Wespeaker/wespeaker-voxceleb-resnet293-LM` | `avg_model.pt` |
+
+Runtime override for a local development pack:
+
+```bash
+export OPENASR_WESPEAKER_PACK=/path/to/wespeaker-voxceleb-resnet34-lm-fp16.oasr
+```
+
+Host-local PyTorch cosine goldens (`#[ignore]`, CPU then Metal) live under
+`OPENASR_WESPEAKER_SPIKE_ROOT` and are not committed.
 
 ### pyannote segmentation-3.0
 

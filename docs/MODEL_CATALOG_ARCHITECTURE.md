@@ -169,14 +169,15 @@ runtime-source validation, and a same-directory atomic rename are required befor
 a pack counts as installed, and untrusted catalog pack filenames must be
 relative basename-only `.oasr` targets.
 
-For the local file Voice ID pipeline, ReDimNet2-B6 is required for both
-`speaker_source` values. An `external` ASR additionally needs the default
-segmentation-3.0 pack and, when its `word_timestamp_source` is
-`forced_aligner`, Qwen3-ForcedAligner-0.6B; a `native` model such as MOSS does
-not need either attribution dependency. A future
-consent-installed DiariZen pack may replace segmentation-3.0 behind the same
-segmenter interface, but its staged source row does not authorize any current
-CLI/server auto-install behavior.
+For the local file Voice ID pipeline, ReDimNet2-B6 is required for the default
+capability probe on both `speaker_source` values. An explicit WeSpeaker ResNet
+preference is a parallel optional embedder, not a substitute for that probe.
+An `external` ASR additionally needs the default segmentation-3.0 pack and,
+when its `word_timestamp_source` is `forced_aligner`,
+Qwen3-ForcedAligner-0.6B; a `native` model such as MOSS does not need either
+attribution dependency. A future consent-installed DiariZen pack may replace
+segmentation-3.0 behind the same segmenter interface, but its staged source
+row does not authorize any current CLI/server auto-install behavior.
 
 The public anonymous distribution path is exercised by
 `tooling/public-hf-e2e/run.sh` and the manual/scheduled `public-hf-e2e` workflow,

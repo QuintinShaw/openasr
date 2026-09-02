@@ -30,12 +30,17 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   guarantees are still pending.
 - Universal Voice ID is currently a local **file-transcription** feature. MOSS
   supplies its own speaker turns; all other ASR families use FireRed Stream-VAD,
-  a speaker segmenter, ReDimNet2-B6, automatic clustering, and overlap-aware
-  reconstruction. Both paths reuse the shared identity/evidence stage and both
-  require ReDimNet2-B6. Missing or broken required packs fail closed. This
-  universal contract is qualified for local file transcription; realtime and
-  remote-compute diarization remain separate surfaces with their own output and
-  privacy gates.
+  a speaker segmenter, a speaker embedder, automatic clustering, and
+  overlap-aware reconstruction. Both paths reuse the shared identity/evidence
+  stage. The default embedder is ReDimNet2-B6, and the default capability probe
+  still requires that pack. An explicit `voice_id_embedder=wespeaker` preference
+  (or `OPENASR_WESPEAKER_PACK`) loads the optional WeSpeaker ResNet family
+  (256-d, VoxCeleb English LM, sizes 34/152/221/293) instead; there is no Auto
+  fallback, and ReDimNet and WeSpeaker occupy different identity spaces so enrollments
+  do not transfer. Missing or broken required or selected packs fail closed.
+  This universal contract is qualified for local file transcription; realtime
+  and remote-compute diarization remain separate surfaces with their own output
+  and privacy gates.
   Labels stay session-relative (`SPEAKER_00/01`, ...) unless an enrolled person
   clears Voice ID's evidence gates. See [FAQ.md](FAQ.md#is-diarization-available)
   and [SECURITY.md](../SECURITY.md).

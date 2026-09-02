@@ -118,13 +118,19 @@ selected by the ASR architecture rather than by a model-id allowlist:
 - `moss-transcribe-diarize` supplies recording-local speaker turns from its own
   decoder.
 - Every other ASR family uses the shared recording-level pipeline: FireRed
-  Stream-VAD, segmentation-3.0, ReDimNet2-B6 embeddings, automatic AHC/spectral
+  Stream-VAD, a speaker segmenter, speaker embeddings, automatic AHC/spectral
   clustering, and overlap-aware reconstruction.
 
-Both routes still require the ReDimNet2-B6 capability pack: MOSS removes the
-external segmentation/clustering step, not the acoustic identity step. Missing
-or broken required packs fail closed instead of fabricating speakers or silently
-falling back to a different embedding space.
+The default speaker embedder is ReDimNet2-B6 (192-d). An explicit
+`voice_id_embedder=wespeaker` preference (or `OPENASR_WESPEAKER_PACK`) loads the
+optional WeSpeaker ResNet family (256-d, VoxCeleb English LM, sizes 34/152/221/293)
+instead. There is no Auto "use whatever is installed": a selected WeSpeaker pack
+that is missing or broken fails closed rather than falling back to ReDimNet.
+ReDimNet and WeSpeaker occupy different identity spaces, so enrollments do not transfer.
+Default diarization capability still requires the ReDimNet2-B6 pack. MOSS removes the external
+segmentation/clustering step, not the acoustic identity step. Missing or
+broken required packs fail closed instead of fabricating speakers or silently
+changing embedding space.
 
 segmentation-3.0 is the permissive default external segmenter. DiariZen
 Large-s80-md-v2 is a higher-accuracy optional provider whose checkpoint is CC
