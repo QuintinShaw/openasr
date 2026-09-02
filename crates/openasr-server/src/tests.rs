@@ -1085,15 +1085,11 @@ async fn loopback_tls_pairing_device_can_call_precise_timeline() {
         body,
     )
     .await;
-    assert_ne!(
+    assert_eq!(
         response.status,
-        403,
-        "device tokens may call forced alignment; got {}",
+        400,
+        "device tokens may call forced alignment; invalid WAV is 400 not 401/403: {}",
         String::from_utf8_lossy(&response.body)
-    );
-    assert_ne!(
-        response.status, 401,
-        "paired device token must authenticate precise-timeline"
     );
 
     let device_history = https_request(
@@ -1228,6 +1224,21 @@ async fn loopback_tls_revoked_pairing_device_cannot_access_remote_compute() {
     )
     .await;
     assert_eq!(transcription.status, 401);
+
+    let (align_content_type, align_body) = remote_precise_timeline_multipart_body();
+    let align = https_request(
+        server.addr,
+        "POST",
+        "/v1/audio/precise-timeline",
+        &[
+            ("Authorization", bearer_auth.as_str()),
+            ("X-OpenASR-Remote-Compute", "client"),
+            ("Content-Type", &align_content_type),
+        ],
+        align_body,
+    )
+    .await;
+    assert_eq!(align.status, 401);
 
     let error =
         match try_connect_loopback_realtime_websocket(&server, &credential.bearer_token).await {

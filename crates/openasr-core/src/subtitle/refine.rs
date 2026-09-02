@@ -196,7 +196,7 @@ mod tests {
         let services = NativeExecutionServices::for_local_process()
             .expect("native execution services for test");
         let audio = vec![0.0f32; 16_000];
-        let error = align_plain_transcript_to_audio(
+        let tagged = align_plain_transcript_to_audio(
             "こんにちは".into(),
             &audio,
             &services,
@@ -206,8 +206,23 @@ mod tests {
         )
         .expect_err("japanese must fail closed");
         assert!(
-            error.to_string().contains("does not yet support language"),
-            "got {error}"
+            tagged.to_string().contains("does not yet support language"),
+            "got {tagged}"
+        );
+        let untagged = align_plain_transcript_to_audio(
+            "こんにちは".into(),
+            &audio,
+            &services,
+            ExecutionTarget::Cpu,
+            Some("en"),
+            true,
+        )
+        .expect_err("hiragana must fail closed even when tagged english");
+        assert!(
+            untagged
+                .to_string()
+                .contains("does not yet support Japanese or Korean text"),
+            "got {untagged}"
         );
     }
 

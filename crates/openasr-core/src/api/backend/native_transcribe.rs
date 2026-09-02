@@ -1710,9 +1710,10 @@ pub fn refine_existing_transcription_timeline(
 /// - each CJK ideograph becomes its own token
 /// - Japanese and Korean fail closed (morphological segmenters are not ported)
 ///
-/// Missing pack, unsupported language, empty normalized text, audio past the
-/// timestamp grid, or a degenerate (collapsed) alignment fail closed instead
-/// of returning a fabricated timeline.
+/// Missing pack, unsupported language or Japanese/Korean script, empty
+/// normalized text, audio past the timestamp grid, a prompt past decoder
+/// context, or a degenerate (collapsed) alignment fail closed instead of
+/// returning a fabricated timeline.
 pub fn align_plain_transcript_to_audio(
     transcript: String,
     prepared_audio_16khz_mono: &[f32],
@@ -1770,11 +1771,6 @@ pub fn align_plain_transcript_to_audio(
         execution_target,
         Some(language.as_str()),
         true,
-    )?;
-    crate::subtitle::reject_degenerate_forced_alignment(&refined, audio_duration_s).map_err(
-        |mismatch| BackendError::WordTimestampAlignmentFailed {
-            reason: mismatch.to_string(),
-        },
     )?;
     if keep_word_timestamps {
         Ok(refined)
@@ -1990,6 +1986,12 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
     if let Some(progress) = progress {
         progress.complete_stage();
     }
+    let audio_duration_s = prepared_audio.as_slice().len() as f32 / 16_000.0;
+    crate::subtitle::reject_degenerate_forced_alignment(&result, audio_duration_s).map_err(
+        |mismatch| BackendError::WordTimestampAlignmentFailed {
+            reason: mismatch.to_string(),
+        },
+    )?;
     Ok(result)
 }
 

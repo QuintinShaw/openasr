@@ -1,12 +1,18 @@
-//! Fail-closed checks for a forced-alignment of an external transcript.
+//! Fail-closed checks for a forced-alignment result.
 //!
 //! Forced alignment always maps the given words onto the audio; it does not
 //! score semantic agreement the way ASR WER would. These checks reject
-//! degenerate outputs (empty word lists, collapsed timestamp bins, unreliable
-//! anchors) so a mismatched script cannot be silently exported as a timeline.
+//! degenerate outputs (empty word lists, collapsed timestamp bins, inverted
+//! or non-monotonic intervals) so a mismatched script cannot be silently
+//! exported as a timeline.
+//!
+//! They intentionally do **not** reuse [`super::validate_word_anchors`]: that
+//! validator is for native ASR anchors and treats a pause longer than 4 s as
+//! a hollow timeline. A manuscript aligner is supposed to leave those gaps.
 
-use super::anchors::{WordAnchorIssue, validate_word_anchors};
 use crate::api::backend::{Transcription, WordTimestamp};
+
+use super::anchors::AUDIO_DURATION_TOLERANCE_S;
 
 /// Forced-aligner classify head uses 80 ms bins. Unique-start collapse is
 /// measured in these bins so the threshold is independent of floating point.
@@ -27,9 +33,6 @@ pub const MAX_ZERO_DURATION_WORD_RATIO: f32 = 0.50;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ForcedAlignmentMismatch {
     EmptyWordList,
-    UnreliableAnchors {
-        issues: Vec<WordAnchorIssue>,
-    },
     CollapsedTimeline {
         unique_starts: usize,
         word_count: usize,
@@ -37,6 +40,17 @@ pub enum ForcedAlignmentMismatch {
     TooManyZeroDurationWords {
         zero_duration: usize,
         word_count: usize,
+    },
+    InvertedInterval {
+        word_index: usize,
+    },
+    NonMonotonic {
+        word_index: usize,
+    },
+    OutsideAudioDuration {
+        word_index: usize,
+        end: f32,
+        audio_duration_s: f32,
     },
 }
 
@@ -46,15 +60,7 @@ impl std::fmt::Display for ForcedAlignmentMismatch {
             Self::EmptyWordList => {
                 write!(
                     f,
-                    "transcript produced no alignable words after normalization (letters, numbers, and apostrophes are kept; other punctuation is stripped)"
-                )
-            }
-            Self::UnreliableAnchors { issues } => {
-                write!(
-                    f,
-                    "aligned word timestamps failed validation ({} issue{}); the transcript and audio are treated as a mismatch rather than exporting a fabricated timeline",
-                    issues.len(),
-                    if issues.len() == 1 { "" } else { "s" }
+                    "transcript produced no alignable words after normalization"
                 )
             }
             Self::CollapsedTimeline {
@@ -71,6 +77,22 @@ impl std::fmt::Display for ForcedAlignmentMismatch {
                 f,
                 "aligned timeline is degenerate: {zero_duration}/{word_count} words have zero duration (severe transcript/audio mismatch)"
             ),
+            Self::InvertedInterval { word_index } => write!(
+                f,
+                "aligned word {word_index} ends before it starts (degenerate timeline)"
+            ),
+            Self::NonMonotonic { word_index } => write!(
+                f,
+                "aligned word {word_index} starts before the previous word (degenerate timeline)"
+            ),
+            Self::OutsideAudioDuration {
+                word_index,
+                end,
+                audio_duration_s,
+            } => write!(
+                f,
+                "aligned word {word_index} ends at {end:.3}s past audio duration {audio_duration_s:.3}s"
+            ),
         }
     }
 }
@@ -85,11 +107,25 @@ pub fn reject_degenerate_forced_alignment(
         return Err(ForcedAlignmentMismatch::EmptyWordList);
     }
 
-    let validation = validate_word_anchors(transcription, audio_duration_s);
-    if !validation.is_reliable() {
-        return Err(ForcedAlignmentMismatch::UnreliableAnchors {
-            issues: validation.issues,
-        });
+    let mut prev_start = f32::NEG_INFINITY;
+    for (word_index, word) in words.iter().enumerate() {
+        if word.end + f32::EPSILON < word.start {
+            return Err(ForcedAlignmentMismatch::InvertedInterval { word_index });
+        }
+        if word.start + 1.0e-3 < prev_start {
+            return Err(ForcedAlignmentMismatch::NonMonotonic { word_index });
+        }
+        if audio_duration_s.is_finite()
+            && audio_duration_s > 0.0
+            && word.end > audio_duration_s + AUDIO_DURATION_TOLERANCE_S
+        {
+            return Err(ForcedAlignmentMismatch::OutsideAudioDuration {
+                word_index,
+                end: word.end,
+                audio_duration_s,
+            });
+        }
+        prev_start = word.start;
     }
 
     let word_count = words.len();
@@ -107,15 +143,15 @@ pub fn reject_degenerate_forced_alignment(
         }
     }
 
-    if word_count >= MIN_WORDS_FOR_COLLAPSE_CHECK {
-        let unique_starts = unique_start_bins(&words);
-        let ratio = unique_starts as f32 / word_count as f32;
-        if ratio < MIN_UNIQUE_START_BIN_RATIO {
-            return Err(ForcedAlignmentMismatch::CollapsedTimeline {
-                unique_starts,
-                word_count,
-            });
-        }
+    let unique_starts = unique_start_bins(&words);
+    let collapsed = (word_count >= 4 && unique_starts == 1)
+        || (word_count >= MIN_WORDS_FOR_COLLAPSE_CHECK
+            && (unique_starts as f32 / word_count as f32) < MIN_UNIQUE_START_BIN_RATIO);
+    if collapsed {
+        return Err(ForcedAlignmentMismatch::CollapsedTimeline {
+            unique_starts,
+            word_count,
+        });
     }
 
     Ok(())
@@ -250,5 +286,47 @@ mod tests {
         let transcription = transcription_with_words(spread_words(21, 11.0));
         reject_degenerate_forced_alignment(&transcription, 11.0)
             .expect("a spread timeline must pass");
+    }
+
+    #[test]
+    fn pause_longer_than_four_seconds_is_not_a_mismatch() {
+        let transcription = transcription_with_words(vec![
+            WordTimestamp {
+                word: "hello".into(),
+                start: 0.0,
+                end: 0.4,
+                confidence: None,
+            },
+            WordTimestamp {
+                word: "world".into(),
+                start: 6.0,
+                end: 6.5,
+                confidence: None,
+            },
+        ]);
+        reject_degenerate_forced_alignment(&transcription, 7.0)
+            .expect("a manuscript pause is a valid forced-aligner timeline");
+    }
+
+    #[test]
+    fn four_words_on_one_bin_are_collapsed() {
+        let words = (0..4)
+            .map(|index| WordTimestamp {
+                word: format!("w{index}"),
+                start: 0.0,
+                end: 0.08,
+                confidence: None,
+            })
+            .collect();
+        let transcription = transcription_with_words(words);
+        let error = reject_degenerate_forced_alignment(&transcription, 5.0)
+            .expect_err("short collapsed lists must fail");
+        assert!(matches!(
+            error,
+            ForcedAlignmentMismatch::CollapsedTimeline {
+                unique_starts: 1,
+                ..
+            }
+        ));
     }
 }

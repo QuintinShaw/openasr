@@ -43,6 +43,10 @@ openasr transcribe audio.wav --model whisper-small --format json
   in any non-interactive/CI context).
 - `--diarize` labels speakers (`SPEAKER_00`, ...); `--word-timestamps` asks
   for per-word timing where the model supports it.
+- `--benchmark` prints timing (elapsed, audio duration, real-time factor)
+  instead of the transcript, for a single input.
+- Non-WAV input (mp3, mp4, ...) needs `ffmpeg` on `PATH`, or pass
+  `--ffmpeg-bin <path>`.
 
 ## Aligning an existing transcript
 
@@ -52,15 +56,14 @@ openasr align audio.wav --transcript script.txt --format srt -o audio.srt
 
 Force-aligns a user-provided plain-text manuscript onto audio (no ASR).
 Requires the Qwen3-ForcedAligner pack; this command is consent to install it
-unless `--offline`. `--language` is optional (defaults to `en`); `ja`/`ko`
-fail closed. `-f` accepts the same formats as `transcribe` (`json` default).
-Punctuation and casing stay in the returned `text`; the aligner tokenizes by
-keeping letters/numbers/apostrophes, stripping other punctuation, splitting
-on ASCII whitespace, and treating each CJK ideograph as its own token.
-- `--benchmark` prints timing (elapsed, audio duration, real-time factor)
-  instead of the transcript, for a single input.
-- Non-WAV input (mp3, mp4, ...) needs `ffmpeg` on `PATH`, or pass
-  `--ffmpeg-bin <path>`.
+unless `--offline`. `--language` is optional (defaults to `en`); Japanese and
+Korean fail closed by language tag (`ja`/`jp`/`ko`/`kr`) and by script
+(hiragana/katakana/hangul) even if the hint is `en`. `-f` accepts the same
+formats as `transcribe` (`json` default). Punctuation and casing stay in the
+returned `text`; the aligner tokenizes by keeping letters/numbers/apostrophes,
+stripping other punctuation, splitting on ASCII whitespace, and treating each
+CJK ideograph as its own token. Non-WAV input needs `ffmpeg` as for
+`transcribe`. Do not pass `--benchmark` — that flag is transcribe-only.
 
 Common failure modes:
 

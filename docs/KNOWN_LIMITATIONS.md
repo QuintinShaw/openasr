@@ -110,12 +110,18 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   returned `text` keeps the caller's punctuation and casing. Internally the
   aligner: splits on ASCII whitespace; keeps letters, numbers, and apostrophes;
   strips other punctuation; treats each CJK ideograph as its own token; defaults
-  omitted/`auto` language to `en`. Japanese and Korean fail closed. Audio longer
-  than the classify-head grid (5000 × 80 ms = 400 s for the shipped pack) fails
-  closed rather than wrapping timestamps. A collapsed or zero-duration timeline
-  is treated as a severe transcript/audio mismatch and rejected instead of being
-  exported as SRT/VTT. The server never downloads the pack; paired device tokens
-  may call the endpoint (it is a compute route, not operator-only). CLI `align`
+  omitted/`auto` language to `en`. Japanese and Korean fail closed by language
+  tag (`ja`/`jp`/`jpn`/`ko`/`kr`/`kor`) and by script (hiragana, katakana,
+  hangul) even when the hint is `en`. Audio longer than the classify-head grid
+  (5000 × 80 ms = 400 s for the shipped pack) fails closed rather than wrapping
+  timestamps. A prompt that would exceed decoder context (`llm_max_positions`,
+  8192 in the shipped pack) also fails closed before the encoder/prefill graphs
+  are built — the 400 s grid is not a substitute for that budget. A collapsed or
+  zero-duration timeline is treated as a severe transcript/audio mismatch;
+  pauses longer than 4 s in a correctly aligned manuscript are not. The server
+  never downloads the pack; paired device tokens may call the endpoint (it is a
+  compute route, not operator-only). This route is not yet on the file
+  FIFO / pause / cancel surface used by `/v1/audio/transcriptions`. CLI `align`
   is itself consent to install the pack unless `--offline`.
 - Hardware execution target selection is generic: Desktop/server requests support
   `auto`, `cpu`, and `accelerated` when the native runtime reports an accelerated
