@@ -31,6 +31,7 @@ pub(super) fn transcribe_many(
     output_dir: &Path,
     skipped: usize,
     options: &TranscribeCommandOptions<'_>,
+    voice_id_embedder: openasr_core::config::VoiceIdEmbedderPreference,
 ) -> Result<()> {
     ensure_batch_output_dir(output_dir)?;
     let longform = if prepared_run.backend_kind == BackendKind::Native {
@@ -48,11 +49,7 @@ pub(super) fn transcribe_many(
         ffmpeg_bin_explicit: prepared_run.ffmpeg_bin_explicit,
         longform,
         diarize: options.diarize,
-        voice_id_embedder: openasr_core::openasr_home()
-            .ok()
-            .and_then(|home| openasr_core::load_config_document(home).ok())
-            .map(|document| document.preferences.voice_id_embedder)
-            .unwrap_or_default(),
+        voice_id_embedder,
         speakers: options.speakers,
         language: options.language.clone(),
         task: options.task,

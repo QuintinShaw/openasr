@@ -1498,6 +1498,7 @@ fn transcribe(
             output_dir,
             skipped,
             &options,
+            document.preferences.voice_id_embedder,
         );
     }
 

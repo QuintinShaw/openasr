@@ -2123,6 +2123,32 @@ mod tests {
     }
 
     #[test]
+    fn native_offline_request_conversion_preserves_voice_id_embedder() {
+        let pack =
+            NativeAsrModelPackRef::new("moonshine-tiny", "moonshine", PathBuf::from("/tmp/pack"));
+        let rebuilt = native_offline_request_to_transcription_request(
+            &pack,
+            ExecutionTarget::Auto,
+            NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav"))
+                .with_voice_id_embedder(crate::config::VoiceIdEmbedderPreference::WeSpeaker),
+        );
+        assert_eq!(
+            rebuilt.voice_id_embedder,
+            crate::config::VoiceIdEmbedderPreference::WeSpeaker
+        );
+
+        let rebuilt_default = native_offline_request_to_transcription_request(
+            &pack,
+            ExecutionTarget::Auto,
+            NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav")),
+        );
+        assert_eq!(
+            rebuilt_default.voice_id_embedder,
+            crate::config::VoiceIdEmbedderPreference::ReDimNet2
+        );
+    }
+
+    #[test]
     fn native_offline_request_conversion_preserves_return_speaker_embeddings() {
         let pack =
             NativeAsrModelPackRef::new("moonshine-tiny", "moonshine", PathBuf::from("/tmp/pack"));

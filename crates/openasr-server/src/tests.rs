@@ -1558,6 +1558,7 @@ fn transcription_preferences_fill_missing_thread_request_only() {
     let preferences = Preferences {
         inference_threads: Some(6),
         voice_id_segmenter: openasr_core::config::VoiceIdSegmenterPreference::Segmentation3_0,
+        voice_id_embedder: openasr_core::config::VoiceIdEmbedderPreference::WeSpeaker,
         ..Default::default()
     };
     let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo");
@@ -1570,7 +1571,7 @@ fn transcription_preferences_fill_missing_thread_request_only() {
     );
     assert_eq!(
         request.voice_id_embedder,
-        openasr_core::config::VoiceIdEmbedderPreference::ReDimNet2
+        openasr_core::config::VoiceIdEmbedderPreference::WeSpeaker
     );
 
     request.inference_threads = Some(2);

@@ -2782,6 +2782,10 @@ pub(crate) async fn transcribe_with_runtime(
                         // `PreparedAudioInput::shared_samples`.
                         .with_prepared_samples(prepared.shared_samples())
                         .with_voice_id_segmenter(request.voice_id_segmenter)
+                        // NativeAsrOfflineRequest::new defaults the embedder to
+                        // ReDimNet2. Dropping this field would make a persisted
+                        // WeSpeaker preference silently load the wrong space.
+                        .with_voice_id_embedder(request.voice_id_embedder)
                         // Explicit cancel/pause/resume context for the whole
                         // synchronous decode call below -- never a thread-local.
                         .with_execution_context(Arc::clone(&execution_context))
