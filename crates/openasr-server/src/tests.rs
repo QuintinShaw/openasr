@@ -2868,19 +2868,31 @@ async fn issue_376_get_json(app: axum::Router, uri: &str) -> (StatusCode, serde_
 }
 
 fn issue_376_realtime_handshake_accepts(runtime: &ServerRuntime, model_id: &str) {
-    let path = runtime
+    let snapshot = runtime
         .model_pack_path
-        .served_pack_path()
+        .served_snapshot()
         .expect("served pack for realtime handshake");
-    let adapter = validate_native_runtime_pack(&path).expect("verify served pack");
+    let adapter = validate_native_runtime_pack(snapshot.path()).expect("verify served pack");
     validate_native_request_model(&adapter, model_id)
         .expect("session.start identity must match the served pack");
+    let key = native_model_session_key(&adapter).expect("native session key");
+    let admitted = runtime
+        .acquire_native_execution_for_snapshot(
+            &snapshot,
+            &key,
+            None,
+            NativeAdmissionKind::Realtime,
+            None,
+        )
+        .expect("session.start admission must accept the served snapshot");
+    drop(admitted);
 }
 
 #[tokio::test]
 async fn issue_376_requested_launch_pack_lists_verified_identity_before_attestation() {
     let temp = tempfile::tempdir().unwrap();
     let pack = write_valid_installed_pack_for_test(temp.path(), "moonshine-tiny", "q8_0", "q8");
+    persist_default_pack(temp.path(), &pack, QuantPreference::pinned(&pack.quant)).unwrap();
     let runtime = ServerRuntime {
         backend: BackendKind::Native,
         native_execution: NativeExecutionSupervisor::default(),
@@ -2906,6 +2918,14 @@ async fn issue_376_requested_launch_pack_lists_verified_identity_before_attestat
     assert_eq!(status, StatusCode::OK);
     assert_eq!(models["data"].as_array().unwrap().len(), 1);
     assert_eq!(models["data"][0]["id"], "moonshine-tiny");
+
+    let (status, default) = issue_376_get_json(app.clone(), "/v1/models/default").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(default["default_model"], "moonshine-tiny");
+    assert_eq!(
+        default["activation"], "committed",
+        "served launch path must count as the bound default before attestation"
+    );
 
     let (status, health) = issue_376_get_json(app.clone(), "/health").await;
     assert_eq!(status, StatusCode::OK);
@@ -2996,6 +3016,54 @@ async fn issue_376_idle_unload_keeps_served_identity_on_models_default_and_realt
     assert_eq!(status, StatusCode::OK);
     assert_eq!(capabilities_after, capabilities_before);
     issue_376_realtime_handshake_accepts(&runtime, "moonshine-tiny");
+}
+
+#[test]
+fn issue_376_session_start_and_transcription_admit_from_served_snapshot() {
+    let start = include_str!("realtime/ws_session.rs")
+        .split("pub(crate) async fn start_native_streaming_session")
+        .nth(1)
+        .expect("start_native_streaming_session")
+        .split("\n    pub(crate)")
+        .next()
+        .expect("start_native_streaming_session body");
+    assert!(
+        start.contains("served_snapshot()"),
+        "session.start must admit the served pack, not only the attested live pointer: {start}"
+    );
+    assert!(
+        !start.contains("current_snapshot()"),
+        "session.start must not fall back to current_snapshot: {start}"
+    );
+
+    let native_arm = include_str!("routes/transcription.rs")
+        .split("pub(crate) async fn transcribe_with_runtime")
+        .nth(1)
+        .expect("transcribe_with_runtime")
+        .split("BackendKind::Native =>")
+        .nth(1)
+        .expect("native transcription arm");
+    assert!(
+        native_arm.contains("served_snapshot()"),
+        "native transcription must admit the served pack: {native_arm}"
+    );
+
+    let served = include_str!("lib.rs")
+        .split("pub(crate) fn served_snapshot")
+        .nth(1)
+        .expect("served_snapshot")
+        .split("fn snapshot_is_current")
+        .next()
+        .expect("served_snapshot body");
+    assert_eq!(
+        served.matches("lock_read()").count(),
+        1,
+        "served_snapshot must observe active and requested under one lock: {served}"
+    );
+    assert!(
+        !served.contains("current_snapshot()"),
+        "served_snapshot must not re-enter current_snapshot across a second lock: {served}"
+    );
 }
 
 #[test]

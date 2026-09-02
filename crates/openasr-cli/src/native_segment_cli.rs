@@ -712,11 +712,10 @@ pub(super) async fn serve(
             ),
             ffmpeg_bin,
             ffmpeg_bin_explicit,
-            // Bind the verified launch pack as served identity immediately.
-            // Boot reactivation still attests residency from durable V2; idle
-            // unload must not clear this slot. `requested()` would hide the
-            // identity until first-compute attestation and empty `/v1/models`.
-            model_pack_path: model_source.model_pack_path.into(),
+            // Launch path is served identity; current() waits for attestation.
+            model_pack_path: openasr_server::ActiveRuntimeSlot::requested(
+                model_source.model_pack_path,
+            ),
         },
         launch_options,
     )

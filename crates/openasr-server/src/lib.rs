@@ -1547,10 +1547,14 @@ impl ActiveRuntimeSlot {
     }
 
     pub(crate) fn served_snapshot(&self) -> Option<ActiveRuntimeSnapshot> {
-        if let Some(snapshot) = self.current_snapshot() {
-            return Some(snapshot);
-        }
         let state = self.lock_read();
+        if let Some(binding) = state.active.as_ref() {
+            return Some(ActiveRuntimeSnapshot {
+                generation: state.generation,
+                path: binding.path.clone(),
+                residency_key: binding.residency_key(),
+            });
+        }
         state
             .requested_path
             .as_ref()
@@ -2744,12 +2748,8 @@ async fn models(
             .map(|card| served_model_item(card.id, None))
             .collect(),
         BackendKind::Native => {
-            // Served identity, not residency: a bound verified pack is listed
-            // even if idle-unload evicted weights or boot attestation has not
-            // finished. No bound pack is a normal fresh-install state -- empty
-            // list, not an error (the transcription path is the fail-closed
-            // boundary for "no model"). Identity is re-verified from the pack
-            // on every read; never from a config string.
+            // Empty list is the no-pack state, not an error. Re-verify the
+            // served pack on every read so listing cannot follow a config string.
             match runtime.model_pack_path.served_pack_path() {
                 None => Vec::new(),
                 Some(model_pack_path) => {
