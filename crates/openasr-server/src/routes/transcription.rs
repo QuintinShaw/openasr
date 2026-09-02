@@ -159,8 +159,7 @@ pub(crate) async fn transcriptions(
             runtime,
             distribution,
             multipart,
-            !remote_compute_client,
-            !remote_compute_client,
+            remote_compute_client,
         )
         .await;
     }
@@ -243,7 +242,7 @@ pub(crate) async fn precise_timeline(
         match parsed.transcript {
             PreciseTimelineTranscript::Timed(transcription) => {
                 refine_existing_transcription_timeline(
-                    transcription,
+                    *transcription,
                     samples.as_slice(),
                     execution_services.as_ref(),
                     parsed.execution_target.unwrap_or_default(),
@@ -292,7 +291,10 @@ struct PreciseTimelineUpload {
 
 #[derive(Debug)]
 enum PreciseTimelineTranscript {
-    Timed(Transcription),
+    /// Boxed: `Transcription` carries optional speaker-embedding payloads and
+    /// segment vectors; leaving it inline trips `large_enum_variant` against
+    /// the plain-text arm.
+    Timed(Box<Transcription>),
     Plain(String),
 }
 
@@ -435,7 +437,10 @@ fn finalize_precise_timeline_fields(
             if transcription.language.is_none() {
                 transcription.language = language_hint;
             }
-            Ok((audio_temp, PreciseTimelineTranscript::Timed(transcription)))
+            Ok((
+                audio_temp,
+                PreciseTimelineTranscript::Timed(Box::new(transcription)),
+            ))
         }
     }
 }
@@ -1066,9 +1071,11 @@ async fn run_offline_transcription(
             upload_ingest_duration,
         );
     }
-    if is_remote_compute_client_request(&headers, &auth) {
+    let remote_compute_client = is_remote_compute_client_request(&headers, &auth);
+    if remote_compute_client {
         apply_remote_compute_client_request_policy(&mut parsed.request);
     }
+    reject_device_token_speaker_embeddings(&parsed.request, remote_compute_client)?;
     if parsed.stream_form_field {
         // Fail closed instead of silently returning a JSON body an OpenAI SDK
         // streaming client would hang on (it expects `transcript.text.*` SSE
@@ -1450,6 +1457,31 @@ pub(crate) fn apply_remote_compute_client_request_policy(request: &mut Transcrip
     request.execution_target = None;
 }
 
+const SPEAKER_EMBEDDINGS_DEVICE_TOKEN_FORBIDDEN: &str = "Speaker embeddings are biometric-derived data and cannot be returned to a remote-compute device token. Omit return_speaker_embeddings to continue with anonymous speaker labels. Operator and loopback clients are not restricted.";
+
+pub(crate) fn reject_device_token_speaker_embeddings(
+    request: &TranscriptionRequest,
+    remote_compute_client: bool,
+) -> Result<(), ApiError> {
+    if request.return_speaker_embeddings && remote_compute_client {
+        return Err(ApiError::Authorization(
+            SPEAKER_EMBEDDINGS_DEVICE_TOKEN_FORBIDDEN.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn reject_streaming_speaker_embeddings(
+    request: &TranscriptionRequest,
+) -> Result<(), ApiError> {
+    if request.return_speaker_embeddings {
+        return Err(ApiError::BadRequest(
+            "return_speaker_embeddings is not supported on streaming transcription.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn record_file_transcription_history(
     distribution: &DistributionContext,
     request: &TranscriptionRequest,
@@ -1550,6 +1582,7 @@ struct TranscriptionRequestBuilder {
     /// Optional request-layer timeline precision (`auto` / `always` / `off`).
     timeline_precision: Option<openasr_core::TimelinePrecisionPolicy>,
     diarize: bool,
+    return_speaker_embeddings: bool,
     speakers: Option<u8>,
     punctuate: bool,
     segment_mode: Option<String>,
@@ -1583,6 +1616,7 @@ impl Default for TranscriptionRequestBuilder {
             timestamp_granularities: Vec::new(),
             timeline_precision: None,
             diarize: false,
+            return_speaker_embeddings: false,
             speakers: None,
             // Auto-on, mirroring `TranscriptionRequest::new`'s default: this
             // form field is only a client-facing opt-out (the desktop
@@ -1652,6 +1686,11 @@ impl TranscriptionRequestBuilder {
             "diarize" => {
                 let value = field.text().await.map_err(ApiError::Multipart)?;
                 self.diarize = parse_bool_field("diarize", &value)?;
+            }
+            "return_speaker_embeddings" => {
+                let value = field.text().await.map_err(ApiError::Multipart)?;
+                self.return_speaker_embeddings =
+                    parse_bool_field("return_speaker_embeddings", &value)?;
             }
             "punctuate" => {
                 let value = field.text().await.map_err(ApiError::Multipart)?;
@@ -1759,6 +1798,7 @@ impl TranscriptionRequestBuilder {
             timestamp_granularities,
             timeline_precision,
             diarize,
+            return_speaker_embeddings,
             speakers,
             punctuate,
             segment_mode,
@@ -1781,6 +1821,16 @@ impl TranscriptionRequestBuilder {
         if speakers.is_some() && !diarize {
             return Err(ApiError::BadRequest(
                 "Form field speakers requires diarize=true.".to_string(),
+            ));
+        }
+        if return_speaker_embeddings && !diarize {
+            return Err(ApiError::BadRequest(
+                "Form field return_speaker_embeddings requires diarize=true.".to_string(),
+            ));
+        }
+        if return_speaker_embeddings && response_format != ResponseFormat::VerboseJson {
+            return Err(ApiError::BadRequest(
+                "return_speaker_embeddings requires response_format=verbose_json.".to_string(),
             ));
         }
 
@@ -1865,6 +1915,7 @@ impl TranscriptionRequestBuilder {
             .with_display_file_name(file_name)
             .with_voice_id(diarize)
             .with_diarize_speakers(speakers)
+            .with_return_speaker_embeddings(return_speaker_embeddings)
             .with_punctuation(punctuate);
         if let Some(timeline_precision) = timeline_precision {
             request = request.with_timeline_precision(timeline_precision);
@@ -2261,12 +2312,17 @@ mod active_transcription_cleanup_tests {
             openasr_core::TranscriptionRequest::new("fixtures/jfk.wav", "whisper-tiny")
                 .with_voice_id(true)
                 .with_diarize_speakers(Some(2))
+                .with_return_speaker_embeddings(true)
                 .with_inference_threads(Some(8))
                 .with_execution_target(Some(openasr_core::ExecutionTarget::Cpu));
         super::apply_remote_compute_client_request_policy(&mut request);
         assert!(!request.voice_id);
         assert!(request.anonymous_diarize);
         assert_eq!(request.diarize_speakers, Some(2));
+        assert!(
+            request.return_speaker_embeddings,
+            "remote policy must not silently drop return_speaker_embeddings"
+        );
         assert!(request.inference_threads.is_none());
         assert!(request.execution_target.is_none());
     }
@@ -2697,6 +2753,7 @@ pub(crate) async fn transcribe_with_runtime(
                                 .with_voice_id(request.voice_id)
                                 .with_anonymous_diarize(request.anonymous_diarize)
                                 .with_diarize_speakers(request.diarize_speakers)
+                                .with_return_speaker_embeddings(request.return_speaker_embeddings)
                                 .with_word_timestamps(request.word_timestamps)
                                 .with_word_timestamps_refine(request.word_timestamps_refine),
                         )

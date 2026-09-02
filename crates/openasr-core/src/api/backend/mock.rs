@@ -7,6 +7,9 @@ impl TranscriptionBackend for MockBackend {
     fn transcribe(&self, request: TranscriptionRequest) -> Result<Transcription, BackendError> {
         super::reject_unsupported_diarization(&request, "mock")?;
         super::reject_unsupported_phrase_bias(&request, "mock")?;
+        if request.return_speaker_embeddings && !request.anonymous_diarize && !request.voice_id {
+            return Err(BackendError::SpeakerEmbeddingsRequireDiarization);
+        }
         // OADP Phase 0: fail closed instead of pretending the adapter applied.
         if request.adapter_path.is_some() {
             return Err(BackendError::AdapterNotSupported { backend: "mock" });
@@ -114,6 +117,32 @@ mod tests {
             Some("SPEAKER_00")
         );
         assert!(transcription.segments[0].speaker_person_id.is_none());
+        assert!(transcription.speaker_embeddings.is_none());
+    }
+
+    #[test]
+    fn mock_backend_does_not_fabricate_speaker_embeddings() {
+        let backend = MockBackend;
+        let request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-tiny")
+            .with_anonymous_diarize(true)
+            .with_return_speaker_embeddings(true);
+
+        let transcription = backend.transcribe(request).unwrap();
+        assert_eq!(
+            transcription.segments[0].speaker_label.as_deref(),
+            Some("SPEAKER_00")
+        );
+        assert!(transcription.speaker_embeddings.is_none());
+    }
+
+    #[test]
+    fn mock_backend_rejects_speaker_embeddings_without_diarization() {
+        let backend = MockBackend;
+        let request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-tiny")
+            .with_return_speaker_embeddings(true);
+
+        let error = backend.transcribe(request).unwrap_err().to_string();
+        assert!(error.contains("return_speaker_embeddings requires diarize=true"));
     }
 
     #[test]

@@ -151,7 +151,10 @@ match.
 This universal identity contract is qualified for local file transcription.
 Realtime and remote-compute diarization use separate API and privacy contracts;
 their lower-level speaker fields do not establish the same cross-recording
-identity guarantee.
+identity guarantee. Per-speaker embedding vectors are omitted from
+transcription responses unless `return_speaker_embeddings=true` is set
+(verbose_json only); a remote-compute device token requesting them is
+rejected.
 
 OpenASR does not perform source/audio separation (isolating vocals from
 background music or noise, the way Demucs or similar stem-splitting tools do).

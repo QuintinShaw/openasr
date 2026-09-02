@@ -76,7 +76,11 @@ named person".
 
 - Labels are anonymous and session-relative (`SPEAKER_00/01`, ...) until a
   speaker has enough evidence to match an explicitly enrolled local person.
-  Temporary recording-level embeddings are not persisted as identities.
+  Temporary recording-level centroids do not appear in transcription
+  responses by default. `return_speaker_embeddings=true` is an
+  operator/loopback opt-in on `verbose_json`; a remote-compute device
+  token requesting that field is rejected with HTTP 403. Temporary
+  recording-level embeddings are not persisted as identities.
 - Identity enrollment is opt-in, and the person library stays on the device.
   Voice ID stores enrolled voiceprints for named people so a person's label can
   remain consistent across turns and later local file transcriptions. Enrolled voiceprints and their

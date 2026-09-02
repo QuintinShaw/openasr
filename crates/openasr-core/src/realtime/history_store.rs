@@ -180,6 +180,7 @@ impl DaemonHistoryDetail {
             language: None,
             truncated_decodes: Vec::new(),
             unnamed_speakers: Vec::new(),
+            ..Default::default()
         }
     }
 }

@@ -3222,6 +3222,9 @@ pub(crate) enum ApiError {
     NotFound(String),
     Conflict(String),
     Forbidden(String),
+    /// HTTP 403 with `error.type = authorization_error`. Distinct from
+    /// [`Self::Forbidden`], which stays `openasr_error` (pause/cancel).
+    Authorization(String),
     Busy(String),
     Catalog(CatalogError),
     Config(openasr_core::ConfigError),
@@ -3285,9 +3288,10 @@ impl std::fmt::Display for ApiError {
         match self {
             Self::BadRequest(message) | Self::Format(message) => f.write_str(message),
             Self::NotFound(message) => f.write_str(message),
-            Self::Conflict(message) | Self::Forbidden(message) | Self::Busy(message) => {
-                f.write_str(message)
-            }
+            Self::Conflict(message)
+            | Self::Forbidden(message)
+            | Self::Authorization(message)
+            | Self::Busy(message) => f.write_str(message),
             Self::Catalog(error) => write!(f, "Could not load model catalog: {error}"),
             Self::Config(error) => write!(f, "Could not read or update OpenASR config: {error}"),
             Self::Home(error) => write!(f, "Could not resolve OpenASR home: {error}"),
@@ -3329,81 +3333,87 @@ impl std::fmt::Display for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            Self::BadRequest(message) | Self::Format(message) => (StatusCode::BAD_REQUEST, message),
-            Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
-            Self::Conflict(message) => (StatusCode::CONFLICT, message),
-            Self::Forbidden(message) => (StatusCode::FORBIDDEN, message),
-            Self::Busy(message) => (StatusCode::TOO_MANY_REQUESTS, message),
-            Self::Catalog(error) => {
-                let status = if matches!(
-                    &error,
-                    CatalogError::InvalidPullReference(_)
-                        | CatalogError::UnknownModel { .. }
-                        | CatalogError::AmbiguousModelRef { .. }
-                        | CatalogError::UnknownQuant { .. }
-                        | CatalogError::ConflictingQuant { .. }
-                ) {
-                    StatusCode::BAD_REQUEST
-                } else {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                };
-                (status, format!("Could not load model catalog: {error}"))
-            }
-            Self::Config(error) => (
-                config_error_status(&error),
-                format!("Could not read or update OpenASR config: {error}"),
-            ),
-            Self::Home(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Could not resolve OpenASR home: {error}"),
-            ),
-            Self::History(error) => {
-                let status = if matches!(
-                    error,
-                    DaemonHistoryStoreError::InvalidId { .. }
-                        | DaemonHistoryStoreError::InvalidRecord { .. }
-                ) {
-                    StatusCode::BAD_REQUEST
-                } else {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                };
-                (
-                    status,
-                    format!("Could not update transcription history: {error}"),
-                )
-            }
-            Self::JobStore(message) | Self::RequestAttemptIdentity(message) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, message)
-            }
-            Self::MultipartRejection(error) => (
-                StatusCode::BAD_REQUEST,
-                format!("Could not read multipart form: {error}"),
-            ),
-            Self::Multipart(error) => {
-                let status = error.status();
-                let message = multipart_error_message(&error);
-                (status, message)
-            }
-            Self::AudioPreparation(error) => (
-                StatusCode::BAD_REQUEST,
-                format!("Could not prepare uploaded audio for transcription: {error}"),
-            ),
-            Self::ModelSessionCapacity(error) => (
-                StatusCode::TOO_MANY_REQUESTS,
-                format!(
-                    "Model '{}' is at its concurrent native session limit ({}). Retry when an existing request finishes, or increase --max-native-sessions-per-model if this host has enough memory.",
-                    error.model_identity, error.limit,
-                ),
-            ),
-            Self::Backend(error) => {
-                let status = match &error {
+        let (status, message, error_type) = match self {
+            Self::Authorization(message) => (StatusCode::FORBIDDEN, message, "authorization_error"),
+            other => {
+                let (status, message) = match other {
+                    Self::BadRequest(message) | Self::Format(message) => {
+                        (StatusCode::BAD_REQUEST, message)
+                    }
+                    Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
+                    Self::Conflict(message) => (StatusCode::CONFLICT, message),
+                    Self::Forbidden(message) => (StatusCode::FORBIDDEN, message),
+                    Self::Busy(message) => (StatusCode::TOO_MANY_REQUESTS, message),
+                    Self::Catalog(error) => {
+                        let status = if matches!(
+                            &error,
+                            CatalogError::InvalidPullReference(_)
+                                | CatalogError::UnknownModel { .. }
+                                | CatalogError::AmbiguousModelRef { .. }
+                                | CatalogError::UnknownQuant { .. }
+                                | CatalogError::ConflictingQuant { .. }
+                        ) {
+                            StatusCode::BAD_REQUEST
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        };
+                        (status, format!("Could not load model catalog: {error}"))
+                    }
+                    Self::Config(error) => (
+                        config_error_status(&error),
+                        format!("Could not read or update OpenASR config: {error}"),
+                    ),
+                    Self::Home(error) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Could not resolve OpenASR home: {error}"),
+                    ),
+                    Self::History(error) => {
+                        let status = if matches!(
+                            error,
+                            DaemonHistoryStoreError::InvalidId { .. }
+                                | DaemonHistoryStoreError::InvalidRecord { .. }
+                        ) {
+                            StatusCode::BAD_REQUEST
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        };
+                        (
+                            status,
+                            format!("Could not update transcription history: {error}"),
+                        )
+                    }
+                    Self::JobStore(message) | Self::RequestAttemptIdentity(message) => {
+                        (StatusCode::INTERNAL_SERVER_ERROR, message)
+                    }
+                    Self::MultipartRejection(error) => (
+                        StatusCode::BAD_REQUEST,
+                        format!("Could not read multipart form: {error}"),
+                    ),
+                    Self::Multipart(error) => {
+                        let status = error.status();
+                        let message = multipart_error_message(&error);
+                        (status, message)
+                    }
+                    Self::AudioPreparation(error) => (
+                        StatusCode::BAD_REQUEST,
+                        format!("Could not prepare uploaded audio for transcription: {error}"),
+                    ),
+                    Self::ModelSessionCapacity(error) => (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        format!(
+                            "Model '{}' is at its concurrent native session limit ({}). Retry when an existing request finishes, or increase --max-native-sessions-per-model if this host has enough memory.",
+                            error.model_identity, error.limit,
+                        ),
+                    ),
+                    Self::Backend(error) => {
+                        let status = match &error {
                     openasr_core::BackendError::VoiceIdUnsupportedForRealtime { .. }
                     | openasr_core::BackendError::DiarizationNotSupported { .. }
                     | openasr_core::BackendError::DiarizationSegmenterUnavailable
                     | openasr_core::BackendError::ExternalDiarizationFailed { .. }
                     | openasr_core::BackendError::VoiceIdIdentityFailed(_)
                     | openasr_core::BackendError::DiarizeSpeakersRequiresDiarization
+                    | openasr_core::BackendError::SpeakerEmbeddingsRequireDiarization
                     | openasr_core::BackendError::PhraseBiasNotSupported { .. }
                     | openasr_core::BackendError::AdapterNotSupported { .. }
                     | openasr_core::BackendError::PhraseBiasUnsupportedByModel { .. }
@@ -3439,36 +3449,51 @@ impl IntoResponse for ApiError {
                     // from the 400 fail-closed refusals and the 5xx faults.
                     openasr_core::BackendError::TranscriptionCanceled => StatusCode::CONFLICT,
                 };
-                (status, format!("Could not transcribe audio: {error}"))
-            }
-            Self::BackendJoin(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Could not transcribe audio: backend task failed: {error}"),
-            ),
-            Self::Pull(error) => {
-                let status = match &error {
-                    PullError::InvalidTarget { .. }
-                    | PullError::NonHttpsUrl { .. }
-                    | PullError::NotInstalled { .. } => StatusCode::BAD_REQUEST,
-                    PullError::LockHeld { .. } => StatusCode::CONFLICT,
-                    PullError::InsufficientSpace { .. } => StatusCode::INSUFFICIENT_STORAGE,
-                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                        (status, format!("Could not transcribe audio: {error}"))
+                    }
+                    Self::BackendJoin(error) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Could not transcribe audio: backend task failed: {error}"),
+                    ),
+                    Self::Pull(error) => {
+                        let status = match &error {
+                            PullError::InvalidTarget { .. }
+                            | PullError::NonHttpsUrl { .. }
+                            | PullError::NotInstalled { .. } => StatusCode::BAD_REQUEST,
+                            PullError::LockHeld { .. } => StatusCode::CONFLICT,
+                            PullError::InsufficientSpace { .. } => StatusCode::INSUFFICIENT_STORAGE,
+                            _ => StatusCode::INTERNAL_SERVER_ERROR,
+                        };
+                        (status, format!("Could not pull model pack: {error}"))
+                    }
+                    Self::Registry(error) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Could not load model registry: {error}"),
+                    ),
+                    Self::Serialize(error) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Could not render transcription response: {error}"),
+                    ),
+                    Self::TempFile(error) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Could not prepare uploaded audio for transcription: {error}"),
+                    ),
+                    Self::InsufficientDiskSpace(message) => {
+                        (StatusCode::INSUFFICIENT_STORAGE, message)
+                    }
+                    Self::Authorization(_) => unreachable!("Authorization is selected by variant"),
                 };
-                (status, format!("Could not pull model pack: {error}"))
+                let error_type = match status {
+                    StatusCode::BAD_REQUEST => "invalid_request_error",
+                    StatusCode::CONFLICT => "conflict_error",
+                    StatusCode::NOT_FOUND => "not_found_error",
+                    StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+                    StatusCode::SERVICE_UNAVAILABLE => "service_unavailable_error",
+                    StatusCode::INSUFFICIENT_STORAGE => "insufficient_storage_error",
+                    _ => "openasr_error",
+                };
+                (status, message, error_type)
             }
-            Self::Registry(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Could not load model registry: {error}"),
-            ),
-            Self::Serialize(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Could not render transcription response: {error}"),
-            ),
-            Self::TempFile(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Could not prepare uploaded audio for transcription: {error}"),
-            ),
-            Self::InsufficientDiskSpace(message) => (StatusCode::INSUFFICIENT_STORAGE, message),
         };
 
         // Log every failed request to stderr (captured in daemon.log by the
@@ -3483,15 +3508,7 @@ impl IntoResponse for ApiError {
             Json(ErrorResponse {
                 error: ErrorBody {
                     message,
-                    r#type: match status {
-                        StatusCode::BAD_REQUEST => "invalid_request_error",
-                        StatusCode::CONFLICT => "conflict_error",
-                        StatusCode::NOT_FOUND => "not_found_error",
-                        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
-                        StatusCode::SERVICE_UNAVAILABLE => "service_unavailable_error",
-                        StatusCode::INSUFFICIENT_STORAGE => "insufficient_storage_error",
-                        _ => "openasr_error",
-                    },
+                    r#type: error_type,
                     param: None,
                     code: None,
                 },

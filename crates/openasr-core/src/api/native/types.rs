@@ -321,6 +321,10 @@ pub struct NativeAsrRequestOptions {
     /// the Voice ID / anonymous-diarize flags so the server rebuild does not
     /// drop `speakers`.
     pub diarize_speakers: Option<u8>,
+    /// Opt-in per-speaker embeddings. Carried across the native offline
+    /// round-trip so the server rebuild does not drop
+    /// `return_speaker_embeddings`.
+    pub return_speaker_embeddings: bool,
     pub partial_results: bool,
     pub word_timestamps: bool,
     /// Opt-in `--word-timestamps=aligned` / `word_aligned` refinement tier;
@@ -371,6 +375,11 @@ impl NativeAsrRequestOptions {
 
     pub fn with_diarize_speakers(mut self, diarize_speakers: Option<u8>) -> Self {
         self.diarize_speakers = diarize_speakers;
+        self
+    }
+
+    pub fn with_return_speaker_embeddings(mut self, return_speaker_embeddings: bool) -> Self {
+        self.return_speaker_embeddings = return_speaker_embeddings;
         self
     }
 

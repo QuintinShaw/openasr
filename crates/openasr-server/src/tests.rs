@@ -3779,6 +3779,33 @@ fn transcription_canceled_backend_error_maps_to_409() {
     assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
+#[tokio::test]
+async fn speaker_embeddings_authorization_is_403_authorization_error() {
+    let response =
+        ApiError::Authorization("Speaker embeddings are biometric-derived data.".to_string())
+            .into_response();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 64)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "authorization_error");
+}
+
+#[tokio::test]
+async fn pause_forbidden_stays_openasr_error_not_authorization_error() {
+    let response = ApiError::Forbidden(
+        "Only the device that started this transcription can control it.".to_string(),
+    )
+    .into_response();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 64)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "openasr_error");
+}
+
 #[test]
 fn external_diarization_fail_closed_errors_map_to_400() {
     let missing = ApiError::Backend(openasr_core::BackendError::DiarizationSegmenterUnavailable)

@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- API: `POST /v1/audio/transcriptions` and `/v1/audio/translations` accept
+  opt-in `return_speaker_embeddings=true` with `diarize=true` and
+  `response_format=verbose_json`. The response then includes a WhisperX/Speakr
+  `speaker_embeddings` map plus sibling `speaker_embedding_space` metadata
+  copied from already-computed diarization centroids. Default requests omit
+  both fields. Remote-compute device tokens requesting the field receive HTTP
+  403 `authorization_error`; operator and loopback clients are unrestricted.
 - Subtitles: transcription results now keep readable paragraphs separate from
   short subtitle cues. JSON responses expose `subtitle_cues` and
   `timeline_quality`; SRT/VTT render the cue view. The server also provides
