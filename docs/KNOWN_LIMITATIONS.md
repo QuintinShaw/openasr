@@ -121,7 +121,13 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   pauses longer than 4 s in a correctly aligned manuscript are not. The server
   never downloads the pack; paired device tokens may call the endpoint (it is a
   compute route, not operator-only). This route is not yet on the file
-  FIFO / pause / cancel surface used by `/v1/audio/transcriptions`. CLI `align`
+  FIFO / pause / cancel surface used by `/v1/audio/transcriptions`; a request
+  that has entered alignment cannot be cancelled that way. The plain-transcript
+  path still aligns the whole recording as one Forced Aligner item: it does
+  not auto-split. Inputs that would exceed decoder context or the 400 s grid
+  fail closed instead of being chunked. Kanji-only Japanese with no kana, when
+  tagged `en`/`auto`, still takes the CJK character path and is not caught by
+  the hiragana/katakana/hangul script guard. CLI `align`
   is itself consent to install the pack unless `--offline`.
 - Hardware execution target selection is generic: Desktop/server requests support
   `auto`, `cpu`, and `accelerated` when the native runtime reports an accelerated
