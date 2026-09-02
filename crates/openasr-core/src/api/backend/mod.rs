@@ -809,7 +809,7 @@ pub struct Transcription {
     pub speaker_embeddings: Option<SpeakerEmbeddingPayload>,
 }
 
-/// How vectors in [`SpeakerEmbeddingSpace`] are normalized. ReDimNet2-B6
+/// How vectors in [`SpeakerEmbeddingSpace`] are normalized. Production
 /// centroids are already L2; the JSON field is the comparability contract,
 /// not a request to re-normalize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -881,7 +881,7 @@ impl SpeakerEmbeddingPayload {
         }
         Ok(Some(Self {
             space: SpeakerEmbeddingSpace {
-                model_id: crate::diarize::embed::SPEAKER_EMBEDDER_PACK_ID.to_string(),
+                model_id: identity.catalog_model_id,
                 pack_fingerprint: identity.pack_fingerprint,
                 dim: expected_dim,
                 normalization: SpeakerEmbeddingNormalization::L2,
@@ -1593,10 +1593,13 @@ mod tests {
         }
 
         fn identity(&self) -> Option<crate::diarize::embed::SpeakerEmbedderIdentity> {
-            Some(crate::diarize::embed::SpeakerEmbedderIdentity {
-                embedding_dim: self.dim,
-                pack_fingerprint: self.fingerprint.to_string(),
-            })
+            Some(
+                crate::diarize::embed::SpeakerEmbedderIdentity::unlabeled_fixture(
+                    crate::diarize::embed::SpeakerEmbedderFamily::ReDimNet2,
+                    self.dim,
+                    self.fingerprint,
+                ),
+            )
         }
     }
 
@@ -1646,10 +1649,7 @@ mod tests {
         let payload = SpeakerEmbeddingPayload::from_timeline(&timeline, &embedder)
             .expect("matching dims")
             .expect("centroids present");
-        assert_eq!(
-            payload.space.model_id,
-            crate::diarize::embed::SPEAKER_EMBEDDER_PACK_ID
-        );
+        assert_eq!(payload.space.model_id, "unknown");
         assert_eq!(payload.space.pack_fingerprint, "sha256:test-pack");
         assert_eq!(payload.space.dim, 2);
         assert_eq!(
