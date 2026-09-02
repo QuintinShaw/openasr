@@ -167,20 +167,23 @@ fn describe_embedder(
     &'static str,
 ) {
     match identity.family {
-        SpeakerEmbedderFamily::ReDimNet2 => (
+        SpeakerEmbedderFamily::ReDimNet2 if identity.embedding_dim == 192 => (
             "redimnet",
             "redimnet2-b6",
             REDIMNET_MODEL_VERSION,
             REDIMNET_FRONTEND_VERSION,
             REDIMNET_CALIBRATION_VERSION,
         ),
-        SpeakerEmbedderFamily::WeSpeakerResNet => (
+        SpeakerEmbedderFamily::WeSpeakerResNet if identity.embedding_dim == 256 => (
             "wespeaker",
             "wespeaker-resnet",
             WESPEAKER_MODEL_VERSION,
             WESPEAKER_FRONTEND_VERSION,
             WESPEAKER_CALIBRATION_VERSION,
         ),
+        SpeakerEmbedderFamily::ReDimNet2 | SpeakerEmbedderFamily::WeSpeakerResNet => {
+            ("unknown", "unknown", "unknown", "unknown", "unknown")
+        }
     }
 }
 
@@ -270,5 +273,19 @@ mod tests {
         );
         assert_eq!(redimnet.embedder_family, "redimnet");
         assert_ne!(wespeaker.space_id, redimnet.space_id);
+    }
+
+    #[test]
+    fn for_active_embedder_does_not_impersonate_production_space_on_dim_mismatch() {
+        let fake = EmbeddingSpace::for_active_embedder(
+            &SpeakerEmbedderIdentity {
+                family: SpeakerEmbedderFamily::ReDimNet2,
+                embedding_dim: 2,
+                pack_fingerprint: "voice-id-identity-tests-v1".to_string(),
+            },
+            crate::diarize::calibration::REDIMNET_CALIBRATION,
+        );
+        assert_eq!(fake.embedder_family, "unknown");
+        assert_eq!(fake.embedder_model_id, "unknown");
     }
 }
