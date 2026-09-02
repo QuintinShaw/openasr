@@ -57,6 +57,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Core: `openasr pull` skips the network fetch when the installed
+  content-addressed object already matches the catalog SHA-256, then
+  re-verifies the pack contract and refreshes the install record. A catalog
+  filename alone is not identity; an unsealed object whose bytes do not hash
+  to the catalog digest is fetched again. `KNOWN_LIMITATIONS` no longer
+  claims that pull always re-downloads.
 - Core: `--diarize` / Voice ID now installs the native execution broker
   before Stream-VAD and ReDimNet admission. 0.1.37 failed closed with
   `could not load the vendored FireRed Stream-VAD` because those weights

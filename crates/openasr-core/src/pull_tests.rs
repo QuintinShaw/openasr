@@ -2440,6 +2440,144 @@ fn installed_matches_rejects_a_size_mismatch_on_the_stat_alone() {
     assert!(!installed_matches(&target, &paths).unwrap());
 }
 
+/// Re-pulling a pack whose installed object matches the catalog SHA-256 must
+/// skip the download, re-run the pack verifier, and refresh the install
+/// record. The empty FakeClient panics if the download path is entered.
+#[test]
+fn pull_skips_download_when_installed_pack_hash_matches() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let mut client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: bytes.clone(),
+    }]);
+    let mut first_events = Vec::new();
+    let first = pull_model_pack_with_client(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::default(),
+        |event| first_events.push(event),
+    )
+    .unwrap();
+    assert!(
+        first_events
+            .iter()
+            .any(|event| matches!(event, PullProgress::Installed { .. }))
+    );
+    assert!(!client.ranges().is_empty());
+
+    let mut client = FakeClient::default();
+    let mut second_events = Vec::new();
+    let second = pull_model_pack_with_client(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::default(),
+        |event| second_events.push(event),
+    )
+    .unwrap();
+
+    assert!(
+        client.ranges().is_empty(),
+        "matching digest must not open a download"
+    );
+    assert!(
+        second_events
+            .iter()
+            .any(|event| matches!(event, PullProgress::UsingInstalled { .. }))
+    );
+    assert!(!second_events.iter().any(|event| matches!(
+        event,
+        PullProgress::DownloadStarted { .. } | PullProgress::Downloading { .. }
+    )));
+    assert_eq!(second.sha256, first.sha256);
+    assert_eq!(second.path, first.path);
+    assert!(
+        paths_for(temp.path(), &resolved)
+            .installed_meta_path
+            .exists()
+    );
+}
+
+/// A file sitting at the catalog filename is not identity. Skip only when
+/// the content-addressed object matches the catalog digest.
+#[test]
+fn pull_downloads_when_only_catalog_filename_is_present() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let decoy = temp
+        .path()
+        .join("models")
+        .join(&resolved.model_id)
+        .join(&resolved.quant)
+        .join(&resolved.filename);
+    fs::create_dir_all(decoy.parent().unwrap()).unwrap();
+    fs::write(&decoy, b"not-the-catalog-pack").unwrap();
+
+    let mut client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: bytes.clone(),
+    }]);
+    let mut events = Vec::new();
+    let installed = pull_model_pack_with_client(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::default(),
+        |event| events.push(event),
+    )
+    .unwrap();
+
+    assert!(!client.ranges().is_empty());
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, PullProgress::DownloadStarted { .. }))
+    );
+    assert_eq!(fs::read(&installed.path).unwrap(), bytes);
+    assert_eq!(fs::read(&decoy).unwrap(), b"not-the-catalog-pack");
+}
+
+/// Unsealed bytes at the catalog object path that do not hash to the catalog
+/// digest must not skip the download. Filename and path are not identity.
+#[test]
+fn pull_does_not_skip_download_when_unsealed_object_hash_mismatches() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let target = PullTarget::from_resolved(&resolved).unwrap();
+    let paths = pull_paths(temp.path(), &target).unwrap();
+    let mut decoy = bytes.clone();
+    *decoy.last_mut().unwrap() ^= 0xff;
+    assert_ne!(sha256_hex(&decoy), resolved.sha256);
+    seed_final_object(&paths, &decoy, false);
+
+    let mut client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: bytes.clone(),
+    }]);
+    let result = pull_model_pack_with_client(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::default(),
+        |_| {},
+    );
+
+    assert!(
+        !client.ranges().is_empty(),
+        "hash mismatch must re-enter the download path"
+    );
+    // The content store refuses to replace a digest object whose on-disk
+    // bytes do not match the digest in its path. Fail closed rather than
+    // treating the corrupt object as installed.
+    assert!(result.is_err());
+    assert_eq!(fs::read(&paths.final_path).unwrap(), decoy);
+}
+
 /// `config.json`'s `models_dir` field must be the single thing that decides
 /// where a pack lands and where `list_installed_packs` looks for it -- a
 /// redirected home must land the pack entirely outside `<home>/models` and

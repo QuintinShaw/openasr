@@ -198,9 +198,6 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   (`--model-pack` / an installed `--model`). There is no per-request lazy model
   loading or an `openasr ps`-style multi-model runner yet -- restart `serve` to
   switch models.
-- `openasr pull` always fetches and re-installs; it has no incremental update
-  (no revision/digest diff, `up to date` check, or `--force`). Re-pulling a model
-  re-downloads it.
 - Source-language control is per-model and capability-gated (see
   `openasr show <pack>` / `/v1/capabilities`). Multilingual Whisper auto-detects an
   unset language and accepts an explicit `--language`; Cohere and the English-only
