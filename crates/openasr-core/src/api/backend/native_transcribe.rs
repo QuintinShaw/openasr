@@ -2480,9 +2480,10 @@ fn run_native_transcription_impl(
         None
     } else {
         Some(
-            crate::diarize::embed::PolicyResolvedSpeakerRuntime::load_with_intent(
+            crate::diarize::embed::PolicyResolvedSpeakerRuntime::load_with_preference(
                 Arc::clone(execution_services),
                 request_execution_intent.clone(),
+                request.voice_id_embedder,
             )
             .map_err(|error| BackendError::NativeFailClosed {
                 reason: format!("could not construct the admitted speaker runtime: {error}"),

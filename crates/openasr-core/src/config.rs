@@ -86,6 +86,10 @@ pub struct Preferences {
     /// baseline.
     #[serde(default)]
     pub voice_id_segmenter: VoiceIdSegmenterPreference,
+    /// Global speaker-embedder preference. Default stays ReDimNet2-B6.
+    /// WeSpeaker is explicit-only; there is no Auto "use whatever is installed".
+    #[serde(default)]
+    pub voice_id_embedder: VoiceIdEmbedderPreference,
     #[serde(default)]
     pub word_timestamps: bool,
     #[serde(default)]
@@ -129,6 +133,16 @@ pub enum VoiceIdSegmenterPreference {
     Auto,
     #[serde(rename = "segmentation_3_0")]
     Segmentation3_0,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceIdEmbedderPreference {
+    #[default]
+    #[serde(rename = "redimnet2")]
+    ReDimNet2,
+    #[serde(rename = "wespeaker")]
+    WeSpeaker,
 }
 
 /// How much dictation/transcription history to keep on disk.
@@ -357,6 +371,7 @@ impl Default for Preferences {
             language: None,
             diarize: false,
             voice_id_segmenter: VoiceIdSegmenterPreference::Auto,
+            voice_id_embedder: VoiceIdEmbedderPreference::ReDimNet2,
             word_timestamps: false,
             auto_save: false,
             launch_at_login: false,

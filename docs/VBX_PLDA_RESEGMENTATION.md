@@ -27,7 +27,9 @@ or copied.
 
 The pass is intentionally conservative:
 
-- only 192-dimensional ReDimNet2-B6 embeddings are eligible;
+- only WeSpeaker ResNet 256-d embeddings are eligible (`family == WeSpeakerResNet`
+  and `dim == 256`). ReDimNet2-B6 (192-d) is skipped; dimension alone is not
+  enough;
 - only context-rich, dense files with clear AHC oversegmentation enter the pass;
 - cannot-link constraints from simultaneous pyannote regions are preserved;
 - short files, the realtime path, and recordings outside the dense-refinement

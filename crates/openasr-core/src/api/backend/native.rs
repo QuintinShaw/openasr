@@ -1500,6 +1500,7 @@ fn native_offline_request_to_transcription_request(
     request: NativeAsrOfflineRequest,
 ) -> TranscriptionRequest {
     let segmenter = request.voice_id_segmenter;
+    let embedder = request.voice_id_embedder;
     let mut converted = TranscriptionRequest::new(request.input_path, model_pack.id.clone())
         .with_model_pack_path(Some(model_pack.root.clone()))
         .with_language(request.options.language)
@@ -1523,6 +1524,7 @@ fn native_offline_request_to_transcription_request(
         .with_execution_context(request.execution_context)
         .with_serve_batch_max_native_sessions(request.serve_batch_max_native_sessions);
     converted.voice_id_segmenter = segmenter;
+    converted.voice_id_embedder = embedder;
     converted
 }
 
@@ -2118,6 +2120,32 @@ mod tests {
         assert!(!rebuilt.voice_id);
         assert!(rebuilt.anonymous_diarize);
         assert_eq!(rebuilt.diarize_speakers, Some(3));
+    }
+
+    #[test]
+    fn native_offline_request_conversion_preserves_voice_id_embedder() {
+        let pack =
+            NativeAsrModelPackRef::new("moonshine-tiny", "moonshine", PathBuf::from("/tmp/pack"));
+        let rebuilt = native_offline_request_to_transcription_request(
+            &pack,
+            ExecutionTarget::Auto,
+            NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav"))
+                .with_voice_id_embedder(crate::config::VoiceIdEmbedderPreference::WeSpeaker),
+        );
+        assert_eq!(
+            rebuilt.voice_id_embedder,
+            crate::config::VoiceIdEmbedderPreference::WeSpeaker
+        );
+
+        let rebuilt_default = native_offline_request_to_transcription_request(
+            &pack,
+            ExecutionTarget::Auto,
+            NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav")),
+        );
+        assert_eq!(
+            rebuilt_default.voice_id_embedder,
+            crate::config::VoiceIdEmbedderPreference::ReDimNet2
+        );
     }
 
     #[test]

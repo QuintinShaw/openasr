@@ -50,8 +50,8 @@ the onboarding and reviewer contract are its implementation and review views.
 
 | Doc | What it covers |
 | --- | --- |
-| [Diarization Pack Publishing](DIARIZATION_PACK_PUBLISHING.md) | Universal file Voice ID topology; published ReDimNet2-B6/segmentation-3.0 packs; and the explicitly consented non-commercial DiariZen Large-s80-md-v2 path. |
-| [VBx PLDA Resegmentation](VBX_PLDA_RESEGMENTATION.md) | The PLDA-mixture / HMM VBx resegmentation refinement for diarization. |
+| [Diarization Pack Publishing](DIARIZATION_PACK_PUBLISHING.md) | Universal file Voice ID topology; default ReDimNet2-B6 vs optional WeSpeaker ResNet; published segmentation-3.0; and the explicitly consented non-commercial DiariZen Large-s80-md-v2 path. |
+| [VBx PLDA Resegmentation](VBX_PLDA_RESEGMENTATION.md) | The PLDA-mixture / HMM VBx resegmentation refinement (WeSpeaker 256-d only). |
 
 The diarization privacy model and surface-specific identity/redaction contract
 (anonymous labels by default and explicit local enrollment) live in

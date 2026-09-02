@@ -1,7 +1,7 @@
 //! Parity tests for the ReDimNet2-B6 embedder.
 
 use super::{
-    EmbedError, PolicyResolvedSpeakerRuntime, REDIMNET_MAX_BATCH_WORKERS, RedimNet2Embedder,
+    EMBEDDER_MAX_BATCH_WORKERS, EmbedError, PolicyResolvedSpeakerRuntime, RedimNet2Embedder,
     RedimNetResidentRuntime, SpeakerEmbedder, SpeakerEmbeddingExecutionPlan,
     abort_successful_results_after_terminal_failure, embed_batch_worker_range,
 };
@@ -449,7 +449,7 @@ fn redimnet_batch_worker_pareto_benchmark() {
         .expect("OPENASR_REDIMNET_BENCH_WORKERS")
         .parse::<usize>()
         .expect("worker count is an integer");
-    assert!((1..=REDIMNET_MAX_BATCH_WORKERS).contains(&workers));
+    assert!((1..=EMBEDDER_MAX_BATCH_WORKERS).contains(&workers));
     let services = std::sync::Arc::new(
         crate::NativeExecutionServices::for_local_process().expect("execution services"),
     );
@@ -472,7 +472,7 @@ fn redimnet_batch_worker_pareto_benchmark() {
     .expect("load benchmark audio");
     let window_samples = 24_000usize;
     let step_samples = 12_000usize;
-    let batch_clips = REDIMNET_MAX_BATCH_WORKERS * 4;
+    let batch_clips = EMBEDDER_MAX_BATCH_WORKERS * 4;
     assert!(
         samples.len() >= (batch_clips - 1) * step_samples + window_samples,
         "benchmark audio must cover one production embedding batch"
@@ -844,7 +844,7 @@ fn redimnet_backend_benchmark() {
     .expect("load benchmark audio");
     let window_samples = 24_000usize;
     let step_samples = 12_000usize;
-    let clip_count = REDIMNET_MAX_BATCH_WORKERS * 4;
+    let clip_count = EMBEDDER_MAX_BATCH_WORKERS * 4;
     assert!(
         samples.len() >= (clip_count - 1) * step_samples + window_samples,
         "benchmark audio must cover one production embedding batch"

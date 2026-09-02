@@ -324,6 +324,10 @@ fn voice_id_segmenter_preference_is_additive_and_roundtrips() {
         legacy.voice_id_segmenter,
         crate::config::VoiceIdSegmenterPreference::Auto
     );
+    assert_eq!(
+        legacy.voice_id_embedder,
+        crate::config::VoiceIdEmbedderPreference::ReDimNet2
+    );
 
     let forced = Preferences {
         voice_id_segmenter: crate::config::VoiceIdSegmenterPreference::Segmentation3_0,
@@ -805,5 +809,26 @@ fn voice_id_segmenter_preference_has_stable_wire_values() {
     assert_eq!(
         serde_json::from_str::<VoiceIdSegmenterPreference>("\"segmentation_3_0\"").unwrap(),
         VoiceIdSegmenterPreference::Segmentation3_0
+    );
+}
+
+#[test]
+fn voice_id_embedder_preference_has_stable_wire_values() {
+    assert_eq!(
+        serde_json::to_string(&VoiceIdEmbedderPreference::ReDimNet2).unwrap(),
+        "\"redimnet2\""
+    );
+    assert_eq!(
+        serde_json::to_string(&VoiceIdEmbedderPreference::WeSpeaker).unwrap(),
+        "\"wespeaker\""
+    );
+    assert_eq!(
+        serde_json::from_str::<VoiceIdEmbedderPreference>("\"wespeaker\"").unwrap(),
+        VoiceIdEmbedderPreference::WeSpeaker
+    );
+    let legacy: Preferences = serde_json::from_str(r#"{"version":1}"#).unwrap();
+    assert_eq!(
+        legacy.voice_id_embedder,
+        VoiceIdEmbedderPreference::ReDimNet2
     );
 }

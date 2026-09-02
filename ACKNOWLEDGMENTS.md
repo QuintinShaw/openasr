@@ -84,7 +84,13 @@ credits the people who built the original.
 - ReDimNet2-B6 speaker embedder (PalabraAI, MIT) --
   <https://huggingface.co/OpenASR/redimnet2-b6-cn> (192-d ggml-graph embedder
   from the upstream `b6-vb2+vox2+cnc2_v0-lm.pt` checkpoint;
-  <https://github.com/PalabraAI/redimnet2>).
+  <https://github.com/PalabraAI/redimnet2>). Default Voice ID / diarization
+  embedder.
+- WeSpeaker ResNet speaker embedder (WeNet / WeSpeaker, CC BY 4.0) --
+  <https://github.com/wenet-e2e/wespeaker> (optional 256-d ggml-graph family,
+  VoxCeleb English LM checkpoints `wespeaker-voxceleb-resnet{34,152,221,293}-LM`;
+  paper: <https://arxiv.org/abs/2210.17016>). Loaded only on an explicit
+  preference; not a silent fallback for ReDimNet2-B6.
 - DiariZen Large-s80-md-v2 (BUT Speech@FIT, CC BY-NC 4.0 weights) --
   <https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md-v2> (evaluated as an
   optional segmenter; OpenASR has not published or made this pack downloadable).

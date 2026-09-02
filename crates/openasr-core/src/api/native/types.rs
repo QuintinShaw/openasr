@@ -433,6 +433,10 @@ pub struct NativeAsrOfflineRequest {
     /// not exposed as a multipart/per-job option.
     #[doc(hidden)]
     pub voice_id_segmenter: crate::config::VoiceIdSegmenterPreference,
+    /// Persisted speaker-embedder preference carried across the server's
+    /// native offline adapter round-trip.
+    #[doc(hidden)]
+    pub voice_id_embedder: crate::config::VoiceIdEmbedderPreference,
     /// Cancel/pause/resume control and request id for this decode -- same
     /// "explicit, never TLS" contract as
     /// [`crate::TranscriptionRequest::execution_context`], which this carries
@@ -462,6 +466,7 @@ impl NativeAsrOfflineRequest {
             source_container: None,
             prepared_samples: None,
             voice_id_segmenter: crate::config::VoiceIdSegmenterPreference::Auto,
+            voice_id_embedder: crate::config::VoiceIdEmbedderPreference::ReDimNet2,
             execution_context: Arc::new(crate::RequestExecutionContext::uncancellable(
                 "NativeAsrOfflineRequest::new()'s pre-opt-in default; a caller needing \
                  cancellation attaches a real context via with_execution_context",
@@ -483,6 +488,15 @@ impl NativeAsrOfflineRequest {
         preference: crate::config::VoiceIdSegmenterPreference,
     ) -> Self {
         self.voice_id_segmenter = preference;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_voice_id_embedder(
+        mut self,
+        preference: crate::config::VoiceIdEmbedderPreference,
+    ) -> Self {
+        self.voice_id_embedder = preference;
         self
     }
 

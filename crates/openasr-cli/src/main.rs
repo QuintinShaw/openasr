@@ -1337,7 +1337,8 @@ fn transcribe(
     options: TranscribeCommandOptions<'_>,
 ) -> Result<()> {
     let home = openasr_home()?;
-    let config = load_config(&home)?;
+    let document = openasr_core::load_config_document(&home)?;
+    let config = document.config;
     // `--benchmark` measures plain transcription timing; run_benchmark does not
     // thread the request-shaping flags, so reject them rather than silently
     // ignoring them (fail-closed). Checked before any pack install or network.
@@ -1497,6 +1498,7 @@ fn transcribe(
             output_dir,
             skipped,
             &options,
+            document.preferences.voice_id_embedder,
         );
     }
 
@@ -1541,6 +1543,7 @@ fn transcribe(
         })
         .with_phrase_bias(phrase_bias)
         .with_voice_id(options.diarize)
+        .with_voice_id_embedder(document.preferences.voice_id_embedder)
         .with_diarize_speakers(options.speakers)
         .with_punctuation(options.punctuate)
         .with_word_timestamps(options.word_timestamps_mode.is_some())
@@ -1568,6 +1571,25 @@ fn transcribe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clap's debug `Command::debug_assert` walks the full subcommand tree on
+    /// the calling thread. After WeSpeaker landed in `openasr-core`, several
+    /// Linux CI parse tests overflowed the default stack (`SIGABRT`). Parse on
+    /// a dedicated 16 MiB stack so the command tree stays testable.
+    fn parse_cli<I, T>(args: I) -> Result<Cli, clap::error::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+        std::thread::Builder::new()
+            .name("openasr-cli-parse".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args))
+            .expect("spawn cli parse thread")
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    }
 
     fn test_card(id: &str) -> ModelCard {
         ModelCard {
@@ -1598,7 +1620,7 @@ mod tests {
 
     #[test]
     fn parses_bench_receipt_warmup_and_trace_options() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "openasr",
             "bench-receipt",
             "short-audio",
@@ -1640,7 +1662,7 @@ mod tests {
 
     #[test]
     fn parses_bench_receipt_qualification_validator_inputs() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "openasr",
             "bench-receipt",
             "validate-qualification",
@@ -1955,7 +1977,7 @@ mod tests {
 
     #[test]
     fn benchmark_flag_accepts_native_model_pack() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "openasr",
             "transcribe",
             "--benchmark",
@@ -1986,7 +2008,7 @@ mod tests {
 
     #[test]
     fn align_command_parses_transcript_and_srt_format() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "openasr",
             "align",
             "audio.wav",
@@ -2028,7 +2050,7 @@ mod tests {
             "https://example.invalid/license",
             "--quantization",
         ];
-        let cli = Cli::try_parse_from(base.into_iter().chain(["q8-0"]))
+        let cli = parse_cli(base.into_iter().chain(["q8-0"]))
             .expect("the production q8_0 tier must parse");
         let Command::ModelPack {
             command: ModelPackCommand::Import { command },
@@ -2041,7 +2063,7 @@ mod tests {
         };
         assert_eq!(quantization, ImportQwenForcedAlignerQuantization::Q8_0);
 
-        let cli = Cli::try_parse_from(base.into_iter().chain(["q4-k"]))
+        let cli = parse_cli(base.into_iter().chain(["q4-k"]))
             .expect("the policy-guarded q4_k tier must parse");
         let Command::ModelPack {
             command: ModelPackCommand::Import { command },
@@ -2054,14 +2076,14 @@ mod tests {
         };
         assert_eq!(quantization, ImportQwenForcedAlignerQuantization::Q4_K);
 
-        let error = Cli::try_parse_from(base.into_iter().chain(["q4-k-m"]))
+        let error = parse_cli(base.into_iter().chain(["q4-k-m"]))
             .expect_err("q4_k_m must not become a second forced-aligner product identity");
         assert!(error.to_string().contains("invalid value 'q4-k-m'"));
     }
 
     #[test]
     fn audit_quant_cli_accepts_the_policy_guarded_q4_k_tier() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "openasr",
             "model-pack",
             "audit-quant",
@@ -2081,7 +2103,7 @@ mod tests {
 
     #[test]
     fn transcribe_cli_accepts_repeated_hotwords_and_boost() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "openasr",
             "transcribe",
             "--hotword",
@@ -2121,7 +2143,7 @@ mod tests {
 
     #[test]
     fn live_defaults_source_to_mic() {
-        let cli = Cli::try_parse_from(["openasr", "live"]).expect("live parses with no --source");
+        let cli = parse_cli(["openasr", "live"]).expect("live parses with no --source");
         let Command::Live { source, .. } = cli.command else {
             panic!("expected live command");
         };
@@ -2238,7 +2260,7 @@ mod tests {
     /// of silently breaking the desktop sidecar contract.
     #[test]
     fn serve_accepts_desktop_sidecar_contract_flags() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "openasr",
             "serve",
             "--backend",
@@ -2271,7 +2293,7 @@ mod tests {
     #[test]
     fn serve_no_model_conflicts_with_explicit_model_sources() {
         assert!(
-            Cli::try_parse_from([
+            parse_cli([
                 "openasr",
                 "serve",
                 "--no-model",
@@ -2281,7 +2303,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            Cli::try_parse_from([
+            parse_cli([
                 "openasr",
                 "serve",
                 "--no-model",
@@ -2294,10 +2316,7 @@ mod tests {
 
     #[test]
     fn serve_rejects_zero_native_sessions_per_model() {
-        assert!(
-            Cli::try_parse_from(["openasr", "serve", "--max-native-sessions-per-model", "0",])
-                .is_err()
-        );
+        assert!(parse_cli(["openasr", "serve", "--max-native-sessions-per-model", "0",]).is_err());
     }
 
     #[test]
@@ -2306,7 +2325,7 @@ mod tests {
         // (e.g. `openasr serve` from a terminal); they must stay optional so
         // this test only pins their *presence and shape*, not that every
         // caller supplies them.
-        let cli = Cli::try_parse_from(["openasr", "serve"])
+        let cli = parse_cli(["openasr", "serve"])
             .expect("serve must remain usable without the desktop-only flags");
 
         let Command::Serve {

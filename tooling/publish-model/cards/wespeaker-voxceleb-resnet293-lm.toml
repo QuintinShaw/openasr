@@ -1,0 +1,48 @@
+# Per-model card prose for OpenASR/wespeaker-voxceleb-resnet293-lm.
+# Distilled from Wespeaker/wespeaker-voxceleb-resnet293-LM and the WeSpeaker paper.
+
+pipeline_tag = "feature-extraction"
+
+tagline = "WeSpeaker ResNet293 — deepest 256-d VoxCeleb English speaker embeddings"
+
+highlights = [
+  "🎙️ **Optional Voice ID space** — 256-d WeSpeaker ResNet, loaded only when you set `voice_id_embedder=wespeaker`; ReDimNet2-B6 stays the default",
+  "🧬 **ResNet293-TSTP-emb256** — 28.62M-param Bottleneck r-vector with large-margin finetune on VoxCeleb2 Dev",
+  "📏 **Same family, four sizes** — 34/152/221/293 share one ggml graph; this is the largest pack",
+  "🎯 **Parity-gated packaging** — ggml-graph forward matches official PyTorch at cosine ≥ 0.999 on held-out fixtures (CPU and Metal)",
+]
+
+intro = """
+WeSpeaker ResNet293 is the deepest member of Wenet's VoxCeleb English LM
+r-vector family: a 28.62M-parameter Bottleneck ResNet with temporal statistics
+pooling to a 256-d embedding, large-margin finetuned on VoxCeleb2 Dev. OpenASR
+packages the CC BY 4.0 checkpoint as a local fp16 `.oasr` capability pack and
+runs it through the same parameterized ggml graph as ResNet34/152/221. It is an
+explicit optional speaker-embedding space beside the default ReDimNet2-B6 pack —
+there is no Auto fallback, and enrollments do not transfer across the two
+spaces. Languages are English-only (`en`). Pick this size when you want the
+full WeSpeaker depth and can spend the extra compute.
+"""
+
+acknowledgement = """
+This pack redistributes **Wespeaker/wespeaker-voxceleb-resnet293-LM**
+(`avg_model.pt`) in OpenASR's `.oasr` runtime format. Credit for the
+architecture, training, and original weights belongs to the WeSpeaker authors
+(Wenet; paper: Wespeaker: A research and production oriented speaker embedding
+learning toolkit, ICASSP 2023, https://arxiv.org/abs/2210.17016). The upstream
+model is licensed under **CC BY 4.0**; OpenASR packaging retains that license
+and attribution, with the only modification being format conversion for local
+ggml-graph loading.
+"""
+
+[prose_locales."zh-CN"]
+tagline = "WeSpeaker ResNet293：最深的 256 维 VoxCeleb 英语声纹"
+
+highlights = [
+  "🎙️ **可选 Voice ID 空间** — 256 维 WeSpeaker ResNet，仅在设置 `voice_id_embedder=wespeaker` 时加载；默认仍是 ReDimNet2-B6",
+  "🧬 **ResNet293-TSTP-emb256** — 约 28.62M 参数的 Bottleneck r-vector，在 VoxCeleb2 Dev 上做 large-margin 微调",
+  "📏 **同一家族四种尺寸** — 34/152/221/293 共用一张 ggml 计算图；这是体积最大的一档",
+  "🎯 **精度严格校验** — ggml 计算图前向与官方 PyTorch 在固定样本上的余弦相似度 ≥ 0.999（CPU 与 Metal）",
+]
+
+source_sha256 = "8058cf91f2804fc8198c27272f0b0efc08da69ec96e6fa2159dcfd4ed67e973f"

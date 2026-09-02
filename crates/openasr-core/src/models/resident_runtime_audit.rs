@@ -216,7 +216,7 @@ const RESIDENT_CONSTRUCTION_PUBLICATION_INVENTORY: &[(
     ),
     (
         ResidentSurface::Auxiliary,
-        "diarize/embed/policy_runtime.rs",
+        "diarize/embed/policy_family.rs",
         "AuxiliaryRuntimeCacheKey",
         ResidentSiteStatus::Active,
     ),
@@ -250,7 +250,7 @@ const LEASE_CONSTRUCTION_METHODS: &[&str] = &[
 ];
 
 const LEASE_CONSTRUCTION_INVENTORY: &[(&str, &str)] = &[
-    ("diarize/embed/policy_runtime.rs", "try_allocate"),
+    ("diarize/embed/policy_family.rs", "try_allocate"),
     ("diarize/external.rs", "try_reserve_invocation"),
     (
         "diarize/segment/diarizen/runtime.rs",
@@ -434,16 +434,15 @@ fn resident_inventory_set() -> BTreeSet<(String, String, String)> {
         .filter(|(_, path, symbol, _)| {
             !matches!(
                 (*path, *symbol),
-                (
-                    "diarize/embed/policy_runtime.rs",
-                    "AuxiliaryRuntimeCacheKey"
-                ) | (
-                    "diarize/segment/policy_runtime.rs",
-                    "AuxiliaryRuntimeCacheKey"
-                ) | (
-                    "diarize/vad/firered_stream/realtime_runtime.rs",
-                    "PinnedRuntimeActorCheckout"
-                )
+                ("diarize/embed/policy_family.rs", "AuxiliaryRuntimeCacheKey")
+                    | (
+                        "diarize/segment/policy_runtime.rs",
+                        "AuxiliaryRuntimeCacheKey"
+                    )
+                    | (
+                        "diarize/vad/firered_stream/realtime_runtime.rs",
+                        "PinnedRuntimeActorCheckout"
+                    )
             )
         })
         .filter_map(|(_, path, symbol, _)| {
@@ -1137,10 +1136,7 @@ fn k4_family_modules_do_not_bypass_owner_bound_runtime_primitives() {
 fn k4_persistent_auxiliary_families_reference_their_declared_owner_shape() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     for (relative, required) in [
-        (
-            "diarize/embed/policy_runtime.rs",
-            "AuxiliaryRuntimeCacheKey",
-        ),
+        ("diarize/embed/policy_family.rs", "AuxiliaryRuntimeCacheKey"),
         (
             "diarize/segment/policy_runtime.rs",
             "AuxiliaryRuntimeCacheKey",

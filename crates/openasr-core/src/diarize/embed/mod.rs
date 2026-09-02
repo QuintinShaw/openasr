@@ -1,29 +1,36 @@
 //! Speaker embedding.
 //!
-//! The only supported speaker embedder is ReDimNet2-B6 (192-d, ggml graph,
-//! Chinese-enhanced). Weights load from a pulled/local `.oasr` pack and are not
-//! vendored. When the pack is missing, diarization and Voice ID fail closed.
+//! Default speaker embedder is ReDimNet2-B6 (192-d, ggml graph). WeSpeaker
+//! ResNet (256-d, ggml graph) is a parallel family loaded only on explicit
+//! preference or `OPENASR_WESPEAKER_PACK`. Weights load from a pulled/local
+//! `.oasr` pack and are not vendored. When the selected pack is missing,
+//! diarization and Voice ID fail closed.
 
+mod ggml_affine;
 mod pack;
+mod policy_family;
 mod policy_runtime;
-// ReDimNet2-B6 embedder (192-d, ggml graph).
+// Shared 1-D conv primitives for the pure-Rust pyannote segmenter.
 pub(crate) mod ops;
 mod redimnet;
 pub(crate) mod weights;
+mod wespeaker;
 
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
-pub(crate) use pack::REDIMNET_PACK_PREFERENCE;
 pub use pack::{
     DIARIZATION_EMBEDDER_LOAD_FAILED_REASON, REALTIME_DIARIZATION_EMBEDDER_MISSING_REASON,
-    SPEAKER_EMBEDDER_PACK_ID, SPEAKER_EMBEDDER_PACK_LABEL, SpeakerEmbedderIdentity,
-    VOICE_ID_EMBEDDER_PACK_MISSING_REASON, VOICE_ID_NAMING_EMBEDDER_MISSING_REASON,
-    VOICE_MATCH_EMBEDDER_PACK_MISSING_REASON, embedder_pack_installed,
+    REDIMNET_FRONTEND_VERSION, SPEAKER_EMBEDDER_PACK_ID, SPEAKER_EMBEDDER_PACK_LABEL,
+    SpeakerEmbedderFamily, SpeakerEmbedderIdentity, VOICE_ID_EMBEDDER_PACK_MISSING_REASON,
+    VOICE_ID_NAMING_EMBEDDER_MISSING_REASON, VOICE_MATCH_EMBEDDER_PACK_MISSING_REASON,
+    WESPEAKER_EMBEDDER_PACK_ID, embedder_pack_installed,
 };
+#[cfg(test)]
+pub(crate) use pack::{REDIMNET_PACK_PREFERENCE, WESPEAKER_PACK_PREFERENCE};
 pub use policy_runtime::PolicyResolvedSpeakerRuntime;
 pub(crate) use redimnet::backbone::RedimNetResidentRuntime;
+pub(crate) use wespeaker::{WeSpeakerEmbedder, WeSpeakerResidentRuntime};
 
 #[cfg(test)]
 use std::sync::OnceLock;
@@ -36,11 +43,11 @@ use redimnet::frontend::RedimNetFrontend;
 
 /// Sample rate the embedder requires.
 const SAMPLE_RATE_HZ: u32 = 16_000;
-pub(crate) const REDIMNET_MAX_BATCH_WORKERS: usize = 4;
+pub(crate) const EMBEDDER_MAX_BATCH_WORKERS: usize = 4;
 /// Bounded request batch shared by diarization and identity evidence.
 /// Four queued clips per resident worker keep the actor pool saturated while
 /// bounding padded waveform and frontend-feature materialization.
-pub(crate) const REDIMNET_BOUNDED_BATCH_SIZE: usize = REDIMNET_MAX_BATCH_WORKERS * 4;
+pub(crate) const EMBEDDER_BOUNDED_BATCH_SIZE: usize = EMBEDDER_MAX_BATCH_WORKERS * 4;
 
 pub(crate) const fn redimnet_frontend_payload_quote(samples: usize) -> (u64, u64) {
     RedimNetFrontend::quoted_forward_payload_bytes(samples)
@@ -69,16 +76,16 @@ impl SpeakerEmbeddingExecutionPlan {
     }
 }
 
-pub(crate) fn redimnet_batch_worker_limit(pool_threads: usize) -> usize {
+pub(crate) fn embedder_batch_worker_limit(pool_threads: usize) -> usize {
     #[cfg(test)]
     if let Some(limit) = std::env::var(REDIMNET_BENCH_WORKERS_ENV)
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|limit| (1..=REDIMNET_MAX_BATCH_WORKERS).contains(limit))
+        .filter(|limit| (1..=EMBEDDER_MAX_BATCH_WORKERS).contains(limit))
     {
         return pool_threads.max(1).min(limit);
     }
-    pool_threads.clamp(1, REDIMNET_MAX_BATCH_WORKERS)
+    pool_threads.clamp(1, EMBEDDER_MAX_BATCH_WORKERS)
 }
 
 #[derive(Debug, Error)]
@@ -123,11 +130,13 @@ pub trait SpeakerEmbedder: Send + Sync {
             .collect()
     }
 
-    /// Embedding dimensionality (ReDimNet2-B6 = 192).
+    /// Embedding dimensionality (ReDimNet2-B6 = 192, WeSpeaker ResNet = 256).
     fn embedding_dim(&self) -> usize;
 
     /// Calibration profile for clustering and streaming gates in this embedder's
-    /// cosine space. Defaults to the ReDimNet2-B6 profile.
+    /// cosine space. Production pack-backed impls override this; test mocks may
+    /// keep the ReDimNet2-B6 default. Space labels live on `identity()`, not
+    /// on this profile.
     fn calibration_profile(&self) -> SpeakerCalibrationProfile {
         REDIMNET_CALIBRATION
     }

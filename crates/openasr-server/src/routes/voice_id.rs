@@ -1009,10 +1009,7 @@ pub(crate) fn active_space(
         return Ok(None);
     };
     Ok(Some(
-        openasr_core::diarize::voice_id::EmbeddingSpace::for_active_embedder(
-            runtime.identity(),
-            runtime.embedder().calibration_profile(),
-        ),
+        openasr_core::diarize::voice_id::EmbeddingSpace::for_active_embedder(runtime.identity()),
     ))
 }
 

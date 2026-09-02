@@ -157,4 +157,4 @@ dead). Add family-specific verdicts with the measurement behind each; write
 | Dead end | Verdict / evidence | Date |
 | --- | --- | --- |
 | Pure-Rust hand-written ReDimNet2 forward (legacy WeSpeaker-style) | Rejected: family is ggml-graph by design (ggml-only invariant); converter emits ggml `ne` order packs | 2026-07 |
-| Keeping WeSpeaker as a permanent public embedder fallback beside ReDimNet2 | Rejected after B6 public ship: diarization fails closed on ReDimNet2-B6 only; WeSpeaker was fully removed in a separate cutover | 2026-07 |
+| Keeping WeSpeaker as a silent Auto fallback beside ReDimNet2 | Rejected after B6 public ship (2026-07): default capability stays ReDimNet2-B6-only. Reintroduced 2026-09 as an **explicit** parallel family (`voice_id_embedder=wespeaker`), not Auto fallback; see issue 372 / `docs/design/wespeaker-resnet-embedder.md` | 2026-07 / 2026-09 |

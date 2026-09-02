@@ -7,20 +7,16 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::diarize::calibration::{
-    REDIMNET_CALIBRATION, REDIMNET_CALIBRATION_VERSION, SpeakerCalibrationProfile,
-};
 use crate::diarize::embed::SpeakerEmbedderIdentity;
-
-const REDIMNET_MODEL_VERSION: &str = "redimnet2-b6-cn-v1";
 
 /// Matcher policy version for quality-aware medoid prototypes + person-level
 /// margin. Bump when scoring, clustering distance, prototype cap, or support
 /// bonus rules change in a way that invalidates stored prototypes or thresholds.
 pub const MATCHER_POLICY_VERSION: &str = "person-medoid-v1";
 
-/// Frontend identity labels. These are stable contracts, not human labels.
-pub const REDIMNET_FRONTEND_VERSION: &str = "redimnet-tfmel-v1";
+/// Frontend identity label. Defined with the embedder identity so Voice ID
+/// copies it rather than guessing from family or dimension.
+pub use crate::diarize::embed::REDIMNET_FRONTEND_VERSION;
 
 /// Marker used when a v1 profile is imported without full model/calibration
 /// provenance. Such spaces are never eligible for matching.
@@ -70,22 +66,18 @@ impl EmbeddingSpace {
         space
     }
 
-    /// Build a matchable space for the currently active embedder identity plus
-    /// the embedder's calibration profile.
-    pub fn for_active_embedder(
-        identity: &SpeakerEmbedderIdentity,
-        calibration: SpeakerCalibrationProfile,
-    ) -> Self {
-        let (family, model_id, model_version, frontend, cal_version) =
-            describe_embedder(identity.embedding_dim, calibration);
+    /// Build a matchable space from the embedder identity's space labels.
+    /// Voice ID copies those labels; it does not guess family from dimension
+    /// or calibration.
+    pub fn for_active_embedder(identity: &SpeakerEmbedderIdentity) -> Self {
         Self::from_parts(
             identity.embedding_dim,
             identity.pack_fingerprint.clone(),
-            family,
-            model_id,
-            model_version,
-            frontend,
-            cal_version,
+            identity.space_family,
+            identity.space_model_id,
+            identity.model_version,
+            identity.frontend_version,
+            identity.calibration_version,
             MATCHER_POLICY_VERSION,
         )
     }
@@ -154,35 +146,6 @@ impl EmbeddingSpace {
     }
 }
 
-fn describe_embedder(
-    embedding_dim: usize,
-    calibration: SpeakerCalibrationProfile,
-) -> (
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static str,
-) {
-    // Only ReDimNet2-B6 is a supported live embedder. Anything else still forms
-    // a space so fail-closed comparison works, but uses explicit unknown markers.
-    let is_redimnet = calibration.enrollment_default_match_similarity
-        == REDIMNET_CALIBRATION.enrollment_default_match_similarity
-        && calibration.enrollment_match_margin == REDIMNET_CALIBRATION.enrollment_match_margin
-        && embedding_dim == 192;
-    if is_redimnet {
-        (
-            "redimnet",
-            "redimnet2-b6",
-            REDIMNET_MODEL_VERSION,
-            REDIMNET_FRONTEND_VERSION,
-            REDIMNET_CALIBRATION_VERSION,
-        )
-    } else {
-        ("unknown", "unknown", "unknown", "unknown", "unknown")
-    }
-}
-
 fn json_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""))
 }
@@ -190,6 +153,8 @@ fn json_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diarize::calibration::REDIMNET_CALIBRATION_VERSION;
+    use crate::diarize::embed::SpeakerEmbedderFamily;
 
     #[test]
     fn space_id_is_stable_and_sensitive_to_calibration() {
@@ -245,5 +210,40 @@ mod tests {
             MATCHER_POLICY_VERSION,
         );
         assert!(!legacy.is_comparable_to(&modern));
+    }
+
+    #[test]
+    fn for_active_embedder_copies_identity_labels() {
+        let wespeaker =
+            EmbeddingSpace::for_active_embedder(&SpeakerEmbedderIdentity::wespeaker_resnet(
+                "sha256:ws",
+                "wespeaker-voxceleb-resnet34-lm",
+            ));
+        assert_eq!(wespeaker.embedder_family, "wespeaker");
+        assert_eq!(wespeaker.embedder_model_id, "wespeaker-resnet");
+        assert_eq!(wespeaker.dimension, 256);
+        let redimnet = EmbeddingSpace::for_active_embedder(&SpeakerEmbedderIdentity::redimnet2(
+            "sha256:rd",
+            "redimnet2-b6-cn",
+        ));
+        assert_eq!(redimnet.embedder_family, "redimnet");
+        assert_ne!(wespeaker.space_id, redimnet.space_id);
+    }
+
+    #[test]
+    fn for_active_embedder_does_not_impersonate_production_space_on_fixture_identity() {
+        let fake =
+            EmbeddingSpace::for_active_embedder(&SpeakerEmbedderIdentity::unlabeled_fixture(
+                SpeakerEmbedderFamily::ReDimNet2,
+                2,
+                "voice-id-identity-tests-v1",
+            ));
+        assert_eq!(fake.embedder_family, "unknown");
+        assert_eq!(fake.embedder_model_id, "unknown");
+        let production = EmbeddingSpace::for_active_embedder(&SpeakerEmbedderIdentity::redimnet2(
+            "voice-id-identity-tests-v1",
+            "redimnet2-b6-cn",
+        ));
+        assert_ne!(fake.space_id, production.space_id);
     }
 }

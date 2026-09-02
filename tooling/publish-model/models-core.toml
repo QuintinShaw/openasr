@@ -389,6 +389,98 @@ min_cli_version = "0.1.23"
 feature = "speaker-diarization"
 role = "speaker-embedder"
 
+# Optional WeSpeaker ResNet family (VoxCeleb English LM). Default Voice ID
+# remains ReDimNet2-B6; these packs load only on an explicit preference.
+# Staged until a GA that contains the WeSpeaker architecture; do not flip
+# release_public while released 0.1.38 binaries cannot run these packs.
+["wespeaker-voxceleb-resnet34-lm"]
+kind = "capability-pack"
+family = "wespeaker"
+hf_repo = "OpenASR/wespeaker-voxceleb-resnet34-lm"
+release_public = false
+size = "resnet34"
+registry_id = "wespeaker-voxceleb-resnet34-lm"
+display_name = "WeSpeaker ResNet34 VoxCeleb LM"
+license_name = "CC BY 4.0"
+license_source = "https://github.com/wenet-e2e/wespeaker/blob/master/LICENSE"
+license_class = "permissive"
+languages = ["en"]
+quants = ["fp16"]
+recommended_quant = "fp16"
+upstream_release_date = "2024-05-06"
+min_core_version = "0.1.38"
+min_cli_version = "0.1.38"
+
+["wespeaker-voxceleb-resnet34-lm".capability]
+feature = "speaker-diarization"
+role = "speaker-embedder"
+
+["wespeaker-voxceleb-resnet152-lm"]
+kind = "capability-pack"
+family = "wespeaker"
+hf_repo = "OpenASR/wespeaker-voxceleb-resnet152-lm"
+release_public = false
+size = "resnet152"
+registry_id = "wespeaker-voxceleb-resnet152-lm"
+display_name = "WeSpeaker ResNet152 VoxCeleb LM"
+license_name = "CC BY 4.0"
+license_source = "https://github.com/wenet-e2e/wespeaker/blob/master/LICENSE"
+license_class = "permissive"
+languages = ["en"]
+quants = ["fp16"]
+recommended_quant = "fp16"
+upstream_release_date = "2024-05-06"
+min_core_version = "0.1.38"
+min_cli_version = "0.1.38"
+
+["wespeaker-voxceleb-resnet152-lm".capability]
+feature = "speaker-diarization"
+role = "speaker-embedder"
+
+["wespeaker-voxceleb-resnet221-lm"]
+kind = "capability-pack"
+family = "wespeaker"
+hf_repo = "OpenASR/wespeaker-voxceleb-resnet221-lm"
+release_public = false
+size = "resnet221"
+registry_id = "wespeaker-voxceleb-resnet221-lm"
+display_name = "WeSpeaker ResNet221 VoxCeleb LM"
+license_name = "CC BY 4.0"
+license_source = "https://github.com/wenet-e2e/wespeaker/blob/master/LICENSE"
+license_class = "permissive"
+languages = ["en"]
+quants = ["fp16"]
+recommended_quant = "fp16"
+upstream_release_date = "2024-05-06"
+min_core_version = "0.1.38"
+min_cli_version = "0.1.38"
+
+["wespeaker-voxceleb-resnet221-lm".capability]
+feature = "speaker-diarization"
+role = "speaker-embedder"
+
+["wespeaker-voxceleb-resnet293-lm"]
+kind = "capability-pack"
+family = "wespeaker"
+hf_repo = "OpenASR/wespeaker-voxceleb-resnet293-lm"
+release_public = false
+size = "resnet293"
+registry_id = "wespeaker-voxceleb-resnet293-lm"
+display_name = "WeSpeaker ResNet293 VoxCeleb LM"
+license_name = "CC BY 4.0"
+license_source = "https://github.com/wenet-e2e/wespeaker/blob/master/LICENSE"
+license_class = "permissive"
+languages = ["en"]
+quants = ["fp16"]
+recommended_quant = "fp16"
+upstream_release_date = "2024-05-06"
+min_core_version = "0.1.38"
+min_cli_version = "0.1.38"
+
+["wespeaker-voxceleb-resnet293-lm".capability]
+feature = "speaker-diarization"
+role = "speaker-embedder"
+
 
 ["pyannote-segmentation-3.0"]
 kind = "capability-pack"
