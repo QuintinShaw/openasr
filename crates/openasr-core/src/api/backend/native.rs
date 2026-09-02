@@ -67,8 +67,8 @@ pub use transcription_control::{
 pub use transcription_progress::{
     LegacyNativeTranscriptionProgress, NativeTranscriptionPhase, NativeTranscriptionProgress,
     ProgressBackendClass, ProgressPlan, ProgressPlanInput, ProgressReporter, ProgressSegmenterKind,
-    TranscriptionStage, duration_weighted_fraction, native_transcription_progress,
-    native_transcription_progress_for_id,
+    TranscriptionStage, duration_weighted_fraction, native_active_transcription_ids,
+    native_transcription_progress, native_transcription_progress_for_id,
 };
 
 #[derive(Debug, Clone)]

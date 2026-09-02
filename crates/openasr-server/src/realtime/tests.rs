@@ -7672,7 +7672,6 @@ async fn ssot_10_busy_realtime_live_dictation_meeting_fail_immediately() {
 /// SSOT 7: dictation must not request or compute speakers. If correct:
 /// diarize=true on a Dictation session.start is rejected and no diarizer is
 /// built. Otherwise Y: streaming_diarizer is constructed and labels SPEAKER_00.
-#[ignore = "redteam: ssot-7"]
 #[tokio::test]
 async fn ssot_7_dictation_session_rejects_anonymous_speakers() {
     let (event_sender, mut event_receiver) = mpsc::channel(8);
@@ -7707,6 +7706,77 @@ async fn ssot_7_dictation_session_rejects_anonymous_speakers() {
         .await
         .expect("dictation speaker error");
     assert_eq!(event.event_type, "error");
+}
+
+/// SSOT 7: Live and Meeting may still request anonymous speakers. Dictation is
+/// the fail-closed exception; a blanket diarize rejection would break this.
+#[tokio::test]
+async fn live_and_meeting_sessions_accept_anonymous_speakers() {
+    for source_name in ["Live", "Meeting"] {
+        let (event_sender, _event_receiver) = mpsc::channel(8);
+        let mut session = WsSession::new_with_remote_identity(
+            ServerRuntime::default(),
+            test_distribution(),
+            event_sender,
+            false,
+            Some("device-a".to_string()),
+            false,
+            true,
+        );
+        let result = session
+            .start_session(StartSession {
+                model: Some("whisper-large-v3-turbo".to_string()),
+                source_name: Some(source_name.to_string()),
+                diarize: Some(true),
+                voice_id: Some(false),
+                ..StartSession::default()
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "{source_name} must still admit anonymous speakers: {result:?}"
+        );
+        assert!(
+            session.streaming_diarizer.is_some(),
+            "{source_name} must construct the anonymous diarizer"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dictation_speaker_refusal_names_dictation() {
+    let (event_sender, mut event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new_with_remote_identity(
+        ServerRuntime::default(),
+        test_distribution(),
+        event_sender,
+        false,
+        Some("device-a".to_string()),
+        false,
+        true,
+    );
+    let _ = session
+        .start_session(StartSession {
+            model: Some("whisper-large-v3-turbo".to_string()),
+            source_name: Some("Dictation".to_string()),
+            diarize: Some(true),
+            voice_id: Some(false),
+            ..StartSession::default()
+        })
+        .await;
+    let event = event_receiver
+        .recv()
+        .await
+        .expect("dictation speaker error");
+    match event.event {
+        RealtimeEvent::Error(RealtimeErrorEvent { message, .. }) => {
+            assert!(
+                message.contains("Dictation"),
+                "dictation speaker refusal must be distinguishable: {message}"
+            );
+        }
+        other => panic!("expected dictation speaker error, got {other:?}"),
+    }
 }
 
 /// SSOT 23: a transport close holds the session; a second device must not

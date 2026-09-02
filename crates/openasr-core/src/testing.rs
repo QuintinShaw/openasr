@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
@@ -30,6 +31,10 @@ use crate::models::{
 
 static MOCK_TRANSCRIBE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
+thread_local! {
+    static SUPPRESS_MOCK_TRANSCRIBE_DELAY: Cell<bool> = const { Cell::new(false) };
+}
+
 /// Test-only mock backend delay. Production `MockBackend` return bodies stay
 /// unchanged; server tests enable this through the `testing` feature.
 pub fn set_mock_transcribe_delay(duration: Duration) {
@@ -57,11 +62,40 @@ impl Drop for MockTranscribeDelayGuard {
     }
 }
 
-pub fn apply_mock_transcribe_delay() {
-    let ms = MOCK_TRANSCRIBE_DELAY_MS.load(Ordering::SeqCst);
-    if ms > 0 {
-        std::thread::sleep(Duration::from_millis(ms));
+/// Prevents nested [`apply_mock_transcribe_delay`] on this thread after the
+/// caller already waited out the delay on the async task.
+pub struct SuppressMockTranscribeDelay;
+
+impl SuppressMockTranscribeDelay {
+    pub fn install() -> Self {
+        SUPPRESS_MOCK_TRANSCRIBE_DELAY.with(|flag| flag.set(true));
+        Self
     }
+}
+
+impl Drop for SuppressMockTranscribeDelay {
+    fn drop(&mut self) {
+        SUPPRESS_MOCK_TRANSCRIBE_DELAY.with(|flag| flag.set(false));
+    }
+}
+
+/// Take the configured delay so only the job that is already in flight stalls.
+pub fn take_mock_transcribe_delay() -> Duration {
+    Duration::from_millis(MOCK_TRANSCRIBE_DELAY_MS.swap(0, Ordering::SeqCst))
+}
+
+/// Sleeps the configured mock delay. Cancel is observed on the async server
+/// path; this helper only stalls direct `MockBackend` calls.
+pub fn apply_mock_transcribe_delay() -> bool {
+    if SUPPRESS_MOCK_TRANSCRIBE_DELAY.with(Cell::get) {
+        return false;
+    }
+    let delay = take_mock_transcribe_delay();
+    if delay.is_zero() {
+        return false;
+    }
+    std::thread::sleep(delay);
+    false
 }
 
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";

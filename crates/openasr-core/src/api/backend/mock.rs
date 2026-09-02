@@ -11,7 +11,9 @@ impl TranscriptionBackend for MockBackend {
             return Err(BackendError::SpeakerEmbeddingsRequireDiarization);
         }
         #[cfg(any(test, feature = "testing"))]
-        crate::testing::apply_mock_transcribe_delay();
+        if crate::testing::apply_mock_transcribe_delay() {
+            return Err(BackendError::TranscriptionCanceled);
+        }
         // OADP Phase 0: fail closed instead of pretending the adapter applied.
         if request.adapter_path.is_some() {
             return Err(BackendError::AdapterNotSupported { backend: "mock" });

@@ -815,7 +815,6 @@ async fn post_transcription(
 ///
 /// If correct: 409 + PENDING_IDLE_SWITCH_MESSAGE. Otherwise Y: 200 (stream
 /// path bypasses wait_for_file_admission on the mock backend).
-#[ignore = "redteam: ssot-13"]
 #[tokio::test]
 async fn ssot_13_pending_idle_switch_rejects_stream_file_jobs() {
     let temp = tempfile::tempdir().unwrap();
@@ -847,7 +846,6 @@ async fn ssot_13_pending_idle_switch_rejects_stream_file_jobs() {
 ///
 /// If correct: queued (or 429 without starting a second native slot).
 /// Otherwise Y: 200 while the native slot is still held.
-#[ignore = "redteam: ssot-10"]
 #[tokio::test]
 async fn ssot_10_stream_file_jobs_do_not_bypass_fifo() {
     let temp = tempfile::tempdir().unwrap();
@@ -888,7 +886,6 @@ async fn ssot_10_stream_file_jobs_do_not_bypass_fifo() {
 ///
 /// If correct: cancel returns 202 and the stream fails closed canceled.
 /// Otherwise Y: cancel 404 / stream completes with status ok.
-#[ignore = "redteam: ssot-22"]
 #[tokio::test]
 async fn ssot_22_stream_file_jobs_are_cancellable() {
     let temp = tempfile::tempdir().unwrap();
@@ -1006,7 +1003,6 @@ async fn ssot_22_aborting_a_queued_file_job_releases_the_fifo() {
 ///
 /// If correct: a follow-up job is 200 within 200ms of abort.
 /// Otherwise Y: follow-up stays 429/409 until the blocking decode finishes.
-#[ignore = "redteam: ssot-22"]
 #[tokio::test(flavor = "multi_thread")]
 async fn ssot_22_aborting_a_running_file_job_calls_finish_file() {
     let temp = tempfile::tempdir().unwrap();
@@ -1361,6 +1357,230 @@ async fn ssot_5_device_token_cannot_read_or_mutate_voice_id() {
     )
     .await;
     assert_eq!(enrolled.status, 403);
+}
+
+/// SSOT 21: the owning device must be able to cancel its own file job.
+/// Kills `set_transcription_owner` no-op and `transcription_owner -> None`.
+#[tokio::test(flavor = "multi_thread")]
+async fn device_can_cancel_its_own_file_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = spawn_loopback_pairing_server(temp.path()).await;
+    let first = approve_loopback_pairing(&server).await;
+    let _delay =
+        openasr_core::testing::MockTranscribeDelayGuard::new(std::time::Duration::from_secs(2));
+    let (content_type, body) = sample_multipart(Some("own-job"), false);
+    let first_auth = bearer_auth_header(&first.bearer_token);
+    let first_job = {
+        let addr = server.addr;
+        let auth = first_auth.clone();
+        let content_type = content_type.clone();
+        tokio::spawn(async move {
+            https_request(
+                addr,
+                "POST",
+                "/v1/audio/transcriptions",
+                &[
+                    ("Authorization", auth.as_str()),
+                    ("X-OpenASR-Remote-Compute", "client"),
+                    ("Content-Type", content_type.as_str()),
+                ],
+                body,
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let cancel = https_request(
+        server.addr,
+        "POST",
+        "/v1/audio/transcriptions/own-job/cancel",
+        &[("Authorization", first_auth.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(
+        cancel.status,
+        202,
+        "owning device must control its own job: {}",
+        String::from_utf8_lossy(&cancel.body)
+    );
+    first_job.abort();
+}
+
+/// SSOT 6: stream file jobs from a paired device remap enrolled Voice ID to
+/// anonymous labels. Deleting `!voice_id_allowed` would leave voice_id=true
+/// and the mock backend would fail closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn paired_device_stream_file_job_remaps_enrolled_voice_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = spawn_loopback_pairing_server(temp.path()).await;
+    let credential = approve_loopback_pairing(&server).await;
+    let boundary = "openasr-stream-voice";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.wav\"\r\nContent-Type: audio/wav\r\n\r\nnot a real wav\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"diarize\"\r\n\r\ntrue\r\n--{boundary}--\r\n"
+    );
+    let auth = bearer_auth_header(&credential.bearer_token);
+    let streamed = https_request(
+        server.addr,
+        "POST",
+        "/v1/audio/transcriptions?stream=true",
+        &[
+            ("Authorization", auth.as_str()),
+            ("X-OpenASR-Remote-Compute", "client"),
+            (
+                "Content-Type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            ),
+        ],
+        body.into_bytes(),
+    )
+    .await;
+    assert_eq!(
+        streamed.status,
+        200,
+        "paired stream diarize must remap to anonymous labels, got {}: {}",
+        streamed.status,
+        String::from_utf8_lossy(&streamed.body)
+    );
+    let body = String::from_utf8_lossy(&streamed.body);
+    assert!(
+        body.contains("event: done") && body.contains("\"status\":\"ok\""),
+        "paired stream diarize must complete, got {body}"
+    );
+}
+
+/// Local/operator stream still refuses enrolled Voice ID on the mock backend.
+/// Kills flipping `!voice_id_allowed` so the operator path is stripped too.
+#[tokio::test]
+async fn operator_stream_file_job_keeps_enrolled_voice_id_fail_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let app = policy_app(ServerRuntime::default(), home);
+    let boundary = "openasr-local-voice";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.wav\"\r\nContent-Type: audio/wav\r\n\r\nnot a real wav\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"diarize\"\r\n\r\ntrue\r\n--{boundary}--\r\n"
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions?stream=true")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "operator stream diarize stays on the SSE error path, got {}",
+        response.status()
+    );
+    let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("event: error"),
+        "operator stream enrolled Voice ID must fail closed: {body}"
+    );
+}
+
+/// SSOT 21: the id-less progress endpoint uses the same owner gate as
+/// `{id}/progress`. A paired device must not observe an operator-local job.
+#[tokio::test]
+async fn legacy_progress_hides_operator_local_and_peer_jobs_from_device() {
+    use openasr_core::api::backend::{
+        ProgressBackendClass, ProgressPlan, ProgressPlanInput, ProgressReporter,
+        ProgressSegmenterKind,
+    };
+
+    let plan = ProgressPlan::build(ProgressPlanInput {
+        audio_duration_s: 1.0,
+        voice_id: false,
+        external_diarize: false,
+        segmenter: ProgressSegmenterKind::Auto,
+        punctuate: false,
+        align: false,
+        backend: ProgressBackendClass::AutoOrCpu,
+        persist: false,
+    });
+    let _reporter = ProgressReporter::install(Some("progress-job".to_string()), plan);
+    let auth = ServerAuth::pairing("admin-token");
+    {
+        let mut pairing = auth.lock_pairing();
+        pairing.credentials.insert(
+            "aaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            DeviceCredentialRecord {
+                device_id: "aaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                device_name: "Phone".to_string(),
+                token_hash: bearer_token_hash("device-token"),
+                issued_at_unix_secs: 1,
+                last_seen_unix_secs: None,
+                revoked: false,
+            },
+        );
+    }
+    let distribution = DistributionContext::new(DistributionRuntime {
+        openasr_home: None,
+        catalog_url: None,
+        catalog_local_override: None,
+    });
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        "Bearer device-token".parse().unwrap(),
+    );
+
+    let hidden = transcription_progress(
+        axum::Extension(auth.clone()),
+        axum::Extension(distribution.clone()),
+        headers.clone(),
+    )
+    .await
+    .expect("device reading operator-local progress must not error");
+    let hidden_json = to_bytes(hidden.into_body(), 1024 * 64).await.unwrap();
+    let hidden_value: serde_json::Value = serde_json::from_slice(&hidden_json).unwrap();
+    assert_eq!(
+        hidden_value["phase"],
+        serde_json::Value::Null,
+        "operator-local progress must read idle to a paired device: {hidden_value}"
+    );
+
+    distribution.set_transcription_owner("progress-job", Some("bbbbbbbbbbbbbbbbbbbbbbbb"));
+    let peer = transcription_progress(
+        axum::Extension(auth.clone()),
+        axum::Extension(distribution.clone()),
+        headers.clone(),
+    )
+    .await
+    .expect("device reading a peer job must not error");
+    let peer_json = to_bytes(peer.into_body(), 1024 * 64).await.unwrap();
+    let peer_value: serde_json::Value = serde_json::from_slice(&peer_json).unwrap();
+    assert_eq!(
+        peer_value["phase"],
+        serde_json::Value::Null,
+        "peer progress must read idle: {peer_value}"
+    );
+
+    distribution.set_transcription_owner("progress-job", Some("aaaaaaaaaaaaaaaaaaaaaaaa"));
+    let own = transcription_progress(
+        axum::Extension(auth),
+        axum::Extension(distribution),
+        headers,
+    )
+    .await
+    .expect("owner must read its own legacy progress");
+    let own_json = to_bytes(own.into_body(), 1024 * 64).await.unwrap();
+    let own_value: serde_json::Value = serde_json::from_slice(&own_json).unwrap();
+    assert_eq!(
+        own_value["phase"].as_str(),
+        Some("decode"),
+        "owning device must see live progress: {own_value}"
+    );
 }
 
 #[test]
