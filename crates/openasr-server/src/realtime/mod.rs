@@ -639,6 +639,11 @@ enum ClientMessage {
     SessionClose,
 }
 
+#[cfg(fuzzing)]
+pub fn fuzz_parse_client_message(data: &[u8]) -> Result<(), serde_json::Error> {
+    serde_json::from_slice::<ClientMessage>(data).map(|_| ())
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StartSession {

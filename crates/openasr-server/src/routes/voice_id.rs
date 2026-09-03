@@ -961,6 +961,69 @@ async fn parse_sample_multipart(
     })
 }
 
+#[cfg(fuzzing)]
+pub fn fuzz_parse_enroll_multipart(body: &[u8], content_type: &str) {
+    fuzz_parse_multipart(body, content_type, FuzzMultipartKind::Enroll);
+}
+
+#[cfg(fuzzing)]
+pub fn fuzz_parse_sample_multipart(body: &[u8], content_type: &str) {
+    fuzz_parse_multipart(body, content_type, FuzzMultipartKind::Sample);
+}
+
+#[cfg(fuzzing)]
+enum FuzzMultipartKind {
+    Enroll,
+    Sample,
+}
+
+#[cfg(fuzzing)]
+fn fuzz_parse_multipart(body: &[u8], content_type: &str, kind: FuzzMultipartKind) {
+    use axum::{
+        body::Body,
+        extract::{FromRequest, Multipart},
+        http::Request,
+    };
+
+    let Ok(content_type) = HeaderValue::from_str(content_type) else {
+        return;
+    };
+    let Ok(request) = Request::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(body.to_vec()))
+    else {
+        return;
+    };
+    let Some(runtime) = fuzz_runtime() else {
+        return;
+    };
+    runtime.block_on(async move {
+        let multipart = Multipart::from_request(request, &()).await;
+        match kind {
+            FuzzMultipartKind::Enroll => {
+                let _ = parse_enroll_multipart(multipart).await;
+            }
+            FuzzMultipartKind::Sample => {
+                let _ = parse_sample_multipart(multipart).await;
+            }
+        }
+    });
+}
+
+#[cfg(fuzzing)]
+fn fuzz_runtime() -> Option<&'static tokio::runtime::Runtime> {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    if let Some(runtime) = RUNTIME.get() {
+        return Some(runtime);
+    }
+    let built = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    let _ = RUNTIME.set(built);
+    RUNTIME.get()
+}
+
 async fn stream_voice_id_wav(mut field: Field<'_>) -> Result<UploadedVoiceIdWav, ApiError> {
     let mut file = tempfile::Builder::new()
         .prefix("openasr-voice-id-")

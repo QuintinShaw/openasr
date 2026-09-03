@@ -1,0 +1,5 @@
+target
+artifacts
+coverage
+# libFuzzer writes 40-char sha1 files into corpus/; keep named seeds only.
+corpus/**/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*
