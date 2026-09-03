@@ -100,6 +100,37 @@ class ReleaseCompletenessTests(unittest.TestCase):
         )
         self.assertEqual(extra, ["unexpected.bin"])
 
+    def test_compare_accepts_detached_qualification_signatures_for_exact_cells_only(self) -> None:
+        entries = [
+            _pack(
+                vendor="cuda",
+                targets=["sm_75"],
+                files=["openasr-0.1.39-windows-x86_64-cuda-sm_75-plugin.dll"],
+                ident="cuda-sm-75",
+            )
+        ]
+        required = completeness.required_assets("0.1.39", MATRIX, entries)
+        self.assertNotIn("openasr-0.1.39-qualification-cuda-sm_75.signature.json", required)
+
+        actual = set(required)
+        actual.add("openasr-0.1.39-qualification-cuda-sm_75.signature.json")
+        missing, extra, lock = completeness.compare_assets(
+            version="0.1.39",
+            actual=actual,
+            matrix=MATRIX,
+            pack_entries=entries,
+        )
+        self.assertEqual((missing, extra, lock), ([], [], None))
+
+        actual.add("openasr-0.1.39-qualification-cuda-sm_120.signature.json")
+        _, extra, _ = completeness.compare_assets(
+            version="0.1.39",
+            actual=actual,
+            matrix=MATRIX,
+            pack_entries=entries,
+        )
+        self.assertEqual(extra, ["openasr-0.1.39-qualification-cuda-sm_120.signature.json"])
+
     def test_compare_rejects_qualification_mutation_lock(self) -> None:
         entries = [
             _pack(

@@ -99,6 +99,21 @@ def required_from_backend_packs(version: str, entries: list[dict[str, Any]]) -> 
     return names
 
 
+def optional_qualification_signatures(version: str, entries: list[dict[str, Any]]) -> set[str]:
+    """Detached production signatures for the inert qualification manifests.
+
+    They are uploaded locally by sign-and-verify-qualification-manifests.sh
+    between the draft build and finalization, so a draft is complete without
+    them; finalize-core-release.sh separately requires the full set before
+    publication.
+    """
+    names: set[str] = set()
+    for entry in entries:
+        provider, target = qualification_manifest.artifact_cell(entry)
+        names.add(f"openasr-{version}-qualification-{provider}-{target}.signature.json")
+    return names
+
+
 def required_assets(
     version: str,
     matrix: list[dict[str, Any]],
@@ -137,6 +152,7 @@ def compare_assets(
 ) -> tuple[list[str], list[str], str | None]:
     required = required_assets(version, matrix, pack_entries)
     optional = optional_experimental_archives(version, matrix)
+    optional |= optional_qualification_signatures(version, pack_entries)
     lock_asset = f"openasr-{version}{LOCK_ASSET_SUFFIX}"
     lock = lock_asset if lock_asset in actual else None
     missing = sorted(required - actual)
