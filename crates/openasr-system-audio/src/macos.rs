@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use libloading::Library;
 use objc2::AnyThread;
+use objc2::exception::Exception;
 use objc2_core_audio::{
     AudioDeviceCreateIOProcID, AudioDeviceDestroyIOProcID, AudioDeviceIOProcID, AudioDeviceStart,
     AudioDeviceStop, AudioHardwareCreateAggregateDevice, AudioHardwareDestroyAggregateDevice,
@@ -28,7 +29,7 @@ use objc2_core_audio_types::{
     kAudioFormatFlagIsSignedInteger, kAudioFormatLinearPCM,
 };
 use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFRetained, CFString, CFType};
-use objc2_foundation::{NSArray, NSNumber, NSString, NSUUID};
+use objc2_foundation::{NSArray, NSException, NSNumber, NSString, NSUUID};
 
 use crate::{
     CandidateProcess, CaptureBackendError, ProcessLoopbackMode, ProcessLoopbackSupport,
@@ -94,6 +95,14 @@ pub fn run_loopback_capture(
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
+        }
+        if session.callback_state.panicked.load(Ordering::SeqCst) {
+            return Err(CaptureBackendError {
+                code: "capture_backend_failed",
+                message: "macOS system-audio capture failed.".to_string(),
+                diagnostic: "The Core Audio IOProc panicked; capture stopped fail-closed."
+                    .to_string(),
+            });
         }
 
         match rx.recv_timeout(Duration::from_millis(READ_TIMEOUT_MS)) {
@@ -176,8 +185,12 @@ struct MacOsCaptureSession {
 impl MacOsCaptureSession {
     fn create(samples_tx: SyncSender<Vec<i16>>) -> Result<Self, CaptureBackendError> {
         let symbols = ProcessTapSymbols::load()?;
-        let tap_uuid = NSUUID::UUID();
-        let tap_uid = tap_uuid.UUIDString().to_string();
+        let (tap_uuid, tap_uid) =
+            catch_foreign_exceptions("Could not create a macOS Core Audio process tap", || {
+                let tap_uuid = NSUUID::UUID();
+                let tap_uid = tap_uuid.UUIDString().to_string();
+                Ok((tap_uuid, tap_uid))
+            })?;
         let tap_id = create_process_tap(&symbols, &tap_uuid)?;
         let aggregate_device_id = match create_aggregate_device(&tap_uid) {
             Ok(device_id) => device_id,
@@ -203,6 +216,7 @@ impl MacOsCaptureSession {
         let callback_state = Box::new(MacOsAudioCallbackState {
             samples_tx,
             converter: Mutex::new(CoreAudioPcmConverter::new(format)),
+            panicked: AtomicBool::new(false),
         });
 
         let mut session = Self {
@@ -222,44 +236,54 @@ impl MacOsCaptureSession {
     }
 
     fn set_tap_list(&mut self) -> Result<(), CaptureBackendError> {
-        let tap_uid = CFString::from_str(&self.tap_uid);
-        let tap_list = CFArray::<CFString>::from_objects(&[tap_uid.as_ref()]);
-        let mut tap_list_ref = CFRetained::as_ptr(&tap_list).as_ptr().cast::<c_void>();
-        let mut address = property_address(kAudioAggregateDevicePropertyTapList);
-        let status = unsafe {
-            AudioObjectSetPropertyData(
-                self.aggregate_device_id,
-                NonNull::from(&mut address),
-                0,
-                ptr::null(),
-                mem::size_of::<*const c_void>() as u32,
-                NonNull::from(&mut tap_list_ref).cast(),
-            )
-        };
-        check_os_status(
-            status,
-            "capture_backend_failed",
+        catch_foreign_exceptions(
             "Could not attach the Core Audio tap to the aggregate device",
+            || {
+                let tap_uid = CFString::from_str(&self.tap_uid);
+                let tap_list = CFArray::<CFString>::from_objects(&[tap_uid.as_ref()]);
+                let mut tap_list_ref = CFRetained::as_ptr(&tap_list).as_ptr().cast::<c_void>();
+                let mut address = property_address(kAudioAggregateDevicePropertyTapList);
+                let status = unsafe {
+                    AudioObjectSetPropertyData(
+                        self.aggregate_device_id,
+                        NonNull::from(&mut address),
+                        0,
+                        ptr::null(),
+                        mem::size_of::<*const c_void>() as u32,
+                        NonNull::from(&mut tap_list_ref).cast(),
+                    )
+                };
+                check_os_status(
+                    status,
+                    "capture_backend_failed",
+                    "Could not attach the Core Audio tap to the aggregate device",
+                )
+            },
         )
     }
 
     fn create_io_proc(&mut self) -> Result<(), CaptureBackendError> {
-        let mut io_proc_id: AudioDeviceIOProcID = None;
-        let status = unsafe {
-            AudioDeviceCreateIOProcID(
-                self.aggregate_device_id,
-                Some(core_audio_io_proc),
-                (&mut *self.callback_state as *mut MacOsAudioCallbackState).cast(),
-                NonNull::from(&mut io_proc_id),
-            )
-        };
-        check_os_status(
-            status,
-            "capture_backend_failed",
+        catch_foreign_exceptions(
             "Could not register the Core Audio aggregate-device input callback",
-        )?;
-        self.io_proc_id = Some(io_proc_id);
-        Ok(())
+            || {
+                let mut io_proc_id: AudioDeviceIOProcID = None;
+                let status = unsafe {
+                    AudioDeviceCreateIOProcID(
+                        self.aggregate_device_id,
+                        Some(core_audio_io_proc),
+                        (&mut *self.callback_state as *mut MacOsAudioCallbackState).cast(),
+                        NonNull::from(&mut io_proc_id),
+                    )
+                };
+                check_os_status(
+                    status,
+                    "capture_backend_failed",
+                    "Could not register the Core Audio aggregate-device input callback",
+                )?;
+                self.io_proc_id = Some(io_proc_id);
+                Ok(())
+            },
+        )
     }
 
     fn start(&mut self) -> Result<(), CaptureBackendError> {
@@ -270,14 +294,19 @@ impl MacOsCaptureSession {
                 diagnostic: "AudioDeviceCreateIOProcID did not return an IOProcID.".to_string(),
             });
         };
-        let status = unsafe { AudioDeviceStart(self.aggregate_device_id, io_proc_id) };
-        check_os_status(
-            status,
-            "capture_backend_failed",
+        catch_foreign_exceptions(
             "Could not start macOS Core Audio system-audio capture",
-        )?;
-        self.started = true;
-        Ok(())
+            || {
+                let status = unsafe { AudioDeviceStart(self.aggregate_device_id, io_proc_id) };
+                check_os_status(
+                    status,
+                    "capture_backend_failed",
+                    "Could not start macOS Core Audio system-audio capture",
+                )?;
+                self.started = true;
+                Ok(())
+            },
+        )
     }
 
     fn stop(&mut self) {
@@ -310,6 +339,7 @@ impl Drop for MacOsCaptureSession {
 struct MacOsAudioCallbackState {
     samples_tx: SyncSender<Vec<i16>>,
     converter: Mutex<CoreAudioPcmConverter>,
+    panicked: AtomicBool,
 }
 
 unsafe extern "C-unwind" fn core_audio_io_proc(
@@ -321,6 +351,24 @@ unsafe extern "C-unwind" fn core_audio_io_proc(
     _output_time: NonNull<AudioTimeStamp>,
     client_data: *mut c_void,
 ) -> OSStatus {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        core_audio_io_proc_inner(input_data, client_data)
+    }));
+    match result {
+        Ok(status) => status,
+        Err(_) => {
+            if let Some(state) = unsafe { (client_data as *mut MacOsAudioCallbackState).as_ref() } {
+                state.panicked.store(true, Ordering::SeqCst);
+            }
+            kAudioHardwareNoError
+        }
+    }
+}
+
+fn core_audio_io_proc_inner(
+    input_data: NonNull<AudioBufferList>,
+    client_data: *mut c_void,
+) -> OSStatus {
     let Some(state) = (unsafe { (client_data as *mut MacOsAudioCallbackState).as_ref() }) else {
         return kAudioHardwareNoError;
     };
@@ -329,14 +377,26 @@ unsafe extern "C-unwind" fn core_audio_io_proc(
         return kAudioHardwareNoError;
     };
 
-    let input_data = unsafe { input_data.as_ref() };
-    if let Ok(samples) = converter.convert_buffer_list(input_data)
-        && !samples.is_empty()
-    {
-        match state.samples_tx.try_send(samples) {
-            Ok(()) | Err(TrySendError::Full(_)) => {}
-            Err(TrySendError::Disconnected(_)) => {}
+    let process_buffers = || {
+        let input_data = unsafe { input_data.as_ref() };
+        if let Ok(samples) = converter.convert_buffer_list(input_data)
+            && !samples.is_empty()
+        {
+            match state.samples_tx.try_send(samples) {
+                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) => {}
+            }
         }
+        Ok(())
+    };
+
+    if catch_foreign_exceptions(
+        "macOS system-audio capture callback failed",
+        process_buffers,
+    )
+    .is_err()
+    {
+        state.panicked.store(true, Ordering::SeqCst);
     }
 
     kAudioHardwareNoError
@@ -398,128 +458,158 @@ fn create_process_tap(
     symbols: &ProcessTapSymbols,
     tap_uuid: &NSUUID,
 ) -> Result<AudioObjectID, CaptureBackendError> {
-    let excluded_processes = NSArray::<NSNumber>::from_slice(&[]);
-    let description = unsafe {
-        CATapDescription::initMonoGlobalTapButExcludeProcesses(
-            CATapDescription::alloc(),
-            &excluded_processes,
-        )
-    };
-    let tap_name = NSString::from_str("OpenASR System Audio");
-    unsafe {
-        description.setName(&tap_name);
-        description.setUUID(tap_uuid);
-        description.setPrivate(true);
-        description.setProcessRestoreEnabled(false);
-        description.setMuteBehavior(CATapMuteBehavior::Unmuted);
-    }
+    catch_foreign_exceptions("Could not create a macOS Core Audio process tap", || {
+        let excluded_processes = NSArray::<NSNumber>::from_slice(&[]);
+        let description = unsafe {
+            CATapDescription::initMonoGlobalTapButExcludeProcesses(
+                CATapDescription::alloc(),
+                &excluded_processes,
+            )
+        };
+        let tap_name = NSString::from_str("OpenASR System Audio");
+        unsafe {
+            description.setName(&tap_name);
+            description.setUUID(tap_uuid);
+            description.setPrivate(true);
+            description.setProcessRestoreEnabled(false);
+            description.setMuteBehavior(CATapMuteBehavior::Unmuted);
+        }
 
-    let mut tap_id = kAudioObjectUnknown;
-    let status = unsafe { (symbols.create)(Some(&description), &mut tap_id) };
-    check_os_status(
-        status,
-        "capture_backend_failed",
-        "Could not create a macOS Core Audio process tap",
-    )?;
-    if tap_id == kAudioObjectUnknown {
-        return Err(CaptureBackendError {
-            code: "capture_backend_failed",
-            message: "Core Audio returned an unknown tap object.".to_string(),
-            diagnostic: "AudioHardwareCreateProcessTap succeeded with kAudioObjectUnknown."
-                .to_string(),
-        });
-    }
-    Ok(tap_id)
+        let mut tap_id = kAudioObjectUnknown;
+        let status = unsafe { (symbols.create)(Some(&description), &mut tap_id) };
+        let mut created = CreatedProcessTap {
+            symbols,
+            tap_id,
+            taken: false,
+        };
+        check_os_status(
+            status,
+            "capture_backend_failed",
+            "Could not create a macOS Core Audio process tap",
+        )?;
+        if created.tap_id == kAudioObjectUnknown {
+            return Err(CaptureBackendError {
+                code: "capture_backend_failed",
+                message: "Core Audio returned an unknown tap object.".to_string(),
+                diagnostic: "AudioHardwareCreateProcessTap succeeded with kAudioObjectUnknown."
+                    .to_string(),
+            });
+        }
+        Ok(created.take())
+    })
 }
 
 fn create_aggregate_device(tap_uid: &str) -> Result<AudioObjectID, CaptureBackendError> {
-    let aggregate_name_key = cf_key(kAudioAggregateDeviceNameKey)?;
-    let aggregate_uid_key = cf_key(kAudioAggregateDeviceUIDKey)?;
-    let private_key = cf_key(kAudioAggregateDeviceIsPrivateKey)?;
-    let tap_list_key = cf_key(kAudioAggregateDeviceTapListKey)?;
-    let tap_auto_start_key = cf_key(kAudioAggregateDeviceTapAutoStartKey)?;
-    let sub_tap_uid_key = cf_key(kAudioSubTapUIDKey)?;
-
-    let aggregate_name = CFString::from_str("OpenASR System Audio Aggregate");
-    let aggregate_uid = CFString::from_str(&format!("dev.openasr.desktop.system-audio.{tap_uid}"));
-    let is_private = CFBoolean::new(true);
-    let tap_auto_start = CFBoolean::new(true);
-    let tap_uid_value = CFString::from_str(tap_uid);
-    let sub_tap = CFDictionary::<CFType, CFType>::from_slices(
-        &[sub_tap_uid_key.as_ref()],
-        &[tap_uid_value.as_ref()],
-    );
-    let tap_list = CFArray::<CFType>::from_objects(&[sub_tap.as_ref()]);
-
-    let description = CFDictionary::<CFType, CFType>::from_slices(
-        &[
-            aggregate_name_key.as_ref(),
-            aggregate_uid_key.as_ref(),
-            private_key.as_ref(),
-            tap_list_key.as_ref(),
-            tap_auto_start_key.as_ref(),
-        ],
-        &[
-            aggregate_name.as_ref(),
-            aggregate_uid.as_ref(),
-            is_private.as_ref(),
-            tap_list.as_ref(),
-            tap_auto_start.as_ref(),
-        ],
-    );
-
-    let mut device_id = kAudioObjectUnknown;
-    let status = unsafe {
-        AudioHardwareCreateAggregateDevice(description.as_opaque(), NonNull::from(&mut device_id))
-    };
-    check_os_status(
-        status,
-        "capture_backend_failed",
+    catch_foreign_exceptions(
         "Could not create a private Core Audio aggregate device for system-audio capture",
-    )?;
-    if device_id == kAudioObjectUnknown {
-        return Err(CaptureBackendError {
-            code: "capture_backend_failed",
-            message: "Core Audio returned an unknown aggregate device.".to_string(),
-            diagnostic: "AudioHardwareCreateAggregateDevice succeeded with kAudioObjectUnknown."
-                .to_string(),
-        });
-    }
-    Ok(device_id)
+        || {
+            let aggregate_name_key = cf_key(kAudioAggregateDeviceNameKey)?;
+            let aggregate_uid_key = cf_key(kAudioAggregateDeviceUIDKey)?;
+            let private_key = cf_key(kAudioAggregateDeviceIsPrivateKey)?;
+            let tap_list_key = cf_key(kAudioAggregateDeviceTapListKey)?;
+            let tap_auto_start_key = cf_key(kAudioAggregateDeviceTapAutoStartKey)?;
+            let sub_tap_uid_key = cf_key(kAudioSubTapUIDKey)?;
+
+            let aggregate_name = CFString::from_str("OpenASR System Audio Aggregate");
+            let aggregate_uid =
+                CFString::from_str(&format!("dev.openasr.desktop.system-audio.{tap_uid}"));
+            let is_private = CFBoolean::new(true);
+            let tap_auto_start = CFBoolean::new(true);
+            let tap_uid_value = CFString::from_str(tap_uid);
+            let sub_tap = CFDictionary::<CFType, CFType>::from_slices(
+                &[sub_tap_uid_key.as_ref()],
+                &[tap_uid_value.as_ref()],
+            );
+            let tap_list = CFArray::<CFType>::from_objects(&[sub_tap.as_ref()]);
+
+            let description = CFDictionary::<CFType, CFType>::from_slices(
+                &[
+                    aggregate_name_key.as_ref(),
+                    aggregate_uid_key.as_ref(),
+                    private_key.as_ref(),
+                    tap_list_key.as_ref(),
+                    tap_auto_start_key.as_ref(),
+                ],
+                &[
+                    aggregate_name.as_ref(),
+                    aggregate_uid.as_ref(),
+                    is_private.as_ref(),
+                    tap_list.as_ref(),
+                    tap_auto_start.as_ref(),
+                ],
+            );
+
+            let mut device_id = kAudioObjectUnknown;
+            let status = unsafe {
+                AudioHardwareCreateAggregateDevice(
+                    description.as_opaque(),
+                    NonNull::from(&mut device_id),
+                )
+            };
+            let mut created = CreatedAggregateDevice {
+                device_id,
+                taken: false,
+            };
+            check_os_status(
+                status,
+                "capture_backend_failed",
+                "Could not create a private Core Audio aggregate device for system-audio capture",
+            )?;
+            if created.device_id == kAudioObjectUnknown {
+                return Err(CaptureBackendError {
+                    code: "capture_backend_failed",
+                    message: "Core Audio returned an unknown aggregate device.".to_string(),
+                    diagnostic:
+                        "AudioHardwareCreateAggregateDevice succeeded with kAudioObjectUnknown."
+                            .to_string(),
+                });
+            }
+            Ok(created.take())
+        },
+    )
 }
 
 fn read_tap_format(
     tap_id: AudioObjectID,
 ) -> Result<AudioStreamBasicDescription, CaptureBackendError> {
-    let mut address = property_address(kAudioTapPropertyFormat);
-    let mut size = mem::size_of::<AudioStreamBasicDescription>() as u32;
-    let mut format = MaybeUninit::<AudioStreamBasicDescription>::zeroed();
-    let status = unsafe {
-        AudioObjectGetPropertyData(
-            tap_id,
-            NonNull::from(&mut address),
-            0,
-            ptr::null(),
-            NonNull::from(&mut size),
-            NonNull::new(format.as_mut_ptr().cast()).expect("format pointer"),
-        )
-    };
-    check_os_status(
-        status,
-        "format_unsupported",
-        "Could not read the Core Audio tap stream format",
-    )?;
-    if size as usize != mem::size_of::<AudioStreamBasicDescription>() {
-        return Err(CaptureBackendError {
-            code: "format_unsupported",
-            message: "Core Audio returned an unexpected tap stream-format size.".to_string(),
-            diagnostic: format!(
-                "Expected {} bytes, received {size} bytes.",
-                mem::size_of::<AudioStreamBasicDescription>()
-            ),
-        });
-    }
-    Ok(unsafe { format.assume_init() })
+    catch_foreign_exceptions("Could not read the Core Audio tap stream format", || {
+        let mut address = property_address(kAudioTapPropertyFormat);
+        let mut size = mem::size_of::<AudioStreamBasicDescription>() as u32;
+        let mut format = MaybeUninit::<AudioStreamBasicDescription>::zeroed();
+        let Some(format_ptr) = NonNull::new(format.as_mut_ptr().cast()) else {
+            return Err(CaptureBackendError {
+                code: "format_unsupported",
+                message: "Could not read the Core Audio tap stream format.".to_string(),
+                diagnostic: "AudioStreamBasicDescription output pointer was null.".to_string(),
+            });
+        };
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                tap_id,
+                NonNull::from(&mut address),
+                0,
+                ptr::null(),
+                NonNull::from(&mut size),
+                format_ptr,
+            )
+        };
+        check_os_status(
+            status,
+            "format_unsupported",
+            "Could not read the Core Audio tap stream format",
+        )?;
+        if size as usize != mem::size_of::<AudioStreamBasicDescription>() {
+            return Err(CaptureBackendError {
+                code: "format_unsupported",
+                message: "Core Audio returned an unexpected tap stream-format size.".to_string(),
+                diagnostic: format!(
+                    "Expected {} bytes, received {size} bytes.",
+                    mem::size_of::<AudioStreamBasicDescription>()
+                ),
+            });
+        }
+        Ok(unsafe { format.assume_init() })
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -688,10 +778,9 @@ impl CoreAudioPcmConverter {
             let mut count = 0_usize;
             for channel in 0..channels {
                 let sample_offset = frame_offset + channel * self.format.bytes_per_sample;
-                if sample_offset + self.format.bytes_per_sample <= data.len() {
-                    sum += self.decode_sample(
-                        &data[sample_offset..sample_offset + self.format.bytes_per_sample],
-                    );
+                let sample_end = sample_offset.saturating_add(self.format.bytes_per_sample);
+                if sample_end <= data.len() {
+                    sum += self.decode_sample(&data[sample_offset..sample_end])?;
                     count += 1;
                 }
             }
@@ -711,6 +800,9 @@ impl CoreAudioPcmConverter {
         for buffer in buffers.iter().take(channel_count) {
             channel_bytes.push(audio_buffer_bytes(buffer)?);
         }
+        if self.format.bytes_per_sample == 0 {
+            return Ok(Vec::new());
+        }
         let frames = channel_bytes
             .iter()
             .map(|bytes| bytes.len() / self.format.bytes_per_sample)
@@ -722,17 +814,35 @@ impl CoreAudioPcmConverter {
             let mut sum = 0.0_f32;
             for bytes in &channel_bytes {
                 let sample_offset = frame_index * self.format.bytes_per_sample;
-                sum += self.decode_sample(
-                    &bytes[sample_offset..sample_offset + self.format.bytes_per_sample],
-                );
+                let sample_end = sample_offset.saturating_add(self.format.bytes_per_sample);
+                if sample_end > bytes.len() {
+                    return Ok(mono);
+                }
+                sum += self.decode_sample(&bytes[sample_offset..sample_end])?;
             }
             mono.push(sum / channel_bytes.len() as f32);
         }
         Ok(mono)
     }
 
-    fn decode_sample(&self, bytes: &[u8]) -> f32 {
-        match self.format.encoding {
+    fn decode_sample(&self, bytes: &[u8]) -> Result<f32, CaptureBackendError> {
+        let needed = match self.format.encoding {
+            SampleEncoding::Float32 | SampleEncoding::Int32 => 4,
+            SampleEncoding::Float64 => 8,
+            SampleEncoding::Int16 => 2,
+        };
+        if bytes.len() < needed {
+            return Err(CaptureBackendError {
+                code: "format_unsupported",
+                message: "Core Audio buffer was shorter than one PCM sample.".to_string(),
+                diagnostic: format!(
+                    "needed {needed} bytes for {:?}, received {}.",
+                    self.format.encoding,
+                    bytes.len()
+                ),
+            });
+        }
+        let sample = match self.format.encoding {
             SampleEncoding::Float32 => {
                 let raw = [bytes[0], bytes[1], bytes[2], bytes[3]];
                 let value = if self.format.big_endian {
@@ -771,7 +881,8 @@ impl CoreAudioPcmConverter {
                 };
                 value as f32 / i32::MAX as f32
             }
-        }
+        };
+        Ok(sample)
     }
 }
 
@@ -843,15 +954,14 @@ impl LinearPcm16Resampler {
 }
 
 fn audio_buffers(input_data: &AudioBufferList) -> &[AudioBuffer] {
-    if input_data.mNumberBuffers == 0 {
+    let count = input_data.mNumberBuffers as usize;
+    // Core Audio uses a flexible array member; refuse pathological counts
+    // rather than fabricating an unbounded slice from a one-element header.
+    const MAX_AUDIO_BUFFERS: usize = 16;
+    if count == 0 || count > MAX_AUDIO_BUFFERS {
         return &[];
     }
-    unsafe {
-        std::slice::from_raw_parts(
-            input_data.mBuffers.as_ptr(),
-            input_data.mNumberBuffers as usize,
-        )
-    }
+    unsafe { std::slice::from_raw_parts(input_data.mBuffers.as_ptr(), count) }
 }
 
 fn audio_buffer_bytes(buffer: &AudioBuffer) -> Result<&[u8], CaptureBackendError> {
@@ -985,6 +1095,93 @@ fn callback_error(message: &'static str) -> impl FnOnce(String) -> CaptureBacken
     }
 }
 
+struct CreatedProcessTap<'a> {
+    symbols: &'a ProcessTapSymbols,
+    tap_id: AudioObjectID,
+    taken: bool,
+}
+
+impl CreatedProcessTap<'_> {
+    fn take(&mut self) -> AudioObjectID {
+        self.taken = true;
+        self.tap_id
+    }
+}
+
+impl Drop for CreatedProcessTap<'_> {
+    fn drop(&mut self) {
+        if !self.taken && self.tap_id != kAudioObjectUnknown {
+            unsafe {
+                (self.symbols.destroy)(self.tap_id);
+            }
+        }
+    }
+}
+
+struct CreatedAggregateDevice {
+    device_id: AudioObjectID,
+    taken: bool,
+}
+
+impl CreatedAggregateDevice {
+    fn take(&mut self) -> AudioObjectID {
+        self.taken = true;
+        self.device_id
+    }
+}
+
+impl Drop for CreatedAggregateDevice {
+    fn drop(&mut self) {
+        if !self.taken && self.device_id != kAudioObjectUnknown {
+            unsafe {
+                AudioHardwareDestroyAggregateDevice(self.device_id);
+            }
+        }
+    }
+}
+
+/// Catch Objective-C `NSException`s (and other foreign exceptions) that would
+/// otherwise unwind out of a `std::thread::spawn` closure and abort the process
+/// via `__rust_foreign_exception`. One mapping for every Core Audio / ObjC call
+/// site; call sites must not match on the catch result themselves.
+fn catch_foreign_exceptions<T>(
+    user_message: &'static str,
+    op: impl FnOnce() -> Result<T, CaptureBackendError>,
+) -> Result<T, CaptureBackendError> {
+    match objc2::exception::catch(std::panic::AssertUnwindSafe(op)) {
+        Ok(result) => result,
+        Err(caught) => Err(foreign_exception_to_error(user_message, caught.as_deref())),
+    }
+}
+
+fn foreign_exception_to_error(
+    user_message: &'static str,
+    exception: Option<&Exception>,
+) -> CaptureBackendError {
+    let diagnostic = match exception {
+        None => "non-Objective-C foreign exception escaped a Core Audio call".to_string(),
+        Some(exception) => match exception.downcast_ref::<NSException>() {
+            Some(ns_exception) => {
+                let name = ns_exception.name().to_string();
+                let reason = ns_exception
+                    .reason()
+                    .map(|reason| reason.to_string())
+                    .unwrap_or_default();
+                format!("{name}: {reason}")
+            }
+            None => format!(
+                "{}: {exception}",
+                exception.class().name().to_string_lossy()
+            ),
+        },
+    };
+    CaptureBackendError {
+        code: "capture_backend_failed",
+        message: user_message.to_string(),
+        diagnostic,
+    }
+}
+
 fn check_os_status(
     status: OSStatus,
     code: &'static str,
@@ -1110,6 +1307,86 @@ mod tests {
     #[test]
     fn formats_four_char_osstatus() {
         assert_eq!(os_status_diagnostic(0x7768_6174), "'what' (2003329396)");
+    }
+
+    #[test]
+    fn nsexception_from_tap_setup_maps_to_capture_backend_error() {
+        let error = catch_foreign_exceptions(
+            "Could not create a macOS Core Audio process tap",
+            || -> Result<(), CaptureBackendError> {
+                let name = NSString::from_str("NSInvalidArgumentException");
+                let reason = NSString::from_str("synthetic Core Audio failure");
+                let exception =
+                    NSException::new(&name, Some(&reason), None).expect("allocate NSException");
+                exception.raise();
+            },
+        )
+        .expect_err("NSException must map to CaptureBackendError, not abort");
+        assert_eq!(error.code, "capture_backend_failed");
+        assert_eq!(
+            error.message,
+            "Could not create a macOS Core Audio process tap"
+        );
+        assert!(
+            error.diagnostic.contains("NSInvalidArgumentException"),
+            "diagnostic={}",
+            error.diagnostic
+        );
+        assert!(
+            error.diagnostic.contains("synthetic Core Audio failure"),
+            "diagnostic={}",
+            error.diagnostic
+        );
+    }
+
+    #[test]
+    fn convert_buffer_list_returns_empty_on_zero_buffers() {
+        let format = CoreAudioPcmFormat {
+            sample_rate_hz: 16_000.0,
+            channels: 1,
+            bytes_per_frame: 4,
+            bytes_per_sample: 4,
+            non_interleaved: false,
+            big_endian: false,
+            encoding: SampleEncoding::Float32,
+        };
+        let mut converter = CoreAudioPcmConverter::new(format);
+        let list = AudioBufferList {
+            mNumberBuffers: 0,
+            mBuffers: [AudioBuffer {
+                mNumberChannels: 0,
+                mDataByteSize: 0,
+                mData: ptr::null_mut(),
+            }],
+        };
+        let output = converter.convert_buffer_list(&list).expect("convert");
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn convert_buffer_list_rejects_truncated_sample() {
+        let format = CoreAudioPcmFormat {
+            sample_rate_hz: 16_000.0,
+            channels: 1,
+            bytes_per_frame: 4,
+            bytes_per_sample: 4,
+            non_interleaved: false,
+            big_endian: false,
+            encoding: SampleEncoding::Float32,
+        };
+        let mut converter = CoreAudioPcmConverter::new(format);
+        let mut raw = vec![0_u8; 3];
+        let buffer = AudioBuffer {
+            mNumberChannels: 1,
+            mDataByteSize: raw.len() as u32,
+            mData: raw.as_mut_ptr().cast(),
+        };
+        let list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer],
+        };
+        let output = converter.convert_buffer_list(&list).expect("convert");
+        assert!(output.is_empty());
     }
 
     #[test]
