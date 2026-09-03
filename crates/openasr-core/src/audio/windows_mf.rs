@@ -3,22 +3,33 @@
 //!
 //! This is the Windows peer of macOS `/usr/bin/afconvert`: system APIs only,
 //! never Fraunhofer FDK, never a spawned ffmpeg.
+//!
+//! `mfplat.dll` / `mfreadwrite.dll` are resolved at run time, not imported.
+//! Windows N/KN editions and Windows Server without the Media Foundation
+//! feature do not ship them; a load-time import would make every binary that
+//! links this crate fail to start with `STATUS_DLL_NOT_FOUND` and no message.
+//! Loading lazily keeps the process alive and turns the gap into an ordinary
+//! conversion error for the one input that needs the system decoder.
 
+use std::ffi::c_void;
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use windows::Win32::Media::MediaFoundation::{
-    IMFMediaBuffer, IMFMediaType, IMFSample, IMFSourceReader, MF_ACCESSMODE_READ,
-    MF_FILEFLAGS_NONE, MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE,
-    MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND,
-    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_OPENMODE_FAIL_IF_NOT_EXIST, MF_SOURCE_READER_ALL_STREAMS,
+    IMFByteStream, IMFMediaBuffer, IMFMediaType, IMFSample, IMFSourceReader, MF_ACCESSMODE_READ,
+    MF_FILE_ACCESSMODE, MF_FILE_FLAGS, MF_FILE_OPENMODE, MF_FILEFLAGS_NONE,
+    MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT,
+    MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+    MF_OPENMODE_FAIL_IF_NOT_EXIST, MF_SOURCE_READER_ALL_STREAMS,
     MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR,
-    MF_VERSION, MFAudioFormat_PCM, MFCreateFile, MFCreateMediaType,
-    MFCreateSourceReaderFromByteStream, MFMediaType_Audio, MFSTARTUP_NOSOCKET, MFShutdown,
-    MFStartup,
+    MF_VERSION, MFAudioFormat_PCM, MFMediaType_Audio, MFSTARTUP_NOSOCKET,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
-use windows::core::{HRESULT, HSTRING};
+use windows::core::{HRESULT, HSTRING, Interface, PCWSTR};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
 
 /// `RPC_E_CHANGED_MODE`: this thread already has a different COM apartment.
 const RPC_E_CHANGED_MODE: HRESULT = HRESULT(0x8001_0106_u32 as i32);
@@ -28,9 +39,122 @@ const TARGET_CHANNELS: u32 = 1;
 const TARGET_BITS: u32 = 16;
 
 pub(super) fn convert_to_wav16k_mono(input: &Path, output: &Path) -> Result<(), String> {
+    let api = MediaFoundationApi::get()?;
     let _com = ComApartment::enter()?;
-    let _mf = MediaFoundation::startup()?;
-    unsafe { convert_with_source_reader(input, output) }
+    let _mf = MediaFoundation::startup(api)?;
+    unsafe { convert_with_source_reader(api, input, output) }
+}
+
+type MfStartupFn = unsafe extern "system" fn(version: u32, flags: u32) -> HRESULT;
+type MfShutdownFn = unsafe extern "system" fn() -> HRESULT;
+type MfCreateFileFn = unsafe extern "system" fn(
+    access_mode: MF_FILE_ACCESSMODE,
+    open_mode: MF_FILE_OPENMODE,
+    flags: MF_FILE_FLAGS,
+    url: PCWSTR,
+    byte_stream: *mut *mut c_void,
+) -> HRESULT;
+type MfCreateMediaTypeFn = unsafe extern "system" fn(media_type: *mut *mut c_void) -> HRESULT;
+type MfCreateSourceReaderFromByteStreamFn = unsafe extern "system" fn(
+    byte_stream: *mut c_void,
+    attributes: *mut c_void,
+    source_reader: *mut *mut c_void,
+) -> HRESULT;
+
+/// The free functions this converter needs from the two Media Foundation
+/// system DLLs, resolved once per process from `%SystemRoot%\System32` only.
+/// COM interface methods dispatch through vtables and need no import.
+struct MediaFoundationApi {
+    startup: MfStartupFn,
+    shutdown: MfShutdownFn,
+    create_file: MfCreateFileFn,
+    create_media_type: MfCreateMediaTypeFn,
+    create_source_reader_from_byte_stream: MfCreateSourceReaderFromByteStreamFn,
+}
+
+impl MediaFoundationApi {
+    fn get() -> Result<&'static Self, String> {
+        static API: OnceLock<Result<MediaFoundationApi, String>> = OnceLock::new();
+        API.get_or_init(Self::load).as_ref().map_err(Clone::clone)
+    }
+
+    fn load() -> Result<Self, String> {
+        let mfplat = load_system_library("mfplat.dll")?;
+        let mfreadwrite = load_system_library("mfreadwrite.dll")?;
+        // SAFETY: each symbol is resolved from the DLL that documents it and
+        // transmuted to that function's documented `extern "system"` signature.
+        unsafe {
+            Ok(Self {
+                startup: std::mem::transmute::<*const c_void, MfStartupFn>(system_symbol(
+                    mfplat,
+                    "mfplat.dll",
+                    b"MFStartup\0",
+                )?),
+                shutdown: std::mem::transmute::<*const c_void, MfShutdownFn>(system_symbol(
+                    mfplat,
+                    "mfplat.dll",
+                    b"MFShutdown\0",
+                )?),
+                create_file: std::mem::transmute::<*const c_void, MfCreateFileFn>(system_symbol(
+                    mfplat,
+                    "mfplat.dll",
+                    b"MFCreateFile\0",
+                )?),
+                create_media_type: std::mem::transmute::<*const c_void, MfCreateMediaTypeFn>(
+                    system_symbol(mfplat, "mfplat.dll", b"MFCreateMediaType\0")?,
+                ),
+                create_source_reader_from_byte_stream: std::mem::transmute::<
+                    *const c_void,
+                    MfCreateSourceReaderFromByteStreamFn,
+                >(system_symbol(
+                    mfreadwrite,
+                    "mfreadwrite.dll",
+                    b"MFCreateSourceReaderFromByteStream\0",
+                )?),
+            })
+        }
+    }
+}
+
+fn load_system_library(name: &str) -> Result<*mut c_void, String> {
+    let wide = name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+    // SAFETY: `wide` is a live NUL-terminated UTF-16 name. The handle is kept
+    // for the life of the process (the API table is a process-wide singleton).
+    let handle = unsafe {
+        LoadLibraryExW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    };
+    if handle.is_null() {
+        return Err(format!(
+            "Windows Media Foundation is not available on this system ({name}: {}). \
+             Windows N/KN editions need the Media Feature Pack; Windows Server needs the \
+             Media Foundation feature. Convert the file to WAV/FLAC/MP3 or install it.",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(handle.cast())
+}
+
+fn system_symbol(
+    handle: *mut c_void,
+    library: &str,
+    name: &'static [u8],
+) -> Result<*const c_void, String> {
+    debug_assert_eq!(name.last(), Some(&0));
+    // SAFETY: `handle` is a live library handle and `name` is NUL-terminated.
+    let function = unsafe { GetProcAddress(handle.cast(), name.as_ptr()) }.ok_or_else(|| {
+        format!(
+            "Windows Media Foundation ({library}) is missing {}",
+            String::from_utf8_lossy(&name[..name.len() - 1])
+        )
+    })?;
+    Ok(function as *const () as *const c_void)
 }
 
 struct ComApartment {
@@ -58,38 +182,67 @@ impl Drop for ComApartment {
     }
 }
 
-struct MediaFoundation;
+struct MediaFoundation {
+    api: &'static MediaFoundationApi,
+}
 
 impl MediaFoundation {
-    fn startup() -> Result<Self, String> {
-        unsafe { MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET) }
+    fn startup(api: &'static MediaFoundationApi) -> Result<Self, String> {
+        unsafe { (api.startup)(MF_VERSION, MFSTARTUP_NOSOCKET) }
+            .ok()
             .map_err(|error| format!("Media Foundation startup failed: {error}"))?;
-        Ok(Self)
+        Ok(Self { api })
     }
 }
 
 impl Drop for MediaFoundation {
     fn drop(&mut self) {
         unsafe {
-            let _ = MFShutdown();
+            let _ = (self.api.shutdown)();
         }
     }
 }
 
-unsafe fn convert_with_source_reader(input: &Path, output: &Path) -> Result<(), String> {
+/// Take ownership of a COM interface written through an out-pointer by one of
+/// the runtime-resolved factory functions.
+unsafe fn com_out<T: Interface>(hr: HRESULT, raw: *mut c_void, context: &str) -> Result<T, String> {
+    hr.ok().map_err(|error| format!("{context}: {error}"))?;
+    if raw.is_null() {
+        return Err(format!("{context}: no interface returned"));
+    }
+    // SAFETY: the callee wrote one owned reference to a `T` into `raw`.
+    Ok(unsafe { T::from_raw(raw) })
+}
+
+unsafe fn convert_with_source_reader(
+    api: &'static MediaFoundationApi,
+    input: &Path,
+    output: &Path,
+) -> Result<(), String> {
     let path = HSTRING::from(input.to_string_lossy().as_ref());
-    let stream = unsafe {
-        MFCreateFile(
+    let mut raw_stream: *mut c_void = std::ptr::null_mut();
+    let hr = unsafe {
+        (api.create_file)(
             MF_ACCESSMODE_READ,
             MF_OPENMODE_FAIL_IF_NOT_EXIST,
             MF_FILEFLAGS_NONE,
-            &path,
+            PCWSTR(path.as_ptr()),
+            &mut raw_stream,
         )
-    }
-    .map_err(|error| format!("could not open input for Media Foundation: {error}"))?;
+    };
+    let stream: IMFByteStream =
+        unsafe { com_out(hr, raw_stream, "could not open input for Media Foundation") }?;
 
-    let reader: IMFSourceReader = unsafe { MFCreateSourceReaderFromByteStream(&stream, None) }
-        .map_err(|error| format!("Media Foundation could not open this file: {error}"))?;
+    let mut raw_reader: *mut c_void = std::ptr::null_mut();
+    let hr = unsafe {
+        (api.create_source_reader_from_byte_stream)(
+            stream.as_raw(),
+            std::ptr::null_mut(),
+            &mut raw_reader,
+        )
+    };
+    let reader: IMFSourceReader =
+        unsafe { com_out(hr, raw_reader, "Media Foundation could not open this file") }?;
     let all_streams = MF_SOURCE_READER_ALL_STREAMS.0 as u32;
     let audio_stream = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32;
 
@@ -102,8 +255,10 @@ unsafe fn convert_with_source_reader(input: &Path, output: &Path) -> Result<(), 
             .map_err(|error| format!("no audio stream for Media Foundation: {error}"))?;
     }
 
-    let media_type: IMFMediaType = unsafe { MFCreateMediaType() }
-        .map_err(|error| format!("could not create PCM media type: {error}"))?;
+    let mut raw_media_type: *mut c_void = std::ptr::null_mut();
+    let hr = unsafe { (api.create_media_type)(&mut raw_media_type) };
+    let media_type: IMFMediaType =
+        unsafe { com_out(hr, raw_media_type, "could not create PCM media type") }?;
     unsafe {
         media_type
             .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
