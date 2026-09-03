@@ -240,7 +240,9 @@ jobs:
     timeout-minutes: 180
     environment: core-release
     permissions:
-      contents: read
+      # Draft releases are invisible to a read-only token: `gh release view`
+      # returns 404 until publication, so the sync would fail-closed forever.
+      contents: write
     env:
       GH_TOKEN: ${{ github.token }}
       B2_S3_ENDPOINT: ${{ secrets.B2_S3_ENDPOINT }}
