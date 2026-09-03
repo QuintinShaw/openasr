@@ -2,6 +2,11 @@
 # Publish a draft core release only after its signed public catalog exposes the
 # new Windows GPU provider bytes as PublishedInert. Real-hardware qualification
 # happens after publication and can only activate a later signed catalog epoch.
+#
+# The primary caller is release-core.yml's `publish-release` job, which sets
+# OPENASR_DEPLOY_CATALOG_RUN_ID to the orchestrator github.run_id (the
+# reusable deploy-catalog.yml job lives in that same run). A local run still
+# works after stage 2 finishes; pass the completed orchestrator run id.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -163,11 +168,46 @@ python3 tooling/release-manifest/backend_hardware_evidence.py \
 
 # The reusable deploy workflow is the only catalog publication path. Initial
 # release publication accepts only its already-verified PublishedInert epoch.
+# deploy-catalog.yml records GITHUB_RUN_ID == orchestrator_run_id, so the
+# caller run id is the binding id. When this script runs as a later job in
+# that same Actions run, the overall conclusion is still empty; require the
+# "Deploy PublishedInert candidate catalog" job itself to have succeeded.
 deploy_run_id="${OPENASR_DEPLOY_CATALOG_RUN_ID:-}"
 [ -n "$deploy_run_id" ] || fail "set OPENASR_DEPLOY_CATALOG_RUN_ID to the successful reusable catalog-deploy run"
-deploy_conclusion="$(gh run view "$deploy_run_id" --repo "$repository" --json conclusion --jq .conclusion)"
-[ "$deploy_conclusion" = "success" ] \
-  || fail "catalog deploy run $deploy_run_id did not succeed (conclusion=$deploy_conclusion)"
+deploy_preflight="$workdir/deploy-run-preflight.json"
+gh run view "$deploy_run_id" --repo "$repository" \
+  --json conclusion,status,event,workflowName,jobs > "$deploy_preflight" \
+  || fail "cannot inspect catalog deploy run $deploy_run_id"
+python3 - "$deploy_preflight" "$deploy_run_id" <<'PY' \
+  || fail "catalog deploy run $deploy_run_id did not succeed"
+import json, os, sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+run_id = sys.argv[2]
+if value.get("workflowName") != "Release core":
+    raise SystemExit("deploy binding came from another workflow")
+if value.get("event") != "workflow_dispatch":
+    raise SystemExit("release finalization run was not an explicit dispatch")
+jobs = value.get("jobs")
+if not isinstance(jobs, list) or not any(
+    isinstance(job, dict)
+    and "Deploy PublishedInert candidate catalog" in str(job.get("name", ""))
+    and job.get("conclusion") == "success"
+    for job in jobs
+):
+    raise SystemExit("run has no successful PublishedInert catalog deploy job")
+conclusion = value.get("conclusion")
+status = value.get("status")
+same_run = os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("GITHUB_RUN_ID") == run_id
+if conclusion == "success":
+    pass
+elif same_run and status in {"in_progress", "queued", "waiting", "pending", "requested"}:
+    pass
+else:
+    raise SystemExit(
+        f"catalog deploy run did not succeed (conclusion={conclusion} status={status})"
+    )
+PY
 
 # Re-read the annotated remote tag while holding the qualification mutation
 # lock. Its peeled commit must still equal the release identity checked before
@@ -313,16 +353,16 @@ done < "$workdir/qualification-subjects.txt"
 
 deploy_metadata="$workdir/deploy-run.json"
 gh run view "$deploy_run_id" --repo "$repository" \
-  --json workflowName,conclusion,headSha,event,jobs,url > "$deploy_metadata" \
+  --json workflowName,conclusion,status,headSha,event,jobs,url > "$deploy_metadata" \
   || fail "cannot inspect catalog deploy run $deploy_run_id"
-python3 - "$deploy_metadata" "$current_commit" <<'PY' \
+python3 - "$deploy_metadata" "$current_commit" "$deploy_run_id" <<'PY' \
   || fail "catalog deploy run is not bound to this committed PublishedInert catalog"
-import json, sys
+import json, os, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
 if value.get("workflowName") != "Release core":
     raise SystemExit("deploy binding came from another workflow")
-if value.get("conclusion") != "success" or value.get("event") != "workflow_dispatch":
-    raise SystemExit("release finalization run did not complete successfully by explicit dispatch")
+if value.get("event") != "workflow_dispatch":
+    raise SystemExit("release finalization run was not an explicit dispatch")
 if value.get("headSha") != sys.argv[2]:
     raise SystemExit("release finalization run used another catalog commit")
 jobs = value.get("jobs")
@@ -333,6 +373,17 @@ if not isinstance(jobs, list) or not any(
     for job in jobs
 ):
     raise SystemExit("run has no successful PublishedInert catalog deploy job")
+conclusion = value.get("conclusion")
+status = value.get("status")
+same_run = os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("GITHUB_RUN_ID") == sys.argv[3]
+if conclusion == "success":
+    pass
+elif same_run and status in {"in_progress", "queued", "waiting", "pending", "requested"}:
+    pass
+else:
+    raise SystemExit(
+        f"catalog deploy run did not succeed (conclusion={conclusion} status={status})"
+    )
 PY
 
 deploy_binding_dir="$workdir/deploy-binding"
@@ -377,26 +428,52 @@ PY
 python3 tooling/publish-model/scripts/check_catalog_consistency.py \
   || fail "committed catalog/signature pair does not verify under production trust roots"
 
-cache_bust="$(date +%s)"
-curl -fsSL "https://catalog.openasr.org/v1/catalog.json?release=${tag}-${cache_bust}" \
-  -o "$workdir/catalog.json"
-curl -fsSL "https://catalog.openasr.org/v1/catalog.signature.json?release=${tag}-${cache_bust}" \
-  -o "$workdir/catalog.signature.json"
-OPENASR_HOME="$workdir/home" \
-OPENASR_CATALOG_FILE="$workdir/catalog.json" \
-OPENASR_CATALOG_IDENTITY="https://catalog.openasr.org/v1/catalog.json" \
-  cargo run --quiet -p openasr-cli -- doctor >/dev/null
-python3 tooling/release-manifest/backend_catalog.py verify-catalog \
-  --catalog "$workdir/catalog.json" "${all_backend_entry_args[@]}"
-python3 tooling/release-manifest/backend_hardware_evidence.py \
-  "${all_backend_entry_args[@]}" \
-  --catalog "$workdir/catalog.json" --version "$version" >/dev/null
-python3 tooling/release-manifest/backend_catalog.py verify-cdn \
-  --catalog "$workdir/catalog.json" --version "$version"
-cmp -s model-registry/catalog.public.json "$workdir/catalog.json" \
-  || fail "live catalog bytes differ from the deploy run's committed catalog"
-cmp -s model-registry/catalog.public.signature.json "$workdir/catalog.signature.json" \
-  || fail "live catalog signature differs from the deploy run's committed signature"
+# Live catalog/CDN can lag the deploy job. Retry the no-credential plane for
+# up to 10 minutes so a just-written catalog is not a spurious publish failure.
+verify_live_catalog_cdn() {
+  local attempt="$1"
+  local cache_bust
+  cache_bust="$(date +%s)-${attempt}"
+  curl -fsSL "https://catalog.openasr.org/v1/catalog.json?release=${tag}-${cache_bust}" \
+    -o "$workdir/catalog.json" || return 1
+  curl -fsSL "https://catalog.openasr.org/v1/catalog.signature.json?release=${tag}-${cache_bust}" \
+    -o "$workdir/catalog.signature.json" || return 1
+  OPENASR_HOME="$workdir/home-${attempt}" \
+  OPENASR_CATALOG_FILE="$workdir/catalog.json" \
+  OPENASR_CATALOG_IDENTITY="https://catalog.openasr.org/v1/catalog.json" \
+    cargo run --quiet -p openasr-cli -- doctor >/dev/null || return 1
+  python3 tooling/release-manifest/backend_catalog.py verify-catalog \
+    --catalog "$workdir/catalog.json" "${all_backend_entry_args[@]}" || return 1
+  python3 tooling/release-manifest/backend_hardware_evidence.py \
+    "${all_backend_entry_args[@]}" \
+    --catalog "$workdir/catalog.json" --version "$version" >/dev/null || return 1
+  python3 tooling/release-manifest/backend_catalog.py verify-cdn \
+    --catalog "$workdir/catalog.json" --version "$version" || return 1
+  if ! cmp -s model-registry/catalog.public.json "$workdir/catalog.json"; then
+    echo "live catalog bytes differ from the deploy run's committed catalog" >&2
+    return 1
+  fi
+  if ! cmp -s model-registry/catalog.public.signature.json "$workdir/catalog.signature.json"; then
+    echo "live catalog signature differs from the deploy run's committed signature" >&2
+    return 1
+  fi
+  return 0
+}
+
+cdn_ok=false
+for attempt in $(seq 1 20); do
+  if verify_live_catalog_cdn "$attempt"; then
+    cdn_ok=true
+    break
+  fi
+  if [ "$attempt" -eq 20 ]; then
+    break
+  fi
+  echo "live catalog/CDN not yet consistent (attempt ${attempt}/20); retrying in 30s" >&2
+  sleep 30
+done
+[ "$cdn_ok" = "true" ] \
+  || fail "live catalog bytes differ from the deploy run's committed catalog after 10 minutes of retries"
 
 echo "==> signed catalog exposes ${tag} provider bytes as PublishedInert; publishing release"
 [ "$(gh release view "$tag" --repo "$repository" --json isDraft --jq .isDraft)" = "true" ] \

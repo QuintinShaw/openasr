@@ -4,8 +4,8 @@
 # This is deliberately LOCAL ONLY: it consumes the production catalog signing
 # seed, but it does not push, deploy, publish, or undraft anything.  A release
 # remains incomplete until the resulting catalog commit is reviewed, pushed,
-# deployed by deploy-catalog.yml, and finalize-core-release.sh verifies the
-# live bytes before publishing the draft.
+# deployed by deploy-catalog.yml, and release-core.yml's publish-release job
+# runs finalize-core-release.sh to verify the live bytes before undrafting.
 
 set -euo pipefail
 
@@ -178,5 +178,5 @@ echo "  published-inert/signed backend entries: ${#backend_entries[@]}"
 echo "  hardware-qualified exact entries: 0 (qualification is post-publication)"
 echo "  epoch: ${old_epoch} -> ${new_epoch}"
 echo "  next: review and commit model-registry/catalog{,.public}{,.signature}.json + catalog.epoch"
-echo "  then push the catalog commit, wait for deploy-catalog.yml (which rechecks CDN), and run:"
-echo "    scripts/finalize-core-release.sh ${tag}"
+echo "  then push the catalog commit and dispatch Release core again."
+echo "  Stage 2 deploys the catalog and publishes the draft after core-release approval."

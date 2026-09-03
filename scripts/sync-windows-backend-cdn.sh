@@ -3,8 +3,10 @@
 # https://dl.openasr.org/core/vX.Y.Z/.
 #
 # The signed catalog's files[].url values point only at this prefix. GitHub
-# release mirrors are provenance, not a runtime download fallback. This step
-# is local: B2 write credentials never enter CI.
+# release mirrors are provenance, not a runtime download fallback. The
+# primary caller is release-core.yml's `sync-backend-cdn` job, which passes
+# --allow-ci and reads B2 write credentials from the core-release Environment.
+# A local run without CI still sources ~/.openasr/b2-release.env.
 
 set -euo pipefail
 
@@ -19,16 +21,28 @@ fail() {
 
 trap 'fail "aborted at line $LINENO"' ERR
 
-[ "$#" -eq 1 ] || fail "usage: $(basename "$0") vX.Y.Z"
-version="${1#v}"
+allow_ci=false
+tag_arg=""
+for arg in "$@"; do
+  case "$arg" in
+    --allow-ci) allow_ci=true ;;
+    -*) fail "unknown flag: ${arg}" ;;
+    *)
+      [ -z "$tag_arg" ] || fail "usage: $(basename "$0") vX.Y.Z [--allow-ci]"
+      tag_arg="$arg"
+      ;;
+  esac
+done
+[ -n "$tag_arg" ] || fail "usage: $(basename "$0") vX.Y.Z [--allow-ci]"
+version="${tag_arg#v}"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "version must be X.Y.Z or vX.Y.Z"
 tag="v${version}"
 
 if [ "${CI:-}" = "true" ] || [ "${GITHUB_ACTIONS:-}" = "true" ]; then
-  fail "refusing to use B2 write credentials in CI"
+  [ "$allow_ci" = "true" ] || fail "refusing to use B2 write credentials in CI without --allow-ci"
 fi
 [ -n "${B2_S3_ENDPOINT:-}" ] && [ -n "${B2_APPLICATION_KEY_ID:-}" ] && [ -n "${B2_APPLICATION_KEY:-}" ] \
-  || fail "source ~/.openasr/b2-release.env before running (B2_S3_ENDPOINT / B2_APPLICATION_KEY_ID / B2_APPLICATION_KEY)"
+  || fail "source ~/.openasr/b2-release.env or set the core-release Environment secrets (B2_S3_ENDPOINT / B2_APPLICATION_KEY_ID / B2_APPLICATION_KEY)"
 command -v gh >/dev/null 2>&1 || fail "gh is required"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required"
 gh auth status >/dev/null 2>&1 || fail "gh is not authenticated"

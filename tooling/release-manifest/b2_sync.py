@@ -18,23 +18,24 @@ The command uses the same environment variable names as
   B2_BUCKET             Default: openasr-releases
   B2_S3_REGION          Override if it cannot be inferred from B2_S3_ENDPOINT.
 
-Credential source: these write credentials live ONLY in
+Credential source: locally these write credentials live ONLY in
 `~/.openasr/b2-release.env` (chmod 600, outside the repo). `source` that file
 in the shell that runs this script, e.g. `source ~/.openasr/b2-release.env`
 immediately before the command. Do NOT export them from a long-lived shell
 profile (~/.zshrc, ~/.bashrc, ...): a release-bucket write key must not be
-inherited by every terminal process. They are also never CI secrets /
-repository variables / workflow literals for this script -- core's B2 sync is
-a local, human-run step (see README). Missing vars fail closed below with a
-message pointing at the `source` step.
+inherited by every terminal process. `release-core.yml`'s `sync-backend-cdn`
+job reads the same variable names from the `core-release` GitHub Environment
+(required reviewers; never repository-level secrets or workflow literals).
+Missing vars fail closed below with a message pointing at the local `source`
+step or that Environment.
 
 Immutability, same policy as the desktop publish script: before uploading a
 key, HEAD it. If an object already exists there with a DIFFERENT sha256, this
 aborts rather than silently overwriting a shipped release asset -- bump the
-version instead. Re-uploading byte-identical content is a no-op.
-
-This is deliberately not wired into GitHub Actions. It is invoked by the
-maintainer-controlled Windows backend CDN sync path after target approval.
+version instead. Re-uploading byte-identical content is a no-op. New uploads
+record `x-amz-meta-sha256`; later HEADs compare size plus that digest. Objects
+that predate the metadata fall back to size + ETag/MD5, or download-and-hash
+when the ETag is a multipart `hash-N` form.
 """
 from __future__ import annotations
 
@@ -58,6 +59,7 @@ ALGORITHM = "AWS4-HMAC-SHA256"
 SERVICE = "s3"
 DEFAULT_BUCKET = "openasr-releases"
 DEFAULT_DL_BASE_URL = "https://dl.openasr.org"
+SHA256_META_HEADER = "x-amz-meta-sha256"
 
 
 class B2SyncError(Exception):
@@ -158,13 +160,21 @@ class Transport:
     """Minimal HTTP transport seam so tests can inject a fake instead of
     making real network calls."""
 
-    def request(self, method: str, url: str, headers: dict[str, str], body: bytes) -> tuple[int, dict[str, str]]:
+    def request(
+        self, method: str, url: str, headers: dict[str, str], body: bytes
+    ) -> tuple[int, dict[str, str], bytes]:
         request = urllib.request.Request(url, data=body if method != "HEAD" else None, method=method, headers=headers)
         try:
             with urllib.request.urlopen(request) as response:  # noqa: S310 (fixed https B2 endpoint)
-                return response.status, dict(response.headers)
+                payload = b"" if method == "HEAD" else response.read()
+                return response.status, dict(response.headers), payload
         except urllib.error.HTTPError as error:
-            return error.code, dict(error.headers or {})
+            payload = b""
+            try:
+                payload = error.read()
+            except Exception:
+                payload = b""
+            return error.code, dict(error.headers or {}), payload
 
 
 @dataclass
@@ -183,17 +193,19 @@ class B2Credentials:
         secret_access_key = env.get("B2_APPLICATION_KEY")
         if not endpoint:
             raise B2SyncError(
-                "B2_S3_ENDPOINT is not set. These B2 write credentials are kept only in "
-                "~/.openasr/b2-release.env (not in any shell profile and not in CI); run "
-                "`source ~/.openasr/b2-release.env` in this shell and retry. The endpoint is "
+                "B2_S3_ENDPOINT is not set. Locally these B2 write credentials live only in "
+                "~/.openasr/b2-release.env (not in any shell profile); run "
+                "`source ~/.openasr/b2-release.env` in this shell and retry. In Actions they "
+                "come from the core-release Environment secrets. The endpoint is "
                 "the bucket's S3-compatible URL, e.g. https://s3.us-east-005.backblazeb2.com "
                 "(the region/cluster is not known until the bucket is created)."
             )
         if not access_key_id or not secret_access_key:
             raise B2SyncError(
                 "B2_APPLICATION_KEY_ID and B2_APPLICATION_KEY must both be set to sync. They "
-                "live only in ~/.openasr/b2-release.env; run `source ~/.openasr/b2-release.env` "
-                "in this shell and retry (do not export them from ~/.zshrc or any login profile)."
+                "live only in ~/.openasr/b2-release.env locally; run `source ~/.openasr/b2-release.env` "
+                "in this shell and retry (do not export them from ~/.zshrc or any login profile). "
+                "In Actions they come from the core-release Environment secrets."
             )
         return cls(
             endpoint=endpoint,
@@ -248,21 +260,34 @@ class B2Client:
         on any other non-2xx status."""
         payload_hash = sha256_hex(b"")
         headers = self._signed_headers("HEAD", key, payload_hash, {})
-        status, response_headers = self.transport.request("HEAD", self._object_url(key), headers, b"")
+        status, response_headers, _body = self.transport.request("HEAD", self._object_url(key), headers, b"")
         if status == 404:
             return None
         if not 200 <= status < 300:
             raise B2SyncError(f"HEAD {key} failed with status {status}")
         return response_headers
 
+    def get_object(self, key: str) -> bytes:
+        """Download an existing object so a multipart ETag can be compared by SHA-256."""
+        payload_hash = sha256_hex(b"")
+        headers = self._signed_headers("GET", key, payload_hash, {})
+        status, _response_headers, body = self.transport.request("GET", self._object_url(key), headers, b"")
+        if not 200 <= status < 300:
+            raise B2SyncError(f"GET {key} failed with status {status}")
+        return body
+
     def put_object(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
         payload_hash = sha256_hex(data)
-        # content-type/content-length are part of the SIGNED headers here
-        # (passed as extra_headers into sign_request), matching
+        # content-type/content-length/user-metadata are part of the SIGNED
+        # headers here (passed as extra_headers into sign_request), matching
         # b2-s3-client.mjs's s3ObjectRequest -- not just attached afterward.
-        extra_headers = {"content-type": content_type, "content-length": str(len(data))}
+        extra_headers = {
+            "content-type": content_type,
+            "content-length": str(len(data)),
+            SHA256_META_HEADER: payload_hash,
+        }
         headers = self._signed_headers("PUT", key, payload_hash, extra_headers)
-        status, _ = self.transport.request("PUT", self._object_url(key), headers, data)
+        status, _response_headers, _body = self.transport.request("PUT", self._object_url(key), headers, data)
         if not 200 <= status < 300:
             raise B2SyncError(f"PUT {key} failed with status {status}")
 
@@ -274,15 +299,44 @@ def _normalize_etag(etag: str | None) -> str:
     return (etag or "").replace('"', "").lower()
 
 
-def decide_immutability_action(remote: dict[str, object] | None, local_size: int, local_md5_hex: str) -> str:
+def _header(headers: dict[str, str], *names: str) -> str | None:
+    lowered = {key.lower(): value for key, value in headers.items()}
+    for name in names:
+        value = lowered.get(name.lower())
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _is_multipart_etag(etag: str) -> bool:
+    return "-" in etag
+
+
+def decide_immutability_action(
+    remote: dict[str, object] | None,
+    local_size: int,
+    local_md5_hex: str,
+    local_sha256_hex: str | None = None,
+) -> str:
     """Mirrors release-publish.mjs's `decideImmutabilityAction`: "put" if
     nothing is there yet, "skip" if an identical object already is (same
-    size + ETag/md5 -- an idempotent re-run), or raises if a DIFFERENT
-    object already occupies the key (never silently overwrite a shipped
-    release asset; the caller must bump the version instead)."""
+    size + SHA-256 when metadata is present, otherwise size + ETag/md5 --
+    an idempotent re-run), or raises if a DIFFERENT object already occupies
+    the key (never silently overwrite a shipped release asset; the caller
+    must bump the version instead)."""
     if remote is None:
         return "put"
     remote_size = remote.get("size")
+    remote_sha256 = str(remote.get("sha256") or "").lower()
+    local_sha256 = (local_sha256_hex or "").lower()
+    if remote_sha256 and local_sha256:
+        if remote_size == local_size and remote_sha256 == local_sha256:
+            return "skip"
+        raise B2SyncError(
+            f"refusing to overwrite existing object with different content "
+            f"(remote size={remote_size} sha256={remote_sha256!r} vs local size={local_size} "
+            f"sha256={local_sha256!r}); bump the version instead of re-publishing under the same one"
+        )
     remote_etag = _normalize_etag(remote.get("etag"))  # type: ignore[arg-type]
     if remote_size == local_size and remote_etag == local_md5_hex.lower():
         return "skip"
@@ -310,13 +364,17 @@ def _sync_to_keys(
         head = client.head_object(key)
         remote = None
         if head is not None:
-            content_length = head.get("Content-Length") or head.get("content-length")
+            content_length = _header(head, "Content-Length")
             remote = {
                 "size": int(content_length) if content_length is not None else None,
-                "etag": head.get("ETag") or head.get("etag"),
+                "etag": _header(head, "ETag"),
+                "sha256": _header(head, SHA256_META_HEADER),
             }
+            etag = _normalize_etag(remote.get("etag"))  # type: ignore[arg-type]
+            if not remote["sha256"] and _is_multipart_etag(etag):
+                remote["sha256"] = sha256_hex(client.get_object(key))
         local_md5_hex = hashlib.md5(data).hexdigest()  # noqa: S324 (B2/S3 ETag comparison, not a security use)
-        action = decide_immutability_action(remote, len(data), local_md5_hex)
+        action = decide_immutability_action(remote, len(data), local_md5_hex, sha256_hex(data))
         if action == "put":
             client.put_object(key, data)
 
