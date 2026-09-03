@@ -626,9 +626,7 @@ async fn run() -> Result<()> {
             max_native_sessions_per_model,
             parent_pid,
         } => {
-            if let Some(parent_pid) = parent_pid {
-                parent_watchdog::spawn(parent_pid);
-            }
+            let parent_shutdown = parent_pid.and_then(parent_watchdog::spawn);
             serve(
                 native_execution_services,
                 addr,
@@ -643,6 +641,7 @@ async fn run() -> Result<()> {
                     tls_sans,
                     pairing_admin_token_env,
                 },
+                parent_shutdown,
             )
             .await
         }

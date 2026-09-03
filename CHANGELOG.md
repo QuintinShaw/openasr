@@ -149,6 +149,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   process-tap setup. The same failure is fail-closed in the IOProc: a panic
   or foreign exception stops capture with `capture_backend_failed` rather
   than taking down the process.
+- CLI: `openasr serve --parent-pid` now shuts down through the same path as
+  Ctrl-C / SIGTERM instead of calling `process::exit`. ggml Metal backends
+  drop before process teardown, so the daemon no longer aborts in
+  `ggml-metal-device.m` (`GGML_ASSERT` on residency sets) after the parent
+  process disappears.
 - Core: live capture no longer panics when a downsampled mic callback (for
   example 44.1 kHz stereo in 512-frame chunks) leaves the resampler read head
   past the current buffer. The leftover position continues in the next chunk
