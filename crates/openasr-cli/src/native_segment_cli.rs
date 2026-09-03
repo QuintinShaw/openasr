@@ -2526,4 +2526,96 @@ mod tests {
             "non-loopback must not honor a loopback-only API key"
         );
     }
+
+    fn align_options<'a>(
+        audio: &'a Path,
+        transcript: &'a Path,
+        language: Option<String>,
+    ) -> AlignCommandOptions<'a> {
+        AlignCommandOptions {
+            audio,
+            transcript,
+            formats: &[ResponseFormat::Text],
+            language,
+            output: None,
+            backend_kind: Some(BackendKind::Native),
+            runtime_paths: RuntimePathOverrides::default(),
+            execution_target: Some("cpu"),
+            keep_word_timestamps: true,
+            consent: crate::consent::PullConsent {
+                assume_yes: false,
+                offline: true,
+            },
+        }
+    }
+
+    #[test]
+    fn align_command_fails_closed_without_forced_aligner_pack() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvVarRestore::set_os("OPENASR_HOME", temp.path());
+        let _pack = EnvVarRestore::remove("OPENASR_FORCED_ALIGNER_PACK");
+        let audio = sample_wav_fixture_path();
+        let transcript = temp.path().join("transcript.txt");
+        std::fs::write(&transcript, "hello world").unwrap();
+        let error = align_plain_transcript_command(
+            &test_native_execution_services(),
+            align_options(&audio, &transcript, Some("en".into())),
+        )
+        .expect_err("align without the forced-aligner pack must fail closed")
+        .to_string();
+        assert!(
+            error.to_ascii_lowercase().contains("align")
+                || error.to_ascii_lowercase().contains("pack")
+                || error.to_ascii_lowercase().contains("install"),
+            "missing pack error must mention the aligner pack, got {error}"
+        );
+    }
+
+    #[test]
+    fn align_command_fails_closed_on_empty_transcript() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvVarRestore::set_os("OPENASR_HOME", temp.path());
+        let _pack = EnvVarRestore::remove("OPENASR_FORCED_ALIGNER_PACK");
+        let audio = sample_wav_fixture_path();
+        let transcript = temp.path().join("empty.txt");
+        std::fs::write(&transcript, "   \n").unwrap();
+        let error = align_plain_transcript_command(
+            &test_native_execution_services(),
+            align_options(&audio, &transcript, Some("en".into())),
+        )
+        .expect_err("empty manuscript must fail closed")
+        .to_string();
+        assert!(
+            !error.is_empty(),
+            "empty transcript must produce a fail-closed error"
+        );
+    }
+
+    #[test]
+    fn align_command_fails_closed_for_japanese_language_tag() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvVarRestore::set_os("OPENASR_HOME", temp.path());
+        let _pack = EnvVarRestore::remove("OPENASR_FORCED_ALIGNER_PACK");
+        let audio = sample_wav_fixture_path();
+        let transcript = temp.path().join("ja.txt");
+        std::fs::write(&transcript, "日本語の原稿です").unwrap();
+        let error = align_plain_transcript_command(
+            &test_native_execution_services(),
+            align_options(&audio, &transcript, Some("ja".into())),
+        )
+        .expect_err("ja-tagged manuscript must fail closed")
+        .to_string();
+        let lower = error.to_ascii_lowercase();
+        assert!(
+            lower.contains("japan")
+                || lower.contains("ja")
+                || lower.contains("align")
+                || lower.contains("pack")
+                || lower.contains("language"),
+            "ja fail-closed error must be observable, got {error}"
+        );
+    }
 }

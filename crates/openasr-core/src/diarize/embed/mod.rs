@@ -21,6 +21,7 @@ mod rt_380_redteam;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use pack::wespeaker_pack_path;
 pub use pack::{
     DIARIZATION_EMBEDDER_LOAD_FAILED_REASON, REALTIME_DIARIZATION_EMBEDDER_MISSING_REASON,
     REDIMNET_FRONTEND_VERSION, SPEAKER_EMBEDDER_PACK_ID, SPEAKER_EMBEDDER_PACK_LABEL,

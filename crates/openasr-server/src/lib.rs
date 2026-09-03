@@ -1350,6 +1350,10 @@ pub struct ActiveRuntimeSlot {
     /// unset so live warmup runs.
     activation_probe_failpoint: Arc<RwLock<Option<Result<(), String>>>>,
     activation_failpoint: Arc<RwLock<Option<ModelActivationFailpoint>>>,
+    /// Set when boot warmup could not attest the launch pack. `/health`
+    /// surfaces this as `status != "ok"` so a swallowed log is not the only
+    /// signal (`openasr serve --model` with no durable V2 used to do that).
+    launch_attestation_failed: Arc<AtomicBool>,
 }
 
 #[doc(hidden)]
@@ -1445,6 +1449,14 @@ impl ActiveRuntimeSnapshot {
     }
 }
 
+/// Served pack whose GGUF metadata currently verifies. Identity surfaces
+/// (`/health`, `/v1/models`, `/v1/models/default`, `/v1/capabilities`,
+/// compute admission) read this instead of a raw slot path.
+pub(crate) struct ServedNativePack {
+    pub snapshot: ActiveRuntimeSnapshot,
+    pub identity: openasr_core::NativeRuntimeModelIdentity,
+}
+
 /// Compatibility name retained for embedders while the implementation is an
 /// active-runtime slot rather than a path authority.
 pub type BoundModelPackPath = ActiveRuntimeSlot;
@@ -1490,6 +1502,7 @@ impl From<Option<PathBuf>> for ActiveRuntimeSlot {
             activation_barrier: Arc::new(Mutex::new(())),
             activation_probe_failpoint: Arc::new(RwLock::new(None)),
             activation_failpoint: Arc::new(RwLock::new(None)),
+            launch_attestation_failed: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1511,7 +1524,16 @@ impl ActiveRuntimeSlot {
             activation_barrier: Arc::new(Mutex::new(())),
             activation_probe_failpoint: Arc::new(RwLock::new(None)),
             activation_failpoint: Arc::new(RwLock::new(None)),
+            launch_attestation_failed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub(crate) fn mark_launch_attestation_failed(&self) {
+        self.launch_attestation_failed.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn launch_attestation_failed(&self) -> bool {
+        self.launch_attestation_failed.load(Ordering::SeqCst)
     }
 
     fn lock_read(&self) -> std::sync::RwLockReadGuard<'_, ActiveRuntimeSlotState> {
@@ -1865,12 +1887,28 @@ impl ServerRuntime {
     /// Whether a native model pack is currently bound (surfaced by `/health` so
     /// clients can distinguish "daemon not reachable" from "daemon ready, no
     /// model installed" without racing a separate models-list call). Bound
-    /// means this process has a served identity, not that weights are resident.
+    /// means this process has a served identity whose pack currently verifies,
+    /// not that weights are resident.
     fn has_model_bound(&self) -> bool {
         match self.backend {
             BackendKind::Mock => true,
-            BackendKind::Native => self.model_pack_path.served_pack_path().is_some(),
+            BackendKind::Native => self.resolve_served_native_pack().ok().flatten().is_some(),
         }
+    }
+
+    /// Single served-identity gate: `Ok(None)` is an unbound daemon, `Err` is a
+    /// bound path that no longer verifies (deleted or unreadable GGUF).
+    pub(crate) fn resolve_served_native_pack(&self) -> Result<Option<ServedNativePack>, ApiError> {
+        if self.backend != BackendKind::Native {
+            return Ok(None);
+        }
+        let Some(snapshot) = self.model_pack_path.served_snapshot() else {
+            return Ok(None);
+        };
+        let adapter = validate_native_runtime_pack(snapshot.path()).map_err(ApiError::Backend)?;
+        let identity = resolve_verified_native_runtime_model_identity(&adapter, None)
+            .map_err(ApiError::Backend)?;
+        Ok(Some(ServedNativePack { snapshot, identity }))
     }
 
     pub(crate) fn native_rebind_blocked(&self) -> bool {
@@ -2708,7 +2746,11 @@ async fn health(
     Extension(distribution): Extension<DistributionContext>,
 ) -> Json<HealthResponse> {
     Json(HealthResponse {
-        status: "ok",
+        status: if runtime.model_pack_path.launch_attestation_failed() {
+            "error"
+        } else {
+            "ok"
+        },
         server_version: identity.server_version,
         pid: identity.pid,
         instance_token: identity.instance_token.clone(),
@@ -2748,21 +2790,17 @@ async fn models(
             .map(|card| served_model_item(card.id, None))
             .collect(),
         BackendKind::Native => {
-            // Empty list is the no-pack state, not an error. Re-verify the
-            // served pack on every read so listing cannot follow a config string.
-            match runtime.model_pack_path.served_pack_path() {
+            // Empty list is the no-pack state, not an error. Bound-but-unreadable
+            // packs fail closed through `resolve_served_native_pack`.
+            match runtime.resolve_served_native_pack()? {
                 None => Vec::new(),
-                Some(model_pack_path) => {
-                    let adapter = validate_native_runtime_pack(&model_pack_path)
-                        .map_err(ApiError::Backend)?;
-                    let identity = resolve_verified_native_runtime_model_identity(&adapter, None)
-                        .map_err(ApiError::Backend)?;
+                Some(served) => {
                     let pull = bound_pack_display_pull(
                         &distribution,
-                        &model_pack_path,
-                        &identity.model_id,
+                        served.snapshot.path(),
+                        &served.identity.model_id,
                     );
-                    vec![served_model_item(identity.model_id, pull)]
+                    vec![served_model_item(served.identity.model_id, pull)]
                 }
             }
         }
@@ -2810,12 +2848,12 @@ async fn capabilities(
     Extension(distribution): Extension<DistributionContext>,
 ) -> Result<Json<CapabilitiesResponse>, ApiError> {
     let transcription = if runtime.backend == BackendKind::Native {
-        runtime
-            .model_pack_path
-            .served_pack_path()
-            .as_deref()
-            .map(native_runtime_transcription_capabilities_for_path)
-            .unwrap_or_else(|| TranscriptionBackendCapabilities::for_backend_kind(runtime.backend))
+        match runtime.resolve_served_native_pack()? {
+            Some(served) => {
+                native_runtime_transcription_capabilities_for_path(served.snapshot.path())
+            }
+            None => TranscriptionBackendCapabilities::for_backend_kind(runtime.backend),
+        }
     } else {
         TranscriptionBackendCapabilities::for_backend_kind(runtime.backend)
     };
@@ -2847,12 +2885,13 @@ pub(crate) fn realtime_capabilities_for_runtime(
     runtime: &ServerRuntime,
 ) -> RealtimeBackendCapabilities {
     let mut capabilities = if runtime.backend == BackendKind::Native {
-        runtime
-            .model_pack_path
-            .served_pack_path()
-            .as_deref()
-            .map(cached_native_realtime_capabilities_for_path)
-            .unwrap_or_else(|| RealtimeBackendCapabilities::for_backend_kind(runtime.backend))
+        match runtime.resolve_served_native_pack() {
+            Ok(Some(served)) => {
+                cached_native_realtime_capabilities_for_path(served.snapshot.path())
+            }
+            Ok(None) => RealtimeBackendCapabilities::for_backend_kind(runtime.backend),
+            Err(_) => RealtimeBackendCapabilities::for_backend_kind(runtime.backend),
+        }
     } else {
         RealtimeBackendCapabilities::for_backend_kind(runtime.backend)
     };
@@ -2919,6 +2958,41 @@ pub(crate) enum DefaultModelActivationState {
     RolledBack,
     Unavailable,
     Fallback,
+}
+
+/// Wire name for `POST /v1/audio/precise-timeline` JSON bodies. Runtime
+/// responses use `openasr_core::Transcription`; this export keeps the
+/// committed http-wire set covering the alignment endpoint.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/http-wire/"))]
+#[allow(dead_code)]
+struct PreciseTimeline {
+    text: String,
+    language: Option<String>,
+    segments: Vec<PreciseTimelineSegment>,
+    words: Vec<PreciseTimelineWord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/http-wire/"))]
+#[allow(dead_code)]
+struct PreciseTimelineSegment {
+    start: f32,
+    end: f32,
+    text: String,
+    words: Vec<PreciseTimelineWord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/http-wire/"))]
+#[allow(dead_code)]
+struct PreciseTimelineWord {
+    word: String,
+    start: f32,
+    end: f32,
 }
 
 #[derive(Serialize)]

@@ -1827,6 +1827,43 @@ fn bound_model_pack_path_is_shared_across_runtime_clones() {
 }
 
 #[test]
+fn stale_served_snapshot_is_rejected_after_rebind() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack_a = temp.path().join("pack-a.oasr");
+    let pack_b = temp.path().join("pack-b.oasr");
+    write_mock_gguf_runtime_source(&pack_a, Some("whisper-tiny"));
+    write_mock_gguf_runtime_source(&pack_b, Some("whisper-base"));
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_a.clone()).into(),
+    };
+    let snapshot = runtime
+        .model_pack_path
+        .served_snapshot()
+        .expect("bound pack");
+    runtime
+        .rebind_native_model_pack(Some(pack_b))
+        .expect("idle rebind");
+    let error = match runtime.acquire_native_execution_for_snapshot(
+        &snapshot,
+        "native:stale-snapshot",
+        None,
+        NativeAdmissionKind::File,
+        None,
+    ) {
+        Ok(_) => panic!("a pre-rebind snapshot must not admit after publish"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, ApiError::Conflict(_)),
+        "stale snapshot must 409, got {error}"
+    );
+}
+
+#[test]
 fn rebind_native_model_pack_returns_conflict_while_session_is_active() {
     let temp = tempfile::tempdir().unwrap();
     let pack_a = temp.path().join("pack-a.oasr");
@@ -3188,8 +3225,8 @@ fn issue_376_session_start_and_transcription_admit_from_served_snapshot() {
         .next()
         .expect("start_native_streaming_session body");
     assert!(
-        start.contains("served_snapshot()"),
-        "session.start must admit the served pack, not only the attested live pointer: {start}"
+        start.contains("resolve_served_native_pack()"),
+        "session.start must admit the currently resolvable served pack: {start}"
     );
     assert!(
         !start.contains("current_snapshot()"),
@@ -3204,8 +3241,8 @@ fn issue_376_session_start_and_transcription_admit_from_served_snapshot() {
         .nth(1)
         .expect("native transcription arm");
     assert!(
-        native_arm.contains("served_snapshot()"),
-        "native transcription must admit the served pack: {native_arm}"
+        native_arm.contains("resolve_served_native_pack()"),
+        "native transcription must admit the currently resolvable served pack: {native_arm}"
     );
 
     let served = include_str!("lib.rs")
@@ -3344,7 +3381,6 @@ async fn rt377_session_start_claims_id(
 /// identity surface (HTTP 4xx, or 200 without the old id; session.start error).
 /// Otherwise Y: `/health.model_installed=true` and/or `/v1/capabilities` 200
 /// and/or `/v1/models` still lists the launch id from the slot path.
-#[ignore = "redteam: pr-377"]
 #[tokio::test]
 async fn rt_377_deleted_pack_identity_surfaces_fail_closed() {
     let temp = tempfile::tempdir().unwrap();
@@ -3427,10 +3463,8 @@ async fn rt_377_deleted_pack_identity_surfaces_fail_closed() {
     );
 }
 
-/// If correct: flipping bytes in the served pack makes listing re-verify and
-/// refuse the old id (not a config/path string). Otherwise Y: identity
-/// endpoints keep advertising moonshine-tiny after the pack is garbage.
-#[ignore = "redteam: pr-377"]
+/// Listing verifies GGUF metadata and the CAS path digest, not a full-pack
+/// re-hash. Destroying the GGUF magic must fail closed.
 #[tokio::test]
 async fn rt_377_tampered_pack_identity_not_from_config_string() {
     let temp = tempfile::tempdir().unwrap();
@@ -3440,8 +3474,11 @@ async fn rt_377_tampered_pack_identity_not_from_config_string() {
     let app = rt377_app(runtime.clone(), temp.path());
 
     let mut bytes = std::fs::read(&pack.path).unwrap();
-    let flip = bytes.len() / 2;
-    bytes[flip] ^= 0xff;
+    assert!(bytes.len() >= 4, "fixture pack must have a GGUF header");
+    bytes[0] ^= 0xff;
+    bytes[1] ^= 0xff;
+    bytes[2] ^= 0xff;
+    bytes[3] ^= 0xff;
     std::fs::write(&pack.path, bytes).unwrap();
 
     let (models_status, models) = issue_376_get_json(app.clone(), "/v1/models").await;
@@ -3472,7 +3509,6 @@ async fn rt_377_tampered_pack_identity_not_from_config_string() {
 /// If correct: idle unload then a failed reload (pack deleted) fail-closes
 /// identity and compute. Otherwise Y: surfaces still advertise the launch id
 /// or `/health.model_installed` stays true.
-#[ignore = "redteam: pr-377"]
 #[tokio::test]
 async fn rt_377_idle_unload_then_deleted_pack_fail_closed() {
     let _generation_lock = idle_activity::native_unload_generation_test_lock().await;
@@ -3527,7 +3563,6 @@ async fn rt_377_idle_unload_then_deleted_pack_fail_closed() {
 /// or the failure is visible on `/health` / `/v1/models`. Otherwise Y: only
 /// `default_reactivation_failed` is logged, `current()` stays empty, and HTTP
 /// still looks like a healthy bound daemon.
-#[ignore = "redteam: pr-377"]
 #[tokio::test]
 async fn rt_377_boot_reactivation_failed_is_user_visible() {
     let temp = tempfile::tempdir().unwrap();
@@ -3561,7 +3596,6 @@ async fn rt_377_boot_reactivation_failed_is_user_visible() {
 /// If correct: `/v1/models` and `/v1/models/default` both read served identity,
 /// so a launch `--model` pack disagrees with durable V2 they still agree.
 /// Otherwise Y: listing follows the served pack while default follows V2.
-#[ignore = "redteam: pr-377"]
 #[tokio::test]
 async fn rt_377_models_default_follows_served_pack_not_durable_v2() {
     let temp = tempfile::tempdir().unwrap();
@@ -3593,7 +3627,6 @@ async fn rt_377_models_default_follows_served_pack_not_durable_v2() {
 /// If correct: a FIFO-queued file job plus idle unload cannot keep advertising
 /// a pack that has been deleted. Otherwise Y: `/health.model_installed` or
 /// `/v1/models` still claims the old id while the queued job waits.
-#[ignore = "redteam: pr-377"]
 #[tokio::test(flavor = "multi_thread")]
 async fn rt_377_fifo_queued_file_and_idle_unload_fail_closed_on_deleted_pack() {
     let _generation_lock = idle_activity::native_unload_generation_test_lock().await;
@@ -3660,7 +3693,6 @@ async fn rt_377_fifo_queued_file_and_idle_unload_fail_closed_on_deleted_pack() {
 /// target pack until apply succeeds, and must fail closed if the current pack
 /// is gone. Otherwise Y: listing/health still claim the dead source identity
 /// or silently show the pending target.
-#[ignore = "redteam: pr-377"]
 #[tokio::test]
 async fn rt_377_pending_idle_switch_and_idle_unload_fail_closed_on_deleted_source() {
     let _generation_lock = idle_activity::native_unload_generation_test_lock().await;
@@ -3806,8 +3838,9 @@ fn spawn_boot_native_warmup_uses_set_default_transaction_entry() {
         .expect("spawn_boot_native_warmup body");
     assert!(
         spawn.contains("activate_default_model_blocking(")
-            && spawn.contains("ReactivateDurableSelection"),
-        "boot warmup must use the same complete transaction entry as set-default: {spawn}"
+            && spawn.contains("ReactivateDurableSelection")
+            && spawn.contains("AttestLaunchPack"),
+        "boot warmup must attest the launch pack via the set-default transaction: {spawn}"
     );
     assert!(
         !spawn.contains("warm_up_default_native_streaming_worker"),
@@ -3817,7 +3850,7 @@ fn spawn_boot_native_warmup_uses_set_default_transaction_entry() {
         !spawn.contains("rebind_native_model_pack")
             && !spawn.contains("persist_detailed")
             && !spawn.contains("PersistSelection"),
-        "boot reactivation must not bypass the read-only durable journal: {spawn}"
+        "boot reactivation must not write a new durable V2 generation: {spawn}"
     );
 }
 

@@ -32,11 +32,14 @@ pub(crate) async fn default_model(
     Extension(distribution): Extension<DistributionContext>,
 ) -> Result<Json<DefaultModelResponse>, ApiError> {
     let home = distribution.openasr_home()?;
-    let mut response = default_model_response(
-        &home,
-        distribution.catalog_source(),
-        runtime.model_pack_path.served_pack_path().as_deref(),
-    )?;
+    let mut response = match runtime.resolve_served_native_pack()? {
+        Some(served) => default_model_response_from_served(&home, &served)?,
+        None => default_model_response(
+            &home,
+            distribution.catalog_source(),
+            runtime.model_pack_path.served_pack_path().as_deref(),
+        )?,
+    };
     response.idle_switch_pending = runtime
         .native_execution
         .remote_policy()
@@ -196,6 +199,7 @@ pub(crate) fn apply_pending_idle_switch_if_idle(
 pub(crate) enum DefaultModelActivationMode {
     PersistSelection,
     ReactivateDurableSelection,
+    AttestLaunchPack,
 }
 
 pub(crate) fn activate_default_model_blocking(
@@ -256,6 +260,13 @@ pub(crate) fn activate_default_model_blocking(
         }
         DefaultModelActivationMode::ReactivateDurableSelection => {
             openasr_core::DefaultModelActivationJournalFactory::reactivate_durable_selection(
+                home.to_path_buf(),
+                pack.clone(),
+                preference,
+            )
+        }
+        DefaultModelActivationMode::AttestLaunchPack => {
+            openasr_core::DefaultModelActivationJournalFactory::attest_launch_pack(
                 home.to_path_buf(),
                 pack.clone(),
                 preference,
@@ -642,6 +653,29 @@ pub(crate) fn default_model_response(
     active_pack_path: Option<&Path>,
 ) -> Result<DefaultModelResponse, ApiError> {
     default_model_response_with_idle_switch(home, catalog_source, active_pack_path, None)
+}
+
+fn default_model_response_from_served(
+    home: &Path,
+    served: &crate::ServedNativePack,
+) -> Result<DefaultModelResponse, ApiError> {
+    let packs = list_installed_packs(home).map_err(ApiError::Pull)?;
+    let pack = packs
+        .into_iter()
+        .find(|pack| pack.path == served.snapshot.path());
+    Ok(DefaultModelResponse {
+        object: "model.default",
+        default_model: Some(served.identity.model_id.clone()),
+        default_model_status: if pack.is_some() {
+            "installed"
+        } else {
+            "not_installed"
+        },
+        default_pull: pack.as_ref().map(|pack| pack.pull.clone()),
+        pack,
+        activation: DefaultModelActivationState::Committed,
+        idle_switch_pending: None,
+    })
 }
 
 pub(crate) fn default_model_response_with_idle_switch(

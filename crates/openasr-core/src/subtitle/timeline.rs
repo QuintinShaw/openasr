@@ -161,7 +161,7 @@ pub fn project_transcription(
     let subtitle_cues = resegment_segments_into_cues(attributed.clone(), options.audio_duration_s);
     let reading = merge_reading_segments(attributed);
     transcription.segments = reading;
-    transcription.subtitle_cues = subtitle_cues;
+    transcription.subtitle_cues = sanitize_export_cues(&subtitle_cues);
     transcription.timeline_quality = Some(options.timeline_quality);
     if options.strip_words {
         strip_unrequested_word_timestamps(&mut transcription);
@@ -181,12 +181,35 @@ pub fn strip_unrequested_word_timestamps(transcription: &mut Transcription) {
 
 /// Timed cues used by SRT/VTT renderers: prefer `subtitle_cues`, fall back to
 /// reading `segments` for legacy rows that predate the dual-view projection.
-pub fn timed_cues_for_export(transcription: &Transcription) -> &[Segment] {
-    if transcription.subtitle_cues.is_empty() {
+/// Zero-length and overlapping cues are dropped or clamped so exporters never
+/// write illegal timings even if a projection leaked one.
+pub fn timed_cues_for_export(transcription: &Transcription) -> Vec<Segment> {
+    let source = if transcription.subtitle_cues.is_empty() {
         &transcription.segments
     } else {
         &transcription.subtitle_cues
+    };
+    sanitize_export_cues(source)
+}
+
+fn sanitize_export_cues(cues: &[Segment]) -> Vec<Segment> {
+    let mut previous_end = f32::NEG_INFINITY;
+    let mut out = Vec::with_capacity(cues.len());
+    for cue in cues {
+        let mut cue = cue.clone();
+        if cue.end <= cue.start {
+            continue;
+        }
+        if cue.start < previous_end {
+            cue.start = previous_end;
+        }
+        if cue.end <= cue.start {
+            continue;
+        }
+        previous_end = cue.end;
+        out.push(cue);
     }
+    out
 }
 
 #[cfg(test)]

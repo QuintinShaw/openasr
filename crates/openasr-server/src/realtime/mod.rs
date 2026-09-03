@@ -166,6 +166,7 @@ pub(crate) async fn stream_transcription(
     auth: ServerAuth,
     multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
     remote_compute_client: bool,
+    task_override: Option<openasr_core::TranscriptionTask>,
 ) -> Result<Response, ApiError> {
     let home = distribution.openasr_home()?;
     let catalog = super::load_runtime_model_catalog(distribution.catalog_source(), &home)?;
@@ -176,6 +177,30 @@ pub(crate) async fn stream_transcription(
     }
     super::reject_device_token_speaker_embeddings(&parsed.request, remote_compute_client)?;
     super::reject_streaming_speaker_embeddings(&parsed.request)?;
+    if parsed.stream_form_field {
+        return Err(ApiError::BadRequest(
+            "The 'stream' form field is not supported. SSE streaming on this server is the OpenASR realtime protocol, enabled with the '?stream=true' query parameter, and does not emit OpenAI transcript.text.* events -- OpenAI SDK stream=True calls cannot parse it. Retry without 'stream' for a complete response, or POST to /v1/audio/transcriptions?stream=true and handle OpenASR realtime events.".to_string(),
+        ));
+    }
+    if let Some(preferences) = super::load_transcription_preferences(&home) {
+        super::apply_transcription_preferences(&mut parsed.request, &preferences);
+    }
+    if let Some(task) = task_override {
+        parsed.request.task = Some(task);
+    }
+    parsed.request.source = if task_override == Some(openasr_core::TranscriptionTask::Translate) {
+        openasr_core::RequestSource::ServerTranslate
+    } else {
+        openasr_core::RequestSource::ServerTranscribe
+    };
+    if runtime.backend == openasr_core::BackendKind::Native {
+        parsed.request.serve_batch_max_native_sessions = Some(
+            runtime
+                .native_execution
+                .max_concurrent_sessions_per_model()
+                .get(),
+        );
+    }
     if matches!(
         parsed.response_format,
         ResponseFormat::Srt | ResponseFormat::Vtt
@@ -193,7 +218,10 @@ pub(crate) async fn stream_transcription(
     }
     let model_id = parsed.request.model_id.clone();
     let stream_started_at = Instant::now();
-    let outcome = match transcribe_parsed_file(
+    // One-shot file jobs finish before SSE starts. Any error is already
+    // determined, so fail closed with HTTP 4xx/409/429 instead of a 200
+    // event-stream that hides pack, admission, and diarization refusals.
+    let outcome = transcribe_parsed_file(
         runtime,
         headers,
         auth,
@@ -202,11 +230,7 @@ pub(crate) async fn stream_transcription(
         None,
         None,
     )
-    .await
-    {
-        Err(error) if stream_file_job_returns_http_error(&error) => return Err(error),
-        outcome => outcome,
-    };
+    .await?;
 
     let (sender, receiver) =
         mpsc::channel::<Result<Event, Infallible>>(OUTGOING_EVENT_QUEUE_CAPACITY);
@@ -216,23 +240,13 @@ pub(crate) async fn stream_transcription(
         record_history,
         model_id,
         stream_started_at,
-        outcome,
+        Ok(outcome),
     )
     .await;
 
     Ok(Sse::new(ReceiverStream::new(receiver))
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response())
-}
-
-fn stream_file_job_returns_http_error(error: &ApiError) -> bool {
-    matches!(
-        error,
-        ApiError::Busy(_)
-            | ApiError::Conflict(_)
-            | ApiError::Forbidden(_)
-            | ApiError::Backend(openasr_core::BackendError::TranscriptionCanceled)
-    )
 }
 
 async fn emit_one_shot_file_stream_events(

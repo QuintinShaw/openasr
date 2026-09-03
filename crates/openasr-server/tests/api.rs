@@ -1203,7 +1203,7 @@ async fn health_reports_model_bound_but_not_resident_before_any_load() {
     // actual load (warm-up or first request) completes.
     let temp = tempfile::tempdir().unwrap();
     let pack_root = temp.path().join("native-pack.oasr");
-    write_mock_gguf_runtime_source(&pack_root, None);
+    write_mock_gguf_runtime_source(&pack_root, Some("native-pack"));
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
@@ -5044,7 +5044,6 @@ async fn streaming_return_speaker_embeddings_is_rejected() {
 /// translations ignores the query flag and returns a JSON body (mock 200)
 /// or a non-streaming error.
 #[tokio::test]
-#[ignore = "redteam: pr-379"]
 async fn rt_379_translations_stream_rejects_speaker_embeddings() {
     let temp = tempfile::tempdir().unwrap();
     let app = openasr_server::app_with_runtime_and_distribution(
@@ -5095,7 +5094,6 @@ async fn rt_379_translations_stream_rejects_speaker_embeddings() {
 /// has no vectors. Otherwise Y: the form field is ignored as an unknown
 /// precise-timeline field and the request continues as 400/200.
 #[tokio::test]
-#[ignore = "redteam: pr-379"]
 async fn rt_379_device_token_precise_timeline_rejects_speaker_embeddings() {
     let temp = tempfile::tempdir().unwrap();
     let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
@@ -5934,11 +5932,13 @@ async fn stream_transcriptions_with_native_backend_reject_model_mismatch() {
     );
     let response = app.oneshot(request).await.unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let bytes = to_bytes(response.into_body(), 1024 * 256).await.unwrap();
     let body = String::from_utf8_lossy(&bytes);
-    assert!(body.contains("event: error"));
-    assert!(body.contains("\"status\":\"error\""));
+    assert!(
+        body.contains("does not match") || body.contains("model"),
+        "model mismatch must fail closed over HTTP before SSE: {body}"
+    );
 }
 
 #[tokio::test]
@@ -5964,18 +5964,9 @@ async fn stream_transcriptions_with_native_xasr_hotword_emits_model_unsupported_
     );
     let response = app.oneshot(request).await.unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok()),
-        Some("text/event-stream")
-    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let bytes = to_bytes(response.into_body(), 1024 * 256).await.unwrap();
     let body = String::from_utf8_lossy(&bytes);
-    assert!(body.contains("event: error"));
-    assert!(body.contains("\"status\":\"error\""));
     assert!(body.contains("Phrase bias / hotword boosting is not supported"));
     assert!(body.contains("'xasr-zipformer' native model family"));
     assert!(body.contains("ggml-family-xasr-zipformer-runtime-v1"));

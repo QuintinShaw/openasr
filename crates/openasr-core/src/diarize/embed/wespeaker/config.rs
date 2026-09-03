@@ -261,4 +261,35 @@ mod tests {
         assert_eq!(post_stride_time_len(8), 1);
         assert_eq!(post_stride_time_len(9), 2);
     }
+
+    #[test]
+    fn config_from_metadata_rejects_resnet152_weights_labeled_as_resnet34() {
+        use crate::ggml_runtime::{GgufMetadata, GgufMetadataValue};
+        use std::collections::BTreeMap;
+
+        let mut values = BTreeMap::new();
+        values.insert(
+            crate::arch::GENERAL_ARCHITECTURE_KEY.to_string(),
+            GgufMetadataValue::String(ARCHITECTURE_ID.to_string()),
+        );
+        values.insert("wespeaker.depth".into(), GgufMetadataValue::U32(152));
+        values.insert(
+            "wespeaker.block_kind".into(),
+            GgufMetadataValue::String("basic".into()),
+        );
+        values.insert(
+            "wespeaker.num_blocks".into(),
+            GgufMetadataValue::String("[3,8,36,3]".into()),
+        );
+        values.insert("wespeaker.embed_dim".into(), GgufMetadataValue::U32(256));
+        values.insert("wespeaker.n_mels".into(), GgufMetadataValue::U32(80));
+        values.insert("wespeaker.m_channels".into(), GgufMetadataValue::U32(32));
+        let metadata = GgufMetadata::from_values_for_test(values);
+        let error = config_from_metadata(&metadata)
+            .expect_err("resnet152 metadata with basic blocks must fail closed");
+        assert!(
+            error.contains("block_kind") && error.contains("152"),
+            "mismatch must name depth and block kind, got {error}"
+        );
+    }
 }

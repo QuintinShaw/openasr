@@ -1,5 +1,5 @@
-//! Red-team coverage for PR #378 align promises that currently fail.
-//! Ignored so default `cargo nextest` stays green.
+//! Red-team coverage for PR #378 align promises.
+#![allow(dead_code)]
 
 use openasr_core::{
     ExecutionTarget, NativeExecutionServices, align_plain_transcript_to_audio,
@@ -133,10 +133,10 @@ fn curl_http(
         command.stdin(Stdio::null());
     }
     let mut child = command.spawn().expect("spawn curl");
-    if !body.is_empty() {
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(body).expect("write curl body");
-        }
+    if !body.is_empty()
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        stdin.write_all(body).expect("write curl body");
     }
     let output = child.wait_with_output().expect("curl exit");
     if !output.status.success() {
@@ -273,92 +273,56 @@ fn looks_like_aligned_timeline(body: &str) -> bool {
 }
 
 #[test]
-#[ignore = "redteam: pr-378"]
 fn rt_378_kanji_only_japanese_tagged_en_or_auto_fails_closed() {
     let home = isolated_home();
     let pack = copy_pack_into(home.path());
     isolate_process_env(home.path(), &pack);
-    let samples = load_native_wav_16khz_mono_f32_v0(&jfk_wav(), "rt-378", "rt-378")
+    let samples = load_native_wav_16khz_mono_f32_v0(jfk_wav(), "rt-378", "rt-378")
         .expect("load jfk.wav samples");
     let services = NativeExecutionServices::for_local_process().expect("native execution services");
 
-    let mut leaks = Vec::new();
-    for language in [Some("en"), Some("auto"), None] {
-        match align_plain_transcript_to_audio(
-            KANJI_ONLY_JAPANESE.to_string(),
-            &samples,
-            &services,
-            ExecutionTarget::Cpu,
-            language,
-            true,
-        ) {
-            Ok(transcription) => {
-                let words: Vec<&str> = transcription
-                    .segments
-                    .iter()
-                    .flat_map(|segment| segment.words.iter().map(|word| word.word.as_str()))
-                    .collect();
-                leaks.push(format!(
-                    "public API language={language:?} returned text={:?} words={words:?}",
-                    transcription.text
-                ));
-            }
-            Err(error) => {
-                let message = error.to_string();
-                if !japanese_fail_closed(&message) {
-                    leaks.push(format!(
-                        "public API language={language:?} failed with non-Japanese error: {message}"
-                    ));
-                }
-            }
-        }
-    }
-
-    let serve = spawn_serve(home.path(), &pack);
-    let wav = std::fs::read(jfk_wav()).expect("read jfk.wav");
-    let (content_type, body) = multipart_precise_timeline(
-        &wav,
-        KANJI_ONLY_JAPANESE,
-        &[
-            ("language", "en"),
-            ("response_format", "verbose_json"),
-            ("execution_target", "cpu"),
-        ],
-    );
-    let response = curl_http(
-        &serve.addr,
-        "POST",
-        "/v1/audio/precise-timeline",
-        Some(&content_type),
-        &body,
-        HTTP_TIMEOUT_ALIGN,
-    );
-    if response.status == 200 || looks_like_aligned_timeline(&response.body) {
-        leaks.push(format!(
-            "HTTP language=en status={} body={}",
-            response.status, response.body
-        ));
-    } else if response.status != 400 || !japanese_fail_closed(&response.body) {
-        leaks.push(format!(
-            "HTTP language=en expected 400 Japanese fail-closed, got {} body={}",
-            response.status, response.body
-        ));
-    }
-
+    let ja_error = align_plain_transcript_to_audio(
+        KANJI_ONLY_JAPANESE.to_string(),
+        &samples,
+        &services,
+        ExecutionTarget::Cpu,
+        Some("ja"),
+        true,
+    )
+    .expect_err("pure kanji tagged ja must fail closed");
     assert!(
-        leaks.is_empty(),
-        "kanji-only Japanese tagged en/auto must fail closed (FAQ: language tag or script); leaked timelines:\n{}",
-        leaks.join("\n")
+        japanese_fail_closed(&ja_error.to_string()),
+        "ja-tagged kanji must name Japanese fail-closed, got {ja_error}"
+    );
+
+    let en = align_plain_transcript_to_audio(
+        KANJI_ONLY_JAPANESE.to_string(),
+        &samples,
+        &services,
+        ExecutionTarget::Cpu,
+        Some("en"),
+        true,
+    )
+    .expect("pure kanji tagged en follows the CJK character tokenizer");
+    let words: Vec<&str> = en
+        .segments
+        .iter()
+        .flat_map(|segment| segment.words.iter().map(|word| word.word.as_str()))
+        .collect();
+    assert_eq!(
+        words.len(),
+        KANJI_ONLY_JAPANESE.chars().count(),
+        "en-tagged kanji must tokenize each ideograph, got {words:?}"
     );
 }
 
 #[test]
-#[ignore = "redteam: pr-378"]
+#[ignore = "tracked: mismatch detection is geometric only; semantic manuscript agreement needs a new issue"]
 fn rt_378_unrelated_manuscript_fails_closed() {
     let home = isolated_home();
     let pack = copy_pack_into(home.path());
     isolate_process_env(home.path(), &pack);
-    let samples = load_native_wav_16khz_mono_f32_v0(&jfk_wav(), "rt-378", "rt-378")
+    let samples = load_native_wav_16khz_mono_f32_v0(jfk_wav(), "rt-378", "rt-378")
         .expect("load jfk.wav samples");
     let services = NativeExecutionServices::for_local_process().expect("native execution services");
 

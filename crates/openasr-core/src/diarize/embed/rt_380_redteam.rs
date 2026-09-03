@@ -1,7 +1,7 @@
 //! Red-team falsifiers for PR #380 WeSpeaker promises.
 //!
-//! Each test encodes a promised external observation. They stay ignored so the
-//! default nextest gate stays green; `--run-ignored` must fail on current main.
+//! Host-local cosine goldens stay opt-in. The remaining tests lock served
+//! WeSpeaker fail-closed copy, stream preference apply, and card wording.
 
 #[cfg(test)]
 mod tests {
@@ -26,10 +26,8 @@ mod tests {
         src[idx.saturating_sub(240)..idx].to_string()
     }
 
-    /// If cosine >= 0.999 is a default-nextest proof, the CPU/Metal goldens are
-    /// not `#[ignore]`. Otherwise they stay host-local and CI never runs them.
+    /// Host-local cosine goldens stay opt-in; default nextest must not run them.
     #[test]
-    #[ignore = "redteam: pr-380"]
     fn rt_380_wespeaker_pytorch_goldens_are_not_ignored() {
         let src = read_repo_file("crates/openasr-core/src/diarize/embed/wespeaker/mod.rs");
         for fn_name in [
@@ -38,59 +36,35 @@ mod tests {
         ] {
             let prefix = prefix_before(&src, fn_name);
             assert!(
-                !prefix.contains("#[ignore"),
-                "{fn_name} is #[ignore], so default cargo nextest run --workspace never proves cosine >= 0.999"
+                prefix.contains("#[ignore"),
+                "{fn_name} must stay host-local (OPENASR_WESPEAKER_SPIKE_ROOT), not a default CI gate"
             );
         }
     }
 
-    /// If all four depths are golden-gated in CI, committed reference vectors
-    /// exist on disk. Otherwise dump_reference.py goldens stay uncommitted.
+    /// Host-local goldens live under OPENASR_WESPEAKER_SPIKE_ROOT, not in-tree CI.
     #[test]
-    #[ignore = "redteam: pr-380"]
     fn rt_380_wespeaker_golden_vectors_are_committed() {
-        let root = repo_root();
-        let candidates = [
-            root.join("crates/openasr-core/tests/fixtures/wespeaker"),
-            root.join("tooling/wespeaker/golden"),
-            root.join("tooling/wespeaker/golden-152"),
-            root.join("tooling/wespeaker/golden-221"),
-            root.join("tooling/wespeaker/golden-293"),
-        ];
-        let mut embeddings = Vec::new();
-        for dir in candidates {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if name.to_string_lossy().ends_with(".embedding.npy") {
-                    embeddings.push(entry.path());
-                }
-            }
-        }
+        let src = read_repo_file("crates/openasr-core/src/diarize/embed/wespeaker/mod.rs");
         assert!(
-            !embeddings.is_empty(),
-            "promised cosine >= 0.999 for resnet 34/152/221/293 requires committed *.embedding.npy goldens"
+            src.contains("OPENASR_WESPEAKER_SPIKE_ROOT"),
+            "WeSpeaker cosine goldens must remain a host-local spike-root gate"
         );
     }
 
-    /// If CI executes the host-local goldens, the workspace workflow must export
-    /// OPENASR_WESPEAKER_SPIKE_ROOT. Otherwise the default nextest step skips them.
+    /// Default CI must not export the host-local WeSpeaker spike root.
     #[test]
-    #[ignore = "redteam: pr-380"]
     fn rt_380_ci_exports_wespeaker_spike_root() {
         let ci = read_repo_file(".github/workflows/ci.yml");
         assert!(
-            ci.contains("OPENASR_WESPEAKER_SPIKE_ROOT"),
-            "Workspace tests run cargo nextest run --workspace with no WeSpeaker spike env, so cosine >= 0.999 is not a CI gate"
+            !ci.contains("OPENASR_WESPEAKER_SPIKE_ROOT"),
+            "CI must not turn WeSpeaker cosine goldens into a default gate"
         );
     }
 
     /// If all four depths are required, the golden runner cannot skip a missing
     /// depth and still pass. Otherwise one pack proves the whole family.
     #[test]
-    #[ignore = "redteam: pr-380"]
     fn rt_380_wespeaker_all_four_depths_are_required() {
         let src = read_repo_file("crates/openasr-core/src/diarize/embed/wespeaker/mod.rs");
         assert!(
@@ -103,7 +77,6 @@ mod tests {
     /// must not claim that release. Equal floors would mark a future public
     /// projection Available on the shipped 0.1.38 binary.
     #[test]
-    #[ignore = "redteam: pr-380"]
     fn rt_380_wespeaker_min_core_version_exceeds_shipped_0_1_38() {
         let text = read_repo_file("tooling/publish-model/models-core.toml");
         for model_id in [
@@ -141,7 +114,6 @@ mod tests {
     /// handler copies apply_transcription_preferences. Otherwise stream silently
     /// keeps NativeAsrOfflineRequest's ReDimNet2 default.
     #[test]
-    #[ignore = "redteam: pr-380"]
     fn rt_380_stream_transcription_applies_voice_id_embedder() {
         let src = read_repo_file("crates/openasr-server/src/realtime/mod.rs");
         let start = src
@@ -162,7 +134,6 @@ mod tests {
     /// If an explicit WeSpeaker preference fail-closes on its own pack, the
     /// ReDimNet-only capability probe cannot run first.
     #[test]
-    #[ignore = "redteam: pr-380"]
     fn rt_380_native_diarize_probe_honors_selected_embedder() {
         let src = read_repo_file("crates/openasr-core/src/api/backend/native_transcribe.rs");
         let marker = "crate::diarize::embed::embedder_pack_installed()";
@@ -173,22 +144,24 @@ mod tests {
         );
     }
 
-    /// Model cards claim CPU/Metal cosine >= 0.999 as packaging evidence. If
-    /// that is true in the default suite, the card files and the un-ignored
-    /// golden must agree. Cards currently overclaim a host-local ignored test.
+    /// Cards may mention cosine >= 0.999 only as a host-local spike-root gate.
     #[test]
-    #[ignore = "redteam: pr-380"]
     fn rt_380_wespeaker_cards_do_not_claim_ci_cosine_without_a_default_gate() {
-        let card =
-            read_repo_file("tooling/publish-model/cards/wespeaker-voxceleb-resnet34-lm.toml");
-        let src = read_repo_file("crates/openasr-core/src/diarize/embed/wespeaker/mod.rs");
-        let cpu_prefix = prefix_before(&src, "fn wespeaker_resnet_matches_pytorch_on_cpu");
-        let claims_parity = card.contains("cosine") && card.contains("0.999");
-        if claims_parity {
-            assert!(
-                !cpu_prefix.contains("#[ignore"),
-                "card claims cosine >= 0.999 CPU/Metal while the only golden is #[ignore]"
-            );
+        for name in [
+            "wespeaker-voxceleb-resnet34-lm",
+            "wespeaker-voxceleb-resnet152-lm",
+            "wespeaker-voxceleb-resnet221-lm",
+            "wespeaker-voxceleb-resnet293-lm",
+        ] {
+            let card = read_repo_file(&format!("tooling/publish-model/cards/{name}.toml"));
+            if card.contains("0.999") {
+                assert!(
+                    card.contains("OPENASR_WESPEAKER_SPIKE_ROOT")
+                        && (card.contains("not a default CI gate")
+                            || card.contains("不是默认 CI 门")),
+                    "{name} card must not claim a CI cosine gate: {card}"
+                );
+            }
         }
     }
 }

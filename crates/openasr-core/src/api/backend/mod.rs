@@ -878,6 +878,19 @@ impl SpeakerEmbeddingPayload {
                     embedding.dim(),
                 ));
             }
+            let norm = embedding
+                .0
+                .iter()
+                .map(|component| component * component)
+                .sum::<f32>()
+                .sqrt();
+            if (norm - 1.0).abs() > 1e-3 {
+                return Err(BackendError::NativeFailClosed {
+                    reason: format!(
+                        "Speaker embedding L2 norm {norm} is outside 1.0 ± 0.001; refusing to claim l2 normalization."
+                    ),
+                });
+            }
             vectors.insert(speaker_id.label(), embedding.0.clone());
         }
         Ok(Some(Self {

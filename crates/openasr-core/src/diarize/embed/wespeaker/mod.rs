@@ -218,10 +218,12 @@ mod tests {
         for depth in GOLDEN_DEPTHS {
             let pack = pack_path(&root, depth);
             let golden = golden_dir(&root, depth);
-            if !pack.exists() || !golden.is_dir() {
-                eprintln!("skipping depth {depth}: missing pack or goldens");
-                continue;
-            }
+            assert!(
+                pack.exists() && golden.is_dir(),
+                "OPENASR_WESPEAKER_SPIKE_ROOT is set but depth {depth} is missing pack ({}) or goldens ({})",
+                pack.display(),
+                golden.display()
+            );
             let embedder = WeSpeakerEmbedder::from_oasr(&pack).expect("load wespeaker pack");
             assert_eq!(
                 embedder.config().depth,

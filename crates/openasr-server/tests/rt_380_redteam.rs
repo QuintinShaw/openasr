@@ -99,7 +99,6 @@ fn assert_wespeaker_fail_closed(status: StatusCode, body: &str, surface: &str) {
 /// File JSON transcription with a persisted WeSpeaker preference and no
 /// WeSpeaker pack must 400 naming that pack, not the ReDimNet capability probe.
 #[tokio::test]
-#[ignore = "redteam: pr-380"]
 async fn rt_380_http_json_transcription_wespeaker_missing_fail_closed() {
     let (status, body) = post_diarize_with_wespeaker_preference("/v1/audio/transcriptions").await;
     assert_wespeaker_fail_closed(status, &body, "POST /v1/audio/transcriptions");
@@ -109,7 +108,6 @@ async fn rt_380_http_json_transcription_wespeaker_missing_fail_closed() {
 /// Predicted miss: HTTP 200 SSE plus ReDimNet copy, because stream skips
 /// apply_transcription_preferences and maps Backend errors into SSE.
 #[tokio::test]
-#[ignore = "redteam: pr-380"]
 async fn rt_380_http_stream_transcription_wespeaker_missing_fail_closed() {
     let (status, body) =
         post_diarize_with_wespeaker_preference("/v1/audio/transcriptions?stream=true").await;
@@ -118,7 +116,6 @@ async fn rt_380_http_stream_transcription_wespeaker_missing_fail_closed() {
 
 /// Translations alias shares the file Voice ID contract.
 #[tokio::test]
-#[ignore = "redteam: pr-380"]
 async fn rt_380_http_translations_wespeaker_missing_fail_closed() {
     let (status, body) = post_diarize_with_wespeaker_preference("/v1/audio/translations").await;
     assert_wespeaker_fail_closed(status, &body, "POST /v1/audio/translations");

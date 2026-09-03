@@ -1140,35 +1140,17 @@ pub(crate) fn spawn_boot_native_warmup(
     home: PathBuf,
 ) -> tokio::task::JoinHandle<()> {
     // Reactivation walks the same verify -> resolve -> reserve -> materialize
-    // -> attest -> reconcile transaction as set-default. Its journal only
-    // validates that the durable V2 request is still current; it never writes
-    // a new generation during boot.
+    // -> attest -> reconcile transaction as set-default. Durable V2 is used
+    // when it still names the launch pack; a `--model` launch without V2
+    // attests that pack directly instead of logging and staying unattested.
     tokio::task::spawn_blocking(move || {
         let Some(requested_path) = runtime.model_pack_path.requested_path() else {
             return;
         };
-        let record = match openasr_core::default_selection::read_active_model_selection_v2(&home) {
-            Ok(Some(record)) => record,
-            Ok(None) => {
-                log_default_reactivation_failed(
-                    &home,
-                    requested_path.as_path(),
-                    "durable V2 default-selection is missing",
-                );
-                return;
-            }
-            Err(error) => {
-                log_default_reactivation_failed(
-                    &home,
-                    requested_path.as_path(),
-                    &error.to_string(),
-                );
-                return;
-            }
-        };
         let packs = match openasr_core::list_installed_packs(&home) {
             Ok(packs) => packs,
             Err(error) => {
+                runtime.model_pack_path.mark_launch_attestation_failed();
                 log_default_reactivation_failed(
                     &home,
                     requested_path.as_path(),
@@ -1178,6 +1160,7 @@ pub(crate) fn spawn_boot_native_warmup(
             }
         };
         let Some(pack) = packs.into_iter().find(|pack| pack.path == requested_path) else {
+            runtime.model_pack_path.mark_launch_attestation_failed();
             log_default_reactivation_failed(
                 &home,
                 requested_path.as_path(),
@@ -1185,11 +1168,10 @@ pub(crate) fn spawn_boot_native_warmup(
             );
             return;
         };
-        let intent = match openasr_core::default_selection::execution_intent_from_v2_wire(
-            &record.execution_intent,
-        ) {
-            Ok(intent) => intent,
+        let durable = match openasr_core::default_selection::read_active_model_selection_v2(&home) {
+            Ok(record) => record,
             Err(error) => {
+                runtime.model_pack_path.mark_launch_attestation_failed();
                 log_default_reactivation_failed(
                     &home,
                     requested_path.as_path(),
@@ -1198,14 +1180,45 @@ pub(crate) fn spawn_boot_native_warmup(
                 return;
             }
         };
-        if let Err(error) = crate::activate_default_model_blocking(
-            &runtime,
-            &home,
-            &pack,
-            record.quant_preference,
-            intent,
-            crate::DefaultModelActivationMode::ReactivateDurableSelection,
-        ) {
+        let durable_pack = openasr_core::default_selection::resolve_with_catalog(&home, None)
+            .ok()
+            .and_then(openasr_core::default_selection::DefaultModelResolution::into_installed_pack);
+        let (preference, intent, mode) = match (durable, durable_pack) {
+            (Some(record), Some(installed)) if installed.path == requested_path => {
+                match openasr_core::default_selection::execution_intent_from_v2_wire(
+                    &record.execution_intent,
+                ) {
+                    Ok(intent) => (
+                        record.quant_preference,
+                        intent,
+                        crate::DefaultModelActivationMode::ReactivateDurableSelection,
+                    ),
+                    Err(error) => {
+                        runtime.model_pack_path.mark_launch_attestation_failed();
+                        log_default_reactivation_failed(
+                            &home,
+                            requested_path.as_path(),
+                            &error.to_string(),
+                        );
+                        return;
+                    }
+                }
+            }
+            _ => {
+                let intent = realtime_execution_target_preference(&home)
+                    .map(openasr_core::device::execution_policy::ExecutionIntent::from)
+                    .unwrap_or(openasr_core::device::execution_policy::ExecutionIntent::Auto);
+                (
+                    openasr_core::QuantPreference::pinned(&pack.quant),
+                    intent,
+                    crate::DefaultModelActivationMode::AttestLaunchPack,
+                )
+            }
+        };
+        if let Err(error) =
+            crate::activate_default_model_blocking(&runtime, &home, &pack, preference, intent, mode)
+        {
+            runtime.model_pack_path.mark_launch_attestation_failed();
             log_default_reactivation_failed(&home, requested_path.as_path(), &error.to_string());
         }
     })

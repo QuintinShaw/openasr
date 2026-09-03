@@ -135,7 +135,6 @@ fn looks_like_aligned_timeline(body: &str) -> bool {
 }
 
 #[tokio::test]
-#[ignore = "redteam: pr-378"]
 async fn rt_378_precise_timeline_stream_query_is_not_transcription_sse() {
     let home = isolated_home();
     isolate_process_home(home.path());
@@ -181,7 +180,6 @@ async fn rt_378_precise_timeline_stream_query_is_not_transcription_sse() {
 }
 
 #[test]
-#[ignore = "redteam: pr-378"]
 fn rt_378_http_wire_includes_precise_timeline_types() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("generated/http-wire");
     let mut names = Vec::new();
@@ -215,7 +213,6 @@ fn rt_378_http_wire_includes_precise_timeline_types() {
 }
 
 #[test]
-#[ignore = "redteam: pr-378"]
 fn rt_378_shared_exporter_rejects_zero_length_and_overlap_srt() {
     let transcription = Transcription {
         text: "hello world".into(),
@@ -289,11 +286,11 @@ fn rt_378_shared_exporter_rejects_zero_length_and_overlap_srt() {
             illegal = true;
             break;
         }
-        if let Some(previous) = previous_end {
-            if start < previous {
-                illegal = true;
-                break;
-            }
+        if let Some(previous) = previous_end
+            && start < previous
+        {
+            illegal = true;
+            break;
         }
         previous_end = Some(end);
     }

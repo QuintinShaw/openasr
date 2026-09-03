@@ -56,11 +56,10 @@ impl TimedCueFormat {
 }
 
 fn render_timed_cues(transcription: &Transcription, spec: TimedCueFormat) -> String {
-    let cues = render_cue_list(
-        timed_cues_for_export(transcription),
-        spec.separator,
-        |index, start, end, text| render_timed_cue_row(index, start, end, text, spec),
-    );
+    let export_cues = timed_cues_for_export(transcription);
+    let cues = render_cue_list(&export_cues, spec.separator, |index, start, end, text| {
+        render_timed_cue_row(index, start, end, text, spec)
+    });
     format!("{}{cues}{}", spec.prefix, spec.suffix)
 }
 

@@ -1477,14 +1477,16 @@ async fn operator_stream_file_job_keeps_enrolled_voice_id_fail_closed() {
         .unwrap();
     assert_eq!(
         response.status(),
-        StatusCode::OK,
-        "operator stream diarize stays on the SSE error path, got {}",
+        StatusCode::BAD_REQUEST,
+        "operator stream enrolled Voice ID must fail closed over HTTP before SSE, got {}",
         response.status()
     );
     let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
     let body = String::from_utf8_lossy(&body);
     assert!(
-        body.contains("event: error"),
+        body.to_ascii_lowercase().contains("voice")
+            || body.to_ascii_lowercase().contains("diariz")
+            || body.to_ascii_lowercase().contains("speaker"),
         "operator stream enrolled Voice ID must fail closed: {body}"
     );
 }

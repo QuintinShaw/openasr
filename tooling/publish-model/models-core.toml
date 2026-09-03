@@ -408,7 +408,7 @@ languages = ["en"]
 quants = ["fp16"]
 recommended_quant = "fp16"
 upstream_release_date = "2024-05-06"
-min_core_version = "0.1.38"
+min_core_version = "0.1.39"
 min_cli_version = "0.1.38"
 
 ["wespeaker-voxceleb-resnet34-lm".capability]
@@ -430,7 +430,7 @@ languages = ["en"]
 quants = ["fp16"]
 recommended_quant = "fp16"
 upstream_release_date = "2024-05-06"
-min_core_version = "0.1.38"
+min_core_version = "0.1.39"
 min_cli_version = "0.1.38"
 
 ["wespeaker-voxceleb-resnet152-lm".capability]
@@ -452,7 +452,7 @@ languages = ["en"]
 quants = ["fp16"]
 recommended_quant = "fp16"
 upstream_release_date = "2024-05-06"
-min_core_version = "0.1.38"
+min_core_version = "0.1.39"
 min_cli_version = "0.1.38"
 
 ["wespeaker-voxceleb-resnet221-lm".capability]
@@ -474,7 +474,7 @@ languages = ["en"]
 quants = ["fp16"]
 recommended_quant = "fp16"
 upstream_release_date = "2024-05-06"
-min_core_version = "0.1.38"
+min_core_version = "0.1.39"
 min_cli_version = "0.1.38"
 
 ["wespeaker-voxceleb-resnet293-lm".capability]

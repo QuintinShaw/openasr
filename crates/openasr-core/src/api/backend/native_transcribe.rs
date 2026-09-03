@@ -2426,8 +2426,19 @@ fn run_native_transcription_impl(
     // both packs are absent, avoids constructing either runtime on a known
     // incomplete stack, and still lets valid empty audio follow the family's
     // established empty-input behavior without auxiliary models.
-    if speaker_plan != SpeakerPlan::Off && !crate::diarize::embed::embedder_pack_installed() {
-        return Err(BackendError::DiarizationNotSupported { backend: "native" });
+    if speaker_plan != SpeakerPlan::Off {
+        if request.voice_id_embedder == crate::config::VoiceIdEmbedderPreference::WeSpeaker {
+            if crate::diarize::embed::wespeaker_pack_path().is_none() {
+                return Err(BackendError::NativeFailClosed {
+                    reason: crate::diarize::embed::SpeakerEmbedderFamily::WeSpeakerResNet
+                        .missing_install_reason(),
+                });
+            }
+        } else if request.voice_id_embedder != crate::config::VoiceIdEmbedderPreference::WeSpeaker
+            && !crate::diarize::embed::embedder_pack_installed()
+        {
+            return Err(BackendError::DiarizationNotSupported { backend: "native" });
+        }
     }
     if speaker_plan == SpeakerPlan::External && !crate::diarize::segment::segmenter_pack_installed()
     {

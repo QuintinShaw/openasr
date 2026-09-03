@@ -111,7 +111,8 @@ use openasr_core::api::backend::{SpeakerEmbeddingNormalization, SpeakerEmbedding
 
 use crate::{
     CapabilitiesResponse, DefaultModelActivationState, DefaultModelResponse, DevicesResponse,
-    HealthResponse, ModelResponse, ModelsResponse,
+    HealthResponse, ModelResponse, ModelsResponse, PreciseTimeline, PreciseTimelineSegment,
+    PreciseTimelineWord,
 };
 
 const COMMITTED_RELATIVE_DIR: &str = "generated";
@@ -142,6 +143,9 @@ fn export_http_wire_bindings(cfg: &Config) {
         DevicesResponse,
         SpeakerEmbeddingSpace,
         SpeakerEmbeddingNormalization,
+        PreciseTimeline,
+        PreciseTimelineSegment,
+        PreciseTimelineWord,
     );
 }
 
