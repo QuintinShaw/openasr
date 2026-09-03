@@ -190,6 +190,11 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   through the same capability probe rather than emulating it or silently
   falling back to all-system capture; macOS keeps its Core Audio process-tap
   all-system path and Linux keeps its `pactl`/`parec` monitor-source capture.
+  A foreign exception (Objective-C `NSException` or a Core Audio C++ throw)
+  during macOS tap setup is now mapped to `capture_backend_failed` instead of
+  aborting the process; the specific Core Audio call that throws on some
+  macOS 15 hosts has not been reproduced on macOS 26, so the diagnostic
+  string on a failed start is the way to identify it.
   Windows real playback smoke (both all-system and per-process) has been
   executed on a real Windows 11 session; Linux real playback smoke still
   needs to be executed on a Linux session. Per-process capture has no desktop

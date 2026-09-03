@@ -144,6 +144,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- macOS: starting system-audio capture now reports a typed error instead of
+  aborting the whole app when Core Audio or an Objective-C exception escapes
+  process-tap setup. The same failure is fail-closed in the IOProc: a panic
+  or foreign exception stops capture with `capture_backend_failed` rather
+  than taking down the process.
 - Core: live capture no longer panics when a downsampled mic callback (for
   example 44.1 kHz stereo in 512-frame chunks) leaves the resampler read head
   past the current buffer. The leftover position continues in the next chunk
