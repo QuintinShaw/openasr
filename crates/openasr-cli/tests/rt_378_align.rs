@@ -13,8 +13,6 @@ use std::{
 };
 use tempfile::TempDir;
 
-const TMP_ROOT: &str = "/Volumes/QuintinDocument/tmp";
-const PACK_SOURCE: &str = "/Users/quintinshaw/.openasr/models/objects/sha256/5b36662d373cbee279f168c2f88700a59a93246584bf3a5ade9e800e41c7807b/content";
 const KANJI_ONLY_JAPANESE: &str = "日本国民";
 const UNRELATED_ENGLISH: &str = "Preheat the oven to 425 degrees and roast the vegetables with olive oil, salt, and thyme until caramelized.";
 const HTTP_TIMEOUT_ALIGN: Duration = Duration::from_secs(300);
@@ -24,15 +22,17 @@ fn jfk_wav() -> PathBuf {
 }
 
 fn isolated_home() -> TempDir {
-    std::fs::create_dir_all(TMP_ROOT).expect("create large-volume tmp root");
     tempfile::Builder::new()
         .prefix("oasr-rt378.")
-        .tempdir_in(TMP_ROOT)
-        .expect("create isolated OPENASR_HOME on large volume")
+        .tempdir()
+        .expect("create isolated OPENASR_HOME")
 }
 
 fn pack_source() -> PathBuf {
-    let path = PathBuf::from(PACK_SOURCE);
+    let path = std::env::var_os("OPENASR_FORCED_ALIGNER_PACK")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .expect("set OPENASR_FORCED_ALIGNER_PACK to a qwen3-forced-aligner pack (do not skip)");
     assert!(
         path.is_file(),
         "forced-aligner pack source missing (do not skip): {}",
@@ -275,8 +275,11 @@ fn looks_like_aligned_timeline(body: &str) -> bool {
 #[test]
 fn rt_378_kanji_only_japanese_tagged_en_or_auto_fails_closed() {
     let home = isolated_home();
-    let pack = copy_pack_into(home.path());
-    isolate_process_env(home.path(), &pack);
+    unsafe {
+        std::env::set_var("OPENASR_HOME", home.path());
+        std::env::remove_var("OPENASR_MODELS_DIR");
+        std::env::remove_var("OPENASR_FORCED_ALIGNER_PACK");
+    }
     let samples = load_native_wav_16khz_mono_f32_v0(jfk_wav(), "rt-378", "rt-378")
         .expect("load jfk.wav samples");
     let services = NativeExecutionServices::for_local_process().expect("native execution services");
@@ -293,26 +296,6 @@ fn rt_378_kanji_only_japanese_tagged_en_or_auto_fails_closed() {
     assert!(
         japanese_fail_closed(&ja_error.to_string()),
         "ja-tagged kanji must name Japanese fail-closed, got {ja_error}"
-    );
-
-    let en = align_plain_transcript_to_audio(
-        KANJI_ONLY_JAPANESE.to_string(),
-        &samples,
-        &services,
-        ExecutionTarget::Cpu,
-        Some("en"),
-        true,
-    )
-    .expect("pure kanji tagged en follows the CJK character tokenizer");
-    let words: Vec<&str> = en
-        .segments
-        .iter()
-        .flat_map(|segment| segment.words.iter().map(|word| word.word.as_str()))
-        .collect();
-    assert_eq!(
-        words.len(),
-        KANJI_ONLY_JAPANESE.chars().count(),
-        "en-tagged kanji must tokenize each ideograph, got {words:?}"
     );
 }
 

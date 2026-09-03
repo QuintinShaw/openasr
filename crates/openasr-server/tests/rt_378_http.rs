@@ -12,14 +12,12 @@ use std::{
 };
 use tower::ServiceExt;
 
-const TMP_ROOT: &str = "/Volumes/QuintinDocument/tmp";
 const JFK_TRANSCRIPT: &str = "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.";
 
 fn isolated_home() -> tempfile::TempDir {
-    fs::create_dir_all(TMP_ROOT).expect("create large-volume tmp root");
     tempfile::Builder::new()
         .prefix("oasr-rt378.")
-        .tempdir_in(TMP_ROOT)
+        .tempdir()
         .expect("create isolated OPENASR_HOME")
 }
 
