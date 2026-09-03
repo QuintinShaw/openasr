@@ -63,6 +63,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   filename alone is not identity; an unsealed object whose bytes do not hash
   to the catalog digest is fetched again. `KNOWN_LIMITATIONS` no longer
   claims that pull always re-downloads.
+- Docs: published Docker images are runtime-only (binary + model-registry
+  metadata). They do not include `perf/` bench-suite fixtures or baselines;
+  run `openasr bench-suite` from a git checkout.
 - Core: `--diarize` / Voice ID now installs the native execution broker
   before Stream-VAD and ReDimNet admission. 0.1.37 failed closed with
   `could not load the vendored FireRed Stream-VAD` because those weights

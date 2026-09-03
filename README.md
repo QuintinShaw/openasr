@@ -94,9 +94,11 @@ Drop-in compatible with OpenAI SDKs (`base_url="http://127.0.0.1:8080/v1"`) for 
 ### Docker
 
 Published images track each core release on
-[Docker Hub](https://hub.docker.com/r/quintinshaw/openasr) (binary +
+[Docker Hub](https://hub.docker.com/r/quintinshaw/openasr) (runtime binary +
 model-registry metadata only; pull models at runtime into a volume mounted at
-`/data`). The HTTP server never auto-downloads a pack — install one first:
+`/data`). They do not include `bench-suite` fixtures or committed baselines
+under `perf/`; run `openasr bench-suite` from a git checkout. The HTTP server
+never auto-downloads a pack — install one first:
 
 ```bash
 docker pull quintinshaw/openasr:latest

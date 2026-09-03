@@ -25,7 +25,9 @@ contributors -- crate relationships, the audio-to-transcript pipeline, and the
 
 User-facing Docker install/run guide (tags, GPU, volumes, pull-before-serve):
 [openasr.org/docs/docker](https://openasr.org/docs/docker/). The short form lives
-in the root [README](../README.md#docker).
+in the root [README](../README.md#docker). Published images are runtime-only
+(binary + model-registry metadata); they do not include `perf/` bench-suite
+fixtures or baselines.
 
 ## Format contracts (`docs/format/`)
 
