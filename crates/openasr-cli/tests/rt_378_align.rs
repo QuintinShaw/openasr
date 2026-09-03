@@ -300,7 +300,7 @@ fn rt_378_kanji_only_japanese_tagged_en_or_auto_fails_closed() {
 }
 
 #[test]
-#[ignore = "tracked: mismatch detection is geometric only; semantic manuscript agreement needs a new issue"]
+#[ignore = "tracked: #391 semantic manuscript mismatch needs an acoustic score"]
 fn rt_378_unrelated_manuscript_fails_closed() {
     let home = isolated_home();
     let pack = copy_pack_into(home.path());
