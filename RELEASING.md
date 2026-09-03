@@ -73,12 +73,14 @@ bump, or CI's `--locked` builds fail:
    - If no GitHub Release exists yet, the workflow creates the **draft**, then
      calls `release-binaries.yml` with `formal_release: true` (Linux
      x86_64/arm64, macOS x86_64/arm64, Windows, plus Vulkan/CUDA/HIP
-     variants). There is no bootstrap macOS/Linux rebuild and no `push: tags`
-     matrix racing the orchestrator. Completeness fails the run if a required
-     archive is missing.
+     variants), then waits for `core-release` Environment approval and syncs
+     the Windows GPU backend packs to B2. There is no bootstrap macOS/Linux
+     rebuild and no `push: tags` matrix racing the orchestrator. Completeness
+     fails the run if a required archive is missing.
    - If the matching release is still a draft, a second dispatch runs the
-     pre-publication family gate and deploys the committed PublishedInert
-     catalog (see below).
+     pre-publication family gate, deploys the committed PublishedInert
+     catalog, and waits for `core-release` Environment approval to publish
+     the draft (see below).
    - A published (non-draft) release is a no-op.
 
 ### Release notes structure
@@ -99,12 +101,14 @@ No pre-release channels: the core releases plain `X.Y.Z` versions only.
 ## Manual runs
 
 `Release core` is `workflow_dispatch` only. The first dispatch (no GitHub
-Release yet) creates the draft and builds the matrix. After the generated
+Release yet) creates the draft, builds the matrix, and syncs backend CDN
+bytes after `core-release` Environment approval. After the generated
 PublishedInert catalog has been reviewed, signed, committed, and pushed,
 dispatch it again with the same `version` to run the pre-publication family
-gate and catalog deployment for that draft. Failed build or aggregation jobs
-are recovered only with GitHub's **Re-run failed jobs** on the original
-release run, which preserves its exact tag/source/artifact lineage.
+gate, catalog deployment, and `publish-release` (same Environment approval)
+for that draft. Failed build or aggregation jobs are recovered only with
+GitHub's **Re-run failed jobs** on the original release run, which preserves
+its exact tag/source/artifact lineage.
 
 `workflow_dispatch` on `Release binaries` (`.github/workflows/release-binaries.yml`)
 is diagnostic-only: `only_target` is mandatory and the run may publish only an
@@ -127,35 +131,64 @@ bytes without exposing an unqualified provider to users.
 
 ### Publish the inert release bytes
 
-1. Let `Release core` create the draft and let its single formal
-   `release-binaries.yml` call build and checksum the complete release matrix,
-   sign the applicable Windows binaries, and attest the full subject set. Do not
-   use the diagnostic one-target dispatch to assemble or mutate a release.
-2. Run `scripts/sync-windows-backend-cdn.sh vX.Y.Z` locally with the B2 release
-   credentials. It verifies and copies every file declared by the 1 Vulkan, 6
-   CUDA, and 14 HIP release entries to
-   `https://dl.openasr.org/core/vX.Y.Z/`. GitHub is the provenance mirror, not a
-   runtime download fallback.
-3. Run `scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z` locally with
-   the production catalog signing seed. It verifies all 21 exact entries and
-   their already-live CDN bytes, merges every entry as `PublishedInert`, bumps
-   the epoch, and signs the full/public catalogs. It consumes no hardware or
-   token-correctness receipt. Review, commit, and push the five catalog/epoch
-   files.
-4. Dispatch `Release core` again. It re-verifies the draft's complete attested
-   subject set (the same completeness gate as the original matrix, so a later
-   CI-only fix can still see the draft), then runs the reusable pre-publication
-   family contract against the immutable draft CLI and the real-pack CPU family
-   gate. The orchestrator then calls the sole deployment entrypoint,
-   `.github/workflows/deploy-catalog.yml`, with
+The only remaining local maintainer step is catalog signing. Everything else
+runs in Actions after Environment approval.
+
+1. Dispatch `Release core`. Stage 1 creates the draft and lets its single
+   formal `release-binaries.yml` call build and checksum the complete release
+   matrix, sign the applicable Windows binaries, and attest the full subject
+   set. Do not use the diagnostic one-target dispatch to assemble or mutate a
+   release.
+2. Approve the `sync-backend-cdn` job in the Actions UI. It runs under the
+   `core-release` GitHub Environment (required reviewers) and executes
+   `scripts/sync-windows-backend-cdn.sh vX.Y.Z --allow-ci`. The job verifies
+   and copies every file declared by the 1 Vulkan, 6 CUDA, and 14 HIP release
+   entries to `https://dl.openasr.org/core/vX.Y.Z/`. Uploads are idempotent
+   and never overwrite a different object at the same key. GitHub is the
+   provenance mirror, not a runtime download fallback.
+3. Run `scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z` locally
+   with the production catalog signing seed. It verifies all 21 exact entries
+   and their already-live CDN bytes, merges every entry as `PublishedInert`,
+   bumps the epoch, and signs the full/public catalogs. It consumes no
+   hardware or token-correctness receipt. Review, commit, and push the five
+   catalog/epoch files. This is the only local release step that still needs
+   the signing seed.
+4. Dispatch `Release core` again. Stage 2 re-verifies the draft's complete
+   attested subject set (the same completeness gate as the original matrix, so
+   a later CI-only fix can still see the draft), then runs the reusable
+   pre-publication family contract against the immutable draft CLI and the
+   real-pack CPU family gate. The orchestrator then calls the sole deployment
+   entrypoint, `.github/workflows/deploy-catalog.yml`, with
    `activation_transition: published-inert`. The deploy job checks the signed
    catalog, CDN payloads, and released-binary compatibility before writing it.
-5. Record the successful orchestrator run id as
-   `OPENASR_DEPLOY_CATALOG_RUN_ID`, wait until the no-credential catalog/CDN
-   checks see the committed bytes, and run
-   `scripts/finalize-core-release.sh vX.Y.Z`. The finalizer binds the exact tag,
-   source commit, deploy run, catalog SHA, signature SHA, release subjects, and
-   live CDN bytes before removing the GitHub draft flag.
+   `finalize-notes` then rewrites Install & Verify from the real asset list.
+5. Approve the `publish-release` job in the Actions UI (same `core-release`
+   Environment). It runs `scripts/finalize-core-release.sh` with
+   `OPENASR_DEPLOY_CATALOG_RUN_ID` set to this orchestrator run. The
+   reusable deploy workflow shares that run id, so the finalizer looks up
+   the "Deploy PublishedInert candidate catalog" job on this run, binds the
+   exact tag, source commit, catalog SHA, signature SHA, release subjects,
+   and live CDN bytes (retrying the no-credential catalog/CDN plane for up
+   to 10 minutes), then removes the GitHub draft flag.
+
+Any failure leaves the GitHub release as a draft.
+
+### GitHub Environment `core-release`
+
+Create this Environment on `QuintinShaw/openasr` before the first
+Actions-driven publish. Required reviewers must be enabled so the B2 write
+key and the undraft step are not available until a human approves the job
+in the Actions UI.
+
+Environment secrets (not repository secrets):
+
+- `B2_S3_ENDPOINT`
+- `B2_APPLICATION_KEY_ID`
+- `B2_APPLICATION_KEY`
+
+Key policy: a dedicated B2 application key restricted to the release bucket
+and the `core/` prefix with `listFiles` / `readFiles` / `writeFiles` only
+(no `deleteFiles`), separate from the desktop installer key.
 
 Publishing the release triggers two independent GitHub Actions workflows:
 
@@ -167,9 +200,6 @@ Publishing the release triggers two independent GitHub Actions workflows:
   `finalize-core-release.sh` must not pull the matrix onto a maintainer
   laptop for this. Missing `CNB_TOKEN` skips; a token present with a failed
   upload fails that workflow only and does not roll back GitHub.
-
-Any failure in the pre-publication sequence leaves the GitHub release as a
-draft.
 
 ### Qualify and activate one exact backend after publication
 

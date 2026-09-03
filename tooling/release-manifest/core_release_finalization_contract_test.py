@@ -22,7 +22,7 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
             (
                 "binaries",
                 "\n  binaries:\n",
-                "\n  verify-draft-completeness:\n",
+                "\n  sync-backend-cdn:\n",
                 ROOT / ".github/workflows/release-binaries.yml",
             ),
             (
@@ -179,6 +179,15 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("orchestrator_run_id: ${{ github.run_id }}", release)
         self.assertIn("activation_transition: published-inert", release)
         self.assertIn("needs: [resolve, prepublication-family]", release)
+        self.assertIn("sync-backend-cdn:", release)
+        self.assertIn("environment: core-release", release)
+        self.assertIn("sync-windows-backend-cdn.sh", release)
+        self.assertIn("--allow-ci", release)
+        self.assertIn("needs: [resolve, release, binaries]", release)
+        self.assertIn("publish-release:", release)
+        self.assertIn("finalize-core-release.sh", release)
+        self.assertIn("OPENASR_DEPLOY_CATALOG_RUN_ID: ${{ github.run_id }}", release)
+        self.assertIn("needs: [resolve, finalize-notes, deploy-catalog]", release)
         self.assertIn("verify-assets", prepare)
         self.assertIn("gh_release.download_asset", prepare)
         self.assertIn("gh_release.download_url", prepare)
@@ -204,6 +213,8 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
             prepare.index('old_epoch="$(tr -d'),
         )
         self.assertIn("prepare-windows-backend-catalog-release.sh", sync)
+        self.assertIn("--allow-ci", sync)
+        self.assertIn("refusing to use B2 write credentials in CI without --allow-ci", sync)
         self.assertNotIn("backend-hardware-evidence-*.json", sync)
         self.assertNotIn("backend-hardware-audit-*.json", sync)
         self.assertNotIn("backend_hardware_evidence.py", sync)
@@ -248,6 +259,9 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("OPENASR_DEPLOY_CATALOG_RUN_ID", finalize)
         self.assertIn("gh run view", finalize)
         self.assertIn('"Deploy PublishedInert candidate catalog"', finalize)
+        self.assertIn("GITHUB_RUN_ID", finalize)
+        self.assertIn("in_progress", finalize)
+        self.assertIn("retrying in 30s", finalize)
         self.assertIn('value.get("headSha") != sys.argv[2]', finalize)
         self.assertIn('deploy-catalog-binding-${deploy_run_id}', finalize)
         self.assertIn('"release_tag": tag', finalize)

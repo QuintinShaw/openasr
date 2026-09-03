@@ -9,13 +9,17 @@ name: Release core
 #      and, for a new draft, peel to this commit. Dispatch inputs confirm
 #      the pin; they never override it.
 #   2. If no GitHub Release exists yet: create the empty draft, then call
-#      release-binaries.yml with `formal_release: true`.
+#      release-binaries.yml with `formal_release: true`, then
+#      `sync-backend-cdn` (core-release Environment approval + B2 secrets).
 #   3. If the matching release is still a draft: re-verify completeness,
-#      run the pre-publication family gate, and deploy the committed
-#      PublishedInert catalog.
+#      run the pre-publication family gate, deploy the committed
+#      PublishedInert catalog, rewrite Install & Verify, then
+#      `publish-release` (same Environment approval) runs
+#      `scripts/finalize-core-release.sh`.
 #
-# The GitHub Release stays a draft until `scripts/finalize-core-release.sh`
-# runs locally after the signed catalog + CDN plane is live. Agents do not
+# The GitHub Release stays a draft until `publish-release` succeeds. The
+# only remaining local maintainer step is signing and pushing the catalog
+# with `scripts/prepare-windows-backend-catalog-release.sh`. Agents do not
 # dispatch this workflow. See RELEASING.md.
 
 on:
@@ -228,6 +232,28 @@ jobs:
     # ship an unsigned Windows release binary" gate.
     secrets: inherit
 
+  sync-backend-cdn:
+    name: Sync Windows backend bytes to CDN
+    needs: [resolve, release, binaries]
+    if: needs.resolve.outputs.should_build == 'true' && success()
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: core-release
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      B2_S3_ENDPOINT: ${{ secrets.B2_S3_ENDPOINT }}
+      B2_APPLICATION_KEY_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
+      B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/free-disk-space
+        with:
+          tool-cache: true
+      - name: Sync signed backend packs to B2
+        run: scripts/sync-windows-backend-cdn.sh "${{ needs.resolve.outputs.tag }}" --allow-ci
+
   verify-draft-completeness:
     name: Verify draft release completeness
     needs: [resolve]
@@ -295,3 +321,35 @@ jobs:
           python3 scripts/splice-install-verify.py current-body.md install-verify.md > new-body.md
 
           gh release edit "$tag" --notes-file new-body.md
+
+  publish-release:
+    name: Publish draft as latest
+    needs: [resolve, finalize-notes, deploy-catalog]
+    if: needs.resolve.outputs.should_finalize == 'true' && success()
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: core-release
+    permissions:
+      actions: read
+      attestations: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OPENASR_DEPLOY_CATALOG_RUN_ID: ${{ github.run_id }}
+      OPENASR_GGML_NATIVE: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - uses: ./.github/actions/free-disk-space
+        with:
+          tool-cache: true
+      - name: Install Linux audio build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: ./.github/actions/rust-cache
+        with:
+          shared-key: release-core-finalize-ubuntu-latest
+      - name: Publish the draft after catalog and notes succeed
+        run: scripts/finalize-core-release.sh "${{ needs.resolve.outputs.tag }}"

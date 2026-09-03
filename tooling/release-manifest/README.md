@@ -124,11 +124,15 @@ is not required. A revoked backend cannot be requalified or reactivated.
 Do not hand-edit provider entries or activation bindings.
 
 ```bash
-# Before publishing a core release: make every exact provider byte public but inert.
-scripts/sync-windows-backend-cdn.sh vX.Y.Z
+# After stage 1 of Release core (draft + binaries + approved CDN sync):
+# sign the PublishedInert catalog locally, then review / commit / push.
 scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z
-OPENASR_DEPLOY_CATALOG_RUN_ID=<release-core-run-id> \
-  scripts/finalize-core-release.sh vX.Y.Z
+
+# CDN sync and undraft now run in release-core.yml after core-release
+# Environment approval. Local escape hatch (same scripts the jobs call):
+#   scripts/sync-windows-backend-cdn.sh vX.Y.Z
+#   OPENASR_DEPLOY_CATALOG_RUN_ID=<release-core-run-id> \
+#     scripts/finalize-core-release.sh vX.Y.Z
 
 # After exact-tag hardware qualification: prepare one reviewed activation epoch.
 scripts/activate-windows-backend-catalog-release.sh \
@@ -141,8 +145,10 @@ scripts/revoke-windows-backend-catalog-release.sh vX.Y.Z BACKEND_ID
 The CDN sync writes the immutable provider payloads to B2 but does not change a
 catalog or GitHub release. Catalog preparation writes only the five local
 catalog/epoch files; it does not commit, push, deploy, publish, or activate
-anything. The finalizer only publishes a draft whose already-deployed catalog
-exposes the release provider entries as PublishedInert.
+anything. `release-core.yml` runs the CDN sync and the finalizer after
+`core-release` Environment approval. The finalizer only publishes a draft
+whose already-deployed catalog exposes the release provider entries as
+PublishedInert.
 
 Real-hardware evidence must come from a tag-scoped dispatch of
 `.github/workflows/qualify-windows-backend.yml` with exact `release_tag`,
