@@ -1714,17 +1714,26 @@ mod tests {
     /// vectors actually returned on verbose_json, not a label stamped onto raw
     /// centroids.
     ///
-    /// If correct: copied centroids in the rendered body have L2 ≈ 1 (or the
-    /// copy path refuses to claim `"l2"`). Otherwise Y: JSON says `"l2"` while
-    /// `SPEAKER_00` is an unnormalized `[3, 4]`.
+    /// If correct: copied centroids in the rendered body have L2 ≈ 1, and the
+    /// copy path refuses to claim `"l2"` for anything else instead of silently
+    /// re-normalizing. Otherwise Y: JSON says `"l2"` while `SPEAKER_00` is an
+    /// unnormalized `[3, 4]`.
     #[test]
-    #[ignore = "redteam: pr-379"]
     fn rt_379_speaker_embedding_space_l2_matches_vectors() {
-        let timeline = centroid_timeline(vec![(0, vec![3.0, 4.0])]);
         let embedder = IdentifiedEmbedder {
             dim: 2,
             fingerprint: "sha256:test-pack",
         };
+
+        let unnormalized = centroid_timeline(vec![(0, vec![3.0, 4.0])]);
+        let error = SpeakerEmbeddingPayload::from_timeline(&unnormalized, &embedder)
+            .expect_err("a non-unit centroid must not be published under an l2 claim");
+        assert!(
+            matches!(&error, BackendError::NativeFailClosed { reason } if reason.contains("l2")),
+            "unexpected error: {error:?}"
+        );
+
+        let timeline = centroid_timeline(vec![(0, vec![0.6, 0.8])]);
         let payload = SpeakerEmbeddingPayload::from_timeline(&timeline, &embedder)
             .expect("matching dims")
             .expect("centroids present");
