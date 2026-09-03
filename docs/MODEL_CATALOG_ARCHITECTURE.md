@@ -167,7 +167,11 @@ non-interactive / `--offline`);
 fail-closed: HTTPS-only catalog pack URLs, size/sha256 checks, GGUF preflight,
 runtime-source validation, and a same-directory atomic rename are required before
 a pack counts as installed, and untrusted catalog pack filenames must be
-relative basename-only `.oasr` targets.
+relative basename-only `.oasr` targets. Re-pulling an already-installed pack
+skips the download when the content-addressed object matches the catalog
+SHA-256, then re-runs the pack verifier and refreshes the install record. A
+catalog filename alone is not identity; an unsealed object whose bytes do not
+hash to the catalog digest is fetched again rather than trusted.
 
 For the local file Voice ID pipeline, ReDimNet2-B6 is required for the default
 capability probe on both `speaker_source` values. An explicit WeSpeaker ResNet
