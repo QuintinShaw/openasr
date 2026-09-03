@@ -131,8 +131,9 @@ bytes without exposing an unqualified provider to users.
 
 ### Publish the inert release bytes
 
-The only remaining local maintainer step is catalog signing. Everything else
-runs in Actions after Environment approval.
+The only remaining local maintainer steps are the two production-seed
+signatures (qualification manifests, then the catalog). Everything else runs
+in Actions after Environment approval.
 
 1. Dispatch `Release core`. Stage 1 creates the draft and lets its single
    formal `release-binaries.yml` call build and checksum the complete release
@@ -146,14 +147,23 @@ runs in Actions after Environment approval.
    entries to `https://dl.openasr.org/core/vX.Y.Z/`. Uploads are idempotent
    and never overwrite a different object at the same key. GitHub is the
    provenance mirror, not a runtime download fallback.
-3. Run `scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z` locally
-   with the production catalog signing seed. It verifies all 21 exact entries
-   and their already-live CDN bytes, merges every entry as `PublishedInert`,
-   bumps the epoch, and signs the full/public catalogs. It consumes no
-   hardware or token-correctness receipt. Review, commit, and push the five
-   catalog/epoch files. This is the only local release step that still needs
-   the signing seed.
-4. Dispatch `Release core` again. Stage 2 re-verifies the draft's complete
+3. With the worktree checked out at the exact `vX.Y.Z` tag commit (the script
+   refuses any other HEAD), run
+   `scripts/sign-and-verify-qualification-manifests.sh vX.Y.Z` locally with
+   the production catalog signing seed. It signs the 21 inert exact-cell
+   qualification manifests, uploads only the detached
+   `openasr-X.Y.Z-qualification-<cell>.signature.json` assets to the draft,
+   and re-verifies the published pairs. Stage 2's finalizer refuses to publish
+   without the full signature set. If an aborted run leaves
+   `openasr-X.Y.Z-qualification-mutation.lock` on the draft and no other
+   signer is running, delete that asset before retrying.
+4. Run `scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z` locally
+   with the same seed. It verifies all 21 exact entries and their already-live
+   CDN bytes, merges every entry as `PublishedInert`, bumps the epoch, and
+   signs the full/public catalogs. It consumes no hardware or
+   token-correctness receipt. Review, commit, and push the five catalog/epoch
+   files.
+5. Dispatch `Release core` again. Stage 2 re-verifies the draft's complete
    attested subject set (the same completeness gate as the original matrix, so
    a later CI-only fix can still see the draft), then runs the reusable
    pre-publication family contract against the immutable draft CLI and the
@@ -162,7 +172,7 @@ runs in Actions after Environment approval.
    `activation_transition: published-inert`. The deploy job checks the signed
    catalog, CDN payloads, and released-binary compatibility before writing it.
    `finalize-notes` then rewrites Install & Verify from the real asset list.
-5. Approve the `publish-release` job in the Actions UI (same `core-release`
+6. Approve the `publish-release` job in the Actions UI (same `core-release`
    Environment). It runs `scripts/finalize-core-release.sh` with
    `OPENASR_DEPLOY_CATALOG_RUN_ID` set to this orchestrator run. The
    reusable deploy workflow shares that run id, so the finalizer looks up
