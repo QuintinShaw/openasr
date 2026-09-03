@@ -2219,6 +2219,24 @@ fn reject_return_speaker_embeddings_for_plan(
     }
 }
 
+/// Copy clustering centroids onto the transcript only when the caller opted in
+/// *and* the plan actually produced them. Either condition alone must omit the
+/// payload: diarize-without-vectors is the default success path, and an
+/// embeddings opt-in on a non-external plan is rejected earlier.
+fn speaker_embeddings_payload(
+    return_speaker_embeddings: bool,
+    speaker_plan: SpeakerPlan,
+    timeline: &crate::diarize::contract::SpeakerTimeline,
+    embedder: Option<&dyn crate::diarize::embed::SpeakerEmbedder>,
+) -> Result<Option<SpeakerEmbeddingPayload>, BackendError> {
+    if return_speaker_embeddings && speaker_plan == SpeakerPlan::External {
+        let embedder = embedder.expect("external speaker plan has a resolved embedder");
+        SpeakerEmbeddingPayload::from_timeline(timeline, embedder)
+    } else {
+        Ok(None)
+    }
+}
+
 fn voice_id_audio_view(audio: &PcmBuffer, speaker_plan: SpeakerPlan) -> Option<PcmSlice> {
     (speaker_plan != SpeakerPlan::Off).then(|| audio.full_slice())
 }
@@ -2553,15 +2571,12 @@ fn run_native_transcription_impl(
     };
     // Copy centroids while the embedder is still live. External plans drop the
     // ReDimNet lease before ASR admission; the payload is then just data.
-    let speaker_embeddings =
-        if request.return_speaker_embeddings && speaker_plan == SpeakerPlan::External {
-            let embedder = voice_id_embedder
-                .as_deref()
-                .expect("external speaker plan has a resolved embedder");
-            SpeakerEmbeddingPayload::from_timeline(&speaker_turns.timeline, embedder)?
-        } else {
-            None
-        };
+    let speaker_embeddings = speaker_embeddings_payload(
+        request.return_speaker_embeddings,
+        speaker_plan,
+        &speaker_turns.timeline,
+        voice_id_embedder.as_deref(),
+    )?;
     // External attribution is pure data at this point: both the timeline and
     // enrolled-person assignments have been copied out of the auxiliary
     // runtimes. Do not retain the segmenter/ReDimNet candidate leases while
@@ -6689,6 +6704,92 @@ mod tests {
             reject_return_speaker_embeddings_for_plan(true, SpeakerPlan::External, "whisper"),
             Ok(())
         ));
+    }
+
+    struct UnitCentroidEmbedder;
+
+    impl crate::diarize::embed::SpeakerEmbedder for UnitCentroidEmbedder {
+        fn embed(
+            &self,
+            _samples: &[f32],
+            _sample_rate_hz: u32,
+        ) -> Result<crate::diarize::contract::SpeakerEmbedding, crate::diarize::embed::EmbedError>
+        {
+            Ok(crate::diarize::contract::SpeakerEmbedding::l2_normalized(
+                vec![1.0, 0.0],
+            ))
+        }
+
+        fn embedding_dim(&self) -> usize {
+            2
+        }
+
+        fn identity(&self) -> Option<crate::diarize::embed::SpeakerEmbedderIdentity> {
+            Some(
+                crate::diarize::embed::SpeakerEmbedderIdentity::unlabeled_fixture(
+                    crate::diarize::embed::SpeakerEmbedderFamily::ReDimNet2,
+                    2,
+                    "sha256:test-pack",
+                ),
+            )
+        }
+    }
+
+    fn mock_centroid_timeline() -> crate::diarize::contract::SpeakerTimeline {
+        crate::diarize::contract::SpeakerTimeline {
+            turns: Vec::new(),
+            centroids: vec![(
+                crate::diarize::contract::SpeakerId(0),
+                crate::diarize::contract::SpeakerEmbedding(vec![1.0, 0.0]),
+            )],
+        }
+    }
+
+    fn verbose_json_omits_embedding_keys(payload: Option<SpeakerEmbeddingPayload>) -> bool {
+        let transcription = Transcription {
+            text: "hello".to_string(),
+            speaker_embeddings: payload,
+            ..Default::default()
+        };
+        let rendered =
+            crate::render_transcription(&transcription, crate::ResponseFormat::VerboseJson)
+                .expect("verbose_json should render");
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("json");
+        parsed.get("speaker_embeddings").is_none()
+            && parsed.get("speaker_embedding_space").is_none()
+    }
+
+    #[test]
+    fn native_success_path_omits_speaker_embedding_keys_without_opt_in() {
+        let timeline = mock_centroid_timeline();
+        let embedder = UnitCentroidEmbedder;
+        let omitted =
+            speaker_embeddings_payload(false, SpeakerPlan::External, &timeline, Some(&embedder))
+                .expect("diarize without embeddings opt-in is success");
+        assert!(
+            omitted.is_none(),
+            "external diarize must not copy centroids unless return_speaker_embeddings is set"
+        );
+        assert!(
+            verbose_json_omits_embedding_keys(omitted),
+            "default native success path must omit speaker_embeddings and speaker_embedding_space"
+        );
+        assert!(
+            speaker_embeddings_payload(true, SpeakerPlan::Off, &timeline, Some(&embedder))
+                .expect("off plan skips copy")
+                .is_none()
+        );
+        assert!(
+            speaker_embeddings_payload(true, SpeakerPlan::InDecoder, &timeline, Some(&embedder))
+                .expect("in-decoder plan skips copy")
+                .is_none()
+        );
+        let copied =
+            speaker_embeddings_payload(true, SpeakerPlan::External, &timeline, Some(&embedder))
+                .expect("opt-in external copy")
+                .expect("centroids present");
+        assert_eq!(copied.vectors["SPEAKER_00"], vec![1.0, 0.0]);
+        assert!(!verbose_json_omits_embedding_keys(Some(copied)));
     }
 
     #[test]

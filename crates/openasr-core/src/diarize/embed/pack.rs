@@ -552,6 +552,48 @@ mod tests {
         );
     }
 
+    fn isolated_empty_embedder_home() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::test_process_env::with_test_process_env(
+            [
+                ("OPENASR_HOME", Some(dir.path().as_os_str().to_os_string())),
+                (WESPEAKER_PACK_ENV, None),
+                (REDIMNET_PACK_ENV, None),
+                ("OPENASR_MODELS_DIR", None),
+            ],
+            || {
+                let error = match prepare_embedder(VoiceIdEmbedderPreference::WeSpeaker) {
+                    Ok(_) => panic!("WeSpeaker preference with no pack must fail closed"),
+                    Err(error) => error,
+                };
+                match error {
+                    EmbedError::Unavailable(reason) => {
+                        assert!(
+                            reason.contains(WESPEAKER_EMBEDDER_PACK_ID),
+                            "missing WeSpeaker pack must name its catalog id, got {reason}"
+                        );
+                        assert!(
+                            reason.contains("WeSpeaker ResNet"),
+                            "missing WeSpeaker pack must name the family, got {reason}"
+                        );
+                    }
+                    other => panic!("expected Unavailable, got {other}"),
+                }
+                assert!(
+                    prepare_embedder(VoiceIdEmbedderPreference::ReDimNet2)
+                        .expect("ReDimNet absence is not an error at prepare")
+                        .is_none(),
+                    "default ReDimNet preference with no pack must yield None, not a silent WeSpeaker skip"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn prepare_embedder_wespeaker_preference_fails_closed_when_pack_missing() {
+        isolated_empty_embedder_home();
+    }
+
     #[test]
     fn identity_constructors_carry_space_labels_without_guessing() {
         let redimnet = SpeakerEmbedderIdentity::redimnet2("sha256:rd", "redimnet2-b6-cn");

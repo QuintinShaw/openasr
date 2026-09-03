@@ -1864,6 +1864,41 @@ fn stale_served_snapshot_is_rejected_after_rebind() {
 }
 
 #[test]
+fn stale_served_snapshot_is_rejected_after_same_path_republish() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack = temp.path().join("pack-a.oasr");
+    write_mock_gguf_runtime_source(&pack, Some("whisper-tiny"));
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack.clone()).into(),
+    };
+    let snapshot = runtime
+        .model_pack_path
+        .served_snapshot()
+        .expect("bound pack");
+    runtime
+        .rebind_native_model_pack(Some(pack))
+        .expect("same-path republish");
+    let error = match runtime.acquire_native_execution_for_snapshot(
+        &snapshot,
+        "native:stale-generation",
+        None,
+        NativeAdmissionKind::File,
+        None,
+    ) {
+        Ok(_) => panic!("a pre-republish snapshot must not admit after generation bump"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, ApiError::Conflict(_)),
+        "generation-stale snapshot must 409, got {error}"
+    );
+}
+
+#[test]
 fn rebind_native_model_pack_returns_conflict_while_session_is_active() {
     let temp = tempfile::tempdir().unwrap();
     let pack_a = temp.path().join("pack-a.oasr");

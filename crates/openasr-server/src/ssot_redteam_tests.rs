@@ -629,6 +629,16 @@ async fn ssot_route_permission_matrix_covers_every_registered_route() {
     );
 
     let temp = tempfile::tempdir().unwrap();
+    // Pack resolution and Voice ID space still read process OPENASR_HOME, not
+    // DistributionRuntime.openasr_home. Pin the process home so GET
+    // /v1/voice-id/persons cannot load the developer's real ReDimNet pack.
+    #[expect(unsafe_code, reason = "test-only process env override")]
+    unsafe {
+        std::env::set_var("OPENASR_HOME", temp.path());
+        std::env::remove_var("OPENASR_REDIMNET_PACK");
+        std::env::remove_var("OPENASR_WESPEAKER_PACK");
+        std::env::remove_var("OPENASR_MODELS_DIR");
+    }
     let server = spawn_loopback_pairing_server(temp.path()).await;
     let credential = approve_loopback_pairing(&server).await;
     let device_auth = bearer_auth_header(&credential.bearer_token);
