@@ -601,6 +601,7 @@ pub(super) async fn serve(
     no_model: bool,
     max_native_sessions_per_model: std::num::NonZeroUsize,
     security: ServeSecurityOptions,
+    parent_shutdown: Option<parent_watchdog::ParentShutdown>,
 ) -> Result<()> {
     let home = openasr_home()?;
     // Read the config document once: `config` and `idle_unload` (used below
@@ -705,24 +706,26 @@ pub(super) async fn serve(
     // `idle_unload` lives on `Preferences`, on the same document already
     // loaded above as `config_document` -- no second read needed.
     launch_options.idle_unload_after = config_document.preferences.idle_unload.idle_threshold();
-    openasr_server::serve_with_launch_options(
-        addr,
-        openasr_server::ServerRuntime {
-            backend,
-            native_execution: openasr_server::NativeExecutionSupervisor::with_execution_services(
-                max_native_sessions_per_model,
-                native_execution_services,
-            ),
-            ffmpeg_bin,
-            ffmpeg_bin_explicit,
-            // Launch path is served identity; current() waits for attestation.
-            model_pack_path: openasr_server::ActiveRuntimeSlot::requested(
-                model_source.model_pack_path,
-            ),
-        },
-        launch_options,
-    )
-    .await
+    tokio::select! {
+        result = openasr_server::serve_with_launch_options(
+            addr,
+            openasr_server::ServerRuntime {
+                backend,
+                native_execution: openasr_server::NativeExecutionSupervisor::with_execution_services(
+                    max_native_sessions_per_model,
+                    native_execution_services,
+                ),
+                ffmpeg_bin,
+                ffmpeg_bin_explicit,
+                // Launch path is served identity; current() waits for attestation.
+                model_pack_path: openasr_server::ActiveRuntimeSlot::requested(
+                    model_source.model_pack_path,
+                ),
+            },
+            launch_options,
+        ) => result,
+        _ = parent_watchdog::wait_for_shutdown(parent_shutdown) => Ok(()),
+    }
 }
 
 /// True when this `serve` process was launched by the desktop supervisor,
