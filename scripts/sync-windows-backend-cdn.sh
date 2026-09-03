@@ -149,5 +149,6 @@ echo
 echo "BACKEND-CDN-SYNCED for ${tag}"
 echo "  uploaded ${#sync_files[@]} signed objects to https://dl.openasr.org/core/v${version}/"
 echo "  runtime-selectable entries: 0 (hardware/token qualification is post-publication)"
-echo "  next: load the production catalog signing seed and run:"
+echo "  next: load the production catalog signing seed, check out the ${tag} commit, and run:"
+echo "    scripts/sign-and-verify-qualification-manifests.sh ${tag}"
 echo "    scripts/prepare-windows-backend-catalog-release.sh ${tag}"
