@@ -1203,7 +1203,7 @@ async fn health_reports_model_bound_but_not_resident_before_any_load() {
     // actual load (warm-up or first request) completes.
     let temp = tempfile::tempdir().unwrap();
     let pack_root = temp.path().join("native-pack.oasr");
-    write_mock_gguf_runtime_source(&pack_root, None);
+    write_mock_gguf_runtime_source(&pack_root, Some("native-pack"));
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
@@ -5035,6 +5035,130 @@ async fn streaming_return_speaker_embeddings_is_rejected() {
     );
 }
 
+/// Promise: streaming (`?stream=true`) rejects `return_speaker_embeddings`
+/// with HTTP 400. CHANGELOG/http-api apply that gate to the translations
+/// alias as well as transcriptions.
+///
+/// If correct: `POST /v1/audio/translations?stream=true` with the field is
+/// 400 `invalid_request_error` and the body names streaming. Otherwise Y:
+/// translations ignores the query flag and returns a JSON body (mock 200)
+/// or a non-streaming error.
+#[tokio::test]
+async fn rt_379_translations_stream_rejects_speaker_embeddings() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+    let request = multipart_request_with_extra_fields(
+        "/v1/audio/translations?stream=true",
+        "whisper-large-v3-turbo",
+        "sample.wav",
+        b"not a real wav",
+        &[
+            ("diarize", "true"),
+            ("return_speaker_embeddings", "true"),
+            ("response_format", "verbose_json"),
+        ],
+    );
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "translations?stream=true must reject embeddings with 400, not succeed as non-stream JSON"
+    );
+    let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("not supported on streaming"),
+        "unexpected message: {message}"
+    );
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        !body.contains("speaker_embeddings"),
+        "stream reject must not leak embedding vectors: {body}"
+    );
+}
+
+/// Promise: a remote-compute device token requesting speaker embeddings is
+/// rejected with HTTP 403 `authorization_error` (fail-closed, not a silent
+/// strip) on every compute entry, including `POST /v1/audio/precise-timeline`.
+///
+/// If correct: 403 + `authorization_error` + biometric wording, and the body
+/// has no vectors. Otherwise Y: the form field is ignored as an unknown
+/// precise-timeline field and the request continues as 400/200.
+#[tokio::test]
+async fn rt_379_device_token_precise_timeline_rejects_speaker_embeddings() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+        openasr_server::ServerLaunchOptions {
+            auth: openasr_server::ServerAuth::pairing("admin-secret"),
+            ..Default::default()
+        },
+    );
+    let (_device_id, bearer_token) =
+        create_approved_pairing_credential(&app, "Remote Compute Mac").await;
+
+    for include_remote_marker in [true, false] {
+        let mut request = multipart_request_with_extra_fields(
+            "/v1/audio/precise-timeline",
+            "whisper-large-v3-turbo",
+            "sample.wav",
+            b"not a real wav",
+            &[
+                ("transcript", "hello world"),
+                ("return_speaker_embeddings", "true"),
+                ("response_format", "verbose_json"),
+                ("diarize", "true"),
+            ],
+        );
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {bearer_token}").parse().unwrap(),
+        );
+        if include_remote_marker {
+            request
+                .headers_mut()
+                .insert("x-openasr-remote-compute", "client".parse().unwrap());
+        }
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "device token must be 403 for precise-timeline embeddings (marker={include_remote_marker})"
+        );
+        let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["error"]["type"], "authorization_error",
+            "marker={include_remote_marker}"
+        );
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.to_ascii_lowercase().contains("biometric"),
+            "403 must name biometric-derived data for precise-timeline: {message}"
+        );
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            !body.contains("SPEAKER_00") || !body.contains('['),
+            "403 body must not leak embedding vectors: {body}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn remote_compute_header_without_auth_still_records_server_history() {
     let temp = tempfile::tempdir().unwrap();
@@ -5808,11 +5932,13 @@ async fn stream_transcriptions_with_native_backend_reject_model_mismatch() {
     );
     let response = app.oneshot(request).await.unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let bytes = to_bytes(response.into_body(), 1024 * 256).await.unwrap();
     let body = String::from_utf8_lossy(&bytes);
-    assert!(body.contains("event: error"));
-    assert!(body.contains("\"status\":\"error\""));
+    assert!(
+        body.contains("does not match") || body.contains("model"),
+        "model mismatch must fail closed over HTTP before SSE: {body}"
+    );
 }
 
 #[tokio::test]
@@ -5838,18 +5964,9 @@ async fn stream_transcriptions_with_native_xasr_hotword_emits_model_unsupported_
     );
     let response = app.oneshot(request).await.unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok()),
-        Some("text/event-stream")
-    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let bytes = to_bytes(response.into_body(), 1024 * 256).await.unwrap();
     let body = String::from_utf8_lossy(&bytes);
-    assert!(body.contains("event: error"));
-    assert!(body.contains("\"status\":\"error\""));
     assert!(body.contains("Phrase bias / hotword boosting is not supported"));
     assert!(body.contains("'xasr-zipformer' native model family"));
     assert!(body.contains("ggml-family-xasr-zipformer-runtime-v1"));

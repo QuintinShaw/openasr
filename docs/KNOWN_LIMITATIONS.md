@@ -10,6 +10,9 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   There are no package-manager channels yet; building from source remains
   supported. Public model-pack distribution is limited to catalog entries
   explicitly marked `public:true`.
+- `GET /v1/models` and other served-identity listings verify GGUF metadata
+  and the CAS path digest of the bound pack. They do not re-hash a multi-GB
+  object on every read. Full-file integrity is `openasr model-pack verify`.
 - The only executable backends are the default `native` and the opt-in `mock`
   stub. Native transcription runs offline from `.oasr` runtime packs -- a pinned
   `--model-pack`, an installed pack, or one the CLI installs on first use through
@@ -38,6 +41,8 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   (256-d, VoxCeleb English LM, sizes 34/152/221/293) instead; there is no Auto
   fallback, and ReDimNet and WeSpeaker occupy different identity spaces so enrollments
   do not transfer. Missing or broken required or selected packs fail closed.
+  WeSpeaker PyTorch cosine parity is a host-local gate
+  (`OPENASR_WESPEAKER_SPIKE_ROOT`); it is not part of the default CI suite.
   This universal contract is qualified for local file transcription; realtime
   and remote-compute diarization remain separate surfaces with their own output
   and privacy gates.
@@ -123,7 +128,9 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   8192 in the shipped pack) also fails closed before the encoder/prefill graphs
   are built — the 400 s grid is not a substitute for that budget. A collapsed or
   zero-duration timeline is treated as a severe transcript/audio mismatch;
-  pauses longer than 4 s in a correctly aligned manuscript are not. The server
+  pauses longer than 4 s in a correctly aligned manuscript are not. Mismatch
+  detection only rejects geometric degeneration; it does not score semantic
+  agreement between the manuscript and the audio. The server
   never downloads the pack; paired device tokens may call the endpoint (it is a
   compute route, not operator-only). This route is not yet on the file
   FIFO / pause / cancel surface used by `/v1/audio/transcriptions`; a request

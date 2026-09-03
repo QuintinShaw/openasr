@@ -134,7 +134,8 @@ remote-serving flow.
   `model_installed` (a pack is bound) and `model_resident` (0.1.13+: that
   pack's runtime is currently loaded in memory, vs. idle-unloaded or not yet
   loaded this boot).
-- `GET /v1/models` -- installed packs.
+- `GET /v1/models` -- the pack this process is serving (not the local
+  installed inventory; that is `GET /v1/models/local`).
 - `GET /v1/devices` -- OpenASR extension (0.1.13+): read-only enumeration of
   this daemon's own ggml compute devices (always `auto` + `cpu`, plus an
   `accelerated` entry when the runtime detects a GPU) and

@@ -260,6 +260,32 @@ mod tests {
     }
 
     #[test]
+    fn zero_duration_ratio_at_half_is_accepted_and_just_over_is_rejected() {
+        let mut words = spread_words(8, 8.0);
+        for word in words.iter_mut().take(4) {
+            word.end = word.start;
+        }
+        let transcription = transcription_with_words(words);
+        reject_degenerate_forced_alignment(&transcription, 8.0)
+            .expect("exactly 50% zero-duration words is still admitted");
+
+        let mut words = spread_words(8, 8.0);
+        for word in words.iter_mut().take(5) {
+            word.end = word.start;
+        }
+        let transcription = transcription_with_words(words);
+        let error = reject_degenerate_forced_alignment(&transcription, 8.0)
+            .expect_err("more than 50% zero-duration words must fail closed");
+        assert!(matches!(
+            error,
+            ForcedAlignmentMismatch::TooManyZeroDurationWords {
+                zero_duration: 5,
+                word_count: 8
+            }
+        ));
+    }
+
+    #[test]
     fn zero_duration_majority_is_rejected() {
         let words = (0..10)
             .map(|index| {

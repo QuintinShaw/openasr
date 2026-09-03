@@ -162,6 +162,7 @@ pub(crate) async fn transcriptions(
             auth,
             multipart,
             remote_compute_client,
+            None,
         )
         .await;
     }
@@ -198,10 +199,23 @@ pub(crate) async fn transcriptions(
 /// call it; it is not operator-only.
 pub(crate) async fn precise_timeline(
     State(runtime): State<ServerRuntime>,
+    Query(query): Query<TranscriptionQuery>,
+    headers: HeaderMap,
+    Extension(auth): Extension<ServerAuth>,
     Extension(distribution): Extension<DistributionContext>,
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Response, ApiError> {
+    if query.stream.unwrap_or(false) {
+        return Err(ApiError::BadRequest(
+            "The '?stream=true' query parameter is not supported on /v1/audio/precise-timeline. Forced alignment returns a complete timeline; retry without stream.".to_string(),
+        ));
+    }
     let parsed = parse_precise_timeline_multipart(multipart).await?;
+    let remote_compute_client = is_remote_compute_client_request(&headers, &auth);
+    reject_device_token_return_speaker_embeddings(
+        parsed.return_speaker_embeddings,
+        remote_compute_client,
+    )?;
     let execution_services = Arc::clone(&distribution.native_execution_services);
     let backend = runtime.backend;
     let ffmpeg_bin = runtime.ffmpeg_bin.clone();
@@ -289,6 +303,7 @@ struct PreciseTimelineUpload {
     keep_word_timestamps: bool,
     execution_target: Option<ExecutionTarget>,
     response_format: ResponseFormat,
+    return_speaker_embeddings: bool,
 }
 
 #[derive(Debug)]
@@ -337,6 +352,7 @@ async fn parse_precise_timeline_multipart(
     let mut keep_word_timestamps = true;
     let mut execution_target: Option<ExecutionTarget> = None;
     let mut response_format = ResponseFormat::VerboseJson;
+    let mut return_speaker_embeddings = false;
 
     while let Some(field) = multipart.next_field().await.map_err(ApiError::Multipart)? {
         let name = field.name().unwrap_or_default().to_string();
@@ -372,6 +388,10 @@ async fn parse_precise_timeline_multipart(
                 let value = field.text().await.map_err(ApiError::Multipart)?;
                 response_format = ResponseFormat::from_str(&value).map_err(ApiError::Format)?;
             }
+            "return_speaker_embeddings" => {
+                let value = field.text().await.map_err(ApiError::Multipart)?;
+                return_speaker_embeddings = parse_bool_field("return_speaker_embeddings", &value)?;
+            }
             _ => {
                 // Ignore unknown fields for forward compatibility.
                 let _ = field.bytes().await.map_err(ApiError::Multipart)?;
@@ -395,6 +415,7 @@ async fn parse_precise_timeline_multipart(
         keep_word_timestamps,
         execution_target,
         response_format,
+        return_speaker_embeddings,
     })
 }
 
@@ -547,11 +568,25 @@ mod precise_timeline_parse_tests {
 /// only, matching the OpenAI translations contract.
 pub(crate) async fn translations(
     State(runtime): State<ServerRuntime>,
+    Query(query): Query<TranscriptionQuery>,
     headers: HeaderMap,
     Extension(auth): Extension<ServerAuth>,
     Extension(distribution): Extension<DistributionContext>,
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Response, ApiError> {
+    let remote_compute_client = is_remote_compute_client_request(&headers, &auth);
+    if query.stream.unwrap_or(false) {
+        return crate::realtime::stream_transcription(
+            runtime,
+            distribution,
+            headers,
+            auth,
+            multipart,
+            remote_compute_client,
+            Some(TranscriptionTask::Translate),
+        )
+        .await;
+    }
     run_offline_transcription_with_attempt(
         runtime,
         headers,
@@ -1239,26 +1274,7 @@ async fn run_offline_transcription(
             "The 'stream' form field is not supported. SSE streaming on this server is the OpenASR realtime protocol, enabled with the '?stream=true' query parameter, and does not emit OpenAI transcript.text.* events -- OpenAI SDK stream=True calls cannot parse it. Retry without 'stream' for a complete response, or POST to /v1/audio/transcriptions?stream=true and handle OpenASR realtime events.".to_string(),
         ));
     }
-    // A well-formed transcription request must not fail because the daemon's
-    // on-disk preferences are unreadable or hold out-of-range values: degrade to
-    // defaults (and log) rather than failing the request. The /v1/config
-    // endpoint still surfaces the corruption for the user to fix.
-    let preferences = match load_config_document(&home) {
-        Ok(document) if document.preferences.validate().is_ok() => Some(document.preferences),
-        Ok(_) => {
-            eprintln!(
-                "openasr-server: ignoring invalid daemon preferences for this transcription; using defaults"
-            );
-            None
-        }
-        Err(error) => {
-            eprintln!(
-                "openasr-server: ignoring unreadable daemon config for this transcription; using defaults: {error}"
-            );
-            None
-        }
-    };
-    if let Some(preferences) = preferences {
+    if let Some(preferences) = load_transcription_preferences(&home) {
         apply_transcription_preferences(&mut parsed.request, &preferences);
     }
     // The translations alias forces translate over the body/preferences.
@@ -1501,7 +1517,17 @@ pub(crate) fn reject_device_token_speaker_embeddings(
     request: &TranscriptionRequest,
     remote_compute_client: bool,
 ) -> Result<(), ApiError> {
-    if request.return_speaker_embeddings && remote_compute_client {
+    reject_device_token_return_speaker_embeddings(
+        request.return_speaker_embeddings,
+        remote_compute_client,
+    )
+}
+
+pub(crate) fn reject_device_token_return_speaker_embeddings(
+    return_speaker_embeddings: bool,
+    remote_compute_client: bool,
+) -> Result<(), ApiError> {
+    if return_speaker_embeddings && remote_compute_client {
         return Err(ApiError::Authorization(
             SPEAKER_EMBEDDINGS_DEVICE_TOKEN_FORBIDDEN.to_string(),
         ));
@@ -1514,7 +1540,8 @@ pub(crate) fn reject_streaming_speaker_embeddings(
 ) -> Result<(), ApiError> {
     if request.return_speaker_embeddings {
         return Err(ApiError::BadRequest(
-            "return_speaker_embeddings is not supported on streaming transcription.".to_string(),
+            "Returning per-speaker vectors is not supported on streaming transcription."
+                .to_string(),
         ));
     }
     Ok(())
@@ -2437,6 +2464,30 @@ pub(crate) fn parse_execution_target_field(raw: &str) -> Result<ExecutionTarget,
 
 // ── Preferences / longform / phrase-bias ─────────────────────────────────────
 
+pub(crate) fn load_transcription_preferences(
+    home: &Path,
+) -> Option<openasr_core::config::Preferences> {
+    // A well-formed transcription request must not fail because the daemon's
+    // on-disk preferences are unreadable or hold out-of-range values: degrade to
+    // defaults (and log) rather than failing the request. The /v1/config
+    // endpoint still surfaces the corruption for the user to fix.
+    match load_config_document(home) {
+        Ok(document) if document.preferences.validate().is_ok() => Some(document.preferences),
+        Ok(_) => {
+            eprintln!(
+                "openasr-server: ignoring invalid daemon preferences for this transcription; using defaults"
+            );
+            None
+        }
+        Err(error) => {
+            eprintln!(
+                "openasr-server: ignoring unreadable daemon config for this transcription; using defaults: {error}"
+            );
+            None
+        }
+    }
+}
+
 pub(crate) fn apply_transcription_preferences(
     request: &mut TranscriptionRequest,
     preferences: &openasr_core::config::Preferences,
@@ -2722,7 +2773,7 @@ pub(crate) async fn transcribe_with_runtime(
         }
         BackendKind::Native => {
             tokio::task::spawn_blocking(move || {
-                let active_model = runtime.model_pack_path.served_snapshot().ok_or_else(|| {
+                let served = runtime.resolve_served_native_pack()?.ok_or_else(|| {
                     ApiError::Backend(openasr_core::BackendError::NativeModelPackPathRejected {
                         reason: format!(
                             "Model '{}' is not installed. No models are installed on this server yet -- install one first (openasr pull {}, or via the model market).",
@@ -2730,6 +2781,7 @@ pub(crate) async fn transcribe_with_runtime(
                         ),
                     })
                 })?;
+                let active_model = served.snapshot;
                 let model_pack_path = active_model.path().to_path_buf();
                 let adapter = native_runtime_model_adapter_for_path(&model_pack_path).ok_or_else(|| {
                     ApiError::Backend(openasr_core::BackendError::NativeFailClosed {

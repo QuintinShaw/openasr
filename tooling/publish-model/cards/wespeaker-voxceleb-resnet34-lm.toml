@@ -9,7 +9,7 @@ highlights = [
   "🎙️ **Optional Voice ID space** — 256-d WeSpeaker ResNet, loaded only when you set `voice_id_embedder=wespeaker`; ReDimNet2-B6 stays the default",
   "🧬 **ResNet34-TSTP-emb256** — 6.63M-param r-vector with large-margin finetune on VoxCeleb2 Dev (5994 speakers)",
   "📏 **Same family, four sizes** — 34/152/221/293 share one ggml graph; this is the smallest pack",
-  "🎯 **Parity-gated packaging** — ggml-graph forward matches official PyTorch at cosine ≥ 0.999 on held-out fixtures (CPU and Metal)",
+  "🎯 **Host-local parity gate** — ggml-graph forward matches official PyTorch at cosine ≥ 0.999 on held-out fixtures (CPU and Metal) when `OPENASR_WESPEAKER_SPIKE_ROOT` is set; this is not a default CI gate",
 ]
 
 intro = """
@@ -41,7 +41,7 @@ highlights = [
   "🎙️ **可选 Voice ID 空间** — 256 维 WeSpeaker ResNet，仅在设置 `voice_id_embedder=wespeaker` 时加载；默认仍是 ReDimNet2-B6",
   "🧬 **ResNet34-TSTP-emb256** — 约 6.63M 参数的 r-vector，在 VoxCeleb2 Dev（5994 说话人）上做 large-margin 微调",
   "📏 **同一家族四种尺寸** — 34/152/221/293 共用一张 ggml 计算图；这是体积最小的一档",
-  "🎯 **精度严格校验** — ggml 计算图前向与官方 PyTorch 在固定样本上的余弦相似度 ≥ 0.999（CPU 与 Metal）",
+  "🎯 **本机精度门** — 设置 `OPENASR_WESPEAKER_SPIKE_ROOT` 时，ggml 计算图前向与官方 PyTorch 在固定样本上的余弦相似度 ≥ 0.999（CPU 与 Metal）；不是默认 CI 门",
 ]
 
-source_sha256 = "690334df899acad7dc28daf66a4dc3b1203475a556e32c20a3ba850d1423fdff"
+source_sha256 = "0c173ce21b1a25279062080718a07dc35c01264b1f338bf90abb66395974095e"

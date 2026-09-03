@@ -629,6 +629,16 @@ async fn ssot_route_permission_matrix_covers_every_registered_route() {
     );
 
     let temp = tempfile::tempdir().unwrap();
+    // Pack resolution and Voice ID space still read process OPENASR_HOME, not
+    // DistributionRuntime.openasr_home. Pin the process home so GET
+    // /v1/voice-id/persons cannot load the developer's real ReDimNet pack.
+    #[expect(unsafe_code, reason = "test-only process env override")]
+    unsafe {
+        std::env::set_var("OPENASR_HOME", temp.path());
+        std::env::remove_var("OPENASR_REDIMNET_PACK");
+        std::env::remove_var("OPENASR_WESPEAKER_PACK");
+        std::env::remove_var("OPENASR_MODELS_DIR");
+    }
     let server = spawn_loopback_pairing_server(temp.path()).await;
     let credential = approve_loopback_pairing(&server).await;
     let device_auth = bearer_auth_header(&credential.bearer_token);
@@ -1477,14 +1487,16 @@ async fn operator_stream_file_job_keeps_enrolled_voice_id_fail_closed() {
         .unwrap();
     assert_eq!(
         response.status(),
-        StatusCode::OK,
-        "operator stream diarize stays on the SSE error path, got {}",
+        StatusCode::BAD_REQUEST,
+        "operator stream enrolled Voice ID must fail closed over HTTP before SSE, got {}",
         response.status()
     );
     let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
     let body = String::from_utf8_lossy(&body);
     assert!(
-        body.contains("event: error"),
+        body.to_ascii_lowercase().contains("voice")
+            || body.to_ascii_lowercase().contains("diariz")
+            || body.to_ascii_lowercase().contains("speaker"),
         "operator stream enrolled Voice ID must fail closed: {body}"
     );
 }

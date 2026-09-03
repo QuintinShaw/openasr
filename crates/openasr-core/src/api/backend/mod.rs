@@ -878,6 +878,19 @@ impl SpeakerEmbeddingPayload {
                     embedding.dim(),
                 ));
             }
+            let norm = embedding
+                .0
+                .iter()
+                .map(|component| component * component)
+                .sum::<f32>()
+                .sqrt();
+            if (norm - 1.0).abs() > 1e-3 {
+                return Err(BackendError::NativeFailClosed {
+                    reason: format!(
+                        "Speaker embedding L2 norm {norm} is outside 1.0 ± 0.001; refusing to claim l2 normalization."
+                    ),
+                });
+            }
             vectors.insert(speaker_id.label(), embedding.0.clone());
         }
         Ok(Some(Self {
@@ -1694,6 +1707,70 @@ mod tests {
             .expect_err("mismatched centroid dim must fail closed");
         assert!(
             matches!(error, BackendError::NativeFailClosed { reason } if reason.contains("dimension mismatch"))
+        );
+    }
+
+    /// Promise: `speaker_embedding_space.normalization: "l2"` describes the
+    /// vectors actually returned on verbose_json, not a label stamped onto raw
+    /// centroids.
+    ///
+    /// If correct: copied centroids in the rendered body have L2 ≈ 1, and the
+    /// copy path refuses to claim `"l2"` for anything else instead of silently
+    /// re-normalizing. Otherwise Y: JSON says `"l2"` while `SPEAKER_00` is an
+    /// unnormalized `[3, 4]`.
+    #[test]
+    fn rt_379_speaker_embedding_space_l2_matches_vectors() {
+        let embedder = IdentifiedEmbedder {
+            dim: 2,
+            fingerprint: "sha256:test-pack",
+        };
+
+        let unnormalized = centroid_timeline(vec![(0, vec![3.0, 4.0])]);
+        let error = SpeakerEmbeddingPayload::from_timeline(&unnormalized, &embedder)
+            .expect_err("a non-unit centroid must not be published under an l2 claim");
+        assert!(
+            matches!(&error, BackendError::NativeFailClosed { reason } if reason.contains("l2")),
+            "unexpected error: {error:?}"
+        );
+
+        let timeline = centroid_timeline(vec![(0, vec![0.6, 0.8])]);
+        let payload = SpeakerEmbeddingPayload::from_timeline(&timeline, &embedder)
+            .expect("matching dims")
+            .expect("centroids present");
+        let transcription = Transcription {
+            text: "hello".to_string(),
+            speaker_embeddings: Some(payload),
+            ..Default::default()
+        };
+        let rendered =
+            crate::render_transcription(&transcription, crate::ResponseFormat::VerboseJson)
+                .expect("verbose_json should render");
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("json");
+        assert_eq!(
+            parsed["speaker_embedding_space"]["normalization"], "l2",
+            "wire contract claims l2: {rendered}"
+        );
+        let vector = parsed["speaker_embeddings"]["SPEAKER_00"]
+            .as_array()
+            .unwrap_or_else(|| panic!("missing SPEAKER_00 vector: {rendered}"));
+        assert_eq!(
+            vector.len(),
+            parsed["speaker_embedding_space"]["dim"]
+                .as_u64()
+                .expect("dim") as usize,
+            "space.dim must match vector length: {rendered}"
+        );
+        let norm = vector
+            .iter()
+            .map(|value| {
+                let x = value.as_f64().expect("f32 component") as f32;
+                x * x
+            })
+            .sum::<f32>()
+            .sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-5,
+            "verbose_json claimed l2 but SPEAKER_00 has L2={norm}: {rendered}"
         );
     }
 }

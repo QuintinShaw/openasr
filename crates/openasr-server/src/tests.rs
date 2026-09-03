@@ -1827,6 +1827,78 @@ fn bound_model_pack_path_is_shared_across_runtime_clones() {
 }
 
 #[test]
+fn stale_served_snapshot_is_rejected_after_rebind() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack_a = temp.path().join("pack-a.oasr");
+    let pack_b = temp.path().join("pack-b.oasr");
+    write_mock_gguf_runtime_source(&pack_a, Some("whisper-tiny"));
+    write_mock_gguf_runtime_source(&pack_b, Some("whisper-base"));
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_a.clone()).into(),
+    };
+    let snapshot = runtime
+        .model_pack_path
+        .served_snapshot()
+        .expect("bound pack");
+    runtime
+        .rebind_native_model_pack(Some(pack_b))
+        .expect("idle rebind");
+    let error = match runtime.acquire_native_execution_for_snapshot(
+        &snapshot,
+        "native:stale-snapshot",
+        None,
+        NativeAdmissionKind::File,
+        None,
+    ) {
+        Ok(_) => panic!("a pre-rebind snapshot must not admit after publish"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, ApiError::Conflict(_)),
+        "stale snapshot must 409, got {error}"
+    );
+}
+
+#[test]
+fn stale_served_snapshot_is_rejected_after_same_path_republish() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack = temp.path().join("pack-a.oasr");
+    write_mock_gguf_runtime_source(&pack, Some("whisper-tiny"));
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack.clone()).into(),
+    };
+    let snapshot = runtime
+        .model_pack_path
+        .served_snapshot()
+        .expect("bound pack");
+    runtime
+        .rebind_native_model_pack(Some(pack))
+        .expect("same-path republish");
+    let error = match runtime.acquire_native_execution_for_snapshot(
+        &snapshot,
+        "native:stale-generation",
+        None,
+        NativeAdmissionKind::File,
+        None,
+    ) {
+        Ok(_) => panic!("a pre-republish snapshot must not admit after generation bump"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, ApiError::Conflict(_)),
+        "generation-stale snapshot must 409, got {error}"
+    );
+}
+
+#[test]
 fn rebind_native_model_pack_returns_conflict_while_session_is_active() {
     let temp = tempfile::tempdir().unwrap();
     let pack_a = temp.path().join("pack-a.oasr");
@@ -3188,8 +3260,8 @@ fn issue_376_session_start_and_transcription_admit_from_served_snapshot() {
         .next()
         .expect("start_native_streaming_session body");
     assert!(
-        start.contains("served_snapshot()"),
-        "session.start must admit the served pack, not only the attested live pointer: {start}"
+        start.contains("resolve_served_native_pack()"),
+        "session.start must admit the currently resolvable served pack: {start}"
     );
     assert!(
         !start.contains("current_snapshot()"),
@@ -3204,8 +3276,8 @@ fn issue_376_session_start_and_transcription_admit_from_served_snapshot() {
         .nth(1)
         .expect("native transcription arm");
     assert!(
-        native_arm.contains("served_snapshot()"),
-        "native transcription must admit the served pack: {native_arm}"
+        native_arm.contains("resolve_served_native_pack()"),
+        "native transcription must admit the currently resolvable served pack: {native_arm}"
     );
 
     let served = include_str!("lib.rs")
@@ -3223,6 +3295,489 @@ fn issue_376_session_start_and_transcription_admit_from_served_snapshot() {
     assert!(
         !served.contains("current_snapshot()"),
         "served_snapshot must not re-enter current_snapshot across a second lock: {served}"
+    );
+}
+
+fn rt377_native_runtime(pack_path: PathBuf) -> ServerRuntime {
+    ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: ActiveRuntimeSlot::requested(Some(pack_path)),
+    }
+}
+
+fn rt377_app(runtime: ServerRuntime, home: &std::path::Path) -> axum::Router {
+    app_with_runtime_and_distribution(
+        runtime,
+        DistributionRuntime {
+            openasr_home: Some(home.to_path_buf()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    )
+}
+
+fn rt377_native_multipart(model: &str, transcription_id: Option<&str>) -> (String, Vec<u8>) {
+    let boundary = "openasr-rt377-boundary";
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.wav\"\r\nContent-Type: audio/wav\r\n\r\nnot a real wav\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n"
+    );
+    if let Some(id) = transcription_id {
+        body.push_str(&format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"transcription_id\"\r\n\r\n{id}\r\n"
+        ));
+    }
+    body.push_str(&format!("--{boundary}--\r\n"));
+    (
+        format!("multipart/form-data; boundary={boundary}"),
+        body.into_bytes(),
+    )
+}
+
+async fn rt377_post(
+    app: axum::Router,
+    uri: &str,
+    content_type: String,
+    body: Vec<u8>,
+) -> (StatusCode, serde_json::Value) {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let json = serde_json::from_slice(&bytes).unwrap_or_else(
+        |_| serde_json::json!({ "raw": String::from_utf8_lossy(&bytes).into_owned() }),
+    );
+    (status, json)
+}
+
+fn rt377_json_claims_id(value: &serde_json::Value, model_id: &str) -> bool {
+    match value {
+        serde_json::Value::String(text) => text == model_id,
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|item| rt377_json_claims_id(item, model_id)),
+        serde_json::Value::Object(map) => map
+            .values()
+            .any(|item| rt377_json_claims_id(item, model_id)),
+        _ => false,
+    }
+}
+
+async fn rt377_session_start_claims_id(
+    runtime: ServerRuntime,
+    home: &std::path::Path,
+    model_id: &str,
+) -> bool {
+    let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel(8);
+    let mut session = realtime::WsSession::new(
+        runtime,
+        DistributionContext::new(DistributionRuntime {
+            openasr_home: Some(home.to_path_buf()),
+            catalog_url: None,
+            catalog_local_override: None,
+        }),
+        event_sender,
+    );
+    let message = format!(r#"{{"type":"session.start","session":{{"model":"{model_id}"}}}}"#);
+    let accepted = session.handle_text(&message).await.is_ok();
+    let mut events = Vec::new();
+    while let Ok(event) = event_receiver.try_recv() {
+        events.push(event);
+    }
+    if accepted {
+        return true;
+    }
+    events.iter().any(|event| match &event.event {
+        openasr_core::RealtimeEvent::Error(error) => {
+            error.code != openasr_core::RealtimeErrorCode::StartupConfigError
+        }
+        openasr_core::RealtimeEvent::Lifecycle(_) | openasr_core::RealtimeEvent::Transcript(_) => {
+            true
+        }
+        _ => false,
+    })
+}
+
+/// If correct: a served pack that no longer verifies must fail closed on every
+/// identity surface (HTTP 4xx, or 200 without the old id; session.start error).
+/// Otherwise Y: `/health.model_installed=true` and/or `/v1/capabilities` 200
+/// and/or `/v1/models` still lists the launch id from the slot path.
+#[tokio::test]
+async fn rt_377_deleted_pack_identity_surfaces_fail_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack = write_valid_installed_pack_for_test(temp.path(), "moonshine-tiny", "q8_0", "q8");
+    persist_default_pack(temp.path(), &pack, QuantPreference::pinned(&pack.quant)).unwrap();
+    let runtime = rt377_native_runtime(pack.path.clone());
+    let app = rt377_app(runtime.clone(), temp.path());
+
+    let (status, models) = issue_376_get_json(app.clone(), "/v1/models").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(models["data"][0]["id"], "moonshine-tiny");
+
+    std::fs::remove_file(&pack.path).unwrap();
+
+    let (models_status, models) = issue_376_get_json(app.clone(), "/v1/models").await;
+    let (default_status, default) = issue_376_get_json(app.clone(), "/v1/models/default").await;
+    let (health_status, health) = issue_376_get_json(app.clone(), "/health").await;
+    let (capabilities_status, capabilities) =
+        issue_376_get_json(app.clone(), "/v1/capabilities").await;
+    let (json_status, json_body) = {
+        let (content_type, body) = rt377_native_multipart("moonshine-tiny", Some("rt377-json"));
+        rt377_post(app.clone(), "/v1/audio/transcriptions", content_type, body).await
+    };
+    let (stream_status, stream_body) = {
+        let (content_type, body) = rt377_native_multipart("moonshine-tiny", Some("rt377-stream"));
+        rt377_post(
+            app.clone(),
+            "/v1/audio/transcriptions?stream=true",
+            content_type,
+            body,
+        )
+        .await
+    };
+    let (translations_status, translations_body) = {
+        let (content_type, body) =
+            rt377_native_multipart("moonshine-tiny", Some("rt377-translations"));
+        rt377_post(app, "/v1/audio/translations", content_type, body).await
+    };
+    let session_claims =
+        rt377_session_start_claims_id(runtime.clone(), temp.path(), "moonshine-tiny").await;
+
+    let mut still_claiming = Vec::new();
+    if models_status == StatusCode::OK && rt377_json_claims_id(&models, "moonshine-tiny") {
+        still_claiming.push(format!("GET /v1/models {models_status} {models}"));
+    }
+    if default_status == StatusCode::OK
+        && (default["default_model"] == "moonshine-tiny" || default["activation"] == "committed")
+    {
+        still_claiming.push(format!("GET /v1/models/default {default_status} {default}"));
+    }
+    if health_status == StatusCode::OK && health["model_installed"] == true {
+        still_claiming.push(format!("GET /health {health_status} {health}"));
+    }
+    if capabilities_status == StatusCode::OK && capabilities["transcription"].is_object() {
+        still_claiming.push(format!(
+            "GET /v1/capabilities {capabilities_status} {capabilities}"
+        ));
+    }
+    if json_status == StatusCode::OK {
+        still_claiming.push(format!(
+            "POST /v1/audio/transcriptions {json_status} {json_body}"
+        ));
+    }
+    if stream_status == StatusCode::OK {
+        still_claiming.push(format!(
+            "POST /v1/audio/transcriptions?stream=true {stream_status} {stream_body}"
+        ));
+    }
+    if translations_status == StatusCode::OK {
+        still_claiming.push(format!(
+            "POST /v1/audio/translations {translations_status} {translations_body}"
+        ));
+    }
+    if session_claims {
+        still_claiming.push("realtime session.start accepted or non-fail-closed".to_string());
+    }
+    assert!(
+        still_claiming.is_empty(),
+        "deleted pack must fail closed on every served-identity surface, still claiming: {still_claiming:?}"
+    );
+}
+
+/// Listing verifies GGUF metadata and the CAS path digest, not a full-pack
+/// re-hash. Destroying the GGUF magic must fail closed.
+#[tokio::test]
+async fn rt_377_tampered_pack_identity_not_from_config_string() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack = write_valid_installed_pack_for_test(temp.path(), "moonshine-tiny", "q8_0", "q8");
+    persist_default_pack(temp.path(), &pack, QuantPreference::pinned(&pack.quant)).unwrap();
+    let runtime = rt377_native_runtime(pack.path.clone());
+    let app = rt377_app(runtime.clone(), temp.path());
+
+    let mut bytes = std::fs::read(&pack.path).unwrap();
+    assert!(bytes.len() >= 4, "fixture pack must have a GGUF header");
+    bytes[0] ^= 0xff;
+    bytes[1] ^= 0xff;
+    bytes[2] ^= 0xff;
+    bytes[3] ^= 0xff;
+    std::fs::write(&pack.path, bytes).unwrap();
+
+    let (models_status, models) = issue_376_get_json(app.clone(), "/v1/models").await;
+    let (default_status, default) = issue_376_get_json(app.clone(), "/v1/models/default").await;
+    let (health_status, health) = issue_376_get_json(app, "/health").await;
+
+    assert_ne!(
+        models_status,
+        StatusCode::OK,
+        "tampered pack must not list a verified id: {models}"
+    );
+    assert!(
+        !rt377_json_claims_id(&models, "moonshine-tiny"),
+        "tampered pack listing must not keep the old id: {models}"
+    );
+    assert!(
+        default_status != StatusCode::OK
+            || default["default_model"] != "moonshine-tiny"
+            || default["activation"] != "committed",
+        "tampered pack must not keep /v1/models/default committed as the old id: {default}"
+    );
+    assert_ne!(
+        health["model_installed"], true,
+        "tampered pack must not keep /health.model_installed=true: status={health_status} {health}"
+    );
+}
+
+/// If correct: idle unload then a failed reload (pack deleted) fail-closes
+/// identity and compute. Otherwise Y: surfaces still advertise the launch id
+/// or `/health.model_installed` stays true.
+#[tokio::test]
+async fn rt_377_idle_unload_then_deleted_pack_fail_closed() {
+    let _generation_lock = idle_activity::native_unload_generation_test_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let pack = write_valid_installed_pack_for_test(temp.path(), "moonshine-tiny", "q8_0", "q8");
+    persist_default_pack(temp.path(), &pack, QuantPreference::pinned(&pack.quant)).unwrap();
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack.path.clone()).into(),
+    };
+    let snapshot = runtime
+        .model_pack_path
+        .served_snapshot()
+        .expect("bound pack");
+    idle_activity::mark_native_model_warm(snapshot.residency_key());
+    let app = rt377_app(runtime.clone(), temp.path());
+
+    idle_activity::bump_native_unload_generation();
+    runtime
+        .native_execution
+        .execution_services()
+        .unload_idle_native_model_runtime_caches();
+    std::fs::remove_file(&pack.path).unwrap();
+
+    let (models_status, models) = issue_376_get_json(app.clone(), "/v1/models").await;
+    let (health_status, health) = issue_376_get_json(app.clone(), "/health").await;
+    let (json_status, json_body) = {
+        let (content_type, body) = rt377_native_multipart("moonshine-tiny", None);
+        rt377_post(app, "/v1/audio/transcriptions", content_type, body).await
+    };
+
+    assert_ne!(
+        models_status,
+        StatusCode::OK,
+        "reload after idle unload must not list a deleted pack: {models}"
+    );
+    assert_ne!(
+        health["model_installed"], true,
+        "reload failure must not keep /health.model_installed=true: status={health_status} {health}"
+    );
+    assert_ne!(
+        json_status,
+        StatusCode::OK,
+        "first compute after failed reload must fail closed: {json_body}"
+    );
+}
+
+/// If correct: `openasr serve --model` boot warmup either attests residency
+/// or the failure is visible on `/health` / `/v1/models`. Otherwise Y: only
+/// `default_reactivation_failed` is logged, `current()` stays empty, and HTTP
+/// still looks like a healthy bound daemon.
+#[tokio::test]
+async fn rt_377_boot_reactivation_failed_is_user_visible() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack = write_valid_installed_pack_for_test(temp.path(), "moonshine-tiny", "q8_0", "q8");
+    let runtime = rt377_native_runtime(pack.path.clone());
+    assert!(runtime.model_pack_path.current().is_none());
+
+    let reactivation =
+        realtime::spawn_boot_native_warmup(runtime.clone(), temp.path().to_path_buf());
+    tokio::time::timeout(std::time::Duration::from_secs(30), reactivation)
+        .await
+        .expect("boot reactivation must finish")
+        .expect("boot reactivation worker must not panic");
+
+    let app = rt377_app(runtime.clone(), temp.path());
+    let (models_status, models) = issue_376_get_json(app.clone(), "/v1/models").await;
+    let (health_status, health) = issue_376_get_json(app, "/health").await;
+
+    let attested = runtime.model_pack_path.current().is_some() && health["model_resident"] == true;
+    let visible_failure = models_status != StatusCode::OK
+        || health_status != StatusCode::OK
+        || health["model_installed"] != true
+        || health.get("status").and_then(|status| status.as_str()) != Some("ok");
+    assert!(
+        attested || visible_failure,
+        "boot reactivation failure must attest residency or be user-visible; got current={:?} models={models_status} {models} health={health_status} {health}",
+        runtime.model_pack_path.current()
+    );
+}
+
+/// If correct: `/v1/models` and `/v1/models/default` both read served identity,
+/// so a launch `--model` pack disagrees with durable V2 they still agree.
+/// Otherwise Y: listing follows the served pack while default follows V2.
+#[tokio::test]
+async fn rt_377_models_default_follows_served_pack_not_durable_v2() {
+    let temp = tempfile::tempdir().unwrap();
+    let durable = write_valid_installed_pack_for_test(temp.path(), "whisper-small", "q8_0", "q8");
+    let served = write_valid_installed_pack_for_test(temp.path(), "moonshine-tiny", "q8_0", "q8");
+    persist_default_pack(
+        temp.path(),
+        &durable,
+        QuantPreference::pinned(&durable.quant),
+    )
+    .unwrap();
+    let runtime = rt377_native_runtime(served.path.clone());
+    let app = rt377_app(runtime, temp.path());
+
+    let (models_status, models) = issue_376_get_json(app.clone(), "/v1/models").await;
+    let (default_status, default) = issue_376_get_json(app, "/v1/models/default").await;
+    assert_eq!(models_status, StatusCode::OK);
+    assert_eq!(default_status, StatusCode::OK);
+    assert_eq!(
+        models["data"][0]["id"], "moonshine-tiny",
+        "served listing must follow launch pack, not durable V2: {models}"
+    );
+    assert_eq!(
+        default["default_model"], models["data"][0]["id"],
+        "GET /v1/models/default must follow the same served snapshot as GET /v1/models: models={models} default={default}"
+    );
+}
+
+/// If correct: a FIFO-queued file job plus idle unload cannot keep advertising
+/// a pack that has been deleted. Otherwise Y: `/health.model_installed` or
+/// `/v1/models` still claims the old id while the queued job waits.
+#[tokio::test(flavor = "multi_thread")]
+async fn rt_377_fifo_queued_file_and_idle_unload_fail_closed_on_deleted_pack() {
+    let _generation_lock = idle_activity::native_unload_generation_test_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let pack = write_valid_installed_pack_for_test(temp.path(), "moonshine-tiny", "q8_0", "q8");
+    persist_default_pack(temp.path(), &pack, QuantPreference::pinned(&pack.quant)).unwrap();
+    let runtime = rt377_native_runtime(pack.path.clone());
+    let permit = runtime
+        .native_execution
+        .try_acquire("hold-native-slot")
+        .unwrap();
+    let app = rt377_app(runtime.clone(), temp.path());
+
+    let (content_type, body) = rt377_native_multipart("moonshine-tiny", Some("rt377-queued"));
+    let queued = tokio::spawn({
+        let app = app.clone();
+        async move { rt377_post(app, "/v1/audio/transcriptions", content_type, body).await }
+    });
+    let queued_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !runtime
+        .native_execution
+        .remote_policy()
+        .is_file_queued("rt377-queued")
+    {
+        assert!(
+            std::time::Instant::now() < queued_deadline,
+            "busy native file job must enter the FIFO"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    idle_activity::bump_native_unload_generation();
+    runtime
+        .native_execution
+        .execution_services()
+        .unload_idle_native_model_runtime_caches();
+    std::fs::remove_file(&pack.path).unwrap();
+
+    let (models_status, models) = issue_376_get_json(app.clone(), "/v1/models").await;
+    let (health_status, health) = issue_376_get_json(app, "/health").await;
+    drop(permit);
+    let (job_status, job_body) = tokio::time::timeout(std::time::Duration::from_secs(10), queued)
+        .await
+        .expect("queued job must finish after the slot is released")
+        .expect("queued job task");
+
+    assert_ne!(
+        models_status,
+        StatusCode::OK,
+        "queued file + idle unload + deleted pack must not keep listing: {models}"
+    );
+    assert_ne!(
+        health["model_installed"], true,
+        "queued file + idle unload + deleted pack must not keep /health.model_installed=true: status={health_status} {health}"
+    );
+    assert_ne!(
+        job_status,
+        StatusCode::OK,
+        "queued file must fail closed after the pack is deleted: {job_body}"
+    );
+}
+
+/// If correct: pending idle-switch plus idle unload must not advertise the
+/// target pack until apply succeeds, and must fail closed if the current pack
+/// is gone. Otherwise Y: listing/health still claim the dead source identity
+/// or silently show the pending target.
+#[tokio::test]
+async fn rt_377_pending_idle_switch_and_idle_unload_fail_closed_on_deleted_source() {
+    let _generation_lock = idle_activity::native_unload_generation_test_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let source = write_valid_installed_pack_for_test(temp.path(), "moonshine-tiny", "q8_0", "q8");
+    let target = write_valid_installed_pack_for_test(temp.path(), "whisper-small", "q8_0", "q8");
+    persist_default_pack(temp.path(), &source, QuantPreference::pinned(&source.quant)).unwrap();
+    let runtime = rt377_native_runtime(source.path.clone());
+    runtime
+        .native_execution
+        .remote_policy()
+        .request_idle_switch(target.pull.clone());
+    let snapshot = runtime
+        .model_pack_path
+        .served_snapshot()
+        .expect("bound pack");
+    idle_activity::mark_native_model_warm(snapshot.residency_key());
+    let app = rt377_app(runtime.clone(), temp.path());
+
+    idle_activity::bump_native_unload_generation();
+    runtime
+        .native_execution
+        .execution_services()
+        .unload_idle_native_model_runtime_caches();
+    std::fs::remove_file(&source.path).unwrap();
+
+    let (models_status, models) = issue_376_get_json(app.clone(), "/v1/models").await;
+    let (default_status, default) = issue_376_get_json(app.clone(), "/v1/models/default").await;
+    let (health_status, health) = issue_376_get_json(app, "/health").await;
+
+    assert_ne!(
+        models_status,
+        StatusCode::OK,
+        "pending idle switch must not keep listing a deleted source pack: {models}"
+    );
+    assert!(
+        !rt377_json_claims_id(&models, "moonshine-tiny"),
+        "deleted source must not appear on /v1/models: {models}"
+    );
+    assert_ne!(
+        models["data"][0]["id"], "whisper-small",
+        "idle unload must not apply a pending switch: status={models_status} {models}"
+    );
+    assert!(
+        default_status != StatusCode::OK || default["activation"] != "committed",
+        "deleted source must not stay committed on /v1/models/default: {default}"
+    );
+    assert_ne!(
+        health["model_installed"], true,
+        "pending idle switch + deleted source must not keep /health.model_installed=true: status={health_status} {health}"
     );
 }
 
@@ -3318,8 +3873,9 @@ fn spawn_boot_native_warmup_uses_set_default_transaction_entry() {
         .expect("spawn_boot_native_warmup body");
     assert!(
         spawn.contains("activate_default_model_blocking(")
-            && spawn.contains("ReactivateDurableSelection"),
-        "boot warmup must use the same complete transaction entry as set-default: {spawn}"
+            && spawn.contains("ReactivateDurableSelection")
+            && spawn.contains("AttestLaunchPack"),
+        "boot warmup must attest the launch pack via the set-default transaction: {spawn}"
     );
     assert!(
         !spawn.contains("warm_up_default_native_streaming_worker"),
@@ -3329,7 +3885,7 @@ fn spawn_boot_native_warmup_uses_set_default_transaction_entry() {
         !spawn.contains("rebind_native_model_pack")
             && !spawn.contains("persist_detailed")
             && !spawn.contains("PersistSelection"),
-        "boot reactivation must not bypass the read-only durable journal: {spawn}"
+        "boot reactivation must not write a new durable V2 generation: {spawn}"
     );
 }
 

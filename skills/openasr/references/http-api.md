@@ -53,8 +53,12 @@ pack that is being served.
   unsupported language (tag `ja`/`jp`/`ko`/`kr` or hiragana/katakana/hangul
   in the text), empty normalized text, audio past the timestamp grid, a
   prompt past decoder context (`llm_max_positions`), or a degenerate
-  alignment fail closed. Paired device tokens may call this compute route;
-  it is not operator-only. The server never downloads the pack.
+  alignment fail closed. Pure-kanji Japanese cannot be identified as
+  Japanese: `language=ja` is 400; `language=en` tokenizes each ideograph.
+  Paired device tokens may call this compute route; it is not
+  operator-only. The server never downloads the pack. Listing endpoints
+  verify GGUF metadata and the CAS path digest; they do not re-hash the
+  whole pack. Integrity of a local file is `openasr model-pack verify`.
 - `POST /v1/audio/translations` -- OpenAI-compatible X->English speech
   translation (non-streaming; model families without a translate task reject
   it explicitly).

@@ -1214,15 +1214,28 @@ impl WsSession {
         partial_results: bool,
         word_timestamps: bool,
     ) -> Result<(), ()> {
-        let Some(active_model) = self.runtime.model_pack_path.served_snapshot() else {
-            self.emit_error(
-                RealtimeErrorCode::StartupConfigError,
-                "Native realtime streaming requires an explicit local runtime pack path.",
-                false,
-            )
-            .await?;
-            return Err(());
+        let served = match self.runtime.resolve_served_native_pack() {
+            Ok(Some(served)) => served,
+            Ok(None) => {
+                self.emit_error(
+                    RealtimeErrorCode::StartupConfigError,
+                    "Native realtime streaming requires an explicit local runtime pack path.",
+                    false,
+                )
+                .await?;
+                return Err(());
+            }
+            Err(error) => {
+                self.emit_error(
+                    RealtimeErrorCode::StartupConfigError,
+                    &error.to_string(),
+                    false,
+                )
+                .await?;
+                return Err(());
+            }
         };
+        let active_model = served.snapshot;
         let model_pack_path = active_model.path().to_path_buf();
         let Some(adapter) = native_runtime_model_adapter_for_path(&model_pack_path) else {
             self.emit_error(

@@ -336,6 +336,19 @@ mod tests {
     }
 
     #[test]
+    fn word_list_kanji_only_japanese_tagged_ja_fails_closed_and_en_splits_ideographs() {
+        let error = word_list_for_language("日本国民", "ja").expect_err("ja tag");
+        assert!(matches!(
+            error,
+            Qwen3ForcedAlignerTextError::UnsupportedLanguage { .. }
+        ));
+        let words = word_list_for_language("日本国民", "en").expect("en-tagged kanji is CJK");
+        assert_eq!(words, vec!["日", "本", "国", "民"]);
+        let auto_as_en = word_list_for_language("日本国民", "English").expect("English tag");
+        assert_eq!(auto_as_en, vec!["日", "本", "国", "民"]);
+    }
+
+    #[test]
     fn word_list_rejects_unsupported_languages() {
         let error = word_list_for_language("hello", "Japanese").expect_err("must fail");
         assert!(matches!(
