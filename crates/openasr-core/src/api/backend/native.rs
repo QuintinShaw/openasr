@@ -1184,9 +1184,15 @@ impl NativeAsrExecutor for NativeBackendExecutor {
                     .expect("non-ready runtime readiness converts to NativeAsrError"));
             }
         }
-        let execution_target = native_execution_target_from_hardware_target(target)
+        let execution_target = request
+            .execution_target
+            .clone()
+            .or_else(|| native_execution_target_from_hardware_target(target))
             .ok_or(NativeAsrError::UnsupportedHardwareTarget { target })?;
-        let execution_intent = execution_intent_from_hardware_target(target)?;
+        let execution_intent = match &execution_target {
+            ExecutionTarget::Device(_) => ExecutionIntent::from(execution_target.clone()),
+            _ => execution_intent_from_hardware_target(target)?,
+        };
         let adapter_capabilities = adapter.capabilities();
         reject_unsupported_native_phrase_bias(
             adapter.adapter_id(),
@@ -1529,11 +1535,23 @@ fn native_offline_request_to_transcription_request(
 }
 
 fn native_backend_error_to_asr(error: BackendError) -> NativeAsrError {
-    let message = match error {
-        BackendError::NativeFailClosed { reason } => reason,
-        error => error.to_string(),
-    };
-    NativeAsrError::SessionFailed { message }
+    match error {
+        BackendError::ExecutionDeviceNotFound { detail } => {
+            NativeAsrError::ExecutionDeviceNotFound { detail }
+        }
+        BackendError::ExecutionDeviceNotAddressable { detail } => {
+            NativeAsrError::ExecutionDeviceNotAddressable { detail }
+        }
+        BackendError::ExecutionDeviceInitFailed { detail } => {
+            NativeAsrError::ExecutionDeviceInitFailed { detail }
+        }
+        BackendError::NativeFailClosed { reason } => {
+            NativeAsrError::SessionFailed { message: reason }
+        }
+        error => NativeAsrError::SessionFailed {
+            message: error.to_string(),
+        },
+    }
 }
 
 pub fn validate_local_native_model_pack_path(

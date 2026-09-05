@@ -143,6 +143,7 @@ fn request_execution_intent_with_backend_env(
         crate::ExecutionTarget::Auto => {
             execution_intent_from_backend_env(backend_env).unwrap_or(ExecutionIntent::Auto)
         }
+        device @ crate::ExecutionTarget::Device(_) => ExecutionIntent::from(device),
     }
 }
 // Stage-weighted progress for the in-flight native file transcription.
@@ -1238,7 +1239,7 @@ fn run_native_transcription_fallible_with_input(
     // re-reads process defaults after the main ASR dispatch completes.
     let request_execution_intent = execution_intent
         .clone()
-        .unwrap_or_else(|| request_execution_intent(request.execution_target));
+        .unwrap_or_else(|| request_execution_intent(request.execution_target.clone()));
     let backend_class = progress_backend_class(&request_execution_intent);
     // Provisional plan: duration and external-diarize are refined inside impl
     // once audio is prepared and the family speaker plan is known. Stages that
@@ -2312,8 +2313,8 @@ fn run_native_transcription_impl(
     )?;
     let emits_punctuation =
         emits_punctuation_for_model_architecture(selected_family.model_architecture);
-    let request_execution_intent =
-        execution_intent.unwrap_or_else(|| request_execution_intent(request.execution_target));
+    let request_execution_intent = execution_intent
+        .unwrap_or_else(|| request_execution_intent(request.execution_target.clone()));
     let execution_plan = resolve_native_execution_plan(
         execution_services.as_ref(),
         &selected_family,
@@ -5224,6 +5225,17 @@ mod tests {
             ),
             ExecutionIntent::ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint::Provider(
                 ExecutionProvider::Vulkan
+            ))
+        );
+        assert_eq!(
+            request_execution_intent_with_backend_env(
+                Some(crate::ExecutionTarget::Device(
+                    "vulkan:amd-radeon-rx-7900-xtx".to_string()
+                )),
+                Some("cuda")
+            ),
+            ExecutionIntent::Exact(crate::ExactDeviceSelector::PublicId(
+                "vulkan:amd-radeon-rx-7900-xtx".to_string()
             ))
         );
     }

@@ -325,6 +325,9 @@ pub fn execution_intent_to_v2_wire(
             provider.map_or("any", |provider| provider.as_str()),
             encode_intent_atom(stable_id)
         ),
+        ExecutionIntent::Exact(ExactDeviceSelector::PublicId(public_id)) => {
+            format!("exact_public:{}", encode_intent_atom(public_id))
+        }
     }
 }
 
@@ -379,6 +382,15 @@ pub fn execution_intent_from_v2_wire(
             provider,
             stable_id: decode_intent_atom(encoded)?,
         }));
+    }
+    if let Some(encoded) = value.strip_prefix("exact_public:") {
+        let public_id = decode_intent_atom(encoded)?;
+        if public_id.is_empty() {
+            return Err("persisted exact public id is empty".to_string());
+        }
+        return Ok(ExecutionIntent::Exact(ExactDeviceSelector::PublicId(
+            public_id,
+        )));
     }
     Err(format!("unknown persisted execution intent {value}"))
 }

@@ -451,6 +451,10 @@ pub struct NativeAsrOfflineRequest {
     /// serial width of 1, and serve-batch never engages on the server path.
     /// `None` leaves the consumer at its serial default.
     pub serve_batch_max_native_sessions: Option<usize>,
+    /// Optional public execution target, including a physical GPU id. When
+    /// set, native transcribe uses this instead of the coarse hardware target
+    /// so Exact pins survive the offline round-trip.
+    pub execution_target: Option<crate::ExecutionTarget>,
 }
 
 impl NativeAsrOfflineRequest {
@@ -472,6 +476,7 @@ impl NativeAsrOfflineRequest {
                  cancellation attaches a real context via with_execution_context",
             )),
             serve_batch_max_native_sessions: None,
+            execution_target: None,
         }
     }
 
@@ -506,6 +511,14 @@ impl NativeAsrOfflineRequest {
         execution_context: Arc<crate::RequestExecutionContext>,
     ) -> Self {
         self.execution_context = execution_context;
+        self
+    }
+
+    pub fn with_execution_target(
+        mut self,
+        execution_target: Option<crate::ExecutionTarget>,
+    ) -> Self {
+        self.execution_target = execution_target;
         self
     }
 

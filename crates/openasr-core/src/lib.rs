@@ -275,9 +275,10 @@ pub use device::compute_devices::{
 };
 pub use device::execution_route::{
     DeviceAddressability, EnumeratedComputeDevice, ExactDeviceSelector, ExecutionProvider,
-    ExecutionRouteCacheKey, ExecutionRouteError, ExecutionRouteRequest, PhysicalResourceKey,
-    ResolvedExecutionRoute, RouteDeviceKind, admission_identity_for_route,
-    enumerate_compute_devices_from_ggml, resolve_execution_route, worker_route_isolation_key,
+    ExecutionRouteCacheKey, ExecutionRouteError, ExecutionRouteRequest, PhysicalGpuIdentity,
+    PhysicalResourceKey, ResolvedExecutionRoute, RouteDeviceKind, admission_identity_for_route,
+    available_execution_target_values, enumerate_compute_devices_from_ggml,
+    physical_gpu_identities_from_ggml, resolve_execution_route, worker_route_isolation_key,
 };
 pub use device::types::{CapabilityClass, DeviceCapabilities};
 pub use download_source::{DownloadSource, DownloadSourcePref, resolve_chain};

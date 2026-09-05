@@ -10709,7 +10709,17 @@ impl GgmlBackendGuard {
     }
 
     fn metal() -> Result<Self, GgmlCpuGraphError> {
-        Self::cached_backend(CachedBackendDeviceKey::Metal, Self::init_metal_backend)
+        match request_backend_override() {
+            Some(RequestBackendPreference::Exact(route))
+                if route.provider == ExecutionProvider::Metal =>
+            {
+                Self::cached_backend(
+                    CachedBackendDeviceKey::Route(route.cache_key()),
+                    move || Self::init_exact_gpu_backend(&route),
+                )
+            }
+            _ => Self::cached_backend(CachedBackendDeviceKey::Metal, Self::init_metal_backend),
+        }
     }
 
     fn gpu() -> Result<Self, GgmlCpuGraphError> {

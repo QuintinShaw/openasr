@@ -655,6 +655,9 @@ fn v2_execution_intent_wire_round_trips_every_selector_shape() {
             provider: None,
             stable_id: "provider-local 设备".to_string(),
         }),
+        ExecutionIntent::Exact(ExactDeviceSelector::PublicId(
+            "vulkan:amd-radeon-rx-7900-xtx".to_string(),
+        )),
     ];
 
     for intent in intents {
@@ -671,6 +674,8 @@ fn v2_execution_intent_wire_rejects_malformed_exact_identifiers() {
         "exact_physical:0",
         "exact_stable:cuda:",
         "exact_stable:not-a-provider:43505530",
+        "exact_public:",
+        "exact_public:0",
         "unknown_intent",
     ] {
         assert!(
