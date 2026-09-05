@@ -1205,9 +1205,20 @@ pub(crate) fn spawn_boot_native_warmup(
                 }
             }
             _ => {
-                let intent = realtime_execution_target_preference(&home)
-                    .map(openasr_core::device::execution_policy::ExecutionIntent::from)
-                    .unwrap_or(openasr_core::device::execution_policy::ExecutionIntent::Auto);
+                let intent = match realtime_execution_target_preference(&home) {
+                    Ok(target) => {
+                        openasr_core::device::execution_policy::ExecutionIntent::from(target)
+                    }
+                    Err(error) => {
+                        runtime.model_pack_path.mark_launch_attestation_failed();
+                        log_default_reactivation_failed(
+                            &home,
+                            requested_path.as_path(),
+                            &error.to_string(),
+                        );
+                        return;
+                    }
+                };
                 (
                     openasr_core::QuantPreference::pinned(&pack.quant),
                     intent,
@@ -1385,14 +1396,16 @@ async fn warm_up_native_pack(
     let inference_threads = preferences_home
         .as_deref()
         .and_then(realtime_inference_threads_preference);
-    let execution_target_preference = preferences_home
-        .as_deref()
-        .and_then(realtime_execution_target_preference);
-    let resolved_route = crate::routes::transcription::resolve_execution_route_for_target(
+    let execution_target_preference = match preferences_home.as_deref() {
+        Some(home) => {
+            realtime_execution_target_preference(home).map_err(|error| error.to_string())?
+        }
+        None => crate::resolve_serve_execution_target(None).map_err(|error| error.to_string())?,
+    };
+    let resolved_route = crate::routes::transcription::resolve_execution_route_for_target(Some(
         execution_target_preference.clone(),
-    )
-    .ok()
-    .flatten();
+    ))
+    .map_err(|error| error.to_string())?;
     let Some(adapter) = openasr_core::native_runtime_model_adapter_for_path(&model_pack_path)
     else {
         return Err("no native runtime adapter for selected model pack".to_string());
@@ -1418,12 +1431,15 @@ async fn warm_up_native_pack(
     // `openasr_home()` resolution failing here (unreadable env, race) just
     // means "no preference found" -- same graceful fallback to defaults the
     // request-time paths use.
-    let options = NativeAsrRequestOptions::new().with_inference_threads(inference_threads);
+    let options = NativeAsrRequestOptions::new()
+        .with_inference_threads(inference_threads)
+        .with_execution_target(Some(execution_target_preference.clone()));
     let session_config = NativeAsrStreamingSessionConfig::new()
         .with_audio_format(RealtimeAudioFormat::pcm16_mono_16khz());
     let executor =
         NativeBackendExecutor::new(Arc::clone(runtime.native_execution.execution_services()));
-    let hardware_target = native_hardware_target_from_execution_target(execution_target_preference);
+    let hardware_target =
+        native_hardware_target_from_execution_target(Some(execution_target_preference));
     let session = match NativeAsrExecutor::start_streaming_session(
         &executor,
         &adapter,

@@ -1570,7 +1570,7 @@ fn transcription_preferences_fill_missing_thread_request_only() {
     };
     let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo");
 
-    apply_transcription_preferences(&mut request, &preferences).unwrap();
+    apply_transcription_preferences(&mut request, Some(&preferences)).unwrap();
     assert_eq!(request.inference_threads, Some(6));
     assert_eq!(
         request.voice_id_segmenter,
@@ -1582,8 +1582,84 @@ fn transcription_preferences_fill_missing_thread_request_only() {
     );
 
     request.inference_threads = Some(2);
-    apply_transcription_preferences(&mut request, &preferences).unwrap();
+    apply_transcription_preferences(&mut request, Some(&preferences)).unwrap();
     assert_eq!(request.inference_threads, Some(2));
+}
+
+struct OpenasrDeviceEnvGuard {
+    previous: Option<String>,
+}
+
+impl OpenasrDeviceEnvGuard {
+    fn set(value: &str) -> Self {
+        let previous = std::env::var(OPENASR_DEVICE_ENV).ok();
+        unsafe { std::env::set_var(OPENASR_DEVICE_ENV, value) };
+        Self { previous }
+    }
+}
+
+impl Drop for OpenasrDeviceEnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(OPENASR_DEVICE_ENV, value),
+                None => std::env::remove_var(OPENASR_DEVICE_ENV),
+            }
+        }
+    }
+}
+
+#[test]
+fn openasr_device_applies_when_preferences_are_absent() {
+    let _lock = openasr_device_env_test_lock();
+    let _guard = OpenasrDeviceEnvGuard::set("vulkan:amd-radeon-rx-7900-xtx");
+    let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo");
+    apply_transcription_preferences(&mut request, None).unwrap();
+    assert_eq!(
+        request.execution_target,
+        Some(ExecutionTarget::Device(
+            "vulkan:amd-radeon-rx-7900-xtx".to_string()
+        ))
+    );
+}
+
+#[test]
+fn openasr_device_overrides_saved_execution_target() {
+    let _lock = openasr_device_env_test_lock();
+    let _guard = OpenasrDeviceEnvGuard::set("vulkan:amd-radeon-rx-7900-xtx");
+    let preferences = Preferences {
+        execution_target: ExecutionTarget::Cpu,
+        ..Default::default()
+    };
+    let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo");
+    apply_transcription_preferences(&mut request, Some(&preferences)).unwrap();
+    assert_eq!(
+        request.execution_target,
+        Some(ExecutionTarget::Device(
+            "vulkan:amd-radeon-rx-7900-xtx".to_string()
+        ))
+    );
+}
+
+#[test]
+fn request_execution_target_wins_over_openasr_device() {
+    let _lock = openasr_device_env_test_lock();
+    let _guard = OpenasrDeviceEnvGuard::set("vulkan:amd-radeon-rx-7900-xtx");
+    let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo")
+        .with_execution_target(Some(ExecutionTarget::Cpu));
+    apply_transcription_preferences(&mut request, None).unwrap();
+    assert_eq!(request.execution_target, Some(ExecutionTarget::Cpu));
+}
+
+#[test]
+fn invalid_openasr_device_is_bad_request_without_preferences() {
+    let _lock = openasr_device_env_test_lock();
+    let _guard = OpenasrDeviceEnvGuard::set("not a device");
+    let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo");
+    let error = apply_transcription_preferences(&mut request, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Unsupported execution_target"), "{error}");
 }
 
 #[test]

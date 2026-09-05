@@ -1274,9 +1274,10 @@ async fn run_offline_transcription(
             "The 'stream' form field is not supported. SSE streaming on this server is the OpenASR realtime protocol, enabled with the '?stream=true' query parameter, and does not emit OpenAI transcript.text.* events -- OpenAI SDK stream=True calls cannot parse it. Retry without 'stream' for a complete response, or POST to /v1/audio/transcriptions?stream=true and handle OpenASR realtime events.".to_string(),
         ));
     }
-    if let Some(preferences) = load_transcription_preferences(&home) {
-        apply_transcription_preferences(&mut parsed.request, &preferences)?;
-    }
+    apply_transcription_preferences(
+        &mut parsed.request,
+        load_transcription_preferences(&home).as_ref(),
+    )?;
     // The translations alias forces translate over the body/preferences.
     if let Some(task) = task_override {
         parsed.request.task = Some(task);
@@ -2453,6 +2454,14 @@ pub(crate) fn parse_inference_threads_field(raw: &str) -> Result<u16, ApiError> 
 
 pub(crate) const OPENASR_DEVICE_ENV: &str = "OPENASR_DEVICE";
 
+#[cfg(test)]
+pub(crate) fn openasr_device_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub(crate) fn parse_execution_target_field(raw: &str) -> Result<ExecutionTarget, ApiError> {
     ExecutionTarget::parse(raw).map_err(ApiError::BadRequest)
 }
@@ -2485,25 +2494,31 @@ pub(crate) fn load_transcription_preferences(
 
 pub(crate) fn apply_transcription_preferences(
     request: &mut TranscriptionRequest,
-    preferences: &openasr_core::config::Preferences,
+    preferences: Option<&openasr_core::config::Preferences>,
 ) -> Result<(), ApiError> {
-    request.voice_id_segmenter = preferences.voice_id_segmenter;
-    request.voice_id_embedder = preferences.voice_id_embedder;
-    if request.inference_threads.is_none() {
-        request.inference_threads = preferences.inference_threads;
+    if let Some(preferences) = preferences {
+        request.voice_id_segmenter = preferences.voice_id_segmenter;
+        request.voice_id_embedder = preferences.voice_id_embedder;
+        if request.inference_threads.is_none() {
+            request.inference_threads = preferences.inference_threads;
+        }
     }
     if request.execution_target.is_none() {
-        request.execution_target = Some(serve_default_execution_target(preferences)?);
+        request.execution_target = Some(resolve_serve_execution_target(preferences)?);
     }
     Ok(())
 }
 
-fn serve_default_execution_target(
-    preferences: &openasr_core::config::Preferences,
+/// Serve-level default: `OPENASR_DEVICE` wins over on-disk preferences, and is
+/// applied even when the config file is missing or invalid.
+pub(crate) fn resolve_serve_execution_target(
+    preferences: Option<&openasr_core::config::Preferences>,
 ) -> Result<ExecutionTarget, ApiError> {
     match std::env::var(OPENASR_DEVICE_ENV) {
         Ok(raw) if !raw.trim().is_empty() => parse_execution_target_field(raw.trim()),
-        _ => Ok(preferences.execution_target.clone()),
+        _ => Ok(preferences
+            .map(|preferences| preferences.execution_target.clone())
+            .unwrap_or_default()),
     }
 }
 

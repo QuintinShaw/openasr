@@ -1011,17 +1011,32 @@ impl WsSession {
                 .await?;
             return Err(());
         }
-        let client_execution_target = if self.remote_compute_client {
-            None
-        } else {
-            session.execution_target.clone()
+        let default_execution_target = match self.distribution.openasr_home() {
+            Ok(home) => realtime_execution_target_preference(&home),
+            Err(_) => crate::resolve_serve_execution_target(None),
         };
-        let execution_target = client_execution_target.or_else(|| {
-            self.distribution
-                .openasr_home()
-                .ok()
-                .and_then(|home| realtime_execution_target_preference(&home))
-        });
+        let default_execution_target = match default_execution_target {
+            Ok(target) => target,
+            Err(error) => {
+                self.emit_error(
+                    RealtimeErrorCode::StartupConfigError,
+                    &error.to_string(),
+                    false,
+                )
+                .await?;
+                return Err(());
+            }
+        };
+        let execution_target = if self.remote_compute_client {
+            Some(default_execution_target)
+        } else {
+            Some(
+                session
+                    .execution_target
+                    .clone()
+                    .unwrap_or(default_execution_target),
+            )
+        };
         let phrase_bias = match build_realtime_phrase_bias_config(&session) {
             Ok(phrase_bias) => phrase_bias,
             Err(message) => {
@@ -1326,7 +1341,8 @@ impl WsSession {
             .with_inference_threads(self.inference_threads)
             .with_voice_id(false)
             .with_partial_results(partial_results)
-            .with_word_timestamps(word_timestamps);
+            .with_word_timestamps(word_timestamps)
+            .with_execution_target(self.execution_target.clone());
         let session_config = NativeAsrStreamingSessionConfig::new()
             .with_audio_format(RealtimeAudioFormat::pcm16_mono_16khz())
             .with_partial_results(partial_results)

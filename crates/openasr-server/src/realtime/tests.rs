@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::routes::transcription::{
-    resolve_execution_route_for_target, validate_native_runtime_pack,
+    OPENASR_DEVICE_ENV, resolve_execution_route_for_target, validate_native_runtime_pack,
 };
 use crate::{NativeExecutionSupervisor, PairingCredentialState};
 use std::path::PathBuf;
@@ -4591,6 +4591,28 @@ async fn session_start_uses_request_execution_target() {
         session.execution_target,
         Some(openasr_core::ExecutionTarget::Cpu)
     );
+}
+
+#[test]
+fn realtime_preference_reads_openasr_device_without_config() {
+    let _lock = crate::openasr_device_env_test_lock();
+    let _guard = EnvVarGuard::set(OPENASR_DEVICE_ENV, "vulkan:amd-radeon-rx-7900-xtx");
+    let home = tempfile::tempdir().unwrap();
+    assert_eq!(
+        realtime_execution_target_preference(home.path()).unwrap(),
+        openasr_core::ExecutionTarget::Device("vulkan:amd-radeon-rx-7900-xtx".to_string())
+    );
+}
+
+#[test]
+fn realtime_preference_rejects_invalid_openasr_device_without_config() {
+    let _lock = crate::openasr_device_env_test_lock();
+    let _guard = EnvVarGuard::set(OPENASR_DEVICE_ENV, "not a device");
+    let home = tempfile::tempdir().unwrap();
+    let error = realtime_execution_target_preference(home.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Unsupported execution_target"), "{error}");
 }
 
 #[tokio::test]

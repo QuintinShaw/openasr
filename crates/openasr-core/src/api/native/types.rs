@@ -331,6 +331,9 @@ pub struct NativeAsrRequestOptions {
     /// see `TranscriptionRequest::word_timestamps_refine`. Offline-only:
     /// streaming sessions never consult this field.
     pub word_timestamps_refine: bool,
+    /// Public execution target, including a physical GPU id. When set, native
+    /// streaming uses Exact pin instead of the coarse hardware target.
+    pub execution_target: Option<crate::ExecutionTarget>,
 }
 
 impl NativeAsrRequestOptions {
@@ -395,6 +398,14 @@ impl NativeAsrRequestOptions {
 
     pub fn with_word_timestamps_refine(mut self, word_timestamps_refine: bool) -> Self {
         self.word_timestamps_refine = word_timestamps_refine;
+        self
+    }
+
+    pub fn with_execution_target(
+        mut self,
+        execution_target: Option<crate::ExecutionTarget>,
+    ) -> Self {
+        self.execution_target = execution_target;
         self
     }
 }
