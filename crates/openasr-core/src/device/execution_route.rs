@@ -9,8 +9,7 @@
 //! - [`ResolvedExecutionRoute`] = logical `(provider, stable_id)` plus optional
 //!   [`PhysicalResourceKey`] (PCI BDF when ggml supplies `device_id`)
 //! - Exact resolution is typed fail-closed: no silent card swap, no CPU fallback
-//! - Metal devices are enumerable but [`DeviceAddressability::NotExactlyAddressable`]
-//!   because ggml Metal still initializes via `MTLCreateSystemDefaultDevice` only
+//! - Metal Exact is available by public/stable GPU id; Metal has no PCI/UUID identity
 //! - Admission capacity stays **per physical device** through the device-memory
 //!   broker. Route identity also feeds the unified execution-lane key used by
 //!   every resident backend owner and serve-batch engine. Content-only prepared
@@ -507,8 +506,7 @@ fn addressability_for_device(
 ) -> DeviceAddressability {
     match provider {
         ExecutionProvider::Metal => DeviceAddressability::NotExactlyAddressable {
-            reason: "Metal initializes via MTLCreateSystemDefaultDevice only; \
-                     exact multi-device selection is not available",
+            reason: "Metal has no PCI/UUID identity; Exact pin uses the public GPU id",
         },
         ExecutionProvider::Cpu => DeviceAddressability::NotExactlyAddressable {
             reason: "CPU is selected by the coarse cpu target, not by Exact device pin",

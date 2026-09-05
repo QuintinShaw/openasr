@@ -2454,12 +2454,53 @@ pub(crate) fn parse_inference_threads_field(raw: &str) -> Result<u16, ApiError> 
 
 pub(crate) const OPENASR_DEVICE_ENV: &str = "OPENASR_DEVICE";
 
+/// Process-global `OPENASR_DEVICE` isolation for tests that read or write it.
 #[cfg(test)]
-pub(crate) fn openasr_device_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+pub(crate) struct OpenasrDeviceEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: Option<String>,
+}
+
+#[cfg(test)]
+impl OpenasrDeviceEnvGuard {
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn set(value: &str) -> Self {
+        let lock = Self::lock();
+        let previous = std::env::var(OPENASR_DEVICE_ENV).ok();
+        unsafe { std::env::set_var(OPENASR_DEVICE_ENV, value) };
+        Self {
+            _lock: lock,
+            previous,
+        }
+    }
+
+    pub(crate) fn unset() -> Self {
+        let lock = Self::lock();
+        let previous = std::env::var(OPENASR_DEVICE_ENV).ok();
+        unsafe { std::env::remove_var(OPENASR_DEVICE_ENV) };
+        Self {
+            _lock: lock,
+            previous,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for OpenasrDeviceEnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(OPENASR_DEVICE_ENV, value),
+                None => std::env::remove_var(OPENASR_DEVICE_ENV),
+            }
+        }
+    }
 }
 
 pub(crate) fn parse_execution_target_field(raw: &str) -> Result<ExecutionTarget, ApiError> {

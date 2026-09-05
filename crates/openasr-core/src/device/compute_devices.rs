@@ -46,9 +46,7 @@ pub struct ComputeDevice {
     pub provider: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<String>,
-    /// Physical GPU rows only. Absent on the coarse `auto`/`cpu`/`accelerated`
-    /// rows so those objects stay byte-identical to the pre-physical-GPU
-    /// contract.
+    /// Present on physical GPU rows. Omitted on coarse auto/cpu/accelerated rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_total_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]

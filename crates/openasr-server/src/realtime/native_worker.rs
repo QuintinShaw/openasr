@@ -1422,15 +1422,8 @@ async fn warm_up_native_pack(
         }
         None => context,
     };
-    // Same saved-preferences fallback a real WS attach applies when a session
-    // does not set an explicit `execution_target`/`inference_threads`
-    // override (`realtime_execution_target_preference` /
-    // `realtime_inference_threads_preference` in `realtime/mod.rs`), so a
-    // user who changed their default hardware target or thread count still
-    // gets a worker warmed at the key their next attach will actually use.
-    // `openasr_home()` resolution failing here (unreadable env, race) just
-    // means "no preference found" -- same graceful fallback to defaults the
-    // request-time paths use.
+    // Same serve-level target as an unscoped WS attach, including
+    // OPENASR_DEVICE. Invalid OPENASR_DEVICE fail-closed.
     let options = NativeAsrRequestOptions::new()
         .with_inference_threads(inference_threads)
         .with_execution_target(Some(execution_target_preference.clone()));

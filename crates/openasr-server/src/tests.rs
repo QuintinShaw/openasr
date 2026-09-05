@@ -1562,6 +1562,7 @@ async fn default_model_response_reports_installed_not_installed_and_unset() {
 
 #[test]
 fn transcription_preferences_fill_missing_thread_request_only() {
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let preferences = Preferences {
         inference_threads: Some(6),
         voice_id_segmenter: openasr_core::config::VoiceIdSegmenterPreference::Segmentation3_0,
@@ -1586,32 +1587,8 @@ fn transcription_preferences_fill_missing_thread_request_only() {
     assert_eq!(request.inference_threads, Some(2));
 }
 
-struct OpenasrDeviceEnvGuard {
-    previous: Option<String>,
-}
-
-impl OpenasrDeviceEnvGuard {
-    fn set(value: &str) -> Self {
-        let previous = std::env::var(OPENASR_DEVICE_ENV).ok();
-        unsafe { std::env::set_var(OPENASR_DEVICE_ENV, value) };
-        Self { previous }
-    }
-}
-
-impl Drop for OpenasrDeviceEnvGuard {
-    fn drop(&mut self) {
-        unsafe {
-            match self.previous.take() {
-                Some(value) => std::env::set_var(OPENASR_DEVICE_ENV, value),
-                None => std::env::remove_var(OPENASR_DEVICE_ENV),
-            }
-        }
-    }
-}
-
 #[test]
 fn openasr_device_applies_when_preferences_are_absent() {
-    let _lock = openasr_device_env_test_lock();
     let _guard = OpenasrDeviceEnvGuard::set("vulkan:amd-radeon-rx-7900-xtx");
     let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo");
     apply_transcription_preferences(&mut request, None).unwrap();
@@ -1625,7 +1602,6 @@ fn openasr_device_applies_when_preferences_are_absent() {
 
 #[test]
 fn openasr_device_overrides_saved_execution_target() {
-    let _lock = openasr_device_env_test_lock();
     let _guard = OpenasrDeviceEnvGuard::set("vulkan:amd-radeon-rx-7900-xtx");
     let preferences = Preferences {
         execution_target: ExecutionTarget::Cpu,
@@ -1643,7 +1619,6 @@ fn openasr_device_overrides_saved_execution_target() {
 
 #[test]
 fn request_execution_target_wins_over_openasr_device() {
-    let _lock = openasr_device_env_test_lock();
     let _guard = OpenasrDeviceEnvGuard::set("vulkan:amd-radeon-rx-7900-xtx");
     let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo")
         .with_execution_target(Some(ExecutionTarget::Cpu));
@@ -1653,7 +1628,6 @@ fn request_execution_target_wins_over_openasr_device() {
 
 #[test]
 fn invalid_openasr_device_is_bad_request_without_preferences() {
-    let _lock = openasr_device_env_test_lock();
     let _guard = OpenasrDeviceEnvGuard::set("not a device");
     let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo");
     let error = apply_transcription_preferences(&mut request, None)
@@ -3465,6 +3439,7 @@ async fn rt377_session_start_claims_id(
     home: &std::path::Path,
     model_id: &str,
 ) -> bool {
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel(8);
     let mut session = realtime::WsSession::new(
         runtime,

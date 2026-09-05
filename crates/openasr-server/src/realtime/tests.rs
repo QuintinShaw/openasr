@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::routes::transcription::{
-    OPENASR_DEVICE_ENV, resolve_execution_route_for_target, validate_native_runtime_pack,
+    resolve_execution_route_for_target, validate_native_runtime_pack,
 };
 use crate::{NativeExecutionSupervisor, PairingCredentialState};
 use std::path::PathBuf;
@@ -58,6 +58,10 @@ impl Drop for EnvVarGuard {
             None => unsafe { std::env::remove_var(self.key) },
         }
     }
+}
+
+fn isolate_openasr_device() -> crate::OpenasrDeviceEnvGuard {
+    crate::OpenasrDeviceEnvGuard::unset()
 }
 
 fn test_native_streaming_worker_key(name: &str) -> NativeStreamingWorkerKey {
@@ -2289,6 +2293,7 @@ async fn unsupported_legacy_stop_and_flush_controls_fail_closed() {
 
 #[tokio::test]
 async fn session_start_rejects_removed_translation_and_unknown_configuration_fields() {
+    let _openasr_device = isolate_openasr_device();
     for unknown_field in [
         r#""translation":{"target_language":"en"}"#,
         r#""future_session_option":true"#,
@@ -2459,6 +2464,7 @@ async fn native_streaming_warm_up_keeps_audio_admission_closed_until_ready() {
 
 #[tokio::test]
 async fn session_start_waits_for_native_warm_without_publishing_lifecycle() {
+    let _openasr_device = isolate_openasr_device();
     let temp = tempfile::tempdir().unwrap();
     let model_id = "moonshine-readiness-barrier-test";
     let pack_path = temp.path().join("moonshine-readiness-barrier-test.oasr");
@@ -3433,6 +3439,7 @@ async fn native_streaming_poll_uses_raw_speech_before_vad_start_debounce() {
 #[tokio::test]
 #[ignore = "requires OPENASR_NATIVE_STREAMING_SMOKE_PACK and OPENASR_NATIVE_STREAMING_SMOKE_WAV"]
 async fn native_realtime_server_smoke_with_real_qwen_pack() {
+    let _openasr_device = isolate_openasr_device();
     let pack_path = required_env_path("OPENASR_NATIVE_STREAMING_SMOKE_PACK");
     let wav_path = required_env_path("OPENASR_NATIVE_STREAMING_SMOKE_WAV");
     let max_ms = std::env::var("OPENASR_NATIVE_STREAMING_SMOKE_MAX_MS")
@@ -3801,6 +3808,7 @@ async fn native_streaming_finish_forwards_final_and_records_history() {
 
 #[tokio::test]
 async fn websocket_session_emits_capabilities_before_start_with_monotonic_sequence() {
+    let _openasr_device = isolate_openasr_device();
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
 
@@ -4159,6 +4167,7 @@ async fn fallback_capacity_rejection_is_backend_not_ready_and_recoverable() {
 
 #[tokio::test]
 async fn finish_transport_closed_holds_session_for_reconnect_grace() {
+    let _openasr_device = isolate_openasr_device();
     let runtime = ServerRuntime::default();
     runtime
         .native_execution
@@ -4225,6 +4234,7 @@ async fn finish_transport_closed_holds_session_for_reconnect_grace() {
 
 #[tokio::test]
 async fn held_realtime_resume_rejects_a_different_device() {
+    let _openasr_device = isolate_openasr_device();
     let runtime = ServerRuntime::default();
     runtime
         .native_execution
@@ -4335,6 +4345,7 @@ async fn held_realtime_session_cancels_after_reconnect_grace() {
 
 #[tokio::test]
 async fn session_start_rejects_realtime_hotwords_instead_of_ignoring_them() {
+    let _openasr_device = isolate_openasr_device();
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
 
@@ -4362,6 +4373,7 @@ async fn session_start_rejects_realtime_hotwords_instead_of_ignoring_them() {
 
 #[tokio::test]
 async fn session_start_rejects_xasr_hotwords_from_active_native_capabilities() {
+    let _openasr_device = isolate_openasr_device();
     let temp = tempfile::tempdir().unwrap();
     let model_id = "xasr-zipformer-test";
     let pack_path = temp.path().join("xasr-zipformer-test.oasr");
@@ -4405,6 +4417,7 @@ async fn session_start_rejects_xasr_hotwords_from_active_native_capabilities() {
 
 #[tokio::test]
 async fn session_start_accepts_hotwords_for_supporting_native_model() {
+    let _openasr_device = isolate_openasr_device();
     let temp = tempfile::tempdir().unwrap();
     let model_id = "moonshine-hotword-test";
     let pack_path = temp.path().join("moonshine-hotword-test.oasr");
@@ -4448,6 +4461,7 @@ async fn session_start_accepts_hotwords_for_supporting_native_model() {
 
 #[tokio::test]
 async fn local_native_streaming_session_rejects_enrolled_voice_id() {
+    let _openasr_device = isolate_openasr_device();
     let temp = tempfile::tempdir().unwrap();
     let model_id = "qwen3-asr-0.6b";
     let pack_path = temp.path().join("qwen3-asr-0.6b.oasr");
@@ -4485,6 +4499,7 @@ async fn local_native_streaming_session_rejects_enrolled_voice_id() {
 
 #[tokio::test]
 async fn remote_compute_session_allows_anonymous_diarize_without_voice_id() {
+    let _openasr_device = isolate_openasr_device();
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new_with_history(
         ServerRuntime::default(),
@@ -4532,6 +4547,7 @@ async fn remote_compute_session_allows_anonymous_diarize_without_voice_id() {
 
 #[tokio::test]
 async fn session_start_without_diarize_keeps_sessions_anonymous() {
+    let _openasr_device = isolate_openasr_device();
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
 
@@ -4558,6 +4574,7 @@ async fn session_start_without_diarize_keeps_sessions_anonymous() {
 
 #[tokio::test]
 async fn session_start_uses_request_inference_threads() {
+    let _openasr_device = isolate_openasr_device();
     let (event_sender, _event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
 
@@ -4575,6 +4592,7 @@ async fn session_start_uses_request_inference_threads() {
 
 #[tokio::test]
 async fn session_start_uses_request_execution_target() {
+    let _openasr_device = isolate_openasr_device();
     let (event_sender, _event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
 
@@ -4595,8 +4613,7 @@ async fn session_start_uses_request_execution_target() {
 
 #[test]
 fn realtime_preference_reads_openasr_device_without_config() {
-    let _lock = crate::openasr_device_env_test_lock();
-    let _guard = EnvVarGuard::set(OPENASR_DEVICE_ENV, "vulkan:amd-radeon-rx-7900-xtx");
+    let _guard = crate::OpenasrDeviceEnvGuard::set("vulkan:amd-radeon-rx-7900-xtx");
     let home = tempfile::tempdir().unwrap();
     assert_eq!(
         realtime_execution_target_preference(home.path()).unwrap(),
@@ -4606,8 +4623,7 @@ fn realtime_preference_reads_openasr_device_without_config() {
 
 #[test]
 fn realtime_preference_rejects_invalid_openasr_device_without_config() {
-    let _lock = crate::openasr_device_env_test_lock();
-    let _guard = EnvVarGuard::set(OPENASR_DEVICE_ENV, "not a device");
+    let _guard = crate::OpenasrDeviceEnvGuard::set("not a device");
     let home = tempfile::tempdir().unwrap();
     let error = realtime_execution_target_preference(home.path())
         .unwrap_err()
@@ -4617,6 +4633,7 @@ fn realtime_preference_rejects_invalid_openasr_device_without_config() {
 
 #[tokio::test]
 async fn remote_compute_session_ignores_client_hardware_fields() {
+    let _openasr_device = isolate_openasr_device();
     let (event_sender, _event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new_with_remote_identity(
         ServerRuntime::default(),
@@ -4661,6 +4678,7 @@ fn realtime_session_ids_are_unguessable() {
 
 #[tokio::test]
 async fn session_start_rejects_invalid_inference_threads() {
+    let _openasr_device = isolate_openasr_device();
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
 
@@ -7603,6 +7621,7 @@ async fn firered_llm_owner_attribution_host_local_phase0() {
 /// controller is installed. Otherwise Y: session starts while a switch waits.
 #[tokio::test]
 async fn ssot_13_pending_idle_switch_rejects_realtime_and_operator_local() {
+    let _openasr_device = isolate_openasr_device();
     let runtime = ServerRuntime::default();
     runtime
         .native_execution
@@ -7650,6 +7669,7 @@ async fn ssot_13_pending_idle_switch_rejects_realtime_and_operator_local() {
 /// succeeds or waits.
 #[tokio::test]
 async fn ssot_10_busy_realtime_live_dictation_meeting_fail_immediately() {
+    let _openasr_device = isolate_openasr_device();
     let runtime = ServerRuntime::default();
     runtime.native_execution.remote_policy().hold_realtime(
         "rt_ws_occupied",
@@ -7696,6 +7716,7 @@ async fn ssot_10_busy_realtime_live_dictation_meeting_fail_immediately() {
 /// built. Otherwise Y: streaming_diarizer is constructed and labels SPEAKER_00.
 #[tokio::test]
 async fn ssot_7_dictation_session_rejects_anonymous_speakers() {
+    let _openasr_device = isolate_openasr_device();
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new_with_remote_identity(
         ServerRuntime::default(),
@@ -7734,6 +7755,7 @@ async fn ssot_7_dictation_session_rejects_anonymous_speakers() {
 /// the fail-closed exception; a blanket diarize rejection would break this.
 #[tokio::test]
 async fn live_and_meeting_sessions_accept_anonymous_speakers() {
+    let _openasr_device = isolate_openasr_device();
     for source_name in ["Live", "Meeting"] {
         let (event_sender, _event_receiver) = mpsc::channel(8);
         let mut session = WsSession::new_with_remote_identity(
@@ -7767,6 +7789,7 @@ async fn live_and_meeting_sessions_accept_anonymous_speakers() {
 
 #[tokio::test]
 async fn dictation_speaker_refusal_names_dictation() {
+    let _openasr_device = isolate_openasr_device();
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new_with_remote_identity(
         ServerRuntime::default(),
@@ -7806,6 +7829,7 @@ async fn dictation_speaker_refusal_names_dictation() {
 /// leave a held slot that blocks later work.
 #[tokio::test]
 async fn ssot_23_held_realtime_second_device_and_decode_error_do_not_leak() {
+    let _openasr_device = isolate_openasr_device();
     let runtime = ServerRuntime::default();
     runtime
         .native_execution

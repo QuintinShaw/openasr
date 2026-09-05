@@ -15,8 +15,6 @@ export type ComputeDevice = { id: string, name: string, meta: string, kind: stri
  */
 provider: string, memory: string | null,
 /**
- * Physical GPU rows only. Absent on the coarse `auto`/`cpu`/`accelerated`
- * rows so those objects stay byte-identical to the pre-physical-GPU
- * contract.
+ * Present on physical GPU rows. Omitted on coarse auto/cpu/accelerated rows.
  */
 memory_total_bytes: number | null, memory_free_bytes: number | null, selectable: boolean | null, };
