@@ -592,7 +592,14 @@ where
 /// `process_into_buffer` is what `process()` itself calls internally after
 /// allocating its buffers (see `Resampler::process` in rubato); only the
 /// buffer lifetime moved from per-chunk to per-call.
+///
+/// Non-finite samples (NaN, +/-inf) are refused up front: rubato's
+/// `FftFixedIn` `unwrap`s inside its IFFT on them and would abort the whole
+/// process on a single corrupt decoded frame.
 fn resample_mono_to_16k(input: &[f32], input_rate: u32) -> Option<Vec<f32>> {
+    if input.iter().any(|sample| !sample.is_finite()) {
+        return None;
+    }
     let mut resampler = FftFixedIn::<f32>::new(
         input_rate as usize,
         TARGET_SAMPLE_RATE_HZ as usize,
@@ -775,14 +782,18 @@ mod tests {
     }
 
     /// Shrunk from `audio_resample_mono_to_16k_random_payload_does_not_panic`:
-    /// `rate=8000`, `len=1`, `head=[-inf]`. `resample_mono_to_16k` feeds
-    /// rubato `FftFixedIn`, whose IFFT path `unwrap`s
-    /// `Err(Imaginary part of first value was non-zero)` on a non-finite
-    /// sample. Production is unchanged here; un-ignore after fail-closing.
+    /// `rate=8000`, `len=1`, `head=[-inf]`. rubato `FftFixedIn`'s IFFT path
+    /// `unwrap`s `Err(Imaginary part of first value was non-zero)` on a
+    /// non-finite sample, so the resampler must refuse such input before
+    /// handing it over instead of aborting the process.
     #[test]
-    #[ignore = "rubato FftFixedIn panics on non-finite samples; expected until resample_mono_to_16k fail-closes"]
-    fn audio_resample_mono_to_16k_neg_infinity_one_sample_panics() {
-        let _ = resample_mono_to_16k(&[f32::NEG_INFINITY], 8_000);
+    fn audio_resample_mono_to_16k_refuses_non_finite_samples() {
+        assert!(resample_mono_to_16k(&[f32::NEG_INFINITY], 8_000).is_none());
+        assert!(resample_mono_to_16k(&[0.0, f32::NAN, 0.0], 48_000).is_none());
+        let mut long = vec![0.25f32; RESAMPLE_CHUNK_FRAMES * 3 + 7];
+        long[RESAMPLE_CHUNK_FRAMES + 1] = f32::INFINITY;
+        assert!(resample_mono_to_16k(&long, 44_100).is_none());
+        assert!(resample_mono_to_16k(&[0.0, 0.5, -0.5], 8_000).is_some());
     }
 
     proptest::proptest! {
