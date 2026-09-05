@@ -9,6 +9,9 @@ repository.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
 [features]
 ## Loopback TLS+pairing fixture for dependent crates' integration tests.
 ## Not a product API; do not enable in release builds.
