@@ -21,8 +21,9 @@ use thiserror::Error;
 
 use crate::ggml_runtime::{GgmlBackendDevice, GgmlBackendKind};
 
-/// Backend provider family for route identity. Distinct from the public coarse
-/// [`crate::ExecutionTarget`] surface (`auto` / `cpu` / `accelerated`).
+/// Backend provider family for route identity. Distinct from the public
+/// [`crate::ExecutionTarget`] surface (`auto` / `cpu` / `accelerated` / a
+/// physical GPU id from `GET /v1/devices`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum ExecutionProvider {
     Cpu,
@@ -1063,6 +1064,41 @@ mod tests {
         )
         .expect_err("metal has no PCI key");
         assert!(matches!(error, ExecutionRouteError::DeviceNotFound { .. }));
+    }
+
+    #[test]
+    fn metal_exact_by_public_id_pins_the_enumerated_device() {
+        let inventory = vec![
+            fake_device(0, "CPU", GgmlBackendKind::Cpu, None),
+            described_gpu(1, "Metal", "Apple M1", GgmlBackendKind::Gpu, None),
+        ];
+        let route = resolve_execution_route(
+            &ExecutionRouteRequest::Exact(ExactDeviceSelector::PublicId(
+                "metal:apple-m1".to_string(),
+            )),
+            &inventory,
+        )
+        .expect("metal public id exact");
+        assert_eq!(route.provider, ExecutionProvider::Metal);
+        assert_eq!(route.stable_id, "Metal");
+    }
+
+    #[test]
+    fn metal_public_id_miss_lists_metal_id() {
+        let inventory = vec![
+            fake_device(0, "CPU", GgmlBackendKind::Cpu, None),
+            described_gpu(1, "Metal", "Apple M1", GgmlBackendKind::Gpu, None),
+        ];
+        let error = resolve_execution_route(
+            &ExecutionRouteRequest::Exact(ExactDeviceSelector::PublicId(
+                "metal:missing-card".to_string(),
+            )),
+            &inventory,
+        )
+        .expect_err("missing metal public id");
+        let message = error.to_string();
+        assert!(matches!(error, ExecutionRouteError::DeviceNotFound { .. }));
+        assert!(message.contains("metal:apple-m1"), "{message}");
     }
 
     #[test]

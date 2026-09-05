@@ -1422,8 +1422,7 @@ async fn warm_up_native_pack(
         }
         None => context,
     };
-    // Same serve-level target as an unscoped WS attach, including
-    // OPENASR_DEVICE. Invalid OPENASR_DEVICE fail-closed.
+    // Warm the same worker key an unscoped WS attach will use.
     let options = NativeAsrRequestOptions::new()
         .with_inference_threads(inference_threads)
         .with_execution_target(Some(execution_target_preference.clone()));

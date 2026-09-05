@@ -64,7 +64,7 @@ pub(crate) struct AlignCliArgs {
     /// Path to an existing ffmpeg binary for preparing recognized non-WAV inputs.
     #[arg(long)]
     pub(crate) ffmpeg_bin: Option<PathBuf>,
-    /// Hardware target: auto, cpu, or accelerated, or a physical GPU id from /v1/devices.
+    /// Hardware target: auto, cpu, accelerated, or a physical GPU id from GET /v1/devices.
     #[arg(long, value_name = "TARGET")]
     pub(crate) execution_target: Option<String>,
     /// Strip per-word arrays from the JSON result (segment/cue times stay).

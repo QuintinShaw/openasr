@@ -2128,6 +2128,7 @@ async fn set_default_model_http_returns_conflict_when_native_session_is_busy() {
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
 
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -2235,6 +2236,7 @@ async fn set_default_model_http_keeps_previous_selection_when_activation_probe_f
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
 
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -2454,6 +2456,7 @@ async fn set_default_model_http_keeps_previous_selection_when_persist_fails() {
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
 
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -2542,6 +2545,7 @@ async fn set_default_model_failure_matrix_preserves_precommit_state() {
     use axum::body::Body;
     use tower::ServiceExt;
 
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -2830,6 +2834,7 @@ async fn set_default_model_http_persists_only_after_activation_probe_succeeds() 
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
 
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -2912,6 +2917,7 @@ async fn set_default_model_http_real_probe_attests_plan_lane_and_live_backend() 
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
 
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
