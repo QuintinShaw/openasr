@@ -4611,6 +4611,48 @@ async fn session_start_uses_request_execution_target() {
     );
 }
 
+#[tokio::test]
+async fn session_start_request_execution_target_wins_over_openasr_device() {
+    let _guard = crate::OpenasrDeviceEnvGuard::set("vulkan:amd-radeon-rx-7900-xtx");
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+
+    session
+        .start_session(StartSession {
+            model: Some("whisper-large-v3-turbo".to_string()),
+            execution_target: Some(openasr_core::ExecutionTarget::Cpu),
+            ..StartSession::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        session.execution_target,
+        Some(openasr_core::ExecutionTarget::Cpu)
+    );
+}
+
+#[tokio::test]
+async fn session_start_request_execution_target_wins_over_invalid_openasr_device() {
+    let _guard = crate::OpenasrDeviceEnvGuard::set("not a device");
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+
+    session
+        .start_session(StartSession {
+            model: Some("whisper-large-v3-turbo".to_string()),
+            execution_target: Some(openasr_core::ExecutionTarget::Cpu),
+            ..StartSession::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        session.execution_target,
+        Some(openasr_core::ExecutionTarget::Cpu)
+    );
+}
+
 #[test]
 fn realtime_preference_reads_openasr_device_without_config() {
     let _guard = crate::OpenasrDeviceEnvGuard::set("vulkan:amd-radeon-rx-7900-xtx");

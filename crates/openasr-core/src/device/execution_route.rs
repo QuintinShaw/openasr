@@ -123,7 +123,8 @@ pub enum DeviceAddressability {
     ExactlyAddressable {
         physical_key: PhysicalResourceKey,
     },
-    /// Device is usable via Auto/Accelerated, but Exact pin is refused.
+    /// No PCI/UUID identity. Public-id and stable-id Exact may still pin this
+    /// device; physical-key Exact is refused.
     NotExactlyAddressable {
         reason: &'static str,
     },
@@ -301,6 +302,23 @@ pub enum ExactDeviceSelector {
     /// Public stable id (`vulkan:amd-radeon-rx-7900-xtx`). Never a VulkanN
     /// ordinal: those change across runs.
     PublicId(String),
+}
+
+impl fmt::Display for ExactDeviceSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PhysicalKey(key) => write!(f, "{key}"),
+            Self::StableId {
+                provider: Some(provider),
+                stable_id,
+            } => write!(f, "{provider}:{stable_id}"),
+            Self::StableId {
+                provider: None,
+                stable_id,
+            } => f.write_str(stable_id),
+            Self::PublicId(id) => f.write_str(id),
+        }
+    }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -656,7 +674,7 @@ fn resolve_exact_route(
 
     match matches.as_slice() {
         [] => Err(ExecutionRouteError::device_not_found(format!(
-            "execution_target selector={selector:?} was not found. Available devices: {}",
+            "execution_target {selector} was not found. Available devices: {}",
             available_execution_target_list(inventory)
         ))),
         [device] => {
@@ -707,7 +725,7 @@ fn resolve_exact_route(
             Ok(device.to_resolved_route())
         }
         many => Err(ExecutionRouteError::device_not_found(format!(
-            "selector={selector:?} matched {} devices (ordinals {}); Exact requires a unique target. Available devices: {}",
+            "execution_target {selector} matched {} devices (ordinals {}); Exact requires a unique target. Available devices: {}",
             many.len(),
             many.iter()
                 .map(|device| device.registry_ordinal.to_string())
@@ -1398,6 +1416,8 @@ mod tests {
         .expect_err("missing public id");
         let message = error.to_string();
         assert!(matches!(error, ExecutionRouteError::DeviceNotFound { .. }));
+        assert!(message.contains("vulkan:missing-card"), "{message}");
+        assert!(!message.contains("PublicId("), "{message}");
         assert!(
             message.contains("vulkan:amd-radeon-rx-7900-xtx"),
             "{message}"

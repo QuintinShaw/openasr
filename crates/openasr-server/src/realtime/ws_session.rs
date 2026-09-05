@@ -1011,31 +1011,27 @@ impl WsSession {
                 .await?;
             return Err(());
         }
-        let default_execution_target = match self.distribution.openasr_home() {
-            Ok(home) => realtime_execution_target_preference(&home),
-            Err(_) => crate::resolve_serve_execution_target(None),
-        };
-        let default_execution_target = match default_execution_target {
-            Ok(target) => target,
-            Err(error) => {
-                self.emit_error(
-                    RealtimeErrorCode::StartupConfigError,
-                    &error.to_string(),
-                    false,
-                )
-                .await?;
-                return Err(());
+        let execution_target = match (self.remote_compute_client, session.execution_target.clone())
+        {
+            (false, Some(target)) => Some(target),
+            (_, _) => {
+                let default = match self.distribution.openasr_home() {
+                    Ok(home) => realtime_execution_target_preference(&home),
+                    Err(_) => crate::resolve_serve_execution_target(None),
+                };
+                match default {
+                    Ok(target) => Some(target),
+                    Err(error) => {
+                        self.emit_error(
+                            RealtimeErrorCode::StartupConfigError,
+                            &error.to_string(),
+                            false,
+                        )
+                        .await?;
+                        return Err(());
+                    }
+                }
             }
-        };
-        let execution_target = if self.remote_compute_client {
-            Some(default_execution_target)
-        } else {
-            Some(
-                session
-                    .execution_target
-                    .clone()
-                    .unwrap_or(default_execution_target),
-            )
         };
         let phrase_bias = match build_realtime_phrase_bias_config(&session) {
             Ok(phrase_bias) => phrase_bias,
