@@ -622,13 +622,14 @@ fn parse_execution_target_field_accepts_supported_targets() {
         parse_execution_target_field("accelerated").unwrap(),
         ExecutionTarget::Accelerated
     );
-    let error = parse_execution_target_field("gpu0")
+    assert_eq!(
+        parse_execution_target_field("vulkan:amd-radeon-rx-7900-xtx").unwrap(),
+        ExecutionTarget::Device("vulkan:amd-radeon-rx-7900-xtx".to_string())
+    );
+    let error = parse_execution_target_field("not a device")
         .unwrap_err()
         .to_string();
-    assert!(
-        error.contains("Unsupported execution_target 'gpu0'"),
-        "{error}"
-    );
+    assert!(error.contains("Unsupported execution_target"), "{error}");
 }
 
 #[test]
@@ -647,6 +648,12 @@ fn native_execution_target_mapping_preserves_server_request_semantics() {
     );
     assert_eq!(
         native_hardware_target_from_execution_target(Some(ExecutionTarget::Accelerated)),
+        NativeAsrHardwareTarget::Accelerated
+    );
+    assert_eq!(
+        native_hardware_target_from_execution_target(Some(ExecutionTarget::Device(
+            "vulkan:amd-radeon-rx-7900-xtx".to_string()
+        ))),
         NativeAsrHardwareTarget::Accelerated
     );
 }
@@ -1563,7 +1570,7 @@ fn transcription_preferences_fill_missing_thread_request_only() {
     };
     let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo");
 
-    apply_transcription_preferences(&mut request, &preferences);
+    apply_transcription_preferences(&mut request, &preferences).unwrap();
     assert_eq!(request.inference_threads, Some(6));
     assert_eq!(
         request.voice_id_segmenter,
@@ -1575,7 +1582,7 @@ fn transcription_preferences_fill_missing_thread_request_only() {
     );
 
     request.inference_threads = Some(2);
-    apply_transcription_preferences(&mut request, &preferences);
+    apply_transcription_preferences(&mut request, &preferences).unwrap();
     assert_eq!(request.inference_threads, Some(2));
 }
 

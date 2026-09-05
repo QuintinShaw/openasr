@@ -1389,7 +1389,7 @@ async fn warm_up_native_pack(
         .as_deref()
         .and_then(realtime_execution_target_preference);
     let resolved_route = crate::routes::transcription::resolve_execution_route_for_target(
-        execution_target_preference,
+        execution_target_preference.clone(),
     )
     .ok()
     .flatten();

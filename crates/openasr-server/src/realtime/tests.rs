@@ -7420,7 +7420,7 @@ async fn firered_llm_owner_attribution_host_local_phase0() {
     } else {
         openasr_core::ExecutionTarget::Accelerated
     };
-    let route = resolve_execution_route_for_target(Some(target))
+    let route = resolve_execution_route_for_target(Some(target.clone()))
         .expect("explicit target route resolution must not fail");
     if target == openasr_core::ExecutionTarget::Accelerated && route.is_none() {
         eprintln!("SKIP: requested accelerated provider is unavailable on this host");
@@ -7455,7 +7455,7 @@ async fn firered_llm_owner_attribution_host_local_phase0() {
     let _home_guard = EnvVarGuard::set("OPENASR_HOME", &home_path);
     let _backend_guard = EnvVarGuard::set("OPENASR_GGML_BACKEND", &requested_backend);
     let mut preferences = openasr_core::config::load_config_document(&home_path).unwrap();
-    preferences.preferences.execution_target = target;
+    preferences.preferences.execution_target = target.clone();
     openasr_core::config::save_config_document(&home_path, &preferences).unwrap();
 
     let services = std::sync::Arc::new(
@@ -7493,7 +7493,7 @@ async fn firered_llm_owner_attribution_host_local_phase0() {
     let mut request =
         openasr_core::TranscriptionRequest::new(audio_path, identity.model_id.clone());
     request.model_pack_path = Some(pack_path.clone());
-    request.execution_target = Some(target);
+    request.execution_target = Some(target.clone());
     let transcription = transcribe_with_runtime(
         runtime,
         request,

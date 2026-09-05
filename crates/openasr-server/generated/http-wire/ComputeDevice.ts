@@ -2,9 +2,9 @@
 
 /**
  * One selectable execution target for the UI picker, derived from the ggml
- * runtime. `id`/`kind`/`target` use the stable wire vocabulary
- * (`auto`/`cpu`/`accelerated`) the desktop `ExecutionTarget` mirrors;
- * `effective_target` is what `auto` actually resolves to on this machine.
+ * runtime. Coarse `id`/`kind`/`target` stay `auto`/`cpu`/`accelerated` for
+ * desktop compatibility; physical GPU rows use `kind: "gpu"` and a stable
+ * id. `effective_target` is what `auto` actually resolves to on this machine.
  */
 export type ComputeDevice = { id: string, name: string, meta: string, kind: string, target: string, effective_target: string,
 /**
@@ -13,4 +13,10 @@ export type ComputeDevice = { id: string, name: string, meta: string, kind: stri
  * attest that the Activated-only optional provider actually loaded instead
  * of mistaking an unactivated GPU device for activation success.
  */
-provider: string, memory: string | null, };
+provider: string, memory: string | null,
+/**
+ * Physical GPU rows only. Absent on the coarse `auto`/`cpu`/`accelerated`
+ * rows so those objects stay byte-identical to the pre-physical-GPU
+ * contract.
+ */
+memory_total_bytes: number | null, memory_free_bytes: number | null, selectable: boolean | null, };

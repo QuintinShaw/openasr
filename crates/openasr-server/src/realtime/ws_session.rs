@@ -1014,7 +1014,7 @@ impl WsSession {
         let client_execution_target = if self.remote_compute_client {
             None
         } else {
-            session.execution_target
+            session.execution_target.clone()
         };
         let execution_target = client_execution_target.or_else(|| {
             self.distribution
@@ -1084,7 +1084,7 @@ impl WsSession {
         let mut controller = match RealtimeSessionController::new_with_execution(
             config,
             Arc::clone(self.runtime.native_execution.execution_services()),
-            execution_target.unwrap_or_default(),
+            execution_target.clone().unwrap_or_default(),
         ) {
             Ok(controller) => controller,
             Err(error) => {
@@ -1254,7 +1254,7 @@ impl WsSession {
             return Err(());
         }
         let resolved_route = match crate::routes::transcription::resolve_execution_route_for_target(
-            self.execution_target,
+            self.execution_target.clone(),
         ) {
             Ok(route) => route,
             Err(error) => {
@@ -1334,7 +1334,8 @@ impl WsSession {
         let executor = NativeBackendExecutor::new(Arc::clone(
             self.runtime.native_execution.execution_services(),
         ));
-        let hardware_target = native_hardware_target_from_execution_target(self.execution_target);
+        let hardware_target =
+            native_hardware_target_from_execution_target(self.execution_target.clone());
         #[cfg(test)]
         let session_result = match self.test_native_streaming_session_factory.as_ref() {
             Some(factory) => factory(),
@@ -2644,7 +2645,7 @@ impl WsSession {
             prompt: self.prompt.clone(),
             phrase_bias: self.phrase_bias.clone(),
             inference_threads: self.inference_threads,
-            execution_target: self.execution_target,
+            execution_target: self.execution_target.clone(),
             word_timestamps: self.word_timestamps,
             display_name: "realtime-utterance.wav".to_string(),
             temp_wav,

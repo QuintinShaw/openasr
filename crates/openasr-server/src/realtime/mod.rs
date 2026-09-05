@@ -183,7 +183,7 @@ pub(crate) async fn stream_transcription(
         ));
     }
     if let Some(preferences) = super::load_transcription_preferences(&home) {
-        super::apply_transcription_preferences(&mut parsed.request, &preferences);
+        super::apply_transcription_preferences(&mut parsed.request, &preferences)?;
     }
     if let Some(task) = task_override {
         parsed.request.task = Some(task);

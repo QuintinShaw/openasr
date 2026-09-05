@@ -188,7 +188,7 @@ pub(crate) async fn transcriptions(
 ///   dual-view result
 /// - `language` (optional): ISO 639-1 or full name (`en` / `English`). Omitted
 ///   or `auto` defaults to `en`. Japanese and Korean fail closed.
-/// - `execution_target` (optional): `auto` / `cpu` / `accelerated`
+/// - `execution_target` (optional): `auto` / `cpu` / `accelerated` / a physical GPU id from `GET /v1/devices`
 /// - `response_format` (optional): `json`, `verbose_json` (default), `text`,
 ///   `srt`, `vtt`, `markdown` — SRT/VTT reuse the shared subtitle exporter
 ///
@@ -1275,7 +1275,7 @@ async fn run_offline_transcription(
         ));
     }
     if let Some(preferences) = load_transcription_preferences(&home) {
-        apply_transcription_preferences(&mut parsed.request, &preferences);
+        apply_transcription_preferences(&mut parsed.request, &preferences)?;
     }
     // The translations alias forces translate over the body/preferences.
     if let Some(task) = task_override {
@@ -2451,15 +2451,10 @@ pub(crate) fn parse_inference_threads_field(raw: &str) -> Result<u16, ApiError> 
     Ok(threads)
 }
 
+pub(crate) const OPENASR_DEVICE_ENV: &str = "OPENASR_DEVICE";
+
 pub(crate) fn parse_execution_target_field(raw: &str) -> Result<ExecutionTarget, ApiError> {
-    match raw.trim() {
-        "auto" => Ok(ExecutionTarget::Auto),
-        "cpu" => Ok(ExecutionTarget::Cpu),
-        "accelerated" => Ok(ExecutionTarget::Accelerated),
-        other => Err(ApiError::BadRequest(format!(
-            "Unsupported execution_target '{other}'. Use one of: auto, cpu, accelerated."
-        ))),
-    }
+    ExecutionTarget::parse(raw).map_err(ApiError::BadRequest)
 }
 
 // ── Preferences / longform / phrase-bias ─────────────────────────────────────
@@ -2491,14 +2486,24 @@ pub(crate) fn load_transcription_preferences(
 pub(crate) fn apply_transcription_preferences(
     request: &mut TranscriptionRequest,
     preferences: &openasr_core::config::Preferences,
-) {
+) -> Result<(), ApiError> {
     request.voice_id_segmenter = preferences.voice_id_segmenter;
     request.voice_id_embedder = preferences.voice_id_embedder;
     if request.inference_threads.is_none() {
         request.inference_threads = preferences.inference_threads;
     }
     if request.execution_target.is_none() {
-        request.execution_target = Some(preferences.execution_target);
+        request.execution_target = Some(serve_default_execution_target(preferences)?);
+    }
+    Ok(())
+}
+
+fn serve_default_execution_target(
+    preferences: &openasr_core::config::Preferences,
+) -> Result<ExecutionTarget, ApiError> {
+    match std::env::var(OPENASR_DEVICE_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => parse_execution_target_field(raw.trim()),
+        _ => Ok(preferences.execution_target.clone()),
     }
 }
 
@@ -2817,8 +2822,9 @@ pub(crate) async fn transcribe_with_runtime(
                     );
                 }
                 let prepared = prepared?;
-                let resolved_route = resolve_execution_route_for_target(request.execution_target)
-                    .map_err(ApiError::Backend)?;
+                let resolved_route =
+                    resolve_execution_route_for_target(request.execution_target.clone())
+                        .map_err(ApiError::Backend)?;
                 let model_session_key = native_model_session_key(&adapter)?;
                 let admission_wait_started = Instant::now();
                 crate::realtime::wait_while_native_warmup_in_flight_blocking();
@@ -2912,7 +2918,8 @@ pub(crate) async fn transcribe_with_runtime(
                         // engage on the server transcription path.
                         .with_serve_batch_max_native_sessions(
                             request.serve_batch_max_native_sessions,
-                        );
+                        )
+                        .with_execution_target(request.execution_target.clone());
                     let executor = NativeBackendExecutor::new(Arc::clone(
                         runtime.native_execution.execution_services(),
                     ));
@@ -2964,14 +2971,15 @@ pub(crate) fn native_hardware_target_from_execution_target(
     match target.unwrap_or_default() {
         ExecutionTarget::Auto => NativeAsrHardwareTarget::Auto,
         ExecutionTarget::Cpu => NativeAsrHardwareTarget::Cpu,
-        ExecutionTarget::Accelerated => NativeAsrHardwareTarget::Accelerated,
+        ExecutionTarget::Accelerated | ExecutionTarget::Device(_) => {
+            NativeAsrHardwareTarget::Accelerated
+        }
     }
 }
 
 /// Resolve the request-level execution route used for admission / worker
-/// isolation. Public surfaces still only accept auto/cpu/accelerated; this
-/// maps those coarse targets onto the internal route vocabulary without
-/// exposing Exact device pins yet.
+/// isolation. Coarse auto/cpu/accelerated stay ranked as before; a physical
+/// GPU id pins one enumerated device and is fail-closed on miss.
 pub(crate) fn resolve_execution_route_for_target(
     target: Option<ExecutionTarget>,
 ) -> Result<Option<openasr_core::ResolvedExecutionRoute>, openasr_core::BackendError> {
