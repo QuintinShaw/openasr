@@ -363,7 +363,8 @@ fn serve_help_documents_local_default_and_remote_security() {
         ))
         .stdout(predicate::str::contains("HTTPS/WSS"))
         .stdout(predicate::str::contains("--tls-self-signed"))
-        .stdout(predicate::str::contains("--pairing-admin-token-env"));
+        .stdout(predicate::str::contains("--pairing-admin-token-env"))
+        .stdout(predicate::str::contains("--pairing-admin-token-file"));
 }
 
 #[test]

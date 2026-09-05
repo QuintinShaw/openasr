@@ -618,6 +618,7 @@ async fn run() -> Result<()> {
             tls_self_signed,
             tls_sans,
             pairing_admin_token_env,
+            pairing_admin_token_file,
             model,
             backend,
             ffmpeg_bin,
@@ -640,6 +641,7 @@ async fn run() -> Result<()> {
                     tls_self_signed,
                     tls_sans,
                     pairing_admin_token_env,
+                    pairing_admin_token_file,
                 },
                 parent_shutdown,
             )

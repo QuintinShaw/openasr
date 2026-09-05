@@ -55,6 +55,32 @@ fn non_loopback_tls_escape_still_requires_authentication() {
     );
 }
 
+#[test]
+fn non_loopback_pairing_with_tls_is_allowed() {
+    let options = ServerLaunchOptions {
+        auth: ServerAuth::pairing("admin-token"),
+        tls: ServerTlsConfig::self_signed(["localhost"]),
+        ..Default::default()
+    };
+    validate_listen_security_with_escape("0.0.0.0:8080".parse().unwrap(), &options, false)
+        .expect("pairing + TLS must allow a non-loopback bind");
+}
+
+#[test]
+fn non_loopback_without_auth_fails_closed_even_with_tls_and_insecure_escape() {
+    let options = ServerLaunchOptions {
+        auth: ServerAuth::disabled(),
+        tls: ServerTlsConfig::self_signed(["localhost"]),
+        ..Default::default()
+    };
+    let err = validate_listen_security_with_escape("0.0.0.0:8080".parse().unwrap(), &options, true)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("requires device authentication"),
+        "unexpected error: {err:?}"
+    );
+}
+
 fn header_map_with_bearer(token: &str) -> axum::http::HeaderMap {
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(
