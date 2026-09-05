@@ -208,8 +208,9 @@ Container Toolkit and refuse to start if no GPU is visible.
 
 The default command binds `0.0.0.0:8080` with HTTPS (`--tls-self-signed`) and
 device pairing. `docker logs` prints `pairing admin token: … (saved at
-/data/pairing-admin-token)` on first start (or reuse that file across volume
-restarts). Supply your own with `-e OPENASR_PAIRING_ADMIN_TOKEN=…`. Pair from
+/data/pairing-admin-token)` when the token file is first created; later starts
+reuse that file without reprinting the secret. Supply your own with
+`-e OPENASR_PAIRING_ADMIN_TOKEN=…`. Pair from
 the desktop app, or `POST /v1/pairing/requests` then approve with
 `Authorization: Bearer <token>`. Unauthenticated `/v1/*` calls return 401;
 `GET /health` is the liveness probe. Talk to the container with `curl -k`

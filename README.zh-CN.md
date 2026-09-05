@@ -115,7 +115,7 @@ docker run --rm -d --name openasr-cuda --gpus all \
 
 默认命令在 `0.0.0.0:8080` 上启用 HTTPS（`--tls-self-signed`）和设备配对。配对完成前，未认证的 `/v1/*` 请求返回 401；`GET /health` 仍是存活探针。直连容器请用 `curl -k`，或钉住自签证书。
 
-**Token。** 首次启动时，若未设置 `OPENASR_PAIRING_ADMIN_TOKEN`，服务会生成随机 token，以仅 owner 可读写的权限写入 `/data/pairing-admin-token`，并在 stdout 打印 `pairing admin token: … (saved at /data/…)`，方便 `docker logs` 查看。自带 token 用 `-e OPENASR_PAIRING_ADMIN_TOKEN=…`。把卷挂在 `/data`，生成的 token 和配对登记才能跨重启保留。
+**Token。** 首次启动时，若未设置 `OPENASR_PAIRING_ADMIN_TOKEN`，服务会生成随机 token，以仅 owner 可读写的权限写入 `/data/pairing-admin-token`，并在首次生成时于 stdout 打印 `pairing admin token: … (saved at /data/…)`。之后启动复用该文件，不再打印明文。自带 token 用 `-e OPENASR_PAIRING_ADMIN_TOKEN=…`。把卷挂在 `/data`，生成的 token 和配对登记才能跨重启保留。
 
 **客户端配对。** 桌面端把该服务加为远程，用管理员 token 批准。走 API：`POST /v1/pairing/requests` 提交设备名，再 `POST /v1/pairing/requests/{id}/approve`，请求头 `Authorization: Bearer <token>`。之后转写用签发的设备凭证，不要继续用管理员 token。
 

@@ -36,11 +36,41 @@ jobs:
           cache-from: type=gha,scope=${{ github.sha }}
           cache-to: type=gha,mode=max,scope=${{ github.sha }},ignore-error=true
 
-      - name: Start container
-        # Mock smoke: the image default CMD is the native server, which cannot
-        # transcribe without an installed pack, so pass explicit mock args plus
-        # the same TLS + pairing flags the image default now uses.
+      - name: Start container with image default command
+        # Pins the published CMD (pairing token file + TLS). A regression to
+        # `serve --addr 0.0.0.0:8080` with no pairing would fail this step.
         # No --rm: keep the container around so `docker logs` works on failure.
+        run: |
+          docker run -d --name openasr-docker-default -p 18080:8080 openasr:ci
+
+      - name: Wait for default-command server
+        run: |
+          for _ in {1..30}; do
+            if curl -kfsS https://127.0.0.1:18080/health; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          docker inspect openasr-docker-default --format 'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' || true
+          docker logs openasr-docker-default
+          exit 1
+
+      - name: Assert default command enables pairing
+        run: |
+          docker logs openasr-docker-default 2>&1 | grep -F 'pairing admin token:'
+          docker exec openasr-docker-default test -s /data/pairing-admin-token
+          code="$(curl -kso /dev/null -w '%{http_code}' https://127.0.0.1:18080/v1/health)"
+          test "${code}" = 401
+
+      - name: Stop default-command container
+        if: always()
+        run: docker rm -f openasr-docker-default || true
+
+      - name: Start mock API container
+        # Transcription smoke needs --backend mock (no pack in the image).
+        # Pairing/TLS flags match the image default; the previous step is what
+        # actually exercises Dockerfile CMD.
         run: |
           docker run -d --name openasr-docker-smoke -p 18080:8080 \
             -e OPENASR_DOCKER_SMOKE_PAIRING_ADMIN_TOKEN \
@@ -80,6 +110,8 @@ jobs:
       - name: Check Docker Compose config
         run: docker compose -f compose.yaml config
 
-      - name: Cleanup container
+      - name: Cleanup containers
         if: always()
-        run: docker rm -f openasr-docker-smoke || true
+        run: |
+          docker rm -f openasr-docker-smoke || true
+          docker rm -f openasr-docker-default || true

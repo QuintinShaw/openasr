@@ -121,7 +121,8 @@ self-signed certificate) when talking to the container directly.
 
 **Token.** On first start, if `OPENASR_PAIRING_ADMIN_TOKEN` is unset, the server
 generates a random token, writes it owner-only to `/data/pairing-admin-token`,
-and prints `pairing admin token: … (saved at /data/…)` to stdout. Supply
+and prints `pairing admin token: … (saved at /data/…)` to stdout on that first
+generate. Later starts reuse the file and do not reprint the secret. Supply
 your own with `-e OPENASR_PAIRING_ADMIN_TOKEN=…`. Reuse a volume at `/data` so
 the generated token and pairing registry survive restarts.
 

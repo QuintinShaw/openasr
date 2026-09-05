@@ -830,7 +830,7 @@ impl Listener for TlsListener {
 /// requires device authentication, then TLS (unless the caller has explicitly
 /// set `OPENASR_ALLOW_INSECURE_NON_LOOPBACK`). The TLS escape never waives
 /// pairing.
-pub fn validate_listen_security(
+fn validate_listen_security(
     addr: SocketAddr,
     launch_options: &ServerLaunchOptions,
 ) -> anyhow::Result<()> {
