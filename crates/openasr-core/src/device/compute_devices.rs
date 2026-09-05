@@ -57,10 +57,8 @@ pub struct ComputeDevice {
 
 /// Build the canonical `Auto` + `CPU` (+ optional `Accelerated`) device list
 /// from a ggml runtime snapshot, then one `kind=gpu` row per physical GPU.
-/// `Auto` ranking is unchanged: it still resolves to the preferred accelerated
-/// backend when one is present, otherwise CPU. The accelerated entry is emitted
-/// only when the runtime reports a GPU device, so a CPU-only runtime yields
-/// exactly `Auto` + `CPU`.
+/// The accelerated entry is emitted only when the runtime reports a GPU
+/// device, so a CPU-only runtime yields exactly `Auto` + `CPU`.
 pub fn compute_devices_from_runtime(runtime: &GgmlRuntimeInfo) -> Vec<ComputeDevice> {
     let cpu_name = cpu_device_name(runtime);
     // On a hybrid-graphics host (Optimus-style: an integrated + a discrete

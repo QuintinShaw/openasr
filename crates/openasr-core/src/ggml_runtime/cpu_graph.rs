@@ -10367,7 +10367,7 @@ impl GgmlSchedulerMemoryOwner {
 /// different card. Exact never falls through.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum CachedBackendDeviceKey {
-    /// System-default Metal device (not exactly addressable).
+    /// System-default Metal device (Auto/Accelerated). Exact uses `Route`.
     Metal,
     /// Discrete / Vulkan / CUDA / HIP device keyed by resolved route identity.
     Route(ExecutionRouteCacheKey),
@@ -10726,16 +10726,9 @@ impl GgmlBackendGuard {
         super::apply_vulkan_device_local_buffer_policy();
         match request_backend_override() {
             Some(RequestBackendPreference::Exact(route)) => {
-                if route.provider == ExecutionProvider::Metal {
-                    return Err(GgmlCpuGraphError::ExecutionRoute(
-                        ExecutionRouteError::not_addressable(format!(
-                            "provider=metal stable_id={} reason=Metal is not exactly addressable",
-                            route.stable_id
-                        )),
-                    ));
-                }
                 // Exact: pin one device, fail closed on miss/init failure, key
-                // is exactly that route (no fallthrough, no key drift).
+                // is exactly that route (no fallthrough, no key drift). Metal
+                // public/stable-id Exact is allowed here the same as metal().
                 Self::cached_backend(
                     CachedBackendDeviceKey::Route(route.cache_key()),
                     move || Self::init_exact_gpu_backend(&route),
