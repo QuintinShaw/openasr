@@ -151,6 +151,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   unset) and `--tls-self-signed`. `OPENASR_ALLOW_INSECURE_NON_LOOPBACK` is no
   longer set in the image; it remains an explicit TLS opt-in for a trusted
   reverse proxy, and still does not disable pairing.
+- Audio: decoding a file whose decoded frames contain NaN or infinite samples
+  no longer aborts the process inside the resampler; the in-process decoder
+  refuses the input and the normal converter fallback takes over.
 - Windows: `openasr.exe` no longer imports `mfplat.dll` / `mfreadwrite.dll` at
   load time. Since 0.1.37 the HE-AAC path made every start fail with
   `STATUS_DLL_NOT_FOUND` (exit `0xC0000135`, no message) on Windows N/KN
