@@ -53,7 +53,7 @@ legacy-windows-static-sidecar = []
 ts-export = ["dep:ts-rs"]
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))', 'cfg(fuzzing)'] }
 
 [dependencies]
 ed25519-dalek.workspace = true
@@ -126,3 +126,4 @@ syn = { version = "2", features = ["full", "visit"] }
 # attribute; the warning is pure proc-macro noise and would otherwise trip
 # `cargo clippy --all-targets -- -D warnings`.
 ts-rs = { version = "12.0.1", features = ["no-serde-warnings"] }
+proptest = "1.11.0"

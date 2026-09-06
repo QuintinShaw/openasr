@@ -317,4 +317,360 @@ mod tests {
         );
         assert!(completed[0].sample_count() > 0);
     }
+
+    // -- Property tests (#352-class: live resample/downmix/framing) ---------------
+
+    const PROP_RATES_HZ: [u32; 6] = [8_000, 16_000, 22_050, 44_100, 48_000, 96_000];
+    const PROP_CHANNELS: [u16; 3] = [1, 2, 6];
+    const OUTPUT_FRAME_SAMPLES: usize = 320; // 20 ms at 16 kHz
+
+    #[derive(Clone, Copy, Debug)]
+    enum LiveFormat {
+        I16,
+        F32,
+        U16,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum LiveDurationKind {
+        Empty,
+        OneInputFrame,
+        PartialOutputFrame,
+        HardwareCallback512,
+        QuarterSecond,
+    }
+
+    const LIVE_DURATION_KINDS: [LiveDurationKind; 5] = [
+        LiveDurationKind::Empty,
+        LiveDurationKind::OneInputFrame,
+        LiveDurationKind::PartialOutputFrame,
+        LiveDurationKind::HardwareCallback512,
+        LiveDurationKind::QuarterSecond,
+    ];
+
+    fn input_frames_for(kind: LiveDurationKind, sample_rate_hz: u32) -> usize {
+        match kind {
+            LiveDurationKind::Empty => 0,
+            LiveDurationKind::OneInputFrame => 1,
+            LiveDurationKind::PartialOutputFrame => {
+                let full_output_frame =
+                    (OUTPUT_FRAME_SAMPLES * sample_rate_hz as usize) / 16_000;
+                full_output_frame.saturating_sub(1).clamp(1, 512)
+            }
+            LiveDurationKind::HardwareCallback512 => 512,
+            LiveDurationKind::QuarterSecond => (sample_rate_hz as usize / 4).clamp(1, 48_000),
+        }
+    }
+
+    fn expected_pcm16_len(input_frames: usize, input_rate_hz: u32) -> usize {
+        if input_rate_hz == 16_000 {
+            input_frames
+        } else {
+            input_frames.saturating_mul(16_000) / input_rate_hz as usize
+        }
+    }
+
+    fn resample_len_slack(input_rate_hz: u32) -> usize {
+        // Linear interpolation uses a 2-sample window and a fractional read
+        // head; bound the leftover by one input-rate step in 16 kHz units.
+        (input_rate_hz as usize / 16_000).max(1) + 2
+    }
+
+    fn interleaved_tone(sample_rate_hz: u32, channels: u16, frames: usize) -> Vec<f32> {
+        let channels = channels as usize;
+        (0..frames.saturating_mul(channels))
+            .map(|index| {
+                let frame = index / channels;
+                (frame as f32 / sample_rate_hz.max(1) as f32 * std::f32::consts::TAU * 440.0).sin()
+                    * 0.5
+            })
+            .collect()
+    }
+
+    fn push_live(
+        engine: &mut CaptureEngine,
+        format: LiveFormat,
+        samples_f32: &[f32],
+    ) -> Result<Vec<RealtimeAudioFrame>, CaptureEngineError> {
+        match format {
+            LiveFormat::F32 => engine.push_f32_interleaved(samples_f32),
+            LiveFormat::I16 => {
+                let samples: Vec<i16> = samples_f32
+                    .iter()
+                    .map(|sample| {
+                        let clamped = sample.clamp(-1.0, 1.0);
+                        (clamped * i16::MAX as f32).round() as i16
+                    })
+                    .collect();
+                engine.push_i16_interleaved(&samples)
+            }
+            LiveFormat::U16 => {
+                let samples: Vec<u16> = samples_f32
+                    .iter()
+                    .map(|sample| {
+                        let clamped = sample.clamp(-1.0, 1.0);
+                        (clamped.mul_add(32767.0, 32768.0)).round() as u16
+                    })
+                    .collect();
+                engine.push_u16_interleaved(&samples)
+            }
+        }
+    }
+
+    fn assert_live_frames(
+        frames: &[RealtimeAudioFrame],
+        input_frames: usize,
+        input_rate_hz: u32,
+        context: &str,
+    ) {
+        let emitted: usize = frames.iter().map(RealtimeAudioFrame::sample_count).sum();
+        for frame in frames {
+            assert_eq!(
+                frame.format,
+                RealtimeAudioFormat::pcm16_mono_16khz(),
+                "{context}: emitted frame is not 16 kHz mono pcm16"
+            );
+            assert_eq!(
+                frame.sample_count(),
+                OUTPUT_FRAME_SAMPLES,
+                "{context}: 20 ms frame must contain {OUTPUT_FRAME_SAMPLES} samples"
+            );
+        }
+
+        let expected = expected_pcm16_len(input_frames, input_rate_hz);
+        let slack = resample_len_slack(input_rate_hz);
+        let min_produced = expected.saturating_sub(slack);
+        let max_produced = expected.saturating_add(slack);
+        let min_emitted = (min_produced / OUTPUT_FRAME_SAMPLES) * OUTPUT_FRAME_SAMPLES;
+        let max_emitted = (max_produced / OUTPUT_FRAME_SAMPLES) * OUTPUT_FRAME_SAMPLES;
+        assert!(
+            emitted >= min_emitted && emitted <= max_emitted,
+            "{context}: emitted {emitted} pcm16 samples, expected frames in \
+             [{min_emitted}, {max_emitted}] (produced ~{expected} +/- {slack}, \
+             remainder stays in the engine)"
+        );
+        assert_eq!(
+            emitted % OUTPUT_FRAME_SAMPLES,
+            0,
+            "{context}: partial frames must remain buffered, not emitted"
+        );
+    }
+
+    fn run_live_case(
+        sample_rate_hz: u32,
+        channels: u16,
+        format: LiveFormat,
+        input_frames: usize,
+        samples_f32: &[f32],
+    ) -> Result<Vec<RealtimeAudioFrame>, String> {
+        let context = format!(
+            "rate={sample_rate_hz} ch={channels} format={format:?} frames={input_frames} len={}",
+            samples_f32.len()
+        );
+        let mut capture = engine(sample_rate_hz, channels, 20);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            push_live(&mut capture, format, samples_f32)
+        }));
+        match caught {
+            Ok(Ok(frames)) => {
+                assert_live_frames(&frames, input_frames, sample_rate_hz, &context);
+                Ok(frames)
+            }
+            Ok(Err(error)) => Err(format!("{context}: unexpected error {error}")),
+            Err(_) => Err(format!(
+                "{context} head={:?}: panicked",
+                &samples_f32[..samples_f32.len().min(8)]
+            )),
+        }
+    }
+
+    #[test]
+    fn live_capture_discrete_grid_does_not_panic() {
+        for &sample_rate_hz in &PROP_RATES_HZ {
+            for &channels in &PROP_CHANNELS {
+                for format in [LiveFormat::I16, LiveFormat::F32, LiveFormat::U16] {
+                    for kind in LIVE_DURATION_KINDS {
+                        let input_frames = input_frames_for(kind, sample_rate_hz);
+                        let samples =
+                            interleaved_tone(sample_rate_hz, channels, input_frames);
+                        run_live_case(
+                            sample_rate_hz,
+                            channels,
+                            format,
+                            input_frames,
+                            &samples,
+                        )
+                        .unwrap_or_else(|error| panic!("{error}"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_capture_non_multiple_of_channels_is_error_not_panic() {
+        for &channels in &[2_u16, 6] {
+            for extra in 1..channels {
+                let samples = vec![0.1_f32; channels as usize * 8 + extra as usize];
+                let mut capture = engine(16_000, channels, 20);
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    capture.push_f32_interleaved(&samples)
+                }));
+                let result = caught.unwrap_or_else(|_| {
+                    panic!(
+                        "rate=16000 ch={channels} leftover={extra} len={}: panicked",
+                        samples.len()
+                    )
+                });
+                assert_eq!(
+                    result,
+                    Err(CaptureEngineError::NonMultipleOfChannels {
+                        sample_count: samples.len(),
+                        channels,
+                    })
+                );
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 48,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        #[test]
+        fn live_capture_random_f32_payload_does_not_panic(
+            rate_idx in 0..PROP_RATES_HZ.len(),
+            ch_idx in 0..PROP_CHANNELS.len(),
+            kind_idx in 0..LIVE_DURATION_KINDS.len(),
+            payload in proptest::collection::vec(proptest::num::f32::ANY, 0..=48_000),
+        ) {
+            let sample_rate_hz = PROP_RATES_HZ[rate_idx];
+            let channels = PROP_CHANNELS[ch_idx];
+            let input_frames = input_frames_for(LIVE_DURATION_KINDS[kind_idx], sample_rate_hz);
+            let len = input_frames.saturating_mul(channels as usize);
+            let mut samples = payload;
+            samples.truncate(len);
+            if samples.len() < len {
+                samples.resize(len, 0.0);
+            }
+            run_live_case(
+                sample_rate_hz,
+                channels,
+                LiveFormat::F32,
+                input_frames,
+                &samples,
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+        }
+
+        #[test]
+        fn live_capture_random_i16_payload_does_not_panic(
+            rate_idx in 0..PROP_RATES_HZ.len(),
+            ch_idx in 0..PROP_CHANNELS.len(),
+            kind_idx in 0..LIVE_DURATION_KINDS.len(),
+            payload in proptest::collection::vec(proptest::num::i16::ANY, 0..=48_000),
+        ) {
+            let sample_rate_hz = PROP_RATES_HZ[rate_idx];
+            let channels = PROP_CHANNELS[ch_idx];
+            let input_frames = input_frames_for(LIVE_DURATION_KINDS[kind_idx], sample_rate_hz);
+            let len = input_frames.saturating_mul(channels as usize);
+            let mut samples = payload;
+            samples.truncate(len);
+            if samples.len() < len {
+                samples.resize(len, 0);
+            }
+            let mut capture = engine(sample_rate_hz, channels, 20);
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                capture.push_i16_interleaved(&samples)
+            }));
+            let frames = match caught {
+                Ok(Ok(frames)) => frames,
+                Ok(Err(error)) => panic!(
+                    "rate={sample_rate_hz} ch={channels} i16 frames={input_frames}: {error}"
+                ),
+                Err(_) => panic!(
+                    "rate={sample_rate_hz} ch={channels} i16 frames={input_frames} len={} head={:?}: panicked",
+                    samples.len(),
+                    &samples[..samples.len().min(8)]
+                ),
+            };
+            assert_live_frames(
+                &frames,
+                input_frames,
+                sample_rate_hz,
+                &format!("rate={sample_rate_hz} ch={channels} i16 frames={input_frames}"),
+            );
+        }
+
+        #[test]
+        fn live_capture_random_u16_payload_does_not_panic(
+            rate_idx in 0..PROP_RATES_HZ.len(),
+            ch_idx in 0..PROP_CHANNELS.len(),
+            payload in proptest::collection::vec(proptest::num::u16::ANY, 0..=4_000),
+        ) {
+            let sample_rate_hz = PROP_RATES_HZ[rate_idx];
+            let channels = PROP_CHANNELS[ch_idx];
+            let len = (payload.len() / channels as usize) * channels as usize;
+            let samples = &payload[..len];
+            let input_frames = samples.len() / channels as usize;
+            let mut capture = engine(sample_rate_hz, channels, 20);
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                capture.push_u16_interleaved(samples)
+            }));
+            let frames = match caught {
+                Ok(Ok(frames)) => frames,
+                Ok(Err(error)) => panic!(
+                    "rate={sample_rate_hz} ch={channels} u16 frames={input_frames}: {error}"
+                ),
+                Err(_) => panic!(
+                    "rate={sample_rate_hz} ch={channels} u16 frames={input_frames} len={} head={:?}: panicked",
+                    samples.len(),
+                    &samples[..samples.len().min(8)]
+                ),
+            };
+            assert_live_frames(
+                &frames,
+                input_frames,
+                sample_rate_hz,
+                &format!("rate={sample_rate_hz} ch={channels} u16 frames={input_frames}"),
+            );
+        }
+
+        #[test]
+        fn live_capture_non_multiple_of_channels_proptest(
+            ch_idx in 0..2usize,
+            frames in 0usize..=1_024,
+            extra in 1u16..=5,
+            payload in proptest::collection::vec(proptest::num::f32::ANY, 0..=8_192),
+        ) {
+            let channels = [2_u16, 6][ch_idx];
+            let leftover = (extra % channels).max(1);
+            let len = frames.saturating_mul(channels as usize) + leftover as usize;
+            let mut samples = payload;
+            samples.truncate(len);
+            if samples.len() < len {
+                samples.resize(len, 0.0);
+            }
+            let mut capture = engine(44_100, channels, 20);
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                capture.push_f32_interleaved(&samples)
+            }));
+            let result = match caught {
+                Ok(result) => result,
+                Err(_) => panic!(
+                    "rate=44100 ch={channels} leftover={leftover} len={}: panicked",
+                    samples.len()
+                ),
+            };
+            proptest::prop_assert_eq!(
+                result,
+                Err(CaptureEngineError::NonMultipleOfChannels {
+                    sample_count: samples.len(),
+                    channels,
+                })
+            );
+        }
+    }
 }

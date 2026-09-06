@@ -3671,6 +3671,12 @@ mod model_session_capacity_error_tests {
     }
 }
 
+#[cfg(fuzzing)]
+pub mod fuzz {
+    pub use super::realtime::fuzz_parse_client_message;
+    pub use super::routes::voice_id::{fuzz_parse_enroll_multipart, fuzz_parse_sample_multipart};
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
