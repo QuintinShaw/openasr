@@ -144,6 +144,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Docker: images 0.1.37-0.1.40 exit immediately on `docker run` because the
+  default command binds `0.0.0.0` without device pairing (required since
+  0.1.37). The default command now enables pairing (generating a token into
+  `$OPENASR_HOME/pairing-admin-token` when `OPENASR_PAIRING_ADMIN_TOKEN` is
+  unset) and `--tls-self-signed`. `OPENASR_ALLOW_INSECURE_NON_LOOPBACK` is no
+  longer set in the image; it remains an explicit TLS opt-in for a trusted
+  reverse proxy, and still does not disable pairing.
 - Windows: `openasr.exe` no longer imports `mfplat.dll` / `mfreadwrite.dll` at
   load time. Since 0.1.37 the HE-AAC path made every start fail with
   `STATUS_DLL_NOT_FOUND` (exit `0xC0000135`, no message) on Windows N/KN

@@ -70,12 +70,10 @@ COPY scripts/docker-cuda-entrypoint.sh /usr/local/bin/docker-cuda-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-cuda-entrypoint.sh
 
 ENV OPENASR_HOME=/data
-# See the CPU Dockerfile for why this opt-in is safe: binding 0.0.0.0 inside
-# the container is the standard Docker exposure pattern (the operator
-# controls exposure via port-publish/orchestration); the server stays
-# fail-closed against non-loopback plaintext unless this is set. Front it
-# with TLS (or a TLS-terminating proxy) for untrusted networks.
-ENV OPENASR_ALLOW_INSECURE_NON_LOOPBACK=1
+# Default command binds 0.0.0.0 with HTTPS (self-signed) and device pairing.
+# See the CPU Dockerfile. OPENASR_ALLOW_INSECURE_NON_LOOPBACK is not set here;
+# it remains an explicit TLS opt-in for a trusted reverse proxy and never
+# waives pairing.
 
 # NVIDIA Container Toolkit contract: request GPU capability + full visibility
 # by default (overridable by the operator via `--gpus`/`NVIDIA_VISIBLE_DEVICES`).
@@ -93,4 +91,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
     CMD /usr/local/bin/docker-cuda-entrypoint.sh --gpu-check-only || exit 1
 
 ENTRYPOINT ["/usr/local/bin/docker-cuda-entrypoint.sh"]
-CMD ["serve", "--addr", "0.0.0.0:8080"]
+CMD ["serve", "--addr", "0.0.0.0:8080", "--tls-self-signed", "--pairing-admin-token-file", "/data/pairing-admin-token"]

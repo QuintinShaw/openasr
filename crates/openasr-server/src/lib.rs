@@ -826,6 +826,10 @@ impl Listener for TlsListener {
     }
 }
 
+/// Fail-closed bind policy for `serve`: loopback is unrestricted, non-loopback
+/// requires device authentication, then TLS (unless the caller has explicitly
+/// set `OPENASR_ALLOW_INSECURE_NON_LOOPBACK`). The TLS escape never waives
+/// pairing.
 fn validate_listen_security(
     addr: SocketAddr,
     launch_options: &ServerLaunchOptions,

@@ -204,8 +204,21 @@ model-registry metadata only — mount a volume at `/data`, then
 server never auto-pulls. They do not ship `perf/` bench-suite fixtures or
 baselines, so `openasr bench-suite` inside the container will fail looking for
 those files; run benchmarks from a git checkout. CUDA tags require the NVIDIA
-Container Toolkit and refuse to start if no GPU is visible. Longer guide:
-[openasr.org/docs/docker](https://openasr.org/docs/docker/).
+Container Toolkit and refuse to start if no GPU is visible.
+
+The default command binds `0.0.0.0:8080` with HTTPS (`--tls-self-signed`) and
+device pairing. `docker logs` prints `pairing admin token: … (saved at
+/data/pairing-admin-token)` when the token file is first created; later starts
+reuse that file without reprinting the secret. Supply your own with
+`-e OPENASR_PAIRING_ADMIN_TOKEN=…`. Pair from
+the desktop app, or `POST /v1/pairing/requests` then approve with
+`Authorization: Bearer <token>`. Unauthenticated `/v1/*` calls return 401;
+`GET /health` is the liveness probe. Talk to the container with `curl -k`
+(self-signed). Behind a TLS-terminating reverse proxy, drop `--tls-self-signed`
+from the command and set `OPENASR_ALLOW_INSECURE_NON_LOOPBACK=1` — that env
+only waives TLS, never pairing, and only belongs on a trusted boundary.
+
+Longer guide: [openasr.org/docs/docker](https://openasr.org/docs/docker/).
 
 ## Is ffmpeg required?
 

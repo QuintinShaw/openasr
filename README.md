@@ -104,12 +104,45 @@ never auto-downloads a pack — install one first:
 docker pull quintinshaw/openasr:latest
 docker run --rm -d --name openasr \
   -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:latest
+docker logs openasr
+# pairing admin token: <token> (saved at /data/pairing-admin-token)
 docker exec openasr openasr pull whisper-small --yes
 
 # NVIDIA GPU (requires NVIDIA Container Toolkit; sm_75 / Turing+)
 docker pull quintinshaw/openasr:cuda-latest
 docker run --rm -d --name openasr-cuda --gpus all \
   -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:cuda-latest
+```
+
+The default command listens on `0.0.0.0:8080` with HTTPS (`--tls-self-signed`)
+and device pairing. Unauthenticated `/v1/*` calls return 401 until a client is
+paired; `GET /health` stays a liveness probe. Use `curl -k` (or pin the
+self-signed certificate) when talking to the container directly.
+
+**Token.** On first start, if `OPENASR_PAIRING_ADMIN_TOKEN` is unset, the server
+generates a random token, writes it owner-only to `/data/pairing-admin-token`,
+and prints `pairing admin token: … (saved at /data/…)` to stdout on that first
+generate. Later starts reuse the file and do not reprint the secret. Supply
+your own with `-e OPENASR_PAIRING_ADMIN_TOKEN=…`. Reuse a volume at `/data` so
+the generated token and pairing registry survive restarts.
+
+**Pair a client.** In the desktop app, add this server as a remote and approve
+with the admin token. Over the API: `POST /v1/pairing/requests` with a device
+name, then `POST /v1/pairing/requests/{id}/approve` with
+`Authorization: Bearer <token>`. Transcription then uses the issued device
+credential, not the admin token.
+
+**Behind a TLS-terminating reverse proxy.** Override the command to drop
+`--tls-self-signed` and set `OPENASR_ALLOW_INSECURE_NON_LOOPBACK=1`. That env
+only waives TLS, and only on a trusted boundary; device pairing stays
+mandatory. Do not set it on an untrusted network.
+
+```bash
+docker run --rm -d --name openasr \
+  -p 8080:8080 -v openasr-data:/data \
+  -e OPENASR_ALLOW_INSECURE_NON_LOOPBACK=1 \
+  quintinshaw/openasr:latest \
+  serve --addr 0.0.0.0:8080 --pairing-admin-token-file /data/pairing-admin-token
 ```
 
 | Tag | Platforms | Notes |

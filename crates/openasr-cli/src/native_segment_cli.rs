@@ -750,11 +750,15 @@ fn load_active_api_key_hashes() -> Result<Vec<String>> {
     Ok(store.active_token_hashes())
 }
 
+const PAIRING_ADMIN_TOKEN_ENV: &str = "OPENASR_PAIRING_ADMIN_TOKEN";
+const PAIRING_ADMIN_TOKEN_RANDOM_BYTES: usize = 32;
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct ServeSecurityOptions {
     pub tls_self_signed: bool,
     pub tls_sans: Vec<String>,
     pub pairing_admin_token_env: Option<String>,
+    pub pairing_admin_token_file: Option<PathBuf>,
 }
 
 fn serve_launch_options(
@@ -770,22 +774,8 @@ fn serve_launch_options(
     } else {
         openasr_server::ServerTlsConfig::Disabled
     };
-    let auth = match security
-        .pairing_admin_token_env
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-    {
-        Some(env_name) => {
-            let token = env::var(env_name).with_context(|| {
-                format!("Could not read pairing administrator token from ${env_name}")
-            })?;
-            let token = token.trim();
-            if token.is_empty() {
-                bail!("Pairing administrator token in ${env_name} must not be empty.");
-            }
-            openasr_server::ServerAuth::pairing(token)
-        }
+    let auth = match resolve_pairing_admin_token(&security)? {
+        Some(token) => openasr_server::ServerAuth::pairing(token),
         // Local API keys (`openasr apikey create`) are a loopback-only escape
         // hatch: they let a trusted-but-explicit caller (a coding agent, a
         // script) require a bearer credential even from 127.0.0.1, where the
@@ -802,6 +792,151 @@ fn serve_launch_options(
         tls,
         ..Default::default()
     })
+}
+
+fn resolve_pairing_admin_token(security: &ServeSecurityOptions) -> Result<Option<String>> {
+    if let Some(env_name) = security
+        .pairing_admin_token_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        match env::var(env_name) {
+            Ok(token) => {
+                let token = token.trim();
+                if token.is_empty() {
+                    bail!("Pairing administrator token in ${env_name} must not be empty.");
+                }
+                return Ok(Some(token.to_string()));
+            }
+            Err(_) if security.pairing_admin_token_file.is_some() => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Could not read pairing administrator token from ${env_name}")
+                });
+            }
+        }
+    }
+
+    if security.pairing_admin_token_file.is_some()
+        && let Ok(token) = env::var(PAIRING_ADMIN_TOKEN_ENV)
+    {
+        let token = token.trim();
+        if token.is_empty() {
+            bail!("Pairing administrator token in ${PAIRING_ADMIN_TOKEN_ENV} must not be empty.");
+        }
+        return Ok(Some(token.to_string()));
+    }
+
+    if let Some(path) = security.pairing_admin_token_file.as_deref() {
+        let loaded = load_or_create_pairing_admin_token(path)?;
+        println!(
+            "{}",
+            pairing_admin_token_file_announcement(loaded.created, &loaded.token, path)
+        );
+        return Ok(Some(loaded.token));
+    }
+
+    Ok(None)
+}
+
+#[derive(Debug)]
+struct PairingAdminTokenFile {
+    token: String,
+    created: bool,
+}
+
+fn pairing_admin_token_file_announcement(created: bool, token: &str, path: &Path) -> String {
+    if created {
+        format!("pairing admin token: {token} (saved at {})", path.display())
+    } else {
+        format!("using pairing admin token file {}", path.display())
+    }
+}
+
+fn empty_pairing_admin_token_file_error(path: &Path) -> anyhow::Error {
+    anyhow!(
+        "Pairing administrator token file {} is empty. Replace it with a non-empty token or delete it so OpenASR can generate one.",
+        path.display()
+    )
+}
+
+fn read_nonempty_pairing_admin_token(path: &Path) -> Result<String> {
+    let contents = fs::read_to_string(path).with_context(|| {
+        format!(
+            "Could not read pairing administrator token from {}",
+            path.display()
+        )
+    })?;
+    let token = contents.trim();
+    if token.is_empty() {
+        return Err(empty_pairing_admin_token_file_error(path));
+    }
+    Ok(token.to_string())
+}
+
+fn load_or_create_pairing_admin_token(path: &Path) -> Result<PairingAdminTokenFile> {
+    match fs::read_to_string(path) {
+        Ok(contents) => {
+            let token = contents.trim();
+            if token.is_empty() {
+                return Err(empty_pairing_admin_token_file_error(path));
+            }
+            Ok(PairingAdminTokenFile {
+                token: token.to_string(),
+                created: false,
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let generated = generate_pairing_admin_token()?;
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "Could not create directory for pairing administrator token {}",
+                        parent.display()
+                    )
+                })?;
+            }
+            openasr_core::write_owner_only_file_atomically(path, generated.as_bytes())
+                .with_context(|| {
+                    format!(
+                        "Could not write pairing administrator token to {}",
+                        path.display()
+                    )
+                })?;
+            // Re-read so a racing writer on a shared volume is what we serve.
+            let persisted = read_nonempty_pairing_admin_token(path)?;
+            Ok(PairingAdminTokenFile {
+                created: persisted == generated,
+                token: persisted,
+            })
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "Could not read pairing administrator token from {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+fn generate_pairing_admin_token() -> Result<String> {
+    let mut bytes = [0u8; PAIRING_ADMIN_TOKEN_RANDOM_BYTES];
+    getrandom::fill(&mut bytes).context("Could not generate a pairing administrator token")?;
+    Ok(pairing_admin_token_hex(&bytes))
+}
+
+fn pairing_admin_token_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn default_tls_subject_alt_names(addr: SocketAddr, configured: &[String]) -> Vec<String> {
@@ -2520,6 +2655,179 @@ mod tests {
             models_status(app, Some("oasr_sk_test-agent-key")).await,
             StatusCode::OK,
             "non-loopback must not honor a loopback-only API key"
+        );
+    }
+
+    #[test]
+    fn pairing_admin_token_file_generates_owner_only_nonempty_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pairing-admin-token");
+        let loaded = load_or_create_pairing_admin_token(&path).expect("generate token");
+        assert!(loaded.created, "missing file must count as a create");
+        assert!(
+            !loaded.token.is_empty(),
+            "generated token must be non-empty"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().trim(),
+            loaded.token,
+            "generated token must be persisted as written"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "generated token file must be owner-only");
+        }
+    }
+
+    #[test]
+    fn pairing_admin_token_file_reuses_existing_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pairing-admin-token");
+        fs::write(&path, "already-set-token\n").unwrap();
+        let first = load_or_create_pairing_admin_token(&path).expect("load token");
+        assert!(!first.created, "existing file must not count as a create");
+        assert_eq!(first.token, "already-set-token");
+        let second = load_or_create_pairing_admin_token(&path).expect("reuse token");
+        assert!(!second.created);
+        assert_eq!(second.token, first.token);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"already-set-token\n",
+            "an existing token file must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn pairing_admin_token_file_rejects_empty_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pairing-admin-token");
+        fs::write(&path, "  \n").unwrap();
+        let error = load_or_create_pairing_admin_token(&path)
+            .expect_err("empty token file must fail")
+            .to_string();
+        assert!(error.contains("is empty"), "{error}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "  \n",
+            "a rejected empty token file must be left untouched"
+        );
+    }
+
+    #[test]
+    fn pairing_admin_token_file_announcement_omits_secret_on_reuse() {
+        let path = Path::new("/data/pairing-admin-token");
+        let created = pairing_admin_token_file_announcement(true, "secret-token", path);
+        assert!(created.contains("secret-token"), "{created}");
+        assert!(
+            created.contains("saved at /data/pairing-admin-token"),
+            "{created}"
+        );
+        let reused = pairing_admin_token_file_announcement(false, "secret-token", path);
+        assert!(
+            !reused.contains("secret-token"),
+            "reuse must not reprint the token: {reused}"
+        );
+        assert!(reused.contains("/data/pairing-admin-token"), "{reused}");
+    }
+
+    #[tokio::test]
+    async fn non_loopback_pairing_token_file_and_tls_enable_pairing_auth() {
+        let launch_options = with_env_lock(|| {
+            let _escape = EnvVarRestore::remove("OPENASR_ALLOW_INSECURE_NON_LOOPBACK");
+            let _supplied = EnvVarRestore::remove(PAIRING_ADMIN_TOKEN_ENV);
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("pairing-admin-token");
+            serve_launch_options(
+                "0.0.0.0:8080".parse().unwrap(),
+                ServeSecurityOptions {
+                    tls_self_signed: true,
+                    pairing_admin_token_file: Some(path),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .expect("serve launch options")
+        });
+        match &launch_options.tls {
+            openasr_server::ServerTlsConfig::SelfSigned { .. } => {}
+            openasr_server::ServerTlsConfig::Disabled => panic!("expected self-signed TLS"),
+        }
+        let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
+            openasr_server::ServerRuntime::default(),
+            openasr_server::DistributionRuntime::default(),
+            launch_options,
+        );
+        assert_eq!(
+            models_status(app, None).await,
+            StatusCode::UNAUTHORIZED,
+            "generated pairing token must gate non-loopback API access"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_loopback_without_pairing_token_leaves_auth_disabled() {
+        let launch_options = serve_launch_options(
+            "0.0.0.0:8080".parse().unwrap(),
+            ServeSecurityOptions {
+                tls_self_signed: true,
+                ..Default::default()
+            },
+            Vec::new(),
+        )
+        .expect("serve launch options");
+        match &launch_options.tls {
+            openasr_server::ServerTlsConfig::SelfSigned { .. } => {}
+            openasr_server::ServerTlsConfig::Disabled => panic!("expected self-signed TLS"),
+        }
+        let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
+            openasr_server::ServerRuntime::default(),
+            openasr_server::DistributionRuntime::default(),
+            launch_options,
+        );
+        assert_eq!(
+            models_status(app, None).await,
+            StatusCode::OK,
+            "without a pairing token, launch options must not enable auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn pairing_admin_token_env_overrides_token_file() {
+        let launch_options = with_env_lock(|| {
+            let _escape = EnvVarRestore::remove("OPENASR_ALLOW_INSECURE_NON_LOOPBACK");
+            let _supplied = EnvVarRestore::set(PAIRING_ADMIN_TOKEN_ENV, "operator-supplied-token");
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("pairing-admin-token");
+            let launch_options = serve_launch_options(
+                "0.0.0.0:8080".parse().unwrap(),
+                ServeSecurityOptions {
+                    tls_self_signed: true,
+                    pairing_admin_token_file: Some(path.clone()),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .expect("serve launch options");
+            assert!(
+                !path.exists(),
+                "a supplied OPENASR_PAIRING_ADMIN_TOKEN must not create the token file"
+            );
+            launch_options
+        });
+        let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
+            openasr_server::ServerRuntime::default(),
+            openasr_server::DistributionRuntime::default(),
+            launch_options,
+        );
+        assert_eq!(
+            models_status(app.clone(), None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            models_status(app, Some("operator-supplied-token")).await,
+            StatusCode::OK
         );
     }
 

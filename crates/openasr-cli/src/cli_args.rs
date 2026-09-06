@@ -706,6 +706,11 @@ pub(crate) enum Command {
         /// Environment variable containing the pairing administrator token for remote device approval.
         #[arg(long)]
         pairing_admin_token_env: Option<String>,
+        /// Owner-only file holding the pairing administrator token. Created
+        /// with a random token if missing. When this flag is set, a non-empty
+        /// `$OPENASR_PAIRING_ADMIN_TOKEN` is used instead of the file.
+        #[arg(long, value_name = "PATH")]
+        pairing_admin_token_file: Option<PathBuf>,
         /// Model id from the registry.
         #[arg(long, env = "OPENASR_MODEL")]
         model: Option<String>,
