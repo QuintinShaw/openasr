@@ -463,7 +463,7 @@ pub(crate) fn bench_receipt_short_audio(
         )
         .with_source(openasr_core::RequestSource::CliTranscribe)
         .with_model_pack_path(prepared_run.model_source.model_pack_path.clone())
-        .with_execution_target(Some(execution_target))
+        .with_execution_target(Some(execution_target.clone()))
         .with_punctuation(false)
         .with_prepared_samples(prepared_audio.shared_samples())
         .with_display_file_name(
@@ -954,6 +954,7 @@ fn resolved_runtime_for_mock_receipt(device: &str) -> Result<ResolvedFamilyRunti
         ExecutionTarget::Cpu => Some(RequestBackendPreference::CpuOnly),
         ExecutionTarget::Accelerated => Some(RequestBackendPreference::Accelerated),
         ExecutionTarget::Auto => None,
+        ExecutionTarget::Device(_) => Some(RequestBackendPreference::Accelerated),
     };
     Ok(
         ResolvedFamilyRuntimeInput::resolve_with_output_contract_and_consumers(

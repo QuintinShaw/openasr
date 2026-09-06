@@ -142,11 +142,13 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   the hiragana/katakana/hangul script guard. CLI `align`
   is itself consent to install the pack unless `--offline`.
 - Hardware execution target selection is generic: Desktop/server requests support
-  `auto`, `cpu`, and `accelerated` when the native runtime reports an accelerated
-  device. There is no public per-provider/per-device pinning surface such as
-  `gpu0`. Internally the runtime can resolve a concrete execution route
-  (`provider` + ggml stable device name + optional PCI `device_id` from CUDA/HIP,
-  and from Vulkan when available). What is route-isolated today:
+  `auto`, `cpu`, `accelerated`, and a physical GPU id from `GET /v1/devices`
+  (for example `vulkan:amd-radeon-rx-7900-xtx` or `metal:apple-m1`). There is
+  no ordinal selector such as `gpu0`. Internally the runtime resolves a concrete
+  execution route (`provider` + ggml stable device name + optional PCI
+  `device_id` from CUDA/HIP, and from Vulkan when available). Metal Exact is
+  allowed by public/stable id; Metal has no PCI/UUID identity. What is
+  route-isolated today:
   - thread-local ggml **backend-handle** cache (Exact pin never shares a handle;
     preferred/Auto may Optimus-fall through discrete -> iGPU but always caches
     under the device that actually initialized)
@@ -162,11 +164,11 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   - **admission capacity stays per model identity** (CPU and accelerated share one
     slot for the same model; route does not multiply capacity)
   Exact device pins are fail-closed: missing devices, init failures, Metal
-  (still `MTLCreateSystemDefaultDevice` only), and CPU StableId Exact return typed
-  not-found / not-addressable / init-failed errors instead of silently swapping
-  cards or falling back to CPU. Unavailable coarse `accelerated` targets still
-  fail closed. Physical PCI keys are normalized (trim + lower-case) only; full
-  BDF grammar validation is a follow-up.
+  PCI/UUID Exact, and CPU StableId Exact return typed not-found /
+  not-addressable / init-failed errors instead of silently swapping cards or
+  falling back to CPU. Unavailable coarse `accelerated` targets still fail
+  closed. Physical PCI keys are normalized (trim + lower-case) only; full BDF
+  grammar validation is a follow-up.
 - On Windows ReBAR discrete GPUs, Vulkan Peak Working Set can exceed the HIP
   and CPU figures even when DeviceLocal buffers are not mapped. ReBAR types
   are DeviceLocal|HostVisible, so Windows still counts that VRAM toward the

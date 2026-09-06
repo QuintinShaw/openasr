@@ -20,7 +20,40 @@ use std::{
 use tower::ServiceExt;
 
 const SERVER_INSTANCE_TOKEN_ENV: &str = "OPENASR_SERVER_INSTANCE_TOKEN";
+const OPENASR_DEVICE_ENV: &str = "OPENASR_DEVICE";
 const LIVE_PULL_FIXTURE_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+
+struct OpenasrDeviceEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: Option<String>,
+}
+
+impl OpenasrDeviceEnvGuard {
+    fn unset() -> Self {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var(OPENASR_DEVICE_ENV).ok();
+        unsafe { std::env::remove_var(OPENASR_DEVICE_ENV) };
+        Self {
+            _lock: lock,
+            previous,
+        }
+    }
+}
+
+impl Drop for OpenasrDeviceEnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(OPENASR_DEVICE_ENV, value),
+                None => std::env::remove_var(OPENASR_DEVICE_ENV),
+            }
+        }
+    }
+}
 
 /// The product default `dictation_shortcut` for the host this test binary is
 /// compiled for -- mirrors openasr-core's `default_dictation_shortcut()`
@@ -1689,6 +1722,7 @@ async fn content_addressed_refs_drive_local_and_default_model_endpoints() {
 
 #[tokio::test]
 async fn default_model_endpoint_marks_local_pack_and_clears_default_on_delete() {
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let (source_pack, distribution) = write_moonshine_pull_fixture(temp.path());
     let home = distribution.openasr_home.as_ref().unwrap().clone();
@@ -1834,6 +1868,7 @@ async fn default_model_endpoint_marks_local_pack_and_clears_default_on_delete() 
 
 #[tokio::test]
 async fn default_model_endpoint_rejects_uninstalled_pack() {
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let (_, distribution) = write_moonshine_pull_fixture(temp.path());
     let app = openasr_server::app_with_runtime_and_distribution(
@@ -1945,6 +1980,7 @@ async fn json_request(
 
 #[tokio::test]
 async fn set_default_rebinds_native_bound_pack_without_restart() {
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let moonshine = install_native_pack(
@@ -2009,6 +2045,7 @@ async fn set_default_rebinds_native_bound_pack_without_restart() {
 
 #[tokio::test]
 async fn set_default_binds_unbound_native_runtime_without_restart() {
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let moonshine = install_native_pack(

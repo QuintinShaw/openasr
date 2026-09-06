@@ -1011,17 +1011,28 @@ impl WsSession {
                 .await?;
             return Err(());
         }
-        let client_execution_target = if self.remote_compute_client {
-            None
-        } else {
-            session.execution_target
+        let execution_target = match (self.remote_compute_client, session.execution_target.clone())
+        {
+            (false, Some(target)) => Some(target),
+            (_, _) => {
+                let default = match self.distribution.openasr_home() {
+                    Ok(home) => realtime_execution_target_preference(&home),
+                    Err(_) => crate::resolve_serve_execution_target(None),
+                };
+                match default {
+                    Ok(target) => Some(target),
+                    Err(error) => {
+                        self.emit_error(
+                            RealtimeErrorCode::StartupConfigError,
+                            &error.to_string(),
+                            false,
+                        )
+                        .await?;
+                        return Err(());
+                    }
+                }
+            }
         };
-        let execution_target = client_execution_target.or_else(|| {
-            self.distribution
-                .openasr_home()
-                .ok()
-                .and_then(|home| realtime_execution_target_preference(&home))
-        });
         let phrase_bias = match build_realtime_phrase_bias_config(&session) {
             Ok(phrase_bias) => phrase_bias,
             Err(message) => {
@@ -1084,7 +1095,7 @@ impl WsSession {
         let mut controller = match RealtimeSessionController::new_with_execution(
             config,
             Arc::clone(self.runtime.native_execution.execution_services()),
-            execution_target.unwrap_or_default(),
+            execution_target.clone().unwrap_or_default(),
         ) {
             Ok(controller) => controller,
             Err(error) => {
@@ -1254,7 +1265,7 @@ impl WsSession {
             return Err(());
         }
         let resolved_route = match crate::routes::transcription::resolve_execution_route_for_target(
-            self.execution_target,
+            self.execution_target.clone(),
         ) {
             Ok(route) => route,
             Err(error) => {
@@ -1326,7 +1337,8 @@ impl WsSession {
             .with_inference_threads(self.inference_threads)
             .with_voice_id(false)
             .with_partial_results(partial_results)
-            .with_word_timestamps(word_timestamps);
+            .with_word_timestamps(word_timestamps)
+            .with_execution_target(self.execution_target.clone());
         let session_config = NativeAsrStreamingSessionConfig::new()
             .with_audio_format(RealtimeAudioFormat::pcm16_mono_16khz())
             .with_partial_results(partial_results)
@@ -1334,7 +1346,8 @@ impl WsSession {
         let executor = NativeBackendExecutor::new(Arc::clone(
             self.runtime.native_execution.execution_services(),
         ));
-        let hardware_target = native_hardware_target_from_execution_target(self.execution_target);
+        let hardware_target =
+            native_hardware_target_from_execution_target(self.execution_target.clone());
         #[cfg(test)]
         let session_result = match self.test_native_streaming_session_factory.as_ref() {
             Some(factory) => factory(),
@@ -2644,7 +2657,7 @@ impl WsSession {
             prompt: self.prompt.clone(),
             phrase_bias: self.phrase_bias.clone(),
             inference_threads: self.inference_threads,
-            execution_target: self.execution_target,
+            execution_target: self.execution_target.clone(),
             word_timestamps: self.word_timestamps,
             display_name: "realtime-utterance.wav".to_string(),
             temp_wav,

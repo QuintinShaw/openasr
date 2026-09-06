@@ -55,9 +55,9 @@ pub(crate) async fn set_default_model(
     let home = distribution.openasr_home()?;
     let pack = resolve_installed_pack_for_default(&home, distribution.catalog_source(), &request)?;
     let preference = request.quant_preference_for_pack(&pack);
-    let intent = crate::realtime::realtime_execution_target_preference(&home)
-        .map(openasr_core::device::execution_policy::ExecutionIntent::from)
-        .unwrap_or(openasr_core::device::execution_policy::ExecutionIntent::Auto);
+    let intent = openasr_core::device::execution_policy::ExecutionIntent::from(
+        crate::realtime::realtime_execution_target_preference(&home)?,
+    );
     if runtime.backend == BackendKind::Native && runtime.native_rebind_blocked() {
         runtime
             .native_execution
@@ -175,9 +175,10 @@ pub(crate) fn apply_pending_idle_switch_if_idle(
         return;
     };
     let preference = request.quant_preference_for_pack(&pack);
-    let intent = crate::realtime::realtime_execution_target_preference(&home)
-        .map(openasr_core::device::execution_policy::ExecutionIntent::from)
-        .unwrap_or(openasr_core::device::execution_policy::ExecutionIntent::Auto);
+    let Ok(target) = crate::realtime::realtime_execution_target_preference(&home) else {
+        return;
+    };
+    let intent = openasr_core::device::execution_policy::ExecutionIntent::from(target);
     if activate_default_model_blocking(
         runtime,
         &home,

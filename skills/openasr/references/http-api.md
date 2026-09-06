@@ -68,12 +68,15 @@ pack that is being served.
 - `GET /v1/devices` -- OpenASR extension (0.1.13+): read-only enumeration of
   this daemon's own ggml compute devices (`{"object":"devices",
   "default_execution_target","devices":[{"id","name","meta","kind","target",
-  "effective_target","memory"?}]}`). Always includes `auto` and `cpu`; an
-  `accelerated` entry (Metal/CUDA/Vulkan/HIP, per platform) is present only
-  when the runtime detects one. `default_execution_target` is what `auto`
-  resolves to on this daemon (`cpu` or `accelerated`). Not operator-gated --
-  same local-auth layer as `/v1/models`. Intended for a UI's execution-target
-  picker; reflects the daemon's own runtime, not a remote sidecar's.
+  "effective_target","provider","memory"?,"memory_total_bytes"?,"memory_free_bytes"?,"selectable"?}]}`).
+  Always includes `auto` and `cpu`; an `accelerated` entry (Metal/CUDA/Vulkan/HIP,
+  per platform) is present only when the runtime detects one. Each physical GPU
+  is also listed as `kind: "gpu"` with a stable id such as
+  `vulkan:amd-radeon-rx-7900-xtx` (not a `VulkanN` ordinal). `default_execution_target`
+  is what `auto` resolves to on this daemon (`cpu` or `accelerated`). Not
+  operator-gated -- same local-auth layer as `/v1/models`. Intended for a UI's
+  execution-target picker; reflects the daemon's own runtime, not a remote
+  sidecar's.
 
 ## OpenAI parameter compatibility matrix
 
@@ -198,5 +201,5 @@ unsupported combinations fail closed with explicit errors):
   `chunk_seconds`, `segment_overlap_seconds`, `vad_threshold_db`,
   `vad_min_silence_ms`, `vad_padding_ms`, `min_segment_seconds`,
   `suppress_silent_slices`
-- Runtime: `inference_threads`, `execution_target` (`auto|cpu|accelerated`)
+- Runtime: `inference_threads`, `execution_target` (`auto|cpu|accelerated` or a physical GPU id from `GET /v1/devices`). Unknown ids are 400 and list the current ids. Serve-level default: `OPENASR_DEVICE`.
 - Control: `transcription_id` (enables pause/resume/cancel endpoints)

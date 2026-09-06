@@ -523,10 +523,11 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
                 ),
             });
         }
-        let request_intent = execution_intent_from_hardware_target(target)?;
-        let execution_plan = resolve_native_execution_plan_for_hardware_target(
+        let request_intent = execution_intent_from_request(&options, target)?;
+        let execution_plan = resolve_native_execution_plan_for_intent(
             execution_services.as_ref(),
             &self.descriptor,
+            request_intent.clone(),
             target,
         )?;
         let streaming_punctuator =
@@ -1184,9 +1185,15 @@ impl NativeAsrExecutor for NativeBackendExecutor {
                     .expect("non-ready runtime readiness converts to NativeAsrError"));
             }
         }
-        let execution_target = native_execution_target_from_hardware_target(target)
+        let execution_target = request
+            .execution_target
+            .clone()
+            .or_else(|| native_execution_target_from_hardware_target(target))
             .ok_or(NativeAsrError::UnsupportedHardwareTarget { target })?;
-        let execution_intent = execution_intent_from_hardware_target(target)?;
+        let execution_intent = match &execution_target {
+            ExecutionTarget::Device(_) => ExecutionIntent::from(execution_target.clone()),
+            _ => execution_intent_from_hardware_target(target)?,
+        };
         let adapter_capabilities = adapter.capabilities();
         reject_unsupported_native_phrase_bias(
             adapter.adapter_id(),
@@ -1322,6 +1329,16 @@ fn native_execution_target_from_hardware_target(
     }
 }
 
+fn execution_intent_from_request(
+    options: &NativeAsrRequestOptions,
+    hardware: NativeAsrHardwareTarget,
+) -> Result<ExecutionIntent, NativeAsrError> {
+    match options.execution_target.as_ref() {
+        Some(target) => Ok(ExecutionIntent::from(target.clone())),
+        None => execution_intent_from_hardware_target(hardware),
+    }
+}
+
 fn execution_intent_from_hardware_target(
     target: NativeAsrHardwareTarget,
 ) -> Result<ExecutionIntent, NativeAsrError> {
@@ -1355,12 +1372,12 @@ fn execution_intent_from_hardware_target(
     }
 }
 
-fn resolve_native_execution_plan_for_hardware_target(
+fn resolve_native_execution_plan_for_intent(
     execution_services: &NativeExecutionServices,
     descriptor: &GgmlFamilyAdapterDescriptor,
-    target: NativeAsrHardwareTarget,
+    intent: ExecutionIntent,
+    error_target: NativeAsrHardwareTarget,
 ) -> Result<ExecutionPlan, NativeAsrError> {
-    let intent = execution_intent_from_hardware_target(target)?;
     let inventory = enumerate_compute_devices_from_ggml(&crate::ggml_available_devices());
     execution_services
         .policy_resolver()
@@ -1372,7 +1389,7 @@ fn resolve_native_execution_plan_for_hardware_target(
             descriptor.execution_capabilities,
             &inventory,
         )
-        .map_err(|error| execution_policy_error_to_native(error, target))
+        .map_err(|error| execution_policy_error_to_native(error, error_target))
 }
 
 fn execution_policy_error_to_native(
@@ -1529,11 +1546,23 @@ fn native_offline_request_to_transcription_request(
 }
 
 fn native_backend_error_to_asr(error: BackendError) -> NativeAsrError {
-    let message = match error {
-        BackendError::NativeFailClosed { reason } => reason,
-        error => error.to_string(),
-    };
-    NativeAsrError::SessionFailed { message }
+    match error {
+        BackendError::ExecutionDeviceNotFound { detail } => {
+            NativeAsrError::ExecutionDeviceNotFound { detail }
+        }
+        BackendError::ExecutionDeviceNotAddressable { detail } => {
+            NativeAsrError::ExecutionDeviceNotAddressable { detail }
+        }
+        BackendError::ExecutionDeviceInitFailed { detail } => {
+            NativeAsrError::ExecutionDeviceInitFailed { detail }
+        }
+        BackendError::NativeFailClosed { reason } => {
+            NativeAsrError::SessionFailed { message: reason }
+        }
+        error => NativeAsrError::SessionFailed {
+            message: error.to_string(),
+        },
+    }
 }
 
 pub fn validate_local_native_model_pack_path(
@@ -3352,6 +3381,27 @@ mod tests {
         assert_eq!(
             native_execution_target_from_hardware_target(NativeAsrHardwareTarget::IntelNpu),
             None
+        );
+    }
+
+    #[test]
+    fn streaming_request_device_target_builds_exact_intent() {
+        let options = NativeAsrRequestOptions::new().with_execution_target(Some(
+            ExecutionTarget::Device("vulkan:amd-radeon-rx-7900-xtx".to_string()),
+        ));
+        assert_eq!(
+            execution_intent_from_request(&options, NativeAsrHardwareTarget::Accelerated).unwrap(),
+            ExecutionIntent::Exact(crate::ExactDeviceSelector::PublicId(
+                "vulkan:amd-radeon-rx-7900-xtx".to_string()
+            ))
+        );
+        assert_eq!(
+            execution_intent_from_request(
+                &NativeAsrRequestOptions::new(),
+                NativeAsrHardwareTarget::Cpu
+            )
+            .unwrap(),
+            ExecutionIntent::CpuOnly
         );
     }
 

@@ -45,9 +45,9 @@ These were prior roadmap goals and are now shipped on the native runtime path:
   source, so same-path byte replacement misses instead of reusing stale weights;
   adapter-bearing families add the adapter fingerprint where required.
   Host-neutral prepared data remains content-keyed by design. Admission capacity
-  remains per-model (not per-route), and there is still no public provider/device
-  selector such as `gpu0`. Metal remains not-exactly-addressable
-  (`MTLCreateSystemDefaultDevice` only), and internal Exact requests fail closed
+  remains per-model (not per-route). Public GPU ids from `GET /v1/devices` are
+  selectable; there is still no ordinal selector such as `gpu0`. Metal Exact is
+  allowed by public/stable id (no PCI/UUID identity). Exact requests fail closed
   rather than falling back to another card or CPU.
 - Desktop remote compute has secure HTTPS/WSS client/server plumbing with
   approved pairing, TOFU fingerprint pinning, keychain device credentials, file

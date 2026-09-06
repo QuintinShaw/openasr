@@ -64,22 +64,88 @@ impl BackendKind {
     pub const SELECTABLE: &'static [&'static str] = Self::ALL;
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Public execution-target vocabulary. Coarse values (`auto` / `cpu` /
+/// `accelerated`) stay the wire default; a physical GPU id from
+/// `GET /v1/devices` pins one card and is fail-closed on miss.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum ExecutionTarget {
     #[default]
     Auto,
     Cpu,
     Accelerated,
+    Device(String),
 }
 
 impl ExecutionTarget {
-    pub const fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::Auto => "auto",
             Self::Cpu => "cpu",
             Self::Accelerated => "accelerated",
+            Self::Device(id) => id,
         }
+    }
+
+    /// Parse a public execution-target string. Coarse names stay reserved;
+    /// any other valid device-id token is accepted here and resolved later
+    /// against the live GPU list (unknown ids fail closed at resolve).
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim() {
+            "" => Err("execution_target must not be empty".to_string()),
+            "auto" => Ok(Self::Auto),
+            "cpu" => Ok(Self::Cpu),
+            "accelerated" => Ok(Self::Accelerated),
+            other => {
+                if !is_public_device_id_token(other) {
+                    return Err(format!(
+                        "Unsupported execution_target '{other}'. Use auto, cpu, accelerated, \
+                         or a physical GPU id from GET /v1/devices."
+                    ));
+                }
+                Ok(Self::Device(other.to_string()))
+            }
+        }
+    }
+}
+
+fn is_public_device_id_token(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.is_ascii()
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b'/' && byte != b'\\')
+}
+
+impl fmt::Display for ExecutionTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ExecutionTarget {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for ExecutionTarget {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ExecutionTarget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1292,6 +1358,36 @@ mod tests {
         let error = "summarize".parse::<TranscriptionTask>().unwrap_err();
         assert!(error.contains("Unsupported task 'summarize'"));
         assert!(error.contains("transcribe, translate"));
+    }
+
+    #[test]
+    fn execution_target_parses_coarse_and_physical_ids() {
+        assert_eq!(
+            ExecutionTarget::parse("auto").unwrap(),
+            ExecutionTarget::Auto
+        );
+        assert_eq!(ExecutionTarget::parse("cpu").unwrap(), ExecutionTarget::Cpu);
+        assert_eq!(
+            ExecutionTarget::parse("accelerated").unwrap(),
+            ExecutionTarget::Accelerated
+        );
+        assert_eq!(
+            ExecutionTarget::parse("vulkan:amd-radeon-rx-7900-xtx").unwrap(),
+            ExecutionTarget::Device("vulkan:amd-radeon-rx-7900-xtx".to_string())
+        );
+        assert!(ExecutionTarget::parse("not a device").is_err());
+        assert!(ExecutionTarget::parse("").is_err());
+        assert_eq!(
+            serde_json::to_string(&ExecutionTarget::Device(
+                "vulkan:amd-radeon-rx-7900-xtx".to_string()
+            ))
+            .unwrap(),
+            "\"vulkan:amd-radeon-rx-7900-xtx\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ExecutionTarget>("\"cpu\"").unwrap(),
+            ExecutionTarget::Cpu
+        );
     }
 
     #[test]

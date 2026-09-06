@@ -622,13 +622,14 @@ fn parse_execution_target_field_accepts_supported_targets() {
         parse_execution_target_field("accelerated").unwrap(),
         ExecutionTarget::Accelerated
     );
-    let error = parse_execution_target_field("gpu0")
+    assert_eq!(
+        parse_execution_target_field("vulkan:amd-radeon-rx-7900-xtx").unwrap(),
+        ExecutionTarget::Device("vulkan:amd-radeon-rx-7900-xtx".to_string())
+    );
+    let error = parse_execution_target_field("not a device")
         .unwrap_err()
         .to_string();
-    assert!(
-        error.contains("Unsupported execution_target 'gpu0'"),
-        "{error}"
-    );
+    assert!(error.contains("Unsupported execution_target"), "{error}");
 }
 
 #[test]
@@ -647,6 +648,12 @@ fn native_execution_target_mapping_preserves_server_request_semantics() {
     );
     assert_eq!(
         native_hardware_target_from_execution_target(Some(ExecutionTarget::Accelerated)),
+        NativeAsrHardwareTarget::Accelerated
+    );
+    assert_eq!(
+        native_hardware_target_from_execution_target(Some(ExecutionTarget::Device(
+            "vulkan:amd-radeon-rx-7900-xtx".to_string()
+        ))),
         NativeAsrHardwareTarget::Accelerated
     );
 }
@@ -1555,6 +1562,7 @@ async fn default_model_response_reports_installed_not_installed_and_unset() {
 
 #[test]
 fn transcription_preferences_fill_missing_thread_request_only() {
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let preferences = Preferences {
         inference_threads: Some(6),
         voice_id_segmenter: openasr_core::config::VoiceIdSegmenterPreference::Segmentation3_0,
@@ -1563,7 +1571,7 @@ fn transcription_preferences_fill_missing_thread_request_only() {
     };
     let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo");
 
-    apply_transcription_preferences(&mut request, &preferences);
+    apply_transcription_preferences(&mut request, Some(&preferences)).unwrap();
     assert_eq!(request.inference_threads, Some(6));
     assert_eq!(
         request.voice_id_segmenter,
@@ -1575,8 +1583,57 @@ fn transcription_preferences_fill_missing_thread_request_only() {
     );
 
     request.inference_threads = Some(2);
-    apply_transcription_preferences(&mut request, &preferences);
+    apply_transcription_preferences(&mut request, Some(&preferences)).unwrap();
     assert_eq!(request.inference_threads, Some(2));
+}
+
+#[test]
+fn openasr_device_applies_when_preferences_are_absent() {
+    let _guard = OpenasrDeviceEnvGuard::set("vulkan:amd-radeon-rx-7900-xtx");
+    let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo");
+    apply_transcription_preferences(&mut request, None).unwrap();
+    assert_eq!(
+        request.execution_target,
+        Some(ExecutionTarget::Device(
+            "vulkan:amd-radeon-rx-7900-xtx".to_string()
+        ))
+    );
+}
+
+#[test]
+fn openasr_device_overrides_saved_execution_target() {
+    let _guard = OpenasrDeviceEnvGuard::set("vulkan:amd-radeon-rx-7900-xtx");
+    let preferences = Preferences {
+        execution_target: ExecutionTarget::Cpu,
+        ..Default::default()
+    };
+    let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo");
+    apply_transcription_preferences(&mut request, Some(&preferences)).unwrap();
+    assert_eq!(
+        request.execution_target,
+        Some(ExecutionTarget::Device(
+            "vulkan:amd-radeon-rx-7900-xtx".to_string()
+        ))
+    );
+}
+
+#[test]
+fn request_execution_target_wins_over_openasr_device() {
+    let _guard = OpenasrDeviceEnvGuard::set("vulkan:amd-radeon-rx-7900-xtx");
+    let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo")
+        .with_execution_target(Some(ExecutionTarget::Cpu));
+    apply_transcription_preferences(&mut request, None).unwrap();
+    assert_eq!(request.execution_target, Some(ExecutionTarget::Cpu));
+}
+
+#[test]
+fn invalid_openasr_device_is_bad_request_without_preferences() {
+    let _guard = OpenasrDeviceEnvGuard::set("not a device");
+    let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo");
+    let error = apply_transcription_preferences(&mut request, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Unsupported execution_target"), "{error}");
 }
 
 #[test]
@@ -2071,6 +2128,7 @@ async fn set_default_model_http_returns_conflict_when_native_session_is_busy() {
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
 
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -2178,6 +2236,7 @@ async fn set_default_model_http_keeps_previous_selection_when_activation_probe_f
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
 
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -2397,6 +2456,7 @@ async fn set_default_model_http_keeps_previous_selection_when_persist_fails() {
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
 
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -2485,6 +2545,7 @@ async fn set_default_model_failure_matrix_preserves_precommit_state() {
     use axum::body::Body;
     use tower::ServiceExt;
 
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -2773,6 +2834,7 @@ async fn set_default_model_http_persists_only_after_activation_probe_succeeds() 
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
 
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -2855,6 +2917,7 @@ async fn set_default_model_http_real_probe_attests_plan_lane_and_live_backend() 
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
 
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -3382,6 +3445,7 @@ async fn rt377_session_start_claims_id(
     home: &std::path::Path,
     model_id: &str,
 ) -> bool {
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel(8);
     let mut session = realtime::WsSession::new(
         runtime,

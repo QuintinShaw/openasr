@@ -45,7 +45,7 @@ fn qwen_real_speech_cjk_hotword_and_negative_boost_affect_decode() {
     let audio_path = repo_root().join("fixtures/jfk.wav");
     let backend = native_backend();
 
-    let baseline = transcribe_text(&backend, QWEN_MODEL_ID, oracle, &audio_path, None);
+    let baseline = transcribe_text(&backend, QWEN_MODEL_ID, &oracle, &audio_path, None);
     oracle.assert_text_eq(&baseline, QWEN_BASELINE);
 
     // Current checked-in speech is already correctly decoded, so default boost is
@@ -53,7 +53,7 @@ fn qwen_real_speech_cjk_hotword_and_negative_boost_affect_decode() {
     let default_hotword = transcribe_text(
         &backend,
         QWEN_MODEL_ID,
-        oracle,
+        &oracle,
         &audio_path,
         Some(default_hotword("达摩院")),
     );
@@ -63,7 +63,7 @@ fn qwen_real_speech_cjk_hotword_and_negative_boost_affect_decode() {
     let suppressed = transcribe_text(
         &backend,
         QWEN_MODEL_ID,
-        oracle,
+        &oracle,
         &audio_path,
         Some(hotword("达摩院", -20.0)),
     );
@@ -72,7 +72,7 @@ fn qwen_real_speech_cjk_hotword_and_negative_boost_affect_decode() {
     oracle.assert_contains(&suppressed, "大摩院");
     oracle.assert_not_contains(&suppressed, "达摩院");
 
-    let causal_baseline = transcribe_text(&backend, QWEN_MODEL_ID, oracle, &audio_path, None);
+    let causal_baseline = transcribe_text(&backend, QWEN_MODEL_ID, &oracle, &audio_path, None);
     oracle.assert_text_eq(&causal_baseline, &baseline);
 }
 
@@ -92,13 +92,13 @@ fn qwen_real_speech_cjk_name_hotword_corrects_homophone_at_default_boost() {
     let audio_path = resolve_cjk_name_real_audio();
     let backend = native_backend();
 
-    let baseline = transcribe_text(&backend, QWEN_MODEL_ID, oracle, &audio_path, None);
+    let baseline = transcribe_text(&backend, QWEN_MODEL_ID, &oracle, &audio_path, None);
     oracle.assert_text_eq(&baseline, QWEN_CJK_NAME_BASELINE_MISS);
 
     let corrected = transcribe_text(
         &backend,
         QWEN_MODEL_ID,
-        oracle,
+        &oracle,
         &audio_path,
         Some(default_hotword("刁天宸")),
     );
@@ -107,7 +107,7 @@ fn qwen_real_speech_cjk_name_hotword_corrects_homophone_at_default_boost() {
     oracle.assert_not_contains(&corrected, "刁天成");
 
     // The hotword session must not leak into a following unbiased decode.
-    let causal_baseline = transcribe_text(&backend, QWEN_MODEL_ID, oracle, &audio_path, None);
+    let causal_baseline = transcribe_text(&backend, QWEN_MODEL_ID, &oracle, &audio_path, None);
     oracle.assert_text_eq(&causal_baseline, &baseline);
 }
 
@@ -120,7 +120,7 @@ fn moonshine_real_speech_hotword_and_negative_boost_affect_decode() {
     let audio_path = repo_root().join("fixtures/jfk.wav");
     let backend = native_backend();
 
-    let baseline = transcribe_text(&backend, MOONSHINE_MODEL_ID, oracle, &audio_path, None);
+    let baseline = transcribe_text(&backend, MOONSHINE_MODEL_ID, &oracle, &audio_path, None);
     oracle.assert_text_eq(&baseline, MOONSHINE_JFK_BASELINE);
 
     // JFK is stable at baseline; default boost confirms the phrase is accepted
@@ -128,7 +128,7 @@ fn moonshine_real_speech_hotword_and_negative_boost_affect_decode() {
     let default_hotword = transcribe_text(
         &backend,
         MOONSHINE_MODEL_ID,
-        oracle,
+        &oracle,
         &audio_path,
         Some(default_hotword("Americans")),
     );
@@ -138,7 +138,7 @@ fn moonshine_real_speech_hotword_and_negative_boost_affect_decode() {
     let suppressed = transcribe_text(
         &backend,
         MOONSHINE_MODEL_ID,
-        oracle,
+        &oracle,
         &audio_path,
         Some(hotword("Americans", -20.0)),
     );
@@ -147,11 +147,11 @@ fn moonshine_real_speech_hotword_and_negative_boost_affect_decode() {
     oracle.assert_contains(&suppressed, "America's");
     oracle.assert_not_contains(&suppressed, "Americans");
 
-    let causal_baseline = transcribe_text(&backend, MOONSHINE_MODEL_ID, oracle, &audio_path, None);
+    let causal_baseline = transcribe_text(&backend, MOONSHINE_MODEL_ID, &oracle, &audio_path, None);
     oracle.assert_text_eq(&causal_baseline, &baseline);
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DecodeOracle<'a> {
     pack_path: &'a Path,
     quant: &'static str,
@@ -167,7 +167,7 @@ impl<'a> DecodeOracle<'a> {
         }
     }
 
-    fn assert_text_eq(self, observed: &str, expected: &str) {
+    fn assert_text_eq(&self, observed: &str, expected: &str) {
         assert_eq!(
             observed,
             expected,
@@ -178,7 +178,7 @@ impl<'a> DecodeOracle<'a> {
         );
     }
 
-    fn assert_contains(self, observed: &str, expected_fragment: &str) {
+    fn assert_contains(&self, observed: &str, expected_fragment: &str) {
         assert!(
             observed.contains(expected_fragment),
             "oracle snapshot mismatch\npack path: {}\nquant: {}\nexecution backend: {}\nexpected text: transcript containing {expected_fragment:?}\nobserved text: {observed:?}",
@@ -188,7 +188,7 @@ impl<'a> DecodeOracle<'a> {
         );
     }
 
-    fn assert_not_contains(self, observed: &str, unexpected_fragment: &str) {
+    fn assert_not_contains(&self, observed: &str, unexpected_fragment: &str) {
         assert!(
             !observed.contains(unexpected_fragment),
             "oracle snapshot mismatch\npack path: {}\nquant: {}\nexecution backend: {}\nexpected text: transcript not containing {unexpected_fragment:?}\nobserved text: {observed:?}",
@@ -208,7 +208,7 @@ fn native_backend() -> NativeBackend {
 fn transcribe_text(
     backend: &NativeBackend,
     model_id: &str,
-    oracle: DecodeOracle<'_>,
+    oracle: &DecodeOracle<'_>,
     audio_path: &Path,
     phrase_bias: Option<PhraseBiasConfig>,
 ) -> String {
@@ -216,7 +216,7 @@ fn transcribe_text(
         .transcribe(
             TranscriptionRequest::new(audio_path, model_id)
                 .with_model_pack_path(Some(oracle.pack_path.to_path_buf()))
-                .with_execution_target(Some(oracle.execution_target))
+                .with_execution_target(Some(oracle.execution_target.clone()))
                 .with_phrase_bias(phrase_bias),
         )
         .unwrap_or_else(|error| {

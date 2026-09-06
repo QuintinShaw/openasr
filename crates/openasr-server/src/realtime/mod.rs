@@ -182,9 +182,10 @@ pub(crate) async fn stream_transcription(
             "The 'stream' form field is not supported. SSE streaming on this server is the OpenASR realtime protocol, enabled with the '?stream=true' query parameter, and does not emit OpenAI transcript.text.* events -- OpenAI SDK stream=True calls cannot parse it. Retry without 'stream' for a complete response, or POST to /v1/audio/transcriptions?stream=true and handle OpenASR realtime events.".to_string(),
         ));
     }
-    if let Some(preferences) = super::load_transcription_preferences(&home) {
-        super::apply_transcription_preferences(&mut parsed.request, &preferences);
-    }
+    super::apply_transcription_preferences(
+        &mut parsed.request,
+        super::load_transcription_preferences(&home).as_ref(),
+    )?;
     if let Some(task) = task_override {
         parsed.request.task = Some(task);
     }
@@ -808,15 +809,15 @@ fn realtime_inference_threads_preference(home: &Path) -> Option<u16> {
         .and_then(|document| document.preferences.inference_threads)
 }
 
-/// Reads the user's saved `execution_target` preference from `home`'s config
-/// document. See [`realtime_inference_threads_preference`] for why this takes
-/// a resolved home directory instead of a [`DistributionContext`].
+/// Serve-level execution default for realtime attach, warmup, and default-model
+/// activation. `OPENASR_DEVICE` wins over on-disk preferences.
 pub(crate) fn realtime_execution_target_preference(
     home: &Path,
-) -> Option<openasr_core::ExecutionTarget> {
-    openasr_core::config::load_config_document(home)
+) -> Result<openasr_core::ExecutionTarget, crate::ApiError> {
+    let preferences = openasr_core::config::load_config_document(home)
         .ok()
-        .map(|document| document.preferences.execution_target)
+        .map(|document| document.preferences);
+    crate::resolve_serve_execution_target(preferences.as_ref())
 }
 
 #[derive(Debug, Deserialize)]

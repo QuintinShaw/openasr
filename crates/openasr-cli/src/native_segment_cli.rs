@@ -1591,18 +1591,11 @@ fn read_align_transcript(path: &Path) -> Result<String> {
 }
 
 fn parse_align_execution_target(raw: Option<&str>) -> Result<openasr_core::ExecutionTarget> {
-    match raw.map(str::trim).filter(|value| !value.is_empty()) {
-        None | Some("auto") => Ok(openasr_core::ExecutionTarget::Auto),
-        Some("cpu") => Ok(openasr_core::ExecutionTarget::Cpu),
-        Some("accelerated") => Ok(openasr_core::ExecutionTarget::Accelerated),
-        Some(other) => Err(consent::CliExit::new(
-            consent::ExitCode::InputError,
-            format!(
-                "Unsupported --execution-target '{other}'. Use one of: auto, cpu, accelerated."
-            ),
-        )
-        .into()),
-    }
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(openasr_core::ExecutionTarget::Auto);
+    };
+    openasr_core::ExecutionTarget::parse(raw)
+        .map_err(|error| consent::CliExit::new(consent::ExitCode::InputError, error).into())
 }
 
 pub(super) fn parse_response_format(value: &str) -> Result<ResponseFormat, String> {

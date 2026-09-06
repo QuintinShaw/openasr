@@ -1,16 +1,15 @@
 //! Request-level execution route foundation.
 //!
-//! Public request surfaces stay coarse (`ExecutionTarget::{Auto,Cpu,Accelerated}`).
-//! This module adds the internal exact-route vocabulary that backend-handle cache
-//! and streaming-worker isolation share before any product UI exposes GPU0/GPU1
-//! picks.
+//! Public request surfaces accept coarse targets (`auto` / `cpu` / `accelerated`)
+//! plus a physical GPU id from `GET /v1/devices`. This module is the internal
+//! exact-route vocabulary that backend-handle cache and streaming-worker
+//! isolation share.
 //!
 //! Correct abstraction:
 //! - [`ResolvedExecutionRoute`] = logical `(provider, stable_id)` plus optional
 //!   [`PhysicalResourceKey`] (PCI BDF when ggml supplies `device_id`)
 //! - Exact resolution is typed fail-closed: no silent card swap, no CPU fallback
-//! - Metal devices are enumerable but [`DeviceAddressability::NotExactlyAddressable`]
-//!   because ggml Metal still initializes via `MTLCreateSystemDefaultDevice` only
+//! - Metal Exact is available by public/stable GPU id; Metal has no PCI/UUID identity
 //! - Admission capacity stays **per physical device** through the device-memory
 //!   broker. Route identity also feeds the unified execution-lane key used by
 //!   every resident backend owner and serve-batch engine. Content-only prepared
@@ -22,8 +21,9 @@ use thiserror::Error;
 
 use crate::ggml_runtime::{GgmlBackendDevice, GgmlBackendKind};
 
-/// Backend provider family for route identity. Distinct from the public coarse
-/// [`crate::ExecutionTarget`] surface (`auto` / `cpu` / `accelerated`).
+/// Backend provider family for route identity. Distinct from the public
+/// [`crate::ExecutionTarget`] surface (`auto` / `cpu` / `accelerated` / a
+/// physical GPU id from `GET /v1/devices`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum ExecutionProvider {
     Cpu,
@@ -76,7 +76,7 @@ impl ExecutionProvider {
     }
 
     pub const fn supports_exact_selection(self) -> bool {
-        matches!(self, Self::Cuda | Self::Hip | Self::Vulkan)
+        matches!(self, Self::Cuda | Self::Hip | Self::Vulkan | Self::Metal)
     }
 }
 
@@ -123,7 +123,8 @@ pub enum DeviceAddressability {
     ExactlyAddressable {
         physical_key: PhysicalResourceKey,
     },
-    /// Device is usable via Auto/Accelerated, but Exact pin is refused.
+    /// No PCI/UUID identity. Public-id and stable-id Exact may still pin this
+    /// device; physical-key Exact is refused.
     NotExactlyAddressable {
         reason: &'static str,
     },
@@ -265,9 +266,8 @@ impl fmt::Display for ExecutionRouteCacheKey {
     }
 }
 
-/// Internal request intent. The public HTTP/CLI surface still only accepts
-/// `auto` / `cpu` / `accelerated`; Exact exists so the runtime can grow a pin
-/// path without inventing a second abstraction later.
+/// Internal request intent. Coarse `auto` / `cpu` / `accelerated` stay the
+/// default public surface; Exact pins one enumerated device and is fail-closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionRouteRequest {
     Auto,
@@ -284,12 +284,14 @@ impl ExecutionRouteRequest {
             crate::ExecutionTarget::Auto => Self::Auto,
             crate::ExecutionTarget::Cpu => Self::Cpu,
             crate::ExecutionTarget::Accelerated => Self::Accelerated,
+            crate::ExecutionTarget::Device(id) => Self::Exact(ExactDeviceSelector::PublicId(id)),
         }
     }
 }
 
 /// Exact device selector. Prefer physical PCI identity when the caller has it;
-/// fall back to provider-scoped stable ggml name.
+/// fall back to provider-scoped stable ggml name, or the public GPU id from
+/// `GET /v1/devices`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExactDeviceSelector {
     PhysicalKey(PhysicalResourceKey),
@@ -297,6 +299,26 @@ pub enum ExactDeviceSelector {
         provider: Option<ExecutionProvider>,
         stable_id: String,
     },
+    /// Public stable id (`vulkan:amd-radeon-rx-7900-xtx`). Never a VulkanN
+    /// ordinal: those change across runs.
+    PublicId(String),
+}
+
+impl fmt::Display for ExactDeviceSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PhysicalKey(key) => write!(f, "{key}"),
+            Self::StableId {
+                provider: Some(provider),
+                stable_id,
+            } => write!(f, "{provider}:{stable_id}"),
+            Self::StableId {
+                provider: None,
+                stable_id,
+            } => f.write_str(stable_id),
+            Self::PublicId(id) => f.write_str(id),
+        }
+    }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -503,8 +525,7 @@ fn addressability_for_device(
 ) -> DeviceAddressability {
     match provider {
         ExecutionProvider::Metal => DeviceAddressability::NotExactlyAddressable {
-            reason: "Metal initializes via MTLCreateSystemDefaultDevice only; \
-                     exact multi-device selection is not available",
+            reason: "Metal has no PCI/UUID identity; Exact pin uses the public GPU id",
         },
         ExecutionProvider::Cpu => DeviceAddressability::NotExactlyAddressable {
             reason: "CPU is selected by the coarse cpu target, not by Exact device pin",
@@ -636,16 +657,25 @@ fn resolve_exact_route(
                     && device.stable_id == *stable_id
             })
             .collect(),
+        ExactDeviceSelector::PublicId(public_id) => {
+            let identities = physical_gpu_identities_from_enumerated(inventory);
+            inventory
+                .iter()
+                .filter(|device| {
+                    identities.iter().any(|identity| {
+                        identity.public_id == *public_id
+                            && identity.registry_ordinal == device.registry_ordinal
+                            && identity.ggml_name == device.stable_id
+                    })
+                })
+                .collect()
+        }
     };
 
     match matches.as_slice() {
         [] => Err(ExecutionRouteError::device_not_found(format!(
-            "selector={selector:?}; inventory_stable_ids=[{}]",
-            inventory
-                .iter()
-                .map(|device| device.stable_id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            "execution_target {selector} was not found. Available devices: {}",
+            available_execution_target_list(inventory)
         ))),
         [device] => {
             // CPU is selected only by the coarse `cpu` target, never Exact pin.
@@ -661,11 +691,11 @@ fn resolve_exact_route(
                     }
                 )));
             }
-            // Metal (and other not-exactly-addressable providers) may match by
-            // stable_id in inventory, but Exact must still fail closed.
-            if device.provider == ExecutionProvider::Metal
-                || (matches!(selector, ExactDeviceSelector::PhysicalKey(_))
-                    && !device.addressability.is_exactly_addressable())
+            // Physical-key Exact still requires a PCI/UUID identity. Stable-id
+            // and public-id Exact pin the enumerated row even when PCI is
+            // missing (Vulkan without bus id, Metal system-default device).
+            if matches!(selector, ExactDeviceSelector::PhysicalKey(_))
+                && !device.addressability.is_exactly_addressable()
             {
                 return Err(ExecutionRouteError::not_addressable(format!(
                     "provider={} stable_id={} reason={}",
@@ -679,12 +709,12 @@ fn resolve_exact_route(
                     }
                 )));
             }
-            // Stable-id Exact on CUDA/HIP/Vulkan is allowed even when PCI id is
-            // missing: the stable ggml name is still a concrete device pin and
-            // must not silently retarget another card. Non-exact providers
-            // (Accelerator/Unknown/...) stay fail-closed here.
-            if matches!(selector, ExactDeviceSelector::StableId { .. })
-                && !device.provider.supports_exact_selection()
+            // Stable-id / public-id Exact is allowed for CUDA/HIP/Vulkan/Metal.
+            // Accelerator/Unknown stay fail-closed.
+            if matches!(
+                selector,
+                ExactDeviceSelector::StableId { .. } | ExactDeviceSelector::PublicId(_)
+            ) && !device.provider.supports_exact_selection()
             {
                 return Err(ExecutionRouteError::not_addressable(format!(
                     "provider={} does not support Exact selection (stable_id={})",
@@ -695,14 +725,199 @@ fn resolve_exact_route(
             Ok(device.to_resolved_route())
         }
         many => Err(ExecutionRouteError::device_not_found(format!(
-            "selector={selector:?} matched {} devices (ordinals {}); Exact requires a unique target",
+            "execution_target {selector} matched {} devices (ordinals {}); Exact requires a unique target. Available devices: {}",
             many.len(),
             many.iter()
                 .map(|device| device.registry_ordinal.to_string())
                 .collect::<Vec<_>>()
-                .join(",")
+                .join(","),
+            available_execution_target_list(inventory)
         ))),
     }
+}
+
+const DUPLICATE_GPU_ID_LIMITATION: &str =
+    "duplicate GPU description; id suffix is not stable if cards are added or removed";
+
+/// One physical GPU with its public stable id. CPU rows are never included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhysicalGpuIdentity {
+    pub public_id: String,
+    pub name: String,
+    pub provider: ExecutionProvider,
+    pub memory: Option<crate::ggml_runtime::GgmlDeviceMemory>,
+    pub ggml_name: String,
+    pub registry_ordinal: usize,
+    pub id_limitation: Option<&'static str>,
+}
+
+pub fn physical_gpu_identities_from_ggml(
+    devices: &[GgmlBackendDevice],
+) -> Vec<PhysicalGpuIdentity> {
+    let sources: Vec<GpuIdSource<'_>> = devices
+        .iter()
+        .enumerate()
+        .filter(|(_, device)| device.kind.is_gpu())
+        .map(|(registry_ordinal, device)| GpuIdSource {
+            provider: ExecutionProvider::from_backend_name(&device.name),
+            description: device.description.as_str(),
+            name: device.name.as_str(),
+            device_id: device.device_id.as_deref(),
+            memory: device.memory,
+            ggml_name: device.name.as_str(),
+            registry_ordinal,
+        })
+        .collect();
+    assign_physical_gpu_ids(&sources)
+}
+
+pub fn physical_gpu_identities_from_enumerated(
+    inventory: &[EnumeratedComputeDevice],
+) -> Vec<PhysicalGpuIdentity> {
+    let sources: Vec<GpuIdSource<'_>> = inventory
+        .iter()
+        .filter(|device| device.kind == RouteDeviceKind::Accelerated && device.ggml_kind.is_gpu())
+        .map(|device| GpuIdSource {
+            provider: device.provider,
+            description: device.description.as_str(),
+            name: device.stable_id.as_str(),
+            device_id: device.device_id.as_deref(),
+            memory: device.memory,
+            ggml_name: device.stable_id.as_str(),
+            registry_ordinal: device.registry_ordinal,
+        })
+        .collect();
+    assign_physical_gpu_ids(&sources)
+}
+
+struct GpuIdSource<'a> {
+    provider: ExecutionProvider,
+    description: &'a str,
+    name: &'a str,
+    device_id: Option<&'a str>,
+    memory: Option<crate::ggml_runtime::GgmlDeviceMemory>,
+    ggml_name: &'a str,
+    registry_ordinal: usize,
+}
+
+fn assign_physical_gpu_ids(sources: &[GpuIdSource<'_>]) -> Vec<PhysicalGpuIdentity> {
+    let bases: Vec<String> = sources
+        .iter()
+        .map(|source| {
+            format!(
+                "{}:{}",
+                source.provider.as_str(),
+                slugify_device_label(non_empty_gpu_label(source.description, source.name))
+            )
+        })
+        .collect();
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for base in &bases {
+        *counts.entry(base.clone()).or_default() += 1;
+    }
+    let mut used = std::collections::BTreeSet::<String>::new();
+    let mut seen_base = std::collections::BTreeMap::<String, usize>::new();
+    sources
+        .iter()
+        .zip(bases)
+        .map(|(source, base)| {
+            let duplicate = counts.get(&base).copied().unwrap_or(1) > 1;
+            let mut public_id = if !duplicate {
+                base.clone()
+            } else if let Some(token) = source.device_id.and_then(slugify_optional) {
+                format!("{base}:{token}")
+            } else {
+                let n = seen_base.entry(base.clone()).or_insert(0);
+                *n += 1;
+                if *n == 1 {
+                    base.clone()
+                } else {
+                    format!("{base}-{n}")
+                }
+            };
+            if !used.insert(public_id.clone()) {
+                let mut suffix = 2;
+                loop {
+                    let candidate = format!("{public_id}-{suffix}");
+                    if used.insert(candidate.clone()) {
+                        public_id = candidate;
+                        break;
+                    }
+                    suffix += 1;
+                }
+            }
+            PhysicalGpuIdentity {
+                public_id,
+                name: non_empty_gpu_label(source.description, source.name).to_string(),
+                provider: source.provider,
+                memory: source.memory,
+                ggml_name: source.ggml_name.to_string(),
+                registry_ordinal: source.registry_ordinal,
+                id_limitation: duplicate.then_some(DUPLICATE_GPU_ID_LIMITATION),
+            }
+        })
+        .collect()
+}
+
+fn non_empty_gpu_label<'a>(description: &'a str, name: &'a str) -> &'a str {
+    let description = description.trim();
+    if !description.is_empty() {
+        return description;
+    }
+    let name = name.trim();
+    if !name.is_empty() {
+        return name;
+    }
+    "gpu"
+}
+
+fn slugify_optional(raw: &str) -> Option<String> {
+    let slug = slugify_device_label(raw);
+    (!slug.is_empty()).then_some(slug)
+}
+
+/// ASCII slug for public GPU ids. Non-ASCII and punctuation become `-`;
+/// empty input becomes `gpu`.
+pub fn slugify_device_label(raw: &str) -> String {
+    let mut slug = String::new();
+    let mut pending_hyphen = false;
+    for byte in raw.bytes() {
+        let c = byte.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            if pending_hyphen && !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.push(c as char);
+            pending_hyphen = false;
+        } else if c.is_ascii() {
+            pending_hyphen = !slug.is_empty();
+        }
+    }
+    if slug.is_empty() {
+        "gpu".to_string()
+    } else {
+        slug
+    }
+}
+
+pub fn available_execution_target_list(inventory: &[EnumeratedComputeDevice]) -> String {
+    available_execution_target_values(inventory).join(", ")
+}
+
+pub fn available_execution_target_values(inventory: &[EnumeratedComputeDevice]) -> Vec<String> {
+    let mut values = vec!["auto".to_string(), "cpu".to_string()];
+    if inventory
+        .iter()
+        .any(|device| device.kind == RouteDeviceKind::Accelerated)
+    {
+        values.push("accelerated".to_string());
+    }
+    values.extend(
+        physical_gpu_identities_from_enumerated(inventory)
+            .into_iter()
+            .map(|identity| identity.public_id),
+    );
+    values
 }
 
 /// Admission / capacity slot identity for native model sessions.
@@ -836,21 +1051,72 @@ mod tests {
     }
 
     #[test]
-    fn metal_exact_is_not_addressable() {
+    fn metal_exact_by_stable_id_pins_the_enumerated_device() {
         let inventory = vec![
             fake_device(0, "CPU", GgmlBackendKind::Cpu, None),
             fake_device(1, "Metal", GgmlBackendKind::Gpu, None),
         ];
-        let error = resolve_execution_route(
+        let route = resolve_execution_route(
             &ExecutionRouteRequest::Exact(ExactDeviceSelector::StableId {
                 provider: Some(ExecutionProvider::Metal),
                 stable_id: "Metal".to_string(),
             }),
             &inventory,
         )
-        .expect_err("metal exact");
-        assert!(matches!(error, ExecutionRouteError::NotAddressable { .. }));
+        .expect("metal exact by stable id");
+        assert_eq!(route.provider, ExecutionProvider::Metal);
+        assert_eq!(route.stable_id, "Metal");
         assert!(!inventory[1].addressability.is_exactly_addressable());
+    }
+
+    #[test]
+    fn metal_exact_by_physical_key_is_not_addressable() {
+        let inventory = vec![
+            fake_device(0, "CPU", GgmlBackendKind::Cpu, None),
+            fake_device(1, "Metal", GgmlBackendKind::Gpu, None),
+        ];
+        let key = PhysicalResourceKey::new("0000:00:00.0").unwrap();
+        let error = resolve_execution_route(
+            &ExecutionRouteRequest::Exact(ExactDeviceSelector::PhysicalKey(key)),
+            &inventory,
+        )
+        .expect_err("metal has no PCI key");
+        assert!(matches!(error, ExecutionRouteError::DeviceNotFound { .. }));
+    }
+
+    #[test]
+    fn metal_exact_by_public_id_pins_the_enumerated_device() {
+        let inventory = vec![
+            fake_device(0, "CPU", GgmlBackendKind::Cpu, None),
+            described_gpu(1, "Metal", "Apple M1", GgmlBackendKind::Gpu, None),
+        ];
+        let route = resolve_execution_route(
+            &ExecutionRouteRequest::Exact(ExactDeviceSelector::PublicId(
+                "metal:apple-m1".to_string(),
+            )),
+            &inventory,
+        )
+        .expect("metal public id exact");
+        assert_eq!(route.provider, ExecutionProvider::Metal);
+        assert_eq!(route.stable_id, "Metal");
+    }
+
+    #[test]
+    fn metal_public_id_miss_lists_metal_id() {
+        let inventory = vec![
+            fake_device(0, "CPU", GgmlBackendKind::Cpu, None),
+            described_gpu(1, "Metal", "Apple M1", GgmlBackendKind::Gpu, None),
+        ];
+        let error = resolve_execution_route(
+            &ExecutionRouteRequest::Exact(ExactDeviceSelector::PublicId(
+                "metal:missing-card".to_string(),
+            )),
+            &inventory,
+        )
+        .expect_err("missing metal public id");
+        let message = error.to_string();
+        assert!(matches!(error, ExecutionRouteError::DeviceNotFound { .. }));
+        assert!(message.contains("metal:apple-m1"), "{message}");
     }
 
     #[test]
@@ -1066,6 +1332,131 @@ mod tests {
             None,
             false
         ));
+    }
+
+    fn described_gpu(
+        ordinal: usize,
+        name: &str,
+        description: &str,
+        kind: GgmlBackendKind,
+        device_id: Option<&str>,
+    ) -> EnumeratedComputeDevice {
+        let mut device = fake_device(ordinal, name, kind, device_id);
+        device.description = description.to_string();
+        device
+    }
+
+    #[test]
+    fn public_id_pins_one_vulkan_card_and_is_stable() {
+        let inventory = vec![
+            fake_device(0, "CPU", GgmlBackendKind::Cpu, None),
+            described_gpu(
+                1,
+                "Vulkan0",
+                "NVIDIA GeForce RTX 2070 SUPER",
+                GgmlBackendKind::Gpu,
+                Some("0000:01:00.0"),
+            ),
+            described_gpu(
+                2,
+                "Vulkan1",
+                "AMD Radeon RX 7900 XTX",
+                GgmlBackendKind::Gpu,
+                Some("0000:03:00.0"),
+            ),
+            described_gpu(
+                3,
+                "Vulkan2",
+                "AMD Radeon Graphics",
+                GgmlBackendKind::IntegratedGpu,
+                Some("0000:00:08.0"),
+            ),
+        ];
+        let first = physical_gpu_identities_from_enumerated(&inventory);
+        let second = physical_gpu_identities_from_enumerated(&inventory);
+        assert_eq!(first, second);
+        let ids: Vec<_> = first.iter().map(|gpu| gpu.public_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "vulkan:nvidia-geforce-rtx-2070-super",
+                "vulkan:amd-radeon-rx-7900-xtx",
+                "vulkan:amd-radeon-graphics",
+            ]
+        );
+        let route = resolve_execution_route(
+            &ExecutionRouteRequest::Exact(ExactDeviceSelector::PublicId(
+                "vulkan:amd-radeon-rx-7900-xtx".to_string(),
+            )),
+            &inventory,
+        )
+        .expect("public id exact");
+        assert_eq!(route.stable_id, "Vulkan1");
+        assert_eq!(route.provider, ExecutionProvider::Vulkan);
+    }
+
+    #[test]
+    fn public_id_miss_lists_available_ids() {
+        let inventory = vec![
+            fake_device(0, "CPU", GgmlBackendKind::Cpu, None),
+            described_gpu(
+                1,
+                "Vulkan0",
+                "AMD Radeon RX 7900 XTX",
+                GgmlBackendKind::Gpu,
+                None,
+            ),
+        ];
+        let error = resolve_execution_route(
+            &ExecutionRouteRequest::Exact(ExactDeviceSelector::PublicId(
+                "vulkan:missing-card".to_string(),
+            )),
+            &inventory,
+        )
+        .expect_err("missing public id");
+        let message = error.to_string();
+        assert!(matches!(error, ExecutionRouteError::DeviceNotFound { .. }));
+        assert!(message.contains("vulkan:missing-card"), "{message}");
+        assert!(!message.contains("PublicId("), "{message}");
+        assert!(
+            message.contains("vulkan:amd-radeon-rx-7900-xtx"),
+            "{message}"
+        );
+        assert!(message.contains("auto"), "{message}");
+        assert!(message.contains("cpu"), "{message}");
+        assert!(message.contains("accelerated"), "{message}");
+    }
+
+    #[test]
+    fn duplicate_gpu_descriptions_get_distinct_public_ids() {
+        let inventory = vec![
+            described_gpu(
+                0,
+                "Vulkan0",
+                "NVIDIA GeForce RTX 2070 SUPER",
+                GgmlBackendKind::Gpu,
+                Some("0000:01:00.0"),
+            ),
+            described_gpu(
+                1,
+                "Vulkan1",
+                "NVIDIA GeForce RTX 2070 SUPER",
+                GgmlBackendKind::Gpu,
+                Some("0000:02:00.0"),
+            ),
+        ];
+        let ids: Vec<_> = physical_gpu_identities_from_enumerated(&inventory)
+            .into_iter()
+            .map(|gpu| gpu.public_id)
+            .collect();
+        assert_ne!(ids[0], ids[1]);
+        assert!(ids[0].starts_with("vulkan:nvidia-geforce-rtx-2070-super"));
+        assert!(ids[1].starts_with("vulkan:nvidia-geforce-rtx-2070-super"));
+        assert!(
+            physical_gpu_identities_from_enumerated(&inventory)
+                .iter()
+                .all(|gpu| gpu.id_limitation.is_some())
+        );
     }
 
     #[cfg(feature = "hip")]
