@@ -234,6 +234,12 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   ignored -- use a multilingual Whisper pack when you need to force or read back the
   language. (Wiring Qwen's text-prompt language conditioning is tracked, but needs a
   real-pack parity check against the reference inference before it can be claimed.)
+  Qwen3-ASR 0.6B q4 on `fixtures/en_zh_mixed.wav` (5s English + ~8s Mandarin)
+  currently drops the English lead-in and truncates the Mandarin tail; the same
+  clip is a single 0--13s decode (not VAD/leading-silence clipping), and the
+  family rejects `--language`. Treat this as a model code-switch limit of that
+  pack -- use Whisper, MiMo-ASR, or moss-transcribe-diarize when the English
+  half must be kept. fp16 / 1.7B were not re-measured on this host.
   Dolphin is specify-only: it does not auto-detect, so an explicit `--language`
   selects one of its 14 recognition codes (`zh` plus 13 Chinese regional-dialect
   codes such as `zh-sichuan`, `zh-shanghai`, `zh-hebei`) via a decode-prompt
