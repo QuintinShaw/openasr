@@ -300,7 +300,6 @@ fn rt_378_kanji_only_japanese_tagged_en_or_auto_fails_closed() {
 }
 
 #[test]
-#[ignore = "tracked: #391 semantic manuscript mismatch needs an acoustic score"]
 fn rt_378_unrelated_manuscript_fails_closed() {
     let home = isolated_home();
     let pack = copy_pack_into(home.path());
@@ -370,6 +369,42 @@ fn rt_378_unrelated_manuscript_fails_closed() {
         leaks.push(format!(
             "CLI exit={:?} stdout={stdout} stderr={stderr}",
             output.status.code()
+        ));
+    } else {
+        let combined = format!("{stdout}{stderr}");
+        if !combined.to_ascii_lowercase().contains("mismatch")
+            && !combined.to_ascii_lowercase().contains("degenerate")
+        {
+            leaks.push(format!(
+                "CLI failed with a non-mismatch error: stdout={stdout} stderr={stderr}"
+            ));
+        }
+    }
+
+    let serve = spawn_serve(home.path(), &pack);
+    let wav = std::fs::read(jfk_wav()).expect("read jfk.wav");
+    let (content_type, body) =
+        multipart_precise_timeline(&wav, UNRELATED_ENGLISH, &[("language", "en")]);
+    let response = curl_http(
+        &serve.addr,
+        "POST",
+        "/v1/audio/precise-timeline",
+        Some(&content_type),
+        &body,
+        HTTP_TIMEOUT_ALIGN,
+    );
+    if response.status == 200 || looks_like_aligned_timeline(&response.body) {
+        leaks.push(format!(
+            "HTTP status={} body={}",
+            response.status, response.body
+        ));
+    } else if response.status != 400
+        || (!response.body.to_ascii_lowercase().contains("mismatch")
+            && !response.body.to_ascii_lowercase().contains("degenerate"))
+    {
+        leaks.push(format!(
+            "HTTP failed with a non-mismatch error: status={} body={}",
+            response.status, response.body
         ));
     }
 
