@@ -11,19 +11,19 @@ rows (start and end). Each row is a softmax over the 80 ms timestamp grid
 **Score** = mean, over every start/end boundary, of the chosen-bin
 log-softmax.
 
-This is the NAR analog of a CTC forced-path average log-probability
-(Graves, Fernández, Gomez, Schmidhuber, ICML 2006, *Connectionist Temporal
-Classification*) and of max-softmax-probability OOD detection (Hendrycks &
-Gimpel, ICLR 2017, *A Baseline for Detecting Misclassified and
-Out-of-Distribution Examples*). The classify head cannot emit a CTC blank
-or a free-decode token posterior; those signals do not exist on this pack.
+The NAR timestamp head does **not** emit tokens. The score is the
+sharpness of the timestamp posterior (how peaked the chosen 80 ms bin is),
+closer to max-softmax-probability OOD detection (Hendrycks & Gimpel, ICLR
+2017, *A Baseline for Detecting Misclassified and Out-of-Distribution
+Examples*) than to a CTC forced-path average log-probability. There is no
+CTC blank and no free-decode token posterior on this pack.
 
 **Alternatives considered**
 
 | Statistic | Why not shipped |
 | --- | --- |
 | Per-word posterior median | A 50/50 partial match can keep the median on the matching half. |
-| Lower-quartile (p25) of per-word means | Larger partial-match gap on this fixture set, but it is an order statistic rather than the path-average log-prob used in the CTC / MFA literature. Mean already separates every pair below. |
+| Lower-quartile (p25) of per-word means | Larger partial-match gap on this fixture set, but it is an order statistic rather than a path-average of the timestamp posterior. Mean already separates every pair below. |
 | Forced-path vs free-decode gap | Would require a second unconstrained decode of a different model family. Out of scope. |
 | WER / string overlap | Explicitly forbidden by #391. |
 
@@ -59,19 +59,37 @@ Calibrated 2026-09-07 on this host (Apple M1, CPU graph, isolated
 - Full-mismatch ceiling (−2.304) is **1.30 nats below** the threshold.
 
 A score equal to the threshold is admitted (same convention as the 50%
-zero-duration geometric gate). Failure returns
-`WordTimestampAlignmentFailed` (HTTP 400 / CLI runtime failure) with the
-score and threshold in the message, the same error class as the geometric
-gates.
+zero-duration geometric gate).
+
+**What failure does depends on the caller.** Shared gates; one policy
+parameter:
+
+- **External manuscript** (`openasr align`, `POST /v1/audio/precise-timeline`,
+  `align_plain_transcript_to_audio`): fail-closed
+  `WordTimestampAlignmentFailed` (HTTP 400 / CLI non-zero) with the score
+  and threshold in the message.
+- **In-process transcription** (the ASR model just produced the text):
+  degrade. The native approximate timeline is returned
+  (`timeline_quality: native_approximate`) plus
+  `timeline_degraded_reason`. CLI prints a warning and exits 0; HTTP
+  `json` / `verbose_json` include the field. Desktop does not yet read
+  the reason.
+
+On a passing alignment the per-word `confidence` field is the chosen-bin
+posterior (`exp` of the start/end log-prob mean). `OPENASR_LOG` /
+`stage_timing` logs `stage=acoustic_confidence mean_log_prob=…`.
 
 ## Known limits
 
+- Calibration is **Apple M1 CPU graph + shipped `q4_k` only** (object
+  `sha256:5b36662d…` above). Other backends and quants have not been
+  re-scored.
 - Near-miss manuscripts (a few substituted or extra words on an otherwise
   matching script) were not in the calibration set. They may score between
   the matching cluster and −1.00.
 - The score measures how peaked the timestamp classifier is, not token
   identity. A manuscript that happens to place confident (but wrong)
-  boundaries could in principle pass; that was not observed on the
-  fixture cross-pairs above.
+  boundaries — “the head is sharp, the words are all wrong” — can in
+  principle pass; that was not observed on the fixture cross-pairs above.
 - Japanese / Korean remain fail-closed by the existing morphology guard
   before this score is computed.

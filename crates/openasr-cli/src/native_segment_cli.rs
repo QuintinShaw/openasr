@@ -1510,6 +1510,7 @@ pub(super) fn write_rendered_formats(
     force_dir: bool,
 ) -> Result<Vec<PathBuf>> {
     warn_about_truncated_decodes(transcription);
+    warn_about_degraded_timeline(transcription);
     if formats.len() <= 1 && !force_dir {
         let format = formats.first().copied().unwrap_or(ResponseFormat::Text);
         let rendered = render_transcription(transcription, format)
@@ -1556,6 +1557,12 @@ pub(super) fn write_rendered_formats(
 /// indistinguishable from a short recording: same exit code, same shape, just
 /// less text. Stderr keeps stdout byte-identical for anything piping the
 /// transcript onward.
+fn warn_about_degraded_timeline(transcription: &openasr_core::Transcription) {
+    if let Some(reason) = &transcription.timeline_degraded_reason {
+        eprintln!("warning: precise timeline is unavailable: {reason}");
+    }
+}
+
 fn warn_about_truncated_decodes(transcription: &openasr_core::Transcription) {
     if transcription.truncated_decodes.is_empty() {
         return;

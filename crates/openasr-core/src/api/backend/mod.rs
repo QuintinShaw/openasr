@@ -845,6 +845,9 @@ pub struct Transcription {
     pub subtitle_cues: Vec<Segment>,
     /// Provenance of the word timeline. `None` on legacy data.
     pub timeline_quality: Option<crate::subtitle::TimelineQuality>,
+    /// Why a requested precise timeline was not used. Present when in-process
+    /// alignment gates failed and the native approximate timeline was kept.
+    pub timeline_degraded_reason: Option<String>,
     pub longform: Option<TranscriptionLongFormMetadata>,
     /// Language the transcription is in (e.g. `en`). For whisper this is the
     /// auto-detected language (or the explicit `--language`); `None` for families

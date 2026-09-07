@@ -1590,6 +1590,7 @@ pub(crate) fn record_file_transcription_history(
             segments: transcription.segments.clone(),
             subtitle_cues: transcription.subtitle_cues.clone(),
             timeline_quality: transcription.timeline_quality,
+            timeline_degraded_reason: transcription.timeline_degraded_reason.clone(),
             text: transcription.text.clone(),
         })
         .map_err(ApiError::History)?;

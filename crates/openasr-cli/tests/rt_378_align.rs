@@ -15,6 +15,7 @@ use tempfile::TempDir;
 
 const KANJI_ONLY_JAPANESE: &str = "日本国民";
 const UNRELATED_ENGLISH: &str = "Preheat the oven to 425 degrees and roast the vegetables with olive oil, salt, and thyme until caramelized.";
+const PARTIAL_ENGLISH: &str = "And so, my fellow Americans, ask not what your country can do for you. Preheat the oven to 425 degrees and roast the vegetables with olive oil, salt, and thyme until caramelized.";
 const HTTP_TIMEOUT_ALIGN: Duration = Duration::from_secs(300);
 
 fn jfk_wav() -> PathBuf {
@@ -28,22 +29,29 @@ fn isolated_home() -> TempDir {
         .expect("create isolated OPENASR_HOME")
 }
 
-fn pack_source() -> PathBuf {
-    let path = std::env::var_os("OPENASR_FORCED_ALIGNER_PACK")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .expect("set OPENASR_FORCED_ALIGNER_PACK to a qwen3-forced-aligner pack (do not skip)");
-    assert!(
-        path.is_file(),
-        "forced-aligner pack source missing (do not skip): {}",
-        path.display()
-    );
-    path
+fn pack_source() -> Result<PathBuf, String> {
+    match openasr_core::testing::external_test_fixture_path(
+        "OPENASR_FORCED_ALIGNER_PACK",
+        "qwen3-forced-aligner pack",
+    ) {
+        Ok(path) if path.is_file() => Ok(path),
+        Ok(path) => Err(format!(
+            "OPENASR_FORCED_ALIGNER_PACK is not a file: {}",
+            path.display()
+        )),
+        Err(skip) => Err(skip.to_string()),
+    }
 }
 
-fn copy_pack_into(home: &Path) -> PathBuf {
+fn copy_pack_into(home: &Path) -> Option<PathBuf> {
+    let source = match pack_source() {
+        Ok(path) => path,
+        Err(skip) => {
+            eprintln!("skipping: {skip}");
+            return None;
+        }
+    };
     let dest = home.join("qwen3-forced-aligner.oasr");
-    let source = pack_source();
     std::fs::copy(&source, &dest).unwrap_or_else(|error| {
         panic!(
             "copy forced-aligner pack with cp semantics failed (hard links are forbidden): {error}"
@@ -57,7 +65,7 @@ fn copy_pack_into(home: &Path) -> PathBuf {
         source_len, dest_len,
         "copied pack size mismatch: source {source_len} dest {dest_len}"
     );
-    dest
+    Some(dest)
 }
 
 fn isolate_process_env(home: &Path, pack: &Path) {
@@ -299,10 +307,13 @@ fn rt_378_kanji_only_japanese_tagged_en_or_auto_fails_closed() {
     );
 }
 
-#[test]
-fn rt_378_unrelated_manuscript_fails_closed() {
+fn assert_external_manuscript_fails_closed(manuscript: &str, case: &str) {
     let home = isolated_home();
-    let pack = copy_pack_into(home.path());
+    // Pack-gated tests in this repo skip with eprintln + return (nextest
+    // still reports PASS). There is no shared nextest SKIP helper.
+    let Some(pack) = copy_pack_into(home.path()) else {
+        return;
+    };
     isolate_process_env(home.path(), &pack);
     let samples = load_native_wav_16khz_mono_f32_v0(jfk_wav(), "rt-378", "rt-378")
         .expect("load jfk.wav samples");
@@ -310,7 +321,7 @@ fn rt_378_unrelated_manuscript_fails_closed() {
 
     let mut leaks = Vec::new();
     match align_plain_transcript_to_audio(
-        UNRELATED_ENGLISH.to_string(),
+        manuscript.to_string(),
         &samples,
         &services,
         ExecutionTarget::Cpu,
@@ -341,8 +352,8 @@ fn rt_378_unrelated_manuscript_fails_closed() {
     }
 
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_openasr"));
-    let transcript_path = home.path().join("unrelated.txt");
-    std::fs::write(&transcript_path, UNRELATED_ENGLISH).expect("write unrelated transcript");
+    let transcript_path = home.path().join(format!("{case}.txt"));
+    std::fs::write(&transcript_path, manuscript).expect("write manuscript");
     command
         .env("OPENASR_HOME", home.path())
         .env("OPENASR_FORCED_ALIGNER_PACK", &pack)
@@ -383,8 +394,7 @@ fn rt_378_unrelated_manuscript_fails_closed() {
 
     let serve = spawn_serve(home.path(), &pack);
     let wav = std::fs::read(jfk_wav()).expect("read jfk.wav");
-    let (content_type, body) =
-        multipart_precise_timeline(&wav, UNRELATED_ENGLISH, &[("language", "en")]);
+    let (content_type, body) = multipart_precise_timeline(&wav, manuscript, &[("language", "en")]);
     let response = curl_http(
         &serve.addr,
         "POST",
@@ -410,7 +420,17 @@ fn rt_378_unrelated_manuscript_fails_closed() {
 
     assert!(
         leaks.is_empty(),
-        "unrelated manuscript vs JFK audio must fail closed as severe transcript/audio mismatch; leaked timelines:\n{}",
+        "{case} manuscript vs JFK audio must fail closed as severe transcript/audio mismatch; leaked timelines:\n{}",
         leaks.join("\n")
     );
+}
+
+#[test]
+fn rt_378_unrelated_manuscript_fails_closed() {
+    assert_external_manuscript_fails_closed(UNRELATED_ENGLISH, "unrelated");
+}
+
+#[test]
+fn rt_378_partial_manuscript_fails_closed() {
+    assert_external_manuscript_fails_closed(PARTIAL_ENGLISH, "partial");
 }
