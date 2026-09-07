@@ -111,8 +111,10 @@ pub use execution_telemetry::{
 pub(crate) use execution_telemetry::{
     current_execution_telemetry_collector, install_execution_telemetry_collector,
 };
+#[cfg(test)]
+pub(crate) use ffi::{GGML_TYPE_COUNT, GGML_TYPE_Q2_0, checked_ggml_type};
 pub(crate) use ffi::{
-    GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, ggml_is_quantized,
+    GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, ggml_is_quantized_checked,
 };
 pub(crate) use gguf_c_parser_sandbox::load_gguf_metadata_and_tensor_index_with_c_parser_sandbox;
 pub use gguf_c_parser_sandbox::{

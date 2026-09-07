@@ -14,7 +14,8 @@
 use thiserror::Error;
 
 use crate::ggml_runtime::{
-    GGML_TYPE_F16, GGML_TYPE_F32, GgufTensorDataReadError, GgufTensorDataReader, ggml_is_quantized,
+    GGML_TYPE_F16, GGML_TYPE_F32, GgufTensorDataReadError, GgufTensorDataReader,
+    ggml_is_quantized_checked,
 };
 
 use super::runtime_contract::MimoAudiotokMetadata;
@@ -225,10 +226,12 @@ fn materialization_extra_bytes(ggml_type: i32, elements: u64) -> Result<u64, Str
                 .ok_or_else(|| "mimo-asr RVQ F16 transient quote overflowed".to_string())?,
         )
         .map_err(|_| "mimo-asr RVQ F16 transient quote exceeds u64".to_string()),
-        other if unsafe { ggml_is_quantized(other) } => Ok(0),
-        other => Err(format!(
-            "mimo-asr RVQ codebook ggml type {other} is unsupported for host materialization"
-        )),
+        other => match ggml_is_quantized_checked(other) {
+            Ok(true) => Ok(0),
+            Ok(false) | Err(_) => Err(format!(
+                "mimo-asr RVQ codebook ggml type {other} is unsupported for host materialization"
+            )),
+        },
     }
 }
 
@@ -450,6 +453,32 @@ mod tests {
         assert!(materialization_extra_bytes(999, 10).is_err());
         let too_many = (usize::MAX as u64 / 2).saturating_add(1);
         assert!(materialization_extra_bytes(GGML_TYPE_F16, too_many).is_err());
+    }
+
+    #[test]
+    fn materialization_peak_rejects_ggml_type_count_bounds() {
+        use crate::ggml_runtime::{
+            GGML_TYPE_COUNT, GGML_TYPE_Q2_0, checked_ggml_type, ggml_is_quantized_checked,
+        };
+        assert!(
+            materialization_extra_bytes(GGML_TYPE_COUNT, 10).is_err(),
+            "GGML_TYPE_COUNT itself is outside 0..COUNT"
+        );
+        assert_eq!(
+            materialization_extra_bytes(GGML_TYPE_Q2_0, 10),
+            Ok(0),
+            "Q2_0 is a quantized type with no host transient"
+        );
+        assert_eq!(
+            ggml_is_quantized_checked(GGML_TYPE_COUNT - 1),
+            Ok(true),
+            "COUNT-1 must remain a live quantized slot in the vendored table"
+        );
+        assert!(
+            checked_ggml_type(u32::MAX).is_err(),
+            "u32::MAX cannot be a ggml type id"
+        );
+        assert!(materialization_extra_bytes(-1, 10).is_err());
     }
 
     #[test]
