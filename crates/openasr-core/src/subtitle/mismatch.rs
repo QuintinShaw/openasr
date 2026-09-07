@@ -1,10 +1,15 @@
 //! Fail-closed checks for a forced-alignment result.
 //!
 //! Forced alignment always maps the given words onto the audio; it does not
-//! score semantic agreement the way ASR WER would. These checks reject
+//! score semantic agreement the way ASR WER would. Geometric checks reject
 //! degenerate outputs (empty word lists, collapsed timestamp bins, inverted
-//! or non-monotonic intervals) so a mismatched script cannot be silently
-//! exported as a timeline.
+//! or non-monotonic intervals). A separate acoustic check rejects a manuscript
+//! whose classify-head chosen-bin log-softmax is below the calibrated
+//! threshold. Neither check is a WER / string heuristic.
+//!
+//! What happens on rejection is a caller policy: external manuscripts stay
+//! fail-closed, while an in-process ASR transcript degrades to its
+//! approximate native timeline. The checks themselves stay shared.
 //!
 //! They intentionally do **not** reuse [`super::validate_word_anchors`]: that
 //! validator is for native ASR anchors and treats a pause longer than 4 s as
@@ -13,6 +18,7 @@
 use crate::api::backend::{Transcription, WordTimestamp};
 
 use super::anchors::AUDIO_DURATION_TOLERANCE_S;
+use super::timeline::TimelineQuality;
 
 /// Forced-aligner classify head uses 80 ms bins. Unique-start collapse is
 /// measured in these bins so the threshold is independent of floating point.
@@ -28,6 +34,22 @@ pub const MIN_UNIQUE_START_BIN_RATIO: f32 = 0.25;
 
 /// Maximum fraction of words that may have zero duration (`start == end`).
 pub const MAX_ZERO_DURATION_WORD_RATIO: f32 = 0.50;
+
+/// Minimum mean per-boundary log-softmax of the chosen timestamp bin.
+///
+/// Qwen3-ForcedAligner is a NAR timestamp classifier, not CTC: each word
+/// boundary is a softmax over the 80 ms grid, and the head does not emit
+/// tokens. The score is the mean chosen-bin log-probability — a sharpness
+/// measure of the timestamp posterior, closer to max-softmax confidence
+/// (Hendrycks & Gimpel, ICLR 2017) than to a CTC forced-path (there is no
+/// token emission to score). Calibrated 2026-09-07 on repository fixtures;
+/// see `docs/forced-align-confidence.md`.
+///
+/// Observed range (CPU, shipped q4_k pack): worst matching mean = -0.360
+/// (jfk.wav + correct English); closest mismatch = -1.498 (JFK first half +
+/// unrelated recipe tail); full-mismatch ceiling = -2.304. `-1.00` sits
+/// 0.64 nats below the worst match and 0.50 nats above the closest mismatch.
+pub const MIN_MEAN_CHOSEN_BIN_LOG_PROB: f32 = -1.00;
 
 /// Why a forced-alignment of an external transcript was rejected.
 #[derive(Debug, Clone, PartialEq)]
@@ -52,6 +74,21 @@ pub enum ForcedAlignmentMismatch {
         end: f32,
         audio_duration_s: f32,
     },
+    LowAcousticConfidence {
+        score: f32,
+        threshold: f32,
+    },
+    NoAlignedBoundaries,
+}
+
+/// Whether a failed geometric / acoustic gate must abort the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForcedAlignmentFailurePolicy {
+    /// External manuscript (`openasr align`, `POST /v1/audio/precise-timeline`).
+    FailClosed,
+    /// In-process ASR output being timestamp-refined. Keep the model-native
+    /// approximate timeline instead of discarding the transcript.
+    DegradeToApproximate,
 }
 
 impl std::fmt::Display for ForcedAlignmentMismatch {
@@ -92,6 +129,14 @@ impl std::fmt::Display for ForcedAlignmentMismatch {
             } => write!(
                 f,
                 "aligned word {word_index} ends at {end:.3}s past audio duration {audio_duration_s:.3}s"
+            ),
+            Self::LowAcousticConfidence { score, threshold } => write!(
+                f,
+                "aligned timeline is acoustically unconfident: mean chosen-bin log-prob {score:.3} is below threshold {threshold:.3} (severe transcript/audio mismatch)"
+            ),
+            Self::NoAlignedBoundaries => write!(
+                f,
+                "aligned timeline produced no aligned boundaries (severe transcript/audio mismatch)"
             ),
         }
     }
@@ -155,6 +200,94 @@ pub fn reject_degenerate_forced_alignment(
     }
 
     Ok(())
+}
+
+/// Aggregate per-boundary chosen-bin log-softmax into the fail-closed score:
+/// the mean of every finite start/end log-prob. Empty or non-finite input
+/// fails closed so a missing acoustic score cannot be treated as a match.
+pub fn mean_chosen_bin_log_prob(log_probs: &[f32]) -> Option<f32> {
+    if log_probs.is_empty() || log_probs.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    Some(log_probs.iter().sum::<f32>() / log_probs.len() as f32)
+}
+
+/// Lower quartile of per-word mean start/end log-probs. Used for calibration
+/// and to document partial-match sensitivity; the shipped gate uses
+/// [`mean_chosen_bin_log_prob`].
+#[cfg(test)]
+pub fn p25_word_log_prob(word_log_probs: &[f32]) -> Option<f32> {
+    if word_log_probs.is_empty() || word_log_probs.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let mut sorted = word_log_probs.to_vec();
+    sorted.sort_by(|left, right| left.total_cmp(right));
+    let index = ((sorted.len() as f32 - 1.0) * 0.25).round() as usize;
+    Some(sorted[index.min(sorted.len() - 1)])
+}
+
+/// Reject a forced alignment whose classify-head path score is below the
+/// calibrated acoustic threshold. Geometric checks stay in
+/// [`reject_degenerate_forced_alignment`].
+pub fn reject_unconfident_forced_alignment(
+    mean_log_prob: f32,
+) -> Result<(), ForcedAlignmentMismatch> {
+    if !mean_log_prob.is_finite() || mean_log_prob < MIN_MEAN_CHOSEN_BIN_LOG_PROB {
+        return Err(ForcedAlignmentMismatch::LowAcousticConfidence {
+            score: mean_log_prob,
+            threshold: MIN_MEAN_CHOSEN_BIN_LOG_PROB,
+        });
+    }
+    Ok(())
+}
+
+/// Shared geometric + acoustic gates. An empty or non-finite score is
+/// [`ForcedAlignmentMismatch::NoAlignedBoundaries`], never a NaN
+/// [`ForcedAlignmentMismatch::LowAcousticConfidence`].
+pub fn evaluate_forced_alignment_gates(
+    aligned: &Transcription,
+    boundary_log_probs: &[f32],
+    audio_duration_s: f32,
+) -> Result<f32, ForcedAlignmentMismatch> {
+    let score = mean_chosen_bin_log_prob(boundary_log_probs)
+        .ok_or(ForcedAlignmentMismatch::NoAlignedBoundaries)?;
+    reject_degenerate_forced_alignment(aligned, audio_duration_s)?;
+    reject_unconfident_forced_alignment(score)?;
+    Ok(score)
+}
+
+/// Apply [`ForcedAlignmentFailurePolicy`] after [`evaluate_forced_alignment_gates`].
+///
+/// Fail-closed returns the mismatch. Degrade returns `original` with
+/// [`TimelineQuality::NativeApproximate`] and a readable reason, never the
+/// rejected aligned words.
+pub fn apply_forced_alignment_gate_policy(
+    original: Transcription,
+    mut aligned: Transcription,
+    gate: Result<f32, ForcedAlignmentMismatch>,
+    policy: ForcedAlignmentFailurePolicy,
+) -> Result<Transcription, ForcedAlignmentMismatch> {
+    match (gate, policy) {
+        (Ok(_score), _) => {
+            aligned.timeline_quality = Some(TimelineQuality::ForcedAligned);
+            aligned.timeline_degraded_reason = None;
+            Ok(aligned)
+        }
+        (Err(error), ForcedAlignmentFailurePolicy::FailClosed) => Err(error),
+        (Err(error), ForcedAlignmentFailurePolicy::DegradeToApproximate) => {
+            let mut kept = original;
+            kept.timeline_quality = Some(TimelineQuality::NativeApproximate);
+            kept.timeline_degraded_reason = Some(error.to_string());
+            Ok(kept)
+        }
+    }
+}
+
+/// Per-word posterior from the start/end chosen-bin log-softmax mean.
+pub fn chosen_bin_probability(start_log_prob: f32, end_log_prob: f32) -> Option<f32> {
+    let mean = 0.5 * (start_log_prob + end_log_prob);
+    let probability = mean.exp();
+    (probability.is_finite() && (0.0..=1.0).contains(&probability)).then_some(probability)
 }
 
 fn alignment_words(transcription: &Transcription) -> Vec<&WordTimestamp> {
@@ -354,5 +487,135 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn mean_chosen_bin_log_prob_rejects_empty_or_non_finite() {
+        assert_eq!(mean_chosen_bin_log_prob(&[]), None);
+        assert_eq!(mean_chosen_bin_log_prob(&[0.0, f32::NAN]), None);
+        let mean = mean_chosen_bin_log_prob(&[-1.0, -3.0]).expect("finite mean");
+        assert!((mean + 2.0).abs() < 1e-6);
+        let p25 = p25_word_log_prob(&[-4.0, -2.0, -1.0, 0.0]).expect("finite p25");
+        assert!((p25 + 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn acoustic_threshold_rejects_below_and_admits_above() {
+        let error = reject_unconfident_forced_alignment(MIN_MEAN_CHOSEN_BIN_LOG_PROB - 0.01)
+            .expect_err("below threshold must fail");
+        assert!(
+            matches!(error, ForcedAlignmentMismatch::LowAcousticConfidence { .. }),
+            "got {error}"
+        );
+        assert!(
+            error.to_string().contains("mismatch"),
+            "error must stay in the mismatch class: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{MIN_MEAN_CHOSEN_BIN_LOG_PROB:.3}")),
+            "error must name the threshold: {error}"
+        );
+        reject_unconfident_forced_alignment(MIN_MEAN_CHOSEN_BIN_LOG_PROB)
+            .expect("score equal to the threshold is admitted");
+    }
+
+    #[test]
+    fn empty_boundaries_are_no_aligned_boundaries_not_nan() {
+        let aligned = transcription_with_words(spread_words(8, 8.0));
+        let error = evaluate_forced_alignment_gates(&aligned, &[], 8.0)
+            .expect_err("empty scores must fail");
+        assert!(
+            matches!(error, ForcedAlignmentMismatch::NoAlignedBoundaries),
+            "got {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("no aligned boundaries"),
+            "error must name the empty-boundary case: {message}"
+        );
+        assert!(
+            !message.contains("NaN") && !message.contains("nan"),
+            "empty scores must not serialize as NaN: {message}"
+        );
+    }
+
+    #[test]
+    fn in_process_gate_failure_keeps_approximate_timeline() {
+        let original = transcription_with_words(spread_words(8, 8.0));
+        let collapsed = transcription_with_words(
+            (0..8)
+                .map(|index| WordTimestamp {
+                    word: format!("x{index}"),
+                    start: 0.0,
+                    end: 0.08,
+                    confidence: None,
+                })
+                .collect(),
+        );
+        let gate = evaluate_forced_alignment_gates(&collapsed, &[-3.0, -3.0], 8.0);
+        assert!(gate.is_err(), "collapsed + unconfident must fail the gates");
+        let kept = apply_forced_alignment_gate_policy(
+            original.clone(),
+            collapsed,
+            gate,
+            ForcedAlignmentFailurePolicy::DegradeToApproximate,
+        )
+        .expect("in-process gate failure must degrade, not abort");
+        assert_eq!(
+            kept.timeline_quality,
+            Some(TimelineQuality::NativeApproximate)
+        );
+        let reason = kept
+            .timeline_degraded_reason
+            .as_deref()
+            .expect("degrade must expose a reason");
+        assert!(
+            reason.contains("mismatch") || reason.contains("degenerate"),
+            "reason must stay in the mismatch class: {reason}"
+        );
+        assert_eq!(kept.segments[0].words, original.segments[0].words);
+    }
+
+    #[test]
+    fn external_gate_failure_is_err() {
+        let original = transcription_with_words(spread_words(8, 8.0));
+        let collapsed = transcription_with_words(
+            (0..8)
+                .map(|index| WordTimestamp {
+                    word: format!("x{index}"),
+                    start: 0.0,
+                    end: 0.08,
+                    confidence: None,
+                })
+                .collect(),
+        );
+        let gate = evaluate_forced_alignment_gates(&collapsed, &[-3.0, -3.0], 8.0);
+        let error = apply_forced_alignment_gate_policy(
+            original,
+            collapsed,
+            gate,
+            ForcedAlignmentFailurePolicy::FailClosed,
+        )
+        .expect_err("external manuscript must fail closed");
+        assert!(
+            matches!(
+                error,
+                ForcedAlignmentMismatch::CollapsedTimeline { .. }
+                    | ForcedAlignmentMismatch::LowAcousticConfidence { .. }
+            ),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn chosen_bin_probability_is_exp_of_mean_log_prob() {
+        let probability = chosen_bin_probability(0.0, 0.0).expect("unit posterior");
+        assert!((probability - 1.0).abs() < 1e-6);
+        let half = chosen_bin_probability(-std::f32::consts::LN_2, -std::f32::consts::LN_2)
+            .expect("half posterior");
+        assert!((half - 0.5).abs() < 1e-3);
+        assert_eq!(chosen_bin_probability(f32::NAN, 0.0), None);
     }
 }

@@ -57,6 +57,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Forced alignment now scores the Qwen3 timestamp-head chosen-bin
+  log-softmax (mean over start/end boundaries) in addition to the existing
+  geometric gates. **External manuscripts** (`openasr align`,
+  `POST /v1/audio/precise-timeline`) stay fail-closed: a geometric or
+  acoustic miss is HTTP 400 / non-zero exit, never
+  `timeline_quality: forced_aligned`. **In-process transcription** (the
+  model just produced the text) degrades instead: the native approximate
+  timeline is kept (`timeline_quality: native_approximate`), and
+  `timeline_degraded_reason` names the cause. CLI prints a warning on
+  stderr and exits 0; HTTP `json` / `verbose_json` include the field for
+  clients to display. Desktop does not yet read the reason.
+  Calibration is Apple M1 CPU graph + shipped `q4_k` only; other
+  backends/quants and near-miss manuscripts (a few wrong words) were
+  not re-scored (`#391`).
 - Core: `openasr pull` skips the network fetch when the installed
   content-addressed object already matches the catalog SHA-256, then
   re-verifies the pack contract and refreshes the install record. A catalog

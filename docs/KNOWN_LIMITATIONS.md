@@ -112,9 +112,15 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   through external morphological segmenters (`nagisa`/`soynlp`) that have not
   been ported, so an `aligned` request against ja/ko text fails closed with a
   typed error rather than mis-tokenizing. Other families keep their approximate
-  timestamps unchanged. Explicit `aligned` only refines words; the automatic
-  Voice ID path additionally consumes those words to assign each text run to
-  the canonical speaker timeline.
+  timestamps unchanged. If the aligner runs on an **in-process** transcript
+  (the model just produced the text) and the geometric or acoustic gates
+  fail, the request still succeeds: the native approximate timeline is kept,
+  `timeline_quality` stays `native_approximate`, and
+  `timeline_degraded_reason` names the cause. CLI prints a warning and
+  exits 0; HTTP `json` / `verbose_json` include the field. Desktop does
+  not yet read the reason. Explicit `aligned` only
+  refines words; the automatic Voice ID path additionally consumes those
+  words to assign each text run to the canonical speaker timeline.
 - External manuscript alignment (`openasr align` / `POST /v1/audio/precise-timeline`
   with `transcript=`) reuses the same Forced Aligner pack and tokenizer. The
   returned `text` keeps the caller's punctuation and casing. Internally the
@@ -129,8 +135,15 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   are built — the 400 s grid is not a substitute for that budget. A collapsed or
   zero-duration timeline is treated as a severe transcript/audio mismatch;
   pauses longer than 4 s in a correctly aligned manuscript are not. Mismatch
-  detection only rejects geometric degeneration; it does not score semantic
-  agreement between the manuscript and the audio. The server
+  detection also rejects a manuscript whose classify-head chosen-bin
+  log-softmax (mean over start/end boundaries) falls below the calibrated
+  acoustic threshold; see [`docs/forced-align-confidence.md`](forced-align-confidence.md).
+  That score is not a WER / string heuristic. **External manuscripts stay
+  fail-closed** (HTTP 400 / non-zero). The threshold was calibrated on Apple
+  M1 CPU graph + shipped `q4_k` only; other backends and quants have not
+  been re-scored. Near-miss manuscripts (a few substituted words on an
+  otherwise matching script) were not in the calibration set. A theoretically
+  sharp but token-wrong timestamp head can also miss. The server
   never downloads the pack; paired device tokens may call the endpoint (it is a
   compute route, not operator-only). This route is not yet on the file
   FIFO / pause / cancel surface used by `/v1/audio/transcriptions`; a request

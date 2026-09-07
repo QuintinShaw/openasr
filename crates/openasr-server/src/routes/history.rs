@@ -137,6 +137,7 @@ pub(crate) async fn history_replace_transcript(
         segments: request.segments,
         subtitle_cues: request.subtitle_cues,
         timeline_quality: request.timeline_quality,
+        timeline_degraded_reason: request.timeline_degraded_reason,
         language: request.language,
         ..Default::default()
     };
@@ -164,6 +165,8 @@ pub(crate) struct HistoryReplaceTranscriptRequest {
     pub(crate) subtitle_cues: Vec<openasr_core::Segment>,
     #[serde(default)]
     pub(crate) timeline_quality: Option<openasr_core::TimelineQuality>,
+    #[serde(default)]
+    pub(crate) timeline_degraded_reason: Option<String>,
 }
 
 pub(crate) async fn history_assign_speakers(

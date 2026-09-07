@@ -4495,6 +4495,7 @@ async fn history_list_supports_search_pagination_and_kind_filter() {
         segments: Vec::new(),
         subtitle_cues: Vec::new(),
         timeline_quality: None,
+        timeline_degraded_reason: None,
         text: text.to_string(),
     };
     let oldest = store

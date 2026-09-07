@@ -22,7 +22,12 @@ pub use anchors::{
     WordAnchorIssue, WordAnchorQuality, WordAnchorValidation, validate_word_anchors,
 };
 pub use cues::{resegment_segments_into_cues, resegment_transcription_cues, segment_into_cues};
-pub(crate) use mismatch::{ForcedAlignmentMismatch, reject_degenerate_forced_alignment};
+pub(crate) use mismatch::{
+    ForcedAlignmentFailurePolicy, ForcedAlignmentMismatch, apply_forced_alignment_gate_policy,
+    chosen_bin_probability, evaluate_forced_alignment_gates,
+};
+#[cfg(test)]
+pub(crate) use mismatch::{mean_chosen_bin_log_prob, p25_word_log_prob};
 pub use reading::merge_reading_segments;
 pub use timeline::{
     ForcedAlignmentDecision, TimelinePrecisionPolicy, TimelineProjectOptions, TimelineQuality,

@@ -3144,6 +3144,7 @@ impl WsSession {
             segments: Vec::new(),
             subtitle_cues: Vec::new(),
             timeline_quality: None,
+            timeline_degraded_reason: None,
             text,
         }) {
             self.emit_error(

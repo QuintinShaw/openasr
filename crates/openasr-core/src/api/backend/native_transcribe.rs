@@ -1356,8 +1356,11 @@ fn run_native_transcription_fallible_with_input(
             &request_execution_intent,
             execution_context.as_ref(),
             Some(&progress),
+            crate::subtitle::ForcedAlignmentFailurePolicy::DegradeToApproximate,
         )?;
-        timeline_quality = crate::subtitle::TimelineQuality::ForcedAligned;
+        timeline_quality = refined
+            .timeline_quality
+            .unwrap_or(crate::subtitle::TimelineQuality::ForcedAligned);
         refined
     } else if may_align {
         // Planned align was skipped: drop its weight so overall can finish.
@@ -1716,6 +1719,7 @@ pub fn refine_existing_transcription_timeline(
             "post-hoc timeline refinement has no external request control",
         ),
         Some(&progress),
+        crate::subtitle::ForcedAlignmentFailurePolicy::FailClosed,
     )?;
     progress.complete_stage_brief(TranscriptionStage::Project);
     Ok(crate::subtitle::project_transcription(
@@ -1742,8 +1746,9 @@ pub fn refine_existing_transcription_timeline(
 ///
 /// Missing pack, unsupported language or Japanese/Korean script, empty
 /// normalized text, audio past the timestamp grid, a prompt past decoder
-/// context, or a degenerate (collapsed) alignment fail closed instead of
-/// returning a fabricated timeline.
+/// context, a degenerate (collapsed) alignment, or an acoustically
+/// unconfident manuscript fail closed instead of returning a fabricated
+/// timeline.
 pub fn align_plain_transcript_to_audio(
     transcript: String,
     prepared_audio_16khz_mono: &[f32],
@@ -1853,6 +1858,7 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
     request_intent: &ExecutionIntent,
     execution_context: &crate::RequestExecutionContext,
     progress: Option<&ProgressReporter>,
+    gate_policy: crate::subtitle::ForcedAlignmentFailurePolicy,
 ) -> Result<Transcription, BackendError> {
     let _abort_callback_guard = execution_context
         .control
@@ -1927,8 +1933,11 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
                 session_load_started.elapsed(),
             );
             let mut refined = transcription.clone();
+            // `transcription` stays available after this closure so a
+            // DegradeToApproximate policy can restore the pre-align words.
             let audio_samples = prepared_audio.as_slice().len();
             let mut completed_align_duration_s = 0.0f64;
+            let mut boundary_log_probs = Vec::new();
             for (index, segment) in refined.segments.iter_mut().enumerate() {
                 if execution_context.is_canceled() {
                     return Err(BackendError::TranscriptionCanceled);
@@ -1988,6 +1997,10 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
                         alignment_started.elapsed().as_secs_f64() * 1000.0,
                     ),
                 );
+                for item in &items {
+                    boundary_log_probs.push(item.start_log_prob);
+                    boundary_log_probs.push(item.end_log_prob);
+                }
                 assign_local_aligned_words(segment, &items);
                 completed_align_duration_s += segment_duration_s;
                 if let Some(progress) = progress {
@@ -1997,10 +2010,10 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
                     ));
                 }
             }
-            Ok(refined)
+            Ok((refined, boundary_log_probs))
         },
     );
-    let result = match result {
+    let (result, boundary_log_probs) = match result {
         Ok(result) => result,
         Err(error)
             if execution_context.is_canceled()
@@ -2017,12 +2030,21 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
         progress.complete_stage();
     }
     let audio_duration_s = prepared_audio.as_slice().len() as f32 / 16_000.0;
-    crate::subtitle::reject_degenerate_forced_alignment(&result, audio_duration_s).map_err(
-        |mismatch| BackendError::WordTimestampAlignmentFailed {
+    let gate = crate::subtitle::evaluate_forced_alignment_gates(
+        &result,
+        &boundary_log_probs,
+        audio_duration_s,
+    );
+    if let Ok(score) = gate {
+        crate::stage_timing::log_detail_event(
+            "forced_aligner",
+            format_args!("stage=acoustic_confidence mean_log_prob={score:.4}"),
+        );
+    }
+    crate::subtitle::apply_forced_alignment_gate_policy(transcription, result, gate, gate_policy)
+        .map_err(|mismatch| BackendError::WordTimestampAlignmentFailed {
             reason: mismatch.to_string(),
-        },
-    )?;
-    Ok(result)
+        })
 }
 
 /// Converts real ForcedAligner execution milestones into a calibrated share of
@@ -2126,7 +2148,10 @@ fn assign_local_aligned_words(segment: &mut Segment, items: &[ForcedAlignItem]) 
                 word: item.text.clone(),
                 start: start as f32,
                 end: end as f32,
-                confidence: None,
+                confidence: crate::subtitle::chosen_bin_probability(
+                    item.start_log_prob,
+                    item.end_log_prob,
+                ),
             }
         })
         .collect();
@@ -5020,6 +5045,7 @@ mod tests {
             &ExecutionIntent::CpuOnly,
             &execution_context,
             None,
+            crate::subtitle::ForcedAlignmentFailurePolicy::FailClosed,
         )
         .expect("CPU forced alignment");
 
@@ -5033,6 +5059,7 @@ mod tests {
             &exact_intent,
             &execution_context,
             None,
+            crate::subtitle::ForcedAlignmentFailurePolicy::FailClosed,
         )
         .expect("Exact Hybrid forced alignment");
         let observed = telemetry.snapshot();
@@ -8857,6 +8884,8 @@ mod tests {
             text: text.to_string(),
             start_time_s,
             end_time_s,
+            start_log_prob: 0.0,
+            end_log_prob: 0.0,
         }
     }
 
@@ -8925,8 +8954,10 @@ mod tests {
         assert_eq!(target.words.len(), 2);
         assert_eq!(target.words[0].start, 30.1);
         assert_eq!(target.words[0].end, 30.4);
+        assert_eq!(target.words[0].confidence, Some(1.0));
         assert_eq!(target.words[1].start, 30.5);
         assert_eq!(target.words[1].end, 32.0);
+        assert_eq!(target.words[1].confidence, Some(1.0));
     }
 
     #[test]

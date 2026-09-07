@@ -19,6 +19,10 @@ pub(super) struct JsonTranscription<'a> {
     /// Provenance of the word timeline. Omitted on legacy data.
     #[serde(skip_serializing_if = "Option::is_none")]
     timeline_quality: Option<TimelineQuality>,
+    /// Why a requested precise timeline was not used. Omitted when alignment
+    /// succeeded or was not requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeline_degraded_reason: Option<&'a str>,
     /// Decodes behind this transcript that stopped before covering their audio.
     ///
     /// Present in the plain `json` format, not only `verbose_json`: "this text
@@ -59,6 +63,10 @@ pub(super) struct VerboseJsonTranscription<'a> {
     /// Provenance of the word timeline.
     #[serde(skip_serializing_if = "Option::is_none")]
     timeline_quality: Option<TimelineQuality>,
+    /// Why a requested precise timeline was not used. Omitted when alignment
+    /// succeeded or was not requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeline_degraded_reason: Option<&'a str>,
     /// OpenAI verbose_json top-level `words` array: per-word timing flattened
     /// across all reading segments. Present only when word timestamps were
     /// produced; the per-segment `words` arrays stay for existing clients.
@@ -306,6 +314,7 @@ impl<'a> From<&'a Transcription> for JsonTranscription<'a> {
             segments: json_segments(transcription, false),
             subtitle_cues: json_subtitle_cues(transcription, false),
             timeline_quality: transcription.timeline_quality,
+            timeline_degraded_reason: transcription.timeline_degraded_reason.as_deref(),
             truncated: json_truncated_decodes(transcription),
             unnamed_speakers: json_unnamed_speakers(transcription),
         }
@@ -325,6 +334,7 @@ impl<'a> From<&'a Transcription> for VerboseJsonTranscription<'a> {
             segments: json_segments(transcription, true),
             subtitle_cues: json_subtitle_cues(transcription, true),
             timeline_quality: transcription.timeline_quality,
+            timeline_degraded_reason: transcription.timeline_degraded_reason.as_deref(),
             words: flattened_words(transcription),
             longform: transcription
                 .longform

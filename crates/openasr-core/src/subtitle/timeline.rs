@@ -72,7 +72,8 @@ pub enum TimelineQuality {
     /// Forced aligner produced (or replaced) the word timestamps.
     ForcedAligned,
     /// Model-native approximate timestamps were kept (policy did not require
-    /// a precise timeline, or validation was not demanded).
+    /// a precise timeline, validation was not demanded, or in-process
+    /// alignment gates failed — see `Transcription.timeline_degraded_reason`).
     NativeApproximate,
 }
 
@@ -406,5 +407,21 @@ mod tests {
         assert!(out.segments.iter().all(|s| s.words.is_empty()));
         assert!(out.subtitle_cues.iter().all(|c| c.words.is_empty()));
         assert!(out.subtitle_cues.iter().all(|c| c.end > c.start));
+    }
+
+    #[test]
+    fn timeline_quality_wire_values_stay_desktop_compatible() {
+        assert_eq!(
+            serde_json::to_string(&TimelineQuality::NativeReliable).unwrap(),
+            "\"native_reliable\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TimelineQuality::ForcedAligned).unwrap(),
+            "\"forced_aligned\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TimelineQuality::NativeApproximate).unwrap(),
+            "\"native_approximate\""
+        );
     }
 }

@@ -1775,6 +1775,7 @@ fn history_retention_last5_prunes_store() {
                 segments: Vec::new(),
                 subtitle_cues: Vec::new(),
                 timeline_quality: None,
+                timeline_degraded_reason: None,
                 text: format!("transcript {index}"),
             })
             .unwrap();
@@ -1816,6 +1817,7 @@ fn history_retention_off_prunes_store_empty() {
                 segments: Vec::new(),
                 subtitle_cues: Vec::new(),
                 timeline_quality: None,
+                timeline_degraded_reason: None,
                 text: format!("transcript {index}"),
             })
             .unwrap();
@@ -1842,6 +1844,7 @@ fn history_retention_off_prunes_store_empty() {
             segments: Vec::new(),
             subtitle_cues: Vec::new(),
             timeline_quality: None,
+            timeline_degraded_reason: None,
             text: "keep me".to_string(),
         })
         .unwrap();
