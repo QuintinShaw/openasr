@@ -158,6 +158,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Long-form: duplicate and isolated fragments at long-audio slice seams
+  are fixed; slice windows and non-seam cue timings are unchanged.
 - Core: invalid GGUF/ggml type ids — out of range or retired slots whose
   block size is zero — are rejected before any ggml type-trait query. An
   unknown tensor type can no longer be treated as quantized or used to

@@ -4760,4 +4760,31 @@ mod tests {
             plan.stats.provenance
         );
     }
+
+    #[test]
+    fn longform_en_zh_fixture_energy_slices_overlap_at_seams() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/longform_en_zh.wav");
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            path,
+            "longform seam fixture",
+            "longform_en_zh.wav",
+        )
+        .expect("load fixtures/longform_en_zh.wav");
+        let options = LongFormOptions {
+            mode: LongFormMode::Energy,
+            ..LongFormOptions::default()
+        };
+        let plan = plan_longform_slices(&samples, 16_000, &options, None).unwrap();
+        assert!(
+            plan.slices.len() >= 2,
+            "69s fixture must slice under the 30s energy window, got {plan:#?}"
+        );
+        for pair in plan.slices.windows(2) {
+            assert!(
+                pair[1].content_start_sample < pair[0].content_end_sample,
+                "consecutive energy slices must re-read the cut: {pair:#?}"
+            );
+        }
+    }
 }
