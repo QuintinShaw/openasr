@@ -57,6 +57,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Forced alignment of an external transcript now also fails closed when the
+  Qwen3 Forced Aligner classify-head path score (mean chosen-bin
+  log-softmax) is below the calibrated acoustic threshold, so an unrelated
+  manuscript can no longer return `timeline_quality: forced_aligned`.
+  Geometric collapse / zero-duration / non-monotonic checks are unchanged
+  (`#391`).
 - Core: `openasr pull` skips the network fetch when the installed
   content-addressed object already matches the catalog SHA-256, then
   re-verifies the pack contract and refreshes the install record. A catalog

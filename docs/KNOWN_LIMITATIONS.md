@@ -129,8 +129,11 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   are built — the 400 s grid is not a substitute for that budget. A collapsed or
   zero-duration timeline is treated as a severe transcript/audio mismatch;
   pauses longer than 4 s in a correctly aligned manuscript are not. Mismatch
-  detection only rejects geometric degeneration; it does not score semantic
-  agreement between the manuscript and the audio. The server
+  detection also rejects a manuscript whose classify-head chosen-bin
+  log-softmax (mean over start/end boundaries) falls below the calibrated
+  acoustic threshold; see [`docs/forced-align-confidence.md`](forced-align-confidence.md).
+  That score is not a WER / string heuristic. Near-miss manuscripts (a few
+  substituted words) were not in the calibration set. The server
   never downloads the pack; paired device tokens may call the endpoint (it is a
   compute route, not operator-only). This route is not yet on the file
   FIFO / pause / cancel surface used by `/v1/audio/transcriptions`; a request
