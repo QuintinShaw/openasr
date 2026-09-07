@@ -1742,8 +1742,9 @@ pub fn refine_existing_transcription_timeline(
 ///
 /// Missing pack, unsupported language or Japanese/Korean script, empty
 /// normalized text, audio past the timestamp grid, a prompt past decoder
-/// context, or a degenerate (collapsed) alignment fail closed instead of
-/// returning a fabricated timeline.
+/// context, a degenerate (collapsed) alignment, or an acoustically
+/// unconfident manuscript fail closed instead of returning a fabricated
+/// timeline.
 pub fn align_plain_transcript_to_audio(
     transcript: String,
     prepared_audio_16khz_mono: &[f32],
@@ -1929,6 +1930,7 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
             let mut refined = transcription.clone();
             let audio_samples = prepared_audio.as_slice().len();
             let mut completed_align_duration_s = 0.0f64;
+            let mut boundary_log_probs = Vec::new();
             for (index, segment) in refined.segments.iter_mut().enumerate() {
                 if execution_context.is_canceled() {
                     return Err(BackendError::TranscriptionCanceled);
@@ -1988,6 +1990,10 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
                         alignment_started.elapsed().as_secs_f64() * 1000.0,
                     ),
                 );
+                for item in &items {
+                    boundary_log_probs.push(item.start_log_prob);
+                    boundary_log_probs.push(item.end_log_prob);
+                }
                 assign_local_aligned_words(segment, &items);
                 completed_align_duration_s += segment_duration_s;
                 if let Some(progress) = progress {
@@ -1997,10 +2003,18 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
                     ));
                 }
             }
-            Ok(refined)
+            let acoustic_score = crate::subtitle::mean_chosen_bin_log_prob(&boundary_log_probs)
+                .ok_or_else(|| BackendError::WordTimestampAlignmentFailed {
+                    reason: crate::subtitle::ForcedAlignmentMismatch::LowAcousticConfidence {
+                        score: f32::NAN,
+                        threshold: crate::subtitle::MIN_MEAN_CHOSEN_BIN_LOG_PROB,
+                    }
+                    .to_string(),
+                })?;
+            Ok((refined, acoustic_score))
         },
     );
-    let result = match result {
+    let (result, acoustic_score) = match result {
         Ok(result) => result,
         Err(error)
             if execution_context.is_canceled()
@@ -2022,6 +2036,11 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
             reason: mismatch.to_string(),
         },
     )?;
+    crate::subtitle::reject_unconfident_forced_alignment(acoustic_score).map_err(|mismatch| {
+        BackendError::WordTimestampAlignmentFailed {
+            reason: mismatch.to_string(),
+        }
+    })?;
     Ok(result)
 }
 
@@ -8857,6 +8876,8 @@ mod tests {
             text: text.to_string(),
             start_time_s,
             end_time_s,
+            start_log_prob: 0.0,
+            end_log_prob: 0.0,
         }
     }
 

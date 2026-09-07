@@ -194,9 +194,10 @@ pub(crate) async fn transcriptions(
 ///
 /// Returns the aligned [`Transcription`]. History persistence is left to the
 /// caller (`POST /v1/history/{id}/transcript` with If-Match). Missing Forced
-/// Aligner pack, unsupported language, empty normalized text, or a degenerate
-/// alignment fail closed. This is a compute route: paired device tokens may
-/// call it; it is not operator-only.
+/// Aligner pack, unsupported language, empty normalized text, a degenerate
+/// alignment, or an acoustically unconfident manuscript (mean chosen-bin
+/// log-softmax below the calibrated threshold) fail closed. This is a compute
+/// route: paired device tokens may call it; it is not operator-only.
 pub(crate) async fn precise_timeline(
     State(runtime): State<ServerRuntime>,
     Query(query): Query<TranscriptionQuery>,
