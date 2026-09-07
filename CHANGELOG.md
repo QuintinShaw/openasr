@@ -144,6 +144,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Core: invalid GGUF/ggml type ids — out of range or retired slots whose
+  block size is zero — are rejected before any ggml type-trait query. An
+  unknown tensor type can no longer be treated as quantized or used to
+  compute a row size, both of which were undefined behaviour. (#400)
 - Docker: images 0.1.37-0.1.40 exit immediately on `docker run` because the
   default command binds `0.0.0.0` without device pairing (required since
   0.1.37). The default command now enables pairing (generating a token into

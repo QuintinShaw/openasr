@@ -1826,6 +1826,10 @@ pub enum GgmlCpuGraphError {
     UnsupportedOperation { operation: GgmlCpuBinaryOp },
     #[error("ggml cpu graph input tensors are unsupported: {reason}")]
     UnsupportedInputs { reason: &'static str },
+    #[error(
+        "ggml type {ggml_type} is outside 0..GGML_TYPE_COUNT or is a retired slot (tensor: {tensor})"
+    )]
+    InvalidGgmlType { ggml_type: i64, tensor: String },
     #[error("ggml cpu graph tensor allocation failed for '{tensor}'")]
     TensorAllocationFailed { tensor: &'static str },
     #[error("ggml cpu graph construction failed at '{step}'")]
@@ -4356,10 +4360,14 @@ impl GgmlStaticTensorArena {
             });
         }
         let block_size =
-            usize::try_from(unsafe { ffi::ggml_blck_size(layout.type_) }).map_err(|_| {
-                GgmlCpuGraphError::UnsupportedInputs {
-                    reason: "loaded tensor block size exceeds usize boundary",
+            usize::try_from(ffi::ggml_blck_size_checked(layout.type_).map_err(|error| {
+                GgmlCpuGraphError::InvalidGgmlType {
+                    ggml_type: error.raw,
+                    tensor: tensor_name.to_string(),
                 }
+            })?)
+            .map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+                reason: "loaded tensor block size exceeds usize boundary",
             })?;
         if block_size == 0 || !dims[0].is_multiple_of(block_size) {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
@@ -9508,7 +9516,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                 | ffi::GGML_TYPE_Q4_K
                 | ffi::GGML_TYPE_Q5_K
                 | ffi::GGML_TYPE_Q6_K
-        ) && unsafe { ffi::ggml_is_quantized(type_) };
+        ) && ffi::ggml_is_quantized_checked(type_) == Ok(true);
         if matches!(type_, ffi::GGML_TYPE_F16 | ffi::GGML_TYPE_F32) || supported_quant_type {
             return Ok(());
         }
@@ -9596,10 +9604,14 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     }
 
     fn type_block_size(&self, type_: i32) -> Result<usize, GgmlCpuGraphError> {
-        let block_size = usize::try_from(unsafe { ffi::ggml_blck_size(type_) }).map_err(|_| {
-            GgmlCpuGraphError::UnsupportedInputs {
-                reason: "tensor block size exceeds usize boundary",
+        let block_size = usize::try_from(ffi::ggml_blck_size_checked(type_).map_err(|error| {
+            GgmlCpuGraphError::InvalidGgmlType {
+                ggml_type: error.raw,
+                tensor: String::from("(unknown)"),
             }
+        })?)
+        .map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+            reason: "tensor block size exceeds usize boundary",
         })?;
         if block_size == 0 {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
@@ -9610,7 +9622,12 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     }
 
     fn element_size_bytes(&self, type_: i32) -> Result<usize, GgmlCpuGraphError> {
-        let size = unsafe { ffi::ggml_type_size(type_) };
+        let size = ffi::ggml_type_size_checked(type_).map_err(|error| {
+            GgmlCpuGraphError::InvalidGgmlType {
+                ggml_type: error.raw,
+                tensor: String::from("(unknown)"),
+            }
+        })?;
         if size == 0 {
             return Err(GgmlCpuGraphError::UnsupportedInputs {
                 reason: "tensor element byte width must be positive",
@@ -12693,7 +12710,10 @@ fn is_loaded_matmul_weight_candidate(layout: ffi::GgmlTensorLayoutPrefix) -> boo
 }
 
 fn ggml_type_name_lossy(type_: c_int) -> String {
-    unsafe { cstr_lossy(ffi::ggml_type_name(type_)) }
+    match ffi::ggml_type_name_checked(type_) {
+        Ok(ptr) => cstr_lossy(ptr),
+        Err(_) => format!("unknown-ggml-type-{type_}"),
+    }
 }
 
 unsafe fn write_tensor_data(

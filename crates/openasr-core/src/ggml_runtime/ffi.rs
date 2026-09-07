@@ -379,6 +379,99 @@ pub(crate) const GGML_TYPE_Q4_K: c_int = 12;
 pub(crate) const GGML_TYPE_Q5_K: c_int = 13;
 pub(crate) const GGML_TYPE_Q6_K: c_int = 14;
 pub(crate) const GGML_TYPE_I32: c_int = 26;
+pub(crate) const GGML_TYPE_Q2_0: c_int = 42;
+
+/// Exclusive upper bound of `enum ggml_type` in vendored
+/// `third_party/openasr-ggml/include/ggml.h` (`GGML_TYPE_COUNT = 43`).
+/// ggml indexes `type_traits[type]` without a range check, so ids outside
+/// `0..GGML_TYPE_COUNT` are an out-of-bounds read. Retired slots inside that
+/// range (removed Q4_2/Q4_3, Q4_0_*, IQ4_NL_*) keep `blck_size == 0`;
+/// NDEBUG `ggml_row_size` would then divide by zero.
+///
+/// When bumping the vendored ggml pin: copy the new `GGML_TYPE_COUNT` from
+/// ggml.h, add any new live type constants, and re-run
+/// `checked_ggml_type_matches_vendored_count` plus the retired-slot tests
+/// (type ids 4 and 31).
+pub(crate) const GGML_TYPE_COUNT: c_int = 43;
+
+const _: () = assert!(GGML_TYPE_Q2_0 < GGML_TYPE_COUNT);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InvalidGgmlType {
+    pub raw: i64,
+}
+
+impl std::fmt::Display for InvalidGgmlType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ggml type {} is outside 0..{GGML_TYPE_COUNT} or is a retired slot",
+            self.raw
+        )
+    }
+}
+
+/// Reject a raw ggml type id before any further `type_traits` query.
+/// Retired in-range slots (`blck_size == 0`) fail the same way as OOB ids.
+pub(crate) fn checked_ggml_type(raw: u32) -> Result<c_int, InvalidGgmlType> {
+    checked_ggml_type_i64(i64::from(raw))
+}
+
+/// GGUF / host metadata store ggml types as `i32` (may be negative).
+pub(crate) fn checked_ggml_type_i32(raw: i32) -> Result<c_int, InvalidGgmlType> {
+    match u32::try_from(raw) {
+        Ok(raw) => checked_ggml_type(raw),
+        Err(_) => Err(InvalidGgmlType {
+            raw: i64::from(raw),
+        }),
+    }
+}
+
+fn checked_ggml_type_i64(raw: i64) -> Result<c_int, InvalidGgmlType> {
+    if raw < 0 || raw >= i64::from(GGML_TYPE_COUNT) {
+        return Err(InvalidGgmlType { raw });
+    }
+    let ty = raw as c_int;
+    // One FFI probe: retired ggml slots keep a type_traits entry with
+    // blck_size == 0. Calling ggml_row_size on those is integer-divide-by-zero
+    // under NDEBUG.
+    if unsafe { ggml_blck_size(ty) } <= 0 {
+        return Err(InvalidGgmlType { raw });
+    }
+    Ok(ty)
+}
+
+pub(crate) fn ggml_is_quantized_checked(raw: i32) -> Result<bool, InvalidGgmlType> {
+    let ty = checked_ggml_type_i32(raw)?;
+    Ok(unsafe { ggml_is_quantized(ty) })
+}
+
+pub(crate) fn ggml_blck_size_checked(raw: i32) -> Result<i64, InvalidGgmlType> {
+    let ty = checked_ggml_type_i32(raw)?;
+    Ok(unsafe { ggml_blck_size(ty) })
+}
+
+pub(crate) fn ggml_type_size_checked(raw: i32) -> Result<usize, InvalidGgmlType> {
+    let ty = checked_ggml_type_i32(raw)?;
+    Ok(unsafe { ggml_type_size(ty) })
+}
+
+pub(crate) fn ggml_row_size_checked(raw: i32, ne: i64) -> Result<usize, InvalidGgmlType> {
+    let ty = checked_ggml_type_i32(raw)?;
+    Ok(unsafe { ggml_row_size(ty, ne) })
+}
+
+pub(crate) fn ggml_get_type_traits_checked(
+    raw: i32,
+) -> Result<*const GgmlTypeTraits, InvalidGgmlType> {
+    let ty = checked_ggml_type_i32(raw)?;
+    Ok(unsafe { ggml_get_type_traits(ty) })
+}
+
+pub(crate) fn ggml_type_name_checked(raw: i32) -> Result<*const c_char, InvalidGgmlType> {
+    let ty = checked_ggml_type_i32(raw)?;
+    Ok(unsafe { ggml_type_name(ty) })
+}
 
 pub(crate) const GGML_LSTM_GATE_ORDER_IOFC: c_int = 0;
 pub(crate) const GGML_LSTM_GATE_ORDER_IFGO: c_int = 1;
@@ -1160,4 +1253,71 @@ unsafe extern "C" {
 
     #[cfg(target_os = "macos")]
     pub(crate) fn ggml_backend_metal_init() -> GgmlBackendRaw;
+}
+
+#[cfg(test)]
+mod ggml_type_tests {
+    use std::ffi::CStr;
+
+    use super::{
+        GGML_TYPE_COUNT, InvalidGgmlType, checked_ggml_type, checked_ggml_type_i32, ggml_type_name,
+    };
+
+    #[test]
+    fn checked_ggml_type_accepts_count_minus_one() {
+        assert_eq!(
+            checked_ggml_type((GGML_TYPE_COUNT - 1) as u32),
+            Ok(GGML_TYPE_COUNT - 1)
+        );
+        assert_eq!(
+            checked_ggml_type_i32(GGML_TYPE_COUNT - 1),
+            Ok(GGML_TYPE_COUNT - 1)
+        );
+    }
+
+    #[test]
+    fn checked_ggml_type_rejects_count_and_u32_max() {
+        assert_eq!(
+            checked_ggml_type(GGML_TYPE_COUNT as u32),
+            Err(InvalidGgmlType {
+                raw: i64::from(GGML_TYPE_COUNT)
+            })
+        );
+        assert_eq!(
+            checked_ggml_type(u32::MAX),
+            Err(InvalidGgmlType {
+                raw: i64::from(u32::MAX)
+            })
+        );
+        assert_eq!(
+            checked_ggml_type_i32(GGML_TYPE_COUNT),
+            Err(InvalidGgmlType {
+                raw: i64::from(GGML_TYPE_COUNT)
+            })
+        );
+        assert_eq!(checked_ggml_type_i32(-1), Err(InvalidGgmlType { raw: -1 }));
+    }
+
+    #[test]
+    fn checked_ggml_type_rejects_retired_slots() {
+        assert_eq!(checked_ggml_type_i32(4), Err(InvalidGgmlType { raw: 4 }));
+        assert_eq!(checked_ggml_type_i32(31), Err(InvalidGgmlType { raw: 31 }));
+        assert!(checked_ggml_type(4).is_err());
+        assert!(checked_ggml_type(31).is_err());
+    }
+
+    #[test]
+    fn checked_ggml_type_matches_vendored_count() {
+        let name_ptr = unsafe { ggml_type_name(GGML_TYPE_COUNT - 1) };
+        assert!(
+            !name_ptr.is_null(),
+            "ggml_type_name(COUNT-1) must name a live type"
+        );
+        let name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy();
+        let upper = name.to_ascii_uppercase();
+        assert!(
+            !upper.contains("REMOVED") && !upper.contains("DEPRECATED"),
+            "ggml_type_name(COUNT-1) was {name:?}"
+        );
+    }
 }
