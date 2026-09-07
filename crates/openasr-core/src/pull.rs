@@ -371,7 +371,7 @@ struct PullPaths {
     lock_path: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 struct PullOptions {
     available_space_override: Option<u64>,
     low_speed_timeout: Duration,
@@ -392,6 +392,10 @@ struct PullOptions {
     /// instead of needing real multi-hundred-MB bodies. `None` in
     /// production, always -- the real segment size is the fixed constant.
     parallel_segment_bytes_override: Option<u64>,
+    /// Clock and sleeper for retry backoff and low-speed windows.
+    /// [`PullOptions::default`] is always the wall clock so a `cfg(test)`
+    /// slip cannot silently busy-poll production retries.
+    time: Arc<dyn PullTime>,
 }
 
 impl PullOptions {
@@ -405,8 +409,130 @@ impl PullOptions {
             segment_low_speed_absolute_floor_bytes: SEGMENT_LOW_SPEED_ABSOLUTE_FLOOR_BYTES,
             segment_low_speed_cooldown: SEGMENT_LOW_SPEED_COOLDOWN,
             parallel_segment_bytes_override: None,
+            time: Arc::new(WallClock),
         }
     }
+
+    /// Test constructor: same knobs as production, but backoff/sleep is a
+    /// no-op so retry loops finish without waiting on the wall clock.
+    #[cfg(test)]
+    fn for_tests() -> Self {
+        Self {
+            time: Arc::new(ImmediateClock),
+            ..Self::default()
+        }
+    }
+}
+
+/// Side effects the downloader needs for retry/backoff and low-speed windows.
+///
+/// No crate-level `Clock`/`Sleep` trait exists today (see the pull testability
+/// audit); this is the single injection point so production keeps the wall
+/// clock while tests can make backoff return immediately.
+trait PullTime: Send + Sync + std::fmt::Debug {
+    fn now(&self) -> Instant;
+    fn sleep(&self, duration: Duration);
+}
+
+#[derive(Debug)]
+struct WallClock;
+
+impl PullTime for WallClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        if !duration.is_zero() {
+            std::thread::sleep(duration);
+        }
+    }
+}
+
+/// Test clock: `sleep` is a no-op so retry/backoff cannot burn real time.
+/// `now` still reads the wall clock, matching existing `Duration::ZERO`
+/// low-speed tests that judge a window on the first `observe` call.
+#[cfg(test)]
+#[derive(Debug)]
+struct ImmediateClock;
+
+#[cfg(test)]
+impl PullTime for ImmediateClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&self, _duration: Duration) {}
+}
+
+/// Test clock whose `sleep` advances `now` without waiting. Use when a
+/// test must cross a non-zero timeout/cooldown without `Duration::ZERO`.
+#[cfg(test)]
+#[derive(Debug)]
+struct VirtualClock {
+    origin: Instant,
+    offset_millis: AtomicUsize,
+}
+
+#[cfg(test)]
+impl VirtualClock {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            offset_millis: AtomicUsize::new(0),
+        }
+    }
+
+    fn advance(&self, duration: Duration) {
+        let millis = usize::try_from(duration.as_millis()).unwrap_or(usize::MAX);
+        self.offset_millis.fetch_add(millis, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+impl PullTime for VirtualClock {
+    fn now(&self) -> Instant {
+        self.origin + Duration::from_millis(self.offset_millis.load(Ordering::SeqCst) as u64)
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.advance(duration);
+    }
+}
+
+/// Test clock that records each `sleep` duration without waiting, so a
+/// retry test can assert the exact backoff sequence and kill a no-op
+/// `sleep_backoff` mutant.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct RecordingClock {
+    sleeps: Mutex<Vec<Duration>>,
+}
+
+#[cfg(test)]
+impl RecordingClock {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn sleeps(&self) -> Vec<Duration> {
+        self.sleeps.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+impl PullTime for RecordingClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.sleeps.lock().unwrap().push(duration);
+    }
+}
+
+fn sleep_backoff(time: &dyn PullTime, attempt: usize) {
+    time.sleep(retry_backoff(attempt));
 }
 
 /// An HTTP byte-range request bound: open-ended (`bytes=start-`) when `end`
@@ -1597,7 +1723,7 @@ fn download_with_retries<C: DownloadClient>(
                     if attempt < DOWNLOAD_MAX_RETRIES && is_retryable_download_error(&error) =>
                 {
                     attempt += 1;
-                    std::thread::sleep(retry_backoff(attempt));
+                    sleep_backoff(&*options.time, attempt);
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -1635,7 +1761,7 @@ fn download_with_retries<C: DownloadClient>(
             Ok(downloaded) => return Ok(downloaded),
             Err(error) if attempt < DOWNLOAD_MAX_RETRIES && is_retryable_download_error(&error) => {
                 attempt += 1;
-                std::thread::sleep(retry_backoff(attempt));
+                sleep_backoff(&*options.time, attempt);
             }
             Err(error) => return Err(error),
         }
@@ -1713,7 +1839,7 @@ fn download_response(
     let mut reader = response.reader;
     let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_BYTES];
     let mut next_meta_write = bytes_done.saturating_add(METADATA_WRITE_INTERVAL_BYTES);
-    let mut low_speed = LowSpeedWindow::new();
+    let mut low_speed = LowSpeedWindow::new(options);
     loop {
         if should_cancel() {
             cleanup_partial(paths);
@@ -1751,13 +1877,7 @@ fn download_response(
             bytes_done,
             bytes_total: target.size_bytes,
         });
-        low_speed.observe(
-            &target.url,
-            target.size_bytes,
-            bytes_done,
-            read as u64,
-            options,
-        )?;
+        low_speed.observe(&target.url, target.size_bytes, bytes_done, read as u64)?;
         if bytes_done >= next_meta_write {
             write_partial_meta(
                 &paths.partial_meta_path,
@@ -2526,6 +2646,7 @@ enum SegmentEvent {
 /// condition -- it means "this connection is bad, get a new one" -- so it is
 /// handled by `run_segment_worker` requeuing the segment instead of by
 /// `fetch_segment_with_retries`'s same-connection retry loop.
+#[derive(Debug)]
 enum SegmentFetchOutcome {
     Done,
     /// Aborted mid-segment by cancel/pause; no event needed, the
@@ -2691,7 +2812,7 @@ fn fetch_segment_with_retries(
             Ok(outcome) => return Ok(outcome),
             Err(error) if attempt < SEGMENT_MAX_RETRIES && is_retryable_download_error(&error) => {
                 attempt += 1;
-                std::thread::sleep(retry_backoff(attempt));
+                sleep_backoff(&*options.time, attempt);
             }
             Err(error) => return Err(error),
         }
@@ -3441,47 +3562,54 @@ impl Read for StallGuardedReader {
 struct LowSpeedWindow {
     started_at: Instant,
     bytes_read: u64,
+    timeout: Duration,
+    min_bytes: u64,
+    time: Arc<dyn PullTime>,
 }
 
 impl LowSpeedWindow {
-    fn new() -> Self {
+    fn new(options: &PullOptions) -> Self {
         Self {
-            started_at: Instant::now(),
+            started_at: options.time.now(),
             bytes_read: 0,
+            timeout: options.low_speed_timeout,
+            min_bytes: options.low_speed_min_bytes,
+            time: options.time.clone(),
         }
     }
 
     /// Shared by the model-pack and backend-pack downloaders; only needs the
     /// URL (for the error message) and the expected total size, not a whole
-    /// `&PullTarget`.
+    /// `&PullTarget`. Thresholds and the clock are captured at construction
+    /// so `observe` cannot drift onto a different `options.time`.
     fn observe(
         &mut self,
         url: &str,
         size_bytes: u64,
         bytes_done: u64,
         bytes_read: u64,
-        options: &PullOptions,
     ) -> Result<(), PullError> {
-        if options.low_speed_min_bytes == 0 || bytes_done >= size_bytes {
+        if self.min_bytes == 0 || bytes_done >= size_bytes {
             return Ok(());
         }
         self.bytes_read = self.bytes_read.saturating_add(bytes_read);
-        let elapsed = self.started_at.elapsed();
-        if elapsed < options.low_speed_timeout {
+        let now = self.time.now();
+        let elapsed = now.saturating_duration_since(self.started_at);
+        if elapsed < self.timeout {
             return Ok(());
         }
-        if self.bytes_read < options.low_speed_min_bytes {
+        if self.bytes_read < self.min_bytes {
             return Err(PullError::Http {
                 url: url.to_string(),
                 message: format!(
                     "download stalled: received {} bytes in {:.1}s, below the {} byte minimum",
                     self.bytes_read,
                     elapsed.as_secs_f64(),
-                    options.low_speed_min_bytes
+                    self.min_bytes
                 ),
             });
         }
-        self.started_at = Instant::now();
+        self.started_at = now;
         self.bytes_read = 0;
         Ok(())
     }
@@ -3519,6 +3647,7 @@ struct SegmentLowSpeedWindow<'a> {
     relative_ratio: f64,
     absolute_floor_bytes: u64,
     cooldown: Duration,
+    time: Arc<dyn PullTime>,
     /// Set once this segment index has already been abandoned
     /// `SEGMENT_MAX_RETRIES` times: this attempt is its last chance, so
     /// evaluation is skipped entirely and it's simply allowed to finish
@@ -3534,7 +3663,7 @@ impl<'a> SegmentLowSpeedWindow<'a> {
         disabled: bool,
     ) -> Self {
         Self {
-            started_at: Instant::now(),
+            started_at: options.time.now(),
             bytes_read: 0,
             timeout: options.segment_low_speed_timeout,
             reference,
@@ -3542,6 +3671,7 @@ impl<'a> SegmentLowSpeedWindow<'a> {
             relative_ratio: options.segment_low_speed_relative_ratio,
             absolute_floor_bytes: options.segment_low_speed_absolute_floor_bytes,
             cooldown: options.segment_low_speed_cooldown,
+            time: options.time.clone(),
             disabled,
         }
     }
@@ -3566,11 +3696,12 @@ impl<'a> SegmentLowSpeedWindow<'a> {
             return false;
         }
         self.bytes_read = self.bytes_read.saturating_add(bytes_read);
-        if self.started_at.elapsed() < self.timeout {
+        let now = self.time.now();
+        if now.saturating_duration_since(self.started_at) < self.timeout {
             return false;
         }
         let window_bytes = self.bytes_read;
-        self.started_at = Instant::now();
+        self.started_at = now;
         self.bytes_read = 0;
         // Compare against the reference as it stood *before* this window is
         // folded in, so a slow window never gets to (even slightly) pull
@@ -3586,9 +3717,9 @@ impl<'a> SegmentLowSpeedWindow<'a> {
             return false;
         }
         let mut cooldown_slot = self.cooldown_slot.lock().unwrap();
-        let now = Instant::now();
+        let now = self.time.now();
         if let Some(last_trip) = *cooldown_slot
-            && now.duration_since(last_trip) < self.cooldown
+            && now.saturating_duration_since(last_trip) < self.cooldown
         {
             return false; // still cooling down from the last trip
         }
@@ -5383,9 +5514,19 @@ fn ensure_backend_content_object<C: DownloadClient>(
     home: &Path,
     progress: &mut impl FnMut(PullProgress),
     parallel: Option<&ParallelDownloadConfig>,
+    options: &PullOptions,
 ) -> Result<BackendContentObject, PullError> {
     let objects_root = home.join("backends").join("_objects");
-    ensure_backend_content_object_in(client, file, &objects_root, None, None, progress, parallel)
+    ensure_backend_content_object_in(
+        client,
+        file,
+        &objects_root,
+        None,
+        None,
+        progress,
+        parallel,
+        options,
+    )
 }
 
 fn ensure_backend_content_object_in<C: DownloadClient>(
@@ -5396,6 +5537,7 @@ fn ensure_backend_content_object_in<C: DownloadClient>(
     expected_unpacked_size_bytes: Option<u64>,
     progress: &mut impl FnMut(PullProgress),
     parallel: Option<&ParallelDownloadConfig>,
+    options: &PullOptions,
 ) -> Result<BackendContentObject, PullError> {
     fs::create_dir_all(objects_root).map_err(|source| PullError::Io {
         path: objects_root.to_path_buf(),
@@ -5427,9 +5569,10 @@ fn ensure_backend_content_object_in<C: DownloadClient>(
                 &source_path,
                 progress,
                 parallel,
+                options,
             )?;
         } else {
-            download_backend_file(client, file, &source_path, progress, parallel)?;
+            download_backend_file(client, file, &source_path, progress, parallel, options)?;
         }
     }
     preflight_backend_file(&source_path, backend_file_format(file.role)?)?;
@@ -5795,7 +5938,14 @@ pub fn install_backend_pack(
         factory: &factory,
     };
     let _store_lock = BackendStoreMutationLock::acquire(home)?;
-    install_backend_pack_with_client_locked(resolved, home, &mut client, progress, Some(&parallel))
+    install_backend_pack_with_client_locked(
+        resolved,
+        home,
+        &mut client,
+        progress,
+        Some(&parallel),
+        &PullOptions::default(),
+    )
 }
 
 /// Installs one resolved pack while the caller holds the backend-store
@@ -5816,7 +5966,14 @@ pub(crate) fn install_backend_pack_locked(
         connections: pull_connections_from_env(),
         factory: &factory,
     };
-    install_backend_pack_with_client_locked(resolved, home, &mut client, progress, Some(&parallel))
+    install_backend_pack_with_client_locked(
+        resolved,
+        home,
+        &mut client,
+        progress,
+        Some(&parallel),
+        &PullOptions::default(),
+    )
 }
 
 /// Install one already-resolved signed pack from a local file or folder,
@@ -5861,7 +6018,14 @@ pub fn install_backend_pack_from_local_path(
     }
     let mut client = LocalFileClient { files_by_url };
     let _store_lock = BackendStoreMutationLock::acquire(home)?;
-    install_backend_pack_with_client_locked(resolved, home, &mut client, progress, None)
+    install_backend_pack_with_client_locked(
+        resolved,
+        home,
+        &mut client,
+        progress,
+        None,
+        &PullOptions::default(),
+    )
 }
 
 fn index_local_backend_import_urls(
@@ -6110,11 +6274,13 @@ pub(crate) fn prepare_qualification_release_artifacts(
 
     let manifest = verified.manifest();
     let mut client = HttpDownloadClient::new()?;
+    let options = PullOptions::default();
     let binary_bundle = prepare_qualification_archive(
         &mut client,
         &manifest.artifacts.binary.bundle,
         &objects_root,
         &mut progress,
+        &options,
     )?;
     let plugin = manifest
         .artifacts
@@ -6128,6 +6294,7 @@ pub(crate) fn prepare_qualification_release_artifacts(
                 &locks_root,
                 Some(BackendFileFormat::NativeLibrary),
                 &mut progress,
+                &options,
             )
         })
         .transpose()?;
@@ -6136,7 +6303,13 @@ pub(crate) fn prepare_qualification_release_artifacts(
         .vendor
         .iter()
         .map(|artifact| {
-            prepare_qualification_archive(&mut client, artifact, &objects_root, &mut progress)
+            prepare_qualification_archive(
+                &mut client,
+                artifact,
+                &objects_root,
+                &mut progress,
+                &options,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     let attestation_bundle = prepare_qualification_direct_file(
@@ -6146,6 +6319,7 @@ pub(crate) fn prepare_qualification_release_artifacts(
         &locks_root,
         None,
         &mut progress,
+        &options,
     )?;
     Ok(PreparedQualificationArtifacts {
         artifact_root,
@@ -6196,6 +6370,7 @@ fn prepare_qualification_direct_file<C: DownloadClient>(
     locks_root: &Path,
     preflight: Option<BackendFileFormat>,
     progress: &mut impl FnMut(PullProgress),
+    options: &PullOptions,
 ) -> Result<PreparedQualificationFile, PullError> {
     let format_role = match artifact.format {
         QualificationArtifactFormat::NativeLibrary => CatalogBackendFileRole::Plugin,
@@ -6214,7 +6389,15 @@ fn prepare_qualification_direct_file<C: DownloadClient>(
     let lock_path = locks_root.join(format!("{}.lock", artifact.sha256));
     let _lock = BackendInstallLock::acquire(&lock_path)?;
     let path = digest_dir.join(&artifact.file_name);
-    download_backend_file_from_signed_urls(client, &file, &artifact.urls, &path, progress, None)?;
+    download_backend_file_from_signed_urls(
+        client,
+        &file,
+        &artifact.urls,
+        &path,
+        progress,
+        None,
+        options,
+    )?;
     reject_qualification_file_links(&path)?;
     if let Some(format) = preflight {
         preflight_backend_file(&path, format)?;
@@ -6231,6 +6414,7 @@ fn prepare_qualification_archive<C: DownloadClient>(
     artifact: &QualificationArtifact,
     objects_root: &Path,
     progress: &mut impl FnMut(PullProgress),
+    options: &PullOptions,
 ) -> Result<PreparedQualificationArchive, PullError> {
     let file = qualification_catalog_file(
         artifact,
@@ -6252,6 +6436,7 @@ fn prepare_qualification_archive<C: DownloadClient>(
         Some(expected_unpacked_size_bytes),
         progress,
         None,
+        options,
     )?;
     let object_dir = backend_content_object_dir_in(objects_root, &file);
     let source_path = object_dir.join("source").join(&artifact.file_name);
@@ -6323,6 +6508,7 @@ pub(crate) fn prepare_backend_runtime_objects_locked(
                     home,
                     &mut progress,
                     Some(&parallel),
+                    &PullOptions::default(),
                 )?;
                 let payload = backend_content_object_dir(home, file).join("payload");
                 for materialized in &object.files {
@@ -6400,7 +6586,14 @@ fn prepare_backend_runtime_objects_with_client<C: DownloadClient>(
         match file.role {
             CatalogBackendFileRole::Runtime | CatalogBackendFileRole::Archive => {
                 saw_runtime = true;
-                let object = ensure_backend_content_object(client, file, home, progress, None)?;
+                let object = ensure_backend_content_object(
+                    client,
+                    file,
+                    home,
+                    progress,
+                    None,
+                    &PullOptions::default(),
+                )?;
                 let payload = backend_content_object_dir(home, file).join("payload");
                 for materialized in &object.files {
                     let relative = Path::new(&materialized.relative_path);
@@ -6444,7 +6637,14 @@ fn install_backend_pack_with_client<C: DownloadClient>(
 ) -> Result<InstalledBackend, PullError> {
     ensure_backend_cli_version_for_install(resolved)?;
     let _store_lock = BackendStoreMutationLock::acquire(home)?;
-    install_backend_pack_with_client_locked(resolved, home, client, progress, None)
+    install_backend_pack_with_client_locked(
+        resolved,
+        home,
+        client,
+        progress,
+        None,
+        &PullOptions::for_tests(),
+    )
 }
 
 fn ensure_backend_cli_version_for_install(
@@ -6470,6 +6670,7 @@ fn install_backend_pack_with_client_locked<C: DownloadClient>(
     client: &mut C,
     mut progress: impl FnMut(PullProgress),
     parallel: Option<&ParallelDownloadConfig>,
+    options: &PullOptions,
 ) -> Result<InstalledBackend, PullError> {
     ensure_backend_cli_version_for_install(resolved)?;
     let vendor = backend_vendor_dirname(resolved.vendor)?;
@@ -6516,7 +6717,7 @@ fn install_backend_pack_with_client_locked<C: DownloadClient>(
         let materialized_files = match file.role {
             CatalogBackendFileRole::Plugin => {
                 let dest = staging_dir.join(&file.filename);
-                download_backend_file(client, file, &dest, &mut progress, parallel)?;
+                download_backend_file(client, file, &dest, &mut progress, parallel, options)?;
                 preflight_backend_file(&dest, backend_file_format(file.role)?)?;
                 vec![InstalledBackendMaterializedFile {
                     relative_path: file.filename.clone(),
@@ -6525,8 +6726,14 @@ fn install_backend_pack_with_client_locked<C: DownloadClient>(
                 }]
             }
             CatalogBackendFileRole::Runtime | CatalogBackendFileRole::Archive => {
-                let object =
-                    ensure_backend_content_object(client, file, home, &mut progress, parallel)?;
+                let object = ensure_backend_content_object(
+                    client,
+                    file,
+                    home,
+                    &mut progress,
+                    parallel,
+                    options,
+                )?;
                 materialize_backend_content_object(home, &staging_dir, file, &object)?
             }
             CatalogBackendFileRole::Unknown => {
@@ -6576,14 +6783,17 @@ fn is_transient_lock_error(error: &io::Error) -> bool {
     }
 }
 
-fn retry_transient_io<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+fn retry_transient_io<T>(
+    time: &dyn PullTime,
+    mut op: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
     const DELAYS_MS: [u64; 6] = [200, 400, 800, 1600, 3200, 6400];
     let mut attempt = 0usize;
     loop {
         match op() {
             Ok(value) => return Ok(value),
             Err(error) if attempt < DELAYS_MS.len() && is_transient_lock_error(&error) => {
-                std::thread::sleep(Duration::from_millis(DELAYS_MS[attempt]));
+                time.sleep(Duration::from_millis(DELAYS_MS[attempt]));
                 attempt += 1;
             }
             Err(error) => return Err(error),
@@ -6591,18 +6801,18 @@ fn retry_transient_io<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T>
     }
 }
 
-fn copy_dir_all_retry(from: &Path, to: &Path) -> io::Result<()> {
-    retry_transient_io(|| fs::create_dir_all(to))?;
-    for entry in retry_transient_io(|| fs::read_dir(from))? {
+fn copy_dir_all_retry(time: &dyn PullTime, from: &Path, to: &Path) -> io::Result<()> {
+    retry_transient_io(time, || fs::create_dir_all(to))?;
+    for entry in retry_transient_io(time, || fs::read_dir(from))? {
         let entry = entry?;
         let source = entry.path();
         reject_symlink(&source).map_err(|error| io::Error::other(error.to_string()))?;
         let destination = to.join(entry.file_name());
-        let file_type = retry_transient_io(|| entry.file_type())?;
+        let file_type = retry_transient_io(time, || entry.file_type())?;
         if file_type.is_dir() {
-            copy_dir_all_retry(&source, &destination)?;
+            copy_dir_all_retry(time, &source, &destination)?;
         } else if file_type.is_file() {
-            retry_transient_io(|| {
+            retry_transient_io(time, || {
                 fs::copy(&source, &destination)?;
                 Ok(())
             })?;
@@ -6647,6 +6857,7 @@ fn promote_backend_directory(
         fingerprint,
         fs_rename,
         fs_remove_dir_all,
+        &WallClock,
     )
 }
 
@@ -6656,14 +6867,17 @@ fn promote_backend_directory_with(
     fingerprint: &str,
     rename: impl Fn(&Path, &Path) -> io::Result<()>,
     remove_dir_all: impl Fn(&Path) -> io::Result<()>,
+    time: &dyn PullTime,
 ) -> Result<(), PullError> {
     let final_parent = final_dir.parent().ok_or_else(|| PullError::InvalidTarget {
         field: "backend install path",
         reason: "final backend directory has no parent".to_string(),
     })?;
-    retry_transient_io(|| fs::create_dir_all(final_parent)).map_err(|source| PullError::Io {
-        path: final_parent.to_path_buf(),
-        source,
+    retry_transient_io(time, || fs::create_dir_all(final_parent)).map_err(|source| {
+        PullError::Io {
+            path: final_parent.to_path_buf(),
+            source,
+        }
     })?;
     let displaced = staging_dir
         .parent()
@@ -6671,22 +6885,24 @@ fn promote_backend_directory_with(
         .join(format!(".replaced-{fingerprint}-{}", unix_seconds_now()));
     let had_previous = final_dir.exists();
     if had_previous {
-        retry_transient_io(|| rename(final_dir, &displaced)).map_err(|source| PullError::Io {
-            path: final_dir.to_path_buf(),
-            source,
+        retry_transient_io(time, || rename(final_dir, &displaced)).map_err(|source| {
+            PullError::Io {
+                path: final_dir.to_path_buf(),
+                source,
+            }
         })?;
     }
-    match retry_transient_io(|| rename(staging_dir, final_dir)) {
+    match retry_transient_io(time, || rename(staging_dir, final_dir)) {
         Ok(()) => {}
         Err(source) if is_transient_lock_error(&source) => {
-            if let Err(copy_error) = copy_dir_all_retry(staging_dir, final_dir) {
-                let _ = retry_transient_io(|| remove_dir_all(final_dir));
+            if let Err(copy_error) = copy_dir_all_retry(time, staging_dir, final_dir) {
+                let _ = retry_transient_io(time, || remove_dir_all(final_dir));
                 if had_previous {
                     let _ = rename(&displaced, final_dir);
                 }
                 return Err(lock_exhausted_io(final_dir.to_path_buf(), copy_error));
             }
-            let _ = retry_transient_io(|| remove_dir_all(staging_dir));
+            let _ = retry_transient_io(time, || remove_dir_all(staging_dir));
         }
         Err(source) => {
             if had_previous {
@@ -6699,7 +6915,7 @@ fn promote_backend_directory_with(
         }
     }
     if had_previous {
-        let _ = retry_transient_io(|| remove_dir_all(&displaced));
+        let _ = retry_transient_io(time, || remove_dir_all(&displaced));
     }
     Ok(())
 }
@@ -7242,6 +7458,7 @@ fn download_backend_file_via_pull<C: DownloadClient>(
     dest: &Path,
     progress: &mut impl FnMut(PullProgress),
     parallel: Option<&ParallelDownloadConfig>,
+    options: &PullOptions,
 ) -> Result<(), PullError> {
     let target = PullTarget::for_backend_file(file)?;
     ensure_https_url(&target.url)?;
@@ -7250,7 +7467,7 @@ fn download_backend_file_via_pull<C: DownloadClient>(
         &target,
         &paths,
         client,
-        PullOptions::default(),
+        options.clone(),
         parallel,
         progress,
         &|| false,
@@ -7298,6 +7515,7 @@ fn download_backend_file_from_signed_urls<C: DownloadClient>(
     dest: &Path,
     progress: &mut impl FnMut(PullProgress),
     parallel: Option<&ParallelDownloadConfig>,
+    options: &PullOptions,
 ) -> Result<(), PullError> {
     let urls = expand_artifact_fetch_urls(urls);
     if urls.is_empty() {
@@ -7314,7 +7532,7 @@ fn download_backend_file_from_signed_urls<C: DownloadClient>(
         }
         let mut candidate = file.clone();
         candidate.url.clone_from(url);
-        match download_backend_file_once(client, &candidate, dest, progress, parallel) {
+        match download_backend_file_once(client, &candidate, dest, progress, parallel, options) {
             Ok(()) => return Ok(()),
             Err(error) if is_source_fallback_error(&error) => {
                 last_error = Some(error);
@@ -7343,6 +7561,7 @@ fn download_backend_file<C: DownloadClient>(
     dest: &Path,
     progress: &mut impl FnMut(PullProgress),
     parallel: Option<&ParallelDownloadConfig>,
+    options: &PullOptions,
 ) -> Result<(), PullError> {
     if backend_file_matches(dest, file) {
         return Ok(());
@@ -7358,6 +7577,7 @@ fn download_backend_file<C: DownloadClient>(
         dest,
         progress,
         parallel,
+        options,
     )
 }
 
@@ -7367,12 +7587,20 @@ fn download_backend_file_once<C: DownloadClient>(
     dest: &Path,
     progress: &mut impl FnMut(PullProgress),
     parallel: Option<&ParallelDownloadConfig>,
+    options: &PullOptions,
 ) -> Result<(), PullError> {
     if backend_file_matches(dest, file) {
         return Ok(());
     }
     if let Some(parallel) = parallel {
-        return download_backend_file_via_pull(client, file, dest, progress, Some(parallel));
+        return download_backend_file_via_pull(
+            client,
+            file,
+            dest,
+            progress,
+            Some(parallel),
+            options,
+        );
     }
     // The parent pack/object directory is already keyed by the full artifact
     // digest. Keep the leaf short enough for Windows MAX_PATH-era tools while
@@ -7408,11 +7636,12 @@ fn download_backend_file_once<C: DownloadClient>(
             &partial_meta,
             &mut expected_etag,
             progress,
+            options,
         ) {
             Ok(()) => return Ok(()),
             Err(error) if attempt < DOWNLOAD_MAX_RETRIES && is_retryable_download_error(&error) => {
                 attempt += 1;
-                std::thread::sleep(retry_backoff(attempt));
+                sleep_backoff(&*options.time, attempt);
             }
             Err(error) => return Err(error),
         }
@@ -7514,6 +7743,7 @@ fn download_backend_file_attempt<C: DownloadClient>(
     partial_meta: &Path,
     expected_etag: &mut Option<String>,
     progress: &mut impl FnMut(PullProgress),
+    options: &PullOptions,
 ) -> Result<(), PullError> {
     let (resume_from, persisted_etag) =
         prepare_backend_partial_for_resume(file, partial, partial_meta)?;
@@ -7594,8 +7824,7 @@ fn download_backend_file_attempt<C: DownloadClient>(
     let mut bytes_done = actual_resume;
     write_backend_partial_meta(partial_meta, file, expected_etag.clone(), bytes_done)?;
     let mut last_meta_bytes = bytes_done;
-    let mut low_speed = LowSpeedWindow::new();
-    let low_speed_options = PullOptions::default();
+    let mut low_speed = LowSpeedWindow::new(options);
     progress(PullProgress::DownloadStarted {
         bytes_total: file.size_bytes,
         resume_from: actual_resume,
@@ -7626,13 +7855,7 @@ fn download_backend_file_attempt<C: DownloadClient>(
             bytes_done,
             bytes_total: file.size_bytes,
         });
-        low_speed.observe(
-            &file.url,
-            file.size_bytes,
-            bytes_done,
-            read as u64,
-            &low_speed_options,
-        )?;
+        low_speed.observe(&file.url, file.size_bytes, bytes_done, read as u64)?;
     }
     out.sync_all().map_err(|source| PullError::Io {
         path: partial.to_path_buf(),
