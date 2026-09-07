@@ -4,7 +4,7 @@
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -1235,7 +1235,7 @@ pub(crate) fn spawn_boot_native_warmup(
     })
 }
 
-fn log_default_reactivation_failed(home: &Path, requested_path: &Path, reason: &str) {
+fn log_default_reactivation_failed(home: &Path, requested_path: &Path, reason: &str) -> String {
     let mut reason = single_line_log_value(reason);
     for sensitive_path in [home, requested_path] {
         let rendered = sensitive_path.to_string_lossy();
@@ -1248,6 +1248,7 @@ fn log_default_reactivation_failed(home: &Path, requested_path: &Path, reason: &
         "server_boot",
         format_args!("stage=default_reactivation_failed reason={reason}"),
     );
+    reason
 }
 
 /// Attest a candidate pack without publishing it as the live default.
@@ -1775,5 +1776,48 @@ async fn run_realtime_backend_job(
             })
         }
         Err(error) => BackendResult::Error(error),
+    }
+}
+
+#[cfg(test)]
+mod reactivation_log_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn default_reactivation_failure_log_redacts_paths_and_flattens_newlines() {
+        let home = Path::new("/tmp/openasr-home-secret");
+        let pack = Path::new("/tmp/openasr-home-secret/models/pack.oasr");
+        let rendered = log_default_reactivation_failed(
+            home,
+            pack,
+            "failed to activate /tmp/openasr-home-secret/models/pack.oasr:\nbad pack",
+        );
+        assert!(
+            !rendered.contains("openasr-home-secret"),
+            "home/pack paths must not leak into daemon logs: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted-path>"),
+            "redaction marker missing: {rendered}"
+        );
+        assert!(
+            !rendered.contains('\n'),
+            "log lines must stay single-line: {rendered}"
+        );
+        assert!(
+            rendered.contains("bad pack"),
+            "failure reason must remain after redaction: {rendered}"
+        );
+        assert!(rendered.len() <= 512, "log reason must stay bounded");
+    }
+
+    #[test]
+    fn default_reactivation_failure_log_truncates_long_reasons() {
+        let home = Path::new("/home/openasr");
+        let pack = Path::new("/models/pack.oasr");
+        let rendered = log_default_reactivation_failed(home, pack, &"x".repeat(1024));
+        assert_eq!(rendered.len(), 512);
+        assert!(rendered.chars().all(|c| c == 'x'));
     }
 }

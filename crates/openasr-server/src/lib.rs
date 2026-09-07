@@ -406,7 +406,7 @@ pub async fn serve_with_launch_options(
                 ),
             );
             println!("OpenASR server listening on http://{addr}");
-            spawn_ggml_backend_boot_log();
+            drop(spawn_ggml_backend_boot_log(ggml_backend_boot_probe));
             axum::serve(listener, app).await?;
         }
         ServerTlsConfig::SelfSigned { subject_alt_names } => {
@@ -446,7 +446,7 @@ pub async fn serve_with_launch_options(
                 "OpenASR server listening on https://{addr} (certificate sha256:{}, pairing code {})",
                 identity.certificate_sha256, identity.pairing_safety_code
             );
-            spawn_ggml_backend_boot_log();
+            drop(spawn_ggml_backend_boot_log(ggml_backend_boot_probe));
             axum::serve(TlsListener::new(listener, identity.acceptor), app).await?;
         }
     }
@@ -460,23 +460,30 @@ pub async fn serve_with_launch_options(
 /// is bound. Blocking the listen path on `ggml_cuda_init` / `LoadLibrary`
 /// made `--no-model` start pay GPU init; the banner and `/health` must not
 /// wait for that.
-fn spawn_ggml_backend_boot_log() {
-    tokio::task::spawn_blocking(|| {
+fn ggml_backend_boot_log_message(summary: &str) -> String {
+    format!("stage=ggml_backend {summary}")
+}
+
+fn ggml_backend_boot_probe() -> String {
+    let info = openasr_core::ggml_runtime_info();
+    openasr_core::ggml_runtime_boot_summary(&info)
+}
+
+fn spawn_ggml_backend_boot_log(
+    probe: impl FnOnce() -> String + Send + 'static,
+) -> tokio::task::JoinHandle<String> {
+    tokio::task::spawn_blocking(move || {
         let stage_started = Instant::now();
-        let info = openasr_core::ggml_runtime_info();
+        let summary = probe();
         openasr_core::stage_timing::log_stage(
             "server_boot",
             "ggml_backend",
             stage_started.elapsed(),
         );
-        openasr_core::stage_timing::log_event(
-            "server_boot",
-            format_args!(
-                "stage=ggml_backend {}",
-                openasr_core::ggml_runtime_boot_summary(&info)
-            ),
-        );
-    });
+        let message = ggml_backend_boot_log_message(&summary);
+        openasr_core::stage_timing::log_event("server_boot", format_args!("{message}"));
+        message
+    })
 }
 
 /// Validity window for a freshly generated self-signed TLS identity: long

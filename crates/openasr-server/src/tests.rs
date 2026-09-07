@@ -4451,6 +4451,129 @@ async fn pull_job_control_ack_sets_flag_without_terminal_state_flip() {
     distribution.clear_active_job("pull-control");
 }
 
+#[test]
+fn next_job_id_is_unique_pull_timestamp_sequence() {
+    let temp = tempfile::tempdir().unwrap();
+    let distribution = distribution_context_for_test(temp.path());
+    let first = distribution.next_job_id();
+    let second = distribution.next_job_id();
+    assert_ne!(first, second);
+    for job_id in [&first, &second] {
+        let mut parts = job_id.splitn(3, '-');
+        assert_eq!(parts.next(), Some("pull"), "{job_id}");
+        let timestamp = parts.next().expect(job_id);
+        let seq = parts.next().expect(job_id);
+        assert!(
+            !timestamp.is_empty() && timestamp.chars().all(|c| c.is_ascii_digit()),
+            "{job_id}"
+        );
+        assert!(
+            !seq.is_empty() && seq.chars().all(|c| c.is_ascii_digit()),
+            "{job_id}"
+        );
+    }
+    let first_seq: u64 = first.rsplit('-').next().unwrap().parse().unwrap();
+    let second_seq: u64 = second.rsplit('-').next().unwrap().parse().unwrap();
+    assert_eq!(second_seq, first_seq + 1);
+}
+
+#[test]
+fn notify_job_snapshot_publishes_to_existing_watchers() {
+    let temp = tempfile::tempdir().unwrap();
+    let distribution = distribution_context_for_test(temp.path());
+    let resolved = resolved_pull_fixture();
+    let snapshot = PullJobSnapshot::queued("pull-notify".to_string(), &resolved, None, false);
+    distribution.insert_job(snapshot).unwrap();
+    let receiver = distribution.subscribe_job("pull-notify").unwrap();
+
+    let mut next = distribution.snapshot("pull-notify").unwrap();
+    next.state = PullJobState::Downloading;
+    next.error = Some("bytes arriving".to_string());
+    distribution.notify_job_snapshot(&next);
+
+    let observed = receiver.borrow().clone();
+    assert_eq!(observed.state, PullJobState::Downloading);
+    assert_eq!(observed.error.as_deref(), Some("bytes arriving"));
+}
+
+#[test]
+fn cancel_job_reports_whether_an_active_worker_was_signaled() {
+    let temp = tempfile::tempdir().unwrap();
+    let distribution = distribution_context_for_test(temp.path());
+    assert!(
+        !distribution.cancel_job("missing-job"),
+        "unknown jobs must not report a successful cancel"
+    );
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let pause_flag = Arc::new(AtomicBool::new(false));
+    distribution.register_active_job("pull-live", cancel_flag.clone(), pause_flag.clone());
+    assert!(distribution.cancel_job("pull-live"));
+    assert!(cancel_flag.load(Ordering::SeqCst));
+    assert!(!pause_flag.load(Ordering::SeqCst));
+}
+
+#[test]
+fn model_activation_failpoint_labels_are_stable_and_distinct() {
+    let labeled = [
+        (
+            ModelActivationFailpoint::PackVerification,
+            "pack-verification",
+        ),
+        (
+            ModelActivationFailpoint::CandidateResolution,
+            "candidate-resolution",
+        ),
+        (
+            ModelActivationFailpoint::QuoteObservation,
+            "quote-observation",
+        ),
+        (
+            ModelActivationFailpoint::BrokerReservation,
+            "broker-reservation",
+        ),
+        (
+            ModelActivationFailpoint::NativeMaterialization,
+            "native-materialization",
+        ),
+        (
+            ModelActivationFailpoint::FirstComputeAttestation,
+            "first-compute-attestation",
+        ),
+        (ModelActivationFailpoint::Reconciliation, "reconciliation"),
+        (ModelActivationFailpoint::V2StagingWrite, "v2-staging-write"),
+        (ModelActivationFailpoint::V2StagingSync, "v2-staging-sync"),
+        (
+            ModelActivationFailpoint::AtomicBeforeReplace,
+            "atomic-before-replace",
+        ),
+        (
+            ModelActivationFailpoint::AtomicAfterReplace,
+            "atomic-after-replace",
+        ),
+        (
+            ModelActivationFailpoint::DurableCommitBeforeLivePublish,
+            "durable-commit-before-live-publish",
+        ),
+    ];
+    let mut seen = std::collections::HashSet::new();
+    for (failpoint, expected) in labeled {
+        let label = failpoint.label();
+        assert_eq!(label, expected);
+        assert!(seen.insert(label), "duplicate failpoint label {label}");
+    }
+}
+
+#[tokio::test]
+async fn spawn_ggml_backend_boot_log_joins_injected_probe_summary() {
+    let handle = spawn_ggml_backend_boot_log(|| "best_backend=Metal cpu_backend=CPU".to_string());
+    let message = handle.await.expect("boot log task");
+    assert_eq!(
+        message,
+        "stage=ggml_backend best_backend=Metal cpu_backend=CPU"
+    );
+}
+
 #[tokio::test]
 async fn transcription_control_endpoints_flip_pause_resume_cancel_flags() {
     let temp = tempfile::tempdir().unwrap();

@@ -2344,6 +2344,66 @@ fn session_start_keeps_unknown_envelope_fields_extensible() {
     );
 }
 
+#[test]
+fn fuzz_parse_client_message_rejects_invalid_json_and_accepts_session_close() {
+    assert!(fuzz_parse_client_message(b"not-json").is_err());
+    assert!(fuzz_parse_client_message(br#"{"type":"session.close"}"#).is_ok());
+}
+
+#[test]
+fn protocol_event_id_uses_zero_padded_proto_sequence() {
+    assert_eq!(protocol_event_id(1), "proto_000001");
+    assert_eq!(protocol_event_id(42), "proto_000042");
+}
+
+async fn rendered_sse_event(event: Event) -> String {
+    use axum::response::IntoResponse;
+    let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(1);
+    sender.send(Ok(event)).await.unwrap();
+    drop(sender);
+    let response = Sse::new(ReceiverStream::new(receiver)).into_response();
+    let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn send_sse_emits_named_session_envelope() {
+    let (sender, mut receiver) = mpsc::channel(1);
+    let envelope = one_shot_controller("whisper-large-v3-turbo")
+        .session_created_event("2026-09-07T00:00:00.000Z");
+    let event_id = envelope.event_id.0.clone();
+    send_sse(&sender, envelope).await;
+    let event = tokio::time::timeout(std::time::Duration::from_millis(200), receiver.recv())
+        .await
+        .expect("send_sse must enqueue an SSE frame")
+        .expect("channel open")
+        .expect("event");
+    let body = rendered_sse_event(event).await;
+    assert!(body.contains("event: session.created"), "{body}");
+    assert!(body.contains(&format!("id: {event_id}")), "{body}");
+    assert!(body.contains("\"type\":\"session.created\""), "{body}");
+}
+
+#[tokio::test]
+async fn send_event_delivers_the_envelope_or_fails_closed() {
+    let envelope = one_shot_controller("whisper-large-v3-turbo")
+        .session_created_event("2026-09-07T00:00:00.000Z");
+    let (sender, mut receiver) = mpsc::channel(1);
+    assert_eq!(send_event(&sender, envelope.clone()).await, Ok(()));
+    let got = tokio::time::timeout(std::time::Duration::from_millis(200), receiver.recv())
+        .await
+        .expect("send_event must deliver without hanging")
+        .expect("envelope");
+    assert_eq!(got.event_type, "session.created");
+    assert_eq!(got.event_id, envelope.event_id);
+
+    let (closed_sender, closed_receiver) = mpsc::channel(1);
+    drop(closed_receiver);
+    assert_eq!(send_event(&closed_sender, envelope).await, Err(()));
+}
+
 #[tokio::test]
 async fn native_streaming_session_receives_binary_frames_without_file_fallback_worker() {
     let (event_sender, mut event_receiver) = mpsc::channel(8);

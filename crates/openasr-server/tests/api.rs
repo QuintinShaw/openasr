@@ -5807,10 +5807,13 @@ async fn stream_transcriptions_with_mock_backend_emits_protocol_events() {
     );
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     let body = String::from_utf8_lossy(&bytes);
+    assert!(body.contains("event: session.created"), "{body}");
     assert!(body.contains("event: segment_start"));
     assert!(body.contains("event: final"));
     assert!(body.contains("event: segment_end"));
     assert!(body.contains("event: done"));
+    assert!(body.contains("id: proto_000001"), "{body}");
+    assert!(body.contains("id: proto_000002"), "{body}");
     assert!(body.contains("\"totalLatencyMs\":"));
 }
 

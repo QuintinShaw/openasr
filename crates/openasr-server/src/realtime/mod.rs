@@ -640,7 +640,7 @@ enum ClientMessage {
     SessionClose,
 }
 
-#[cfg(fuzzing)]
+#[cfg(any(test, fuzzing))]
 pub fn fuzz_parse_client_message(data: &[u8]) -> Result<(), serde_json::Error> {
     serde_json::from_slice::<ClientMessage>(data).map(|_| ())
 }
