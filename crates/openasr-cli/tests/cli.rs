@@ -762,10 +762,11 @@ fn transcribe_mock_formats_match_core_renderers() {
 // fixtures (ffmpeg concat, no new audio content). Pinned against
 // `OPENASR_GGML_BACKEND=cpu` (Metal currently OOMs this family's 7B decoder
 // on a 16GB unified-memory Mac, see the T5 report); the auto energy-VAD
-// slicer picked 3 chunks here, whose seams show as the two small stray-token
-// artifacts in the golden ("我 我" and an extra "中") -- both present in the
-// real committed pack's output, not smoothed over.
-const FIRERED_LLM_GOLDEN_LONGFORM_EN_ZH_TEXT: &str = "and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我 我通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗中 周末的时候我通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country";
+// slicer picked 3 chunks here. The extra "中" is a model token. The first-seam
+// "我 我" is consumed by the shared assembler; the join space remains
+// (`周末的时候我 通常会`). Bytes come from feeding the three origin slice
+// texts through TranscriptAssembler (pending pack re-measure).
+const FIRERED_LLM_GOLDEN_LONGFORM_EN_ZH_TEXT: &str = "and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我 通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗中 周末的时候我通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country";
 
 #[test]
 #[ignore = "requires the private ~8.9GB dev-only firered2-llm-q8_0.oasr pack; runs the real \
@@ -819,15 +820,17 @@ fn firered_llm_golden_diff_longform_cli_transcribe_matches_reference_decode() {
 // this family's ~8B combined weights on a 16GB unified-memory Mac is
 // unverified, see this module's e2e report).
 // The longform assembler joins retained, trimmed segment texts with one space.
-// The spaces inside this `concat!` are therefore golden bytes. The same
-// family's single-utterance EN->ZH golden
+// The spaces inside this `concat!` are therefore golden bytes, taken from
+// feeding the three origin slice texts through TranscriptAssembler. The
+// first-seam "我 我" is consumed; the join space remains (`我 通常会`).
+// The same family's single-utterance EN->ZH golden
 // (`mimo_asr::executor::tests::golden_diff_end_to_end_transcribe_en_zh_mixed_wav`)
 // also asserts the EN->ZH space.
 const GOLDEN_MIMO_LONGFORM_EN_ZH_TEXT: &str = concat!(
     "And so, my fellow Americans, ask not what your country can do for you. ",
     "Ask what you can do for your country. ",
     "今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的川菜馆吃饭，",
-    "听说那里的麻婆豆腐特别正宗。周末的时候，我 我通常会读书或者看一部电影放松一下。",
+    "听说那里的麻婆豆腐特别正宗。周末的时候，我 通常会读书或者看一部电影放松一下。",
     "And so, my fellow Americans, ask not what your country can do for you, ",
     "ask what you can do for your country.",
     "今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的川菜馆吃饭，",
@@ -889,20 +892,19 @@ fn mimo_asr_golden_diff_longform_cli_transcribe_matches_reference_decode() {
 // `encoder_attention_span_caps_every_builtin_architecture_on_the_production_path`
 // in `native_transcribe.rs`), so this 69s input forces the auto energy-VAD
 // slicer to split -- confirmed 3 chunks via `--format verbose_json`'s
-// `longform.chunk_count`. Pinned against `OPENASR_GGML_BACKEND=cpu`. The two
-// chunk seams show up as the golden's two textual artifacts: a duplicated "我"
-// at the first seam (VAD overlap re-transcribing the boundary word) and a
-// missing space between "COUNTRY" and "今天" / "ANDSO" run together at chunk
-// boundaries where the assembler's join lands between two tokens with no SPM
-// space marker between them -- both present in the real committed pack's
-// output, not smoothed over.
+// `longform.chunk_count`. Pinned against `OPENASR_GGML_BACKEND=cpu`. The
+// missing space between "COUNTRY" and "今天" / "ANDSO" is a tokenizer join.
+// The first-seam "我 我" is consumed by the shared assembler; the join
+// space remains (`周末的时候我 通常会`). Bytes come from feeding the
+// three origin slice texts through TranscriptAssembler
+// (pending pack re-measure).
 fn firered_aed_dev_pack_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/firered-out/firered-aed-l-fp16.oasr")
 }
 
 const GOLDEN_FIRERED_AED_LONGFORM_EN_ZH_TEXT: &str = concat!(
     "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO ",
-    "FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我 我通常会读书或者看一部电影放松一下 ",
+    "FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我 通常会读书或者看一部电影放松一下 ",
     "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO ",
     "FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗 周末的时候我通常会读书或者看一部电影放松一下 ",
     "ANDSO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR ",
@@ -1021,6 +1023,80 @@ fn moss_transcribe_diarize_golden_diff_longform_cli_transcribe_matches_reference
         output.trim_end(),
         GOLDEN_MOSS_TRANSCRIBE_DIARIZE_LONGFORM_EN_ZH_TEXT,
         "unexpected longform CLI transcript"
+    );
+}
+
+// qwen3-asr-0.6b longform seam: the shared assembler used to keep the
+// energy-slicer overlap re-read on wordless CJK segments (0.1.40 reproduced
+// "周末的时候，我。" / "的时候，" at 25.5s). This pins the user-facing CLI
+// path once a published qwen3 pack is available.
+#[test]
+#[ignore = "requires qwen3-asr-0.6b:q4 in OPENASR_QWEN3_HOME or OPENASR_QWEN3_ASR_PACK; \
+            runs the real longform CLI path on fixtures/longform_en_zh.wav"]
+fn qwen3_asr_longform_cli_seam_does_not_duplicate_overlap_text() {
+    let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/longform_en_zh.wav")
+        .canonicalize()
+        .expect("longform_en_zh.wav fixture must exist");
+
+    let mut command = if let Ok(home) = std::env::var("OPENASR_QWEN3_HOME") {
+        let mut command = openasr_with_home(Path::new(&home));
+        command.env("OPENASR_OFFLINE", "1").args([
+            "transcribe",
+            &input.display().to_string(),
+            "-m",
+            "qwen3-asr-0.6b:q4",
+            "--offline",
+            "--format",
+            "text",
+        ]);
+        command
+    } else {
+        let pack_path =
+            match external_test_fixture_path("OPENASR_QWEN3_ASR_PACK", "Qwen3-ASR 0.6B .oasr pack")
+            {
+                Ok(path) => path,
+                Err(skip) => {
+                    eprintln!("skipping: {skip}");
+                    return;
+                }
+            };
+        let mut command = openasr();
+        command.env("OPENASR_OFFLINE", "1").args([
+            "transcribe",
+            &input.display().to_string(),
+            "--model-pack",
+            &pack_path.display().to_string(),
+            "--offline",
+            "--format",
+            "text",
+        ]);
+        command
+    };
+
+    let assert = command.assert().success();
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    let text = output.trim_end();
+    eprintln!("qwen3-asr longform CLI transcript: {text:?}");
+    assert_eq!(
+        text.matches("听说那里的麻婆豆腐特别正宗").count(),
+        2,
+        "each Chinese block keeps 听说…正宗 once, got {text:?}"
+    );
+    assert!(
+        !text.split_whitespace().any(|cue| cue == "吃饭。")
+            && !text.contains("\n吃饭。\n")
+            && !text.contains("吃饭。吃饭"),
+        "isolated 吃饭。 seam fragment must not survive, got {text:?}"
+    );
+    assert_eq!(
+        text.matches("周末的时候").count(),
+        2,
+        "weekend sentence must appear once per Chinese block, got {text:?}"
+    );
+    assert!(
+        text.contains("我通常会"),
+        "stitched sentence must keep both halves, got {text:?}"
     );
 }
 
