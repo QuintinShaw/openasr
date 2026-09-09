@@ -23,14 +23,18 @@ pub(crate) fn sensevoice_sanm_flash_attention_enabled(
     backend_preference: Option<&RequestBackendPreference>,
     placement: Option<ExecutionPlacement>,
 ) -> bool {
+    // ggml CPU flash_attn_ext is the same kernel v0.1.36 used. Keeping it
+    // off made short-reuse RTF regress ~25% against that baseline. HIP stays
+    // off: the discrete-GPU GQA/SANM kernels are not validated there.
+    if config.backend == GgmlCpuGraphBackend::Cpu {
+        return true;
+    }
     config.backend == GgmlCpuGraphBackend::Gpu
         && !config.use_scheduler
         && placement == Some(ExecutionPlacement::FullDevice)
         && matches!(
-            backend_preference,
-            Some(RequestBackendPreference::Exact(route))
-                if route.addressability.is_exactly_addressable()
-                    && matches!(route.provider, ExecutionProvider::Cuda | ExecutionProvider::Vulkan)
+            crate::ggml_runtime::proven_discrete_gpu_provider(backend_preference),
+            Some(ExecutionProvider::Cuda | ExecutionProvider::Vulkan)
         )
 }
 
@@ -73,7 +77,16 @@ mod tests {
     }
 
     #[test]
-    fn sanm_flash_is_limited_to_exact_direct_cuda_and_vulkan() {
+    fn sanm_flash_is_on_for_cpu_and_exact_direct_cuda_vulkan() {
+        let cpu = GgmlCpuGraphConfig {
+            backend: GgmlCpuGraphBackend::Cpu,
+            ..GgmlCpuGraphConfig::conservative_default()
+        };
+        assert!(sensevoice_sanm_flash_attention_enabled(
+            &cpu,
+            None,
+            Some(ExecutionPlacement::CpuOnly),
+        ));
         let direct_gpu = GgmlCpuGraphConfig {
             backend: GgmlCpuGraphBackend::Gpu,
             use_scheduler: false,

@@ -73,6 +73,9 @@ openasr live
 
 # SRT 字幕 + 说话人分离
 openasr transcribe meeting.wav -f srt --diarize
+
+# 把已有逐字稿对齐到音频（SRT/VTT/JSON）
+openasr align recording.wav --transcript script.txt -f srt -o recording.srt
 ```
 
 详细步骤见 [Quickstart](docs/QUICKSTART.md),或 `openasr --help` 查看完整命令。
@@ -86,25 +89,44 @@ curl http://127.0.0.1:8080/v1/audio/transcriptions \
   -F file=@audio.wav -F model=qwen3-asr-0.6b
 ```
 
-与 OpenAI SDK 直接兼容(`base_url="http://127.0.0.1:8080/v1"`)。API Key 和 Agent 集成见 [Agent Integration](docs/AGENT_INTEGRATION.md)。
+转写与 OpenAI SDK 直接兼容(`base_url="http://127.0.0.1:8080/v1"`)。把已有逐字稿打轴是 OpenASR 原生命名：`POST /v1/audio/precise-timeline`（`file` + `transcript`），OpenAI 没有对应端点。API Key 和 Agent 集成见 [Agent Integration](docs/AGENT_INTEGRATION.md)。
 
 ### Docker
 
 每个 core release 会同步发布到
-[Docker Hub](https://hub.docker.com/r/quintinshaw/openasr)(仅二进制 +
-model-registry 元数据;模型权重在运行时拉取到挂载在 `/data` 的卷)。HTTP 服务
-**不会**自动下载模型——先显式安装:
+[Docker Hub](https://hub.docker.com/r/quintinshaw/openasr)(仅运行时二进制 +
+model-registry 元数据;模型权重在运行时拉取到挂载在 `/data` 的卷)。镜像不含
+`perf/` 下的 bench-suite 夹具与基线，容器里直接跑 `openasr bench-suite`
+会找不到文件；基准请在 git 检出里跑。HTTP 服务 **不会**自动下载模型——先显式安装:
 
 ```bash
 docker pull quintinshaw/openasr:latest
 docker run --rm -d --name openasr \
   -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:latest
+docker logs openasr
+# pairing admin token: <token> (saved at /data/pairing-admin-token)
 docker exec openasr openasr pull whisper-small --yes
 
 # NVIDIA GPU(需要 NVIDIA Container Toolkit; sm_75 / Turing 及以上)
 docker pull quintinshaw/openasr:cuda-latest
 docker run --rm -d --name openasr-cuda --gpus all \
   -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:cuda-latest
+```
+
+默认命令在 `0.0.0.0:8080` 上启用 HTTPS（`--tls-self-signed`）和设备配对。配对完成前，未认证的 `/v1/*` 请求返回 401；`GET /health` 仍是存活探针。直连容器请用 `curl -k`，或钉住自签证书。
+
+**Token。** 首次启动时，若未设置 `OPENASR_PAIRING_ADMIN_TOKEN`，服务会生成随机 token，以仅 owner 可读写的权限写入 `/data/pairing-admin-token`，并在首次生成时于 stdout 打印 `pairing admin token: … (saved at /data/…)`。之后启动复用该文件，不再打印明文。自带 token 用 `-e OPENASR_PAIRING_ADMIN_TOKEN=…`。把卷挂在 `/data`，生成的 token 和配对登记才能跨重启保留。
+
+**客户端配对。** 桌面端把该服务加为远程，用管理员 token 批准。走 API：`POST /v1/pairing/requests` 提交设备名，再 `POST /v1/pairing/requests/{id}/approve`，请求头 `Authorization: Bearer <token>`。之后转写用签发的设备凭证，不要继续用管理员 token。
+
+**接在会终止 TLS 的反代后面。** 覆盖命令、去掉 `--tls-self-signed`，并设置 `OPENASR_ALLOW_INSECURE_NON_LOOPBACK=1`。这个环境变量只豁免 TLS，且只该用在可信边界；设备配对仍然强制。不要在不可信网络上设置它。
+
+```bash
+docker run --rm -d --name openasr \
+  -p 8080:8080 -v openasr-data:/data \
+  -e OPENASR_ALLOW_INSECURE_NON_LOOPBACK=1 \
+  quintinshaw/openasr:latest \
+  serve --addr 0.0.0.0:8080 --pairing-admin-token-file /data/pairing-admin-token
 ```
 
 | 标签 | 平台 | 说明 |

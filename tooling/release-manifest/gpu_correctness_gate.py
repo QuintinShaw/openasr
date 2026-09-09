@@ -32,6 +32,10 @@ EVIDENCE_SCHEMA = "openasr.short-audio-receipt.evidence.v1"
 GPU_PROVIDERS = ("cuda", "vulkan", "hip")
 LaneKey = tuple[str, str, str, str, str, str]
 ReceiptKey = tuple[str, str, str, str, str, str, str, str]
+TOKEN_TRACE_SCHEMA = "openasr.gpu-correctness-trace.v1"
+FULL_LOGITS_TRACE_SCHEMA = "openasr.gpu-full-logits-trace.v1"
+MAX_TRACE_STEPS = 4_096
+MAX_LOGITS_VOCAB = 1_000_000
 
 
 class MatrixError(ValueError):
@@ -111,7 +115,12 @@ def _advertised_providers(descriptor: dict[str, Any]) -> list[tuple[str, str, li
 
 def _lane_policies(provider: str) -> tuple[str, str, str]:
     """Return explicit staging policies, not claims of successful hardware runs."""
-    capture = "enabled" if provider == "hip" else "disabled"
+    # HIP is the sole shipping lane compiled with executable-graph capture.
+    # CUDA is currently built with GGML_CUDA_GRAPHS=OFF; CPU, Vulkan, and
+    # Metal expose no equivalent executable-capture path. Those lanes are
+    # unsupported rather than runtime-disabled. A future runtime toggle is a
+    # distinct `disabled` cell and must provide a native disabled observation.
+    capture = "enabled" if provider == "hip" else "unsupported"
     scheduler = "disabled"
     # Production reuse evidence is currently Unknown, so qualification must
     # exercise the shipped FreshGraph plan in both cold- and warm-process rows.
@@ -550,33 +559,397 @@ def _driver_version(value: object) -> bool:
     )
 
 
+def _trace_run_id(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 32 and all(char in "0123456789abcdef" for char in value)
+
+
+def _strict_selection_ref(value: object) -> tuple[int, int, int, int, int, int] | None:
+    fields = (
+        "graph_instance", "graph_generation", "compute_sequence", "output_generation",
+        "output_index", "output_count",
+    )
+    if (
+        not isinstance(value, dict)
+        or set(value) != set(fields)
+        or any(
+            not isinstance(value[field], int) or isinstance(value[field], bool)
+            for field in fields
+        )
+        or any(value[field] <= 0 for field in fields[:4])
+        or value["output_count"] <= 0
+        or value["output_index"] < 0
+        or value["output_index"] >= value["output_count"]
+    ):
+        return None
+    return tuple(value[field] for field in fields)
+
+
+_LIFECYCLE_COMMON_FIELDS = {
+    "schema", "sequence", "provider", "device", "graph_instance",
+    "graph_generation", "event",
+}
+_LIFECYCLE_EVENT_FIELDS: dict[str, tuple[set[str], set[str]]] = {
+    "created": ({"scheduler_enabled"}, set()),
+    "existing_graph_observed": ({"scheduler_enabled"}, {"prepare_generation"}),
+    "prepared": ({"prepare_generation"}, set()),
+    "input_write": ({"input_generation", "bytes"}, set()),
+    "compute_started": (
+        {"compute_sequence"},
+        {"prepare_generation", "input_generation_consumed", "capture_executable_generation"},
+    ),
+    "compute_completed": ({"compute_sequence", "output_generation"}, set()),
+    "output_read": ({"compute_sequence", "output_generation_consumed", "bytes"}, set()),
+    "kv_write_committed": ({"compute_sequence", "kv_write_generation"}, set()),
+    "rebuilt": ({"previous_graph_generation", "reason"}, set()),
+    "poisoned": ({"reason"}, set()),
+    "dropped": (set(), set()),
+    "capture_state_observed": (
+        {"phase", "capture_supported", "graph_tracked", "executable_present"},
+        {"capture_enabled"},
+    ),
+    "capture_executable_observed": ({"capture_executable_generation", "last_change"}, set()),
+    "capture_executable_created": ({"capture_executable_generation", "change"}, set()),
+}
+
+
+def _require_lifecycle_event_shape(path: Path, event: object) -> None:
+    if not isinstance(event, dict) or not isinstance(event.get("event"), str):
+        raise MatrixError(f"{path} contains a malformed lifecycle event")
+    kind = event["event"]
+    contract = _LIFECYCLE_EVENT_FIELDS.get(kind)
+    if contract is None:
+        raise MatrixError(f"{path} contains an unknown lifecycle event")
+    required, optional = contract
+    actual = set(event)
+    required_all = _LIFECYCLE_COMMON_FIELDS | required
+    if not required_all <= actual or not actual <= required_all | optional:
+        raise MatrixError(
+            f"{path} lifecycle event {kind!r} has unknown or missing fields"
+        )
+
+
 def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    if not events or events[0].get("schema") != "openasr.gpu-correctness-trace.v1" or events[0].get("event") != "header":
+    if not events or events[0].get("schema") != TOKEN_TRACE_SCHEMA or events[0].get("event") != "header":
         raise MatrixError(f"{path} lacks the strict runtime trace header")
     header = events[0]
+    expected_header_fields = {
+        "schema", "event", "run_id", "process_nonce", "process_id",
+        "mode", "graph_mode", "provider", "device_target", "backend_id",
+        "driver_version", "artifact_fingerprint", "device",
+        "actual_provider", "actual_stable_device_id", "actual_device",
+    }
+    if (
+        set(header) != expected_header_fields
+        or not _trace_run_id(header.get("run_id"))
+        or not _trace_run_id(header.get("process_nonce"))
+        or not isinstance(header.get("process_id"), int)
+        or isinstance(header.get("process_id"), bool)
+        or not 0 < header.get("process_id") <= 0xFFFFFFFF
+        or header.get("mode") not in {"cold", "reuse"}
+        or header.get("graph_mode") not in {"fresh_graph", "reusable_graph"}
+        or not isinstance(header.get("provider"), str)
+        or not isinstance(header.get("device_target"), str)
+        or not isinstance(header.get("backend_id"), str)
+        or not isinstance(header.get("driver_version"), str)
+        or not isinstance(header.get("artifact_fingerprint"), str)
+        or not isinstance(header.get("device"), str)
+    ):
+        raise MatrixError(f"{path} has invalid runtime trace identity")
+    actual_device = header.get("actual_device")
+    bounded_text = lambda value, limit: isinstance(value, str) and bool(value.strip()) and len(value) <= limit and "\n" not in value and "\r" not in value
+    positive_int = lambda value: isinstance(value, int) and not isinstance(value, bool) and value > 0
+    non_negative_int = lambda value: isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    finite_number = lambda value: isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    if (
+        header.get("actual_provider") != header["provider"]
+        or header.get("actual_stable_device_id") != header["device"]
+        or not bounded_text(header["provider"], 64)
+        or not bounded_text(header["device"], 128)
+        or not isinstance(actual_device, dict)
+        or actual_device.get("name") != header["device"]
+        or not bounded_text(actual_device.get("type"), 64)
+        or not bounded_text(actual_device.get("name"), 128)
+        or not bounded_text(actual_device.get("description"), 256)
+    ):
+        raise MatrixError(f"{path} lacks bounded live actual-device facts")
+    provider_device_id = actual_device.get("provider_device_id")
+    if provider_device_id is not None and (not isinstance(provider_device_id, str) or not provider_device_id or len(provider_device_id) > 128):
+        raise MatrixError(f"{path} has an invalid ggml provider device id")
+    pci_vendor_id = actual_device.get("pci_vendor_id")
+    if pci_vendor_id is not None and (not isinstance(pci_vendor_id, int) or isinstance(pci_vendor_id, bool) or not 0 < pci_vendor_id <= 0xFFFFFFFF):
+        raise MatrixError(f"{path} has an invalid observed PCI vendor id")
     tokens: dict[int, dict[str, Any]] = {}
     topks: dict[int, list[dict[str, Any]]] = {}
-    margins: dict[int, float] = {}
-    logits_digests: dict[int, dict[str, Any]] = {}
-    for event in events[1:]:
-        if event.get("schema") != "openasr.gpu-correctness-trace.v1" or not isinstance(event.get("step_index"), int):
+    topk_margins: dict[int, float] = {}
+    token_compute_refs: dict[int, tuple[int, int, int, int, int, int]] = {}
+    topk_compute_refs: dict[int, tuple[int, int, int, int, int, int]] = {}
+    token_trace_event_indexes: dict[int, int] = {}
+    topk_trace_event_indexes: dict[int, int] = {}
+    output_reads: dict[tuple[int, int, int, int], tuple[int, int]] = {}
+    graph_states: dict[tuple[int, int], dict[str, Any]] = {}
+    graph_generations: set[int] = set()
+    graph_instances: set[int] = set()
+    lifecycle_kinds: set[str] = set()
+    last_lifecycle_sequence = 0
+    for event_index, event in enumerate(events[1:], start=1):
+        if event.get("schema") == "openasr.ggml-graph-lifecycle.v1":
+            _require_lifecycle_event_shape(path, event)
+            if event.get("provider") != header["actual_provider"] or event.get("device") != header["actual_stable_device_id"]:
+                raise MatrixError(f"{path} lifecycle event is not bound to the final trace route")
+            instance = event.get("graph_instance")
+            generation = event.get("graph_generation")
+            sequence = event.get("sequence")
+            if not all(positive_int(value) for value in (instance, generation, sequence)):
+                raise MatrixError(f"{path} contains an invalid opaque graph identity")
+            if sequence <= last_lifecycle_sequence:
+                raise MatrixError(f"{path} graph lifecycle sequence is not strictly increasing")
+            last_lifecycle_sequence = sequence
+            key = (instance, generation)
+            kind = event.get("event")
+            state = graph_states.get(key)
+            if kind in {"created", "existing_graph_observed"}:
+                prepare_generation = (
+                    event.get("prepare_generation")
+                    if kind == "existing_graph_observed"
+                    else None
+                )
+                if (
+                    state is not None
+                    or instance in graph_instances
+                    or generation in graph_generations
+                    or not isinstance(event.get("scheduler_enabled"), bool)
+                    or (
+                        kind == "existing_graph_observed"
+                        and prepare_generation is not None
+                        and not positive_int(prepare_generation)
+                    )
+                ):
+                    raise MatrixError(f"{path} contains a duplicate or malformed graph attachment")
+                graph_states[key] = {
+                    "prepare": prepare_generation,
+                    "input": None,
+                    "active_compute": None,
+                    "completed": {},
+                    "capture": None,
+                    "capture_supported": None,
+                    "graph_tracked": None,
+                    "capture_enabled": None,
+                    "capture_state_observed": False,
+                    "capture_before_pending": False,
+                    "capture_before_computes": set(),
+                    "capture_after_computes": set(),
+                    "last_capture_phase": None,
+                    "capture_executable_present": False,
+                    "capture_present_observed": False,
+                    "compute_captures": [],
+                    "poisoned": False,
+                    "dropped": False,
+                    "last_compute": 0,
+                    "latest_output": None,
+                    "completed_output_read": False,
+                }
+                graph_instances.add(instance)
+                graph_generations.add(generation)
+                lifecycle_kinds.add(kind)
+                continue
+            if state is None or state["dropped"]:
+                raise MatrixError(f"{path} lifecycle event occurs outside a live graph generation")
+            if state["poisoned"] and kind not in {"dropped"}:
+                raise MatrixError(f"{path} executes or mutates a poisoned graph generation")
+            if kind == "prepared":
+                prepare = event.get("prepare_generation")
+                if not positive_int(prepare) or state["prepare"] is not None:
+                    raise MatrixError(f"{path} contains an invalid prepare generation")
+                state["prepare"] = prepare
+            elif kind == "input_write":
+                input_generation = event.get("input_generation")
+                if not positive_int(input_generation) or not positive_int(event.get("bytes")):
+                    raise MatrixError(f"{path} contains an invalid input write generation")
+                state["input"] = input_generation
+            elif kind == "capture_state_observed":
+                phase = event.get("phase")
+                supported = event.get("capture_supported")
+                graph_tracked = event.get("graph_tracked")
+                enabled = event.get("capture_enabled")
+                executable_present = event.get("executable_present")
+                if (
+                    not all(isinstance(value, bool) for value in (supported, graph_tracked, executable_present))
+                    or phase not in {"before_compute", "after_compute"}
+                    or (graph_tracked and not isinstance(enabled, bool))
+                    or (not graph_tracked and enabled is not None)
+                    or (graph_tracked and not supported)
+                    or (executable_present and (not graph_tracked or enabled is not True))
+                    or (
+                        state["capture_supported"] is not None
+                        and state["capture_supported"] != supported
+                    )
+                    or (
+                        state["graph_tracked"] is True
+                        and not graph_tracked
+                    )
+                    or (
+                        state["graph_tracked"] is True
+                        and graph_tracked
+                        and state["capture_enabled"] != enabled
+                    )
+                    or (
+                        state["capture_executable_present"]
+                        and not executable_present
+                    )
+                ):
+                    raise MatrixError(f"{path} contains an invalid or drifting native capture state")
+                if phase == "before_compute":
+                    if state["active_compute"] is not None or state["capture_before_pending"]:
+                        raise MatrixError(f"{path} contains a duplicate or in-compute capture-before observation")
+                    state["capture_before_pending"] = True
+                else:
+                    compute = state["active_compute"]
+                    if (
+                        compute is None
+                        or compute not in state["capture_before_computes"]
+                        or compute in state["capture_after_computes"]
+                    ):
+                        raise MatrixError(f"{path} capture-after observation is not paired with the active compute")
+                    state["capture_after_computes"].add(compute)
+                state["capture_supported"] = supported
+                state["graph_tracked"] = graph_tracked
+                state["capture_enabled"] = enabled
+                state["capture_state_observed"] = True
+                state["last_capture_phase"] = phase
+                state["capture_executable_present"] = executable_present
+                state["capture_present_observed"] |= executable_present
+            elif kind == "capture_executable_observed":
+                capture = event.get("capture_executable_generation")
+                if (
+                    not positive_int(capture)
+                    or state["capture"] is not None
+                    or event.get("last_change") not in {"instantiated", "updated", "replaced"}
+                    or state["active_compute"] is not None
+                    or state["last_capture_phase"] != "before_compute"
+                    or not state["capture_state_observed"]
+                    or not state["capture_supported"]
+                    or not state["graph_tracked"]
+                    or state["capture_enabled"] is not True
+                    or not state["capture_executable_present"]
+                ):
+                    raise MatrixError(f"{path} contains an invalid pre-compute capture executable observation")
+                state["capture"] = capture
+            elif kind == "capture_executable_created":
+                capture = event.get("capture_executable_generation")
+                if (
+                    not positive_int(capture)
+                    or (state["capture"] is not None and capture <= state["capture"])
+                    or event.get("change") not in {"instantiated", "updated", "replaced"}
+                    or state["active_compute"] is None
+                    or state["last_capture_phase"] != "after_compute"
+                    or not state["capture_state_observed"]
+                    or not state["capture_supported"]
+                    or not state["graph_tracked"]
+                    or state["capture_enabled"] is not True
+                    or not state["capture_executable_present"]
+                ):
+                    raise MatrixError(f"{path} contains an invalid capture executable generation")
+                state["capture"] = capture
+            elif kind == "compute_started":
+                compute = event.get("compute_sequence")
+                if (
+                    not positive_int(compute)
+                    or compute <= state["last_compute"]
+                    or state["active_compute"] is not None
+                    or state["prepare"] is None
+                    or state["input"] is None
+                    or (
+                        state["capture_state_observed"]
+                        and (
+                            not state["capture_before_pending"]
+                            or state["last_capture_phase"] != "before_compute"
+                        )
+                    )
+                ):
+                    raise MatrixError(f"{path} contains an invalid compute start")
+                if event.get("prepare_generation") != state["prepare"] or event.get("input_generation_consumed") != state["input"]:
+                    raise MatrixError(f"{path} compute did not consume the current prepare/input generations")
+                if event.get("capture_executable_generation") != state["capture"]:
+                    raise MatrixError(f"{path} compute capture generation was not observed from a backend API event")
+                state["active_compute"] = compute
+                if state["capture_before_pending"]:
+                    state["capture_before_computes"].add(compute)
+                    state["capture_before_pending"] = False
+                state["compute_captures"].append(state["capture"])
+            elif kind == "compute_completed":
+                compute = event.get("compute_sequence")
+                output = event.get("output_generation")
+                if (
+                    compute != state["active_compute"]
+                    or not positive_int(output)
+                    or (
+                        state["capture_state_observed"]
+                        and compute not in state["capture_after_computes"]
+                    )
+                ):
+                    raise MatrixError(f"{path} contains an unmatched compute completion")
+                state["active_compute"] = None
+                state["last_compute"] = compute
+                state["latest_output"] = output
+                state["completed"][compute] = output
+            elif kind == "output_read":
+                compute = event.get("compute_sequence")
+                if compute != state["last_compute"] or state["latest_output"] != event.get("output_generation_consumed") or not positive_int(event.get("bytes")):
+                    raise MatrixError(f"{path} output read did not consume a completed output generation")
+                state["completed_output_read"] = True
+                output_ref = (instance, generation, compute, event["output_generation_consumed"])
+                if output_ref in output_reads:
+                    raise MatrixError(f"{path} has ambiguous repeated output reads for one compute")
+                output_reads[output_ref] = (event_index, event["bytes"])
+            elif kind == "kv_write_committed":
+                compute = event.get("compute_sequence")
+                kv = event.get("kv_write_generation")
+                if compute not in state["completed"] or not positive_int(kv):
+                    raise MatrixError(f"{path} KV commit is not bound to a completed compute")
+            elif kind == "rebuilt":
+                previous = event.get("previous_graph_generation")
+                if not positive_int(previous) or previous == generation or previous not in graph_generations or event.get("reason") not in {"fresh_step", "topology_changed", "poison_recovery"}:
+                    raise MatrixError(f"{path} contains an unbound graph rebuild")
+            elif kind == "poisoned":
+                if event.get("reason") not in {"compute_failed", "readback_failed", "memory_commit_failed", "capture_observation_failed", "explicit"}:
+                    raise MatrixError(f"{path} contains an invalid poison reason")
+                state["poisoned"] = True
+                state["active_compute"] = None
+            elif kind == "dropped":
+                if state["active_compute"] is not None:
+                    raise MatrixError(f"{path} dropped a graph with an unmatched compute")
+                state["dropped"] = True
+            else:
+                raise MatrixError(f"{path} contains an unknown lifecycle event")
+            lifecycle_kinds.add(kind)
+            continue
+        if event.get("schema") != TOKEN_TRACE_SCHEMA or not non_negative_int(event.get("step_index")):
             raise MatrixError(f"{path} contains an unversioned or malformed trace event")
         step = event["step_index"]
+        selection_ref = _strict_selection_ref(event.get("compute"))
+        if selection_ref is None:
+            raise MatrixError(f"{path} trace event lacks a strict compute reference")
         if event.get("event") == "token":
             if (
-                not isinstance(event.get("token_id"), int)
-                or event["token_id"] < 0
-                or event.get("is_eot") not in {0, 1, False, True}
+                set(event) != {"schema", "event", "step_index", "token_id", "is_eot", "compute"}
+                or not non_negative_int(event.get("token_id"))
+                or event.get("is_eot") not in {0, 1}
+                or isinstance(event.get("is_eot"), bool)
                 or step in tokens
             ):
                 raise MatrixError(f"{path} contains an invalid token event")
             tokens[step] = event
+            token_compute_refs[step] = selection_ref
+            token_trace_event_indexes[step] = event_index
         elif event.get("event") == "top_k":
             items = event.get("items")
             margin = event.get("top1_top2_margin")
             if (
-                not isinstance(items, list)
+                set(event) != {
+                    "schema", "event", "step_index", "items", "top1_top2_margin", "compute"
+                }
+                or not isinstance(items, list)
                 or len(items) < 2
                 or any(
                     not isinstance(item, dict)
@@ -593,28 +966,92 @@ def _parse_trace_events(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
             ):
                 raise MatrixError(f"{path} contains an invalid top-k event")
             topks[step] = items
-            margins[step] = float(margin)
-        elif event.get("event") == "logits_digest":
-            if (
-                type(event.get("element_count")) is not int
-                or event["element_count"] <= 0
-                or not _hex_digest(event.get("sha256"))
-                or event.get("non_finite_count") != 0
-                or step in logits_digests
-            ):
-                raise MatrixError(f"{path} contains an invalid logits digest event")
-            logits_digests[step] = event
+            topk_margins[step] = float(margin)
+            topk_compute_refs[step] = selection_ref
+            topk_trace_event_indexes[step] = event_index
         else:
             raise MatrixError(f"{path} contains an unknown trace event")
-    if not tokens or set(tokens) != set(topks) or set(tokens) != set(logits_digests):
+    if not tokens or set(tokens) != set(topks):
+        raise MatrixError(f"{path} does not contain matching per-step token and top-k events")
+    if len(tokens) > MAX_TRACE_STEPS or set(tokens) != set(range(len(tokens))):
+        raise MatrixError(f"{path} token trace steps are not bounded and contiguous from zero")
+    used_selection_refs: set[tuple[int, int, int, int, int, int]] = set()
+    for step in tokens:
+        token_ref = token_compute_refs[step]
+        topk_ref = topk_compute_refs[step]
+        if token_ref != topk_ref:
+            raise MatrixError(f"{path} token and top-k events disagree on their compute reference")
+        output_read = output_reads.get(token_ref[:4])
+        if output_read is None:
+            raise MatrixError(f"{path} trace compute reference has no matching lifecycle output read")
+        output_read_index, _output_read_bytes = output_read
+        if output_read_index >= token_trace_event_indexes[step] or output_read_index >= topk_trace_event_indexes[step]:
+            raise MatrixError(f"{path} trace event precedes its lifecycle output read")
+        if token_ref in used_selection_refs:
+            raise MatrixError(f"{path} reuses one lifecycle compute reference across trace steps")
+        used_selection_refs.add(token_ref)
+    if not ({"created", "existing_graph_observed"} & lifecycle_kinds):
+        raise MatrixError(f"{path} lacks a real graph creation or warm attachment event")
+    required_lifecycle = {"input_write", "compute_started", "compute_completed", "output_read"}
+    if not required_lifecycle <= lifecycle_kinds:
         raise MatrixError(
-            f"{path} does not contain matching per-step token, top-k, and logits digest events"
+            f"{path} lacks required real graph lifecycle events: "
+            f"{sorted(required_lifecycle - lifecycle_kinds)}"
         )
+    if not any(
+        state["last_compute"] > 0
+        and state["completed_output_read"]
+        and not state["poisoned"]
+        for state in graph_states.values()
+    ):
+        raise MatrixError(
+            f"{path} has no single graph generation with a complete observed compute/read lifecycle"
+        )
+    computed_states = [
+        state for state in graph_states.values() if state["last_compute"] > 0
+    ]
+    for state in computed_states:
+        if state["capture_state_observed"] and (
+            state["capture_before_pending"]
+            or state["capture_before_computes"] != set(state["completed"])
+            or state["capture_after_computes"] != set(state["completed"])
+        ):
+            raise MatrixError(
+                f"{path} does not contain one backend capture observation before and after every completed compute"
+            )
+    capture_state_modes = {
+        (state["capture_supported"], state["graph_tracked"], state["capture_enabled"])
+        for state in computed_states
+        if state["capture_state_observed"]
+    }
     return header, {
-        "tokens": tokens,
-        "topks": topks,
-        "margins": margins,
-        "logits_digests": logits_digests,
+        "actual_device": actual_device,
+        "steps": sorted(tokens),
+        "tokens": {step: {"token_id": event["token_id"], "compute": token_compute_refs[step]} for step, event in tokens.items()},
+        "topks": {
+            step: {"items": items, "margin": topk_margins[step], "compute": topk_compute_refs[step]}
+            for step, items in topks.items()
+        },
+        "lifecycle_kinds": sorted(lifecycle_kinds),
+        "computed_graph_count": len(computed_states),
+        "capture_state_graph_count": sum(
+            bool(state["capture_state_observed"]) for state in computed_states
+        ),
+        "capture_phase_paired_compute_count": sum(
+            len(state["capture_after_computes"]) for state in computed_states
+        ),
+        "capture_state_modes": capture_state_modes,
+        "capture_executable_present_observed": any(
+            state["capture_present_observed"] for state in computed_states
+        ),
+        "capture_generation_observed": any(
+            state["capture"] is not None for state in graph_states.values()
+        ),
+        "capture_generation_consumed": any(
+            any(generation is not None for generation in state["compute_captures"])
+            for state in graph_states.values()
+        ),
+        "output_read_bytes": {ref: value[1] for ref, value in output_reads.items()},
     }
 
 
@@ -631,6 +1068,10 @@ def parse_trace_artifact(path: Path) -> dict[str, Any]:
     ):
         raise MatrixError(f"{path} has invalid runtime trace identity")
     return {
+        "run_id": header["run_id"],
+        "process_nonce": header["process_nonce"],
+        "process_id": header["process_id"],
+        "mode": header["mode"],
         "graph_mode": header["graph_mode"],
         "provider": header["provider"],
         "device_target": header["device_target"],
@@ -638,16 +1079,31 @@ def parse_trace_artifact(path: Path) -> dict[str, Any]:
         "driver_version": header["driver_version"],
         "artifact_fingerprint": header["artifact_fingerprint"],
         "device": header["device"],
-        "steps": sorted(trace["tokens"]),
+        "actual_provider": header["actual_provider"],
+        "actual_stable_device_id": header["actual_stable_device_id"],
+        "actual_device": trace["actual_device"],
+        "steps": trace["steps"],
+        "tokens": trace["tokens"],
         "token_ids": {
             step: event["token_id"] for step, event in trace["tokens"].items()
         },
         "topks": trace["topks"],
-        "margins": trace["margins"],
-        "logits_sha256": {
-            step: event["sha256"]
-            for step, event in trace["logits_digests"].items()
+        "margins": {
+            step: event["margin"] for step, event in trace["topks"].items()
         },
+        "lifecycle_kinds": trace["lifecycle_kinds"],
+        "computed_graph_count": trace["computed_graph_count"],
+        "capture_state_graph_count": trace["capture_state_graph_count"],
+        "capture_phase_paired_compute_count": trace[
+            "capture_phase_paired_compute_count"
+        ],
+        "capture_state_modes": trace["capture_state_modes"],
+        "capture_executable_present_observed": trace[
+            "capture_executable_present_observed"
+        ],
+        "capture_generation_observed": trace["capture_generation_observed"],
+        "capture_generation_consumed": trace["capture_generation_consumed"],
+        "output_read_bytes": trace["output_read_bytes"],
     }
 
 
@@ -660,13 +1116,242 @@ def parse_cpu_oracle_trace(path: Path) -> dict[str, Any]:
     ):
         raise MatrixError(f"{path} is not a CPU family-oracle trace")
     return {
+        "run_id": header["run_id"],
+        "process_nonce": header["process_nonce"],
+        "process_id": header["process_id"],
+        "mode": header["mode"],
         "graph_mode": header["graph_mode"],
         "device": header["device"],
-        "steps": sorted(trace["tokens"]),
+        "steps": trace["steps"],
         "token_ids": {
             step: event["token_id"] for step, event in trace["tokens"].items()
         },
     }
+
+
+def parse_full_logits_artifact(path: Path) -> dict[str, Any]:
+    try:
+        events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except (OSError, json.JSONDecodeError) as error:
+        raise MatrixError(f"cannot read full logits trace {path}: {error}") from error
+    if not events or not isinstance(events[0], dict):
+        raise MatrixError(f"{path} lacks the full logits trace header")
+    header = events[0]
+    expected_header_fields = {
+        "schema", "event", "run_id", "process_nonce", "process_id",
+        "mode", "graph_mode", "provider", "device_target", "backend_id",
+        "driver_version", "artifact_fingerprint", "device",
+        "actual_provider", "actual_stable_device_id", "actual_device",
+        "dtype", "encoding", "step_count",
+    }
+    actual_device = header.get("actual_device")
+    step_count = header.get("step_count")
+    if (
+        set(header) != expected_header_fields
+        or header.get("schema") != FULL_LOGITS_TRACE_SCHEMA
+        or header.get("event") != "header"
+        or not _trace_run_id(header.get("run_id"))
+        or not _trace_run_id(header.get("process_nonce"))
+        or not isinstance(header.get("process_id"), int)
+        or isinstance(header.get("process_id"), bool)
+        or not 0 < header.get("process_id") <= 0xFFFFFFFF
+        or header.get("mode") not in {"cold", "reuse"}
+        or header.get("graph_mode") not in {"fresh_graph", "reusable_graph"}
+        or not isinstance(header.get("provider"), str)
+        or not isinstance(header.get("device_target"), str)
+        or not isinstance(header.get("backend_id"), str)
+        or not _driver_version(header.get("driver_version"))
+        or not _hex_digest(header.get("artifact_fingerprint"))
+        or not isinstance(header.get("device"), str)
+        or header.get("actual_provider") != header.get("provider")
+        or header.get("actual_stable_device_id") != header.get("device")
+        or not isinstance(actual_device, dict)
+        or actual_device.get("name") != header.get("device")
+        or header.get("dtype") != "f32"
+        or header.get("encoding") != "json_numbers"
+        or not isinstance(step_count, int)
+        or isinstance(step_count, bool)
+        or not 0 < step_count <= MAX_TRACE_STEPS
+    ):
+        raise MatrixError(f"{path} has an invalid full logits trace header")
+    for field, limit in (("provider", 64), ("device", 128)):
+        value = header[field]
+        if not value.strip() or len(value) > limit or "\n" in value or "\r" in value:
+            raise MatrixError(f"{path} has an unbounded full logits {field}")
+    for field, limit in (("type", 64), ("name", 128), ("description", 256)):
+        value = actual_device.get(field)
+        if not isinstance(value, str) or not value.strip() or len(value) > limit or "\n" in value or "\r" in value:
+            raise MatrixError(f"{path} has invalid full logits actual-device facts")
+
+    rows: dict[int, dict[str, Any]] = {}
+    used_selection_refs: set[tuple[int, int, int, int, int, int]] = set()
+    vocab_size: int | None = None
+    expected_row_fields = {
+        "schema", "event", "step_index", "compute", "vocab_size", "values"
+    }
+    for event in events[1:]:
+        if not isinstance(event, dict) or set(event) != expected_row_fields or event.get("schema") != FULL_LOGITS_TRACE_SCHEMA or event.get("event") != "logits":
+            raise MatrixError(f"{path} contains an unknown or malformed full logits event")
+        step = event.get("step_index")
+        row_vocab = event.get("vocab_size")
+        values = event.get("values")
+        selection_ref = _strict_selection_ref(event.get("compute"))
+        if (
+            not isinstance(step, int)
+            or isinstance(step, bool)
+            or step < 0
+            or step in rows
+            or not isinstance(row_vocab, int)
+            or isinstance(row_vocab, bool)
+            or not 0 < row_vocab <= MAX_LOGITS_VOCAB
+            or not isinstance(values, list)
+            or len(values) != row_vocab
+            or any(not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) for value in values)
+            or selection_ref is None
+            or selection_ref in used_selection_refs
+        ):
+            raise MatrixError(f"{path} contains an invalid or incomplete full logits row")
+        if vocab_size is not None and row_vocab != vocab_size:
+            raise MatrixError(f"{path} changes vocab_size across full logits rows")
+        vocab_size = row_vocab
+        used_selection_refs.add(selection_ref)
+        rows[step] = {"compute": selection_ref, "values": values}
+    if len(rows) != step_count or set(rows) != set(range(step_count)):
+        raise MatrixError(f"{path} full logits rows do not exactly cover declared steps")
+    return {
+        "run_id": header["run_id"],
+        "process_nonce": header["process_nonce"],
+        "process_id": header["process_id"],
+        "mode": header["mode"],
+        "graph_mode": header["graph_mode"],
+        "provider": header["provider"],
+        "device_target": header["device_target"],
+        "backend_id": header["backend_id"],
+        "driver_version": header["driver_version"],
+        "artifact_fingerprint": header["artifact_fingerprint"],
+        "device": header["device"],
+        "actual_provider": header["actual_provider"],
+        "actual_stable_device_id": header["actual_stable_device_id"],
+        "actual_device": actual_device,
+        "steps": sorted(rows),
+        "rows": rows,
+        "vocab_size": vocab_size,
+    }
+
+
+def _require_full_logits_match(
+    receipt_path: Path,
+    token_trace: dict[str, Any],
+    logits_trace: dict[str, Any],
+    tie_policy: str,
+    receipt_trace: dict[str, Any],
+) -> None:
+    for field in (
+        "run_id", "process_nonce", "process_id", "mode", "graph_mode", "provider",
+        "device_target", "backend_id", "driver_version", "artifact_fingerprint",
+        "device", "actual_provider", "actual_stable_device_id", "actual_device", "steps",
+    ):
+        if token_trace[field] != logits_trace[field]:
+            raise MatrixError(f"{receipt_path} token/logits traces disagree on {field}")
+    if tie_policy not in {"first_maximum", "last_maximum"}:
+        raise MatrixError(f"{receipt_path} has an unsupported logits tie policy")
+    expected_summaries: dict[int, tuple[list[dict[str, Any]], float]] = {}
+    for step in token_trace["steps"]:
+        token = token_trace["tokens"][step]
+        topk = token_trace["topks"][step]
+        row = logits_trace["rows"][step]
+        if token["compute"] != row["compute"] or topk["compute"] != row["compute"]:
+            raise MatrixError(f"{receipt_path} token/logits step is bound to a different compute")
+        values = row["values"]
+        selection_ref = row["compute"]
+        output_count = selection_ref[5]
+        expected_bytes = output_count * len(values) * 4
+        if token_trace["output_read_bytes"].get(selection_ref[:4]) != expected_bytes:
+            raise MatrixError(
+                f"{receipt_path} logits row partition does not match its native output read size"
+            )
+        best_value = max(values)
+        tied = [index for index, value in enumerate(values) if value == best_value]
+        selected = tied[0] if tie_policy == "first_maximum" else tied[-1]
+        if token["token_id"] != selected:
+            raise MatrixError(f"{receipt_path} token does not match the full-logits family oracle")
+        if tie_policy == "first_maximum":
+            order = sorted(range(len(values)), key=lambda index: (-values[index], index))
+        else:
+            order = sorted(range(len(values)), key=lambda index: (-values[index], -index))
+        expected_top = [
+            {"token_id": index, "value": values[index]}
+            for index in order[: len(topk["items"])]
+        ]
+        if topk["items"] != expected_top:
+            raise MatrixError(f"{receipt_path} top-k trace does not match complete logits")
+        expected_margin = values[order[0]] - values[order[1]]
+        if topk["margin"] != expected_margin:
+            raise MatrixError(f"{receipt_path} top-k margin does not match complete logits")
+        expected_summaries[step] = (expected_top, expected_margin)
+
+    summary_top = receipt_trace.get("top_k")
+    summary_margin = receipt_trace.get("top1_top2_margin")
+    worst_step = min(expected_summaries, key=lambda step: expected_summaries[step][1])
+    expected_summary_top, expected_summary_margin = expected_summaries[worst_step]
+    if (
+        not isinstance(summary_top, list)
+        or not summary_top
+        or len(summary_top) > len(expected_summary_top)
+        or summary_top != expected_summary_top[: len(summary_top)]
+        or summary_margin != expected_summary_margin
+    ):
+        raise MatrixError(f"{receipt_path} receipt top-k summary does not match complete logits")
+
+
+def _require_trace_capture_policy(
+    path: Path, semantics: dict[str, Any], capture_mode: str
+) -> None:
+    computed_graphs = semantics["computed_graph_count"]
+    observed_graphs = semantics["capture_state_graph_count"]
+    paired_computes = semantics["capture_phase_paired_compute_count"]
+    observed_modes = semantics["capture_state_modes"]
+    executable_present = semantics["capture_executable_present_observed"]
+    capture_observed = semantics["capture_generation_observed"]
+    capture_consumed = semantics["capture_generation_consumed"]
+    if capture_mode == "enabled":
+        if (
+            computed_graphs == 0
+            or observed_graphs != computed_graphs
+            or paired_computes == 0
+            or observed_modes != {(True, True, True)}
+            or not executable_present
+            or not capture_observed
+            or not capture_consumed
+        ):
+            raise MatrixError(
+                f"{path} capture-enabled lane lacks observed native enablement, an executable generation, and a compute that consumed it"
+            )
+    elif capture_mode == "disabled":
+        if (
+            computed_graphs == 0
+            or observed_graphs != computed_graphs
+            or paired_computes == 0
+            or observed_modes != {(True, True, False)}
+            or executable_present
+            or capture_observed
+            or capture_consumed
+        ):
+            raise MatrixError(
+                f"{path} capture-disabled lane lacks observed native disablement or unexpectedly observed an executable"
+            )
+    elif capture_mode == "unsupported":
+        if (
+            observed_modes not in (set(), {(False, False, None)})
+            or executable_present
+            or capture_observed
+            or capture_consumed
+        ):
+            raise MatrixError(
+                f"{path} capture-unsupported lane unexpectedly observed native capture support or an executable"
+            )
+    else:
+        raise MatrixError(f"{path} has invalid capture policy {capture_mode!r}")
 
 def _evidence_for(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     document = _read(path)
@@ -881,11 +1566,31 @@ def closed_receipt_keys(
     )
     (qualification_validator or _core_validate_qualification_receipts)(receipt_paths)
     trace_paths = trace_paths or []
-    trace_hashes = {path.name: _sha256(path) for path in trace_paths}
-    trace_semantics = {path.name: parse_trace_artifact(path) for path in trace_paths}
+    trace_hashes: dict[str, str] = {}
+    token_trace_semantics: dict[str, dict[str, Any]] = {}
+    logits_trace_semantics: dict[str, dict[str, Any]] = {}
+    for path in trace_paths:
+        if path.name in trace_hashes:
+            raise MatrixError(f"duplicate trace artifact basename {path.name}")
+        try:
+            first_line = next(line for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+            first_event = json.loads(first_line)
+        except (OSError, StopIteration, json.JSONDecodeError) as error:
+            raise MatrixError(f"cannot classify trace artifact {path}: {error}") from error
+        schema = first_event.get("schema") if isinstance(first_event, dict) else None
+        trace_hashes[path.name] = _sha256(path)
+        if schema == TOKEN_TRACE_SCHEMA:
+            token_trace_semantics[path.name] = parse_trace_artifact(path)
+        elif schema == FULL_LOGITS_TRACE_SCHEMA:
+            logits_trace_semantics[path.name] = parse_full_logits_artifact(path)
+        else:
+            raise MatrixError(f"{path} has an unknown trace artifact schema")
     expected, cell_by_lane = expected_receipt_keys(matrix)
     receipts: set[ReceiptKey] = set()
     classes: set[str] = set()
+    token_trace_modes_by_lane: dict[
+        tuple[str, str, str, str, str, str], dict[str, dict[str, Any]]
+    ] = {}
     for path in receipt_paths:
         document, evidence = _evidence_for(path)
         evidence_class = evidence.get("evidence_class")
@@ -931,6 +1636,14 @@ def closed_receipt_keys(
             raise MatrixError(f"{path} topology does not match its matrix cell")
         if evidence.get("capture_mode") != lane["capture_mode"] or evidence.get("scheduler_mode") != lane["scheduler_mode"]:
             raise MatrixError(f"{path} capture/scheduler identity does not match its matrix cell")
+        actual_device = evidence.get("actual_device")
+        if evidence_class != "build_packaging" and (
+            evidence.get("actual_provider") != provider
+            or evidence.get("actual_stable_device_id") != evidence.get("device")
+            or not isinstance(actual_device, dict)
+            or actual_device.get("name") != evidence.get("actual_stable_device_id")
+        ):
+            raise MatrixError(f"{path} actual device identity does not match its evidence lane")
         artifacts = evidence["artifacts"]
         if (
             artifacts["binary"].get("sha256") != contract["binary_sha256"]
@@ -990,25 +1703,50 @@ def closed_receipt_keys(
             if not isinstance(trace, dict) or not isinstance(trace.get("token_trace"), dict) or not _hex_digest(trace["token_trace"].get("sha256")):
                 raise MatrixError(f"{path} token evidence lacks a non-empty trace artifact hash")
             token_trace = trace["token_trace"]
-            if token_trace.get("label") not in trace_hashes or trace_hashes[token_trace["label"]] != token_trace.get("sha256"):
-                raise MatrixError(f"{path} token trace artifact content hash does not verify")
-            semantics = trace_semantics[token_trace["label"]]
             if (
-                semantics["graph_mode"] != lane["graph_mode"]
+                token_trace.get("label") not in token_trace_semantics
+                or trace_hashes.get(token_trace["label"]) != token_trace.get("sha256")
+            ):
+                raise MatrixError(f"{path} token trace artifact content hash does not verify")
+            semantics = token_trace_semantics[token_trace["label"]]
+            if (
+                semantics["mode"] != mode
+                or semantics["graph_mode"] != lane["graph_mode"]
                 or semantics["provider"] != provider
                 or semantics["device_target"] != device_target
                 or semantics["backend_id"] != backend_id
                 or semantics["driver_version"] != evidence.get("driver_version")
                 or semantics["artifact_fingerprint"] != evidence.get("artifact_fingerprint")
                 or semantics["device"] != evidence.get("device")
+                or semantics["actual_provider"] != evidence.get("actual_provider")
+                or semantics["actual_stable_device_id"]
+                != evidence.get("actual_stable_device_id")
             ):
                 raise MatrixError(f"{path} trace header does not match receipt execution identity")
+            if semantics["actual_device"] != evidence.get("actual_device"):
+                raise MatrixError(f"{path} trace actual-device facts do not match receipt evidence")
+            _require_trace_capture_policy(path, semantics, lane["capture_mode"])
             if lane["output_plan"]["requires_complete_output"]:
                 logits = trace.get("logits")
                 if not isinstance(logits, dict) or not _hex_digest(logits.get("sha256")):
                     raise MatrixError(f"{path} complete-output plan lacks logits trace content hash")
-                if logits.get("label") not in trace_hashes or trace_hashes[logits["label"]] != logits.get("sha256"):
+                if (
+                    logits.get("label") not in logits_trace_semantics
+                    or trace_hashes.get(logits["label"]) != logits.get("sha256")
+                ):
                     raise MatrixError(f"{path} logits trace artifact content hash does not verify")
+                _require_full_logits_match(
+                    path,
+                    semantics,
+                    logits_trace_semantics[logits["label"]],
+                    oracle["tie_policy"],
+                    trace,
+                )
+            lane_key = (family, model_id, quant, provider, device_target, backend_id)
+            mode_semantics = token_trace_modes_by_lane.setdefault(lane_key, {})
+            if mode in mode_semantics:
+                raise MatrixError(f"{path} duplicates token trace mode for exact lane")
+            mode_semantics[mode] = semantics
             top_k = trace.get("top_k")
             if not isinstance(top_k, list) or not top_k or len(top_k) > 32 or any(not isinstance(item, dict) or not isinstance(item.get("value"), (int, float)) for item in top_k):
                 raise MatrixError(f"{path} has invalid top-k summary")
@@ -1018,6 +1756,22 @@ def closed_receipt_keys(
         if key in receipts:
             raise MatrixError(f"duplicate evidence for correctness cell {key}")
         receipts.add(key)
+    for lane_key, mode_semantics in token_trace_modes_by_lane.items():
+        cold = mode_semantics.get("cold")
+        reuse = mode_semantics.get("reuse")
+        if cold is None or reuse is None:
+            continue
+        if (
+            cold["process_nonce"] != reuse["process_nonce"]
+            or cold["process_id"] != reuse["process_id"]
+        ):
+            raise MatrixError(
+                f"cold/reuse token traces for exact lane {lane_key} were not produced by the same process"
+            )
+        if cold["run_id"] == reuse["run_id"]:
+            raise MatrixError(
+                f"cold/reuse token traces for exact lane {lane_key} reuse one request identity"
+            )
     unknown = sorted(receipts - expected)
     if unknown:
         raise MatrixError(f"receipts are not bound to projected matrix cells: {unknown}")
@@ -1818,6 +2572,7 @@ def bind_runtime_cell_receipts(
     process_mode: str,
     gpu_receipt_path: Path,
     gpu_trace_path: Path,
+    gpu_logits_path: Path,
     cpu_receipt_path: Path,
     cpu_trace_path: Path,
     binary_path: Path,
@@ -1887,9 +2642,16 @@ def bind_runtime_cell_receipts(
         gpu_receipt, provider=provider, scheduler_mode=cell["scheduler_mode"]
     )
 
-    gpu_trace = parse_trace_artifact(gpu_trace_path)
     if (
-        gpu_trace["provider"] != provider
+        gpu_trace_path.resolve() == gpu_logits_path.resolve()
+        or gpu_trace_path.name == gpu_logits_path.name
+    ):
+        raise MatrixError("GPU token and full-logits traces must be distinct artifacts")
+    gpu_trace = parse_trace_artifact(gpu_trace_path)
+    gpu_logits = parse_full_logits_artifact(gpu_logits_path)
+    if (
+        gpu_trace["mode"] != process_mode
+        or gpu_trace["provider"] != provider
         or gpu_trace["device_target"] != cell["device_target"]
         or gpu_trace["backend_id"] != backend_id
         or gpu_trace["artifact_fingerprint"] != cell["artifact_fingerprint"]
@@ -1907,16 +2669,18 @@ def bind_runtime_cell_receipts(
     ):
         raise MatrixError("GPU transcript/inputs diverge from the CPU family oracle")
 
-    for step, items in gpu_trace["topks"].items():
-        maximum = max(float(item["value"]) for item in items)
-        tied = [
-            int(item["token_id"])
-            for item in items
-            if float(item["value"]) == maximum
-        ]
-        oracle_token = min(tied) if cell["output_plan"]["tie_policy"] == "first_maximum" else max(tied)
-        if gpu_trace["token_ids"][step] != oracle_token:
-            raise MatrixError("GPU selected token violates the family tie policy")
+    worst_step = min(gpu_trace["margins"], key=gpu_trace["margins"].get)
+    trace_summary = {
+        "top_k": gpu_trace["topks"][worst_step]["items"],
+        "top1_top2_margin": gpu_trace["margins"][worst_step],
+    }
+    _require_full_logits_match(
+        gpu_receipt_path,
+        gpu_trace,
+        gpu_logits,
+        cell["output_plan"]["tie_policy"],
+        trace_summary,
+    )
 
     if _sha256(binary_path) != matrix["artifact_contract"]["binary_sha256"]:
         raise MatrixError("runtime binary bytes do not match the matrix")
@@ -1927,8 +2691,8 @@ def bind_runtime_cell_receipts(
     if _sha256(fixture_path) != audio.get("sha256"):
         raise MatrixError("audio fixture bytes do not match the runtime receipt")
 
-    worst_step = min(gpu_trace["margins"], key=gpu_trace["margins"].get)
     trace_identity = _artifact_identity(gpu_trace_path.name, gpu_trace_path)
+    logits_identity = _artifact_identity(gpu_logits_path.name, gpu_logits_path)
     artifacts = {
         "binary": _artifact_identity(binary_path.name, binary_path),
         "plugin": _artifact_identity(plugin_path.name, plugin_path),
@@ -1956,6 +2720,9 @@ def bind_runtime_cell_receipts(
         "driver_version": gpu_trace["driver_version"],
         "artifact_fingerprint": cell["artifact_fingerprint"],
         "device": gpu_trace["device"],
+        "actual_provider": gpu_trace["actual_provider"],
+        "actual_stable_device_id": gpu_trace["actual_stable_device_id"],
+        "actual_device": gpu_trace["actual_device"],
         "placement": cell["placement"],
         "capture_mode": cell["capture_mode"],
         "scheduler_mode": cell["scheduler_mode"],
@@ -1971,11 +2738,13 @@ def bind_runtime_cell_receipts(
         },
     }
     placement_receipt = copy.deepcopy(gpu_receipt)
+    placement_receipt["notes"] = []
     placement_receipt["evidence"] = {
         **copy.deepcopy(common_evidence),
         "evidence_class": "placement_resource",
     }
     token_receipt = copy.deepcopy(gpu_receipt)
+    token_receipt["notes"] = []
     token_receipt["evidence"] = {
         **copy.deepcopy(common_evidence),
         "evidence_class": "token_transcript",
@@ -1987,9 +2756,9 @@ def bind_runtime_cell_receipts(
         "trace": {
             "token_trace": trace_identity,
             "logits": (
-                trace_identity if cell["output_plan"]["requires_complete_output"] else None
+                logits_identity if cell["output_plan"]["requires_complete_output"] else None
             ),
-            "top_k": gpu_trace["topks"][worst_step],
+            "top_k": gpu_trace["topks"][worst_step]["items"],
             "top1_top2_margin": gpu_trace["margins"][worst_step],
         },
     }
@@ -2190,6 +2959,7 @@ def main() -> int:
     bind_cell.add_argument("--process-mode", choices=("cold", "reuse"), required=True)
     bind_cell.add_argument("--gpu-receipt", type=Path, required=True)
     bind_cell.add_argument("--gpu-trace", type=Path, required=True)
+    bind_cell.add_argument("--gpu-logits", type=Path, required=True)
     bind_cell.add_argument("--cpu-receipt", type=Path, required=True)
     bind_cell.add_argument("--cpu-trace", type=Path, required=True)
     bind_cell.add_argument("--binary", type=Path, required=True)
@@ -2382,6 +3152,7 @@ def main() -> int:
             process_mode=args.process_mode,
             gpu_receipt_path=args.gpu_receipt,
             gpu_trace_path=args.gpu_trace,
+            gpu_logits_path=args.gpu_logits,
             cpu_receipt_path=args.cpu_receipt,
             cpu_trace_path=args.cpu_trace,
             binary_path=args.binary,

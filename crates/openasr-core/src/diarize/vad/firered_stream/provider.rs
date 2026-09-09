@@ -205,10 +205,10 @@ impl PolicyResolvedFireRedStreamVadProvider {
     pub(crate) fn for_intent(
         execution_services: Arc<NativeExecutionServices>,
         intent: ExecutionIntent,
-    ) -> Result<Option<Self>, FireRedStreamVadError> {
-        let Some(model) = super::shared_model() else {
-            return Ok(None);
-        };
+    ) -> Result<Self, FireRedStreamVadError> {
+        let model = super::shared_model().ok_or_else(|| FireRedStreamVadError::ExecutionPolicy {
+            reason: "Stream-VAD admission failed; vendored weights require an installed native execution broker".to_string(),
+        })?;
         let model_for_builder = model.clone();
         let inventory = enumerate_compute_devices_from_ggml(&crate::ggml_available_devices());
         let plan = execution_services
@@ -259,10 +259,10 @@ impl PolicyResolvedFireRedStreamVadProvider {
             activation_quote,
         )
         .map_err(map_policy_error)?;
-        Ok(Some(Self {
+        Ok(Self {
             runtime: Mutex::new(runtime),
             invocation_scratch_peak_bytes,
-        }))
+        })
     }
 
     pub(crate) const fn invocation_scratch_peak_bytes(&self) -> u64 {
@@ -469,12 +469,14 @@ mod tests {
             NativeExecutionServices::for_local_process()
                 .expect("construct native execution services"),
         );
+        let _nes = crate::models::native_execution_services::install_native_execution_services(
+            services.as_ref(),
+        );
         let provider = PolicyResolvedFireRedStreamVadProvider::for_intent(
-            services,
+            Arc::clone(&services),
             ExecutionIntent::AcceleratedOnly,
         )
-        .expect("resolve explicit accelerated Stream-VAD")
-        .expect("embedded Stream-VAD model");
+        .expect("resolve explicit accelerated Stream-VAD");
         let placement = crate::GgmlExecutionTelemetryCollector::new();
         let _placement_guard = placement.install();
         let actual = provider

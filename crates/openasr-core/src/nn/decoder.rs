@@ -570,7 +570,7 @@ where
             .cpy(src, dst)
             .map_err(|source| map_err(step, source))?;
         graph
-            .add_side_effect_root(write)
+            .add_kv_write_root(write)
             .map_err(|source| map_err(step, source))?;
     }
     Ok(())
@@ -910,10 +910,10 @@ where
     )?;
     let (self_k_source, self_v_source) = if let Some(row_indices) = self_kv.row_indices {
         let k = graph
-            .set_rows(self_kv.key, k, row_indices)
+            .set_kv_rows(self_kv.key, k, row_indices)
             .map_err(|source| map_err("decoder_self_k_set_rows", source))?;
         let v = graph
-            .set_rows(self_kv.value, v, row_indices)
+            .set_kv_rows(self_kv.value, v, row_indices)
             .map_err(|source| map_err("decoder_self_v_set_rows", source))?;
         (k, v)
     } else {
@@ -1499,6 +1499,7 @@ pub(crate) struct LlmReusableDecodeGraph {
     pub attention_mask: GgmlCpuTensor<'static>,
     pub state: GgmlCpuTensor<'static>,
     pub top1: Option<GgmlCpuTensor<'static>>,
+    pub fused_logits: Option<GgmlCpuTensor<'static>>,
 }
 
 impl LlmReusableDecodeGraph {
@@ -1515,6 +1516,7 @@ impl LlmReusableDecodeGraph {
         attention_mask: GgmlCpuTensor<'static>,
         state: GgmlCpuTensor<'static>,
         top1: Option<GgmlCpuTensor<'static>>,
+        fused_logits: Option<GgmlCpuTensor<'static>>,
     ) -> Self {
         Self {
             session,
@@ -1528,6 +1530,7 @@ impl LlmReusableDecodeGraph {
             attention_mask,
             state,
             top1,
+            fused_logits,
         }
     }
 
@@ -2023,10 +2026,10 @@ where
     // for its `mul_mat` RHS. Materializing Q here would copy q_width floats per
     // layer per decoded token without changing any value the kernels read.
     let k_full = graph
-        .set_rows(kv.key_history, k_new, kv.row_indices)
+        .set_kv_rows(kv.key_history, k_new, kv.row_indices)
         .map_err(|source| map_err("llm_k_set_rows", source))?;
     let v_full = graph
-        .set_rows(kv.value_history, v_new, kv.row_indices)
+        .set_kv_rows(kv.value_history, v_new, kv.row_indices)
         .map_err(|source| map_err("llm_v_set_rows", source))?;
     let (k_full, v_full) = expand_attention_kv(
         graph,

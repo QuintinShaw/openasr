@@ -54,8 +54,8 @@ pub use native_model_id::{
     NativeRuntimeModelIdSource, NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError,
 };
 pub use native_transcribe::{
-    describe_native_runtime_model_mismatch, native_runtime_model_refs_match,
-    refine_existing_transcription_timeline,
+    align_plain_transcript_to_audio, describe_native_runtime_model_mismatch,
+    native_runtime_model_refs_match, refine_existing_transcription_timeline,
 };
 pub use request_execution_context::{
     RequestAttemptId, RequestAttemptIdError, RequestExecutionContext,
@@ -67,8 +67,8 @@ pub use transcription_control::{
 pub use transcription_progress::{
     LegacyNativeTranscriptionProgress, NativeTranscriptionPhase, NativeTranscriptionProgress,
     ProgressBackendClass, ProgressPlan, ProgressPlanInput, ProgressReporter, ProgressSegmenterKind,
-    TranscriptionStage, duration_weighted_fraction, native_transcription_progress,
-    native_transcription_progress_for_id,
+    TranscriptionStage, duration_weighted_fraction, native_active_transcription_ids,
+    native_transcription_progress, native_transcription_progress_for_id,
 };
 
 #[derive(Debug, Clone)]
@@ -523,10 +523,11 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
                 ),
             });
         }
-        let request_intent = execution_intent_from_hardware_target(target)?;
-        let execution_plan = resolve_native_execution_plan_for_hardware_target(
+        let request_intent = execution_intent_from_request(&options, target)?;
+        let execution_plan = resolve_native_execution_plan_for_intent(
             execution_services.as_ref(),
             &self.descriptor,
+            request_intent.clone(),
             target,
         )?;
         let streaming_punctuator =
@@ -1184,9 +1185,15 @@ impl NativeAsrExecutor for NativeBackendExecutor {
                     .expect("non-ready runtime readiness converts to NativeAsrError"));
             }
         }
-        let execution_target = native_execution_target_from_hardware_target(target)
+        let execution_target = request
+            .execution_target
+            .clone()
+            .or_else(|| native_execution_target_from_hardware_target(target))
             .ok_or(NativeAsrError::UnsupportedHardwareTarget { target })?;
-        let execution_intent = execution_intent_from_hardware_target(target)?;
+        let execution_intent = match &execution_target {
+            ExecutionTarget::Device(_) => ExecutionIntent::from(execution_target.clone()),
+            _ => execution_intent_from_hardware_target(target)?,
+        };
         let adapter_capabilities = adapter.capabilities();
         reject_unsupported_native_phrase_bias(
             adapter.adapter_id(),
@@ -1322,6 +1329,16 @@ fn native_execution_target_from_hardware_target(
     }
 }
 
+fn execution_intent_from_request(
+    options: &NativeAsrRequestOptions,
+    hardware: NativeAsrHardwareTarget,
+) -> Result<ExecutionIntent, NativeAsrError> {
+    match options.execution_target.as_ref() {
+        Some(target) => Ok(ExecutionIntent::from(target.clone())),
+        None => execution_intent_from_hardware_target(hardware),
+    }
+}
+
 fn execution_intent_from_hardware_target(
     target: NativeAsrHardwareTarget,
 ) -> Result<ExecutionIntent, NativeAsrError> {
@@ -1355,12 +1372,12 @@ fn execution_intent_from_hardware_target(
     }
 }
 
-fn resolve_native_execution_plan_for_hardware_target(
+fn resolve_native_execution_plan_for_intent(
     execution_services: &NativeExecutionServices,
     descriptor: &GgmlFamilyAdapterDescriptor,
-    target: NativeAsrHardwareTarget,
+    intent: ExecutionIntent,
+    error_target: NativeAsrHardwareTarget,
 ) -> Result<ExecutionPlan, NativeAsrError> {
-    let intent = execution_intent_from_hardware_target(target)?;
     let inventory = enumerate_compute_devices_from_ggml(&crate::ggml_available_devices());
     execution_services
         .policy_resolver()
@@ -1372,7 +1389,7 @@ fn resolve_native_execution_plan_for_hardware_target(
             descriptor.execution_capabilities,
             &inventory,
         )
-        .map_err(|error| execution_policy_error_to_native(error, target))
+        .map_err(|error| execution_policy_error_to_native(error, error_target))
 }
 
 fn execution_policy_error_to_native(
@@ -1500,6 +1517,7 @@ fn native_offline_request_to_transcription_request(
     request: NativeAsrOfflineRequest,
 ) -> TranscriptionRequest {
     let segmenter = request.voice_id_segmenter;
+    let embedder = request.voice_id_embedder;
     let mut converted = TranscriptionRequest::new(request.input_path, model_pack.id.clone())
         .with_model_pack_path(Some(model_pack.root.clone()))
         .with_language(request.options.language)
@@ -1511,6 +1529,9 @@ fn native_offline_request_to_transcription_request(
         .with_word_timestamps(request.options.word_timestamps)
         .with_word_timestamps_refine(request.options.word_timestamps_refine)
         .with_voice_id(request.options.voice_id)
+        .with_anonymous_diarize(request.options.anonymous_diarize)
+        .with_diarize_speakers(request.options.diarize_speakers)
+        .with_return_speaker_embeddings(request.options.return_speaker_embeddings)
         .with_longform(request.longform)
         .with_display_file_name(request.display_file_name)
         .with_source(request.source)
@@ -1520,15 +1541,28 @@ fn native_offline_request_to_transcription_request(
         .with_execution_context(request.execution_context)
         .with_serve_batch_max_native_sessions(request.serve_batch_max_native_sessions);
     converted.voice_id_segmenter = segmenter;
+    converted.voice_id_embedder = embedder;
     converted
 }
 
 fn native_backend_error_to_asr(error: BackendError) -> NativeAsrError {
-    let message = match error {
-        BackendError::NativeFailClosed { reason } => reason,
-        error => error.to_string(),
-    };
-    NativeAsrError::SessionFailed { message }
+    match error {
+        BackendError::ExecutionDeviceNotFound { detail } => {
+            NativeAsrError::ExecutionDeviceNotFound { detail }
+        }
+        BackendError::ExecutionDeviceNotAddressable { detail } => {
+            NativeAsrError::ExecutionDeviceNotAddressable { detail }
+        }
+        BackendError::ExecutionDeviceInitFailed { detail } => {
+            NativeAsrError::ExecutionDeviceInitFailed { detail }
+        }
+        BackendError::NativeFailClosed { reason } => {
+            NativeAsrError::SessionFailed { message: reason }
+        }
+        error => NativeAsrError::SessionFailed {
+            message: error.to_string(),
+        },
+    }
 }
 
 pub fn validate_local_native_model_pack_path(
@@ -2096,6 +2130,75 @@ mod tests {
             NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav")),
         );
         assert_eq!(rebuilt_default.serve_batch_max_native_sessions, None);
+    }
+
+    #[test]
+    fn native_offline_request_conversion_preserves_anonymous_diarize() {
+        let pack =
+            NativeAsrModelPackRef::new("moonshine-tiny", "moonshine", PathBuf::from("/tmp/pack"));
+        let rebuilt = native_offline_request_to_transcription_request(
+            &pack,
+            ExecutionTarget::Auto,
+            NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav")).with_options(
+                NativeAsrRequestOptions::new()
+                    .with_voice_id(false)
+                    .with_anonymous_diarize(true)
+                    .with_diarize_speakers(Some(3)),
+            ),
+        );
+        assert!(!rebuilt.voice_id);
+        assert!(rebuilt.anonymous_diarize);
+        assert_eq!(rebuilt.diarize_speakers, Some(3));
+    }
+
+    #[test]
+    fn native_offline_request_conversion_preserves_voice_id_embedder() {
+        let pack =
+            NativeAsrModelPackRef::new("moonshine-tiny", "moonshine", PathBuf::from("/tmp/pack"));
+        let rebuilt = native_offline_request_to_transcription_request(
+            &pack,
+            ExecutionTarget::Auto,
+            NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav"))
+                .with_voice_id_embedder(crate::config::VoiceIdEmbedderPreference::WeSpeaker),
+        );
+        assert_eq!(
+            rebuilt.voice_id_embedder,
+            crate::config::VoiceIdEmbedderPreference::WeSpeaker
+        );
+
+        let rebuilt_default = native_offline_request_to_transcription_request(
+            &pack,
+            ExecutionTarget::Auto,
+            NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav")),
+        );
+        assert_eq!(
+            rebuilt_default.voice_id_embedder,
+            crate::config::VoiceIdEmbedderPreference::ReDimNet2
+        );
+    }
+
+    #[test]
+    fn native_offline_request_conversion_preserves_return_speaker_embeddings() {
+        let pack =
+            NativeAsrModelPackRef::new("moonshine-tiny", "moonshine", PathBuf::from("/tmp/pack"));
+        let rebuilt = native_offline_request_to_transcription_request(
+            &pack,
+            ExecutionTarget::Auto,
+            NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav")).with_options(
+                NativeAsrRequestOptions::new()
+                    .with_anonymous_diarize(true)
+                    .with_return_speaker_embeddings(true),
+            ),
+        );
+        assert!(rebuilt.anonymous_diarize);
+        assert!(rebuilt.return_speaker_embeddings);
+
+        let rebuilt_default = native_offline_request_to_transcription_request(
+            &pack,
+            ExecutionTarget::Auto,
+            NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav")),
+        );
+        assert!(!rebuilt_default.return_speaker_embeddings);
     }
 
     fn write_mono_pcm16_wav(path: &Path, sample_rate_hz: u32, frames: u32) {
@@ -3282,6 +3385,27 @@ mod tests {
     }
 
     #[test]
+    fn streaming_request_device_target_builds_exact_intent() {
+        let options = NativeAsrRequestOptions::new().with_execution_target(Some(
+            ExecutionTarget::Device("vulkan:amd-radeon-rx-7900-xtx".to_string()),
+        ));
+        assert_eq!(
+            execution_intent_from_request(&options, NativeAsrHardwareTarget::Accelerated).unwrap(),
+            ExecutionIntent::Exact(crate::ExactDeviceSelector::PublicId(
+                "vulkan:amd-radeon-rx-7900-xtx".to_string()
+            ))
+        );
+        assert_eq!(
+            execution_intent_from_request(
+                &NativeAsrRequestOptions::new(),
+                NativeAsrHardwareTarget::Cpu
+            )
+            .unwrap(),
+            ExecutionIntent::CpuOnly
+        );
+    }
+
+    #[test]
     fn native_hardware_target_mapping_preserves_policy_constraints() {
         assert_eq!(
             execution_intent_from_hardware_target(NativeAsrHardwareTarget::Auto).unwrap(),
@@ -3730,6 +3854,9 @@ mod tests {
                     .with_phrase_bias(Some(phrase_bias.clone()))
                     .with_inference_threads(Some(6))
                     .with_voice_id(true)
+                    .with_anonymous_diarize(true)
+                    .with_diarize_speakers(Some(2))
+                    .with_return_speaker_embeddings(true)
                     .with_word_timestamps(true),
             )
             .with_voice_id_segmenter(crate::config::VoiceIdSegmenterPreference::Segmentation3_0)
@@ -3762,6 +3889,9 @@ mod tests {
         );
         assert!(converted.word_timestamps);
         assert!(converted.voice_id);
+        assert!(converted.anonymous_diarize);
+        assert_eq!(converted.diarize_speakers, Some(2));
+        assert!(converted.return_speaker_embeddings);
         assert_eq!(converted.longform, Some(longform));
         assert_eq!(converted.display_file_name.as_deref(), Some("meeting.wav"));
     }
@@ -3985,7 +4115,7 @@ mod tests {
             crate::ggml_runtime::GgmlDecodeOutputPlan::FullLogits,
             "word timestamps force complete logits on the same streaming planner seam"
         );
-        assert_eq!(facts.resolved_runtime.evidence_revision(), 1);
+        assert_eq!(facts.resolved_runtime.evidence_revision(), 2);
         assert_eq!(facts.topology.adapter_id, descriptor.adapter_id);
     }
 

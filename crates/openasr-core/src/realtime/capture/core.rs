@@ -208,7 +208,7 @@ impl CaptureEngine {
             output.push(f32_to_i16(a + (b - a) * fraction));
             self.resample_pos += self.resample_step;
         }
-        let consumed = self.resample_pos.floor() as usize;
+        let consumed = resample_consumed_len(self.resample_pos, self.resample_input.len());
         if consumed > 0 {
             self.resample_input.drain(0..consumed);
             self.resample_pos -= consumed as f64;
@@ -235,6 +235,16 @@ impl CaptureEngine {
         }
         Ok(frames)
     }
+}
+
+/// How many held input samples the resampler can drop after a pass.
+///
+/// The interpolate loop stops when `pos + 1 >= len`, then advances by `step`.
+/// Any downsample (`step > 1`) can leave the read head past this chunk. Drop
+/// only samples still in the buffer; leftover `pos` is the head in the next
+/// chunk, so the timeline stays contiguous.
+fn resample_consumed_len(pos: f64, input_len: usize) -> usize {
+    (pos.floor() as usize).min(input_len)
 }
 
 fn downmix_interleaved<T: Copy>(

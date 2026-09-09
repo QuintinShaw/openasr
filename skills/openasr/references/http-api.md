@@ -44,6 +44,21 @@ pack that is being served.
   no `created` field).
 - `POST /v1/audio/transcriptions` -- OpenAI-compatible transcription
   (multipart form).
+- `POST /v1/audio/precise-timeline` -- OpenASR-native forced alignment
+  (multipart form). Does not run ASR. Accepts source `file` plus exactly one
+  of `transcript` (plain text) or `transcript_json` (timed verbose/json body).
+  Optional: `language`, `word_timestamps` (default true), `execution_target`,
+  `response_format` (`verbose_json` default; `json`/`text`/`srt`/`vtt`/`markdown`).
+  SRT/VTT reuse the shared subtitle exporter. Missing Forced Aligner pack,
+  unsupported language (tag `ja`/`jp`/`ko`/`kr` or hiragana/katakana/hangul
+  in the text), empty normalized text, audio past the timestamp grid, a
+  prompt past decoder context (`llm_max_positions`), or a degenerate
+  alignment fail closed. Pure-kanji Japanese cannot be identified as
+  Japanese: `language=ja` is 400; `language=en` tokenizes each ideograph.
+  Paired device tokens may call this compute route; it is not
+  operator-only. The server never downloads the pack. Listing endpoints
+  verify GGUF metadata and the CAS path digest; they do not re-hash the
+  whole pack. Integrity of a local file is `openasr model-pack verify`.
 - `POST /v1/audio/translations` -- OpenAI-compatible X->English speech
   translation (non-streaming; model families without a translate task reject
   it explicitly).
@@ -53,12 +68,15 @@ pack that is being served.
 - `GET /v1/devices` -- OpenASR extension (0.1.13+): read-only enumeration of
   this daemon's own ggml compute devices (`{"object":"devices",
   "default_execution_target","devices":[{"id","name","meta","kind","target",
-  "effective_target","memory"?}]}`). Always includes `auto` and `cpu`; an
-  `accelerated` entry (Metal/CUDA/Vulkan/HIP, per platform) is present only
-  when the runtime detects one. `default_execution_target` is what `auto`
-  resolves to on this daemon (`cpu` or `accelerated`). Not operator-gated --
-  same local-auth layer as `/v1/models`. Intended for a UI's execution-target
-  picker; reflects the daemon's own runtime, not a remote sidecar's.
+  "effective_target","provider","memory"?,"memory_total_bytes"?,"memory_free_bytes"?,"selectable"?}]}`).
+  Always includes `auto` and `cpu`; an `accelerated` entry (Metal/CUDA/Vulkan/HIP,
+  per platform) is present only when the runtime detects one. Each physical GPU
+  is also listed as `kind: "gpu"` with a stable id such as
+  `vulkan:amd-radeon-rx-7900-xtx` (not a `VulkanN` ordinal). `default_execution_target`
+  is what `auto` resolves to on this daemon (`cpu` or `accelerated`). Not
+  operator-gated -- same local-auth layer as `/v1/models`. Intended for a UI's
+  execution-target picker; reflects the daemon's own runtime, not a remote
+  sidecar's.
 
 ## OpenAI parameter compatibility matrix
 
@@ -82,13 +100,16 @@ Behavior of each OpenAI `audio/transcriptions` request parameter:
 
 - `json`: `{"text", "segments":[{"start","end","text",...}]}` -- OpenAI's
   `json` plus a `segments` extension.
-- `verbose_json`: `{"language" (English name, when reported), "duration"
-  (last segment end, seconds), "text", "segments":[{"id","start","end",
-  "text", "words":[...] when word timing was requested, "speaker"/
-  "speaker_label"/"speaker_profile_id" when diarizing}], "words":[flattened
-  per-word timing] when word timing was requested}`.
+- `verbose_json`: language (English name, when reported), duration (last
+  segment end, seconds), text, segments (`id`, `start`, `end`, `text`,
+  `words` when word timing was requested, `speaker` / `speaker_label` /
+  `speaker_profile_id` when diarizing), flattened top-level `words` when
+  word timing was requested. When `return_speaker_embeddings=true`, also
+  `speaker_embeddings` (label-to-vector map) and sibling
+  `speaker_embedding_space`.
   Not produced: `task`, `usage`, and per-segment decoder internals
   (`seek`, `tokens`, `avg_logprob`, `compression_ratio`, `no_speech_prob`).
+  Plain `json` never includes `speaker_embeddings` / `speaker_embedding_space`.
 - `text`, `srt`, `vtt`: plain bodies, same as OpenAI. `markdown` (extension)
   renders a `# Transcript` document.
 
@@ -122,8 +143,10 @@ OpenAI-style envelope with every key clients expect:
 ```
 
 Statuses: 400 (invalid/unsupported/fail-closed refusals, including
-model-not-loaded), 401 (missing/bad API key when keys exist), 404, 409
-(canceled), 413 (upload too large), 429/503 (busy), 507 (disk full).
+model-not-loaded), 401 (missing/bad API key when keys exist), 403
+(`authorization_error` when a remote-compute device token requests
+`return_speaker_embeddings`), 404, 409 (canceled), 413 (upload too large),
+429/503 (busy), 507 (disk full).
 Messages are self-describing; surface them verbatim.
 
 ## Streaming (OpenASR SSE, not OpenAI events)
@@ -163,10 +186,20 @@ Multipart form fields beyond the OpenAI set (all optional, all validated --
 unsupported combinations fail closed with explicit errors):
 
 - `task` (`transcribe`|`translate`), `diarize`, `speakers`, `punctuate`
+- `return_speaker_embeddings` (opt-in; requires `diarize=true` and
+  `response_format=verbose_json`). Default requests omit embeddings.
+  When set, `verbose_json` adds a WhisperX/Speakr-compatible
+  `speaker_embeddings` map (`SPEAKER_00` -> vector) plus a sibling
+  `speaker_embedding_space` object (`model_id`, `pack_fingerprint`,
+  `dim`, `normalization: "l2"`). These are biometric-derived data and
+  are returned only on an explicit request. A remote-compute device
+  token requesting this field is rejected with HTTP 403
+  `authorization_error`; operator and loopback clients are not
+  restricted. Streaming (`?stream=true`) rejects the field with 400.
 - `hotword`/`phrase_bias` (repeatable) + `hotword_boost`/`phrase_bias_boost`
 - Long-form segmentation: `segment_mode` (`off|auto|fixed|energy|vad`),
   `chunk_seconds`, `segment_overlap_seconds`, `vad_threshold_db`,
   `vad_min_silence_ms`, `vad_padding_ms`, `min_segment_seconds`,
   `suppress_silent_slices`
-- Runtime: `inference_threads`, `execution_target` (`auto|cpu|accelerated`)
+- Runtime: `inference_threads`, `execution_target` (`auto|cpu|accelerated` or a physical GPU id from `GET /v1/devices`). Unknown ids are 400 and list the current ids. Serve-level default: `OPENASR_DEVICE`.
 - Control: `transcription_id` (enables pause/resume/cancel endpoints)

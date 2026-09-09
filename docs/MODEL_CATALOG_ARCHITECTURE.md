@@ -167,16 +167,21 @@ non-interactive / `--offline`);
 fail-closed: HTTPS-only catalog pack URLs, size/sha256 checks, GGUF preflight,
 runtime-source validation, and a same-directory atomic rename are required before
 a pack counts as installed, and untrusted catalog pack filenames must be
-relative basename-only `.oasr` targets.
+relative basename-only `.oasr` targets. Re-pulling an already-installed pack
+skips the download when the content-addressed object matches the catalog
+SHA-256, then re-runs the pack verifier and refreshes the install record. A
+catalog filename alone is not identity; an unsealed object whose bytes do not
+hash to the catalog digest is fetched again rather than trusted.
 
-For the local file Voice ID pipeline, ReDimNet2-B6 is required for both
-`speaker_source` values. An `external` ASR additionally needs the default
-segmentation-3.0 pack and, when its `word_timestamp_source` is
-`forced_aligner`, Qwen3-ForcedAligner-0.6B; a `native` model such as MOSS does
-not need either attribution dependency. A future
-consent-installed DiariZen pack may replace segmentation-3.0 behind the same
-segmenter interface, but its staged source row does not authorize any current
-CLI/server auto-install behavior.
+For the local file Voice ID pipeline, ReDimNet2-B6 is required for the default
+capability probe on both `speaker_source` values. An explicit WeSpeaker ResNet
+preference is a parallel optional embedder, not a substitute for that probe.
+An `external` ASR additionally needs the default segmentation-3.0 pack and,
+when its `word_timestamp_source` is `forced_aligner`,
+Qwen3-ForcedAligner-0.6B; a `native` model such as MOSS does not need either
+attribution dependency. A future consent-installed DiariZen pack may replace
+segmentation-3.0 behind the same segmenter interface, but its staged source
+row does not authorize any current CLI/server auto-install behavior.
 
 The public anonymous distribution path is exercised by
 `tooling/public-hf-e2e/run.sh` and the manual/scheduled `public-hf-e2e` workflow,
@@ -198,12 +203,13 @@ because `public` is the download/import gate, not the ASR market-list gate. The
 catalog's URLs stay pinned to `huggingface.co` as
 the signed, canonical *identity*; the client rewrites only the transport *host*
 via `http::apply_catalog_endpoint`, controlled by `OPENASR_CATALOG_ENDPOINT`
-(default `https://catalog.openasr.org`; override only for a self-host/mirror).
-Because the signed `catalog_url` is unchanged, the host is an availability layer,
-not a trust anchor — moving it needs no re-sign or signing seed. This is
-independent of `HF_ENDPOINT`, which routes weight downloads only. Deploys are
-automated by the `deploy-catalog` workflow on push; signing stays local (the seed
-never enters CI).
+(allowlist: `https://catalog.openasr.org` — a no-op — and
+`https://catalog.bug.im`, the Aliyun ESA byte-identical replica). The signed
+`catalog_url` is always `https://catalog.openasr.org/v1/catalog.json`; swapping
+the fetch host needs no re-sign. This is independent of `HF_ENDPOINT`, which
+routes weight downloads only. Deploys push the same two JSON files to Cloudflare
+and, when `esa-cli` is logged in, to ESA; ESA never origin-fetches Cloudflare.
+Signing stays local (the seed never enters CI).
 
 ## Cache And Rollback Boundary
 

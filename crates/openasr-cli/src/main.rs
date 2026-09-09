@@ -25,9 +25,10 @@ use openasr_core::{
     derive_catalog_public_key_hex, discover_batch_inputs, embedded_catalog_fingerprint,
     load_config, models_dir, openasr_home, parse_model_catalog, parse_model_ref,
     render_batch_summary, render_benchmark, render_catalog_signature_manifest,
-    resolve_registry_model_ref, resolve_runtime_model_ref, runtime_registry, save_config,
-    validate_local_native_model_pack_path, verify_catalog_signature_manifest,
-    verify_local_catalog_signature_manifest,
+    render_validated_qualification_manifest_signature, resolve_registry_model_ref,
+    resolve_runtime_model_ref, runtime_registry, save_config,
+    validate_local_native_model_pack_path, verify_and_parse_qualification_manifest,
+    verify_catalog_signature_manifest, verify_local_catalog_signature_manifest,
 };
 
 mod backend_plugin_cli;
@@ -38,12 +39,16 @@ mod cli_args;
 mod consent;
 mod doctor_cli;
 mod live;
+mod memory_pressure_helper;
 mod model_pack_cli;
 mod native_segment_cli;
+mod ownership_evidence_cli;
 mod panic_hook;
 mod parent_watchdog;
 mod progress;
 mod pull_cli;
+mod qualification_cli;
+mod real_family_cli;
 
 use catalog_cli::*;
 use cli_args::*;
@@ -60,6 +65,9 @@ const UNSET_VALUE: &str = "<unset>";
 /// clap keeps its own `2` for usage/argument errors.
 fn exit_with_error(error: &anyhow::Error) -> ! {
     eprintln!("Error: {error}");
+    for cause in error.chain().skip(1) {
+        eprintln!("Caused by: {cause}");
+    }
     let code = error
         .downcast_ref::<consent::CliExit>()
         .map(|exit| exit.code as i32)
@@ -149,6 +157,7 @@ fn command_reads_the_model_store(command: &Command) -> bool {
             | Command::Show { .. }
             | Command::ModelPack { .. }
             | Command::Transcribe { .. }
+            | Command::Align(_)
             | Command::BenchSuite { .. }
             | Command::BenchReceipt { .. }
             | Command::Live { .. }
@@ -201,6 +210,85 @@ fn migrate_model_store_once() {
 
 async fn run() -> Result<()> {
     let command = match Cli::parse().command {
+        Command::MemoryPressureHelper {
+            parent_pid,
+            candidate_required_bytes,
+            absolute_floor_bytes,
+            proportional_floor_basis_points,
+            timeout_seconds,
+        } => {
+            return memory_pressure_helper::run(memory_pressure_helper::PressureHelperOptions {
+                parent_pid,
+                candidate_required_bytes,
+                absolute_floor_bytes,
+                proportional_floor_basis_points,
+                timeout_seconds,
+            });
+        }
+        Command::ValidateOwnershipEvidence {
+            artifact_dir,
+            envelopes,
+        } => {
+            return ownership_evidence_cli::validate_bundle(&artifact_dir, &envelopes);
+        }
+        Command::SignQualificationManifest {
+            manifest,
+            out,
+            manifest_url,
+            key_id,
+            print_public_key,
+        } => {
+            return sign_qualification_manifest_command(
+                &manifest,
+                &out,
+                &manifest_url,
+                &key_id,
+                print_public_key,
+            );
+        }
+        Command::VerifyQualificationManifest {
+            manifest,
+            signature,
+            manifest_url,
+        } => {
+            return verify_qualification_manifest_command(&manifest, &signature, &manifest_url);
+        }
+        Command::QualifyBackend {
+            manifest,
+            signature,
+            manifest_url,
+            qualification_home,
+        } => {
+            return tokio::task::spawn_blocking(move || {
+                qualification_cli::run_parent(
+                    &manifest,
+                    &signature,
+                    &manifest_url,
+                    &qualification_home,
+                )
+            })
+            .await
+            .context("qualification parent worker task failed")?;
+        }
+        Command::QualificationChild {
+            manifest,
+            signature,
+            manifest_url,
+            qualification_home,
+            expected_manifest_sha256,
+        } => {
+            return tokio::task::spawn_blocking(move || {
+                qualification_cli::run_child(
+                    &manifest,
+                    &signature,
+                    &manifest_url,
+                    &qualification_home,
+                    &expected_manifest_sha256,
+                )
+            })
+            .await
+            .context("qualification child worker task failed")?;
+        }
         Command::BackendPlugin { command } => {
             // Backend-pack installation uses the blocking catalog/download
             // client by design: the same implementation is shared with the
@@ -270,6 +358,12 @@ async fn run() -> Result<()> {
         Command::Show { target } => show_model(&target),
         Command::ModelPack { command } => model_pack_command(command),
         Command::BackendPlugin { .. } => unreachable!("handled before runtime initialization"),
+        Command::MemoryPressureHelper { .. } => {
+            unreachable!("handled before runtime initialization")
+        }
+        Command::ValidateOwnershipEvidence { .. } => {
+            unreachable!("handled before runtime initialization")
+        }
         Command::GgufCParserProbe { path } => {
             let output = openasr_core::render_gguf_c_parser_sandbox_child_output(&path)?;
             println!("{output}");
@@ -291,6 +385,12 @@ async fn run() -> Result<()> {
             print_public_key,
         ),
         Command::CatalogFingerprint => catalog_fingerprint_command(),
+        Command::SignQualificationManifest { .. }
+        | Command::VerifyQualificationManifest { .. }
+        | Command::QualifyBackend { .. }
+        | Command::QualificationChild { .. } => {
+            unreachable!("handled before runtime initialization")
+        }
         Command::Transcribe {
             inputs,
             formats,
@@ -339,6 +439,27 @@ async fn run() -> Result<()> {
         })
         .await
         .context("openasr transcribe worker task failed")?,
+        Command::Align(args) => tokio::task::spawn_blocking(move || {
+            align_plain_transcript_command(
+                &native_execution_services,
+                AlignCommandOptions {
+                    audio: &args.audio,
+                    transcript: &args.transcript,
+                    formats: &args.formats,
+                    language: normalize_language_hint(args.language),
+                    output: args.output.as_deref(),
+                    backend_kind: args.backend,
+                    runtime_paths: RuntimePathOverrides {
+                        ffmpeg_bin: args.ffmpeg_bin,
+                    },
+                    execution_target: args.execution_target.as_deref(),
+                    keep_word_timestamps: !args.no_word_timestamps,
+                    consent: consent::PullConsent::resolve(args.yes, args.offline),
+                },
+            )
+        })
+        .await
+        .context("openasr align worker task failed")?,
         Command::Apikey { command } => apikey_command(command),
         Command::BenchSuite {
             config,
@@ -376,6 +497,7 @@ async fn run() -> Result<()> {
                 scope,
                 ffmpeg_bin,
                 trace_out,
+                logits_out,
             } => {
                 let git_cwd = env::current_dir().ok();
                 bench_receipt_cli::bench_receipt_short_audio(
@@ -394,12 +516,26 @@ async fn run() -> Result<()> {
                         ffmpeg_bin,
                         git_cwd: git_cwd.as_deref(),
                         trace_out: trace_out.as_deref(),
+                        logits_out: logits_out.as_deref(),
+                        write_outputs: true,
                     },
                 )
+                .map(|_| ())
             }
             BenchReceiptCommand::ValidateQualification { receipt } => {
                 bench_receipt_cli::validate_qualification_receipts(&receipt)
             }
+            BenchReceiptCommand::QualifyFamily { args } => real_family_cli::run(
+                &native_execution_services,
+                args.model.as_deref(),
+                &args.audio,
+                &args.device,
+                args.model_pack.as_deref(),
+                &args.binding,
+                &args.out_dir,
+                args.core_commit.as_deref(),
+                args.ffmpeg_bin,
+            ),
         },
         Command::Live {
             source,
@@ -482,6 +618,7 @@ async fn run() -> Result<()> {
             tls_self_signed,
             tls_sans,
             pairing_admin_token_env,
+            pairing_admin_token_file,
             model,
             backend,
             ffmpeg_bin,
@@ -490,9 +627,7 @@ async fn run() -> Result<()> {
             max_native_sessions_per_model,
             parent_pid,
         } => {
-            if let Some(parent_pid) = parent_pid {
-                parent_watchdog::spawn(parent_pid);
-            }
+            let parent_shutdown = parent_pid.and_then(parent_watchdog::spawn);
             serve(
                 native_execution_services,
                 addr,
@@ -506,7 +641,9 @@ async fn run() -> Result<()> {
                     tls_self_signed,
                     tls_sans,
                     pairing_admin_token_env,
+                    pairing_admin_token_file,
                 },
+                parent_shutdown,
             )
             .await
         }
@@ -748,6 +885,100 @@ fn sign_catalog_manifest_command(
         )
     })?;
     println!("Wrote catalog signature manifest: {}", out.display());
+    Ok(())
+}
+
+fn sign_qualification_manifest_command(
+    manifest: &Path,
+    out: &Path,
+    manifest_url: &str,
+    key_id: &str,
+    print_public_key: bool,
+) -> Result<()> {
+    let signing_key_seed_hex =
+        env::var(OPENASR_CATALOG_SIGNING_KEY_SEED_HEX).with_context(|| {
+            format!(
+                "{OPENASR_CATALOG_SIGNING_KEY_SEED_HEX} must be set to a 32-byte hex Ed25519 seed"
+            )
+        })?;
+    if print_public_key {
+        let public_key = derive_catalog_public_key_hex(&signing_key_seed_hex)
+            .context("Could not derive qualification-manifest signature public key")?;
+        println!("{public_key}");
+        return Ok(());
+    }
+
+    let manifest_contents = fs::read_to_string(manifest).with_context(|| {
+        format!(
+            "Could not read qualification-manifest JSON '{}'",
+            manifest.display()
+        )
+    })?;
+    let signature = render_validated_qualification_manifest_signature(
+        &manifest_contents,
+        manifest_url,
+        key_id,
+        &signing_key_seed_hex,
+    )
+    .context("Could not render qualification-manifest signature")?;
+
+    if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Could not create output directory '{}'", parent.display()))?;
+    }
+    atomic_write_text(out, &signature).with_context(|| {
+        format!(
+            "Could not write qualification-manifest signature '{}'",
+            out.display()
+        )
+    })?;
+    println!("Wrote qualification-manifest signature: {}", out.display());
+    Ok(())
+}
+
+fn verify_qualification_manifest_command(
+    manifest: &Path,
+    signature: &Path,
+    manifest_url: &str,
+) -> Result<()> {
+    let manifest_contents = fs::read(manifest).with_context(|| {
+        format!(
+            "Could not read qualification-manifest JSON '{}'",
+            manifest.display()
+        )
+    })?;
+    let signature_contents = fs::read(signature).with_context(|| {
+        format!(
+            "Could not read qualification-manifest signature '{}'",
+            signature.display()
+        )
+    })?;
+    let verified = verify_and_parse_qualification_manifest(
+        &manifest_contents,
+        &signature_contents,
+        manifest_url,
+    )
+    .context("qualification manifest did not verify against the production trust root")?;
+    let body = verified.manifest();
+    println!(
+        "{}",
+        serde_json::json!({
+            "verified": true,
+            "manifest_url": manifest_url,
+            "manifest_sha256": verified.manifest_sha256(),
+            "key_id": verified.signature_key_id(),
+            "release_subject": body.release_subject,
+            "provider": body.provider_target.provider.as_str(),
+            "artifact_target": body.provider_target.target,
+            "host_abi_fingerprint": body.host_abi.fingerprint,
+            "binary_sha256": body.artifacts.binary.sha256,
+            "binary_bundle_sha256": body.artifacts.binary.bundle.sha256,
+            "plugin_sha256": body.artifacts.plugin.as_ref().map(|artifact| artifact.sha256.as_str()),
+            "vendor_sha256": body.artifacts.vendor.iter().map(|artifact| artifact.sha256.as_str()).collect::<Vec<_>>(),
+            "attestation_sha256": body.attestation.bundle.sha256,
+            "source_digest": body.attestation.source_digest,
+        })
+    );
     Ok(())
 }
 
@@ -1074,7 +1305,9 @@ fn print_model_language_details(target: &str) {
 /// `transcribe -` reads a WAV stream from stdin into a temp file used as the sole
 /// input (audio prep is extension-based, so stdin is treated as WAV). Returns the
 /// temp file to keep alive for the run; `-` must be the only input.
-fn maybe_read_stdin_to_temp(inputs: &[PathBuf]) -> Result<Option<tempfile::NamedTempFile>> {
+pub(crate) fn maybe_read_stdin_to_temp(
+    inputs: &[PathBuf],
+) -> Result<Option<tempfile::NamedTempFile>> {
     let dash = Path::new("-");
     if !inputs.iter().any(|input| input == dash) {
         return Ok(None);
@@ -1105,7 +1338,8 @@ fn transcribe(
     options: TranscribeCommandOptions<'_>,
 ) -> Result<()> {
     let home = openasr_home()?;
-    let config = load_config(&home)?;
+    let document = openasr_core::load_config_document(&home)?;
+    let config = document.config;
     // `--benchmark` measures plain transcription timing; run_benchmark does not
     // thread the request-shaping flags, so reject them rather than silently
     // ignoring them (fail-closed). Checked before any pack install or network.
@@ -1265,6 +1499,7 @@ fn transcribe(
             output_dir,
             skipped,
             &options,
+            document.preferences.voice_id_embedder,
         );
     }
 
@@ -1309,6 +1544,7 @@ fn transcribe(
         })
         .with_phrase_bias(phrase_bias)
         .with_voice_id(options.diarize)
+        .with_voice_id_embedder(document.preferences.voice_id_embedder)
         .with_diarize_speakers(options.speakers)
         .with_punctuation(options.punctuate)
         .with_word_timestamps(options.word_timestamps_mode.is_some())
@@ -1336,6 +1572,25 @@ fn transcribe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clap's debug `Command::debug_assert` walks the full subcommand tree on
+    /// the calling thread. After WeSpeaker landed in `openasr-core`, several
+    /// Linux CI parse tests overflowed the default stack (`SIGABRT`). Parse on
+    /// a dedicated 16 MiB stack so the command tree stays testable.
+    fn parse_cli<I, T>(args: I) -> Result<Cli, clap::error::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+        std::thread::Builder::new()
+            .name("openasr-cli-parse".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args))
+            .expect("spawn cli parse thread")
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    }
 
     fn test_card(id: &str) -> ModelCard {
         ModelCard {
@@ -1366,7 +1621,7 @@ mod tests {
 
     #[test]
     fn parses_bench_receipt_warmup_and_trace_options() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "openasr",
             "bench-receipt",
             "short-audio",
@@ -1390,6 +1645,7 @@ mod tests {
                     runs,
                     warmup_runs,
                     trace_out,
+                    logits_out,
                     ..
                 },
         } = cli.command
@@ -1402,11 +1658,12 @@ mod tests {
             trace_out.as_deref(),
             Some(std::path::Path::new("trace.jsonl"))
         );
+        assert!(logits_out.is_none());
     }
 
     #[test]
     fn parses_bench_receipt_qualification_validator_inputs() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "openasr",
             "bench-receipt",
             "validate-qualification",
@@ -1721,7 +1978,7 @@ mod tests {
 
     #[test]
     fn benchmark_flag_accepts_native_model_pack() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "openasr",
             "transcribe",
             "--benchmark",
@@ -1751,6 +2008,33 @@ mod tests {
     }
 
     #[test]
+    fn align_command_parses_transcript_and_srt_format() {
+        let cli = parse_cli([
+            "openasr",
+            "align",
+            "audio.wav",
+            "--transcript",
+            "script.txt",
+            "-f",
+            "srt",
+            "-l",
+            "en",
+            "-o",
+            "out.srt",
+        ])
+        .expect("align parses");
+        let Command::Align(args) = cli.command else {
+            panic!("expected align command");
+        };
+        assert_eq!(args.audio, PathBuf::from("audio.wav"));
+        assert_eq!(args.transcript, PathBuf::from("script.txt"));
+        assert_eq!(args.formats, vec![ResponseFormat::Srt]);
+        assert_eq!(args.language.as_deref(), Some("en"));
+        assert_eq!(args.output, Some(PathBuf::from("out.srt")));
+        assert!(!args.no_word_timestamps);
+    }
+
+    #[test]
     fn forced_aligner_import_cli_accepts_q8_and_policy_guarded_q4_k() {
         let base = [
             "openasr",
@@ -1767,7 +2051,7 @@ mod tests {
             "https://example.invalid/license",
             "--quantization",
         ];
-        let cli = Cli::try_parse_from(base.into_iter().chain(["q8-0"]))
+        let cli = parse_cli(base.into_iter().chain(["q8-0"]))
             .expect("the production q8_0 tier must parse");
         let Command::ModelPack {
             command: ModelPackCommand::Import { command },
@@ -1780,7 +2064,7 @@ mod tests {
         };
         assert_eq!(quantization, ImportQwenForcedAlignerQuantization::Q8_0);
 
-        let cli = Cli::try_parse_from(base.into_iter().chain(["q4-k"]))
+        let cli = parse_cli(base.into_iter().chain(["q4-k"]))
             .expect("the policy-guarded q4_k tier must parse");
         let Command::ModelPack {
             command: ModelPackCommand::Import { command },
@@ -1793,14 +2077,14 @@ mod tests {
         };
         assert_eq!(quantization, ImportQwenForcedAlignerQuantization::Q4_K);
 
-        let error = Cli::try_parse_from(base.into_iter().chain(["q4-k-m"]))
+        let error = parse_cli(base.into_iter().chain(["q4-k-m"]))
             .expect_err("q4_k_m must not become a second forced-aligner product identity");
         assert!(error.to_string().contains("invalid value 'q4-k-m'"));
     }
 
     #[test]
     fn audit_quant_cli_accepts_the_policy_guarded_q4_k_tier() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "openasr",
             "model-pack",
             "audit-quant",
@@ -1820,7 +2104,7 @@ mod tests {
 
     #[test]
     fn transcribe_cli_accepts_repeated_hotwords_and_boost() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "openasr",
             "transcribe",
             "--hotword",
@@ -1860,7 +2144,7 @@ mod tests {
 
     #[test]
     fn live_defaults_source_to_mic() {
-        let cli = Cli::try_parse_from(["openasr", "live"]).expect("live parses with no --source");
+        let cli = parse_cli(["openasr", "live"]).expect("live parses with no --source");
         let Command::Live { source, .. } = cli.command else {
             panic!("expected live command");
         };
@@ -1977,7 +2261,7 @@ mod tests {
     /// of silently breaking the desktop sidecar contract.
     #[test]
     fn serve_accepts_desktop_sidecar_contract_flags() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "openasr",
             "serve",
             "--backend",
@@ -2010,7 +2294,7 @@ mod tests {
     #[test]
     fn serve_no_model_conflicts_with_explicit_model_sources() {
         assert!(
-            Cli::try_parse_from([
+            parse_cli([
                 "openasr",
                 "serve",
                 "--no-model",
@@ -2020,7 +2304,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            Cli::try_parse_from([
+            parse_cli([
                 "openasr",
                 "serve",
                 "--no-model",
@@ -2033,10 +2317,7 @@ mod tests {
 
     #[test]
     fn serve_rejects_zero_native_sessions_per_model() {
-        assert!(
-            Cli::try_parse_from(["openasr", "serve", "--max-native-sessions-per-model", "0",])
-                .is_err()
-        );
+        assert!(parse_cli(["openasr", "serve", "--max-native-sessions-per-model", "0",]).is_err());
     }
 
     #[test]
@@ -2045,7 +2326,7 @@ mod tests {
         // (e.g. `openasr serve` from a terminal); they must stay optional so
         // this test only pins their *presence and shape*, not that every
         // caller supplies them.
-        let cli = Cli::try_parse_from(["openasr", "serve"])
+        let cli = parse_cli(["openasr", "serve"])
             .expect("serve must remain usable without the desktop-only flags");
 
         let Command::Serve {

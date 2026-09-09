@@ -51,7 +51,17 @@ pub fn validate_safe_relative_path(field: &str, value: &str) -> Result<(), Strin
     let mut has_normal_component = false;
     for component in path.components() {
         match component {
-            Component::Normal(_) => has_normal_component = true,
+            Component::Normal(component) => {
+                let Some(component) = component.to_str() else {
+                    return Err(format!("{field} must be valid UTF-8"));
+                };
+                if !windows_safe_path_component(component) {
+                    return Err(format!(
+                        "{field} contains a component that is unsafe on Windows"
+                    ));
+                }
+                has_normal_component = true;
+            }
             Component::ParentDir => {
                 return Err(format!("{field} must not contain '..'"));
             }
@@ -64,6 +74,27 @@ pub fn validate_safe_relative_path(field: &str, value: &str) -> Result<(), Strin
         return Err(format!("{field} must be a safe relative path"));
     }
     Ok(())
+}
+
+fn windows_safe_path_component(component: &str) -> bool {
+    if component.is_empty()
+        || component.ends_with(['.', ' '])
+        || component.contains(':')
+        || component.chars().any(|character| {
+            character.is_control() || matches!(character, '<' | '>' | '"' | '|' | '?' | '*')
+        })
+    {
+        return false;
+    }
+    let stem = component.split('.').next().unwrap_or_default();
+    let upper = stem.to_ascii_uppercase();
+    !matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        && !upper.strip_prefix("COM").is_some_and(|suffix| {
+            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+        })
+        && !upper.strip_prefix("LPT").is_some_and(|suffix| {
+            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+        })
 }
 
 pub fn validate_sha256(field: &str, value: &str) -> Result<(), String> {
@@ -122,6 +153,28 @@ mod tests {
                 .unwrap_err()
                 .contains("relative path")
         );
+        for value in [
+            "vendor/CON.dll",
+            "vendor/nul.txt",
+            "vendor/COM1",
+            "vendor/LPT9.bin",
+            "vendor/stream:payload",
+            "vendor/less<than.dll",
+            "vendor/greater>than.dll",
+            "vendor/quote\"name.dll",
+            "vendor/pipe|name.dll",
+            "vendor/question?.dll",
+            "vendor/star*.dll",
+            "vendor/trailing.",
+            "vendor/trailing ",
+        ] {
+            assert!(
+                validate_safe_relative_path("path", value)
+                    .unwrap_err()
+                    .contains("unsafe on Windows"),
+                "{value}"
+            );
+        }
     }
 
     #[test]

@@ -1,7 +1,8 @@
 use super::*;
 use crate::api::backend::{
-    DecodeTruncation, DecodeTruncationReason, Segment, Transcription,
-    TranscriptionLongFormMetadata, TruncatedDecode, WordTimestamp,
+    DecodeTruncation, DecodeTruncationReason, Segment, SpeakerEmbeddingNormalization,
+    SpeakerEmbeddingPayload, SpeakerEmbeddingSpace, Transcription, TranscriptionLongFormMetadata,
+    TruncatedDecode, WordTimestamp,
 };
 
 fn sample() -> Transcription {
@@ -164,6 +165,8 @@ fn renders_json() {
     // The plain `json` format stays free of the verbose_json-only fields.
     assert!(!rendered.contains("\"id\""));
     assert!(!rendered.contains("\"duration\""));
+    assert!(!rendered.contains("\"speaker_embeddings\""));
+    assert!(!rendered.contains("\"speaker_embedding_space\""));
 }
 
 #[test]
@@ -189,6 +192,66 @@ fn renders_verbose_json() {
     assert_eq!(parsed["segments"][0]["id"], 0);
     assert!(parsed.get("words").is_none());
     assert!(parsed.get("language").is_none());
+    assert!(parsed.get("speaker_embeddings").is_none());
+    assert!(parsed.get("speaker_embedding_space").is_none());
+}
+
+fn speaker_embedding_sample() -> Transcription {
+    let mut transcription = sample();
+    transcription.speaker_embeddings = Some(SpeakerEmbeddingPayload {
+        space: SpeakerEmbeddingSpace {
+            model_id: "redimnet2-b6-cn".to_string(),
+            pack_fingerprint: "sha256:abc".to_string(),
+            dim: 2,
+            normalization: SpeakerEmbeddingNormalization::L2,
+        },
+        vectors: [
+            ("SPEAKER_00".to_string(), vec![1.0, 0.0]),
+            ("SPEAKER_01".to_string(), vec![0.0, 1.0]),
+        ]
+        .into_iter()
+        .collect(),
+    });
+    transcription
+}
+
+#[test]
+fn renders_verbose_json_speaker_embeddings_as_label_map_and_space() {
+    let rendered =
+        render_transcription(&speaker_embedding_sample(), ResponseFormat::VerboseJson).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(
+        parsed["speaker_embeddings"]["SPEAKER_00"],
+        serde_json::json!([1.0, 0.0])
+    );
+    assert_eq!(
+        parsed["speaker_embeddings"]["SPEAKER_01"],
+        serde_json::json!([0.0, 1.0])
+    );
+    assert!(parsed["speaker_embeddings"].get("speakers").is_none());
+    assert!(parsed["speaker_embeddings"].get("vectors").is_none());
+    assert_eq!(
+        parsed["speaker_embedding_space"]["model_id"],
+        "redimnet2-b6-cn"
+    );
+    assert_eq!(
+        parsed["speaker_embedding_space"]["pack_fingerprint"],
+        "sha256:abc"
+    );
+    assert_eq!(parsed["speaker_embedding_space"]["dim"], 2);
+    assert_eq!(parsed["speaker_embedding_space"]["normalization"], "l2");
+    assert!(
+        parsed["speaker_embedding_space"]
+            .get("matcher_policy")
+            .is_none()
+    );
+}
+
+#[test]
+fn renders_plain_json_without_speaker_embeddings() {
+    let rendered = render_transcription(&speaker_embedding_sample(), ResponseFormat::Json).unwrap();
+    assert!(!rendered.contains("\"speaker_embeddings\""));
+    assert!(!rendered.contains("\"speaker_embedding_space\""));
 }
 
 #[test]

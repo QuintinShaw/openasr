@@ -2,6 +2,11 @@
 # Publish a draft core release only after its signed public catalog exposes the
 # new Windows GPU provider bytes as PublishedInert. Real-hardware qualification
 # happens after publication and can only activate a later signed catalog epoch.
+#
+# The primary caller is release-core.yml's `publish-release` job, which sets
+# OPENASR_DEPLOY_CATALOG_RUN_ID to the orchestrator github.run_id (the
+# reusable deploy-catalog.yml job lives in that same run). A local run still
+# works after stage 2 finishes; pass the completed orchestrator run id.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,6 +36,7 @@ resolve_tag_commit() {
 version="${1#v}"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "version must be X.Y.Z or vX.Y.Z"
 tag="v${version}"
+repository="QuintinShaw/openasr"
 command -v gh >/dev/null 2>&1 || fail "gh is required"
 command -v curl >/dev/null 2>&1 || fail "curl is required"
 command -v cargo >/dev/null 2>&1 || fail "cargo is required"
@@ -59,14 +65,56 @@ git merge-base --is-ancestor "$tag_commit" "$current_commit" \
 release_signer="${repository}/.github/workflows/release-binaries.yml"
 
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/openasr-release-finalize.XXXXXX")"
-trap 'rm -rf "$workdir"' EXIT
-gh release download "$tag" --repo "$repository" \
-  -p 'backend-pack-*.json' \
-  -p 'backend-plugin-hints.json' \
-  -p 'catalog.backends.candidate.json' \
-  -p 'openasr-*' \
-  -p 'SHA256SUMS' \
-  -D "$workdir" --clobber
+lock_token="$workdir/qualification-release-lock.token"
+lock_acquired=false
+cleanup() {
+  if [ "$lock_acquired" = "true" ]; then
+    scripts/qualification-release-lock.sh release "$tag" "$lock_token" \
+      || printf 'warning: qualification release lock requires manual cleanup\n' >&2
+  fi
+  rm -rf -- "$workdir"
+}
+trap cleanup EXIT
+scripts/qualification-release-lock.sh acquire "$tag" "$lock_token"
+lock_acquired=true
+[ "$(gh release view "$tag" --repo "$repository" --json isDraft --jq .isDraft)" = "true" ] \
+  || fail "release ${tag} stopped being a draft while acquiring the finalization lock"
+python3 - "$tag" "$repository" "$workdir" "$version" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "tooling/release-manifest")
+import gh_release
+import release_completeness
+
+tag, repository, dest, version = sys.argv[1], sys.argv[2], Path(sys.argv[3]), sys.argv[4]
+metadata = [
+    "SHA256SUMS",
+    "backend-plugin-hints.json",
+    "catalog.backends.candidate.json",
+    *release_completeness.backend_pack_names(release_completeness.load_matrix()),
+]
+gh_release.download_assets(tag, metadata, dest, repository=repository)
+subjects = []
+for line in (dest / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    asset_name = line.split(None, 1)[-1].lstrip("*")
+    if Path(asset_name).name != asset_name:
+        raise SystemExit(f"SHA256SUMS contains an unsafe release basename: {asset_name}")
+    subjects.append(asset_name)
+gh_release.download_assets(tag, subjects, dest, repository=repository)
+qualification = []
+for name in gh_release.list_asset_names(tag, repository):
+    if name.endswith(".lock"):
+        continue
+    if name.startswith(f"openasr-{version}-qualification-") or name == (
+        f"openasr-{version}-build-provenance.bundle.json"
+    ):
+        qualification.append(name)
+gh_release.download_assets(tag, qualification, dest, repository=repository)
+PY
 
 shopt -s nullglob
 backend_entries=("$workdir"/backend-pack-*.json)
@@ -79,12 +127,19 @@ fi
 checksums="$workdir/SHA256SUMS"
 [ -f "$checksums" ] || fail "release ${tag} has no SHA256SUMS"
 
-# SHA256SUMS is not trusted by itself. Every downloaded subject must both match
-# that file and carry GitHub provenance from the exact peeled release commit.
+# SHA256SUMS is not trusted by itself. Every subject named by it must both match
+# and carry GitHub provenance from the exact peeled release commit. Qualification
+# manifests, detached signatures, and the copied provenance bundle are verified
+# separately below because they are intentionally not self-listed as subjects.
 verified_subjects=0
-for subject in "$workdir"/*; do
-  [ -f "$subject" ] || continue
-  [ "$subject" = "$checksums" ] && continue
+while read -r _checksum asset_name || [ -n "${asset_name:-}" ]; do
+  asset_name="${asset_name#\*}"
+  [ -n "$asset_name" ] || continue
+  case "$asset_name" in
+    */*|*\\*) fail "SHA256SUMS contains an unsafe release basename: $asset_name" ;;
+  esac
+  subject="$workdir/$asset_name"
+  [ -f "$subject" ] || fail "SHA256SUMS subject is missing from the release: $asset_name"
   python3 tooling/release-manifest/release_asset_verifier.py \
     --asset "$subject" --checksums "$checksums" >/dev/null
   gh attestation verify "$subject" \
@@ -92,7 +147,7 @@ for subject in "$workdir"/*; do
     --source-digest "$tag_commit" --format=json >/dev/null \
     || fail "release subject attestation failed: $(basename "$subject")"
   verified_subjects=$((verified_subjects + 1))
-done
+done < <(tr -d '\r' < "$checksums")
 [ "$verified_subjects" -gt 21 ] || fail "release ${tag} did not expose a complete attested subject set"
 
 all_backend_entry_args=()
@@ -113,20 +168,201 @@ python3 tooling/release-manifest/backend_hardware_evidence.py \
 
 # The reusable deploy workflow is the only catalog publication path. Initial
 # release publication accepts only its already-verified PublishedInert epoch.
+# deploy-catalog.yml records GITHUB_RUN_ID == orchestrator_run_id, so the
+# caller run id is the binding id. When this script runs as a later job in
+# that same Actions run, the overall conclusion is still empty; require the
+# "Deploy PublishedInert candidate catalog" job itself to have succeeded.
 deploy_run_id="${OPENASR_DEPLOY_CATALOG_RUN_ID:-}"
 [ -n "$deploy_run_id" ] || fail "set OPENASR_DEPLOY_CATALOG_RUN_ID to the successful reusable catalog-deploy run"
+deploy_preflight="$workdir/deploy-run-preflight.json"
+gh run view "$deploy_run_id" --repo "$repository" \
+  --json conclusion,status,event,workflowName,jobs > "$deploy_preflight" \
+  || fail "cannot inspect catalog deploy run $deploy_run_id"
+python3 - "$deploy_preflight" "$deploy_run_id" <<'PY' \
+  || fail "catalog deploy run $deploy_run_id did not succeed"
+import json, os, sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+run_id = sys.argv[2]
+if value.get("workflowName") != "Release core":
+    raise SystemExit("deploy binding came from another workflow")
+if value.get("event") != "workflow_dispatch":
+    raise SystemExit("release finalization run was not an explicit dispatch")
+jobs = value.get("jobs")
+if not isinstance(jobs, list) or not any(
+    isinstance(job, dict)
+    and "Deploy PublishedInert candidate catalog" in str(job.get("name", ""))
+    and job.get("conclusion") == "success"
+    for job in jobs
+):
+    raise SystemExit("run has no successful PublishedInert catalog deploy job")
+conclusion = value.get("conclusion")
+status = value.get("status")
+same_run = os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("GITHUB_RUN_ID") == run_id
+if conclusion == "success":
+    pass
+elif same_run and status in {"in_progress", "queued", "waiting", "pending", "requested"}:
+    pass
+else:
+    raise SystemExit(
+        f"catalog deploy run did not succeed (conclusion={conclusion} status={status})"
+    )
+PY
+
+# Re-read the annotated remote tag while holding the qualification mutation
+# lock. Its peeled commit must still equal the release identity checked before
+# the lock was acquired.
+IFS=$'\t' read -r remote_tag_type remote_tag_object < <(
+  gh api "repos/${repository}/git/ref/tags/${tag}" --jq '[.object.type,.object.sha] | @tsv'
+)
+[ "$remote_tag_type" = "tag" ] || fail "${tag} is not an annotated GitHub release tag"
+IFS=$'\t' read -r remote_target_type locked_tag_commit < <(
+  gh api "repos/${repository}/git/tags/${remote_tag_object}" \
+    --jq '[.object.type,.object.sha] | @tsv'
+)
+[ "$remote_target_type" = "commit" ] && [[ "$locked_tag_commit" =~ ^[0-9a-f]{40}$ ]] \
+  || fail "cannot peel annotated tag ${tag} to one source commit"
+[ "$locked_tag_commit" = "$tag_commit" ] \
+  || fail "release tag ${tag} changed while acquiring the finalization lock"
+
+# Qualification metadata is intentionally generated after SHA256SUMS and its
+# provenance statement, so it is authorized by detached production signatures
+# rather than pretending to be one of that statement's subjects. Rebuild the
+# exact set from the release's backend packs, re-hash every referenced release
+# byte, and verify both signature domains before publication.
+python3 - "$workdir" "$version" "$tag_commit" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+version = sys.argv[2]
+tag_commit = sys.argv[3]
+sys.path.insert(0, "tooling/release-manifest")
+import qualification_manifest as compiler
+
+cells = set()
+for entry_path in sorted(root.glob("backend-pack-*.json")):
+    entry = json.loads(entry_path.read_text(encoding="utf-8"))
+    try:
+        cell = compiler.artifact_cell(entry)
+    except compiler.QualificationManifestError as error:
+        raise SystemExit(f"invalid backend qualification entry {entry_path.name}: {error}") from error
+    if cell in cells:
+        raise SystemExit(f"duplicate qualification cell: {cell}")
+    cells.add(cell)
+
+expected_manifests = {
+    compiler.manifest_asset_name(version, provider, target)
+    for provider, target in cells
+}
+expected_signatures = {
+    f"{Path(name).stem}.signature.json" for name in expected_manifests
+}
+qualification_paths = set(root.glob(f"openasr-{version}-qualification-*.json"))
+actual_manifests = {
+    path.name for path in qualification_paths if not path.name.endswith(".signature.json")
+}
+actual_signatures = {
+    path.name for path in qualification_paths if path.name.endswith(".signature.json")
+}
+if actual_manifests != expected_manifests or actual_signatures != expected_signatures:
+    raise SystemExit(
+        "qualification manifest/signature set differs from backend-pack cells: "
+        f"manifest_missing={sorted(expected_manifests-actual_manifests)} "
+        f"manifest_extra={sorted(actual_manifests-expected_manifests)} "
+        f"signature_missing={sorted(expected_signatures-actual_signatures)} "
+        f"signature_extra={sorted(actual_signatures-expected_signatures)}"
+    )
+
+bundle_name = f"openasr-{version}-build-provenance.bundle.json"
+bundle_path = root / bundle_name
+predicate, subjects = compiler._attestation_subjects(bundle_path)
+if predicate != compiler.ATTESTATION_PREDICATE_TYPE:
+    raise SystemExit("qualification provenance predicate changed")
+referenced = set()
+rows = []
+for manifest_name in sorted(expected_manifests):
+    value = json.loads((root / manifest_name).read_text(encoding="utf-8"))
+    if value.get("schema_version") != compiler.SCHEMA_VERSION or value.get("release_subject") != f"v{version}":
+        raise SystemExit(f"qualification manifest identity changed: {manifest_name}")
+    provider_target = value.get("provider_target")
+    if not isinstance(provider_target, dict):
+        raise SystemExit(f"qualification manifest has no exact cell: {manifest_name}")
+    cell = (provider_target.get("provider"), provider_target.get("target"))
+    if cell not in cells or compiler.manifest_asset_name(version, *cell) != manifest_name:
+        raise SystemExit(f"qualification manifest cell/name mismatch: {manifest_name}")
+    attestation = value.get("attestation")
+    artifacts = value.get("artifacts")
+    if not isinstance(attestation, dict) or not isinstance(artifacts, dict):
+        raise SystemExit(f"qualification manifest is incomplete: {manifest_name}")
+    if attestation.get("source_digest") != tag_commit:
+        raise SystemExit(f"qualification manifest source differs from tag: {manifest_name}")
+    bundle = attestation.get("bundle")
+    if not isinstance(bundle, dict) or bundle.get("file_name") != bundle_name:
+        raise SystemExit(f"qualification manifest bundle differs: {manifest_name}")
+    binary = artifacts.get("binary")
+    if not isinstance(binary, dict):
+        raise SystemExit(f"qualification manifest binary is missing: {manifest_name}")
+    values = [binary.get("bundle"), artifacts.get("plugin"), *artifacts.get("vendor", []), bundle]
+    for artifact in values:
+        if artifact is None:
+            continue
+        if not isinstance(artifact, dict):
+            raise SystemExit(f"qualification artifact is malformed: {manifest_name}")
+        file_name = compiler._safe_basename(artifact.get("file_name"), "release artifact")
+        path = root / file_name
+        digest, size = compiler._sha256_size(path)
+        if digest != artifact.get("sha256") or size != artifact.get("size_bytes"):
+            raise SystemExit(f"qualification release bytes changed: {file_name}")
+        if file_name != bundle_name:
+            compiler._require_attested(subjects, path)
+            referenced.add(file_name)
+    signature_name = f"{Path(manifest_name).stem}.signature.json"
+    rows.append(
+        (manifest_name, f"https://dl.openasr.org/core/v{version}/{manifest_name}", signature_name)
+    )
+
+(root / "qualification-index.tsv").write_text(
+    "".join("\t".join(row) + "\n" for row in rows), encoding="utf-8"
+)
+(root / "qualification-subjects.txt").write_text(
+    "".join(name + "\n" for name in sorted(referenced)), encoding="utf-8"
+)
+(root / "qualification-bundle-name.txt").write_text(bundle_name + "\n", encoding="utf-8")
+PY
+
+while IFS=$'\t' read -r manifest_name manifest_url signature_name; do
+  OPENASR_HOME="$workdir/home-qualification" \
+    cargo run --quiet -p openasr-cli -- __openasr-verify-qualification-manifest \
+    "$workdir/$manifest_name" --signature "$workdir/$signature_name" \
+    --manifest-url "$manifest_url" >/dev/null
+done < "$workdir/qualification-index.tsv"
+qualification_bundle="$(tr -d '\r\n' < "$workdir/qualification-bundle-name.txt")"
+while IFS= read -r asset_name || [ -n "$asset_name" ]; do
+  [ -n "$asset_name" ] || continue
+  gh attestation verify "$workdir/$asset_name" \
+    --repo "$repository" \
+    --signer-workflow "${repository}/.github/workflows/release-binaries.yml" \
+    --source-digest "$tag_commit" \
+    --predicate-type "https://slsa.dev/provenance/v1" \
+    --deny-self-hosted-runners \
+    --bundle "$workdir/$qualification_bundle" \
+    --format json >/dev/null
+done < "$workdir/qualification-subjects.txt"
+
 deploy_metadata="$workdir/deploy-run.json"
 gh run view "$deploy_run_id" --repo "$repository" \
-  --json workflowName,conclusion,headSha,event,jobs,url > "$deploy_metadata" \
+  --json workflowName,conclusion,status,headSha,event,jobs,url > "$deploy_metadata" \
   || fail "cannot inspect catalog deploy run $deploy_run_id"
-python3 - "$deploy_metadata" "$current_commit" <<'PY' \
+python3 - "$deploy_metadata" "$current_commit" "$deploy_run_id" <<'PY' \
   || fail "catalog deploy run is not bound to this committed PublishedInert catalog"
-import json, sys
+import json, os, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
 if value.get("workflowName") != "Release core":
     raise SystemExit("deploy binding came from another workflow")
-if value.get("conclusion") != "success" or value.get("event") != "workflow_dispatch":
-    raise SystemExit("release finalization run did not complete successfully by explicit dispatch")
+if value.get("event") != "workflow_dispatch":
+    raise SystemExit("release finalization run was not an explicit dispatch")
 if value.get("headSha") != sys.argv[2]:
     raise SystemExit("release finalization run used another catalog commit")
 jobs = value.get("jobs")
@@ -137,6 +373,17 @@ if not isinstance(jobs, list) or not any(
     for job in jobs
 ):
     raise SystemExit("run has no successful PublishedInert catalog deploy job")
+conclusion = value.get("conclusion")
+status = value.get("status")
+same_run = os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("GITHUB_RUN_ID") == sys.argv[3]
+if conclusion == "success":
+    pass
+elif same_run and status in {"in_progress", "queued", "waiting", "pending", "requested"}:
+    pass
+else:
+    raise SystemExit(
+        f"catalog deploy run did not succeed (conclusion={conclusion} status={status})"
+    )
 PY
 
 deploy_binding_dir="$workdir/deploy-binding"
@@ -181,27 +428,58 @@ PY
 python3 tooling/publish-model/scripts/check_catalog_consistency.py \
   || fail "committed catalog/signature pair does not verify under production trust roots"
 
-cache_bust="$(date +%s)"
-curl -fsSL "https://catalog.openasr.org/v1/catalog.json?release=${tag}-${cache_bust}" \
-  -o "$workdir/catalog.json"
-curl -fsSL "https://catalog.openasr.org/v1/catalog.signature.json?release=${tag}-${cache_bust}" \
-  -o "$workdir/catalog.signature.json"
-OPENASR_HOME="$workdir/home" \
-OPENASR_CATALOG_FILE="$workdir/catalog.json" \
-OPENASR_CATALOG_IDENTITY="https://catalog.openasr.org/v1/catalog.json" \
-  cargo run --quiet -p openasr-cli -- doctor >/dev/null
-python3 tooling/release-manifest/backend_catalog.py verify-catalog \
-  --catalog "$workdir/catalog.json" "${all_backend_entry_args[@]}"
-python3 tooling/release-manifest/backend_hardware_evidence.py \
-  "${all_backend_entry_args[@]}" \
-  --catalog "$workdir/catalog.json" --version "$version" >/dev/null
-python3 tooling/release-manifest/backend_catalog.py verify-cdn \
-  --catalog "$workdir/catalog.json" --version "$version"
-cmp -s model-registry/catalog.public.json "$workdir/catalog.json" \
-  || fail "live catalog bytes differ from the deploy run's committed catalog"
-cmp -s model-registry/catalog.public.signature.json "$workdir/catalog.signature.json" \
-  || fail "live catalog signature differs from the deploy run's committed signature"
+# Live catalog/CDN can lag the deploy job. Retry the no-credential plane for
+# up to 10 minutes so a just-written catalog is not a spurious publish failure.
+verify_live_catalog_cdn() {
+  local attempt="$1"
+  local cache_bust
+  cache_bust="$(date +%s)-${attempt}"
+  curl -fsSL "https://catalog.openasr.org/v1/catalog.json?release=${tag}-${cache_bust}" \
+    -o "$workdir/catalog.json" || return 1
+  curl -fsSL "https://catalog.openasr.org/v1/catalog.signature.json?release=${tag}-${cache_bust}" \
+    -o "$workdir/catalog.signature.json" || return 1
+  OPENASR_HOME="$workdir/home-${attempt}" \
+  OPENASR_CATALOG_FILE="$workdir/catalog.json" \
+  OPENASR_CATALOG_IDENTITY="https://catalog.openasr.org/v1/catalog.json" \
+    cargo run --quiet -p openasr-cli -- doctor >/dev/null || return 1
+  python3 tooling/release-manifest/backend_catalog.py verify-catalog \
+    --catalog "$workdir/catalog.json" "${all_backend_entry_args[@]}" || return 1
+  python3 tooling/release-manifest/backend_hardware_evidence.py \
+    "${all_backend_entry_args[@]}" \
+    --catalog "$workdir/catalog.json" --version "$version" >/dev/null || return 1
+  python3 tooling/release-manifest/backend_catalog.py verify-cdn \
+    --catalog "$workdir/catalog.json" --version "$version" || return 1
+  if ! cmp -s model-registry/catalog.public.json "$workdir/catalog.json"; then
+    echo "live catalog bytes differ from the deploy run's committed catalog" >&2
+    return 1
+  fi
+  if ! cmp -s model-registry/catalog.public.signature.json "$workdir/catalog.signature.json"; then
+    echo "live catalog signature differs from the deploy run's committed signature" >&2
+    return 1
+  fi
+  return 0
+}
+
+cdn_ok=false
+for attempt in $(seq 1 20); do
+  if verify_live_catalog_cdn "$attempt"; then
+    cdn_ok=true
+    break
+  fi
+  if [ "$attempt" -eq 20 ]; then
+    break
+  fi
+  echo "live catalog/CDN not yet consistent (attempt ${attempt}/20); retrying in 30s" >&2
+  sleep 30
+done
+[ "$cdn_ok" = "true" ] \
+  || fail "live catalog bytes differ from the deploy run's committed catalog after 10 minutes of retries"
 
 echo "==> signed catalog exposes ${tag} provider bytes as PublishedInert; publishing release"
+[ "$(gh release view "$tag" --repo "$repository" --json isDraft --jq .isDraft)" = "true" ] \
+  || fail "release ${tag} stopped being a draft before publication"
 gh release edit "$tag" --repo "$repository" --draft=false --latest
+scripts/qualification-release-lock.sh release "$tag" "$lock_token"
+lock_acquired=false
 echo "RELEASE-PUBLISHED-INERT ${tag}"
+echo "China asset mirror: .github/workflows/sync-release-to-cnb.yml on release published"

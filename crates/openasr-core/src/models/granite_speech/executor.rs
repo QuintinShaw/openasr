@@ -1295,7 +1295,7 @@ mod tests {
             .transcribe(
                 TranscriptionRequest::new(audio.clone(), NATIVE_RUNTIME_MODEL_ID_AUTO)
                     .with_model_pack_path(Some(pack_path.clone()))
-                    .with_execution_target(Some(target))
+                    .with_execution_target(Some(target.clone()))
                     .with_longform(Some(longform.clone())),
             )
             .unwrap_or_else(|error| panic!("{target:?} longform failed: {error}"))

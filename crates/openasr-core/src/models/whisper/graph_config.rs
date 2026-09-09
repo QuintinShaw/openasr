@@ -63,6 +63,24 @@ pub(crate) fn whisper_runtime_graph_config(backend: GgmlCpuGraphBackend) -> Ggml
     )
 }
 
+pub(crate) fn whisper_encoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
+    whisper_encoder_graph_config_with_policy(backend, WhisperDecoderPlacementPolicy::resolve())
+}
+
+fn whisper_encoder_graph_config_with_policy(
+    backend: GgmlCpuGraphBackend,
+    placement_policy: WhisperDecoderPlacementPolicy,
+) -> GgmlCpuGraphConfig {
+    let mut config = whisper_runtime_graph_config(backend);
+    // Match the Exact CUDA/Vulkan decoder: a scheduler-backed encoder blocks
+    // the unified GPU owner and LoadedView weights, and keeps a CPU fallback
+    // participant that FullDevice already forbids at attestation.
+    if placement_policy.uses_exact_cuda_or_vulkan_default(config.backend) {
+        config.use_scheduler = false;
+    }
+    config
+}
+
 pub(crate) fn whisper_encoder_prelude_graph_config(
     backend: GgmlCpuGraphBackend,
 ) -> GgmlCpuGraphConfig {
@@ -385,6 +403,17 @@ mod tests {
             assert_eq!(config.backend, GgmlCpuGraphBackend::Gpu);
             assert_eq!(config.use_scheduler, use_scheduler);
         }
+    }
+
+    #[test]
+    fn exact_cuda_vulkan_encoder_defaults_without_scheduler() {
+        let config = whisper_encoder_graph_config_with_policy(
+            GgmlCpuGraphBackend::Gpu,
+            WhisperDecoderPlacementPolicy::for_test(true),
+        );
+
+        assert_eq!(config.backend, GgmlCpuGraphBackend::Gpu);
+        assert!(!config.use_scheduler);
     }
 
     #[test]

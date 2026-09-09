@@ -13,7 +13,8 @@ Local engineering scripts for validation and iteration.
 
 - `bump-version.sh`
   - Bump the workspace release version, commit, and tag it (`--notes`
-    required; see `RELEASING.md`).
+    required). This only pins the version; it does not publish. See
+    `RELEASING.md`.
 - `render-install-verify.sh`
   - Render a release's "Install & Verify" section from its actual asset list
     (used by `.github/workflows/release-core.yml`, both for the initial stub
@@ -27,6 +28,12 @@ Local engineering scripts for validation and iteration.
     by `.github/workflows/publish-core-channels.yml` after the release is public
     against a checkout of `QuintinShaw/homebrew-tap`). See `RELEASING.md`'s
     "Homebrew tap" section.
+- `sync-release-to-cnb.sh`
+  - Idempotent GitHub → cnb.cool asset mirror. Core releases call it from
+    `.github/workflows/sync-release-to-cnb.yml` after the draft is published.
+    Do not invoke it from `finalize-core-release.sh`. Desktop packaging may
+    still pass extra local files that are not GitHub assets. See
+    `RELEASING.md`'s "China mirror (CNB)" section.
 - `generate_longform_pause_probe.py`
   - Generate a deterministic longform pause probe from a local speech WAV — a
     test-data generator for longform planner validation.

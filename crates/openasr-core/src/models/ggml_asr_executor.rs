@@ -496,70 +496,27 @@ fn offline_invocation_envelope_samples(
         request_options
             .longform
             .as_ref()
-            .map(|options| duration_samples_ceil(options.max_chunk_seconds, sample_rate_hz))
+            .map(|options| {
+                crate::longform::executor_window_limit_samples(
+                    options.max_chunk_seconds,
+                    sample_rate_hz,
+                )
+                .map_err(|error| {
+                    GgmlAsrDecoderStatePlanningError::InvalidEnvelopeDuration {
+                        value: match error {
+                            crate::longform::ExecutorWindowLimitError::InvalidDuration {
+                                value,
+                            } => value,
+                        },
+                    }
+                })
+            })
             .transpose()?
             .unwrap_or(actual_samples)
     } else {
         actual_samples
     };
     Ok(configured_samples)
-}
-
-fn duration_samples_ceil(
-    seconds: f32,
-    sample_rate_hz: NonZeroU32,
-) -> Result<usize, GgmlAsrDecoderStatePlanningError> {
-    // Decode the finite positive f32 at the configuration boundary into its
-    // exact binary rational, then perform ceil(rate * seconds) in integers.
-    // No float is allowed into family topology/oracle arithmetic.
-    let bits = seconds.to_bits();
-    let sign = bits >> 31;
-    let exponent_bits = (bits >> 23) & 0xff;
-    let fraction = bits & 0x7f_ff_ff;
-    if sign != 0 || exponent_bits == 0xff || (exponent_bits == 0 && fraction == 0) {
-        return Err(GgmlAsrDecoderStatePlanningError::InvalidEnvelopeDuration {
-            value: seconds.to_string(),
-        });
-    }
-    let (significand, exponent_two): (u128, i32) = if exponent_bits == 0 {
-        (u128::from(fraction), -149)
-    } else {
-        (
-            u128::from((1 << 23) | fraction),
-            exponent_bits as i32 - 127 - 23,
-        )
-    };
-    let scaled = significand
-        .checked_mul(u128::from(sample_rate_hz.get()))
-        .ok_or_else(
-            || GgmlAsrDecoderStatePlanningError::InvalidEnvelopeDuration {
-                value: seconds.to_string(),
-            },
-        )?;
-    let samples = if exponent_two >= 0 {
-        scaled.checked_shl(exponent_two as u32).ok_or_else(|| {
-            GgmlAsrDecoderStatePlanningError::InvalidEnvelopeDuration {
-                value: seconds.to_string(),
-            }
-        })?
-    } else {
-        let shift = exponent_two.unsigned_abs();
-        if shift >= u128::BITS {
-            1
-        } else {
-            let denominator = 1_u128 << shift;
-            scaled.checked_add(denominator - 1).ok_or_else(|| {
-                GgmlAsrDecoderStatePlanningError::InvalidEnvelopeDuration {
-                    value: seconds.to_string(),
-                }
-            })? / denominator
-        }
-    };
-    usize::try_from(samples).map_err(|_| {
-        GgmlAsrDecoderStatePlanningError::InvalidEnvelopeDuration {
-            value: seconds.to_string(),
-        }
-    })
 }
 
 pub(crate) type GgmlAsrDecoderStatePlanner = for<'a> fn(
@@ -1876,22 +1833,35 @@ mod tests {
     };
 
     #[test]
-    fn duration_boundary_ceil_uses_exact_integer_binary_rational() {
+    fn offline_envelope_maps_longform_oracle_errors() {
         let rate = NonZeroU32::new(16_000).unwrap();
-        assert_eq!(duration_samples_ceil(30.0, rate).unwrap(), 480_000);
-        assert_eq!(duration_samples_ceil(30.5, rate).unwrap(), 488_000);
-        // The stored f32 value is slightly greater than decimal 0.1. Exact
-        // integer ceil must retain that conservative final sample.
-        assert_eq!(duration_samples_ceil(0.1, rate).unwrap(), 1_601);
-        assert_eq!(duration_samples_ceil(f32::from_bits(1), rate).unwrap(), 1);
-        assert!(matches!(
-            duration_samples_ceil(0.0, rate),
-            Err(GgmlAsrDecoderStatePlanningError::InvalidEnvelopeDuration { .. })
-        ));
-        assert!(matches!(
-            duration_samples_ceil(f32::NAN, rate),
-            Err(GgmlAsrDecoderStatePlanningError::InvalidEnvelopeDuration { .. })
-        ));
+        for seconds in [0.0_f32, f32::NAN] {
+            let options = GgmlAsrExecutionOptions {
+                longform: Some(crate::LongFormOptions {
+                    max_chunk_seconds: seconds,
+                    ..crate::LongFormOptions::default()
+                }),
+                ..GgmlAsrExecutionOptions::default()
+            };
+            assert!(
+                matches!(
+                    offline_invocation_envelope_samples(&options, rate, 160_000),
+                    Err(GgmlAsrDecoderStatePlanningError::InvalidEnvelopeDuration { .. })
+                ),
+                "seconds={seconds}"
+            );
+        }
+        let tenth = GgmlAsrExecutionOptions {
+            longform: Some(crate::LongFormOptions {
+                max_chunk_seconds: 0.1,
+                ..crate::LongFormOptions::default()
+            }),
+            ..GgmlAsrExecutionOptions::default()
+        };
+        assert_eq!(
+            offline_invocation_envelope_samples(&tenth, rate, 16_000).unwrap(),
+            1_601
+        );
     }
 
     #[test]

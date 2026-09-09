@@ -58,7 +58,7 @@ pub(crate) fn load_person_matcher_for_embedder(
     embedder: &dyn SpeakerEmbedder,
 ) -> Result<PersonMatcher, VoiceIdLibraryError> {
     let calibration = embedder.calibration_profile();
-    let space = EmbeddingSpace::for_active_embedder(identity, calibration);
+    let space = EmbeddingSpace::for_active_embedder(identity);
     let threshold = calibration.voice_id_accept_threshold();
     let margin = calibration.voice_id_margin();
     let store = VoiceIdStore::open_default()?;
@@ -91,7 +91,7 @@ pub fn prepare_sample_from_pcm(
 ) -> Result<NewSampleInput, VoiceIdServiceError> {
     let quality = assess_enrollment_quality(pcm)?;
     let embedding = embed_enrollment(embedder, pcm)?;
-    let space = EmbeddingSpace::for_active_embedder(identity, embedder.calibration_profile());
+    let space = EmbeddingSpace::for_active_embedder(identity);
     if embedding.dim() != space.dimension {
         return Err(VoiceIdServiceError::Embed(EmbedError::Unavailable(
             format!(
@@ -281,10 +281,11 @@ mod tests {
         }
 
         fn identity(&self) -> Option<SpeakerEmbedderIdentity> {
-            Some(SpeakerEmbedderIdentity {
-                embedding_dim: 192,
-                pack_fingerprint: "test-pack".to_string(),
-            })
+            Some(SpeakerEmbedderIdentity::unlabeled_fixture(
+                crate::diarize::embed::SpeakerEmbedderFamily::ReDimNet2,
+                192,
+                "test-pack",
+            ))
         }
     }
 

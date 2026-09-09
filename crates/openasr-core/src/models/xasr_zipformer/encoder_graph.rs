@@ -6529,22 +6529,30 @@ fn register_resident_cache_writes<'a>(
     destination: XasrDeviceLayerCacheTensors,
 ) -> Result<(), XasrEncoderGraphError> {
     let destination = destination.as_graph_tensors();
-    for (source, target) in [
-        (output.new_cached_key, destination.cached_key),
+    for (source, target, is_kv_cache) in [
+        (output.new_cached_key, destination.cached_key, true),
         (
             output.new_cached_nonlin_attention,
             destination.cached_nonlin_attention,
+            false,
         ),
-        (output.new_cached_val1, destination.cached_val1),
-        (output.new_cached_val2, destination.cached_val2),
-        (output.new_cached_conv1, destination.cached_conv1),
-        (output.new_cached_conv2, destination.cached_conv2),
+        (output.new_cached_val1, destination.cached_val1, true),
+        (output.new_cached_val2, destination.cached_val2, true),
+        (output.new_cached_conv1, destination.cached_conv1, false),
+        (output.new_cached_conv2, destination.cached_conv2, false),
     ] {
         let write = map_ggml_stage("resident_cache_copy", graph.cpy(source, target))?;
-        map_ggml_stage(
-            "resident_cache_side_effect",
-            graph.add_side_effect_root(write),
-        )?;
+        if is_kv_cache {
+            map_ggml_stage(
+                "resident_kv_cache_side_effect",
+                graph.add_kv_write_root(write),
+            )?;
+        } else {
+            map_ggml_stage(
+                "resident_cache_side_effect",
+                graph.add_side_effect_root(write),
+            )?;
+        }
     }
     Ok(())
 }
@@ -8832,7 +8840,7 @@ mod tests {
 
         let mut config = GgmlCpuGraphConfig::conservative_default();
         config.context_bytes = 64 * 1024 * 1024;
-        config.graph_size = 65_536;
+        config.graph_size = crate::models::xasr_zipformer::graph_config::FULL_ENCODER_GRAPH_SIZE;
         let mut runner =
             GgmlCpuGraphRunner::new(config).expect("cpu graph runner should initialize");
         let mut graph = runner.start_graph();
@@ -9948,9 +9956,7 @@ mod tests {
         let weights = load_xasr_encoder_weights(&reader, &metadata).expect("weights");
         // Right-sized like the runtime path (see
         // `xasr_zipformer_encoder_graph_config`): stack0 is a strict subset of
-        // the full encoder, so the full-encoder node budget covers it with >5x
-        // headroom. The old flat 256 MB over-reserved the `no_alloc` metadata
-        // context, which only holds tensor bookkeeping.
+        // the full encoder, so the full-encoder node budget covers it.
         let mut config = GgmlCpuGraphConfig::conservative_default();
         config.graph_size = config
             .graph_size

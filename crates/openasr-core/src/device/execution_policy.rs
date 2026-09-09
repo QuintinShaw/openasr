@@ -30,7 +30,7 @@ pub enum ExecutionIntent {
     /// Accelerated execution constrained by a stable provider or proven
     /// hardware-vendor fact. It never appends pure CPU or an unrelated device.
     ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint),
-    /// Exact remains internal until public multi-device pinning is ready.
+    /// Pin one enumerated device. Fail-closed on miss or init failure.
     Exact(ExactDeviceSelector),
 }
 

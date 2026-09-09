@@ -1,0 +1,79 @@
+name: Sync release assets to CNB
+
+# GitHub remains the signed source. After a stable core tag is public, CI
+# mirrors every uploaded GitHub asset to cnb.cool. Local finalize must not
+# download the release to disk for this. Missing CNB_TOKEN skips.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published core tag to mirror, e.g. v0.1.38"
+        required: true
+        type: string
+
+concurrency:
+  group: sync-release-to-cnb-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Mirror GitHub release assets to CNB
+    # The public repo also hosts desktop-vX.Y.Z releases. Ignore those release
+    # events without painting the repository red; a manual repair still runs
+    # and fails closed on an invalid tag.
+    if: >-
+      ${{
+        github.repository == 'QuintinShaw/openasr' &&
+        (github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v'))
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check for CNB credentials
+        id: check
+        run: |
+          if [ -n "${{ secrets.CNB_TOKEN }}" ]; then
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CNB_TOKEN secret not set -- skipping China asset mirror"
+          fi
+
+      - name: Resolve published core tag
+        if: steps.check.outputs.has_token == 'true'
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${EVENT_TAG:-$INPUT_TAG}"
+          if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::expected a stable vX.Y.Z release tag, got '$tag'"
+            exit 1
+          fi
+          release="$(gh api "repos/${{ github.repository }}/releases/tags/${tag}")"
+          if [ "$(jq -r .draft <<<"$release")" != "false" ] || [ "$(jq -r .prerelease <<<"$release")" != "false" ]; then
+            echo "::error::${tag} is not a published stable release"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Upload GitHub assets to CNB
+        if: steps.check.outputs.has_token == 'true'
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          OPENASR_CNB_STRICT: "1"
+          TAG: ${{ steps.release.outputs.tag }}
+        run: scripts/sync-release-to-cnb.sh "$TAG"

@@ -4,7 +4,7 @@
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -1140,51 +1140,115 @@ pub(crate) fn spawn_boot_native_warmup(
     home: PathBuf,
 ) -> tokio::task::JoinHandle<()> {
     // Reactivation walks the same verify -> resolve -> reserve -> materialize
-    // -> attest -> reconcile transaction as set-default. Its journal only
-    // validates that the durable V2 request is still current; it never writes
-    // a new generation during boot.
+    // -> attest -> reconcile transaction as set-default. Durable V2 is used
+    // when it still names the launch pack; a `--model` launch without V2
+    // attests that pack directly instead of logging and staying unattested.
     tokio::task::spawn_blocking(move || {
         let Some(requested_path) = runtime.model_pack_path.requested_path() else {
             return;
         };
-        let Ok(Some(record)) =
-            openasr_core::default_selection::read_active_model_selection_v2(&home)
-        else {
-            return;
-        };
-        let Ok(packs) = openasr_core::list_installed_packs(&home) else {
-            return;
+        let packs = match openasr_core::list_installed_packs(&home) {
+            Ok(packs) => packs,
+            Err(error) => {
+                runtime.model_pack_path.mark_launch_attestation_failed();
+                log_default_reactivation_failed(
+                    &home,
+                    requested_path.as_path(),
+                    &error.to_string(),
+                );
+                return;
+            }
         };
         let Some(pack) = packs.into_iter().find(|pack| pack.path == requested_path) else {
+            runtime.model_pack_path.mark_launch_attestation_failed();
+            log_default_reactivation_failed(
+                &home,
+                requested_path.as_path(),
+                "requested pack is not in InstalledModelStore",
+            );
             return;
         };
-        let Ok(intent) = openasr_core::default_selection::execution_intent_from_v2_wire(
-            &record.execution_intent,
-        ) else {
-            return;
+        let durable = match openasr_core::default_selection::read_active_model_selection_v2(&home) {
+            Ok(record) => record,
+            Err(error) => {
+                runtime.model_pack_path.mark_launch_attestation_failed();
+                log_default_reactivation_failed(
+                    &home,
+                    requested_path.as_path(),
+                    &error.to_string(),
+                );
+                return;
+            }
         };
-        if let Err(error) = crate::activate_default_model_blocking(
-            &runtime,
-            &home,
-            &pack,
-            record.quant_preference,
-            intent,
-            crate::DefaultModelActivationMode::ReactivateDurableSelection,
-        ) {
-            let mut reason = single_line_log_value(&error.to_string());
-            for sensitive_path in [&home, requested_path.as_path()] {
-                let rendered = sensitive_path.to_string_lossy();
-                if !rendered.is_empty() {
-                    reason = reason.replace(rendered.as_ref(), "<redacted-path>");
+        let durable_pack = openasr_core::default_selection::resolve_with_catalog(&home, None)
+            .ok()
+            .and_then(openasr_core::default_selection::DefaultModelResolution::into_installed_pack);
+        let (preference, intent, mode) = match (durable, durable_pack) {
+            (Some(record), Some(installed)) if installed.path == requested_path => {
+                match openasr_core::default_selection::execution_intent_from_v2_wire(
+                    &record.execution_intent,
+                ) {
+                    Ok(intent) => (
+                        record.quant_preference,
+                        intent,
+                        crate::DefaultModelActivationMode::ReactivateDurableSelection,
+                    ),
+                    Err(error) => {
+                        runtime.model_pack_path.mark_launch_attestation_failed();
+                        log_default_reactivation_failed(
+                            &home,
+                            requested_path.as_path(),
+                            &error.to_string(),
+                        );
+                        return;
+                    }
                 }
             }
-            let reason = reason.chars().take(512).collect::<String>();
-            openasr_core::stage_timing::log_event(
-                "server_boot",
-                format_args!("stage=default_reactivation_failed reason={reason}"),
-            );
+            _ => {
+                let intent = match realtime_execution_target_preference(&home) {
+                    Ok(target) => {
+                        openasr_core::device::execution_policy::ExecutionIntent::from(target)
+                    }
+                    Err(error) => {
+                        runtime.model_pack_path.mark_launch_attestation_failed();
+                        log_default_reactivation_failed(
+                            &home,
+                            requested_path.as_path(),
+                            &error.to_string(),
+                        );
+                        return;
+                    }
+                };
+                (
+                    openasr_core::QuantPreference::pinned(&pack.quant),
+                    intent,
+                    crate::DefaultModelActivationMode::AttestLaunchPack,
+                )
+            }
+        };
+        if let Err(error) =
+            crate::activate_default_model_blocking(&runtime, &home, &pack, preference, intent, mode)
+        {
+            runtime.model_pack_path.mark_launch_attestation_failed();
+            log_default_reactivation_failed(&home, requested_path.as_path(), &error.to_string());
         }
     })
+}
+
+fn log_default_reactivation_failed(home: &Path, requested_path: &Path, reason: &str) -> String {
+    let mut reason = single_line_log_value(reason);
+    for sensitive_path in [home, requested_path] {
+        let rendered = sensitive_path.to_string_lossy();
+        if !rendered.is_empty() {
+            reason = reason.replace(rendered.as_ref(), "<redacted-path>");
+        }
+    }
+    let reason = reason.chars().take(512).collect::<String>();
+    openasr_core::stage_timing::log_event(
+        "server_boot",
+        format_args!("stage=default_reactivation_failed reason={reason}"),
+    );
+    reason
 }
 
 /// Attest a candidate pack without publishing it as the live default.
@@ -1306,7 +1370,7 @@ async fn warm_up_native_pack(
                 let _activation_barrier = runtime
                     .begin_native_activation()
                     .map_err(|error| error.to_string())?;
-                let Some(active_model) = runtime.model_pack_path.current_snapshot() else {
+                let Some(active_model) = runtime.model_pack_path.served_snapshot() else {
                     // Fresh install / no model installed yet: nothing to warm.
                     // The daemon still serves `/health`; a later activation
                     // binds and probes a verified pack transactionally.
@@ -1333,14 +1397,16 @@ async fn warm_up_native_pack(
     let inference_threads = preferences_home
         .as_deref()
         .and_then(realtime_inference_threads_preference);
-    let execution_target_preference = preferences_home
-        .as_deref()
-        .and_then(realtime_execution_target_preference);
-    let resolved_route = crate::routes::transcription::resolve_execution_route_for_target(
-        execution_target_preference,
-    )
-    .ok()
-    .flatten();
+    let execution_target_preference = match preferences_home.as_deref() {
+        Some(home) => {
+            realtime_execution_target_preference(home).map_err(|error| error.to_string())?
+        }
+        None => crate::resolve_serve_execution_target(None).map_err(|error| error.to_string())?,
+    };
+    let resolved_route = crate::routes::transcription::resolve_execution_route_for_target(Some(
+        execution_target_preference.clone(),
+    ))
+    .map_err(|error| error.to_string())?;
     let Some(adapter) = openasr_core::native_runtime_model_adapter_for_path(&model_pack_path)
     else {
         return Err("no native runtime adapter for selected model pack".to_string());
@@ -1357,21 +1423,16 @@ async fn warm_up_native_pack(
         }
         None => context,
     };
-    // Same saved-preferences fallback a real WS attach applies when a session
-    // does not set an explicit `execution_target`/`inference_threads`
-    // override (`realtime_execution_target_preference` /
-    // `realtime_inference_threads_preference` in `realtime/mod.rs`), so a
-    // user who changed their default hardware target or thread count still
-    // gets a worker warmed at the key their next attach will actually use.
-    // `openasr_home()` resolution failing here (unreadable env, race) just
-    // means "no preference found" -- same graceful fallback to defaults the
-    // request-time paths use.
-    let options = NativeAsrRequestOptions::new().with_inference_threads(inference_threads);
+    // Warm the same worker key an unscoped WS attach will use.
+    let options = NativeAsrRequestOptions::new()
+        .with_inference_threads(inference_threads)
+        .with_execution_target(Some(execution_target_preference.clone()));
     let session_config = NativeAsrStreamingSessionConfig::new()
         .with_audio_format(RealtimeAudioFormat::pcm16_mono_16khz());
     let executor =
         NativeBackendExecutor::new(Arc::clone(runtime.native_execution.execution_services()));
-    let hardware_target = native_hardware_target_from_execution_target(execution_target_preference);
+    let hardware_target =
+        native_hardware_target_from_execution_target(Some(execution_target_preference));
     let session = match NativeAsrExecutor::start_streaming_session(
         &executor,
         &adapter,
@@ -1497,7 +1558,7 @@ impl RealtimeBackendWorkerKey {
         Self {
             backend: runtime.backend.to_string(),
             ffmpeg_bin: runtime.ffmpeg_bin.clone(),
-            model_pack_path: runtime.model_pack_path.current(),
+            model_pack_path: runtime.model_pack_path.served_pack_path(),
         }
     }
 }
@@ -1715,5 +1776,48 @@ async fn run_realtime_backend_job(
             })
         }
         Err(error) => BackendResult::Error(error),
+    }
+}
+
+#[cfg(test)]
+mod reactivation_log_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn default_reactivation_failure_log_redacts_paths_and_flattens_newlines() {
+        let home = Path::new("/tmp/openasr-home-secret");
+        let pack = Path::new("/tmp/openasr-home-secret/models/pack.oasr");
+        let rendered = log_default_reactivation_failed(
+            home,
+            pack,
+            "failed to activate /tmp/openasr-home-secret/models/pack.oasr:\nbad pack",
+        );
+        assert!(
+            !rendered.contains("openasr-home-secret"),
+            "home/pack paths must not leak into daemon logs: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted-path>"),
+            "redaction marker missing: {rendered}"
+        );
+        assert!(
+            !rendered.contains('\n'),
+            "log lines must stay single-line: {rendered}"
+        );
+        assert!(
+            rendered.contains("bad pack"),
+            "failure reason must remain after redaction: {rendered}"
+        );
+        assert!(rendered.len() <= 512, "log reason must stay bounded");
+    }
+
+    #[test]
+    fn default_reactivation_failure_log_truncates_long_reasons() {
+        let home = Path::new("/home/openasr");
+        let pack = Path::new("/models/pack.oasr");
+        let rendered = log_default_reactivation_failed(home, pack, &"x".repeat(1024));
+        assert_eq!(rendered.len(), 512);
+        assert!(rendered.chars().all(|c| c == 'x'));
     }
 }

@@ -12,7 +12,15 @@ services:
       OPENASR_HOME: /data
     volumes:
       - openasr-data:/data
-    command: ["serve", "--addr", "0.0.0.0:8080"]
+    command:
+      [
+        "serve",
+        "--addr",
+        "0.0.0.0:8080",
+        "--tls-self-signed",
+        "--pairing-admin-token-file",
+        "/data/pairing-admin-token",
+      ]
 
   # NVIDIA GPU variant (Dockerfile.cuda). Requires the NVIDIA Container
   # Toolkit on the host (https://github.com/NVIDIA/nvidia-container-toolkit)
@@ -36,7 +44,15 @@ services:
       OPENASR_HOME: /data
     volumes:
       - openasr-cuda-data:/data
-    command: ["serve", "--addr", "0.0.0.0:8080"]
+    command:
+      [
+        "serve",
+        "--addr",
+        "0.0.0.0:8080",
+        "--tls-self-signed",
+        "--pairing-admin-token-file",
+        "/data/pairing-admin-token",
+      ]
     deploy:
       resources:
         reservations:

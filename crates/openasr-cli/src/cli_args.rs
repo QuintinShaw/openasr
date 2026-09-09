@@ -17,6 +17,83 @@ pub(crate) struct RuntimePathOverrides {
     pub(crate) ffmpeg_bin: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, clap::Args)]
+pub(crate) struct QualifyFamilyDecodeArgs {
+    #[arg(long, short = 'm')]
+    pub model: Option<String>,
+    #[arg(long)]
+    pub audio: PathBuf,
+    #[arg(long, default_value = "cpu")]
+    pub device: String,
+    #[arg(long)]
+    pub model_pack: Option<PathBuf>,
+    /// JSON `RealFamilyEvidenceBinding` with matrix/catalog/artifact identity.
+    #[arg(long)]
+    pub binding: PathBuf,
+    #[arg(long)]
+    pub out_dir: PathBuf,
+    #[arg(long)]
+    pub core_commit: Option<String>,
+    #[arg(long)]
+    pub ffmpeg_bin: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Args)]
+pub(crate) struct AlignCliArgs {
+    /// Source audio (or `-` for a WAV stream on stdin).
+    #[arg(value_name = "AUDIO")]
+    pub(crate) audio: PathBuf,
+    /// Plain-text transcript file (`-` reads stdin). Cannot be `-` when
+    /// AUDIO is also `-`.
+    #[arg(long)]
+    pub(crate) transcript: PathBuf,
+    /// Output format(s): text, json, srt, vtt, verbose_json, markdown.
+    /// Repeat `-f` to write several sidecar files.
+    #[arg(long = "format", short = 'f', value_name = "FORMAT", default_value = "json", value_parser = parse_response_format)]
+    pub(crate) formats: Vec<ResponseFormat>,
+    /// Language hint (e.g. en, zh, English). Omit or `auto` defaults to en.
+    /// Japanese and Korean fail closed.
+    #[arg(long, short = 'l', value_name = "LANG")]
+    pub(crate) language: Option<String>,
+    /// Write output to this file. Defaults to stdout.
+    #[arg(long, short = 'o')]
+    pub(crate) output: Option<PathBuf>,
+    /// Transcription backend: mock or native. Align is native-only.
+    #[arg(long, value_parser = parse_backend_kind, hide = true)]
+    pub(crate) backend: Option<BackendKind>,
+    /// Path to an existing ffmpeg binary for preparing recognized non-WAV inputs.
+    #[arg(long)]
+    pub(crate) ffmpeg_bin: Option<PathBuf>,
+    /// Hardware target: auto, cpu, accelerated, or a physical GPU id from GET /v1/devices.
+    #[arg(long, value_name = "TARGET")]
+    pub(crate) execution_target: Option<String>,
+    /// Strip per-word arrays from the JSON result (segment/cue times stay).
+    #[arg(long)]
+    pub(crate) no_word_timestamps: bool,
+    /// Download a missing Forced Aligner pack without the interactive
+    /// confirmation (also set by OPENASR_ASSUME_YES).
+    #[arg(long, short = 'y')]
+    pub(crate) yes: bool,
+    /// Never download: fail closed if the Forced Aligner pack is not installed
+    /// (also set by OPENASR_OFFLINE).
+    #[arg(long, visible_alias = "no-pull")]
+    pub(crate) offline: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AlignCommandOptions<'a> {
+    pub(crate) audio: &'a Path,
+    pub(crate) transcript: &'a Path,
+    pub(crate) formats: &'a [ResponseFormat],
+    pub(crate) language: Option<String>,
+    pub(crate) output: Option<&'a Path>,
+    pub(crate) backend_kind: Option<BackendKind>,
+    pub(crate) runtime_paths: RuntimePathOverrides,
+    pub(crate) execution_target: Option<&'a str>,
+    pub(crate) keep_word_timestamps: bool,
+    pub(crate) consent: crate::consent::PullConsent,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TranscribeCommandOptions<'a> {
     pub(crate) inputs: &'a [PathBuf],
@@ -67,6 +144,7 @@ pub(crate) struct BatchRunContext<'a> {
     pub(crate) ffmpeg_bin_explicit: bool,
     pub(crate) longform: Option<openasr_core::LongFormOptions>,
     pub(crate) diarize: bool,
+    pub(crate) voice_id_embedder: openasr_core::config::VoiceIdEmbedderPreference,
     pub(crate) speakers: Option<u8>,
     pub(crate) language: Option<String>,
     pub(crate) task: Option<TranscriptionTask>,
@@ -243,6 +321,38 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: BackendPluginCommand,
     },
+    /// Qualification-only Windows helper that safely creates real host-memory
+    /// pressure for the ownership/activation evidence harness.
+    #[command(name = "__openasr-memory-pressure-helper", hide = true)]
+    MemoryPressureHelper {
+        /// PID of the qualification parent. The helper exits if it dies.
+        #[arg(long)]
+        parent_pid: u32,
+        /// Exact candidate request whose native observation must cross from
+        /// admissible to rejected. This is not an arbitrary allocation size.
+        #[arg(long)]
+        candidate_required_bytes: u64,
+        /// Absolute available-memory floor. Values below 2 GiB are rejected.
+        #[arg(long, default_value_t = 2 * 1024_u64 * 1024 * 1024)]
+        absolute_floor_bytes: u64,
+        /// Proportional available-memory floor in basis points of physical RAM.
+        #[arg(long, default_value_t = 2_000)]
+        proportional_floor_basis_points: u16,
+        /// Hard lifetime limit. The helper never accepts more than 120 seconds.
+        #[arg(long, default_value_t = 60)]
+        timeout_seconds: u64,
+    },
+    /// Validate a complete artifact-bound ownership evidence bundle without
+    /// consulting runtime policy or network state.
+    #[command(name = "__openasr-validate-ownership-evidence", hide = true)]
+    ValidateOwnershipEvidence {
+        /// Directory containing the immutable release evidence artifacts.
+        #[arg(long)]
+        artifact_dir: PathBuf,
+        /// Ownership envelope. Repeat exactly once per required scenario.
+        #[arg(long = "envelope", required = true)]
+        envelopes: Vec<PathBuf>,
+    },
     /// Internal helper for sandboxed GGUF C parser probes.
     #[command(name = "__openasr-gguf-c-parser-probe", hide = true)]
     GgufCParserProbe {
@@ -284,6 +394,69 @@ pub(crate) enum Command {
     /// embedded catalog matches a copied catalog resource.
     #[command(name = "catalog-fingerprint", hide = true)]
     CatalogFingerprint,
+    /// Internal helper: sign an inert exact-cell qualification manifest with
+    /// the production catalog key under the qualification-specific signature
+    /// domain. This command never signs a capability or activation policy.
+    #[command(name = "__openasr-sign-qualification-manifest", hide = true)]
+    SignQualificationManifest {
+        /// Exact-cell qualification manifest file to sign.
+        manifest: PathBuf,
+        /// Output qualification-manifest.signature.json path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Canonical immutable release URL bound into the signature.
+        #[arg(long)]
+        manifest_url: String,
+        /// Production catalog key id. Qualification has no local-dev key.
+        #[arg(long, default_value = "openasr-catalog-v1")]
+        key_id: String,
+        /// Print the derived public key for the env signing seed and exit.
+        #[arg(long)]
+        print_public_key: bool,
+    },
+    /// Internal read-only verifier for a signed qualification manifest. It
+    /// validates the signature and the inert schema but does not download or
+    /// load any artifact.
+    #[command(name = "__openasr-verify-qualification-manifest", hide = true)]
+    VerifyQualificationManifest {
+        /// Exact-cell qualification manifest file to verify.
+        manifest: PathBuf,
+        /// qualification-manifest.signature.json sidecar.
+        #[arg(long)]
+        signature: PathBuf,
+        /// Canonical immutable release URL the signature must bind.
+        #[arg(long)]
+        manifest_url: String,
+    },
+    /// Explicit parent runner for inert, signed backend qualification assets.
+    /// It has no plugin-path or activation-mode argument and spawns a fresh
+    /// child using this exact executable.
+    #[command(name = "__openasr-qualify-backend", hide = true)]
+    QualifyBackend {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        signature: PathBuf,
+        #[arg(long)]
+        manifest_url: String,
+        #[arg(long)]
+        qualification_home: PathBuf,
+    },
+    /// Fresh-process half of `__openasr-qualify-backend`. The expected
+    /// manifest digest binds the child to the bytes the parent prepared.
+    #[command(name = "__openasr-qualification-child", hide = true)]
+    QualificationChild {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        signature: PathBuf,
+        #[arg(long)]
+        manifest_url: String,
+        #[arg(long)]
+        qualification_home: PathBuf,
+        #[arg(long)]
+        expected_manifest_sha256: String,
+    },
     /// Transcribe one or more audio files (or directories of audio).
     #[command(visible_alias = "t")]
     Transcribe {
@@ -363,6 +536,10 @@ pub(crate) enum Command {
         #[command(flatten)]
         language_task: LanguageTaskCliOptions,
     },
+    /// Force-align a user-provided plain-text transcript onto audio and emit a
+    /// timed timeline (JSON / SRT / VTT). Requires the Qwen3-ForcedAligner
+    /// pack; this command is itself the consent to install it unless `--offline`.
+    Align(AlignCliArgs),
     /// Run the committed performance suite (RTF + peak RSS + WER) and gate
     /// against a baseline.
     BenchSuite {
@@ -529,6 +706,11 @@ pub(crate) enum Command {
         /// Environment variable containing the pairing administrator token for remote device approval.
         #[arg(long)]
         pairing_admin_token_env: Option<String>,
+        /// Owner-only file holding the pairing administrator token. Created
+        /// with a random token if missing. When this flag is set, a non-empty
+        /// `$OPENASR_PAIRING_ADMIN_TOKEN` is used instead of the file.
+        #[arg(long, value_name = "PATH")]
+        pairing_admin_token_file: Option<PathBuf>,
         /// Model id from the registry.
         #[arg(long, env = "OPENASR_MODEL")]
         model: Option<String>,
@@ -628,13 +810,26 @@ pub(crate) enum BackendPluginCommand {
     },
     /// Remove the optional GPU selector; bundled CPU remains.
     Deactivate,
-    /// Reclaim unselected backend-pack generations and shared vendor objects.
-    /// Active and explicitly retained backend ids are never removed.
+    /// Reclaim replaced backend-pack generations and unreferenced vendor objects.
+    /// Installed library packs stay until explicitly uninstalled.
     Gc {
         #[arg(long = "keep-backend-id")]
         keep_backend_ids: Vec<String>,
         #[arg(long, default_value_t = 7 * 24 * 60 * 60)]
         min_age_seconds: u64,
+    },
+    /// List installed optional GPU packs (library membership, not the active kernel).
+    List,
+    /// Delete one vendor's installed library pack. Refuses if that pack is in use.
+    Uninstall {
+        #[arg(value_parser = ["cuda", "hip"])]
+        provider: String,
+    },
+    /// Import an official CUDA/HIP pack from a local file or folder. Does not activate.
+    Import {
+        #[arg(value_parser = ["cuda", "hip"])]
+        provider: String,
+        path: PathBuf,
     },
 }
 
@@ -686,6 +881,10 @@ pub(crate) enum BenchReceiptCommand {
         /// native candidate records execution facts.
         #[arg(long)]
         trace_out: Option<PathBuf>,
+        /// Write the complete per-step f32 logits artifact. Requires
+        /// `--trace-out` and a native FullLogits execution plan.
+        #[arg(long, requires = "trace_out")]
+        logits_out: Option<PathBuf>,
     },
     /// Validate one or more receipts with the core-owned release qualification
     /// predicate. This command does not approve a matrix cell; it only proves
@@ -695,6 +894,13 @@ pub(crate) enum BenchReceiptCommand {
         /// Receipt JSON to validate. Repeat for every candidate receipt.
         #[arg(long, required = true)]
         receipt: Vec<PathBuf>,
+    },
+    /// Bind a native short-audio cold+reuse pair to formal evidence.v1.
+    /// Generic `short-audio` remains evidence-free.
+    #[command(name = "qualify-family", hide = true)]
+    QualifyFamily {
+        #[command(flatten)]
+        args: Box<QualifyFamilyDecodeArgs>,
     },
 }
 

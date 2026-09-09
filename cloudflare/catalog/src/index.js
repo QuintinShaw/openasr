@@ -31,37 +31,45 @@ function denied(status, message, extraHeaders = {}) {
   });
 }
 
+/// Shared by the Cloudflare Worker and the Aliyun ESA twin (`index.esa.js`).
+/// `getAsset(filename)` must return the committed catalog / signature bytes
+/// verbatim — no JSON parse/stringify, which would break the signed sha256.
+export async function handleCatalogRequest(request, getAsset) {
+  const url = new URL(request.url);
+
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+  if (request.method !== "GET") {
+    return denied(405, "Method Not Allowed: the catalog host serves GET only", {
+      Allow: ALLOWED_METHODS,
+    });
+  }
+  const match = CATALOG_PATH.exec(url.pathname);
+  if (!match) {
+    return denied(
+      403,
+      "Forbidden: only the OpenASR catalog and its signature manifest are served here",
+    );
+  }
+
+  const asset = await getAsset(match[1]);
+  if (!asset || !asset.ok) {
+    const status = asset?.status === 404 ? 404 : 502;
+    return denied(status, `Catalog asset unavailable (${asset?.status ?? "missing"})`);
+  }
+
+  const headers = new Headers(CORS_HEADERS);
+  headers.set("Content-Type", "application/json; charset=utf-8");
+  headers.set("Cache-Control", "public, max-age=300");
+  return new Response(asset.body, { status: 200, headers });
+}
+
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
-
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: CORS_HEADERS });
-    }
-    if (request.method !== "GET") {
-      return denied(405, "Method Not Allowed: the catalog host serves GET only", {
-        Allow: ALLOWED_METHODS,
-      });
-    }
-    const match = CATALOG_PATH.exec(url.pathname);
-    if (!match) {
-      return denied(
-        403,
-        "Forbidden: only the OpenASR catalog and its signature manifest are served here",
-      );
-    }
-
-    // Serve the byte-identical asset (no transform — preserving sha256/signature).
-    // The asset name is rev-independent; the signed catalog_url identity is checked
-    // by the client, not here.
-    const asset = await env.ASSETS.fetch(new Request(new URL(`/${match[1]}`, url.origin)));
-    if (!asset.ok) {
-      return denied(asset.status === 404 ? 404 : 502, `Catalog asset unavailable (${asset.status})`);
-    }
-
-    const headers = new Headers(CORS_HEADERS);
-    headers.set("Content-Type", "application/json; charset=utf-8");
-    headers.set("Cache-Control", "public, max-age=300");
-    return new Response(asset.body, { status: 200, headers });
+    const origin = new URL(request.url).origin;
+    return handleCatalogRequest(request, (name) =>
+      env.ASSETS.fetch(new Request(new URL(`/${name}`, origin))),
+    );
   },
 };

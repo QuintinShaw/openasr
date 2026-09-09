@@ -28,7 +28,9 @@ The harness drives the **real** transcription call path (`transcribe_with_backen
 → `NativeBackend`), the same one `transcribe --benchmark` and `bench-suite` use — it measures
 the production runtime, not a re-implementation. Each entry runs in a fresh
 subprocess (`--run-single-entry`), so its peak RSS (a process high-water mark)
-is uncontaminated by earlier entries.
+is uncontaminated by earlier entries. Published Docker images are runtime-only
+and do not include these fixtures or baselines; run `bench-suite` from a git
+checkout.
 
 ## What is gated
 

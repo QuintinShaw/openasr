@@ -152,28 +152,31 @@ done
 [ "${#correctness_receipts[@]}" -ge 4 ] || fail "qualification runs contain no correctness receipt cell"
 [ "${#correctness_traces[@]}" -ge 2 ] || fail "qualification runs contain no correctness traces"
 
-gh release download "$tag" --repo "$repository" \
-  -p 'backend-pack-*.json' -p 'SHA256SUMS' \
-  -D "$workdir/release" --clobber
+python3 tooling/release-manifest/gh_release.py download-packs \
+  "$tag" "$workdir/release" --repo "$repository"
+python3 tooling/release-manifest/gh_release.py download \
+  "$tag" "$workdir/release" SHA256SUMS --repo "$repository"
 backend_entries=("$workdir"/release/backend-pack-*.json)
 [ "${#backend_entries[@]}" -eq 21 ] || fail "release does not contain exactly 21 backend entries"
 
-while IFS= read -r filename || [ -n "$filename" ]; do
-  [ -n "$filename" ] || continue
-  gh release download "$tag" --repo "$repository" \
-    -p "$filename" -D "$workdir/release" --clobber
-done < <(python3 - "$hardware_raw" <<'PY'
-import json, pathlib, sys
-raw = json.load(open(sys.argv[1], encoding="utf-8"))
-names = set()
+python3 - "$tag" "$repository" "$workdir/release" "$hardware_raw" <<'PY'
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, "tooling/release-manifest")
+import gh_release
+
+tag, repository, dest = sys.argv[1], sys.argv[2], pathlib.Path(sys.argv[3])
+raw = json.load(open(sys.argv[4], encoding="utf-8"))
+names = []
 for subject in raw.get("attested_release_subjects", []):
     name = subject.get("filename") if isinstance(subject, dict) else None
     if not isinstance(name, str) or pathlib.Path(name).name != name:
         raise SystemExit("hardware audit has an unsafe release subject")
-    names.add(name)
-print("\n".join(sorted(names)))
+    names.append(name)
+gh_release.download_assets(tag, names, dest, repository=repository)
 PY
-)
 
 entry_args=()
 for entry in "${backend_entries[@]}"; do entry_args+=(--entry "$entry"); done

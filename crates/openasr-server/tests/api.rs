@@ -20,7 +20,40 @@ use std::{
 use tower::ServiceExt;
 
 const SERVER_INSTANCE_TOKEN_ENV: &str = "OPENASR_SERVER_INSTANCE_TOKEN";
+const OPENASR_DEVICE_ENV: &str = "OPENASR_DEVICE";
 const LIVE_PULL_FIXTURE_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+
+struct OpenasrDeviceEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: Option<String>,
+}
+
+impl OpenasrDeviceEnvGuard {
+    fn unset() -> Self {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var(OPENASR_DEVICE_ENV).ok();
+        unsafe { std::env::remove_var(OPENASR_DEVICE_ENV) };
+        Self {
+            _lock: lock,
+            previous,
+        }
+    }
+}
+
+impl Drop for OpenasrDeviceEnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(OPENASR_DEVICE_ENV, value),
+                None => std::env::remove_var(OPENASR_DEVICE_ENV),
+            }
+        }
+    }
+}
 
 /// The product default `dictation_shortcut` for the host this test binary is
 /// compiled for -- mirrors openasr-core's `default_dictation_shortcut()`
@@ -1203,7 +1236,7 @@ async fn health_reports_model_bound_but_not_resident_before_any_load() {
     // actual load (warm-up or first request) completes.
     let temp = tempfile::tempdir().unwrap();
     let pack_root = temp.path().join("native-pack.oasr");
-    write_mock_gguf_runtime_source(&pack_root, None);
+    write_mock_gguf_runtime_source(&pack_root, Some("native-pack"));
     let app = openasr_server::app_with_runtime(openasr_server::ServerRuntime {
         backend: openasr_core::BackendKind::Native,
         native_execution: openasr_server::NativeExecutionSupervisor::default(),
@@ -1689,6 +1722,7 @@ async fn content_addressed_refs_drive_local_and_default_model_endpoints() {
 
 #[tokio::test]
 async fn default_model_endpoint_marks_local_pack_and_clears_default_on_delete() {
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let (source_pack, distribution) = write_moonshine_pull_fixture(temp.path());
     let home = distribution.openasr_home.as_ref().unwrap().clone();
@@ -1834,6 +1868,7 @@ async fn default_model_endpoint_marks_local_pack_and_clears_default_on_delete() 
 
 #[tokio::test]
 async fn default_model_endpoint_rejects_uninstalled_pack() {
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let (_, distribution) = write_moonshine_pull_fixture(temp.path());
     let app = openasr_server::app_with_runtime_and_distribution(
@@ -1945,6 +1980,7 @@ async fn json_request(
 
 #[tokio::test]
 async fn set_default_rebinds_native_bound_pack_without_restart() {
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let moonshine = install_native_pack(
@@ -2009,6 +2045,7 @@ async fn set_default_rebinds_native_bound_pack_without_restart() {
 
 #[tokio::test]
 async fn set_default_binds_unbound_native_runtime_without_restart() {
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let moonshine = install_native_pack(
@@ -4411,6 +4448,7 @@ async fn history_delete_requires_matching_if_match_revision() {
             segments: Vec::new(),
             subtitle_cues: Vec::new(),
             timeline_quality: None,
+            timeline_degraded_reason: None,
         })
         .unwrap();
     store
@@ -4589,6 +4627,7 @@ async fn history_list_supports_search_pagination_and_kind_filter() {
         segments: Vec::new(),
         subtitle_cues: Vec::new(),
         timeline_quality: None,
+        timeline_degraded_reason: None,
         text: text.to_string(),
     };
     let oldest = store
@@ -4917,15 +4956,376 @@ async fn paired_device_cannot_enable_voice_id_on_remote_compute_routes() {
         }
 
         let response = app.clone().oneshot(request).await.unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
-            "paired device Voice ID must fail closed for {uri} (marker={include_remote_marker})"
-        );
         let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
         let body = String::from_utf8_lossy(&body);
-        assert!(body.contains("available only for local file transcription"));
-        assert!(body.contains("omit diarize=true"));
+        assert!(
+            !body.contains("omit diarize=true"),
+            "remote anonymous speaker separation must not be rejected as Voice ID for {uri} (marker={include_remote_marker}): {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn return_speaker_embeddings_without_diarize_is_invalid_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+    let request = multipart_request_with_extra_fields(
+        "/v1/audio/transcriptions",
+        "whisper-large-v3-turbo",
+        "sample.wav",
+        b"not a real wav",
+        &[
+            ("return_speaker_embeddings", "true"),
+            ("response_format", "verbose_json"),
+        ],
+    );
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("return_speaker_embeddings requires diarize=true"),
+        "unexpected message: {message}"
+    );
+}
+
+#[tokio::test]
+async fn return_speaker_embeddings_requires_verbose_json() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+    let request = multipart_request_with_extra_fields(
+        "/v1/audio/transcriptions",
+        "whisper-large-v3-turbo",
+        "sample.wav",
+        b"not a real wav",
+        &[
+            ("diarize", "true"),
+            ("return_speaker_embeddings", "true"),
+            ("response_format", "json"),
+        ],
+    );
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("return_speaker_embeddings requires response_format=verbose_json"),
+        "unexpected message: {message}"
+    );
+}
+
+#[tokio::test]
+async fn paired_device_cannot_request_speaker_embeddings() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+        openasr_server::ServerLaunchOptions {
+            auth: openasr_server::ServerAuth::pairing("admin-secret"),
+            ..Default::default()
+        },
+    );
+    let (_device_id, bearer_token) =
+        create_approved_pairing_credential(&app, "Remote Compute Mac").await;
+
+    for (uri, include_remote_marker) in [
+        ("/v1/audio/transcriptions", true),
+        ("/v1/audio/transcriptions", false),
+        ("/v1/audio/transcriptions?stream=true", true),
+        ("/v1/audio/translations", true),
+    ] {
+        let mut request = multipart_request_with_extra_fields(
+            uri,
+            "whisper-large-v3-turbo",
+            "sample.wav",
+            b"not a real wav",
+            &[
+                ("diarize", "true"),
+                ("return_speaker_embeddings", "true"),
+                ("response_format", "verbose_json"),
+            ],
+        );
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {bearer_token}").parse().unwrap(),
+        );
+        if include_remote_marker {
+            request
+                .headers_mut()
+                .insert("x-openasr-remote-compute", "client".parse().unwrap());
+        }
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "device token must be 403 for {uri} (marker={include_remote_marker})"
+        );
+        let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["error"]["type"], "authorization_error",
+            "{uri} marker={include_remote_marker}"
+        );
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.to_ascii_lowercase().contains("biometric"),
+            "403 must name biometric-derived data for {uri}: {message}"
+        );
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            !body.contains("SPEAKER_00") || !body.contains('['),
+            "403 body must not leak embedding vectors for {uri}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn operator_and_loopback_may_request_speaker_embeddings_without_403() {
+    let temp = tempfile::tempdir().unwrap();
+    let pairing_app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+        openasr_server::ServerLaunchOptions {
+            auth: openasr_server::ServerAuth::pairing("admin-secret"),
+            ..Default::default()
+        },
+    );
+    let operator_request = {
+        let mut request = multipart_request_with_extra_fields(
+            "/v1/audio/transcriptions",
+            "whisper-large-v3-turbo",
+            "sample.wav",
+            b"not a real wav",
+            &[
+                ("diarize", "true"),
+                ("return_speaker_embeddings", "true"),
+                ("response_format", "verbose_json"),
+            ],
+        );
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Bearer admin-secret".parse().unwrap(),
+        );
+        request
+    };
+    let operator = pairing_app.oneshot(operator_request).await.unwrap();
+    assert_ne!(
+        operator.status(),
+        StatusCode::FORBIDDEN,
+        "operator must not be 403 for return_speaker_embeddings"
+    );
+
+    let loopback_app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home-loopback")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+    let loopback = loopback_app
+        .oneshot(multipart_request_with_extra_fields(
+            "/v1/audio/transcriptions",
+            "whisper-large-v3-turbo",
+            "sample.wav",
+            b"not a real wav",
+            &[
+                ("diarize", "true"),
+                ("return_speaker_embeddings", "true"),
+                ("response_format", "verbose_json"),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_ne!(
+        loopback.status(),
+        StatusCode::FORBIDDEN,
+        "loopback must not be 403 for return_speaker_embeddings"
+    );
+}
+
+#[tokio::test]
+async fn streaming_return_speaker_embeddings_is_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+    let request = multipart_request_with_extra_fields(
+        "/v1/audio/transcriptions?stream=true",
+        "whisper-large-v3-turbo",
+        "sample.wav",
+        b"not a real wav",
+        &[
+            ("diarize", "true"),
+            ("return_speaker_embeddings", "true"),
+            ("response_format", "verbose_json"),
+        ],
+    );
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("not supported on streaming"),
+        "unexpected message: {message}"
+    );
+}
+
+/// Promise: streaming (`?stream=true`) rejects `return_speaker_embeddings`
+/// with HTTP 400. CHANGELOG/http-api apply that gate to the translations
+/// alias as well as transcriptions.
+///
+/// If correct: `POST /v1/audio/translations?stream=true` with the field is
+/// 400 `invalid_request_error` and the body names streaming. Otherwise Y:
+/// translations ignores the query flag and returns a JSON body (mock 200)
+/// or a non-streaming error.
+#[tokio::test]
+async fn rt_379_translations_stream_rejects_speaker_embeddings() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+    let request = multipart_request_with_extra_fields(
+        "/v1/audio/translations?stream=true",
+        "whisper-large-v3-turbo",
+        "sample.wav",
+        b"not a real wav",
+        &[
+            ("diarize", "true"),
+            ("return_speaker_embeddings", "true"),
+            ("response_format", "verbose_json"),
+        ],
+    );
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "translations?stream=true must reject embeddings with 400, not succeed as non-stream JSON"
+    );
+    let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("not supported on streaming"),
+        "unexpected message: {message}"
+    );
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        !body.contains("speaker_embeddings"),
+        "stream reject must not leak embedding vectors: {body}"
+    );
+}
+
+/// Promise: a remote-compute device token requesting speaker embeddings is
+/// rejected with HTTP 403 `authorization_error` (fail-closed, not a silent
+/// strip) on every compute entry, including `POST /v1/audio/precise-timeline`.
+///
+/// If correct: 403 + `authorization_error` + biometric wording, and the body
+/// has no vectors. Otherwise Y: the form field is ignored as an unknown
+/// precise-timeline field and the request continues as 400/200.
+#[tokio::test]
+async fn rt_379_device_token_precise_timeline_rejects_speaker_embeddings() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime {
+            openasr_home: Some(temp.path().join("home")),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+        openasr_server::ServerLaunchOptions {
+            auth: openasr_server::ServerAuth::pairing("admin-secret"),
+            ..Default::default()
+        },
+    );
+    let (_device_id, bearer_token) =
+        create_approved_pairing_credential(&app, "Remote Compute Mac").await;
+
+    for include_remote_marker in [true, false] {
+        let mut request = multipart_request_with_extra_fields(
+            "/v1/audio/precise-timeline",
+            "whisper-large-v3-turbo",
+            "sample.wav",
+            b"not a real wav",
+            &[
+                ("transcript", "hello world"),
+                ("return_speaker_embeddings", "true"),
+                ("response_format", "verbose_json"),
+                ("diarize", "true"),
+            ],
+        );
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {bearer_token}").parse().unwrap(),
+        );
+        if include_remote_marker {
+            request
+                .headers_mut()
+                .insert("x-openasr-remote-compute", "client".parse().unwrap());
+        }
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "device token must be 403 for precise-timeline embeddings (marker={include_remote_marker})"
+        );
+        let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["error"]["type"], "authorization_error",
+            "marker={include_remote_marker}"
+        );
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.to_ascii_lowercase().contains("biometric"),
+            "403 must name biometric-derived data for precise-timeline: {message}"
+        );
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            !body.contains("SPEAKER_00") || !body.contains('['),
+            "403 body must not leak embedding vectors: {body}"
+        );
     }
 }
 
@@ -5540,10 +5940,13 @@ async fn stream_transcriptions_with_mock_backend_emits_protocol_events() {
     );
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     let body = String::from_utf8_lossy(&bytes);
+    assert!(body.contains("event: session.created"), "{body}");
     assert!(body.contains("event: segment_start"));
     assert!(body.contains("event: final"));
     assert!(body.contains("event: segment_end"));
     assert!(body.contains("event: done"));
+    assert!(body.contains("id: proto_000001"), "{body}");
+    assert!(body.contains("id: proto_000002"), "{body}");
     assert!(body.contains("\"totalLatencyMs\":"));
 }
 
@@ -5702,11 +6105,13 @@ async fn stream_transcriptions_with_native_backend_reject_model_mismatch() {
     );
     let response = app.oneshot(request).await.unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let bytes = to_bytes(response.into_body(), 1024 * 256).await.unwrap();
     let body = String::from_utf8_lossy(&bytes);
-    assert!(body.contains("event: error"));
-    assert!(body.contains("\"status\":\"error\""));
+    assert!(
+        body.contains("does not match") || body.contains("model"),
+        "model mismatch must fail closed over HTTP before SSE: {body}"
+    );
 }
 
 #[tokio::test]
@@ -5732,18 +6137,9 @@ async fn stream_transcriptions_with_native_xasr_hotword_emits_model_unsupported_
     );
     let response = app.oneshot(request).await.unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok()),
-        Some("text/event-stream")
-    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let bytes = to_bytes(response.into_body(), 1024 * 256).await.unwrap();
     let body = String::from_utf8_lossy(&bytes);
-    assert!(body.contains("event: error"));
-    assert!(body.contains("\"status\":\"error\""));
     assert!(body.contains("Phrase bias / hotword boosting is not supported"));
     assert!(body.contains("'xasr-zipformer' native model family"));
     assert!(body.contains("ggml-family-xasr-zipformer-runtime-v1"));
@@ -5839,6 +6235,7 @@ async fn models_with_native_backend_lists_loaded_local_pack_id() {
     let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
     let parsed: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(parsed["data"][0]["id"], "native-pack");
+    assert!(parsed["data"][0].get("pull").is_none());
 }
 
 #[tokio::test]

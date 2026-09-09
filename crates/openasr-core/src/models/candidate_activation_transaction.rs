@@ -1570,6 +1570,11 @@ pub struct DefaultModelActivationJournalFactory {
 enum DefaultModelActivationPublication {
     PersistSelection,
     ReactivateDurableSelection,
+    /// Attest the process launch pack without reading or writing durable V2.
+    /// Used when `openasr serve --model` binds a pack that is not the stored
+    /// default: residency still has to come up, but the durable selection
+    /// must stay untouched.
+    AttestLaunchPack,
 }
 
 /// Opaque production journal. Families and the server cannot call publish.
@@ -1608,6 +1613,20 @@ impl DefaultModelActivationJournalFactory {
             pack,
             preference,
             publication: DefaultModelActivationPublication::ReactivateDurableSelection,
+            write_fault: None,
+        }
+    }
+
+    pub fn attest_launch_pack(
+        home: std::path::PathBuf,
+        pack: crate::InstalledPack,
+        preference: crate::QuantPreference,
+    ) -> Self {
+        Self {
+            home,
+            pack,
+            preference,
+            publication: DefaultModelActivationPublication::AttestLaunchPack,
             write_fault: None,
         }
     }
@@ -1735,6 +1754,7 @@ impl
                     Err(error) => Err(PublicationFailure::Rejected(error.to_string())),
                 }
             }
+            DefaultModelActivationPublication::AttestLaunchPack => Ok(()),
         }
     }
 

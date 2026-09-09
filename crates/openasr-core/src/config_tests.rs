@@ -101,6 +101,7 @@ fn catalog_model(id: &str, family: &str, aliases: &[&str], size: &str) -> ModelC
         generated_at: "2026-06-04T00:00:00Z".to_string(),
         catalog_url: "fixture".to_string(),
         backends: Vec::new(),
+        execution_approvals: None,
         language_labels: std::collections::BTreeMap::new(),
         models: vec![crate::CatalogModel {
             id: id.to_string(),
@@ -323,6 +324,10 @@ fn voice_id_segmenter_preference_is_additive_and_roundtrips() {
         legacy.voice_id_segmenter,
         crate::config::VoiceIdSegmenterPreference::Auto
     );
+    assert_eq!(
+        legacy.voice_id_embedder,
+        crate::config::VoiceIdEmbedderPreference::ReDimNet2
+    );
 
     let forced = Preferences {
         voice_id_segmenter: crate::config::VoiceIdSegmenterPreference::Segmentation3_0,
@@ -463,6 +468,32 @@ fn download_source_rejects_unknown_value() {
     let error = config
         .set(ConfigKey::DownloadSource, "modelscope", &registry())
         .unwrap_err();
+    assert!(
+        matches!(error, ConfigError::UnsupportedDownloadSource(value) if value == "modelscope")
+    );
+}
+
+#[test]
+fn download_source_validate_rejects_hand_edited_modelscope_pin() {
+    let config = OpenAsrConfig {
+        download_source: DownloadSourcePref::pinned(DownloadSource::ModelScope),
+        ..OpenAsrConfig::default()
+    };
+    let error = config.validate(&registry()).unwrap_err();
+    assert!(
+        matches!(error, ConfigError::UnsupportedDownloadSource(value) if value == "modelscope")
+    );
+}
+
+#[test]
+fn load_config_rejects_hand_edited_modelscope_pin() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.json"),
+        r#"{"download_source":{"mode":"pinned","source":"modelscope"}}"#,
+    )
+    .unwrap();
+    let error = load_config(temp.path()).unwrap_err();
     assert!(
         matches!(error, ConfigError::UnsupportedDownloadSource(value) if value == "modelscope")
     );
@@ -778,5 +809,26 @@ fn voice_id_segmenter_preference_has_stable_wire_values() {
     assert_eq!(
         serde_json::from_str::<VoiceIdSegmenterPreference>("\"segmentation_3_0\"").unwrap(),
         VoiceIdSegmenterPreference::Segmentation3_0
+    );
+}
+
+#[test]
+fn voice_id_embedder_preference_has_stable_wire_values() {
+    assert_eq!(
+        serde_json::to_string(&VoiceIdEmbedderPreference::ReDimNet2).unwrap(),
+        "\"redimnet2\""
+    );
+    assert_eq!(
+        serde_json::to_string(&VoiceIdEmbedderPreference::WeSpeaker).unwrap(),
+        "\"wespeaker\""
+    );
+    assert_eq!(
+        serde_json::from_str::<VoiceIdEmbedderPreference>("\"wespeaker\"").unwrap(),
+        VoiceIdEmbedderPreference::WeSpeaker
+    );
+    let legacy: Preferences = serde_json::from_str(r#"{"version":1}"#).unwrap();
+    assert_eq!(
+        legacy.voice_id_embedder,
+        VoiceIdEmbedderPreference::ReDimNet2
     );
 }

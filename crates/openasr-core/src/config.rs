@@ -9,10 +9,11 @@ use thiserror::Error;
 
 use crate::{
     BackendKind, ExecutionTarget, ModelCard, ModelCatalog, ModelResolutionError, PhraseBiasConfig,
-    RuntimeModelResolutionError, atomic_file, resolve_registry_model_ref,
-    resolve_runtime_model_ref,
+    RuntimeModelResolutionError, atomic_file,
+    download_source::{DownloadSource, DownloadSourcePref},
+    launch_pack::QuantPreference,
+    resolve_registry_model_ref, resolve_runtime_model_ref,
 };
-use crate::{download_source::DownloadSourcePref, launch_pack::QuantPreference};
 
 /// The CLI's bare-invocation convention: which model id `transcribe`/`live`/
 /// `pull` resolve to when the caller passes neither `--model` nor has a
@@ -85,6 +86,10 @@ pub struct Preferences {
     /// baseline.
     #[serde(default)]
     pub voice_id_segmenter: VoiceIdSegmenterPreference,
+    /// Global speaker-embedder preference. Default stays ReDimNet2-B6.
+    /// WeSpeaker is explicit-only; there is no Auto "use whatever is installed".
+    #[serde(default)]
+    pub voice_id_embedder: VoiceIdEmbedderPreference,
     #[serde(default)]
     pub word_timestamps: bool,
     #[serde(default)]
@@ -128,6 +133,16 @@ pub enum VoiceIdSegmenterPreference {
     Auto,
     #[serde(rename = "segmentation_3_0")]
     Segmentation3_0,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceIdEmbedderPreference {
+    #[default]
+    #[serde(rename = "redimnet2")]
+    ReDimNet2,
+    #[serde(rename = "wespeaker")]
+    WeSpeaker,
 }
 
 /// How much dictation/transcription history to keep on disk.
@@ -356,6 +371,7 @@ impl Default for Preferences {
             language: None,
             diarize: false,
             voice_id_segmenter: VoiceIdSegmenterPreference::Auto,
+            voice_id_embedder: VoiceIdEmbedderPreference::ReDimNet2,
             word_timestamps: false,
             auto_save: false,
             launch_at_login: false,
@@ -475,6 +491,16 @@ impl OpenAsrConfig {
                     default_backend.to_string(),
                 ));
             }
+        }
+        if matches!(
+            self.download_source,
+            DownloadSourcePref::Pinned {
+                source: DownloadSource::ModelScope
+            }
+        ) {
+            return Err(ConfigError::UnsupportedDownloadSource(
+                "modelscope".to_string(),
+            ));
         }
         if let Some(models_dir) = self.models_dir.as_deref() {
             // Deliberately lenient beyond "absolute": an override naming a
@@ -605,8 +631,23 @@ pub fn load_config_document(
 ) -> Result<OpenAsrConfigDocument, ConfigError> {
     let path = config_path(openasr_home);
     match fs::read_to_string(&path) {
-        Ok(contents) => serde_json::from_str(&contents)
-            .map_err(|source| ConfigError::ParseConfig { path, source }),
+        Ok(contents) => {
+            let document: OpenAsrConfigDocument = serde_json::from_str(&contents)
+                .map_err(|source| ConfigError::ParseConfig { path, source })?;
+            // User-facing knobs stay china/global. A hand-edited pin must not
+            // sneak ModelScope past parse_env_value.
+            if matches!(
+                document.config.download_source,
+                DownloadSourcePref::Pinned {
+                    source: DownloadSource::ModelScope
+                }
+            ) {
+                return Err(ConfigError::UnsupportedDownloadSource(
+                    "modelscope".to_string(),
+                ));
+            }
+            Ok(document)
+        }
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
             Ok(OpenAsrConfigDocument::default())
         }

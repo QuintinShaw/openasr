@@ -189,6 +189,9 @@ pub(crate) struct WsSession {
     pub(crate) history_duration_ms: u64,
     pub(crate) history_recorded: bool,
     pub(crate) record_history: bool,
+    pub(crate) pairing_device_id: Option<String>,
+    pub(crate) caller_is_operator: bool,
+    pub(crate) remote_compute_client: bool,
     pub(crate) backend_failed: bool,
     pub(crate) closed: bool,
     pub(crate) captured_audio_frames: VecDeque<RealtimeAudioFrame>,
@@ -466,7 +469,7 @@ fn realtime_phrase_bias_rejection_message(
     capability: openasr_core::api::backend::BackendFeatureCapability,
 ) -> String {
     if runtime.backend == openasr_core::BackendKind::Native
-        && let Some(path) = runtime.model_pack_path.current()
+        && let Some(path) = runtime.model_pack_path.served_pack_path()
         && let Some(adapter) = native_runtime_model_adapter_for_path(&path)
     {
         return format!(
@@ -489,14 +492,35 @@ impl WsSession {
         distribution: DistributionContext,
         event_sender: mpsc::Sender<RealtimeEventEnvelope>,
     ) -> Self {
-        Self::new_with_history(runtime, distribution, event_sender, true)
+        Self::new_with_remote_identity(runtime, distribution, event_sender, true, None, true, false)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_history(
         runtime: ServerRuntime,
         distribution: DistributionContext,
         event_sender: mpsc::Sender<RealtimeEventEnvelope>,
         record_history: bool,
+    ) -> Self {
+        Self::new_with_remote_identity(
+            runtime,
+            distribution,
+            event_sender,
+            record_history,
+            None,
+            true,
+            false,
+        )
+    }
+
+    pub(crate) fn new_with_remote_identity(
+        runtime: ServerRuntime,
+        distribution: DistributionContext,
+        event_sender: mpsc::Sender<RealtimeEventEnvelope>,
+        record_history: bool,
+        pairing_device_id: Option<String>,
+        caller_is_operator: bool,
+        remote_compute_client: bool,
     ) -> Self {
         let (audio_frames, audio_frame_receiver) = mpsc::channel(AUDIO_FRAME_QUEUE_CAPACITY);
         let format = RealtimeAudioFormat::pcm16_mono_16khz();
@@ -544,6 +568,9 @@ impl WsSession {
             history_duration_ms: 0,
             history_recorded: false,
             record_history,
+            pairing_device_id,
+            caller_is_operator,
+            remote_compute_client,
             backend_failed: false,
             closed: false,
             captured_audio_frames: VecDeque::new(),
@@ -749,12 +776,158 @@ impl WsSession {
         Ok(())
     }
 
+    fn park_for_reconnect(&mut self) {
+        let policy = self.runtime.native_execution.remote_policy();
+        policy.hold_realtime(
+            self.session_id.0.clone(),
+            Arc::clone(&self.backend_control),
+            self.pairing_device_id.clone(),
+        );
+        super::park_realtime_control(
+            self.session_id.0.clone(),
+            super::ParkedRealtimeControl {
+                controller: self.controller.take(),
+                streaming_diarizer: self.streaming_diarizer.take(),
+                native_speaker_change_detector: self.native_speaker_change_detector.take(),
+            },
+        );
+        super::spawn_held_realtime_expiry(
+            policy.clone(),
+            self.runtime.clone(),
+            self.distribution.clone(),
+            self.session_id.0.clone(),
+        );
+    }
+
+    async fn resume_held_realtime(&mut self, resume_id: &str) -> Result<(), ()> {
+        let policy = self.runtime.native_execution.remote_policy();
+        let Some(control) = policy.resume_realtime(
+            resume_id,
+            SystemTime::now(),
+            self.pairing_device_id.as_deref(),
+            self.caller_is_operator,
+        ) else {
+            self.emit_error(
+                RealtimeErrorCode::BackendNotReady,
+                "The remote session is no longer available.",
+                false,
+            )
+            .await?;
+            return Err(());
+        };
+        self.session_id = RealtimeSessionId(resume_id.to_string());
+        self.sequencer = RealtimeEventSequencer::new(self.session_id.clone());
+        self.backend_control = control;
+        self.closed = false;
+        if let Some(worker) = super::take_parked_native_realtime_worker(resume_id) {
+            self.native_streaming = Some(worker);
+        }
+        if let Some(parked) = super::take_parked_realtime_control(resume_id) {
+            self.controller = parked.controller;
+            self.streaming_diarizer = parked.streaming_diarizer;
+            self.native_speaker_change_detector = parked.native_speaker_change_detector;
+        }
+        // A resumed Running session must emit audio.input.started so the
+        // client handshake can complete.
+        self.emit_event(RealtimeEvent::AudioInput(
+            openasr_core::RealtimeAudioInputEvent::Started(
+                openasr_core::realtime::events::AudioInputStartedEvent {},
+            ),
+        ))
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) fn observe_idle_for_pending_switch(&self) {
+        crate::schedule_apply_pending_idle_switch_when_native_idle(
+            self.runtime.clone(),
+            self.distribution.clone(),
+        );
+    }
+
+    fn attach_anonymous_streaming_diarizer(&mut self) -> Result<(), String> {
+        match openasr_core::diarize::embed::PolicyResolvedSpeakerRuntime::load(Arc::clone(
+            self.runtime.native_execution.execution_services(),
+        )) {
+            Ok(Some(runtime)) => {
+                self.streaming_diarizer = Some(runtime.anonymous_diarizer(16_000));
+                self.native_speaker_change_detector = Some(runtime.speaker_change_detector(16_000));
+                Ok(())
+            }
+            Ok(None) => {
+                #[cfg(test)]
+                {
+                    self.attach_test_anonymous_diarizer();
+                    Ok(())
+                }
+                #[cfg(not(test))]
+                Err(
+                    openasr_core::diarize::embed::REALTIME_DIARIZATION_EMBEDDER_MISSING_REASON
+                        .to_string(),
+                )
+            }
+            Err(error) => {
+                #[cfg(test)]
+                {
+                    let _ = error;
+                    self.attach_test_anonymous_diarizer();
+                    Ok(())
+                }
+                #[cfg(not(test))]
+                Err(format!(
+                    "{} ({error})",
+                    openasr_core::diarize::embed::DIARIZATION_EMBEDDER_LOAD_FAILED_REASON
+                ))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn attach_test_anonymous_diarizer(&mut self) {
+        self.streaming_diarizer = Some(
+            openasr_core::diarize::streaming::StreamingDiarizer::with_embedder(
+                &TEST_ANONYMOUS_EMBEDDER,
+                16_000,
+            ),
+        );
+    }
+
     pub(crate) async fn start_session(&mut self, session: StartSession) -> Result<(), ()> {
         if self.controller.is_some() {
             self.emit_error(
                 RealtimeErrorCode::StartupConfigError,
                 "Realtime session.start was received after a session was already started.",
                 false,
+            )
+            .await?;
+            return Err(());
+        }
+        if let Some(resume_id) = session
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            return self.resume_held_realtime(resume_id).await;
+        }
+        let policy = self.runtime.native_execution.remote_policy();
+        if !policy.admits_new_tasks() {
+            self.emit_error(
+                RealtimeErrorCode::BackendNotReady,
+                crate::PENDING_IDLE_SWITCH_MESSAGE,
+                true,
+            )
+            .await?;
+            return Err(());
+        }
+        if policy.file_running().is_some()
+            || self.runtime.native_execution.has_active_sessions()
+            || policy.has_held_realtime()
+        {
+            self.emit_error(
+                RealtimeErrorCode::BackendNotReady,
+                crate::SERVER_BUSY_MESSAGE,
+                true,
             )
             .await?;
             return Err(());
@@ -803,8 +976,7 @@ impl WsSession {
             .await?;
             return Err(());
         }
-        let diarize = session.diarize.unwrap_or(false);
-        if diarize {
+        if session.voice_id == Some(true) {
             self.emit_error(
                 RealtimeErrorCode::StartupConfigError,
                 REALTIME_VOICE_ID_UNSUPPORTED_REASON,
@@ -813,13 +985,54 @@ impl WsSession {
             .await?;
             return Err(());
         }
-        self.required_stage_readiness = RequiredStageReadinessBarrier::for_session(diarize);
-        let execution_target = session.execution_target.or_else(|| {
-            self.distribution
-                .openasr_home()
-                .ok()
-                .and_then(|home| realtime_execution_target_preference(&home))
-        });
+        // Anonymous speaker separation (SPEAKER_00) is independent of enrolled
+        // Voice ID matching and does not require the speaker-identity stage.
+        // Dictation is single-speaker text: reject the request instead of
+        // computing labels and hiding them later.
+        let source_name = session
+            .source_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let anonymous_diarize = session.diarize.unwrap_or(false);
+        if anonymous_diarize && source_name.as_deref() == Some(DICTATION_SOURCE_NAME) {
+            self.emit_error(
+                RealtimeErrorCode::StartupConfigError,
+                DICTATION_SPEAKERS_UNSUPPORTED_MESSAGE,
+                false,
+            )
+            .await?;
+            return Err(());
+        }
+        self.required_stage_readiness = RequiredStageReadinessBarrier::for_session(false);
+        if anonymous_diarize && let Err(message) = self.attach_anonymous_streaming_diarizer() {
+            self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
+                .await?;
+            return Err(());
+        }
+        let execution_target = match (self.remote_compute_client, session.execution_target.clone())
+        {
+            (false, Some(target)) => Some(target),
+            (_, _) => {
+                let default = match self.distribution.openasr_home() {
+                    Ok(home) => realtime_execution_target_preference(&home),
+                    Err(_) => crate::resolve_serve_execution_target(None),
+                };
+                match default {
+                    Ok(target) => Some(target),
+                    Err(error) => {
+                        self.emit_error(
+                            RealtimeErrorCode::StartupConfigError,
+                            &error.to_string(),
+                            false,
+                        )
+                        .await?;
+                        return Err(());
+                    }
+                }
+            }
+        };
         let phrase_bias = match build_realtime_phrase_bias_config(&session) {
             Ok(phrase_bias) => phrase_bias,
             Err(message) => {
@@ -862,12 +1075,6 @@ impl WsSession {
             }
         };
 
-        let source_name = session
-            .source_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
         let use_native_streaming =
             should_use_native_streaming_session(source_name.as_deref(), capabilities);
         let effective_partial_results = effective_session_partial_results(
@@ -882,12 +1089,13 @@ impl WsSession {
         );
         config.partial_results = effective_partial_results;
         config.word_timestamps = word_timestamps;
+        config.diarize = anonymous_diarize;
         config.vad = vad;
         config.buffer = buffer;
         let mut controller = match RealtimeSessionController::new_with_execution(
             config,
             Arc::clone(self.runtime.native_execution.execution_services()),
-            execution_target.unwrap_or_default(),
+            execution_target.clone().unwrap_or_default(),
         ) {
             Ok(controller) => controller,
             Err(error) => {
@@ -905,20 +1113,25 @@ impl WsSession {
         self.task = session.task;
         self.prompt = session.prompt;
         self.phrase_bias = phrase_bias;
-        self.inference_threads =
-            match validate_realtime_inference_threads(session.inference_threads) {
-                Ok(inference_threads) => inference_threads.or_else(|| {
-                    self.distribution
-                        .openasr_home()
-                        .ok()
-                        .and_then(|home| realtime_inference_threads_preference(&home))
-                }),
-                Err(message) => {
-                    self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
-                        .await?;
-                    return Err(());
-                }
-            };
+        let client_inference_threads = if self.remote_compute_client {
+            None
+        } else {
+            session.inference_threads
+        };
+        self.inference_threads = match validate_realtime_inference_threads(client_inference_threads)
+        {
+            Ok(inference_threads) => inference_threads.or_else(|| {
+                self.distribution
+                    .openasr_home()
+                    .ok()
+                    .and_then(|home| realtime_inference_threads_preference(&home))
+            }),
+            Err(message) => {
+                self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
+                    .await?;
+                return Err(());
+            }
+        };
         self.execution_target = execution_target;
         self.word_timestamps = word_timestamps;
         self.source_name = source_name;
@@ -1012,15 +1225,28 @@ impl WsSession {
         partial_results: bool,
         word_timestamps: bool,
     ) -> Result<(), ()> {
-        let Some(active_model) = self.runtime.model_pack_path.current_snapshot() else {
-            self.emit_error(
-                RealtimeErrorCode::StartupConfigError,
-                "Native realtime streaming requires an explicit local runtime pack path.",
-                false,
-            )
-            .await?;
-            return Err(());
+        let served = match self.runtime.resolve_served_native_pack() {
+            Ok(Some(served)) => served,
+            Ok(None) => {
+                self.emit_error(
+                    RealtimeErrorCode::StartupConfigError,
+                    "Native realtime streaming requires an explicit local runtime pack path.",
+                    false,
+                )
+                .await?;
+                return Err(());
+            }
+            Err(error) => {
+                self.emit_error(
+                    RealtimeErrorCode::StartupConfigError,
+                    &error.to_string(),
+                    false,
+                )
+                .await?;
+                return Err(());
+            }
         };
+        let active_model = served.snapshot;
         let model_pack_path = active_model.path().to_path_buf();
         let Some(adapter) = native_runtime_model_adapter_for_path(&model_pack_path) else {
             self.emit_error(
@@ -1039,7 +1265,7 @@ impl WsSession {
             return Err(());
         }
         let resolved_route = match crate::routes::transcription::resolve_execution_route_for_target(
-            self.execution_target,
+            self.execution_target.clone(),
         ) {
             Ok(route) => route,
             Err(error) => {
@@ -1070,10 +1296,15 @@ impl WsSession {
             &active_model,
             &model_session_key,
             resolved_route.as_ref(),
+            crate::NativeAdmissionKind::Realtime,
+            None,
         ) {
             Ok(permit) => permit,
             Err(error) => {
-                let recoverable = matches!(error, ApiError::ModelSessionCapacity(_));
+                let recoverable = matches!(
+                    error,
+                    ApiError::ModelSessionCapacity(_) | ApiError::Busy(_) | ApiError::Conflict(_)
+                );
                 let code = realtime_error_code_for_api_error(&error);
                 self.emit_error(code, &error.to_string(), recoverable)
                     .await?;
@@ -1106,7 +1337,8 @@ impl WsSession {
             .with_inference_threads(self.inference_threads)
             .with_voice_id(false)
             .with_partial_results(partial_results)
-            .with_word_timestamps(word_timestamps);
+            .with_word_timestamps(word_timestamps)
+            .with_execution_target(self.execution_target.clone());
         let session_config = NativeAsrStreamingSessionConfig::new()
             .with_audio_format(RealtimeAudioFormat::pcm16_mono_16khz())
             .with_partial_results(partial_results)
@@ -1114,7 +1346,8 @@ impl WsSession {
         let executor = NativeBackendExecutor::new(Arc::clone(
             self.runtime.native_execution.execution_services(),
         ));
-        let hardware_target = native_hardware_target_from_execution_target(self.execution_target);
+        let hardware_target =
+            native_hardware_target_from_execution_target(self.execution_target.clone());
         #[cfg(test)]
         let session_result = match self.test_native_streaming_session_factory.as_ref() {
             Some(factory) => factory(),
@@ -2424,7 +2657,7 @@ impl WsSession {
             prompt: self.prompt.clone(),
             phrase_bias: self.phrase_bias.clone(),
             inference_threads: self.inference_threads,
-            execution_target: self.execution_target,
+            execution_target: self.execution_target.clone(),
             word_timestamps: self.word_timestamps,
             display_name: "realtime-utterance.wav".to_string(),
             temp_wav,
@@ -2585,7 +2818,10 @@ impl WsSession {
                 Ok(())
             }
             BackendResult::Error(error) => {
-                let recoverable = matches!(error, ApiError::ModelSessionCapacity(_));
+                let recoverable = matches!(
+                    error,
+                    ApiError::ModelSessionCapacity(_) | ApiError::Busy(_) | ApiError::Conflict(_)
+                );
                 let code = realtime_error_code_for_api_error(&error);
                 self.emit_error(code, &error.to_string(), recoverable)
                     .await?;
@@ -2611,6 +2847,11 @@ impl WsSession {
         }
         if transport_closed {
             self.carry.clear();
+            if !self.backend_failed && self.controller.is_some() {
+                self.park_for_reconnect();
+                self.closed = true;
+                return Ok(());
+            }
             self.cancel_backend_jobs();
         }
         if !self.backend_failed && !transport_closed {
@@ -2644,7 +2885,12 @@ impl WsSession {
                     }
                     BackendResult::Error(error) => {
                         self.pending_backend_jobs = self.pending_backend_jobs.saturating_sub(1);
-                        let recoverable = matches!(error, ApiError::ModelSessionCapacity(_));
+                        let recoverable = matches!(
+                            error,
+                            ApiError::ModelSessionCapacity(_)
+                                | ApiError::Busy(_)
+                                | ApiError::Conflict(_)
+                        );
                         if !self.backend_failed {
                             self.emit_error(
                                 realtime_error_code_for_api_error(&error),
@@ -2715,6 +2961,7 @@ impl WsSession {
             self.emit_envelope(closed).await?;
             self.closed = true;
         }
+        self.observe_idle_for_pending_switch();
         if self.backend_failed { Err(()) } else { Ok(()) }
     }
 
@@ -2725,9 +2972,18 @@ impl WsSession {
     ) -> Result<(), ()> {
         if transport_closed {
             self.carry.clear();
-            if let Some(worker) = self.native_streaming.take() {
-                worker.detach_cancel();
+            if self.backend_failed {
+                if let Some(worker) = self.native_streaming.take() {
+                    worker.detach_cancel();
+                }
+                self.closed = true;
+                self.observe_idle_for_pending_switch();
+                return Ok(());
             }
+            if let Some(worker) = self.native_streaming.take() {
+                super::park_native_realtime_worker(self.session_id.0.clone(), worker);
+            }
+            self.park_for_reconnect();
             self.closed = true;
             return Ok(());
         } else if !self.carry.is_empty() {
@@ -2766,6 +3022,7 @@ impl WsSession {
             self.record_history_entry().await?;
         }
         self.closed = true;
+        self.observe_idle_for_pending_switch();
         Ok(())
     }
 
@@ -2783,6 +3040,7 @@ impl WsSession {
                 self.emit_envelope(closed).await?;
             }
             self.closed = true;
+            self.observe_idle_for_pending_switch();
             return Err(());
         }
         self.cancel_backend_jobs();
@@ -2795,6 +3053,7 @@ impl WsSession {
             self.emit_envelope(closed).await?;
         }
         self.closed = true;
+        self.observe_idle_for_pending_switch();
         Err(())
     }
 
@@ -2885,6 +3144,7 @@ impl WsSession {
             segments: Vec::new(),
             subtitle_cues: Vec::new(),
             timeline_quality: None,
+            timeline_degraded_reason: None,
             text,
         }) {
             self.emit_error(
@@ -2953,5 +3213,29 @@ impl WsSession {
         self.backend_jobs = Some(realtime_backend_worker_for_runtime(self.runtime.clone()));
         self.backend_results = Some(result_receiver);
         self.backend_result_sender = Some(result_sender);
+    }
+}
+
+#[cfg(test)]
+struct TestAnonymousEmbedder;
+
+#[cfg(test)]
+static TEST_ANONYMOUS_EMBEDDER: TestAnonymousEmbedder = TestAnonymousEmbedder;
+
+#[cfg(test)]
+impl openasr_core::diarize::embed::SpeakerEmbedder for TestAnonymousEmbedder {
+    fn embed(
+        &self,
+        _samples: &[f32],
+        _sample_rate_hz: u32,
+    ) -> Result<
+        openasr_core::diarize::contract::SpeakerEmbedding,
+        openasr_core::diarize::embed::EmbedError,
+    > {
+        Ok(openasr_core::diarize::contract::SpeakerEmbedding::l2_normalized(vec![1.0, 0.0]))
+    }
+
+    fn embedding_dim(&self) -> usize {
+        2
     }
 }

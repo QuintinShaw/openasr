@@ -22,14 +22,15 @@ COPY --from=builder /app/target/release/openasr /usr/local/bin/openasr
 COPY --from=builder /app/model-registry ./model-registry
 
 ENV OPENASR_HOME=/data
-# Binding 0.0.0.0 inside the container is the standard Docker pattern (exposure is
-# controlled by the operator's port-publish / orchestration). The server is
-# fail-closed against non-loopback plaintext by default; this image opts in
-# explicitly. Front it with TLS (or a TLS-terminating proxy) for untrusted networks.
-ENV OPENASR_ALLOW_INSECURE_NON_LOOPBACK=1
+# Default command binds 0.0.0.0 with HTTPS (self-signed) and device pairing.
+# On first start, if OPENASR_PAIRING_ADMIN_TOKEN is unset, `serve` generates a
+# random token, writes it owner-only to /data/pairing-admin-token, and prints
+# it to stdout. Behind a TLS-terminating reverse proxy you may drop
+# --tls-self-signed and set OPENASR_ALLOW_INSECURE_NON_LOOPBACK=1; that env
+# only waives TLS, never pairing.
 
 EXPOSE 8080
 
 USER openasr
 ENTRYPOINT ["openasr"]
-CMD ["serve", "--addr", "0.0.0.0:8080"]
+CMD ["serve", "--addr", "0.0.0.0:8080", "--tls-self-signed", "--pairing-admin-token-file", "/data/pairing-admin-token"]

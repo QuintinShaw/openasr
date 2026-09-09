@@ -1,6 +1,10 @@
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
-use crate::api::backend::{Transcription, TranscriptionLongFormMetadata, TruncatedDecode};
+use crate::api::backend::{
+    SpeakerEmbeddingSpace, Transcription, TranscriptionLongFormMetadata, TruncatedDecode,
+};
 use crate::diarize::voice_id::SpeakerNamingRefusal;
 use crate::subtitle::TimelineQuality;
 
@@ -15,6 +19,10 @@ pub(super) struct JsonTranscription<'a> {
     /// Provenance of the word timeline. Omitted on legacy data.
     #[serde(skip_serializing_if = "Option::is_none")]
     timeline_quality: Option<TimelineQuality>,
+    /// Why a requested precise timeline was not used. Omitted when alignment
+    /// succeeded or was not requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeline_degraded_reason: Option<&'a str>,
     /// Decodes behind this transcript that stopped before covering their audio.
     ///
     /// Present in the plain `json` format, not only `verbose_json`: "this text
@@ -55,6 +63,10 @@ pub(super) struct VerboseJsonTranscription<'a> {
     /// Provenance of the word timeline.
     #[serde(skip_serializing_if = "Option::is_none")]
     timeline_quality: Option<TimelineQuality>,
+    /// Why a requested precise timeline was not used. Omitted when alignment
+    /// succeeded or was not requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeline_degraded_reason: Option<&'a str>,
     /// OpenAI verbose_json top-level `words` array: per-word timing flattened
     /// across all reading segments. Present only when word timestamps were
     /// produced; the per-segment `words` arrays stay for existing clients.
@@ -68,6 +80,14 @@ pub(super) struct VerboseJsonTranscription<'a> {
     /// See [`JsonTranscription::unnamed_speakers`].
     #[serde(skip_serializing_if = "Vec::is_empty")]
     unnamed_speakers: Vec<JsonUnnamedSpeaker<'a>>,
+    /// WhisperX/Speakr-compatible `SPEAKER_NN` -> vector map. Omitted when the
+    /// caller did not opt in or no centroids were produced.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    speaker_embeddings: BTreeMap<&'a str, &'a [f32]>,
+    /// Comparability metadata for `speaker_embeddings`. Sibling field, not
+    /// nested under the map, so Speakr can keep reading the map as-is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speaker_embedding_space: Option<&'a SpeakerEmbeddingSpace>,
 }
 
 #[derive(Serialize)]
@@ -294,6 +314,7 @@ impl<'a> From<&'a Transcription> for JsonTranscription<'a> {
             segments: json_segments(transcription, false),
             subtitle_cues: json_subtitle_cues(transcription, false),
             timeline_quality: transcription.timeline_quality,
+            timeline_degraded_reason: transcription.timeline_degraded_reason.as_deref(),
             truncated: json_truncated_decodes(transcription),
             unnamed_speakers: json_unnamed_speakers(transcription),
         }
@@ -302,6 +323,7 @@ impl<'a> From<&'a Transcription> for JsonTranscription<'a> {
 
 impl<'a> From<&'a Transcription> for VerboseJsonTranscription<'a> {
     fn from(transcription: &'a Transcription) -> Self {
+        let (speaker_embeddings, speaker_embedding_space) = json_speaker_embeddings(transcription);
         Self {
             language: transcription
                 .language
@@ -312,6 +334,7 @@ impl<'a> From<&'a Transcription> for VerboseJsonTranscription<'a> {
             segments: json_segments(transcription, true),
             subtitle_cues: json_subtitle_cues(transcription, true),
             timeline_quality: transcription.timeline_quality,
+            timeline_degraded_reason: transcription.timeline_degraded_reason.as_deref(),
             words: flattened_words(transcription),
             longform: transcription
                 .longform
@@ -319,7 +342,25 @@ impl<'a> From<&'a Transcription> for VerboseJsonTranscription<'a> {
                 .map(verbose_longform_metadata),
             truncated: json_truncated_decodes(transcription),
             unnamed_speakers: json_unnamed_speakers(transcription),
+            speaker_embeddings,
+            speaker_embedding_space,
         }
+    }
+}
+
+fn json_speaker_embeddings(
+    transcription: &Transcription,
+) -> (BTreeMap<&str, &[f32]>, Option<&SpeakerEmbeddingSpace>) {
+    match transcription.speaker_embeddings.as_ref() {
+        Some(payload) if !payload.vectors.is_empty() => (
+            payload
+                .vectors
+                .iter()
+                .map(|(label, vector)| (label.as_str(), vector.as_slice()))
+                .collect(),
+            Some(&payload.space),
+        ),
+        _ => (BTreeMap::new(), None),
     }
 }
 

@@ -17,6 +17,207 @@ GATE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(GATE)
 
 
+def actual_device(provider: str, device: str) -> dict:
+    return {
+        "type": "cpu" if provider == "cpu" else "gpu",
+        "name": device,
+        "description": f"test {provider} device",
+        "provider_device_id": f"{provider}:0",
+        "pci_vendor_id": None,
+    }
+
+
+def parser_test_cell(provider: str) -> dict:
+    targets = {
+        "cpu": "cpu_local",
+        "cuda": "sm_75",
+        "hip": "gfx1100",
+        "vulkan": "vk_caps_00001002_0000744c_0123456789abcdef0123456789abcdef",
+    }
+    return {
+        "provider": provider,
+        "device_target": targets[provider],
+        "backend_id": f"{provider}-parser-test",
+        "artifact_fingerprint": "a" * 64,
+        "graph_mode": "fresh_graph",
+    }
+
+
+def trace_run_id(provider: str, _device: str, mode: str) -> str:
+    cell = parser_test_cell(provider)
+    return GpuCorrectnessGateTests.trace_run_id(cell, mode, provider)
+
+
+def trace_process_nonce(provider: str, _device: str) -> str:
+    cell = parser_test_cell(provider)
+    return GpuCorrectnessGateTests.trace_process_nonce(cell, provider)
+
+
+def trace_content(
+    provider: str, device: str, mode: str, *, include_top_k: bool = True
+) -> str:
+    cell = parser_test_cell(provider)
+    header = {
+        "schema": GATE.TOKEN_TRACE_SCHEMA,
+        "event": "header",
+        "run_id": trace_run_id(provider, device, mode),
+        "process_nonce": trace_process_nonce(provider, device),
+        "process_id": 4242,
+        "mode": mode,
+        "graph_mode": cell["graph_mode"],
+        "provider": provider,
+        "device_target": cell["device_target"],
+        "backend_id": cell["backend_id"],
+        "driver_version": "12.7.0",
+        "artifact_fingerprint": cell["artifact_fingerprint"],
+        "device": device,
+        "actual_provider": provider,
+        "actual_stable_device_id": device,
+        "actual_device": actual_device(provider, device),
+    }
+    route = {
+        "schema": "openasr.ggml-graph-lifecycle.v1",
+        "provider": provider,
+        "device": device,
+        "graph_instance": 1,
+        "graph_generation": 2,
+    }
+    lifecycle = [
+        {**route, "sequence": 1, "event": "created", "scheduler_enabled": False},
+        {**route, "sequence": 2, "event": "prepared", "prepare_generation": 3},
+        {
+            **route,
+            "sequence": 3,
+            "event": "input_write",
+            "input_generation": 4,
+            "bytes": 16,
+        },
+        {
+            **route,
+            "sequence": 4,
+            "event": "compute_started",
+            "compute_sequence": 1,
+            "prepare_generation": 3,
+            "input_generation_consumed": 4,
+        },
+        {
+            **route,
+            "sequence": 5,
+            "event": "compute_completed",
+            "compute_sequence": 1,
+            "output_generation": 5,
+        },
+        {
+            **route,
+            "sequence": 6,
+            "event": "output_read",
+            "compute_sequence": 1,
+            "output_generation_consumed": 5,
+            "bytes": 36,
+        },
+    ]
+    compute_sequence = 1
+    output_generation = 5
+    if provider == "hip":
+        lifecycle[3:] = [
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 4, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "capture_state_observed", "phase": "before_compute", "capture_supported": True, "graph_tracked": False, "executable_present": False},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 5, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "compute_started", "compute_sequence": 1, "prepare_generation": 3, "input_generation_consumed": 4},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 6, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "capture_state_observed", "phase": "after_compute", "capture_supported": True, "graph_tracked": True, "capture_enabled": True, "executable_present": True},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 7, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "capture_executable_created", "capture_executable_generation": 10, "change": "instantiated"},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 8, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "compute_completed", "compute_sequence": 1, "output_generation": 5},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 9, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "output_read", "compute_sequence": 1, "output_generation_consumed": 5, "bytes": 36},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 10, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "input_write", "input_generation": 6, "bytes": 16},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 11, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "capture_state_observed", "phase": "before_compute", "capture_supported": True, "graph_tracked": True, "capture_enabled": True, "executable_present": True},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 12, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "compute_started", "compute_sequence": 2, "prepare_generation": 3, "input_generation_consumed": 6, "capture_executable_generation": 10},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 13, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "capture_state_observed", "phase": "after_compute", "capture_supported": True, "graph_tracked": True, "capture_enabled": True, "executable_present": True},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 14, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "compute_completed", "compute_sequence": 2, "output_generation": 7},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 15, "provider": provider, "device": device, "graph_instance": 1, "graph_generation": 2, "event": "output_read", "compute_sequence": 2, "output_generation_consumed": 7, "bytes": 36},
+        ]
+        compute_sequence = 2
+        output_generation = 7
+    compute = {
+        "graph_instance": 1,
+        "graph_generation": 2,
+        "compute_sequence": compute_sequence,
+        "output_generation": output_generation,
+        "output_index": 0,
+        "output_count": 1,
+    }
+    events = [
+        header,
+        *lifecycle,
+        {
+            "schema": GATE.TOKEN_TRACE_SCHEMA,
+            "event": "token",
+            "step_index": 0,
+            "token_id": 7,
+            "is_eot": 0,
+            "compute": compute,
+        },
+    ]
+    if include_top_k:
+        events.append(
+            {
+                "schema": GATE.TOKEN_TRACE_SCHEMA,
+                "event": "top_k",
+                "step_index": 0,
+                "items": [
+                    {"token_id": 7, "value": 1.25},
+                    {"token_id": 8, "value": 0.75},
+                ],
+                "top1_top2_margin": 0.5,
+                "compute": compute,
+            }
+        )
+    return "".join(json.dumps(event) + "\n" for event in events)
+
+
+def logits_content(provider: str, device: str, mode: str) -> str:
+    cell = parser_test_cell(provider)
+    values = [-2.0] * 9
+    values[7] = 1.25
+    values[8] = 0.75
+    events = [
+        {
+            "schema": GATE.FULL_LOGITS_TRACE_SCHEMA,
+            "event": "header",
+            "run_id": trace_run_id(provider, device, mode),
+            "process_nonce": trace_process_nonce(provider, device),
+            "process_id": 4242,
+            "mode": mode,
+            "graph_mode": cell["graph_mode"],
+            "provider": provider,
+            "device_target": cell["device_target"],
+            "backend_id": cell["backend_id"],
+            "driver_version": "12.7.0",
+            "artifact_fingerprint": cell["artifact_fingerprint"],
+            "device": device,
+            "actual_provider": provider,
+            "actual_stable_device_id": device,
+            "actual_device": actual_device(provider, device),
+            "dtype": "f32",
+            "encoding": "json_numbers",
+            "step_count": 1,
+        },
+        {
+            "schema": GATE.FULL_LOGITS_TRACE_SCHEMA,
+            "event": "logits",
+            "step_index": 0,
+            "compute": {
+                "graph_instance": 1,
+                "graph_generation": 2,
+                "compute_sequence": 2 if provider == "hip" else 1,
+                "output_generation": 7 if provider == "hip" else 5,
+                "output_index": 0,
+                "output_count": 1,
+            },
+            "vocab_size": len(values),
+            "values": values,
+        },
+    ]
+    return "".join(json.dumps(event) + "\n" for event in events)
+
+
 class GpuCorrectnessGateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.inventory = {
@@ -121,6 +322,30 @@ class GpuCorrectnessGateTests(unittest.TestCase):
         )
 
     @staticmethod
+    def trace_run_id(cell: dict, mode: str, provider: str | None = None) -> str:
+        identity = ":".join(
+            (
+                provider or cell["provider"],
+                cell["device_target"],
+                cell["backend_id"],
+                mode,
+            )
+        )
+        return hashlib.sha256(identity.encode()).hexdigest()[:32]
+
+    @staticmethod
+    def trace_process_nonce(cell: dict, provider: str | None = None) -> str:
+        identity = ":".join(
+            (
+                provider or cell["provider"],
+                cell["device_target"],
+                cell["backend_id"],
+                "process",
+            )
+        )
+        return hashlib.sha256(identity.encode()).hexdigest()[:32]
+
+    @staticmethod
     def trace_content(
         cell: dict,
         mode: str,
@@ -129,45 +354,120 @@ class GpuCorrectnessGateTests(unittest.TestCase):
         device_target: str | None = None,
         backend_id: str | None = None,
         artifact_fingerprint: str | None = None,
+        include_top_k: bool = True,
     ) -> str:
-        return (
-            json.dumps(
+        observed_provider = provider or cell["provider"]
+        device = f"test-{observed_provider}"
+        compute = {
+            "graph_instance": 1,
+            "graph_generation": 1,
+            "compute_sequence": 1,
+            "output_generation": 1,
+            "output_index": 0,
+            "output_count": 1,
+        }
+        route = {
+            "schema": "openasr.ggml-graph-lifecycle.v1",
+            "provider": observed_provider,
+            "device": device,
+            "graph_instance": 1,
+            "graph_generation": 1,
+        }
+        events = [
+            {
+                "schema": "openasr.gpu-correctness-trace.v1",
+                "event": "header",
+                "run_id": GpuCorrectnessGateTests.trace_run_id(
+                    cell, mode, observed_provider
+                ),
+                "process_nonce": GpuCorrectnessGateTests.trace_process_nonce(
+                    cell, observed_provider
+                ),
+                "process_id": 4242,
+                "mode": mode,
+                "graph_mode": cell["graph_mode"],
+                "provider": observed_provider,
+                "device_target": device_target or cell["device_target"],
+                "backend_id": backend_id or cell["backend_id"],
+                "driver_version": "12.7.0",
+                "artifact_fingerprint": artifact_fingerprint
+                or cell["artifact_fingerprint"],
+                "device": device,
+                "actual_provider": observed_provider,
+                "actual_stable_device_id": device,
+                "actual_device": actual_device(observed_provider, device),
+            },
+            {**route, "event": "created", "sequence": 1, "scheduler_enabled": False},
+            {**route, "event": "prepared", "sequence": 2, "prepare_generation": 1},
+            {
+                **route,
+                "event": "input_write",
+                "sequence": 3,
+                "input_generation": 1,
+                "bytes": 8,
+            },
+            {
+                **route,
+                "event": "compute_started",
+                "sequence": 4,
+                "compute_sequence": 1,
+                "prepare_generation": 1,
+                "input_generation_consumed": 1,
+                "capture_executable_generation": None,
+            },
+            {
+                **route,
+                "event": "compute_completed",
+                "sequence": 5,
+                "compute_sequence": 1,
+                "output_generation": 1,
+            },
+            {
+                **route,
+                "event": "output_read",
+                "sequence": 6,
+                "compute_sequence": 1,
+                "output_generation_consumed": 1,
+                "bytes": 36,
+            },
+            {
+                "schema": "openasr.gpu-correctness-trace.v1",
+                "event": "token",
+                "step_index": 0,
+                "token_id": 7,
+                "is_eot": 0,
+                "compute": compute,
+            },
+        ]
+        if observed_provider == "hip":
+            events[4]["sequence"] = 6
+            events[4]["capture_executable_generation"] = 10
+            events[5]["sequence"] = 7
+            events[6]["sequence"] = 8
+            events.insert(
+                4,
                 {
-                    "schema": "openasr.gpu-correctness-trace.v1",
-                    "event": "header",
-                    "graph_mode": cell["graph_mode"],
-                    "provider": provider or cell["provider"],
-                    "device_target": device_target or cell["device_target"],
-                    "backend_id": backend_id or cell["backend_id"],
-                    "driver_version": "12.7.0",
-                    "artifact_fingerprint": artifact_fingerprint
-                    or cell["artifact_fingerprint"],
-                    "device": f"test-{cell['provider']}",
-                }
+                    **route,
+                    "event": "capture_state_observed",
+                    "sequence": 4,
+                    "capture_supported": True,
+                    "graph_tracked": True,
+                    "capture_enabled": True,
+                    "executable_present": True,
+                },
             )
-            + "\n"
-            + json.dumps(
+            events.insert(
+                5,
                 {
-                    "schema": "openasr.gpu-correctness-trace.v1",
-                    "event": "logits_digest",
-                    "step_index": 0,
-                    "element_count": 2,
-                    "sha256": "a" * 64,
-                    "non_finite_count": 0,
-                }
+                    **route,
+                    "event": "capture_executable_observed",
+                    "sequence": 5,
+                    "capture_executable_generation": 10,
+                    "last_change": "instantiated",
+                },
             )
-            + "\n"
-            + json.dumps(
-                {
-                    "schema": "openasr.gpu-correctness-trace.v1",
-                    "event": "token",
-                    "step_index": 0,
-                    "token_id": 7,
-                    "is_eot": 0,
-                }
-            )
-            + "\n"
-            + json.dumps(
+        if include_top_k:
+            events.append(
                 {
                     "schema": "openasr.gpu-correctness-trace.v1",
                     "event": "top_k",
@@ -177,14 +477,63 @@ class GpuCorrectnessGateTests(unittest.TestCase):
                         {"token_id": 8, "value": 0.75},
                     ],
                     "top1_top2_margin": 0.5,
+                    "compute": compute,
                 }
             )
-            + "\n"
-        )
+        return "\n".join(json.dumps(event) for event in events) + "\n"
+
+    @staticmethod
+    def logits_content(cell: dict, mode: str) -> str:
+        provider = cell["provider"]
+        device = f"test-{provider}"
+        values = [-2.0] * 9
+        values[7] = 1.25
+        values[8] = 0.75
+        events = [
+            {
+                "schema": GATE.FULL_LOGITS_TRACE_SCHEMA,
+                "event": "header",
+                "run_id": GpuCorrectnessGateTests.trace_run_id(cell, mode),
+                "process_nonce": GpuCorrectnessGateTests.trace_process_nonce(cell),
+                "process_id": 4242,
+                "mode": mode,
+                "graph_mode": cell["graph_mode"],
+                "provider": provider,
+                "device_target": cell["device_target"],
+                "backend_id": cell["backend_id"],
+                "driver_version": "12.7.0",
+                "artifact_fingerprint": cell["artifact_fingerprint"],
+                "device": device,
+                "actual_provider": provider,
+                "actual_stable_device_id": device,
+                "actual_device": actual_device(provider, device),
+                "dtype": "f32",
+                "encoding": "json_numbers",
+                "step_count": 1,
+            },
+            {
+                "schema": GATE.FULL_LOGITS_TRACE_SCHEMA,
+                "event": "logits",
+                "step_index": 0,
+                "compute": {
+                    "graph_instance": 1,
+                    "graph_generation": 1,
+                    "compute_sequence": 1,
+                    "output_generation": 1,
+                    "output_index": 0,
+                    "output_count": 1,
+                },
+                "vocab_size": len(values),
+                "values": values,
+            },
+        ]
+        return "\n".join(json.dumps(event) for event in events) + "\n"
 
     def receipt(self, cell: dict, evidence_class: str, mode: str) -> dict:
         token_content = self.trace_content(cell, mode)
         token_hash = hashlib.sha256(token_content.encode()).hexdigest()
+        logits_trace_content = self.logits_content(cell, mode)
+        logits_hash = hashlib.sha256(logits_trace_content.encode()).hexdigest()
         evidence = {
             "schema": GATE.EVIDENCE_SCHEMA,
             "contract": "openasr.gpu-correctness-artifact.v1",
@@ -211,6 +560,11 @@ class GpuCorrectnessGateTests(unittest.TestCase):
             "driver_version": "12.7.0",
             "artifact_fingerprint": cell["artifact_fingerprint"],
             "device": f"test-{cell['provider']}",
+            "actual_provider": cell["provider"],
+            "actual_stable_device_id": f"test-{cell['provider']}",
+            "actual_device": actual_device(
+                cell["provider"], f"test-{cell['provider']}"
+            ),
             "placement": cell["placement"],
             "capture_mode": cell["capture_mode"],
             "scheduler_mode": cell["scheduler_mode"],
@@ -241,7 +595,7 @@ class GpuCorrectnessGateTests(unittest.TestCase):
                         },
                         "logits": {
                             "label": self.trace_label(cell, mode, "logits"),
-                            "sha256": token_hash,
+                            "sha256": logits_hash,
                         },
                         "top_k": [{"token_id": 7, "value": 1.25}],
                         "top1_top2_margin": 0.5,
@@ -326,13 +680,25 @@ class GpuCorrectnessGateTests(unittest.TestCase):
         }
 
     def write_traces(self, root: Path, cell: dict, mode: str) -> list[Path]:
-        content = self.trace_content(cell, mode)
-        result = []
-        for kind in ("token", "logits"):
-            path = root / self.trace_label(cell, mode, kind)
-            path.write_text(content)
-            result.append(path)
-        return result
+        token_path = root / self.trace_label(cell, mode, "token")
+        token_path.write_text(self.trace_content(cell, mode))
+        logits_path = root / self.trace_label(cell, mode, "logits")
+        logits_path.write_text(self.logits_content(cell, mode))
+        return [token_path, logits_path]
+
+    def write_token_traces(self, root: Path, receipt: dict) -> list[Path]:
+        evidence = receipt["evidence"]
+        cell = next(
+            cell
+            for cell in self.project()["cells"]
+            if cell["family"] == evidence["family"]
+            and cell["model_id"] == evidence["model_id"]
+            and cell["quant"] == evidence["quant"]
+            and cell["provider"] == evidence["provider"]
+            and cell["device_target"] == evidence["device_target"]
+            and cell["backend_id"] == evidence["backend_id"]
+        )
+        return self.write_traces(root, cell, evidence["execution"]["mode"])
 
     def test_projection_is_exact_target_and_catalog_derived(self) -> None:
         matrix = self.project()
@@ -387,7 +753,6 @@ class GpuCorrectnessGateTests(unittest.TestCase):
             inert["artifact_contract"]["backend_candidates_sha256"],
             projected["artifact_contract"]["backend_candidates_sha256"],
         )
-
         with self.assertRaisesRegex(GATE.MatrixError, "canonical vk_caps"):
             self.project(
                 vulkan_targets={"vulkan-test-generic": "vk_caps_wrong"}
@@ -823,6 +1188,8 @@ class GpuCorrectnessGateTests(unittest.TestCase):
 
             gpu_trace = root / self.trace_label(cell, "cold", "gpu-correctness-trace")
             gpu_trace.write_text(self.trace_content(cell, "cold"))
+            gpu_logits = root / self.trace_label(cell, "cold", "gpu-full-logits")
+            gpu_logits.write_text(self.logits_content(cell, "cold"))
             cpu_lines = [
                 json.loads(line)
                 for line in self.trace_content(cell, "cold").splitlines()
@@ -835,8 +1202,15 @@ class GpuCorrectnessGateTests(unittest.TestCase):
                     "driver_version": "unqualified",
                     "artifact_fingerprint": "unqualified",
                     "device": "cpu0",
+                    "actual_provider": "cpu",
+                    "actual_stable_device_id": "cpu0",
+                    "actual_device": actual_device("cpu", "cpu0"),
                 }
             )
+            for event in cpu_lines[1:]:
+                if event.get("schema") == "openasr.ggml-graph-lifecycle.v1":
+                    event["provider"] = "cpu"
+                    event["device"] = "cpu0"
             cpu_trace = root / "cpu-oracle.jsonl"
             cpu_trace.write_text("\n".join(json.dumps(line) for line in cpu_lines) + "\n")
 
@@ -872,6 +1246,7 @@ class GpuCorrectnessGateTests(unittest.TestCase):
                 process_mode="cold",
                 gpu_receipt_path=gpu_receipt,
                 gpu_trace_path=gpu_trace,
+                gpu_logits_path=gpu_logits,
                 cpu_receipt_path=cpu_receipt,
                 cpu_trace_path=cpu_trace,
                 binary_path=binary,
@@ -882,9 +1257,17 @@ class GpuCorrectnessGateTests(unittest.TestCase):
             self.assertEqual(placement["evidence"]["evidence_class"], "placement_resource")
             self.assertEqual(token["evidence"]["evidence_class"], "token_transcript")
             self.assertEqual(token["evidence"]["device_target"], "sm_75")
-            self.assertEqual(token["evidence"]["trace"]["logits"]["label"], gpu_trace.name)
+            self.assertEqual(
+                token["evidence"]["trace"]["logits"]["label"], gpu_logits.name
+            )
+            self.assertNotEqual(
+                token["evidence"]["trace"]["token_trace"]["label"],
+                token["evidence"]["trace"]["logits"]["label"],
+            )
 
-            cpu_lines[2]["token_id"] = 99
+            next(event for event in cpu_lines if event.get("event") == "token")[
+                "token_id"
+            ] = 99
             cpu_trace.write_text("\n".join(json.dumps(line) for line in cpu_lines) + "\n")
             with self.assertRaisesRegex(GATE.MatrixError, "CPU family oracle"):
                 GATE.bind_runtime_cell_receipts(
@@ -897,6 +1280,7 @@ class GpuCorrectnessGateTests(unittest.TestCase):
                     process_mode="cold",
                     gpu_receipt_path=gpu_receipt,
                     gpu_trace_path=gpu_trace,
+                    gpu_logits_path=gpu_logits,
                     cpu_receipt_path=cpu_receipt,
                     cpu_trace_path=cpu_trace,
                     binary_path=binary,
@@ -953,7 +1337,7 @@ class GpuCorrectnessGateTests(unittest.TestCase):
             token = root / receipt["evidence"]["trace"]["token_trace"]["label"]
             token.write_text(forged)
             logits = root / receipt["evidence"]["trace"]["logits"]["label"]
-            logits.write_text(self.trace_content(cell, "cold"))
+            logits.write_text(self.logits_content(cell, "cold"))
             with self.assertRaisesRegex(GATE.MatrixError, "trace header does not match"):
                 GATE.closed_receipt_keys(
                     matrix, [receipt_path], **self.bind_kwargs([token, logits])
@@ -1029,6 +1413,525 @@ class GpuCorrectnessGateTests(unittest.TestCase):
             trace.write_text(self.trace_content(matrix["cells"][0], "cold"))
             with self.assertRaisesRegex(GATE.MatrixError, "no versioned correctness evidence"):
                 GATE.validate_matrix(matrix, [path], **self.bind_kwargs([trace]))
+
+    def test_trace_rejects_unknown_lifecycle_fields(self) -> None:
+        events = [json.loads(line) for line in trace_content("cpu", "CPU", "cold").splitlines()]
+        next(event for event in events if event.get("event") == "created")["activation_mode"] = "auto"
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "unknown-lifecycle-field.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with self.assertRaisesRegex(GATE.MatrixError, "unknown or missing fields"):
+                GATE.parse_trace_artifact(path)
+
+    def test_trace_rejects_capture_creation_before_after_compute_observation(self) -> None:
+        events = [json.loads(line) for line in trace_content("hip", "HIP0", "cold").splitlines()]
+        after_index = next(
+            index
+            for index, event in enumerate(events)
+            if event.get("event") == "capture_state_observed"
+            and event.get("phase") == "after_compute"
+        )
+        created_index = next(
+            index
+            for index, event in enumerate(events)
+            if event.get("event") == "capture_executable_created"
+        )
+        created = events.pop(created_index)
+        events.insert(after_index, created)
+        for sequence, event in enumerate(events[1:], start=1):
+            if event.get("schema") == "openasr.ggml-graph-lifecycle.v1":
+                event["sequence"] = sequence
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "premature-capture-created.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with self.assertRaisesRegex(GATE.MatrixError, "invalid capture executable generation"):
+                GATE.parse_trace_artifact(path)
+
+    def test_trace_rejects_token_without_compute_reference(self) -> None:
+        events = [json.loads(line) for line in trace_content("cpu", "CPU", "cold").splitlines()]
+        next(event for event in events if event.get("event") == "token").pop("compute")
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "missing-compute-ref.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with self.assertRaisesRegex(GATE.MatrixError, "strict compute reference"):
+                GATE.parse_trace_artifact(path)
+
+    def test_trace_rejects_different_token_and_top_k_compute_references(self) -> None:
+        events = [json.loads(line) for line in trace_content("cpu", "CPU", "cold").splitlines()]
+        next(event for event in events if event.get("event") == "top_k")["compute"]["output_generation"] = 6
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "different-compute-refs.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with self.assertRaisesRegex(GATE.MatrixError, "disagree on their compute reference"):
+                GATE.parse_trace_artifact(path)
+
+    def test_trace_rejects_compute_reference_without_output_read(self) -> None:
+        events = [json.loads(line) for line in trace_content("cpu", "CPU", "cold").splitlines()]
+        for event in events:
+            if event.get("event") in {"token", "top_k"}:
+                event["compute"]["output_generation"] = 99
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "unread-compute-ref.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with self.assertRaisesRegex(GATE.MatrixError, "no matching lifecycle output read"):
+                GATE.parse_trace_artifact(path)
+
+    def test_trace_rejects_compute_reference_for_another_graph(self) -> None:
+        events = [json.loads(line) for line in trace_content("cpu", "CPU", "cold").splitlines()]
+        for event in events:
+            if event.get("event") in {"token", "top_k"}:
+                event["compute"]["graph_instance"] = 2
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "other-graph-compute-ref.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with self.assertRaisesRegex(GATE.MatrixError, "no matching lifecycle output read"):
+                GATE.parse_trace_artifact(path)
+
+    def test_trace_rejects_reused_compute_reference_across_steps(self) -> None:
+        events = [json.loads(line) for line in trace_content("cpu", "CPU", "cold").splitlines()]
+        token = next(event for event in events if event.get("event") == "token")
+        top_k = next(event for event in events if event.get("event") == "top_k")
+        duplicate_token = copy.deepcopy(token)
+        duplicate_token["step_index"] = 1
+        duplicate_token["token_id"] = 8
+        duplicate_top_k = copy.deepcopy(top_k)
+        duplicate_top_k["step_index"] = 1
+        events.extend([duplicate_token, duplicate_top_k])
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "reused-compute-ref.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with self.assertRaisesRegex(GATE.MatrixError, "reuses one lifecycle compute reference"):
+                GATE.parse_trace_artifact(path)
+
+    def test_trace_accepts_distinct_runtime_minted_rows_from_one_batch_compute(self) -> None:
+        events = [json.loads(line) for line in trace_content("cpu", "CPU", "cold").splitlines()]
+        token = next(event for event in events if event.get("event") == "token")
+        top_k = next(event for event in events if event.get("event") == "top_k")
+        token["compute"]["output_count"] = 2
+        top_k["compute"]["output_count"] = 2
+        second_token = copy.deepcopy(token)
+        second_token["step_index"] = 1
+        second_token["compute"]["output_index"] = 1
+        second_top_k = copy.deepcopy(top_k)
+        second_top_k["step_index"] = 1
+        second_top_k["compute"]["output_index"] = 1
+        events.extend([second_token, second_top_k])
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "batched-rows.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            semantics = GATE.parse_trace_artifact(path)
+            self.assertEqual(semantics["steps"], [0, 1])
+
+    def test_trace_accepts_request_local_attachment_to_a_prepared_warm_graph(self) -> None:
+        events = [json.loads(line) for line in trace_content("cpu", "CPU", "reuse").splitlines()]
+        created = next(event for event in events if event.get("event") == "created")
+        created["event"] = "existing_graph_observed"
+        created["prepare_generation"] = 3
+        events = [event for event in events if event.get("event") != "prepared"]
+        for sequence, event in enumerate(events[1:], start=1):
+            if event.get("schema") == "openasr.ggml-graph-lifecycle.v1":
+                event["sequence"] = sequence
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "warm-existing-graph.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            semantics = GATE.parse_trace_artifact(path)
+            self.assertIn("existing_graph_observed", semantics["lifecycle_kinds"])
+
+    def test_warm_hip_attachment_requires_fresh_native_capture_observations(self) -> None:
+        source = [
+            json.loads(line)
+            for line in trace_content("hip", "HIP0", "reuse").splitlines()
+        ]
+        header = source[0]
+        lifecycle = {
+            (event.get("event"), event.get("compute_sequence")): copy.deepcopy(event)
+            for event in source[1:]
+            if event.get("schema") == "openasr.ggml-graph-lifecycle.v1"
+        }
+        attachment = lifecycle[("created", None)]
+        attachment["event"] = "existing_graph_observed"
+        attachment["prepare_generation"] = 3
+        capture_before = copy.deepcopy(next(
+            event
+            for event in source
+            if event.get("event") == "capture_state_observed"
+            and event.get("phase") == "before_compute"
+            and event.get("executable_present") is True
+        ))
+        capture_after = copy.deepcopy(next(
+            event
+            for event in source
+            if event.get("event") == "capture_state_observed"
+            and event.get("phase") == "after_compute"
+            and event.get("executable_present") is True
+        ))
+        capture_observed = lifecycle[("capture_executable_created", None)]
+        capture_observed["event"] = "capture_executable_observed"
+        capture_observed["last_change"] = capture_observed.pop("change")
+        warm_events = [
+            header,
+            attachment,
+            lifecycle[("input_write", None)],
+            capture_before,
+            capture_observed,
+            lifecycle[("compute_started", 2)],
+            capture_after,
+            lifecycle[("compute_completed", 2)],
+            lifecycle[("output_read", 2)],
+            *[
+                copy.deepcopy(event)
+                for event in source[1:]
+                if event.get("schema") == GATE.TOKEN_TRACE_SCHEMA
+            ],
+        ]
+        for sequence, event in enumerate(warm_events[1:], start=1):
+            if event.get("schema") == "openasr.ggml-graph-lifecycle.v1":
+                event["sequence"] = sequence
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "warm-hip-capture.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in warm_events))
+            semantics = GATE.parse_trace_artifact(path)
+            GATE._require_trace_capture_policy(path, semantics, "enabled")
+
+            missing_observation = [
+                event
+                for event in warm_events
+                if event.get("event") != "capture_executable_observed"
+            ]
+            for sequence, event in enumerate(missing_observation[1:], start=1):
+                if event.get("schema") == "openasr.ggml-graph-lifecycle.v1":
+                    event["sequence"] = sequence
+            path.write_text(
+                "".join(json.dumps(event) + "\n" for event in missing_observation)
+            )
+            with self.assertRaisesRegex(GATE.MatrixError, "capture generation was not observed"):
+                GATE.parse_trace_artifact(path)
+
+    def test_trace_rejects_unbounded_or_non_runtime_selection_index(self) -> None:
+        events = [json.loads(line) for line in trace_content("cpu", "CPU", "cold").splitlines()]
+        for event in events:
+            if event.get("event") in {"token", "top_k"}:
+                event["compute"]["output_index"] = 1
+                event["compute"]["output_count"] = 1
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "unbounded-row.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with self.assertRaisesRegex(GATE.MatrixError, "strict compute reference"):
+                GATE.parse_trace_artifact(path)
+
+    def test_full_logits_rejects_empty_arbitrary_and_incomplete_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name, content in (("empty", ""), ("arbitrary", "not-json\n")):
+                path = root / f"{name}.jsonl"
+                path.write_text(content)
+                with self.subTest(name=name), self.assertRaises(GATE.MatrixError):
+                    GATE.parse_full_logits_artifact(path)
+            events = [
+                json.loads(line)
+                for line in logits_content("cuda", "test-cuda", "cold").splitlines()
+            ]
+            events[1]["vocab_size"] += 1
+            path = root / "wrong-vocab.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with self.assertRaisesRegex(GATE.MatrixError, "invalid or incomplete"):
+                GATE.parse_full_logits_artifact(path)
+
+    def test_full_logits_rejects_cross_run_compute_and_oracle_splicing(self) -> None:
+        matrix = self.project()
+        cell = next(cell for cell in matrix["cells"] if cell["provider"] == "cuda")
+        for mutation, expected in (
+            ("run", "disagree on run_id"),
+            ("process_nonce", "disagree on process_nonce"),
+            ("process_id", "disagree on process_id"),
+            ("compute", "different compute"),
+            ("oracle", "family oracle"),
+        ):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                receipt = self.receipt(cell, "token_transcript", "cold")
+                receipt_path = root / "receipt.json"
+                traces = self.write_token_traces(root, receipt)
+                logits_path = next(path for path in traces if path.name.startswith("logits-"))
+                events = [json.loads(line) for line in logits_path.read_text().splitlines()]
+                if mutation == "run":
+                    events[0]["run_id"] = "f" * 32
+                elif mutation == "process_nonce":
+                    events[0]["process_nonce"] = "f" * 32
+                elif mutation == "process_id":
+                    events[0]["process_id"] += 1
+                elif mutation == "compute":
+                    events[1]["compute"]["output_generation"] += 1
+                else:
+                    events[1]["values"][8] = 2.0
+                content = "".join(json.dumps(event) + "\n" for event in events)
+                logits_path.write_text(content)
+                receipt["evidence"]["trace"]["logits"]["sha256"] = hashlib.sha256(
+                    content.encode()
+                ).hexdigest()
+                receipt_path.write_text(json.dumps(receipt))
+                with self.assertRaisesRegex(GATE.MatrixError, expected):
+                    GATE.closed_receipt_keys(
+                        matrix,
+                        [receipt_path],
+                        **self.bind_kwargs(traces),
+                    )
+
+    def test_exact_lane_cold_and_reuse_require_same_process_and_distinct_requests(self) -> None:
+        matrix = self.project()
+        cell = next(cell for cell in matrix["cells"] if cell["provider"] == "cuda")
+        for field, value, expected in (
+            ("process_nonce", "f" * 32, "same process"),
+            (
+                "run_id",
+                self.trace_run_id(cell, "cold"),
+                "request identity",
+            ),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                cold = self.receipt(cell, "token_transcript", "cold")
+                reuse = self.receipt(cell, "token_transcript", "reuse")
+                traces = [
+                    *self.write_token_traces(root, cold),
+                    *self.write_token_traces(root, reuse),
+                ]
+                for path in traces[2:]:
+                    events = [json.loads(line) for line in path.read_text().splitlines()]
+                    events[0][field] = value
+                    content = "".join(json.dumps(event) + "\n" for event in events)
+                    path.write_text(content)
+                    trace_key = (
+                        "logits"
+                        if events[0]["schema"] == GATE.FULL_LOGITS_TRACE_SCHEMA
+                        else "token_trace"
+                    )
+                    reuse["evidence"]["trace"][trace_key]["sha256"] = hashlib.sha256(
+                        content.encode()
+                    ).hexdigest()
+                cold_path = root / "cold-receipt.json"
+                reuse_path = root / "reuse-receipt.json"
+                cold_path.write_text(json.dumps(cold))
+                reuse_path.write_text(json.dumps(reuse))
+                with self.assertRaisesRegex(GATE.MatrixError, expected):
+                    GATE.closed_receipt_keys(
+                        matrix,
+                        [cold_path, reuse_path],
+                        **self.bind_kwargs(traces),
+                    )
+
+    def test_full_logits_rejects_row_partition_that_exceeds_native_readback(self) -> None:
+        matrix = self.project()
+        cell = next(cell for cell in matrix["cells"] if cell["provider"] == "cuda")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            receipt = self.receipt(cell, "token_transcript", "cold")
+            receipt_path = root / "receipt.json"
+            traces = self.write_token_traces(root, receipt)
+            for path in traces:
+                events = [json.loads(line) for line in path.read_text().splitlines()]
+                for event in events:
+                    if event.get("event") in {"token", "top_k", "logits"}:
+                        event["compute"]["output_count"] = 2
+                content = "".join(json.dumps(event) + "\n" for event in events)
+                path.write_text(content)
+                trace = receipt["evidence"]["trace"]
+                key = "logits" if path.name.startswith("logits-") else "token_trace"
+                trace[key]["sha256"] = hashlib.sha256(content.encode()).hexdigest()
+            receipt_path.write_text(json.dumps(receipt))
+            with self.assertRaisesRegex(GATE.MatrixError, "native output read size"):
+                GATE.closed_receipt_keys(
+                    matrix,
+                    [receipt_path],
+                    **self.bind_kwargs(traces),
+                )
+
+    def test_trace_rejects_unobserved_capture_executable_generation(self) -> None:
+        events = [json.loads(line) for line in trace_content("hip", "HIP0", "reuse").splitlines()]
+        compute = next(event for event in events if event["event"] == "compute_started")
+        compute["capture_executable_generation"] = 77
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "fabricated-capture.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with self.assertRaisesRegex(GATE.MatrixError, "not observed from a backend API"):
+                GATE.parse_trace_artifact(path)
+
+    def test_capture_policy_requires_native_generation_and_later_consumption(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            hip_path = Path(temp) / "hip-capture.jsonl"
+            hip_path.write_text(trace_content("hip", "HIP0", "reuse"))
+            hip = GATE.parse_trace_artifact(hip_path)
+            self.assertEqual(hip["capture_state_modes"], {(True, True, True)})
+            self.assertTrue(hip["capture_generation_observed"])
+            self.assertTrue(hip["capture_generation_consumed"])
+            GATE._require_trace_capture_policy(hip_path, hip, "enabled")
+            with self.assertRaisesRegex(GATE.MatrixError, "lacks observed native disablement"):
+                GATE._require_trace_capture_policy(hip_path, hip, "disabled")
+
+            cpu_path = Path(temp) / "cpu-no-capture.jsonl"
+            cpu_path.write_text(trace_content("cpu", "CPU", "cold"))
+            cpu = GATE.parse_trace_artifact(cpu_path)
+            self.assertFalse(cpu["capture_generation_observed"])
+            self.assertFalse(cpu["capture_generation_consumed"])
+            GATE._require_trace_capture_policy(cpu_path, cpu, "unsupported")
+            with self.assertRaisesRegex(GATE.MatrixError, "lacks observed native enablement"):
+                GATE._require_trace_capture_policy(cpu_path, cpu, "enabled")
+
+    def test_capture_enabled_lane_allows_one_shot_graph_when_another_graph_consumes(self) -> None:
+        events = [json.loads(line) for line in trace_content("hip", "HIP0", "reuse").splitlines()]
+        token_start = next(
+            index
+            for index, event in enumerate(events)
+            if event.get("event") in {"token", "top_k"}
+        )
+        one_shot_graph = [
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "created", "scheduler_enabled": False},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "prepared", "prepare_generation": 22},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "input_write", "input_generation": 23, "bytes": 16},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "capture_state_observed", "phase": "before_compute", "capture_supported": True, "graph_tracked": True, "capture_enabled": True, "executable_present": False},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "compute_started", "compute_sequence": 1, "prepare_generation": 22, "input_generation_consumed": 23},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "capture_state_observed", "phase": "after_compute", "capture_supported": True, "graph_tracked": True, "capture_enabled": True, "executable_present": True},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "capture_executable_created", "capture_executable_generation": 24, "change": "instantiated"},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "compute_completed", "compute_sequence": 1, "output_generation": 25},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "provider": "hip", "device": "HIP0", "graph_instance": 20, "graph_generation": 21, "event": "output_read", "compute_sequence": 1, "output_generation_consumed": 25, "bytes": 36},
+        ]
+        events[token_start:token_start] = one_shot_graph
+        sequence = 0
+        for event in events:
+            if event.get("schema") == "openasr.ggml-graph-lifecycle.v1":
+                sequence += 1
+                event["sequence"] = sequence
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "hip-capture-with-one-shot-graph.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            semantics = GATE.parse_trace_artifact(path)
+            self.assertEqual(semantics["computed_graph_count"], 2)
+            self.assertEqual(semantics["capture_state_graph_count"], 2)
+            self.assertTrue(semantics["capture_generation_consumed"])
+            GATE._require_trace_capture_policy(path, semantics, "enabled")
+
+    def test_capture_disabled_policy_requires_observed_native_disablement(self) -> None:
+        events = [json.loads(line) for line in trace_content("hip", "HIP0", "reuse").splitlines()]
+        events = [
+            event
+            for event in events
+            if event.get("event") != "capture_executable_created"
+            and not (
+                event.get("schema") == "openasr.ggml-graph-lifecycle.v1"
+                and event.get("sequence", 0) >= 10
+            )
+        ]
+        for event in events:
+            if event.get("event") == "capture_state_observed":
+                event["graph_tracked"] = True
+                event["capture_enabled"] = False
+                event["executable_present"] = False
+            if event.get("event") in {"token", "top_k"}:
+                event["compute"]["compute_sequence"] = 1
+                event["compute"]["output_generation"] = 5
+        for sequence, event in enumerate(events[1:], start=1):
+            if event.get("schema") == "openasr.ggml-graph-lifecycle.v1":
+                event["sequence"] = sequence
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "hip-capture-disabled.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            semantics = GATE.parse_trace_artifact(path)
+            GATE._require_trace_capture_policy(path, semantics, "disabled")
+
+    def test_trace_rejects_capture_generation_without_observed_enablement(self) -> None:
+        events = [json.loads(line) for line in trace_content("hip", "HIP0", "reuse").splitlines()]
+        events = [event for event in events if event.get("event") != "capture_state_observed"]
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "capture-without-native-state.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with self.assertRaisesRegex(GATE.MatrixError, "invalid capture executable generation"):
+                GATE.parse_trace_artifact(path)
+
+    def test_preexisting_capture_is_observed_before_the_compute_that_consumes_it(self) -> None:
+        events = [json.loads(line) for line in trace_content("hip", "HIP0", "reuse").splitlines()]
+        header = events[0]
+        trace_events = [event for event in events[1:] if event.get("schema") != "openasr.ggml-graph-lifecycle.v1"]
+        lifecycle = [event for event in events[1:] if event.get("schema") == "openasr.ggml-graph-lifecycle.v1"]
+        first_compute = next(event for event in lifecycle if event.get("event") == "compute_started")
+        state = next(
+            event
+            for event in lifecycle
+            if event.get("event") == "capture_state_observed"
+            and event.get("phase") == "before_compute"
+        )
+        state["graph_tracked"] = True
+        state["capture_enabled"] = True
+        state["executable_present"] = True
+        capture = next(event for event in lifecycle if event.get("event") == "capture_executable_created")
+        capture["event"] = "capture_executable_observed"
+        capture["last_change"] = capture.pop("change")
+        first_compute["capture_executable_generation"] = capture["capture_executable_generation"]
+        created = next(event for event in lifecycle if event.get("event") == "created")
+        prepared = next(event for event in lifecycle if event.get("event") == "prepared")
+        first_input = next(
+            event
+            for event in lifecycle
+            if event.get("event") == "input_write" and event.get("input_generation") == 4
+        )
+        moved = {id(event) for event in (created, prepared, first_input, state, capture, first_compute)}
+        tail = [event for event in lifecycle if id(event) not in moved]
+        ordered = [created, prepared, first_input, state, capture, first_compute, *tail]
+        for sequence, event in enumerate(ordered, start=1):
+            event["sequence"] = sequence
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "preexisting-capture.jsonl"
+            path.write_text(
+                "".join(json.dumps(event) + "\n" for event in [header, *ordered, *trace_events])
+            )
+            semantics = GATE.parse_trace_artifact(path)
+            self.assertTrue(semantics["capture_generation_consumed"])
+            GATE._require_trace_capture_policy(path, semantics, "enabled")
+
+    def test_trace_rejects_capture_generation_without_native_change_kind(self) -> None:
+        events = [json.loads(line) for line in trace_content("hip", "HIP0", "reuse").splitlines()]
+        capture = next(event for event in events if event["event"] == "capture_executable_created")
+        capture.pop("change")
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "capture-without-change.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with self.assertRaisesRegex(GATE.MatrixError, "unknown or missing fields"):
+                GATE.parse_trace_artifact(path)
+
+    def test_trace_rejects_non_monotonic_lifecycle_sequence(self) -> None:
+        events = [json.loads(line) for line in trace_content("cpu", "CPU", "cold").splitlines()]
+        completed = next(event for event in events if event["event"] == "compute_completed")
+        completed["sequence"] = 2
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "reordered-lifecycle.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with self.assertRaisesRegex(GATE.MatrixError, "strictly increasing"):
+                GATE.parse_trace_artifact(path)
+
+    def test_trace_rejects_stale_output_generation_after_later_compute(self) -> None:
+        events = [json.loads(line) for line in trace_content("cpu", "CPU", "reuse").splitlines()]
+        output_index = next(index for index, event in enumerate(events) if event["event"] == "output_read")
+        stale_output = events[output_index]
+        stale_output["sequence"] = 9
+        events[output_index:output_index] = [
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 6, "provider": "cpu", "device": "CPU", "graph_instance": 1, "graph_generation": 2, "event": "input_write", "input_generation": 6, "bytes": 16},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 7, "provider": "cpu", "device": "CPU", "graph_instance": 1, "graph_generation": 2, "event": "compute_started", "compute_sequence": 2, "prepare_generation": 3, "input_generation_consumed": 6},
+            {"schema": "openasr.ggml-graph-lifecycle.v1", "sequence": 8, "provider": "cpu", "device": "CPU", "graph_instance": 1, "graph_generation": 2, "event": "compute_completed", "compute_sequence": 2, "output_generation": 7},
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "stale-output.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with self.assertRaisesRegex(GATE.MatrixError, "completed output generation"):
+                GATE.parse_trace_artifact(path)
+
+    def test_trace_rejects_unbounded_actual_device_facts(self) -> None:
+        events = [json.loads(line) for line in trace_content("vulkan", "Vulkan0", "cold").splitlines()]
+        events[0]["actual_device"]["description"] = "x" * 257
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "unbounded-device.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with self.assertRaisesRegex(GATE.MatrixError, "bounded live actual-device"):
+                GATE.parse_trace_artifact(path)
 
 
 if __name__ == "__main__":

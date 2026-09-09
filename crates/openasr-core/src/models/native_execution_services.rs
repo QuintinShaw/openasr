@@ -25,7 +25,8 @@ use thiserror::Error;
 use crate::device::{
     execution_memory::{
         AllocationLifetime, DeviceMemoryBrokerSet, DeviceMemoryPolicy,
-        DeviceMemoryReservationBatch, MemoryReservationCohortId, PhaseSet, PhysicalDeviceKey,
+        DeviceMemoryReservationBatch, DeviceMemorySnapshot, MappingEnvelopeHandle, MemoryDomainKey,
+        MemoryReservationCohortId, PhaseSet, PhysicalDeviceKey, QuoteConfidence,
     },
     execution_policy::{
         DefaultExecutionPolicyResolver, ExecutionCandidate, ExecutionCandidateFailure,
@@ -48,8 +49,9 @@ use crate::ggml_runtime::{
 use crate::ggml_runtime::{
     GgmlBackend, GgmlBackendKind, GgmlCpuGraphBackend, GgmlDeviceMemory,
     GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector, GgmlExecutionTelemetryGuard,
-    RequestBackendOverrideGuard, RequestBackendPreference, current_execution_telemetry_collector,
-    ensure_backends_loaded, ggml_available_devices, install_execution_telemetry_collector,
+    GgmlGraphLifecycleGuard, RequestBackendOverrideGuard, RequestBackendPreference,
+    current_execution_telemetry_collector, ensure_backends_loaded, ggml_available_devices,
+    install_execution_telemetry_collector, install_graph_lifecycle_collector,
     install_request_backend_override, request_backend_override, resolve_request_execution_route,
 };
 use crate::models::pack_verifier::{PackRoute, VerifiedPack};
@@ -191,6 +193,7 @@ pub(crate) struct ExecutionBackendObservation {
     pub(crate) backend_name: String,
     pub(crate) actual_provider: ExecutionProvider,
     pub(crate) actual_stable_id: String,
+    pub(crate) actual_device: crate::GgmlActualDeviceFacts,
     pub(crate) use_scheduler: bool,
     /// In-process join key only. It is never emitted by the smoke receipt.
     backend_identity: usize,
@@ -784,6 +787,7 @@ pub(crate) struct NativeExecutionContextGuard {
     previous_cache_attempt_id: Option<ExecutionCacheAttemptId>,
     previous_activation_reservation_cohort: Option<MemoryReservationCohortId>,
     execution_telemetry: GgmlExecutionTelemetryGuard,
+    _graph_lifecycle: GgmlGraphLifecycleGuard,
     previous_receipt: Option<NativeExecutionReceiptCollector>,
     backend: RequestBackendOverrideGuard,
 }
@@ -1025,6 +1029,7 @@ pub(crate) fn current_request_attempt_id() -> Option<crate::RequestAttemptId> {
 
 pub(crate) struct ExecutionReceiptCollectorGuard {
     previous: Option<NativeExecutionReceiptCollector>,
+    _graph_lifecycle: GgmlGraphLifecycleGuard,
 }
 
 impl Drop for ExecutionReceiptCollectorGuard {
@@ -1041,8 +1046,16 @@ impl Drop for ExecutionReceiptCollectorGuard {
 pub(crate) fn install_execution_receipt_collector(
     collector: Option<NativeExecutionReceiptCollector>,
 ) -> ExecutionReceiptCollectorGuard {
+    let graph_lifecycle = install_graph_lifecycle_collector(
+        collector
+            .as_ref()
+            .map(NativeExecutionReceiptCollector::graph_lifecycle_collector),
+    );
     let previous = CURRENT_EXECUTION_RECEIPT.with(|current| current.replace(collector));
-    ExecutionReceiptCollectorGuard { previous }
+    ExecutionReceiptCollectorGuard {
+        previous,
+        _graph_lifecycle: graph_lifecycle,
+    }
 }
 
 /// Records a runner-backed observation only while an explicitly instrumented
@@ -1055,10 +1068,17 @@ pub(crate) fn record_current_execution_backend_observation(
     backend_name: &str,
     actual_provider: ExecutionProvider,
     actual_stable_id: &str,
+    actual_device: &crate::GgmlActualDeviceFacts,
     use_scheduler: bool,
 ) {
     if let Some(receipt) = current_execution_receipt_collector() {
-        receipt.record_backend_observation(actual_provider, actual_stable_id, use_scheduler);
+        receipt.record_backend_observation(
+            backend_identity,
+            actual_provider,
+            actual_stable_id,
+            actual_device,
+            use_scheduler,
+        );
     }
     let Some(sink) = current_execution_observation_sink() else {
         return;
@@ -1078,6 +1098,7 @@ pub(crate) fn record_current_execution_backend_observation(
         backend_name: backend_name.to_string(),
         actual_provider,
         actual_stable_id: actual_stable_id.to_string(),
+        actual_device: actual_device.clone(),
         use_scheduler,
         backend_identity,
         memory_receipts: Vec::new(),
@@ -1367,6 +1388,12 @@ pub(crate) fn install_native_execution_context(
     let previous_activation_reservation_cohort = CURRENT_ACTIVATION_RESERVATION_COHORT
         .with(|current| current.replace(context.activation_reservation_cohort));
     let execution_telemetry = install_execution_telemetry_collector(context.execution_telemetry);
+    let graph_lifecycle = install_graph_lifecycle_collector(
+        context
+            .receipt
+            .as_ref()
+            .map(NativeExecutionReceiptCollector::graph_lifecycle_collector),
+    );
     let previous_receipt =
         CURRENT_EXECUTION_RECEIPT.with(|current| current.replace(context.receipt));
     let backend = install_request_backend_override(context.backend_preference);
@@ -1383,6 +1410,7 @@ pub(crate) fn install_native_execution_context(
         previous_cache_attempt_id,
         previous_activation_reservation_cohort,
         execution_telemetry,
+        _graph_lifecycle: graph_lifecycle,
         previous_receipt,
         backend,
     }
@@ -1677,8 +1705,20 @@ pub struct ActivationReservationContext {
     cohort_id: MemoryReservationCohortId,
 }
 
+impl ActivationReservationContext {
+    /// Mint a request-scoped cohort so concurrent longform slices and nested
+    /// host owners share one exclusive system-memory gate. Independent
+    /// candidate fallbacks still mint their own attempt journals underneath.
+    pub(crate) fn mint() -> Self {
+        Self {
+            cohort_id: MemoryReservationCohortId::new(ExecutionCacheAttemptId::next().0),
+        }
+    }
+}
+
 pub struct BrokerActivationReservation {
     batch: Option<DeviceMemoryReservationBatch>,
+    envelope: Option<MappingEnvelopeHandle>,
     context: ActivationReservationContext,
 }
 
@@ -1694,8 +1734,20 @@ impl BrokerActivationReservation {
         }
         Ok(Self {
             batch: Some(batch),
+            envelope: None,
             context: ActivationReservationContext { cohort_id },
         })
+    }
+
+    fn from_envelope(
+        envelope: MappingEnvelopeHandle,
+        cohort_id: MemoryReservationCohortId,
+    ) -> Self {
+        Self {
+            batch: None,
+            envelope: Some(envelope),
+            context: ActivationReservationContext { cohort_id },
+        }
     }
 
     pub const fn context(&self) -> ActivationReservationContext {
@@ -1708,6 +1760,7 @@ impl ActivationReservation for BrokerActivationReservation {
 
     fn release(&mut self) -> Result<(), Self::Error> {
         drop(self.batch.take());
+        drop(self.envelope.take());
         Ok(())
     }
 
@@ -1715,6 +1768,7 @@ impl ActivationReservation for BrokerActivationReservation {
         if let Some(mut batch) = self.batch.take() {
             batch.quarantine();
         }
+        drop(self.envelope.take());
         Ok(())
     }
 }
@@ -1809,7 +1863,6 @@ pub fn resolve_candidate_activation_lane(
 /// output-plan evidence, or reuse evidence.
 #[derive(Debug, Clone)]
 pub struct ResolvedDefaultModelActivation {
-    candidate: ExecutionCandidate,
     verified_pack: VerifiedPack,
     facts: DefaultModelActivationFacts,
 }
@@ -1820,14 +1873,12 @@ impl ResolvedDefaultModelActivation {
     }
 
     pub fn quote(&self) -> Result<DefaultModelActivationQuote, String> {
-        let (_backends, _mapping, plan) = quote_candidate_activation_plan(
+        let (_backends, _mapping, mapping) = quote_candidate_activation_plan(
             &self.verified_pack,
-            &self.candidate,
             self.facts.plan().resident_topology(),
         )?;
         Ok(DefaultModelActivationQuote {
-            plan,
-            candidate: self.candidate.clone(),
+            mapping,
             content_id: self.verified_pack.content_id().to_string(),
         })
     }
@@ -1844,8 +1895,7 @@ impl ResolvedDefaultModelActivation {
 /// or audit checkpoint between quote/stat observation and broker mutation, but
 /// cannot inspect or rewrite physical-domain rows.
 pub struct DefaultModelActivationQuote {
-    plan: NativeMemoryAdmissionPlan,
-    candidate: ExecutionCandidate,
+    mapping: PackMappingQuote,
     content_id: String,
 }
 
@@ -1854,13 +1904,19 @@ impl DefaultModelActivationQuote {
         self,
         services: &NativeExecutionServices,
     ) -> Result<BrokerActivationReservation, String> {
-        reserve_activation_plan(
-            services,
-            &self.plan,
-            &self.candidate,
-            Some(&self.content_id),
-        )
+        reserve_pack_mapping(services, &self.mapping, Some(&self.content_id))
     }
+}
+
+/// Observation-bound host-import of one already-open pack mapping.
+///
+/// This is not a broker reservation batch. Activation opens a mapping
+/// envelope; GPU `pack-weight-buffer` reserves separately.
+struct PackMappingQuote {
+    snapshot: DeviceMemorySnapshot,
+    bytes: u64,
+    resource_id: String,
+    quote_confidence: QuoteConfidence,
 }
 
 fn resolve_resident_topology_plan(
@@ -1953,7 +2009,6 @@ pub fn resolve_default_model_activation(
         resident_topology,
     );
     Ok(ResolvedDefaultModelActivation {
-        candidate,
         verified_pack: pack.clone(),
         facts: ResolvedExecutionFacts::new(plan, lane, identity),
     })
@@ -1976,6 +2031,12 @@ fn ggml_backend_physical_identity(
         return Err("candidate activation quote received a null ggml backend".to_string());
     }
     let device = unsafe { ffi::ggml_backend_get_device(backend) };
+    ggml_device_physical_identity(device)
+}
+
+fn ggml_device_physical_identity(
+    device: ffi::GgmlBackendDevRaw,
+) -> Result<PhysicalDeviceKey, String> {
     if device.is_null() {
         return Err("candidate activation backend has no device for physical identity".to_string());
     }
@@ -2006,42 +2067,12 @@ fn host_backend_for_activation() -> Result<GgmlBackend, String> {
     GgmlBackend::cpu().map_err(|error| error.to_string())
 }
 
-fn discrete_backend_for_candidate(
-    candidate: &ExecutionCandidate,
-) -> Result<Option<GgmlBackend>, String> {
-    match candidate.device.route.provider {
-        ExecutionProvider::Cuda | ExecutionProvider::Hip | ExecutionProvider::Vulkan
-            if candidate.placement != ExecutionPlacement::CpuOnly => {}
-        _ => return Ok(None),
-    }
-    ensure_backends_loaded();
-    let devices = ggml_available_devices();
-    let wanted = candidate.device.route.provider;
-    let stable = candidate.device.route.stable_id.as_str();
-    let device = devices.iter().find(|device| {
-        ExecutionProvider::from_backend_name(&device.name) == wanted
-            && (device.name == stable
-                || device
-                    .device_id
-                    .as_deref()
-                    .is_some_and(|id| id.eq_ignore_ascii_case(stable)))
-    });
-    match device {
-        Some(device) => device
-            .initialize()
-            .map(Some)
-            .map_err(|error| error.to_string()),
-        None => Ok(None),
-    }
-}
-
 fn quote_activation_group(
     group_id: &str,
-    backend: &GgmlBackend,
+    identity: PhysicalDeviceKey,
+    abi: BackendMemoryAbi,
     request: ffi::GgmlBackendMemoryRequestV1,
 ) -> Result<NativeQuotedBackendGroup, String> {
-    let abi = unsafe { BackendMemoryAbi::from_backend(backend.as_ptr()) }
-        .map_err(|error| format!("candidate activation ABI: {error}"))?;
     let semantics = NativeMemoryClaimSemantics {
         resource_id: group_id.to_owned(),
         lifetime: AllocationLifetime::PackShared,
@@ -2049,7 +2080,7 @@ fn quote_activation_group(
     };
     NativeQuotedBackendGroup::quote(
         group_id,
-        ggml_backend_physical_identity(backend.as_ptr())?,
+        identity,
         abi,
         vec![request],
         BTreeMap::from([(request.request_id, semantics.clone())]),
@@ -2058,15 +2089,29 @@ fn quote_activation_group(
     .map_err(|error| format!("candidate activation ggml quote: {error}"))
 }
 
+fn quote_host_activation_group(
+    group_id: &str,
+    host: &GgmlBackend,
+    request: ffi::GgmlBackendMemoryRequestV1,
+) -> Result<NativeQuotedBackendGroup, String> {
+    let abi = unsafe { BackendMemoryAbi::from_backend(host.as_ptr()) }
+        .map_err(|error| format!("candidate activation ABI: {error}"))?;
+    quote_activation_group(
+        group_id,
+        ggml_backend_physical_identity(host.as_ptr())?,
+        abi,
+        request,
+    )
+}
+
 fn quote_candidate_activation_plan(
     pack: &VerifiedPack,
-    candidate: &ExecutionCandidate,
     resident_topology: &DefaultModelResidentTopologyPlan,
 ) -> Result<
     (
         Vec<GgmlBackend>,
         std::sync::Arc<memmap2::Mmap>,
-        NativeMemoryAdmissionPlan,
+        PackMappingQuote,
     ),
     String,
 > {
@@ -2092,22 +2137,20 @@ fn quote_candidate_activation_plan(
         resident_topology.architecture,
         prepared_components.join(",")
     );
-    quote_pack_activation_plan(pack, candidate, &topology_resource)
+    quote_pack_activation_plan(pack, &topology_resource)
 }
 
-/// Quote the verified pack bytes for one already-resolved activation resource.
-/// ASR callers derive that identity from their resident topology. Auxiliary
-/// callers derive it from the canonical aux registry instead of masquerading
-/// as an ASR architecture descriptor.
+/// Quote the already-open pack mapping as host-import for one activation
+/// resource. Discrete GPU VRAM is reserved later at `pack-weight-buffer`
+/// allocation, never as a mmap-sized device-copy forecast of this mapping.
 fn quote_pack_activation_plan(
     pack: &VerifiedPack,
-    candidate: &ExecutionCandidate,
     activation_resource: &str,
 ) -> Result<
     (
         Vec<GgmlBackend>,
         std::sync::Arc<memmap2::Mmap>,
-        NativeMemoryAdmissionPlan,
+        PackMappingQuote,
     ),
     String,
 > {
@@ -2128,61 +2171,28 @@ fn quote_pack_activation_plan(
         ..Default::default()
     };
     let host_group_id = format!("candidate-activation-host-import:{activation_resource}");
-    let host_group = quote_activation_group(&host_group_id, &host, host_import).or_else(|_| {
-        let device = unsafe { ffi::ggml_backend_get_device(host.as_ptr()) };
-        if device.is_null() {
-            return Err("host activation backend has no device".to_string());
+    let host_group = quote_host_activation_group(&host_group_id, &host, host_import)?;
+    let plan = admission_plan_from_quoted_groups(vec![host_group])?;
+    let request = match plan.reservation_requests() {
+        [request] if request.domain == MemoryDomainKey::SystemMemory && request.peak_bytes > 0 => {
+            request
         }
-        let buft = unsafe { ffi::ggml_backend_dev_buffer_type(device) };
-        if buft.is_null() {
-            return Err("host activation backend has no buffer type to quote".to_string());
+        _ => {
+            return Err(
+                "candidate activation host-import must quote one SystemMemory mapping".to_string(),
+            );
         }
-        let host_copy = ffi::GgmlBackendMemoryRequestV1 {
-            kind: ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER,
-            usage: ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS as u32,
-            request_id: 1,
-            backend: host.as_ptr(),
-            buft,
-            requested_bytes,
-            currently_allocated_bytes: 0,
-            ..Default::default()
-        };
-        quote_activation_group(
-            &format!("candidate-activation-host-copy:{activation_resource}"),
-            &host,
-            host_copy,
-        )
-    })?;
-    let mut groups = vec![host_group];
-    let mut backends = vec![host];
-    if let Some(device) = discrete_backend_for_candidate(candidate)? {
-        let device_raw = unsafe { ffi::ggml_backend_get_device(device.as_ptr()) };
-        if device_raw.is_null() {
-            return Err("discrete activation backend has no device".to_string());
-        }
-        let buft = unsafe { ffi::ggml_backend_dev_buffer_type(device_raw) };
-        if buft.is_null() {
-            return Err("discrete activation backend has no buffer type to quote".to_string());
-        }
-        let device_copy = ffi::GgmlBackendMemoryRequestV1 {
-            kind: ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER,
-            usage: ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS as u32,
-            request_id: 1,
-            backend: device.as_ptr(),
-            buft,
-            requested_bytes,
-            currently_allocated_bytes: 0,
-            ..Default::default()
-        };
-        groups.push(quote_activation_group(
-            &format!("candidate-activation-device-copy:{activation_resource}"),
-            &device,
-            device_copy,
-        )?);
-        backends.push(device);
-    }
-    let plan = admission_plan_from_quoted_groups(groups)?;
-    Ok((backends, mmap, plan))
+    };
+    Ok((
+        vec![host],
+        mmap,
+        PackMappingQuote {
+            snapshot: request.snapshot,
+            bytes: requested_bytes,
+            resource_id: request.resource_id.clone(),
+            quote_confidence: plan.quote_confidence_for_domain(&MemoryDomainKey::SystemMemory),
+        },
+    ))
 }
 
 fn admission_plan_from_quoted_groups(
@@ -2232,9 +2242,56 @@ fn quote_cpu_buffer_plan(
         currently_allocated_bytes: 0,
         ..Default::default()
     };
-    let group = quote_activation_group(group_id, &host, request)?;
+    let group = quote_host_activation_group(group_id, &host, request)?;
     let plan = admission_plan_from_quoted_groups(vec![group])?;
     Ok((host, plan))
+}
+
+fn reserve_pack_mapping(
+    services: &NativeExecutionServices,
+    mapping: &PackMappingQuote,
+    content_id: Option<&str>,
+) -> Result<BrokerActivationReservation, String> {
+    let cohort_id = current_memory_reservation_cohort_id()
+        .unwrap_or_else(|| MemoryReservationCohortId::new(ExecutionCacheAttemptId::next().0));
+    let collector = services.runtime_receipts();
+    let handle = services
+        .memory_broker()
+        .open_mapping_envelope(
+            mapping.snapshot,
+            mapping.bytes,
+            cohort_id,
+            mapping.resource_id.clone(),
+            Some(services.scope_id),
+            RuntimeOwnerPlacement::HostNeutral,
+        )
+        .map_err(|error| format!("candidate activation reserve: {error}"))?;
+    if collector.is_available()
+        && let Some(owner) = collector.host_neutral_owner_descriptor(
+            "mapping-envelope",
+            content_id,
+            Some(mapping.resource_id.as_str()),
+        )
+        && let Some(resource) = collector.resource_descriptor(
+            &mapping.resource_id,
+            &MemoryDomainKey::SystemMemory,
+            mapping.bytes,
+            mapping.bytes,
+            mapping.bytes,
+            mapping.quote_confidence,
+            Some(mapping.snapshot.confidence),
+        )
+    {
+        services.memory_broker().attach_mapping_envelope_receipt(
+            &handle,
+            collector.clone(),
+            owner,
+            resource,
+        );
+    }
+    Ok(BrokerActivationReservation::from_envelope(
+        handle, cohort_id,
+    ))
 }
 
 fn reserve_activation_plan(
@@ -2348,7 +2405,7 @@ pub(crate) fn quote_and_reserve_candidate_activation(
     pack: &VerifiedPack,
 ) -> Result<BrokerActivationReservation, String> {
     let architecture_id = architecture_id_from_pack(pack)?;
-    let (_backends, _mapping, plan) = match pack.route() {
+    let (_backends, _mapping, mapping) = match pack.route() {
         PackRoute::Asr { .. } => {
             let descriptor = crate::arch::OpenAsrArchitectureRegistry::with_builtins()
                 .find_by_model_architecture(architecture_id)
@@ -2365,7 +2422,7 @@ pub(crate) fn quote_and_reserve_candidate_activation(
             );
             let topology =
                 resolve_resident_topology_plan(descriptor, pack, candidate, &intent, true)?;
-            quote_candidate_activation_plan(pack, candidate, &topology)?
+            quote_candidate_activation_plan(pack, &topology)?
         }
         PackRoute::Aux { .. } => {
             let policy = super::aux_pack_registry::auxiliary_execution_policy(architecture_id)
@@ -2391,10 +2448,10 @@ pub(crate) fn quote_and_reserve_candidate_activation(
                         )
                     })?;
             let activation_resource = format!("aux:{architecture_id}:{}", ownership.as_str());
-            quote_pack_activation_plan(pack, candidate, &activation_resource)?
+            quote_pack_activation_plan(pack, &activation_resource)?
         }
     };
-    reserve_activation_plan(services, &plan, candidate, Some(pack.content_id()))
+    reserve_pack_mapping(services, &mapping, Some(pack.content_id()))
 }
 
 /// Runs a complete allocation/execution operation inside one candidate's
@@ -2442,6 +2499,9 @@ pub(crate) fn run_execution_candidate_attempt<T, E>(
         let _telemetry = install_execution_telemetry_collector(combined_collector);
         let _attempt =
             install_execution_candidate_attempt(services, candidate, failure_sink.clone());
+        if receipt.is_some() {
+            services.runtime_receipts.begin_request_event_window();
+        }
         let journal_scope = ExecutionCacheJournalScope::begin();
         let reservation = match quote_and_reserve_current_candidate_activation(services, candidate)
         {
@@ -2577,6 +2637,11 @@ pub struct NativeExecutionServices {
             super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
             crate::diarize::embed::RedimNetResidentRuntime,
         >,
+    wespeaker_runtime_actors:
+        super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool<
+            super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
+            crate::diarize::embed::WeSpeakerResidentRuntime,
+        >,
     firered_stream_vad_realtime_actors:
         super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool<
             super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
@@ -2670,9 +2735,18 @@ impl NativeExecutionServices {
                 super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool::new(
                     "openasr-redimnet-owner",
                     super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
-                        crate::diarize::embed::REDIMNET_MAX_BATCH_WORKERS,
+                        crate::diarize::embed::EMBEDDER_MAX_BATCH_WORKERS,
                         crate::host::host_available_memory_bytes().unwrap_or(u64::MAX),
-                        crate::diarize::embed::REDIMNET_MAX_BATCH_WORKERS,
+                        crate::diarize::embed::EMBEDDER_MAX_BATCH_WORKERS,
+                    ),
+                ),
+            wespeaker_runtime_actors:
+                super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool::new(
+                    "openasr-wespeaker-owner",
+                    super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPoolLimits::new(
+                        crate::diarize::embed::EMBEDDER_MAX_BATCH_WORKERS,
+                        crate::host::host_available_memory_bytes().unwrap_or(u64::MAX),
+                        crate::diarize::embed::EMBEDDER_MAX_BATCH_WORKERS,
                     ),
                 ),
             firered_stream_vad_realtime_actors:
@@ -2748,6 +2822,15 @@ impl NativeExecutionServices {
         &self.redimnet_runtime_actors
     }
 
+    pub(crate) fn wespeaker_runtime_actors(
+        &self,
+    ) -> &super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool<
+        super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
+        crate::diarize::embed::WeSpeakerResidentRuntime,
+    > {
+        &self.wespeaker_runtime_actors
+    }
+
     pub(crate) fn firered_stream_vad_realtime_actors(
         &self,
     ) -> &super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorCheckoutPool<
@@ -2775,6 +2858,7 @@ impl NativeExecutionServices {
         self.diarizen_segmenter_actors.clear();
         self.pyannote_segmenter_actors.clear();
         self.redimnet_runtime_actors.clear();
+        self.wespeaker_runtime_actors.clear();
         self.firered_stream_vad_realtime_actors.clear();
         *self
             .firered_stream_vad_embedded
@@ -2799,6 +2883,8 @@ impl NativeExecutionServices {
         self.pyannote_segmenter_actors
             .evict_where(|key| key.has_content_id(pack_content_id));
         self.redimnet_runtime_actors
+            .evict_where(|key| key.has_content_id(pack_content_id));
+        self.wespeaker_runtime_actors
             .evict_where(|key| key.has_content_id(pack_content_id));
         self.loaded_weight_owners.evict_content_id(pack_content_id);
     }
@@ -2862,8 +2948,19 @@ mod tests {
         },
     };
     use crate::ggml_runtime::{
-        GgmlBackendKind, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
+        GgmlActualDeviceFacts, GgmlBackendKind, GgmlCpuGraphConfig, GgmlCpuGraphError,
+        GgmlCpuGraphRunner,
     };
+
+    fn test_cuda_device() -> GgmlActualDeviceFacts {
+        GgmlActualDeviceFacts {
+            device_type: "gpu".to_string(),
+            name: "CUDA0".to_string(),
+            description: "test CUDA device".to_string(),
+            provider_device_id: Some("0000:01:00.0".to_string()),
+            pci_vendor_id: Some(0x10de),
+        }
+    }
 
     fn nes_unit_test_declared_resident() -> SystemMemoryAllocationQuote {
         SystemMemoryAllocationQuote::new("nes-unit-test.declared-resident", 64 * 1024, 64 * 1024)
@@ -3213,6 +3310,7 @@ mod tests {
                     "CUDA0",
                     ExecutionProvider::Cuda,
                     "CUDA0",
+                    &test_cuda_device(),
                     true,
                 );
             })
@@ -3230,6 +3328,7 @@ mod tests {
                 backend_name: "CUDA0".to_string(),
                 actual_provider: ExecutionProvider::Cuda,
                 actual_stable_id: "CUDA0".to_string(),
+                actual_device: test_cuda_device(),
                 use_scheduler: true,
                 backend_identity: 1,
                 memory_receipts: Vec::new(),
@@ -3262,6 +3361,7 @@ mod tests {
                 "CUDA0",
                 ExecutionProvider::Cuda,
                 "CUDA0",
+                &test_cuda_device(),
                 false,
             );
             record_current_execution_candidate_failure(ExecutionCandidateFailure::capacity(
@@ -3281,6 +3381,7 @@ mod tests {
                 "CUDA0",
                 ExecutionProvider::Cuda,
                 "CUDA0",
+                &test_cuda_device(),
                 false,
             );
             Ok::<_, &str>(())
@@ -3440,6 +3541,36 @@ mod tests {
         assert!(next.result.is_ok());
         // A completed attempt must never reopen the previous cohort gate.
         assert_ne!(outer, next.result.unwrap());
+    }
+
+    #[test]
+    fn nested_candidate_attempts_keep_parent_activation_cohort() {
+        let services = test_native_execution_services();
+        let candidate = cpu_candidate();
+        let parent = ActivationReservationContext::mint();
+        let parent_id = parent.cohort_id;
+        let _guard = install_activation_reservation_context(Some(parent));
+        let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            assert_eq!(
+                current_memory_reservation_cohort_id().expect("attempt cohort"),
+                parent_id
+            );
+            let nested = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+                Ok::<_, ()>(current_memory_reservation_cohort_id().expect("nested cohort"))
+            });
+            assert_eq!(nested.result.unwrap(), parent_id);
+            let context = current_native_execution_context().expect("attempt context");
+            let worker = std::thread::spawn(move || {
+                let _guard = install_native_execution_context(context);
+                current_memory_reservation_cohort_id().expect("worker cohort")
+            })
+            .join()
+            .unwrap();
+            assert_eq!(worker, parent_id);
+            Ok::<_, ()>(())
+        });
+        assert!(outcome.result.is_ok());
+        assert!(outcome.candidate_failure.is_none());
     }
 
     #[test]
@@ -3942,23 +4073,12 @@ mod tests {
                 true,
             )
             .unwrap();
-            let (_backends, _mapping, plan) =
-                quote_candidate_activation_plan(&pack, &candidate, &topology)
-                    .expect("activation footprint must be quotable");
-            let peak = plan
-                .reservation_requests()
-                .iter()
-                .map(|request| request.peak_bytes)
-                .sum::<u64>();
+            let (_backends, _mapping, mapping) = quote_candidate_activation_plan(&pack, &topology)
+                .expect("activation footprint must be quotable");
+            let peak = mapping.bytes;
             assert!(
                 peak > 4096,
                 "quoted activation peak must exceed a placeholder page, got {peak}"
-            );
-            assert!(
-                plan.reservation_requests()
-                    .iter()
-                    .all(|request| request.peak_bytes > 0),
-                "quoted activation domains must not be reserved as zero"
             );
             peak
         };

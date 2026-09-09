@@ -40,6 +40,9 @@ fn clear_inherited_openasr_env(command: &mut Command) {
         "OPENASR_ADDR",
         "OPENASR_ASSUME_YES",
         "OPENASR_OFFLINE",
+        "OPENASR_CATALOG_URL",
+        "OPENASR_CATALOG_FILE",
+        "OPENASR_CATALOG_IDENTITY",
     ] {
         command.env_remove(key);
     }
@@ -360,7 +363,8 @@ fn serve_help_documents_local_default_and_remote_security() {
         ))
         .stdout(predicate::str::contains("HTTPS/WSS"))
         .stdout(predicate::str::contains("--tls-self-signed"))
-        .stdout(predicate::str::contains("--pairing-admin-token-env"));
+        .stdout(predicate::str::contains("--pairing-admin-token-env"))
+        .stdout(predicate::str::contains("--pairing-admin-token-file"));
 }
 
 #[test]
@@ -758,10 +762,11 @@ fn transcribe_mock_formats_match_core_renderers() {
 // fixtures (ffmpeg concat, no new audio content). Pinned against
 // `OPENASR_GGML_BACKEND=cpu` (Metal currently OOMs this family's 7B decoder
 // on a 16GB unified-memory Mac, see the T5 report); the auto energy-VAD
-// slicer picked 3 chunks here, whose seams show as the two small stray-token
-// artifacts in the golden ("我 我" and an extra "中") -- both present in the
-// real committed pack's output, not smoothed over.
-const FIRERED_LLM_GOLDEN_LONGFORM_EN_ZH_TEXT: &str = "and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我 我通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗中 周末的时候我通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country";
+// slicer picked 3 chunks here. The extra "中" is a model token. The first-seam
+// "我 我" is consumed by the shared assembler; the join space remains
+// (`周末的时候我 通常会`). Bytes come from feeding the three origin slice
+// texts through TranscriptAssembler (pending pack re-measure).
+const FIRERED_LLM_GOLDEN_LONGFORM_EN_ZH_TEXT: &str = "and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我 通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗中 周末的时候我通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country";
 
 #[test]
 #[ignore = "requires the private ~8.9GB dev-only firered2-llm-q8_0.oasr pack; runs the real \
@@ -815,15 +820,17 @@ fn firered_llm_golden_diff_longform_cli_transcribe_matches_reference_decode() {
 // this family's ~8B combined weights on a 16GB unified-memory Mac is
 // unverified, see this module's e2e report).
 // The longform assembler joins retained, trimmed segment texts with one space.
-// The spaces inside this `concat!` are therefore golden bytes. The same
-// family's single-utterance EN->ZH golden
+// The spaces inside this `concat!` are therefore golden bytes, taken from
+// feeding the three origin slice texts through TranscriptAssembler. The
+// first-seam "我 我" is consumed; the join space remains (`我 通常会`).
+// The same family's single-utterance EN->ZH golden
 // (`mimo_asr::executor::tests::golden_diff_end_to_end_transcribe_en_zh_mixed_wav`)
 // also asserts the EN->ZH space.
 const GOLDEN_MIMO_LONGFORM_EN_ZH_TEXT: &str = concat!(
     "And so, my fellow Americans, ask not what your country can do for you. ",
     "Ask what you can do for your country. ",
     "今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的川菜馆吃饭，",
-    "听说那里的麻婆豆腐特别正宗。周末的时候，我 我通常会读书或者看一部电影放松一下。",
+    "听说那里的麻婆豆腐特别正宗。周末的时候，我 通常会读书或者看一部电影放松一下。",
     "And so, my fellow Americans, ask not what your country can do for you, ",
     "ask what you can do for your country.",
     "今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的川菜馆吃饭，",
@@ -885,20 +892,19 @@ fn mimo_asr_golden_diff_longform_cli_transcribe_matches_reference_decode() {
 // `encoder_attention_span_caps_every_builtin_architecture_on_the_production_path`
 // in `native_transcribe.rs`), so this 69s input forces the auto energy-VAD
 // slicer to split -- confirmed 3 chunks via `--format verbose_json`'s
-// `longform.chunk_count`. Pinned against `OPENASR_GGML_BACKEND=cpu`. The two
-// chunk seams show up as the golden's two textual artifacts: a duplicated "我"
-// at the first seam (VAD overlap re-transcribing the boundary word) and a
-// missing space between "COUNTRY" and "今天" / "ANDSO" run together at chunk
-// boundaries where the assembler's join lands between two tokens with no SPM
-// space marker between them -- both present in the real committed pack's
-// output, not smoothed over.
+// `longform.chunk_count`. Pinned against `OPENASR_GGML_BACKEND=cpu`. The
+// missing space between "COUNTRY" and "今天" / "ANDSO" is a tokenizer join.
+// The first-seam "我 我" is consumed by the shared assembler; the join
+// space remains (`周末的时候我 通常会`). Bytes come from feeding the
+// three origin slice texts through TranscriptAssembler
+// (pending pack re-measure).
 fn firered_aed_dev_pack_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/firered-out/firered-aed-l-fp16.oasr")
 }
 
 const GOLDEN_FIRERED_AED_LONGFORM_EN_ZH_TEXT: &str = concat!(
     "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO ",
-    "FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我 我通常会读书或者看一部电影放松一下 ",
+    "FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我 通常会读书或者看一部电影放松一下 ",
     "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO ",
     "FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗 周末的时候我通常会读书或者看一部电影放松一下 ",
     "ANDSO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR ",
@@ -1017,6 +1023,80 @@ fn moss_transcribe_diarize_golden_diff_longform_cli_transcribe_matches_reference
         output.trim_end(),
         GOLDEN_MOSS_TRANSCRIBE_DIARIZE_LONGFORM_EN_ZH_TEXT,
         "unexpected longform CLI transcript"
+    );
+}
+
+// qwen3-asr-0.6b longform seam: the shared assembler used to keep the
+// energy-slicer overlap re-read on wordless CJK segments (0.1.40 reproduced
+// "周末的时候，我。" / "的时候，" at 25.5s). This pins the user-facing CLI
+// path once a published qwen3 pack is available.
+#[test]
+#[ignore = "requires qwen3-asr-0.6b:q4 in OPENASR_QWEN3_HOME or OPENASR_QWEN3_ASR_PACK; \
+            runs the real longform CLI path on fixtures/longform_en_zh.wav"]
+fn qwen3_asr_longform_cli_seam_does_not_duplicate_overlap_text() {
+    let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/longform_en_zh.wav")
+        .canonicalize()
+        .expect("longform_en_zh.wav fixture must exist");
+
+    let mut command = if let Ok(home) = std::env::var("OPENASR_QWEN3_HOME") {
+        let mut command = openasr_with_home(Path::new(&home));
+        command.env("OPENASR_OFFLINE", "1").args([
+            "transcribe",
+            &input.display().to_string(),
+            "-m",
+            "qwen3-asr-0.6b:q4",
+            "--offline",
+            "--format",
+            "text",
+        ]);
+        command
+    } else {
+        let pack_path =
+            match external_test_fixture_path("OPENASR_QWEN3_ASR_PACK", "Qwen3-ASR 0.6B .oasr pack")
+            {
+                Ok(path) => path,
+                Err(skip) => {
+                    eprintln!("skipping: {skip}");
+                    return;
+                }
+            };
+        let mut command = openasr();
+        command.env("OPENASR_OFFLINE", "1").args([
+            "transcribe",
+            &input.display().to_string(),
+            "--model-pack",
+            &pack_path.display().to_string(),
+            "--offline",
+            "--format",
+            "text",
+        ]);
+        command
+    };
+
+    let assert = command.assert().success();
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    let text = output.trim_end();
+    eprintln!("qwen3-asr longform CLI transcript: {text:?}");
+    assert_eq!(
+        text.matches("听说那里的麻婆豆腐特别正宗").count(),
+        2,
+        "each Chinese block keeps 听说…正宗 once, got {text:?}"
+    );
+    assert!(
+        !text.split_whitespace().any(|cue| cue == "吃饭。")
+            && !text.contains("\n吃饭。\n")
+            && !text.contains("吃饭。吃饭"),
+        "isolated 吃饭。 seam fragment must not survive, got {text:?}"
+    );
+    assert_eq!(
+        text.matches("周末的时候").count(),
+        2,
+        "weekend sentence must appear once per Chinese block, got {text:?}"
+    );
+    assert!(
+        text.contains("我通常会"),
+        "stitched sentence must keep both halves, got {text:?}"
     );
 }
 
@@ -1197,8 +1277,7 @@ fn serve_native_accepts_quant_pinned_model_ref_for_bare_local_runtime_source() {
     // must use the tolerant bare-id matcher, not string equality -- strict
     // equality rejected every catalog-installed pack it was about to serve.
     let temp = tempfile::tempdir().unwrap();
-    let pack_root = temp.path().join("whisper-runtime.oasr");
-    write_whisper_oasr_v1_fixture(&pack_root, "whisper-runtime");
+    let pack_root = install_whisper_runtime_pack_with_v2(temp.path());
 
     let reserved = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve ephemeral port");
     let addr = reserved.local_addr().expect("reserved addr").to_string();
@@ -1254,6 +1333,81 @@ fn serve_native_accepts_quant_pinned_model_ref_for_bare_local_runtime_source() {
             panic!("openasr serve did not report listening within 10s");
         }
     }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn serve_model_pack_loose_file_does_not_listen() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack_root = temp.path().join("whisper-runtime.oasr");
+    write_whisper_oasr_v1_fixture(&pack_root, "whisper-runtime");
+
+    openasr_with_home(temp.path())
+        .args([
+            "serve",
+            "--backend",
+            "native",
+            "--model-pack",
+            &pack_root.display().to_string(),
+            "--model",
+            "whisper-runtime",
+            "--addr",
+            "127.0.0.1:0",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "already installed content-addressed pack",
+        ))
+        .stderr(predicate::str::contains(
+            "Loose .oasr files are not a second runtime",
+        ));
+}
+
+#[test]
+fn serve_model_pack_migrates_legacy_default_and_listens() {
+    let temp = tempfile::tempdir().unwrap();
+    install_default_fixture_pack(
+        temp.path(),
+        "whisper-runtime",
+        "q8_0",
+        "q8",
+        &TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed(
+            "whisper-runtime",
+        ),
+    );
+    let pack = openasr_core::list_installed_packs(temp.path())
+        .expect("list installed whisper fixture")
+        .into_iter()
+        .next()
+        .expect("installed whisper fixture");
+    assert!(
+        openasr_core::default_selection::read_active_model_selection_v2(temp.path())
+            .unwrap()
+            .is_none(),
+        "fixture must start as a pre-V2 home"
+    );
+
+    let pack_path = pack.path.display().to_string();
+    let (mut child, _addr) = spawn_serve_with_extra_args_and_wait_until_listening(
+        temp.path(),
+        &["--model-pack", &pack_path],
+    );
+    let record = openasr_core::default_selection::read_active_model_selection_v2(temp.path())
+        .unwrap()
+        .expect("legacy default must migrate to V2 before --model-pack binds");
+    assert_eq!(
+        record.status,
+        openasr_core::default_selection::ActiveModelSelectionStatus::Installed
+    );
+    assert_eq!(
+        record
+            .expected_pack
+            .as_ref()
+            .map(|expected| expected.sha256.as_str()),
+        Some(pack.sha256.as_str())
+    );
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -1381,6 +1535,35 @@ fn install_default_fixture_pack(
         },
     )
     .expect("persist installed default model");
+}
+
+fn install_whisper_runtime_pack_with_v2(home: &Path) -> PathBuf {
+    install_default_fixture_pack(
+        home,
+        "whisper-runtime",
+        "q8_0",
+        "q8",
+        &TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_runtime_fail_closed(
+            "whisper-runtime",
+        ),
+    );
+    let pack = openasr_core::list_installed_packs(home)
+        .expect("list installed whisper fixture")
+        .into_iter()
+        .next()
+        .expect("installed whisper fixture");
+    let verified = openasr_core::PackVerifier
+        .verify_candidate(openasr_core::PackCandidate::new(pack.path.clone()))
+        .expect("whisper fixture must verify");
+    openasr_core::default_selection::persist_activation_detailed(
+        home,
+        &pack,
+        openasr_core::QuantPreference::pinned(&pack.quant),
+        verified.model_architecture(),
+        &openasr_core::device::execution_policy::ExecutionIntent::CpuOnly,
+    )
+    .expect("persist durable V2 for whisper fixture");
+    pack.path
 }
 
 fn install_default_moonshine_pack(home: &Path) {
@@ -2279,6 +2462,33 @@ fn pull_installs_local_pack_from_catalog_reference() {
 }
 
 #[test]
+fn pull_without_catalog_url_flag_honors_openasr_catalog_url() {
+    let home = temp_home();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pack = temp.path().join("moonshine-tiny-q8_0.oasr");
+    write_moonshine_oasr_v1_fixture(&pack, "moonshine-tiny");
+    let bytes = std::fs::read(&pack).expect("read pack fixture");
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let catalog = temp.path().join("catalog.json");
+    write_catalog_fixture(&catalog, &sha256, bytes.len() as u64);
+    let catalog_url = format!("file://{}", catalog.display());
+
+    openasr_with_home(home.path())
+        .env("OPENASR_CATALOG_URL", &catalog_url)
+        .env("OPENASR_OFFLINE", "1")
+        .args([
+            "pull",
+            "moonshine-tiny:q8",
+            "--from",
+            pack.to_str().expect("pack path"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("moonshine-tiny:q8"))
+        .stdout(predicate::str::contains(&sha256));
+}
+
+#[test]
 fn pull_preserves_existing_default_selection() {
     let home = temp_home();
     let temp = tempfile::tempdir().expect("pull fixture tempdir");
@@ -2716,6 +2926,111 @@ fn doctor_marks_unknown_saved_default_backend_as_unknown() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Default backend: mokk (unknown)"));
+}
+
+fn write_probe_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, contents).expect("write probe fixture file");
+    path
+}
+
+#[test]
+fn verify_qualification_manifest_rejects_a_missing_signature_before_runtime_init() {
+    let home = temp_home();
+    let manifest = write_probe_file(
+        home.path(),
+        "qualification-manifest.json",
+        r#"{"schema_version":1}"#,
+    );
+
+    openasr()
+        .arg("__openasr-verify-qualification-manifest")
+        .arg(&manifest)
+        .arg("--signature")
+        .arg(home.path().join("qualification-manifest.signature.json"))
+        .arg("--manifest-url")
+        .arg("https://dl.openasr.org/core/v0.1.37/openasr-0.1.37-qualification-cuda-sm_89.json")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Could not read qualification-manifest signature",
+        ));
+}
+
+#[test]
+fn sign_qualification_manifest_rejects_activation_policy_before_writing() {
+    let home = temp_home();
+    let manifest = write_probe_file(
+        home.path(),
+        "qualification-manifest.json",
+        r#"{"schema_version":1,"activation_modes":["explicit"]}"#,
+    );
+    let output = home.path().join("qualification-manifest.signature.json");
+
+    openasr()
+        .env(
+            "OPENASR_CATALOG_SIGNING_KEY_SEED_HEX",
+            "0101010101010101010101010101010101010101010101010101010101010101",
+        )
+        .arg("__openasr-sign-qualification-manifest")
+        .arg(&manifest)
+        .arg("--out")
+        .arg(&output)
+        .arg("--manifest-url")
+        .arg("https://dl.openasr.org/core/v0.1.37/openasr-0.1.37-qualification-cuda-sm_89.json")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Could not render qualification-manifest signature",
+        ));
+    assert!(
+        !output.exists(),
+        "unsafe manifest must not receive a signature"
+    );
+}
+
+#[test]
+fn qualification_runner_surface_has_no_plugin_or_activation_bypass() {
+    openasr()
+        .args(["__openasr-qualify-backend", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--manifest <MANIFEST>"))
+        .stdout(predicate::str::contains("--signature <SIGNATURE>"))
+        .stdout(predicate::str::contains(
+            "--qualification-home <QUALIFICATION_HOME>",
+        ))
+        .stdout(predicate::str::contains("--plugin-path").not())
+        .stdout(predicate::str::contains("--backend-id").not())
+        .stdout(predicate::str::contains("--activation-mode").not());
+}
+
+#[test]
+fn qualification_parent_rejects_missing_signature_before_artifact_or_runtime_work() {
+    let home = temp_home();
+    let manifest = write_probe_file(
+        home.path(),
+        "qualification-manifest.json",
+        r#"{"schema_version":1}"#,
+    );
+    let qualification_home = home.path().join("qualification-home");
+
+    openasr()
+        .arg("__openasr-qualify-backend")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--signature")
+        .arg(home.path().join("missing.signature.json"))
+        .arg("--manifest-url")
+        .arg("https://dl.openasr.org/core/v0.1.37/openasr-0.1.37-qualification-cuda-sm_89.json")
+        .arg("--qualification-home")
+        .arg(&qualification_home)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "could not read qualification signature",
+        ));
+    assert!(!qualification_home.exists());
 }
 
 // --- model-pack audit-quant (quantization-strategy self-check) -------------

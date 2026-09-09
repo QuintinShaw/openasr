@@ -283,6 +283,12 @@ pub enum GgufTensorIndexReadError {
         tensor_name: String,
         ggml_type: i32,
     },
+    #[error("gguf tensor '{tensor_name}' in '{path}' has invalid ggml type {ggml_type}")]
+    InvalidGgmlType {
+        path: PathBuf,
+        tensor_name: String,
+        ggml_type: i64,
+    },
     #[error(
         "gguf tensor type name for tensor '{tensor_name}' in '{path}' is not valid utf-8: {source}"
     )]
@@ -463,7 +469,14 @@ pub(crate) fn read_gguf_tensor_index_from_context(
             dims.push(dim_value as u64);
         }
 
-        let ggml_type = unsafe { ffi::gguf_get_tensor_type(context.as_ptr(), tensor_index) };
+        let raw_ggml_type = unsafe { ffi::gguf_get_tensor_type(context.as_ptr(), tensor_index) };
+        let ggml_type = ffi::checked_ggml_type_i32(raw_ggml_type).map_err(|error| {
+            GgufTensorIndexReadError::InvalidGgmlType {
+                path: path.to_path_buf(),
+                tensor_name: name.clone(),
+                ggml_type: error.raw,
+            }
+        })?;
         let type_name_ptr = unsafe { ffi::ggml_type_name(ggml_type) };
         if type_name_ptr.is_null() {
             return Err(GgufTensorIndexReadError::NullTensorTypeName {

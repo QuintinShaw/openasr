@@ -77,9 +77,11 @@ use std::collections::HashMap;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
     GgmlDecodeReuseMode, GgmlKvElementType, GgmlLoadedTensor, GgmlLoadedWeightContext,
-    GgmlPersistentGraphSession, GgmlRopeExtParams,
+    GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlSelectionEvidenceRef,
 };
-use crate::models::device_greedy_token::{DeviceGreedyStepOutputMode, device_top1_token_id};
+use crate::models::device_greedy_token::{
+    DeviceGreedyStepOutputMode, compute_greedy_step_output_with_evidence, device_top1_token_id,
+};
 use crate::models::mapped_token_embedding::MappedTokenEmbeddingDeviceSpec;
 use crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeStepLogitsOutput;
 use crate::models::system_memory_owner::{
@@ -465,6 +467,7 @@ pub(crate) struct GraniteSpeechDecodeSession {
     /// request-scoped even when the resident arena/graph survives in the
     /// cross-request cache.
     logical_capacity: usize,
+    last_step_compute_evidence: Option<GgmlSelectionEvidenceRef>,
 }
 
 /// Build-once/re-run persistent single-token Granite decode graph plus its
@@ -657,6 +660,7 @@ impl GraniteSpeechDecodeSession {
             resident_kv: None,
             resident_capacity: 0,
             logical_capacity: 0,
+            last_step_compute_evidence: None,
         })
     }
 
@@ -679,6 +683,11 @@ impl GraniteSpeechDecodeSession {
         self.seq_len = 0;
         self.prefilled = false;
         self.logical_capacity = 0;
+        self.last_step_compute_evidence = None;
+    }
+
+    pub(crate) fn take_compute_evidence(&mut self) -> Option<GgmlSelectionEvidenceRef> {
+        self.last_step_compute_evidence.take()
     }
 
     pub(crate) fn is_prefilled(&self) -> bool {
@@ -737,7 +746,7 @@ impl GraniteSpeechDecodeSession {
             // Metal reuse path: seed the resident KV arena directly from the
             // prefill graph (rows `0..n_tokens` via `set_rows`), no host copy.
             self.ensure_resident_arena(capacity.resident_positions())?;
-            let output = run_prefill_graph_seeding_resident(
+            let (output, evidence) = run_prefill_graph_seeding_resident(
                 &mut self.runner,
                 &self.weights,
                 &self.config,
@@ -748,6 +757,7 @@ impl GraniteSpeechDecodeSession {
                 n_tokens,
                 DeviceGreedyStepOutputMode::FullLogits,
             )?;
+            self.last_step_compute_evidence = evidence;
             debug_assert!(output.greedy_token_hint.is_none());
             self.seq_len = n_tokens;
             self.prefilled = true;
@@ -765,7 +775,7 @@ impl GraniteSpeechDecodeSession {
             self.config.num_kv_heads,
             self.config.head_dim,
         )?;
-        let last_logits = run_prefill_graph(
+        let (last_logits, evidence) = run_prefill_graph(
             &mut self.runner,
             &self.weights,
             &self.config,
@@ -773,6 +783,7 @@ impl GraniteSpeechDecodeSession {
             n_tokens,
             &mut host_kv,
         )?;
+        self.last_step_compute_evidence = evidence;
         self.host_kv = Some(host_kv);
         self.seq_len = n_tokens;
         self.prefilled = true;
@@ -835,7 +846,7 @@ impl GraniteSpeechDecodeSession {
             });
         }
         self.ensure_resident_arena(capacity.resident_positions())?;
-        let output = run_prefill_graph_seeding_resident(
+        let (output, evidence) = run_prefill_graph_seeding_resident(
             &mut self.runner,
             &self.weights,
             &self.config,
@@ -851,6 +862,7 @@ impl GraniteSpeechDecodeSession {
             n_tokens,
             self.greedy_step_output_mode,
         )?;
+        self.last_step_compute_evidence = evidence;
         self.seq_len = n_tokens;
         self.prefilled = true;
         self.logical_capacity = capacity.logical_positions();
@@ -967,7 +979,7 @@ impl GraniteSpeechDecodeSession {
             .ok_or_else(|| GraniteSpeechDecoderError::Shape {
                 reason: "granite CPU decode path has no admitted host KV owner".to_string(),
             })?;
-        let logits = run_decode_step_graph(
+        let (logits, evidence) = run_decode_step_graph(
             &mut self.runner,
             &self.weights,
             &self.config,
@@ -975,6 +987,7 @@ impl GraniteSpeechDecodeSession {
             seq_len,
             host_kv,
         )?;
+        self.last_step_compute_evidence = evidence;
         self.seq_len += 1;
         Ok(logits)
     }
@@ -1112,28 +1125,10 @@ impl GraniteSpeechDecodeSession {
                 )
                 .map_err(map_ggml("reuse_upload_mask"))?;
         }
-        let output = match top1 {
-            Some(top1) => {
-                let token_id = graph
-                    .compute_output_i32(top1, 1)
-                    .map_err(map_ggml("reuse_compute_top1"))?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| GraniteSpeechDecoderError::Shape {
-                        reason: "granite reused device top-1 returned no token id".to_string(),
-                    })?;
-                Seq2SeqGreedyDecodeStepLogitsOutput {
-                    logits: Vec::new(),
-                    greedy_token_hint: Some(map_device_top1_token(token_id, vocab_size)?),
-                }
-            }
-            None => Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits: graph
-                    .compute_output_f32(logits, vocab_size)
-                    .map_err(map_ggml("reuse_compute"))?,
-                greedy_token_hint: None,
-            },
-        };
+        let (output, evidence) =
+            compute_greedy_step_output_with_evidence(graph, logits, top1, vocab_size)
+                .map_err(map_ggml("reuse_compute"))?;
+        self.last_step_compute_evidence = evidence;
         self.seq_len = position + 1;
         Ok(output)
     }
@@ -1247,10 +1242,10 @@ impl GraniteSpeechDecodeSession {
             // the returned handles are the full `[head_dim, max_positions,
             // kv_heads]` span (with the new row now live) that attention reads.
             let k_full = graph
-                .set_rows(arena_k, pre.k_perm, row_index)
+                .set_kv_rows(arena_k, pre.k_perm, row_index)
                 .map_err(map_ggml("reuse_k_set_rows"))?;
             let v_full = graph
-                .set_rows(arena_v, pre.v_perm, row_index)
+                .set_kv_rows(arena_v, pre.v_perm, row_index)
                 .map_err(map_ggml("reuse_v_set_rows"))?;
             let attended = if use_flash_attention {
                 graph
@@ -1355,7 +1350,7 @@ fn run_prefill_graph(
     embeddings: &[f32],
     n_tokens: usize,
     host_kv: &mut GraniteHostKvState,
-) -> Result<Vec<f32>, GraniteSpeechDecoderError> {
+) -> Result<(Vec<f32>, Option<GgmlSelectionEvidenceRef>), GraniteSpeechDecoderError> {
     let head_dim = config.head_dim;
     let kv_heads = config.num_kv_heads;
     let hidden_size = config.hidden_size;
@@ -1549,10 +1544,10 @@ fn run_prefill_graph(
         destinations.push((*k_tap, &mut k_history[..written_len]));
         destinations.push((*v_tap, &mut v_history[..written_len]));
     }
-    graph
-        .compute_outputs_into_f32(destinations.as_mut_slice())
+    let evidence = graph
+        .compute_outputs_into_f32_with_evidence(destinations.as_mut_slice())
         .map_err(map_ggml("session_prefill_compute"))?;
-    Ok(last_logits)
+    Ok((last_logits, evidence))
 }
 
 /// One-shot causal prefill that ALSO seeds the device-resident KV arena
@@ -1592,7 +1587,13 @@ fn run_prefill_graph_seeding_resident(
     input: GraniteResidentPrefillInput<'_>,
     n_tokens: usize,
     output_mode: DeviceGreedyStepOutputMode,
-) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, GraniteSpeechDecoderError> {
+) -> Result<
+    (
+        Seq2SeqGreedyDecodeStepLogitsOutput,
+        Option<GgmlSelectionEvidenceRef>,
+    ),
+    GraniteSpeechDecoderError,
+> {
     let head_dim = config.head_dim;
     let hidden_size = config.hidden_size;
     let vocab_size = config.vocab_size;
@@ -1733,13 +1734,13 @@ fn run_prefill_graph_seeding_resident(
             .set_rows(arena_k, pre.k_perm, seed_indices)
             .map_err(map_ggml("seed_prefill_k_set_rows"))?;
         graph
-            .add_side_effect_root(k_seed)
+            .add_kv_write_root(k_seed)
             .map_err(map_ggml("seed_prefill_k_root"))?;
         let v_seed = graph
             .set_rows(arena_v, pre.v_perm, seed_indices)
             .map_err(map_ggml("seed_prefill_v_set_rows"))?;
         graph
-            .add_side_effect_root(v_seed)
+            .add_kv_write_root(v_seed)
             .map_err(map_ggml("seed_prefill_v_root"))?;
 
         let attended = if use_flash_attention {
@@ -1879,28 +1880,8 @@ fn run_prefill_graph_seeding_resident(
     graph
         .set_i32_slice(seed_indices, &position_ids, "granite_seed_prefill_rows")
         .map_err(map_ggml("seed_prefill_upload_rows"))?;
-    match top1 {
-        Some(top1) => {
-            let token_id = graph
-                .compute_output_i32(top1, 1)
-                .map_err(map_ggml("seed_prefill_compute_top1"))?
-                .into_iter()
-                .next()
-                .ok_or_else(|| GraniteSpeechDecoderError::Shape {
-                    reason: "granite prefill device top-1 returned no token id".to_string(),
-                })?;
-            Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits: Vec::new(),
-                greedy_token_hint: Some(map_device_top1_token(token_id, vocab_size)?),
-            })
-        }
-        None => Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-            logits: graph
-                .compute_output_f32(logits, vocab_size)
-                .map_err(map_ggml("seed_prefill_compute"))?,
-            greedy_token_hint: None,
-        }),
-    }
+    compute_greedy_step_output_with_evidence(&mut graph, logits, top1, vocab_size)
+        .map_err(map_ggml("seed_prefill_compute"))
 }
 
 /// One incremental single-token step. Each admitted history layer is a
@@ -1917,7 +1898,7 @@ fn run_decode_step_graph(
     embed_row: &[f32],
     seq_len: usize,
     host_kv: &mut GraniteHostKvState,
-) -> Result<Vec<f32>, GraniteSpeechDecoderError> {
+) -> Result<(Vec<f32>, Option<GgmlSelectionEvidenceRef>), GraniteSpeechDecoderError> {
     let head_dim = config.head_dim;
     let kv_heads = config.num_kv_heads;
     let hidden_size = config.hidden_size;
@@ -2165,10 +2146,10 @@ fn run_decode_step_graph(
         destinations.push((*k_tap, &mut k_history[history_len..row_end]));
         destinations.push((*v_tap, &mut v_history[history_len..row_end]));
     }
-    graph
-        .compute_outputs_into_f32(destinations.as_mut_slice())
+    let evidence = graph
+        .compute_outputs_into_f32_with_evidence(destinations.as_mut_slice())
         .map_err(map_ggml("session_step_compute"))?;
-    Ok(logits_row)
+    Ok((logits_row, evidence))
 }
 
 #[cfg(test)]

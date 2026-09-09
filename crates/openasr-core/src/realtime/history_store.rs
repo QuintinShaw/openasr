@@ -312,6 +312,9 @@ pub struct DaemonHistoryDetail {
     /// Provenance of the word timeline. `None` on legacy rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeline_quality: Option<TimelineQuality>,
+    /// Why a requested precise timeline was not used. `None` on legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline_degraded_reason: Option<String>,
 }
 
 impl DaemonHistoryDetail {
@@ -326,10 +329,12 @@ impl DaemonHistoryDetail {
             segments: self.segments.clone(),
             subtitle_cues: self.subtitle_cues.clone(),
             timeline_quality: self.timeline_quality,
+            timeline_degraded_reason: self.timeline_degraded_reason.clone(),
             longform: None,
             language: None,
             truncated_decodes: Vec::new(),
             unnamed_speakers: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -353,6 +358,7 @@ pub struct DaemonHistoryRecord {
     /// Short subtitle cues from the dual-view projection.
     pub subtitle_cues: Vec<Segment>,
     pub timeline_quality: Option<TimelineQuality>,
+    pub timeline_degraded_reason: Option<String>,
 }
 
 /// On-disk body stored in `segments_json`. Accepts both the legacy bare
@@ -364,6 +370,8 @@ struct PersistedTranscriptBody {
     subtitle_cues: Vec<Segment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timeline_quality: Option<TimelineQuality>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeline_degraded_reason: Option<String>,
 }
 
 /// A resolved assignment applied to every persisted segment sharing a stable
@@ -556,6 +564,7 @@ impl DaemonHistoryStore {
                     segments: body.segments,
                     subtitle_cues: body.subtitle_cues,
                     timeline_quality: body.timeline_quality,
+                    timeline_degraded_reason: body.timeline_degraded_reason,
                 })
             },
         )
@@ -707,6 +716,7 @@ impl DaemonHistoryStore {
             segments: transcription.segments.clone(),
             subtitle_cues: transcription.subtitle_cues.clone(),
             timeline_quality: transcription.timeline_quality,
+            timeline_degraded_reason: transcription.timeline_degraded_reason.clone(),
         };
         let has_timed = !body.segments.is_empty() || !body.subtitle_cues.is_empty();
         let segments_json = if has_timed {
@@ -893,6 +903,7 @@ impl DaemonHistoryStore {
                 segments: record.segments.clone(),
                 subtitle_cues: record.subtitle_cues.clone(),
                 timeline_quality: record.timeline_quality,
+                timeline_degraded_reason: record.timeline_degraded_reason.clone(),
             };
             match serde_json::to_string(&body) {
                 Ok(json) => Some(json),
@@ -1105,13 +1116,14 @@ fn ensure_history_entry_columns(conn: &Connection) -> rusqlite::Result<()> {
 /// (or, for `row_to_entry`, misreport `formats`) on a corrupt/legacy payload.
 ///
 /// Accepts both the pre-0.1.31 bare `Segment[]` array and the dual-view object
-/// `{ segments, subtitle_cues?, timeline_quality? }`.
+/// `{ segments, subtitle_cues?, timeline_quality?, timeline_degraded_reason? }`.
 fn parse_transcript_body(segments_json: Option<String>) -> PersistedTranscriptBody {
     let Some(json) = segments_json else {
         return PersistedTranscriptBody {
             segments: Vec::new(),
             subtitle_cues: Vec::new(),
             timeline_quality: None,
+            timeline_degraded_reason: None,
         };
     };
     if let Ok(body) = serde_json::from_str::<PersistedTranscriptBody>(&json) {
@@ -1123,6 +1135,7 @@ fn parse_transcript_body(segments_json: Option<String>) -> PersistedTranscriptBo
         segments,
         subtitle_cues: Vec::new(),
         timeline_quality: None,
+        timeline_degraded_reason: None,
     }
 }
 
@@ -1350,6 +1363,7 @@ mod tests {
                 }],
                 subtitle_cues: Vec::new(),
                 timeline_quality: None,
+                timeline_degraded_reason: None,
             })
             .unwrap();
 
@@ -1644,6 +1658,7 @@ mod tests {
                         segments: Vec::new(),
                         subtitle_cues: Vec::new(),
                         timeline_quality: None,
+                        timeline_degraded_reason: None,
                         text: format!("hello from session {index}"),
                     })
                     .unwrap();
@@ -1764,6 +1779,7 @@ mod tests {
             }],
             subtitle_cues: Vec::new(),
             timeline_quality: None,
+            timeline_degraded_reason: None,
         };
 
         let value = serde_json::to_value(&detail).unwrap();
@@ -1807,6 +1823,7 @@ mod tests {
                 segments: Vec::new(),
                 subtitle_cues: Vec::new(),
                 timeline_quality: None,
+                timeline_degraded_reason: None,
                 text: "legacy text".to_string(),
             })
             .unwrap();
@@ -1907,6 +1924,7 @@ mod tests {
                 segments: Vec::new(),
                 subtitle_cues: Vec::new(),
                 timeline_quality: None,
+                timeline_degraded_reason: None,
                 text: "file transcript".to_string(),
             })
             .unwrap();
@@ -1993,6 +2011,7 @@ mod tests {
                     segments: Vec::new(),
                     subtitle_cues: Vec::new(),
                     timeline_quality: None,
+                    timeline_degraded_reason: None,
                     text: "should not persist".to_string(),
                 })
                 .is_err()
@@ -2017,6 +2036,7 @@ mod tests {
                 segments: Vec::new(),
                 subtitle_cues: Vec::new(),
                 timeline_quality: None,
+                timeline_degraded_reason: None,
                 text: "plain body".to_string(),
             })
             .unwrap();
@@ -2054,6 +2074,7 @@ mod tests {
                 }],
                 subtitle_cues: Vec::new(),
                 timeline_quality: None,
+                timeline_degraded_reason: None,
                 text: "timed body".to_string(),
             })
             .unwrap();
@@ -2152,6 +2173,7 @@ mod tests {
                 }],
                 subtitle_cues: Vec::new(),
                 timeline_quality: None,
+                timeline_degraded_reason: None,
                 text: "new body".to_string(),
             })
             .unwrap();
@@ -2238,6 +2260,7 @@ mod tests {
                 }],
                 subtitle_cues: Vec::new(),
                 timeline_quality: None,
+                timeline_degraded_reason: None,
             })
             .unwrap();
         let updated = store
@@ -2306,6 +2329,7 @@ mod tests {
                 }],
                 subtitle_cues: Vec::new(),
                 timeline_quality: Some(TimelineQuality::NativeApproximate),
+                timeline_degraded_reason: None,
             })
             .unwrap();
 
@@ -2376,6 +2400,61 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn timeline_degraded_reason_round_trips_and_legacy_body_is_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DaemonHistoryStore::open(temp.path());
+        let reason = "aligned timeline is acoustically unconfident: mean chosen-bin log-prob -2.304 is below threshold -1.000 (severe transcript/audio mismatch)";
+        let entry = store
+            .record(DaemonHistoryRecord {
+                kind: DaemonHistoryKind::File,
+                model: "qwen3-asr-0.6b".into(),
+                source_name: Some("clip.wav".into()),
+                duration_seconds: Some(2.0),
+                output_format: Some(ResponseFormat::Json),
+                diarization_active: Some(false),
+                provenance: Some(DaemonHistoryProvenance::Recorded),
+                text: "hello".into(),
+                segments: vec![Segment {
+                    start: 0.0,
+                    end: 1.0,
+                    text: "hello".into(),
+                    speaker: None,
+                    speaker_label: None,
+                    speaker_person_id: None,
+                    speaker_snapshot_label: None,
+                    words: Vec::new(),
+                }],
+                subtitle_cues: Vec::new(),
+                timeline_quality: Some(TimelineQuality::NativeApproximate),
+                timeline_degraded_reason: Some(reason.into()),
+            })
+            .unwrap();
+
+        let fetched = store.get(&entry.id).unwrap().expect("row exists");
+        assert_eq!(
+            fetched.timeline_quality,
+            Some(TimelineQuality::NativeApproximate)
+        );
+        assert_eq!(fetched.timeline_degraded_reason.as_deref(), Some(reason));
+        assert_eq!(
+            fetched
+                .to_transcription()
+                .timeline_degraded_reason
+                .as_deref(),
+            Some(reason)
+        );
+
+        let legacy = parse_transcript_body(Some(
+            r#"{"segments":[],"timeline_quality":"native_approximate"}"#.into(),
+        ));
+        assert_eq!(
+            legacy.timeline_quality,
+            Some(TimelineQuality::NativeApproximate)
+        );
+        assert_eq!(legacy.timeline_degraded_reason, None);
+    }
+
     // No test exercises `record()`'s "segments fail to serialize -> degrade to
     // text-only" branch (the fix B change in `record`) with a real trigger:
     // `serde_json::to_string` cannot actually fail for `Vec<Segment>`. Its only
@@ -2404,6 +2483,7 @@ mod tests {
                 segments: Vec::new(),
                 subtitle_cues: Vec::new(),
                 timeline_quality: None,
+                timeline_degraded_reason: None,
                 text: text.to_string(),
             })
             .unwrap()

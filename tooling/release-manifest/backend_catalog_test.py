@@ -60,6 +60,24 @@ class BackendCatalogTest(unittest.TestCase):
             self.assertEqual(digest, expected.hexdigest())
             self.assertEqual([item[0] for item in rows], ["vendor/B.bin", "vendor/a.bin"])
 
+    def test_vendor_tree_rows_reject_nonportable_collisions_and_file_prefixes(
+        self,
+    ):
+        digest = hashlib.sha256(b"payload").hexdigest()
+        invalid_rows = (
+            [("vendor/A.dll", 7, digest), ("vendor/a.dll", 7, digest)],
+            [("vendor/runtime", 7, digest), ("vendor/runtime/a.dll", 7, digest)],
+            [("vendor/bad?.dll", 7, digest)],
+            [("vendor/caf\u00e9.dll", 7, digest)],
+            [("vendor/oversized.dll", 1 << 64, digest)],
+            [("vendor/type.dll", 7, None)],
+        )
+        for rows in invalid_rows:
+            with self.subTest(rows=rows), self.assertRaises(
+                backend_catalog.BackendCatalogError
+            ):
+                backend_catalog.materialized_tree_sha256_rows(rows)
+
     def test_compile_binds_actual_plugin_vendor_tree_and_host_abi(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -463,6 +481,7 @@ class BackendCatalogTest(unittest.TestCase):
             self.assertEqual(backend_catalog.head_cdn_url("https://example.invalid/file"), (200, 42))
 
         command = run.call_args.args[0]
+        self.assertIn("--http1.1", command)
         self.assertIn("--connect-timeout", command)
         self.assertIn("--max-time", command)
         self.assertIn("--retry", command)

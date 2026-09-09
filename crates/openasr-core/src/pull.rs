@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -15,13 +15,23 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
+#[cfg(windows)]
+use std::os::windows::{fs::MetadataExt as _, io::AsRawHandle as _};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, GetFileInformationByHandle,
+};
+
 use crate::models::pack_verifier::{
     AdmittedPack, PackCandidate, PackRoute, PackVerificationError, PackVerifier,
 };
 use crate::{
-    CatalogBackendFile, CatalogBackendFileRole, CatalogBackendVendor, CatalogModel,
-    CatalogPullRequest, CatalogQuant, ModelCatalog, OPENASR_RUNTIME_PACK_EXTENSION,
-    ResolvedCatalogBackendPull, ResolvedCatalogPull, atomic_file, canonical_quant_tag,
+    BackendAvailability, CatalogBackendFile, CatalogBackendFileRole, CatalogBackendVendor,
+    CatalogModel, CatalogPullRequest, CatalogQuant, ModelCatalog, OPENASR_RUNTIME_PACK_EXTENSION,
+    QualificationArtifact, QualificationArtifactFormat, ResolvedCatalogBackendPull,
+    ResolvedCatalogPull, VerifiedQualificationManifest, atomic_file, canonical_quant_tag,
     catalog_series::family_aliases_match,
     content_store,
     download_source::{self, DownloadSource},
@@ -39,15 +49,13 @@ const HTTP_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_LOW_SPEED_TIMEOUT: Duration = Duration::from_secs(60);
 const DOWNLOAD_LOW_SPEED_MIN_BYTES: u64 = 64 * 1024;
 const DOWNLOAD_USER_AGENT: &str = concat!("OpenASR/", env!("CARGO_PKG_VERSION"));
-/// Fixed segment size for concurrent chunked downloads. 64 MiB amortizes
-/// per-segment overhead (redirect resolution, TLS/connection setup) over a
-/// large body while still giving the default connection count real
-/// parallelism on typical multi-hundred-MB to multi-GB model packs (e.g. a
-/// 300 MB pack still splits into 5 segments at 4 connections). This is a
-/// fixed build-time constant, not an env knob: resumable segment bitmaps
-/// (`SegmentedPartialMeta`) are keyed on it, so changing it is a format
-/// change, not a runtime tuning parameter (see `PARALLEL_META_FORMAT`).
-const DOWNLOAD_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+/// Fixed segment size for concurrent chunked downloads. 8 MiB keeps
+/// per-segment overhead modest while making typical OpenASR packs (tens of
+/// MB) eligible for the default 4 connections (`parallel_download_eligible`
+/// requires `size >= 2 * segment`). Previously 64 MiB, which left common
+/// small packs on a single stream. Changing this must bump
+/// `PARALLEL_META_FORMAT`.
+const DOWNLOAD_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
 /// Default number of concurrent Range connections for chunked downloads.
 const DEFAULT_PULL_CONNECTIONS: usize = 4;
 /// Hard upper clamp on `OPENASR_PULL_CONNECTIONS` so a misconfigured
@@ -122,7 +130,7 @@ const SEGMENT_LOW_SPEED_REFERENCE_CAPACITY: usize = 64;
 /// resume never misreads a legacy (pre-chunking) `PartialMeta` -- or a future
 /// incompatible format -- as a valid segment bitmap. Bumping the segment size
 /// or the bitmap's shape must also bump this string.
-const PARALLEL_META_FORMAT: &str = "segmented-v1";
+const PARALLEL_META_FORMAT: &str = "segmented-v2";
 const BACKEND_STORE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_BACKEND_GC_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -191,6 +199,14 @@ pub enum PullError {
     NonHttpsUrl { url: String },
     #[error("Invalid catalog pull target '{field}': {reason}")]
     InvalidTarget { field: &'static str, reason: String },
+    #[error(
+        "Backend '{backend_id}' requires OpenASR >= {min_cli_version} (this build is {current_cli_version}). Update OpenASR to install it."
+    )]
+    BackendRequiresNewerCli {
+        backend_id: String,
+        min_cli_version: String,
+        current_cli_version: String,
+    },
     #[error("Could not create OpenASR model directory '{path}': {source}")]
     CreateDir {
         path: PathBuf,
@@ -291,6 +307,10 @@ pub enum PullError {
     RuntimeValidation { path: PathBuf, reason: String },
     #[error("Installed model pack not found: {reference}")]
     NotInstalled { reference: String },
+    #[error("Cannot delete the in-use '{vendor}' GPU acceleration pack; switch away first")]
+    BackendPackInUse { vendor: String },
+    #[error("Local GPU acceleration pack import rejected: {reason}")]
+    BackendImportRejected { reason: String },
     #[error("Model pack pull was canceled: {reference}")]
     Canceled { reference: String },
     #[error("Model pack pull was paused: {reference}")]
@@ -351,7 +371,7 @@ struct PullPaths {
     lock_path: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 struct PullOptions {
     available_space_override: Option<u64>,
     low_speed_timeout: Duration,
@@ -372,6 +392,10 @@ struct PullOptions {
     /// instead of needing real multi-hundred-MB bodies. `None` in
     /// production, always -- the real segment size is the fixed constant.
     parallel_segment_bytes_override: Option<u64>,
+    /// Clock and sleeper for retry backoff and low-speed windows.
+    /// [`PullOptions::default`] is always the wall clock so a `cfg(test)`
+    /// slip cannot silently busy-poll production retries.
+    time: Arc<dyn PullTime>,
 }
 
 impl PullOptions {
@@ -385,8 +409,130 @@ impl PullOptions {
             segment_low_speed_absolute_floor_bytes: SEGMENT_LOW_SPEED_ABSOLUTE_FLOOR_BYTES,
             segment_low_speed_cooldown: SEGMENT_LOW_SPEED_COOLDOWN,
             parallel_segment_bytes_override: None,
+            time: Arc::new(WallClock),
         }
     }
+
+    /// Test constructor: same knobs as production, but backoff/sleep is a
+    /// no-op so retry loops finish without waiting on the wall clock.
+    #[cfg(test)]
+    fn for_tests() -> Self {
+        Self {
+            time: Arc::new(ImmediateClock),
+            ..Self::default()
+        }
+    }
+}
+
+/// Side effects the downloader needs for retry/backoff and low-speed windows.
+///
+/// No crate-level `Clock`/`Sleep` trait exists today (see the pull testability
+/// audit); this is the single injection point so production keeps the wall
+/// clock while tests can make backoff return immediately.
+trait PullTime: Send + Sync + std::fmt::Debug {
+    fn now(&self) -> Instant;
+    fn sleep(&self, duration: Duration);
+}
+
+#[derive(Debug)]
+struct WallClock;
+
+impl PullTime for WallClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        if !duration.is_zero() {
+            std::thread::sleep(duration);
+        }
+    }
+}
+
+/// Test clock: `sleep` is a no-op so retry/backoff cannot burn real time.
+/// `now` still reads the wall clock, matching existing `Duration::ZERO`
+/// low-speed tests that judge a window on the first `observe` call.
+#[cfg(test)]
+#[derive(Debug)]
+struct ImmediateClock;
+
+#[cfg(test)]
+impl PullTime for ImmediateClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&self, _duration: Duration) {}
+}
+
+/// Test clock whose `sleep` advances `now` without waiting. Use when a
+/// test must cross a non-zero timeout/cooldown without `Duration::ZERO`.
+#[cfg(test)]
+#[derive(Debug)]
+struct VirtualClock {
+    origin: Instant,
+    offset_millis: AtomicUsize,
+}
+
+#[cfg(test)]
+impl VirtualClock {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            offset_millis: AtomicUsize::new(0),
+        }
+    }
+
+    fn advance(&self, duration: Duration) {
+        let millis = usize::try_from(duration.as_millis()).unwrap_or(usize::MAX);
+        self.offset_millis.fetch_add(millis, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+impl PullTime for VirtualClock {
+    fn now(&self) -> Instant {
+        self.origin + Duration::from_millis(self.offset_millis.load(Ordering::SeqCst) as u64)
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.advance(duration);
+    }
+}
+
+/// Test clock that records each `sleep` duration without waiting, so a
+/// retry test can assert the exact backoff sequence and kill a no-op
+/// `sleep_backoff` mutant.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct RecordingClock {
+    sleeps: Mutex<Vec<Duration>>,
+}
+
+#[cfg(test)]
+impl RecordingClock {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn sleeps(&self) -> Vec<Duration> {
+        self.sleeps.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+impl PullTime for RecordingClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.sleeps.lock().unwrap().push(duration);
+    }
+}
+
+fn sleep_backoff(time: &dyn PullTime, attempt: usize) {
+    time.sleep(retry_backoff(attempt));
 }
 
 /// An HTTP byte-range request bound: open-ended (`bytes=start-`) when `end`
@@ -1577,7 +1723,7 @@ fn download_with_retries<C: DownloadClient>(
                     if attempt < DOWNLOAD_MAX_RETRIES && is_retryable_download_error(&error) =>
                 {
                     attempt += 1;
-                    std::thread::sleep(retry_backoff(attempt));
+                    sleep_backoff(&*options.time, attempt);
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -1615,7 +1761,7 @@ fn download_with_retries<C: DownloadClient>(
             Ok(downloaded) => return Ok(downloaded),
             Err(error) if attempt < DOWNLOAD_MAX_RETRIES && is_retryable_download_error(&error) => {
                 attempt += 1;
-                std::thread::sleep(retry_backoff(attempt));
+                sleep_backoff(&*options.time, attempt);
             }
             Err(error) => return Err(error),
         }
@@ -1693,7 +1839,7 @@ fn download_response(
     let mut reader = response.reader;
     let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_BYTES];
     let mut next_meta_write = bytes_done.saturating_add(METADATA_WRITE_INTERVAL_BYTES);
-    let mut low_speed = LowSpeedWindow::new();
+    let mut low_speed = LowSpeedWindow::new(options);
     loop {
         if should_cancel() {
             cleanup_partial(paths);
@@ -1731,13 +1877,7 @@ fn download_response(
             bytes_done,
             bytes_total: target.size_bytes,
         });
-        low_speed.observe(
-            &target.url,
-            target.size_bytes,
-            bytes_done,
-            read as u64,
-            options,
-        )?;
+        low_speed.observe(&target.url, target.size_bytes, bytes_done, read as u64)?;
         if bytes_done >= next_meta_write {
             write_partial_meta(
                 &paths.partial_meta_path,
@@ -2506,6 +2646,7 @@ enum SegmentEvent {
 /// condition -- it means "this connection is bad, get a new one" -- so it is
 /// handled by `run_segment_worker` requeuing the segment instead of by
 /// `fetch_segment_with_retries`'s same-connection retry loop.
+#[derive(Debug)]
 enum SegmentFetchOutcome {
     Done,
     /// Aborted mid-segment by cancel/pause; no event needed, the
@@ -2671,7 +2812,7 @@ fn fetch_segment_with_retries(
             Ok(outcome) => return Ok(outcome),
             Err(error) if attempt < SEGMENT_MAX_RETRIES && is_retryable_download_error(&error) => {
                 attempt += 1;
-                std::thread::sleep(retry_backoff(attempt));
+                sleep_backoff(&*options.time, attempt);
             }
             Err(error) => return Err(error),
         }
@@ -3135,11 +3276,61 @@ fn reject_symlink(path: &Path) -> Result<(), PullError> {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return Ok(());
     };
-    if metadata.file_type().is_symlink() {
+    #[cfg(windows)]
+    let is_reparse_point = metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    #[cfg(not(windows))]
+    let is_reparse_point = false;
+    if metadata.file_type().is_symlink() || is_reparse_point {
         return Err(PullError::UnsafeStoragePath {
             path: path.to_path_buf(),
         });
     }
+    Ok(())
+}
+
+pub(crate) fn reject_qualification_file_links(path: &Path) -> Result<(), PullError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| PullError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(PullError::UnsafeStoragePath {
+            path: path.to_path_buf(),
+        });
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        return Err(PullError::UnsafeStoragePath {
+            path: path.to_path_buf(),
+        });
+    }
+    #[cfg(windows)]
+    {
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(PullError::UnsafeStoragePath {
+                path: path.to_path_buf(),
+            });
+        }
+        let file = File::open(path).map_err(|source| PullError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` owns a live handle and `information` is writable for
+        // the exact structure required by GetFileInformationByHandle.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0
+            || information.nNumberOfLinks != 1
+        {
+            return Err(PullError::UnsafeStoragePath {
+                path: path.to_path_buf(),
+            });
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    return Err(PullError::UnsafeStoragePath {
+        path: path.to_path_buf(),
+    });
+    #[cfg(any(unix, windows))]
     Ok(())
 }
 
@@ -3371,47 +3562,54 @@ impl Read for StallGuardedReader {
 struct LowSpeedWindow {
     started_at: Instant,
     bytes_read: u64,
+    timeout: Duration,
+    min_bytes: u64,
+    time: Arc<dyn PullTime>,
 }
 
 impl LowSpeedWindow {
-    fn new() -> Self {
+    fn new(options: &PullOptions) -> Self {
         Self {
-            started_at: Instant::now(),
+            started_at: options.time.now(),
             bytes_read: 0,
+            timeout: options.low_speed_timeout,
+            min_bytes: options.low_speed_min_bytes,
+            time: options.time.clone(),
         }
     }
 
     /// Shared by the model-pack and backend-pack downloaders; only needs the
     /// URL (for the error message) and the expected total size, not a whole
-    /// `&PullTarget`.
+    /// `&PullTarget`. Thresholds and the clock are captured at construction
+    /// so `observe` cannot drift onto a different `options.time`.
     fn observe(
         &mut self,
         url: &str,
         size_bytes: u64,
         bytes_done: u64,
         bytes_read: u64,
-        options: &PullOptions,
     ) -> Result<(), PullError> {
-        if options.low_speed_min_bytes == 0 || bytes_done >= size_bytes {
+        if self.min_bytes == 0 || bytes_done >= size_bytes {
             return Ok(());
         }
         self.bytes_read = self.bytes_read.saturating_add(bytes_read);
-        let elapsed = self.started_at.elapsed();
-        if elapsed < options.low_speed_timeout {
+        let now = self.time.now();
+        let elapsed = now.saturating_duration_since(self.started_at);
+        if elapsed < self.timeout {
             return Ok(());
         }
-        if self.bytes_read < options.low_speed_min_bytes {
+        if self.bytes_read < self.min_bytes {
             return Err(PullError::Http {
                 url: url.to_string(),
                 message: format!(
                     "download stalled: received {} bytes in {:.1}s, below the {} byte minimum",
                     self.bytes_read,
                     elapsed.as_secs_f64(),
-                    options.low_speed_min_bytes
+                    self.min_bytes
                 ),
             });
         }
-        self.started_at = Instant::now();
+        self.started_at = now;
         self.bytes_read = 0;
         Ok(())
     }
@@ -3449,6 +3647,7 @@ struct SegmentLowSpeedWindow<'a> {
     relative_ratio: f64,
     absolute_floor_bytes: u64,
     cooldown: Duration,
+    time: Arc<dyn PullTime>,
     /// Set once this segment index has already been abandoned
     /// `SEGMENT_MAX_RETRIES` times: this attempt is its last chance, so
     /// evaluation is skipped entirely and it's simply allowed to finish
@@ -3464,7 +3663,7 @@ impl<'a> SegmentLowSpeedWindow<'a> {
         disabled: bool,
     ) -> Self {
         Self {
-            started_at: Instant::now(),
+            started_at: options.time.now(),
             bytes_read: 0,
             timeout: options.segment_low_speed_timeout,
             reference,
@@ -3472,6 +3671,7 @@ impl<'a> SegmentLowSpeedWindow<'a> {
             relative_ratio: options.segment_low_speed_relative_ratio,
             absolute_floor_bytes: options.segment_low_speed_absolute_floor_bytes,
             cooldown: options.segment_low_speed_cooldown,
+            time: options.time.clone(),
             disabled,
         }
     }
@@ -3496,11 +3696,12 @@ impl<'a> SegmentLowSpeedWindow<'a> {
             return false;
         }
         self.bytes_read = self.bytes_read.saturating_add(bytes_read);
-        if self.started_at.elapsed() < self.timeout {
+        let now = self.time.now();
+        if now.saturating_duration_since(self.started_at) < self.timeout {
             return false;
         }
         let window_bytes = self.bytes_read;
-        self.started_at = Instant::now();
+        self.started_at = now;
         self.bytes_read = 0;
         // Compare against the reference as it stood *before* this window is
         // folded in, so a slow window never gets to (even slightly) pull
@@ -3516,9 +3717,9 @@ impl<'a> SegmentLowSpeedWindow<'a> {
             return false;
         }
         let mut cooldown_slot = self.cooldown_slot.lock().unwrap();
-        let now = Instant::now();
+        let now = self.time.now();
         if let Some(last_trip) = *cooldown_slot
-            && now.duration_since(last_trip) < self.cooldown
+            && now.saturating_duration_since(last_trip) < self.cooldown
         {
             return false; // still cooling down from the last trip
         }
@@ -3619,7 +3820,7 @@ pub fn available_disk_space_bytes(path: &Path) -> Option<u64> {
     available_space_bytes(path)
 }
 
-fn file_size_and_sha256(path: &Path) -> Result<(u64, String), PullError> {
+pub(crate) fn file_size_and_sha256(path: &Path) -> Result<(u64, String), PullError> {
     let mut file = File::open(path).map_err(|source| PullError::Io {
         path: path.to_path_buf(),
         source,
@@ -3740,6 +3941,39 @@ impl PullTarget {
             source: Some(source.into()),
             ..self.clone()
         }
+    }
+
+    fn for_backend_file(file: &CatalogBackendFile) -> Result<Self, PullError> {
+        validate_sha256("sha256", &file.sha256).map_err(|reason| PullError::InvalidTarget {
+            field: "backend.files.sha256",
+            reason,
+        })?;
+        if file.size_bytes == 0 {
+            return Err(PullError::InvalidTarget {
+                field: "backend.files.size_bytes",
+                reason: "size_bytes must be greater than zero".to_string(),
+            });
+        }
+        if file.filename.contains('/') || file.filename.contains('\\') {
+            return Err(PullError::InvalidTarget {
+                field: "backend.files.filename",
+                reason: "filename must be a local basename".to_string(),
+            });
+        }
+        Ok(Self {
+            model_id: "backend".to_string(),
+            expected_catalog_family_id: None,
+            display_name: file.filename.clone(),
+            quant: "file".to_string(),
+            suffix: String::new(),
+            pull: file.filename.clone(),
+            filename: file.filename.clone(),
+            url: file.url.clone(),
+            hf_revision: file.sha256.clone(),
+            sha256: file.sha256.clone(),
+            size_bytes: file.size_bytes,
+            source: None,
+        })
     }
 }
 
@@ -4223,7 +4457,7 @@ fn is_source_fallback_error(error: &PullError) -> bool {
         // repeats the same verdict. These must fail the whole pull on the
         // first occurrence as a permanent error.
         PullError::UnexpectedStatus { status, .. } => {
-            *status >= 500 || *status == 403 || *status == 404
+            *status >= 500 || *status == 403 || *status == 404 || *status == 429
         }
         _ => false,
     }
@@ -5006,9 +5240,11 @@ fn should_hash_installed_backend_file(
 }
 
 fn backend_content_object_dir(home: &Path, file: &CatalogBackendFile) -> PathBuf {
-    home.join("backends")
-        .join("_objects")
-        .join(file.sha256.to_ascii_lowercase())
+    backend_content_object_dir_in(&home.join("backends").join("_objects"), file)
+}
+
+fn backend_content_object_dir_in(objects_root: &Path, file: &CatalogBackendFile) -> PathBuf {
+    objects_root.join(file.sha256.to_ascii_lowercase())
 }
 
 fn backend_pack_staging_dir(
@@ -5026,8 +5262,11 @@ fn backend_pack_staging_dir(
 }
 
 fn backend_object_staging_source(home: &Path, file: &CatalogBackendFile) -> PathBuf {
-    home.join("backends")
-        .join("_objects")
+    backend_object_staging_source_in(&home.join("backends").join("_objects"), file)
+}
+
+fn backend_object_staging_source_in(objects_root: &Path, file: &CatalogBackendFile) -> PathBuf {
+    objects_root
         .join(".staging")
         .join(file.sha256.to_ascii_lowercase())
         .join("source")
@@ -5188,6 +5427,14 @@ fn verify_backend_content_object(
             reason: "object identity does not match the signed catalog file".to_string(),
         });
     }
+    let source_path = object_dir.join("source").join(&file.filename);
+    if !backend_file_matches(&source_path, file) {
+        return Err(PullError::InvalidTarget {
+            field: "backend content object source",
+            reason: "content object no longer contains the signed source bytes".to_string(),
+        });
+    }
+    preflight_backend_file(&source_path, backend_file_format(file.role)?)?;
     let actual_files = collect_materialized_files(&object_dir.join("payload"))?;
     if actual_files != object.files {
         return Err(PullError::InvalidTarget {
@@ -5266,13 +5513,37 @@ fn ensure_backend_content_object<C: DownloadClient>(
     file: &CatalogBackendFile,
     home: &Path,
     progress: &mut impl FnMut(PullProgress),
+    parallel: Option<&ParallelDownloadConfig>,
+    options: &PullOptions,
 ) -> Result<BackendContentObject, PullError> {
     let objects_root = home.join("backends").join("_objects");
-    fs::create_dir_all(&objects_root).map_err(|source| PullError::Io {
-        path: objects_root.clone(),
+    ensure_backend_content_object_in(
+        client,
+        file,
+        &objects_root,
+        None,
+        None,
+        progress,
+        parallel,
+        options,
+    )
+}
+
+fn ensure_backend_content_object_in<C: DownloadClient>(
+    client: &mut C,
+    file: &CatalogBackendFile,
+    objects_root: &Path,
+    signed_urls: Option<&[String]>,
+    expected_unpacked_size_bytes: Option<u64>,
+    progress: &mut impl FnMut(PullProgress),
+    parallel: Option<&ParallelDownloadConfig>,
+    options: &PullOptions,
+) -> Result<BackendContentObject, PullError> {
+    fs::create_dir_all(objects_root).map_err(|source| PullError::Io {
+        path: objects_root.to_path_buf(),
         source,
     })?;
-    let object_dir = backend_content_object_dir(home, file);
+    let object_dir = backend_content_object_dir_in(objects_root, file);
     let lock_path = objects_root.join(format!("{}.lock", file.sha256.to_ascii_lowercase()));
     let _lock = BackendInstallLock::acquire(&lock_path)?;
     if let Ok(object) = verify_backend_content_object(&object_dir, file) {
@@ -5290,7 +5561,19 @@ fn ensure_backend_content_object<C: DownloadClient>(
     let source_valid = file_size_and_sha256(&source_path)
         .is_ok_and(|(size, sha)| size == file.size_bytes && sha.eq_ignore_ascii_case(&file.sha256));
     if !source_valid {
-        download_backend_file(client, file, &source_path, progress)?;
+        if let Some(urls) = signed_urls {
+            download_backend_file_from_signed_urls(
+                client,
+                file,
+                urls,
+                &source_path,
+                progress,
+                parallel,
+                options,
+            )?;
+        } else {
+            download_backend_file(client, file, &source_path, progress, parallel, options)?;
+        }
     }
     preflight_backend_file(&source_path, backend_file_format(file.role)?)?;
 
@@ -5314,10 +5597,11 @@ fn ensure_backend_content_object<C: DownloadClient>(
             link_or_copy_backend_payload(&source_path, &payload.join(&file.filename))?;
         }
         CatalogBackendFileRole::Archive => {
-            extract_backend_archive(
+            extract_backend_archive_with_expected_size(
                 &source_path,
                 &payload,
                 file.extract_subdir.as_deref().unwrap_or(""),
+                expected_unpacked_size_bytes,
             )?;
         }
         CatalogBackendFileRole::Plugin | CatalogBackendFileRole::Unknown => {
@@ -5644,8 +5928,24 @@ pub fn install_backend_pack(
     home: impl AsRef<Path>,
     progress: impl FnMut(PullProgress),
 ) -> Result<InstalledBackend, PullError> {
+    let home = home.as_ref();
     let mut client = HttpDownloadClient::new()?;
-    install_backend_pack_with_client(resolved, home.as_ref(), &mut client, progress)
+    let worker = client.clone();
+    let factory =
+        move || -> Result<BoxedDownloadClient, PullError> { Ok(Box::new(worker.clone())) };
+    let parallel = ParallelDownloadConfig {
+        connections: pull_connections_from_env(),
+        factory: &factory,
+    };
+    let _store_lock = BackendStoreMutationLock::acquire(home)?;
+    install_backend_pack_with_client_locked(
+        resolved,
+        home,
+        &mut client,
+        progress,
+        Some(&parallel),
+        &PullOptions::default(),
+    )
 }
 
 /// Installs one resolved pack while the caller holds the backend-store
@@ -5659,7 +5959,203 @@ pub(crate) fn install_backend_pack_locked(
     progress: impl FnMut(PullProgress),
 ) -> Result<InstalledBackend, PullError> {
     let mut client = HttpDownloadClient::new()?;
-    install_backend_pack_with_client_locked(resolved, home, &mut client, progress)
+    let worker = client.clone();
+    let factory =
+        move || -> Result<BoxedDownloadClient, PullError> { Ok(Box::new(worker.clone())) };
+    let parallel = ParallelDownloadConfig {
+        connections: pull_connections_from_env(),
+        factory: &factory,
+    };
+    install_backend_pack_with_client_locked(
+        resolved,
+        home,
+        &mut client,
+        progress,
+        Some(&parallel),
+        &PullOptions::default(),
+    )
+}
+
+/// Install one already-resolved signed pack from a local file or folder,
+/// using the same verification as a network install. Does not activate.
+pub fn install_backend_pack_from_local_path(
+    resolved: &ResolvedCatalogBackendPull,
+    source: impl AsRef<Path>,
+    home: impl AsRef<Path>,
+    progress: impl FnMut(PullProgress),
+) -> Result<InstalledBackend, PullError> {
+    let home = home.as_ref();
+    let local_files = collect_local_backend_import_files(source.as_ref())?;
+    let mut files_by_url = BTreeMap::new();
+    for file in &resolved.files {
+        if let Some(path) = local_files.get(&file.sha256.to_ascii_lowercase()) {
+            index_local_backend_import_urls(&mut files_by_url, file, path.clone());
+            continue;
+        }
+        if matches!(
+            file.role,
+            CatalogBackendFileRole::Runtime | CatalogBackendFileRole::Archive
+        ) && verify_backend_content_object(&backend_content_object_dir(home, file), file).is_ok()
+        {
+            continue;
+        }
+        let reason = if file.role == CatalogBackendFileRole::Plugin {
+            "not an official pack for this GPU vendor, or the plugin file is missing"
+        } else {
+            "the official pack is incomplete"
+        };
+        return Err(PullError::BackendImportRejected {
+            reason: reason.to_string(),
+        });
+    }
+    if !resolved.files.iter().any(|file| {
+        file.role == CatalogBackendFileRole::Plugin && files_by_url.contains_key(&file.url)
+    }) {
+        return Err(PullError::BackendImportRejected {
+            reason: "not an official pack for this GPU vendor, or the plugin file is missing"
+                .to_string(),
+        });
+    }
+    let mut client = LocalFileClient { files_by_url };
+    let _store_lock = BackendStoreMutationLock::acquire(home)?;
+    install_backend_pack_with_client_locked(
+        resolved,
+        home,
+        &mut client,
+        progress,
+        None,
+        &PullOptions::default(),
+    )
+}
+
+fn index_local_backend_import_urls(
+    files_by_url: &mut BTreeMap<String, PathBuf>,
+    file: &CatalogBackendFile,
+    path: PathBuf,
+) {
+    files_by_url.insert(file.url.clone(), path.clone());
+    // Local import is keyed by sha256, but the download client later fetches
+    // through `artifact_fetch_urls` (GitHub first, then the catalog URL).
+    // Index every rewritten origin so a USB/folder import does not fail closed
+    // on the first alternate URL.
+    for url in crate::transport::artifact_fetch_urls(&file.url) {
+        files_by_url.entry(url).or_insert_with(|| path.clone());
+    }
+}
+
+fn collect_local_backend_import_files(
+    source: &Path,
+) -> Result<BTreeMap<String, PathBuf>, PullError> {
+    let root = if source.is_file() {
+        source.parent().unwrap_or(source)
+    } else {
+        source
+    };
+    if !root.exists() {
+        return Err(PullError::BackendImportRejected {
+            reason: "the selected path does not exist".to_string(),
+        });
+    }
+    let mut files = BTreeMap::new();
+    collect_local_backend_import_files_at(root, 0, &mut files)?;
+    if files.is_empty() {
+        return Err(PullError::BackendImportRejected {
+            reason: "no importable files were found".to_string(),
+        });
+    }
+    Ok(files)
+}
+
+fn collect_local_backend_import_files_at(
+    path: &Path,
+    depth: u8,
+    files: &mut BTreeMap<String, PathBuf>,
+) -> Result<(), PullError> {
+    if depth > 6 {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|source| PullError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_file() {
+        if let Ok((_, sha)) = file_size_and_sha256(path) {
+            files.entry(sha).or_insert_with(|| path.to_path_buf());
+        }
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    let entries = fs::read_dir(path).map_err(|source| PullError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| PullError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        collect_local_backend_import_files_at(&entry.path(), depth.saturating_add(1), files)?;
+    }
+    Ok(())
+}
+
+struct LocalFileClient {
+    files_by_url: BTreeMap<String, PathBuf>,
+}
+
+impl DownloadClient for LocalFileClient {
+    fn open(&mut self, url: &str, range: Option<ByteRange>) -> Result<DownloadResponse, PullError> {
+        let path = self
+            .files_by_url
+            .get(url)
+            .ok_or_else(|| PullError::BackendImportRejected {
+                reason: "local files do not contain this official pack file".to_string(),
+            })?
+            .clone();
+        let mut file = File::open(&path).map_err(|source| PullError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let total = file
+            .metadata()
+            .map_err(|source| PullError::Io {
+                path: path.clone(),
+                source,
+            })?
+            .len();
+        let start = range.map(|range| range.start).unwrap_or(0);
+        if start > total {
+            return Err(PullError::BackendImportRejected {
+                reason: "local file is smaller than the official pack".to_string(),
+            });
+        }
+        if start > 0 {
+            file.seek(SeekFrom::Start(start))
+                .map_err(|source| PullError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+        }
+        let remaining = total.saturating_sub(start);
+        let (status, content_range) = if range.is_some() {
+            let end = start.saturating_add(remaining).saturating_sub(1);
+            (206, Some(format!("bytes {start}-{end}/{total}")))
+        } else {
+            (200, None)
+        };
+        Ok(DownloadResponse {
+            status,
+            content_length: Some(remaining),
+            content_range,
+            etag: Some("local-import".to_string()),
+            reader: Box::new(file),
+        })
+    }
 }
 
 /// Conservative logical bytes that must remain reachable while `resolved` is
@@ -5724,12 +6220,281 @@ pub(crate) struct PreparedBackendRuntimeObjects {
     pub files: Vec<PreparedBackendRuntimeFile>,
 }
 
+/// Downloaded qualification artifact whose bytes were selected exclusively by
+/// a production-signature-verified qualification manifest. Paths stay
+/// crate-private so no caller can turn this into an arbitrary plugin-path API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedQualificationFile {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+/// Verified archive release subject and its separately namespaced extracted
+/// payload. `materialized_files` is the same canonical tree representation the
+/// ordinary backend store uses; qualification adds the signed total-byte
+/// bound before extraction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedQualificationArchive {
+    pub source: PreparedQualificationFile,
+    pub payload_root: PathBuf,
+    pub materialized_files: Vec<InstalledBackendMaterializedFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedQualificationArtifacts {
+    pub artifact_root: PathBuf,
+    pub binary_bundle: PreparedQualificationArchive,
+    pub plugin: Option<PreparedQualificationFile>,
+    pub vendor: Vec<PreparedQualificationArchive>,
+    pub attestation_bundle: PreparedQualificationFile,
+}
+
+/// Fetch and materialize the inert release subjects named by one verified
+/// qualification manifest. This deliberately does not install a backend pack,
+/// touch the ordinary backend store, or create an activation pointer.
+pub(crate) fn prepare_qualification_release_artifacts(
+    verified: &VerifiedQualificationManifest,
+    qualification_store_root: &Path,
+    mut progress: impl FnMut(PullProgress),
+) -> Result<PreparedQualificationArtifacts, PullError> {
+    let artifact_root = qualification_store_root.join(verified.manifest_sha256());
+    let downloads_root = artifact_root.join("downloads");
+    let objects_root = artifact_root.join("objects");
+    let locks_root = artifact_root.join("locks");
+    for path in [
+        qualification_store_root,
+        artifact_root.as_path(),
+        downloads_root.as_path(),
+        objects_root.as_path(),
+        locks_root.as_path(),
+    ] {
+        ensure_safe_directory_under_root(qualification_store_root, path)?;
+    }
+
+    let manifest = verified.manifest();
+    let mut client = HttpDownloadClient::new()?;
+    let options = PullOptions::default();
+    let binary_bundle = prepare_qualification_archive(
+        &mut client,
+        &manifest.artifacts.binary.bundle,
+        &objects_root,
+        &mut progress,
+        &options,
+    )?;
+    let plugin = manifest
+        .artifacts
+        .plugin
+        .as_ref()
+        .map(|artifact| {
+            prepare_qualification_direct_file(
+                &mut client,
+                artifact,
+                &downloads_root,
+                &locks_root,
+                Some(BackendFileFormat::NativeLibrary),
+                &mut progress,
+                &options,
+            )
+        })
+        .transpose()?;
+    let vendor = manifest
+        .artifacts
+        .vendor
+        .iter()
+        .map(|artifact| {
+            prepare_qualification_archive(
+                &mut client,
+                artifact,
+                &objects_root,
+                &mut progress,
+                &options,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let attestation_bundle = prepare_qualification_direct_file(
+        &mut client,
+        &manifest.attestation.bundle,
+        &downloads_root,
+        &locks_root,
+        None,
+        &mut progress,
+        &options,
+    )?;
+    Ok(PreparedQualificationArtifacts {
+        artifact_root,
+        binary_bundle,
+        plugin,
+        vendor,
+        attestation_bundle,
+    })
+}
+
+fn qualification_catalog_file(
+    artifact: &QualificationArtifact,
+    role: CatalogBackendFileRole,
+    expected_format: QualificationArtifactFormat,
+) -> Result<CatalogBackendFile, PullError> {
+    if role == CatalogBackendFileRole::Unknown || artifact.format != expected_format {
+        return Err(PullError::InvalidTarget {
+            field: "qualification artifact format",
+            reason: format!(
+                "signed {:?} artifact cannot be materialized as {role:?}",
+                artifact.format
+            ),
+        });
+    }
+    Ok(CatalogBackendFile {
+        filename: artifact.file_name.clone(),
+        url: artifact
+            .urls
+            .first()
+            .cloned()
+            .ok_or(PullError::InvalidTarget {
+                field: "qualification artifact URLs",
+                reason: "at least one signed URL is required".to_string(),
+            })?,
+        mirrors: Vec::new(),
+        sha256: artifact.sha256.clone(),
+        size_bytes: artifact.size_bytes,
+        role,
+        extract_subdir: (role == CatalogBackendFileRole::Archive).then(String::new),
+        extracted_tree_sha256: artifact.unpacked_tree_sha256.clone(),
+    })
+}
+
+fn prepare_qualification_direct_file<C: DownloadClient>(
+    client: &mut C,
+    artifact: &QualificationArtifact,
+    downloads_root: &Path,
+    locks_root: &Path,
+    preflight: Option<BackendFileFormat>,
+    progress: &mut impl FnMut(PullProgress),
+    options: &PullOptions,
+) -> Result<PreparedQualificationFile, PullError> {
+    let format_role = match artifact.format {
+        QualificationArtifactFormat::NativeLibrary => CatalogBackendFileRole::Plugin,
+        QualificationArtifactFormat::AttestationBundle => CatalogBackendFileRole::Runtime,
+        QualificationArtifactFormat::ZipArchive | QualificationArtifactFormat::Unknown => {
+            return Err(PullError::InvalidTarget {
+                field: "qualification direct artifact format",
+                reason: "only native libraries and attestation bundles are direct files"
+                    .to_string(),
+            });
+        }
+    };
+    let file = qualification_catalog_file(artifact, format_role, artifact.format)?;
+    let digest_dir = downloads_root.join(&artifact.sha256);
+    ensure_safe_directory_under_root(downloads_root, &digest_dir)?;
+    let lock_path = locks_root.join(format!("{}.lock", artifact.sha256));
+    let _lock = BackendInstallLock::acquire(&lock_path)?;
+    let path = digest_dir.join(&artifact.file_name);
+    download_backend_file_from_signed_urls(
+        client,
+        &file,
+        &artifact.urls,
+        &path,
+        progress,
+        None,
+        options,
+    )?;
+    reject_qualification_file_links(&path)?;
+    if let Some(format) = preflight {
+        preflight_backend_file(&path, format)?;
+    }
+    Ok(PreparedQualificationFile {
+        path,
+        size_bytes: artifact.size_bytes,
+        sha256: artifact.sha256.clone(),
+    })
+}
+
+fn prepare_qualification_archive<C: DownloadClient>(
+    client: &mut C,
+    artifact: &QualificationArtifact,
+    objects_root: &Path,
+    progress: &mut impl FnMut(PullProgress),
+    options: &PullOptions,
+) -> Result<PreparedQualificationArchive, PullError> {
+    let file = qualification_catalog_file(
+        artifact,
+        CatalogBackendFileRole::Archive,
+        QualificationArtifactFormat::ZipArchive,
+    )?;
+    let expected_unpacked_size_bytes =
+        artifact
+            .unpacked_size_bytes
+            .ok_or(PullError::InvalidTarget {
+                field: "qualification archive unpacked_size_bytes",
+                reason: "signed unpacked size is required".to_string(),
+            })?;
+    let object = ensure_backend_content_object_in(
+        client,
+        &file,
+        objects_root,
+        Some(&artifact.urls),
+        Some(expected_unpacked_size_bytes),
+        progress,
+        None,
+        options,
+    )?;
+    let object_dir = backend_content_object_dir_in(objects_root, &file);
+    let source_path = object_dir.join("source").join(&artifact.file_name);
+    reject_qualification_file_links(&source_path)?;
+    let (source_size, source_sha256) = file_size_and_sha256(&source_path)?;
+    if source_size != artifact.size_bytes {
+        return Err(PullError::SizeMismatch {
+            path: source_path,
+            expected: artifact.size_bytes,
+            actual: source_size,
+        });
+    }
+    if source_sha256 != artifact.sha256 {
+        return Err(PullError::ShaMismatch {
+            path: source_path,
+            expected: artifact.sha256.clone(),
+            actual: source_sha256,
+        });
+    }
+    let actual_unpacked_size_bytes = object.files.iter().try_fold(0_u64, |total, file| {
+        total
+            .checked_add(file.size_bytes)
+            .ok_or(PullError::InvalidTarget {
+                field: "qualification archive unpacked_size_bytes",
+                reason: "materialized file total overflowed u64".to_string(),
+            })
+    })?;
+    if actual_unpacked_size_bytes != expected_unpacked_size_bytes {
+        return Err(PullError::SizeMismatch {
+            path: object_dir.join("payload"),
+            expected: expected_unpacked_size_bytes,
+            actual: actual_unpacked_size_bytes,
+        });
+    }
+    Ok(PreparedQualificationArchive {
+        source: PreparedQualificationFile {
+            path: object_dir.join("source").join(&artifact.file_name),
+            size_bytes: artifact.size_bytes,
+            sha256: artifact.sha256.clone(),
+        },
+        payload_root: object_dir.join("payload"),
+        materialized_files: object.files,
+    })
+}
+
 pub(crate) fn prepare_backend_runtime_objects_locked(
     resolved: &ResolvedCatalogBackendPull,
     home: &Path,
     mut progress: impl FnMut(PullProgress),
 ) -> Result<PreparedBackendRuntimeObjects, PullError> {
     let mut client = HttpDownloadClient::new()?;
+    let worker = client.clone();
+    let factory =
+        move || -> Result<BoxedDownloadClient, PullError> { Ok(Box::new(worker.clone())) };
+    let parallel = ParallelDownloadConfig {
+        connections: pull_connections_from_env(),
+        factory: &factory,
+    };
     let mut dependency_dirs = BTreeSet::new();
     let mut verified_files = Vec::new();
     let mut saw_runtime = false;
@@ -5737,7 +6502,14 @@ pub(crate) fn prepare_backend_runtime_objects_locked(
         match file.role {
             CatalogBackendFileRole::Runtime | CatalogBackendFileRole::Archive => {
                 saw_runtime = true;
-                let object = ensure_backend_content_object(&mut client, file, home, &mut progress)?;
+                let object = ensure_backend_content_object(
+                    &mut client,
+                    file,
+                    home,
+                    &mut progress,
+                    Some(&parallel),
+                    &PullOptions::default(),
+                )?;
                 let payload = backend_content_object_dir(home, file).join("payload");
                 for materialized in &object.files {
                     let relative = Path::new(&materialized.relative_path);
@@ -5772,14 +6544,124 @@ pub(crate) fn prepare_backend_runtime_objects_locked(
     })
 }
 
+pub(crate) fn prepare_backend_runtime_objects_from_local_path(
+    resolved: &ResolvedCatalogBackendPull,
+    source: impl AsRef<Path>,
+    home: impl AsRef<Path>,
+    mut progress: impl FnMut(PullProgress),
+) -> Result<PreparedBackendRuntimeObjects, PullError> {
+    let home = home.as_ref();
+    let local_files = collect_local_backend_import_files(source.as_ref())?;
+    let mut files_by_url = BTreeMap::new();
+    for file in &resolved.files {
+        if matches!(
+            file.role,
+            CatalogBackendFileRole::Runtime | CatalogBackendFileRole::Archive
+        ) {
+            if let Some(path) = local_files.get(&file.sha256.to_ascii_lowercase()) {
+                index_local_backend_import_urls(&mut files_by_url, file, path.clone());
+            } else if verify_backend_content_object(&backend_content_object_dir(home, file), file)
+                .is_err()
+            {
+                return Err(PullError::BackendImportRejected {
+                    reason: "the official pack is incomplete".to_string(),
+                });
+            }
+        }
+    }
+    let mut client = LocalFileClient { files_by_url };
+    prepare_backend_runtime_objects_with_client(resolved, home, &mut client, &mut progress)
+}
+
+fn prepare_backend_runtime_objects_with_client<C: DownloadClient>(
+    resolved: &ResolvedCatalogBackendPull,
+    home: &Path,
+    client: &mut C,
+    progress: &mut impl FnMut(PullProgress),
+) -> Result<PreparedBackendRuntimeObjects, PullError> {
+    let mut dependency_dirs = BTreeSet::new();
+    let mut verified_files = Vec::new();
+    let mut saw_runtime = false;
+    for file in &resolved.files {
+        match file.role {
+            CatalogBackendFileRole::Runtime | CatalogBackendFileRole::Archive => {
+                saw_runtime = true;
+                let object = ensure_backend_content_object(
+                    client,
+                    file,
+                    home,
+                    progress,
+                    None,
+                    &PullOptions::default(),
+                )?;
+                let payload = backend_content_object_dir(home, file).join("payload");
+                for materialized in &object.files {
+                    let relative = Path::new(&materialized.relative_path);
+                    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+                    dependency_dirs.insert(payload.join(parent));
+                    verified_files.push(PreparedBackendRuntimeFile {
+                        path: payload.join(relative),
+                        size_bytes: materialized.size_bytes,
+                        sha256: materialized.sha256.clone(),
+                    });
+                }
+            }
+            CatalogBackendFileRole::Plugin => {}
+            CatalogBackendFileRole::Unknown => {
+                return Err(PullError::InvalidTarget {
+                    field: "backend.files.role",
+                    reason: "unknown backend file role".to_string(),
+                });
+            }
+        }
+    }
+    if !saw_runtime {
+        return Err(PullError::InvalidTarget {
+            field: "backend.files",
+            reason: "provider discovery requires a signed shared runtime".to_string(),
+        });
+    }
+    verified_files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(PreparedBackendRuntimeObjects {
+        dependency_dirs: dependency_dirs.into_iter().collect(),
+        files: verified_files,
+    })
+}
+
+#[cfg(test)]
 fn install_backend_pack_with_client<C: DownloadClient>(
     resolved: &ResolvedCatalogBackendPull,
     home: &Path,
     client: &mut C,
     progress: impl FnMut(PullProgress),
 ) -> Result<InstalledBackend, PullError> {
+    ensure_backend_cli_version_for_install(resolved)?;
     let _store_lock = BackendStoreMutationLock::acquire(home)?;
-    install_backend_pack_with_client_locked(resolved, home, client, progress)
+    install_backend_pack_with_client_locked(
+        resolved,
+        home,
+        client,
+        progress,
+        None,
+        &PullOptions::for_tests(),
+    )
+}
+
+fn ensure_backend_cli_version_for_install(
+    resolved: &ResolvedCatalogBackendPull,
+) -> Result<(), PullError> {
+    if let BackendAvailability::RequiresUpdate {
+        min_cli_version,
+        current_cli_version,
+    } = resolved.availability()
+    {
+        return Err(PullError::BackendRequiresNewerCli {
+            backend_id: resolved.backend_id.clone(),
+            min_cli_version,
+            current_cli_version,
+        });
+    }
+    Ok(())
 }
 
 fn install_backend_pack_with_client_locked<C: DownloadClient>(
@@ -5787,7 +6669,10 @@ fn install_backend_pack_with_client_locked<C: DownloadClient>(
     home: &Path,
     client: &mut C,
     mut progress: impl FnMut(PullProgress),
+    parallel: Option<&ParallelDownloadConfig>,
+    options: &PullOptions,
 ) -> Result<InstalledBackend, PullError> {
+    ensure_backend_cli_version_for_install(resolved)?;
     let vendor = backend_vendor_dirname(resolved.vendor)?;
     validate_backend_pack_version(&resolved.version)?;
     let plugin_filename = resolved
@@ -5832,7 +6717,7 @@ fn install_backend_pack_with_client_locked<C: DownloadClient>(
         let materialized_files = match file.role {
             CatalogBackendFileRole::Plugin => {
                 let dest = staging_dir.join(&file.filename);
-                download_backend_file(client, file, &dest, &mut progress)?;
+                download_backend_file(client, file, &dest, &mut progress, parallel, options)?;
                 preflight_backend_file(&dest, backend_file_format(file.role)?)?;
                 vec![InstalledBackendMaterializedFile {
                     relative_path: file.filename.clone(),
@@ -5841,7 +6726,14 @@ fn install_backend_pack_with_client_locked<C: DownloadClient>(
                 }]
             }
             CatalogBackendFileRole::Runtime | CatalogBackendFileRole::Archive => {
-                let object = ensure_backend_content_object(client, file, home, &mut progress)?;
+                let object = ensure_backend_content_object(
+                    client,
+                    file,
+                    home,
+                    &mut progress,
+                    parallel,
+                    options,
+                )?;
                 materialize_backend_content_object(home, &staging_dir, file, &object)?
             }
             CatalogBackendFileRole::Unknown => {
@@ -5879,18 +6771,113 @@ fn install_backend_pack_with_client_locked<C: DownloadClient>(
     read_and_verify_installed_backend(&dir, resolved)
 }
 
+fn is_transient_lock_error(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(error.raw_os_error(), Some(5 | 32 | 33))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+fn retry_transient_io<T>(
+    time: &dyn PullTime,
+    mut op: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    const DELAYS_MS: [u64; 6] = [200, 400, 800, 1600, 3200, 6400];
+    let mut attempt = 0usize;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt < DELAYS_MS.len() && is_transient_lock_error(&error) => {
+                time.sleep(Duration::from_millis(DELAYS_MS[attempt]));
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn copy_dir_all_retry(time: &dyn PullTime, from: &Path, to: &Path) -> io::Result<()> {
+    retry_transient_io(time, || fs::create_dir_all(to))?;
+    for entry in retry_transient_io(time, || fs::read_dir(from))? {
+        let entry = entry?;
+        let source = entry.path();
+        reject_symlink(&source).map_err(|error| io::Error::other(error.to_string()))?;
+        let destination = to.join(entry.file_name());
+        let file_type = retry_transient_io(time, || entry.file_type())?;
+        if file_type.is_dir() {
+            copy_dir_all_retry(time, &source, &destination)?;
+        } else if file_type.is_file() {
+            retry_transient_io(time, || {
+                fs::copy(&source, &destination)?;
+                Ok(())
+            })?;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "backend tree contains a non-file object",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn lock_exhausted_io(path: PathBuf, source: io::Error) -> PullError {
+    PullError::Io {
+        path,
+        source: io::Error::new(
+            source.kind(),
+            format!(
+                "{source}. Windows had the files open (antivirus real-time scanning is the usual cause). Retry the install. If it keeps failing, exclude the OpenASR backends folder from scanning. OpenASR does not change folder permissions."
+            ),
+        ),
+    }
+}
+
+fn fs_rename(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+fn fs_remove_dir_all(path: &Path) -> io::Result<()> {
+    fs::remove_dir_all(path)
+}
+
 fn promote_backend_directory(
     staging_dir: &Path,
     final_dir: &Path,
     fingerprint: &str,
 ) -> Result<(), PullError> {
+    promote_backend_directory_with(
+        staging_dir,
+        final_dir,
+        fingerprint,
+        fs_rename,
+        fs_remove_dir_all,
+        &WallClock,
+    )
+}
+
+fn promote_backend_directory_with(
+    staging_dir: &Path,
+    final_dir: &Path,
+    fingerprint: &str,
+    rename: impl Fn(&Path, &Path) -> io::Result<()>,
+    remove_dir_all: impl Fn(&Path) -> io::Result<()>,
+    time: &dyn PullTime,
+) -> Result<(), PullError> {
     let final_parent = final_dir.parent().ok_or_else(|| PullError::InvalidTarget {
         field: "backend install path",
         reason: "final backend directory has no parent".to_string(),
     })?;
-    fs::create_dir_all(final_parent).map_err(|source| PullError::Io {
-        path: final_parent.to_path_buf(),
-        source,
+    retry_transient_io(time, || fs::create_dir_all(final_parent)).map_err(|source| {
+        PullError::Io {
+            path: final_parent.to_path_buf(),
+            source,
+        }
     })?;
     let displaced = staging_dir
         .parent()
@@ -5898,32 +6885,48 @@ fn promote_backend_directory(
         .join(format!(".replaced-{fingerprint}-{}", unix_seconds_now()));
     let had_previous = final_dir.exists();
     if had_previous {
-        fs::rename(final_dir, &displaced).map_err(|source| PullError::Io {
-            path: final_dir.to_path_buf(),
-            source,
+        retry_transient_io(time, || rename(final_dir, &displaced)).map_err(|source| {
+            PullError::Io {
+                path: final_dir.to_path_buf(),
+                source,
+            }
         })?;
     }
-    if let Err(source) = fs::rename(staging_dir, final_dir) {
-        if had_previous {
-            let _ = fs::rename(&displaced, final_dir);
+    match retry_transient_io(time, || rename(staging_dir, final_dir)) {
+        Ok(()) => {}
+        Err(source) if is_transient_lock_error(&source) => {
+            if let Err(copy_error) = copy_dir_all_retry(time, staging_dir, final_dir) {
+                let _ = retry_transient_io(time, || remove_dir_all(final_dir));
+                if had_previous {
+                    let _ = rename(&displaced, final_dir);
+                }
+                return Err(lock_exhausted_io(final_dir.to_path_buf(), copy_error));
+            }
+            let _ = retry_transient_io(time, || remove_dir_all(staging_dir));
         }
-        return Err(PullError::Io {
-            path: final_dir.to_path_buf(),
-            source,
-        });
+        Err(source) => {
+            if had_previous {
+                let _ = rename(&displaced, final_dir);
+            }
+            return Err(PullError::Io {
+                path: final_dir.to_path_buf(),
+                source,
+            });
+        }
     }
     if had_previous {
-        let _ = fs::remove_dir_all(displaced);
+        let _ = retry_transient_io(time, || remove_dir_all(&displaced));
     }
     Ok(())
 }
 
-/// Reclaims backend-pack generations and shared runtime objects that are no
-/// longer selected or explicitly retained by a caller (for example Desktop's
-/// future-core pending candidate). The mutation lock makes this safe against
-/// a concurrent installer or activation commit. Young artifacts are retained
-/// for a bounded rollback/resume window; corrupt metadata never broadens a
-/// deletion target and causes shared objects to be retained conservatively.
+/// Reclaims *replaced generations* of backend packs and unreferenced shared
+/// objects. Every currently installed pack remains a library member until the
+/// user explicitly uninstalls it: being unselected / deactivated is not a
+/// deletion. `keep_backend_ids` is extra protection (for example a future-core
+/// pending candidate). Young artifacts are retained for a bounded
+/// rollback/resume window; corrupt metadata never broadens a deletion target
+/// and causes shared objects to be retained conservatively.
 pub fn gc_backend_store(
     home: impl AsRef<Path>,
     keep_backend_ids: impl IntoIterator<Item = String>,
@@ -5937,6 +6940,160 @@ pub fn gc_backend_store(
         min_age.unwrap_or(DEFAULT_BACKEND_GC_MIN_AGE),
         unix_seconds_now(),
     )
+}
+
+/// Installed optional GPU packs currently on disk. Library membership is
+/// independent of which pack `active.json` names.
+pub fn list_installed_backend_packs(
+    home: impl AsRef<Path>,
+) -> Result<Vec<InstalledBackend>, PullError> {
+    let home = home.as_ref();
+    let mut deferred = Vec::new();
+    let packs = discover_installed_backend_packs(home, &mut deferred)?;
+    Ok(packs
+        .into_iter()
+        .map(|discovered| discovered.installed)
+        .collect())
+}
+
+/// Explicit user delete of one vendor's library packs (CUDA or HIP). Fails if
+/// that vendor is the currently activated kernel. Reclaims the vendor's pack
+/// directories and then runs GC so unreferenced shared objects can go.
+pub fn uninstall_backend_packs_for_vendor(
+    home: impl AsRef<Path>,
+    vendor: CatalogBackendVendor,
+) -> Result<BackendStoreGcReport, PullError> {
+    let home = home.as_ref();
+    let vendor_name = backend_vendor_dirname(vendor)?.to_string();
+    let _store_lock = BackendStoreMutationLock::acquire(home)?;
+    let active = crate::backend_distribution::read_activated_backend(home).map_err(|error| {
+        PullError::InvalidTarget {
+            field: "backends/active.json",
+            reason: error.to_string(),
+        }
+    })?;
+    if active
+        .as_ref()
+        .is_some_and(|active| active.vendor == vendor)
+    {
+        return Err(PullError::BackendPackInUse {
+            vendor: vendor_name,
+        });
+    }
+    let mut deferred = Vec::new();
+    let mut report = BackendStoreGcReport {
+        schema_version: BACKEND_STORE_SCHEMA_VERSION,
+        retained_backend_ids: Vec::new(),
+        removed_pack_directories: 0,
+        removed_staging_directories: 0,
+        removed_content_objects: 0,
+        reclaimed_bytes: 0,
+        deferred_paths: Vec::new(),
+    };
+    for discovered in discover_installed_backend_packs(home, &mut deferred)? {
+        if discovered.installed.vendor == vendor_name
+            && let Some(bytes) = remove_backend_gc_directory(&discovered.path, &mut report)
+        {
+            report.removed_pack_directories = report.removed_pack_directories.saturating_add(1);
+            report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(bytes);
+        }
+    }
+    let leftover_keep = discover_installed_backend_packs(home, &mut Vec::new())?
+        .into_iter()
+        .map(|discovered| discovered.installed.backend_id)
+        .collect();
+    let leftover = gc_backend_store_locked(
+        home,
+        leftover_keep,
+        DEFAULT_BACKEND_GC_MIN_AGE,
+        unix_seconds_now(),
+    )?;
+    report.removed_staging_directories = leftover.removed_staging_directories;
+    report.removed_content_objects = leftover.removed_content_objects;
+    report.reclaimed_bytes = report
+        .reclaimed_bytes
+        .saturating_add(leftover.reclaimed_bytes);
+    report.retained_backend_ids = leftover.retained_backend_ids;
+    report.deferred_paths.extend(deferred);
+    report.deferred_paths.extend(leftover.deferred_paths);
+    report.deferred_paths.sort();
+    report.deferred_paths.dedup();
+    Ok(report)
+}
+
+struct DiscoveredBackendPack {
+    installed: InstalledBackend,
+    path: PathBuf,
+}
+
+fn discover_installed_backend_packs(
+    home: &Path,
+    deferred: &mut Vec<PathBuf>,
+) -> Result<Vec<DiscoveredBackendPack>, PullError> {
+    let backends_root = home.join("backends");
+    if !backends_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut packs = Vec::new();
+    for vendor in ["cpu", "vulkan", "cuda", "hip"] {
+        let vendor_dir = backends_root.join(vendor);
+        for version_dir in safe_child_directories(&vendor_dir, deferred)? {
+            for pack_dir in safe_child_directories(&version_dir, deferred)? {
+                let marker_path = pack_dir.join("backend.json");
+                let Some(mut installed) = fs::read_to_string(&marker_path)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<InstalledBackend>(&text).ok())
+                    .filter(|installed| {
+                        installed.schema_version == INSTALLED_BACKEND_SCHEMA_VERSION
+                            && installed.vendor == vendor
+                            && installed.version
+                                == version_dir
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or_default()
+                            && installed.artifact_fingerprint
+                                == pack_dir
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or_default()
+                    })
+                else {
+                    continue;
+                };
+                installed.dir = pack_dir.clone();
+                packs.push(DiscoveredBackendPack {
+                    installed,
+                    path: pack_dir,
+                });
+            }
+        }
+    }
+    Ok(packs)
+}
+
+fn newest_generation_fingerprints(
+    packs: &[DiscoveredBackendPack],
+) -> BTreeMap<String, (u64, BTreeSet<String>)> {
+    let mut newest = BTreeMap::new();
+    for pack in packs {
+        let stamp = pack.installed.installed_at_unix_seconds;
+        let fingerprint = pack.installed.artifact_fingerprint.clone();
+        newest
+            .entry(pack.installed.backend_id.clone())
+            .and_modify(
+                |(installed_at, fingerprints): &mut (u64, BTreeSet<String>)| {
+                    if stamp > *installed_at {
+                        *installed_at = stamp;
+                        fingerprints.clear();
+                        fingerprints.insert(fingerprint.clone());
+                    } else if stamp == *installed_at {
+                        fingerprints.insert(fingerprint.clone());
+                    }
+                },
+            )
+            .or_insert_with(|| (stamp, BTreeSet::from([fingerprint])));
+    }
+    newest
 }
 
 fn gc_backend_store_locked(
@@ -5960,9 +7117,15 @@ fn gc_backend_store_locked(
         keep_backend_ids.insert(active.backend_id.clone());
     }
     let cutoff = now.saturating_sub(min_age.as_secs());
+    let discovered = discover_installed_backend_packs(home, &mut Vec::new())?;
+    let newest = newest_generation_fingerprints(&discovered);
+    let mut retained_ids = keep_backend_ids.clone();
+    for backend_id in newest.keys() {
+        retained_ids.insert(backend_id.clone());
+    }
     let mut report = BackendStoreGcReport {
         schema_version: BACKEND_STORE_SCHEMA_VERSION,
-        retained_backend_ids: keep_backend_ids.iter().cloned().collect(),
+        retained_backend_ids: retained_ids.into_iter().collect(),
         removed_pack_directories: 0,
         removed_staging_directories: 0,
         removed_content_objects: 0,
@@ -5977,9 +7140,16 @@ fn gc_backend_store_locked(
         for version_dir in safe_child_directories(&vendor_dir, &mut report.deferred_paths)? {
             for pack_dir in safe_child_directories(&version_dir, &mut report.deferred_paths)? {
                 let marker_path = pack_dir.join("backend.json");
-                let installed = fs::read_to_string(&marker_path)
+                let marker = match fs::read_to_string(&marker_path) {
+                    Ok(text) => text,
+                    Err(_) => {
+                        report.deferred_paths.push(pack_dir);
+                        retain_all_objects = true;
+                        continue;
+                    }
+                };
+                let installed = serde_json::from_str::<InstalledBackend>(&marker)
                     .ok()
-                    .and_then(|text| serde_json::from_str::<InstalledBackend>(&text).ok())
                     .filter(|installed| {
                         installed.schema_version == INSTALLED_BACKEND_SCHEMA_VERSION
                             && installed.vendor == vendor
@@ -6003,6 +7173,13 @@ fn gc_backend_store_locked(
                 let caller_kept = installed
                     .as_ref()
                     .is_some_and(|installed| keep_backend_ids.contains(&installed.backend_id));
+                let library_current = installed.as_ref().is_some_and(|installed| {
+                    newest
+                        .get(&installed.backend_id)
+                        .is_some_and(|(_, fingerprints)| {
+                            fingerprints.contains(&installed.artifact_fingerprint)
+                        })
+                });
                 let modified = safe_tree_stats(&pack_dir)
                     .map(|stats| stats.newest_modified_unix_seconds)
                     .unwrap_or(now);
@@ -6011,7 +7188,7 @@ fn gc_backend_store_locked(
                     .map(|installed| installed.installed_at_unix_seconds.max(modified))
                     .unwrap_or(modified)
                     > cutoff;
-                if active_match || caller_kept || young {
+                if active_match || caller_kept || young || library_current {
                     if let Some(installed) = installed {
                         for file in installed.files {
                             if matches!(
@@ -6248,6 +7425,73 @@ fn prune_empty_directories(root: &Path) {
     }
 }
 
+fn pull_paths_for_backend_dest(dest: &Path) -> Result<PullPaths, PullError> {
+    let (partial, partial_meta) = backend_partial_paths(dest)?;
+    let stem = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| PullError::InvalidTarget {
+            field: "backend.files.filename",
+            reason: format!("'{}' has no UTF-8 file name", dest.display()),
+        })?;
+    let dir = dest
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| PullError::InvalidTarget {
+            field: "backend install path",
+            reason: "destination has no parent".to_string(),
+        })?;
+    Ok(PullPaths {
+        partial_path: partial,
+        partial_meta_path: partial_meta,
+        partial_segments_meta_path: dest.with_file_name(format!(".{stem}.partial.segments.json")),
+        installed_meta_path: dest.with_file_name(format!(".{stem}.installed.json")),
+        lock_path: dest.with_file_name(format!(".{stem}.pull.lock")),
+        dir,
+        final_path: dest.to_path_buf(),
+    })
+}
+
+fn download_backend_file_via_pull<C: DownloadClient>(
+    client: &mut C,
+    file: &CatalogBackendFile,
+    dest: &Path,
+    progress: &mut impl FnMut(PullProgress),
+    parallel: Option<&ParallelDownloadConfig>,
+    options: &PullOptions,
+) -> Result<(), PullError> {
+    let target = PullTarget::for_backend_file(file)?;
+    ensure_https_url(&target.url)?;
+    let paths = pull_paths_for_backend_dest(dest)?;
+    let downloaded = download_with_retries(
+        &target,
+        &paths,
+        client,
+        options.clone(),
+        parallel,
+        progress,
+        &|| false,
+        &|| false,
+    )?;
+    if !downloaded.sha256.eq_ignore_ascii_case(&file.sha256) {
+        cleanup_partial(&paths);
+        return Err(PullError::ShaMismatch {
+            path: dest.to_path_buf(),
+            expected: file.sha256.clone(),
+            actual: downloaded.sha256,
+        });
+    }
+    atomic_file::replace_file_atomically(&paths.partial_path, dest).map_err(|source| {
+        PullError::Io {
+            path: dest.to_path_buf(),
+            source,
+        }
+    })?;
+    let _ = fs::remove_file(&paths.partial_meta_path);
+    let _ = fs::remove_file(&paths.partial_segments_meta_path);
+    Ok(())
+}
+
 /// Download a single backend-pack file (plugin binary or archive) to `dest`,
 /// streamed to a `.partial` file and sha256-verified before the atomic
 /// rename -- the backend-pack analogue of the model-pack single-stream path
@@ -6264,17 +7508,99 @@ fn prune_empty_directories(root: &Path) {
 /// a replacement Desktop process can resume after NSIS terminates the old
 /// process. The signed sha256 remains the final authority; ETag is only a
 /// transport guard that prevents appending bytes from two representations.
+fn download_backend_file_from_signed_urls<C: DownloadClient>(
+    client: &mut C,
+    file: &CatalogBackendFile,
+    urls: &[String],
+    dest: &Path,
+    progress: &mut impl FnMut(PullProgress),
+    parallel: Option<&ParallelDownloadConfig>,
+    options: &PullOptions,
+) -> Result<(), PullError> {
+    let urls = expand_artifact_fetch_urls(urls);
+    if urls.is_empty() {
+        return Err(PullError::InvalidTarget {
+            field: "qualification artifact URLs",
+            reason: "at least one signed URL is required".to_string(),
+        });
+    }
+    let mut last_error = None;
+    for (index, url) in urls.iter().enumerate() {
+        if index > 0 {
+            let (partial, partial_meta) = backend_partial_paths(dest)?;
+            discard_backend_partial(&partial, &partial_meta);
+        }
+        let mut candidate = file.clone();
+        candidate.url.clone_from(url);
+        match download_backend_file_once(client, &candidate, dest, progress, parallel, options) {
+            Ok(()) => return Ok(()),
+            Err(error) if is_source_fallback_error(&error) => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.expect("non-empty signed URL list produced an error"))
+}
+
+fn expand_artifact_fetch_urls(urls: &[String]) -> Vec<String> {
+    let mut expanded = Vec::new();
+    for url in urls {
+        for fetch in crate::transport::artifact_fetch_urls(url) {
+            if !expanded.contains(&fetch) {
+                expanded.push(fetch);
+            }
+        }
+    }
+    expanded
+}
+
 fn download_backend_file<C: DownloadClient>(
     client: &mut C,
     file: &CatalogBackendFile,
     dest: &Path,
     progress: &mut impl FnMut(PullProgress),
+    parallel: Option<&ParallelDownloadConfig>,
+    options: &PullOptions,
 ) -> Result<(), PullError> {
     if backend_file_matches(dest, file) {
         return Ok(());
     }
-    if let Some(local_path) = file.url.strip_prefix("file://") {
+    if file.url.starts_with("file://") {
+        let local_path = file.url.strip_prefix("file://").unwrap_or(&file.url);
         return copy_local_backend_file(Path::new(local_path), dest, file, progress);
+    }
+    download_backend_file_from_signed_urls(
+        client,
+        file,
+        std::slice::from_ref(&file.url),
+        dest,
+        progress,
+        parallel,
+        options,
+    )
+}
+
+fn download_backend_file_once<C: DownloadClient>(
+    client: &mut C,
+    file: &CatalogBackendFile,
+    dest: &Path,
+    progress: &mut impl FnMut(PullProgress),
+    parallel: Option<&ParallelDownloadConfig>,
+    options: &PullOptions,
+) -> Result<(), PullError> {
+    if backend_file_matches(dest, file) {
+        return Ok(());
+    }
+    if let Some(parallel) = parallel {
+        return download_backend_file_via_pull(
+            client,
+            file,
+            dest,
+            progress,
+            Some(parallel),
+            options,
+        );
     }
     // The parent pack/object directory is already keyed by the full artifact
     // digest. Keep the leaf short enough for Windows MAX_PATH-era tools while
@@ -6310,11 +7636,12 @@ fn download_backend_file<C: DownloadClient>(
             &partial_meta,
             &mut expected_etag,
             progress,
+            options,
         ) {
             Ok(()) => return Ok(()),
             Err(error) if attempt < DOWNLOAD_MAX_RETRIES && is_retryable_download_error(&error) => {
                 attempt += 1;
-                std::thread::sleep(retry_backoff(attempt));
+                sleep_backoff(&*options.time, attempt);
             }
             Err(error) => return Err(error),
         }
@@ -6416,6 +7743,7 @@ fn download_backend_file_attempt<C: DownloadClient>(
     partial_meta: &Path,
     expected_etag: &mut Option<String>,
     progress: &mut impl FnMut(PullProgress),
+    options: &PullOptions,
 ) -> Result<(), PullError> {
     let (resume_from, persisted_etag) =
         prepare_backend_partial_for_resume(file, partial, partial_meta)?;
@@ -6496,8 +7824,7 @@ fn download_backend_file_attempt<C: DownloadClient>(
     let mut bytes_done = actual_resume;
     write_backend_partial_meta(partial_meta, file, expected_etag.clone(), bytes_done)?;
     let mut last_meta_bytes = bytes_done;
-    let mut low_speed = LowSpeedWindow::new();
-    let low_speed_options = PullOptions::default();
+    let mut low_speed = LowSpeedWindow::new(options);
     progress(PullProgress::DownloadStarted {
         bytes_total: file.size_bytes,
         resume_from: actual_resume,
@@ -6528,13 +7855,7 @@ fn download_backend_file_attempt<C: DownloadClient>(
             bytes_done,
             bytes_total: file.size_bytes,
         });
-        low_speed.observe(
-            &file.url,
-            file.size_bytes,
-            bytes_done,
-            read as u64,
-            &low_speed_options,
-        )?;
+        low_speed.observe(&file.url, file.size_bytes, bytes_done, read as u64)?;
     }
     out.sync_all().map_err(|source| PullError::Io {
         path: partial.to_path_buf(),
@@ -6563,10 +7884,11 @@ fn download_backend_file_attempt<C: DownloadClient>(
 /// Extract a verified zip archive into `<pack_dir>/<subdir>`, rejecting any entry
 /// whose path escapes the destination (zip-slip). The archive's own sha256 was
 /// already checked by the caller; this guards only the per-entry paths.
-fn extract_backend_archive(
+fn extract_backend_archive_with_expected_size(
     zip_path: &Path,
     pack_dir: &Path,
     subdir: &str,
+    expected_unpacked_size_bytes: Option<u64>,
 ) -> Result<(), PullError> {
     let dest_root = pack_dir.join(subdir);
     let file = File::open(zip_path).map_err(|source| PullError::Io {
@@ -6578,6 +7900,8 @@ fn extract_backend_archive(
             path: zip_path.to_path_buf(),
             reason: format!("could not open zip archive: {error}"),
         })?;
+    let mut seen_paths = BTreeSet::new();
+    let mut unpacked_size_bytes = 0_u64;
     for index in 0..archive.len() {
         let mut entry =
             archive
@@ -6593,6 +7917,39 @@ fn extract_backend_archive(
                 reason: format!("zip entry '{}' escapes the extraction dir", entry.name()),
             });
         };
+        let relative_text = relative
+            .to_str()
+            .ok_or_else(|| PullError::BackendFilePreflight {
+                path: zip_path.to_path_buf(),
+                reason: format!("zip entry '{}' has a non-UTF-8 path", entry.name()),
+            })?;
+        validate_safe_relative_path("backend archive entry", relative_text).map_err(|reason| {
+            PullError::BackendFilePreflight {
+                path: zip_path.to_path_buf(),
+                reason,
+            }
+        })?;
+        if !seen_paths.insert(relative_text.to_lowercase()) {
+            return Err(PullError::BackendFilePreflight {
+                path: zip_path.to_path_buf(),
+                reason: format!(
+                    "zip entry '{}' collides case-insensitively with another entry",
+                    entry.name()
+                ),
+            });
+        }
+        if entry.unix_mode().is_some_and(|mode| {
+            let kind = mode & 0o170000;
+            kind != 0 && kind != 0o040000 && kind != 0o100000
+        }) {
+            return Err(PullError::BackendFilePreflight {
+                path: zip_path.to_path_buf(),
+                reason: format!(
+                    "zip entry '{}' is not a regular file or directory",
+                    entry.name()
+                ),
+            });
+        }
         let out_path = dest_root.join(&relative);
         if entry.is_dir() {
             fs::create_dir_all(&out_path).map_err(|source| PullError::Io {
@@ -6607,14 +7964,48 @@ fn extract_backend_archive(
                 source,
             })?;
         }
+        let remaining = expected_unpacked_size_bytes
+            .map(|expected| expected.saturating_sub(unpacked_size_bytes));
+        if remaining.is_some_and(|remaining| entry.size() > remaining) {
+            return Err(PullError::BackendFilePreflight {
+                path: zip_path.to_path_buf(),
+                reason: "archive exceeds its signed unpacked_size_bytes".to_string(),
+            });
+        }
         let mut out = File::create(&out_path).map_err(|source| PullError::Io {
             path: out_path.clone(),
             source,
         })?;
-        io::copy(&mut entry, &mut out).map_err(|source| PullError::Io {
+        let copied = match remaining {
+            Some(remaining) => io::copy(&mut entry.take(remaining.saturating_add(1)), &mut out),
+            None => io::copy(&mut entry, &mut out),
+        }
+        .map_err(|source| PullError::Io {
             path: out_path.clone(),
             source,
         })?;
+        if remaining.is_some_and(|remaining| copied > remaining) {
+            return Err(PullError::BackendFilePreflight {
+                path: zip_path.to_path_buf(),
+                reason: "archive exceeds its signed unpacked_size_bytes".to_string(),
+            });
+        }
+        unpacked_size_bytes = unpacked_size_bytes.checked_add(copied).ok_or_else(|| {
+            PullError::BackendFilePreflight {
+                path: zip_path.to_path_buf(),
+                reason: "archive unpacked size overflowed u64".to_string(),
+            }
+        })?;
+    }
+    if let Some(expected) = expected_unpacked_size_bytes
+        && expected != unpacked_size_bytes
+    {
+        return Err(PullError::BackendFilePreflight {
+            path: zip_path.to_path_buf(),
+            reason: format!(
+                "archive unpacked size mismatch: expected {expected}, got {unpacked_size_bytes}"
+            ),
+        });
     }
     Ok(())
 }

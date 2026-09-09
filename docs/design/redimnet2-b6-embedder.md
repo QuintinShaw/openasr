@@ -4,8 +4,10 @@ Implemented design and validation record for the **ReDimNet2-B6** speaker
 embedder (PalabraAI/redimnet2, MIT) under `diarize/embed/`.
 B6 is a 12.46 M-param UNet-style "dimension reshaping" net that outputs a
 192-dim speaker embedding, with a Chinese-enhanced training mix (vb2+vox2+cnc2).
-It replaced the retired pure-Rust WeSpeaker ResNet34 (256-dim) and is the sole
-speaker embedding space used by diarization and Voice ID.
+It replaced the retired pure-Rust WeSpeaker ResNet34 (256-dim) and remains the
+**default** speaker embedding space for diarization and Voice ID. A later ggml
+WeSpeaker ResNet family is a parallel optional space (explicit preference, no
+Auto fallback); see [wespeaker-resnet-embedder.md](wespeaker-resnet-embedder.md).
 
 Reference source is the upstream `redimnet2/` Python package (checkpoint
 `b6-vb2+vox2+cnc2_v0-lm.pt`, SHA256 `287365f6...`, byte-verified against the
@@ -84,12 +86,14 @@ BN -> linear. See "Validation record" below.
 ### 5. One shared embedder and identity contract
 
 The `SpeakerEmbedder` implementation, runtime pack resolver, and ReDimNet
-calibration profile are now the single embedding seam used by external speaker
+calibration profile are the default embedding seam used by external speaker
 clustering and enrolled-person matching. `SpeakerEmbedderIdentity` binds the
 192-d space to the exact pack content fingerprint, so a same-path replacement
 cannot reuse enrollment data or a resident runtime from different bytes. A
 request freezes one `Arc` snapshot so clustering and naming cannot observe
-different embedding spaces halfway through a long transcription.
+different embedding spaces halfway through a long transcription. WeSpeaker
+ResNet, when explicitly selected, is a different identity (256-d,
+`wespeaker-cal-v1`) rather than a silent fallback.
 
 The published capability pack is fp16-only. q8_0 did not justify a second
 public tier on this small network and remains deferred; f32 is a parity/development

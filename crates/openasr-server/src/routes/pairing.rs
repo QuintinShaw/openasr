@@ -325,8 +325,10 @@ pub(crate) async fn require_server_auth(
 
 pub(crate) fn is_operator_only_path(method: &axum::http::Method, path: &str) -> bool {
     use axum::http::Method;
-    // The server operator's local data + model mutations. Reads of model/catalog
-    // lists and capabilities stay open to paired compute clients.
+    // The server operator's local data + model mutations. Bound identity
+    // (`GET /v1/models`) and capabilities stay open to paired compute clients.
+    // Installed inventory (`GET /v1/models/local`) is operator-only so a remote
+    // client cannot build a marketplace of packs this process is not serving.
     if path == "/v1/history" || path.starts_with("/v1/history/") {
         return true; // list / get / delete operator transcripts
     }
@@ -339,8 +341,23 @@ pub(crate) fn is_operator_only_path(method: &axum::http::Method, path: &str) -> 
     if path == "/v1/debug/runtime-receipts" || path == "/v1/runtime/receipts" {
         return true; // bounded runtime ownership diagnostics are operator-local
     }
+    if path == "/v1/models/local" {
+        return true; // installed inventory; handshake identity is GET /v1/models
+    }
     if path == "/v1/models/default" {
         return method != Method::GET; // set-default (POST/PUT); GET is informational
+    }
+    if path == "/v1/models/default/idle-switch/cancel" {
+        return true;
+    }
+    if path == "/v1/runtime/runs" {
+        return true;
+    }
+    if path == "/v1/capabilities/requests/approve" {
+        return true;
+    }
+    if path == "/v1/capabilities/requests" {
+        return method == Method::GET;
     }
     if path == "/v1/models/pulls" {
         // Unlike a single-job GET (which requires already knowing the job

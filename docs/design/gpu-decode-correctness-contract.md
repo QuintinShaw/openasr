@@ -24,6 +24,48 @@ The shared software migration is in place:
 - same-graph dual output, fresh/reuse four-quadrant, backend-op, Layer-3, and
   release-matrix gates are separate; missing, stale, deferred, or mismatched
   cells fail closed;
+- the signed-artifact qualification child now runs one backend-neutral,
+  exact-route Layer-1/Layer-2/production-width four-quadrant suite and its
+  parent strictly revalidates the typed result against the prepared artifacts;
+  this remains diagnostic evidence and does not close a real-family cell;
+- `bind_real_family_evidence` and hidden `bench-receipt qualify-family` are the
+  only constructors that may attach `ShortAudioReceipt evidence.v1`; generic
+  `bench-receipt short-audio` still leaves `evidence` absent. Binding does not
+  close a matrix cell until cold+reuse receipts run on final artifacts;
+- a Windows HIP static sidecar host produced diagnostic-not-release
+  `placement_resource` and `token_transcript` evidence.v1 for
+  `funasr-nano:q4_k` on gfx1200 (capture-on, FreshGraph, cold+reuse). That
+  run is not a signed-plugin or release-artifact cell;
+- the same machine also produced diagnostic-not-release evidence.v1 on the
+  CPU-neutral `GGML_BACKEND_DL` host after loading a locally verified
+  `ggml-hip.dll` through the qualification selector (`schema_version` 3,
+  gfx1200). That still is not a production-catalog or Authenticode release
+  cell;
+- the same RX 9060 XT then produced diagnostic-not-release evidence.v1 for
+  physical Vulkan on the same CPU-neutral host after loading a locally
+  verified `ggml-vulkan.dll` through the qualification selector
+  (`schema_version` 3, empty catalog targets, live
+  `vk_caps_00001002_00007590_*`, capture unsupported, FreshGraph,
+  cold+reuse, `funasr-nano:q4_k`). That still is not a production-catalog
+  or Authenticode release cell;
+- after `8cf47e0f` (`origin/main`), the same RX 9060 XT re-ran those local-dev
+  HIP and Vulkan plugin cells for `funasr-nano:q4_k` (qualify-family
+  cold+reuse token `evidence.v1` pass, HTTP JFK). Additional local-dev HIP
+  cells passed for `qwen3-asr-0.6b:q4_k`, `qwen3-asr-1.7b:q4_k`, and
+  `firered-aed-l-v2:q4_k`; Vulkan also passed `firered-aed-l-v2:q4_k`. A later
+  local receipt-contract rebuild on the same machine then passed HIP
+  `moonshine-tiny:q8_0` and Vulkan `qwen3-asr-0.6b:q4_k`,
+  `qwen3-asr-1.7b:q4_k`, `sensevoice-small:q8_0`, `xasr-zh-en:q8_0`,
+  `moonshine-tiny:q8_0`, `whisper-tiny:q4_k`, and `whisper-small:q4_k`. A
+  later HIP plugin rebuild on the same machine then passed HIP
+  `sensevoice-small:q8_0`, `xasr-zh-en:q8_0`, `whisper-tiny:q4_k`, and
+  `whisper-small:q4_k`. Compact remains off. HIP and Vulkan reuse evidence is
+  now planner-validated (`ReusableGraph` + `FullLogits` resident KV) so FunASR
+  q4_k HIP no longer rebuilds a host-KV graph every token; CUDA stays
+  `FreshGraph`. These are still not a production-catalog or Authenticode cell;
+- native `ARGMAX_FIRST` now has one cross-backend non-finite rule: any NaN or
+  infinity in a row yields the `-1` sentinel, which request decoding rejects
+  instead of accepting a provider-dependent token;
 - FireRed's test-only encoder twin now taps every bounded subsample seam before
   relative-position attention/depthwise/readback, so a complete run can name
   the first input, convolution, bias, ReLU, layout, or projection divergence;
@@ -32,11 +74,166 @@ The shared software migration is in place:
   failed activation on the previous selected/LKG backend.
 
 The evidence boundary remains strict. The committed CPU/Metal Layer-3 receipts
-at the earlier checkpoint do not authorize a later release commit. This Apple
-host has no CUDA, physical Vulkan, or HIP/ROCm lane, and its plugin host is
-`legacy_static`, not the shipped Windows `neutral_dynamic` host. Those cells,
-including HIP capture-on and the original Windows CUDA fp16 reproduction, are
-not passes and remain non-activatable until release-bound receipts are returned.
+at the earlier checkpoint do not authorize a later release commit. The Windows
+HIP sidecar, local-dev HIP plugin, and local-dev physical Vulkan plugin
+evidence.v1 runs do not authorize a production-signed catalog epoch,
+Authenticode release ZIP, or CUDA. Those cells remain non-activatable until
+release-bound receipts are returned.
+
+## Accepted completion program
+
+The remaining work is an implementation program, not a permanent
+`BLOCKED_BY_HARNESS` disposition. The program is complete only after the shared
+runtime can produce and the release gate can consume real provider evidence for
+the layers below.
+
+### Current diagnostic limitations
+
+The following baseline outputs must not be promoted into stronger claims:
+
+- `generate_backend_hardware_evidence.py` produces artifact-bound FullDevice
+  placement/resource evidence for HIP or CUDA. It does not prove token parity,
+  graph reuse, ownership lifecycle, or product behavior.
+- an ordinary `bench-receipt short-audio --trace-out` run is a request-scoped
+  runtime diagnostic, but its receipt currently carries no versioned correctness
+  evidence and cannot close the final matrix;
+- older short-audio diagnostics derived `graph_rebuilt=true` from the selected
+  `FreshGraph` plan. The current emitter instead requires a runtime-minted
+  compute/output witness bound to the `created` or `existing_graph_observed`
+  origin in effect at that compute; a later observation-scope re-attach on the
+  same graph identity does not make earlier origin events ambiguous. Missing
+  origin, start, complete, or readback still fails closed. This correction does
+  not make an ordinary evidence-less bench receipt release-authorizing; and
+- the Desktop JavaScript plugin-switch runner is a machine-protocol smoke. It
+  does not start the packaged Tauri application or traverse the production
+  kernel-switch transaction and `DaemonSupervisor`.
+
+These limitations are required producer work. They are not waivers.
+
+### Exact capability cell
+
+Activation evidence is keyed at least by:
+
+```text
+release subject
+x core / host ABI
+x binary / plugin artifact identity
+x pack content identity
+x family / model / quant
+x topology
+x provider
+x concrete target or explicitly approved target set
+x placement / output plan
+x capture / scheduler mode
+x evidence revision
+x Auto / Explicit activation mode
+```
+
+Exact target is the default. Cross-target approval requires a separately
+reviewed equivalence proof and an `approved_target_set` digest. Provider hardware
+schema v2 may project genuinely target-invariant build or packaging properties;
+it cannot project family token correctness from one gfx/SM target to another.
+
+Base `FullLogits + FreshGraph` execution, native compact selection, persistent
+graph reuse, and graph capture are independent capabilities. Passing one never
+authorizes another.
+
+The runtime ownership and activation contract owns the typed approval path from
+an `ExecutionCandidate` to an `ApprovedExecutionCandidate`. This contract
+requires that the approval bind the exact output/reuse plan and that no family
+code parse a provider, catalog, matrix, or approval record.
+
+### Observed graph lifecycle
+
+Formal graph evidence is emitted at the shared ggml runtime events where the
+operation actually occurs. It contains bounded, opaque process-local identities
+for:
+
+- graph instance and generation;
+- an `existing_graph_observed` attachment when a later request starts observing
+  a graph prepared by an earlier request in the same process;
+- prepare generation;
+- compute sequence;
+- rebuild event and typed reason;
+- input, output, and KV write generations plus the generation actually consumed;
+- a readback-layer-minted logical output-row witness containing a bounded row
+  index/count. Family code can carry and serialize this witness but cannot
+  construct or deserialize it; batched selection rows must exactly partition
+  the observed native output byte count;
+- native capture support, exact-graph tracking, and enablement observed both
+  immediately before and after compute;
+- pre-existing capture executable generation and its last native change,
+  separately from an instantiate/update/replace caused by the measured
+  compute;
+- graph poison; and
+- graph drop.
+
+Native pointers are never serialized. IDs are never compared across daemon
+starts. Formal cold/reuse pairs carry distinct random request IDs plus the same
+process-random nonce and OS process ID before any process-local graph identity is
+compared. Planner state, `Option<prepared_graph>`, provider labels, caller-
+supplied trace headers, and reuse mode cannot synthesize these events.
+Serialized lifecycle events use an exact per-kind field contract. Rust artifact
+parsers and the Python finalizer reject unknown, missing, reordered, or
+unpaired capture fields before consuming the event semantically.
+
+Attachment is scoped to each transactional request/candidate attempt, not only
+to collector pointer identity. A warm scope must repeat the live native capture
+state and any pre-existing executable generation before its first compute; a
+failed attempt may roll back its events but cannot suppress those observations
+from the succeeding scope.
+
+The evidence must prove that fresh steps use distinct graph generations, reuse
+retains the intended graph/capture executable, refreshed input/output/KV state is
+consumed by the correct compute, topology changes rebuild for the declared
+reason, and poisoned graphs cannot execute or re-enter a cache. A first
+post-compute observation cannot be labeled as creation: the producer must use
+the read-only native ABI before and after compute so an executable that already
+existed in the backend context is reported as observed, not newly created.
+
+### Required shared producers
+
+One backend-neutral implementation serves HIP, physical Vulkan, and CUDA:
+
+1. An exact-route Layer-1 producer runs the final binary/plugin on the selected
+   physical device and covers the complete semantic selector fixture set.
+2. A capture-aware Layer-2 producer verifies actual persistent input/output/KV
+   refresh, topology rebuild, scheduler/capture identity, poison/drop, and
+   fresh/reuse behavior.
+3. A production-shape four-quadrant producer runs A/B/C/D in independent runtime
+   instances. Unsupported C/D cells remain explicit and non-activatable.
+4. A real-family producer fills the existing `ShortAudioReceipt evidence.v1`
+   schema with complete artifact/matrix bindings, token traces, required
+   logits/scores artifacts, actual graph lifecycle, and cold plus same-process
+   warm/reuse evidence.
+5. The artifact-bound hardware producer is generalized to physical Vulkan
+   without allowing software Vulkan to populate a physical-device cell.
+
+The shared implementation for items 1-3 is executed by the isolated
+qualification child after the signed final provider is loaded. Its nested typed
+report is revalidated by the parent and is deliberately not consumed by the
+capability finalizer. Formal release authorization still requires item 4 to
+carry the same observed lifecycle through the existing short-audio receipt and
+trace schema; no standalone conformance JSON is a policy authority.
+
+The real-family producer must emit the separate `placement_resource` and
+`token_transcript` evidence classes expected by the common gate. A diagnostic
+receipt whose evidence field is absent remains non-authorizing.
+
+### Product and release interaction
+
+The Desktop product gate launches the packaged Tauri application and enters
+through public IPC, production `kernel_switch_neutral_impl`, the production
+`DaemonSupervisor`, real transcription, persistence, and rollback. Direct core
+CLI control, handwritten Desktop state, or script-simulated rollback cannot
+populate that gate.
+
+Artifact publication and capability activation are separate gates. A final CUDA
+artifact may be published inert for qualification, but ordinary Auto, Explicit,
+and Desktop execution cannot see it until exact cells close and a separately
+authorized signed capability/catalog epoch activates them. The ownership and
+activation contract owns qualification, old-client rejection, revocation, and
+the publication sequence.
 
 This design complements [GPU weight placement](gpu-weight-placement.md),
 [Decoder state and native memory planning](decoder-state-memory-planning.md),
@@ -425,6 +622,19 @@ currently defaults `OPENASR_HIP_GRAPHS` to true, the plugin build documents
 `GGML_HIP_GRAPHS=ON`, and HIP shares the CUDA `USE_CUDA_GRAPH` implementation
 path. CUDA capture-off evidence cannot authorize HIP capture-on behavior.
 
+HIP capture stays on. hipBLASLt GEMMs cannot join a capturing stream, so the
+HIP plugin pauses capture around those GEMMs, immediately launches each
+recorded fragment on the same stream (stream capture records kernels and
+does not execute them), keeps every non-empty fragment executable, and on
+reuse GraphLaunches those fragments in order interleaved with the same
+eager GEMMs. The first fragment remains the observable executable.
+Eager-walking the full ggml graph on mixed reuse is not the shipping
+path: FunASR q4_k HIP reuse regressed ~3x that way because capturable mmq
+kernels were re-launched one by one. Graphs that still have an instantiated
+executable are not time-evicted. Quantized-weight padding memset uses the
+per-thread stream rather than a blocking legacy-stream `cudaMemset`, which
+is illegal while another stream is capturing.
+
 For HIP, `CaptureCompatibility` must describe the current capture-on lane. A
 compact or reusable output plan remains unsupported until production-shape
 persistent input/output and KV evidence passes with capture enabled. If the
@@ -723,6 +933,12 @@ On every actual backend claiming native first-max support, test:
 - changing inputs across repeated execution; and
 - fail-closed rejection of unsupported type, layout, or shape.
 
+The non-finite policy is exact: if any element of an `ARGMAX_FIRST` row is NaN,
+positive infinity, or negative infinity, the operator returns signed `-1`.
+The family/runtime token boundary must reject that sentinel. It must never wrap
+or clamp it into a vocabulary token, and no backend may substitute a different
+NaN reduction order.
+
 Run the tests on real hardware and the final compiled plugin. A software Vulkan
 implementation is useful additional coverage but not proof for a physical
 Vulkan device.
@@ -919,7 +1135,10 @@ boundary while adding output-plan, token-trace, reuse, and lane evidence.
 ## Interaction with runtime ownership and model activation
 
 GPU output correctness and runtime ownership are related but separate contracts.
-They should not land as one unreviewable change.
+They should not land as one unreviewable change. Local-dev Vulkan
+`funasr-nano:q4_k` now has both: token evidence.v1 (this contract) and a
+verifier-passing diagnostic ColdWarm ownership envelope (the ownership
+contract). Compact output remains disabled.
 
 The required sequencing is:
 
@@ -1082,7 +1301,7 @@ a gross logits divergence.
 |---|---|
 | x86/ARM CPU | native operator and family host-oracle parity |
 | Apple Metal | target state is complete logits until a semantic native selector and all gates pass; migrate the current Qwen-shaped reverse exception |
-| NVIDIA CUDA | semantic operator, persistent graph, real-pack family parity; capture is currently off |
+| NVIDIA CUDA | semantic operator, persistent graph, real-pack family parity; capture is currently compiled out and therefore projects as `unsupported`, not runtime `disabled` |
 | physical Vulkan | semantic operator, persistent graph, real-pack family parity |
 | AMD HIP/ROCm | semantic operator, current capture-on persistent graph, Qwen-shaped and other advertised family parity |
 

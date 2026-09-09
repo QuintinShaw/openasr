@@ -157,8 +157,9 @@ pub(crate) struct MoonshineEncoderGraphRuntime {
     metadata: MoonshineExecutionMetadata,
     runner: GgmlCpuGraphRunner,
     // Owns the mmap'd pack backing every zero-copy WeightSlot::Loaded handle;
-    // must outlive `layers`. Kept even when None (f32-fallback path).
-    #[allow(dead_code)]
+    // must outlive `layers`. Kept even when None (f32-fallback path). The
+    // unified GPU owner clones this into the decoder so both stages share one
+    // DeviceCopied buffer instead of loading the whole pack twice.
     loaded_weights: Option<GgmlLoadedWeightContext>,
     arena: GgmlStaticTensorArena,
     conv1_weight: GgmlStaticTensor,
@@ -208,6 +209,10 @@ impl MoonshineEncoderGraphRuntime {
             backend,
             graph_config,
         )
+    }
+
+    pub(crate) fn cloned_loaded_weights(&self) -> Option<GgmlLoadedWeightContext> {
+        self.loaded_weights.clone()
     }
 
     #[cfg(test)]

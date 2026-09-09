@@ -204,43 +204,7 @@ pub(super) fn group_norm_1d<'a>(
     graph.cont(reshaped).map_err(m)
 }
 
-/// Precomputed per-channel affine (`scale`,`shift`) for an eval-mode BatchNorm:
-/// `y = gamma*(x-mean)/sqrt(var+eps) + beta = x*scale + shift`. Computed on the
-/// host (not the graph) since the four BN tensors are static pack weights, not
-/// request data.
-pub(super) fn batchnorm_affine(
-    gamma: &[f32],
-    beta: &[f32],
-    running_mean: &[f32],
-    running_var: &[f32],
-    eps: f32,
-) -> (Vec<f32>, Vec<f32>) {
-    let n = gamma.len();
-    let mut scale = vec![0.0f32; n];
-    let mut shift = vec![0.0f32; n];
-    for i in 0..n {
-        let s = gamma[i] / (running_var[i] + eps).sqrt();
-        scale[i] = s;
-        shift[i] = beta[i] - running_mean[i] * s;
-    }
-    (scale, shift)
-}
-
-/// Apply a precomputed per-channel affine to a 2D tensor (`ne=[T,F,C,N]`,
-/// `scale`/`shift` are `ne=[C]`, broadcast via a `[1,1,C,1]` reshape).
-pub(super) fn apply_channel_affine_2d<'a>(
-    graph: &GgmlCpuGraphBuilder<'a>,
-    x2d: GgmlCpuTensor<'a>,
-    c: usize,
-    scale: GgmlCpuTensor<'a>,
-    shift: GgmlCpuTensor<'a>,
-) -> OpResult<'a> {
-    let m = map_err("channel_affine_2d");
-    let scale4d = graph.reshape_4d(scale, 1, 1, c, 1).map_err(m)?;
-    let shift4d = graph.reshape_4d(shift, 1, 1, c, 1).map_err(m)?;
-    let scaled = graph.mul(x2d, scale4d).map_err(m)?;
-    graph.add(scaled, shift4d).map_err(m)
-}
+pub(super) use super::super::ggml_affine::{apply_channel_affine_2d, batchnorm_affine};
 
 /// Apply a precomputed per-channel affine to a channel-inner 1D tensor
 /// (`ne=[C,T]`); `scale`/`shift` are `ne=[C]` and broadcast directly (no

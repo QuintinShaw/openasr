@@ -72,6 +72,19 @@ caller-provided local `.oasr` file via ggml. They reject remote URLs, missing
 paths, and directory paths, and
 do not run inference.
 
+## Can I align an existing transcript onto audio?
+
+Yes. `openasr align audio.wav --transcript script.txt -f srt` force-aligns a
+plain-text manuscript onto the audio with the Qwen3-ForcedAligner pack (no ASR).
+The HTTP equivalent is `POST /v1/audio/precise-timeline` with `file` +
+`transcript`. Japanese and Korean fail closed by language tag (`ja`/`ko`)
+or by kana/hangul script. Pure-kanji Japanese cannot be identified as
+Japanese: tagged `ja` it is 400; tagged `en` it follows the CJK character
+tokenizer. A missing pack, empty normalized text, a prompt past decoder
+context, or a degenerate timeline is an error rather than a fabricated SRT.
+See [Known Limitations](KNOWN_LIMITATIONS.md) for normalization rules, the
+400 s timestamp-grid ceiling, and the decoder-context admission.
+
 ## Can I transcribe with a local native pack?
 
 Yes. `openasr transcribe <audio>` uses the native backend by default and runs an
@@ -107,13 +120,19 @@ selected by the ASR architecture rather than by a model-id allowlist:
 - `moss-transcribe-diarize` supplies recording-local speaker turns from its own
   decoder.
 - Every other ASR family uses the shared recording-level pipeline: FireRed
-  Stream-VAD, segmentation-3.0, ReDimNet2-B6 embeddings, automatic AHC/spectral
+  Stream-VAD, a speaker segmenter, speaker embeddings, automatic AHC/spectral
   clustering, and overlap-aware reconstruction.
 
-Both routes still require the ReDimNet2-B6 capability pack: MOSS removes the
-external segmentation/clustering step, not the acoustic identity step. Missing
-or broken required packs fail closed instead of fabricating speakers or silently
-falling back to a different embedding space.
+The default speaker embedder is ReDimNet2-B6 (192-d). An explicit
+`voice_id_embedder=wespeaker` preference (or `OPENASR_WESPEAKER_PACK`) loads the
+optional WeSpeaker ResNet family (256-d, VoxCeleb English LM, sizes 34/152/221/293)
+instead. There is no Auto "use whatever is installed": a selected WeSpeaker pack
+that is missing or broken fails closed rather than falling back to ReDimNet.
+ReDimNet and WeSpeaker occupy different identity spaces, so enrollments do not transfer.
+Default diarization capability still requires the ReDimNet2-B6 pack. MOSS removes the external
+segmentation/clustering step, not the acoustic identity step. Missing or
+broken required packs fail closed instead of fabricating speakers or silently
+changing embedding space.
 
 segmentation-3.0 is the permissive default external segmenter. DiariZen
 Large-s80-md-v2 is a higher-accuracy optional provider whose checkpoint is CC
@@ -140,7 +159,10 @@ match.
 This universal identity contract is qualified for local file transcription.
 Realtime and remote-compute diarization use separate API and privacy contracts;
 their lower-level speaker fields do not establish the same cross-recording
-identity guarantee.
+identity guarantee. Per-speaker embedding vectors are omitted from
+transcription responses unless `return_speaker_embeddings=true` is set
+(verbose_json only); a remote-compute device token requesting them is
+rejected.
 
 OpenASR does not perform source/audio separation (isolating vocals from
 background music or noise, the way Demucs or similar stem-splitting tools do).
@@ -179,9 +201,24 @@ amd64). The separate macOS/Windows desktop apps ship from
 Yes. `quintinshaw/openasr` on Docker Hub. Images contain the release binary and
 model-registry metadata only — mount a volume at `/data`, then
 `docker exec … openasr pull <model> --yes` before calling the HTTP API. The
-server never auto-pulls. CUDA tags require the NVIDIA Container Toolkit and
-refuse to start if no GPU is visible. Longer guide:
-[openasr.org/docs/docker](https://openasr.org/docs/docker/).
+server never auto-pulls. They do not ship `perf/` bench-suite fixtures or
+baselines, so `openasr bench-suite` inside the container will fail looking for
+those files; run benchmarks from a git checkout. CUDA tags require the NVIDIA
+Container Toolkit and refuse to start if no GPU is visible.
+
+The default command binds `0.0.0.0:8080` with HTTPS (`--tls-self-signed`) and
+device pairing. `docker logs` prints `pairing admin token: … (saved at
+/data/pairing-admin-token)` when the token file is first created; later starts
+reuse that file without reprinting the secret. Supply your own with
+`-e OPENASR_PAIRING_ADMIN_TOKEN=…`. Pair from
+the desktop app, or `POST /v1/pairing/requests` then approve with
+`Authorization: Bearer <token>`. Unauthenticated `/v1/*` calls return 401;
+`GET /health` is the liveness probe. Talk to the container with `curl -k`
+(self-signed). Behind a TLS-terminating reverse proxy, drop `--tls-self-signed`
+from the command and set `OPENASR_ALLOW_INSECURE_NON_LOOPBACK=1` — that env
+only waives TLS, never pairing, and only belongs on a trusted boundary.
+
+Longer guide: [openasr.org/docs/docker](https://openasr.org/docs/docker/).
 
 ## Is ffmpeg required?
 

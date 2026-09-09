@@ -24,6 +24,10 @@ EXPECTED_CAPABILITY_PACKS = {
     "pyannote-segmentation-3.0": "speaker-segmenter",
     "qwen3-forced-aligner-0.6b": "forced-aligner",
     "redimnet2-b6-cn": "speaker-embedder",
+    "wespeaker-voxceleb-resnet152-lm": "speaker-embedder",
+    "wespeaker-voxceleb-resnet221-lm": "speaker-embedder",
+    "wespeaker-voxceleb-resnet293-lm": "speaker-embedder",
+    "wespeaker-voxceleb-resnet34-lm": "speaker-embedder",
 }
 # Capability-pack feature per model: most existing packs serve
 # speaker-diarization, but qwen3-forced-aligner-0.6b serves the distinct
@@ -35,6 +39,10 @@ EXPECTED_CAPABILITY_FEATURES = {
     "pyannote-segmentation-3.0": "speaker-diarization",
     "qwen3-forced-aligner-0.6b": "word-timestamps",
     "redimnet2-b6-cn": "speaker-diarization",
+    "wespeaker-voxceleb-resnet152-lm": "speaker-diarization",
+    "wespeaker-voxceleb-resnet221-lm": "speaker-diarization",
+    "wespeaker-voxceleb-resnet293-lm": "speaker-diarization",
+    "wespeaker-voxceleb-resnet34-lm": "speaker-diarization",
 }
 EXPECTED_TRANSLATION_MODELS = {}
 

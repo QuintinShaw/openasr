@@ -17,31 +17,109 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
 
     def test_release_caller_grants_every_permission_requested_by_reusable_jobs(self) -> None:
         release = (ROOT / ".github/workflows/release-core.yml").read_text(encoding="utf-8")
+        permission_rank = {"read": 1, "write": 2}
+        cases = (
+            (
+                "binaries",
+                "\n  binaries:\n",
+                "\n  sync-backend-cdn:\n",
+                ROOT / ".github/workflows/release-binaries.yml",
+            ),
+            (
+                "prepublication-family",
+                "\n  prepublication-family:\n",
+                "\n  deploy-catalog:\n",
+                ROOT / ".github/workflows/family-regression.yml",
+            ),
+            (
+                "deploy-catalog",
+                "\n  deploy-catalog:\n",
+                "\n  finalize-notes:\n",
+                ROOT / ".github/workflows/deploy-catalog.yml",
+            ),
+        )
+        for name, start, end, path in cases:
+            caller = release.split(start, maxsplit=1)[1].split(end, maxsplit=1)[0]
+            called = path.read_text(encoding="utf-8")
+            caller_permissions = dict(
+                re.findall(r"(?m)^      ([a-z-]+): (read|write)$", caller)
+            )
+            requested_permissions = re.findall(
+                r"(?m)^(?:  |      )([a-z-]+): (read|write)$", called
+            )
+            for scope, requested in requested_permissions:
+                granted = caller_permissions.get(scope)
+                self.assertIsNotNone(
+                    granted,
+                    f"{name} caller does not grant requested {scope}: {requested}",
+                )
+                self.assertGreaterEqual(
+                    permission_rank[granted],
+                    permission_rank[requested],
+                    f"{name} caller grants {scope}: {granted}, below {requested}",
+                )
+
+    def test_draft_release_readers_request_contents_write(self) -> None:
+        release = (ROOT / ".github/workflows/release-core.yml").read_text(encoding="utf-8")
+        family = (ROOT / ".github/workflows/family-regression.yml").read_text(
+            encoding="utf-8"
+        )
+        deploy = (ROOT / ".github/workflows/deploy-catalog.yml").read_text(
+            encoding="utf-8"
+        )
         binaries = (ROOT / ".github/workflows/release-binaries.yml").read_text(
             encoding="utf-8"
         )
-        caller = release.split("\n  binaries:\n", maxsplit=1)[1].split(
-            "\n  prepublication-family:\n", maxsplit=1
+        completeness = (ROOT / "scripts/verify-release-completeness.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("scripts/verify-release-completeness.sh", release)
+        self.assertIn("scripts/verify-release-completeness.sh", binaries)
+        self.assertIn("verify-draft-completeness:", release)
+        self.assertIn("needs: [resolve, verify-draft-completeness]", release)
+        completeness_job = binaries.split("\n  verify-completeness:\n", 1)[1]
+        self.assertIn("contents: write", completeness_job.split("\n    steps:", 1)[0])
+        self.assertIn("contents: write", family.split("jobs:", 1)[0])
+        self.assertIn("contents: write", deploy.split("jobs:", 1)[0])
+        family_caller = release.split("\n  prepublication-family:\n", 1)[1].split(
+            "\n  deploy-catalog:\n", 1
         )[0]
-        caller_permissions = dict(
-            re.findall(r"(?m)^      ([a-z-]+): (read|write)$", caller)
-        )
-        requested_permissions = re.findall(
-            r"(?m)^(?:  |      )([a-z-]+): (read|write)$", binaries
-        )
-        permission_rank = {"read": 1, "write": 2}
+        deploy_caller = release.split("\n  deploy-catalog:\n", 1)[1].split(
+            "\n  finalize-notes:\n", 1
+        )[0]
+        self.assertIn("contents: write", family_caller)
+        self.assertIn("contents: write", deploy_caller)
+        self.assertIn("gh_release.py download-packs", completeness)
+        self.assertIn("gh release view", completeness)
 
-        for scope, requested in requested_permissions:
-            granted = caller_permissions.get(scope)
-            self.assertIsNotNone(
-                granted,
-                f"release-core reusable caller does not grant requested {scope}: {requested}",
-            )
-            self.assertGreaterEqual(
-                permission_rank[granted],
-                permission_rank[requested],
-                f"release-core reusable caller grants {scope}: {granted}, below {requested}",
-            )
+    def test_release_readers_do_not_call_gh_release_download(self) -> None:
+        offenders: list[str] = []
+        roots = (
+            ROOT / "scripts",
+            ROOT / ".github" / "workflows",
+            ROOT / "tooling" / "release-manifest",
+        )
+        skip_names = {
+            "gh_release.py",
+            "gh_release_test.py",
+            "core_release_finalization_contract_test.py",
+            # 64-hex lock token; fake-gh mutex test intercepts this argv.
+            "qualification-release-lock.sh",
+        }
+        for root in roots:
+            for path in root.rglob("*"):
+                if not path.is_file() or path.name in skip_names:
+                    continue
+                if path.suffix not in {".sh", ".py", ".yml", ".yaml"}:
+                    continue
+                for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                    stripped = line.lstrip()
+                    if stripped.startswith("#") or stripped.startswith("//"):
+                        continue
+                    if "gh release download" in line:
+                        offenders.append(f"{path.relative_to(ROOT)}:{line_number}:{stripped}")
+        self.assertEqual(offenders, [])
+
     def test_reusable_release_declares_every_referenced_input(self) -> None:
         binaries = (ROOT / ".github/workflows/release-binaries.yml").read_text(
             encoding="utf-8"
@@ -81,6 +159,10 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
 
         self.assertIn("gh release create", release)
         self.assertIn("--draft", release)
+        self.assertNotRegex(release, r"(?m)^  push:")
+        self.assertIn("workflow_dispatch:", release)
+        self.assertIn("WANT: ${{ inputs.version }}", release)
+        self.assertNotIn('want="${{ inputs.version }}"', release)
         self.assertIn("should_build", release)
         self.assertIn("should_finalize", release)
         self.assertIn('tag_commit="$(git rev-parse "${tag}^{}")"', release)
@@ -90,12 +172,25 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("release ${tag} is a draft", release)
         self.assertIn("uses: ./.github/workflows/family-regression.yml", release)
         self.assertIn("uses: ./.github/workflows/deploy-catalog.yml", release)
+        self.assertIn("verify-draft-completeness:", release)
+        self.assertIn("scripts/verify-release-completeness.sh", release)
         self.assertNotIn("correctness_sources_artifact", release)
         self.assertNotIn("correctness_matrix_artifact", release)
         self.assertIn("orchestrator_run_id: ${{ github.run_id }}", release)
         self.assertIn("activation_transition: published-inert", release)
         self.assertIn("needs: [resolve, prepublication-family]", release)
+        self.assertIn("sync-backend-cdn:", release)
+        self.assertIn("environment: core-release", release)
+        self.assertIn("sync-windows-backend-cdn.sh", release)
+        self.assertIn("--allow-ci", release)
+        self.assertIn("needs: [resolve, release, binaries]", release)
+        self.assertIn("publish-release:", release)
+        self.assertIn("finalize-core-release.sh", release)
+        self.assertIn("OPENASR_DEPLOY_CATALOG_RUN_ID: ${{ github.run_id }}", release)
+        self.assertIn("needs: [resolve, finalize-notes, deploy-catalog]", release)
         self.assertIn("verify-assets", prepare)
+        self.assertIn("gh_release.download_asset", prepare)
+        self.assertIn("gh_release.download_url", prepare)
         self.assertIn("publish_catalog.sh", prepare)
         self.assertIn("verify-catalog", prepare)
         self.assertIn("verify-cdn", prepare)
@@ -118,6 +213,8 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
             prepare.index('old_epoch="$(tr -d'),
         )
         self.assertIn("prepare-windows-backend-catalog-release.sh", sync)
+        self.assertIn("--allow-ci", sync)
+        self.assertIn("refusing to use B2 write credentials in CI without --allow-ci", sync)
         self.assertNotIn("backend-hardware-evidence-*.json", sync)
         self.assertNotIn("backend-hardware-audit-*.json", sync)
         self.assertNotIn("backend_hardware_evidence.py", sync)
@@ -151,6 +248,10 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("backend_hardware_evidence.py", finalize)
         self.assertNotIn("backend-hardware-audit-*.json", finalize)
         self.assertNotIn("gpu-correctness-matrix.v1.json", finalize)
+        self.assertNotIn("gpu-correctness-source-inventory.json", finalize)
+        self.assertNotIn("gpu-correctness-source-model-catalog.json", finalize)
+        self.assertNotIn("gpu-correctness-source-backend-catalog.json", finalize)
+        self.assertNotIn("gpu_correctness_gate.py validate", finalize)
         self.assertIn("resolve_tag_commit", finalize)
         self.assertIn("git/tags/${object_sha}", finalize)
         self.assertIn("gh attestation verify", finalize)
@@ -158,6 +259,9 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("OPENASR_DEPLOY_CATALOG_RUN_ID", finalize)
         self.assertIn("gh run view", finalize)
         self.assertIn('"Deploy PublishedInert candidate catalog"', finalize)
+        self.assertIn("GITHUB_RUN_ID", finalize)
+        self.assertIn("in_progress", finalize)
+        self.assertIn("retrying in 30s", finalize)
         self.assertIn('value.get("headSha") != sys.argv[2]', finalize)
         self.assertIn('deploy-catalog-binding-${deploy_run_id}', finalize)
         self.assertIn('"release_tag": tag', finalize)
@@ -168,7 +272,28 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("live catalog bytes differ", finalize)
         self.assertIn('gh release edit "$tag" --repo "$repository" --draft=false --latest', finalize)
         self.assertIn("RELEASE-PUBLISHED-INERT", finalize)
+        self.assertIn("qualification-release-lock.sh acquire", finalize)
+        self.assertIn("qualification-release-lock.sh release", finalize)
+        self.assertIn("qualification-index.tsv", finalize)
+        self.assertIn("__openasr-verify-qualification-manifest", finalize)
+        self.assertIn("qualification-subjects.txt", finalize)
+        self.assertIn("gh attestation verify", finalize)
+        self.assertIn("git/tags/${remote_tag_object}", finalize)
+        self.assertIn("done < <(tr -d '\\r' < \"$checksums\")", finalize)
+        self.assertNotIn('for subject in "$workdir"/*', finalize)
+        self.assertIn("tr -d '\\r'", finalize)
+        self.assertIn("did not succeed", finalize)
         self.assertLess(finalize.index("verify-cdn"), finalize.index("--draft=false"))
+        publish = finalize.index(
+            'gh release edit "$tag" --repo "$repository" --draft=false --latest'
+        )
+        self.assertLess(finalize.index("qualification-release-lock.sh acquire"), publish)
+        self.assertGreater(finalize.rindex("qualification-release-lock.sh release"), publish)
+        self.assertLess(
+            finalize.index("stopped being a draft before publication"), publish
+        )
+        self.assertNotIn("scripts/sync-release-to-cnb.sh", finalize)
+        self.assertIn("sync-release-to-cnb.yml", finalize)
 
     def test_finalizer_never_publishes_before_all_gpu_provider_entries(self) -> None:
         finalize = (ROOT / "scripts/finalize-core-release.sh").read_text(encoding="utf-8")
@@ -203,6 +328,44 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("verify-cdn", channels)
         self.assertIn("needs: [resolve, distribution-gate]", channels)
         self.assertIn("git push origin main", channels)
+        self.assertNotIn("sync-release-to-cnb.sh", channels)
+        gate = channels.split("\n  distribution-gate:\n", 1)[1].split(
+            "\n  docker-images:\n", 1
+        )[0]
+        self.assertIn("github.event.repository.default_branch", gate)
+        self.assertNotIn("needs.resolve.outputs.tag", gate.split("Download release trust metadata", 1)[0])
+        brew = channels.split("\n  update-homebrew-tap:\n", 1)[1]
+        brew_checkout = brew.split("\n      - name: Check for tap credentials\n", 1)[0]
+        self.assertIn("github.event.repository.default_branch", brew_checkout)
+        self.assertNotIn("needs.resolve.outputs.tag", brew_checkout)
+        self.assertIn("ref: ${{ needs.resolve.outputs.tag }}", channels)
+
+    def test_china_asset_mirror_runs_on_github_after_publish_not_on_the_finalizer_host(self) -> None:
+        cnb = (ROOT / ".github/workflows/sync-release-to-cnb.yml").read_text(
+            encoding="utf-8"
+        )
+        main_sync = (ROOT / ".github/workflows/sync-main-to-cnb.yml").read_text(
+            encoding="utf-8"
+        )
+        script = (ROOT / "scripts/sync-release-to-cnb.sh").read_text(encoding="utf-8")
+        finalize = (ROOT / "scripts/finalize-core-release.sh").read_text(encoding="utf-8")
+
+        self.assertIn("types: [published]", cnb)
+        self.assertIn("workflow_dispatch:", cnb)
+        self.assertIn("scripts/sync-release-to-cnb.sh", cnb)
+        self.assertIn("OPENASR_CNB_STRICT", cnb)
+        self.assertIn("timeout-minutes: 360", cnb)
+        self.assertNotIn("releases/latest", cnb)
+        self.assertIn("secrets.CNB_TOKEN", cnb)
+        guard = (
+            "github.event_name != 'release' || "
+            "startsWith(github.event.release.tag_name, 'v')"
+        )
+        self.assertIn(guard, cnb)
+        self.assertNotIn("scripts/sync-release-to-cnb.sh", finalize)
+        self.assertIn("sync-release-to-cnb.yml", main_sync)
+        self.assertIn("Do not download them onto a maintainer laptop", main_sync)
+        self.assertIn(".github/workflows/sync-release-to-cnb.yml", script)
 
     def test_family_regression_reuses_published_assets_instead_of_racing_raw_tag(self) -> None:
         family = (ROOT / ".github/workflows/family-regression.yml").read_text(
@@ -214,7 +377,9 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("releases/latest", family)
         self.assertIn("refusing a duplicate local build", family)
         self.assertEqual(family.count("release_asset_verifier.py"), 3)
-        self.assertEqual(family.count("--pattern SHA256SUMS"), 2)
+        self.assertEqual(family.count("gh_release.py download"), 3)
+        self.assertGreaterEqual(family.count("SHA256SUMS"), 3)
+        self.assertNotIn("--pattern", family)
         self.assertEqual(family.count("gh attestation verify"), 3)
         self.assertEqual(family.count("--signer-workflow"), 3)
         self.assertIn("attestations: read", family)
@@ -264,10 +429,10 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
             "qualification may consume only already-public PublishedInert release bytes",
             qualify,
         )
-        self.assertIn("gh release download $tag", qualify)
+        self.assertIn("gh_release.py", qualify)
         self.assertLess(
             qualify.index("qualification may consume only already-public PublishedInert release bytes"),
-            qualify.index("gh release download $tag"),
+            qualify.index("gh_release.py"),
         )
         self.assertIn('"backend-pack-*.json"', qualify)
         self.assertIn('"catalog.backends.candidate.json"', qualify)
@@ -294,7 +459,7 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("--json isDraft,isPrerelease,tagName,publishedAt", prepare)
         self.assertIn("already-public stable PublishedInert bytes", prepare)
         self.assertLess(prepare.index("already-public stable PublishedInert bytes"), prepare.index("gh run download"))
-        self.assertIn('gh release download "$tag" --repo "$repository"', prepare)
+        self.assertIn("gh_release.py download-packs", prepare)
         self.assertIn("qualification-signer-workflow", prepare)
         self.assertIn("must be independently qualified", gate)
 

@@ -302,36 +302,65 @@ impl DeviceMemoryBrokerSet {
         // last Drop cannot observe a half-published generation, and so the
         // stale refund above is atomic with the new charge relative to other
         // acquirers of this key.
-        let mut request = super::execution_memory::DomainReservationRequest {
-            domain: key.domain.clone(),
-            snapshot,
-            peak_bytes: bytes,
-            retained_bytes: bytes,
-            // Already-resident file-backed pages are reclaimable; do not require
-            // live free == pack size. Policy ledger still prevents oversell.
-            observed_peak_bytes: Some(0),
-            requires_reconciliation: false,
-            resource_id: format!(
-                "pack-weight-residency:{}:{:#x}",
-                key.domain,
-                key.mapping_identity.as_raw()
-            ),
-            cohort_id: None,
-        };
-        request.cohort_id = cohort_id;
+        let resource_id = format!(
+            "pack-weight-residency:{}:{:#x}",
+            key.domain,
+            key.mapping_identity.as_raw()
+        );
         let owner_scope_id = current_native_execution_scope_id();
         let owner_placement = if owner_scope_id.is_some() {
             RuntimeOwnerPlacement::HostNeutral
         } else {
             RuntimeOwnerPlacement::Unknown
         };
-        let mut batch = self.try_reserve_batch_for_scope_and_placement(
-            vec![request],
-            owner_scope_id,
-            owner_placement,
-        )?;
-        batch.commit_quoted()?;
+        let mut batch = if key.domain == MemoryDomainKey::SystemMemory {
+            match self.try_consume_mapping_envelope(bytes, cohort_id, resource_id.clone())? {
+                Some(batch) => batch,
+                None => {
+                    let mut request = super::execution_memory::DomainReservationRequest {
+                        domain: key.domain.clone(),
+                        snapshot,
+                        peak_bytes: bytes,
+                        retained_bytes: bytes,
+                        observed_peak_bytes: None,
+                        requires_reconciliation: false,
+                        resource_id: resource_id.clone(),
+                        cohort_id,
+                    }
+                    .already_open_file_backed();
+                    request.cohort_id = cohort_id;
+                    let mut batch = self.try_reserve_batch_for_scope_and_placement(
+                        vec![request],
+                        owner_scope_id,
+                        owner_placement,
+                    )?;
+                    batch.commit_quoted()?;
+                    batch
+                }
+            }
+        } else {
+            let mut request = super::execution_memory::DomainReservationRequest {
+                domain: key.domain.clone(),
+                snapshot,
+                peak_bytes: bytes,
+                retained_bytes: bytes,
+                observed_peak_bytes: None,
+                requires_reconciliation: false,
+                resource_id: resource_id.clone(),
+                cohort_id,
+            }
+            .already_open_file_backed();
+            request.cohort_id = cohort_id;
+            let mut batch = self.try_reserve_batch_for_scope_and_placement(
+                vec![request],
+                owner_scope_id,
+                owner_placement,
+            )?;
+            batch.commit_quoted()?;
+            batch
+        };
 
+        let seeded_receipt = batch.take_receipt_pair();
         let generation = self
             .next_pack_weight_residency_generation
             .fetch_add(1, Ordering::Relaxed);
@@ -340,7 +369,7 @@ impl DeviceMemoryBrokerSet {
             key: key.clone(),
             generation,
             charged_bytes: bytes,
-            receipt: Mutex::new(None),
+            receipt: Mutex::new(seeded_receipt),
             mapping_owner,
         });
         table.insert(
@@ -437,7 +466,7 @@ impl DeviceMemoryBrokerSet {
             snapshot,
             peak_bytes: bytes,
             retained_bytes: bytes,
-            observed_peak_bytes: Some(0),
+            observed_peak_bytes: None,
             requires_reconciliation: false,
             resource_id: format!(
                 "pack-weight-residency-dead-inject:{}:{:#x}",
@@ -445,7 +474,8 @@ impl DeviceMemoryBrokerSet {
                 key.mapping_identity.as_raw()
             ),
             cohort_id: None,
-        };
+        }
+        .already_open_file_backed();
         request.cohort_id = None;
         let mut batch = self.try_reserve_batch(vec![request])?;
         batch.commit_quoted()?;
@@ -481,6 +511,7 @@ mod tests {
     use super::*;
     use crate::device::execution_memory::{
         DeviceMemoryPolicy, DeviceMemorySnapshot, MemoryDomainKey, MemoryObservationConfidence,
+        MemoryReservationCohortId,
     };
     use std::sync::Barrier;
     use std::thread;
@@ -668,6 +699,41 @@ mod tests {
             err,
             MemoryPlanningError::DeviceBudgetExceeded { .. }
         ));
+    }
+
+    #[test]
+    fn residency_joins_same_cohort_host_activation_envelope() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            minimum_headroom_bytes: 0,
+            maximum_owned_basis_points: 10_000,
+        }));
+        let snap = snapshot(16 * GIB, 16 * GIB);
+        let cohort = MemoryReservationCohortId::new(9);
+        let _activation = broker
+            .open_mapping_envelope(
+                snap,
+                4 * GIB,
+                cohort,
+                "candidate-activation-host-import".to_string(),
+                None,
+                RuntimeOwnerPlacement::HostNeutral,
+            )
+            .expect("host activation envelope");
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).pending_bytes,
+            4 * GIB
+        );
+        let (_handle, charged) = broker
+            .acquire_pack_weight_residency(key(1), 4 * GIB, snap, Some(cohort))
+            .expect("residency");
+        assert_eq!(charged, 4 * GIB);
+        let usage = broker.usage(&MemoryDomainKey::SystemMemory);
+        assert_eq!(
+            usage.pending_bytes + usage.committed_bytes,
+            4 * GIB,
+            "one open mapping must not occupy two SystemMemory copies"
+        );
+        assert!(!usage.quarantined);
     }
 
     #[test]

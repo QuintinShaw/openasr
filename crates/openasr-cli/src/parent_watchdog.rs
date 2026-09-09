@@ -1,4 +1,4 @@
-//! Kills this process when the process that spawned it (identified by
+//! Shuts this process down when the process that spawned it (identified by
 //! `openasr serve --parent-pid <pid>`) disappears without cleanly stopping
 //! this one first.
 //!
@@ -14,8 +14,11 @@
 //! fresh ephemeral port rather than noticing the leftover.
 //!
 //! `--parent-pid` closes that gap independent of *how* the supervisor dies:
-//! this process polls whether `parent_pid` is still alive and exits as soon
-//! as it is not, with no dependency on the supervisor sending any signal.
+//! this process polls whether `parent_pid` is still alive and joins the same
+//! graceful shutdown path as Ctrl-C / SIGTERM as soon as it is not, so ggml
+//! backends can drop before process teardown. Calling `process::exit` here
+//! skipped Rust `Drop` and aborted in ggml Metal atexit
+//! (`GGML_ASSERT([rsets->data count] == 0)`).
 
 use std::{thread, time::Duration};
 
@@ -24,14 +27,19 @@ use std::{thread, time::Duration};
 /// enough that it costs nothing meaningful over a daemon's lifetime.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Spawns a background thread that exits this process shortly after
+/// Receiver fired when the watched parent disappears. The serve loop awaits
+/// this alongside Ctrl-C / SIGTERM so every exit path drops backends first.
+pub(crate) type ParentShutdown = tokio::sync::oneshot::Receiver<()>;
+
+/// Spawns a background thread that signals graceful shutdown shortly after
 /// `parent_pid` disappears. A no-op if `parent_pid` is 0 (never a valid pid,
 /// and clap's `Option<u32>` cannot itself reject it), so a malformed launch
 /// arg degrades to "watchdog disabled" rather than an instant self-kill.
-pub(crate) fn spawn(parent_pid: u32) {
+pub(crate) fn spawn(parent_pid: u32) -> Option<ParentShutdown> {
     if parent_pid == 0 {
-        return;
+        return None;
     }
+    let (tx, rx) = tokio::sync::oneshot::channel();
     let spawned = thread::Builder::new()
         .name("parent-death-watchdog".to_string())
         .spawn(move || {
@@ -40,7 +48,8 @@ pub(crate) fn spawn(parent_pid: u32) {
                     eprintln!(
                         "openasr serve: parent process {parent_pid} is gone; shutting down to avoid an orphaned daemon."
                     );
-                    std::process::exit(0);
+                    let _ = tx.send(());
+                    return;
                 }
                 thread::sleep(POLL_INTERVAL);
             }
@@ -50,7 +59,43 @@ pub(crate) fn spawn(parent_pid: u32) {
     // safety net rather than aborting a healthy startup.
     if let Err(error) = spawned {
         eprintln!("openasr serve: could not start parent-death watchdog: {error}");
+        return None;
     }
+    Some(rx)
+}
+
+/// Completes when the operator sends Ctrl-C / SIGTERM or the parent watchdog
+/// fires. Shared by `openasr serve` so parent-loss and interactive stop both
+/// return from the server future instead of `process::exit`.
+pub(crate) async fn wait_for_shutdown(parent_gone: Option<ParentShutdown>) {
+    let parent_lost = async {
+        match parent_gone {
+            Some(rx) => {
+                let _ = rx.await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = unix_terminate() => {}
+        _ = parent_lost => {}
+    }
+}
+
+#[cfg(unix)]
+async fn unix_terminate() {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut signal) => {
+            let _ = signal.recv().await;
+        }
+        Err(_) => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(not(unix))]
+async fn unix_terminate() {
+    std::future::pending::<()>().await
 }
 
 /// Unix liveness probe: `kill(pid, 0)` sends no signal, it only asks the
@@ -131,5 +176,20 @@ mod tests {
         let pid = child.id();
         child.wait().expect("wait for child");
         assert!(!parent_is_alive(pid));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn parent_loss_signals_shutdown_without_exiting() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn `true`");
+        let pid = child.id();
+        child.wait().expect("wait for child");
+        let rx = spawn(pid).expect("watchdog should start for a real pid");
+        tokio::time::timeout(Duration::from_secs(8), rx)
+            .await
+            .expect("watchdog should notice the dead parent")
+            .expect("watchdog oneshot should fire");
     }
 }

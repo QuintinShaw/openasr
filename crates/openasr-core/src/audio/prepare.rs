@@ -102,27 +102,7 @@ pub(crate) fn prepare_external_input(
         .tempdir()
         .map_err(|source| AudioPreparationError::TempDir { source })?;
     let prepared_path = temp_dir.path().join("prepared.wav");
-    let output = tool
-        .build_command(&info.path, &prepared_path)
-        .output()
-        .map_err(|source| AudioPreparationError::ConversionSpawn {
-            tool: tool.label().to_string(),
-            path: tool.path().clone(),
-            source,
-        })?;
-
-    if !output.status.success() {
-        return Err(AudioPreparationError::ConversionFailed {
-            backend: options.backend,
-            tool: tool.label().to_string(),
-            status: output.status.code().map_or_else(
-                || "terminated by signal".to_string(),
-                |code| code.to_string(),
-            ),
-            stderr: format_stderr_suffix(tool.label(), &String::from_utf8_lossy(&output.stderr)),
-            codec_note: codec_note(&diagnostic),
-        });
-    }
+    tool.convert(&info.path, &prepared_path, options.backend, &diagnostic)?;
 
     match fs::metadata(&prepared_path) {
         Ok(metadata) if metadata.is_file() => Ok(PreparedAudioInput {
@@ -232,14 +212,15 @@ impl From<Option<String>> for Diagnostic {
     }
 }
 
-/// An external tool used to convert a non-WAV input into a 16 kHz mono PCM16
-/// WAV. macOS ships `/usr/bin/afconvert` on every install (no Homebrew
-/// required), so it is used as a fallback conversion path when ffmpeg is not
-/// configured and cannot be found on PATH.
+/// An external or system converter used to produce a 16 kHz mono PCM16 WAV
+/// when the in-process decoder cannot. macOS uses `/usr/bin/afconvert`;
+/// Windows uses Media Foundation (same role, no FDK, no bundled ffmpeg).
 enum ConversionTool {
     Ffmpeg(PathBuf),
     #[cfg(target_os = "macos")]
     Afconvert(PathBuf),
+    #[cfg(windows)]
+    MediaFoundation,
 }
 
 impl ConversionTool {
@@ -248,14 +229,70 @@ impl ConversionTool {
             Self::Ffmpeg(_) => "ffmpeg",
             #[cfg(target_os = "macos")]
             Self::Afconvert(_) => "afconvert",
+            #[cfg(windows)]
+            Self::MediaFoundation => "mediafoundation",
         }
     }
 
-    fn path(&self) -> &PathBuf {
+    fn convert(
+        &self,
+        input: &std::path::Path,
+        output: &std::path::Path,
+        backend: BackendKind,
+        diagnostic: &Diagnostic,
+    ) -> Result<(), AudioPreparationError> {
+        match self {
+            #[cfg(windows)]
+            Self::MediaFoundation => {
+                crate::audio::windows_mf::convert_to_wav16k_mono(input, output).map_err(
+                    |message| AudioPreparationError::ConversionFailed {
+                        backend,
+                        tool: self.label().to_string(),
+                        status: "failed".to_string(),
+                        stderr: format!(
+                            "\nmediafoundation: {message}. Windows system decoding failed; install ffmpeg and add it to PATH, pass --ffmpeg-bin, set OPENASR_FFMPEG_BIN, or run `openasr config set media.ffmpeg_bin`."
+                        ),
+                        codec_note: codec_note(diagnostic),
+                    },
+                )
+            }
+            _ => {
+                let output_status = self
+                    .build_command(input, output)
+                    .output()
+                    .map_err(|source| AudioPreparationError::ConversionSpawn {
+                        tool: self.label().to_string(),
+                        path: self.spawn_path().clone(),
+                        source,
+                    })?;
+                if output_status.status.success() {
+                    Ok(())
+                } else {
+                    Err(AudioPreparationError::ConversionFailed {
+                        backend,
+                        tool: self.label().to_string(),
+                        status: output_status.status.code().map_or_else(
+                            || "terminated by signal".to_string(),
+                            |code| code.to_string(),
+                        ),
+                        stderr: format_stderr_suffix(
+                            self.label(),
+                            &String::from_utf8_lossy(&output_status.stderr),
+                        ),
+                        codec_note: codec_note(diagnostic),
+                    })
+                }
+            }
+        }
+    }
+
+    fn spawn_path(&self) -> &PathBuf {
         match self {
             Self::Ffmpeg(path) => path,
             #[cfg(target_os = "macos")]
             Self::Afconvert(path) => path,
+            #[cfg(windows)]
+            Self::MediaFoundation => unreachable!("Media Foundation does not spawn a process"),
         }
     }
 
@@ -299,6 +336,8 @@ impl ConversionTool {
                     .arg(output);
                 command
             }
+            #[cfg(windows)]
+            Self::MediaFoundation => unreachable!("Media Foundation does not spawn a process"),
         }
     }
 }
@@ -310,7 +349,8 @@ const MACOS_AFCONVERT_PATH: &str = "/usr/bin/afconvert";
 
 fn resolve_conversion_tool(
     options: &AudioPreparationOptions,
-    diagnostic: &Diagnostic,
+    #[cfg(not(windows))] diagnostic: &Diagnostic,
+    #[cfg(windows)] _diagnostic: &Diagnostic,
 ) -> Result<ConversionTool, AudioPreparationError> {
     if let Some(path) = options.ffmpeg_bin.clone() {
         if path.components().count() == 1 {
@@ -330,6 +370,12 @@ fn resolve_conversion_tool(
         }
     }
 
+    #[cfg(windows)]
+    {
+        Ok(ConversionTool::MediaFoundation)
+    }
+
+    #[cfg(not(windows))]
     Err(AudioPreparationError::MissingFfmpeg {
         backend: options.backend,
         hint: missing_converter_hint(diagnostic),
@@ -386,6 +432,7 @@ fn codec_note(diagnostic: &Diagnostic) -> String {
     }
 }
 
+#[cfg(not(windows))]
 fn missing_converter_hint(diagnostic: &Diagnostic) -> String {
     let codec_phrase = match diagnostic {
         // See `codec_note`'s matching arms: a fallback carrying the "Opus"

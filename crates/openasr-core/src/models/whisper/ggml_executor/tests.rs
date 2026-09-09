@@ -49,7 +49,24 @@ fn exactly_addressable_preference(provider: ExecutionProvider) -> RequestBackend
 }
 
 #[test]
-fn unified_owner_is_limited_to_exact_direct_cuda_vulkan_full_device() {
+fn unified_offline_path_checkouts_combined_owner_instead_of_encoder_only_actor() {
+    assert!(
+        whisper_should_checkout_unified_gpu_owner(false, false, true),
+        "offline unified GPU must skip the encoder-only actor so prelude cannot install a second TLS backend"
+    );
+    assert!(!whisper_should_checkout_unified_gpu_owner(
+        true, false, true
+    ));
+    assert!(!whisper_should_checkout_unified_gpu_owner(
+        false, true, true
+    ));
+    assert!(!whisper_should_checkout_unified_gpu_owner(
+        false, false, false
+    ));
+}
+
+#[test]
+fn unified_owner_is_limited_to_exact_direct_cuda_hip_vulkan_full_device() {
     let direct_gpu = GgmlCpuGraphConfig {
         backend: GgmlCpuGraphBackend::Gpu,
         use_scheduler: false,
@@ -78,50 +95,53 @@ fn unified_owner_is_limited_to_exact_direct_cuda_vulkan_full_device() {
         None,
     ));
     let cuda = exactly_addressable_preference(ExecutionProvider::Cuda);
-    assert!(!whisper_unified_runtime_enabled_with_override(
-        GgmlCpuGraphBackend::Gpu,
-        Some(&cuda),
-        Some(ExecutionPlacement::FullDevice),
-        direct_gpu,
-        direct_gpu,
-        medium_geometry,
-        false,
-        None,
-        None,
-    ));
-    assert!(whisper_unified_runtime_enabled_with_override(
-        GgmlCpuGraphBackend::Gpu,
-        Some(&cuda),
-        Some(ExecutionPlacement::FullDevice),
-        direct_gpu,
-        direct_gpu,
-        medium_geometry,
-        true,
-        None,
-        None,
-    ));
-    assert!(whisper_unified_runtime_enabled_with_override(
-        GgmlCpuGraphBackend::Gpu,
-        Some(&cuda),
-        Some(ExecutionPlacement::FullDevice),
-        direct_gpu,
-        direct_gpu,
-        large_geometry,
-        false,
-        None,
-        None,
-    ));
-    assert!(whisper_unified_runtime_enabled_with_override(
-        GgmlCpuGraphBackend::Gpu,
-        Some(&cuda),
-        Some(ExecutionPlacement::FullDevice),
-        direct_gpu,
-        direct_gpu,
-        medium_geometry,
-        false,
-        None,
-        Some("1"),
-    ));
+    let hip = exactly_addressable_preference(ExecutionProvider::Hip);
+    for capture_gpu in [&cuda, &hip] {
+        assert!(!whisper_unified_runtime_enabled_with_override(
+            GgmlCpuGraphBackend::Gpu,
+            Some(capture_gpu),
+            Some(ExecutionPlacement::FullDevice),
+            direct_gpu,
+            direct_gpu,
+            medium_geometry,
+            false,
+            None,
+            None,
+        ));
+        assert!(whisper_unified_runtime_enabled_with_override(
+            GgmlCpuGraphBackend::Gpu,
+            Some(capture_gpu),
+            Some(ExecutionPlacement::FullDevice),
+            direct_gpu,
+            direct_gpu,
+            medium_geometry,
+            true,
+            None,
+            None,
+        ));
+        assert!(whisper_unified_runtime_enabled_with_override(
+            GgmlCpuGraphBackend::Gpu,
+            Some(capture_gpu),
+            Some(ExecutionPlacement::FullDevice),
+            direct_gpu,
+            direct_gpu,
+            large_geometry,
+            false,
+            None,
+            None,
+        ));
+        assert!(whisper_unified_runtime_enabled_with_override(
+            GgmlCpuGraphBackend::Gpu,
+            Some(capture_gpu),
+            Some(ExecutionPlacement::FullDevice),
+            direct_gpu,
+            direct_gpu,
+            medium_geometry,
+            false,
+            None,
+            Some("1"),
+        ));
+    }
     assert!(!whisper_unified_runtime_enabled_with_override(
         GgmlCpuGraphBackend::Gpu,
         Some(&vulkan),
@@ -136,7 +156,6 @@ fn unified_owner_is_limited_to_exact_direct_cuda_vulkan_full_device() {
     for provider in [
         ExecutionProvider::Cpu,
         ExecutionProvider::Metal,
-        ExecutionProvider::Hip,
         ExecutionProvider::Accelerator,
         ExecutionProvider::Unknown,
     ] {
@@ -171,13 +190,17 @@ fn unified_owner_is_limited_to_exact_direct_cuda_vulkan_full_device() {
 }
 
 #[test]
-fn gpu_loaded_f16_views_require_exact_direct_cuda_vulkan_full_device() {
+fn gpu_loaded_f16_views_require_exact_direct_cuda_hip_vulkan_full_device() {
     let direct_gpu = GgmlCpuGraphConfig {
         backend: GgmlCpuGraphBackend::Gpu,
         use_scheduler: false,
         ..GgmlCpuGraphConfig::conservative_default()
     };
-    for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
+    for provider in [
+        ExecutionProvider::Cuda,
+        ExecutionProvider::Hip,
+        ExecutionProvider::Vulkan,
+    ] {
         let preference = exactly_addressable_preference(provider);
         assert_eq!(
             whisper_gpu_loaded_f16_weight_mode_with_override(
@@ -203,7 +226,6 @@ fn gpu_loaded_f16_views_require_exact_direct_cuda_vulkan_full_device() {
     for provider in [
         ExecutionProvider::Cpu,
         ExecutionProvider::Metal,
-        ExecutionProvider::Hip,
         ExecutionProvider::Accelerator,
         ExecutionProvider::Unknown,
     ] {

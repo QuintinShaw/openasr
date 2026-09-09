@@ -500,7 +500,15 @@ impl GgufTensorDataReader {
                 dim_index: 0,
                 dim_value: ne0,
             })?;
-        let block_size = unsafe { ffi::ggml_blck_size(payload.metadata.ggml_type) };
+        let ggml_type =
+            ffi::checked_ggml_type_i32(payload.metadata.ggml_type).map_err(|error| {
+                GgufTensorDataReadError::InvalidGgmlType {
+                    path: self.tensor_index.path().to_path_buf(),
+                    tensor_name: payload.metadata.name.clone(),
+                    ggml_type: error.raw,
+                }
+            })?;
+        let block_size = unsafe { ffi::ggml_blck_size(ggml_type) };
         if block_size <= 0 {
             return Err(
                 GgufTensorDataReadError::TensorTypeUnsupportedForWeightMaterialization {
@@ -527,7 +535,7 @@ impl GgufTensorDataReader {
                 actual_bytes: ne0,
             });
         }
-        let row_size = unsafe { ffi::ggml_row_size(payload.metadata.ggml_type, ne0_i64) };
+        let row_size = unsafe { ffi::ggml_row_size(ggml_type, ne0_i64) };
         let rows = payload
             .metadata
             .dims
@@ -563,7 +571,14 @@ impl GgufTensorDataReader {
             });
         }
 
-        let traits_ptr = unsafe { ffi::ggml_get_type_traits(payload.metadata.ggml_type) };
+        let traits_ptr = ffi::ggml_get_type_traits_checked(ggml_type).map_err(|_| {
+            GgufTensorDataReadError::TensorTypeUnsupportedForWeightMaterialization {
+                path: self.tensor_index.path().to_path_buf(),
+                tensor_name: payload.metadata.name.clone(),
+                ggml_type: payload.metadata.ggml_type,
+                type_name: payload.metadata.type_name.clone(),
+            }
+        })?;
         if traits_ptr.is_null() {
             return Err(
                 GgufTensorDataReadError::TensorTypeUnsupportedForWeightMaterialization {
@@ -624,7 +639,7 @@ impl GgufTensorDataReader {
         let (element_type, element_size_bytes) = match payload.metadata.ggml_type {
             GGML_TYPE_F32 => (GgufWeightTensorElementType::F32, 4_u64),
             GGML_TYPE_F16 => (GgufWeightTensorElementType::F16, 2_u64),
-            ggml_type if unsafe { ffi::ggml_is_quantized(ggml_type) } => {
+            ggml_type if ffi::ggml_is_quantized_checked(ggml_type) == Ok(true) => {
                 (GgufWeightTensorElementType::RawGgml { ggml_type }, 0_u64)
             }
             _ => {
@@ -765,7 +780,7 @@ pub struct GgufHostTensorPayload<'a> {
 /// tensor into per-row spans without re-opening the reader.
 pub(crate) fn ggml_row_size_bytes(ggml_type: i32, ne0: usize) -> Option<usize> {
     let ne0_i64 = i64::try_from(ne0).ok()?;
-    Some(unsafe { ffi::ggml_row_size(ggml_type, ne0_i64) })
+    ffi::ggml_row_size_checked(ggml_type, ne0_i64).ok()
 }
 
 /// Dequantize one typed/quantized ggml row -- `row_bytes` must be exactly
@@ -779,6 +794,11 @@ pub(crate) fn dequantize_ggml_row_to_f32(
     ne0: usize,
     out: &mut Vec<f32>,
 ) -> Result<(), GgufQuantizedRowDequantizeError> {
+    let ggml_type = ffi::checked_ggml_type_i32(ggml_type).map_err(|error| {
+        GgufQuantizedRowDequantizeError::InvalidGgmlType {
+            ggml_type: error.raw,
+        }
+    })?;
     let ne0_i64 =
         i64::try_from(ne0).map_err(|_| GgufQuantizedRowDequantizeError::Ne0Overflow { ne0 })?;
     let row_size = unsafe { ffi::ggml_row_size(ggml_type, ne0_i64) };
@@ -789,7 +809,8 @@ pub(crate) fn dequantize_ggml_row_to_f32(
             actual: row_bytes.len(),
         });
     }
-    let traits_ptr = unsafe { ffi::ggml_get_type_traits(ggml_type) };
+    let traits_ptr = ffi::ggml_get_type_traits_checked(ggml_type)
+        .map_err(|_| GgufQuantizedRowDequantizeError::UnsupportedType { ggml_type })?;
     if traits_ptr.is_null() {
         return Err(GgufQuantizedRowDequantizeError::UnsupportedType { ggml_type });
     }
@@ -825,6 +846,8 @@ pub(crate) enum GgufQuantizedRowDequantizeError {
     Ne0Overflow { ne0: usize },
     #[error("ggml_type {ggml_type} has no to_float trait for row dequantize")]
     UnsupportedType { ggml_type: i32 },
+    #[error("ggml type {ggml_type} is outside 0..GGML_TYPE_COUNT or is a retired slot")]
+    InvalidGgmlType { ggml_type: i64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1118,6 +1141,12 @@ pub enum GgufTensorDataReadError {
         ggml_type: i32,
         type_name: String,
     },
+    #[error("gguf tensor '{tensor_name}' in '{path}' has invalid ggml type {ggml_type}")]
+    InvalidGgmlType {
+        path: PathBuf,
+        tensor_name: String,
+        ggml_type: i64,
+    },
     #[error(
         "gguf tensor '{tensor_name}' in '{path}' uses quantized type without row traits for raw weight materialization: ggml_type={ggml_type} ({type_name})"
     )]
@@ -1291,6 +1320,13 @@ fn checked_row_major_ggml_tensor_bytes(
             tensor_name: tensor.name.clone(),
             rank: tensor.rank(),
             max_supported_rank: GGUF_MAX_WEIGHT_TENSOR_RANK,
+        }
+    })?;
+    let ggml_type = ffi::checked_ggml_type_i32(ggml_type).map_err(|error| {
+        GgufTensorDataReadError::InvalidGgmlType {
+            path: path.to_path_buf(),
+            tensor_name: tensor.name.clone(),
+            ggml_type: error.raw,
         }
     })?;
     let ne0_i64 =

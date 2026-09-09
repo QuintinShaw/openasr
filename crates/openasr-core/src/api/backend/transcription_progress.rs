@@ -795,6 +795,11 @@ pub fn native_transcription_progress() -> LegacyNativeTranscriptionProgress {
     })
 }
 
+/// Ids of in-flight native progress entries, in registry order.
+pub fn native_active_transcription_ids() -> Vec<String> {
+    with_registry(|reg| reg.entries.iter().map(|(id, _)| id.clone()).collect())
+}
+
 /// RAII handle: removes the registry entry on drop (completion / cancel /
 /// panic). Creating a handle does not publish; the first `enter`/`report`
 /// does after `install`.

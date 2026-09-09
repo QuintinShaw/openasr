@@ -32,7 +32,7 @@ This copies the whole skill directory -- `SKILL.md` plus
 example `.claude/skills/openasr/` for Claude Code). Verified locally with
 `npx skills add <path-to-checkout> --skill openasr --agent claude-code`,
 which installs both files under `./.claude/skills/openasr/`. The Skill
-teaches the agent the `openasr` CLI surface: `transcribe`, `live`,
+teaches the agent the `openasr` CLI surface: `transcribe`, `align`, `live`,
 `search`/`pull`/`list`, `serve`, and `apikey`, including expected output
 shapes and common failure modes (missing model, `--offline` fail-closed,
 non-WAV without `ffmpeg`); the reference file carries the full HTTP API
@@ -134,12 +134,14 @@ remote-serving flow.
   `model_installed` (a pack is bound) and `model_resident` (0.1.13+: that
   pack's runtime is currently loaded in memory, vs. idle-unloaded or not yet
   loaded this boot).
-- `GET /v1/models` -- installed packs.
+- `GET /v1/models` -- the pack this process is serving (not the local
+  installed inventory; that is `GET /v1/models/local`).
 - `GET /v1/devices` -- OpenASR extension (0.1.13+): read-only enumeration of
   this daemon's own ggml compute devices (always `auto` + `cpu`, plus an
-  `accelerated` entry when the runtime detects a GPU) and
-  `default_execution_target` (what `auto` resolves to here). Not
-  operator-gated.
+  `accelerated` entry when the runtime detects a GPU, plus one `kind: "gpu"`
+  row per physical GPU with a stable id) and `default_execution_target`
+  (what `auto` resolves to here). Pass a GPU id as `execution_target` to pin
+  that card; unknown ids fail closed. Not operator-gated.
 - `POST /v1/audio/transcriptions` -- OpenAI-compatible transcription
   (multipart `file` + `model`; `response_format` of `json`, `text`, `srt`,
   `vtt`, `verbose_json`, or `markdown`).
@@ -159,7 +161,9 @@ local equivalent (`temperature`, `include[]`, `chunking_strategy`,
 `known_speaker_*`) are accepted and ignored. SDK `stream=True` (the `stream`
 form field) is rejected with an actionable 400: SSE streaming is the
 OpenASR realtime protocol behind the `?stream=true` query parameter, not
-OpenAI `transcript.text.*` events.
+OpenAI `transcript.text.*` events. When that query-parameter stream is used
+for a file job, a busy server returns HTTP 429 instead of joining the
+cancelable JSON file FIFO; see [Known Limitations](KNOWN_LIMITATIONS.md).
 
 ### Incomplete transcripts
 

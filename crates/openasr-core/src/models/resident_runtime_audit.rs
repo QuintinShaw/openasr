@@ -216,7 +216,7 @@ const RESIDENT_CONSTRUCTION_PUBLICATION_INVENTORY: &[(
     ),
     (
         ResidentSurface::Auxiliary,
-        "diarize/embed/policy_runtime.rs",
+        "diarize/embed/policy_family.rs",
         "AuxiliaryRuntimeCacheKey",
         ResidentSiteStatus::Active,
     ),
@@ -250,7 +250,7 @@ const LEASE_CONSTRUCTION_METHODS: &[&str] = &[
 ];
 
 const LEASE_CONSTRUCTION_INVENTORY: &[(&str, &str)] = &[
-    ("diarize/embed/policy_runtime.rs", "try_allocate"),
+    ("diarize/embed/policy_family.rs", "try_allocate"),
     ("diarize/external.rs", "try_reserve_invocation"),
     (
         "diarize/segment/diarizen/runtime.rs",
@@ -434,16 +434,15 @@ fn resident_inventory_set() -> BTreeSet<(String, String, String)> {
         .filter(|(_, path, symbol, _)| {
             !matches!(
                 (*path, *symbol),
-                (
-                    "diarize/embed/policy_runtime.rs",
-                    "AuxiliaryRuntimeCacheKey"
-                ) | (
-                    "diarize/segment/policy_runtime.rs",
-                    "AuxiliaryRuntimeCacheKey"
-                ) | (
-                    "diarize/vad/firered_stream/realtime_runtime.rs",
-                    "PinnedRuntimeActorCheckout"
-                )
+                ("diarize/embed/policy_family.rs", "AuxiliaryRuntimeCacheKey")
+                    | (
+                        "diarize/segment/policy_runtime.rs",
+                        "AuxiliaryRuntimeCacheKey"
+                    )
+                    | (
+                        "diarize/vad/firered_stream/realtime_runtime.rs",
+                        "PinnedRuntimeActorCheckout"
+                    )
             )
         })
         .filter_map(|(_, path, symbol, _)| {
@@ -505,6 +504,10 @@ fn resident_inventory_set() -> BTreeSet<(String, String, String)> {
         (
             "models/moonshine/ggml_executor.rs",
             "MoonshineEncoderRuntimePool",
+        ),
+        (
+            "models/moonshine/ggml_executor.rs",
+            "MoonshineUnifiedRuntimePool",
         ),
         (
             "models/moss_transcribe_diarize/executor.rs",
@@ -958,16 +961,18 @@ fn thread_affine_backend_cache_is_scoped_and_receipted() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ggml_runtime/cpu_graph.rs");
     let source = std::fs::read_to_string(path).expect("read cpu graph source");
     assert!(source.contains("struct CachedBackendKey"));
-    assert!(
-        source
-            .contains("scope_id: crate::models::native_execution_services::NativeExecutionScopeId")
-    );
     assert!(source.contains("current_native_execution_scope_id"));
+    assert!(
+        !source
+            .contains("scope_id: crate::models::native_execution_services::NativeExecutionScopeId"),
+        "GPU backend contexts are thread+device state; request scopes must not split them"
+    );
     assert!(
         source
             .contains("_receipt_owner: Option<crate::models::runtime_receipts::RuntimeOwnerGuard>")
     );
-    assert!(source.contains("free_on_drop: true"));
+    assert!(source.contains("impl Drop for GgmlBackendLifetime"));
+    assert!(source.contains("ggml_backend_free_status(self.raw.as_ptr())"));
 }
 
 #[test]
@@ -1131,10 +1136,7 @@ fn k4_family_modules_do_not_bypass_owner_bound_runtime_primitives() {
 fn k4_persistent_auxiliary_families_reference_their_declared_owner_shape() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     for (relative, required) in [
-        (
-            "diarize/embed/policy_runtime.rs",
-            "AuxiliaryRuntimeCacheKey",
-        ),
+        ("diarize/embed/policy_family.rs", "AuxiliaryRuntimeCacheKey"),
         (
             "diarize/segment/policy_runtime.rs",
             "AuxiliaryRuntimeCacheKey",
@@ -1369,9 +1371,9 @@ fn production_activation_reserve_does_not_use_placeholder_bytes() {
         .next()
         .expect("quote function body");
     let production = source
-        .split("pub fn quote_and_reserve_candidate_activation")
+        .split("pub(crate) fn quote_and_reserve_candidate_activation")
         .next()
-        .expect("production quote helpers precede the public function");
+        .expect("production quote helpers precede the candidate activation function");
     assert!(
         !quote.contains("4096") && !quote.contains("HOST_IMPORT_GATE"),
         "activation quote must not use a placeholder page: {quote}"
@@ -1384,7 +1386,7 @@ fn production_activation_reserve_does_not_use_placeholder_bytes() {
         .split("fn quote_activation_group")
         .nth(1)
         .expect("quote_activation_group")
-        .split("pub fn quote_and_reserve_candidate_activation")
+        .split("pub(crate) fn quote_and_reserve_candidate_activation")
         .next()
         .expect("plan body");
     assert!(
@@ -1394,6 +1396,40 @@ fn production_activation_reserve_does_not_use_placeholder_bytes() {
     assert!(
         !plan.contains("peak_bytes: 0,"),
         "activation plan must not emit zero-byte domain rows: {plan}"
+    );
+    assert!(
+        !production.contains("candidate-activation-device-copy")
+            && !production.contains("quote_discrete_activation_group")
+            && !production.contains("candidate-activation-host-copy")
+            && !production.contains("resource_id.contains"),
+        "activation must not forecast mmap bytes as a discrete GPU buffer: {production}"
+    );
+    assert!(
+        production.contains("reserve_pack_mapping")
+            && production.contains("open_mapping_envelope")
+            && !production.contains("observed_peak_bytes == Some(0)"),
+        "pack activation must open the mapping envelope directly: {production}"
+    );
+    let pack_plan = source
+        .split("fn quote_pack_activation_plan")
+        .nth(1)
+        .expect("quote_pack_activation_plan")
+        .split("fn admission_plan_from_quoted_groups")
+        .next()
+        .expect("pack plan body");
+    assert!(
+        pack_plan.contains("HOST_IMPORT")
+            && pack_plan.contains("candidate-activation-host-import")
+            && pack_plan.contains("PackMappingQuote")
+            && pack_plan.contains("requested_bytes")
+            && !pack_plan.contains("GGML_BACKEND_MEMORY_REQUEST_BUFFER")
+            && !pack_plan.contains("already_open_file_backed")
+            && !pack_plan.contains("or_else"),
+        "activation must quote only the already-open pack mapping as host-import: {pack_plan}"
+    );
+    assert!(
+        plan.contains("HOST_IMPORT") && plan.contains("candidate-activation-host-import"),
+        "activation must quote the already-open pack mapping as host-import: {plan}"
     );
     assert!(
         !quote.contains("verified_pack_from_preflight_for_test")

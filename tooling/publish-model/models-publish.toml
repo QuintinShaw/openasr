@@ -202,6 +202,46 @@ needs_license_flags = false
 required_download_files = ["b6-vb2+vox2+cnc2_v0-lm.pt"]
 external_converter = "python3 tooling/redimnet2/convert_redimnet2.py --in {src}/b6-vb2+vox2+cnc2_v0-lm.pt --out {out} --quant {quant}"
 
+["wespeaker-voxceleb-resnet34-lm"]
+import_subcommand = "external: tooling/wespeaker/convert_wespeaker.py"
+upstream_repo = "Wespeaker/wespeaker-voxceleb-resnet34-LM"
+source_revision = "f0c48c298fd835726c27956a5d617bad7115627e"
+needs_license_flags = false
+download_includes = ["avg_model"]
+required_download_files = ["avg_model"]
+required_source_files = ["avg_model"]
+external_converter = "python3 tooling/wespeaker/convert_wespeaker.py --in {src}/avg_model --out {out} --quant {quant} --model-id {registry_id} --depth 34"
+
+["wespeaker-voxceleb-resnet152-lm"]
+import_subcommand = "external: tooling/wespeaker/convert_wespeaker.py"
+upstream_repo = "Wespeaker/wespeaker-voxceleb-resnet152-LM"
+source_revision = "4adba1525a6c9d5fff74b6df43a6ec97a86c4112"
+needs_license_flags = false
+download_includes = ["voxceleb_resnet152_LM.pt"]
+required_download_files = ["voxceleb_resnet152_LM.pt"]
+required_source_files = ["voxceleb_resnet152_LM.pt"]
+external_converter = "python3 tooling/wespeaker/convert_wespeaker.py --in {src}/voxceleb_resnet152_LM.pt --out {out} --quant {quant} --model-id {registry_id} --depth 152"
+
+["wespeaker-voxceleb-resnet221-lm"]
+import_subcommand = "external: tooling/wespeaker/convert_wespeaker.py"
+upstream_repo = "Wespeaker/wespeaker-voxceleb-resnet221-LM"
+source_revision = "26732f43821f238bfb258c5ef54924a798e62118"
+needs_license_flags = false
+download_includes = ["voxceleb_resnet221_LM.pt"]
+required_download_files = ["voxceleb_resnet221_LM.pt"]
+required_source_files = ["voxceleb_resnet221_LM.pt"]
+external_converter = "python3 tooling/wespeaker/convert_wespeaker.py --in {src}/voxceleb_resnet221_LM.pt --out {out} --quant {quant} --model-id {registry_id} --depth 221"
+
+["wespeaker-voxceleb-resnet293-lm"]
+import_subcommand = "external: tooling/wespeaker/convert_wespeaker.py"
+upstream_repo = "Wespeaker/wespeaker-voxceleb-resnet293-LM"
+source_revision = "6e6bffe5bf3d772a1f143dc6dbfea58a0799ea83"
+needs_license_flags = false
+download_includes = ["avg_model.pt"]
+required_download_files = ["avg_model.pt"]
+required_source_files = ["avg_model.pt"]
+external_converter = "python3 tooling/wespeaker/convert_wespeaker.py --in {src}/avg_model.pt --out {out} --quant {quant} --model-id {registry_id} --depth 293"
+
 # pyannote segmentation: the ONNX export is the source of truth;
 # pyannote_extract.py normalizes it to pyannote_seg.safetensors for the
 # `import pyannote` subcommand.

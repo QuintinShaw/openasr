@@ -72,10 +72,10 @@ wrong-artifact, placement-only, CPU-only, or partial matrices.
 | `run.env_allowlist` | no | Small non-path allowlisted env snapshot. `OPENASR_HOME` is forbidden. Never a full env dump. |
 | `run.warmup` | yes | `cold` or `warm`. |
 | `run.cache_state` | yes | `empty` or `populated`. |
-| `metrics.rtf_samples` | no | Wall-clock RTF samples; may be empty. |
-| `metrics.rtf_median` | no | Median of `rtf_samples` when samples exist. |
-| `metrics.measurement_method` | no | v0 uses `wall_clock_process_elapsed`. |
-| `metrics.wer_or_cer` / `metrics.ttft_s` | no | Optional quality/latency values; leave null/absent when not measured. |
+| `metrics.rtf_samples` | no | Finite, non-negative wall-clock RTF samples; may be empty. |
+| `metrics.rtf_median` | no | Finite, non-negative median of `rtf_samples` when present. |
+| `metrics.measurement_method` | conditional | Must be exactly `wall_clock_process_elapsed` whenever RTF samples exist; other methods are rejected on load rather than normalized. |
+| `metrics.wer_or_cer` / `metrics.ttft_s` | no | Optional finite, non-negative quality/latency values; leave null/absent when not measured. |
 | `metrics.peak_rss_before_model_bytes` / `metrics.peak_rss_bytes` | no | Process RSS high-water before model execution and after all runs. Their difference isolates model-created high-water from CLI/audio setup. |
 | `metrics.rss_before_model_bytes` / `metrics.rss_after_model_bytes` | no | Current process RSS immediately before the first model run and after the last run while runtime caches remain warm. |
 | `metrics.phys_footprint_before_model_bytes` / `metrics.phys_footprint_after_model_bytes` | no | Darwin current physical footprint at the same lifecycle boundaries; absent on unsupported platforms. |
@@ -89,7 +89,12 @@ wrong-artifact, placement-only, CPU-only, or partial matrices.
 | `execution` | no | Additive projection of the existing request/runtime receipts: request and candidate attempts, safe exact lanes/domains, live lease reconciliation, independent live/event completeness, four-phase timings, and typed terminal. No new journal/schema authority is created. |
 | `decode_diagnostics` | yes | Fail-closed projection of the runtime `GgmlDecodeOutputPlan` and reuse mode, including the unique `full_logits` fallback when compact selection is unproven. Dual-output agreement here is not compact-path authorization. |
 | `scope` | yes | Default `short-audio-gate`. Hardware runners may append exactly one `/<32-lower-hex nonce>` segment; absolute, UNC, drive and traversal paths are invalid. |
-| `notes` | no | Free-form annotations. |
+| `notes` | no | Diagnostic-only annotations on unbound v0 receipts. Any receipt carrying formal `evidence.v1` must use an empty list; free-form text never enters release qualification evidence. |
+
+Every qualification-consumable object rejects unknown JSON fields. The flattened
+graph-lifecycle event union is checked against its exact per-event field shape
+before deserialization, so an unrecognized local path or policy field cannot be
+silently dropped and then republished as valid evidence.
 
 ## Emitter
 
@@ -109,7 +114,8 @@ Optional flags:
 - `--warmup-runs N` - untimed passes before sampling (marks warm/populated)
 - `--core-commit <40-hex>` - otherwise `OPENASR_BUILD_COMMIT` or `git rev-parse HEAD`
 - `--scope <label>` - default `short-audio-gate`
-- `--trace-out <path>` - native-only strict token trace. It is create-new (never replaces an existing path), rejects any final-path alias with `--out` including dangling symlink chains and symlinked parent directories, and fails closed if the trace directory metadata cannot be synced. Both targets pin canonical parent directories before trace publication, so later caller-path symlink swaps cannot redirect the receipt write. A trace artifact retained after that sync failure is not release-valid.
+- `--trace-out <path>` - native-only strict token/lifecycle diagnostic for one measured request, so it requires `--runs 1`. It is create-new (never replaces an existing path), rejects any final-path alias with `--out` including dangling symlink chains and symlinked parent directories, and fails closed if the trace directory metadata cannot be synced. Both targets pin canonical parent directories before trace publication, so later caller-path symlink swaps cannot redirect the receipt write. A trace artifact retained after that sync failure is not release-valid.
+- `--logits-out <path>` - requires `--trace-out` and writes the complete finite f32 selection row for every measured FullLogits step. Token and logits headers share a cryptographically random request `run_id`, process-random `process_nonce`, and OS `process_id`. Every row carries the runtime-minted graph/compute/output generation plus a bounded `output_index`/`output_count`; the gate verifies that the complete partition matches the actual native readback byte count. Model-family code cannot construct or deserialize this witness.
 - `--backend mock` - plumbing only; not a quality/perf claim
 
 The command is an **explicit tooling surface**. It does not change the default
@@ -137,9 +143,20 @@ The command is an **explicit tooling surface**. It does not change the default
 - `token_transcript` evidence must carry a family oracle, resolved typed output
   plan, cold/reuse mode, non-empty token trace artifact, and bounded logits/top-k/
   margin summary. `placement_resource` requires observed placement. Classes are
-  never interchangeable. The generic bench command refuses native output until
-  the runtime trace producer is connected; it cannot emit a fixed `evidence:null`
-  correctness claim.
+  never interchangeable. The generic bench command may emit strong runtime
+  diagnostics through `--trace-out`/`--logits-out`, but it deliberately leaves
+  `evidence` absent. Only the explicit real-family qualification producer may
+  bind those artifacts to a release subject and matrix as formal evidence.v1.
+- Cold and reuse traces for one exact family/model/quant/provider lane must have
+  different request `run_id` values and the same process-random nonce plus OS
+  process ID. A label supplied by the caller cannot establish same-process
+  execution. Process-local graph IDs are interpreted only after this pairing.
+- Each token/top-k/full-logits step uses the same readback-layer-minted output
+  witness. A scalar output has index 0/count 1. A batched output may reuse one
+  compute only through distinct runtime-minted row witnesses whose count and
+  vocab width exactly reconstruct the native readback byte size. Caller-supplied
+  row numbers, duplicate row witnesses, missing rows, cross-run splicing, or
+  non-contiguous step indexes fail closed.
 - When a native accelerated run executes a ggml graph, `observed_placement` is
   populated from runtime telemetry and the emitter fails closed if observed
   compute violates the resolved FullDevice/Hybrid placement. Older v0 receipts

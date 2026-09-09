@@ -49,6 +49,9 @@ pub(crate) fn execution_capabilities() -> crate::device::execution_policy::Execu
 
     // Feature extraction remains host-side preprocessing on every backend;
     // the complete neural DFSMN graph executes on the selected device.
+    // HIP shares the discrete-GPU ggml lane with CUDA/Vulkan
+    // (`GgmlCpuGraphBackend::Gpu`). Omitting it makes AcceleratedOnly
+    // longform fail closed on ROCm because Stream-VAD is required to slice.
     ExecutionCapabilities::new(true)
         .with_provider(
             ExecutionProvider::Metal,
@@ -56,6 +59,10 @@ pub(crate) fn execution_capabilities() -> crate::device::execution_policy::Execu
         )
         .with_provider(
             ExecutionProvider::Cuda,
+            AcceleratedPlacementCapabilities::FULL_DEVICE,
+        )
+        .with_provider(
+            ExecutionProvider::Hip,
             AcceleratedPlacementCapabilities::FULL_DEVICE,
         )
         .with_provider(
@@ -69,7 +76,7 @@ pub(crate) fn execution_capabilities() -> crate::device::execution_policy::Execu
 pub(crate) const AUTO_GPU_POLICY: crate::ggml_runtime::AutoGpuPolicy =
     crate::ggml_runtime::AutoGpuPolicy::Never;
 
-/// Offline slicing uses CUDA/Vulkan automatically while Metal remains an
+/// Offline slicing uses CUDA/HIP/Vulkan automatically while Metal remains an
 /// explicit opt-in until its product-level latency evidence is promoted.
 pub(crate) const OFFLINE_AUTO_GPU_POLICY: crate::ggml_runtime::AutoGpuPolicy =
     crate::ggml_runtime::AutoGpuPolicy::ExceptMetal;

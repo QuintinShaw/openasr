@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlSelectionEvidenceRef};
 use crate::models::mapped_token_embedding::{MappedTokenEmbeddingError, MappedTokenEmbeddingTable};
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
@@ -155,6 +155,12 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechDecodeStepExecutor<'_> {
             greedy_token_hint: None,
         })
     }
+
+    fn take_compute_evidence(&mut self) -> Option<GgmlSelectionEvidenceRef> {
+        self.session
+            .as_mut()
+            .and_then(GraniteSpeechDecodeSession::take_compute_evidence)
+    }
 }
 
 /// Same incremental-KV session as [`GraniteSpeechDecodeStepExecutor`], but for a
@@ -235,6 +241,12 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechAudioDecodeStepExecutor<'_
             logits,
             greedy_token_hint: None,
         })
+    }
+
+    fn take_compute_evidence(&mut self) -> Option<GgmlSelectionEvidenceRef> {
+        self.session
+            .as_mut()
+            .and_then(GraniteSpeechDecodeSession::take_compute_evidence)
     }
 }
 
@@ -366,6 +378,10 @@ impl Seq2SeqGreedyDecodeStepExecutor for GraniteSpeechResidentAudioDecodeStepExe
         self.prompt_len = self.initial_prompt_token_ids.len();
         self.prefilled = true;
         Ok(output)
+    }
+
+    fn take_compute_evidence(&mut self) -> Option<GgmlSelectionEvidenceRef> {
+        self.session.take_compute_evidence()
     }
 }
 

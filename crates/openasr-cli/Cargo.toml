@@ -30,6 +30,7 @@ legacy-windows-static-sidecar = ["openasr-core/legacy-windows-static-sidecar"]
 anyhow.workspace = true
 clap.workspace = true
 cpal.workspace = true
+getrandom.workspace = true
 indicatif.workspace = true
 openasr-core.workspace = true
 openasr-server.workspace = true

@@ -18,4 +18,9 @@ default_model_status: string, default_pull: string | null, pack: InstalledPack |
  * durable selection resolves to the same pack currently bound by the
  * daemon; every other state is fail-closed as `unavailable`.
  */
-activation: DefaultModelActivationState, };
+activation: DefaultModelActivationState,
+/**
+ * Operator idle-after-busy ASR switch. Present only while a pending
+ * rebind is waiting for the current tasks to finish.
+ */
+idle_switch_pending?: string, };

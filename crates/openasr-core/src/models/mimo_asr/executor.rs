@@ -292,6 +292,10 @@ impl Seq2SeqGreedyDecodeStepExecutor for MimoAsrGreedyStepExecutor<'_> {
             greedy_token_hint: None,
         })
     }
+
+    fn take_compute_evidence(&mut self) -> Option<crate::ggml_runtime::GgmlSelectionEvidenceRef> {
+        self.decoder.take_compute_evidence()
+    }
 }
 
 impl MimoAsrPreparedRuntime {

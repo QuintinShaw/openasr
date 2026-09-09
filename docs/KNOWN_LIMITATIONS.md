@@ -10,6 +10,9 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   There are no package-manager channels yet; building from source remains
   supported. Public model-pack distribution is limited to catalog entries
   explicitly marked `public:true`.
+- `GET /v1/models` and other served-identity listings verify GGUF metadata
+  and the CAS path digest of the bound pack. They do not re-hash a multi-GB
+  object on every read. Full-file integrity is `openasr model-pack verify`.
 - The only executable backends are the default `native` and the opt-in `mock`
   stub. Native transcription runs offline from `.oasr` runtime packs -- a pinned
   `--model-pack`, an installed pack, or one the CLI installs on first use through
@@ -30,12 +33,19 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   guarantees are still pending.
 - Universal Voice ID is currently a local **file-transcription** feature. MOSS
   supplies its own speaker turns; all other ASR families use FireRed Stream-VAD,
-  a speaker segmenter, ReDimNet2-B6, automatic clustering, and overlap-aware
-  reconstruction. Both paths reuse the shared identity/evidence stage and both
-  require ReDimNet2-B6. Missing or broken required packs fail closed. This
-  universal contract is qualified for local file transcription; realtime and
-  remote-compute diarization remain separate surfaces with their own output and
-  privacy gates.
+  a speaker segmenter, a speaker embedder, automatic clustering, and
+  overlap-aware reconstruction. Both paths reuse the shared identity/evidence
+  stage. The default embedder is ReDimNet2-B6, and the default capability probe
+  still requires that pack. An explicit `voice_id_embedder=wespeaker` preference
+  (or `OPENASR_WESPEAKER_PACK`) loads the optional WeSpeaker ResNet family
+  (256-d, VoxCeleb English LM, sizes 34/152/221/293) instead; there is no Auto
+  fallback, and ReDimNet and WeSpeaker occupy different identity spaces so enrollments
+  do not transfer. Missing or broken required or selected packs fail closed.
+  WeSpeaker PyTorch cosine parity is a host-local gate
+  (`OPENASR_WESPEAKER_SPIKE_ROOT`); it is not part of the default CI suite.
+  This universal contract is qualified for local file transcription; realtime
+  and remote-compute diarization remain separate surfaces with their own output
+  and privacy gates.
   Labels stay session-relative (`SPEAKER_00/01`, ...) unless an enrolled person
   clears Voice ID's evidence gates. See [FAQ.md](FAQ.md#is-diarization-available)
   and [SECURITY.md](../SECURITY.md).
@@ -102,15 +112,56 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   through external morphological segmenters (`nagisa`/`soynlp`) that have not
   been ported, so an `aligned` request against ja/ko text fails closed with a
   typed error rather than mis-tokenizing. Other families keep their approximate
-  timestamps unchanged. Explicit `aligned` only refines words; the automatic
-  Voice ID path additionally consumes those words to assign each text run to
-  the canonical speaker timeline.
+  timestamps unchanged. If the aligner runs on an **in-process** transcript
+  (the model just produced the text) and the geometric or acoustic gates
+  fail, the request still succeeds: the native approximate timeline is kept,
+  `timeline_quality` stays `native_approximate`, and
+  `timeline_degraded_reason` names the cause. CLI prints a warning and
+  exits 0; HTTP `json` / `verbose_json` include the field. Desktop does
+  not yet read the reason. Explicit `aligned` only
+  refines words; the automatic Voice ID path additionally consumes those
+  words to assign each text run to the canonical speaker timeline.
+- External manuscript alignment (`openasr align` / `POST /v1/audio/precise-timeline`
+  with `transcript=`) reuses the same Forced Aligner pack and tokenizer. The
+  returned `text` keeps the caller's punctuation and casing. Internally the
+  aligner: splits on ASCII whitespace; keeps letters, numbers, and apostrophes;
+  strips other punctuation; treats each CJK ideograph as its own token; defaults
+  omitted/`auto` language to `en`. Japanese and Korean fail closed by language
+  tag (`ja`/`jp`/`jpn`/`ko`/`kr`/`kor`) and by script (hiragana, katakana,
+  hangul) even when the hint is `en`. Audio longer than the classify-head grid
+  (5000 × 80 ms = 400 s for the shipped pack) fails closed rather than wrapping
+  timestamps. A prompt that would exceed decoder context (`llm_max_positions`,
+  8192 in the shipped pack) also fails closed before the encoder/prefill graphs
+  are built — the 400 s grid is not a substitute for that budget. A collapsed or
+  zero-duration timeline is treated as a severe transcript/audio mismatch;
+  pauses longer than 4 s in a correctly aligned manuscript are not. Mismatch
+  detection also rejects a manuscript whose classify-head chosen-bin
+  log-softmax (mean over start/end boundaries) falls below the calibrated
+  acoustic threshold; see [`docs/forced-align-confidence.md`](forced-align-confidence.md).
+  That score is not a WER / string heuristic. **External manuscripts stay
+  fail-closed** (HTTP 400 / non-zero). The threshold was calibrated on Apple
+  M1 CPU graph + shipped `q4_k` only; other backends and quants have not
+  been re-scored. Near-miss manuscripts (a few substituted words on an
+  otherwise matching script) were not in the calibration set. A theoretically
+  sharp but token-wrong timestamp head can also miss. The server
+  never downloads the pack; paired device tokens may call the endpoint (it is a
+  compute route, not operator-only). This route is not yet on the file
+  FIFO / pause / cancel surface used by `/v1/audio/transcriptions`; a request
+  that has entered alignment cannot be cancelled that way. The plain-transcript
+  path still aligns the whole recording as one Forced Aligner item: it does
+  not auto-split. Inputs that would exceed decoder context or the 400 s grid
+  fail closed instead of being chunked. Kanji-only Japanese with no kana, when
+  tagged `en`/`auto`, still takes the CJK character path and is not caught by
+  the hiragana/katakana/hangul script guard. CLI `align`
+  is itself consent to install the pack unless `--offline`.
 - Hardware execution target selection is generic: Desktop/server requests support
-  `auto`, `cpu`, and `accelerated` when the native runtime reports an accelerated
-  device. There is no public per-provider/per-device pinning surface such as
-  `gpu0`. Internally the runtime can resolve a concrete execution route
-  (`provider` + ggml stable device name + optional PCI `device_id` from CUDA/HIP,
-  and from Vulkan when available). What is route-isolated today:
+  `auto`, `cpu`, `accelerated`, and a physical GPU id from `GET /v1/devices`
+  (for example `vulkan:amd-radeon-rx-7900-xtx` or `metal:apple-m1`). There is
+  no ordinal selector such as `gpu0`. Internally the runtime resolves a concrete
+  execution route (`provider` + ggml stable device name + optional PCI
+  `device_id` from CUDA/HIP, and from Vulkan when available). Metal Exact is
+  allowed by public/stable id; Metal has no PCI/UUID identity. What is
+  route-isolated today:
   - thread-local ggml **backend-handle** cache (Exact pin never shares a handle;
     preferred/Auto may Optimus-fall through discrete -> iGPU but always caches
     under the device that actually initialized)
@@ -126,11 +177,16 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   - **admission capacity stays per model identity** (CPU and accelerated share one
     slot for the same model; route does not multiply capacity)
   Exact device pins are fail-closed: missing devices, init failures, Metal
-  (still `MTLCreateSystemDefaultDevice` only), and CPU StableId Exact return typed
-  not-found / not-addressable / init-failed errors instead of silently swapping
-  cards or falling back to CPU. Unavailable coarse `accelerated` targets still
-  fail closed. Physical PCI keys are normalized (trim + lower-case) only; full
-  BDF grammar validation is a follow-up.
+  PCI/UUID Exact, and CPU StableId Exact return typed not-found /
+  not-addressable / init-failed errors instead of silently swapping cards or
+  falling back to CPU. Unavailable coarse `accelerated` targets still fail
+  closed. Physical PCI keys are normalized (trim + lower-case) only; full BDF
+  grammar validation is a follow-up.
+- On Windows ReBAR discrete GPUs, Vulkan Peak Working Set can exceed the HIP
+  and CPU figures even when DeviceLocal buffers are not mapped. ReBAR types
+  are DeviceLocal|HostVisible, so Windows still counts that VRAM toward the
+  process working set. This is a measured PeakWS tax, not a host leak; HIP
+  does not pay it the same way.
 - No public reproducible real-backend benchmark or long-audio stability evidence
   is published. The performance harness, regression gates, and competitive
   comparisons are internal (see [Performance](../perf/PERFORMANCE.md)); no claim of
@@ -156,6 +212,11 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   through the same capability probe rather than emulating it or silently
   falling back to all-system capture; macOS keeps its Core Audio process-tap
   all-system path and Linux keeps its `pactl`/`parec` monitor-source capture.
+  A foreign exception (Objective-C `NSException` or a Core Audio C++ throw)
+  during macOS tap setup is now mapped to `capture_backend_failed` instead of
+  aborting the process; the specific Core Audio call that throws on some
+  macOS 15 hosts has not been reproduced on macOS 26, so the diagnostic
+  string on a failed start is the way to identify it.
   Windows real playback smoke (both all-system and per-process) has been
   executed on a real Windows 11 session; Linux real playback smoke still
   needs to be executed on a Linux session. Per-process capture has no desktop
@@ -164,9 +225,6 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   (`--model-pack` / an installed `--model`). There is no per-request lazy model
   loading or an `openasr ps`-style multi-model runner yet -- restart `serve` to
   switch models.
-- `openasr pull` always fetches and re-installs; it has no incremental update
-  (no revision/digest diff, `up to date` check, or `--force`). Re-pulling a model
-  re-downloads it.
 - Source-language control is per-model and capability-gated (see
   `openasr show <pack>` / `/v1/capabilities`). Multilingual Whisper auto-detects an
   unset language and accepts an explicit `--language`; Cohere and the English-only
@@ -176,6 +234,12 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   ignored -- use a multilingual Whisper pack when you need to force or read back the
   language. (Wiring Qwen's text-prompt language conditioning is tracked, but needs a
   real-pack parity check against the reference inference before it can be claimed.)
+  Qwen3-ASR 0.6B q4 on `fixtures/en_zh_mixed.wav` (5s English + ~8s Mandarin)
+  currently drops the English lead-in and truncates the Mandarin tail; the same
+  clip is a single 0--13s decode (not VAD/leading-silence clipping), and the
+  family rejects `--language`. Treat this as a model code-switch limit of that
+  pack -- use Whisper, MiMo-ASR, or moss-transcribe-diarize when the English
+  half must be kept. fp16 / 1.7B were not re-measured on this host.
   Dolphin is specify-only: it does not auto-detect, so an explicit `--language`
   selects one of its 14 recognition codes (`zh` plus 13 Chinese regional-dialect
   codes such as `zh-sichuan`, `zh-shanghai`, `zh-hebei`) via a decode-prompt
@@ -209,6 +273,12 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   are retained. See
   [Graph cancellation contract](design/graph-cancellation.md).
   Pause still only blocks at slice boundaries and never arms graph cancellation.
+- `POST /v1/audio/transcriptions?stream=true` shares owner checks, cancel
+  control, and `finish_file` cleanup with JSON file jobs, but a busy server
+  rejects the stream with HTTP 429 instead of enqueueing it on the cancelable
+  file FIFO. JSON `POST /v1/audio/transcriptions` still queues. Desktop remote
+  file transcription uses the JSON endpoint. A later change can emit a queued
+  SSE event and then stream the result.
 
 ## What works now
 

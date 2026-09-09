@@ -282,7 +282,7 @@ fn native_float_wav_passthrough_without_ffmpeg() {
 }
 
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn native_non_wav_conversion_mode_requires_ffmpeg_when_enabled() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("sample.mp3");
@@ -304,7 +304,37 @@ fn native_non_wav_conversion_mode_requires_ffmpeg_when_enabled() {
 }
 
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+fn native_non_wav_conversion_reaches_media_foundation_when_ffmpeg_absent() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("sample.mp3");
+    fs::write(&input, b"mock bytes").unwrap();
+
+    let error = prepare_audio_input(
+        &input,
+        &AudioPreparationOptions::new(BackendKind::Native).with_native_non_wav_conversion(true),
+    )
+    .unwrap_err();
+
+    let message = error.to_string();
+    assert!(
+        matches!(&error, AudioPreparationError::ConversionFailed { tool, .. } if tool == "mediafoundation"),
+        "garbage mp3 must reach Media Foundation, not MissingFfmpeg: {message}"
+    );
+    assert!(
+        message.contains("Windows system decoding failed"),
+        "MF failure must name system decoding: {message}"
+    );
+    assert!(
+        message.contains("--ffmpeg-bin")
+            && message.contains("OPENASR_FFMPEG_BIN")
+            && message.contains("media.ffmpeg_bin"),
+        "MF failure must point at ffmpeg knobs: {message}"
+    );
+}
+
+#[test]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn native_qta_input_is_recognized_and_reaches_ffmpeg_conversion() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("sample.qta");
@@ -326,6 +356,25 @@ fn native_qta_input_is_recognized_and_reaches_ffmpeg_conversion() {
             ..
         }
     ));
+}
+
+#[test]
+#[cfg(windows)]
+fn native_qta_input_is_recognized_and_reaches_media_foundation_conversion() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("sample.qta");
+    fs::write(&input, b"mock bytes").unwrap();
+
+    let error = prepare_audio_input(
+        &input,
+        &AudioPreparationOptions::new(BackendKind::Native).with_native_non_wav_conversion(true),
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(&error, AudioPreparationError::ConversionFailed { tool, .. } if tool == "mediafoundation"),
+        "a .qta file must reach Media Foundation, not be rejected as unrecognized: {error}"
+    );
 }
 
 // On macOS these same inputs reach the afconvert fallback instead of erroring
@@ -483,6 +532,10 @@ fn assert_prepared_16k_mono_audio(prepared: &PreparedAudioInput) {
 fn symphonia_decodes_m4a_aac_lc_in_process() {
     let prepared = prepare_native_conversion(&crate_fixture("tone_mono.m4a"))
         .expect("m4a/AAC-LC should decode via the in-process symphonia path");
+    assert!(
+        prepared.temp_dir.is_none(),
+        "AAC-LC must stay in-process and not take the Media Foundation or ffmpeg path"
+    );
     assert_prepared_16k_mono_audio(&prepared);
 }
 
@@ -536,6 +589,10 @@ fn symphonia_decodes_m4a_alac_in_process() {
 fn symphonia_decodes_bare_adts_aac_in_process() {
     let prepared = prepare_native_conversion(&crate_fixture("tone_mono.aac"))
         .expect("bare ADTS .aac should decode via the in-process symphonia path");
+    assert!(
+        prepared.temp_dir.is_none(),
+        "AAC-LC / ADTS must stay in-process and not spawn Media Foundation or ffmpeg"
+    );
     assert_prepared_16k_mono_audio(&prepared);
 }
 
@@ -589,7 +646,7 @@ fn wma_falls_back_to_afconvert_or_succeeds_without_symphonia_support() {
 }
 
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn wma_reaches_missing_ffmpeg_without_symphonia_support() {
     let error = prepare_native_conversion(&crate_fixture("tone_mono.wma")).unwrap_err();
     assert!(
@@ -597,6 +654,18 @@ fn wma_reaches_missing_ffmpeg_without_symphonia_support() {
         "a real .wma file must reach the ffmpeg-required path, not be rejected as an \
          unrecognized extension: {error}"
     );
+}
+
+#[test]
+#[cfg(windows)]
+fn wma_reaches_media_foundation_without_symphonia_support() {
+    match prepare_native_conversion(&crate_fixture("tone_mono.wma")) {
+        Ok(prepared) => assert_prepared_16k_mono_audio(&prepared),
+        Err(AudioPreparationError::ConversionFailed { tool, .. }) if tool == "mediafoundation" => {}
+        Err(error) => panic!(
+            "a real .wma file must reach Media Foundation, not be rejected as an unrecognized extension: {error}"
+        ),
+    }
 }
 
 /// Beyond routing, this proves ffmpeg genuinely decodes the format when it is
@@ -676,7 +745,7 @@ fn malformed_webm_falls_back_to_typed_error_instead_of_panicking() {
 }
 
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn malformed_webm_falls_back_to_typed_error_instead_of_panicking() {
     // See the macOS counterpart above for the vint-underflow panic this
     // guards against. Without ffmpeg configured and no afconvert fallback,
@@ -689,6 +758,21 @@ fn malformed_webm_falls_back_to_typed_error_instead_of_panicking() {
     assert!(
         message.contains("malformed or corrupted"),
         "missing-ffmpeg hint should report the parser-internal-error condition: {message}"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn malformed_webm_falls_back_to_typed_error_instead_of_panicking() {
+    let error = prepare_native_conversion(&crate_fixture("malformed_vint_zero.webm")).unwrap_err();
+    let message = error.to_string();
+    assert!(
+        matches!(&error, AudioPreparationError::ConversionFailed { tool, .. } if tool == "mediafoundation"),
+        "malformed webm must fail closed through Media Foundation, not panic: {error}"
+    );
+    assert!(
+        message.contains("internal error while inspecting this file"),
+        "error should report a parser-internal-error, not a bare tool failure: {message}"
     );
 }
 
@@ -750,7 +834,7 @@ fn garbage_bytes_wav_fails_closed_instead_of_passing_through() {
 }
 
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn garbage_bytes_wav_fails_closed_instead_of_passing_through() {
     let temp = tempfile::tempdir().unwrap();
     let wav = temp.path().join("garbage.wav");
@@ -765,6 +849,21 @@ fn garbage_bytes_wav_fails_closed_instead_of_passing_through() {
 }
 
 #[test]
+#[cfg(windows)]
+fn garbage_bytes_wav_fails_closed_instead_of_passing_through() {
+    let temp = tempfile::tempdir().unwrap();
+    let wav = temp.path().join("garbage.wav");
+    fs::write(&wav, garbage_bytes()).unwrap();
+
+    let error = prepare_native_conversion(&wav).unwrap_err();
+
+    assert!(
+        matches!(&error, AudioPreparationError::ConversionFailed { tool, .. } if tool == "mediafoundation"),
+        "garbage-byte wav must fail closed through Media Foundation, not pass through: {error}"
+    );
+}
+
+#[test]
 #[cfg(target_os = "macos")]
 fn he_aac_falls_back_to_afconvert_when_symphonia_cannot_decode_it() {
     // HE-AAC (SBR) is outside what the enabled symphonia `aac` feature can
@@ -773,6 +872,19 @@ fn he_aac_falls_back_to_afconvert_when_symphonia_cannot_decode_it() {
     // silently emitting bandwidth-limited audio.
     let prepared = prepare_native_conversion(&crate_fixture("tone_heaac.m4a"))
         .expect("HE-AAC should fall back to afconvert and still succeed");
+    assert_prepared_16k_mono_audio(&prepared);
+}
+
+#[test]
+#[cfg(windows)]
+fn he_aac_falls_back_to_media_foundation_when_symphonia_cannot_decode_it() {
+    let prepared = prepare_native_conversion(&crate_fixture("tone_heaac.m4a")).expect(
+        "HE-AAC should fall back to Windows Media Foundation and still succeed without ffmpeg",
+    );
+    assert!(
+        prepared.temp_dir.is_some(),
+        "the Media Foundation path writes prepared.wav; AAC-LC must not take this path"
+    );
     assert_prepared_16k_mono_audio(&prepared);
 }
 
@@ -862,7 +974,7 @@ fn truncated_opus_is_handled_without_panicking() {
 /// The non-macOS counterpart: with no ffmpeg configured and no afconvert
 /// fallback, the typed `MissingFfmpeg` surfaces instead of a panic.
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn truncated_opus_is_handled_without_panicking() {
     let (_temp, path) = write_truncated_opus_fixture();
 
@@ -871,6 +983,16 @@ fn truncated_opus_is_handled_without_panicking() {
         matches!(error, AudioPreparationError::MissingFfmpeg { .. }),
         "truncated opus must fail closed with a typed error: {error}"
     );
+}
+
+#[test]
+#[cfg(windows)]
+fn truncated_opus_is_handled_without_panicking() {
+    let (_temp, path) = write_truncated_opus_fixture();
+    match prepare_native_conversion(&path) {
+        Ok(_) | Err(AudioPreparationError::ConversionFailed { .. }) => {}
+        Err(error) => panic!("truncated opus must fail closed with a typed error: {error}"),
+    }
 }
 
 /// Corrupt Opus bytes must fail closed with a typed error (never a panic,
@@ -904,7 +1026,12 @@ fn assert_corrupt_opus_is_typed_error(bytes: Vec<u8>) {
         matches!(&error, AudioPreparationError::ConversionFailed { tool, .. } if tool == "afconvert"),
         "corrupt opus must fail closed through the external converter: {message}"
     );
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    assert!(
+        matches!(&error, AudioPreparationError::ConversionFailed { tool, .. } if tool == "mediafoundation"),
+        "corrupt opus must fail closed through Media Foundation: {message}"
+    );
+    #[cfg(not(any(target_os = "macos", windows)))]
     assert!(
         matches!(&error, AudioPreparationError::MissingFfmpeg { .. }),
         "corrupt opus must fail closed with a typed error: {message}"
@@ -1028,6 +1155,7 @@ fn write_test_wav(path: &Path, sample_rate: u32, channels: u16, bits_per_sample:
         sample_rate,
         channels,
         bits_per_sample,
+        1,
         frames,
         |index| {
             let phase = index as f32 / sample_rate as f32 * 440.0 * TAU;
@@ -1037,9 +1165,16 @@ fn write_test_wav(path: &Path, sample_rate: u32, channels: u16, bits_per_sample:
 }
 
 fn write_float_wav(path: &Path, sample_rate: u32, channels: u16, frames: u32) {
-    write_wav(path, sample_rate, channels, 32, frames, |index| {
+    write_wav(path, sample_rate, channels, 32, 3, frames, |index| {
         let phase = index as f32 / sample_rate as f32 * 440.0 * TAU;
         SampleBytes::F32(phase.sin())
+    });
+}
+
+fn write_i32_wav(path: &Path, sample_rate: u32, channels: u16, frames: u32) {
+    write_wav(path, sample_rate, channels, 32, 1, frames, |index| {
+        let phase = index as f32 / sample_rate as f32 * 440.0 * TAU;
+        SampleBytes::I32((phase.sin() * i32::MAX as f32) as i32)
     });
 }
 
@@ -1048,12 +1183,12 @@ fn write_wav<F>(
     sample_rate: u32,
     channels: u16,
     bits_per_sample: u16,
+    audio_format: u16,
     frames: u32,
     mut sample_at: F,
 ) where
     F: FnMut(u32) -> SampleBytes,
 {
-    let audio_format = if bits_per_sample == 32 { 3_u16 } else { 1_u16 };
     let data_size = frames * channels as u32 * (bits_per_sample as u32 / 8);
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"RIFF");
@@ -1073,16 +1208,190 @@ fn write_wav<F>(
     bytes.extend_from_slice(&data_size.to_le_bytes());
 
     for index in 0..frames {
-        match sample_at(index) {
-            SampleBytes::I16(sample) => bytes.extend_from_slice(&sample.to_le_bytes()),
-            SampleBytes::F32(sample) => bytes.extend_from_slice(&sample.to_le_bytes()),
+        let sample = sample_at(index);
+        for _ in 0..channels {
+            match sample {
+                SampleBytes::I16(value) => bytes.extend_from_slice(&value.to_le_bytes()),
+                SampleBytes::I32(value) => bytes.extend_from_slice(&value.to_le_bytes()),
+                SampleBytes::F32(value) => bytes.extend_from_slice(&value.to_le_bytes()),
+            }
         }
     }
 
     fs::write(path, bytes).unwrap();
 }
 
+#[derive(Clone, Copy)]
 enum SampleBytes {
     I16(i16),
+    I32(i32),
     F32(f32),
+}
+
+const PROP_AUDIO_RATES_HZ: [u32; 6] = [8_000, 16_000, 22_050, 44_100, 48_000, 96_000];
+const PROP_AUDIO_CHANNELS: [u16; 3] = [1, 2, 6];
+
+#[derive(Clone, Copy, Debug)]
+enum FileWavFormat {
+    I16,
+    I32,
+    F32,
+}
+
+fn write_prop_wav(
+    path: &Path,
+    sample_rate: u32,
+    channels: u16,
+    frames: u32,
+    format: FileWavFormat,
+) {
+    match format {
+        FileWavFormat::I16 => write_test_wav(path, sample_rate, channels, 16, frames),
+        FileWavFormat::I32 => write_i32_wav(path, sample_rate, channels, frames),
+        FileWavFormat::F32 => write_float_wav(path, sample_rate, channels, frames),
+    }
+}
+
+fn expected_file_resample_len(input_frames: usize, input_rate_hz: u32) -> usize {
+    input_frames.saturating_mul(16_000) / input_rate_hz.max(1) as usize
+}
+
+fn assert_decoded_16k_mono_len(samples: &[f32], input_frames: usize, input_rate_hz: u32) {
+    let expected = expected_file_resample_len(input_frames, input_rate_hz);
+    // Same slack family as `resample_preserves_frame_count_ratio`, doubled
+    // because a sub-chunk input still flushes two FFT windows (8192).
+    let tolerance = 8192usize;
+    assert!(
+        samples.len().abs_diff(expected) <= tolerance,
+        "expected ~{expected} 16 kHz samples from {input_frames} frames at {input_rate_hz} Hz, got {}",
+        samples.len()
+    );
+}
+
+fn decode_wav_case(
+    sample_rate_hz: u32,
+    channels: u16,
+    frames: u32,
+    format: FileWavFormat,
+) -> Result<(), String> {
+    let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let wav = temp.path().join("prop.wav");
+    write_prop_wav(&wav, sample_rate_hz, channels, frames, format);
+    let context = format!("rate={sample_rate_hz} ch={channels} format={format:?} frames={frames}");
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::symphonia_decode::try_decode_to_pcm16_mono_16k(&wav, Some("wav"))
+    }));
+    match caught {
+        Ok(super::symphonia_decode::SymphoniaOutcome::Decoded(samples, source)) => {
+            assert_eq!(
+                source.sample_rate_hz, sample_rate_hz,
+                "{context}: source rate should be preserved for diagnostics"
+            );
+            assert_eq!(
+                source.channels, channels,
+                "{context}: source channels should be preserved for diagnostics"
+            );
+            if frames == 0 {
+                return Err(format!(
+                    "{context}: empty wav decoded to {} samples",
+                    samples.len()
+                ));
+            }
+            assert_decoded_16k_mono_len(&samples, frames as usize, sample_rate_hz);
+            Ok(())
+        }
+        Ok(super::symphonia_decode::SymphoniaOutcome::Unsupported { .. })
+        | Ok(super::symphonia_decode::SymphoniaOutcome::ParserPanicked) => {
+            if frames == 0 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{context}: well-formed PCM wav did not decode in-process"
+                ))
+            }
+        }
+        Err(_) => Err(format!("{context}: panicked")),
+    }
+}
+
+#[test]
+fn audio_file_decode_wav_discrete_grid_does_not_panic() {
+    let durations = [0_u32, 1, 100, 512];
+    for &sample_rate_hz in &PROP_AUDIO_RATES_HZ {
+        for &channels in &PROP_AUDIO_CHANNELS {
+            for format in [FileWavFormat::I16, FileWavFormat::I32, FileWavFormat::F32] {
+                for frames in durations {
+                    decode_wav_case(sample_rate_hz, channels, frames, format)
+                        .unwrap_or_else(|error| panic!("{error}"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn prepare_audio_input_wav_short_matrix_does_not_panic() {
+    let cases = [
+        (8_000, 1_u16, FileWavFormat::I16, 160_u32),
+        (16_000, 1, FileWavFormat::I16, 320),
+        (22_050, 2, FileWavFormat::F32, 220),
+        (44_100, 2, FileWavFormat::I16, 512),
+        (48_000, 6, FileWavFormat::I32, 480),
+        (96_000, 1, FileWavFormat::F32, 96),
+        (44_100, 6, FileWavFormat::I32, 64),
+        (8_000, 2, FileWavFormat::I32, 80),
+    ];
+    for (sample_rate_hz, channels, format, frames) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let wav = temp.path().join("prepare.wav");
+        write_prop_wav(&wav, sample_rate_hz, channels, frames, format);
+        let context = format!(
+            "prepare rate={sample_rate_hz} ch={channels} format={format:?} frames={frames}"
+        );
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            prepare_audio_input(
+                &wav,
+                &AudioPreparationOptions::new(BackendKind::Native)
+                    .with_native_non_wav_conversion(true),
+            )
+        }));
+        match caught {
+            Ok(Ok(prepared)) => {
+                if let Some(samples) = prepared.samples() {
+                    assert_decoded_16k_mono_len(samples, frames as usize, sample_rate_hz);
+                } else if prepared.is_converted() {
+                    assert_prepared_16k_mono_audio(&prepared);
+                } else {
+                    assert_eq!(
+                        prepared.path(),
+                        wav.as_path(),
+                        "{context}: already-conformant wav should pass through"
+                    );
+                }
+            }
+            Ok(Err(_)) => {}
+            Err(_) => panic!("{context}: panicked"),
+        }
+    }
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config {
+        cases: 24,
+        ..proptest::test_runner::Config::default()
+    })]
+
+    #[test]
+    fn audio_file_decode_wav_random_duration_does_not_panic(
+        rate_idx in 0..PROP_AUDIO_RATES_HZ.len(),
+        ch_idx in 0..PROP_AUDIO_CHANNELS.len(),
+        format_idx in 0..3usize,
+        frames in 0u32..=2_048,
+    ) {
+        let sample_rate_hz = PROP_AUDIO_RATES_HZ[rate_idx];
+        let channels = PROP_AUDIO_CHANNELS[ch_idx];
+        let format = [FileWavFormat::I16, FileWavFormat::I32, FileWavFormat::F32][format_idx];
+        decode_wav_case(sample_rate_hz, channels, frames, format)
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
 }

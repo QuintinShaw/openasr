@@ -10,10 +10,12 @@
     "dev": "wrangler dev",
     "predeploy": "npm run build:assets",
     "deploy": "wrangler deploy",
+    "build:esa": "node scripts/build-esa.mjs",
     "test": "vitest run"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.5.0",
+    "esbuild": "^0.25.0",
     "vitest": "^2.1.0",
     "wrangler": "^4.0.0"
   }

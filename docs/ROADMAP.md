@@ -45,15 +45,19 @@ These were prior roadmap goals and are now shipped on the native runtime path:
   source, so same-path byte replacement misses instead of reusing stale weights;
   adapter-bearing families add the adapter fingerprint where required.
   Host-neutral prepared data remains content-keyed by design. Admission capacity
-  remains per-model (not per-route), and there is still no public provider/device
-  selector such as `gpu0`. Metal remains not-exactly-addressable
-  (`MTLCreateSystemDefaultDevice` only), and internal Exact requests fail closed
+  remains per-model (not per-route). Public GPU ids from `GET /v1/devices` are
+  selectable; there is still no ordinal selector such as `gpu0`. Metal Exact is
+  allowed by public/stable id (no PCI/UUID identity). Exact requests fail closed
   rather than falling back to another card or CPU.
 - Desktop remote compute has secure HTTPS/WSS client/server plumbing with
   approved pairing, TOFU fingerprint pinning, keychain device credentials, file
   transcription routing, realtime routing, revocation, and server-history
   isolation for paired device-token compute requests. The remaining release
   gate is end-to-end multi-device Desktop UI validation evidence.
+- External transcript-guided forced alignment is a public compute path:
+  `openasr align` and `POST /v1/audio/precise-timeline` (`transcript` or
+  `transcript_json`) reuse the Qwen3-ForcedAligner pack, project dual-view
+  segments/subtitle cues, and export SRT/VTT through the shared renderer.
 
 ## Active priorities
 

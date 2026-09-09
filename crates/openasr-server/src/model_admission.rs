@@ -7,6 +7,8 @@ use std::{
 use openasr_core::NativeExecutionServices;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::remote_runtime_policy::RemoteRuntimePolicy;
+
 /// Bounds concurrent native executions for one resolved runtime model identity.
 ///
 /// Admission is deliberately non-blocking. Queuing a second heavyweight model
@@ -47,10 +49,17 @@ pub(crate) struct ModelSessionPermit {
     permit: Option<OwnedSemaphorePermit>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeAdmissionKind {
+    File,
+    Realtime,
+}
+
 #[derive(Clone, Debug)]
 pub struct NativeExecutionSupervisor {
     admission: ModelSessionAdmission,
     execution_services: Arc<NativeExecutionServices>,
+    remote_policy: RemoteRuntimePolicy,
 }
 
 impl PartialEq for NativeExecutionSupervisor {
@@ -86,11 +95,16 @@ impl NativeExecutionSupervisor {
         Self {
             admission: ModelSessionAdmission::new(max_concurrent_sessions_per_model),
             execution_services,
+            remote_policy: RemoteRuntimePolicy::new(),
         }
     }
 
     pub fn execution_services(&self) -> &Arc<NativeExecutionServices> {
         &self.execution_services
+    }
+
+    pub(crate) fn remote_policy(&self) -> &RemoteRuntimePolicy {
+        &self.remote_policy
     }
 
     pub(crate) fn try_acquire(

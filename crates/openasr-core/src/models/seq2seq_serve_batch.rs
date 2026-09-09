@@ -2812,7 +2812,13 @@ mod slot_isolation_tests {
 
         let live = services.runtime_receipts().snapshot();
         assert_eq!(live.live_owners.len(), 1);
-        assert_eq!(live.live_owners[0].resources.len(), 1);
+        let resource_count = live.live_owners[0].resources.len();
+        // A two-job batch can keep the original width and a compacted width
+        // resident; each width is one no-broker runtime receipt.
+        assert!(
+            (1..=2).contains(&resource_count),
+            "serialized actor retains one receipt per resident runtime width, got {resource_count}"
+        );
         let resource = live.live_owners[0]
             .resources
             .values()

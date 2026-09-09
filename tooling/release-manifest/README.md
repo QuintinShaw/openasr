@@ -1,5 +1,71 @@
 # Windows provider release and qualification authority
 
+## Exact-cell backend qualification
+
+`qualification_manifest.py` compiles one inert manifest for every exact Windows
+CUDA/HIP target plus one generic Vulkan provider artifact. The Vulkan manifest
+does not claim a physical target at release time; the isolated runner derives
+and binds the exact `vk_caps_*` identity from the real device. The compiler does
+not infer a provider or target from an asset filename. Instead it joins and
+cross-checks:
+
+- the final Authenticode-signed neutral ZIP, including the exact `openasr.exe`,
+  complete unpacked tree, and host ABI;
+- one `backend-pack-*.json` candidate and the exact plugin/vendor bytes it
+  declares, including the signed Vulkan plugin and loader archive;
+- the successful `actions/attest-build-provenance` output bundle and its subject
+  digests.
+
+ZIPs are streamed rather than extracted. The compiler rejects traversal,
+Windows-unsafe names, case collisions, encrypted/non-regular entries, byte/tree
+drift, host/plugin ABI drift, and an attestation missing any referenced release
+subject. It computes both the ordinary backend archive tree with its `vendor/`
+install prefix and the qualification namespace's empty-root tree; those are
+different identities and must not be substituted for one another.
+
+`.github/workflows/release-binaries.yml` copies the `bundle-path` from the
+successful attestation attempt to the stable release asset
+`openasr-<version>-build-provenance.bundle.json`, then emits collision-free
+`openasr-<version>-qualification-<exact-cell>.json` files. These files and the
+bundle are publication metadata only: they are not appended to the already
+attested subject set, contain no activation mode, and never enter the ordinary
+backend catalog.
+
+The workflow never receives the production Ed25519 seed. While the GitHub
+release is still a draft, a maintainer checks out its exact tag and runs the one
+local atomic command:
+
+```bash
+OPENASR_CATALOG_SIGNING_KEY_SEED_HEX=<real production seed> \
+  scripts/sign-and-verify-qualification-manifests.sh v<version>
+```
+
+The script requires a clean checkout at the exact tag, verifies every release
+byte against its manifest and the offline Sigstore bundle, confirms the local
+annotated tag object and peeled commit still equal GitHub's current tag, asks `gh attestation
+verify` to enforce repository/workflow/source/predicate/non-self-hosted-runner
+constraints, signs every exact cell required by the tagged release matrix
+(currently 21) in the qualification-specific domain,
+uploads only detached signatures, and re-downloads every pair for production-root
+verification. A failure at any point leaves qualification incomplete; it never
+publishes a catalog entry or activates a provider.
+
+The signer, the formal Actions upload path, and the final `draft -> published`
+transition acquire the same atomic draft-release asset lock before reading,
+replacing, or publishing manifests/signatures. Lock ownership is nonce-bound,
+and release completeness rejects a stale lock, so a local signing run cannot
+race release-asset replacement or cross publication.
+The finalizer rebuilds the exact manifest/signature set from the release's
+backend packs and re-verifies artifact hashes, the qualification signature, and
+Sigstore provenance while holding that lock. Manual workflow dispatch remains
+diagnostic-only and cannot recover, replace, sign, or publish release assets.
+
+Run generator and workflow contract tests with the shared release-manifest gate:
+
+```bash
+python3 -m unittest discover -s tooling/release-manifest -p '*_test.py'
+```
+
 This directory owns the open-core release metadata and the two evidence gates
 for the terminal Windows topology: one CPU-neutral `GGML_BACKEND_DL` host plus
 optional signed Vulkan, CUDA, and HIP provider packs. It does not own Desktop
@@ -58,11 +124,15 @@ is not required. A revoked backend cannot be requalified or reactivated.
 Do not hand-edit provider entries or activation bindings.
 
 ```bash
-# Before publishing a core release: make every exact provider byte public but inert.
-scripts/sync-windows-backend-cdn.sh vX.Y.Z
+# After stage 1 of Release core (draft + binaries + approved CDN sync):
+# sign the PublishedInert catalog locally, then review / commit / push.
 scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z
-OPENASR_DEPLOY_CATALOG_RUN_ID=<release-core-run-id> \
-  scripts/finalize-core-release.sh vX.Y.Z
+
+# CDN sync and undraft now run in release-core.yml after core-release
+# Environment approval. Local escape hatch (same scripts the jobs call):
+#   scripts/sync-windows-backend-cdn.sh vX.Y.Z
+#   OPENASR_DEPLOY_CATALOG_RUN_ID=<release-core-run-id> \
+#     scripts/finalize-core-release.sh vX.Y.Z
 
 # After exact-tag hardware qualification: prepare one reviewed activation epoch.
 scripts/activate-windows-backend-catalog-release.sh \
@@ -75,8 +145,10 @@ scripts/revoke-windows-backend-catalog-release.sh vX.Y.Z BACKEND_ID
 The CDN sync writes the immutable provider payloads to B2 but does not change a
 catalog or GitHub release. Catalog preparation writes only the five local
 catalog/epoch files; it does not commit, push, deploy, publish, or activate
-anything. The finalizer only publishes a draft whose already-deployed catalog
-exposes the release provider entries as PublishedInert.
+anything. `release-core.yml` runs the CDN sync and the finalizer after
+`core-release` Environment approval. The finalizer only publishes a draft
+whose already-deployed catalog exposes the release provider entries as
+PublishedInert.
 
 Real-hardware evidence must come from a tag-scoped dispatch of
 `.github/workflows/qualify-windows-backend.yml` with exact `release_tag`,

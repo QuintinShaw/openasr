@@ -1,4 +1,4 @@
-use std::{fmt, str::FromStr, sync::Arc};
+use std::{collections::BTreeMap, fmt, str::FromStr, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -18,7 +18,8 @@ pub use native::{
     NativeTranscriptionProgress, ProgressBackendClass, ProgressPlan, ProgressPlanInput,
     ProgressReporter, ProgressSegmenterKind, RequestAttemptId, RequestAttemptIdError,
     RequestExecutionContext, SliceBoundaryControl, TranscriptionControl, TranscriptionStage,
-    describe_native_runtime_model_mismatch, duration_weighted_fraction,
+    align_plain_transcript_to_audio, describe_native_runtime_model_mismatch,
+    duration_weighted_fraction, native_active_transcription_ids,
     native_runtime_model_adapter_for_path, native_runtime_model_refs_match,
     native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, native_transcription_progress,
@@ -63,22 +64,88 @@ impl BackendKind {
     pub const SELECTABLE: &'static [&'static str] = Self::ALL;
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Public execution-target vocabulary. Coarse values (`auto` / `cpu` /
+/// `accelerated`) stay the wire default; a physical GPU id from
+/// `GET /v1/devices` pins one card and is fail-closed on miss.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum ExecutionTarget {
     #[default]
     Auto,
     Cpu,
     Accelerated,
+    Device(String),
 }
 
 impl ExecutionTarget {
-    pub const fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::Auto => "auto",
             Self::Cpu => "cpu",
             Self::Accelerated => "accelerated",
+            Self::Device(id) => id,
         }
+    }
+
+    /// Parse a public execution-target string. Coarse names stay reserved;
+    /// any other valid device-id token is accepted here and resolved later
+    /// against the live GPU list (unknown ids fail closed at resolve).
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim() {
+            "" => Err("execution_target must not be empty".to_string()),
+            "auto" => Ok(Self::Auto),
+            "cpu" => Ok(Self::Cpu),
+            "accelerated" => Ok(Self::Accelerated),
+            other => {
+                if !is_public_device_id_token(other) {
+                    return Err(format!(
+                        "Unsupported execution_target '{other}'. Use auto, cpu, accelerated, \
+                         or a physical GPU id from GET /v1/devices."
+                    ));
+                }
+                Ok(Self::Device(other.to_string()))
+            }
+        }
+    }
+}
+
+fn is_public_device_id_token(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.is_ascii()
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b'/' && byte != b'\\')
+}
+
+impl fmt::Display for ExecutionTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ExecutionTarget {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for ExecutionTarget {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ExecutionTarget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
     }
 }
 
@@ -394,11 +461,21 @@ pub struct TranscriptionRequest {
     /// and enrolled-person matcher, so an explicit request fails closed when
     /// that embedder is unavailable.
     pub voice_id: bool,
+    /// Anonymous speaker separation without enrolled-person matching.
+    /// Remote compute uses this so `diarize=true` does not open Voice ID.
+    pub anonymous_diarize: bool,
+    /// Opt-in per-speaker embeddings on `verbose_json`. Requires diarization
+    /// (Voice ID or anonymous diarize) and the external clustering path;
+    /// in-decoder families fail closed because they have no centroids.
+    pub return_speaker_embeddings: bool,
     /// Persisted recording-level segmenter preference copied into the request
     /// by the host configuration layer. This is internal execution plumbing,
     /// not a multipart/per-job picker.
     #[doc(hidden)]
     pub voice_id_segmenter: crate::config::VoiceIdSegmenterPreference,
+    /// Persisted speaker-embedder preference. Default remains ReDimNet2.
+    #[doc(hidden)]
+    pub voice_id_embedder: crate::config::VoiceIdEmbedderPreference,
     /// Exact speaker count to force during diarization clustering (the
     /// `DiarizeHint::NumSpeakers` hint), in
     /// `1..=crate::diarize::contract::MAX_DIARIZATION_SPEAKERS`; `None` lets
@@ -479,7 +556,10 @@ impl TranscriptionRequest {
             longform: None,
             display_file_name: None,
             voice_id: false,
+            anonymous_diarize: false,
+            return_speaker_embeddings: false,
             voice_id_segmenter: crate::config::VoiceIdSegmenterPreference::Auto,
+            voice_id_embedder: crate::config::VoiceIdEmbedderPreference::ReDimNet2,
             diarize_speakers: None,
             punctuate: true,
             source: RequestSource::default(),
@@ -626,6 +706,24 @@ impl TranscriptionRequest {
         self
     }
 
+    pub fn with_voice_id_embedder(
+        mut self,
+        preference: crate::config::VoiceIdEmbedderPreference,
+    ) -> Self {
+        self.voice_id_embedder = preference;
+        self
+    }
+
+    pub fn with_anonymous_diarize(mut self, anonymous_diarize: bool) -> Self {
+        self.anonymous_diarize = anonymous_diarize;
+        self
+    }
+
+    pub fn with_return_speaker_embeddings(mut self, return_speaker_embeddings: bool) -> Self {
+        self.return_speaker_embeddings = return_speaker_embeddings;
+        self
+    }
+
     pub fn with_diarize_speakers(mut self, diarize_speakers: Option<u8>) -> Self {
         self.diarize_speakers = diarize_speakers;
         self
@@ -747,6 +845,9 @@ pub struct Transcription {
     pub subtitle_cues: Vec<Segment>,
     /// Provenance of the word timeline. `None` on legacy data.
     pub timeline_quality: Option<crate::subtitle::TimelineQuality>,
+    /// Why a requested precise timeline was not used. Present when in-process
+    /// alignment gates failed and the native approximate timeline was kept.
+    pub timeline_degraded_reason: Option<String>,
     pub longform: Option<TranscriptionLongFormMetadata>,
     /// Language the transcription is in (e.g. `en`). For whisper this is the
     /// auto-detected language (or the explicit `--language`); `None` for families
@@ -772,6 +873,113 @@ pub struct Transcription {
     /// from "the speaker model is missing", and users read all three as the
     /// feature being broken.
     pub unnamed_speakers: Vec<crate::diarize::voice_id::UnnamedSpeaker>,
+    /// Per-speaker embeddings copied from external diarization centroids.
+    /// Present only when the caller opted in; omitted from the default
+    /// transcript and from every non-`verbose_json` renderer.
+    pub speaker_embeddings: Option<SpeakerEmbeddingPayload>,
+}
+
+/// How vectors in [`SpeakerEmbeddingSpace`] are normalized. Production
+/// centroids are already L2; the JSON field is the comparability contract,
+/// not a request to re-normalize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(any(test, feature = "ts-export"), derive(ts_rs::TS))]
+#[cfg_attr(
+    any(test, feature = "ts-export"),
+    ts(export_to = "generated/http-wire/")
+)]
+pub enum SpeakerEmbeddingNormalization {
+    #[serde(rename = "l2")]
+    L2,
+}
+
+/// Comparability metadata for per-speaker embedding vectors. Pack fingerprint
+/// plus dimension plus L2 is the space identity; this is not Voice ID's
+/// `EmbeddingSpace` (no matcher policy).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(any(test, feature = "ts-export"), derive(ts_rs::TS))]
+#[cfg_attr(
+    any(test, feature = "ts-export"),
+    ts(export_to = "generated/http-wire/")
+)]
+pub struct SpeakerEmbeddingSpace {
+    pub model_id: String,
+    pub pack_fingerprint: String,
+    pub dim: usize,
+    pub normalization: SpeakerEmbeddingNormalization,
+}
+
+/// Internal transcript payload: space plus `SPEAKER_NN` -> vector. JSON
+/// rendering splits this into a WhisperX/Speakr label map plus a sibling
+/// `speaker_embedding_space` object.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpeakerEmbeddingPayload {
+    pub space: SpeakerEmbeddingSpace,
+    pub vectors: BTreeMap<String, Vec<f32>>,
+}
+
+impl SpeakerEmbeddingPayload {
+    /// Copy already-computed clustering centroids. Empty centroids or a
+    /// missing embedder identity yield `Ok(None)` rather than inventing a
+    /// space. A dimension mismatch fails closed instead of truncating.
+    pub fn from_timeline(
+        timeline: &crate::diarize::contract::SpeakerTimeline,
+        embedder: &dyn crate::diarize::embed::SpeakerEmbedder,
+    ) -> Result<Option<Self>, BackendError> {
+        if timeline.centroids.is_empty() {
+            return Ok(None);
+        }
+        let Some(identity) = embedder.identity() else {
+            return Ok(None);
+        };
+        let expected_dim = identity.embedding_dim;
+        if embedder.embedding_dim() != expected_dim {
+            return Err(speaker_embedding_dimension_mismatch(
+                expected_dim,
+                embedder.embedding_dim(),
+            ));
+        }
+        let mut vectors = BTreeMap::new();
+        for (speaker_id, embedding) in &timeline.centroids {
+            if embedding.dim() != expected_dim {
+                return Err(speaker_embedding_dimension_mismatch(
+                    expected_dim,
+                    embedding.dim(),
+                ));
+            }
+            let norm = embedding
+                .0
+                .iter()
+                .map(|component| component * component)
+                .sum::<f32>()
+                .sqrt();
+            if (norm - 1.0).abs() > 1e-3 {
+                return Err(BackendError::NativeFailClosed {
+                    reason: format!(
+                        "Speaker embedding L2 norm {norm} is outside 1.0 ± 0.001; refusing to claim l2 normalization."
+                    ),
+                });
+            }
+            vectors.insert(speaker_id.label(), embedding.0.clone());
+        }
+        Ok(Some(Self {
+            space: SpeakerEmbeddingSpace {
+                model_id: identity.catalog_model_id,
+                pack_fingerprint: identity.pack_fingerprint,
+                dim: expected_dim,
+                normalization: SpeakerEmbeddingNormalization::L2,
+            },
+            vectors,
+        }))
+    }
+}
+
+fn speaker_embedding_dimension_mismatch(expected: usize, actual: usize) -> BackendError {
+    BackendError::NativeFailClosed {
+        reason: format!(
+            "Speaker embedding dimension mismatch: expected {expected}, got {actual}. The request was rejected instead of truncating vectors."
+        ),
+    }
 }
 
 impl Transcription {
@@ -984,6 +1192,10 @@ pub enum BackendError {
     )]
     DiarizeSpeakersRequiresDiarization,
     #[error(
+        "return_speaker_embeddings requires diarize=true.\nThe request was rejected instead of silently ignoring return_speaker_embeddings."
+    )]
+    SpeakerEmbeddingsRequireDiarization,
+    #[error(
         "Phrase bias / hotword boosting is not supported by the {backend} backend yet.\nThe request was rejected instead of silently ignoring phrase_bias."
     )]
     PhraseBiasNotSupported { backend: &'static str },
@@ -1047,11 +1259,11 @@ pub enum BackendError {
     )]
     WordTimestampAlignmentRequiresWordTimestamps,
     #[error(
-        "Word-timestamp alignment refinement (--word-timestamps=aligned) is not available for the {backend} backend: the Qwen3-ForcedAligner-0.6B capability pack is not installed.\nInstall it, or use --word-timestamps for the model's own approximate timestamps."
+        "Forced alignment is not available for the {backend} backend: the Qwen3-ForcedAligner-0.6B capability pack is not installed.\nInstall it with `openasr pull qwen3-forced-aligner-0.6b`. Transcription can still use --word-timestamps for the model's own approximate timestamps."
     )]
     WordTimestampAlignmentPackMissing { backend: &'static str },
     #[error(
-        "Word-timestamp alignment refinement failed: {reason}\nThe request was rejected instead of returning approximate timestamps silently relabeled as aligned."
+        "Forced alignment failed: {reason}\nThe request was rejected instead of returning a fabricated timeline."
     )]
     WordTimestampAlignmentFailed { reason: String },
     #[error(
@@ -1149,6 +1361,36 @@ mod tests {
         let error = "summarize".parse::<TranscriptionTask>().unwrap_err();
         assert!(error.contains("Unsupported task 'summarize'"));
         assert!(error.contains("transcribe, translate"));
+    }
+
+    #[test]
+    fn execution_target_parses_coarse_and_physical_ids() {
+        assert_eq!(
+            ExecutionTarget::parse("auto").unwrap(),
+            ExecutionTarget::Auto
+        );
+        assert_eq!(ExecutionTarget::parse("cpu").unwrap(), ExecutionTarget::Cpu);
+        assert_eq!(
+            ExecutionTarget::parse("accelerated").unwrap(),
+            ExecutionTarget::Accelerated
+        );
+        assert_eq!(
+            ExecutionTarget::parse("vulkan:amd-radeon-rx-7900-xtx").unwrap(),
+            ExecutionTarget::Device("vulkan:amd-radeon-rx-7900-xtx".to_string())
+        );
+        assert!(ExecutionTarget::parse("not a device").is_err());
+        assert!(ExecutionTarget::parse("").is_err());
+        assert_eq!(
+            serde_json::to_string(&ExecutionTarget::Device(
+                "vulkan:amd-radeon-rx-7900-xtx".to_string()
+            ))
+            .unwrap(),
+            "\"vulkan:amd-radeon-rx-7900-xtx\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ExecutionTarget>("\"cpu\"").unwrap(),
+            ExecutionTarget::Cpu
+        );
     }
 
     #[test]
@@ -1440,5 +1682,194 @@ mod tests {
         assert!(transcription.segments[0].words[0].end <= 3.0);
         assert_eq!(transcription.segments[0].words[1].word, "world");
         assert_eq!(transcription.segments[0].words[1].end, 3.0);
+    }
+
+    struct IdentifiedEmbedder {
+        dim: usize,
+        fingerprint: &'static str,
+    }
+
+    impl crate::diarize::embed::SpeakerEmbedder for IdentifiedEmbedder {
+        fn embed(
+            &self,
+            _samples: &[f32],
+            _sample_rate_hz: u32,
+        ) -> Result<crate::diarize::contract::SpeakerEmbedding, crate::diarize::embed::EmbedError>
+        {
+            Ok(crate::diarize::contract::SpeakerEmbedding::l2_normalized(
+                vec![1.0; self.dim],
+            ))
+        }
+
+        fn embedding_dim(&self) -> usize {
+            self.dim
+        }
+
+        fn identity(&self) -> Option<crate::diarize::embed::SpeakerEmbedderIdentity> {
+            Some(
+                crate::diarize::embed::SpeakerEmbedderIdentity::unlabeled_fixture(
+                    crate::diarize::embed::SpeakerEmbedderFamily::ReDimNet2,
+                    self.dim,
+                    self.fingerprint,
+                ),
+            )
+        }
+    }
+
+    struct IdentitylessEmbedder;
+
+    impl crate::diarize::embed::SpeakerEmbedder for IdentitylessEmbedder {
+        fn embed(
+            &self,
+            _samples: &[f32],
+            _sample_rate_hz: u32,
+        ) -> Result<crate::diarize::contract::SpeakerEmbedding, crate::diarize::embed::EmbedError>
+        {
+            Ok(crate::diarize::contract::SpeakerEmbedding::l2_normalized(
+                vec![1.0, 0.0],
+            ))
+        }
+
+        fn embedding_dim(&self) -> usize {
+            2
+        }
+    }
+
+    fn centroid_timeline(
+        vectors: Vec<(u32, Vec<f32>)>,
+    ) -> crate::diarize::contract::SpeakerTimeline {
+        crate::diarize::contract::SpeakerTimeline {
+            turns: Vec::new(),
+            centroids: vectors
+                .into_iter()
+                .map(|(id, values)| {
+                    (
+                        crate::diarize::contract::SpeakerId(id),
+                        crate::diarize::contract::SpeakerEmbedding(values),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn speaker_embedding_payload_from_timeline_copies_l2_centroids() {
+        let timeline = centroid_timeline(vec![(0, vec![1.0, 0.0]), (1, vec![0.0, 1.0])]);
+        let embedder = IdentifiedEmbedder {
+            dim: 2,
+            fingerprint: "sha256:test-pack",
+        };
+        let payload = SpeakerEmbeddingPayload::from_timeline(&timeline, &embedder)
+            .expect("matching dims")
+            .expect("centroids present");
+        assert_eq!(payload.space.model_id, "unknown");
+        assert_eq!(payload.space.pack_fingerprint, "sha256:test-pack");
+        assert_eq!(payload.space.dim, 2);
+        assert_eq!(
+            payload.space.normalization,
+            SpeakerEmbeddingNormalization::L2
+        );
+        assert_eq!(payload.vectors["SPEAKER_00"], vec![1.0, 0.0]);
+        assert_eq!(payload.vectors["SPEAKER_01"], vec![0.0, 1.0]);
+    }
+
+    #[test]
+    fn speaker_embedding_payload_from_timeline_omits_empty_or_identityless() {
+        let embedder = IdentifiedEmbedder {
+            dim: 2,
+            fingerprint: "sha256:test-pack",
+        };
+        assert!(
+            SpeakerEmbeddingPayload::from_timeline(
+                &crate::diarize::contract::SpeakerTimeline::default(),
+                &embedder
+            )
+            .unwrap()
+            .is_none()
+        );
+        let timeline = centroid_timeline(vec![(0, vec![1.0, 0.0])]);
+        assert!(
+            SpeakerEmbeddingPayload::from_timeline(&timeline, &IdentitylessEmbedder)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn speaker_embedding_payload_from_timeline_rejects_dimension_mismatch() {
+        let embedder = IdentifiedEmbedder {
+            dim: 2,
+            fingerprint: "sha256:test-pack",
+        };
+        let timeline = centroid_timeline(vec![(0, vec![1.0, 0.0, 0.0])]);
+        let error = SpeakerEmbeddingPayload::from_timeline(&timeline, &embedder)
+            .expect_err("mismatched centroid dim must fail closed");
+        assert!(
+            matches!(error, BackendError::NativeFailClosed { reason } if reason.contains("dimension mismatch"))
+        );
+    }
+
+    /// Promise: `speaker_embedding_space.normalization: "l2"` describes the
+    /// vectors actually returned on verbose_json, not a label stamped onto raw
+    /// centroids.
+    ///
+    /// If correct: copied centroids in the rendered body have L2 ≈ 1, and the
+    /// copy path refuses to claim `"l2"` for anything else instead of silently
+    /// re-normalizing. Otherwise Y: JSON says `"l2"` while `SPEAKER_00` is an
+    /// unnormalized `[3, 4]`.
+    #[test]
+    fn rt_379_speaker_embedding_space_l2_matches_vectors() {
+        let embedder = IdentifiedEmbedder {
+            dim: 2,
+            fingerprint: "sha256:test-pack",
+        };
+
+        let unnormalized = centroid_timeline(vec![(0, vec![3.0, 4.0])]);
+        let error = SpeakerEmbeddingPayload::from_timeline(&unnormalized, &embedder)
+            .expect_err("a non-unit centroid must not be published under an l2 claim");
+        assert!(
+            matches!(&error, BackendError::NativeFailClosed { reason } if reason.contains("l2")),
+            "unexpected error: {error:?}"
+        );
+
+        let timeline = centroid_timeline(vec![(0, vec![0.6, 0.8])]);
+        let payload = SpeakerEmbeddingPayload::from_timeline(&timeline, &embedder)
+            .expect("matching dims")
+            .expect("centroids present");
+        let transcription = Transcription {
+            text: "hello".to_string(),
+            speaker_embeddings: Some(payload),
+            ..Default::default()
+        };
+        let rendered =
+            crate::render_transcription(&transcription, crate::ResponseFormat::VerboseJson)
+                .expect("verbose_json should render");
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("json");
+        assert_eq!(
+            parsed["speaker_embedding_space"]["normalization"], "l2",
+            "wire contract claims l2: {rendered}"
+        );
+        let vector = parsed["speaker_embeddings"]["SPEAKER_00"]
+            .as_array()
+            .unwrap_or_else(|| panic!("missing SPEAKER_00 vector: {rendered}"));
+        assert_eq!(
+            vector.len(),
+            parsed["speaker_embedding_space"]["dim"]
+                .as_u64()
+                .expect("dim") as usize,
+            "space.dim must match vector length: {rendered}"
+        );
+        let norm = vector
+            .iter()
+            .map(|value| {
+                let x = value.as_f64().expect("f32 component") as f32;
+                x * x
+            })
+            .sum::<f32>()
+            .sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-5,
+            "verbose_json claimed l2 but SPEAKER_00 has L2={norm}: {rendered}"
+        );
     }
 }

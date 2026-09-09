@@ -29,8 +29,11 @@ use super::native_execution_services::{
 
 /// Schema marker for the phase-0 in-process ownership evidence.
 pub const RUNTIME_RECEIPT_SCHEMA: &str = "openasr.runtime-ownership-receipt.v1";
-const DEFAULT_EVENT_CAPACITY: usize = 256;
-const MAX_EVENT_CAPACITY: usize = 4096;
+/// One advertised short-audio family decode currently emits ~14k owner/resource
+/// events at ggml-context granularity. The ring must hold that request window;
+/// overflow remains fail-closed for qualification.
+const DEFAULT_EVENT_CAPACITY: usize = 16_384;
+const MAX_EVENT_CAPACITY: usize = 32_768;
 const MAX_LIVE_OWNERS: usize = 1024;
 const MAX_RESOURCES_PER_OWNER: usize = 256;
 
@@ -447,7 +450,10 @@ impl RuntimeReceiptCollector {
                 next_resource_ordinal: AtomicU64::new(next_resource_ordinal),
                 identity_exhausted: false,
                 live_owners: BTreeMap::new(),
-                events: VecDeque::with_capacity(event_capacity),
+                // Bound is enforced on push; pre-filling 16k large events
+                // would commit a constant ~host-MiB tax on every NES root
+                // even when the request emits far fewer events.
+                events: VecDeque::new(),
                 dropped_events: 0,
                 dropped_owners: 0,
                 rejected_resources: 0,
@@ -987,6 +993,21 @@ impl RuntimeReceiptCollector {
                 request_attempt_id,
             },
         );
+    }
+
+    /// Start a request-local event window. Live owners stay; the bounded ring
+    /// and drop counters reset so one request cannot inherit another request's
+    /// overflow. Qualification still fails if this window itself overflows.
+    pub(crate) fn begin_request_event_window(&self) {
+        let mut state = self.lock_state();
+        if !self.state_is_available(&state) {
+            return;
+        }
+        state.events.clear();
+        state.dropped_events = 0;
+        state.dropped_notifications = 0;
+        state.event_history_complete = true;
+        state.event_history_reason = None;
     }
 
     /// Returns a bounded immutable diagnostic snapshot. It has no effect on
@@ -1583,6 +1604,23 @@ mod tests {
     }
 
     #[test]
+    fn request_event_window_clears_overflow_without_dropping_live_owners() {
+        let collector = collector(2);
+        let first = owner(&collector);
+        drop(first);
+        let live = owner(&collector);
+        live.record_reuse(None);
+        assert!(!collector.snapshot().completeness.event_history_complete);
+        collector.begin_request_event_window();
+        let snapshot = collector.snapshot();
+        assert!(snapshot.completeness.event_history_complete);
+        assert_eq!(snapshot.completeness.dropped_events, 0);
+        assert!(snapshot.events.is_empty());
+        assert_eq!(snapshot.live_owners.len(), 1);
+        drop(live);
+    }
+
+    #[test]
     fn ring_overflow_marks_snapshot_incomplete_without_unbounded_growth() {
         let collector = collector(2);
         let first = owner(&collector);
@@ -1608,6 +1646,19 @@ mod tests {
             LeaseReceiptShadow::Matched,
             "bounded event history must not invalidate the authoritative live owner table"
         );
+    }
+
+    #[test]
+    fn event_ring_does_not_preallocate_the_advertised_capacity() {
+        let collector =
+            RuntimeReceiptCollector::new_for_test(scope(), DEFAULT_EVENT_CAPACITY).unwrap();
+        assert_eq!(
+            collector.lock_state().events.capacity(),
+            0,
+            "empty collector must not commit DEFAULT_EVENT_CAPACITY event slots"
+        );
+        assert_eq!(collector.summary().event_capacity, DEFAULT_EVENT_CAPACITY);
+        assert_eq!(collector.summary().event_count, 0);
     }
 
     #[test]

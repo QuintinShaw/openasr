@@ -313,12 +313,27 @@ pub struct NativeAsrRequestOptions {
     /// `arch::SpeakerSegmentationSource`, and whether the turns can be matched
     /// to known people additionally depends on an installed speaker embedder.
     pub voice_id: bool,
+    /// Anonymous speaker separation without enrolled-person matching. Remote
+    /// compute carries this across the native offline round-trip so file
+    /// `diarize=true` does not collapse to `SpeakerPlan::Off`.
+    pub anonymous_diarize: bool,
+    /// Exact speaker-count hint for the external clustering path. Carried with
+    /// the Voice ID / anonymous-diarize flags so the server rebuild does not
+    /// drop `speakers`.
+    pub diarize_speakers: Option<u8>,
+    /// Opt-in per-speaker embeddings. Carried across the native offline
+    /// round-trip so the server rebuild does not drop
+    /// `return_speaker_embeddings`.
+    pub return_speaker_embeddings: bool,
     pub partial_results: bool,
     pub word_timestamps: bool,
     /// Opt-in `--word-timestamps=aligned` / `word_aligned` refinement tier;
     /// see `TranscriptionRequest::word_timestamps_refine`. Offline-only:
     /// streaming sessions never consult this field.
     pub word_timestamps_refine: bool,
+    /// Public execution target, including a physical GPU id. When set, native
+    /// streaming uses Exact pin instead of the coarse hardware target.
+    pub execution_target: Option<crate::ExecutionTarget>,
 }
 
 impl NativeAsrRequestOptions {
@@ -356,6 +371,21 @@ impl NativeAsrRequestOptions {
         self
     }
 
+    pub fn with_anonymous_diarize(mut self, anonymous_diarize: bool) -> Self {
+        self.anonymous_diarize = anonymous_diarize;
+        self
+    }
+
+    pub fn with_diarize_speakers(mut self, diarize_speakers: Option<u8>) -> Self {
+        self.diarize_speakers = diarize_speakers;
+        self
+    }
+
+    pub fn with_return_speaker_embeddings(mut self, return_speaker_embeddings: bool) -> Self {
+        self.return_speaker_embeddings = return_speaker_embeddings;
+        self
+    }
+
     pub fn with_partial_results(mut self, partial_results: bool) -> Self {
         self.partial_results = partial_results;
         self
@@ -368,6 +398,14 @@ impl NativeAsrRequestOptions {
 
     pub fn with_word_timestamps_refine(mut self, word_timestamps_refine: bool) -> Self {
         self.word_timestamps_refine = word_timestamps_refine;
+        self
+    }
+
+    pub fn with_execution_target(
+        mut self,
+        execution_target: Option<crate::ExecutionTarget>,
+    ) -> Self {
+        self.execution_target = execution_target;
         self
     }
 }
@@ -406,6 +444,10 @@ pub struct NativeAsrOfflineRequest {
     /// not exposed as a multipart/per-job option.
     #[doc(hidden)]
     pub voice_id_segmenter: crate::config::VoiceIdSegmenterPreference,
+    /// Persisted speaker-embedder preference carried across the server's
+    /// native offline adapter round-trip.
+    #[doc(hidden)]
+    pub voice_id_embedder: crate::config::VoiceIdEmbedderPreference,
     /// Cancel/pause/resume control and request id for this decode -- same
     /// "explicit, never TLS" contract as
     /// [`crate::TranscriptionRequest::execution_context`], which this carries
@@ -420,6 +462,10 @@ pub struct NativeAsrOfflineRequest {
     /// serial width of 1, and serve-batch never engages on the server path.
     /// `None` leaves the consumer at its serial default.
     pub serve_batch_max_native_sessions: Option<usize>,
+    /// Optional public execution target, including a physical GPU id. When
+    /// set, native transcribe uses this instead of the coarse hardware target
+    /// so Exact pins survive the offline round-trip.
+    pub execution_target: Option<crate::ExecutionTarget>,
 }
 
 impl NativeAsrOfflineRequest {
@@ -435,11 +481,13 @@ impl NativeAsrOfflineRequest {
             source_container: None,
             prepared_samples: None,
             voice_id_segmenter: crate::config::VoiceIdSegmenterPreference::Auto,
+            voice_id_embedder: crate::config::VoiceIdEmbedderPreference::ReDimNet2,
             execution_context: Arc::new(crate::RequestExecutionContext::uncancellable(
                 "NativeAsrOfflineRequest::new()'s pre-opt-in default; a caller needing \
                  cancellation attaches a real context via with_execution_context",
             )),
             serve_batch_max_native_sessions: None,
+            execution_target: None,
         }
     }
 
@@ -459,12 +507,29 @@ impl NativeAsrOfflineRequest {
         self
     }
 
+    #[doc(hidden)]
+    pub fn with_voice_id_embedder(
+        mut self,
+        preference: crate::config::VoiceIdEmbedderPreference,
+    ) -> Self {
+        self.voice_id_embedder = preference;
+        self
+    }
+
     /// Attaches the explicit cancel/pause/resume context for this request.
     pub fn with_execution_context(
         mut self,
         execution_context: Arc<crate::RequestExecutionContext>,
     ) -> Self {
         self.execution_context = execution_context;
+        self
+    }
+
+    pub fn with_execution_target(
+        mut self,
+        execution_target: Option<crate::ExecutionTarget>,
+    ) -> Self {
+        self.execution_target = execution_target;
         self
     }
 

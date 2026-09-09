@@ -8,6 +8,7 @@ from b2_sync import (
     B2Client,
     B2Credentials,
     B2SyncError,
+    SHA256_META_HEADER,
     amz_date_parts,
     build_canonical_request,
     canonical_uri,
@@ -222,6 +223,21 @@ class DecideImmutabilityActionTest(unittest.TestCase):
         with self.assertRaises(B2SyncError):
             decide_immutability_action(remote, 10, "abc123")
 
+    def test_skip_when_sha256_metadata_matches(self) -> None:
+        payload = b"same-bytes"
+        digest = hashlib.sha256(payload).hexdigest()
+        remote = {"size": len(payload), "etag": '"not-the-md5"', "sha256": digest}
+        self.assertEqual(
+            decide_immutability_action(remote, len(payload), "abc123", digest),
+            "skip",
+        )
+
+    def test_raises_when_sha256_metadata_differs(self) -> None:
+        remote = {"size": 10, "etag": '"ignored"', "sha256": "ab" * 32}
+        with self.assertRaises(B2SyncError) as ctx:
+            decide_immutability_action(remote, 10, "abc123", "cd" * 32)
+        self.assertIn("sha256", str(ctx.exception))
+
 
 class FakeTransport:
     """In-memory stand-in for b2_sync.Transport -- lets sync_files be tested
@@ -229,6 +245,8 @@ class FakeTransport:
 
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
+        self.meta: dict[str, dict[str, str]] = {}
+        self.etags: dict[str, str] = {}
         self.requests: list[tuple[str, str]] = []
 
     def request(self, method, url, headers, body):
@@ -237,15 +255,27 @@ class FakeTransport:
         key = url.split("/", 3)[-1]
         if method == "HEAD":
             if key not in self.objects:
-                return 404, {}
+                return 404, {}, b""
             data = self.objects[key]
-            return 200, {
+            response_headers = {
                 "Content-Length": str(len(data)),
-                "ETag": f'"{hashlib.md5(data).hexdigest()}"',
+                "ETag": self.etags.get(key, f'"{hashlib.md5(data).hexdigest()}"'),
             }
+            response_headers.update(self.meta.get(key, {}))
+            return 200, response_headers, b""
+        if method == "GET":
+            if key not in self.objects:
+                return 404, {}, b""
+            return 200, {"Content-Length": str(len(self.objects[key]))}, self.objects[key]
         if method == "PUT":
             self.objects[key] = body
-            return 200, {}
+            stored_meta = {}
+            for name, value in headers.items():
+                if name.lower() == SHA256_META_HEADER:
+                    stored_meta[SHA256_META_HEADER] = value
+            self.meta[key] = stored_meta
+            self.etags[key] = f'"{hashlib.md5(body).hexdigest()}"'
+            return 200, {}, b""
         raise AssertionError(f"unexpected method: {method}")
 
 
@@ -311,6 +341,41 @@ class SyncFilesTest(unittest.TestCase):
         client, _ = _fake_client()
         with self.assertRaises(B2SyncError):
             sync_files(client, "0.1.10", [self.dist_dir / "does-not-exist.zip"])
+
+    def test_put_records_sha256_user_metadata(self) -> None:
+        client, transport = _fake_client()
+        payload = b'{"schema_version":1}'
+        path = self._write("backend-pack-cuda-sm_86.json", payload)
+
+        sync_files(client, "0.1.10", [path])
+
+        key = "core/v0.1.10/backend-pack-cuda-sm_86.json"
+        self.assertEqual(transport.meta[key][SHA256_META_HEADER], hashlib.sha256(payload).hexdigest())
+
+    def test_skip_when_legacy_multipart_etag_matches_downloaded_sha256(self) -> None:
+        client, transport = _fake_client()
+        payload = b"multipart-identical-bytes"
+        path = self._write("backend-pack-cuda-sm_86.json", payload)
+        key = "core/v0.1.10/backend-pack-cuda-sm_86.json"
+        transport.objects[key] = payload
+        transport.etags[key] = '"abc123def456-3"'
+
+        urls = sync_files(client, "0.1.10", [path])
+
+        self.assertEqual(urls, ["https://dl.openasr.org/core/v0.1.10/backend-pack-cuda-sm_86.json"])
+        self.assertEqual(sum(1 for method, _ in transport.requests if method == "GET"), 1)
+        self.assertEqual(sum(1 for method, _ in transport.requests if method == "PUT"), 0)
+
+    def test_refuses_legacy_multipart_etag_when_downloaded_bytes_differ(self) -> None:
+        client, transport = _fake_client()
+        path = self._write("backend-pack-cuda-sm_86.json", b"local-bytes")
+        key = "core/v0.1.10/backend-pack-cuda-sm_86.json"
+        transport.objects[key] = b"remote-different-bytes"
+        transport.etags[key] = '"abc123def456-3"'
+
+        with self.assertRaises(B2SyncError):
+            sync_files(client, "0.1.10", [path])
+        self.assertEqual(sum(1 for method, _ in transport.requests if method == "PUT"), 0)
 
 
 if __name__ == "__main__":

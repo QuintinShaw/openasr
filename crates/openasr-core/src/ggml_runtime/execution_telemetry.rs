@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 /// Aggregated execution placement observed from actual graph computes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GgmlExecutionPlacementSummary {
     pub direct_graph_computes: u64,
     pub scheduler_graph_computes: u64,
@@ -34,6 +35,7 @@ pub struct GgmlExecutionPlacementSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GgmlExecutionNodeSample {
     pub name: String,
     pub op: String,

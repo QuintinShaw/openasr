@@ -9,6 +9,7 @@ use std::{
         Arc, Barrier, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -247,6 +248,13 @@ struct RangeServerClient {
     etags: Arc<Vec<String>>,
     calls: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<(u64, Option<u64>)>>>,
+    /// Per-range status queue consumed before a successful 206. Used to
+    /// inject a 503 (or other) on a specific segment without depending on
+    /// worker scheduling order.
+    fail_queue: Arc<Mutex<HashMap<(u64, Option<u64>), VecDeque<u16>>>>,
+    /// Hard ceiling so an infinite segment-retry mutant panics the test
+    /// instead of spinning until cargo-mutants times out.
+    call_ceiling: Arc<AtomicUsize>,
 }
 
 impl RangeServerClient {
@@ -257,7 +265,22 @@ impl RangeServerClient {
             etags: Arc::new(vec!["etag-a".to_string()]),
             calls: Arc::new(AtomicUsize::new(0)),
             requests: Arc::new(Mutex::new(Vec::new())),
+            fail_queue: Arc::new(Mutex::new(HashMap::new())),
+            call_ceiling: Arc::new(AtomicUsize::new(64)),
         }
+    }
+
+    fn fail_range(self, start: u64, end: Option<u64>, statuses: &[u16]) -> Self {
+        self.fail_queue
+            .lock()
+            .unwrap()
+            .insert((start, end), statuses.iter().copied().collect());
+        self
+    }
+
+    fn with_call_ceiling(self, ceiling: usize) -> Self {
+        self.call_ceiling.store(ceiling, Ordering::SeqCst);
+        self
     }
 
     fn without_range_support(self) -> Self {
@@ -286,10 +309,31 @@ impl DownloadClient for RangeServerClient {
         range: Option<ByteRange>,
     ) -> Result<DownloadResponse, PullError> {
         let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
-        self.requests.lock().unwrap().push((
+        let ceiling = self.call_ceiling.load(Ordering::SeqCst);
+        assert!(
+            call_index < ceiling,
+            "RangeServerClient exceeded call ceiling {ceiling} (infinite retry?)"
+        );
+        let recorded = (
             range.map(|r| r.start).unwrap_or(0),
             range.and_then(|r| r.end),
-        ));
+        );
+        self.requests.lock().unwrap().push(recorded);
+        if let Some(status) = self
+            .fail_queue
+            .lock()
+            .unwrap()
+            .get_mut(&recorded)
+            .and_then(VecDeque::pop_front)
+        {
+            return Ok(DownloadResponse {
+                status,
+                content_length: Some(0),
+                content_range: None,
+                etag: Some("etag-a".to_string()),
+                reader: Box::new(Cursor::new(Vec::new())),
+            });
+        }
         let etag = self.etags[call_index.min(self.etags.len() - 1)].clone();
         let total = self.bytes.len() as u64;
         if !self.supports_range.load(Ordering::SeqCst) || range.is_none() {
@@ -328,7 +372,7 @@ fn small_segment_bytes(total: usize, segments: u64) -> u64 {
 fn parallel_test_options(segment_bytes: u64) -> PullOptions {
     PullOptions {
         parallel_segment_bytes_override: Some(segment_bytes),
-        ..PullOptions::default()
+        ..PullOptions::for_tests()
     }
 }
 
@@ -426,6 +470,7 @@ fn catalog_for_resolved(resolved: &ResolvedCatalogPull) -> ModelCatalog {
         generated_at: "2026-06-08T00:00:00Z".to_string(),
         catalog_url: "fixture".to_string(),
         backends: Vec::new(),
+        execution_approvals: None,
         language_labels: std::collections::BTreeMap::new(),
         models: vec![CatalogModel {
             id: resolved.model_id.clone(),
@@ -599,6 +644,7 @@ fn hf_token_only_attaches_to_the_huggingface_host() {
     assert!(!hf_token_allowed_for_host(Some("cdn-lfs.huggingface.co")));
     assert!(!hf_token_allowed_for_host(Some("hf-mirror.com")));
     assert!(!hf_token_allowed_for_host(Some("modelscope.cn")));
+    assert!(!hf_token_allowed_for_host(Some("www.modelscope.cn")));
     // The weights worker and the Xet CDN it forwards to are always anonymous.
     assert!(!hf_token_allowed_for_host(Some("weights.openasr.org")));
     assert!(!hf_token_allowed_for_host(Some("us.aws.cdn.hf.co")));
@@ -688,7 +734,7 @@ fn pull_installs_valid_pack_and_writes_record() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |event| events.push(event),
     )
     .unwrap();
@@ -898,7 +944,7 @@ fn capability_pack_stays_pullable_and_importable_by_digest() {
         &from_catalog,
         pull_home.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap();
@@ -936,7 +982,7 @@ fn pull_falls_back_to_next_source_after_sha_mismatch() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         &[DownloadSource::Hf, DownloadSource::HfMirror],
         None,
         None,
@@ -960,6 +1006,46 @@ fn pull_falls_back_to_next_source_after_sha_mismatch() {
 }
 
 #[test]
+fn china_chain_tries_modelscope_before_direct_hf() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let mut client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 404,
+            body: Vec::new(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: bytes.clone(),
+        },
+    ]);
+
+    let installed = pull_model_pack_with_client_sources_and_cancel(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::for_tests(),
+        &[DownloadSource::ModelScope, DownloadSource::Hf],
+        None,
+        None,
+        |_| {},
+        || false,
+        || false,
+    )
+    .unwrap();
+
+    assert_eq!(installed.pull, "moonshine-tiny:q8");
+    assert_eq!(
+        client.urls(),
+        vec![
+            "https://www.modelscope.cn/models/openasr/moonshine-tiny/resolve/master/moonshine-tiny-q8_0.oasr".to_string(),
+            resolved.url.clone(),
+        ]
+    );
+}
+
+#[test]
 fn pinned_source_does_not_fallback_after_sha_mismatch() {
     let bytes = tiny_pack_bytes();
     let resolved = resolved_for(&bytes);
@@ -975,7 +1061,7 @@ fn pinned_source_does_not_fallback_after_sha_mismatch() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         &[DownloadSource::Hf],
         None,
         None,
@@ -1017,7 +1103,7 @@ fn pull_does_not_fallback_after_gguf_preflight_failure() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         &[DownloadSource::Hf, DownloadSource::HfMirror],
         None,
         None,
@@ -1069,7 +1155,7 @@ fn pull_does_not_fallback_after_runtime_validation_failure() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         &[DownloadSource::Hf, DownloadSource::HfMirror],
         None,
         None,
@@ -1109,7 +1195,7 @@ fn pull_falls_back_to_hf_mirror_after_weights_404() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         &[DownloadSource::Weights, DownloadSource::HfMirror],
         None,
         None,
@@ -1152,7 +1238,7 @@ fn pull_falls_back_to_next_source_after_403_forbidden() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         &[DownloadSource::Hf, DownloadSource::HfMirror],
         None,
         None,
@@ -1192,7 +1278,7 @@ fn pull_does_not_fallback_after_400_bad_request() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         &[DownloadSource::Hf, DownloadSource::HfMirror],
         None,
         None,
@@ -1229,7 +1315,7 @@ fn pull_does_not_fallback_after_401_unauthorized() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         &[DownloadSource::Hf, DownloadSource::HfMirror],
         None,
         None,
@@ -1265,7 +1351,7 @@ fn pull_cancel_cleans_partial_download() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |event| {
             if matches!(event, PullProgress::Downloading { .. }) {
                 cancel_on_progress.store(true, Ordering::SeqCst);
@@ -1299,7 +1385,7 @@ fn pull_pause_preserves_partial_download() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |event| {
             if matches!(event, PullProgress::Downloading { .. }) {
                 pause_on_progress.store(true, Ordering::SeqCst);
@@ -1321,7 +1407,7 @@ fn pull_pause_preserves_partial_download() {
         &resolved,
         temp.path(),
         &mut resume_client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap();
@@ -1349,7 +1435,7 @@ fn pull_cancel_pause_race_cancel_wins_and_cleans_partial_download() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |event| {
             if !matches!(event, PullProgress::Downloading { .. }) {
                 return;
@@ -1412,7 +1498,7 @@ fn pull_resumes_partial_when_server_returns_206() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap();
@@ -1451,7 +1537,7 @@ fn pull_keeps_partial_when_meta_url_came_from_another_download_source() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap();
@@ -1483,7 +1569,7 @@ fn pull_restarts_partial_when_server_returns_200() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap();
@@ -1513,7 +1599,7 @@ fn pull_restarts_partial_when_content_range_does_not_match_resume() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap();
@@ -1548,7 +1634,7 @@ fn pull_discards_partial_when_metadata_does_not_match_target() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap();
@@ -1572,7 +1658,7 @@ fn pull_rejects_sha_mismatch_and_removes_partial() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap_err();
@@ -1667,7 +1753,7 @@ fn download_response_rejects_fresh_content_length_mismatch_before_reading() {
         &paths,
         0,
         response,
-        &PullOptions::default(),
+        &PullOptions::for_tests(),
         &mut progress,
         &|| false,
         &|| false,
@@ -1708,7 +1794,7 @@ fn pull_retries_server_error_and_resumes_successfully() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap();
@@ -1728,7 +1814,7 @@ fn pull_retries_body_read_timeout_and_restarts_safely() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap();
@@ -1751,7 +1837,7 @@ fn pull_retries_low_speed_body_and_restarts_safely() {
         PullOptions {
             low_speed_timeout: Duration::ZERO,
             low_speed_min_bytes: 2,
-            ..PullOptions::default()
+            ..PullOptions::for_tests()
         },
         |_| {},
     )
@@ -1771,7 +1857,7 @@ fn pull_retries_low_speed_body_and_restarts_safely() {
 fn zero_window_options() -> PullOptions {
     PullOptions {
         segment_low_speed_timeout: Duration::ZERO,
-        ..PullOptions::default()
+        ..PullOptions::for_tests()
     }
 }
 
@@ -1954,7 +2040,7 @@ fn pull_rejects_non_https_url_before_downloading() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap_err();
@@ -1975,7 +2061,7 @@ fn pull_rejects_path_traversal_target_before_downloading() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap_err();
@@ -2008,7 +2094,7 @@ fn pull_rejects_symlinked_model_storage_dir_before_downloading() {
         &resolved,
         &home,
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap_err();
@@ -2036,7 +2122,7 @@ fn pull_rejects_symlinked_quant_storage_dir_before_downloading() {
         &resolved,
         &home,
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap_err();
@@ -2060,7 +2146,7 @@ fn pull_lock_blocks_second_writer() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap_err();
@@ -2134,7 +2220,7 @@ fn pull_rejects_corrupt_gguf_before_installing() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap_err();
@@ -2278,7 +2364,7 @@ fn pull_rejects_truncated_immutable_object_without_replacing_it() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap_err();
@@ -2397,6 +2483,144 @@ fn installed_matches_rejects_a_size_mismatch_on_the_stat_alone() {
     assert!(!installed_matches(&target, &paths).unwrap());
 }
 
+/// Re-pulling a pack whose installed object matches the catalog SHA-256 must
+/// skip the download, re-run the pack verifier, and refresh the install
+/// record. The empty FakeClient panics if the download path is entered.
+#[test]
+fn pull_skips_download_when_installed_pack_hash_matches() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let mut client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: bytes.clone(),
+    }]);
+    let mut first_events = Vec::new();
+    let first = pull_model_pack_with_client(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::for_tests(),
+        |event| first_events.push(event),
+    )
+    .unwrap();
+    assert!(
+        first_events
+            .iter()
+            .any(|event| matches!(event, PullProgress::Installed { .. }))
+    );
+    assert!(!client.ranges().is_empty());
+
+    let mut client = FakeClient::default();
+    let mut second_events = Vec::new();
+    let second = pull_model_pack_with_client(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::for_tests(),
+        |event| second_events.push(event),
+    )
+    .unwrap();
+
+    assert!(
+        client.ranges().is_empty(),
+        "matching digest must not open a download"
+    );
+    assert!(
+        second_events
+            .iter()
+            .any(|event| matches!(event, PullProgress::UsingInstalled { .. }))
+    );
+    assert!(!second_events.iter().any(|event| matches!(
+        event,
+        PullProgress::DownloadStarted { .. } | PullProgress::Downloading { .. }
+    )));
+    assert_eq!(second.sha256, first.sha256);
+    assert_eq!(second.path, first.path);
+    assert!(
+        paths_for(temp.path(), &resolved)
+            .installed_meta_path
+            .exists()
+    );
+}
+
+/// A file sitting at the catalog filename is not identity. Skip only when
+/// the content-addressed object matches the catalog digest.
+#[test]
+fn pull_downloads_when_only_catalog_filename_is_present() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let decoy = temp
+        .path()
+        .join("models")
+        .join(&resolved.model_id)
+        .join(&resolved.quant)
+        .join(&resolved.filename);
+    fs::create_dir_all(decoy.parent().unwrap()).unwrap();
+    fs::write(&decoy, b"not-the-catalog-pack").unwrap();
+
+    let mut client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: bytes.clone(),
+    }]);
+    let mut events = Vec::new();
+    let installed = pull_model_pack_with_client(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::for_tests(),
+        |event| events.push(event),
+    )
+    .unwrap();
+
+    assert!(!client.ranges().is_empty());
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, PullProgress::DownloadStarted { .. }))
+    );
+    assert_eq!(fs::read(&installed.path).unwrap(), bytes);
+    assert_eq!(fs::read(&decoy).unwrap(), b"not-the-catalog-pack");
+}
+
+/// Unsealed bytes at the catalog object path that do not hash to the catalog
+/// digest must not skip the download. Filename and path are not identity.
+#[test]
+fn pull_does_not_skip_download_when_unsealed_object_hash_mismatches() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let target = PullTarget::from_resolved(&resolved).unwrap();
+    let paths = pull_paths(temp.path(), &target).unwrap();
+    let mut decoy = bytes.clone();
+    *decoy.last_mut().unwrap() ^= 0xff;
+    assert_ne!(sha256_hex(&decoy), resolved.sha256);
+    seed_final_object(&paths, &decoy, false);
+
+    let mut client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: bytes.clone(),
+    }]);
+    let result = pull_model_pack_with_client(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::for_tests(),
+        |_| {},
+    );
+
+    assert!(
+        !client.ranges().is_empty(),
+        "hash mismatch must re-enter the download path"
+    );
+    // The content store refuses to replace a digest object whose on-disk
+    // bytes do not match the digest in its path. Fail closed rather than
+    // treating the corrupt object as installed.
+    assert!(result.is_err());
+    assert_eq!(fs::read(&paths.final_path).unwrap(), decoy);
+}
+
 /// `config.json`'s `models_dir` field must be the single thing that decides
 /// where a pack lands and where `list_installed_packs` looks for it -- a
 /// redirected home must land the pack entirely outside `<home>/models` and
@@ -2425,7 +2649,7 @@ fn config_models_dir_redirects_pull_and_list() {
         &resolved,
         home.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap();
@@ -2472,7 +2696,7 @@ fn pull_checks_available_space_before_download() {
         &mut client,
         PullOptions {
             available_space_override: Some(1),
-            ..PullOptions::default()
+            ..PullOptions::for_tests()
         },
         |_| {},
     )
@@ -2548,7 +2772,7 @@ fn remove_model_pack_deletes_installed_quant() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap();
@@ -2575,7 +2799,7 @@ fn remove_model_pack_deletes_empty_model_dir() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap();
@@ -2610,9 +2834,14 @@ fn remove_model_pack_keeps_model_dir_when_sibling_quant_remains() {
         status: 200,
         body: bytes.clone(),
     }]);
-    let first =
-        pull_model_pack_with_client(&resolved, home, &mut client, PullOptions::default(), |_| {})
-            .unwrap();
+    let first = pull_model_pack_with_client(
+        &resolved,
+        home,
+        &mut client,
+        PullOptions::for_tests(),
+        |_| {},
+    )
+    .unwrap();
 
     // A second quant of the same model, published as a ref against the very
     // same object. Deduplication makes this the interesting case: removing one
@@ -2674,7 +2903,7 @@ fn resolve_installed_pack_reference_matches_quant_aliases() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap();
@@ -2740,7 +2969,7 @@ fn remove_model_pack_deletes_installed_quant_by_canonical_quant_alias() {
         &resolved,
         temp.path(),
         &mut client,
-        PullOptions::default(),
+        PullOptions::for_tests(),
         |_| {},
     )
     .unwrap();
@@ -2778,6 +3007,7 @@ fn installed_pack_alias_catalog() -> ModelCatalog {
         generated_at: "2026-06-04T00:00:00Z".to_string(),
         catalog_url: "fixture".to_string(),
         backends: Vec::new(),
+        execution_approvals: None,
         language_labels: std::collections::BTreeMap::new(),
         models: vec![CatalogModel {
             id: "qwen3-asr-0.6b".to_string(),
@@ -2963,6 +3193,187 @@ fn tensile_zip_bytes() -> Vec<u8> {
     buf
 }
 
+fn backend_zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+        for (name, bytes) in entries {
+            writer
+                .start_file(*name, zip::write::FileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    buf
+}
+
+#[test]
+fn qualification_archive_uses_signed_url_fallback_and_exact_unpacked_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let payload = b"signed runtime";
+    let archive = backend_zip_bytes(&[("runtime.dll", payload)]);
+    let artifact = QualificationArtifact {
+        file_name: "vendor.zip".to_string(),
+        format: QualificationArtifactFormat::ZipArchive,
+        sha256: sha256_hex(&archive),
+        size_bytes: archive.len() as u64,
+        unpacked_size_bytes: Some(payload.len() as u64),
+        unpacked_tree_sha256: Some(materialized_tree_sha256(&[
+            InstalledBackendMaterializedFile {
+                relative_path: "runtime.dll".to_string(),
+                sha256: sha256_hex(payload),
+                size_bytes: payload.len() as u64,
+            },
+        ])),
+        urls: vec![
+            "https://primary.example/vendor.zip".to_string(),
+            "https://mirror.example/vendor.zip".to_string(),
+        ],
+    };
+    let mut client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 404,
+            body: Vec::new(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+    let prepared = prepare_qualification_archive(
+        &mut client,
+        &artifact,
+        &temp.path().join("objects"),
+        &mut |_| {},
+        &PullOptions::for_tests(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        client.urls(),
+        vec![
+            "https://primary.example/vendor.zip",
+            "https://mirror.example/vendor.zip"
+        ]
+    );
+    assert_eq!(prepared.materialized_files.len(), 1);
+    assert_eq!(
+        fs::read(prepared.payload_root.join("runtime.dll")).unwrap(),
+        payload
+    );
+}
+
+#[test]
+fn qualification_archive_repairs_a_content_object_missing_its_attested_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let payload = b"signed runtime";
+    let archive = backend_zip_bytes(&[("runtime.dll", payload)]);
+    let artifact = QualificationArtifact {
+        file_name: "vendor.zip".to_string(),
+        format: QualificationArtifactFormat::ZipArchive,
+        sha256: sha256_hex(&archive),
+        size_bytes: archive.len() as u64,
+        unpacked_size_bytes: Some(payload.len() as u64),
+        unpacked_tree_sha256: Some(materialized_tree_sha256(&[
+            InstalledBackendMaterializedFile {
+                relative_path: "runtime.dll".to_string(),
+                sha256: sha256_hex(payload),
+                size_bytes: payload.len() as u64,
+            },
+        ])),
+        urls: vec!["https://primary.example/vendor.zip".to_string()],
+    };
+    let objects_root = temp.path().join("objects");
+    let mut first = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: archive.clone(),
+    }]);
+    let prepared = prepare_qualification_archive(
+        &mut first,
+        &artifact,
+        &objects_root,
+        &mut |_| {},
+        &PullOptions::for_tests(),
+    )
+    .unwrap();
+    fs::remove_file(&prepared.source.path).unwrap();
+
+    let mut repair = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: archive,
+    }]);
+    let repaired = prepare_qualification_archive(
+        &mut repair,
+        &artifact,
+        &objects_root,
+        &mut |_| {},
+        &PullOptions::for_tests(),
+    )
+    .unwrap();
+    assert!(repaired.source.path.is_file());
+    assert_eq!(repair.urls(), vec!["https://primary.example/vendor.zip"]);
+}
+
+#[test]
+fn qualification_archive_rejects_a_signed_unpacked_size_that_does_not_match() {
+    let temp = tempfile::tempdir().unwrap();
+    let payload = b"runtime";
+    let archive = backend_zip_bytes(&[("runtime.dll", payload)]);
+    let artifact = QualificationArtifact {
+        file_name: "vendor.zip".to_string(),
+        format: QualificationArtifactFormat::ZipArchive,
+        sha256: sha256_hex(&archive),
+        size_bytes: archive.len() as u64,
+        unpacked_size_bytes: Some((payload.len() - 1) as u64),
+        unpacked_tree_sha256: Some(materialized_tree_sha256(&[
+            InstalledBackendMaterializedFile {
+                relative_path: "runtime.dll".to_string(),
+                sha256: sha256_hex(payload),
+                size_bytes: payload.len() as u64,
+            },
+        ])),
+        urls: vec!["https://primary.example/vendor.zip".to_string()],
+    };
+    let mut client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: archive,
+    }]);
+
+    assert!(matches!(
+        prepare_qualification_archive(
+            &mut client,
+            &artifact,
+            &temp.path().join("objects"),
+            &mut |_| {},
+            &PullOptions::for_tests(),
+        ),
+        Err(PullError::BackendFilePreflight { .. })
+    ));
+}
+
+#[test]
+fn backend_archive_rejects_windows_unsafe_and_case_colliding_entries_before_materializing() {
+    for entries in [
+        vec![("vendor/CON.dll", b"bad".as_slice())],
+        vec![
+            ("vendor/Runtime.dll", b"one".as_slice()),
+            ("vendor/runtime.DLL", b"two".as_slice()),
+        ],
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = backend_zip_bytes(&entries);
+        let zip_path = temp.path().join("vendor.zip");
+        fs::write(&zip_path, archive).unwrap();
+        let output = temp.path().join("output");
+        fs::create_dir(&output).unwrap();
+        assert!(matches!(
+            extract_backend_archive_with_expected_size(&zip_path, &output, "", None),
+            Err(PullError::BackendFilePreflight { .. })
+        ));
+    }
+}
+
 fn hip_pack_resolved(plugin: &[u8], archive: &[u8]) -> ResolvedCatalogBackendPull {
     let extracted_tree_sha256 = materialized_tree_sha256(&[InstalledBackendMaterializedFile {
         relative_path: "rocblas/library/Kernels.so-000-gfx1200.hsaco".to_string(),
@@ -2974,6 +3385,7 @@ fn hip_pack_resolved(plugin: &[u8], archive: &[u8]) -> ResolvedCatalogBackendPul
         vendor: CatalogBackendVendor::Hip,
         version: "0.13.1".to_string(),
         display_name: "AMD ROCm".to_string(),
+        min_cli_version: crate::current_cli_version().to_string(),
         host_abi: crate::backend_distribution::BackendHostAbi::current(),
         targets: vec!["gfx1200".to_string()],
         min_driver_api: Some("7.1.0".to_string()),
@@ -3065,6 +3477,23 @@ fn install_backend_pack_downloads_verifies_and_extracts() {
     assert_eq!(plan.required_download_bytes, 0);
     assert_eq!(plan.required_plugin_bytes, 0);
     assert_eq!(plan.required_vendor_bytes, 0);
+}
+
+#[test]
+fn install_backend_pack_rechecks_min_cli_version_before_writing_or_downloading() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let mut resolved = hip_pack_resolved(&plugin, &archive);
+    resolved.min_cli_version = "999.0.0".to_string();
+    let mut client = FakeClient::with_responses(Vec::new());
+
+    let error =
+        install_backend_pack_with_client(&resolved, home.path(), &mut client, |_| {}).unwrap_err();
+
+    assert!(matches!(error, PullError::BackendRequiresNewerCli { .. }));
+    assert!(client.urls().is_empty());
+    assert!(!home.path().join("backends").exists());
 }
 
 #[cfg(target_os = "windows")]
@@ -3547,17 +3976,210 @@ fn backend_store_gc_retains_requested_pack_and_its_shared_vendor_object() {
         Some(Duration::ZERO),
     )
     .unwrap();
-    assert!(!first_dir.exists());
+    assert!(
+        first_dir.is_dir(),
+        "unselected library packs must survive GC"
+    );
     assert!(second_dir.is_dir());
     assert!(object_dir.is_dir());
-    assert_eq!(report.removed_pack_directories, 1);
+    assert_eq!(report.removed_pack_directories, 0);
     assert_eq!(report.removed_content_objects, 0);
 
     let report = gc_backend_store(home.path(), Vec::new(), Some(Duration::ZERO)).unwrap();
-    assert!(!second_dir.exists());
-    assert!(!object_dir.exists());
+    assert!(first_dir.is_dir());
+    assert!(second_dir.is_dir());
+    assert!(object_dir.is_dir());
+    assert_eq!(report.removed_pack_directories, 0);
+    assert_eq!(report.removed_content_objects, 0);
+}
+
+#[test]
+fn backend_store_gc_reclaims_replaced_generation_of_the_same_pack() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let first = hip_pack_resolved(&plugin, &archive);
+    let mut first_client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: plugin.clone(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive.clone(),
+        },
+    ]);
+    install_backend_pack_with_client(&first, home.path(), &mut first_client, |_| {}).unwrap();
+
+    let mut second = first.clone();
+    second.version = "0.13.2".to_string();
+    let mut second_plugin = plugin.clone();
+    second_plugin.push(0x11);
+    second.files[0].sha256 = sha256_hex(&second_plugin);
+    second.files[0].size_bytes = second_plugin.len() as u64;
+    let mut second_client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: second_plugin,
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+    std::thread::sleep(Duration::from_millis(1100));
+    install_backend_pack_with_client(&second, home.path(), &mut second_client, |_| {}).unwrap();
+
+    let first_dir = backend_pack_install_dir(home.path(), &first).unwrap();
+    let second_dir = backend_pack_install_dir(home.path(), &second).unwrap();
+    let report = gc_backend_store(home.path(), Vec::new(), Some(Duration::ZERO)).unwrap();
+    assert!(!first_dir.exists(), "replaced generation must be reclaimed");
+    assert!(second_dir.is_dir(), "current generation must remain");
     assert_eq!(report.removed_pack_directories, 1);
-    assert_eq!(report.removed_content_objects, 1);
+}
+
+#[test]
+fn uninstall_backend_vendor_leaves_the_other_library_pack() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let hip = hip_pack_resolved(&plugin, &archive);
+    let mut hip_client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: plugin.clone(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive.clone(),
+        },
+    ]);
+    install_backend_pack_with_client(&hip, home.path(), &mut hip_client, |_| {}).unwrap();
+
+    let mut cuda = hip.clone();
+    cuda.backend_id = "cuda-ampere".to_string();
+    cuda.vendor = CatalogBackendVendor::Cuda;
+    cuda.files[0].filename = "ggml-cuda.dll".to_string();
+    let mut cuda_plugin = plugin.clone();
+    cuda_plugin.push(0x22);
+    cuda.files[0].sha256 = sha256_hex(&cuda_plugin);
+    cuda.files[0].size_bytes = cuda_plugin.len() as u64;
+    let mut cuda_client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: cuda_plugin,
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+    install_backend_pack_with_client(&cuda, home.path(), &mut cuda_client, |_| {}).unwrap();
+
+    let hip_dir = backend_pack_install_dir(home.path(), &hip).unwrap();
+    let cuda_dir = backend_pack_install_dir(home.path(), &cuda).unwrap();
+    uninstall_backend_packs_for_vendor(home.path(), CatalogBackendVendor::Cuda).unwrap();
+    assert!(hip_dir.is_dir());
+    assert!(!cuda_dir.exists());
+    let leftover = list_installed_backend_packs(home.path()).unwrap();
+    assert_eq!(leftover.len(), 1);
+    assert_eq!(leftover[0].vendor, "hip");
+}
+
+#[test]
+fn uninstall_backend_vendor_refuses_while_in_use() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let hip = hip_pack_resolved(&plugin, &archive);
+    let mut hip_client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: plugin.clone(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+    install_backend_pack_with_client(&hip, home.path(), &mut hip_client, |_| {}).unwrap();
+    let hip_dir = backend_pack_install_dir(home.path(), &hip).unwrap();
+    fs::create_dir_all(home.path().join("backends")).unwrap();
+    let sha = "a".repeat(64);
+    let active = crate::backend_distribution::ActivatedBackendPack {
+        schema_version: crate::backend_distribution::ACTIVATED_BACKEND_SCHEMA_VERSION,
+        backend_id: hip.backend_id.clone(),
+        vendor: CatalogBackendVendor::Hip,
+        version: hip.version.clone(),
+        artifact_fingerprint: "b".repeat(64),
+        host_abi_fingerprint: hip.host_abi.fingerprint.clone(),
+        device_target: "gfx1200".to_string(),
+        driver_version: "7.1.0".to_string(),
+        qualification_source_catalog_sha256: sha.clone(),
+        hardware_evidence_sha256: sha.clone(),
+        correctness_matrix_sha256: sha.clone(),
+        correctness_receipts_sha256: sha,
+        activated_at_unix_seconds: 1,
+    };
+    fs::write(
+        home.path().join("backends").join("active.json"),
+        serde_json::to_string(&active).unwrap(),
+    )
+    .unwrap();
+
+    let error =
+        uninstall_backend_packs_for_vendor(home.path(), CatalogBackendVendor::Hip).unwrap_err();
+    assert!(matches!(
+        error,
+        PullError::BackendPackInUse { vendor } if vendor == "hip"
+    ));
+    assert!(hip_dir.is_dir(), "in-use pack must stay installed");
+
+    crate::backend_distribution::deactivate_backend_pack(home.path()).unwrap();
+    uninstall_backend_packs_for_vendor(home.path(), CatalogBackendVendor::Hip).unwrap();
+    assert!(!hip_dir.exists());
+}
+
+#[test]
+fn install_backend_pack_from_local_path_does_not_activate() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let resolved = hip_pack_resolved(&plugin, &archive);
+    let source = home.path().join("usb");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("ggml-hip.dll"), &plugin).unwrap();
+    fs::write(source.join("rocblas-library.zip"), &archive).unwrap();
+
+    let installed =
+        install_backend_pack_from_local_path(&resolved, &source, home.path(), |_| {}).unwrap();
+    assert_eq!(installed.backend_id, "hip-radeon");
+    assert!(
+        backend_pack_install_dir(home.path(), &resolved)
+            .unwrap()
+            .join("ggml-hip.dll")
+            .is_file()
+    );
+    assert!(!home.path().join("backends").join("active.json").exists());
+}
+
+#[test]
+fn install_backend_pack_from_local_path_rejects_garbage() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let resolved = hip_pack_resolved(&plugin, &archive);
+    let source = home.path().join("usb");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("readme.txt"), b"not a pack").unwrap();
+    let error =
+        install_backend_pack_from_local_path(&resolved, &source, home.path(), |_| {}).unwrap_err();
+    assert!(matches!(error, PullError::BackendImportRejected { .. }));
+    assert!(
+        list_installed_backend_packs(home.path())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -3787,6 +4409,7 @@ fn backend_pack_resume_survives_process_boundary_metadata_reload() {
             &partial_meta,
             &mut expected_etag,
             &mut |_| {},
+            &PullOptions::for_tests(),
         )
         .is_err()
     );
@@ -3802,7 +4425,15 @@ fn backend_pack_resume_survives_process_boundary_metadata_reload() {
         attempts: 1,
         ranges: Vec::new(),
     };
-    download_backend_file(&mut replacement, file, &dest, &mut |_| {}).unwrap();
+    download_backend_file(
+        &mut replacement,
+        file,
+        &dest,
+        &mut |_| {},
+        None,
+        &PullOptions::for_tests(),
+    )
+    .unwrap();
     assert_eq!(replacement.ranges(), vec![Some(700)]);
     assert_eq!(fs::read(dest).unwrap(), plugin);
     assert!(!partial.exists());
@@ -5308,5 +5939,783 @@ fn model_store_lifecycle_converts_and_reclaims_a_leaking_store() {
     assert!(
         after < before,
         "the store must shrink (before {before}, after {after})"
+    );
+}
+
+#[test]
+fn retry_transient_io_succeeds_on_the_first_ok() {
+    let mut calls = 0;
+    let value = retry_transient_io(&ImmediateClock, || {
+        calls += 1;
+        Ok::<_, io::Error>(7)
+    })
+    .unwrap();
+    assert_eq!(value, 7);
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn retry_transient_io_does_not_retry_a_non_transient_error() {
+    let mut calls = 0;
+    let error = retry_transient_io(&ImmediateClock, || {
+        calls += 1;
+        Err::<(), _>(io::Error::from_raw_os_error(1))
+    })
+    .unwrap_err();
+    assert_eq!(calls, 1);
+    assert_eq!(error.raw_os_error(), Some(1));
+}
+
+#[cfg(windows)]
+#[test]
+fn retry_transient_io_gives_up_after_the_lock_budget() {
+    let mut calls = 0;
+    let error = retry_transient_io(&ImmediateClock, || {
+        calls += 1;
+        Err::<(), _>(io::Error::from_raw_os_error(32))
+    })
+    .unwrap_err();
+    assert_eq!(calls, 7);
+    assert_eq!(error.raw_os_error(), Some(32));
+}
+
+#[cfg(windows)]
+#[test]
+fn promote_backend_directory_copies_when_rename_stays_locked() {
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join("staging");
+    let dest = temp.path().join("final");
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join("ggml-cuda.dll"), b"plugin").unwrap();
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(dest.join("stale.dll"), b"stale").unwrap();
+
+    promote_backend_directory_with(
+        &staging,
+        &dest,
+        "fp",
+        |from, to| {
+            if from.ends_with("staging") {
+                return Err(io::Error::from_raw_os_error(5));
+            }
+            fs::rename(from, to)
+        },
+        super::fs_remove_dir_all,
+        &ImmediateClock,
+    )
+    .expect("locked rename must still promote by copying the readable staging tree");
+
+    assert_eq!(fs::read(dest.join("ggml-cuda.dll")).unwrap(), b"plugin");
+    assert!(!dest.join("stale.dll").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn promote_backend_directory_clears_dest_when_copy_fallback_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join("staging");
+    let dest = temp.path().join("final");
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join("ggml-cuda.dll"), b"plugin").unwrap();
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(dest.join("prior.dll"), b"prior").unwrap();
+
+    let error = promote_backend_directory_with(
+        &staging,
+        &dest,
+        "fp",
+        |from, to| {
+            if from.ends_with("staging") {
+                fs::create_dir_all(to.join("ggml-cuda.dll")).unwrap();
+                return Err(io::Error::from_raw_os_error(5));
+            }
+            fs::rename(from, to)
+        },
+        super::fs_remove_dir_all,
+        &ImmediateClock,
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("antivirus") && message.contains("Retry the install"),
+        "{message}"
+    );
+    assert_eq!(
+        fs::read(dest.join("prior.dll")).unwrap(),
+        b"prior",
+        "the previous install must be restored after a failed copy fallback"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Predicate matrix: decision functions tested directly so a mutated retry
+// / digest / fallback / verify predicate fails immediately instead of
+// hanging on real backoff or a real socket.
+// ---------------------------------------------------------------------------
+
+fn status_error(status: u16) -> PullError {
+    PullError::UnexpectedStatus {
+        url: "https://example.invalid/pack.oasr".to_string(),
+        status,
+    }
+}
+
+fn expected_download_backoff_sequence() -> Vec<Duration> {
+    (1..=DOWNLOAD_MAX_RETRIES).map(retry_backoff).collect()
+}
+
+#[test]
+fn retry_backoff_is_injected_and_does_not_sleep_under_the_test_clock() {
+    let clock = RecordingClock::new();
+    sleep_backoff(&clock, 1);
+    sleep_backoff(&clock, 5);
+    sleep_backoff(&clock, 8);
+    assert_eq!(
+        clock.sleeps(),
+        vec![retry_backoff(1), retry_backoff(5), retry_backoff(8),]
+    );
+    assert_eq!(retry_backoff(1), Duration::from_millis(500));
+    assert_eq!(retry_backoff(5), Duration::from_millis(5_000));
+    assert_eq!(retry_backoff(8), Duration::from_millis(5_000));
+}
+
+#[test]
+fn download_error_retry_and_source_fallback_matrix() {
+    struct Case {
+        name: &'static str,
+        error: PullError,
+        retry_same_source: bool,
+        fallback_to_next_source: bool,
+    }
+    let path = PathBuf::from("/tmp/openasr-predicate-matrix");
+    let cases = [
+        Case {
+            name: "http transport",
+            error: PullError::Http {
+                url: "https://example.invalid/pack.oasr".to_string(),
+                message: "reset".to_string(),
+            },
+            retry_same_source: true,
+            fallback_to_next_source: true,
+        },
+        Case {
+            name: "io",
+            error: PullError::Io {
+                path: path.clone(),
+                source: io::Error::other("disk"),
+            },
+            retry_same_source: true,
+            fallback_to_next_source: true,
+        },
+        Case {
+            name: "5xx",
+            error: status_error(503),
+            retry_same_source: true,
+            fallback_to_next_source: true,
+        },
+        Case {
+            name: "429",
+            error: status_error(429),
+            retry_same_source: false,
+            fallback_to_next_source: true,
+        },
+        Case {
+            name: "403",
+            error: status_error(403),
+            retry_same_source: false,
+            fallback_to_next_source: true,
+        },
+        Case {
+            name: "404",
+            error: status_error(404),
+            retry_same_source: false,
+            fallback_to_next_source: true,
+        },
+        Case {
+            name: "400",
+            error: status_error(400),
+            retry_same_source: false,
+            fallback_to_next_source: false,
+        },
+        Case {
+            name: "401",
+            error: status_error(401),
+            retry_same_source: false,
+            fallback_to_next_source: false,
+        },
+        Case {
+            name: "sha mismatch",
+            error: PullError::ShaMismatch {
+                path: path.clone(),
+                expected: "aa".repeat(32),
+                actual: "bb".repeat(32),
+            },
+            retry_same_source: false,
+            fallback_to_next_source: true,
+        },
+        Case {
+            name: "gguf preflight",
+            error: PullError::GgufPreflight {
+                path: path.clone(),
+                reason: "not a pack".to_string(),
+            },
+            retry_same_source: false,
+            fallback_to_next_source: false,
+        },
+        Case {
+            name: "runtime validation",
+            error: PullError::RuntimeValidation {
+                path,
+                reason: "family mismatch".to_string(),
+            },
+            retry_same_source: false,
+            fallback_to_next_source: false,
+        },
+    ];
+    for case in cases {
+        assert_eq!(
+            is_retryable_download_error(&case.error),
+            case.retry_same_source,
+            "{}: retry-same-source",
+            case.name
+        );
+        assert_eq!(
+            is_source_fallback_error(&case.error),
+            case.fallback_to_next_source,
+            "{}: fallback-to-next-source",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn same_source_retries_5xx_then_fails_closed_when_retries_are_exhausted() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let failures = (0..=DOWNLOAD_MAX_RETRIES)
+        .map(|_| ResponseSpec {
+            status: 503,
+            body: Vec::new(),
+        })
+        .collect();
+    let mut client = FakeClient::with_responses(failures);
+    let clock = Arc::new(RecordingClock::new());
+    let options = PullOptions {
+        time: clock.clone(),
+        ..PullOptions::for_tests()
+    };
+
+    let error = pull_model_pack_with_client(&resolved, temp.path(), &mut client, options, |_| {})
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        PullError::UnexpectedStatus { status: 503, .. }
+    ));
+    assert_eq!(client.urls().len(), DOWNLOAD_MAX_RETRIES + 1);
+    assert_eq!(clock.sleeps(), expected_download_backoff_sequence());
+    assert_no_partial_or_install(&paths_for(temp.path(), &resolved));
+}
+
+#[test]
+fn same_source_does_not_retry_a_client_4xx() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let mut client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 400,
+            body: b"bad request".to_vec(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: bytes,
+        },
+    ]);
+
+    let error = pull_model_pack_with_client(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::for_tests(),
+        |_| {},
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PullError::UnexpectedStatus { status: 400, .. }
+    ));
+    assert_eq!(client.urls().len(), 1, "400 must not retry the same source");
+    assert_no_partial_or_install(&paths_for(temp.path(), &resolved));
+}
+
+#[test]
+fn prepare_partial_for_resume_keeps_matching_bytes_and_discards_stale_or_orphan_state() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let target = PullTarget::from_resolved(&resolved).unwrap();
+    let paths = pull_paths(temp.path(), &target).unwrap();
+    fs::create_dir_all(&paths.dir).unwrap();
+
+    assert_eq!(prepare_partial_for_resume(&target, &paths).unwrap(), 0);
+
+    let split = bytes.len() / 2;
+    fs::write(&paths.partial_path, &bytes[..split]).unwrap();
+    write_partial_meta(
+        &paths.partial_meta_path,
+        &PartialMeta::for_target(&target, Some("etag-test".to_string()), split as u64),
+    )
+    .unwrap();
+    assert_eq!(
+        prepare_partial_for_resume(&target, &paths).unwrap(),
+        split as u64
+    );
+    assert!(paths.partial_path.exists());
+
+    let mut stale = target.clone();
+    stale.sha256 = "0".repeat(64);
+    write_partial_meta(
+        &paths.partial_meta_path,
+        &PartialMeta::for_target(&stale, Some("etag-test".to_string()), split as u64),
+    )
+    .unwrap();
+    assert_eq!(prepare_partial_for_resume(&target, &paths).unwrap(), 0);
+    assert!(!paths.partial_path.exists());
+    assert!(!paths.partial_meta_path.exists());
+
+    fs::write(&paths.partial_path, &bytes[..split]).unwrap();
+    assert_eq!(prepare_partial_for_resume(&target, &paths).unwrap(), 0);
+    assert!(
+        !paths.partial_path.exists(),
+        "a partial without metadata must be discarded, not resumed"
+    );
+}
+
+#[test]
+fn installed_digest_match_skips_download_mismatch_does_not() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let target = PullTarget::from_resolved(&resolved).unwrap();
+    let paths = pull_paths(temp.path(), &target).unwrap();
+    assert!(!installed_matches(&target, &paths).unwrap());
+
+    seed_final_object(&paths, &bytes, true);
+    assert!(installed_matches(&target, &paths).unwrap());
+
+    let mut other = target.clone();
+    other.sha256 = "ab".repeat(32);
+    other.size_bytes = bytes.len() as u64;
+    assert!(!installed_matches(&other, &paths).unwrap());
+}
+
+#[test]
+fn verify_partial_and_install_rejects_unverified_bytes_and_does_not_write_a_record() {
+    let garbage = b"this is not a GGUF-backed .oasr pack".to_vec();
+    let resolved = resolved_for(&garbage);
+    let temp = tempfile::tempdir().unwrap();
+    let (target, paths) = write_complete_partial(temp.path(), &resolved, &garbage);
+
+    let error = verify_partial_and_install(
+        &target,
+        &paths,
+        Some(DownloadedPartial {
+            bytes_done: garbage.len() as u64,
+            sha256: sha256_hex(&garbage),
+        }),
+        None,
+        &|| false,
+        |_| {},
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            PullError::GgufPreflight { .. } | PullError::RuntimeValidation { .. }
+        ),
+        "unverified bytes must fail closed: {error}"
+    );
+    assert!(!paths.final_path.exists());
+    assert!(!paths.installed_meta_path.exists());
+    assert!(
+        !paths.partial_path.exists(),
+        "a failed verify must not leave installable partial bytes"
+    );
+}
+
+#[test]
+fn signed_catalog_rejects_a_pack_digest_it_does_not_list() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let mut catalog = catalog_for_resolved(&resolved);
+    catalog.models.clear();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("unknown.oasr");
+    fs::write(&source, bytes).unwrap();
+
+    let error = resolve_catalog_model_pack_from_path(&catalog, &source).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            PullError::InvalidTarget {
+                field: "sha256",
+                ..
+            }
+        ),
+        "missing catalog entry must fail closed: {error}"
+    );
+    assert!(
+        list_installed_packs(temp.path()).unwrap().is_empty(),
+        "a digest absent from the signed catalog must not install"
+    );
+}
+
+#[test]
+fn digest_match_refresh_fails_closed_when_the_install_record_cannot_be_written() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let mut client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: bytes.clone(),
+    }]);
+    pull_model_pack_with_client(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::for_tests(),
+        |_| {},
+    )
+    .unwrap();
+
+    let paths = paths_for(temp.path(), &resolved);
+    fs::remove_file(&paths.installed_meta_path).unwrap();
+    fs::create_dir(&paths.installed_meta_path).unwrap();
+
+    let mut client = FakeClient::default();
+    let error = pull_model_pack_with_client(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::for_tests(),
+        |_| {},
+    )
+    .unwrap_err();
+
+    assert!(
+        client.urls().is_empty(),
+        "digest match must not re-enter the download path"
+    );
+    assert!(
+        matches!(error, PullError::Io { .. }),
+        "a record write failure must fail closed: {error}"
+    );
+}
+
+#[test]
+fn virtual_clock_trips_low_speed_without_waiting_and_releases_segment_cooldown() {
+    let clock = Arc::new(VirtualClock::new());
+    let options = PullOptions {
+        low_speed_timeout: Duration::from_secs(2),
+        low_speed_min_bytes: 64,
+        time: clock.clone(),
+        ..PullOptions::for_tests()
+    };
+    let mut window = LowSpeedWindow::new(&options);
+    assert!(
+        window
+            .observe("https://example.invalid/pack.oasr", 1_000, 8, 8)
+            .is_ok(),
+        "before the injected timeout the window must not trip"
+    );
+    clock.advance(Duration::from_secs(2));
+    let error = window
+        .observe("https://example.invalid/pack.oasr", 1_000, 16, 8)
+        .unwrap_err();
+    assert!(matches!(error, PullError::Http { .. }));
+
+    let reference = reference_with_history(&[10_000_000, 10_000_000, 10_000_000, 10_000_000]);
+    let cooldown_slot = Mutex::new(None);
+    let segment_options = PullOptions {
+        segment_low_speed_timeout: Duration::ZERO,
+        segment_low_speed_cooldown: Duration::from_secs(30),
+        time: clock.clone(),
+        ..PullOptions::for_tests()
+    };
+    let mut first = SegmentLowSpeedWindow::new(&segment_options, &reference, &cooldown_slot, false);
+    assert!(first.observe(1_000_000), "first outlier must trip");
+    let mut second =
+        SegmentLowSpeedWindow::new(&segment_options, &reference, &cooldown_slot, false);
+    assert!(
+        !second.observe(1_000_000),
+        "cooldown must suppress an immediate re-trip"
+    );
+    clock.advance(Duration::from_secs(30));
+    let mut third = SegmentLowSpeedWindow::new(&segment_options, &reference, &cooldown_slot, false);
+    assert!(
+        third.observe(1_000_000),
+        "after the injected cooldown the same outlier must trip again"
+    );
+}
+
+#[test]
+fn catalog_family_mismatch_is_a_terminal_fail_closed_error() {
+    let path = PathBuf::from("/tmp/openasr-family-mismatch.oasr");
+    let error = ensure_catalog_family_matches(Some("whisper"), Some("moonshine"), &path)
+        .expect_err("family mismatch must fail closed");
+    assert!(matches!(error, PullError::RuntimeValidation { .. }));
+    assert!(!is_retryable_download_error(&error));
+    assert!(!is_source_fallback_error(&error));
+    ensure_catalog_family_matches(Some("moonshine"), Some("moonshine"), &path).unwrap();
+    ensure_catalog_family_matches(None, Some("moonshine"), &path).unwrap();
+}
+
+fn count_requests_for(requests: &[(u64, Option<u64>)], start: u64, end: Option<u64>) -> usize {
+    requests
+        .iter()
+        .filter(|request| **request == (start, end))
+        .count()
+}
+
+#[test]
+fn segment_retry_recovers_from_one_5xx_without_retrying_siblings() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let segment_bytes = small_segment_bytes(bytes.len(), 4);
+    let total_segments = segment_count(bytes.len() as u64, segment_bytes);
+    assert!(total_segments >= 3, "fixture must have a non-probe sibling");
+    let (fail_start, fail_end) = segment_range(1, bytes.len() as u64, segment_bytes);
+
+    let server =
+        RangeServerClient::new(bytes.clone()).fail_range(fail_start, Some(fail_end), &[503]);
+    let (mut probe_client, factory) = parallel_probe_and_factory(&server);
+    let parallel = ParallelDownloadConfig {
+        connections: 4,
+        factory: &*factory,
+    };
+
+    pull_model_pack_with_client_parallel(
+        &resolved,
+        temp.path(),
+        &mut probe_client,
+        parallel_test_options(segment_bytes),
+        parallel,
+        |_| {},
+        || false,
+        || false,
+    )
+    .unwrap();
+
+    let requests = server.requests();
+    assert_eq!(
+        count_requests_for(&requests, fail_start, Some(fail_end)),
+        2,
+        "the 503 segment must be fetched twice (retry on the same attempt)"
+    );
+    for index in 0..total_segments {
+        if index == 1 {
+            continue;
+        }
+        let (start, end) = segment_range(index, bytes.len() as u64, segment_bytes);
+        assert_eq!(
+            count_requests_for(&requests, start, Some(end)),
+            1,
+            "sibling segment {index} must be fetched once"
+        );
+    }
+    assert_eq!(
+        server.call_count(),
+        total_segments + 1,
+        "one extra open is the recovered segment; the outer attempt must not restart"
+    );
+}
+
+#[test]
+fn segment_retry_fails_closed_when_the_segment_budget_is_exhausted() {
+    let bytes = tiny_pack_bytes();
+    let segment_bytes = small_segment_bytes(bytes.len(), 4);
+    let (start, end) = segment_range(1, bytes.len() as u64, segment_bytes);
+    let statuses = vec![503; SEGMENT_MAX_RETRIES + 8];
+    let mut server = RangeServerClient::new(bytes.clone())
+        .fail_range(start, Some(end), &statuses)
+        .with_call_ceiling(32);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("segment.partial");
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
+    file.set_len(bytes.len() as u64).unwrap();
+    let (sender, _receiver) = std::sync::mpsc::channel();
+    let abort = AtomicBool::new(false);
+    let reference = SegmentThroughputReference::new();
+    let cooldown = Mutex::new(None);
+
+    let error = fetch_segment_with_retries(
+        &mut server,
+        &mut file,
+        &path,
+        "https://example.invalid/pack.oasr",
+        start,
+        end,
+        Some("etag-a"),
+        &abort,
+        &sender,
+        &PullOptions::for_tests(),
+        &reference,
+        &cooldown,
+        false,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PullError::UnexpectedStatus { status: 503, .. }
+    ));
+    assert_eq!(
+        server.call_count(),
+        SEGMENT_MAX_RETRIES + 1,
+        "same-segment retries must stop at SEGMENT_MAX_RETRIES"
+    );
+}
+
+#[test]
+fn parallel_attempt_retries_then_fails_closed_and_clears_partial() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let segment_bytes = small_segment_bytes(bytes.len(), 4);
+    let failures = (0..=DOWNLOAD_MAX_RETRIES)
+        .map(|_| ResponseSpec {
+            status: 503,
+            body: Vec::new(),
+        })
+        .collect();
+    let mut client = FakeClient::with_responses(failures);
+    let factory_client = client.clone();
+    let factory: Box<dyn Fn() -> Result<BoxedDownloadClient, PullError>> =
+        Box::new(move || Ok(Box::new(factory_client.clone()) as BoxedDownloadClient));
+    let parallel = ParallelDownloadConfig {
+        connections: 4,
+        factory: &*factory,
+    };
+
+    let error = pull_model_pack_with_client_parallel(
+        &resolved,
+        temp.path(),
+        &mut client,
+        parallel_test_options(segment_bytes),
+        parallel,
+        |_| {},
+        || false,
+        || false,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PullError::UnexpectedStatus { status: 503, .. }
+    ));
+    assert_eq!(client.urls().len(), DOWNLOAD_MAX_RETRIES + 1);
+    assert_no_partial_or_install(&paths_for(temp.path(), &resolved));
+}
+
+fn signed_archive_fixture() -> (CatalogBackendFile, Vec<u8>, u64, Vec<String>) {
+    let payload = b"signed runtime";
+    let archive = backend_zip_bytes(&[("runtime.dll", payload)]);
+    let unpacked = payload.len() as u64;
+    let tree = materialized_tree_sha256(&[InstalledBackendMaterializedFile {
+        relative_path: "runtime.dll".to_string(),
+        sha256: sha256_hex(payload),
+        size_bytes: payload.len() as u64,
+    }]);
+    let urls = vec![
+        "https://primary.example/vendor.zip".to_string(),
+        "https://mirror.example/vendor.zip".to_string(),
+    ];
+    let file = CatalogBackendFile {
+        filename: "vendor.zip".to_string(),
+        url: urls[0].clone(),
+        mirrors: Vec::new(),
+        sha256: sha256_hex(&archive),
+        size_bytes: archive.len() as u64,
+        role: CatalogBackendFileRole::Archive,
+        extract_subdir: Some(String::new()),
+        extracted_tree_sha256: Some(tree),
+    };
+    (file, archive, unpacked, urls)
+}
+
+#[test]
+fn signed_url_chain_falls_back_after_404_and_installs_from_the_next_url() {
+    let (file, archive, unpacked, urls) = signed_archive_fixture();
+    let temp = tempfile::tempdir().unwrap();
+    let mut client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 404,
+            body: Vec::new(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+
+    ensure_backend_content_object_in(
+        &mut client,
+        &file,
+        &temp.path().join("objects"),
+        Some(&urls),
+        Some(unpacked),
+        &mut |_| {},
+        None,
+        &PullOptions::for_tests(),
+    )
+    .unwrap();
+
+    assert_eq!(client.urls(), urls);
+}
+
+#[test]
+fn signed_url_chain_does_not_fall_back_after_a_client_400() {
+    let (file, archive, unpacked, urls) = signed_archive_fixture();
+    let temp = tempfile::tempdir().unwrap();
+    let mut client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 400,
+            body: b"bad request".to_vec(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+
+    let error = ensure_backend_content_object_in(
+        &mut client,
+        &file,
+        &temp.path().join("objects"),
+        Some(&urls),
+        Some(unpacked),
+        &mut |_| {},
+        None,
+        &PullOptions::for_tests(),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PullError::UnexpectedStatus { status: 400, .. }
+    ));
+    assert_eq!(
+        client.urls(),
+        vec![urls[0].clone()],
+        "400 must fail closed on the first signed URL"
     );
 }

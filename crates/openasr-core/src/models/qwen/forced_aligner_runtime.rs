@@ -29,7 +29,7 @@ use crate::models::{
 
 use super::audio_encoder::{
     Qwen3AsrAudioEncoderError, Qwen3AsrAudioEncoderRuntime, Qwen3AsrAudioEncoderWeights,
-    load_qwen3_audio_encoder_weights_from_reader,
+    load_qwen3_audio_encoder_weights_from_reader, qwen3_audio_token_count_for_mel_frames,
 };
 use super::decode_prompt::Qwen3AsrDecodePrompt;
 use super::forced_aligner_align_text::{
@@ -70,6 +70,53 @@ const OPENASR_MODEL_ID_KEY: &str = "openasr.model.id";
 /// still amortizing graph construction and GPU submission across many words.
 /// The bound is independent of transcript length.
 const FORCED_ALIGNER_LOGITS_BATCH_ROWS: usize = 64;
+
+/// Exclusive upper bound of the classify-head timestamp grid, in seconds.
+pub(crate) fn timestamp_grid_limit_s(classify_num: usize, timestamp_segment_time_ms: u32) -> f64 {
+    classify_num as f64 * f64::from(timestamp_segment_time_ms) / 1000.0
+}
+
+/// Mel frames implied by the Forced Aligner frontend: zero-center STFT then
+/// drop the trailing pad frame, which is `samples / hop`.
+pub(crate) fn estimated_mel_frames(sample_count: usize, hop_length: usize) -> usize {
+    sample_count.checked_div(hop_length).unwrap_or(0)
+}
+
+fn reject_forced_aligner_prompt_length(
+    token_count: usize,
+    max_positions: usize,
+) -> Result<(), Qwen3ForcedAlignerRuntimeError> {
+    if token_count > max_positions {
+        return Err(
+            Qwen3ForcedAlignerRuntimeError::PromptExceedsDecoderContext {
+                token_count,
+                max_positions,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn admit_forced_aligner_prompt_length(
+    metadata: &Qwen3ForcedAlignerRuntimeMetadata,
+    token_to_id: &std::collections::BTreeMap<String, u32>,
+    merge_rank: &std::collections::BTreeMap<String, usize>,
+    word_list: &[String],
+    sample_count: usize,
+) -> Result<(), Qwen3ForcedAlignerRuntimeError> {
+    let audio_tokens = qwen3_audio_token_count_for_mel_frames(estimated_mel_frames(
+        sample_count,
+        metadata.hop_length,
+    ));
+    let (prompt, _) = build_forced_aligner_decode_prompt(
+        metadata,
+        token_to_id,
+        merge_rank,
+        word_list,
+        audio_tokens,
+    )?;
+    reject_forced_aligner_prompt_length(prompt.token_ids.len(), metadata.llm_max_positions)
+}
 // A <=2% odds advantage is below the cross-backend reduction-order envelope
 // measured for this Q8 classification head. Treat such candidates as a
 // numerical tie and choose the later timestamp bin deterministically. The
@@ -89,6 +136,30 @@ fn stable_timestamp_bin(logits: &[f32]) -> Option<u32> {
             .then(|| u32::try_from(index).ok())
             .flatten()
     })
+}
+
+/// Numerically stable log-softmax of the bin actually selected by
+/// [`stable_timestamp_bin`]. This is the NAR analog of a CTC forced-path
+/// token log-prob: the classify head is a timestamp-bin classifier, so the
+/// chosen-bin posterior is P(boundary time | audio, manuscript).
+fn chosen_bin_log_softmax(logits: &[f32], bin: u32) -> Option<f32> {
+    let index = usize::try_from(bin).ok()?;
+    if logits.is_empty() || index >= logits.len() {
+        return None;
+    }
+    if logits.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let max = logits.iter().copied().reduce(f32::max)?;
+    let sum_exp = logits.iter().try_fold(0.0f32, |acc, &value| {
+        let term = (value - max).exp();
+        term.is_finite().then_some(acc + term)
+    })?;
+    if !sum_exp.is_finite() || sum_exp <= 0.0 {
+        return None;
+    }
+    let log_prob = logits[index] - (max + sum_exp.ln());
+    log_prob.is_finite().then_some(log_prob)
 }
 
 const KEY_SAMPLE_RATE: &str = "qwen3_forced_aligner.audio.sample_rate_hz";
@@ -155,6 +226,26 @@ pub(crate) enum Qwen3ForcedAlignerRuntimeError {
     LlmTransformerFailed(#[from] super::llm_transformer::Qwen3AsrLlmTransformerError),
     #[error("qwen3-forced-aligner prepared assets admission failed: {reason}")]
     PreparedAssetsAdmissionFailed { reason: String },
+    #[error(
+        "qwen3-forced-aligner transcript is empty after normalization (letters, numbers, and apostrophes are kept; other punctuation is stripped)"
+    )]
+    EmptyNormalizedTranscript,
+    #[error(
+        "qwen3-forced-aligner audio is {duration_s:.3}s which exceeds the timestamp grid of {max_s:.3}s ({classify_num} bins x {bin_ms}ms); split the audio rather than wrapping timestamps"
+    )]
+    AudioExceedsTimestampGrid {
+        duration_s: f64,
+        max_s: f64,
+        classify_num: usize,
+        bin_ms: u32,
+    },
+    #[error(
+        "qwen3-forced-aligner prompt is {token_count} tokens which exceeds decoder context {max_positions}; split the audio or shorten the transcript"
+    )]
+    PromptExceedsDecoderContext {
+        token_count: usize,
+        max_positions: usize,
+    },
 }
 
 /// Parsed `qwen3_forced_aligner.*` GGUF metadata, with the embedding-table
@@ -312,6 +403,18 @@ pub(crate) struct ForcedAlignItem {
     pub text: String,
     pub start_time_s: f64,
     pub end_time_s: f64,
+    /// Log-softmax of the classify-head bin chosen for the start boundary.
+    pub start_log_prob: f32,
+    /// Log-softmax of the classify-head bin chosen for the end boundary.
+    pub end_log_prob: f32,
+}
+
+impl ForcedAlignItem {
+    /// Mean of the start/end chosen-bin log-softmax values.
+    #[cfg(test)]
+    fn mean_boundary_log_prob(&self) -> f32 {
+        0.5 * (self.start_log_prob + self.end_log_prob)
+    }
 }
 
 /// Honest request-local milestones exposed by the NAR alignment pipeline.
@@ -715,6 +818,29 @@ fn align_forced_with_stage_backends(
         }
     };
     let word_list = word_list_for_language(text, language)?;
+    if word_list.is_empty() {
+        return Err(Qwen3ForcedAlignerRuntimeError::EmptyNormalizedTranscript);
+    }
+    let audio_duration_s = audio_samples_16khz_mono.len() as f64 / 16_000.0;
+    let max_s = timestamp_grid_limit_s(
+        assets.metadata.classify_num,
+        assets.metadata.timestamp_segment_time_ms,
+    );
+    if audio_duration_s > max_s {
+        return Err(Qwen3ForcedAlignerRuntimeError::AudioExceedsTimestampGrid {
+            duration_s: audio_duration_s,
+            max_s,
+            classify_num: assets.metadata.classify_num,
+            bin_ms: assets.metadata.timestamp_segment_time_ms,
+        });
+    }
+    admit_forced_aligner_prompt_length(
+        &assets.metadata,
+        &assets.token_to_id,
+        &assets.merge_rank,
+        &word_list,
+        audio_samples_16khz_mono.len(),
+    )?;
 
     let embedding_metadata = assets.metadata.as_embedding_execution_metadata();
     let prepared_audio = forced_aligner_prepared_audio(audio_samples_16khz_mono);
@@ -768,6 +894,10 @@ fn align_forced_with_stage_backends(
         &assets.merge_rank,
         &word_list,
         audio_embeddings.row_count,
+    )?;
+    reject_forced_aligner_prompt_length(
+        decode_prompt.token_ids.len(),
+        assets.metadata.llm_max_positions,
     )?;
 
     report(ForcedAlignerProgressEvent::DecoderPrefillStarted);
@@ -892,6 +1022,7 @@ fn align_forced_with_stage_backends(
         total: timestamp_positions.len(),
     });
     let mut raw_timestamps_ms = Vec::with_capacity(timestamp_positions.len());
+    let mut chosen_log_probs = Vec::with_capacity(timestamp_positions.len());
     let max_hidden_values = hidden_size
         .checked_mul(FORCED_ALIGNER_LOGITS_BATCH_ROWS)
         .ok_or(Qwen3ForcedAlignerRuntimeError::TimestampHiddenBatchOverflow)?;
@@ -927,8 +1058,15 @@ fn align_forced_with_stage_backends(
                     reason: "timestamp classification produced an empty logits row".to_string(),
                 }
             })?;
+            let log_prob = chosen_bin_log_softmax(row, bin).ok_or_else(|| {
+                Qwen3ForcedAlignerRuntimeError::LlmGraphFailed {
+                    reason: "timestamp classification produced a non-finite chosen-bin log-prob"
+                        .to_string(),
+                }
+            })?;
             raw_timestamps_ms
                 .push(i64::from(bin) * i64::from(assets.metadata.timestamp_segment_time_ms));
+            chosen_log_probs.push(log_prob);
         }
         report(ForcedAlignerProgressEvent::TimestampLogits {
             completed: raw_timestamps_ms.len(),
@@ -947,6 +1085,8 @@ fn align_forced_with_stage_backends(
             text: word,
             start_time_s: round_to_millis(start_ms as f64 / 1000.0),
             end_time_s: round_to_millis(end_ms as f64 / 1000.0),
+            start_log_prob: chosen_log_probs[index * 2],
+            end_log_prob: chosen_log_probs[index * 2 + 1],
         });
     }
     report(ForcedAlignerProgressEvent::Finalized);
@@ -1263,6 +1403,37 @@ impl Qwen3ForcedAlignerSession {
 mod tests {
     use super::*;
 
+    #[test]
+    fn timestamp_grid_limit_matches_catalog_5000_by_80ms() {
+        assert_eq!(timestamp_grid_limit_s(5_000, 80), 400.0);
+    }
+
+    #[test]
+    fn estimated_mel_frames_are_samples_over_hop() {
+        assert_eq!(estimated_mel_frames(16_000, 160), 100);
+        assert_eq!(estimated_mel_frames(0, 160), 0);
+        assert_eq!(estimated_mel_frames(16_000, 0), 0);
+    }
+
+    #[test]
+    fn one_second_of_qwen3_audio_is_thirteen_decoder_tokens() {
+        assert_eq!(qwen3_audio_token_count_for_mel_frames(100), 13);
+    }
+
+    #[test]
+    fn prompt_length_admission_rejects_over_decoder_context() {
+        let error = reject_forced_aligner_prompt_length(8193, 8192)
+            .expect_err("over-budget prompt must fail closed");
+        assert!(matches!(
+            error,
+            Qwen3ForcedAlignerRuntimeError::PromptExceedsDecoderContext {
+                token_count: 8193,
+                max_positions: 8192
+            }
+        ));
+        reject_forced_aligner_prompt_length(8192, 8192).expect("exact budget is admitted");
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ForcedAlignerTestBackend {
         Cpu,
@@ -1410,6 +1581,23 @@ mod tests {
         assert_eq!(stable_timestamp_bin(&[1.0, 1.01, 1.01]), Some(2));
         assert_eq!(stable_timestamp_bin(&[1.0, f32::NAN, 1.0]), None);
         assert_eq!(stable_timestamp_bin(&[1.0, f32::INFINITY]), None);
+    }
+
+    #[test]
+    fn chosen_bin_log_softmax_matches_stable_softmax_and_rejects_non_finite() {
+        let logits = [1.0f32, 2.0, 3.0];
+        let max = 3.0f32;
+        let log_z = max + ((1.0 - max).exp() + (2.0 - max).exp() + (3.0 - max).exp()).ln();
+        let expected = 3.0 - log_z;
+        let got = chosen_bin_log_softmax(&logits, 2).expect("finite peaked row");
+        assert!(
+            (got - expected).abs() < 1e-6,
+            "got {got} expected {expected}"
+        );
+        assert!(got > chosen_bin_log_softmax(&logits, 0).expect("first bin"));
+        assert_eq!(chosen_bin_log_softmax(&[], 0), None);
+        assert_eq!(chosen_bin_log_softmax(&logits, 9), None);
+        assert_eq!(chosen_bin_log_softmax(&[1.0, f32::NAN], 0), None);
     }
 
     #[test]
@@ -2265,5 +2453,135 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&pack_path);
+    }
+
+    #[test]
+    #[ignore = "host-local calibration: needs OPENASR_FORCED_ALIGNER_PACK and fixtures"]
+    fn calibrate_forced_aligner_acoustic_confidence() {
+        let pack = crate::testing::external_test_fixture_path(
+            "OPENASR_FORCED_ALIGNER_PACK",
+            "Qwen3 forced-aligner runtime pack",
+        )
+        .expect("OPENASR_FORCED_ALIGNER_PACK");
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let session = Qwen3ForcedAlignerSession::load(
+            &pack,
+            crate::ggml_runtime::GgmlCpuGraphConfig::runtime_default().backend,
+        )
+        .expect("load forced-aligner session");
+
+        struct Pair {
+            label: &'static str,
+            audio: &'static str,
+            text: &'static str,
+            language: &'static str,
+            expected_match: bool,
+        }
+        const JFK: &str = "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.";
+        const ZH: &str = "今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我通常会读书或者看一部电影放松一下";
+        const MIXED: &str = "and so my fellow americans ask not 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开";
+        const RECIPE: &str = "Preheat the oven to 425 degrees and roast the vegetables with olive oil, salt, and thyme until caramelized.";
+        const PARTIAL: &str = "And so, my fellow Americans, ask not what your country can do for you. Preheat the oven to 425 degrees and roast the vegetables with olive oil, salt, and thyme until caramelized.";
+        let pairs = [
+            Pair {
+                label: "match jfk + correct English",
+                audio: "fixtures/jfk.wav",
+                text: JFK,
+                language: "en",
+                expected_match: true,
+            },
+            Pair {
+                label: "match zh_sample + correct Chinese",
+                audio: "fixtures/zh_sample.wav",
+                text: ZH,
+                language: "zh",
+                expected_match: true,
+            },
+            Pair {
+                label: "match en_zh_mixed + mixed transcript",
+                audio: "fixtures/en_zh_mixed.wav",
+                text: MIXED,
+                language: "en",
+                expected_match: true,
+            },
+            Pair {
+                label: "mismatch jfk + English recipe",
+                audio: "fixtures/jfk.wav",
+                text: RECIPE,
+                language: "en",
+                expected_match: false,
+            },
+            Pair {
+                label: "mismatch jfk + Chinese manuscript",
+                audio: "fixtures/jfk.wav",
+                text: ZH,
+                language: "zh",
+                expected_match: false,
+            },
+            Pair {
+                label: "mismatch zh_sample + JFK English",
+                audio: "fixtures/zh_sample.wav",
+                text: JFK,
+                language: "en",
+                expected_match: false,
+            },
+            Pair {
+                label: "mismatch zh_sample + English recipe",
+                audio: "fixtures/zh_sample.wav",
+                text: RECIPE,
+                language: "en",
+                expected_match: false,
+            },
+            Pair {
+                label: "partial jfk first-half + recipe tail",
+                audio: "fixtures/jfk.wav",
+                text: PARTIAL,
+                language: "en",
+                expected_match: false,
+            },
+        ];
+
+        eprintln!("ALIGN_CONFIDENCE_CALIBRATION header=label|mean|p25|min_word|words|expected");
+        for pair in pairs {
+            let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+                repo_root.join(pair.audio),
+                "forced-aligner-confidence-calibration",
+                pair.label,
+            )
+            .unwrap_or_else(|error| panic!("load {}: {error}", pair.audio));
+            let items = session
+                .align(
+                    crate::PcmBuffer::from_vec(samples).full_slice(),
+                    pair.text,
+                    pair.language,
+                )
+                .unwrap_or_else(|error| panic!("align {}: {error}", pair.label));
+            let boundaries: Vec<f32> = items
+                .iter()
+                .flat_map(|item| [item.start_log_prob, item.end_log_prob])
+                .collect();
+            let words: Vec<f32> = items
+                .iter()
+                .map(ForcedAlignItem::mean_boundary_log_prob)
+                .collect();
+            let mean = crate::subtitle::mean_chosen_bin_log_prob(&boundaries)
+                .expect("finite mean log-prob");
+            let p25 = crate::subtitle::p25_word_log_prob(&words).expect("finite p25 log-prob");
+            let min_word = words
+                .iter()
+                .copied()
+                .reduce(f32::min)
+                .expect("non-empty word scores");
+            eprintln!(
+                "ALIGN_CONFIDENCE_CALIBRATION {}|{mean:.4}|{p25:.4}|{min_word:.4}|{}|{}",
+                pair.label,
+                words.len(),
+                if pair.expected_match {
+                    "match"
+                } else {
+                    "mismatch"
+                }
+            );
+        }
     }
 }

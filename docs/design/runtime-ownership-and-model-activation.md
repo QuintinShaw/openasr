@@ -43,10 +43,271 @@ The software-side migration is complete for the current inventory:
 - Desktop delegates activation to the daemon and vendors the generated HTTP
   contract. It does not calculate capacity or persist a competing selection.
 
-This does **not** convert missing hardware into success. CUDA, physical Vulkan,
-and HIP/ROCm (including HIP capture-on), plus the Windows neutral-dynamic
-plugin-switch product flow, still require release-bound real-host receipts. The
-gate must remain closed while those cells are missing, stale, or unavailable.
+This does **not** convert missing hardware into success. Local-dev HIP
+(capture-on) and physical Vulkan (`vk_caps` exact cell, capture unsupported)
+decode evidence.v1 now exist on one RX 9060 XT. They are still not a
+production-catalog or Authenticode cell.
+
+The remaining product hole on that host was not a missing family matrix.
+`serve --model-pack` used to set `requested_path` and listen while `active`
+stayed empty, because boot reactivation silently returned unless the path was
+already an `InstalledModelStore` object named by durable V2. Loose `.oasr`
+files are no longer a second runtime: `--model-pack` fail-closes before bind
+unless that store+V2 pair exists. The working admit path is catalog-gated
+`pull --from` then `POST /v1/models/default` (the existing activation
+transaction). That path now binds `funasr-nano:q4` on the Vulkan-qualified
+neutral host (`model_installed`/`model_resident`, HTTP JFK). A
+`cold_warm_lifecycle` `openasr.runtime-ownership-evidence.v1` envelope for
+that same cell now passes `__openasr-validate-ownership-evidence`
+(diagnostic-not-release): baseline empty, cold=warm live owners after JFK,
+idle-unload `now` returns to empty, lease matched. GRAPH_PRIVATE high-water
+is one backend-owned lease on the cached GPU backend; a fresh-graph builder
+must reuse that row instead of admitting a new zero-byte `native-memory-owner`
+per compute. After `8cf47e0f` (`origin/main`), isolated HIP and Vulkan HOMEs
+on the same RX 9060 XT official-admitted `funasr-nano:q4` via catalog-gated
+`pull --from` plus `POST /v1/models/default`; both backends then produced
+verifier-pass `cold_warm_lifecycle` envelopes (baseline empty, cold=warm 21
+live owners, idle-unload `now` empty, lease matched). A real-host
+pressure-rollback envelope is UNAVAILABLE on this close-out (ColdWarm is the accepted alternative). CUDA, production-signed
+plugin activation, and the packaged product kernel-switch flow still require
+release-bound real-host receipts. The gate must remain closed while those
+cells are missing, stale, or unavailable.
+
+## Accepted completion program
+
+The remaining work completes the release and real-host portions of this
+contract. Existing HTTP ownership snapshots and deterministic tests are strong
+diagnostics, but they are not a substitute for the artifact-bound ownership,
+pressure, capability, and product gates defined here.
+
+### Orthogonal artifact and capability state
+
+Publication is not a linear state enum. It is the product of two dimensions:
+
+- artifact state is `compiled` or `published` and is proven by immutable release
+  subjects, hashes, checksums, and attestations;
+- capability state is `qualification_only`, `activatable`, or `revoked` and is
+  derived from signed capability/catalog state plus complete exact-cell
+  receipts.
+
+Architecture inventory describes code and topology; it is not the mutable
+publication authority.
+
+A qualification manifest may contain only the release subject, binary/plugin/
+vendor hashes, host ABI, provider target, attestation, and immutable download
+locations. It carries no activation modes and never enters ordinary runtime
+candidate generation.
+
+Each exact cell has one collision-free release asset named
+`openasr-<version>-qualification-<provider-target>.json` (bundled Vulkan uses
+its already provider-qualified `vulkan-windows-*` target without repeating the
+provider). Its detached signature binds the identical basename at
+`https://dl.openasr.org/core/v<version>/`; a mirror may transport those bytes,
+but cannot change their canonical signed identity. CI compiles only unsigned,
+inert manifests after the successful provenance action emits its exact Sigstore
+bundle. The production catalog seed remains local; one fail-closed maintainer
+command signs every cell on the draft release, uploads only detached signatures,
+then re-downloads and verifies every published pair.
+The CI upload paths, local signer, and final `draft -> published` transition
+share one atomically-created, nonce-owned draft-release lock asset. A stale lock
+fails release completeness; no manifest may be replaced concurrently with
+signature creation or publication. The finalizer reconstructs the exact cell
+set from backend packs and re-verifies every manifest/signature, referenced byte,
+and provenance subject while holding that lock. The shared Rust verifier,
+not only the generator script, rechecks the release version, host artifact,
+provider/target plugin name, content-addressed vendor name, provenance bundle,
+and canonical CDN/GitHub URLs before either signing or qualification loading.
+
+On Windows, `artifacts.binary` binds both the exact `openasr.exe` member and
+the attested release ZIP that contains it. The ZIP also carries a signed
+unpacked-byte total and canonical tree digest, so qualification rejects a
+correct executable combined with changed or extra companion DLLs. Plugin DLLs
+and vendor ZIPs use the same signed URL/hash discipline in a qualification-only
+content namespace; none is installed into the ordinary backend store.
+
+Before qualification succeeds, the ordinary capability-aware runtime catalog
+contains no CUDA candidate compatible with the new host ABI. The explicit
+qualification runner consumes the signed manifest in an isolated child process
+using the exact final release bytes. It refuses the real user home, does not
+write ordinary `active.json`, accepts no arbitrary plugin path, and exposes no
+Auto or Explicit activation path.
+
+The explicit `__openasr-qualify-backend` parent verifies and prepares the
+manifest, then starts the same executable as a fresh
+`__openasr-qualification-child` bound to the parent's manifest SHA. The child
+re-verifies the production signature, exact host ABI, release-bundle tree,
+artifact hashes, and attestations before loading anything. Windows file handles
+deny write/delete sharing from the final rehash through provider execution;
+directory components reject symlinks, junctions, and reparse points.
+
+GitHub CLI is currently part of the qualification-host trusted computing base
+for Sigstore bundle verification. The runner resolves `gh.exe` once to an
+absolute non-linked file, holds a deny-write/delete handle, records its version
+and SHA-256, passes the signed repository/workflow/source/predicate constraints,
+and supplies the signed offline bundle. This is an explicit host-tool
+assumption, not an OpenASR artifact correctness proof; replacing it with an
+in-process Sigstore verifier may narrow the TCB later without changing the
+manifest or capability contract.
+
+### Old-client rejection
+
+An unknown ordinary catalog field is not an old-client gate. The first
+capability-aware release must:
+
+1. bump `BACKEND_HOST_ABI_SCHEMA_VERSION` so previous stable clients hide or
+   reject every new qualification artifact;
+2. carry backend `min_cli_version` into `ResolvedCatalogBackendPull` and enforce
+   it during resolve, prepare, and install;
+3. set a later public CUDA entry's minimum version to the first
+   capability-aware stable release; and
+4. run the previous stable binary as a black box and prove the new entry cannot
+   resolve, install, or activate.
+
+After qualification, a public CUDA entry binds the new ABI, minimum CLI version,
+release subject, artifact identity, and signed capability matrix digest/epoch.
+`active.json` remains only an atomic pointer and never substitutes for the
+current signed catalog or capability proof.
+
+Legacy-ABI entries require signed tombstone/removal semantics. An offline client
+cannot know a tombstone it has not downloaded; this limitation is documented and
+does not justify forced networking or phone-home behavior.
+
+### Typed exact-cell approval
+
+`ExecutionCandidate` remains a pure device/placement type. Once the verified
+pack, family, quant, topology, candidate, output plan, and reuse plan are known,
+the shared `CapabilityApprovalResolver` performs an O(1) typed lookup against an
+immutable, already verified in-process `CapabilityApprovalSnapshot` and returns
+an `ApprovedExecutionCandidate`.
+
+Only the approved type may enter activation, request dispatch, resident owner/
+cache identity, or release-bound receipts. Family code cannot parse provider
+names, catalogs, matrices, or approval records.
+
+Approval is checked at four boundaries:
+
+1. catalog resolve/prepare/install validates artifact publication and host
+   compatibility;
+2. plugin activation validates artifact-level capability proof;
+3. daemon boot revalidates current signed catalog, epoch, matrix digest, and
+   tombstones; and
+4. model activation plus every request candidate generation validates the exact
+   family/model/quant/topology/provider/target/plan/mode cell.
+
+Approval epoch and matrix digest partition owner/cache identity. After a
+tombstone or epoch change, an old owner cannot be checked out by a new session.
+No network access, signature verification, or JSON parsing occurs on the request
+hot path.
+
+### Artifact-bound ownership evidence
+
+`openasr.runtime-ownership-receipt.v1` remains the production diagnostic
+snapshot for owner/resource/domain/lifecycle/completeness and ledger facts. Its
+random redaction key belongs to one service root, so redacted identities are not
+compared across daemon starts.
+
+Formal release evidence wraps, rather than replaces, those snapshots:
+
+```text
+artifact-bound ownership evidence envelope
+|- release / core / plugin / pack / catalog bindings
+|- ordered phase list
+|- daemon start identity per phase
+|- request / activation receipt bindings
+|- hashes of runtime-ownership-receipt.v1 snapshots
+|- expected transition assertions
+`- final result
+```
+
+The envelope is not an admission or policy authority. Cross-process continuity
+uses pack SHA, artifact identity, phase order, and daemon start identity. Within
+one process, request facts, doctor, and plugin activation attestation bind the
+raw selected device to the HTTP snapshot's redacted lane identity without
+publishing sensitive raw identifiers. The finalizer verifies every referenced
+snapshot and receipt hash.
+
+### Deterministic and real pressure gates
+
+Both gates require a causal state transition.
+
+The deterministic race requires:
+
+```text
+baseline forecast succeeds
+-> broker/native facts change
+-> activation reads fresh facts and rejects reserve
+-> old durable/live runtime remains
+-> staged owners release or quarantine correctly
+-> ledger reconciliation matches
+```
+
+The Windows real-host gate uses a repository-owned helper that actually commits
+and touches memory. It preserves absolute and proportional available-memory
+safety floors, refuses to cross either floor, has a hard timeout, runs inside a
+Job Object with kill-on-close, cleans up on parent death, continuously checks the
+floor, never locks pages, and releases all memory after every terminal path.
+
+A passing real-host sequence requires:
+
+```text
+same pack/exact lane is admissible and old runtime is active
+-> pressure helper becomes ready
+-> native observation crosses the rejection threshold
+-> the same candidate fails activation on a fresh observation
+-> old durable selection remains unchanged
+-> old live runtime completes a real transcription
+-> staged owners clean up and ledger reconciliation matches
+-> helper exits and available memory/observation recover
+```
+
+If the baseline already fails, the helper does not cross the boundary, crossing
+would violate a safety floor, the failure identity changes, or cleanup/recovery
+is incomplete, the result is `UNAVAILABLE`, `BLOCKED_BY_HARNESS`, or `FAIL`, not
+PASS.
+
+### Revocation and safe restart
+
+A downloaded signed tombstone supersedes cached approval. New activations and
+sessions cannot enter the revoked lane, and old owners cannot be checked out.
+An in-progress native call is not interrupted by unloading its DLL. The daemon
+drains it, blocks new work, and restarts onto a bundled approved backend. The
+offline client continues to use its last locally verified signed state until a
+new state is explicitly obtained.
+
+### Release sequence
+
+The release pipeline has two separately authorized gates:
+
+1. finish the implementation and local/HIP/physical-Vulkan evidence;
+2. publish the formal capability-aware release and inert CUDA qualification
+   assets only after explicit user approval;
+3. run the qualification runner on the external CUDA host using those exact
+   published bytes;
+4. bind passing receipts to exact capability cells;
+5. publish a signed capability/catalog epoch only after a second explicit user
+   approval; and
+6. activate those cells in the already-published runtime version without
+   creating a second binary release.
+
+If qualification fails, the assets stay inert and the code fix enters a later
+version.
+
+### Completion workstreams
+
+The coordinated program consists of six workstreams:
+
+1. exact-route Layer 1, capture-aware Layer 2, production-shape four-quadrant,
+   and observed graph lifecycle shared by HIP, physical Vulkan, and CUDA;
+2. formal real-family `ShortAudioReceipt evidence.v1` production with complete
+   logits/token traces and matrix binding;
+3. physical Vulkan artifact-bound hardware evidence;
+4. packaged Tauri product E2E through public IPC, the production kernel-switch
+   transaction, `DaemonSupervisor`, real transcription, persistence, and
+   rollback;
+5. artifact-publication/capability-activation gates, qualification, exact-cell
+   approval, old-client rejection, and signed revocation; and
+6. the ownership evidence envelope, finalizer consumption, deterministic race,
+   and safe real-host pressure/rollback harness.
 
 ## Executive decision
 
@@ -371,6 +632,11 @@ failures may advance to another candidate. Error strings are not policy.
 15. After the planned-topology migration gate, production family code may
     materialize declared components on demand but may not allocate, retry,
     publish, or fall back through an unplanned family-local JIT path.
+16. A persistent graph's raw backend and scheduler handles are covered by the
+    same shared native lifetime owners as its runner/cache entry. Runner or
+    thread-cache teardown cannot free those handles first, and scheduler
+    replacement fails before mutation while any persistent session retains the
+    old scheduler.
 
 ## Target architecture
 

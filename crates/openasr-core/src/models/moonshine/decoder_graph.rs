@@ -9,8 +9,8 @@ use crate::PhraseBiasConfig;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
     GgmlCpuGraphRunner, GgmlCpuTensor, GgmlDecodeReuseMode, GgmlLoadedTensor,
-    GgmlLoadedWeightContext, GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
-    GgufRuntimeSourcePreflight,
+    GgmlLoadedWeightContext, GgmlRopeExtParams, GgmlSelectionEvidenceRef, GgmlStaticTensor,
+    GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, BuiltinSeq2SeqDecodePolicyConfigInput,
@@ -47,11 +47,17 @@ const MOONSHINE_LAYER_NORM_EPSILON: f32 = 1.0e-5;
 /// `GgmlStaticTensorArena`/`allocate_zeroed_llm_resident_kv_arena`: real
 /// tensor bytes land in a backend buffer sized from actual shapes,
 /// independent of this context's size). Mirrors the encoder's proven
-/// `16_384` headroom (`moonshine_encoder_graph_config`).
-const MOONSHINE_DECODER_GRAPH_SIZE_FLOOR: usize = 16_384;
+/// Same bound as the encoder: prefill, cross-KV warmup, and incremental
+/// decode all fit in 4096 nodes. Matching the persistent session capacity
+/// means `start_graph` cannot leave a 6.4 MiB PeakWorkingSet watermark.
+const MOONSHINE_DECODER_GRAPH_SIZE_FLOOR: usize = 4_096;
+/// Incremental reusable decode cgraph only. Keep this identical to the runner
+/// floor so parking the idle runner does not allocate a second host context.
+const MOONSHINE_DECODER_REUSE_GRAPH_NODES: usize = 4_096;
 
 enum RuntimeWeightSource<'a> {
     Verified(&'a GgufRuntimeSourcePreflight),
+    Reused(GgmlLoadedWeightContext),
     #[cfg(test)]
     Synthetic,
 }
@@ -378,6 +384,7 @@ pub(crate) struct MoonshineDecoderGraphRuntime {
     n_seq: usize,
     greedy_step_output_mode: DeviceGreedyStepOutputMode,
     reuse_mode: GgmlDecodeReuseMode,
+    last_step_compute_evidence: Option<GgmlSelectionEvidenceRef>,
 }
 
 /// The resolved-input identity a decoder runtime is built from: the weights
@@ -428,6 +435,10 @@ impl Seq2SeqGreedyDecodeStepExecutor for MoonshineDecoderStepExecutor<'_> {
         })?;
         Ok(output)
     }
+
+    fn take_compute_evidence(&mut self) -> Option<GgmlSelectionEvidenceRef> {
+        self.runtime.last_step_compute_evidence.take()
+    }
 }
 
 fn reuse_mode_allows_persistent_graph(reuse_mode: GgmlDecodeReuseMode) -> bool {
@@ -437,6 +448,49 @@ fn reuse_mode_allows_persistent_graph(reuse_mode: GgmlDecodeReuseMode) -> bool {
 impl MoonshineDecoderGraphRuntime {
     fn supports_reusable_decode_graph(&self) -> bool {
         reuse_mode_allows_persistent_graph(self.reuse_mode)
+    }
+
+    fn finish_step_compute<'a>(
+        last_step_compute_evidence: &mut Option<GgmlSelectionEvidenceRef>,
+        vocab_size: usize,
+        graph: &mut GgmlCpuGraphBuilder<'a>,
+        logits: GgmlCpuTensor<'a>,
+        top1: Option<GgmlCpuTensor<'a>>,
+    ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, MoonshineDecoderGraphError> {
+        match top1 {
+            Some(top1) => {
+                let readback =
+                    graph
+                        .compute_output_i32_with_evidence(top1, 1)
+                        .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
+                            reason: error.to_string(),
+                        })?;
+                let (token_ids, evidence) = readback.into_parts();
+                *last_step_compute_evidence = evidence;
+                let token_id = token_ids.into_iter().next().ok_or_else(|| {
+                    MoonshineDecoderGraphError::GraphExecutionFailed {
+                        reason: "moonshine device top-1 returned no token id".to_string(),
+                    }
+                })?;
+                Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                    logits: Vec::new(),
+                    greedy_token_hint: Some(map_device_top1_token(token_id, vocab_size)?),
+                })
+            }
+            None => {
+                let readback = graph
+                    .compute_output_f32_with_evidence(logits, vocab_size)
+                    .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
+                        reason: error.to_string(),
+                    })?;
+                let (logits, evidence) = readback.into_parts();
+                *last_step_compute_evidence = evidence;
+                Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
+                    logits,
+                    greedy_token_hint: None,
+                })
+            }
+        }
     }
 
     fn ensure_resident_self_kv_arena(&mut self) -> Result<(), MoonshineDecoderGraphError> {
@@ -486,6 +540,27 @@ impl MoonshineDecoderGraphRuntime {
             input.graph_config,
             input.reuse_mode,
             runtime_preflight,
+            1,
+            adapter,
+            greedy_step_output_mode,
+        )
+    }
+
+    pub(crate) fn new_with_shared_pack_weights(
+        input: MoonshineDecoderRuntimeInput<'_>,
+        _runtime_preflight: &GgufRuntimeSourcePreflight,
+        adapter: Option<&MoonshineLoraAdapter>,
+        greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        shared_weights: GgmlLoadedWeightContext,
+    ) -> Result<Self, MoonshineDecoderGraphError> {
+        Self::new_with_n_seq_impl(
+            input.decoder_weights,
+            input.metadata,
+            input.decoder_state,
+            input.backend,
+            input.graph_config,
+            input.reuse_mode,
+            RuntimeWeightSource::Reused(shared_weights),
             1,
             adapter,
             greedy_step_output_mode,
@@ -637,13 +712,7 @@ impl MoonshineDecoderGraphRuntime {
         }
 
         let mut config = graph_config;
-        config.graph_size = config.graph_size.max(MOONSHINE_DECODER_GRAPH_SIZE_FLOOR);
-        config.context_bytes =
-            config
-                .context_bytes
-                .max(GgmlCpuGraphConfig::metadata_context_bytes(
-                    config.graph_size,
-                ));
+        config.set_graph_node_capacity(config.graph_size.max(MOONSHINE_DECODER_GRAPH_SIZE_FLOOR));
         let runner = GgmlCpuGraphRunner::new(config).map_err(build_err("runner_init"))?;
         // Bind the per-layer 2-D linears (self/cross attn + ffn) zero-copy from the
         // mmap'd pack (native q8_0 [in,out]); the loader supplies them meta-only, so
@@ -655,6 +724,7 @@ impl MoonshineDecoderGraphRuntime {
                     .load_gguf_weight_context_from_preflight(preflight)
                     .map_err(build_err("load_gguf_weight_context"))?,
             ),
+            RuntimeWeightSource::Reused(shared) => Some(shared),
             #[cfg(test)]
             RuntimeWeightSource::Synthetic => None,
         };
@@ -841,6 +911,7 @@ impl MoonshineDecoderGraphRuntime {
             n_seq,
             greedy_step_output_mode,
             reuse_mode,
+            last_step_compute_evidence: None,
         })
     }
 
@@ -887,6 +958,16 @@ impl MoonshineDecoderGraphRuntime {
         self.decoder_state = decoder_state;
         self.cross_frame_count = decoder_state.cross_attention.logical_positions;
         Ok(())
+    }
+
+    pub(crate) fn release_transient_compute_memory(
+        &mut self,
+    ) -> Result<(), MoonshineDecoderGraphError> {
+        self.reuse = None;
+        match self.runner.release_request_compute_residency() {
+            Ok(()) | Err(GgmlCpuGraphError::PersistentGraphSessionActive) => Ok(()),
+            Err(error) => Err(build_err("release_request_compute_residency")(error)),
+        }
     }
 
     /// Precompute per-layer cross-attention K/V from the encoder output (once per utterance).
@@ -1013,13 +1094,13 @@ impl MoonshineDecoderGraphRuntime {
                 .cpy(key, key_target)
                 .map_err(build_err("ggml_cpy(cross_k_cache)"))?;
             graph
-                .add_side_effect_root(write_key)
+                .add_kv_write_root(write_key)
                 .map_err(build_err("side_effect(cross_k)"))?;
             let write_value = graph
                 .cpy(value, value_target)
                 .map_err(build_err("ggml_cpy(cross_v_cache)"))?;
             graph
-                .add_side_effect_root(write_value)
+                .add_kv_write_root(write_value)
                 .map_err(build_err("side_effect(cross_v)"))?;
             graph
                 .set_output(value)
@@ -1078,6 +1159,7 @@ impl MoonshineDecoderGraphRuntime {
         position: usize,
         output_mode: DeviceGreedyStepOutputMode,
     ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, MoonshineDecoderGraphError> {
+        self.last_step_compute_evidence = None;
         if !self.supports_reusable_decode_graph() {
             return Err(MoonshineDecoderGraphError::InvalidInput {
                 reason: "moonshine incremental decode requires ReusableGraph evidence".to_string(),
@@ -1152,35 +1234,13 @@ impl MoonshineDecoderGraphRuntime {
             .set_f16_bits_slice(attention_mask, &mask_bits, "moonshine_reuse_self_mask")
             .map_err(build_err("ggml_set_f16_bits_slice(reuse_mask)"))?;
 
-        match top1 {
-            Some(top1) => {
-                let token_id = graph
-                    .compute_output_i32(top1, 1)
-                    .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
-                        reason: error.to_string(),
-                    })?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| MoonshineDecoderGraphError::GraphExecutionFailed {
-                        reason: "moonshine device top-1 returned no token id".to_string(),
-                    })?;
-                Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-                    logits: Vec::new(),
-                    greedy_token_hint: Some(map_device_top1_token(
-                        token_id,
-                        self.metadata.vocab_size,
-                    )?),
-                })
-            }
-            None => Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits: graph
-                    .compute_output_f32(logits, self.metadata.vocab_size)
-                    .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
-                        reason: error.to_string(),
-                    })?,
-                greedy_token_hint: None,
-            }),
-        }
+        Self::finish_step_compute(
+            &mut self.last_step_compute_evidence,
+            self.metadata.vocab_size,
+            graph,
+            logits,
+            top1,
+        )
     }
 
     // Wired by the moonshine serve-batch owner thread in the follow-up step.
@@ -1495,7 +1555,7 @@ impl MoonshineDecoderGraphRuntime {
 
         let mut session = self
             .runner
-            .start_capacity_sized_persistent_graph_session()
+            .start_persistent_graph_session_with_node_capacity(MOONSHINE_DECODER_REUSE_GRAPH_NODES)
             .map_err(build_err("moonshine_reuse_session"))?;
         let graph = session.builder();
         let token_id = graph
@@ -1638,6 +1698,7 @@ impl MoonshineDecoderGraphRuntime {
         tokens: &[u32],
         output_mode: DeviceGreedyStepOutputMode,
     ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, MoonshineDecoderGraphError> {
+        self.last_step_compute_evidence = None;
         let token_count = tokens.len();
         if token_count == 0 {
             return Err(MoonshineDecoderGraphError::InvalidInput {
@@ -1759,35 +1820,13 @@ impl MoonshineDecoderGraphRuntime {
                 .map_err(build_err("ggml_set_f16_bits_slice(self_mask)"))?;
         }
 
-        match top1 {
-            Some(top1) => {
-                let token_id = graph
-                    .compute_output_i32(top1, 1)
-                    .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
-                        reason: error.to_string(),
-                    })?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| MoonshineDecoderGraphError::GraphExecutionFailed {
-                        reason: "moonshine device top-1 returned no token id".to_string(),
-                    })?;
-                Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-                    logits: Vec::new(),
-                    greedy_token_hint: Some(map_device_top1_token(
-                        token_id,
-                        self.metadata.vocab_size,
-                    )?),
-                })
-            }
-            None => Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits: graph
-                    .compute_output_f32(logits, self.metadata.vocab_size)
-                    .map_err(|error| MoonshineDecoderGraphError::GraphExecutionFailed {
-                        reason: error.to_string(),
-                    })?,
-                greedy_token_hint: None,
-            }),
-        }
+        Self::finish_step_compute(
+            &mut self.last_step_compute_evidence,
+            self.metadata.vocab_size,
+            &mut graph,
+            logits,
+            top1,
+        )
     }
 }
 
@@ -1896,10 +1935,10 @@ fn run_incremental_decoder_layer<'a>(
     )?;
     let v = reshape_incremental_for_attn(graph, v, head_dim, heads, n_seq, "dec_v_attn")?;
     let k = graph
-        .set_rows(self_k_cache, k, row_index)
+        .set_kv_rows(self_k_cache, k, row_index)
         .map_err(build_err("ggml_set_rows(dec_self_k_cache)"))?;
     let v = graph
-        .set_rows(self_v_cache, v, row_index)
+        .set_kv_rows(self_v_cache, v, row_index)
         .map_err(build_err("ggml_set_rows(dec_self_v_cache)"))?;
     let k = view_self_kv_prefix(
         graph,
@@ -2059,10 +2098,10 @@ fn run_prefill_decoder_layer<'a>(
         "prefill_dec_v_attn",
     )?;
     let k = graph
-        .set_rows(self_k_cache, k, row_index)
+        .set_kv_rows(self_k_cache, k, row_index)
         .map_err(build_err("ggml_set_rows(prefill_dec_self_k_cache)"))?;
     let v = graph
-        .set_rows(self_v_cache, v, row_index)
+        .set_kv_rows(self_v_cache, v, row_index)
         .map_err(build_err("ggml_set_rows(prefill_dec_self_v_cache)"))?;
     let k = view_self_kv_prefix(
         graph,

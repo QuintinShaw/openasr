@@ -1,0 +1,47 @@
+[package]
+name = "openasr-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+openasr-core = { path = "../crates/openasr-core" }
+openasr-server = { path = "../crates/openasr-server" }
+
+[workspace]
+members = ["."]
+
+[lints.cargo]
+non_kebab_case_bins = "allow"
+
+[[bin]]
+name = "oasr_package_probe"
+path = "fuzz_targets/oasr_package_probe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "multipart_parse"
+path = "fuzz_targets/multipart_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "catalog_json_parse"
+path = "fuzz_targets/catalog_json_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ws_session_start"
+path = "fuzz_targets/ws_session_start.rs"
+test = false
+doc = false
+bench = false

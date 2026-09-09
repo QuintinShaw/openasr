@@ -76,7 +76,7 @@ impl Weights {
         for tensor in tensor_index.tensors() {
             let elements = tensor.num_elements().ok_or_else(|| {
                 WeightsError::InvalidInput(format!(
-                    "redimnet tensor '{}' element count overflow",
+                    "embedder tensor '{}' element count overflow",
                     tensor.name
                 ))
             })?;
@@ -84,7 +84,7 @@ impl Weights {
                 .checked_mul(std::mem::size_of::<f32>() as u64)
                 .ok_or_else(|| {
                     WeightsError::InvalidInput(format!(
-                        "redimnet tensor '{}' f32 byte count overflow",
+                        "embedder tensor '{}' f32 byte count overflow",
                         tensor.name
                     ))
                 })?;
@@ -92,7 +92,7 @@ impl Weights {
                 .checked_mul(std::mem::size_of::<usize>() as u64)
                 .ok_or_else(|| {
                     WeightsError::InvalidInput(format!(
-                        "redimnet tensor '{}' shape byte count overflow",
+                        "embedder tensor '{}' shape byte count overflow",
                         tensor.name
                     ))
                 })?;
@@ -104,7 +104,7 @@ impl Weights {
             ] {
                 bytes = bytes.checked_add(commitment).ok_or_else(|| {
                     WeightsError::InvalidInput(
-                        "redimnet quoted weight byte sum overflow".to_string(),
+                        "embedder quoted weight byte sum overflow".to_string(),
                     )
                 })?;
             }
@@ -246,14 +246,14 @@ impl Weights {
                 .capacity()
                 .checked_mul(std::mem::size_of::<usize>())
                 .ok_or_else(|| {
-                    WeightsError::InvalidInput("redimnet shape capacity byte overflow".to_string())
+                    WeightsError::InvalidInput("embedder shape capacity byte overflow".to_string())
                 })?;
             let data_bytes = tensor
                 .data
                 .capacity()
                 .checked_mul(std::mem::size_of::<f32>())
                 .ok_or_else(|| {
-                    WeightsError::InvalidInput("redimnet tensor capacity byte overflow".to_string())
+                    WeightsError::InvalidInput("embedder tensor capacity byte overflow".to_string())
                 })?;
             for commitment in [
                 allocation_commitment(name.capacity())?,
@@ -263,7 +263,7 @@ impl Weights {
             ] {
                 bytes = bytes.checked_add(commitment).ok_or_else(|| {
                     WeightsError::InvalidInput(
-                        "redimnet retained weight byte sum overflow".to_string(),
+                        "embedder retained weight byte sum overflow".to_string(),
                     )
                 })?;
             }
@@ -351,7 +351,7 @@ pub(crate) const HOST_ALLOCATION_PAGE_BYTES: u64 = 4096;
 
 pub(crate) fn allocation_commitment(requested_bytes: usize) -> Result<u64, WeightsError> {
     let requested = u64::try_from(requested_bytes).map_err(|_| {
-        WeightsError::InvalidInput("redimnet allocation size does not fit u64".to_string())
+        WeightsError::InvalidInput("embedder allocation size does not fit u64".to_string())
     })?;
     allocation_commitment_u64(requested)
 }
@@ -360,7 +360,7 @@ pub(crate) fn allocation_commitment_u64(requested: u64) -> Result<u64, WeightsEr
     let with_header = requested
         .checked_add((std::mem::size_of::<usize>() * 2) as u64)
         .ok_or_else(|| {
-            WeightsError::InvalidInput("redimnet allocation header byte overflow".to_string())
+            WeightsError::InvalidInput("embedder allocation header byte overflow".to_string())
         })?;
     let remainder = with_header % HOST_ALLOCATION_PAGE_BYTES;
     if remainder == 0 {
@@ -369,7 +369,7 @@ pub(crate) fn allocation_commitment_u64(requested: u64) -> Result<u64, WeightsEr
         with_header
             .checked_add(HOST_ALLOCATION_PAGE_BYTES - remainder)
             .ok_or_else(|| {
-                WeightsError::InvalidInput("redimnet allocation rounding overflow".to_string())
+                WeightsError::InvalidInput("embedder allocation rounding overflow".to_string())
             })
     }
 }

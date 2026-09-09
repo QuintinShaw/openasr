@@ -1313,6 +1313,17 @@ impl NativeBackendPrivateMemoryLease {
         !inner.committed && !inner.quarantined && inner.transaction.is_some()
     }
 
+    /// Records that a later graph compute reused this backend-owned high-water
+    /// lease instead of admitting a second receipt row for the same native pool.
+    pub(crate) fn record_receipt_reuse(&self) {
+        let inner = self.inner.borrow();
+        if let Some(transaction) = inner.transaction.as_ref() {
+            transaction.reservation().record_receipt_reuse();
+        } else if let Some(reservation) = inner.committed_reservation.as_ref() {
+            reservation.record_receipt_reuse();
+        }
+    }
+
     /// Captures any private growth performed by `reserve_private` itself,
     /// before the scheduler sibling mutates the same physical domain.
     pub(crate) fn checkpoint_private_growth(&self) -> Result<(), NativeBackendPrivateMemoryError> {
@@ -3721,10 +3732,22 @@ mod tests {
         assert_eq!(usage.pending_bytes, 0);
         assert_eq!(usage.unreclaimable_bytes, GIB);
         assert!(usage.quarantined);
+        let mut exhausted = dedicated_request(dedicated.clone(), 1, "scheduler-blocked");
+        exhausted.snapshot.free_bytes = 0;
         assert!(matches!(
-            broker.try_reserve_batch(vec![dedicated_request(dedicated, 1, "scheduler-blocked")]),
+            broker.try_reserve_batch(vec![exhausted]),
             Err(MemoryPlanningError::DeviceQuarantined { .. })
         ));
+        assert!(
+            broker
+                .try_reserve_batch(vec![dedicated_request(
+                    dedicated.clone(),
+                    1,
+                    "scheduler-recovered"
+                )])
+                .is_ok()
+        );
+        assert!(!broker.usage(&dedicated).quarantined);
     }
 
     #[derive(Debug)]

@@ -1,8 +1,12 @@
 param()
 
-# qwen GPU raw diagnostic. It never skips a missing GPU, fixture, pack, or
-# trace, but caller expectations and local activation state are not release
-# authority. Output names deliberately cannot match the release gate globs.
+# Qwen GPU transcript diagnostic. It never skips a missing GPU, fixture, pack,
+# or debug trace, but it does not emit release correctness evidence. The
+# OPENASR_SEQ2SEQ_TRACE_FILE artifacts use the non-authoritative
+# openasr.seq2seq-debug-trace.v1 schema; only the request receipt collector may
+# emit openasr.gpu-correctness-trace.v1. Caller expectations and local
+# activation state are not release authority, and diagnostic output names
+# deliberately cannot match the release-gate globs.
 #
 # Run locally on a gfx1200 / CUDA / Vulkan box:
 #   cargo build -p openasr-cli --release --features hip   # or cuda / vulkan

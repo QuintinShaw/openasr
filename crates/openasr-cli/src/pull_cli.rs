@@ -7,9 +7,8 @@ use openasr_core::{
     NativeExecutionServices, OpenAsrConfig, PullModelPackRequest, QuantPreference,
     ResolvedCatalogPull, host_quant_recommendation_profile,
     install_model_pack_from_path_with_execution_services, list_installed_packs, load_config,
-    load_model_catalog, model_install_license_decision, openasr_home,
-    remove_model_pack_with_execution_services, resolve_catalog_pull_with_profile, resolve_chain,
-    resolve_launch_pack,
+    model_install_license_decision, openasr_home, remove_model_pack_with_execution_services,
+    resolve_catalog_pull_with_profile, resolve_chain, resolve_launch_pack,
 };
 
 use crate::PullCommandOptions;
@@ -27,7 +26,7 @@ pub(crate) fn pull(
 ) -> Result<()> {
     let home = openasr_home()?;
     let config = load_config(&home)?;
-    let catalog = load_model_catalog(options.catalog_url, &home)?;
+    let catalog = crate::catalog_cli::load_operator_model_catalog(options.catalog_url, &home)?;
     let pull_request = CatalogPullRequest {
         reference: options.reference.to_string(),
         quant: options.quant.map(ToOwned::to_owned),
@@ -275,7 +274,7 @@ pub(crate) fn ensure_asr_model_installed(
     // Now we need the catalog (cache/embedded-first) -- for alias resolution and
     // to resolve the pull. Loading it only here keeps a declined/installed run
     // from contacting project infrastructure.
-    let catalog = load_model_catalog(None, &home)?;
+    let catalog = crate::catalog_cli::load_operator_model_catalog(None, &home)?;
     let catalog_probe = LaunchPackRequest {
         model_ref: &model_ref,
         preference: &QuantPreference::Auto,
@@ -603,6 +602,7 @@ mod tests {
             generated_at: "2026-06-11T00:00:00Z".to_string(),
             catalog_url: "fixture".to_string(),
             backends: Vec::new(),
+            execution_approvals: None,
             language_labels: std::collections::BTreeMap::new(),
             models: vec![catalog_model(
                 "moonshine-tiny",
@@ -623,6 +623,7 @@ mod tests {
             generated_at: "2026-06-11T00:00:00Z".to_string(),
             catalog_url: "fixture".to_string(),
             backends: Vec::new(),
+            execution_approvals: None,
             language_labels: std::collections::BTreeMap::new(),
             models: vec![
                 catalog_model(

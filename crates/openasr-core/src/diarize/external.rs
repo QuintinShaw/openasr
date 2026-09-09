@@ -36,7 +36,7 @@ const EMBEDDING_STEP_S: f64 = 0.75;
 /// bounded batch keeps four queued windows per worker without retaining an
 /// unbounded meeting-length waveform expansion; at 1.5 s per clip it caps
 /// 16 kHz padded waveform storage at about 1.5 MiB.
-const EMBEDDING_BATCH_SIZE: usize = super::embed::REDIMNET_BOUNDED_BATCH_SIZE;
+const EMBEDDING_BATCH_SIZE: usize = super::embed::EMBEDDER_BOUNDED_BATCH_SIZE;
 const VAD_FRAME_STEP_SAMPLES: usize = 160;
 
 #[derive(Clone, Copy, Default)]
@@ -133,7 +133,7 @@ fn external_diarization_scratch_plan(
     let padded_clip_bytes =
         (EMBEDDING_WINDOW_S * SAMPLE_RATE_HZ as f64) as usize * std::mem::size_of::<f32>();
     let batch_clips = EMBEDDING_BATCH_SIZE.min(embedding_count);
-    let frontend_workers = super::embed::REDIMNET_MAX_BATCH_WORKERS.min(batch_clips);
+    let frontend_workers = super::embed::EMBEDDER_MAX_BATCH_WORKERS.min(batch_clips);
     let (feature_bytes_per_clip, frontend_peak_per_worker) =
         super::embed::redimnet_frontend_payload_quote(
             padded_clip_bytes / std::mem::size_of::<f32>(),
@@ -364,8 +364,6 @@ fn bytes_for_count(count: usize, element_bytes: usize) -> u64 {
 pub enum ExternalDiarizationError {
     #[error(transparent)]
     Segmenter(#[from] SegmentError),
-    #[error("external Voice ID could not load the vendored FireRed Stream-VAD")]
-    VadUnavailable,
     #[error("external Voice ID FireRed VAD failed: {0}")]
     Vad(String),
     #[error("external Voice ID ReDim embedding failed: {0}")]
@@ -414,8 +412,7 @@ impl PreparedExternalDiarizer {
             Arc::clone(&execution_services),
             execution_intent.clone(),
         )
-        .map_err(|error| ExternalDiarizationError::Vad(error.to_string()))?
-        .ok_or(ExternalDiarizationError::VadUnavailable)?;
+        .map_err(|error| ExternalDiarizationError::Vad(error.to_string()))?;
         let segmenter = PolicyResolvedSegmenterRuntime::load_prepared(
             execution_services,
             execution_intent,

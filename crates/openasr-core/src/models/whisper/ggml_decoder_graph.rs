@@ -14,8 +14,8 @@ use thiserror::Error;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlStaticTensor,
-    GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightContext,
+    GgmlSelectionEvidenceRef, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
 };
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, STANDARD_HEAD_PERMUTE_AXES,
@@ -824,6 +824,7 @@ pub(crate) struct WhisperDecoderGraphExecutionOutput {
     pub prefix_len: usize,
     pub vocab_size: usize,
     pub last_token_cross_attention_frame_probs: Option<Vec<f32>>,
+    pub compute_evidence: Option<GgmlSelectionEvidenceRef>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3052,7 +3053,7 @@ fn execute_whisper_decoder_with_position_offset_ggml_v0(
     let upload_ms = upload_start.elapsed().as_millis();
 
     let compute_start = Instant::now();
-    let (logits, last_token_cross_attention_frame_probs) =
+    let (logits, last_token_cross_attention_frame_probs, compute_evidence) =
         if let Some(attention_tensor) = last_token_cross_attention_tensor {
             let attention_len = encoder_frames
                 .checked_mul(prefix_len)
@@ -3060,8 +3061,8 @@ fn execute_whisper_decoder_with_position_offset_ggml_v0(
                 .ok_or_else(|| WhisperDecoderGraphExecutionError::GraphExecutionFailed {
                     reason: "decoder cross-attention output shape overflowed".to_string(),
                 })?;
-            let mut outputs = graph
-                .compute_outputs_f32(&[
+            let output = graph
+                .compute_outputs_f32_with_evidence(&[
                     (last_token_logits_tensor, plan.output_projection.vocab_size),
                     (attention_tensor, attention_len),
                 ])
@@ -3070,6 +3071,7 @@ fn execute_whisper_decoder_with_position_offset_ggml_v0(
                         reason: format!("decoder graph compute failed: {error}"),
                     },
                 )?;
+            let (mut outputs, evidence) = output.into_parts();
             let attention = outputs.pop().ok_or_else(|| {
                 WhisperDecoderGraphExecutionError::GraphExecutionFailed {
                     reason: "decoder graph did not return cross-attention output".to_string(),
@@ -3086,16 +3088,20 @@ fn execute_whisper_decoder_with_position_offset_ggml_v0(
                 prefix_len,
                 config.attention_heads,
             )?;
-            (logits, Some(frame_probs))
+            (logits, Some(frame_probs), evidence)
         } else {
-            let logits = graph
-                .compute_output_f32(last_token_logits_tensor, plan.output_projection.vocab_size)
+            let output = graph
+                .compute_output_f32_with_evidence(
+                    last_token_logits_tensor,
+                    plan.output_projection.vocab_size,
+                )
                 .map_err(
                     |error| WhisperDecoderGraphExecutionError::GraphExecutionFailed {
                         reason: format!("decoder graph compute failed: {error}"),
                     },
                 )?;
-            (logits, None)
+            let (logits, evidence) = output.into_parts();
+            (logits, None, evidence)
         };
     if logits.iter().any(|value| !value.is_finite()) {
         return Err(WhisperDecoderGraphExecutionError::GraphExecutionFailed {
@@ -3113,6 +3119,7 @@ fn execute_whisper_decoder_with_position_offset_ggml_v0(
         prefix_len,
         vocab_size: plan.output_projection.vocab_size,
         last_token_cross_attention_frame_probs,
+        compute_evidence,
     };
     let compute_ms = compute_start.elapsed().as_millis();
 
@@ -3255,13 +3262,14 @@ pub(crate) fn run_whisper_decoder_reused_incremental_step_ggml_v0(
     let upload_ms = upload_start.elapsed().as_millis();
 
     let compute_start = Instant::now();
-    let logits = graph
-        .compute_output_f32(logits_tensor, plan.output_projection.vocab_size)
+    let output = graph
+        .compute_output_f32_with_evidence(logits_tensor, plan.output_projection.vocab_size)
         .map_err(
             |error| WhisperDecoderGraphExecutionError::GraphExecutionFailed {
                 reason: format!("decoder reusable graph compute failed: {error}"),
             },
         )?;
+    let (logits, compute_evidence) = output.into_parts();
     let compute_ms = compute_start.elapsed().as_millis();
     if logits.iter().any(|value| !value.is_finite()) {
         return Err(WhisperDecoderGraphExecutionError::GraphExecutionFailed {
@@ -3292,6 +3300,7 @@ pub(crate) fn run_whisper_decoder_reused_incremental_step_ggml_v0(
         prefix_len: 1,
         vocab_size: plan.output_projection.vocab_size,
         last_token_cross_attention_frame_probs: None,
+        compute_evidence,
     })
 }
 
@@ -3884,7 +3893,7 @@ fn build_whisper_decoder_reusable_incremental_graph_with_n_seq(
     let hidden = plan.input_shape.hidden_size;
     let encoder_frames = plan.input_shape.encoder_frames;
     let mut session = runner
-        .start_capacity_sized_persistent_graph_session()
+        .start_persistent_graph_session_with_node_capacity(4_096)
         .map_err(|error| map_decoder_execute_graph_error("whisper_reuse_session", error))?;
     let graph = session.builder();
     let token_id = graph
@@ -4716,16 +4725,18 @@ fn apply_decoder_self_attention<'a>(
                 let v_rows = graph.reshape_2d(v, hidden, token_count).map_err(|error| {
                     map_decoder_execute_graph_error("ggml_reshape_2d(self_v_rows)", error)
                 })?;
-                let k_written = graph
-                    .set_rows(k_layer, k_rows, row_indices)
-                    .map_err(|error| {
-                        map_decoder_execute_graph_error("ggml_set_rows(self_k_write)", error)
-                    })?;
-                let v_written = graph
-                    .set_rows(v_layer, v_rows, row_indices)
-                    .map_err(|error| {
-                        map_decoder_execute_graph_error("ggml_set_rows(self_v_write)", error)
-                    })?;
+                let k_written =
+                    graph
+                        .set_kv_rows(k_layer, k_rows, row_indices)
+                        .map_err(|error| {
+                            map_decoder_execute_graph_error("ggml_set_rows(self_k_write)", error)
+                        })?;
+                let v_written =
+                    graph
+                        .set_kv_rows(v_layer, v_rows, row_indices)
+                        .map_err(|error| {
+                            map_decoder_execute_graph_error("ggml_set_rows(self_v_write)", error)
+                        })?;
                 let nb1 = row_stride;
                 let nb2 = head_dim.checked_mul(element_size).ok_or_else(|| {
                     WhisperDecoderGraphExecutionError::InvalidInput {
@@ -4805,16 +4816,18 @@ fn apply_decoder_self_attention<'a>(
                     n_seq,
                     "ggml_cont(self_v_rows)",
                 )?;
-                let k_written = graph
-                    .set_rows(k_layer, k_rows, row_indices)
-                    .map_err(|error| {
-                        map_decoder_execute_graph_error("ggml_set_rows(self_k_write)", error)
-                    })?;
-                let v_written = graph
-                    .set_rows(v_layer, v_rows, row_indices)
-                    .map_err(|error| {
-                        map_decoder_execute_graph_error("ggml_set_rows(self_v_write)", error)
-                    })?;
+                let k_written =
+                    graph
+                        .set_kv_rows(k_layer, k_rows, row_indices)
+                        .map_err(|error| {
+                            map_decoder_execute_graph_error("ggml_set_rows(self_k_write)", error)
+                        })?;
+                let v_written =
+                    graph
+                        .set_kv_rows(v_layer, v_rows, row_indices)
+                        .map_err(|error| {
+                            map_decoder_execute_graph_error("ggml_set_rows(self_v_write)", error)
+                        })?;
                 (k_written, v_written)
             }
         } else {
@@ -4853,7 +4866,7 @@ fn apply_decoder_self_attention<'a>(
             let k_write = graph.cpy(k_flat, k_dst).map_err(|error| {
                 map_decoder_execute_graph_error("ggml_cpy(self_k_write)", error)
             })?;
-            graph.add_side_effect_root(k_write).map_err(|error| {
+            graph.add_kv_write_root(k_write).map_err(|error| {
                 map_decoder_execute_graph_error("ggml_side_effect(self_k)", error)
             })?;
 
@@ -4868,7 +4881,7 @@ fn apply_decoder_self_attention<'a>(
             let v_write = graph.cpy(v_flat, v_dst).map_err(|error| {
                 map_decoder_execute_graph_error("ggml_cpy(self_v_write)", error)
             })?;
-            graph.add_side_effect_root(v_write).map_err(|error| {
+            graph.add_kv_write_root(v_write).map_err(|error| {
                 map_decoder_execute_graph_error("ggml_side_effect(self_v)", error)
             })?;
             let nb1 = hidden.checked_mul(element_size).ok_or_else(|| {
@@ -5796,13 +5809,13 @@ fn prepare_cross_attention_projection_pairs_with_persistent_weights_runner_ggml<
         let key_write = graph
             .cpy(key_output, arena.graph_tensor(task.key_target))
             .map_err(|error| map_decoder_execute_graph_error("ggml_cpy(cross_k_write)", error))?;
-        graph.add_side_effect_root(key_write).map_err(|error| {
+        graph.add_kv_write_root(key_write).map_err(|error| {
             map_decoder_execute_graph_error("ggml_build_forward_expand(cross_k_write)", error)
         })?;
         let value_write = graph
             .cpy(value_output, arena.graph_tensor(task.value_target))
             .map_err(|error| map_decoder_execute_graph_error("ggml_cpy(cross_v_write)", error))?;
-        graph.add_side_effect_root(value_write).map_err(|error| {
+        graph.add_kv_write_root(value_write).map_err(|error| {
             map_decoder_execute_graph_error("ggml_build_forward_expand(cross_v_write)", error)
         })?;
     }

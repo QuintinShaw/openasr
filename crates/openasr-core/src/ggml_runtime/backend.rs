@@ -65,6 +65,8 @@ pub enum BackendPluginActivationError {
     LoadFailed { backend_id: String },
     #[error("backend pack '{backend_id}' failed live device/driver attestation")]
     LiveProbeFailed { backend_id: String },
+    #[error("qualification artifact verification failed before provider load: {0}")]
+    QualificationArtifactInvalid(String),
     #[error("backend pack '{backend_id}' registered '{actual}', expected provider '{expected}'")]
     ProviderMismatch {
         backend_id: String,
@@ -179,8 +181,19 @@ impl GgmlRuntimeInfo {
 
 impl GgmlBackendDevice {
     pub fn initialize(&self) -> Result<GgmlBackend, GgmlRuntimeError> {
+        if super::env_flags::env_var_truthy("OPENASR_LOG_GGML_BACKEND_INIT") {
+            eprintln!(
+                "ggml-backend-init name={} kind={:?} device_id={:?}",
+                self.name, self.kind, self.device_id
+            );
+        }
         let raw = unsafe { ffi::ggml_backend_dev_init(self.raw.as_ptr(), ptr::null()) };
         GgmlBackend::from_raw(raw, "device")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_ptr(&self) -> ffi::GgmlBackendDevRaw {
+        self.raw.as_ptr()
     }
 
     /// Whether this device can execute a `mul_mat` whose weight operand has
@@ -479,6 +492,14 @@ pub(crate) struct ActivatedBackendExecutionIdentity {
     pub provider: ExecutionProvider,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct QualificationBackendActivation {
+    pub backend_id: String,
+    pub device_target: String,
+    pub driver_api_version: Option<String>,
+    pub provider_device_index: usize,
+}
+
 impl AcceleratedDeviceSelectionRule {
     /// The `rule=` value used in the boot summary's `gpu_selection` field.
     fn boot_log_label(self) -> &'static str {
@@ -588,12 +609,31 @@ pub(crate) fn preferred_accelerated_device(
     select_accelerated_device(devices, is_accelerated).map(|(device, _rule)| device)
 }
 
+/// Do not set `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM`. On ReBAR discrete GPUs
+/// every DeviceLocal heap is also HostVisible, so excluding HostVisible types
+/// fails closed with `no non-host-visible DeviceLocal memory type`.
+///
+/// SPIR-V float-controls patching makes AMD WDDM allocate ~2MiB ISA heap per
+/// compiled pipeline. Honor an explicit operator opt-in; otherwise disable
+/// the patch before the plugin reads getenv at device init.
+pub(crate) fn apply_vulkan_device_local_buffer_policy() {
+    const KEY: &str = "GGML_VK_DISABLE_FLOAT_CONTROLS_PATCH";
+    if std::env::var_os(KEY).is_none()
+        && std::env::var_os("GGML_VK_ENABLE_FLOAT_CONTROLS_PATCH").is_none()
+    {
+        // SAFETY: called once before vulkan device init; the plugin reads this
+        // with getenv on the same process. No concurrent set_var on this key.
+        unsafe { std::env::set_var(KEY, "1") };
+    }
+}
+
 /// Register backend modules once per process before the first registry query.
 /// A dynamic host loads only the bundled CPU rescue module and at most one
 /// exact, signed, integrity-verified optional GPU pack. Static hosts never load
 /// modules, avoiding the double-ggml global-state collision seen when a static
 /// GPU host loads a dynamic module.
 pub(crate) fn ensure_backends_loaded() {
+    apply_vulkan_device_local_buffer_policy();
     let _ = bundled_cpu_activation_cell().get_or_init(load_bundled_cpu_module);
     backend_plugin_activation_cell().get_or_init(|| {
         bundled_cpu_activation_cell()
@@ -1188,16 +1228,6 @@ fn activate_selected_backend_plugin()
         "ggml_backend_verify2",
         stage_started.elapsed(),
     );
-    let stage_started = Instant::now();
-    let live_driver = probe_exact_backend_plugin_candidate(
-        &backend_id,
-        requested.vendor,
-        &plugin_path,
-        &dependency_dirs,
-        &device_target,
-        live_backend_driver_floor(requested.vendor, requested.min_driver_api.as_deref()),
-    )?;
-    crate::stage_timing::log_stage("server_boot", "ggml_backend_probe", stage_started.elapsed());
     let expected_driver = activated_record
         .as_ref()
         .map(|record| record.driver_version.as_str())
@@ -1206,6 +1236,25 @@ fn activate_selected_backend_plugin()
                 .as_ref()
                 .map(|record| record.driver_version.as_str())
         });
+    // A throwaway LoadLibrary + vkCreateInstance leaves AMD WDDM ~2.1MiB host
+    // slabs in PeakWorkingSet after vkDestroyInstance. When the signed binding
+    // already names the driver, skip that extra instance: load_exact still
+    // live-proves the catalog target and driver floor on the production
+    // VkInstance.
+    let stage_started = Instant::now();
+    let live_driver = if let Some(expected) = expected_driver {
+        expected.to_string()
+    } else {
+        probe_exact_backend_plugin_candidate(
+            &backend_id,
+            requested.vendor,
+            &plugin_path,
+            &dependency_dirs,
+            &device_target,
+            live_backend_driver_floor(requested.vendor, requested.min_driver_api.as_deref()),
+        )?
+    };
+    crate::stage_timing::log_stage("server_boot", "ggml_backend_probe", stage_started.elapsed());
     if expected_driver.is_some_and(|expected| expected != live_driver) {
         return Err(BackendPluginActivationError::ActivationState(
             "live backend driver changed from the exact signed/scoped binding".to_string(),
@@ -1248,6 +1297,126 @@ fn activate_selected_backend_plugin()
         artifact_fingerprint: backend_artifact_fingerprint(&resolved),
         provider: execution_provider_for_catalog_vendor(resolved.vendor),
     }))
+}
+
+/// Load an optional provider only from the private artifact-bound
+/// qualification typestate. This does not read a catalog, accept a path from a
+/// caller, or persist an activation selector.
+pub(crate) fn activate_attested_qualification_backend(
+    attested: &crate::qualification_runtime::AttestedQualificationBackend,
+) -> Result<QualificationBackendActivation, BackendPluginActivationError> {
+    if !ggml_backend_dl_build_enabled() {
+        return Err(BackendPluginActivationError::DynamicLoadingUnavailable);
+    }
+    bundled_cpu_activation_cell()
+        .get_or_init(load_bundled_cpu_module)
+        .clone()?;
+    attested.reverify_for_load().map_err(|error| {
+        BackendPluginActivationError::QualificationArtifactInvalid(error.to_string())
+    })?;
+
+    let vendor = match attested.provider() {
+        crate::QualificationProvider::Cuda => CatalogBackendVendor::Cuda,
+        crate::QualificationProvider::Hip => CatalogBackendVendor::Hip,
+        crate::QualificationProvider::Vulkan => CatalogBackendVendor::Vulkan,
+        crate::QualificationProvider::Unknown => {
+            return Err(BackendPluginActivationError::QualificationArtifactInvalid(
+                "unknown qualification provider".to_string(),
+            ));
+        }
+    };
+    if backend_plugin_activation_cell().get().is_some() {
+        return Err(BackendPluginActivationError::QualificationArtifactInvalid(
+            "optional backend activation was initialized before qualification load".to_string(),
+        ));
+    }
+    let plugin_path = attested.plugin_path().ok_or_else(|| {
+        BackendPluginActivationError::QualificationArtifactInvalid(
+            "qualification provider has no signed plugin".to_string(),
+        )
+    })?;
+    let dependency_dirs = attested.dependency_dirs();
+    if vendor == CatalogBackendVendor::Hip {
+        crate::backend_distribution::bind_verified_hip_kernel_libpaths(&dependency_dirs);
+    }
+    let backend_id = format!(
+        "qualification:{}:{}:{}",
+        attested.manifest_sha256(),
+        attested.provider().as_str(),
+        attested.artifact_target()
+    );
+    let _load_guards =
+        lock_verified_backend_load_files(&backend_id, plugin_path, &dependency_dirs)?;
+    attested.reverify_for_load().map_err(|error| {
+        BackendPluginActivationError::QualificationArtifactInvalid(error.to_string())
+    })?;
+    let provider_device_index = 0;
+    let (device_target, discovered_driver) = if vendor == CatalogBackendVendor::Vulkan {
+        let (target, driver) = probe_backend_plugin_identity_candidate(
+            &backend_id,
+            vendor,
+            plugin_path,
+            &dependency_dirs,
+            provider_device_index,
+        )?;
+        if !crate::registry::is_canonical_vulkan_qualification_target(&target) {
+            return Err(BackendPluginActivationError::QualificationArtifactInvalid(
+                "verified Vulkan plugin returned a non-canonical physical target".to_string(),
+            ));
+        }
+        (target, Some(driver))
+    } else {
+        (attested.artifact_target().to_string(), None)
+    };
+    let driver_api_version = probe_exact_backend_plugin_candidate(
+        &backend_id,
+        vendor,
+        plugin_path,
+        &dependency_dirs,
+        &device_target,
+        None,
+    )?;
+    if discovered_driver
+        .as_deref()
+        .is_some_and(|driver| driver != driver_api_version)
+    {
+        return Err(BackendPluginActivationError::QualificationArtifactInvalid(
+            "Vulkan target discovery and exact live probe reported different drivers".to_string(),
+        ));
+    }
+    let artifact_fingerprint = attested.plugin_sha256().ok_or_else(|| {
+        BackendPluginActivationError::QualificationArtifactInvalid(
+            "qualification provider has no signed plugin identity".to_string(),
+        )
+    })?;
+    load_exact_backend_plugin(
+        &backend_id,
+        vendor,
+        plugin_path,
+        &dependency_dirs,
+        &device_target,
+        None,
+    )?;
+    let provider = execution_provider_for_catalog_vendor(vendor);
+    backend_plugin_activation_cell()
+        .set(Ok(Some(ActivatedBackendRuntime {
+            backend_id: backend_id.clone(),
+            device_target: device_target.clone(),
+            driver_version: driver_api_version.clone(),
+            artifact_fingerprint: artifact_fingerprint.to_string(),
+            provider,
+        })))
+        .map_err(|_| {
+            BackendPluginActivationError::QualificationArtifactInvalid(
+                "optional backend activation raced qualification load".to_string(),
+            )
+        })?;
+    Ok(QualificationBackendActivation {
+        backend_id,
+        device_target,
+        driver_api_version: Some(driver_api_version),
+        provider_device_index,
+    })
 }
 
 const fn execution_provider_for_catalog_vendor(vendor: CatalogBackendVendor) -> ExecutionProvider {
@@ -1468,6 +1637,66 @@ fn backend_provider_label(
             actual: "unknown catalog vendor".to_string(),
         }),
     }
+}
+
+fn probe_backend_plugin_identity_candidate(
+    backend_id: &str,
+    vendor: CatalogBackendVendor,
+    plugin_path: &Path,
+    dependency_dirs: &[PathBuf],
+    provider_device_index: usize,
+) -> Result<(String, String), BackendPluginActivationError> {
+    let path = path_to_utf8_cstring(backend_id, plugin_path)?;
+    let abi = CString::new(BackendHostAbi::current().fingerprint)
+        .expect("backend ABI fingerprint is hexadecimal");
+    let provider = CString::new(backend_provider_label(vendor, backend_id)?)
+        .expect("provider is static ASCII");
+    let (dependency_dir_cstrings, dependency_dir_ptrs) =
+        dependency_dirs_to_ffi(backend_id, dependency_dirs)?;
+    let dependency_dir_ptr = if dependency_dir_ptrs.is_empty() {
+        std::ptr::null()
+    } else {
+        dependency_dir_ptrs.as_ptr()
+    };
+    let mut target = [0 as std::ffi::c_char; 128];
+    let mut driver = [0 as std::ffi::c_char; 64];
+    let ok = unsafe {
+        ffi::ggml_backend_probe_identity_verified_v1_utf8(
+            path.as_ptr(),
+            dependency_dir_ptr,
+            dependency_dir_cstrings.len(),
+            abi.as_ptr(),
+            provider.as_ptr(),
+            provider_device_index,
+            target.as_mut_ptr(),
+            target.len(),
+            driver.as_mut_ptr(),
+            driver.len(),
+        )
+    };
+    if !ok {
+        return Err(BackendPluginActivationError::LiveProbeFailed {
+            backend_id: backend_id.to_string(),
+        });
+    }
+    let target = unsafe { CStr::from_ptr(target.as_ptr()) }
+        .to_str()
+        .map_err(|_| BackendPluginActivationError::LiveProbeFailed {
+            backend_id: backend_id.to_string(),
+        })?
+        .to_string();
+    let driver = unsafe { CStr::from_ptr(driver.as_ptr()) }
+        .to_str()
+        .map_err(|_| BackendPluginActivationError::LiveProbeFailed {
+            backend_id: backend_id.to_string(),
+        })?
+        .to_string();
+    if target.is_empty() || driver.is_empty() {
+        return Err(BackendPluginActivationError::LiveProbeFailed {
+            backend_id: backend_id.to_string(),
+        });
+    }
+    Ok((target, driver))
 }
 
 pub(crate) fn probe_exact_backend_plugin_candidate(
@@ -1769,7 +1998,7 @@ pub fn ggml_available_devices() -> Vec<GgmlBackendDevice> {
 
 /// Optional backend hardware fact queried through ggml's shared no-throw
 /// adapter. Older plugins remain ABI-safe and report zero/unknown.
-unsafe fn device_pci_vendor_id(device: NonNull<c_void>) -> Option<u32> {
+pub(crate) unsafe fn device_pci_vendor_id(device: NonNull<c_void>) -> Option<u32> {
     let vendor_id = unsafe { ffi::ggml_backend_dev_pci_vendor_id(device.as_ptr()) };
     (vendor_id != 0).then_some(vendor_id)
 }
@@ -1827,7 +2056,7 @@ pub fn ggml_native_build_enabled() -> bool {
 /// `use_backend_dl`): the CPU/GPU compute backends are runtime-loaded plugin
 /// DLLs rather than statically linked. See [`ensure_backends_loaded`] for why
 /// this gates the `ggml_backend_load_all` directory scan.
-fn ggml_backend_dl_build_enabled() -> bool {
+pub(crate) fn ggml_backend_dl_build_enabled() -> bool {
     option_env!("OPENASR_GGML_BACKEND_DL_ENABLED") == Some("1")
 }
 

@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use thiserror::Error;
 
 use crate::PhraseBiasConfig;
@@ -13,6 +15,8 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeConfig, Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult,
     Seq2SeqGreedyDecodeStepExecutor, run_seq2seq_greedy_decode_loop_with_adapter_v0,
 };
+
+const SEQ2SEQ_DEBUG_TRACE_SCHEMA: &str = "openasr.seq2seq-debug-trace.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BuiltinDecodePolicyLongformPromptCarryMode {
@@ -516,6 +520,7 @@ pub(crate) fn run_builtin_seq2seq_decode_policy<E>(
 /// `frame_logits[t]` is the length-`vocab_size` logit row for frame `t`;
 /// `decode_text_token_ids` maps the collapsed ids to text (its own error
 /// stringified by the family). Fails closed if the policy is not `CtcGreedyV0`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_builtin_ctc_decode_policy<E>(
     decode_policy_id: &str,
     frame_logits: &[&[f32]],
@@ -526,6 +531,7 @@ pub(crate) fn run_builtin_ctc_decode_policy<E>(
     map_ctc_error_to_family: fn(CtcGreedyDecodeError) -> E,
     map_registry_error: fn(BuiltinDecodePolicyComponentRegistryError) -> E,
     decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
+    frame_compute: Option<&[crate::ggml_runtime::GgmlSelectionEvidenceRef]>,
 ) -> Result<CtcGreedyDecodeResult, E> {
     let descriptor = resolve_builtin_decode_policy(decode_policy_id).map_err(map_registry_error)?;
     match descriptor.execution_kind {
@@ -553,6 +559,9 @@ pub(crate) fn run_builtin_ctc_decode_policy<E>(
                 |reason| CtcGreedyDecodeError::DetokenizeFailed { reason },
                 decode_work_progress,
             )
+            .inspect(|result| {
+                record_ctc_collapsed_token_receipt(result, frame_logits, frame_compute);
+            })
             .map_err(map_ctc_error_to_family)
         }
         // Fail closed: a seq2seq policy must never route through the CTC path.
@@ -763,6 +772,36 @@ pub(crate) fn seq2seq_transcript_byte_start(
     }
 }
 
+fn record_ctc_collapsed_token_receipt(
+    result: &CtcGreedyDecodeResult,
+    frame_logits: &[&[f32]],
+    frame_compute: Option<&[crate::ggml_runtime::GgmlSelectionEvidenceRef]>,
+) {
+    let Some(receipt) =
+        crate::models::native_execution_services::current_execution_receipt_collector()
+    else {
+        return;
+    };
+    let Some(frame_compute) = frame_compute else {
+        return;
+    };
+    if frame_compute.len() != result.frame_count {
+        return;
+    }
+    for (step_index, span) in result.token_spans.iter().enumerate() {
+        let Some(compute) = frame_compute.get(span.start_frame).copied() else {
+            continue;
+        };
+        let Some(row) = frame_logits.get(span.start_frame).copied() else {
+            continue;
+        };
+        receipt.begin_decode_step(step_index, Some(compute));
+        receipt.record_top_k(step_index, row);
+        receipt.record_token(step_index, span.token_id, false);
+        receipt.finish_decode_step(step_index);
+    }
+}
+
 fn emit_seq2seq_token_trace(
     kind: BuiltinDecodePolicySeq2SeqTraceKind,
     step_index: usize,
@@ -770,11 +809,10 @@ fn emit_seq2seq_token_trace(
     is_eot: bool,
 ) {
     if kind == BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1 {
-        if let Some(receipt) =
-            crate::models::native_execution_services::current_execution_receipt_collector()
-        {
-            receipt.record_token(step_index, token_id, is_eot);
-        }
+        append_seq2seq_debug_jsonl_trace(&format!(
+            "{{\"schema\":\"{SEQ2SEQ_DEBUG_TRACE_SCHEMA}\",\"event\":\"token\",\"step_index\":{step_index},\"token_id\":{token_id},\"is_eot\":{}}}",
+            usize::from(is_eot)
+        ));
         return;
     }
     if kind != BuiltinDecodePolicySeq2SeqTraceKind::WhisperEnvV0
@@ -794,11 +832,31 @@ fn emit_seq2seq_topk_trace(
     logits: &[f32],
 ) {
     if kind == BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1 {
-        if let Some(receipt) =
-            crate::models::native_execution_services::current_execution_receipt_collector()
-        {
-            receipt.record_top_k(step_index, logits);
+        let mut top = Vec::<(usize, f32)>::new();
+        for (token_id, logit) in logits.iter().copied().enumerate() {
+            if !logit.is_finite() {
+                continue;
+            }
+            let insert_at = top
+                .iter()
+                .position(|(_, existing)| logit.total_cmp(existing).is_gt());
+            if let Some(insert_at) = insert_at {
+                top.insert(insert_at, (token_id, logit));
+            } else if top.len() < 8 {
+                top.push((token_id, logit));
+            }
+            if top.len() > 8 {
+                top.truncate(8);
+            }
         }
+        let items = top
+            .iter()
+            .map(|(token_id, logit)| format!("{{\"token_id\":{token_id},\"value\":{logit:.6}}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        append_seq2seq_debug_jsonl_trace(&format!(
+            "{{\"schema\":\"{SEQ2SEQ_DEBUG_TRACE_SCHEMA}\",\"event\":\"top_k\",\"step_index\":{step_index},\"items\":[{items}]}}"
+        ));
         return;
     }
     if kind != BuiltinDecodePolicySeq2SeqTraceKind::WhisperEnvV0
@@ -831,6 +889,40 @@ fn emit_seq2seq_topk_trace(
     eprintln!(
         "openasr_whisper_ggml_trace stage=greedy_decode event=topk status=ok step_index={step_index} topk={items}"
     );
+}
+
+fn append_seq2seq_debug_jsonl_trace(line: &str) {
+    let Some(path) = std::env::var_os("OPENASR_SEQ2SEQ_TRACE_FILE") else {
+        return;
+    };
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    if file
+        .metadata()
+        .map(|metadata| metadata.len() == 0)
+        .unwrap_or(false)
+    {
+        let (Some(mode), Some(provider), Some(device)) = (
+            std::env::var_os("OPENASR_SEQ2SEQ_TRACE_MODE"),
+            std::env::var_os("OPENASR_SEQ2SEQ_TRACE_PROVIDER"),
+            std::env::var_os("OPENASR_SEQ2SEQ_TRACE_DEVICE"),
+        ) else {
+            return;
+        };
+        let header = format!(
+            "{{\"schema\":\"{SEQ2SEQ_DEBUG_TRACE_SCHEMA}\",\"event\":\"header\",\"mode\":\"{}\",\"provider\":\"{}\",\"device\":\"{}\"}}",
+            mode.to_string_lossy(),
+            provider.to_string_lossy(),
+            device.to_string_lossy()
+        );
+        let _ = writeln!(file, "{header}");
+    }
+    let _ = writeln!(file, "{line}");
 }
 
 #[cfg(test)]
@@ -1459,6 +1551,7 @@ mod tests {
             ctc_err_to_string,
             registry_err_to_string,
             None,
+            None,
         )
         .expect("ctc decode");
         assert_eq!(result.token_ids, vec![5, 7]);
@@ -1480,6 +1573,7 @@ mod tests {
             ctc_err_to_string,
             registry_err_to_string,
             None,
+            None,
         )
         .expect_err("seq2seq policy must not run through the CTC path");
         assert!(
@@ -1492,28 +1586,30 @@ mod tests {
     fn qwen_runtime_trace_producer_binds_to_request_receipt() {
         let receipt =
             crate::models::request_execution_receipt::NativeExecutionReceiptCollector::new();
-        let _guard = crate::models::native_execution_services::install_execution_receipt_collector(
-            Some(receipt.clone()),
-        );
-        emit_seq2seq_token_trace(
-            BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
-            0,
-            7,
-            false,
-        );
-        emit_seq2seq_topk_trace(
-            BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
-            0,
-            &[1.0, 0.5],
-        );
+        receipt.commit_decode_step(None, 7, false, &[1.0, 0.5]);
         let snapshot = receipt.snapshot();
         let text = snapshot.trace.jsonl;
         assert!(text.contains("\"schema\":\"openasr.gpu-correctness-trace.v1\""));
         assert!(text.contains("\"event\":\"token\""));
-        assert!(text.contains("\"event\":\"top_k\""));
+        assert!(
+            !text.contains("\"event\":\"top_k\""),
+            "full-vocab top-k JSON is opt-in via enable_full_logits_trace"
+        );
         assert_eq!(snapshot.token_steps.len(), 1);
         assert_eq!(snapshot.token_steps[0].token_id, 7);
         assert_eq!(snapshot.token_steps[0].top2_margin, Some(0.5));
+        assert!(
+            snapshot.token_steps[0].logits_sha256.is_none(),
+            "SHA-256 of logits is opt-in via enable_full_logits_trace"
+        );
+
+        let traced =
+            crate::models::request_execution_receipt::NativeExecutionReceiptCollector::new();
+        traced.enable_full_logits_trace();
+        traced.commit_decode_step(None, 7, false, &[1.0, 0.5]);
+        let traced_snapshot = traced.snapshot();
+        assert!(traced_snapshot.trace.jsonl.contains("\"event\":\"top_k\""));
+        assert!(traced_snapshot.token_steps[0].logits_sha256.is_some());
     }
 
     #[test]
@@ -1595,6 +1691,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn qwen_env_trace_is_namespaced_as_non_authoritative_debug_jsonl() {
+        let trace = tempfile::NamedTempFile::new().expect("trace file");
+        let path = trace.path().to_string_lossy().into_owned();
+        unsafe {
+            std::env::set_var("OPENASR_SEQ2SEQ_TRACE_FILE", &path);
+            std::env::set_var("OPENASR_SEQ2SEQ_TRACE_MODE", "cold");
+            std::env::set_var("OPENASR_SEQ2SEQ_TRACE_PROVIDER", "cuda");
+            std::env::set_var("OPENASR_SEQ2SEQ_TRACE_DEVICE", "cuda0");
+        }
+        emit_seq2seq_token_trace(
+            BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
+            0,
+            7,
+            false,
+        );
+        emit_seq2seq_topk_trace(
+            BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
+            0,
+            &[1.0, 0.5],
+        );
+        let text = std::fs::read_to_string(&path).expect("read trace");
+        assert!(text.contains("\"schema\":\"openasr.seq2seq-debug-trace.v1\""));
+        assert!(!text.contains("\"schema\":\"openasr.gpu-correctness-trace.v1\""));
+        assert!(text.contains("\"event\":\"token\""));
+        assert!(text.contains("\"event\":\"top_k\""));
+        unsafe {
+            std::env::remove_var("OPENASR_SEQ2SEQ_TRACE_FILE");
+            std::env::remove_var("OPENASR_SEQ2SEQ_TRACE_MODE");
+            std::env::remove_var("OPENASR_SEQ2SEQ_TRACE_PROVIDER");
+            std::env::remove_var("OPENASR_SEQ2SEQ_TRACE_DEVICE");
+        }
+    }
     #[test]
     fn parakeet_decode_policy_is_ctc_greedy_with_blank() {
         let parakeet = resolve_builtin_decode_policy(crate::PARAKEET_CTC_DECODE_POLICY_ID)

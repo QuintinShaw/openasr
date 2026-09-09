@@ -194,6 +194,16 @@ fn validate_redimnet2(
         .map_err(|error| error.to_string())
 }
 
+fn validate_wespeaker_resnet(
+    _path: &Path,
+    _metadata: &GgufMetadata,
+    tensor_index: &GgufTensorIndex,
+) -> Result<(), String> {
+    crate::diarize::embed::WeSpeakerEmbedder::quoted_persistent_host_commitment_bytes(tensor_index)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 fn validate_firered_punc(
     _path: &Path,
     metadata: &GgufMetadata,
@@ -228,6 +238,7 @@ fn validate_forced_aligner(
 /// -- the only production reader of the string -- is its home. Referenced by
 /// `models::pack_quant_audit` too, so both stay in sync.
 pub(crate) const REDIMNET2_GGML_ARCHITECTURE_ID: &str = "redimnet2";
+pub(crate) const WESPEAKER_RESNET_ARCHITECTURE_ID: &str = "wespeaker-resnet";
 
 const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
     AuxPackDescriptor {
@@ -247,6 +258,21 @@ const AUX_PACK_DESCRIPTORS: &[AuxPackDescriptor] = &[
                 model_architecture: REDIMNET2_GGML_ARCHITECTURE_ID,
             },
         validate: validate_redimnet2,
+    },
+    AuxPackDescriptor {
+        architecture_id: WESPEAKER_RESNET_ARCHITECTURE_ID,
+        catalog_family_id: "wespeaker",
+        kind: AuxPackKind::Diarization,
+        execution_policy: AuxiliaryExecutionPolicy::RequestScoped {
+            capabilities: AUX_CPU_METAL_CUDA_VULKAN_FULL_DEVICE_EXECUTION,
+            auto_gpu_policy: AutoGpuPolicy::ExceptMetal,
+        },
+        ownership: AuxiliaryRuntimeOwnership::AdmittedPinnedActor,
+        quantization_classification:
+            crate::models::pack_quant::TensorQuantizationContract::EntireAcousticPack {
+                model_architecture: WESPEAKER_RESNET_ARCHITECTURE_ID,
+            },
+        validate: validate_wespeaker_resnet,
     },
     AuxPackDescriptor {
         architecture_id: crate::models::pyannote::PYANNOTE_GGML_ARCHITECTURE_ID,
@@ -660,9 +686,14 @@ mod tests {
             .map(|descriptor| descriptor.catalog_family_id)
             .collect::<std::collections::BTreeSet<_>>();
 
-        assert_eq!(
-            runtime, published,
-            "aux runtime and publish catalog capability-family IDs drifted apart",
+        assert!(
+            published.is_subset(&runtime),
+            "published catalog families missing from aux runtime: {:?}",
+            published.difference(&runtime)
+        );
+        assert!(
+            runtime.contains("wespeaker"),
+            "WeSpeaker must be an admitted aux family before catalog publish"
         );
     }
 

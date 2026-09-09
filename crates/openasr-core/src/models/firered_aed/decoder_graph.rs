@@ -32,7 +32,7 @@ use thiserror::Error;
 use crate::ggml_runtime::{
     GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
     GgmlDecodeReuseMode, GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext,
-    GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
+    GgmlSelectionEvidenceRef, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinSeq2SeqDecodePolicyConfigInput, run_builtin_seq2seq_decode_policy,
@@ -154,6 +154,7 @@ pub(crate) struct FireRedDecoderGraphRuntime {
     cached_positions: usize,
     greedy_step_output_mode: DeviceGreedyStepOutputMode,
     reuse_mode: GgmlDecodeReuseMode,
+    last_step_compute_evidence: Option<GgmlSelectionEvidenceRef>,
 }
 
 /// The static-tensor arena plus everything allocated directly in it
@@ -446,6 +447,7 @@ impl FireRedDecoderGraphRuntime {
             cached_positions: 0,
             greedy_step_output_mode,
             reuse_mode,
+            last_step_compute_evidence: None,
         })
     }
 
@@ -502,6 +504,14 @@ impl FireRedDecoderGraphRuntime {
         self.decoder_state = decoder_state;
         self.cross_frame_count = decoder_state.cross_attention.logical_positions;
         Ok(())
+    }
+
+    pub(crate) fn release_transient_compute_memory(&mut self) -> Result<(), FireRedDecoderError> {
+        self.reuse = None;
+        match self.runner.release_request_compute_residency() {
+            Ok(()) | Err(GgmlCpuGraphError::PersistentGraphSessionActive) => Ok(()),
+            Err(error) => Err(map_err("release_request_compute_residency", error)),
+        }
     }
 
     /// Precompute cross-attention K/V for every layer from the encoder output
@@ -582,7 +592,7 @@ impl FireRedDecoderGraphRuntime {
                 .cpy(key_rows, key_target)
                 .map_err(|source| map_err("cross_cache_k_write", source))?;
             graph
-                .add_side_effect_root(write_key)
+                .add_kv_write_root(write_key)
                 .map_err(|source| map_err("cross_cache_k_root", source))?;
 
             let value_rows = apply_linear_with_bias(
@@ -600,7 +610,7 @@ impl FireRedDecoderGraphRuntime {
                 .cpy(value_rows, value_target)
                 .map_err(|source| map_err("cross_cache_v_write", source))?;
             graph
-                .add_side_effect_root(write_value)
+                .add_kv_write_root(write_value)
                 .map_err(|source| map_err("cross_cache_v_root", source))?;
             last_value_rows = Some(value_rows);
         }
@@ -689,6 +699,7 @@ impl FireRedDecoderGraphRuntime {
         allow_reuse: bool,
         output_mode: DeviceGreedyStepOutputMode,
     ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, FireRedDecoderError> {
+        self.last_step_compute_evidence = None;
         let total_prefix_tokens = decoder_tokens.len();
         if total_prefix_tokens == 0 {
             return Err(FireRedDecoderError::InvalidInput {
@@ -929,16 +940,19 @@ impl FireRedDecoderGraphRuntime {
 
         let output = match top1 {
             Some(top1) => {
-                let token_id = graph
-                    .compute_output_i32(top1, 1)
-                    .map_err(|error| FireRedDecoderError::GraphExecutionFailed {
-                        reason: error.to_string(),
-                    })?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| FireRedDecoderError::GraphExecutionFailed {
+                let readback =
+                    graph
+                        .compute_output_i32_with_evidence(top1, 1)
+                        .map_err(|error| FireRedDecoderError::GraphExecutionFailed {
+                            reason: error.to_string(),
+                        })?;
+                let (token_ids, evidence) = readback.into_parts();
+                self.last_step_compute_evidence = evidence;
+                let token_id = token_ids.into_iter().next().ok_or_else(|| {
+                    FireRedDecoderError::GraphExecutionFailed {
                         reason: "device top-1 returned no token id".to_string(),
-                    })?;
+                    }
+                })?;
                 Seq2SeqGreedyDecodeStepLogitsOutput {
                     logits: Vec::new(),
                     greedy_token_hint: Some(map_device_top1_token(
@@ -947,14 +961,19 @@ impl FireRedDecoderGraphRuntime {
                     )?),
                 }
             }
-            None => Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits: graph
-                    .compute_output_f32(logits, self.metadata.vocab_size)
+            None => {
+                let readback = graph
+                    .compute_output_f32_with_evidence(logits, self.metadata.vocab_size)
                     .map_err(|error| FireRedDecoderError::GraphExecutionFailed {
                         reason: error.to_string(),
-                    })?,
-                greedy_token_hint: None,
-            },
+                    })?;
+                let (logits, evidence) = readback.into_parts();
+                self.last_step_compute_evidence = evidence;
+                Seq2SeqGreedyDecodeStepLogitsOutput {
+                    logits,
+                    greedy_token_hint: None,
+                }
+            }
         };
         self.cached_positions = total_token_count;
         Ok(output)
@@ -1047,16 +1066,19 @@ impl FireRedDecoderGraphRuntime {
 
         let output = match top1 {
             Some(top1) => {
-                let token_id = graph
-                    .compute_output_i32(top1, 1)
-                    .map_err(|error| FireRedDecoderError::GraphExecutionFailed {
-                        reason: error.to_string(),
-                    })?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| FireRedDecoderError::GraphExecutionFailed {
+                let readback =
+                    graph
+                        .compute_output_i32_with_evidence(top1, 1)
+                        .map_err(|error| FireRedDecoderError::GraphExecutionFailed {
+                            reason: error.to_string(),
+                        })?;
+                let (token_ids, evidence) = readback.into_parts();
+                self.last_step_compute_evidence = evidence;
+                let token_id = token_ids.into_iter().next().ok_or_else(|| {
+                    FireRedDecoderError::GraphExecutionFailed {
                         reason: "reused device top-1 returned no token id".to_string(),
-                    })?;
+                    }
+                })?;
                 Seq2SeqGreedyDecodeStepLogitsOutput {
                     logits: Vec::new(),
                     greedy_token_hint: Some(map_device_top1_token(
@@ -1065,14 +1087,19 @@ impl FireRedDecoderGraphRuntime {
                     )?),
                 }
             }
-            None => Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits: graph
-                    .compute_output_f32(logits, self.metadata.vocab_size)
+            None => {
+                let readback = graph
+                    .compute_output_f32_with_evidence(logits, self.metadata.vocab_size)
                     .map_err(|error| FireRedDecoderError::GraphExecutionFailed {
                         reason: error.to_string(),
-                    })?,
-                greedy_token_hint: None,
-            },
+                    })?;
+                let (logits, evidence) = readback.into_parts();
+                self.last_step_compute_evidence = evidence;
+                Seq2SeqGreedyDecodeStepLogitsOutput {
+                    logits,
+                    greedy_token_hint: None,
+                }
+            }
         };
         self.cached_positions = total_tokens;
         Ok(output)
@@ -1330,6 +1357,10 @@ impl Seq2SeqGreedyDecodeStepExecutor for FireRedDecoderGraphRuntime {
                 reason: error.to_string(),
             }
         })
+    }
+
+    fn take_compute_evidence(&mut self) -> Option<GgmlSelectionEvidenceRef> {
+        self.last_step_compute_evidence.take()
     }
 }
 

@@ -233,8 +233,8 @@ pub(crate) enum GgufWriteError {
         expected: u64,
         actual: u64,
     },
-    #[error("gguf tensor '{name}' raw ggml type {ggml_type} has an invalid row size")]
-    TensorRawTypeInvalid { name: String, ggml_type: i32 },
+    #[error("gguf tensor '{name}' has invalid ggml type {ggml_type}")]
+    InvalidGgmlType { name: String, ggml_type: i64 },
     #[error("gguf streaming writer supports alignment 32, got {alignment}")]
     StreamingAlignmentUnsupported { alignment: u64 },
 }
@@ -483,11 +483,17 @@ fn stream_tensor_nbytes(tensor: &GgufStreamTensorSpec) -> Result<u64, GgufWriteE
             name: tensor.name.clone(),
             value: tensor.dims[0],
         })?;
-    let row_size = unsafe { ffi::ggml_row_size(tensor.ggml_type, ne0) };
-    if row_size == 0 {
-        return Err(GgufWriteError::TensorRawTypeInvalid {
+    let ggml_type = ffi::checked_ggml_type_i32(tensor.ggml_type).map_err(|error| {
+        GgufWriteError::InvalidGgmlType {
             name: tensor.name.clone(),
-            ggml_type: tensor.ggml_type,
+            ggml_type: error.raw,
+        }
+    })?;
+    let row_size = unsafe { ffi::ggml_row_size(ggml_type, ne0) };
+    if row_size == 0 {
+        return Err(GgufWriteError::InvalidGgmlType {
+            name: tensor.name.clone(),
+            ggml_type: i64::from(tensor.ggml_type),
         });
     }
     let rows = tensor

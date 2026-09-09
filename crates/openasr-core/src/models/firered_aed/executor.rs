@@ -32,6 +32,7 @@ use crate::NativeAsrSession;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::FIRERED_AED_GGML_ADAPTER_ID;
 use crate::device::execution_policy::ExecutionPlacement;
+#[cfg(test)]
 use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlDecodeOutputPlan, GgmlDecodeReuseMode, GgufRuntimeSourcePreflight,
@@ -435,12 +436,7 @@ fn unified_runtime_owner_enabled(
 ) -> bool {
     backend == GgmlCpuGraphBackend::Gpu
         && placement == Some(ExecutionPlacement::FullDevice)
-        && matches!(
-            backend_preference,
-            Some(RequestBackendPreference::Exact(route))
-                if route.addressability.is_exactly_addressable()
-                    && matches!(route.provider, ExecutionProvider::Cuda | ExecutionProvider::Vulkan)
-        )
+        && crate::ggml_runtime::exact_discrete_gpu_unified_owner_is_proven(backend_preference)
 }
 
 impl FireRedAedGgmlExecutor {
@@ -656,7 +652,7 @@ impl FireRedAedGgmlExecutor {
         runtime
             .call_mut(move |runtime| {
                 runtime.activate_decoder_state(decoder_state)?;
-                run_firered_aed_decoder_greedy_with_runtime(
+                let decode_result = run_firered_aed_decoder_greedy_with_runtime(
                     runtime,
                     metadata,
                     &encoder_rows,
@@ -665,7 +661,13 @@ impl FireRedAedGgmlExecutor {
                     &control,
                     decode_work_progress.as_ref(),
                     unstable_decode_text.as_ref(),
-                )
+                );
+                let release_result = runtime.release_transient_compute_memory();
+                match (decode_result, release_result) {
+                    (Ok(output), Ok(())) => Ok(output),
+                    (Err(error), _) => Err(error),
+                    (Ok(_), Err(error)) => Err(error),
+                }
             })
             .map_err(|error| Self::map_actor_error("decoder", error))?
             .map_err(|error| FireRedAedExecutorError::DecoderFailed {
@@ -689,7 +691,7 @@ impl FireRedAedGgmlExecutor {
         runtime
             .call_mut_fallible(move |runtime| {
                 runtime.decoder.activate_decoder_state(decoder_state)?;
-                run_firered_aed_decoder_greedy_with_runtime(
+                let decode_result = run_firered_aed_decoder_greedy_with_runtime(
                     &mut runtime.decoder,
                     metadata,
                     &encoder_rows,
@@ -698,7 +700,13 @@ impl FireRedAedGgmlExecutor {
                     &control,
                     decode_work_progress.as_ref(),
                     unstable_decode_text.as_ref(),
-                )
+                );
+                let release_result = runtime.decoder.release_transient_compute_memory();
+                match (decode_result, release_result) {
+                    (Ok(output), Ok(())) => Ok(output),
+                    (Err(error), _) => Err(error),
+                    (Ok(_), Err(error)) => Err(error),
+                }
             })
             .map_err(|error| Self::map_actor_error("unified-decoder", error))?
             .map_err(|error| FireRedAedExecutorError::DecoderFailed {
@@ -1127,8 +1135,12 @@ mod tests {
     }
 
     #[test]
-    fn unified_owner_is_limited_to_exact_cuda_and_vulkan_full_device() {
-        for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
+    fn unified_owner_is_limited_to_exact_cuda_hip_and_vulkan_full_device() {
+        for provider in [
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Vulkan,
+        ] {
             let preference = exactly_addressable_preference(provider);
             assert!(unified_runtime_owner_enabled(
                 GgmlCpuGraphBackend::Gpu,
@@ -1145,7 +1157,6 @@ mod tests {
         for provider in [
             ExecutionProvider::Cpu,
             ExecutionProvider::Metal,
-            ExecutionProvider::Hip,
             ExecutionProvider::Accelerator,
             ExecutionProvider::Unknown,
         ] {

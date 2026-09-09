@@ -107,9 +107,12 @@ use std::path::{Path, PathBuf};
 
 use ts_rs::{Config, TS};
 
+use openasr_core::api::backend::{SpeakerEmbeddingNormalization, SpeakerEmbeddingSpace};
+
 use crate::{
     CapabilitiesResponse, DefaultModelActivationState, DefaultModelResponse, DevicesResponse,
-    HealthResponse, ModelResponse, ModelsResponse,
+    HealthResponse, ModelResponse, ModelsResponse, PreciseTimeline, PreciseTimelineSegment,
+    PreciseTimelineWord,
 };
 
 const COMMITTED_RELATIVE_DIR: &str = "generated";
@@ -138,6 +141,11 @@ fn export_http_wire_bindings(cfg: &Config) {
         DefaultModelResponse,
         CapabilitiesResponse,
         DevicesResponse,
+        SpeakerEmbeddingSpace,
+        SpeakerEmbeddingNormalization,
+        PreciseTimeline,
+        PreciseTimelineSegment,
+        PreciseTimelineWord,
     );
 }
 

@@ -55,10 +55,12 @@ Bundled model cards are metadata-only planning/provenance records and are non-do
 When a flow does fetch the model catalog (an explicit `pull`, or a
 consent-approved auto-install during `transcribe`/`live` — never silently), the catalog is served from
 OpenASR-operated infrastructure at `https://catalog.openasr.org` (a Cloudflare
-static-asset host) rather than Hugging Face. The signed `catalog_url` stays
-HF-canonical only as the verification identity; the ed25519 signature, sha256, and
-monotonic-epoch checks are unchanged, and model **weights are still fetched
-directly from Hugging Face** (the catalog host never sees or serves weights). Only
+static-asset host) rather than Hugging Face. The signed `catalog_url` is always
+`https://catalog.openasr.org/v1/catalog.json`; `catalog.bug.im` is an allowlisted
+fetch replica, not a second identity. The ed25519 signature, sha256, and
+monotonic-epoch checks are unchanged. Model **weights stay identified by the
+signed Hugging Face pack URL**; China transport may fetch the same bytes from
+ModelScope. The catalog host never sees or serves weights. Only
 the **public** projection is served/embedded — staged `public:false` entries are
 never exposed. It is not usage telemetry — only the catalog index is requested —
 but the catalog fetch's network metadata (e.g. client IP) is observable by the
@@ -74,7 +76,11 @@ named person".
 
 - Labels are anonymous and session-relative (`SPEAKER_00/01`, ...) until a
   speaker has enough evidence to match an explicitly enrolled local person.
-  Temporary recording-level embeddings are not persisted as identities.
+  Temporary recording-level centroids do not appear in transcription
+  responses by default. `return_speaker_embeddings=true` is an
+  operator/loopback opt-in on `verbose_json`; a remote-compute device
+  token requesting that field is rejected with HTTP 403. Temporary
+  recording-level embeddings are not persisted as identities.
 - Identity enrollment is opt-in, and the person library stays on the device.
   Voice ID stores enrolled voiceprints for named people so a person's label can
   remain consistent across turns and later local file transcriptions. Enrolled voiceprints and their

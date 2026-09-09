@@ -65,10 +65,40 @@ jobs:
       include: ${{ steps.select.outputs.include }}
       mode: ${{ steps.select.outputs.mode }}
       selected_target: ${{ steps.select.outputs.selected_target }}
+      source_digest: ${{ steps.source_identity.outputs.source_digest }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.ref }}
+      - name: Bind aggregation and provenance to one source commit
+        id: source_identity
+        env:
+          REQUESTED_REF: ${{ inputs.ref || github.ref }}
+        run: |
+          set -euo pipefail
+          checkout_commit="$(git rev-parse HEAD^{commit})"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "GITHUB_SHA is not a lowercase commit digest" >&2
+            exit 1
+          }
+          [ "$checkout_commit" = "$GITHUB_SHA" ] || {
+            echo "requested ref '$REQUESTED_REF' resolved to $checkout_commit but the attestation event source is $GITHUB_SHA" >&2
+            echo "dispatch the workflow from the exact release tag/commit; provenance cannot describe a different checkout" >&2
+            exit 1
+          }
+          case "$REQUESTED_REF" in
+            refs/tags/*) release_tag="${REQUESTED_REF#refs/tags/}" ;;
+            v[0-9]*.*) release_tag="$REQUESTED_REF" ;;
+            *) release_tag="" ;;
+          esac
+          if [ -n "$release_tag" ]; then
+            tag_commit="$(git rev-parse "${release_tag}^{commit}")"
+            [ "$tag_commit" = "$checkout_commit" ] || {
+              echo "release tag $release_tag does not resolve to the attested checkout" >&2
+              exit 1
+            }
+          fi
+          echo "source_digest=$checkout_commit" >> "$GITHUB_OUTPUT"
       - name: Select matrix include
         id: select
         env:
@@ -206,13 +236,9 @@ jobs:
     # published-inert provider packs with content-addressed runtimes.
     # Legacy whole-engine Vulkan/CUDA/HIP sidecars ended with core 0.1.33.
     #
-    # NOTE: jobs.verify-completeness below hardcodes this same asset/ext list
-    # (TARGETS, now friendly asset names) to assert the release ends up with
-    # every archive. Keep both in sync when adding/removing a leg. The
-    # xcframework job further below is a separate, non-matrix leg (macOS/iOS
-    # SDK, not a CLI binary) but its asset is folded into the same TARGETS list
-    # -- keep that in sync too. Legs marked `experimental: true` are NOT in
-    # TARGETS (they may drop out until proven green), so keep them out of it.
+    # NOTE: jobs.verify-completeness derives the required asset set from this
+    # matrix via tooling/release-manifest/release_completeness.py. Experimental
+    # legs may appear when they succeed; they are optional, never required.
     strategy:
       fail-fast: false
       # Include rows live in tooling/release-manifest/release_binaries_matrix.json
@@ -238,7 +264,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ needs.select-matrix.outputs.source_digest }}
 
       - name: Resolve workspace version
         shell: bash
@@ -604,7 +630,7 @@ jobs:
       # runner cannot execute, so they skip every smoke step (build + package
       # validation only).
       - name: Smoke release binary
-        if: runner.os != 'Windows' && !contains(matrix.features, 'cuda') && !contains(matrix.features, 'hip') && !matrix.rust_target
+        if: runner.os != 'Windows' && matrix.distribution != 'plugin' && !contains(matrix.features, 'cuda') && !contains(matrix.features, 'hip') && !matrix.rust_target
         run: |
           "${RELEASE_DIR}/openasr" --version
           "${RELEASE_DIR}/openasr" --help
@@ -614,14 +640,16 @@ jobs:
       # import-links amdhip64.dll (AMD driver), neither of which this GPU-less
       # runner has, so those cannot launch here: build + package only. The
       # Vulkan exe resolves against the SDK loader installed above, so it
-      # launches and runs CPU paths here.
+      # launches and runs CPU paths here. Plugin rows compile openasr-core
+      # only and never emit openasr.exe, so they must not smoke the CLI.
       - name: Smoke release binary
-        if: runner.os == 'Windows' && !contains(matrix.features, 'cuda') && !contains(matrix.features, 'hip') && !matrix.rust_target
+        if: runner.os == 'Windows' && matrix.distribution != 'plugin' && !contains(matrix.features, 'cuda') && !contains(matrix.features, 'hip') && !matrix.rust_target
         shell: pwsh
         run: |
-          & "$env:RELEASE_DIR\openasr.exe" --version
-          & "$env:RELEASE_DIR\openasr.exe" --help
-          & "$env:RELEASE_DIR\openasr.exe" list
+          $cli = Join-Path $env:RELEASE_DIR "openasr.exe"
+          & $cli --version
+          & $cli --help
+          & $cli list
 
       - name: Restore model pack cache
         if: matrix.target == 'x86_64-pc-windows-msvc'
@@ -1201,6 +1229,7 @@ jobs:
 
   xcframework:
     name: Build OpenASR.xcframework
+    needs: [select-matrix]
     # A single-target diagnostic dispatch must consume only that platform's
     # runner. The SDK artifact belongs to complete releases, not to a Windows
     # or Linux `only_target` probe.
@@ -1224,7 +1253,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ needs.select-matrix.outputs.source_digest }}
 
       - name: Resolve workspace version
         shell: bash
@@ -1290,6 +1319,8 @@ jobs:
     # build and the complete-release xcframework must have reached its upload.
     if: ${{ !cancelled() && inputs.formal_release == true && needs.select-matrix.result == 'success' && needs.build.result == 'success' && needs.xcframework.result == 'success' }}
     runs-on: ubuntu-latest
+    outputs:
+      source_digest: ${{ needs.select-matrix.outputs.source_digest }}
     permissions:
       actions: read
       contents: read
@@ -1300,7 +1331,7 @@ jobs:
       # clean the staging/dist directories populated by later steps.
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ needs.select-matrix.outputs.source_digest }}
       - name: Download archives
         uses: actions/download-artifact@v8
         with:
@@ -1418,10 +1449,128 @@ jobs:
         run: sleep 90
 
       - name: Attest release subjects (attempt 3)
+        id: attest_release_3
         if: steps.attest_release_1.outcome != 'success' && steps.attest_release_2.outcome != 'success'
         uses: actions/attest-build-provenance@v4
         with:
           subject-checksums: dist/SHA256SUMS
+
+      # `actions/attest-build-provenance` already emits the exact serialized
+      # Sigstore bundle it uploaded. Preserve the successful attempt directly;
+      # querying the API again with `gh attestation download` would add a second
+      # network race and platform-dependent digest filenames. Qualification
+      # manifests are generated only after this bundle exists because they bind
+      # its exact bytes. They remain inert and unsigned here: the production
+      # catalog seed never enters CI.
+      - name: Compile inert backend qualification manifests
+        if: inputs.only_target == ''
+        env:
+          ATTEST_1_OUTCOME: ${{ steps.attest_release_1.outcome }}
+          ATTEST_1_BUNDLE: ${{ steps.attest_release_1.outputs.bundle-path }}
+          ATTEST_2_OUTCOME: ${{ steps.attest_release_2.outcome }}
+          ATTEST_2_BUNDLE: ${{ steps.attest_release_2.outputs.bundle-path }}
+          ATTEST_3_OUTCOME: ${{ steps.attest_release_3.outcome }}
+          ATTEST_3_BUNDLE: ${{ steps.attest_release_3.outputs.bundle-path }}
+          QUALIFICATION_SOURCE_DIGEST: ${{ needs.select-matrix.outputs.source_digest }}
+        run: |
+          set -euo pipefail
+          bundle_path=""
+          for attempt in 1 2 3; do
+            outcome_var="ATTEST_${attempt}_OUTCOME"
+            bundle_var="ATTEST_${attempt}_BUNDLE"
+            if [ "${!outcome_var:-}" = "success" ]; then
+              bundle_path="${!bundle_var:-}"
+              break
+            fi
+          done
+          [ -n "$bundle_path" ] && [ -s "$bundle_path" ] || {
+            echo "successful provenance attempt did not expose a non-empty bundle" >&2
+            exit 1
+          }
+          version="$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "could not resolve workspace release version" >&2
+            exit 1
+          }
+          [[ "$QUALIFICATION_SOURCE_DIGEST" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "qualification source identity step did not return a commit digest" >&2
+            exit 1
+          }
+          tag="v${version}"
+          base_url="https://dl.openasr.org/core/${tag}"
+          mirror_base_url="https://github.com/QuintinShaw/openasr/releases/download/${tag}"
+          neutral="dist/openasr-${version}-windows-x86_64-neutral.zip"
+          [ -f "$neutral" ] || { echo "missing neutral host archive: $neutral" >&2; exit 1; }
+          bundle_asset="dist/openasr-${version}-build-provenance.bundle.json"
+          cp -- "$bundle_path" "$bundle_asset"
+          python3 -m json.tool "$bundle_asset" >/dev/null
+
+          shopt -s nullglob
+          backend_entries=(
+            dist/backend-pack-cuda-sm_*.json
+            dist/backend-pack-hip-gfx*.json
+            dist/backend-pack-vulkan-generic.json
+          )
+          python3 - "${backend_entries[@]}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "tooling/release-manifest")
+          import qualification_manifest as compiler
+
+          matrix = json.loads(Path("tooling/release-manifest/release_binaries_matrix.json").read_text())
+          expected = compiler.expected_artifact_cells(matrix)
+          actual = set()
+          for entry_path in map(Path, sys.argv[1:]):
+              entry = json.loads(entry_path.read_text(encoding="utf-8"))
+              cell = compiler.artifact_cell(entry)
+              if cell in actual:
+                  raise SystemExit(f"duplicate exact-target backend entry: {cell}")
+              actual.add(cell)
+          if actual != expected:
+              raise SystemExit(
+                  f"qualification entries differ from release matrix: missing={sorted(expected-actual)} extra={sorted(actual-expected)}"
+              )
+          PY
+          for entry in "${backend_entries[@]}"; do
+            read -r provider target < <(python3 - "$entry" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "tooling/release-manifest")
+          import qualification_manifest as compiler
+
+          provider, target = compiler.artifact_cell(
+              json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          )
+          print(provider, target)
+          PY
+            )
+            out="dist/openasr-${version}-qualification-${provider}-${target}.json"
+            python3 tooling/release-manifest/qualification_manifest.py \
+              --neutral-archive "$neutral" \
+              --backend-entry "$entry" \
+              --asset-directory dist \
+              --attestation-bundle "$bundle_asset" \
+              --release-subject "$tag" \
+              --source-digest "$QUALIFICATION_SOURCE_DIGEST" \
+              --base-url "$base_url" \
+              --mirror-base-url "$mirror_base_url" \
+              --out "$out"
+          done
+
+      - name: Upload inert backend qualification assets
+        if: inputs.only_target == ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-qualification-assets
+          path: |
+            dist/openasr-*-build-provenance.bundle.json
+            dist/openasr-*-qualification-*.json
+          if-no-files-found: error
+
       - name: Upload SHA256SUMS
         uses: actions/upload-artifact@v7
         with:
@@ -1442,7 +1591,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ needs.checksums.outputs.source_digest }}
 
       - name: Resolve the release tag for this ref
         id: tag
@@ -1479,7 +1628,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "release: ${{ steps.tag.outputs.tag }}"
-          find staging -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dll' -o -name 'backend-pack-*.json' -o -name 'backend-plugin-hints.json' -o -name 'catalog.backends.candidate.json' -o -name '*.sha256' -o -name 'SHA256SUMS' \) -print | sort
+          find staging -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dll' -o -name 'backend-pack-*.json' -o -name 'backend-plugin-hints.json' -o -name 'catalog.backends.candidate.json' -o -name 'openasr-*-build-provenance.bundle.json' -o -name 'openasr-*-qualification-*.json' -o -name '*.sha256' -o -name 'SHA256SUMS' \) -print | sort
 
       - name: Upload assets to release
         env:
@@ -1487,32 +1636,68 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ steps.tag.outputs.tag }}"
-          is_draft="$(gh release view "$tag" --repo "${{ github.repository }}" \
-            --json isDraft --jq .isDraft)"
+          if ! gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "release ${tag} does not exist yet -- release-core.yml should create it before calling this workflow" >&2
+            exit 1
+          fi
+          is_draft="$(gh release view "$tag" --repo "${{ github.repository }}" --json isDraft --jq .isDraft)"
           [ "$is_draft" = "true" ] || {
-            echo "refusing to overwrite assets on a public release" >&2; exit 1;
+            echo "refusing to overwrite assets on a public release" >&2
+            exit 1
+          }
+          lock_dir="$(mktemp -d)"
+          lock_token="$lock_dir/token"
+          lock_acquired=false
+          cleanup_lock() {
+            if [ "$lock_acquired" = "true" ]; then
+              scripts/qualification-release-lock.sh release "$tag" "$lock_token" || true
+            fi
+            rm -rf -- "$lock_dir"
+          }
+          trap cleanup_lock EXIT
+          scripts/qualification-release-lock.sh acquire "$tag" "$lock_token"
+          lock_acquired=true
+          [ "$(gh release view "$tag" --repo "${{ github.repository }}" --json isDraft --jq .isDraft)" = "true" ] || {
+            echo "release stopped being a draft while acquiring the qualification lock" >&2
+            exit 1
+          }
+          existing_signatures="$(gh release view "$tag" --repo "${{ github.repository }}" --json assets \
+            --jq '.assets[].name | select(contains("-qualification-") and endswith(".signature.json"))')"
+          [ -z "$existing_signatures" ] || {
+            echo "refusing to replace qualification manifests while detached signatures exist:" >&2
+            echo "$existing_signatures" >&2
+            echo "remove/revoke those signatures explicitly, rebuild the inert bytes, then rerun local signing" >&2
+            exit 1
           }
           # nullglob drops optional unmatched artifact patterns instead of
           # passing them to `gh` as literal paths.
           shopt -s nullglob
-          assets=(staging/*.tar.gz staging/*.zip staging/*.dll staging/backend-pack-*.json staging/backend-plugin-hints.json staging/catalog.backends.candidate.json staging/*.sha256 staging/SHA256SUMS)
+          assets=(staging/*.tar.gz staging/*.zip staging/*.dll staging/backend-pack-*.json staging/backend-plugin-hints.json staging/catalog.backends.candidate.json staging/openasr-*-build-provenance.bundle.json staging/openasr-*-qualification-*.json staging/*.sha256 staging/SHA256SUMS)
           # --clobber so a re-run (retrying a flaky leg) replaces stale assets
           # instead of failing on "asset already exists".
+          [ "$(gh release view "$tag" --repo "${{ github.repository }}" --json isDraft --jq .isDraft)" = "true" ] || {
+            echo "release stopped being a draft before asset upload" >&2
+            exit 1
+          }
           gh release upload "$tag" "${assets[@]}" \
             --repo "${{ github.repository }}" --clobber
+          scripts/qualification-release-lock.sh release "$tag" "$lock_token"
+          lock_acquired=false
 
   verify-completeness:
     name: Verify release completeness
     needs: [checksums, upload-to-release]
     if: ${{ always() && !cancelled() && inputs.formal_release == true && needs.checksums.result == 'success' && needs.upload-to-release.result == 'success' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ needs.upload-to-release.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ needs.checksums.outputs.source_digest }}
 
       - name: Resolve workspace version
         run: |
@@ -1521,123 +1706,9 @@ jobs:
           echo "OPENASR_VERSION=${version}" >> "${GITHUB_ENV}"
 
       - name: Assert the release has every expected matrix asset
-        # Keep this TARGETS list (friendly asset names, matching each matrix
-        # leg's `asset:` field) in sync with jobs.build.strategy.matrix.include
-        # above, plus jobs.xcframework's asset -- this is the release-integrity
-        # gate: a release "shipped" but missing a platform's archive (e.g. one
-        # matrix leg failed and `checksums` silently dropped it, per its
-        # `!cancelled()` condition)
-        # must fail loudly here instead of quietly shipping partial coverage.
-        # `experimental: true` legs (e.g. windows-arm64) are deliberately NOT
-        # listed: they may fail without failing the run, so requiring their
-        # asset here would defeat the escape hatch. Promote such a leg (drop
-        # `experimental`, add its asset:ext here) once it proves green.
+        # Draft GitHub Releases are invisible to contents:read. This job only
+        # reads the draft, but it still needs contents:write to see it.
         run: |
           set -euo pipefail
-          tag="${RELEASE_TAG}"
-          [ -n "$tag" ] || { echo "release tag is empty" >&2; exit 1; }
-          version="${OPENASR_VERSION}"
-
-          TARGETS=(
-            "linux-x86_64:tar.gz"
-            "linux-arm64:tar.gz"
-            "macos-x86_64:tar.gz"
-            "macos-arm64:tar.gz"
-            "windows-x86_64:zip"
-            "windows-x86_64-neutral:zip"
-            "linux-x86_64-vulkan:tar.gz"
-            "linux-x86_64-cuda:tar.gz"
-            "linux-x86_64-rocm:tar.gz"
-            # Not a CLI binary leg (see jobs.xcframework above), but still a
-            # released, version-named asset -- keep it in this same
-            # completeness gate so a broken xcframework build fails loudly
-            # instead of quietly shipping a release without the SDK.
-            "xcframework:zip"
-          )
-
-          expected_file="$(mktemp)"
-          base_expected="$(mktemp)"
-          {
-            for entry in "${TARGETS[@]}"; do
-              target="${entry%%:*}"
-              ext="${entry##*:}"
-              echo "openasr-${version}-${target}.${ext}"
-            done
-            echo "openasr-${version}-xcframework.zip.sha256"
-          } > "$base_expected"
-          pack_names="$(mktemp)"
-          python3 - "$pack_names" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          matrix = json.loads(Path("tooling/release-manifest/release_binaries_matrix.json").read_text())
-          names = []
-          for row in matrix:
-              provider = row.get("provider")
-              if provider == "cuda" and not row.get("experimental", False):
-                  names.append(f"backend-pack-cuda-sm_{row['cuda_gpu_target']}.json")
-              elif provider == "hip" and not row.get("experimental", False):
-                  names.append(f"backend-pack-hip-{row['hip_gpu_target']}.json")
-              elif provider == "vulkan" and row.get("distribution") == "plugin":
-                  names.append("backend-pack-vulkan-generic.json")
-          Path(sys.argv[1]).write_text("\n".join(names) + "\n", encoding="utf-8")
-          PY
-          pack_dir="$(mktemp -d)"
-          while IFS= read -r pack_name; do
-            [ -n "$pack_name" ] || continue
-            gh release download "$tag" --repo "${{ github.repository }}" \
-              -p "$pack_name" -D "$pack_dir"
-          done < "$pack_names"
-          pack_payload_names="$(mktemp)"
-          python3 - "$pack_dir" > "$pack_payload_names" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          root = Path(sys.argv[1])
-          for entry_path in sorted(root.glob("backend-pack-*.json")):
-              entry = json.loads(entry_path.read_text(encoding="utf-8"))
-              files = entry.get("files")
-              if not isinstance(files, list) or not files:
-                  raise SystemExit(f"{entry_path.name} has no files")
-              for file in files:
-                  name = file.get("filename") if isinstance(file, dict) else None
-                  if not isinstance(name, str) or not name or Path(name).name != name:
-                      raise SystemExit(f"{entry_path.name} has unsafe filename {name!r}")
-                  print(name)
-          PY
-          {
-            cat "$base_expected"
-            cat "$pack_names"
-            cat "$pack_payload_names"
-            echo "backend-plugin-hints.json"
-            echo "catalog.backends.candidate.json"
-            echo "SHA256SUMS"
-          } > "$expected_file"
-          sort -u -o "$expected_file" "$expected_file"
-
-          actual_file="$(mktemp)"
-          gh release view "$tag" --repo "${{ github.repository }}" --json assets \
-            --jq '.assets[].name' | sort > "$actual_file"
-
-          echo "== expected =="
-          cat "$expected_file"
-          echo "== actual =="
-          cat "$actual_file"
-
-          missing="$(comm -23 "$expected_file" "$actual_file")"
-          extra="$(comm -13 "$expected_file" "$actual_file")"
-          if [ -n "$missing" ]; then
-            echo "::error::release ${tag} is missing expected asset(s):"
-            echo "$missing"
-            exit 1
-          fi
-          if [ -n "$extra" ]; then
-            echo "::error::release ${tag} contains unexpected asset(s):"
-            echo "$extra"
-            exit 1
-          fi
-          echo "release ${tag} has all $(wc -l < "$expected_file" | tr -d ' ') expected assets."
-
-          echo "release ${tag} has every plugin and content-addressed vendor archive declared by its required backend packs."
+          [ -n "${RELEASE_TAG}" ] || { echo "release tag is empty" >&2; exit 1; }
+          scripts/verify-release-completeness.sh "${RELEASE_TAG}" "${{ github.repository }}"

@@ -1,8 +1,11 @@
-//! ReDimNet2-B6 diarization calibration.
+//! Speaker-embedder diarization calibration.
 //!
 //! Batch clustering and streaming registry gates stay in one profile so runtime
 //! code consumes calibrated thresholds without embedding model conditionals.
 
+/// Stable calibration identity for WeSpeaker's cosine space. Bump when any
+/// threshold that participates in Voice ID matching changes.
+pub const WESPEAKER_CALIBRATION_VERSION: &str = "wespeaker-cal-v1";
 /// Stable calibration identity for ReDimNet2-B6's cosine space.
 /// Bump when any threshold that participates in Voice ID matching changes.
 pub const REDIMNET_CALIBRATION_VERSION: &str = "redimnet2-b6-cal-v2";
@@ -90,6 +93,38 @@ pub(crate) struct StreamingCalibrationProfile {
     pub native_profile_anchor_similarity: f32,
     pub speaker_change_max_cosine: f32,
 }
+
+pub(crate) const WESPEAKER_CALIBRATION: SpeakerCalibrationProfile = SpeakerCalibrationProfile {
+    clustering: ClusteringCalibrationProfile {
+        plain_merge_threshold: 0.43,
+        context_auto_merge_threshold: 0.73,
+        dense_context_min_embeddings: 30,
+        dense_context_merge_threshold: 0.43,
+        context_gap: Some(ContextGapCalibrationProfile {
+            min_gap: 0.05,
+            max_speakers: 4,
+            fallback_speakers: 3,
+        }),
+    },
+    streaming: StreamingCalibrationProfile {
+        match_similarity: 0.57,
+        strong_existing_match_similarity: 0.65,
+        relaxed_match_similarity: 0.33,
+        relaxed_match_margin: 0.20,
+        relaxed_reuse_max_weight: 3.0,
+        new_speaker_max_existing_similarity: 0.44,
+        profile_anchor_similarity: 0.80,
+        native_profile_anchor_similarity: 0.50,
+        speaker_change_max_cosine: 0.42,
+    },
+    enrollment_default_match_similarity: 0.5,
+    // Not calibrated: this 256-d WeSpeaker cosine space never had a
+    // top1-vs-top2 margin eval run against it, and the batch matcher's
+    // margin gate was hardcoded to 0.0 (effectively off) before this field
+    // existed. Keep it 0.0 so WeSpeaker's batch match behavior is unchanged
+    // by adding the gate.
+    enrollment_match_margin: 0.0,
+};
 
 /// ReDimNet2-B6 calibration (192-dim cosine space).
 ///
@@ -183,6 +218,17 @@ pub(crate) const REDIMNET_CALIBRATION: SpeakerCalibrationProfile = SpeakerCalibr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wespeaker_calibration_profile_is_pinned() {
+        assert_eq!(WESPEAKER_CALIBRATION.clustering.plain_merge_threshold, 0.43);
+        assert_eq!(WESPEAKER_CALIBRATION.streaming.match_similarity, 0.57);
+        assert_eq!(
+            WESPEAKER_CALIBRATION.enrollment_default_match_similarity,
+            0.5
+        );
+        assert_eq!(WESPEAKER_CALIBRATION.enrollment_match_margin, 0.0);
+    }
 
     #[test]
     fn redimnet_calibration_profile_is_pinned() {

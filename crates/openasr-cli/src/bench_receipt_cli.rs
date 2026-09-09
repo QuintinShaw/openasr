@@ -8,7 +8,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 #[cfg(test)]
 use std::{fs, io::Write};
@@ -17,11 +17,12 @@ use anyhow::{Context, Result, bail};
 use openasr_core::{
     BackendKind, ExecutionTarget, GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector,
     InstalledPack, NativeExecutionReceiptCollector, NativeExecutionReceiptSnapshot,
-    NativeExecutionServices, RequestAttemptId, RequestExecutionTerminal, ResolvedOutputTarget,
-    SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK, SHORT_AUDIO_RECEIPT_SCHEMA,
-    ShortAudioExecutionProjection, ShortAudioReceipt, ShortAudioReceiptAudio,
-    ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptMetrics, ShortAudioReceiptPack,
-    ShortAudioReceiptRun, ShortAudioReceiptTranscript, TranscriptionRequest, atomic_write_text,
+    NativeExecutionServices, NativeExecutionTraceMode, RequestAttemptId, RequestExecutionPhase,
+    RequestExecutionTerminal, ResolvedOutputTarget, SHORT_AUDIO_RECEIPT_MEASUREMENT_WALL_CLOCK,
+    SHORT_AUDIO_RECEIPT_SCHEMA, ShortAudioExecutionProjection, ShortAudioReceipt,
+    ShortAudioReceiptAudio, ShortAudioReceiptDecodeDiagnostics, ShortAudioReceiptMetrics,
+    ShortAudioReceiptPack, ShortAudioReceiptRun, ShortAudioReceiptTranscript, TranscriptionRequest,
+    atomic_write_text,
     ggml_runtime::{
         AutoGpuPolicy, GgmlDecodeLogitsConsumers, GgmlDecodeOutputContract,
         RequestBackendPreference, ResolvedFamilyRuntimeInput,
@@ -33,6 +34,226 @@ use openasr_core::{
 
 use crate::cli_args::RuntimePathOverrides;
 use crate::native_segment_cli::{prepare_backend_run, transcribe_with_backend};
+
+type ArtifactComputeIdentity = (u64, u64, u64, u64);
+type ArtifactSelectionIdentity = (u64, u64, u64, u64, u64, u64);
+
+/// Data-only artifact representation. It must never be convertible into the
+/// core runtime witness, whose constructor remains inside ggml readback.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactSelectionEvidenceRef {
+    graph_instance: u64,
+    graph_generation: u64,
+    compute_sequence: u64,
+    output_generation: u64,
+    output_index: u64,
+    output_count: u64,
+}
+
+#[derive(Default)]
+struct ArtifactCaptureLifecycleState {
+    capture_supported: Option<bool>,
+    graph_tracked: Option<bool>,
+    capture_enabled: Option<bool>,
+    executable_present: bool,
+    capture_generation: Option<u64>,
+    capture_generation_consumed: bool,
+    capture_before_pending: bool,
+    capture_before_computes: BTreeSet<u64>,
+    capture_after_computes: BTreeSet<u64>,
+    last_capture_phase: Option<openasr_core::GgmlCaptureObservationPhase>,
+    computed: bool,
+    active_compute: Option<u64>,
+}
+
+fn validate_artifact_capture_lifecycle(
+    states: &mut BTreeMap<(u64, u64), ArtifactCaptureLifecycleState>,
+    event: &openasr_core::GgmlGraphLifecycleEvent,
+) -> Result<()> {
+    use openasr_core::GgmlGraphLifecycleEventKind as Kind;
+
+    let key = (event.graph_instance, event.graph_generation);
+    if matches!(
+        &event.kind,
+        Kind::Created { .. } | Kind::ExistingGraphObserved { .. }
+    ) {
+        if states
+            .insert(key, ArtifactCaptureLifecycleState::default())
+            .is_some()
+        {
+            bail!("runtime trace attaches one graph generation more than once");
+        }
+        return Ok(());
+    }
+    let state = states
+        .get_mut(&key)
+        .ok_or_else(|| anyhow::anyhow!("runtime lifecycle event precedes graph attachment"))?;
+    match &event.kind {
+        Kind::CaptureStateObserved {
+            phase,
+            capture_supported,
+            graph_tracked,
+            capture_enabled,
+            executable_present,
+        } => {
+            if (*graph_tracked && (!*capture_supported || capture_enabled.is_none()))
+                || (!*graph_tracked && capture_enabled.is_some())
+                || (*executable_present && (!*graph_tracked || *capture_enabled != Some(true)))
+                || state
+                    .capture_supported
+                    .is_some_and(|previous| previous != *capture_supported)
+                || (state.graph_tracked == Some(true) && !*graph_tracked)
+                || (state.graph_tracked == Some(true)
+                    && *graph_tracked
+                    && state.capture_enabled != *capture_enabled)
+                || (state.executable_present && !*executable_present)
+            {
+                bail!("runtime trace contains invalid or drifting native capture state");
+            }
+            match phase {
+                openasr_core::GgmlCaptureObservationPhase::BeforeCompute => {
+                    if state.active_compute.is_some() || state.capture_before_pending {
+                        bail!(
+                            "runtime trace contains a duplicate or in-compute capture-before observation"
+                        );
+                    }
+                    state.capture_before_pending = true;
+                }
+                openasr_core::GgmlCaptureObservationPhase::AfterCompute => {
+                    let compute_sequence = state.active_compute.ok_or_else(|| {
+                        anyhow::anyhow!("runtime capture-after observation has no active compute")
+                    })?;
+                    if !state.capture_before_computes.contains(&compute_sequence)
+                        || !state.capture_after_computes.insert(compute_sequence)
+                    {
+                        bail!(
+                            "runtime capture-after observation is not paired with the active compute"
+                        );
+                    }
+                }
+            }
+            state.capture_supported = Some(*capture_supported);
+            state.graph_tracked = Some(*graph_tracked);
+            state.capture_enabled = *capture_enabled;
+            state.executable_present = *executable_present;
+            state.last_capture_phase = Some(*phase);
+        }
+        Kind::CaptureExecutableObserved {
+            capture_executable_generation,
+            ..
+        } => {
+            if *capture_executable_generation == 0
+                || state.capture_generation.is_some()
+                || state.active_compute.is_some()
+                || state.last_capture_phase
+                    != Some(openasr_core::GgmlCaptureObservationPhase::BeforeCompute)
+                || state.capture_supported != Some(true)
+                || state.graph_tracked != Some(true)
+                || state.capture_enabled != Some(true)
+                || !state.executable_present
+            {
+                bail!("runtime trace contains an invalid pre-compute capture observation");
+            }
+            state.capture_generation = Some(*capture_executable_generation);
+        }
+        Kind::CaptureExecutableCreated {
+            capture_executable_generation,
+            ..
+        } => {
+            if *capture_executable_generation == 0
+                || state
+                    .capture_generation
+                    .is_some_and(|previous| *capture_executable_generation <= previous)
+                || state.active_compute.is_none()
+                || state.last_capture_phase
+                    != Some(openasr_core::GgmlCaptureObservationPhase::AfterCompute)
+                || state.capture_supported != Some(true)
+                || state.graph_tracked != Some(true)
+                || state.capture_enabled != Some(true)
+                || !state.executable_present
+            {
+                bail!("runtime trace contains an invalid capture executable generation");
+            }
+            state.capture_generation = Some(*capture_executable_generation);
+        }
+        Kind::ComputeStarted {
+            compute_sequence,
+            capture_executable_generation,
+            ..
+        } => {
+            if *compute_sequence == 0
+                || state.active_compute.is_some()
+                || (state.capture_supported.is_some() && !state.capture_before_pending)
+                || *capture_executable_generation != state.capture_generation
+            {
+                bail!(
+                    "runtime compute did not consume a capture generation observed in this trace"
+                );
+            }
+            state.capture_generation_consumed |= capture_executable_generation.is_some();
+            if state.capture_before_pending {
+                state.capture_before_computes.insert(*compute_sequence);
+                state.capture_before_pending = false;
+            }
+            state.computed = true;
+            state.active_compute = Some(*compute_sequence);
+        }
+        Kind::ComputeCompleted {
+            compute_sequence, ..
+        } => {
+            if state.active_compute != Some(*compute_sequence)
+                || (state.capture_supported.is_some()
+                    && !state.capture_after_computes.contains(compute_sequence))
+            {
+                bail!("runtime trace contains an unmatched compute completion");
+            }
+            state.active_compute = None;
+        }
+        Kind::Poisoned { .. } => state.active_compute = None,
+        Kind::Dropped if state.active_compute.is_some() => {
+            bail!("runtime trace drops a graph during an active compute");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+impl ArtifactSelectionEvidenceRef {
+    fn parse(value: serde_json::Value, context: &'static str) -> Result<Self> {
+        let evidence: Self = serde_json::from_value(value).with_context(|| context)?;
+        if evidence.graph_instance == 0
+            || evidence.graph_generation == 0
+            || evidence.compute_sequence == 0
+            || evidence.output_generation == 0
+            || evidence.output_count == 0
+            || evidence.output_index >= evidence.output_count
+        {
+            bail!("{context}");
+        }
+        Ok(evidence)
+    }
+
+    fn compute_identity(&self) -> ArtifactComputeIdentity {
+        (
+            self.graph_instance,
+            self.graph_generation,
+            self.compute_sequence,
+            self.output_generation,
+        )
+    }
+
+    fn selection_identity(&self) -> ArtifactSelectionIdentity {
+        (
+            self.graph_instance,
+            self.graph_generation,
+            self.compute_sequence,
+            self.output_generation,
+            self.output_index,
+            self.output_count,
+        )
+    }
+}
 
 /// CLI inputs for one short-audio receipt run.
 #[derive(Debug, Clone)]
@@ -50,6 +271,16 @@ pub(crate) struct ShortAudioReceiptOptions<'a> {
     pub(crate) ffmpeg_bin: Option<PathBuf>,
     pub(crate) git_cwd: Option<&'a Path>,
     pub(crate) trace_out: Option<&'a Path>,
+    pub(crate) logits_out: Option<&'a Path>,
+    pub(crate) write_outputs: bool,
+}
+
+/// Native short-audio observation before any evidence.v1 binding.
+#[derive(Debug, Clone)]
+pub(crate) struct CollectedShortAudio {
+    pub receipt: openasr_core::ShortAudioReceipt,
+    pub token_trace_jsonl: Option<String>,
+    pub logits_jsonl: Option<String>,
 }
 
 /// Delegate release eligibility to the core-owned receipt predicate. The GPU
@@ -75,7 +306,7 @@ pub(crate) fn validate_qualification_receipts(paths: &[PathBuf]) -> Result<()> {
 pub(crate) fn bench_receipt_short_audio(
     native_execution_services: &Arc<NativeExecutionServices>,
     options: ShortAudioReceiptOptions<'_>,
-) -> Result<()> {
+) -> Result<CollectedShortAudio> {
     if options.runs == 0 {
         bail!("--runs must be >= 1");
     }
@@ -93,6 +324,12 @@ pub(crate) fn bench_receipt_short_audio(
     if options.trace_out.is_some() && options.backend_kind != BackendKind::Native {
         bail!("--trace-out requires --backend native; mock cannot produce a native trace");
     }
+    if options.logits_out.is_some() && options.trace_out.is_none() {
+        bail!("--logits-out requires --trace-out");
+    }
+    if options.trace_out.is_some() && options.runs != 1 {
+        bail!("--trace-out requires --runs 1 so one artifact binds one measured request");
+    }
     if options.trace_out.is_some()
         && let Some(parent) = options.out.parent()
         && !parent.as_os_str().is_empty()
@@ -106,12 +343,19 @@ pub(crate) fn bench_receipt_short_audio(
     }
     let fixed_output_targets = options
         .trace_out
-        .map(|trace_out| fixed_receipt_and_trace_targets(options.out, trace_out))
+        .map(|trace_out| {
+            fixed_receipt_trace_and_logits_targets(options.out, trace_out, options.logits_out)
+        })
         .transpose()?;
-    if let Some((_, trace_target)) = &fixed_output_targets
+    if let Some((_, trace_target, _)) = &fixed_output_targets
         && trace_target.path().exists()
     {
         bail!("refusing to overwrite runtime trace output");
+    }
+    if let Some((_, _, Some(logits_target))) = &fixed_output_targets
+        && logits_target.path().exists()
+    {
+        bail!("refusing to overwrite full logits trace output");
     }
 
     let home = openasr_home()?;
@@ -147,9 +391,12 @@ pub(crate) fn bench_receipt_short_audio(
         &home,
     )?;
 
+    let upload_ingest_started = Instant::now();
     let (_audio_size, audio_sha256) = sha256_file(options.audio)
         .with_context(|| format!("Could not hash audio file {}", options.audio.display()))?;
+    let upload_ingest_duration = upload_ingest_started.elapsed();
 
+    let decode_normalize_started = Instant::now();
     let prepared_audio = prepare_audio_input(
         options.audio,
         &crate::native_segment_cli::audio_preparation_options(
@@ -158,6 +405,7 @@ pub(crate) fn bench_receipt_short_audio(
             prepared_run.ffmpeg_bin_explicit,
         ),
     )?;
+    let decode_normalize_duration = decode_normalize_started.elapsed();
     let audio_duration_s = prepared_audio.duration_seconds();
     let memory_before_model = process_memory_snapshot();
 
@@ -171,7 +419,7 @@ pub(crate) fn bench_receipt_short_audio(
     // Native receipts must project decode_diagnostics from the runtime that
     // actually ran. Reconstructing output_plan/reuse_mode from --device or
     // --warmup-runs is forbidden.
-    let mut last_request_receipt = None;
+    let mut last_request_receipt = None::<NativeExecutionReceiptCollector>;
     let mut rtf_samples = Vec::with_capacity(options.runs);
     let mut last_text = String::new();
     let mut last_truncated = Vec::new();
@@ -197,6 +445,14 @@ pub(crate) fn bench_receipt_short_audio(
             let attempt_id = RequestAttemptId::generate()
                 .map_err(|_| anyhow::anyhow!("could not allocate request attempt identity"))?;
             let receipt = NativeExecutionReceiptCollector::new();
+            receipt.set_trace_mode(if pass == 0 {
+                NativeExecutionTraceMode::Cold
+            } else {
+                NativeExecutionTraceMode::Reuse
+            });
+            if (options.logits_out.is_some() || !options.write_outputs) && !is_warmup {
+                receipt.enable_full_logits_trace();
+            }
             Some((attempt_id, receipt))
         } else {
             None
@@ -207,7 +463,7 @@ pub(crate) fn bench_receipt_short_audio(
         )
         .with_source(openasr_core::RequestSource::CliTranscribe)
         .with_model_pack_path(prepared_run.model_source.model_pack_path.clone())
-        .with_execution_target(Some(execution_target))
+        .with_execution_target(Some(execution_target.clone()))
         .with_punctuation(false)
         .with_prepared_samples(prepared_audio.shared_samples())
         .with_display_file_name(
@@ -242,8 +498,18 @@ pub(crate) fn bench_receipt_short_audio(
         })?;
         let elapsed = started.elapsed();
         if let Some((_, receipt)) = &pass_receipt {
+            receipt
+                .record_phase_duration(RequestExecutionPhase::UploadIngest, upload_ingest_duration);
+            receipt.record_phase_duration(
+                RequestExecutionPhase::DecodeNormalize,
+                decode_normalize_duration,
+            );
+            receipt.record_phase_duration(RequestExecutionPhase::AdmissionWait, Duration::ZERO);
+            receipt.record_phase_duration(RequestExecutionPhase::Compute, elapsed);
             receipt.record_terminal(RequestExecutionTerminal::Succeeded);
-            last_request_receipt = Some(receipt.clone());
+            if !is_warmup {
+                last_request_receipt = Some(receipt.clone());
+            }
         }
         if options.trace_out.is_some()
             && transcription
@@ -257,7 +523,6 @@ pub(crate) fn bench_receipt_short_audio(
         }
         last_text = transcription.text;
         last_truncated = transcription.truncated_decodes;
-
         if is_warmup {
             continue;
         }
@@ -318,7 +583,7 @@ pub(crate) fn bench_receipt_short_audio(
     {
         notes.push("decode_stop=stop_token".to_string());
     }
-    if let (Some((_, trace_target)), Some(snapshot)) =
+    if let (Some((_, trace_target, logits_target)), Some(snapshot)) =
         (fixed_output_targets.as_ref(), native_snapshot.as_ref())
     {
         let facts = snapshot.facts.as_ref().ok_or_else(|| {
@@ -326,15 +591,38 @@ pub(crate) fn bench_receipt_short_audio(
         })?;
         if !snapshot.completed
             || snapshot.trace.overflowed
+            || snapshot.trace.invalid_binding
             || snapshot.trace.event_count == 0
             || snapshot.trace.jsonl.is_empty()
+            || snapshot.graph_lifecycle.overflowed
+            || snapshot.graph_lifecycle.events.is_empty()
             || facts.actual_provider != Some(facts.selected_provider)
             || facts.actual_stable_device_id.as_deref() != Some(facts.stable_device_id.as_str())
+            || facts.actual_device.is_none()
             || facts.scheduler_enabled.is_none()
         {
-            bail!("native trace is incomplete; refusing to emit an approval trace");
+            bail!("native trace is incomplete; refusing to emit a strict runtime trace");
         }
-        validate_release_trace(&snapshot.trace.jsonl)?;
+        validate_strict_runtime_trace(&snapshot.trace.jsonl)?;
+        if let Some(logits_target) = logits_target {
+            let full_logits = snapshot.trace.full_logits_jsonl.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("native FullLogits trace is missing its complete logits artifact")
+            })?;
+            if snapshot.trace.full_logits_step_count != snapshot.token_steps.len()
+                || snapshot.trace.full_logits_step_count == 0
+            {
+                bail!("native FullLogits trace does not cover every token-selection step");
+            }
+            validate_full_logits_trace(full_logits, &snapshot.trace.jsonl)?;
+            logits_target
+                .create_new_text_and_sync_parent(full_logits)
+                .with_context(|| {
+                    format!(
+                        "Could not write full logits trace to {}",
+                        logits_target.path().display()
+                    )
+                })?;
+        }
         trace_target
             .create_new_text_and_sync_parent(&snapshot.trace.jsonl)
             .with_context(|| {
@@ -344,14 +632,26 @@ pub(crate) fn bench_receipt_short_audio(
                 )
             })?;
     }
-    // A generic native receipt records only typed placement telemetry produced
-    // by the runtime. It is not a release correctness approval; token-transcript
-    // evidence requires the runtime token-trace producer and immutable matrix
-    // bindings. Strict trace publication above remains the only
-    // approval-producing path.
+    // A generic native receipt and its optional strict traces are diagnostics,
+    // not release approval. Only the explicit real-family qualification
+    // producer may add immutable matrix/artifact bindings and evidence.v1.
     let receipt_evidence = None;
     let execution = native_snapshot.as_ref().map(|request_snapshot| {
         let runtime_snapshot = native_execution_services.runtime_receipts().snapshot();
+        if std::env::var_os("OPENASR_RECEIPT_MEMORY_NOTES").is_some() {
+            let live_resources = runtime_snapshot
+                .live_owners
+                .iter()
+                .map(|owner| owner.resources.len())
+                .sum::<usize>();
+            notes.push(format!(
+                "runtime_receipts events={} owners={} resources={} dropped={}",
+                runtime_snapshot.events.len(),
+                runtime_snapshot.live_owners.len(),
+                live_resources,
+                runtime_snapshot.completeness.dropped_events
+            ));
+        }
         let reconciliation = native_execution_services
             .runtime_receipts()
             .reconcile_live_leases_quiescent(native_execution_services.memory_broker());
@@ -403,6 +703,23 @@ pub(crate) fn bench_receipt_short_audio(
         transcript: ShortAudioReceiptTranscript::from_text(last_text),
         placement: device_label,
         observed_placement: (!observed_placement.is_empty()).then_some(observed_placement),
+        graph_lifecycle: native_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.graph_lifecycle.clone())
+            .filter(|lifecycle| !lifecycle.events.is_empty()),
+        actual_provider: native_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.facts.as_ref())
+            .and_then(|facts| facts.actual_provider)
+            .map(|provider| provider.as_str().to_string()),
+        actual_stable_device_id: native_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.facts.as_ref())
+            .and_then(|facts| facts.actual_stable_device_id.clone()),
+        actual_device: native_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.facts.as_ref())
+            .and_then(|facts| facts.actual_device.clone()),
         evidence: receipt_evidence,
         execution,
         scope: options.scope.to_string(),
@@ -410,6 +727,22 @@ pub(crate) fn bench_receipt_short_audio(
         decode_diagnostics: Some(decode_diagnostics),
     })
     .context("Constructed short-audio receipt failed validation")?;
+
+    let token_trace_jsonl = native_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.trace.jsonl.clone())
+        .filter(|jsonl| !jsonl.is_empty());
+    let logits_jsonl = native_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.trace.full_logits_jsonl.clone());
+    let collected = CollectedShortAudio {
+        receipt: receipt.clone(),
+        token_trace_jsonl,
+        logits_jsonl,
+    };
+    if !options.write_outputs {
+        return Ok(collected);
+    }
 
     let json = receipt
         .to_pretty_json()
@@ -424,7 +757,7 @@ pub(crate) fn bench_receipt_short_audio(
             )
         })?;
     }
-    if let Some((receipt_target, _)) = fixed_output_targets.as_ref() {
+    if let Some((receipt_target, _, _)) = fixed_output_targets.as_ref() {
         receipt_target
             .atomic_write_text(&format!("{json}\n"))
             .with_context(|| {
@@ -446,7 +779,7 @@ pub(crate) fn bench_receipt_short_audio(
         SHORT_AUDIO_RECEIPT_SCHEMA,
         options.out.display()
     );
-    Ok(())
+    Ok(collected)
 }
 
 #[derive(Debug, Clone)]
@@ -555,22 +888,21 @@ fn find_installed_pack<'a>(
 }
 
 fn display_model_id(model_arg: Option<&str>, resolved_model_id: &str, quant: &str) -> String {
-    if let Some(model_arg) = model_arg
+    let source = model_arg
         .map(str::trim)
         .filter(|value| !value.is_empty() && !looks_like_local_path(value))
-    {
-        if model_arg.contains(':') {
-            return model_arg.to_string();
-        }
-        if quant != "unknown" {
-            return format!("{model_arg}:{quant}");
-        }
-        return model_arg.to_string();
-    }
+        .unwrap_or(resolved_model_id);
+    let family = match parse_model_ref(source) {
+        Ok(model_ref) => model_ref.family,
+        Err(_) => source
+            .split_once(':')
+            .map(|(family, _)| family.to_string())
+            .unwrap_or_else(|| source.to_string()),
+    };
     if quant != "unknown" {
-        format!("{resolved_model_id}:{quant}")
+        format!("{family}:{quant}")
     } else {
-        resolved_model_id.to_string()
+        family
     }
 }
 
@@ -594,9 +926,22 @@ fn project_decode_diagnostics(
 ) -> Result<ShortAudioReceiptDecodeDiagnostics> {
     openasr_core::decode_diagnostics_from_shipped_runtime(resolved.as_ref(), snapshot).map_err(
         |error| match error {
-            openasr_core::ShortAudioReceiptError::DecodeDiagnosticsMissing => anyhow::anyhow!(
-                "short-audio receipt is missing shipped output_plan/reuse_mode; refusing to emit a receipt"
-            ),
+            openasr_core::ShortAudioReceiptError::DecodeDiagnosticsMissing => {
+                let detail = match snapshot {
+                    None => "native snapshot is absent".to_string(),
+                    Some(snapshot) => format!(
+                        "native snapshot completed={} facts={} token_steps={} lifecycle_events={} overflowed={}",
+                        snapshot.completed,
+                        snapshot.facts.is_some(),
+                        snapshot.token_steps.len(),
+                        snapshot.graph_lifecycle.events.len(),
+                        snapshot.graph_lifecycle.overflowed,
+                    ),
+                };
+                anyhow::anyhow!(
+                    "short-audio receipt is missing shipped output_plan/reuse_mode; refusing to emit a receipt ({detail})"
+                )
+            }
             other => anyhow::anyhow!("{other}"),
         },
     )
@@ -609,6 +954,7 @@ fn resolved_runtime_for_mock_receipt(device: &str) -> Result<ResolvedFamilyRunti
         ExecutionTarget::Cpu => Some(RequestBackendPreference::CpuOnly),
         ExecutionTarget::Accelerated => Some(RequestBackendPreference::Accelerated),
         ExecutionTarget::Auto => None,
+        ExecutionTarget::Device(_) => Some(RequestBackendPreference::Accelerated),
     };
     Ok(
         ResolvedFamilyRuntimeInput::resolve_with_output_contract_and_consumers(
@@ -713,6 +1059,10 @@ fn build_command_argv(
         command.push("--trace-out".to_string());
         command.push("runtime-trace-output".to_string());
     }
+    if options.logits_out.is_some() {
+        command.push("--logits-out".to_string());
+        command.push("full-logits-output".to_string());
+    }
     command
 }
 
@@ -760,6 +1110,32 @@ fn fixed_receipt_and_trace_targets(
         bail!("--out and --trace-out must name different output targets");
     }
     Ok((receipt, trace))
+}
+
+fn fixed_receipt_trace_and_logits_targets(
+    receipt: &Path,
+    trace: &Path,
+    logits: Option<&Path>,
+) -> Result<(
+    ResolvedOutputTarget,
+    ResolvedOutputTarget,
+    Option<ResolvedOutputTarget>,
+)> {
+    let (receipt, trace) = fixed_receipt_and_trace_targets(receipt, trace)?;
+    let logits = logits.map(resolve_output_target_handle).transpose()?;
+    if logits
+        .as_ref()
+        .is_some_and(|logits| logits.path() == receipt.path() || logits.path() == trace.path())
+    {
+        bail!("--logits-out must name a different target from --out and --trace-out");
+    }
+    Ok((receipt, trace, logits))
+}
+
+fn has_exact_json_fields(value: &serde_json::Value, fields: &[&str]) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == fields.len() && fields.iter().all(|field| object.contains_key(*field))
+    })
 }
 
 /// Write a complete trace through a same-directory temporary file, then publish
@@ -815,73 +1191,596 @@ fn atomic_create_new_trace_at_target_with(
     Ok(())
 }
 
-fn validate_release_trace(jsonl: &str) -> Result<()> {
+fn validate_strict_runtime_trace(jsonl: &str) -> Result<()> {
     let mut token_steps = BTreeSet::new();
     let mut top_k_steps = BTreeSet::new();
-    let mut logits_steps = BTreeSet::new();
-    for line in jsonl.lines() {
+    let mut token_computes = BTreeMap::new();
+    let mut top_k_computes = BTreeMap::new();
+    let mut output_reads = BTreeMap::<ArtifactComputeIdentity, u64>::new();
+    let mut capture_states = BTreeMap::<(u64, u64), ArtifactCaptureLifecycleState>::new();
+    let mut lifecycle_kinds = BTreeSet::new();
+    let mut last_lifecycle_sequence = 0_u64;
+    let mut header_route = None::<(String, String)>;
+    for (line_index, line) in jsonl.lines().enumerate() {
         let event: serde_json::Value =
             serde_json::from_str(line).context("runtime trace contains invalid JSON")?;
+        if event.get("schema").and_then(serde_json::Value::as_str)
+            == Some(openasr_core::GGML_GRAPH_LIFECYCLE_SCHEMA)
+        {
+            if !openasr_core::ggml_graph_lifecycle_json_shape_is_strict(&event) {
+                bail!("runtime lifecycle event has unknown or missing fields");
+            }
+            let lifecycle: openasr_core::GgmlGraphLifecycleEvent = serde_json::from_value(event)
+                .context("runtime graph lifecycle event is invalid")?;
+            if lifecycle.sequence <= last_lifecycle_sequence {
+                bail!("runtime graph lifecycle sequence is not strictly increasing");
+            }
+            last_lifecycle_sequence = lifecycle.sequence;
+            let Some((provider, device)) = &header_route else {
+                bail!("runtime graph lifecycle event precedes the strict trace header");
+            };
+            if lifecycle.provider.as_ref() != provider.as_str()
+                || lifecycle.device.as_ref() != device.as_str()
+            {
+                bail!("runtime graph lifecycle event is not bound to the final route");
+            }
+            validate_artifact_capture_lifecycle(&mut capture_states, &lifecycle)?;
+            let graph_instance = lifecycle.graph_instance;
+            let graph_generation = lifecycle.graph_generation;
+            lifecycle_kinds.insert(match lifecycle.kind {
+                openasr_core::GgmlGraphLifecycleEventKind::Created { .. } => "created",
+                openasr_core::GgmlGraphLifecycleEventKind::ExistingGraphObserved { .. } => {
+                    "existing_graph_observed"
+                }
+                openasr_core::GgmlGraphLifecycleEventKind::Prepared { .. } => "prepared",
+                openasr_core::GgmlGraphLifecycleEventKind::InputWrite { .. } => "input_write",
+                openasr_core::GgmlGraphLifecycleEventKind::ComputeStarted { .. } => {
+                    "compute_started"
+                }
+                openasr_core::GgmlGraphLifecycleEventKind::ComputeCompleted { .. } => {
+                    "compute_completed"
+                }
+                openasr_core::GgmlGraphLifecycleEventKind::OutputRead {
+                    compute_sequence,
+                    output_generation_consumed,
+                    bytes,
+                } => {
+                    let identity = (
+                        graph_instance,
+                        graph_generation,
+                        compute_sequence,
+                        output_generation_consumed,
+                    );
+                    if output_reads.insert(identity, bytes).is_some() {
+                        bail!("runtime trace has ambiguous repeated output reads for one compute");
+                    }
+                    "output_read"
+                }
+                openasr_core::GgmlGraphLifecycleEventKind::KvWriteCommitted { .. } => {
+                    "kv_write_committed"
+                }
+                openasr_core::GgmlGraphLifecycleEventKind::Rebuilt { .. } => "rebuilt",
+                openasr_core::GgmlGraphLifecycleEventKind::Poisoned { .. } => "poisoned",
+                openasr_core::GgmlGraphLifecycleEventKind::Dropped => "dropped",
+                openasr_core::GgmlGraphLifecycleEventKind::CaptureStateObserved { .. } => {
+                    "capture_state_observed"
+                }
+                openasr_core::GgmlGraphLifecycleEventKind::CaptureExecutableObserved { .. } => {
+                    "capture_executable_observed"
+                }
+                openasr_core::GgmlGraphLifecycleEventKind::CaptureExecutableCreated { .. } => {
+                    "capture_executable_created"
+                }
+            });
+            continue;
+        }
         let step = event.get("step_index").and_then(serde_json::Value::as_u64);
         match event.get("event").and_then(serde_json::Value::as_str) {
+            Some("header") => {
+                if line_index != 0
+                    || header_route.is_some()
+                    || event.get("schema").and_then(serde_json::Value::as_str)
+                        != Some("openasr.gpu-correctness-trace.v1")
+                    || !has_exact_json_fields(
+                        &event,
+                        &[
+                            "schema",
+                            "event",
+                            "run_id",
+                            "process_nonce",
+                            "process_id",
+                            "mode",
+                            "graph_mode",
+                            "provider",
+                            "device_target",
+                            "backend_id",
+                            "driver_version",
+                            "artifact_fingerprint",
+                            "device",
+                            "actual_provider",
+                            "actual_stable_device_id",
+                            "actual_device",
+                        ],
+                    )
+                {
+                    bail!("runtime trace must contain exactly one leading header");
+                }
+                let provider = event
+                    .get("provider")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("runtime trace header has no provider"))?;
+                let device = event
+                    .get("device")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("runtime trace header has no device"))?;
+                if event
+                    .get("actual_provider")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(provider)
+                    || event
+                        .get("actual_stable_device_id")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(device)
+                {
+                    bail!("runtime trace header lacks matching live backend identity");
+                }
+                let actual_device: openasr_core::GgmlActualDeviceFacts =
+                    serde_json::from_value(event.get("actual_device").cloned().ok_or_else(
+                        || anyhow::anyhow!("runtime trace header has no actual_device"),
+                    )?)
+                    .context("runtime trace header actual_device is invalid")?;
+                if actual_device.name != device
+                    || actual_device.device_type.is_empty()
+                    || actual_device.description.is_empty()
+                {
+                    bail!("runtime trace header actual_device does not match its stable id");
+                }
+                let run_id = event
+                    .get("run_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("runtime trace header has no run_id"))?;
+                if run_id.len() != 32
+                    || !run_id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    bail!("runtime trace header has an invalid run_id");
+                }
+                let process_nonce = event
+                    .get("process_nonce")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("runtime trace header has no process_nonce"))?;
+                if process_nonce.len() != 32
+                    || !process_nonce
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    || event
+                        .get("process_id")
+                        .and_then(serde_json::Value::as_u64)
+                        .filter(|process_id| *process_id > 0 && *process_id <= u32::MAX.into())
+                        .is_none()
+                {
+                    bail!("runtime trace header has an invalid process identity");
+                }
+                if !matches!(
+                    event.get("mode").and_then(serde_json::Value::as_str),
+                    Some("cold" | "reuse")
+                ) {
+                    bail!("runtime trace header has an invalid execution mode");
+                }
+                if !matches!(
+                    event.get("graph_mode").and_then(serde_json::Value::as_str),
+                    Some("fresh_graph" | "reusable_graph")
+                ) {
+                    bail!("runtime trace header has an invalid graph mode");
+                }
+                for field in [
+                    "provider",
+                    "device_target",
+                    "backend_id",
+                    "driver_version",
+                    "artifact_fingerprint",
+                    "device",
+                ] {
+                    let value =
+                        event
+                            .get(field)
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|value| {
+                                !value.is_empty()
+                                    && value.len() <= 256
+                                    && !value.contains('\n')
+                                    && !value.contains('\r')
+                            });
+                    if value.is_none() {
+                        bail!("runtime trace header has an invalid {field}");
+                    }
+                }
+                header_route = Some((provider.to_string(), device.to_string()));
+            }
             Some("token") => {
+                if !has_exact_json_fields(
+                    &event,
+                    &[
+                        "schema",
+                        "event",
+                        "step_index",
+                        "token_id",
+                        "is_eot",
+                        "compute",
+                    ],
+                ) {
+                    bail!("runtime token trace contains unknown or missing fields");
+                }
                 let step =
                     step.ok_or_else(|| anyhow::anyhow!("runtime token trace has no step_index"))?;
+                let token_id = event
+                    .get("token_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok());
+                let is_eot = event.get("is_eot").and_then(serde_json::Value::as_u64);
+                if token_id.is_none() || !matches!(is_eot, Some(0 | 1)) {
+                    bail!("runtime token trace has an invalid token or EOT value");
+                }
+                let compute = ArtifactSelectionEvidenceRef::parse(
+                    event
+                        .get("compute")
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("runtime token trace has no compute ref"))?,
+                    "runtime token trace compute ref is invalid",
+                )?;
                 if !token_steps.insert(step) {
                     bail!("runtime token trace has duplicate step_index {step}");
                 }
+                token_computes.insert(step, compute.selection_identity());
             }
             Some("top_k") => {
+                if !has_exact_json_fields(
+                    &event,
+                    &[
+                        "schema",
+                        "event",
+                        "step_index",
+                        "items",
+                        "top1_top2_margin",
+                        "compute",
+                    ],
+                ) {
+                    bail!("runtime top-k trace contains unknown or missing fields");
+                }
                 let step =
                     step.ok_or_else(|| anyhow::anyhow!("runtime top-k trace has no step_index"))?;
                 let items = event
                     .get("items")
                     .and_then(serde_json::Value::as_array)
                     .ok_or_else(|| anyhow::anyhow!("runtime top-k trace has no items"))?;
+                let margin = event
+                    .get("top1_top2_margin")
+                    .and_then(serde_json::Value::as_f64)
+                    .filter(|value| value.is_finite() && *value >= 0.0);
                 if items.len() < 2
-                    || event
-                        .get("top1_top2_margin")
-                        .and_then(serde_json::Value::as_f64)
-                        .is_none()
+                    || margin.is_none()
+                    || items.iter().any(|item| {
+                        item.as_object().is_none_or(|object| {
+                            object.len() != 2
+                                || !object.contains_key("token_id")
+                                || !object.contains_key("value")
+                                || item
+                                    .get("token_id")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .and_then(|value| u32::try_from(value).ok())
+                                    .is_none()
+                                || item
+                                    .get("value")
+                                    .and_then(serde_json::Value::as_f64)
+                                    .is_none_or(|value| !value.is_finite())
+                        })
+                    })
                 {
                     bail!("runtime top-k trace lacks a real top1/top2 margin at step {step}");
                 }
                 if !top_k_steps.insert(step) {
                     bail!("runtime top-k trace has duplicate step_index {step}");
                 }
+                let compute = ArtifactSelectionEvidenceRef::parse(
+                    event
+                        .get("compute")
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("runtime top-k trace has no compute ref"))?,
+                    "runtime top-k trace compute ref is invalid",
+                )?;
+                top_k_computes.insert(step, compute.selection_identity());
             }
-            Some("logits_digest") => {
-                let step =
-                    step.ok_or_else(|| anyhow::anyhow!("runtime logits digest has no step_index"))?;
-                let digest = event.get("sha256").and_then(serde_json::Value::as_str);
-                if event
-                    .get("element_count")
-                    .and_then(serde_json::Value::as_u64)
-                    .is_none_or(|count| count == 0)
-                    || event
-                        .get("non_finite_count")
-                        .and_then(serde_json::Value::as_u64)
-                        != Some(0)
-                    || digest.is_none_or(|value| {
-                        value.len() != 64
-                            || value.bytes().any(|byte| {
-                                !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte)
-                            })
-                    })
-                {
-                    bail!("runtime logits digest is invalid at step {step}");
-                }
-                if !logits_steps.insert(step) {
-                    bail!("runtime logits trace has duplicate step_index {step}");
-                }
-            }
-            _ => {}
+            _ => bail!("runtime trace contains an unknown event"),
         }
     }
-    if token_steps.is_empty() || token_steps != top_k_steps || token_steps != logits_steps {
+    if header_route.is_none() {
+        bail!("runtime trace has no strict header");
+    }
+    if token_steps.is_empty() || token_steps != top_k_steps {
+        bail!("every runtime token trace step must have exactly one same-step top-k/margin record");
+    }
+    let expected_steps = (0..u64::try_from(token_steps.len()).context("step count exceeds u64")?)
+        .collect::<BTreeSet<_>>();
+    if token_steps.len() > openasr_core::GPU_CORRECTNESS_TRACE_MAX_STEPS
+        || token_steps != expected_steps
+    {
+        bail!("runtime token trace steps must be bounded and contiguous from zero");
+    }
+    if token_computes != top_k_computes
+        || token_computes.values().any(|compute| {
+            !output_reads.contains_key(&(compute.0, compute.1, compute.2, compute.3))
+        })
+        || token_computes.values().collect::<BTreeSet<_>>().len() != token_computes.len()
+    {
+        bail!("every runtime token/top-k step must bind the same successfully read graph compute");
+    }
+    if !lifecycle_kinds.contains("created") && !lifecycle_kinds.contains("existing_graph_observed")
+    {
+        bail!("runtime trace lacks a real graph creation or warm attachment event");
+    }
+    for required in [
+        "input_write",
+        "compute_started",
+        "compute_completed",
+        "output_read",
+    ] {
+        if !lifecycle_kinds.contains(required) {
+            bail!("runtime trace lacks required lifecycle event {required}");
+        }
+    }
+    let computed_capture_states = capture_states
+        .values()
+        .filter(|state| state.computed)
+        .collect::<Vec<_>>();
+    let observed_capture_modes = computed_capture_states
+        .iter()
+        .filter_map(|state| {
+            state.capture_supported.map(|capture_supported| {
+                (
+                    capture_supported,
+                    state.graph_tracked,
+                    state.capture_enabled,
+                )
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    if observed_capture_modes
+        .iter()
+        .any(|(capture_supported, graph_tracked, capture_enabled)| {
+            *capture_supported || *graph_tracked == Some(true) || capture_enabled.is_some()
+        })
+        && (observed_capture_modes.len() != 1
+            || computed_capture_states
+                .iter()
+                .any(|state| state.capture_supported.is_none()))
+    {
         bail!(
-            "every runtime token trace step must have exactly one same-step top-k/margin and logits-digest record"
+            "runtime trace does not bind one consistent native capture mode to every computed graph"
         );
+    }
+    let capture_executable_observed = computed_capture_states
+        .iter()
+        .any(|state| state.capture_enabled == Some(true) && state.executable_present);
+    let capture_generation_consumed = computed_capture_states
+        .iter()
+        .any(|state| state.capture_generation_consumed);
+    if capture_executable_observed && !capture_generation_consumed {
+        bail!(
+            "runtime trace observes enabled native capture without a compute that consumed its executable generation"
+        );
+    }
+    Ok(())
+}
+
+fn validate_full_logits_trace(logits_jsonl: &str, token_jsonl: &str) -> Result<()> {
+    let token_events = token_jsonl
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .context("runtime token trace contains invalid JSON")?;
+    let token_header = token_events
+        .first()
+        .filter(|event| event.get("event").and_then(serde_json::Value::as_str) == Some("header"))
+        .ok_or_else(|| anyhow::anyhow!("runtime token trace has no leading header"))?;
+    let mut output_read_bytes = BTreeMap::<ArtifactComputeIdentity, u64>::new();
+    for event in &token_events[1..] {
+        if event.get("schema").and_then(serde_json::Value::as_str)
+            == Some(openasr_core::GGML_GRAPH_LIFECYCLE_SCHEMA)
+            && event.get("event").and_then(serde_json::Value::as_str) == Some("output_read")
+        {
+            let field = |name| {
+                event
+                    .get(name)
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| anyhow::anyhow!("output_read has invalid {name}"))
+            };
+            let identity = (
+                field("graph_instance")?,
+                field("graph_generation")?,
+                field("compute_sequence")?,
+                field("output_generation_consumed")?,
+            );
+            let bytes = field("bytes")?;
+            if output_read_bytes.insert(identity, bytes).is_some() {
+                bail!("token trace has ambiguous repeated output reads for one compute");
+            }
+        }
+    }
+    let mut tokens = BTreeMap::<u64, (u32, ArtifactSelectionIdentity)>::new();
+    for event in &token_events[1..] {
+        if event.get("schema").and_then(serde_json::Value::as_str)
+            != Some("openasr.gpu-correctness-trace.v1")
+            || event.get("event").and_then(serde_json::Value::as_str) != Some("token")
+        {
+            continue;
+        }
+        let step = event
+            .get("step_index")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("runtime token trace has an invalid step"))?;
+        let token_id = event
+            .get("token_id")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| anyhow::anyhow!("runtime token trace has an invalid token id"))?;
+        let compute = ArtifactSelectionEvidenceRef::parse(
+            event
+                .get("compute")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("runtime token trace has no compute ref"))?,
+            "runtime token trace compute ref is invalid",
+        )?;
+        if tokens
+            .insert(step, (token_id, compute.selection_identity()))
+            .is_some()
+        {
+            bail!("runtime token trace contains a duplicate step");
+        }
+    }
+
+    let logits_events = logits_jsonl
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .context("full logits trace contains invalid JSON")?;
+    let header = logits_events
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("full logits trace is empty"))?;
+    if !has_exact_json_fields(
+        header,
+        &[
+            "schema",
+            "event",
+            "run_id",
+            "process_nonce",
+            "process_id",
+            "mode",
+            "graph_mode",
+            "provider",
+            "device_target",
+            "backend_id",
+            "driver_version",
+            "artifact_fingerprint",
+            "device",
+            "actual_provider",
+            "actual_stable_device_id",
+            "actual_device",
+            "dtype",
+            "encoding",
+            "step_count",
+        ],
+    ) || header.get("schema").and_then(serde_json::Value::as_str)
+        != Some(openasr_core::GPU_FULL_LOGITS_TRACE_SCHEMA)
+        || header.get("event").and_then(serde_json::Value::as_str) != Some("header")
+        || header.get("dtype").and_then(serde_json::Value::as_str) != Some("f32")
+        || header.get("encoding").and_then(serde_json::Value::as_str) != Some("json_numbers")
+    {
+        bail!("full logits trace has an invalid header");
+    }
+    for field in [
+        "run_id",
+        "process_nonce",
+        "process_id",
+        "mode",
+        "graph_mode",
+        "provider",
+        "device_target",
+        "backend_id",
+        "driver_version",
+        "artifact_fingerprint",
+        "device",
+        "actual_provider",
+        "actual_stable_device_id",
+        "actual_device",
+    ] {
+        if header.get(field) != token_header.get(field) {
+            bail!("full logits trace header does not match token trace field {field}");
+        }
+    }
+    let declared_steps = header
+        .get("step_count")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| 0 < *value && *value <= openasr_core::GPU_CORRECTNESS_TRACE_MAX_STEPS)
+        .ok_or_else(|| anyhow::anyhow!("full logits trace has no valid step_count"))?;
+    let mut logits = BTreeMap::<u64, (usize, ArtifactSelectionIdentity)>::new();
+    for event in &logits_events[1..] {
+        if !has_exact_json_fields(
+            event,
+            &[
+                "schema",
+                "event",
+                "step_index",
+                "compute",
+                "vocab_size",
+                "values",
+            ],
+        ) || event.get("schema").and_then(serde_json::Value::as_str)
+            != Some(openasr_core::GPU_FULL_LOGITS_TRACE_SCHEMA)
+            || event.get("event").and_then(serde_json::Value::as_str) != Some("logits")
+        {
+            bail!("full logits trace contains an unknown event");
+        }
+        let step = event
+            .get("step_index")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("full logits trace has an invalid step"))?;
+        let vocab_size = event
+            .get("vocab_size")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| 0 < *value && *value <= openasr_core::GPU_FULL_LOGITS_MAX_VOCAB)
+            .ok_or_else(|| anyhow::anyhow!("full logits trace has an invalid vocab_size"))?;
+        let values = event
+            .get("values")
+            .and_then(serde_json::Value::as_array)
+            .filter(|values| {
+                values.len() == vocab_size
+                    && values
+                        .iter()
+                        .all(|value| value.as_f64().is_some_and(f64::is_finite))
+            })
+            .ok_or_else(|| anyhow::anyhow!("full logits trace has an incomplete f32 row"))?;
+        let compute = ArtifactSelectionEvidenceRef::parse(
+            event
+                .get("compute")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("full logits trace has no compute ref"))?,
+            "full logits trace compute ref is invalid",
+        )?;
+        let token = tokens
+            .get(&step)
+            .ok_or_else(|| anyhow::anyhow!("full logits trace step has no token event"))?;
+        if token.1 != compute.selection_identity() || token.0 as usize >= values.len() {
+            bail!("full logits trace step is not bound to its token compute");
+        }
+        let expected_bytes = compute
+            .output_count
+            .checked_mul(u64::try_from(vocab_size).context("vocab size exceeds u64")?)
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or_else(|| anyhow::anyhow!("full logits output byte count overflowed"))?;
+        if output_read_bytes.get(&compute.compute_identity()) != Some(&expected_bytes) {
+            bail!("full logits row partition does not match its native output read size");
+        }
+        if logits
+            .insert(step, (vocab_size, compute.selection_identity()))
+            .is_some()
+        {
+            bail!("full logits trace contains a duplicate step");
+        }
+    }
+    let expected_steps = (0..u64::try_from(declared_steps).context("step count exceeds u64")?)
+        .collect::<BTreeSet<_>>();
+    if declared_steps != logits.len()
+        || tokens.len() != logits.len()
+        || logits.keys().copied().collect::<BTreeSet<_>>() != expected_steps
+        || tokens.keys().copied().collect::<BTreeSet<_>>() != expected_steps
+    {
+        bail!("full logits trace does not cover every token step");
     }
     Ok(())
 }
@@ -1097,6 +1996,8 @@ mod tests {
                 ffmpeg_bin: None,
                 git_cwd: None,
                 trace_out: None,
+                logits_out: None,
+                write_outputs: true,
             },
         );
         match previous_home {
@@ -1170,6 +2071,7 @@ mod tests {
         let out = PathBuf::from("/home/alice/receipt.json");
         let model_pack = PathBuf::from(r"C:\Users\alice\AppData\Local\model.oasr");
         let trace_out = PathBuf::from("/tmp/openasr/trace.jsonl");
+        let logits_out = PathBuf::from("/tmp/openasr/full-logits.jsonl");
         let options = ShortAudioReceiptOptions {
             model: Some(r"C:\Users\alice\AppData\Local\model.oasr"),
             audio: &audio,
@@ -1184,6 +2086,8 @@ mod tests {
             ffmpeg_bin: None,
             git_cwd: None,
             trace_out: Some(&trace_out),
+            logits_out: Some(&logits_out),
+            write_outputs: true,
         };
         let pack = PackBinding {
             model_id: "whisper-tiny:q4_k".to_string(),
@@ -1198,6 +2102,7 @@ mod tests {
         assert!(command.contains(&audio_label));
         assert!(command.contains(&"receipt-output".to_string()));
         assert!(command.contains(&"runtime-trace-output".to_string()));
+        assert!(command.contains(&"full-logits-output".to_string()));
         for forbidden in [
             "/private/var",
             "/home/alice",
@@ -1312,13 +2217,177 @@ mod tests {
     #[test]
     fn strict_trace_requires_same_step_logits_top_k_and_margin() {
         let valid = concat!(
-            "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"header\"}\n",
-            "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"token\",\"step_index\":0}\n",
-            "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"logits_digest\",\"step_index\":0,\"element_count\":2,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"non_finite_count\":0}\n",
-            "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"top_k\",\"step_index\":0,\"items\":[{\"token_id\":1,\"value\":2.0},{\"token_id\":2,\"value\":1.0}],\"top1_top2_margin\":1.0}\n"
+            "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"header\",\"run_id\":\"0123456789abcdef0123456789abcdef\",\"process_nonce\":\"abcdef0123456789abcdef0123456789\",\"process_id\":4242,\"mode\":\"cold\",\"graph_mode\":\"fresh_graph\",\"provider\":\"cpu\",\"device_target\":\"unqualified\",\"backend_id\":\"unqualified\",\"driver_version\":\"unqualified\",\"artifact_fingerprint\":\"unqualified\",\"device\":\"CPU\",\"actual_provider\":\"cpu\",\"actual_stable_device_id\":\"CPU\",\"actual_device\":{\"type\":\"cpu\",\"name\":\"CPU\",\"description\":\"test CPU\"}}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":1,\"provider\":\"cpu\",\"device\":\"CPU\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"created\",\"scheduler_enabled\":false}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":2,\"provider\":\"cpu\",\"device\":\"CPU\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"prepared\",\"prepare_generation\":3}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":3,\"provider\":\"cpu\",\"device\":\"CPU\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"input_write\",\"input_generation\":4,\"bytes\":16}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":4,\"provider\":\"cpu\",\"device\":\"CPU\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"compute_started\",\"compute_sequence\":1,\"prepare_generation\":3,\"input_generation_consumed\":4}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":5,\"provider\":\"cpu\",\"device\":\"CPU\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"compute_completed\",\"compute_sequence\":1,\"output_generation\":5}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":6,\"provider\":\"cpu\",\"device\":\"CPU\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"output_read\",\"compute_sequence\":1,\"output_generation_consumed\":5,\"bytes\":12}\n",
+            "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"token\",\"step_index\":0,\"token_id\":1,\"is_eot\":0,\"compute\":{\"graph_instance\":1,\"graph_generation\":2,\"compute_sequence\":1,\"output_generation\":5,\"output_index\":0,\"output_count\":1}}\n",
+            "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"top_k\",\"step_index\":0,\"items\":[{\"token_id\":1,\"value\":2.0},{\"token_id\":2,\"value\":1.0}],\"top1_top2_margin\":1.0,\"compute\":{\"graph_instance\":1,\"graph_generation\":2,\"compute_sequence\":1,\"output_generation\":5,\"output_index\":0,\"output_count\":1}}\n"
         );
-        validate_release_trace(valid).expect("complete trace accepted");
-        assert!(validate_release_trace("{\"event\":\"token\",\"step_index\":0}\n").is_err());
+        validate_strict_runtime_trace(valid).expect("complete trace accepted");
+        let logits = concat!(
+            "{\"schema\":\"openasr.gpu-full-logits-trace.v1\",\"event\":\"header\",\"run_id\":\"0123456789abcdef0123456789abcdef\",\"process_nonce\":\"abcdef0123456789abcdef0123456789\",\"process_id\":4242,\"mode\":\"cold\",\"graph_mode\":\"fresh_graph\",\"provider\":\"cpu\",\"device_target\":\"unqualified\",\"backend_id\":\"unqualified\",\"driver_version\":\"unqualified\",\"artifact_fingerprint\":\"unqualified\",\"device\":\"CPU\",\"actual_provider\":\"cpu\",\"actual_stable_device_id\":\"CPU\",\"actual_device\":{\"type\":\"cpu\",\"name\":\"CPU\",\"description\":\"test CPU\"},\"dtype\":\"f32\",\"encoding\":\"json_numbers\",\"step_count\":1}\n",
+            "{\"schema\":\"openasr.gpu-full-logits-trace.v1\",\"event\":\"logits\",\"step_index\":0,\"compute\":{\"graph_instance\":1,\"graph_generation\":2,\"compute_sequence\":1,\"output_generation\":5,\"output_index\":0,\"output_count\":1},\"vocab_size\":3,\"values\":[0.0,2.0,1.0]}\n",
+        );
+        validate_full_logits_trace(logits, valid).expect("complete logits trace accepted");
+        let mismatched_process_nonce = logits.replace(
+            "\"process_nonce\":\"abcdef0123456789abcdef0123456789\"",
+            "\"process_nonce\":\"ffffffffffffffffffffffffffffffff\"",
+        );
+        assert!(validate_full_logits_trace(&mismatched_process_nonce, valid).is_err());
+        let mismatched_process_id = logits.replace("\"process_id\":4242", "\"process_id\":4243");
+        assert!(validate_full_logits_trace(&mismatched_process_id, valid).is_err());
+        let invalid_process_id = valid.replace("\"process_id\":4242", "\"process_id\":0");
+        assert!(validate_strict_runtime_trace(&invalid_process_id).is_err());
+        let unknown_lifecycle_field = valid.replace(
+            "\"scheduler_enabled\":false}",
+            "\"scheduler_enabled\":false,\"activation_mode\":\"auto\"}",
+        );
+        assert!(validate_strict_runtime_trace(&unknown_lifecycle_field).is_err());
+        assert!(validate_full_logits_trace("", valid).is_err());
+        assert!(validate_strict_runtime_trace("{\"event\":\"token\",\"step_index\":0}\n").is_err());
+    }
+
+    #[test]
+    fn strict_trace_rejects_enabled_capture_not_consumed_by_compute() {
+        let trace = concat!(
+            "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"header\",\"run_id\":\"0123456789abcdef0123456789abcdef\",\"process_nonce\":\"abcdef0123456789abcdef0123456789\",\"process_id\":4242,\"mode\":\"cold\",\"graph_mode\":\"fresh_graph\",\"provider\":\"hip\",\"device_target\":\"gfx1100\",\"backend_id\":\"hip-test\",\"driver_version\":\"1.0\",\"artifact_fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"device\":\"HIP0\",\"actual_provider\":\"hip\",\"actual_stable_device_id\":\"HIP0\",\"actual_device\":{\"type\":\"gpu\",\"name\":\"HIP0\",\"description\":\"test HIP device\"}}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":1,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"created\",\"scheduler_enabled\":false}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":2,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"prepared\",\"prepare_generation\":3}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":3,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"input_write\",\"input_generation\":4,\"bytes\":16}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":4,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"compute_started\",\"compute_sequence\":1,\"prepare_generation\":3,\"input_generation_consumed\":4}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":5,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"compute_completed\",\"compute_sequence\":1,\"output_generation\":5}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":6,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"output_read\",\"compute_sequence\":1,\"output_generation_consumed\":5,\"bytes\":12}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":7,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"capture_state_observed\",\"phase\":\"after_compute\",\"capture_supported\":true,\"graph_tracked\":true,\"capture_enabled\":true,\"executable_present\":true}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":8,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"capture_executable_observed\",\"capture_executable_generation\":6,\"last_change\":\"instantiated\"}\n",
+            "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"token\",\"step_index\":0,\"token_id\":1,\"is_eot\":0,\"compute\":{\"graph_instance\":1,\"graph_generation\":2,\"compute_sequence\":1,\"output_generation\":5,\"output_index\":0,\"output_count\":1}}\n",
+            "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"top_k\",\"step_index\":0,\"items\":[{\"token_id\":1,\"value\":2.0},{\"token_id\":2,\"value\":1.0}],\"top1_top2_margin\":1.0,\"compute\":{\"graph_instance\":1,\"graph_generation\":2,\"compute_sequence\":1,\"output_generation\":5,\"output_index\":0,\"output_count\":1}}\n"
+        );
+        assert!(validate_strict_runtime_trace(trace).is_err());
+    }
+
+    #[test]
+    fn capture_executable_creation_requires_post_compute_observation() {
+        use openasr_core::{
+            GGML_GRAPH_LIFECYCLE_SCHEMA, GgmlCaptureExecutableChange, GgmlCaptureObservationPhase,
+            GgmlGraphLifecycleEvent, GgmlGraphLifecycleEventKind,
+        };
+
+        let event = |sequence, kind| GgmlGraphLifecycleEvent {
+            schema: GGML_GRAPH_LIFECYCLE_SCHEMA.into(),
+            sequence,
+            provider: "hip".into(),
+            device: "HIP0".into(),
+            graph_instance: 1,
+            graph_generation: 2,
+            kind,
+        };
+        let mut states = BTreeMap::new();
+        validate_artifact_capture_lifecycle(
+            &mut states,
+            &event(
+                1,
+                GgmlGraphLifecycleEventKind::Created {
+                    scheduler_enabled: false,
+                },
+            ),
+        )
+        .expect("attach graph");
+        validate_artifact_capture_lifecycle(
+            &mut states,
+            &event(
+                2,
+                GgmlGraphLifecycleEventKind::CaptureStateObserved {
+                    phase: GgmlCaptureObservationPhase::BeforeCompute,
+                    capture_supported: true,
+                    graph_tracked: true,
+                    capture_enabled: Some(true),
+                    executable_present: false,
+                },
+            ),
+        )
+        .expect("observe pre-compute state");
+        validate_artifact_capture_lifecycle(
+            &mut states,
+            &event(
+                3,
+                GgmlGraphLifecycleEventKind::ComputeStarted {
+                    compute_sequence: 1,
+                    prepare_generation: Some(3),
+                    input_generation_consumed: Some(4),
+                    capture_executable_generation: None,
+                },
+            ),
+        )
+        .expect("start compute");
+        let error = validate_artifact_capture_lifecycle(
+            &mut states,
+            &event(
+                4,
+                GgmlGraphLifecycleEventKind::CaptureExecutableCreated {
+                    capture_executable_generation: 5,
+                    change: GgmlCaptureExecutableChange::Instantiated,
+                },
+            ),
+        )
+        .expect_err("capture creation cannot precede the after-compute ABI observation");
+        assert!(error.to_string().contains("capture executable generation"));
+    }
+
+    #[test]
+    fn strict_trace_requires_request_local_warm_capture_observation() {
+        let warm = concat!(
+            "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"header\",\"run_id\":\"0123456789abcdef0123456789abcdef\",\"process_nonce\":\"abcdef0123456789abcdef0123456789\",\"process_id\":4242,\"mode\":\"reuse\",\"graph_mode\":\"fresh_graph\",\"provider\":\"hip\",\"device_target\":\"gfx1100\",\"backend_id\":\"hip-test\",\"driver_version\":\"1.0\",\"artifact_fingerprint\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"device\":\"HIP0\",\"actual_provider\":\"hip\",\"actual_stable_device_id\":\"HIP0\",\"actual_device\":{\"type\":\"gpu\",\"name\":\"HIP0\",\"description\":\"test HIP device\"}}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":1,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"existing_graph_observed\",\"scheduler_enabled\":false,\"prepare_generation\":3}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":2,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"input_write\",\"input_generation\":4,\"bytes\":16}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":3,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"capture_state_observed\",\"phase\":\"before_compute\",\"capture_supported\":true,\"graph_tracked\":true,\"capture_enabled\":true,\"executable_present\":true}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":4,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"capture_executable_observed\",\"capture_executable_generation\":10,\"last_change\":\"instantiated\"}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":5,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"compute_started\",\"compute_sequence\":2,\"prepare_generation\":3,\"input_generation_consumed\":4,\"capture_executable_generation\":10}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":6,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"capture_state_observed\",\"phase\":\"after_compute\",\"capture_supported\":true,\"graph_tracked\":true,\"capture_enabled\":true,\"executable_present\":true}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":7,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"compute_completed\",\"compute_sequence\":2,\"output_generation\":5}\n",
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":8,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"output_read\",\"compute_sequence\":2,\"output_generation_consumed\":5,\"bytes\":12}\n",
+            "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"token\",\"step_index\":0,\"token_id\":1,\"is_eot\":0,\"compute\":{\"graph_instance\":1,\"graph_generation\":2,\"compute_sequence\":2,\"output_generation\":5,\"output_index\":0,\"output_count\":1}}\n",
+            "{\"schema\":\"openasr.gpu-correctness-trace.v1\",\"event\":\"top_k\",\"step_index\":0,\"items\":[{\"token_id\":1,\"value\":2.0},{\"token_id\":2,\"value\":1.0}],\"top1_top2_margin\":1.0,\"compute\":{\"graph_instance\":1,\"graph_generation\":2,\"compute_sequence\":2,\"output_generation\":5,\"output_index\":0,\"output_count\":1}}\n"
+        );
+        validate_strict_runtime_trace(warm).expect("warm native capture observation accepted");
+        let missing = warm.replace(
+            "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":4,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":1,\"graph_generation\":2,\"event\":\"capture_executable_observed\",\"capture_executable_generation\":10,\"last_change\":\"instantiated\"}\n",
+            "",
+        );
+        assert!(validate_strict_runtime_trace(&missing).is_err());
+
+        let uncovered_graph = format!(
+            "{warm}{}",
+            concat!(
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":8,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"created\",\"scheduler_enabled\":false}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":9,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"prepared\",\"prepare_generation\":22}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":10,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"input_write\",\"input_generation\":23,\"bytes\":16}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":11,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"compute_started\",\"compute_sequence\":1,\"prepare_generation\":22,\"input_generation_consumed\":23}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":12,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"compute_completed\",\"compute_sequence\":1,\"output_generation\":24}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":13,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"output_read\",\"compute_sequence\":1,\"output_generation_consumed\":24,\"bytes\":12}\n"
+            )
+        );
+        assert!(validate_strict_runtime_trace(&uncovered_graph).is_err());
+
+        let one_shot_capture_graph = format!(
+            "{warm}{}",
+            concat!(
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":9,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"created\",\"scheduler_enabled\":false}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":10,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"prepared\",\"prepare_generation\":22}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":11,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"input_write\",\"input_generation\":23,\"bytes\":16}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":12,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"capture_state_observed\",\"phase\":\"before_compute\",\"capture_supported\":true,\"graph_tracked\":true,\"capture_enabled\":true,\"executable_present\":false}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":13,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"compute_started\",\"compute_sequence\":1,\"prepare_generation\":22,\"input_generation_consumed\":23}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":14,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"capture_state_observed\",\"phase\":\"after_compute\",\"capture_supported\":true,\"graph_tracked\":true,\"capture_enabled\":true,\"executable_present\":true}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":15,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"capture_executable_created\",\"capture_executable_generation\":24,\"change\":\"instantiated\"}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":16,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"compute_completed\",\"compute_sequence\":1,\"output_generation\":25}\n",
+                "{\"schema\":\"openasr.ggml-graph-lifecycle.v1\",\"sequence\":17,\"provider\":\"hip\",\"device\":\"HIP0\",\"graph_instance\":20,\"graph_generation\":21,\"event\":\"output_read\",\"compute_sequence\":1,\"output_generation_consumed\":25,\"bytes\":12}\n"
+            )
+        );
+        validate_strict_runtime_trace(&one_shot_capture_graph)
+            .expect("one-shot graph may create capture while another graph proves consumption");
     }
 
     #[test]
@@ -1352,7 +2421,7 @@ mod tests {
     fn display_model_id_prefers_explicit_quant_ref() {
         assert_eq!(
             display_model_id(Some("funasr-nano:q4"), "funasr-nano", "q4_k"),
-            "funasr-nano:q4"
+            "funasr-nano:q4_k"
         );
         assert_eq!(
             display_model_id(Some("funasr-nano"), "funasr-nano", "q4_k"),
@@ -1377,7 +2446,7 @@ mod tests {
     }
 
     #[test]
-    fn shipped_emitter_projects_token_steps_from_collector_record_token() {
+    fn shipped_emitter_rejects_tokens_without_native_compute_witness() {
         let resolved = resolved_runtime(
             Some(RequestBackendPreference::CpuOnly),
             GgmlDecodeLogitsConsumers::none(),
@@ -1387,15 +2456,8 @@ mod tests {
         collector.record_token(0, 11, false);
         collector.record_token(1, 7, true);
         let snapshot = collector.snapshot();
-        let diagnostics = project_decode_diagnostics(Some(resolved), Some(&snapshot))
-            .expect("collector token steps must project");
-        assert_eq!(diagnostics.steps.len(), 2);
-        assert_eq!(diagnostics.steps[0].step, 0);
-        assert_eq!(diagnostics.steps[0].token_id, Some(11));
-        assert_eq!(diagnostics.steps[0].top2_margin, Some(1.0));
-        assert!(diagnostics.steps[0].graph_rebuilt);
-        assert_eq!(diagnostics.steps[1].token_id, Some(7));
-        assert_eq!(diagnostics.steps[1].top2_margin, None);
+        project_decode_diagnostics(Some(resolved), Some(&snapshot))
+            .expect_err("caller-recorded tokens cannot synthesize graph lifecycle evidence");
         assert!(snapshot.trace.event_count > 0);
     }
 

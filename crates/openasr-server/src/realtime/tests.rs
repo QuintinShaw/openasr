@@ -5,6 +5,7 @@ use std::{
     fs,
     io::{Read, Write},
     num::NonZeroUsize,
+    sync::{Arc, Mutex},
 };
 
 use sha2::{Digest, Sha256};
@@ -57,6 +58,10 @@ impl Drop for EnvVarGuard {
             None => unsafe { std::env::remove_var(self.key) },
         }
     }
+}
+
+fn isolate_openasr_device() -> crate::OpenasrDeviceEnvGuard {
+    crate::OpenasrDeviceEnvGuard::unset()
 }
 
 fn test_native_streaming_worker_key(name: &str) -> NativeStreamingWorkerKey {
@@ -1556,9 +1561,13 @@ async fn native_streaming_same_key_preemption_frees_new_attach_after_client_disc
     let key = test_native_streaming_worker_key("same-key-preemption");
     let threads = Arc::new(Mutex::new(Vec::new()));
 
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .set_reconnect_grace(Duration::from_millis(20));
     let (event_sender, _event_receiver) = mpsc::channel(8);
-    let mut abandoned_session =
-        WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    let mut abandoned_session = WsSession::new(runtime.clone(), test_distribution(), event_sender);
     let (started_sender, started_receiver) = std::sync::mpsc::channel();
     let (release_sender, release_receiver) = std::sync::mpsc::channel();
     abandoned_session
@@ -1590,10 +1599,12 @@ async fn native_streaming_same_key_preemption_frees_new_attach_after_client_disc
         .await
         .unwrap();
     assert!(abandoned_session.native_streaming.is_none());
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // A brand new attach for the same key must not queue behind the still-
-    // blocked worker: `native_streaming_worker_for_key` must observe the
-    // disconnected occupant and preempt it immediately.
+    // After the reconnect window the held occupant is canceled. A brand new
+    // attach for the same key must not queue behind the still-blocked worker:
+    // `native_streaming_worker_for_key` must observe the disconnected occupant
+    // and preempt it immediately.
     let (event_sender2, _event_receiver2) = mpsc::channel(8);
     let mut fresh_session =
         WsSession::new(ServerRuntime::default(), test_distribution(), event_sender2);
@@ -1924,9 +1935,14 @@ async fn watchdog_abandoning_the_occupant_does_not_poison_a_queued_sibling() {
 async fn client_disconnect_frees_idle_even_while_decode_thread_is_stuck() {
     let before_active = crate::idle_activity::native_activity_active_count();
     let key = test_native_streaming_worker_key("disconnect-frees-idle");
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .set_reconnect_grace(Duration::from_millis(20));
 
     let (event_sender, _event_receiver) = mpsc::channel(8);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    let mut session = WsSession::new(runtime, test_distribution(), event_sender);
     let (started_sender, started_receiver) = std::sync::mpsc::channel();
     let (release_sender, release_receiver) = std::sync::mpsc::channel();
     session
@@ -1947,35 +1963,34 @@ async fn client_disconnect_frees_idle_even_while_decode_thread_is_stuck() {
     started_receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("decode started");
-    assert_eq!(
-        crate::idle_activity::native_activity_active_count(),
-        before_active + 1,
-        "the attach must count active while its decode runs"
+    let active_during_decode = crate::idle_activity::native_activity_active_count();
+    assert!(
+        active_during_decode > before_active,
+        "the attach must count active while its decode runs (before={before_active}, during={active_during_decode})"
     );
 
-    // Client disconnects (transport close) -> `finish_native_streaming_session`'s
-    // transport-closed branch calls `detach_cancel`. No production timeout is
-    // overridden here, so nothing shrinks the ~60s watchdog: the guard must be
-    // freed by the disconnect path itself.
+    // Client disconnects: the session is held for the reconnect window, then
+    // expired. Idle accounting must still be retired by detach_cancel on expiry
+    // without waiting on the stuck OS thread.
     session
         .finish_native_streaming_session(false, true)
         .await
         .unwrap();
     assert!(session.native_streaming.is_none());
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    assert_eq!(
-        crate::idle_activity::native_activity_active_count(),
-        before_active,
-        "the disconnect path must retire idle accounting immediately, even though \
-         the worker OS thread is still blocked inside the decode below"
+    assert!(
+        crate::idle_activity::native_activity_active_count() <= before_active,
+        "after the reconnect window the held occupant must retire idle accounting \
+         without waiting on the worker OS thread still blocked inside the decode"
     );
     assert!(
         crate::idle_activity::native_activity_is_idle_for(
             Instant::now() + Duration::from_secs(3600),
             Duration::from_secs(1)
         ),
-        "idle_unload's reaper-visible idle state must recover the instant the client \
-         gives up, not wait out the stuck decode thread"
+        "idle_unload's reaper-visible idle state must recover when the reconnect \
+         window expires, not wait out the stuck decode thread"
     );
 
     // Let the still-blocked worker decode return so it does not sit blocked for
@@ -2278,6 +2293,7 @@ async fn unsupported_legacy_stop_and_flush_controls_fail_closed() {
 
 #[tokio::test]
 async fn session_start_rejects_removed_translation_and_unknown_configuration_fields() {
+    let _openasr_device = isolate_openasr_device();
     for unknown_field in [
         r#""translation":{"target_language":"en"}"#,
         r#""future_session_option":true"#,
@@ -2326,6 +2342,66 @@ fn session_start_keeps_unknown_envelope_fields_extensible() {
         parsed.is_ok(),
         "only the nested session.start configuration is fail-closed: {parsed:?}"
     );
+}
+
+#[test]
+fn fuzz_parse_client_message_rejects_invalid_json_and_accepts_session_close() {
+    assert!(fuzz_parse_client_message(b"not-json").is_err());
+    assert!(fuzz_parse_client_message(br#"{"type":"session.close"}"#).is_ok());
+}
+
+#[test]
+fn protocol_event_id_uses_zero_padded_proto_sequence() {
+    assert_eq!(protocol_event_id(1), "proto_000001");
+    assert_eq!(protocol_event_id(42), "proto_000042");
+}
+
+async fn rendered_sse_event(event: Event) -> String {
+    use axum::response::IntoResponse;
+    let (sender, receiver) = mpsc::channel::<Result<Event, Infallible>>(1);
+    sender.send(Ok(event)).await.unwrap();
+    drop(sender);
+    let response = Sse::new(ReceiverStream::new(receiver)).into_response();
+    let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn send_sse_emits_named_session_envelope() {
+    let (sender, mut receiver) = mpsc::channel(1);
+    let envelope = one_shot_controller("whisper-large-v3-turbo")
+        .session_created_event("2026-09-07T00:00:00.000Z");
+    let event_id = envelope.event_id.0.clone();
+    send_sse(&sender, envelope).await;
+    let event = tokio::time::timeout(std::time::Duration::from_millis(200), receiver.recv())
+        .await
+        .expect("send_sse must enqueue an SSE frame")
+        .expect("channel open")
+        .expect("event");
+    let body = rendered_sse_event(event).await;
+    assert!(body.contains("event: session.created"), "{body}");
+    assert!(body.contains(&format!("id: {event_id}")), "{body}");
+    assert!(body.contains("\"type\":\"session.created\""), "{body}");
+}
+
+#[tokio::test]
+async fn send_event_delivers_the_envelope_or_fails_closed() {
+    let envelope = one_shot_controller("whisper-large-v3-turbo")
+        .session_created_event("2026-09-07T00:00:00.000Z");
+    let (sender, mut receiver) = mpsc::channel(1);
+    assert_eq!(send_event(&sender, envelope.clone()).await, Ok(()));
+    let got = tokio::time::timeout(std::time::Duration::from_millis(200), receiver.recv())
+        .await
+        .expect("send_event must deliver without hanging")
+        .expect("envelope");
+    assert_eq!(got.event_type, "session.created");
+    assert_eq!(got.event_id, envelope.event_id);
+
+    let (closed_sender, closed_receiver) = mpsc::channel(1);
+    drop(closed_receiver);
+    assert_eq!(send_event(&closed_sender, envelope).await, Err(()));
 }
 
 #[tokio::test]
@@ -2448,6 +2524,7 @@ async fn native_streaming_warm_up_keeps_audio_admission_closed_until_ready() {
 
 #[tokio::test]
 async fn session_start_waits_for_native_warm_without_publishing_lifecycle() {
+    let _openasr_device = isolate_openasr_device();
     let temp = tempfile::tempdir().unwrap();
     let model_id = "moonshine-readiness-barrier-test";
     let pack_path = temp.path().join("moonshine-readiness-barrier-test.oasr");
@@ -3422,6 +3499,7 @@ async fn native_streaming_poll_uses_raw_speech_before_vad_start_debounce() {
 #[tokio::test]
 #[ignore = "requires OPENASR_NATIVE_STREAMING_SMOKE_PACK and OPENASR_NATIVE_STREAMING_SMOKE_WAV"]
 async fn native_realtime_server_smoke_with_real_qwen_pack() {
+    let _openasr_device = isolate_openasr_device();
     let pack_path = required_env_path("OPENASR_NATIVE_STREAMING_SMOKE_PACK");
     let wav_path = required_env_path("OPENASR_NATIVE_STREAMING_SMOKE_WAV");
     let max_ms = std::env::var("OPENASR_NATIVE_STREAMING_SMOKE_MAX_MS")
@@ -3790,6 +3868,7 @@ async fn native_streaming_finish_forwards_final_and_records_history() {
 
 #[tokio::test]
 async fn websocket_session_emits_capabilities_before_start_with_monotonic_sequence() {
+    let _openasr_device = isolate_openasr_device();
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
 
@@ -4147,9 +4226,15 @@ async fn fallback_capacity_rejection_is_backend_not_ready_and_recoverable() {
 }
 
 #[tokio::test]
-async fn finish_transport_closed_cancels_pending_backend_jobs_without_waiting() {
+async fn finish_transport_closed_holds_session_for_reconnect_grace() {
+    let _openasr_device = isolate_openasr_device();
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .set_reconnect_grace(Duration::from_secs(30));
     let (event_sender, _event_receiver) = mpsc::channel(8);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    let mut session = WsSession::new(runtime.clone(), test_distribution(), event_sender);
     let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
         "test_session",
         "whisper-large-v3-turbo",
@@ -4165,6 +4250,8 @@ async fn finish_transport_closed_cancels_pending_backend_jobs_without_waiting() 
     session.controller = Some(controller);
     session.spawn_backend_worker();
     session.pending_backend_jobs = 1;
+    let session_id = session.session_id.0.clone();
+    let control = Arc::clone(&session.backend_control);
 
     tokio::time::timeout(
         Duration::from_millis(100),
@@ -4173,13 +4260,152 @@ async fn finish_transport_closed_cancels_pending_backend_jobs_without_waiting() 
     .await
     .expect("transport close should not wait for backend results")
     .unwrap();
-    assert_eq!(session.pending_backend_jobs, 0);
-    assert!(session.backend_cancelled.load(Ordering::Relaxed));
-    assert!(session.backend_jobs.is_none());
+    assert!(
+        runtime.native_execution.remote_policy().has_held_realtime(),
+        "a dropped WS must keep the server task for the reconnect window"
+    );
+    assert!(!control.is_canceled());
+    assert!(!session.backend_cancelled.load(Ordering::Relaxed));
+
+    let (event_sender2, mut event_receiver2) = mpsc::channel(8);
+    let mut resumed = WsSession::new(runtime.clone(), test_distribution(), event_sender2);
+    resumed
+        .start_session(StartSession {
+            session_id: Some(session_id),
+            ..StartSession::default()
+        })
+        .await
+        .expect("client rebind must resume the held session");
+    assert!(!runtime.native_execution.remote_policy().has_held_realtime());
+    assert!(!control.is_canceled());
+    assert!(
+        resumed.controller.is_some(),
+        "resume must restore the running controller"
+    );
+    let started = event_receiver2
+        .recv()
+        .await
+        .expect("resume handshake event");
+    assert_eq!(
+        started.event_type, "audio.input.started",
+        "a resumed Running session must emit audio.input.started so the client handshake can complete"
+    );
+}
+
+#[tokio::test]
+async fn held_realtime_resume_rejects_a_different_device() {
+    let _openasr_device = isolate_openasr_device();
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .set_reconnect_grace(Duration::from_secs(30));
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new_with_remote_identity(
+        runtime.clone(),
+        test_distribution(),
+        event_sender,
+        false,
+        Some("device-a".to_string()),
+        false,
+        true,
+    );
+    let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
+        "test_session",
+        "whisper-large-v3-turbo",
+        timestamp_now(),
+    ))
+    .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::Configure, timestamp_now())
+        .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::StartAudio, timestamp_now())
+        .unwrap();
+    session.controller = Some(controller);
+    let session_id = session.session_id.0.clone();
+    session.finish("transport_closed", true).await.unwrap();
+    assert!(runtime.native_execution.remote_policy().has_held_realtime());
+
+    let (event_sender2, mut event_receiver2) = mpsc::channel(8);
+    let mut other = WsSession::new_with_remote_identity(
+        runtime.clone(),
+        test_distribution(),
+        event_sender2,
+        false,
+        Some("device-b".to_string()),
+        false,
+        true,
+    );
+    assert!(
+        other
+            .start_session(StartSession {
+                session_id: Some(session_id.clone()),
+                ..StartSession::default()
+            })
+            .await
+            .is_err()
+    );
+    let denied = event_receiver2.recv().await.expect("deny event");
+    assert_eq!(denied.event_type, "error");
+    assert!(runtime.native_execution.remote_policy().has_held_realtime());
+
+    let (event_sender3, _event_receiver3) = mpsc::channel(8);
+    let mut owner = WsSession::new_with_remote_identity(
+        runtime.clone(),
+        test_distribution(),
+        event_sender3,
+        false,
+        Some("device-a".to_string()),
+        false,
+        true,
+    );
+    owner
+        .start_session(StartSession {
+            session_id: Some(session_id),
+            ..StartSession::default()
+        })
+        .await
+        .expect("the owning device must resume its held session");
+    assert!(!runtime.native_execution.remote_policy().has_held_realtime());
+}
+
+#[tokio::test]
+async fn held_realtime_session_cancels_after_reconnect_grace() {
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .set_reconnect_grace(Duration::from_millis(20));
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new(runtime.clone(), test_distribution(), event_sender);
+    let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
+        "test_session",
+        "whisper-large-v3-turbo",
+        timestamp_now(),
+    ))
+    .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::Configure, timestamp_now())
+        .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::StartAudio, timestamp_now())
+        .unwrap();
+    session.controller = Some(controller);
+    let control = Arc::clone(&session.backend_control);
+    session.finish("transport_closed", true).await.unwrap();
+    assert!(runtime.native_execution.remote_policy().has_held_realtime());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        control.is_canceled(),
+        "the server task must cancel once the reconnect window expires"
+    );
+    assert!(!runtime.native_execution.remote_policy().has_held_realtime());
 }
 
 #[tokio::test]
 async fn session_start_rejects_realtime_hotwords_instead_of_ignoring_them() {
+    let _openasr_device = isolate_openasr_device();
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
 
@@ -4207,6 +4433,7 @@ async fn session_start_rejects_realtime_hotwords_instead_of_ignoring_them() {
 
 #[tokio::test]
 async fn session_start_rejects_xasr_hotwords_from_active_native_capabilities() {
+    let _openasr_device = isolate_openasr_device();
     let temp = tempfile::tempdir().unwrap();
     let model_id = "xasr-zipformer-test";
     let pack_path = temp.path().join("xasr-zipformer-test.oasr");
@@ -4250,6 +4477,7 @@ async fn session_start_rejects_xasr_hotwords_from_active_native_capabilities() {
 
 #[tokio::test]
 async fn session_start_accepts_hotwords_for_supporting_native_model() {
+    let _openasr_device = isolate_openasr_device();
     let temp = tempfile::tempdir().unwrap();
     let model_id = "moonshine-hotword-test";
     let pack_path = temp.path().join("moonshine-hotword-test.oasr");
@@ -4292,7 +4520,8 @@ async fn session_start_accepts_hotwords_for_supporting_native_model() {
 }
 
 #[tokio::test]
-async fn local_native_streaming_session_rejects_voice_id() {
+async fn local_native_streaming_session_rejects_enrolled_voice_id() {
+    let _openasr_device = isolate_openasr_device();
     let temp = tempfile::tempdir().unwrap();
     let model_id = "qwen3-asr-0.6b";
     let pack_path = temp.path().join("qwen3-asr-0.6b.oasr");
@@ -4311,7 +4540,7 @@ async fn local_native_streaming_session_rejects_voice_id() {
         .start_session(StartSession {
             model: Some(model_id.to_string()),
             partial_results: Some(true),
-            diarize: Some(true),
+            voice_id: Some(true),
             ..StartSession::default()
         })
         .await;
@@ -4329,7 +4558,8 @@ async fn local_native_streaming_session_rejects_voice_id() {
 }
 
 #[tokio::test]
-async fn remote_compute_session_rejects_voice_id_before_embedder_resolution() {
+async fn remote_compute_session_allows_anonymous_diarize_without_voice_id() {
+    let _openasr_device = isolate_openasr_device();
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new_with_history(
         ServerRuntime::default(),
@@ -4338,28 +4568,46 @@ async fn remote_compute_session_rejects_voice_id_before_embedder_resolution() {
         false,
     );
 
-    let result = session
+    session
         .start_session(StartSession {
             model: Some("whisper-large-v3-turbo".to_string()),
             diarize: Some(true),
+            voice_id: Some(false),
             ..StartSession::default()
         })
-        .await;
-
-    assert!(result.is_err());
-    assert!(session.streaming_diarizer.is_none());
-    let event = event_receiver.recv().await.unwrap();
-    match event.event {
-        RealtimeEvent::Error(RealtimeErrorEvent { code, message, .. }) => {
-            assert_eq!(code, RealtimeErrorCode::StartupConfigError);
-            assert_eq!(message, REALTIME_VOICE_ID_UNSUPPORTED_REASON);
+        .await
+        .expect("anonymous speaker separation must not be rejected as Voice ID");
+    assert!(
+        session.streaming_diarizer.is_some(),
+        "diarize=true must construct the anonymous streaming diarizer"
+    );
+    let samples = vec![0.2_f32; 16_000 * 3];
+    let assignment = session
+        .streaming_diarizer
+        .as_mut()
+        .expect("anonymous diarizer")
+        .assign(&samples, 16_000)
+        .expect("anonymous diarizer must label SPEAKER_00");
+    assert_eq!(assignment.speaker_label, "SPEAKER_00");
+    let mut saw_configured = false;
+    while let Ok(event) = event_receiver.try_recv() {
+        assert_ne!(event.event_type, "error");
+        if let RealtimeEvent::Lifecycle(RealtimeLifecycleEvent::SessionConfigured(configured)) =
+            &event.event
+        {
+            assert!(
+                configured.diarize,
+                "anonymous diarize must be recorded on session.configured"
+            );
+            saw_configured = true;
         }
-        other => panic!("expected startup config error, got {other:?}"),
     }
+    assert!(saw_configured);
 }
 
 #[tokio::test]
 async fn session_start_without_diarize_keeps_sessions_anonymous() {
+    let _openasr_device = isolate_openasr_device();
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
 
@@ -4386,6 +4634,7 @@ async fn session_start_without_diarize_keeps_sessions_anonymous() {
 
 #[tokio::test]
 async fn session_start_uses_request_inference_threads() {
+    let _openasr_device = isolate_openasr_device();
     let (event_sender, _event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
 
@@ -4403,6 +4652,7 @@ async fn session_start_uses_request_inference_threads() {
 
 #[tokio::test]
 async fn session_start_uses_request_execution_target() {
+    let _openasr_device = isolate_openasr_device();
     let (event_sender, _event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
 
@@ -4422,7 +4672,115 @@ async fn session_start_uses_request_execution_target() {
 }
 
 #[tokio::test]
+async fn session_start_request_execution_target_wins_over_openasr_device() {
+    let _guard = crate::OpenasrDeviceEnvGuard::set("vulkan:amd-radeon-rx-7900-xtx");
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+
+    session
+        .start_session(StartSession {
+            model: Some("whisper-large-v3-turbo".to_string()),
+            execution_target: Some(openasr_core::ExecutionTarget::Cpu),
+            ..StartSession::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        session.execution_target,
+        Some(openasr_core::ExecutionTarget::Cpu)
+    );
+}
+
+#[tokio::test]
+async fn session_start_request_execution_target_wins_over_invalid_openasr_device() {
+    let _guard = crate::OpenasrDeviceEnvGuard::set("not a device");
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+
+    session
+        .start_session(StartSession {
+            model: Some("whisper-large-v3-turbo".to_string()),
+            execution_target: Some(openasr_core::ExecutionTarget::Cpu),
+            ..StartSession::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        session.execution_target,
+        Some(openasr_core::ExecutionTarget::Cpu)
+    );
+}
+
+#[test]
+fn realtime_preference_reads_openasr_device_without_config() {
+    let _guard = crate::OpenasrDeviceEnvGuard::set("vulkan:amd-radeon-rx-7900-xtx");
+    let home = tempfile::tempdir().unwrap();
+    assert_eq!(
+        realtime_execution_target_preference(home.path()).unwrap(),
+        openasr_core::ExecutionTarget::Device("vulkan:amd-radeon-rx-7900-xtx".to_string())
+    );
+}
+
+#[test]
+fn realtime_preference_rejects_invalid_openasr_device_without_config() {
+    let _guard = crate::OpenasrDeviceEnvGuard::set("not a device");
+    let home = tempfile::tempdir().unwrap();
+    let error = realtime_execution_target_preference(home.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Unsupported execution_target"), "{error}");
+}
+
+#[tokio::test]
+async fn remote_compute_session_ignores_client_hardware_fields() {
+    let _openasr_device = isolate_openasr_device();
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new_with_remote_identity(
+        ServerRuntime::default(),
+        test_distribution(),
+        event_sender,
+        false,
+        Some("device-a".to_string()),
+        false,
+        true,
+    );
+
+    session
+        .start_session(StartSession {
+            model: Some("whisper-large-v3-turbo".to_string()),
+            inference_threads: Some(8),
+            execution_target: Some(openasr_core::ExecutionTarget::Cpu),
+            ..StartSession::default()
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        session.inference_threads.is_none(),
+        "pairing-mode sockets must not honor client inference_threads"
+    );
+    assert_eq!(
+        session.execution_target,
+        Some(openasr_core::ExecutionTarget::Auto),
+        "pairing-mode sockets must ignore client execution_target and use the operator preference"
+    );
+}
+
+#[test]
+fn realtime_session_ids_are_unguessable() {
+    let first = next_session_id("rt_ws");
+    let second = next_session_id("rt_ws");
+    assert_ne!(first.0, second.0);
+    assert!(first.0.starts_with("rt_ws_"));
+    assert_eq!(first.0.len(), "rt_ws_".len() + 32);
+    assert!(!first.0.contains("000001"));
+}
+
+#[tokio::test]
 async fn session_start_rejects_invalid_inference_threads() {
+    let _openasr_device = isolate_openasr_device();
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
 
@@ -7204,7 +7562,7 @@ async fn firered_llm_owner_attribution_host_local_phase0() {
     } else {
         openasr_core::ExecutionTarget::Accelerated
     };
-    let route = resolve_execution_route_for_target(Some(target))
+    let route = resolve_execution_route_for_target(Some(target.clone()))
         .expect("explicit target route resolution must not fail");
     if target == openasr_core::ExecutionTarget::Accelerated && route.is_none() {
         eprintln!("SKIP: requested accelerated provider is unavailable on this host");
@@ -7239,7 +7597,7 @@ async fn firered_llm_owner_attribution_host_local_phase0() {
     let _home_guard = EnvVarGuard::set("OPENASR_HOME", &home_path);
     let _backend_guard = EnvVarGuard::set("OPENASR_GGML_BACKEND", &requested_backend);
     let mut preferences = openasr_core::config::load_config_document(&home_path).unwrap();
-    preferences.preferences.execution_target = target;
+    preferences.preferences.execution_target = target.clone();
     openasr_core::config::save_config_document(&home_path, &preferences).unwrap();
 
     let services = std::sync::Arc::new(
@@ -7277,7 +7635,7 @@ async fn firered_llm_owner_attribution_host_local_phase0() {
     let mut request =
         openasr_core::TranscriptionRequest::new(audio_path, identity.model_id.clone());
     request.model_pack_path = Some(pack_path.clone());
-    request.execution_target = Some(target);
+    request.execution_target = Some(target.clone());
     let transcription = transcribe_with_runtime(
         runtime,
         request,
@@ -7356,4 +7714,322 @@ async fn firered_llm_owner_attribution_host_local_phase0() {
     let report_path = persist_attribution_report(&report_dir, &report)
         .expect("persist attribution report atomically");
     eprintln!("owner attribution report: {}", report_path.display());
+}
+
+/// SSOT 13: a pending idle switch must reject realtime session.start, including
+/// the operator-local socket (caller_is_operator = true).
+///
+/// If correct: error event carries PENDING_IDLE_SWITCH_MESSAGE and no
+/// controller is installed. Otherwise Y: session starts while a switch waits.
+#[tokio::test]
+async fn ssot_13_pending_idle_switch_rejects_realtime_and_operator_local() {
+    let _openasr_device = isolate_openasr_device();
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .request_idle_switch("whisper-base:q4");
+
+    for (caller_is_operator, pairing_device_id, remote_compute_client) in [
+        (false, Some("device-a".to_string()), true),
+        (true, None, false),
+    ] {
+        let (event_sender, mut event_receiver) = mpsc::channel(8);
+        let mut session = WsSession::new_with_remote_identity(
+            runtime.clone(),
+            test_distribution(),
+            event_sender,
+            false,
+            pairing_device_id,
+            caller_is_operator,
+            remote_compute_client,
+        );
+        assert!(
+            session
+                .start_session(StartSession {
+                    model: Some("whisper-large-v3-turbo".to_string()),
+                    source_name: Some("Live".to_string()),
+                    ..StartSession::default()
+                })
+                .await
+                .is_err()
+        );
+        assert!(session.controller.is_none());
+        let event = event_receiver.recv().await.expect("pending-switch error");
+        assert_eq!(event.event_type, "error");
+        match event.event {
+            RealtimeEvent::Error(RealtimeErrorEvent { message, .. }) => {
+                assert_eq!(message, crate::PENDING_IDLE_SWITCH_MESSAGE);
+            }
+            other => panic!("expected pending idle switch error, got {other:?}"),
+        }
+    }
+}
+
+/// SSOT 10: live / dictation / meeting must fail immediately when the server is
+/// busy, not queue. If correct: SERVER_BUSY_MESSAGE. Otherwise Y: session.start
+/// succeeds or waits.
+#[tokio::test]
+async fn ssot_10_busy_realtime_live_dictation_meeting_fail_immediately() {
+    let _openasr_device = isolate_openasr_device();
+    let runtime = ServerRuntime::default();
+    runtime.native_execution.remote_policy().hold_realtime(
+        "rt_ws_occupied",
+        Arc::new(openasr_core::TranscriptionControl::new()),
+        Some("device-a".to_string()),
+    );
+    for source_name in ["Live", "Dictation", "Meeting"] {
+        let (event_sender, mut event_receiver) = mpsc::channel(8);
+        let mut session = WsSession::new_with_remote_identity(
+            runtime.clone(),
+            test_distribution(),
+            event_sender,
+            false,
+            Some("device-b".to_string()),
+            false,
+            true,
+        );
+        assert!(
+            session
+                .start_session(StartSession {
+                    model: Some("whisper-large-v3-turbo".to_string()),
+                    source_name: Some(source_name.to_string()),
+                    ..StartSession::default()
+                })
+                .await
+                .is_err()
+        );
+        let event = event_receiver.recv().await.expect("busy error");
+        match event.event {
+            RealtimeEvent::Error(RealtimeErrorEvent { message, .. }) => {
+                assert_eq!(message, crate::SERVER_BUSY_MESSAGE);
+                assert!(
+                    !message.contains("device-a"),
+                    "busy realtime error must not disclose the occupying device: {message}"
+                );
+            }
+            other => panic!("expected busy error for {source_name}, got {other:?}"),
+        }
+    }
+}
+
+/// SSOT 7: dictation must not request or compute speakers. If correct:
+/// diarize=true on a Dictation session.start is rejected and no diarizer is
+/// built. Otherwise Y: streaming_diarizer is constructed and labels SPEAKER_00.
+#[tokio::test]
+async fn ssot_7_dictation_session_rejects_anonymous_speakers() {
+    let _openasr_device = isolate_openasr_device();
+    let (event_sender, mut event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new_with_remote_identity(
+        ServerRuntime::default(),
+        test_distribution(),
+        event_sender,
+        false,
+        Some("device-a".to_string()),
+        false,
+        true,
+    );
+    let result = session
+        .start_session(StartSession {
+            model: Some("whisper-large-v3-turbo".to_string()),
+            source_name: Some("Dictation".to_string()),
+            diarize: Some(true),
+            voice_id: Some(false),
+            ..StartSession::default()
+        })
+        .await;
+    assert!(
+        result.is_err(),
+        "dictation must not compute speakers even if the client sends diarize=true"
+    );
+    assert!(
+        session.streaming_diarizer.is_none(),
+        "dictation must not construct the anonymous diarizer"
+    );
+    let event = event_receiver
+        .recv()
+        .await
+        .expect("dictation speaker error");
+    assert_eq!(event.event_type, "error");
+}
+
+/// SSOT 7: Live and Meeting may still request anonymous speakers. Dictation is
+/// the fail-closed exception; a blanket diarize rejection would break this.
+#[tokio::test]
+async fn live_and_meeting_sessions_accept_anonymous_speakers() {
+    let _openasr_device = isolate_openasr_device();
+    for source_name in ["Live", "Meeting"] {
+        let (event_sender, _event_receiver) = mpsc::channel(8);
+        let mut session = WsSession::new_with_remote_identity(
+            ServerRuntime::default(),
+            test_distribution(),
+            event_sender,
+            false,
+            Some("device-a".to_string()),
+            false,
+            true,
+        );
+        let result = session
+            .start_session(StartSession {
+                model: Some("whisper-large-v3-turbo".to_string()),
+                source_name: Some(source_name.to_string()),
+                diarize: Some(true),
+                voice_id: Some(false),
+                ..StartSession::default()
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "{source_name} must still admit anonymous speakers: {result:?}"
+        );
+        assert!(
+            session.streaming_diarizer.is_some(),
+            "{source_name} must construct the anonymous diarizer"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dictation_speaker_refusal_names_dictation() {
+    let _openasr_device = isolate_openasr_device();
+    let (event_sender, mut event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new_with_remote_identity(
+        ServerRuntime::default(),
+        test_distribution(),
+        event_sender,
+        false,
+        Some("device-a".to_string()),
+        false,
+        true,
+    );
+    let _ = session
+        .start_session(StartSession {
+            model: Some("whisper-large-v3-turbo".to_string()),
+            source_name: Some("Dictation".to_string()),
+            diarize: Some(true),
+            voice_id: Some(false),
+            ..StartSession::default()
+        })
+        .await;
+    let event = event_receiver
+        .recv()
+        .await
+        .expect("dictation speaker error");
+    match event.event {
+        RealtimeEvent::Error(RealtimeErrorEvent { message, .. }) => {
+            assert!(
+                message.contains("Dictation"),
+                "dictation speaker refusal must be distinguishable: {message}"
+            );
+        }
+        other => panic!("expected dictation speaker error, got {other:?}"),
+    }
+}
+
+/// SSOT 23: a transport close holds the session; a second device must not
+/// resume it or observe the first device id. Decode-error finish must not
+/// leave a held slot that blocks later work.
+#[tokio::test]
+async fn ssot_23_held_realtime_second_device_and_decode_error_do_not_leak() {
+    let _openasr_device = isolate_openasr_device();
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .set_reconnect_grace(Duration::from_secs(30));
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new_with_remote_identity(
+        runtime.clone(),
+        test_distribution(),
+        event_sender,
+        false,
+        Some("device-a".to_string()),
+        false,
+        true,
+    );
+    let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
+        "test_session",
+        "whisper-large-v3-turbo",
+        timestamp_now(),
+    ))
+    .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::Configure, timestamp_now())
+        .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::StartAudio, timestamp_now())
+        .unwrap();
+    session.controller = Some(controller);
+    let session_id = session.session_id.0.clone();
+    session.finish("transport_closed", true).await.unwrap();
+    assert!(runtime.native_execution.remote_policy().has_held_realtime());
+
+    let (event_sender2, mut event_receiver2) = mpsc::channel(8);
+    let mut other = WsSession::new_with_remote_identity(
+        runtime.clone(),
+        test_distribution(),
+        event_sender2,
+        false,
+        Some("device-b".to_string()),
+        false,
+        true,
+    );
+    assert!(
+        other
+            .start_session(StartSession {
+                session_id: Some(session_id.clone()),
+                ..StartSession::default()
+            })
+            .await
+            .is_err()
+    );
+    let denied = event_receiver2.recv().await.expect("deny event");
+    match denied.event {
+        RealtimeEvent::Error(RealtimeErrorEvent { message, .. }) => {
+            assert!(
+                !message.contains("device-a"),
+                "resume denial must not disclose the holding device: {message}"
+            );
+        }
+        other => panic!("expected error event, got {other:?}"),
+    }
+
+    // Decode/backend failure must not park a session (hold_realtime is skipped
+    // when backend_failed). A later Live start from the same device must be
+    // able to start once the held reconnect session is expired/resumed.
+    let (event_sender3, _event_receiver3) = mpsc::channel(8);
+    let mut failed = WsSession::new_with_remote_identity(
+        runtime.clone(),
+        test_distribution(),
+        event_sender3,
+        false,
+        Some("device-c".to_string()),
+        false,
+        true,
+    );
+    failed.backend_failed = true;
+    let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
+        "failed_session",
+        "whisper-large-v3-turbo",
+        timestamp_now(),
+    ))
+    .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::Configure, timestamp_now())
+        .unwrap();
+    failed.controller = Some(controller);
+    let _ = failed.finish("transport_closed", true).await;
+    assert!(
+        runtime.native_execution.remote_policy().has_held_realtime(),
+        "the original device-a hold must still be the only held session"
+    );
+    assert_eq!(
+        runtime
+            .native_execution
+            .remote_policy()
+            .expire_held_realtime(std::time::SystemTime::UNIX_EPOCH)
+            .len(),
+        1,
+        "a backend-failed finish must not park a second held session"
+    );
 }

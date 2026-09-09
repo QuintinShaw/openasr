@@ -416,19 +416,120 @@ fn decode_opus_track(
 /// Detects explicit-signaling HE-AAC (SBR / PS) from the ISO 14496-3
 /// `AudioSpecificConfig` so callers can fall back to an external converter
 /// instead of silently producing bandwidth-limited audio: the plain AAC-LC
-/// decoder these features enable ignores the SBR high-band extension. This
-/// only recognizes *explicit* backward-compatible signaling (object type 5 =
-/// SBR, 29 = PS), which is how mainstream m4a/mp4 encoders signal HE-AAC;
-/// implicit signaling in raw ADTS streams is not detected here.
+/// decoder these features enable ignores the SBR high-band extension.
+///
+/// Two explicit forms are recognized:
+/// - Hierarchical: the ASC itself starts with object type 5 (SBR) or 29 (PS).
+/// - Backward-compatible: the ASC starts as AAC-LC (object type 2) and then
+///   carries `syncExtensionType` `0x2B7` with `sbrPresentFlag = 1` (and
+///   optionally `0x548` for PS). ffmpeg's HE-AAC m4a encoder writes this
+///   form; AAC-LC often writes the same extension with `sbrPresentFlag = 0`
+///   and must stay in-process.
+///
+/// Implicit SBR in raw ADTS (no ASC extra data) is not detected here.
+/// Neither are unusual ASCs that need `program_config_element()`
+/// (`channelConfiguration == 0`) or extra GASpecificConfig fields
+/// (`extensionFlag == 1`, AOT 6 `layerNr`): those stay on the in-process
+/// AAC-LC path, same class as implicit ADTS SBR.
 fn is_unsupported_aac_extension(codec: &CodecType, extra_data: &[u8]) -> bool {
-    if *codec != CODEC_TYPE_AAC {
-        return false;
-    }
-    let Some(&first_byte) = extra_data.first() else {
+    *codec == CODEC_TYPE_AAC && asc_signals_he_aac(extra_data)
+}
+
+/// ISO 14496-3 `syncExtensionType` for SBR (11 bits).
+const SBR_SYNC_EXTENSION: u32 = 0x2B7;
+/// ISO 14496-3 `syncExtensionType` for Parametric Stereo (11 bits).
+const PS_SYNC_EXTENSION: u32 = 0x548;
+
+fn asc_signals_he_aac(extra_data: &[u8]) -> bool {
+    let mut bits = BitReader::new(extra_data);
+    let Some(audio_object_type) = bits.read_audio_object_type() else {
         return false;
     };
-    let audio_object_type = first_byte >> 3;
-    matches!(audio_object_type, 5 | 29)
+    if matches!(audio_object_type, 5 | 29) {
+        return true;
+    }
+
+    let Some(sampling_frequency_index) = bits.read(4) else {
+        return false;
+    };
+    if sampling_frequency_index == 15 && bits.read(24).is_none() {
+        return false;
+    }
+    if bits.read(4).is_none() {
+        return false;
+    }
+
+    // GASpecificConfig for AAC-LC and the other MPEG-4 General Audio types
+    // that can carry a trailing SBR/PS extension.
+    if matches!(audio_object_type, 1 | 2 | 3 | 4 | 6 | 7) {
+        if bits.read(1).is_none() {
+            return false;
+        }
+        match bits.read(1) {
+            Some(1) if bits.read(14).is_none() => return false,
+            Some(_) => {}
+            None => return false,
+        }
+        if bits.read(1).is_none() {
+            return false;
+        }
+    }
+
+    let Some(sync) = bits.read(11) else {
+        return false;
+    };
+    if sync == SBR_SYNC_EXTENSION {
+        let Some(extension_aot) = bits.read_audio_object_type() else {
+            return false;
+        };
+        if extension_aot == 29 {
+            return true;
+        }
+        if extension_aot == 5 {
+            return bits.read(1) == Some(1);
+        }
+        return false;
+    }
+    sync == PS_SYNC_EXTENSION && bits.read(1) == Some(1)
+}
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    bit: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit: 0 }
+    }
+
+    fn remaining_bits(&self) -> usize {
+        self.data.len().saturating_mul(8).saturating_sub(self.bit)
+    }
+
+    fn read(&mut self, n: u32) -> Option<u32> {
+        let n = n as usize;
+        if n == 0 || n > 32 || self.remaining_bits() < n {
+            return None;
+        }
+        let mut value = 0_u32;
+        for _ in 0..n {
+            let byte = self.data[self.bit / 8];
+            let shift = 7 - (self.bit % 8);
+            value = (value << 1) | u32::from((byte >> shift) & 1);
+            self.bit += 1;
+        }
+        Some(value)
+    }
+
+    fn read_audio_object_type(&mut self) -> Option<u32> {
+        let audio_object_type = self.read(5)?;
+        if audio_object_type == 31 {
+            Some(32 + self.read(6)?)
+        } else {
+            Some(audio_object_type)
+        }
+    }
 }
 
 fn push_downmixed_samples(decoded: &AudioBufferRef<'_>, out: &mut Vec<f32>) {
@@ -491,7 +592,14 @@ where
 /// `process_into_buffer` is what `process()` itself calls internally after
 /// allocating its buffers (see `Resampler::process` in rubato); only the
 /// buffer lifetime moved from per-chunk to per-call.
+///
+/// Non-finite samples (NaN, +/-inf) are refused up front: rubato's
+/// `FftFixedIn` `unwrap`s inside its IFFT on them and would abort the whole
+/// process on a single corrupt decoded frame.
 fn resample_mono_to_16k(input: &[f32], input_rate: u32) -> Option<Vec<f32>> {
+    if input.iter().any(|sample| !sample.is_finite()) {
+        return None;
+    }
     let mut resampler = FftFixedIn::<f32>::new(
         input_rate as usize,
         TARGET_SAMPLE_RATE_HZ as usize,
@@ -556,6 +664,49 @@ mod tests {
     /// in an error instead of a generic "unsupported format" message (#159:
     /// dictaphone/conferencing-system wav uploads are commonly MS/IMA ADPCM).
     #[test]
+    fn he_aac_backward_compatible_sbr_flag_is_detected() {
+        // DecoderSpecificInfo from tests/fixtures/tone_heaac.m4a: AAC-LC
+        // (AOT 2) + syncExtensionType 0x2B7 with sbrPresentFlag = 1.
+        assert!(asc_signals_he_aac(&[0x15, 0x88, 0x56, 0xe5, 0xc0]));
+        assert!(is_unsupported_aac_extension(
+            &CODEC_TYPE_AAC,
+            &[0x15, 0x88, 0x56, 0xe5, 0xc0]
+        ));
+    }
+
+    #[test]
+    fn hierarchical_sbr_and_ps_object_types_are_detected() {
+        // First five bits 00101 = AOT 5 (SBR). Remaining bits unused.
+        assert!(asc_signals_he_aac(&[0x28]));
+        // First five bits 11101 = AOT 29 (PS).
+        assert!(asc_signals_he_aac(&[0xe8]));
+    }
+
+    #[test]
+    fn aac_lc_with_sbr_not_present_stays_in_process() {
+        // DecoderSpecificInfo from tests/fixtures/tone_mono.m4a: same 0x2B7
+        // extension as HE-AAC, but sbrPresentFlag = 0.
+        assert!(!asc_signals_he_aac(&[0x14, 0x08, 0x56, 0xe5, 0x00]));
+        assert!(!is_unsupported_aac_extension(
+            &CODEC_TYPE_AAC,
+            &[0x14, 0x08, 0x56, 0xe5, 0x00]
+        ));
+    }
+
+    #[test]
+    fn he_aac_m4a_fixture_is_not_decoded_in_process() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tone_heaac.m4a");
+        assert!(
+            matches!(
+                try_decode_to_pcm16_mono_16k(&fixture, Some("m4a")),
+                SymphoniaOutcome::Unsupported { .. }
+            ),
+            "HE-AAC must fall through to the system converter, not the AAC-LC decoder"
+        );
+    }
+
+    #[test]
     fn probe_codec_label_identifies_ms_adpcm_wav() {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tone_mono_adpcm_ms.wav");
@@ -582,6 +733,103 @@ mod tests {
             "expected ~{expected} samples, got {}",
             output.len()
         );
+    }
+
+    const PROP_RESAMPLE_RATES_HZ: [u32; 6] = [8_000, 16_000, 22_050, 44_100, 48_000, 96_000];
+
+    fn resample_input_len(kind: u8) -> usize {
+        match kind % 4 {
+            0 => 0,
+            1 => 1,
+            2 => RESAMPLE_CHUNK_FRAMES + 17, // one full FFT chunk plus a remainder
+            _ => 8_192,
+        }
+    }
+
+    fn assert_resample_len(input_len: usize, input_rate_hz: u32, output_len: usize) {
+        let expected = input_len.saturating_mul(16_000) / input_rate_hz.max(1) as usize;
+        // Empty / sub-chunk inputs still flush the FFT delay line, which emits
+        // about two `RESAMPLE_CHUNK_FRAMES` windows (see `RESAMPLE_SUB_CHUNKS`).
+        let tolerance = 2 * RESAMPLE_CHUNK_FRAMES;
+        assert!(
+            output_len.abs_diff(expected) <= tolerance,
+            "expected ~{expected} samples from {input_len} frames at {input_rate_hz} Hz, got {output_len}"
+        );
+    }
+
+    #[test]
+    fn audio_resample_mono_to_16k_discrete_grid_does_not_panic() {
+        for &rate_hz in &PROP_RESAMPLE_RATES_HZ {
+            for kind in 0..4u8 {
+                let len = resample_input_len(kind);
+                let input: Vec<f32> = (0..len)
+                    .map(|index| {
+                        (index as f32 / rate_hz.max(1) as f32 * std::f32::consts::TAU * 440.0).sin()
+                    })
+                    .collect();
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    resample_mono_to_16k(&input, rate_hz)
+                }));
+                match caught {
+                    Ok(Some(output)) => {
+                        assert_resample_len(len, rate_hz, output.len());
+                    }
+                    Ok(None) => {}
+                    Err(_) => panic!("rate={rate_hz} len={len}: panicked"),
+                }
+            }
+        }
+    }
+
+    /// Shrunk from `audio_resample_mono_to_16k_random_payload_does_not_panic`:
+    /// `rate=8000`, `len=1`, `head=[-inf]`. rubato `FftFixedIn`'s IFFT path
+    /// `unwrap`s `Err(Imaginary part of first value was non-zero)` on a
+    /// non-finite sample, so the resampler must refuse such input before
+    /// handing it over instead of aborting the process.
+    #[test]
+    fn audio_resample_mono_to_16k_refuses_non_finite_samples() {
+        assert!(resample_mono_to_16k(&[f32::NEG_INFINITY], 8_000).is_none());
+        assert!(resample_mono_to_16k(&[0.0, f32::NAN, 0.0], 48_000).is_none());
+        let mut long = vec![0.25f32; RESAMPLE_CHUNK_FRAMES * 3 + 7];
+        long[RESAMPLE_CHUNK_FRAMES + 1] = f32::INFINITY;
+        assert!(resample_mono_to_16k(&long, 44_100).is_none());
+        assert!(resample_mono_to_16k(&[0.0, 0.5, -0.5], 8_000).is_some());
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 24,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        #[test]
+        fn audio_resample_mono_to_16k_random_payload_does_not_panic(
+            rate_idx in 0..PROP_RESAMPLE_RATES_HZ.len(),
+            kind in 0u8..4,
+            payload in proptest::collection::vec(-1.0f32..1.0, 0..=8_192),
+        ) {
+            let rate_hz = PROP_RESAMPLE_RATES_HZ[rate_idx];
+            let len = resample_input_len(kind);
+            let mut input = payload;
+            input.truncate(len);
+            if input.len() < len {
+                input.resize(len, 0.0);
+            }
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                resample_mono_to_16k(&input, rate_hz)
+            }));
+            match caught {
+                Ok(Some(output)) => {
+                    assert_resample_len(input.len(), rate_hz, output.len());
+                }
+                Ok(None) => {}
+                Err(_) => panic!(
+                    "rate={rate_hz} len={} head={:?}: panicked",
+                    input.len(),
+                    &input[..input.len().min(8)]
+                ),
+            }
+        }
     }
 
     /// A minimal webm/mkv EBML header whose size vint is the single byte

@@ -39,6 +39,7 @@ pub(crate) use decoder_contract::{
 pub(crate) use decoder_tail::{
     QwenDecoderTail, QwenDecoderTailLoadError, load_qwen_decoder_tail_from_contract,
 };
+pub(crate) use forced_aligner_align_text::word_list_for_language;
 pub(crate) use forced_aligner_import::forced_aligner_tensor_role;
 pub use forced_aligner_import::{
     QWEN3_FORCED_ALIGNER_GGML_ARCHITECTURE_ID, QWEN3_FORCED_ALIGNER_MODEL_FAMILY,
