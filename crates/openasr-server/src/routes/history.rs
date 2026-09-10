@@ -232,9 +232,16 @@ pub(crate) async fn history_assign_speakers(
 }
 
 fn parse_required_quoted_if_match(headers: &HeaderMap) -> Result<u64, ApiError> {
-    let raw = headers
-        .get(header::IF_MATCH)
-        .ok_or_else(|| ApiError::BadRequest("If-Match is required".into()))?
+    let mut values = headers.get_all(header::IF_MATCH).iter();
+    let raw = values
+        .next()
+        .ok_or_else(|| ApiError::BadRequest("If-Match is required".into()))?;
+    if values.next().is_some() {
+        return Err(ApiError::BadRequest(
+            "If-Match must contain exactly one value".into(),
+        ));
+    }
+    let raw = raw
         .to_str()
         .map_err(|_| ApiError::BadRequest("Invalid If-Match header".into()))?;
     parse_quoted_revision(raw)
@@ -277,7 +284,10 @@ fn history_assignment_error(
         DaemonHistoryStoreError::RevisionConflict { .. } => ApiError::Conflict(error.to_string()),
         DaemonHistoryStoreError::InvalidId { .. }
         | DaemonHistoryStoreError::InvalidSpeakerAssignment(_)
-        | DaemonHistoryStoreError::InvalidRecord { .. } => ApiError::BadRequest(error.to_string()),
+        | DaemonHistoryStoreError::InvalidRecord { .. }
+        | DaemonHistoryStoreError::RevisionOutOfRange { .. } => {
+            ApiError::BadRequest(error.to_string())
+        }
         other => ApiError::History(other),
     }
 }
@@ -285,10 +295,15 @@ fn history_assignment_error(
 pub(crate) async fn history_delete(
     AxumPath(id): AxumPath<String>,
     Extension(distribution): Extension<DistributionContext>,
+    headers: HeaderMap,
 ) -> Result<Json<DeleteHistoryResponse>, ApiError> {
+    let expected_revision = parse_required_quoted_if_match(&headers)?;
     let home = distribution.openasr_home()?;
     let store = DaemonHistoryStore::open(&home);
-    if !store.delete(&id).map_err(ApiError::History)? {
+    if !store
+        .delete_if_revision(&id, expected_revision)
+        .map_err(history_assignment_error)?
+    {
         return Err(ApiError::NotFound(format!("History entry not found: {id}")));
     }
     Ok(Json(DeleteHistoryResponse { deleted: true, id }))
@@ -340,6 +355,13 @@ mod tests {
         assert!(parse_required_quoted_if_match(&headers).is_err());
         headers.insert(header::IF_MATCH, HeaderValue::from_static("\"3\""));
         assert_eq!(parse_required_quoted_if_match(&headers).unwrap(), 3);
+
+        headers.append(header::IF_MATCH, HeaderValue::from_static("\"3\""));
+        assert!(parse_required_quoted_if_match(&headers).is_err());
+        headers.remove(header::IF_MATCH);
+        headers.append(header::IF_MATCH, HeaderValue::from_static("\"2\""));
+        headers.append(header::IF_MATCH, HeaderValue::from_static("\"3\""));
+        assert!(parse_required_quoted_if_match(&headers).is_err());
     }
 
     #[test]
@@ -368,5 +390,15 @@ mod tests {
             },
         );
         assert!(matches!(err, ApiError::Conflict(_)));
+    }
+
+    #[test]
+    fn revision_out_of_range_maps_to_bad_request() {
+        let err = history_assignment_error(
+            openasr_core::realtime::history::DaemonHistoryStoreError::RevisionOutOfRange {
+                revision: u64::MAX,
+            },
+        );
+        assert!(matches!(err, ApiError::BadRequest(_)));
     }
 }

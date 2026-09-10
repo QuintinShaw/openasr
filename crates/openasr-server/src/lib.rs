@@ -3457,6 +3457,7 @@ impl IntoResponse for ApiError {
                             error,
                             DaemonHistoryStoreError::InvalidId { .. }
                                 | DaemonHistoryStoreError::InvalidRecord { .. }
+                                | DaemonHistoryStoreError::RevisionOutOfRange { .. }
                         ) {
                             StatusCode::BAD_REQUEST
                         } else {

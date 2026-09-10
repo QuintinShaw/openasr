@@ -52,9 +52,16 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+#[cfg(test)]
+use std::{
+    cell::Cell,
+    sync::{Condvar, Mutex, OnceLock},
+    time::Instant,
+};
 
 use crate::ResponseFormat;
 use crate::api::backend::Segment;
@@ -64,6 +71,149 @@ use crate::subtitle::TimelineQuality;
 /// [`DaemonHistoryStore::connection`]. See that method for why this can't
 /// rely on `busy_timeout` alone.
 static CONNECTION_SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+// Test-only handshake: the callback fires only once this delete connection's
+// BEGIN IMMEDIATE actually encounters the writer-held SQLite lock.
+thread_local! {
+    static TEST_HISTORY_BUSY_HANDLER_ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestHistoryBusyState {
+    Idle,
+    Armed,
+    Waiting,
+    Release,
+    Cancel,
+}
+
+#[cfg(test)]
+// Coordinator wait fails fast if BEGIN IMMEDIATE never hits the writer lock.
+// The callback watchdog starts at the first SQLITE_BUSY and must outlast that
+// wait plus the writer's later commit/fsync; a matching 2s pair races the
+// remaining window and can Cancel after wait already succeeded.
+const TEST_HISTORY_BUSY_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const TEST_HISTORY_BUSY_HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(test)]
+static TEST_HISTORY_BUSY_WAITER: OnceLock<(Mutex<TestHistoryBusyState>, Condvar)> = OnceLock::new();
+
+#[cfg(test)]
+fn test_history_busy_waiter() -> &'static (Mutex<TestHistoryBusyState>, Condvar) {
+    TEST_HISTORY_BUSY_WAITER
+        .get_or_init(|| (Mutex::new(TestHistoryBusyState::Idle), Condvar::new()))
+}
+
+#[cfg(test)]
+fn arm_test_history_busy_handler() {
+    let (lock, waiter) = test_history_busy_waiter();
+    *lock.lock().unwrap() = TestHistoryBusyState::Armed;
+    waiter.notify_all();
+    TEST_HISTORY_BUSY_HANDLER_ARMED.with(|armed| armed.set(true));
+}
+
+#[cfg(test)]
+fn disarm_test_history_busy_handler() {
+    TEST_HISTORY_BUSY_HANDLER_ARMED.with(|armed| armed.set(false));
+}
+
+#[cfg(test)]
+fn cancel_test_history_busy_handler() {
+    let (lock, waiter) = test_history_busy_waiter();
+    *lock.lock().unwrap() = TestHistoryBusyState::Cancel;
+    waiter.notify_all();
+}
+
+#[cfg(test)]
+fn release_test_history_busy_handler() {
+    let (lock, waiter) = test_history_busy_waiter();
+    *lock.lock().unwrap() = TestHistoryBusyState::Release;
+    waiter.notify_all();
+}
+
+#[cfg(test)]
+fn reset_test_history_busy_handler() {
+    let (lock, waiter) = test_history_busy_waiter();
+    *lock.lock().unwrap() = TestHistoryBusyState::Idle;
+    waiter.notify_all();
+}
+
+#[cfg(test)]
+fn test_history_busy_handler(_count: i32) -> bool {
+    let (lock, waiter) = test_history_busy_waiter();
+    let mut state = lock.lock().unwrap();
+    if *state != TestHistoryBusyState::Armed {
+        return false;
+    }
+    *state = TestHistoryBusyState::Waiting;
+    waiter.notify_all();
+    let deadline = Instant::now() + TEST_HISTORY_BUSY_HANDLER_TIMEOUT;
+    while *state == TestHistoryBusyState::Waiting {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            *state = TestHistoryBusyState::Cancel;
+            waiter.notify_all();
+            return false;
+        }
+        let (next_state, timeout) = waiter.wait_timeout(state, remaining).unwrap();
+        state = next_state;
+        if timeout.timed_out() && *state == TestHistoryBusyState::Waiting {
+            *state = TestHistoryBusyState::Cancel;
+            waiter.notify_all();
+            return false;
+        }
+    }
+    if *state == TestHistoryBusyState::Release {
+        *state = TestHistoryBusyState::Idle;
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+fn install_test_history_busy_handler(conn: &Connection) -> rusqlite::Result<()> {
+    conn.busy_handler(Some(test_history_busy_handler))
+}
+
+#[cfg(test)]
+fn wait_for_test_history_busy_handler(timeout: Duration) -> Result<(), String> {
+    let (lock, waiter) = test_history_busy_waiter();
+    let mut state = lock.lock().unwrap();
+    let deadline = Instant::now() + timeout;
+    loop {
+        match *state {
+            TestHistoryBusyState::Waiting => return Ok(()),
+            TestHistoryBusyState::Cancel => {
+                return Err("busy handler cancelled before signal".into());
+            }
+            TestHistoryBusyState::Idle => {}
+            TestHistoryBusyState::Armed | TestHistoryBusyState::Release => {}
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let observed = *state;
+            *state = TestHistoryBusyState::Cancel;
+            waiter.notify_all();
+            return Err(format!(
+                "timed out waiting for SQLite busy signal (state={observed:?})"
+            ));
+        }
+        let (next_state, timeout_result) = waiter.wait_timeout(state, remaining).unwrap();
+        state = next_state;
+        if timeout_result.timed_out() {
+            let observed = *state;
+            *state = TestHistoryBusyState::Cancel;
+            waiter.notify_all();
+            return Err(format!(
+                "timed out waiting for SQLite busy signal (state={observed:?})"
+            ));
+        }
+    }
+}
 
 /// Columns shared by every query that needs to build a [`DaemonHistoryEntry`]
 /// via [`row_to_entry`]. Deliberately selects `segments_json` instead of the
@@ -280,6 +430,8 @@ pub enum DaemonHistoryStoreError {
     NotFound(String),
     #[error("History entry revision conflict: expected {expected}, current {actual}")]
     RevisionConflict { expected: u64, actual: u64 },
+    #[error("History entry revision is outside the supported range: {revision}")]
+    RevisionOutOfRange { revision: u64 },
     #[error("Invalid speaker assignment: {0}")]
     InvalidSpeakerAssignment(String),
     #[error("Could not create history directory '{path}': {source}")]
@@ -430,6 +582,7 @@ impl DaemonHistoryStore {
         assignments: &[DaemonHistorySpeakerAssignment],
     ) -> Result<DaemonHistoryDetail, DaemonHistoryStoreError> {
         validate_history_id(id)?;
+        revision_to_sql(expected_revision)?;
         if assignments.is_empty() {
             return Err(DaemonHistoryStoreError::InvalidSpeakerAssignment(
                 "assignments must not be empty".into(),
@@ -472,15 +625,14 @@ impl DaemonHistoryStore {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
-                        row.get::<_, i64>(2)?,
+                        row_revision(row, 2)?,
                     ))
                 },
             )
             .optional()
             .map_err(DaemonHistoryStoreError::Query)?
             .ok_or_else(|| DaemonHistoryStoreError::NotFound(id.to_string()))?;
-        let (text, segments_json, revision) = row;
-        let actual_revision = revision.max(0) as u64;
+        let (text, segments_json, actual_revision) = row;
         if actual_revision != expected_revision {
             return Err(DaemonHistoryStoreError::RevisionConflict {
                 expected: expected_revision,
@@ -509,10 +661,10 @@ impl DaemonHistoryStore {
                 "transcript body cannot be serialized: {error}"
             ))
         })?;
-        let new_revision = actual_revision.saturating_add(1);
+        let new_revision = next_history_revision(actual_revision)?;
         tx.execute(
             "UPDATE history_entries SET segments_json = ?1, revision = ?2 WHERE id = ?3",
-            params![segments_json, new_revision as i64, id],
+            params![segments_json, revision_to_sql(new_revision)?, id],
         )
         .map_err(DaemonHistoryStoreError::Query)?;
         tx.commit().map_err(DaemonHistoryStoreError::Query)?;
@@ -534,6 +686,7 @@ impl DaemonHistoryStore {
         transcription: &crate::api::backend::Transcription,
     ) -> Result<DaemonHistoryDetail, DaemonHistoryStoreError> {
         validate_history_id(id)?;
+        revision_to_sql(expected_revision)?;
         let mut conn = self.connection()?;
         let tx = conn.transaction().map_err(DaemonHistoryStoreError::Query)?;
         let row = tx
@@ -544,15 +697,14 @@ impl DaemonHistoryStore {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
-                        row.get::<_, i64>(2)?,
+                        row_revision(row, 2)?,
                     ))
                 },
             )
             .optional()
             .map_err(DaemonHistoryStoreError::Query)?
             .ok_or_else(|| DaemonHistoryStoreError::NotFound(id.to_string()))?;
-        let (model, source_name, revision) = row;
-        let actual_revision = revision.max(0) as u64;
+        let (model, source_name, actual_revision) = row;
         if actual_revision != expected_revision {
             return Err(DaemonHistoryStoreError::RevisionConflict {
                 expected: expected_revision,
@@ -587,7 +739,7 @@ impl DaemonHistoryStore {
             source_name.as_deref().unwrap_or(""),
             transcription.text
         );
-        let new_revision = actual_revision.saturating_add(1);
+        let new_revision = next_history_revision(actual_revision)?;
         tx.execute(
             "UPDATE history_entries SET text = ?1, segments_json = ?2, preview = ?3, \
              formats = ?4, revision = ?5 WHERE id = ?6",
@@ -596,7 +748,7 @@ impl DaemonHistoryStore {
                 segments_json,
                 preview,
                 formats_json,
-                new_revision as i64,
+                revision_to_sql(new_revision)?,
                 id
             ],
         )
@@ -614,17 +766,65 @@ impl DaemonHistoryStore {
             .ok_or_else(|| DaemonHistoryStoreError::NotFound(id.to_string()))
     }
 
-    pub fn delete(&self, id: &str) -> Result<bool, DaemonHistoryStoreError> {
+    /// Deletes one entry only when its optimistic-concurrency revision still
+    /// equals `expected_revision`.
+    ///
+    /// The conditional `DELETE` is the first row operation in the transaction,
+    /// so a caller cannot delete a newer revision after reading an older one.
+    /// `Ok(true)` means the row was deleted, `Ok(false)` means the id did not
+    /// exist, and an existing row with another revision returns
+    /// [`DaemonHistoryStoreError::RevisionConflict`].
+    pub fn delete_if_revision(
+        &self,
+        id: &str,
+        expected_revision: u64,
+    ) -> Result<bool, DaemonHistoryStoreError> {
         validate_history_id(id)?;
+        let expected_revision_sql = revision_to_sql(expected_revision)?;
         let mut conn = self.connection()?;
-        let tx = conn.transaction().map_err(DaemonHistoryStoreError::Query)?;
-        tx.execute("DELETE FROM history_entries_fts WHERE id = ?1", params![id])
+        #[cfg(test)]
+        if TEST_HISTORY_BUSY_HANDLER_ARMED.with(Cell::get) {
+            install_test_history_busy_handler(&conn).map_err(DaemonHistoryStoreError::Query)?;
+        }
+        // Take the writer lock before classifying a failed conditional delete.
+        // Otherwise another writer could change the row between the DELETE and
+        // the diagnostic SELECT, reintroducing the very TOCTOU this primitive
+        // is intended to remove.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(DaemonHistoryStoreError::Query)?;
         let removed = tx
-            .execute("DELETE FROM history_entries WHERE id = ?1", params![id])
+            .execute(
+                "DELETE FROM history_entries WHERE id = ?1 AND revision = ?2",
+                params![id, expected_revision_sql],
+            )
             .map_err(DaemonHistoryStoreError::Query)?;
-        tx.commit().map_err(DaemonHistoryStoreError::Query)?;
-        Ok(removed > 0)
+
+        if removed > 0 {
+            tx.execute("DELETE FROM history_entries_fts WHERE id = ?1", params![id])
+                .map_err(DaemonHistoryStoreError::Query)?;
+            tx.commit().map_err(DaemonHistoryStoreError::Query)?;
+            return Ok(true);
+        }
+
+        let current_revision = tx
+            .query_row(
+                "SELECT revision FROM history_entries WHERE id = ?1",
+                params![id],
+                |row| row_revision(row, 0),
+            )
+            .optional()
+            .map_err(DaemonHistoryStoreError::Query)?;
+        match current_revision {
+            None => {
+                tx.commit().map_err(DaemonHistoryStoreError::Query)?;
+                Ok(false)
+            }
+            Some(actual_revision) => Err(DaemonHistoryStoreError::RevisionConflict {
+                expected: expected_revision,
+                actual: actual_revision,
+            }),
+        }
     }
 
     pub fn delete_older_than(
@@ -972,6 +1172,11 @@ fn apply_speaker_assignments(
     }
 }
 
+fn row_revision(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<u64> {
+    let revision: i64 = row.get(column)?;
+    u64::try_from(revision).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, revision))
+}
+
 /// Builds a [`DaemonHistoryEntry`] from a row selected via [`ENTRY_COLUMNS`].
 /// `formats` is derived here from whether `segments_json` actually holds
 /// segments, not read back from the persisted `formats` column: that column
@@ -1004,7 +1209,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<DaemonHistoryEntry>
             .and_then(DaemonHistoryProvenance::parse),
         formats: formats_for_content(has_segments),
         preview: row.get(10)?,
-        revision: row.get::<_, i64>(11)?.max(0) as u64,
+        revision: row_revision(row, 11)?,
     })
 }
 
@@ -1025,6 +1230,19 @@ fn like_substring_pattern(needle: &str) -> String {
 
 pub fn history_dir(openasr_home: impl AsRef<Path>) -> PathBuf {
     openasr_home.as_ref().join("history")
+}
+
+const MAX_HISTORY_REVISION: u64 = i64::MAX as u64;
+
+fn revision_to_sql(revision: u64) -> Result<i64, DaemonHistoryStoreError> {
+    i64::try_from(revision).map_err(|_| DaemonHistoryStoreError::RevisionOutOfRange { revision })
+}
+
+fn next_history_revision(revision: u64) -> Result<u64, DaemonHistoryStoreError> {
+    revision
+        .checked_add(1)
+        .filter(|next| *next <= MAX_HISTORY_REVISION)
+        .ok_or(DaemonHistoryStoreError::RevisionOutOfRange { revision })
 }
 
 fn validate_history_id(id: &str) -> Result<(), DaemonHistoryStoreError> {
@@ -1117,6 +1335,7 @@ fn unix_millis_now() -> u128 {
 mod tests {
     use super::*;
     use crate::api::backend::WordTimestamp;
+    use std::sync::{Arc, Barrier};
 
     #[test]
     fn daemon_history_store_records_lists_gets_and_deletes() {
@@ -1184,9 +1403,237 @@ mod tests {
         assert!(srt.contains("00:00:00,000 --> 00:00:01,500"), "{srt}");
         assert!(srt.contains("hello OpenASR history"), "{srt}");
 
-        assert!(store.delete(&entry.id).unwrap());
+        assert!(store.delete_if_revision(&entry.id, entry.revision).unwrap());
         assert!(store.list().unwrap().is_empty());
         assert!(store.get(&entry.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn daemon_history_store_conditional_delete_rejects_stale_revision_and_deletes_current() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DaemonHistoryStore::open(temp.path());
+        let concurrent_store = DaemonHistoryStore::open(temp.path());
+        let entry = record_history_for_test(&store, "original transcript");
+
+        // Simulate another request committing a newer revision between the
+        // caller's read and its delete request.
+        let updated = concurrent_store
+            .replace_transcript(
+                &entry.id,
+                entry.revision,
+                &crate::api::backend::Transcription {
+                    text: "newer transcript".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.entry.revision, entry.revision + 1);
+
+        let error = store
+            .delete_if_revision(&entry.id, entry.revision)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DaemonHistoryStoreError::RevisionConflict {
+                expected: 0,
+                actual: 1
+            }
+        ));
+        let retained = store.get(&entry.id).unwrap().unwrap();
+        assert_eq!(retained.text, "newer transcript");
+        assert_eq!(retained.entry.revision, updated.entry.revision);
+
+        assert!(
+            store
+                .delete_if_revision(&entry.id, updated.entry.revision)
+                .unwrap()
+        );
+        assert!(store.get(&entry.id).unwrap().is_none());
+        assert!(
+            !store
+                .delete_if_revision(&entry.id, updated.entry.revision)
+                .unwrap()
+        );
+        assert!(!store.delete_if_revision("hist-missing", 0).unwrap());
+    }
+
+    #[test]
+    fn daemon_history_busy_signal_timeout_cancels_without_hanging() {
+        arm_test_history_busy_handler();
+        let error = wait_for_test_history_busy_handler(Duration::from_millis(50)).unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        cancel_test_history_busy_handler();
+        disarm_test_history_busy_handler();
+        reset_test_history_busy_handler();
+    }
+
+    #[test]
+    fn daemon_history_store_conditional_delete_serializes_against_concurrent_update() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DaemonHistoryStore::open(temp.path());
+        let entry = record_history_for_test(&store, "original transcript");
+
+        // Hold an uncommitted writer update while the delete starts on a second
+        // connection. The delete must wait for this commit, then reject the
+        // stale revision rather than observing/deleting the old row.
+        let mut conn = store.connection().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute(
+            "UPDATE history_entries SET text = 'newer transcript', preview = 'newer transcript', \
+             revision = revision + 1 WHERE id = ?1",
+            params![entry.id],
+        )
+        .unwrap();
+        tx.execute(
+            "DELETE FROM history_entries_fts WHERE id = ?1",
+            params![entry.id],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO history_entries_fts (id, search_text) VALUES (?1, 'newer transcript')",
+            params![entry.id],
+        )
+        .unwrap();
+
+        let delete_store = DaemonHistoryStore::open(temp.path());
+        let id = entry.id.clone();
+        let start = Arc::new(Barrier::new(2));
+        let delete_start = Arc::clone(&start);
+        let handle = std::thread::spawn(move || {
+            delete_start.wait();
+            arm_test_history_busy_handler();
+            let result = delete_store.delete_if_revision(&id, entry.revision);
+            disarm_test_history_busy_handler();
+            result
+        });
+        start.wait();
+        if let Err(error) = wait_for_test_history_busy_handler(TEST_HISTORY_BUSY_WAIT_TIMEOUT) {
+            cancel_test_history_busy_handler();
+            drop(tx);
+            let worker_result = handle.join().unwrap();
+            reset_test_history_busy_handler();
+            panic!("{error}; delete worker result: {worker_result:?}");
+        }
+        if let Err(error) = tx.commit() {
+            cancel_test_history_busy_handler();
+            let worker_result = handle.join().unwrap();
+            reset_test_history_busy_handler();
+            panic!(
+                "could not commit concurrent update: {error}; delete worker result: {worker_result:?}"
+            );
+        }
+        // The writer commit happened while the delete worker was blocked in
+        // its busy handler; release it only after the newer revision is durable.
+        release_test_history_busy_handler();
+        let delete_result = handle.join().unwrap();
+        reset_test_history_busy_handler();
+
+        assert!(matches!(
+            delete_result.unwrap_err(),
+            DaemonHistoryStoreError::RevisionConflict {
+                expected: 0,
+                actual: 1
+            }
+        ));
+        let retained = store.get(&entry.id).unwrap().unwrap();
+        assert_eq!(retained.text, "newer transcript");
+        assert_eq!(retained.entry.revision, 1);
+        assert_eq!(
+            store
+                .query(&DaemonHistoryQuery {
+                    search: Some("newer".into()),
+                    ..Default::default()
+                })
+                .unwrap()
+                .total,
+            1
+        );
+        assert_eq!(
+            store
+                .query(&DaemonHistoryQuery {
+                    search: Some("original".into()),
+                    ..Default::default()
+                })
+                .unwrap()
+                .total,
+            0
+        );
+
+        assert!(store.delete_if_revision(&entry.id, 1).unwrap());
+        assert_eq!(
+            store
+                .query(&DaemonHistoryQuery {
+                    search: Some("newer".into()),
+                    ..Default::default()
+                })
+                .unwrap()
+                .total,
+            0
+        );
+    }
+
+    #[test]
+    fn daemon_history_store_rejects_revision_overflow_without_deleting_or_updating() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DaemonHistoryStore::open(temp.path());
+        let entry = record_history_for_test(&store, "max revision");
+        let conn = store.connection().unwrap();
+        conn.execute(
+            "UPDATE history_entries SET revision = ?1 WHERE id = ?2",
+            params![i64::MAX, entry.id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let max = i64::MAX as u64;
+        assert_eq!(store.get(&entry.id).unwrap().unwrap().entry.revision, max);
+        assert!(matches!(
+            store.delete_if_revision(&entry.id, u64::MAX),
+            Err(DaemonHistoryStoreError::RevisionOutOfRange { revision: u64::MAX })
+        ));
+        assert_eq!(store.get(&entry.id).unwrap().unwrap().entry.revision, max);
+        assert!(matches!(
+            store.replace_transcript(
+                &entry.id,
+                max,
+                &crate::api::backend::Transcription {
+                    text: "must not update".into(),
+                    ..Default::default()
+                }
+            ),
+            Err(DaemonHistoryStoreError::RevisionOutOfRange { revision })
+                if revision == max
+        ));
+        assert_eq!(store.get(&entry.id).unwrap().unwrap().text, "max revision");
+        assert!(store.delete_if_revision(&entry.id, max).unwrap());
+    }
+
+    #[test]
+    fn daemon_history_store_rejects_negative_persisted_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = DaemonHistoryStore::open(temp.path());
+        let entry = record_history_for_test(&store, "negative revision");
+        let conn = store.connection().unwrap();
+        conn.execute(
+            "UPDATE history_entries SET revision = -1 WHERE id = ?1",
+            params![entry.id],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(store.get(&entry.id).is_err());
+        assert!(store.delete_if_revision(&entry.id, 0).is_err());
+        let conn = store.connection().unwrap();
+        let revision: i64 = conn
+            .query_row(
+                "SELECT revision FROM history_entries WHERE id = ?1",
+                params![entry.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revision, -1);
     }
 
     #[test]
