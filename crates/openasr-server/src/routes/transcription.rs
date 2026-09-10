@@ -2836,6 +2836,12 @@ pub(crate) async fn transcribe_with_runtime(
         }
         BackendKind::Native => {
             tokio::task::spawn_blocking(move || {
+                // Boot attestation publishes a new generation of this same
+                // model. Wait before taking the snapshot, otherwise the first
+                // request rejects its own pre-warmup snapshot as stale.
+                let warmup_wait_started = Instant::now();
+                crate::realtime::wait_while_native_warmup_in_flight_blocking(&runtime);
+                let warmup_wait_duration = warmup_wait_started.elapsed();
                 let served = runtime.resolve_served_native_pack()?.ok_or_else(|| {
                     ApiError::Backend(openasr_core::BackendError::NativeModelPackPathRejected {
                         reason: format!(
@@ -2885,7 +2891,6 @@ pub(crate) async fn transcribe_with_runtime(
                         .map_err(ApiError::Backend)?;
                 let model_session_key = native_model_session_key(&adapter)?;
                 let admission_wait_started = Instant::now();
-                crate::realtime::wait_while_native_warmup_in_flight_blocking();
                 let admitted_execution = runtime
                     .acquire_native_execution_for_snapshot(
                         &active_model,
@@ -2894,7 +2899,7 @@ pub(crate) async fn transcribe_with_runtime(
                         NativeAdmissionKind::File,
                         execution_context.request_id.as_deref(),
                     );
-                let admission_wait_duration = admission_wait_started.elapsed();
+                let admission_wait_duration = warmup_wait_duration + admission_wait_started.elapsed();
                 openasr_core::stage_timing::log_stage(
                     "http_transcription",
                     "admission_wait",

@@ -1225,6 +1225,9 @@ impl WsSession {
         partial_results: bool,
         word_timestamps: bool,
     ) -> Result<(), ()> {
+        // Boot attestation changes the active publication generation; capture
+        // the served snapshot only after that transition, just like file ASR.
+        super::wait_while_native_warmup_in_flight(&self.runtime).await;
         let served = match self.runtime.resolve_served_native_pack() {
             Ok(Some(served)) => served,
             Ok(None) => {
@@ -1291,7 +1294,6 @@ impl WsSession {
                     return Err(());
                 }
             };
-        super::wait_while_native_warmup_in_flight().await;
         let admitted_execution = match self.runtime.acquire_native_execution_for_snapshot(
             &active_model,
             &model_session_key,

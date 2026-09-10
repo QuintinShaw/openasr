@@ -1118,19 +1118,24 @@ impl Drop for NativeWarmupLease {
     }
 }
 
-pub(crate) async fn wait_while_native_warmup_in_flight() {
+pub(crate) async fn wait_while_native_warmup_in_flight(runtime: &ServerRuntime) {
     let started = Instant::now();
     let notify = native_warmup_notify();
-    while native_warmup_in_flight() && started.elapsed() < Duration::from_secs(60) {
+    while (runtime.model_pack_path.boot_attestation_pending() || native_warmup_in_flight())
+        && started.elapsed() < Duration::from_secs(60)
+    {
         let _ = tokio::time::timeout(Duration::from_millis(50), notify.notified()).await;
     }
 }
 
 /// Blocking counterpart for `spawn_blocking` transcription: same 60s cap, no
-/// tokio runtime. Call immediately before `acquire_native_execution`.
-pub(crate) fn wait_while_native_warmup_in_flight_blocking() {
+/// tokio runtime. Call before reading the active model snapshot: successful
+/// boot attestation publishes a new generation even for the same pack.
+pub(crate) fn wait_while_native_warmup_in_flight_blocking(runtime: &ServerRuntime) {
     let started = Instant::now();
-    while native_warmup_in_flight() && started.elapsed() < Duration::from_secs(60) {
+    while (runtime.model_pack_path.boot_attestation_pending() || native_warmup_in_flight())
+        && started.elapsed() < Duration::from_secs(60)
+    {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -1139,11 +1144,13 @@ pub(crate) fn spawn_boot_native_warmup(
     runtime: ServerRuntime,
     home: PathBuf,
 ) -> tokio::task::JoinHandle<()> {
+    let boot_attestation = runtime.model_pack_path.begin_boot_attestation();
     // Reactivation walks the same verify -> resolve -> reserve -> materialize
     // -> attest -> reconcile transaction as set-default. Durable V2 is used
     // when it still names the launch pack; a `--model` launch without V2
     // attests that pack directly instead of logging and staying unattested.
     tokio::task::spawn_blocking(move || {
+        let _boot_attestation = boot_attestation;
         let Some(requested_path) = runtime.model_pack_path.requested_path() else {
             return;
         };

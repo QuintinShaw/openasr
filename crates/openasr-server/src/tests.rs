@@ -3063,6 +3063,22 @@ fn stale_active_runtime_snapshot_cannot_start_after_republication() {
         .current_snapshot()
         .expect("initial active runtime snapshot");
 
+    // A caller whose bounded startup wait expired must not bypass boot
+    // attestation, even if no inner warmup lease exists yet.
+    let boot = runtime.model_pack_path.begin_boot_attestation();
+    assert!(matches!(
+        runtime.acquire_native_execution_for_snapshot(
+            &snapshot,
+            "pending-boot",
+            None,
+            NativeAdmissionKind::Realtime,
+            None,
+        ),
+        Err(ApiError::Conflict(_))
+    ));
+    assert!(!runtime.native_execution.has_active_sessions());
+    drop(boot);
+
     // Re-publishing even the same path is a new generation: the underlying
     // bytes may have been reinstalled in place, so path equality cannot be an
     // admission authority and must not create an ABA hole.
@@ -3370,6 +3386,18 @@ fn issue_376_session_start_and_transcription_admit_from_served_snapshot() {
     assert!(
         native_arm.contains("resolve_served_native_pack()"),
         "native transcription must admit the currently resolvable served pack: {native_arm}"
+    );
+    assert!(
+        native_arm
+            .find("wait_while_native_warmup_in_flight_blocking")
+            .unwrap()
+            < native_arm.find("resolve_served_native_pack()").unwrap(),
+        "file requests must wait for boot publication before capturing a snapshot"
+    );
+    assert!(
+        start.find("wait_while_native_warmup_in_flight").unwrap()
+            < start.find("resolve_served_native_pack()").unwrap(),
+        "streaming requests must wait for boot publication before capturing a snapshot"
     );
 
     let served = include_str!("lib.rs")
