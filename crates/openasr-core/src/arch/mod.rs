@@ -459,7 +459,18 @@ impl SpeakerSegmentationSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WordTimestampSource {
     Native,
+    /// Native decoder emission instants, not measured spoken-word spans.
+    /// Retain them as approximate anchors; precise timelines need alignment.
+    NativeEmission,
+    /// Decode-token positions interpolated across the audio, not acoustic spans.
+    NativeApproximate,
     ForcedAligner,
+}
+
+impl WordTimestampSource {
+    pub(crate) fn has_synthetic_word_spans(self) -> bool {
+        matches!(self, Self::NativeApproximate | Self::ForcedAligner)
+    }
 }
 
 /// How one recording is cut up for this architecture before decode -- the
@@ -968,6 +979,23 @@ pub(crate) fn builtin_adapter_descriptor(model_architecture: &str) -> GgmlFamily
         .find_by_model_architecture(model_architecture)
         .unwrap_or_else(|| panic!("builtin architecture '{model_architecture}' must be registered"))
         .ggml_family_adapter_descriptor()
+}
+
+/// Current runtime support for acoustic word spans, keyed by signed catalog
+/// family. This is a dependency-planning hint, not an execution or alignment
+/// proof: individual results still require validation. Catalog `native` also
+/// covers emission points and interpolated estimates in older catalogs.
+pub fn native_word_anchor_support() -> BTreeMap<String, bool> {
+    OpenAsrArchitectureRegistry::with_builtins()
+        .descriptors()
+        .iter()
+        .map(|descriptor| {
+            (
+                descriptor.identity.catalog_family_id.to_string(),
+                descriptor.execution_contract.word_timestamp_source == WordTimestampSource::Native,
+            )
+        })
+        .collect()
 }
 
 /// Whether a builtin family's decoder ever predicts a punctuation token (see
@@ -1678,7 +1706,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::RevisableSnapshot,
             speaker_segmentation: SpeakerSegmentationSource::External,
-            word_timestamp_source: WordTimestampSource::Native,
+            word_timestamp_source: WordTimestampSource::NativeApproximate,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Elastic,
             emits_punctuation: Some(true),
@@ -1869,7 +1897,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::RevisableSnapshot,
             speaker_segmentation: SpeakerSegmentationSource::External,
-            word_timestamp_source: WordTimestampSource::Native,
+            word_timestamp_source: WordTimestampSource::NativeApproximate,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Elastic,
             emits_punctuation: Some(true),
@@ -2247,7 +2275,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::FrameSyncAppend,
             speaker_segmentation: SpeakerSegmentationSource::External,
-            word_timestamp_source: WordTimestampSource::Native,
+            word_timestamp_source: WordTimestampSource::NativeEmission,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Elastic,
             emits_punctuation: Some(true),
@@ -2348,7 +2376,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
             streaming_partial_granularity: StreamingPartialGranularity::RevisableSnapshot,
             speaker_segmentation: SpeakerSegmentationSource::External,
-            word_timestamp_source: WordTimestampSource::Native,
+            word_timestamp_source: WordTimestampSource::NativeApproximate,
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Elastic,
             emits_punctuation: Some(true),
@@ -3260,6 +3288,24 @@ mod tests {
     }
 
     #[test]
+    fn native_word_anchor_support_distinguishes_spans_from_estimates() {
+        let support = native_word_anchor_support();
+        for family in [
+            "qwen",
+            "cohere",
+            "moonshine",
+            "xasr-zipformer",
+            "firered-aed",
+        ] {
+            assert_eq!(support.get(family), Some(&false), "{family}");
+        }
+        for family in ["whisper", "parakeet", "parakeet-tdt", "wav2vec2"] {
+            assert_eq!(support.get(family), Some(&true), "{family}");
+        }
+        assert!(!support.contains_key("unknown-family"));
+    }
+
+    #[test]
     fn builtin_architectures_validate_inventory_invariants() {
         OpenAsrArchitectureRegistry::with_builtins()
             .validate_references()
@@ -3626,6 +3672,16 @@ mod tests {
             let expected_word_source =
                 if forced_aligner_word_timestamps.contains(model_architecture) {
                     WordTimestampSource::ForcedAligner
+                } else if model_architecture == XASR_ZIPFORMER_GGML_ARCHITECTURE_ID {
+                    WordTimestampSource::NativeEmission
+                } else if [
+                    COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+                    QWEN3_ASR_GGML_ARCHITECTURE_ID,
+                    MOONSHINE_GGML_ARCHITECTURE_ID,
+                ]
+                .contains(&model_architecture)
+                {
+                    WordTimestampSource::NativeApproximate
                 } else {
                     WordTimestampSource::Native
                 };

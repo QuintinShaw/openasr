@@ -448,12 +448,9 @@ pub(crate) fn normalize_moss_td_decode(
             segment.speaker_label = None;
         }
     }
-    let text = segments
-        .iter()
-        .map(|segment| segment.text.trim())
-        .filter(|segment_text| !segment_text.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let text = crate::transcript_text::join_segment_texts(
+        segments.iter().map(|segment| segment.text.as_str()),
+    );
     MossTdNormalizedDecode {
         segments,
         text,

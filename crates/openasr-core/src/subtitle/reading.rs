@@ -18,6 +18,7 @@
 //!   segmented at natural boundaries)
 
 use crate::api::backend::{Segment, WordTimestamp};
+use crate::transcript_text::needs_ascii_space_join;
 
 /// Soft ceiling on merged paragraph duration (seconds). Tunable V1 constant.
 pub const MAX_PARAGRAPH_SECONDS: f32 = 45.0;
@@ -123,39 +124,6 @@ fn merge_into(target: &mut Segment, next: Segment) {
         target.speaker_snapshot_label = next.speaker_snapshot_label;
     }
     append_words(&mut target.words, next.words);
-}
-
-fn needs_ascii_space_join(left: &str, right: &str) -> bool {
-    let Some(prev) = left.chars().next_back() else {
-        return false;
-    };
-    let Some(next) = right.chars().next() else {
-        return false;
-    };
-    if prev.is_whitespace() || next.is_whitespace() {
-        return false;
-    }
-    // CJK / fullwidth runs concatenate without a Latin word space.
-    if is_cjk_or_fullwidth(prev) || is_cjk_or_fullwidth(next) {
-        return false;
-    }
-    true
-}
-
-fn is_cjk_or_fullwidth(ch: char) -> bool {
-    matches!(
-        u32::from(ch),
-        0x1100..=0x115F
-            | 0x2E80..=0x2EFF
-            | 0x3000..=0x303F
-            | 0x3040..=0x30FF
-            | 0x3400..=0x4DBF
-            | 0x4E00..=0x9FFF
-            | 0xAC00..=0xD7A3
-            | 0xF900..=0xFAFF
-            | 0xFF00..=0xFF60
-            | 0x20000..=0x3134F
-    )
 }
 
 fn append_words(target: &mut Vec<WordTimestamp>, next: Vec<WordTimestamp>) {

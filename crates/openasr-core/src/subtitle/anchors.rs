@@ -53,6 +53,10 @@ pub enum WordAnchorQuality {
 /// One concrete reason a word-anchor stream failed validation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WordAnchorIssue {
+    /// The decoder supplied emission points, not spoken-word intervals.
+    NativeEmissionPoints,
+    /// This decoder has no native word alignment; its word spans are estimates.
+    ApproximateNativeWords,
     /// A timed speech segment carried no `words[]`.
     MissingWordsOnSpeech {
         segment_index: usize,
@@ -95,6 +99,33 @@ pub enum WordAnchorIssue {
     InsufficientTextCoverage { segment_index: usize, coverage: f32 },
     /// A large span of speech had no word anchors between consecutive words.
     LargeWordlessGap { segment_index: usize, gap_s: f32 },
+}
+
+/// Validate native timestamps using the decoder's timing contract as well as
+/// the numeric anchors. Monotonic emission points cannot prove word spans.
+pub(crate) fn validate_native_word_anchors(
+    transcription: &Transcription,
+    audio_duration_s: f32,
+    source: crate::arch::WordTimestampSource,
+) -> WordAnchorValidation {
+    let mut validation = validate_word_anchors(transcription, audio_duration_s);
+    if transcription.segments.iter().any(is_speech_segment) {
+        let issue = match source {
+            crate::arch::WordTimestampSource::Native => None,
+            crate::arch::WordTimestampSource::NativeEmission => {
+                Some(WordAnchorIssue::NativeEmissionPoints)
+            }
+            crate::arch::WordTimestampSource::ForcedAligner
+            | crate::arch::WordTimestampSource::NativeApproximate => {
+                Some(WordAnchorIssue::ApproximateNativeWords)
+            }
+        };
+        if let Some(issue) = issue {
+            validation.quality = WordAnchorQuality::Unreliable;
+            validation.issues.push(issue);
+        }
+    }
+    validation
 }
 
 /// Validate word anchors on a finished transcription against the audio length.
@@ -316,6 +347,71 @@ mod tests {
             segments,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn emission_points_do_not_certify_a_precise_native_timeline() {
+        use crate::arch::WordTimestampSource;
+        use crate::subtitle::{TimelinePrecisionPolicy, decide_forced_alignment};
+
+        let t = transcription(vec![segment(
+            "你好世界",
+            vec![word("你好", 0.5, 0.54), word("世界", 0.8, 0.84)],
+        )]);
+        assert!(validate_word_anchors(&t, 1.0).is_reliable());
+        let validation = validate_native_word_anchors(&t, 1.0, WordTimestampSource::NativeEmission);
+        assert!(!validation.is_reliable());
+        assert!(
+            validation
+                .issues
+                .contains(&WordAnchorIssue::NativeEmissionPoints)
+        );
+        assert!(
+            decide_forced_alignment(
+                TimelinePrecisionPolicy::Always,
+                false,
+                false,
+                false,
+                &validation
+            )
+            .need_align
+        );
+        assert!(
+            decide_forced_alignment(
+                TimelinePrecisionPolicy::Auto,
+                false,
+                false,
+                true,
+                &validation
+            )
+            .need_align
+        );
+        assert!(
+            !decide_forced_alignment(
+                TimelinePrecisionPolicy::Off,
+                false,
+                false,
+                true,
+                &validation
+            )
+            .need_align
+        );
+        assert!(validate_native_word_anchors(&t, 1.0, WordTimestampSource::Native).is_reliable());
+        let approximate = validate_native_word_anchors(&t, 1.0, WordTimestampSource::ForcedAligner);
+        assert!(!approximate.is_reliable());
+        assert!(
+            approximate
+                .issues
+                .contains(&WordAnchorIssue::ApproximateNativeWords)
+        );
+        assert!(
+            validate_native_word_anchors(
+                &Transcription::default(),
+                1.0,
+                WordTimestampSource::NativeEmission
+            )
+            .is_reliable()
+        );
     }
 
     #[test]

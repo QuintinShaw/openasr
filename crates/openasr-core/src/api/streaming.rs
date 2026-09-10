@@ -560,38 +560,7 @@ fn realtime_word_to_timestamp(word: &RealtimeTranscriptWord) -> crate::WordTimes
 /// space-free text, so segments already ending or starting with a CJK
 /// character are concatenated without an inserted ASCII space; otherwise a
 /// single space separates them.
-fn join_segment_texts<'a>(texts: impl Iterator<Item = &'a str>) -> String {
-    let mut out = String::new();
-    for text in texts {
-        let text = text.trim();
-        if text.is_empty() {
-            continue;
-        }
-        if !out.is_empty() {
-            let prev = out.chars().last();
-            let next = text.chars().next();
-            if !boundary_is_cjk(prev) && !boundary_is_cjk(next) {
-                out.push(' ');
-            }
-        }
-        out.push_str(text);
-    }
-    out
-}
-
-fn boundary_is_cjk(ch: Option<char>) -> bool {
-    matches!(ch, Some(ch) if is_cjk(ch))
-}
-
-fn is_cjk(ch: char) -> bool {
-    matches!(ch as u32,
-        0x3400..=0x4DBF   // CJK Ext A
-        | 0x4E00..=0x9FFF // CJK Unified
-        | 0xF900..=0xFAFF // CJK Compatibility Ideographs
-        | 0x3000..=0x303F // CJK symbols/punctuation
-        | 0xFF00..=0xFFEF // Fullwidth forms
-    )
-}
+use crate::transcript_text::join_segment_texts;
 
 #[cfg(test)]
 #[path = "streaming_tests.rs"]
