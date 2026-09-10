@@ -58,6 +58,7 @@ pub struct TranscriptAssembler {
     /// a redundant re-read (or a weak-model hallucination of partial audio) and
     /// is trimmed by time before it can survive into the transcript.
     committed_end_original: Option<f32>,
+    approximate_word_timestamps: bool,
 }
 
 impl TranscriptAssembler {
@@ -69,7 +70,15 @@ impl TranscriptAssembler {
             speaker_scope_by_segment: Vec::new(),
             stats: LongFormAssembleStats::default(),
             committed_end_original: None,
+            approximate_word_timestamps: false,
         }
+    }
+
+    /// Only decoders without native word alignment may regenerate estimates
+    /// after stitching. Acoustic/native anchors retain their original times.
+    pub(crate) fn with_approximate_word_timestamps(mut self, approximate: bool) -> Self {
+        self.approximate_word_timestamps = approximate;
+        self
     }
 
     pub fn push_slice_result(&mut self, transcript: SliceTranscript) {
@@ -193,13 +202,9 @@ impl TranscriptAssembler {
     pub(crate) fn into_parts_with_speaker_scopes(
         self,
     ) -> (Transcription, LongFormAssembleStats, Vec<Option<usize>>) {
-        let text = self
-            .segments
-            .iter()
-            .map(|segment| segment.text.trim())
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let text = crate::transcript_text::join_segment_texts(
+            self.segments.iter().map(|segment| segment.text.as_str()),
+        );
         let transcription = Transcription {
             truncated_decodes: Vec::new(),
             unnamed_speakers: Vec::new(),
@@ -345,7 +350,31 @@ impl TranscriptAssembler {
             return false;
         }
         let min_units = if time_overlaps { 2 } else { 3 };
-        apply_suffix_prefix_stitch(previous, current, min_units, time_overlap)
+        let stitched = apply_suffix_prefix_stitch(previous, current, min_units, time_overlap);
+        if stitched && self.approximate_word_timestamps {
+            // A prior seam may already have advanced these estimates beyond
+            // the original audio window. Preserve that committed boundary
+            // when this same segment is stitched to yet another slice.
+            let previous_start = previous
+                .words
+                .first()
+                .map_or(previous.start, |word| word.start.max(previous.start))
+                .min(previous.end);
+            previous.words = crate::subtitle::cues::interpolate_word_timestamps(
+                &previous.text,
+                previous_start,
+                previous.end,
+            );
+            // Keep both original segment windows for subsequent alignment.
+            // Only the approximate remainder starts after committed speech.
+            let remainder_start = current.start.max(previous.end).min(current.end);
+            current.words = crate::subtitle::cues::interpolate_word_timestamps(
+                &current.text,
+                remainder_start,
+                current.end,
+            );
+        }
+        stitched
     }
 }
 
@@ -490,12 +519,11 @@ fn trim_committed_overlap(segment: &mut Segment, boundary: f32) -> bool {
             .to_string(),
         // Words did not align to the text (unexpected): rebuild from the kept
         // word tokens rather than mis-slice the string.
-        None => segment.words[first_keep..]
-            .iter()
-            .map(|word| word.word.trim())
-            .filter(|word| !word.is_empty())
-            .collect::<Vec<_>>()
-            .join(" "),
+        None => crate::transcript_text::join_segment_texts(
+            segment.words[first_keep..]
+                .iter()
+                .map(|word| word.word.as_str()),
+        ),
     };
     segment.words.drain(0..first_keep);
     if let Some(first) = segment.words.first() {
@@ -1485,6 +1513,76 @@ mod tests {
     }
 
     #[test]
+    fn stitched_estimates_fill_the_original_windows_without_retiming_native_words() {
+        let previous = "周末的时候，我。";
+        let current = "的时候，我通常会读书。";
+        for approximate in [false, true] {
+            let mut assembler =
+                TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default())
+                    .with_approximate_word_timestamps(approximate);
+            assembler.push_slice_result(SliceTranscript {
+                slice: energy_slice(0, 0, 16_000 * 25 + 8_000),
+                text: previous.into(),
+                segments: vec![absolute_segment(
+                    previous,
+                    0.0,
+                    25.5,
+                    interpolated_words(previous, 0.0, 25.5),
+                )],
+                time_domain: SegmentTimeDomain::RelativeToSliceContent,
+            });
+            let original_words = interpolated_words(current, 0.0, 20.0);
+            assembler.push_slice_result(SliceTranscript {
+                slice: energy_slice(1, 16_000 * 25, 16_000 * 45),
+                text: current.into(),
+                segments: vec![absolute_segment(current, 0.0, 20.0, original_words.clone())],
+                time_domain: SegmentTimeDomain::RelativeToSliceContent,
+            });
+            let out = assembler.into_transcription();
+            assert_eq!(out.segments.len(), 2);
+            let left = &out.segments[0];
+            let right = &out.segments[1];
+            assert_eq!(left.end, 25.5);
+            assert_eq!(right.start, 25.0);
+            assert_eq!(right.end, 45.0);
+            assert_eq!(right.text, "通常会读书。");
+            if approximate {
+                assert_eq!(left.words.last().unwrap().end, left.end);
+                assert_eq!(right.words.first().unwrap().start, left.end);
+                assert_eq!(right.words.last().unwrap().end, right.end);
+                assert_eq!(
+                    left.words
+                        .iter()
+                        .map(|word| word.word.as_str())
+                        .collect::<String>(),
+                    left.text
+                );
+                assert!(right.words.iter().all(|word| word.confidence.is_none()));
+                // A later stitch must not rewind a start already repaired at
+                // the preceding seam, even when the original windows overlap.
+                let mut next = absolute_segment("会读书。然后散步。", 44.5, 60.0, Vec::new());
+                let mut resumed = TranscriptAssembler::new(
+                    TimelineMap::identity(),
+                    SegmentMergePolicy::default(),
+                )
+                .with_approximate_word_timestamps(true);
+                resumed.segments = out.segments.clone();
+                assert!(resumed.try_stitch_seam_overlap(&mut next));
+                assert_eq!(resumed.segments[1].words[0].start, 25.5);
+            } else {
+                let native_first = original_words
+                    .iter()
+                    .find(|word| word.word == "通")
+                    .unwrap();
+                assert_eq!(
+                    right.words.first().unwrap().start,
+                    25.0 + native_first.start
+                );
+            }
+        }
+    }
+
+    #[test]
     fn assembler_stitches_decode_invariant_worded_qwen_slice_seam() {
         // Production CLI path: DecodeInvariant words are forced on for cue
         // splitting, so qwen emits one slice-spanning segment with interpolated
@@ -1707,15 +1805,15 @@ mod tests {
         ]);
         assert_eq!(
             mimo,
-            "And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country. 今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的川菜馆吃饭，听说那里的麻婆豆腐特别正宗。周末的时候，我 通常会读书或者看一部电影放松一下。And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的川菜馆吃饭，听说那里的麻婆豆腐特别正宗。 周末的时候，我通常会读书或者看一部电影放松一下。And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country."
+            "And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country. 今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的川菜馆吃饭，听说那里的麻婆豆腐特别正宗。周末的时候，我通常会读书或者看一部电影放松一下。And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的川菜馆吃饭，听说那里的麻婆豆腐特别正宗。周末的时候，我通常会读书或者看一部电影放松一下。And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country."
         );
         assert_eq!(
             firered_aed,
-            "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我 通常会读书或者看一部电影放松一下 AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗 周末的时候我通常会读书或者看一部电影放松一下 ANDSO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR YOUR COUNTRY"
+            "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我通常会读书或者看一部电影放松一下 AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我通常会读书或者看一部电影放松一下 ANDSO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR YOUR COUNTRY"
         );
         assert_eq!(
             firered_llm,
-            "and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我 通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗中 周末的时候我通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country"
+            "and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗中周末的时候我通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country"
         );
     }
 
@@ -1725,7 +1823,7 @@ mod tests {
         let transcription =
             assemble_wordless_overlap("周末的时候，我", "我通常会读书或者看一部电影放松一下。");
         assert_eq!(
-            transcription.text.replace(' ', ""),
+            transcription.text,
             "周末的时候，我通常会读书或者看一部电影放松一下。"
         );
     }
@@ -1750,7 +1848,7 @@ mod tests {
         });
         let transcription = assembler.into_transcription();
         assert_eq!(transcription.segments.len(), 2);
-        assert_eq!(transcription.text, "今天好 今天坏");
+        assert_eq!(transcription.text, "今天好今天坏");
     }
 
     #[test]
@@ -1869,14 +1967,14 @@ mod tests {
     fn assembler_does_not_glue_digit_strings_at_a_shared_numeral() {
         let transcription = assemble_wordless_overlap("电话是一三八", "八零零一二三四");
         assert_eq!(transcription.segments.len(), 2);
-        assert_eq!(transcription.text, "电话是一三八 八零零一二三四");
+        assert_eq!(transcription.text, "电话是一三八八零零一二三四");
     }
 
     #[test]
     fn assembler_does_not_eat_reduplicated_thanks() {
         let transcription = assemble_wordless_overlap("非常感谢", "谢谢大家");
         assert_eq!(transcription.segments.len(), 2);
-        assert_eq!(transcription.text, "非常感谢 谢谢大家");
+        assert_eq!(transcription.text, "非常感谢谢谢大家");
     }
 
     #[test]

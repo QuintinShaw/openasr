@@ -15,6 +15,7 @@ mod file_identity;
 mod http;
 mod pe_image_identity;
 mod qualification_manifest_security;
+mod transcript_text;
 mod transport;
 #[cfg(test)]
 mod windows_cmake_cache;
@@ -49,7 +50,7 @@ pub use arch::{
     WHISPER_AUDIO_FRONTEND_ID, WHISPER_DECODE_POLICY_ID, WHISPER_GGML_ADAPTER_ID,
     WHISPER_GGML_ARCHITECTURE_ID, WHISPER_TOKENIZER_ID, XASR_ZIPFORMER_AUDIO_FRONTEND_ID,
     XASR_ZIPFORMER_DECODE_POLICY_ID, XASR_ZIPFORMER_GGML_ADAPTER_ID,
-    XASR_ZIPFORMER_GGML_ARCHITECTURE_ID, XASR_ZIPFORMER_TOKENIZER_ID,
+    XASR_ZIPFORMER_GGML_ARCHITECTURE_ID, XASR_ZIPFORMER_TOKENIZER_ID, native_word_anchor_support,
 };
 pub use backend_distribution::{
     ACTIVATED_BACKEND_SCHEMA_VERSION, ActivatedBackendPack, BACKEND_HOST_ABI_SCHEMA_VERSION,

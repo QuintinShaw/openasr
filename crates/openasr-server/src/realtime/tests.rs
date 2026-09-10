@@ -2848,7 +2848,9 @@ async fn boot_warmup_does_not_consume_the_user_session_slot() {
 #[tokio::test]
 async fn wait_while_native_warmup_in_flight_unblocks_when_lease_drops() {
     let lease = try_begin_native_warmup().expect("warmup lease must be free");
-    let waiter = tokio::spawn(wait_while_native_warmup_in_flight());
+    let waiter = tokio::spawn(async {
+        wait_while_native_warmup_in_flight(&ServerRuntime::default()).await;
+    });
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(
         !waiter.is_finished(),
@@ -2859,6 +2861,45 @@ async fn wait_while_native_warmup_in_flight_unblocks_when_lease_drops() {
         .await
         .expect("waiter must unblock when the warmup lease drops")
         .expect("waiter must not panic");
+}
+
+#[tokio::test]
+async fn boot_attestation_wait_covers_preparation_before_the_inner_warmup_lease() {
+    let runtime = ServerRuntime::default();
+    let boot = runtime.model_pack_path.begin_boot_attestation();
+    assert!(!native_warmup_in_flight());
+    let async_runtime = runtime.clone();
+    let async_waiter = tokio::spawn(async move {
+        wait_while_native_warmup_in_flight(&async_runtime).await;
+        async_runtime.model_pack_path.current_snapshot()
+    });
+    let blocking_runtime = runtime.clone();
+    let blocking_waiter = tokio::task::spawn_blocking(move || {
+        wait_while_native_warmup_in_flight_blocking(&blocking_runtime);
+        blocking_runtime.model_pack_path.current_snapshot()
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!async_waiter.is_finished());
+    assert!(!blocking_waiter.is_finished());
+    runtime
+        .model_pack_path
+        .set_legacy_binding(Some(PathBuf::from("attested-boot-fixture.oasr")));
+    let published = runtime.model_pack_path.current_snapshot();
+    drop(boot);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), async_waiter)
+            .await
+            .unwrap()
+            .unwrap(),
+        published
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), blocking_waiter)
+            .await
+            .unwrap()
+            .unwrap(),
+        published
+    );
 }
 
 #[tokio::test]

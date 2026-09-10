@@ -226,7 +226,7 @@ fn build_tokens(segment: &Segment, chars: &[char]) -> (Vec<CueToken>, bool) {
             .collect();
         return (tokens, true);
     }
-    (synthesize_tokens(segment, chars), false)
+    (synthesize_tokens(chars, segment.start, segment.end), false)
 }
 
 /// Synthesise word-sized tokens when real `words[]` are missing or cannot be
@@ -241,13 +241,13 @@ fn build_tokens(segment: &Segment, chars: &[char]) -> (Vec<CueToken>, bool) {
 ///
 /// Times are interpolated proportionally across
 /// `[segment.start, segment.end]` by character position.
-fn synthesize_tokens(segment: &Segment, chars: &[char]) -> Vec<CueToken> {
+fn synthesize_tokens(chars: &[char], start: f32, end: f32) -> Vec<CueToken> {
     let total = chars.len();
     if total == 0 {
         return Vec::new();
     }
-    let span_start = segment.start;
-    let span = (segment.end - segment.start).max(0.0);
+    let span_start = start;
+    let span = (end - start).max(0.0);
     let at = |char_index: usize| span_start + span * (char_index as f32 / total as f32);
     let mut tokens = Vec::new();
     let mut index = 0usize;
@@ -283,6 +283,25 @@ fn synthesize_tokens(segment: &Segment, chars: &[char]) -> Vec<CueToken> {
         });
     }
     tokens
+}
+
+/// Rebuild approximate word anchors after a manuscript seam edit. These are
+/// presentation estimates, never acoustic evidence or forced-aligned words.
+pub(crate) fn interpolate_word_timestamps(
+    text: &str,
+    start: f32,
+    end: f32,
+) -> Vec<crate::WordTimestamp> {
+    let chars: Vec<char> = text.chars().collect();
+    synthesize_tokens(&chars, start, end)
+        .into_iter()
+        .map(|token| crate::WordTimestamp {
+            word: chars[token.char_start..token.char_end].iter().collect(),
+            start: token.start,
+            end: token.end,
+            confidence: None,
+        })
+        .collect()
 }
 
 fn is_cjk_or_fullwidth_punct(ch: char) -> bool {

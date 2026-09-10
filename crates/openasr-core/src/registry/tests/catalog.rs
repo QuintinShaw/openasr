@@ -1804,7 +1804,11 @@ fn embedded_catalog_speaker_capabilities_match_architecture_registry() {
             architecture
         );
         let expected_word_source = match descriptor.execution_contract.word_timestamp_source {
-            crate::arch::WordTimestampSource::Native => CatalogWordTimestampSource::Native,
+            crate::arch::WordTimestampSource::Native
+            | crate::arch::WordTimestampSource::NativeApproximate
+            | crate::arch::WordTimestampSource::NativeEmission => {
+                CatalogWordTimestampSource::Native
+            }
             crate::arch::WordTimestampSource::ForcedAligner => {
                 CatalogWordTimestampSource::ForcedAligner
             }

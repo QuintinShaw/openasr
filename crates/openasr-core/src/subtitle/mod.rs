@@ -17,6 +17,7 @@ mod mismatch;
 mod reading;
 mod refine;
 mod timeline;
+pub(crate) use anchors::validate_native_word_anchors;
 
 pub use anchors::{
     WordAnchorIssue, WordAnchorQuality, WordAnchorValidation, validate_word_anchors,

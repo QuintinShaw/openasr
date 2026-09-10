@@ -1365,6 +1365,18 @@ pub struct ActiveRuntimeSlot {
     /// surfaces this as `status != "ok"` so a swallowed log is not the only
     /// signal (`openasr serve --model` with no durable V2 used to do that).
     launch_attestation_failed: Arc<AtomicBool>,
+    pending_boot_attestations: Arc<AtomicU64>,
+}
+
+/// Covers the entire boot task, including queued work and pack verification,
+/// before the inner native warmup lease exists. It is deliberately separate
+/// from the activation busy gate so boot cannot block its own transaction.
+pub(crate) struct BootAttestationGuard(Arc<AtomicU64>);
+
+impl Drop for BootAttestationGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[doc(hidden)]
@@ -1514,6 +1526,7 @@ impl From<Option<PathBuf>> for ActiveRuntimeSlot {
             activation_probe_failpoint: Arc::new(RwLock::new(None)),
             activation_failpoint: Arc::new(RwLock::new(None)),
             launch_attestation_failed: Arc::new(AtomicBool::new(false)),
+            pending_boot_attestations: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -1536,11 +1549,22 @@ impl ActiveRuntimeSlot {
             activation_probe_failpoint: Arc::new(RwLock::new(None)),
             activation_failpoint: Arc::new(RwLock::new(None)),
             launch_attestation_failed: Arc::new(AtomicBool::new(false)),
+            pending_boot_attestations: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub(crate) fn mark_launch_attestation_failed(&self) {
         self.launch_attestation_failed.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn begin_boot_attestation(&self) -> BootAttestationGuard {
+        self.pending_boot_attestations
+            .fetch_add(1, Ordering::SeqCst);
+        BootAttestationGuard(Arc::clone(&self.pending_boot_attestations))
+    }
+
+    pub(crate) fn boot_attestation_pending(&self) -> bool {
+        self.pending_boot_attestations.load(Ordering::SeqCst) != 0
     }
 
     pub(crate) fn launch_attestation_failed(&self) -> bool {
@@ -1815,6 +1839,11 @@ impl ServerRuntime {
                 ));
             }
         };
+        if self.model_pack_path.boot_attestation_pending() {
+            return Err(ApiError::Conflict(
+                "The server is still preparing its startup model; retry the request.".to_string(),
+            ));
+        }
         if !self.model_pack_path.snapshot_is_current(snapshot) {
             return Err(ApiError::Conflict(
                 "The active model changed while the native session was being prepared; retry the request."

@@ -106,11 +106,10 @@ impl ManagedDaemonEndpoint {
 
 /// An opened-once proof of user-selected local media.
 ///
-/// The proof owns the file handle that was validated. Callers clone that
-/// handle for streaming; they never reopen the path. Replacing the directory
-/// entry after selection therefore cannot change the bytes an authorized
-/// request reads. The canonical path is retained only for native playback
-/// scope and display-name projection, never as later read authority.
+/// The proof owns the validated file handle. Independent readers must use
+/// [`Self::open_fresh`], which checks the reopened handle against this proof;
+/// the canonical path alone is never read authority. Cloned handles retain
+/// the opened generation but share a read cursor.
 #[derive(Debug)]
 pub struct SelectedMedia {
     file: File,
@@ -156,9 +155,31 @@ impl SelectedMedia {
         })
     }
 
+    /// Clone the held handle, sharing its read cursor. Use [`Self::open_fresh`]
+    /// for independent uploads or retries.
     pub fn try_clone_file(&self) -> Result<File, LocalTrustError> {
         self.ensure_identity()?;
         self.file.try_clone().map_err(LocalTrustError::CloneMedia)
+    }
+
+    /// Open an independent reader at offset zero, rejecting changed media or
+    /// a replaced path. Identity is checked on the opened handle, not the path.
+    pub fn open_fresh(&self) -> Result<File, LocalTrustError> {
+        self.ensure_identity()?;
+        let file = open_without_following_final_link(&self.canonical_path)
+            .map_err(LocalTrustError::OpenMedia)?;
+        let metadata = file
+            .metadata()
+            .map_err(LocalTrustError::InspectOpenedMedia)?;
+        if !is_plain_regular_file(&metadata) {
+            return Err(LocalTrustError::MediaIsNotRegularFile);
+        }
+        let identity = StrongFileIdentity::of_file(&file, &metadata)
+            .ok_or(LocalTrustError::UnsupportedMediaIdentity)?;
+        if identity != self.identity {
+            return Err(LocalTrustError::MediaIdentityChanged);
+        }
+        Ok(file)
     }
 
     pub fn canonical_path(&self) -> &Path {
@@ -240,7 +261,9 @@ fn open_without_following_final_link(path: &Path) -> std::io::Result<File> {
 
     OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        // Do not block if a path is raced into a FIFO; regular files ignore
+        // O_NONBLOCK and the opened metadata rejects special files below.
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
 }
 
@@ -320,6 +343,10 @@ mod tests {
         assert_eq!(bytes, b"selected-generation");
         assert_eq!(selected.display_name(), "selected.wav");
         assert_eq!(selected.len(), b"selected-generation".len() as u64);
+        assert!(matches!(
+            selected.open_fresh(),
+            Err(LocalTrustError::MediaIdentityChanged)
+        ));
     }
 
     #[test]
@@ -332,6 +359,31 @@ mod tests {
     }
 
     #[test]
+    fn fresh_media_readers_have_independent_offsets_after_a_full_upload() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("selected.wav");
+        std::fs::write(&path, b"selected-generation").unwrap();
+        let selected = SelectedMedia::open(&path).unwrap();
+        let mut uploaded = Vec::new();
+        selected
+            .try_clone_file()
+            .unwrap()
+            .read_to_end(&mut uploaded)
+            .unwrap();
+        let mut first = selected.open_fresh().unwrap();
+        let mut second = selected.open_fresh().unwrap();
+        let mut prefix = [0; 3];
+        first.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"sel");
+        let mut replay = Vec::new();
+        second.read_to_end(&mut replay).unwrap();
+        assert_eq!(replay, uploaded);
+        let mut remainder = Vec::new();
+        first.read_to_end(&mut remainder).unwrap();
+        assert_eq!(remainder, b"ected-generation");
+    }
+
+    #[test]
     fn selected_media_rejects_in_place_mutation_before_cloning() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("selected.wav");
@@ -341,6 +393,45 @@ mod tests {
         assert!(matches!(
             selected.try_clone_file(),
             Err(LocalTrustError::MediaIdentityChanged)
+        ));
+        assert!(matches!(
+            selected.open_fresh(),
+            Err(LocalTrustError::MediaIdentityChanged)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_media_reader_rejects_symlink_to_the_original_generation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("selected.wav");
+        let original = directory.path().join("original.wav");
+        std::fs::write(&path, b"audio").unwrap();
+        let selected = SelectedMedia::open(&path).unwrap();
+        std::fs::rename(&path, &original).unwrap();
+        std::os::unix::fs::symlink(&original, &path).unwrap();
+        assert!(matches!(
+            selected.open_fresh(),
+            Err(LocalTrustError::OpenMedia(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_media_reader_rejects_fifo_replacement_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("selected.wav");
+        std::fs::write(&path, b"audio").unwrap();
+        let selected = SelectedMedia::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let fifo = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo is a valid, NUL-terminated path in the owned tempdir.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(matches!(
+            selected.open_fresh(),
+            Err(LocalTrustError::MediaIsNotRegularFile)
         ));
     }
 

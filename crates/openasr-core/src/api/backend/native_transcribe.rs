@@ -1002,6 +1002,7 @@ struct NativeTranscriptionOutcome {
     transcription: Transcription,
     prepared_audio: PcmBuffer,
     emits_punctuation: Option<bool>,
+    word_timestamp_source: crate::arch::WordTimestampSource,
     speaker_finalization: SpeakerFinalizationContext,
     /// Resolved progress weights (actual backend + segmenter after prepare).
     progress_backend: ProgressBackendClass,
@@ -1264,6 +1265,7 @@ fn run_native_transcription_fallible_with_input(
         transcription,
         prepared_audio,
         emits_punctuation,
+        word_timestamp_source,
         speaker_finalization,
         progress_backend: backend_class,
         progress_segmenter: segmenter_kind,
@@ -1313,8 +1315,11 @@ fn run_native_transcription_fallible_with_input(
         execution_context.as_ref(),
         &progress,
     )?;
-    let native_validation =
-        crate::subtitle::validate_word_anchors(&transcription, audio_duration_s);
+    let native_validation = crate::subtitle::validate_native_word_anchors(
+        &transcription,
+        audio_duration_s,
+        word_timestamp_source,
+    );
     let voice_id_needs_align = speaker_finalization
         .requires_word_alignment(&transcription, native_validation.is_reliable());
     let align_decision = crate::subtitle::decide_forced_alignment(
@@ -1554,7 +1559,7 @@ fn optional_punctuation_failure_disables_stage(
 /// stage's documented "finalize-only, per segment" contract -- see
 /// `crate::punctuation`'s module docs) and rebuilds the top-level `text` field
 /// from the punctuated segments the same way the longform assembler does
-/// (trim, drop empties, join with a space), so the punctuated text and
+/// (trim, drop empties, join at script-aware boundaries), so the punctuated text and
 /// segments stay consistent. A segment whose classifier call fails keeps its
 /// original (unpunctuated) text -- fail-closed per segment rather than
 /// aborting the whole transcript.
@@ -1568,13 +1573,12 @@ fn punctuate_transcription_segments(
             segment.text = punctuated;
         }
     }
-    transcription.text = transcription
-        .segments
-        .iter()
-        .map(|segment| segment.text.trim())
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+    transcription.text = crate::transcript_text::join_segment_texts(
+        transcription
+            .segments
+            .iter()
+            .map(|segment| segment.text.as_str()),
+    );
     transcription
 }
 
@@ -1604,13 +1608,12 @@ fn punctuate_transcription_segments_with_actor(
         }
         progress.report_units((index as u64).saturating_add(1), total.max(1));
     }
-    transcription.text = transcription
-        .segments
-        .iter()
-        .map(|segment| segment.text.trim())
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+    transcription.text = crate::transcript_text::join_segment_texts(
+        transcription
+            .segments
+            .iter()
+            .map(|segment| segment.text.as_str()),
+    );
     Ok(transcription)
 }
 
@@ -2665,6 +2668,19 @@ fn run_native_transcription_impl(
     let strip_forced_word_timestamps =
         (external_speakers || force_word_timestamps_for_segmentation) && !request.word_timestamps;
     request_options.word_timestamps_forced_for_diarization = strip_forced_word_timestamps;
+    // Decode-sensitive families preserve their ordinary decode when words
+    // are forced only for speaker attribution. Their batch lane also produces
+    // post-hoc estimates; batch eligibility is not proof of cross-attention
+    // anchors even if a particular request ultimately executes serially.
+    let word_timestamp_source = if (strip_forced_word_timestamps
+        || request_options.serve_batch.enabled())
+        && selected_family.word_timestamps
+            == crate::arch::OpenAsrWordTimestampStrategy::DecodeSensitive
+    {
+        crate::arch::WordTimestampSource::NativeApproximate
+    } else {
+        selected_family.word_timestamp_source
+    };
     // OADP Phase 0: the request-level adapter path rides the execution options
     // down to the family executor (env stays the server-side fallback).
     request_options.adapter_path = request.adapter_path.clone();
@@ -2838,6 +2854,7 @@ fn run_native_transcription_impl(
                 },
                 prepared_audio,
                 emits_punctuation,
+                word_timestamp_source,
                 speaker_finalization: SpeakerFinalizationContext::new(
                     speaker_turns,
                     voice_id_embedder,
@@ -2853,7 +2870,10 @@ fn run_native_transcription_impl(
         }
         if has_processed_audio || plan.slices.len() > 1 {
             let mut assembler =
-                TranscriptAssembler::new(plan.timeline.clone(), SegmentMergePolicy::default());
+                TranscriptAssembler::new(plan.timeline.clone(), SegmentMergePolicy::default())
+                    .with_approximate_word_timestamps(
+                        word_timestamp_source.has_synthetic_word_spans(),
+                    );
             let mut rolling_prompt = request_options.prompt.clone().unwrap_or_default();
             let mut rolling_prompt_token_ids: Vec<u32> = Vec::new();
             let carry_prompt_mode =
@@ -3185,6 +3205,7 @@ fn run_native_transcription_impl(
                     transcription,
                     prepared_audio,
                     emits_punctuation,
+                    word_timestamp_source,
                     speaker_finalization: SpeakerFinalizationContext::new(
                         speaker_turns,
                         voice_id_embedder,
@@ -3209,6 +3230,7 @@ fn run_native_transcription_impl(
                 transcription,
                 prepared_audio,
                 emits_punctuation,
+                word_timestamp_source,
                 speaker_finalization: SpeakerFinalizationContext::new(
                     speaker_turns,
                     voice_id_embedder,
@@ -3295,6 +3317,7 @@ fn run_native_transcription_impl(
         transcription,
         prepared_audio,
         emits_punctuation,
+        word_timestamp_source,
         speaker_finalization: SpeakerFinalizationContext::new(
             speaker_turns,
             voice_id_embedder,
@@ -4872,13 +4895,12 @@ fn normalize_transcription_segments(
 
     transcription.segments = normalized;
     if trimmed_text.is_empty() {
-        transcription.text = transcription
-            .segments
-            .iter()
-            .map(|segment| segment.text.trim())
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        transcription.text = crate::transcript_text::join_segment_texts(
+            transcription
+                .segments
+                .iter()
+                .map(|segment| segment.text.as_str()),
+        );
     } else {
         transcription.text = trimmed_text;
     }

@@ -258,12 +258,9 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
                 &decode_text_token_ids,
             )?
         } else {
-            let text = segments
-                .iter()
-                .map(|segment| segment.text.trim())
-                .filter(|text| !text.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
+            let text = crate::transcript_text::join_segment_texts(
+                segments.iter().map(|segment| segment.text.as_str()),
+            );
             Transcription {
                 truncated_decodes: Vec::new(),
                 unnamed_speakers: Vec::new(),

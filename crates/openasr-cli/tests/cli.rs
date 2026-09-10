@@ -763,10 +763,10 @@ fn transcribe_mock_formats_match_core_renderers() {
 // `OPENASR_GGML_BACKEND=cpu` (Metal currently OOMs this family's 7B decoder
 // on a 16GB unified-memory Mac, see the T5 report); the auto energy-VAD
 // slicer picked 3 chunks here. The extra "中" is a model token. The first-seam
-// "我 我" is consumed by the shared assembler; the join space remains
-// (`周末的时候我 通常会`). Bytes come from feeding the three origin slice
+// "我 我" is consumed by the shared assembler without an inserted CJK space.
+// Bytes come from feeding the three origin slice
 // texts through TranscriptAssembler (pending pack re-measure).
-const FIRERED_LLM_GOLDEN_LONGFORM_EN_ZH_TEXT: &str = "and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我 通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗中 周末的时候我通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country";
+const FIRERED_LLM_GOLDEN_LONGFORM_EN_ZH_TEXT: &str = "and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country 今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗中周末的时候我通常会读书或者看一部电影放松一下 and so my fellow americans ask not what your country can do for you ask what you can do for your country";
 
 #[test]
 #[ignore = "requires the private ~8.9GB dev-only firered2-llm-q8_0.oasr pack; runs the real \
@@ -774,13 +774,8 @@ const FIRERED_LLM_GOLDEN_LONGFORM_EN_ZH_TEXT: &str = "and so my fellow americans
             (~30 minutes wall clock at this family's current CPU-decode RTF -- see the T5 report)"]
 fn firered_llm_golden_diff_longform_cli_transcribe_matches_reference_decode() {
     let pack_path =
-        match external_test_fixture_path("OPENASR_FIRERED_LLM_PACK", "FireRed2 LLM .oasr pack") {
-            Ok(path) => path,
-            Err(skip) => {
-                eprintln!("skipping: {skip}");
-                return;
-            }
-        };
+        external_test_fixture_path("OPENASR_FIRERED_LLM_PACK", "FireRed2 LLM .oasr pack")
+            .expect("explicitly requested longform golden requires its exact model fixture");
     let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/longform_en_zh.wav")
         .canonicalize()
@@ -819,10 +814,9 @@ fn firered_llm_golden_diff_longform_cli_transcribe_matches_reference_decode() {
 // content). Pinned against `OPENASR_GGML_BACKEND=cpu` (Metal memory fit for
 // this family's ~8B combined weights on a 16GB unified-memory Mac is
 // unverified, see this module's e2e report).
-// The longform assembler joins retained, trimmed segment texts with one space.
-// The spaces inside this `concat!` are therefore golden bytes, taken from
-// feeding the three origin slice texts through TranscriptAssembler. The
-// first-seam "我 我" is consumed; the join space remains (`我 通常会`).
+// The longform assembler joins retained texts at script-aware boundaries.
+// Expected bytes are projected from the three origin slice texts; exact-pack
+// re-measure remains required. The first-seam "我 我" is consumed without space.
 // The same family's single-utterance EN->ZH golden
 // (`mimo_asr::executor::tests::golden_diff_end_to_end_transcribe_en_zh_mixed_wav`)
 // also asserts the EN->ZH space.
@@ -830,11 +824,11 @@ const GOLDEN_MIMO_LONGFORM_EN_ZH_TEXT: &str = concat!(
     "And so, my fellow Americans, ask not what your country can do for you. ",
     "Ask what you can do for your country. ",
     "今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的川菜馆吃饭，",
-    "听说那里的麻婆豆腐特别正宗。周末的时候，我 通常会读书或者看一部电影放松一下。",
+    "听说那里的麻婆豆腐特别正宗。周末的时候，我通常会读书或者看一部电影放松一下。",
     "And so, my fellow Americans, ask not what your country can do for you, ",
     "ask what you can do for your country.",
     "今天天气非常好，我打算和朋友们一起去公园散步。晚上我们还计划去一家新开的川菜馆吃饭，",
-    "听说那里的麻婆豆腐特别正宗。 ",
+    "听说那里的麻婆豆腐特别正宗。",
     "周末的时候，我通常会读书或者看一部电影放松一下。",
     "And so, my fellow Americans, ask not what your country can do for you. ",
     "Ask what you can do for your country.",
@@ -846,14 +840,8 @@ const GOLDEN_MIMO_LONGFORM_EN_ZH_TEXT: &str = concat!(
             (~38 minutes wall clock at this family's current CPU-decode RTF -- 3 chunk \
             decodes, see this test's doc comment)"]
 fn mimo_asr_golden_diff_longform_cli_transcribe_matches_reference_decode() {
-    let pack_path = match external_test_fixture_path("OPENASR_MIMO_ASR_PACK", "MiMo ASR .oasr pack")
-    {
-        Ok(path) => path,
-        Err(skip) => {
-            eprintln!("skipping: {skip}");
-            return;
-        }
-    };
+    let pack_path = external_test_fixture_path("OPENASR_MIMO_ASR_PACK", "MiMo ASR .oasr pack")
+        .expect("explicitly requested longform golden requires its exact model fixture");
     let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/longform_en_zh.wav")
         .canonicalize()
@@ -894,8 +882,8 @@ fn mimo_asr_golden_diff_longform_cli_transcribe_matches_reference_decode() {
 // slicer to split -- confirmed 3 chunks via `--format verbose_json`'s
 // `longform.chunk_count`. Pinned against `OPENASR_GGML_BACKEND=cpu`. The
 // missing space between "COUNTRY" and "今天" / "ANDSO" is a tokenizer join.
-// The first-seam "我 我" is consumed by the shared assembler; the join
-// space remains (`周末的时候我 通常会`). Bytes come from feeding the
+// The first-seam "我 我" is consumed without an inserted CJK join space.
+// Bytes come from feeding the
 // three origin slice texts through TranscriptAssembler
 // (pending pack re-measure).
 fn firered_aed_dev_pack_path() -> PathBuf {
@@ -904,9 +892,9 @@ fn firered_aed_dev_pack_path() -> PathBuf {
 
 const GOLDEN_FIRERED_AED_LONGFORM_EN_ZH_TEXT: &str = concat!(
     "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO ",
-    "FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我 通常会读书或者看一部电影放松一下 ",
+    "FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我通常会读书或者看一部电影放松一下 ",
     "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO ",
-    "FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗 周末的时候我通常会读书或者看一部电影放松一下 ",
+    "FOR YOUR COUNTRY今天天气非常好我打算和朋友们一起去公园散步晚上我们还计划去一家新开的川菜馆吃饭听说那里的麻婆豆腐特别正宗周末的时候我通常会读书或者看一部电影放松一下 ",
     "ANDSO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR ",
     "YOUR COUNTRY",
 );
@@ -916,10 +904,11 @@ const GOLDEN_FIRERED_AED_LONGFORM_EN_ZH_TEXT: &str = concat!(
             longform-chunked CLI transcribe path on a ~69s fixture, OPENASR_GGML_BACKEND=cpu"]
 fn firered_aed_golden_diff_longform_cli_transcribe_matches_reference_decode() {
     let pack_path = firered_aed_dev_pack_path();
-    if !pack_path.exists() {
-        eprintln!("skipping: {} not present", pack_path.display());
-        return;
-    }
+    assert!(
+        pack_path.is_file(),
+        "explicitly requested longform golden requires {}",
+        pack_path.display()
+    );
     let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/longform_en_zh.wav")
         .canonicalize()

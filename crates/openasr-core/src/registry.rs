@@ -308,6 +308,10 @@ pub struct CatalogModel {
     /// Where this ASR family obtains usable word anchors. This mirrors the
     /// architecture descriptor so clients can install a forced-aligner pack
     /// before starting external speaker attribution instead of failing late.
+    /// Older signed catalogs label emission points and interpolated estimates
+    /// as `Native`; local dependency planning must also consult
+    /// [`crate::native_word_anchor_support`]. A catalog flag is not proof that
+    /// an individual result has reliable acoustic word spans.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub word_timestamp_source: Option<CatalogWordTimestampSource>,
     // Whether the model's transcripts include punctuation -- an architecture/

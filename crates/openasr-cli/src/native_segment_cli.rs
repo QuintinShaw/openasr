@@ -350,6 +350,11 @@ pub(super) fn resolve_model_source_for_backend(
         });
     }
 
+    // Installed binaries may run outside a checkout with no catalog override.
+    // Keep signed quant aliases available offline, just as show/language
+    // metadata does. This fallback performs no network request.
+    let catalog = Some(native_catalog_or_embedded(catalog, &home)?);
+
     // Native: an explicit --model-pack is the advanced escape hatch; otherwise
     // resolve an installed pack by model id. This path NEVER pulls -- the CLI
     // transcribe/live handlers run the consent-pull before reaching here, while
@@ -384,6 +389,17 @@ pub(super) fn resolve_model_source_for_backend(
         model_id,
         model_pack_path: Some(model_pack_root),
     })
+}
+
+fn native_catalog_or_embedded(
+    catalog: Option<openasr_core::ModelCatalog>,
+    home: &Path,
+) -> Result<openasr_core::ModelCatalog> {
+    match catalog {
+        Some(catalog) => Ok(catalog),
+        None => openasr_core::load_embedded_signed_catalog(home)
+            .context("Could not load the embedded signed model catalog"),
+    }
 }
 
 /// With no explicit reference, resolving the persisted default against installed
@@ -1767,6 +1783,17 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use tower::ServiceExt;
+
+    #[test]
+    fn installed_binary_resolves_quant_aliases_without_a_checkout_catalog() {
+        let home = tempfile::tempdir().unwrap();
+        let catalog = native_catalog_or_embedded(None, home.path()).unwrap();
+        let cards = runtime_registry(Some(&catalog)).unwrap();
+        for reference in ["xasr-zh-en:q8", "xasr-zh-en:q8_0"] {
+            let resolved = resolve_runtime_model_ref(&cards, Some(&catalog), reference).unwrap();
+            assert_eq!(resolved.runtime_model_id, "xasr-zh-en:q8_0");
+        }
+    }
 
     fn test_native_execution_services() -> Arc<NativeExecutionServices> {
         Arc::new(

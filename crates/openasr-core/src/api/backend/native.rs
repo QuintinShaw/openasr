@@ -273,8 +273,7 @@ impl NativeRuntimeModelAdapter {
     /// descriptor is the sole source of this capability fact.
     pub fn requires_forced_aligner_for_voice_id(&self) -> bool {
         !self.descriptor.speaker_segmentation.is_in_decoder()
-            && self.descriptor.word_timestamp_source
-                == crate::arch::WordTimestampSource::ForcedAligner
+            && self.descriptor.word_timestamp_source != crate::arch::WordTimestampSource::Native
     }
 }
 

@@ -405,9 +405,9 @@ fn irregular_chunk_feed_keeps_frame_sequence_and_matches_whole_feed() {
 
 #[test]
 fn cjk_segments_join_without_inserted_space() {
-    let joined = super::join_segment_texts(["你好", "世界"].into_iter());
+    let joined = super::join_segment_texts(["你好", "世界"]);
     assert_eq!(joined, "你好世界");
-    let latin = super::join_segment_texts(["hello", "world"].into_iter());
+    let latin = super::join_segment_texts(["hello", "world"]);
     assert_eq!(latin, "hello world");
 }
 
