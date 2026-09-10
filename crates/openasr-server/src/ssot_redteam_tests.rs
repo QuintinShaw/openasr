@@ -35,7 +35,7 @@ const EXPECTED_ROUTE_MATRIX: &[RouteExpect] = &[
         path: "/v1/history/{id}",
         none: 401,
         device: 403,
-        operator: 404,
+        operator: 400, // The matrix probe omits the required If-Match header.
     },
     RouteExpect {
         method: "DELETE",
