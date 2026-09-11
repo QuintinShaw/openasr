@@ -340,6 +340,26 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertNotIn("needs.resolve.outputs.tag", brew_checkout)
         self.assertIn("ref: ${{ needs.resolve.outputs.tag }}", channels)
 
+    def test_token_publication_explicitly_dispatches_channels_after_publish(self) -> None:
+        release = (ROOT / ".github/workflows/release-core.yml").read_text(encoding="utf-8")
+        dispatch = release.split("\n  dispatch-channels:\n", 1)[1]
+        self.assertIn("needs: [resolve, publish-release]", dispatch)
+        self.assertIn("if: needs.resolve.outputs.should_finalize == 'true' && success()", dispatch)
+        self.assertIn("actions: write", dispatch)
+        self.assertIn("contents: read", dispatch)
+        self.assertNotIn("contents: write", dispatch)
+        self.assertNotIn("secrets.", dispatch)
+        self.assertIn("fail-fast: false", dispatch)
+        self.assertIn("workflow: [publish-core-channels.yml, sync-release-to-cnb.yml]", dispatch)
+        self.assertIn("RELEASE_TAG: ${{ needs.resolve.outputs.tag }}", dispatch)
+        self.assertIn("DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}", dispatch)
+        self.assertIn("WORKFLOW: ${{ matrix.workflow }}", dispatch)
+        self.assertIn(
+            'gh workflow run "$WORKFLOW" --repo "$GITHUB_REPOSITORY" '
+            '--ref "$DEFAULT_BRANCH" -f "tag=$RELEASE_TAG"',
+            dispatch,
+        )
+
     def test_china_asset_mirror_runs_on_github_after_publish_not_on_the_finalizer_host(self) -> None:
         cnb = (ROOT / ".github/workflows/sync-release-to-cnb.yml").read_text(
             encoding="utf-8"

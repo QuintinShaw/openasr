@@ -355,3 +355,28 @@ jobs:
           shared-key: release-core-finalize-ubuntu-latest
       - name: Publish the draft after catalog and notes succeed
         run: scripts/finalize-core-release.sh "${{ needs.resolve.outputs.tag }}"
+
+  dispatch-channels:
+    name: Dispatch ${{ matrix.workflow }}
+    needs: [resolve, publish-release]
+    if: needs.resolve.outputs.should_finalize == 'true' && success()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        workflow: [publish-core-channels.yml, sync-release-to-cnb.yml]
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      WORKFLOW: ${{ matrix.workflow }}
+    steps:
+      # GITHUB_TOKEN publication does not emit a new release-triggered run.
+      # Explicit dispatch preserves each channel's published-release gates and
+      # lets failed dispatches retry without repeating a successful sibling.
+      - name: Start the published-release channel workflow
+        run: gh workflow run "$WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f "tag=$RELEASE_TAG"
