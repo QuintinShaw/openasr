@@ -200,7 +200,11 @@ Key policy: a dedicated B2 application key restricted to the release bucket
 and the `core/` prefix with `listFiles` / `readFiles` / `writeFiles` only
 (no `deleteFiles`), separate from the desktop installer key.
 
-Publishing the release triggers two independent GitHub Actions workflows:
+After publishing with `GITHUB_TOKEN`, the orchestrator explicitly dispatches two
+independent GitHub Actions workflows. A token-created release does not trigger
+new `release: published` workflow runs; those listeners remain available for
+maintainer-created releases. Dispatch jobs run only after `publish-release`
+succeeds, and a failed dispatch can be retried without repeating its sibling:
 
 - `publish-core-channels.yml` moves Docker/Homebrew only after the canonical
   catalog/CDN plane is complete.

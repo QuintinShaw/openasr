@@ -482,4 +482,4 @@ gh release edit "$tag" --repo "$repository" --draft=false --latest
 scripts/qualification-release-lock.sh release "$tag" "$lock_token"
 lock_acquired=false
 echo "RELEASE-PUBLISHED-INERT ${tag}"
-echo "China asset mirror: .github/workflows/sync-release-to-cnb.yml on release published"
+echo "China asset mirror: the orchestrator dispatches .github/workflows/sync-release-to-cnb.yml after publication"
