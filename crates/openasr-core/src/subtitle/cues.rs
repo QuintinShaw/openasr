@@ -24,8 +24,8 @@ use crate::api::backend::{Segment, Transcription, WordTimestamp};
 /// Preferred cue duration. Cues are grown up to this bound before a cut is
 /// forced, so most cues land at or under it.
 const TARGET_CUE_SECONDS: f32 = 6.0;
-/// Hard ceiling used only when merging a dangling orphan tail back into its
-/// neighbour; a normal cue is already bounded by [`TARGET_CUE_SECONDS`].
+/// Hard ceiling for orphan merges and display stretch; normal cue packing is
+/// bounded by [`TARGET_CUE_SECONDS`].
 const MAX_CUE_SECONDS: f32 = 8.0;
 /// ~42 characters x 2 lines for Latin-script cues.
 const LATIN_MAX_CHARS: usize = 84;
@@ -40,8 +40,8 @@ const LATIN_MAX_CPS: f32 = 21.0;
 const CJK_MAX_CPS: f32 = 9.0;
 /// Inter-word gap treated as a deliberate pause when choosing a forced cut.
 const MIN_PAUSE_GAP_S: f32 = 0.35;
-/// A trailing piece of this many words or fewer is treated as an orphan and
-/// merged back into the previous cue when it fits within the hard caps.
+/// A piece of this many words or fewer is treated as an orphan and merged
+/// into a neighbour when it fits within the hard caps.
 const ORPHAN_MAX_WORDS: usize = 2;
 
 /// Re-segment every segment of `transcription` into subtitle-grade cues,
@@ -62,7 +62,9 @@ pub fn resegment_transcription_cues(mut transcription: Transcription) -> Transcr
 }
 
 /// Split attributed segments into short subtitle cues, then layout display ends
-/// with CPS stretch clamped to the next cue start or `audio_duration_s`.
+/// with CPS stretch clamped to the next cue start, `audio_duration_s`, and the
+/// hard duration cap. Packing uses bounded candidate display windows for CPS
+/// while preserving the original acoustic word timestamps.
 ///
 /// Speaker identity on each input segment is copied onto every child cue;
 /// segments are never merged, so a speaker change is always a hard boundary.
@@ -149,7 +151,9 @@ pub fn segment_into_cues(segment: Segment) -> Vec<Segment> {
 /// Apply bounded CPS display stretch across packed cues.
 ///
 /// `hard_end` for cue `i` is the next cue's start, or `audio_duration_s` for
-/// the last cue. Stretch only when the CPS target fits inside that bound;
+/// the last cue, capped by the audio end when known. The maximum cue duration
+/// limits display stretch without shortening an unsplittable acoustic span.
+/// Stretch only when the CPS target fits inside that bound;
 /// otherwise keep the acoustic end (clamped). Text is never rewritten.
 fn layout_cue_display_ends(mut cues: Vec<Segment>, audio_duration_s: Option<f32>) -> Vec<Segment> {
     let n = cues.len();
@@ -170,6 +174,8 @@ fn layout_cue_display_ends(mut cues: Vec<Segment>, audio_duration_s: Option<f32>
             cues[i].end = acoustic_end;
             continue;
         };
+        let hard_end = audio_hard_end.map_or(hard_end, |audio_end| hard_end.min(audio_end));
+        let hard_end = hard_end.min((start + MAX_CUE_SECONDS).max(acoustic_end));
         let chars: Vec<char> = cues[i].text.chars().collect();
         let limits = cue_limits(&chars);
         let content = chars
@@ -345,31 +351,35 @@ fn pack_tokens(chars: &[char], tokens: &[CueToken], limits: CueLimits) -> Vec<(u
     let mut ranges = Vec::new();
     let mut start = 0usize;
     while start < n {
-        let mut end = start;
+        let mut end = attached_punctuation_end(chars, tokens, start);
         // Grow the cue until it hits a content-bearing sentence boundary, a
         // deliberate pause before the next token, runs out of tokens, or the
         // next token would overflow the target caps.
-        while !(ends_sentence(chars, &tokens[end]) && range_has_content(chars, tokens, start, end))
+        while !(ends_sentence(chars, tokens, end) && range_has_content(chars, tokens, start, end))
             && end + 1 < n
-            && fits(chars, tokens, start, end + 1, limits, TARGET_CUE_SECONDS)
         {
-            let gap = tokens[end + 1].start - tokens[end].end;
             // Active pause cut: end the cue at a real breath even when the
             // running total is still under char/duration/CPS caps. The
             // MIN_PAUSE_GAP_S floor (0.35s) avoids chopping after the first
             // word on ordinary short inter-word gaps.
-            if gap >= MIN_PAUSE_GAP_S && range_has_content(chars, tokens, start, end) {
+            if deliberate_pause_after(chars, tokens, end)
+                && range_has_content(chars, tokens, start, end)
+            {
                 break;
             }
-            end += 1;
+            let next = attached_punctuation_end(chars, tokens, end + 1);
+            if !fits(chars, tokens, start, next, limits, TARGET_CUE_SECONDS) {
+                break;
+            }
+            end = next;
         }
-        let cut = if (ends_sentence(chars, &tokens[end])
+        let cut = if (ends_sentence(chars, tokens, end)
             && range_has_content(chars, tokens, start, end))
             || end == n - 1
         {
             end
         } else if end + 1 < n
-            && (tokens[end + 1].start - tokens[end].end) >= MIN_PAUSE_GAP_S
+            && deliberate_pause_after(chars, tokens, end)
             && range_has_content(chars, tokens, start, end)
         {
             // Grow stopped on a deliberate pause; keep the cut there rather
@@ -382,7 +392,53 @@ fn pack_tokens(chars: &[char], tokens: &[CueToken], limits: CueLimits) -> Vec<(u
         ranges.push((start, cut));
         start = cut + 1;
     }
-    merge_orphan_tails(chars, tokens, ranges, limits)
+    merge_orphans(chars, tokens, ranges, limits)
+}
+
+/// Opening punctuation belongs to the following content; closing punctuation
+/// belongs to the preceding content even when its emission point is delayed.
+/// Keep indices intact so real word records still map 1:1.
+fn attached_punctuation_end(chars: &[char], tokens: &[CueToken], mut end: usize) -> usize {
+    while end + 1 < tokens.len() && is_opening_token(chars, &tokens[end]) {
+        end += 1;
+    }
+    while end + 1 < tokens.len() && is_closing_token(chars, &tokens[end + 1]) {
+        end += 1;
+    }
+    end
+}
+
+fn is_opening_token(chars: &[char], token: &CueToken) -> bool {
+    let span = &chars[token.char_start..token.char_end];
+    span.iter().any(|c| !c.is_whitespace())
+        && span.iter().enumerate().all(|(offset, c)| {
+            c.is_whitespace() || is_opening_punct_at(chars, token.char_start + offset)
+        })
+}
+
+fn is_closing_token(chars: &[char], token: &CueToken) -> bool {
+    let span = &chars[token.char_start..token.char_end];
+    span.iter().any(|c| !c.is_whitespace())
+        && span.iter().all(|c| !char_has_content(*c))
+        && !is_opening_token(chars, token)
+}
+
+/// Punctuation timestamps are not breaths. Measure pauses between the content
+/// on either side so a delayed comma cannot hide a deliberate speech pause.
+fn deliberate_pause_after(chars: &[char], tokens: &[CueToken], end: usize) -> bool {
+    if end + 1 >= tokens.len() || attached_punctuation_end(chars, tokens, end) != end {
+        return false;
+    }
+    let previous = tokens[..=end]
+        .iter()
+        .rev()
+        .find(|token| !is_closing_token(chars, token) && !is_opening_token(chars, token));
+    let next = tokens[end + 1..]
+        .iter()
+        .find(|token| !is_closing_token(chars, token) && !is_opening_token(chars, token));
+    previous
+        .zip(next)
+        .is_some_and(|(previous, next)| next.start - previous.end >= MIN_PAUSE_GAP_S)
 }
 
 /// Final CPS / duration / char-budget gate before a range is committed.
@@ -390,21 +446,23 @@ fn pack_tokens(chars: &[char], tokens: &[CueToken], limits: CueLimits) -> Vec<(u
 /// The grow loop already refuses to *add* a token that would overflow, but a
 /// subsequent natural cut (pause / clause / widest gap) can shrink duration
 /// faster than content and raise CPS above the cap. Shrink until the range
-/// fits. A single token that still fails is retained for emission; later
+/// fits. A single token with its attached closing punctuation is unsplittable
+/// and retained for emission even when it fails; later
 /// layout may stretch its display end only when a hard bound (next cue /
 /// audio end) has room -- never by inventing an unbounded end.
 fn enforce_range_fits(
     chars: &[char],
     tokens: &[CueToken],
     start: usize,
-    mut end: usize,
+    end: usize,
     limits: CueLimits,
 ) -> usize {
     if fits(chars, tokens, start, end, limits, TARGET_CUE_SECONDS) {
         return end;
     }
-    if start >= end {
-        // Physically unsplittable single token; keep it (bounded layout later).
+    let first_end = attached_punctuation_end(chars, tokens, start);
+    if first_end >= end {
+        // Physically unsplittable content and punctuation; keep bounded layout.
         return end;
     }
     // Prefer a natural cut inside the failing window when that sub-range fits.
@@ -412,25 +470,17 @@ fn enforce_range_fits(
     if preferred < end && fits(chars, tokens, start, preferred, limits, TARGET_CUE_SECONDS) {
         return preferred;
     }
-    // Walk end backward until the prefix fits, keeping at least one token
-    // (and preferring to leave content when the tail is pure punctuation).
-    while end > start {
-        let candidate = end - 1;
-        if fits(chars, tokens, start, candidate, limits, TARGET_CUE_SECONDS)
+    // Walk legal boundaries backward; never strand closing punctuation.
+    for candidate in (first_end..end).rev() {
+        if attached_punctuation_end(chars, tokens, candidate) == candidate
+            && fits(chars, tokens, start, candidate, limits, TARGET_CUE_SECONDS)
             && range_has_content(chars, tokens, start, candidate)
         {
             return candidate;
         }
-        // Still failing, or candidate is punctuation-only: keep shrinking as
-        // long as a content-bearing shorter prefix remains.
-        if candidate > start && range_has_content(chars, tokens, start, candidate) {
-            end = candidate;
-            continue;
-        }
-        break;
     }
-    // Last resort: single leading token; layout may stretch only inside bounds.
-    start
+    // Last resort: one content token and its punctuation, with bounded layout.
+    first_end
 }
 
 /// Pick the split point within `[start, end]` for a sentence that is too long
@@ -439,19 +489,24 @@ fn enforce_range_fits(
 fn choose_cut(chars: &[char], tokens: &[CueToken], start: usize, end: usize) -> usize {
     // Prefer a real pause so cues breathe with speech rhythm.
     for k in (start..end).rev() {
-        let gap = tokens[k + 1].start - tokens[k].end;
-        if gap >= MIN_PAUSE_GAP_S && range_has_content(chars, tokens, start, k) {
+        if deliberate_pause_after(chars, tokens, k) && range_has_content(chars, tokens, start, k) {
             return k;
         }
     }
     for k in (start..=end).rev() {
-        if ends_clause(chars, &tokens[k]) && range_has_content(chars, tokens, start, k) {
+        if attached_punctuation_end(chars, tokens, k) == k
+            && ends_clause(chars, &tokens[k])
+            && range_has_content(chars, tokens, start, k)
+        {
             return k;
         }
     }
     let mut best_k = end;
     let mut best_gap = 0.0f32;
     for k in start..end {
+        if attached_punctuation_end(chars, tokens, k) != k {
+            continue;
+        }
         let gap = tokens[k + 1].start - tokens[k].end;
         if gap > best_gap {
             best_gap = gap;
@@ -461,7 +516,7 @@ fn choose_cut(chars: &[char], tokens: &[CueToken], start: usize, end: usize) -> 
     best_k
 }
 
-/// Merge a trailing 1-2 word cue back into its predecessor when they belong to
+/// Merge a 1-2 word cue into a neighbour when they belong to
 /// the same sentence (the predecessor did not end one) and the union still fits
 /// the hard caps -- avoids leaving a dangling orphan word on its own line.
 ///
@@ -469,7 +524,7 @@ fn choose_cut(chars: &[char], tokens: &[CueToken], start: usize, end: usize) -> 
 /// trailing anomaly to the preceding timestamp. Such a zero-duration range is
 /// never useful as a standalone subtitle cue, so merge it even when the prior
 /// token ended a sentence. The original word timestamp remains untouched.
-fn merge_orphan_tails(
+fn merge_orphans(
     chars: &[char],
     tokens: &[CueToken],
     ranges: Vec<(usize, usize)>,
@@ -479,13 +534,12 @@ fn merge_orphan_tails(
     for (first, last) in ranges {
         if let Some(&(prev_first, prev_last)) = merged.last() {
             let word_count = last - first + 1;
-            let prev_ends_sentence = ends_sentence(chars, &tokens[prev_last]);
+            let prev_ends_sentence = ends_sentence(chars, tokens, prev_last);
             let zero_duration = tokens[last].end <= tokens[first].start;
             // Do not re-glue cues the packer split on a deliberate pause:
             // that cut is intentional speech rhythm, not an accidental orphan.
             // Zero-duration forced-aligner repairs still merge (gap <= 0).
-            let pause_between =
-                !zero_duration && (tokens[first].start - tokens[prev_last].end) >= MIN_PAUSE_GAP_S;
+            let pause_between = !zero_duration && deliberate_pause_after(chars, tokens, prev_last);
             if word_count <= ORPHAN_MAX_WORDS
                 && (zero_duration || !prev_ends_sentence)
                 && !pause_between
@@ -497,11 +551,30 @@ fn merge_orphan_tails(
         }
         merged.push((first, last));
     }
+    // A dense short head may fail the grow gate while the longer following
+    // range supplies enough bounded display time for their union.
+    let mut index = 0;
+    while index + 1 < merged.len() {
+        let (first, last) = merged[index];
+        let (_, next_last) = merged[index + 1];
+        if last - first < ORPHAN_MAX_WORDS
+            && !ends_sentence(chars, tokens, last)
+            && !deliberate_pause_after(chars, tokens, last)
+            && fits(chars, tokens, first, next_last, limits, MAX_CUE_SECONDS)
+        {
+            merged[index] = (first, next_last);
+            merged.remove(index + 1);
+        } else {
+            index += 1;
+        }
+    }
     merged
 }
 
 /// Whether `tokens[start..=end]` fits the two-line char budget, max reading
-/// speed (CPS), and `max_seconds` hard duration.
+/// speed (CPS), and `max_seconds` hard duration. CPS uses available display
+/// time through the next token start, bounded by the duration cap and never
+/// earlier than the acoustic end. Without a next token, use the acoustic end.
 fn fits(
     chars: &[char],
     tokens: &[CueToken],
@@ -516,10 +589,11 @@ fn fits(
     if span_chars > limits.char_budget {
         return false;
     }
-    let duration = tokens[end].end - tokens[start].start;
-    if duration > max_seconds {
+    let acoustic_duration = tokens[end].end - tokens[start].start;
+    if acoustic_duration > max_seconds {
         return false;
     }
+    let duration = candidate_display_duration(tokens, start, end, max_seconds);
     // Reading-speed gate: dense text on a short cue is unreadable. Tiny /
     // zero-duration ranges skip the CPS check so zero-duration FA repairs can
     // still merge as orphans.
@@ -530,6 +604,19 @@ fn fits(
         }
     }
     true
+}
+
+fn candidate_display_duration(
+    tokens: &[CueToken],
+    start: usize,
+    end: usize,
+    max_seconds: f32,
+) -> f32 {
+    let acoustic_end = tokens[end].end;
+    let display_end = tokens
+        .get(end + 1)
+        .map_or(acoustic_end, |next| next.start.max(acoustic_end));
+    (display_end - tokens[start].start).min(max_seconds)
 }
 
 fn content_char_count_in_range(
@@ -588,11 +675,15 @@ fn is_wide_script(ch: char) -> bool {
     )
 }
 
-/// Whether the token ends a sentence: its last non-closing character is
-/// sentence-final punctuation. The mark may be its own token (`" . "`) or glued
+/// Whether a boundary ends a sentence, looking back through standalone closing
+/// quotes/brackets. The terminal mark may be its own token (`" . "`) or glued
 /// to the last word (`"country."`).
-fn ends_sentence(chars: &[char], token: &CueToken) -> bool {
-    last_significant_char(chars, token).is_some_and(is_sentence_terminal_char)
+fn ends_sentence(chars: &[char], tokens: &[CueToken], end: usize) -> bool {
+    tokens[..=end]
+        .iter()
+        .rev()
+        .find_map(|token| last_significant_char(chars, token))
+        .is_some_and(is_sentence_terminal_char)
 }
 
 /// Whether the token ends a clause: its last non-closing character is clause
@@ -650,6 +741,33 @@ fn is_segment_closing_punct(c: char) -> bool {
     )
 }
 
+fn is_segment_opening_punct(c: char) -> bool {
+    matches!(
+        c,
+        '(' | '['
+            | '{'
+            | '\u{201c}'
+            | '\u{2018}'
+            | '\u{ff08}'
+            | '\u{3010}'
+            | '\u{300c}'
+            | '\u{300e}'
+    )
+}
+
+fn is_opening_punct_at(chars: &[char], index: usize) -> bool {
+    if is_segment_opening_punct(chars[index]) {
+        return true;
+    }
+    // Symmetric quotes open after whitespace or another opener and close
+    // after content. Directional CJK/curly quotes do not need this context.
+    matches!(chars[index], '"' | '\'')
+        && (index == 0
+            || chars[index - 1].is_whitespace()
+            || is_segment_opening_punct(chars[index - 1]))
+        && chars.get(index + 1).is_some_and(|c| !c.is_whitespace())
+}
+
 fn char_has_content(c: char) -> bool {
     !is_sentence_terminal_char(c)
         && !is_clause_punct(c)
@@ -663,7 +781,8 @@ fn char_has_content(c: char) -> bool {
 /// `world`; `你好，今天` -> one timestamp per ideograph). Try the exact form
 /// first, then allow only punctuation/whitespace to be skipped while matching
 /// an alphanumeric/apostrophe-only token. Separator text is attached to the
-/// preceding span so cue slicing preserves the original transcript verbatim.
+/// preceding span, except opening punctuation belongs to the following span,
+/// so cue slicing preserves the original transcript verbatim.
 /// Returns `None` if content characters disagree, so the caller falls back to
 /// synthesised tokens rather than mis-slicing text.
 fn word_char_spans(chars: &[char], words: &[WordTimestamp]) -> Option<Vec<(usize, usize)>> {
@@ -686,6 +805,18 @@ fn word_char_spans(chars: &[char], words: &[WordTimestamp]) -> Option<Vec<(usize
         first.0 = 0;
     }
     for index in 0..spans.len().saturating_sub(1) {
+        let gap_start = spans[index].1;
+        let gap_end = spans[index + 1].0;
+        if let Some(offset) =
+            chars[gap_start..gap_end]
+                .iter()
+                .enumerate()
+                .find_map(|(offset, _)| {
+                    is_opening_punct_at(chars, gap_start + offset).then_some(offset)
+                })
+        {
+            spans[index + 1].0 = gap_start + offset;
+        }
         spans[index].1 = spans[index + 1].0;
     }
     if let Some(last) = spans.last_mut() {
@@ -1071,6 +1202,38 @@ mod tests {
     }
 
     #[test]
+    fn display_cap_preserves_long_unsplittable_acoustic_spans() {
+        for words in [vec![word("Hello", 0.0, 12.0)], Vec::new()] {
+            let mut original = segment("Hello", words);
+            original.end = 12.0;
+            for audio_duration in [None, Some(15.0)] {
+                let cues = resegment_segments_into_cues(vec![original.clone()], audio_duration);
+                assert_eq!(cues, vec![original.clone()]);
+            }
+
+            let next = segment("Next", vec![word("Next", 14.0, 15.0)]);
+            let cues =
+                resegment_segments_into_cues(vec![original.clone(), next.clone()], Some(15.0));
+            assert_eq!(cues, vec![original, next]);
+        }
+    }
+
+    #[test]
+    fn long_unsplittable_acoustic_spans_still_obey_external_bounds() {
+        let original = segment("Hello", vec![word("Hello", 0.0, 12.0)]);
+        let cues = resegment_segments_into_cues(vec![original.clone()], Some(10.0));
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].end, 10.0);
+        assert_eq!(cues[0].words, original.words);
+
+        let next = segment("Next", vec![word("Next", 10.0, 11.0)]);
+        let cues = resegment_segments_into_cues(vec![original.clone(), next], Some(15.0));
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].end, cues[1].start);
+        assert_eq!(cues[0].words, original.words);
+    }
+
+    #[test]
     fn merges_trailing_orphan_into_previous_cue() {
         // Duration forces a cut that leaves a dangling two-word tail of the
         // same sentence. Inter-word gaps stay below MIN_PAUSE_GAP_S so the
@@ -1162,12 +1325,15 @@ mod tests {
             acoustic.len() >= 2,
             "high-CPS multi-token run must split: {acoustic:?}"
         );
-        // Multi-token acoustic ranges must not silently exceed the CPS cap;
+        // Multi-token ranges must fit the bounded candidate display window;
         // single-token leftovers may still be dense until layout stretches
         // (and only when a hard end has room).
-        for cue in &acoustic {
+        for (index, cue) in acoustic.iter().enumerate() {
             if cue.words.len() > 1 {
-                let duration = (cue.end - cue.start).max(1e-6);
+                let horizon = acoustic
+                    .get(index + 1)
+                    .map_or(cue.end, |next| next.start.max(cue.end));
+                let duration = (horizon - cue.start).clamp(1e-6, MAX_CUE_SECONDS);
                 let content = cue.text.chars().filter(|c| char_has_content(*c)).count();
                 let cps = content as f32 / duration;
                 assert!(
@@ -1208,8 +1374,330 @@ mod tests {
     }
 
     #[test]
+    fn point_words_use_bounded_display_time_without_rewriting_acoustics() {
+        let text = "\u{4f60}\u{597d}\u{3002}\u{4eca}";
+        let words = vec![
+            word("\u{4f60}", 0.0, 0.0395),
+            word("\u{597d}\u{3002}", 0.16, 0.1995),
+            word("\u{4eca}", 0.32, 0.3595),
+        ];
+        let original = segment(text, words.clone());
+        let acoustic = segment_into_cues(original.clone());
+        assert_eq!(acoustic.len(), 2, "{acoustic:?}");
+        assert_eq!(acoustic[0].words, words[..2]);
+        assert_eq!(acoustic[0].end, 0.1995);
+        assert!(2.0 / (acoustic[0].end - acoustic[0].start) > CJK_MAX_CPS);
+
+        let displayed = resegment_segments_into_cues(vec![original.clone()], Some(0.6));
+        assert_eq!(displayed[0].text, acoustic[0].text);
+        assert!(2.0 / (displayed[0].end - displayed[0].start) <= CJK_MAX_CPS + 1e-3);
+        assert!(displayed[0].end <= displayed[1].start);
+        assert_eq!(
+            displayed
+                .iter()
+                .flat_map(|cue| cue.words.clone())
+                .collect::<Vec<_>>(),
+            words
+        );
+        let unbounded = resegment_segments_into_cues(vec![original], None);
+        assert_eq!(unbounded.last().unwrap().end, 0.3595);
+    }
+
+    #[test]
+    fn merges_short_point_word_head_into_longer_following_range() {
+        let text = "\u{4f60}\u{597d}\u{4e16}\u{754c}\u{4eca}\u{5929}\u{5929}\u{6c14}";
+        let starts = [0.0, 0.08, 0.16, 0.34, 0.52, 0.70, 0.88, 1.06];
+        let words = text
+            .chars()
+            .zip(starts)
+            .map(|(ch, start)| word(&ch.to_string(), start, start + 0.0395))
+            .collect::<Vec<_>>();
+        let original = segment(text, words.clone());
+        let chars = text.chars().collect::<Vec<_>>();
+        let (tokens, _) = build_tokens(&original, &chars);
+        let limits = cue_limits(&chars);
+        // The first two tokens cannot fit, but the longer union can. The
+        // following range is too long to be repaired as a trailing orphan.
+        assert!(!fits(&chars, &tokens, 0, 1, limits, TARGET_CUE_SECONDS));
+        assert!(fits(&chars, &tokens, 1, 7, limits, TARGET_CUE_SECONDS));
+        assert_eq!(
+            merge_orphans(&chars, &tokens, vec![(0, 0), (1, 7)], limits),
+            vec![(0, 7)]
+        );
+        let cues = segment_into_cues(original);
+        assert_eq!(cues.len(), 1, "{cues:?}");
+        assert_eq!(cues[0].text, text);
+        assert_eq!(cues[0].words, words);
+    }
+
+    #[test]
+    fn orphan_repairs_respect_cps_chars_duration_sentences_and_pauses() {
+        let words = vec![
+            word("a", 0.0, 0.04),
+            word("b", 0.08, 0.12),
+            word("c", 0.24, 0.28),
+            word("d", 0.40, 0.44),
+        ];
+        let original = segment("a b c d", words);
+        let chars = original.text.chars().collect::<Vec<_>>();
+        let (tokens, _) = build_tokens(&original, &chars);
+        let limits = cue_limits(&chars);
+        for ranges in [vec![(0, 0), (1, 3)], vec![(0, 2), (3, 3)]] {
+            assert_eq!(
+                merge_orphans(&chars, &tokens, ranges.clone(), limits),
+                vec![(0, 3)]
+            );
+            for constrained in [
+                CueLimits {
+                    max_cps: 8.0,
+                    ..limits
+                },
+                CueLimits {
+                    char_budget: 6,
+                    ..limits
+                },
+            ] {
+                assert_eq!(
+                    merge_orphans(&chars, &tokens, ranges.clone(), constrained),
+                    ranges
+                );
+            }
+            let mut long_words = original.words.clone();
+            long_words[3].end = MAX_CUE_SECONDS + 0.1;
+            let (long_tokens, _) = build_tokens(&segment(&original.text, long_words), &chars);
+            assert_eq!(
+                merge_orphans(&chars, &long_tokens, ranges.clone(), limits),
+                ranges
+            );
+        }
+        for first in ["a.", "a"] {
+            let words = vec![
+                word(first, 0.0, 0.1),
+                word("b", 0.5, 0.6),
+                word("c", 0.7, 0.8),
+                word("d", 0.9, 1.0),
+            ];
+            let cues = segment_into_cues(segment(&format!("{first} b c d"), words));
+            assert_eq!(cues.len(), 2, "{cues:?}");
+            assert_eq!(cues[0].text, first);
+        }
+        let cues = segment_into_cues(segment(
+            "a. b c d",
+            vec![
+                word("a.", 0.0, 0.1),
+                word("b", 0.2, 0.3),
+                word("c", 0.4, 0.5),
+                word("d", 0.6, 0.7),
+            ],
+        ));
+        assert_eq!(cues.len(), 2, "a sentence boundary is not an orphan");
+    }
+
+    #[test]
+    fn delayed_closing_punctuation_stays_with_preceding_sentence() {
+        for (text, tokens, expected) in [
+            ("We go. Next", ["We", "go", ".", "Next"], ["We go.", "Next"]),
+            (
+                "\u{4f60}\u{597d}\u{3002}\u{4eca}",
+                ["\u{4f60}", "\u{597d}", "\u{3002}", "\u{4eca}"],
+                ["\u{4f60}\u{597d}\u{3002}", "\u{4eca}"],
+            ),
+        ] {
+            let words = vec![
+                word(tokens[0], 0.0, 0.0395),
+                word(tokens[1], 0.2, 0.2395),
+                word(tokens[2], 0.8685, 0.908),
+                word(tokens[3], 1.05, 1.5),
+            ];
+            let cues = segment_into_cues(segment(text, words.clone()));
+            assert_eq!(
+                cues.iter().map(|cue| cue.text.as_str()).collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                cues.iter()
+                    .flat_map(|cue| cue.words.clone())
+                    .collect::<Vec<_>>(),
+                words
+            );
+        }
+    }
+
+    #[test]
+    fn natural_cut_does_not_strand_closing_punctuation() {
+        let words = vec![
+            word("one", 0.0, 0.2),
+            word("two", 0.3, 0.5),
+            word(",", 1.129, 1.169),
+            word("three", 1.3, 1.6),
+            word("four", 1.7, 2.0),
+        ];
+        let original = segment("one two, three four", words.clone());
+        let chars = original.text.chars().collect::<Vec<_>>();
+        let (tokens, _) = build_tokens(&original, &chars);
+        assert_eq!(choose_cut(&chars, &tokens, 0, 4), 2);
+        let cues = segment_into_cues(original);
+        assert_eq!(cues[0].text, "one two,");
+        assert_eq!(cues[1].text, "three four");
+        assert_eq!(
+            cues.iter()
+                .flat_map(|cue| cue.words.clone())
+                .collect::<Vec<_>>(),
+            words
+        );
+    }
+
+    #[test]
+    fn closing_quote_preserves_sentence_boundary_and_next_opening_punctuation() {
+        let text = "\u{300c}\u{597d}\u{3002}\u{300d}\u{300c}\u{4eca}\u{5929}\u{300d}";
+        let tokens = [
+            "\u{300c}\u{597d}",
+            "\u{3002}",
+            "\u{300d}",
+            "\u{300c}",
+            "\u{4eca}",
+            "\u{5929}",
+            "\u{300d}",
+        ];
+        let words = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, token)| word(token, i as f32 * 0.2, i as f32 * 0.2 + 0.1))
+            .collect::<Vec<_>>();
+        let cues = segment_into_cues(segment(text, words.clone()));
+        assert_eq!(cues.len(), 2, "{cues:?}");
+        assert_eq!(cues[0].text, "\u{300c}\u{597d}\u{3002}\u{300d}");
+        assert_eq!(cues[1].text, "\u{300c}\u{4eca}\u{5929}\u{300d}");
+        assert_eq!(
+            cues.iter()
+                .flat_map(|cue| cue.words.clone())
+                .collect::<Vec<_>>(),
+            words
+        );
+    }
+
+    #[test]
+    fn forced_aligner_mapping_leaves_opening_punctuation_on_next_sentence() {
+        for (text, expected) in [
+            ("hi. (next)", ["hi.", "(next)"]),
+            ("hi. \"next\"", ["hi.", "\"next\""]),
+            (
+                "\u{597d}\u{3002}\u{300c}\u{4eca}\u{300d}",
+                ["\u{597d}\u{3002}", "\u{300c}\u{4eca}\u{300d}"],
+            ),
+        ] {
+            let tokens = if text.starts_with("hi") {
+                ["hi", "next"]
+            } else {
+                ["\u{597d}", "\u{4eca}"]
+            };
+            let words = vec![word(tokens[0], 0.0, 0.2), word(tokens[1], 0.3, 0.6)];
+            let cues = segment_into_cues(segment(text, words.clone()));
+            assert_eq!(
+                cues.iter().map(|cue| cue.text.as_str()).collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                cues.iter()
+                    .flat_map(|cue| cue.words.clone())
+                    .collect::<Vec<_>>(),
+                words
+            );
+        }
+    }
+
+    #[test]
+    fn unsplittable_dense_word_keeps_its_punctuation_and_bounded_end() {
+        let words = vec![
+            word("abcdefghij", 0.0, 0.0395),
+            word(".", 0.04, 0.0795),
+            word("(", 0.08, 0.09),
+            word("klmnopqrst", 0.1, 0.1395),
+            word(")", 0.14, 0.1795),
+        ];
+        let cues = resegment_segments_into_cues(
+            vec![segment("abcdefghij. (klmnopqrst)", words.clone())],
+            Some(0.2),
+        );
+        assert_eq!(cues.len(), 2, "{cues:?}");
+        assert_eq!(cues[0].text, "abcdefghij.");
+        assert_eq!(cues[1].text, "(klmnopqrst)");
+        assert_eq!(cues[0].end, 0.0795);
+        assert_eq!(cues[1].end, 0.1795);
+        assert_eq!(
+            cues.iter()
+                .flat_map(|cue| cue.words.clone())
+                .collect::<Vec<_>>(),
+            words
+        );
+        let words = vec![
+            word("hi.", 0.0, 0.2),
+            word("\"", 0.3, 0.31),
+            word("next", 0.32, 0.6),
+            word("\"", 0.61, 0.62),
+        ];
+        let cues = segment_into_cues(segment("hi. \"next\"", words.clone()));
+        assert_eq!(cues.len(), 2, "{cues:?}");
+        assert_eq!(cues[0].text, "hi.");
+        assert_eq!(cues[1].text, "\"next\"");
+        assert_eq!(
+            cues.iter()
+                .flat_map(|cue| cue.words.clone())
+                .collect::<Vec<_>>(),
+            words
+        );
+    }
+
+    #[test]
+    fn candidate_window_is_capped_and_never_shorter_than_acoustics() {
+        let original = segment(
+            "a b c",
+            vec![
+                word("a", 0.0, 0.2),
+                word("b", 0.1, 0.15),
+                word("c", 20.0, 20.2),
+            ],
+        );
+        let chars = original.text.chars().collect::<Vec<_>>();
+        let (tokens, _) = build_tokens(&original, &chars);
+        assert_eq!(
+            candidate_display_duration(&tokens, 0, 0, TARGET_CUE_SECONDS),
+            0.2
+        );
+        assert_eq!(
+            candidate_display_duration(&tokens, 0, 1, TARGET_CUE_SECONDS),
+            TARGET_CUE_SECONDS
+        );
+        assert_eq!(
+            candidate_display_duration(&tokens, 0, 1, MAX_CUE_SECONDS),
+            MAX_CUE_SECONDS
+        );
+        assert!((candidate_display_duration(&tokens, 2, 2, MAX_CUE_SECONDS) - 0.2).abs() < 1e-3);
+        let long = "a".repeat(200);
+        let cues = resegment_segments_into_cues(
+            vec![segment(&long, vec![word(&long, 0.0, 0.1)])],
+            Some(20.0),
+        );
+        assert_eq!(
+            cues[0].end, 0.1,
+            "an unsplittable word cannot stretch past the duration cap"
+        );
+    }
+
+    #[test]
+    fn empty_and_single_token_inputs_remain_unchanged() {
+        assert!(resegment_segments_into_cues(Vec::new(), None).is_empty());
+        for original in [
+            segment("", Vec::new()),
+            segment("hi", vec![word("hi", 0.0, 0.0395)]),
+        ] {
+            assert_eq!(segment_into_cues(original.clone()), vec![original]);
+        }
+    }
+
+    #[test]
     fn does_not_merge_orphan_across_deliberate_pause() {
-        // Pause-split cues of orphan length must stay split; merge_orphan_tails
+        // Pause-split cues of orphan length must stay split; merge_orphans
         // must not glue them back across gap >= MIN_PAUSE_GAP_S.
         let text = "hello world";
         let words = vec![
