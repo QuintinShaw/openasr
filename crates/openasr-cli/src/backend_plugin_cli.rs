@@ -24,9 +24,10 @@ pub(crate) fn backend_plugin_command(command: BackendPluginCommand) -> Result<()
         }
         BackendPluginCommand::DescribeProvider { provider } => {
             let catalog = load_backend_catalog(&home)?;
-            let description =
-                describe_backend_provider(&catalog, provider_vendor(&provider), &home)?;
-            println!("{}", serde_json::to_string(&description)?);
+            match describe_backend_provider(&catalog, provider_vendor(&provider), &home) {
+                Ok(description) => println!("{}", serde_json::to_string(&description)?),
+                Err(error) => return provider_failure(error),
+            }
         }
         BackendPluginCommand::PrepareProvider { provider } => {
             let catalog = load_backend_catalog(&home)?;
@@ -209,17 +210,18 @@ fn terminal_record(event: &'static str, value: serde_json::Value) -> serde_json:
 }
 
 fn provider_failure(error: openasr_core::BackendActivationError) -> Result<()> {
-    println!(
-        "{}",
-        json!({
-            "schema_version": 1,
-            "event": "failed",
-            "class": error.machine_failure_class(),
-            "code": error.machine_failure_code(),
-            "message": error.to_string(),
-        })
-    );
+    println!("{}", provider_failure_record(&error));
     Err(anyhow::anyhow!("backend provider command failed"))
+}
+
+fn provider_failure_record(error: &openasr_core::BackendActivationError) -> serde_json::Value {
+    json!({
+        "schema_version": 1,
+        "event": "failed",
+        "class": error.machine_failure_class(),
+        "code": error.machine_failure_code(),
+        "message": error.to_string(),
+    })
 }
 
 fn print_progress(progress: PullProgress) {
@@ -265,5 +267,16 @@ mod tests {
         assert_eq!(record["schema_version"], 1);
         assert_eq!(record["event"], "prepared");
         assert_eq!(record["backend_id"], "cuda-windows-sm_86");
+    }
+
+    #[test]
+    fn provider_failure_record_preserves_typed_activation_classification() {
+        let record = provider_failure_record(&openasr_core::BackendActivationError::DeviceProbe {
+            code: "driver_unavailable",
+            message: "redacted".to_string(),
+        });
+        assert_eq!(record["event"], "failed");
+        assert_eq!(record["class"], "unsupported_device");
+        assert_eq!(record["code"], "driver_unavailable");
     }
 }

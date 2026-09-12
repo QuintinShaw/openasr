@@ -2722,6 +2722,15 @@ fn remove_subcommand_is_removed() {
 }
 
 #[test]
+fn live_diarize_compatibility_flag_is_removed() {
+    openasr()
+        .args(["live", "--diarize"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument '--diarize'"));
+}
+
+#[test]
 fn transcribe_rejects_unknown_saved_default_model_value() {
     let home = temp_home();
     std::fs::write(

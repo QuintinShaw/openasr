@@ -95,13 +95,6 @@ const EXPECTED_ROUTE_MATRIX: &[RouteExpect] = &[
     },
     RouteExpect {
         method: "GET",
-        path: "/v1/audio/transcriptions/progress",
-        none: 401,
-        device: 200,
-        operator: 200,
-    },
-    RouteExpect {
-        method: "GET",
         path: "/v1/audio/transcriptions/{id}/progress",
         none: 401,
         device: 200,
@@ -1498,100 +1491,6 @@ async fn operator_stream_file_job_keeps_enrolled_voice_id_fail_closed() {
             || body.to_ascii_lowercase().contains("diariz")
             || body.to_ascii_lowercase().contains("speaker"),
         "operator stream enrolled Voice ID must fail closed: {body}"
-    );
-}
-
-/// SSOT 21: the id-less progress endpoint uses the same owner gate as
-/// `{id}/progress`. A paired device must not observe an operator-local job.
-#[tokio::test]
-async fn legacy_progress_hides_operator_local_and_peer_jobs_from_device() {
-    use openasr_core::api::backend::{
-        ProgressBackendClass, ProgressPlan, ProgressPlanInput, ProgressReporter,
-        ProgressSegmenterKind,
-    };
-
-    let plan = ProgressPlan::build(ProgressPlanInput {
-        audio_duration_s: 1.0,
-        voice_id: false,
-        external_diarize: false,
-        segmenter: ProgressSegmenterKind::Auto,
-        punctuate: false,
-        align: false,
-        backend: ProgressBackendClass::AutoOrCpu,
-        persist: false,
-    });
-    let _reporter = ProgressReporter::install(Some("progress-job".to_string()), plan);
-    let auth = ServerAuth::pairing("admin-token");
-    {
-        let mut pairing = auth.lock_pairing();
-        pairing.credentials.insert(
-            "aaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            DeviceCredentialRecord {
-                device_id: "aaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-                device_name: "Phone".to_string(),
-                token_hash: bearer_token_hash("device-token"),
-                issued_at_unix_secs: 1,
-                last_seen_unix_secs: None,
-                revoked: false,
-            },
-        );
-    }
-    let distribution = DistributionContext::new(DistributionRuntime {
-        openasr_home: None,
-        catalog_url: None,
-        catalog_local_override: None,
-    });
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        header::AUTHORIZATION,
-        "Bearer device-token".parse().unwrap(),
-    );
-
-    let hidden = transcription_progress(
-        axum::Extension(auth.clone()),
-        axum::Extension(distribution.clone()),
-        headers.clone(),
-    )
-    .await
-    .expect("device reading operator-local progress must not error");
-    let hidden_json = to_bytes(hidden.into_body(), 1024 * 64).await.unwrap();
-    let hidden_value: serde_json::Value = serde_json::from_slice(&hidden_json).unwrap();
-    assert_eq!(
-        hidden_value["phase"],
-        serde_json::Value::Null,
-        "operator-local progress must read idle to a paired device: {hidden_value}"
-    );
-
-    distribution.set_transcription_owner("progress-job", Some("bbbbbbbbbbbbbbbbbbbbbbbb"));
-    let peer = transcription_progress(
-        axum::Extension(auth.clone()),
-        axum::Extension(distribution.clone()),
-        headers.clone(),
-    )
-    .await
-    .expect("device reading a peer job must not error");
-    let peer_json = to_bytes(peer.into_body(), 1024 * 64).await.unwrap();
-    let peer_value: serde_json::Value = serde_json::from_slice(&peer_json).unwrap();
-    assert_eq!(
-        peer_value["phase"],
-        serde_json::Value::Null,
-        "peer progress must read idle: {peer_value}"
-    );
-
-    distribution.set_transcription_owner("progress-job", Some("aaaaaaaaaaaaaaaaaaaaaaaa"));
-    let own = transcription_progress(
-        axum::Extension(auth),
-        axum::Extension(distribution),
-        headers,
-    )
-    .await
-    .expect("owner must read its own legacy progress");
-    let own_json = to_bytes(own.into_body(), 1024 * 64).await.unwrap();
-    let own_value: serde_json::Value = serde_json::from_slice(&own_json).unwrap();
-    assert_eq!(
-        own_value["phase"].as_str(),
-        Some("decode"),
-        "owning device must see live progress: {own_value}"
     );
 }
 

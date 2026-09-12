@@ -158,10 +158,9 @@ change the default ASR model. The reserved `translation-model` kind has no curre
 published entries or runtime. `openasr transcribe
 --diarize` is explicit consent for the CLI to install a missing required
 `speaker-diarization` capability pack before the fail-closed capability check.
-Realtime `live --diarize` is a hidden compatibility flag that fails before
-device/model resolution because recording-level Voice ID is
-file-transcription-only. The default CLI `transcribe` / `live` flow installs a
-missing ASR model only with a visible consent prompt (or fails closed when
+Recording-level Voice ID is file-transcription-only. The default CLI
+`transcribe` / `live` flow installs a missing ASR model only with a visible
+consent prompt (or fails closed when
 non-interactive / `--offline`);
 `serve` and the shared resolve path never execute downloads. The pull path is
 fail-closed: HTTPS-only catalog pack URLs, size/sha256 checks, GGUF preflight,

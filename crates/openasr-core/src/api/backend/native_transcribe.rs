@@ -153,15 +153,15 @@ fn request_execution_intent_with_backend_env(
 // increases (no fixed fake percentages, no time-based auto-climb).
 
 #[cfg(test)]
-use super::transcription_progress::{LegacyNativeTranscriptionProgress, NativeTranscriptionPhase};
+use super::transcription_progress::NativeTranscriptionPhase;
 use super::transcription_progress::{
     ProgressBackendClass, ProgressPlan, ProgressPlanInput, ProgressRegistryHandle,
     ProgressReporter, ProgressSegmenterKind, TranscriptionStage, duration_weighted_fraction,
 };
 #[cfg(test)]
 use super::transcription_progress::{
-    clear_progress_registry_for_test, native_transcription_progress,
-    native_transcription_progress_for_id, progress_registry_test_lock,
+    clear_progress_registry_for_test, native_transcription_progress_for_id,
+    progress_registry_test_lock,
 };
 
 /// Decode-stage sub-progress for multi-slice long-form (and the single-pass
@@ -7332,50 +7332,65 @@ mod tests {
     }
 
     #[test]
-    fn native_transcription_progress_legacy_reports_idle_with_no_active_runs() {
+    fn native_transcription_progress_by_id_reports_none_with_no_active_runs() {
         let _serial = progress_registry_test_lock();
         clear_progress_registry_for_test();
-        assert_eq!(
-            native_transcription_progress(),
-            LegacyNativeTranscriptionProgress::Idle
-        );
+        assert_eq!(native_transcription_progress_for_id("no-active-runs"), None);
     }
 
     #[test]
-    fn native_transcription_progress_legacy_reports_the_single_active_run() {
+    fn native_transcription_progress_by_id_reports_the_registered_run() {
         let _serial = progress_registry_test_lock();
         clear_progress_registry_for_test();
-        let id = "legacy-single-active";
+        let id = "progress-single-active";
         let _handle = ProgressRegistryHandle::new(Some(id.to_string()));
         let reporter = ProgressReporter::install(Some(id.to_string()), test_plan(false));
         reporter.enter_stage(TranscriptionStage::Decode);
         reporter.report_fraction(0.33);
-        match native_transcription_progress() {
-            LegacyNativeTranscriptionProgress::Single(p) => {
-                assert_eq!(p.stage, TranscriptionStage::Decode);
-                assert!((p.stage_fraction.unwrap() - 0.33).abs() < 1e-5);
-                assert!((p.fraction - p.overall_fraction).abs() < 1e-9);
-            }
-            other => panic!("expected Single, got {other:?}"),
-        }
+        let progress = native_transcription_progress_for_id(id).expect("registered run progress");
+        assert_eq!(progress.stage, TranscriptionStage::Decode);
+        assert!((progress.stage_fraction.unwrap() - 0.33).abs() < 1e-5);
+        assert!((progress.fraction - progress.overall_fraction).abs() < 1e-9);
         clear_progress_registry_for_test();
     }
 
     #[test]
-    fn native_transcription_progress_legacy_is_ambiguous_with_more_than_one_active_run() {
+    fn native_transcription_progress_by_id_keeps_concurrent_runs_distinct() {
         let _serial = progress_registry_test_lock();
         clear_progress_registry_for_test();
-        let id_a = "legacy-ambiguous-a";
-        let id_b = "legacy-ambiguous-b";
+        let id_a = "progress-a";
+        let id_b = "progress-b";
         let _handle_a = ProgressRegistryHandle::new(Some(id_a.to_string()));
         let _handle_b = ProgressRegistryHandle::new(Some(id_b.to_string()));
         let ra = ProgressReporter::install(Some(id_a.to_string()), test_plan(false));
         let rb = ProgressReporter::install(Some(id_b.to_string()), test_plan(false));
         ra.enter_stage(TranscriptionStage::Decode);
         rb.enter_stage(TranscriptionStage::Decode);
+        ra.report_fraction(0.25);
+        rb.report_fraction(0.75);
         assert_eq!(
-            native_transcription_progress(),
-            LegacyNativeTranscriptionProgress::Ambiguous { active_count: 2 }
+            native_transcription_progress_for_id(id_a)
+                .expect("registered run A progress")
+                .stage,
+            TranscriptionStage::Decode
+        );
+        assert_eq!(
+            native_transcription_progress_for_id(id_b)
+                .expect("registered run B progress")
+                .stage,
+            TranscriptionStage::Decode
+        );
+        assert_eq!(
+            native_transcription_progress_for_id(id_a)
+                .unwrap()
+                .stage_fraction,
+            Some(0.25)
+        );
+        assert_eq!(
+            native_transcription_progress_for_id(id_b)
+                .unwrap()
+                .stage_fraction,
+            Some(0.75)
         );
         clear_progress_registry_for_test();
     }
