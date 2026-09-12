@@ -155,17 +155,10 @@ it fully, be able to explain any line without AI help, and own its maintenance.
 write PR descriptions, issue reports, and reviewer responses yourself — not with AI.
 The full policy and the rules for AI coding agents live in [AGENTS.md](AGENTS.md).
 
-## Developer Certificate of Origin (sign-off)
+## Contribution license
 
 OpenASR uses **inbound = outbound**: contributions are accepted under the same
-[Apache-2.0](LICENSE) license that covers the project. We require a
-[Developer Certificate of Origin](https://developercertificate.org/) sign-off on
-each commit — it certifies you wrote the patch or otherwise have the right to submit
-it under that license. Add it with `git commit -s`, which appends:
-
-```text
-Signed-off-by: Your Name <you@example.com>
-```
+[Apache-2.0](LICENSE) license that covers the project. No DCO sign-off is required.
 
 ## PR checklist
 
@@ -178,5 +171,4 @@ Before opening a PR:
 - `cargo clippy --all-targets -- -D warnings` passes;
 - relevant tests pass;
 - no forbidden artifacts were committed;
-- meaningful AI use is disclosed (see [AGENTS.md](AGENTS.md));
-- commits are signed off (`git commit -s`).
+- meaningful AI use is disclosed (see [AGENTS.md](AGENTS.md)).
