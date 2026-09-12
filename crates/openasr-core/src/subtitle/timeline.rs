@@ -20,8 +20,8 @@ use crate::api::backend::{Segment, Transcription};
 /// - [`Auto`](Self::Auto) (default): guarantee a precise timeline only when
 ///   Voice ID needs word anchors, the response is a subtitle export
 ///   (SRT/VTT), or the caller explicitly refined.
-/// - [`Always`](Self::Always): guarantee precise word timestamps during
-///   transcription (skip the aligner when native anchors already validate).
+/// - [`Always`](Self::Always): run forced alignment during transcription,
+///   even when native anchors already validate.
 /// - [`Off`](Self::Off): do not run the forced aligner for timeline quality;
 ///   keep model-native timestamps. Voice ID that still requires word anchors
 ///   overrides this for the alignment step only (see
@@ -86,15 +86,16 @@ pub struct ForcedAlignmentDecision {
     pub required_for_voice_id: bool,
     /// True when alignment is mandatory for the requested precision / export.
     pub required_for_precision: bool,
-    /// Native anchors already validate; the aligner can be skipped even when
-    /// precision is requested.
+    /// Native anchors already validate; Auto can skip the aligner. Always and
+    /// explicit refine still request alignment regardless of this diagnostic.
     pub native_reliable: bool,
 }
 
 /// Decide whether forced alignment must run for this request.
 ///
 /// V1 never partially splices native and aligned words: when alignment is
-/// needed and native anchors are unreliable, the whole transcript is realigned.
+/// needed, the whole transcript is realigned. Always and explicit refine request
+/// alignment independently of native reliability; failure handling is unchanged.
 pub fn decide_forced_alignment(
     policy: TimelinePrecisionPolicy,
     explicit_refine: bool,
@@ -113,8 +114,8 @@ pub fn decide_forced_alignment(
     // boundary, not a silent degradation.
     let want_precise = required_for_voice_id || required_for_precision;
 
-    let need_align = if explicit_refine {
-        // Explicit refine always runs the aligner (user asked for aligned words).
+    let need_align = if explicit_refine || matches!(policy, TimelinePrecisionPolicy::Always) {
+        // An explicit alignment request takes precedence over native reliability.
         true
     } else if required_for_voice_id && !native_reliable {
         true
@@ -272,27 +273,44 @@ mod tests {
     }
 
     #[test]
-    fn always_aligns_only_when_native_unreliable() {
-        assert!(
-            !decide_forced_alignment(
-                TimelinePrecisionPolicy::Always,
-                false,
-                false,
-                false,
-                &reliable(),
-            )
-            .need_align
-        );
-        assert!(
-            decide_forced_alignment(
-                TimelinePrecisionPolicy::Always,
-                false,
-                false,
-                false,
-                &unreliable(),
-            )
-            .need_align
-        );
+    fn alignment_policy_decision_matrix() {
+        for policy in [
+            TimelinePrecisionPolicy::Auto,
+            TimelinePrecisionPolicy::Always,
+            TimelinePrecisionPolicy::Off,
+        ] {
+            for validation in [reliable(), unreliable()] {
+                for subtitle_export in [false, true] {
+                    for voice_id in [false, true] {
+                        for explicit_refine in [false, true] {
+                            let precision = explicit_refine
+                                || policy == TimelinePrecisionPolicy::Always
+                                || (policy == TimelinePrecisionPolicy::Auto && subtitle_export);
+                            let expected = ForcedAlignmentDecision {
+                                need_align: explicit_refine
+                                    || policy == TimelinePrecisionPolicy::Always
+                                    || ((voice_id || precision) && !validation.is_reliable()),
+                                required_for_voice_id: voice_id,
+                                required_for_precision: precision,
+                                native_reliable: validation.is_reliable(),
+                            };
+                            assert_eq!(
+                                decide_forced_alignment(
+                                    policy,
+                                    explicit_refine,
+                                    voice_id,
+                                    subtitle_export,
+                                    &validation,
+                                ),
+                                expected,
+                                "{policy:?}, {validation:?}, export={subtitle_export}, \
+                                 voice_id={voice_id}, refine={explicit_refine}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -407,6 +425,88 @@ mod tests {
         assert!(out.segments.iter().all(|s| s.words.is_empty()));
         assert!(out.subtitle_cues.iter().all(|c| c.words.is_empty()));
         assert!(out.subtitle_cues.iter().all(|c| c.end > c.start));
+    }
+
+    #[test]
+    fn point_word_projection_preserves_text_identity_and_bounded_export_times() {
+        let mut input = attributed_two_speakers();
+        input.segments[0].text = "We go. Next".to_string();
+        input.segments[0].start = 0.0;
+        input.segments[0].end = 1.2395;
+        input.segments[0].words = vec![
+            word("We", 0.0, 0.0395),
+            word("go", 0.2, 0.2395),
+            word(".", 0.8685, 0.908),
+            word("Next", 1.2, 1.2395),
+        ];
+        input.segments[0].speaker_person_id = Some("person-0".to_string());
+        input.segments[0].speaker_snapshot_label = Some("Alice".to_string());
+        // This unsplittable burst needs more display time than the tight audio
+        // bound permits; a larger known recording end can accommodate it.
+        let dense = "abcdefghijabcdefghijabcdefghij";
+        input.segments[1].text = dense.to_string();
+        input.segments[1].start = 1.4;
+        input.segments[1].end = 1.4395;
+        input.segments[1].words = vec![word(dense, 1.4, 1.4395)];
+        input.text = format!("We go. Next {dense}");
+        let original_words = input
+            .segments
+            .iter()
+            .flat_map(|segment| segment.words.clone())
+            .collect::<Vec<_>>();
+
+        for audio_duration_s in [None, Some(1.5), Some(4.0)] {
+            let out = project_transcription(
+                input.clone(),
+                TimelineProjectOptions {
+                    timeline_quality: TimelineQuality::NativeApproximate,
+                    strip_words: false,
+                    audio_duration_s,
+                },
+            );
+            assert_eq!(out.text, input.text);
+            assert_eq!(out.segments, input.segments);
+            assert_eq!(
+                out.timeline_quality,
+                Some(TimelineQuality::NativeApproximate)
+            );
+            let export = timed_cues_for_export(&out);
+            assert_eq!(export, out.subtitle_cues);
+            assert_eq!(export[0].text, "We go.");
+            assert_eq!(export[1].text, "Next");
+            assert_eq!(
+                export
+                    .iter()
+                    .flat_map(|cue| cue.words.clone())
+                    .collect::<Vec<_>>(),
+                original_words
+            );
+            for cue in &export {
+                assert!(cue.start >= 0.0 && cue.end > cue.start);
+                if let Some(duration) = audio_duration_s {
+                    assert!(cue.end <= duration);
+                }
+                let attributed = input
+                    .segments
+                    .iter()
+                    .find(|segment| segment.speaker == cue.speaker)
+                    .unwrap();
+                assert_eq!(cue.speaker_label, attributed.speaker_label);
+                assert_eq!(cue.speaker_person_id, attributed.speaker_person_id);
+                assert_eq!(
+                    cue.speaker_snapshot_label,
+                    attributed.speaker_snapshot_label
+                );
+            }
+            assert!(export.windows(2).all(|pair| pair[0].end <= pair[1].start));
+            let last = export.last().unwrap();
+            if audio_duration_s == Some(4.0) {
+                assert!(30.0 / (last.end - last.start) <= 21.0 + 1e-3);
+            } else {
+                assert_eq!(last.end, 1.4395);
+                assert!(30.0 / (last.end - last.start) > 21.0);
+            }
+        }
     }
 
     #[test]
