@@ -553,22 +553,29 @@ fn merge_orphans(
     }
     // A dense short head may fail the grow gate while the longer following
     // range supplies enough bounded display time for their union.
-    let mut index = 0;
-    while index + 1 < merged.len() {
-        let (first, last) = merged[index];
-        let (_, next_last) = merged[index + 1];
+    // Compact forward rather than removing from the middle of the vector:
+    // every input range is visited once and the unvisited suffix never moves.
+    let mut repaired = Vec::with_capacity(merged.len());
+    let mut ranges = merged.into_iter();
+    let Some(mut current) = ranges.next() else {
+        return repaired;
+    };
+    for next in ranges {
+        let (first, last) = current;
+        let (_, next_last) = next;
         if last - first < ORPHAN_MAX_WORDS
             && !ends_sentence(chars, tokens, last)
             && !deliberate_pause_after(chars, tokens, last)
             && fits(chars, tokens, first, next_last, limits, MAX_CUE_SECONDS)
         {
-            merged[index] = (first, next_last);
-            merged.remove(index + 1);
+            current = (first, next_last);
         } else {
-            index += 1;
+            repaired.push(current);
+            current = next;
         }
     }
-    merged
+    repaired.push(current);
+    repaired
 }
 
 /// Whether `tokens[start..=end]` fits the two-line char budget, max reading
