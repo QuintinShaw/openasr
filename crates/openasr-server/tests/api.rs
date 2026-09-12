@@ -2446,6 +2446,24 @@ async fn legacy_speaker_routes_are_not_registered() {
 }
 
 #[tokio::test]
+async fn idless_transcription_progress_route_is_not_registered() {
+    let app = openasr_server::app_with_runtime_and_distribution(
+        openasr_server::ServerRuntime::default(),
+        openasr_server::DistributionRuntime::default(),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/audio/transcriptions/progress")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn voice_id_routes_require_operator_credentials_for_paired_devices() {
     let temp = tempfile::tempdir().unwrap();
     let app = openasr_server::app_with_runtime_and_distribution_and_launch_options(

@@ -710,79 +710,10 @@ impl TranscriptionProgressBody {
     }
 }
 
-/// Pure mapping from the core's aggregate legacy read to this endpoint's
-/// wire response, kept separate from [`transcription_progress`] so the
-/// idle/single/ambiguous mapping is unit-testable without needing a real
-/// native transcription in flight.
-fn legacy_progress_response(
-    progress: openasr_core::api::backend::LegacyNativeTranscriptionProgress,
-) -> Result<Response, ApiError> {
-    use openasr_core::api::backend::LegacyNativeTranscriptionProgress;
-    match progress {
-        LegacyNativeTranscriptionProgress::Idle => {
-            Ok(Json(TranscriptionProgressBody::idle()).into_response())
-        }
-        LegacyNativeTranscriptionProgress::Single(progress) => {
-            Ok(Json(TranscriptionProgressBody::from_progress(progress)).into_response())
-        }
-        LegacyNativeTranscriptionProgress::Ambiguous { active_count } => {
-            Err(ApiError::Conflict(format!(
-                "{active_count} native transcriptions are currently in flight; this id-less \
-                 endpoint cannot say which one's progress to report. Poll GET \
-                 /v1/audio/transcriptions/{{id}}/progress with the transcription id instead."
-            )))
-        }
-    }
-}
-
-/// Legacy id-less progress read: `GET /v1/audio/transcriptions/progress`.
-/// Returns `{phase:null,fraction:0,done:0,total:0}` when nothing is running,
-/// exactly as before. The server places no concurrency gate on native
-/// transcription, so more than one file transcription can be in flight at
-/// once; unlike the single-slot design this replaced, an id-less caller in
-/// that situation gets an explicit 409 conflict rather than one arbitrary
-/// run's progress silently impersonating "the" global progress. New callers
-/// should prefer the id-scoped `GET /v1/audio/transcriptions/{id}/progress`
-/// below, which never has this ambiguity. Auth is enforced by the shared
-/// middleware like every other non-operator route. Device tokens only see
-/// jobs they own; an operator-local job (no owner) reads as idle to a
-/// paired device, matching [`transcription_progress_by_id`].
-pub(crate) async fn transcription_progress(
-    Extension(auth): Extension<crate::ServerAuth>,
-    Extension(distribution): Extension<DistributionContext>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    let caller = auth.pairing_device_id_for_headers(&headers);
-    let caller_is_operator = auth.authorizes_pairing_admin(&headers);
-    let visible: Vec<String> = openasr_core::api::backend::native_active_transcription_ids()
-        .into_iter()
-        .filter(|id| {
-            caller_may_control_transcription(
-                distribution.transcription_owner(id).as_deref(),
-                caller.as_deref(),
-                caller_is_operator,
-            )
-        })
-        .collect();
-    let progress = match visible.as_slice() {
-        [] => openasr_core::api::backend::LegacyNativeTranscriptionProgress::Idle,
-        [id] => match openasr_core::api::backend::native_transcription_progress_for_id(id) {
-            Some(progress) => {
-                openasr_core::api::backend::LegacyNativeTranscriptionProgress::Single(progress)
-            }
-            None => openasr_core::api::backend::LegacyNativeTranscriptionProgress::Idle,
-        },
-        ids => openasr_core::api::backend::LegacyNativeTranscriptionProgress::Ambiguous {
-            active_count: ids.len(),
-        },
-    };
-    legacy_progress_response(progress)
-}
-
 /// `GET /v1/audio/transcriptions/{id}/progress`: progress of the file
 /// transcription registered under `id`, for the UI progress bar. Returns the
-/// same idle body as the legacy endpoint above when `id` has not published a
-/// report yet (still resolving the model) or has already finished/never
+/// canonical idle body when `id` has not published a report yet (still
+/// resolving the model) or has already finished/never
 /// existed -- there is no ambiguity to fail closed on here, since `id` always
 /// names exactly one run. A live duplicate id is rejected at registration.
 pub(crate) async fn transcription_progress_by_id(
@@ -3232,8 +3163,8 @@ mod native_runtime_tests {
     use axum::{
         Extension,
         extract::{FromRequest, Path as AxumPath},
-        http::{HeaderMap, StatusCode},
-        response::{IntoResponse, Response},
+        http::HeaderMap,
+        response::Response,
     };
 
     use super::{
@@ -3507,35 +3438,6 @@ mod native_runtime_tests {
         serde_json::from_slice(&bytes).expect("response body is JSON")
     }
 
-    // Locks the wire shape of GET /v1/audio/transcriptions/progress. No native run
-    // is in flight in this unit test, so the idle body must stay backward
-    // compatible: `total == 0` keeps legacy clients on their time-based estimate,
-    // and the new `phase`/`fraction` fields are present (null / 0.0) for clients
-    // that read them. Depends on per-test process isolation (no other test in
-    // this process concurrently holding an active native transcription) --
-    // same requirement as every other test that reads this aggregate,
-    // workspace-shared state; see AGENTS.md's `cargo nextest` requirement.
-    #[tokio::test]
-    async fn transcription_progress_idle_body_is_backward_compatible() {
-        let distribution = crate::DistributionContext::new(crate::DistributionRuntime {
-            openasr_home: None,
-            catalog_url: None,
-            catalog_local_override: None,
-        });
-        let response = super::transcription_progress(
-            Extension(crate::ServerAuth::disabled()),
-            Extension(distribution),
-            HeaderMap::new(),
-        )
-        .await
-        .expect("no active run must not error");
-        let value = response_json_body(response).await;
-        assert_eq!(value["phase"], serde_json::Value::Null);
-        assert_eq!(value["fraction"], serde_json::json!(0.0));
-        assert_eq!(value["done"], serde_json::json!(0));
-        assert_eq!(value["total"], serde_json::json!(0));
-    }
-
     /// Pins the id-scoped endpoint's default: an id with no published report
     /// yet (or already finished, or never registered) reads as idle, exactly
     /// like the legacy endpoint's no-run-active body -- never a 404, since
@@ -3574,11 +3476,9 @@ mod native_runtime_tests {
 
     #[tokio::test]
     async fn transcription_progress_serializes_every_rich_stage_field() {
-        use openasr_core::api::backend::{
-            LegacyNativeTranscriptionProgress, NativeTranscriptionProgress, TranscriptionStage,
-        };
+        use openasr_core::api::backend::{NativeTranscriptionProgress, TranscriptionStage};
 
-        let response = super::legacy_progress_response(LegacyNativeTranscriptionProgress::Single(
+        let value = serde_json::to_value(super::TranscriptionProgressBody::from_progress(
             NativeTranscriptionProgress::new(
                 TranscriptionStage::IdentifySpeakers,
                 Some(0.4),
@@ -3589,7 +3489,6 @@ mod native_runtime_tests {
             ),
         ))
         .expect("a rich progress snapshot must serialize");
-        let value = response_json_body(response).await;
 
         assert_eq!(value["phase"], serde_json::json!("decode"));
         assert_eq!(value["fraction"], serde_json::json!(0.625));
@@ -3605,52 +3504,6 @@ mod native_runtime_tests {
             value["detail"],
             serde_json::json!("embedding speaker windows")
         );
-    }
-
-    /// Backward compatibility: a single active run's legacy read must still
-    /// map to the same body shape (no status-code or shape change) that
-    /// existed before per-id progress -- covered directly against the pure
-    /// mapping function so it needs no real in-flight native transcription.
-    #[test]
-    fn legacy_progress_response_reports_the_single_active_run_body() {
-        use openasr_core::api::backend::{
-            LegacyNativeTranscriptionProgress, NativeTranscriptionProgress, TranscriptionStage,
-        };
-
-        let response = super::legacy_progress_response(LegacyNativeTranscriptionProgress::Single(
-            NativeTranscriptionProgress::new(
-                TranscriptionStage::Decode,
-                Some(0.5),
-                0.5,
-                None,
-                None,
-                None,
-            ),
-        ))
-        .expect("a single active run must not error");
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    /// Requirement: with more than one native transcription in flight, the
-    /// id-less legacy endpoint must fail closed with an explicit conflict
-    /// rather than silently reporting one arbitrary owner's progress as "the"
-    /// global progress.
-    #[test]
-    fn legacy_progress_response_maps_ambiguous_to_409_conflict() {
-        use openasr_core::api::backend::LegacyNativeTranscriptionProgress;
-
-        let error = super::legacy_progress_response(LegacyNativeTranscriptionProgress::Ambiguous {
-            active_count: 3,
-        })
-        .expect_err("ambiguous must fail closed, not pick an arbitrary owner");
-        match error {
-            super::ApiError::Conflict(message) => {
-                assert!(message.contains('3'), "{message}");
-                let response = super::ApiError::Conflict(message).into_response();
-                assert_eq!(response.status(), StatusCode::CONFLICT);
-            }
-            other => panic!("expected Conflict, got {other:?}"),
-        }
     }
 }
 

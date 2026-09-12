@@ -77,7 +77,6 @@ pub(crate) struct LiveCommandOptions<'a> {
     pub energy_threshold: Option<f32>,
     pub partial_interval_ms: Option<u64>,
     pub partial_window_ms: Option<u32>,
-    pub diarize: bool,
     pub save_path: Option<PathBuf>,
     pub save_join_segments: bool,
     pub save_suggest_title: bool,
@@ -119,9 +118,6 @@ pub(crate) async fn run_live(
     native_execution_services: Arc<openasr_core::NativeExecutionServices>,
     options: LiveCommandOptions<'_>,
 ) -> Result<()> {
-    // Realtime Voice ID/diarization is intentionally not supported by the CLI
-    // live path. Reject it before capability resolution or runtime setup.
-    ensure_live_voice_id_not_requested(options.diarize)?;
     validate_live_limits(options.max_seconds, options.max_utterances)?;
 
     let host = cpal::default_host();
@@ -252,13 +248,6 @@ pub(crate) async fn run_live(
     let result = capture.run(&mut pipeline);
     drop(stream);
     result
-}
-
-fn ensure_live_voice_id_not_requested(diarize: bool) -> Result<()> {
-    if diarize {
-        bail!(openasr_core::realtime::REALTIME_VOICE_ID_UNSUPPORTED_REASON);
-    }
-    Ok(())
 }
 
 fn run_live_from_system_audio(
@@ -2860,18 +2849,6 @@ mod tests {
         handle.join().unwrap();
     }
 
-    #[test]
-    fn live_voice_id_is_always_rejected() {
-        ensure_live_voice_id_not_requested(false).unwrap();
-        let error = ensure_live_voice_id_not_requested(true)
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            openasr_core::realtime::REALTIME_VOICE_ID_UNSUPPORTED_REASON
-        );
-    }
-
     fn base_live_options<'a>() -> LiveCommandOptions<'a> {
         LiveCommandOptions {
             source: LiveSource::Mic,
@@ -2881,7 +2858,6 @@ mod tests {
             model: None,
             backend: Some(BackendKind::Mock),
             model_pack: None,
-            diarize: false,
             output_format: LiveOutputFormat::Text,
             max_seconds: None,
             max_utterances: None,

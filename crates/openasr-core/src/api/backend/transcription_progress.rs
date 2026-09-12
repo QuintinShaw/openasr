@@ -144,14 +144,6 @@ impl NativeTranscriptionProgress {
     }
 }
 
-/// Legacy (pre-multi-request) id-less progress read.
-#[derive(Debug, Clone, PartialEq)]
-pub enum LegacyNativeTranscriptionProgress {
-    Idle,
-    Single(NativeTranscriptionProgress),
-    Ambiguous { active_count: usize },
-}
-
 /// Coarse backend class for the first-cut cost profile (Metal vs CPU-ish).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProgressBackendClass {
@@ -762,15 +754,15 @@ fn with_registry<T>(f: impl FnOnce(&mut ProgressRegistry) -> T) -> T {
     f(&mut registry)
 }
 
-/// Test-only: wipe every registry entry so aggregate legacy reads are
-/// isolated under plain `cargo test` (which shares one process). Prefer
-/// `cargo nextest` for real isolation; this is a belt-and-braces cleanup.
+/// Test-only: wipe every registry entry so serial tests start clean under
+/// plain `cargo test` (which shares one process). Prefer `cargo nextest` for
+/// real isolation; this is a belt-and-braces cleanup.
 #[cfg(test)]
 pub(crate) fn clear_progress_registry_for_test() {
     with_registry(|reg| reg.entries.clear());
 }
 
-/// Serializes tests that inspect the process-global aggregate registry under
+/// Serializes tests that inspect the process-global progress registry under
 /// plain `cargo test` (which runs tests in one process). `cargo nextest`
 /// isolates per test process so this is a no-op race-wise there.
 #[cfg(test)]
@@ -783,21 +775,6 @@ pub(crate) fn progress_registry_test_lock() -> std::sync::MutexGuard<'static, ()
 /// when no such run is currently active.
 pub fn native_transcription_progress_for_id(id: &str) -> Option<NativeTranscriptionProgress> {
     with_registry(|reg| reg.get(id))
-}
-
-pub fn native_transcription_progress() -> LegacyNativeTranscriptionProgress {
-    with_registry(|reg| match reg.entries.as_slice() {
-        [] => LegacyNativeTranscriptionProgress::Idle,
-        [(_, state)] => LegacyNativeTranscriptionProgress::Single(state.snapshot()),
-        entries => LegacyNativeTranscriptionProgress::Ambiguous {
-            active_count: entries.len(),
-        },
-    })
-}
-
-/// Ids of in-flight native progress entries, in registry order.
-pub fn native_active_transcription_ids() -> Vec<String> {
-    with_registry(|reg| reg.entries.iter().map(|(id, _)| id.clone()).collect())
 }
 
 /// RAII handle: removes the registry entry on drop (completion / cancel /
@@ -1463,33 +1440,23 @@ mod tests {
     }
 
     #[test]
-    fn legacy_aggregate_idle_single_ambiguous() {
+    fn progress_is_scoped_to_each_registered_id() {
         let _serial = progress_registry_test_lock();
         clear_progress_registry_for_test();
-        assert_eq!(
-            native_transcription_progress(),
-            LegacyNativeTranscriptionProgress::Idle
-        );
-        let id_a = "legacy-progress-a";
-        let id_b = "legacy-progress-b";
+        let id_a = "progress-a";
+        let id_b = "progress-b";
         let _ha = ProgressRegistryHandle::new(Some(id_a.to_string()));
         let ra = ProgressReporter::install(Some(id_a.to_string()), plain_plan(5.0, false));
         ra.enter_stage(TranscriptionStage::Decode);
         ra.report_fraction(0.33);
-        match native_transcription_progress() {
-            LegacyNativeTranscriptionProgress::Single(p) => {
-                assert!((p.fraction - p.overall_fraction).abs() < 1e-9);
-                assert!((p.stage_fraction.unwrap() - 0.33).abs() < 1e-5);
-            }
-            other => panic!("expected Single, got {other:?}"),
-        }
+        let progress_a = native_transcription_progress_for_id(id_a).expect("registered id A");
+        assert!((progress_a.fraction - progress_a.overall_fraction).abs() < 1e-9);
+        assert!((progress_a.stage_fraction.unwrap() - 0.33).abs() < 1e-5);
         let _hb = ProgressRegistryHandle::new(Some(id_b.to_string()));
         let rb = ProgressReporter::install(Some(id_b.to_string()), plain_plan(5.0, false));
         rb.enter_stage(TranscriptionStage::Decode);
-        assert_eq!(
-            native_transcription_progress(),
-            LegacyNativeTranscriptionProgress::Ambiguous { active_count: 2 }
-        );
+        assert!(native_transcription_progress_for_id(id_a).is_some());
+        assert!(native_transcription_progress_for_id(id_b).is_some());
         clear_progress_registry_for_test();
     }
 
