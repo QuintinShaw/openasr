@@ -536,6 +536,58 @@ fn catalog_parser_hides_unrecognized_model_kind_via_full_parse_pipeline() {
 }
 
 #[test]
+fn catalog_abi_filter_summarizes_repeated_mismatches_per_load() {
+    let contents = catalog_json_with_backends(&valid_hip_backend_json());
+    let original: ModelCatalog = serde_json::from_str(&contents).unwrap();
+    let mut fixture = original.clone();
+    for index in 0..700 {
+        let mut backend = original.backends[0].clone();
+        backend.id = format!("old-backend-{index}");
+        backend.host_abi.schema_version = 2;
+        fixture.backends.push(backend);
+    }
+    for _ in 0..2 {
+        let mut catalog = fixture.clone();
+        let notes = super::filter_forward_compatible_catalog(&mut catalog);
+        assert_eq!(catalog.backends.len(), 1);
+        assert_eq!(catalog.backends[0].id, "hip-radeon");
+        assert_eq!(notes.len(), 1, "one summary per load, not per backend");
+        assert!(notes[0].contains("700 backend packs"), "{notes:?}");
+        assert!(notes[0].contains("2: 700"), "{notes:?}");
+        assert!(notes[0].contains(&format!("supports {BACKEND_HOST_ABI_SCHEMA_VERSION}")));
+        super::validate_model_catalog(&catalog, "fixture").unwrap();
+    }
+    let parsed = parse_model_catalog(&serde_json::to_string(&fixture).unwrap(), "fixture").unwrap();
+    assert_eq!(parsed.backends.len(), 1);
+}
+
+#[test]
+fn catalog_abi_summary_keeps_other_compatibility_diagnostics() {
+    let contents = catalog_json_with_backends(&valid_hip_backend_json());
+    let mut catalog: ModelCatalog = serde_json::from_str(&contents).unwrap();
+    for schema in [2, BACKEND_HOST_ABI_SCHEMA_VERSION + 1] {
+        let mut backend = catalog.backends[0].clone();
+        backend.id = format!("other-schema-{schema}");
+        backend.host_abi.schema_version = schema;
+        catalog.backends.push(backend);
+    }
+    let mut unknown = catalog.backends[0].clone();
+    unknown.id = "future-vendor".to_string();
+    unknown.vendor = CatalogBackendVendor::Unknown;
+    catalog.backends.push(unknown);
+    let notes = super::filter_forward_compatible_catalog(&mut catalog);
+    assert_eq!(catalog.backends.len(), 1);
+    assert_eq!(notes.len(), 2);
+    assert!(notes.iter().any(|note| note.contains("future-vendor")));
+    let summary = notes
+        .iter()
+        .find(|note| note.contains("2 backend packs"))
+        .unwrap();
+    assert!(summary.contains("2: 1"));
+    assert!(summary.contains(&format!("{}: 1", BACKEND_HOST_ABI_SCHEMA_VERSION + 1)));
+}
+
+#[test]
 fn catalog_parser_hides_backend_with_unrecognized_vendor_via_full_parse_pipeline() {
     let backends = format!(
         "{},\n{}",

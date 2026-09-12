@@ -64,6 +64,12 @@ the signing keys, and the epoch/signature verification math are untouched.
   two; `kind` similarly determines dispatch (market listing vs. capability
   pack vs. translation model), so an unrecognized value must not silently
   masquerade as `asr-model`.
+- **Unsupported backend host ABI schemas.** Packs whose host ABI schema differs
+  from the supported version remain hidden. Each parse emits one summary with
+  the total hidden pack count, counts by schema version, and the supported
+  version. Historical releases therefore do not produce a separate log line
+  for every pack. Other compatibility diagnostics and all validation failures
+  remain unchanged; this is per-load reporting, not process-global suppression.
 - **Unknown JSON object keys.** Neither `ModelCatalog` nor `CatalogModel`
   declare `#[serde(deny_unknown_fields)]`, so a future field this build
   doesn't know about is already ignored by serde's default behavior. (The

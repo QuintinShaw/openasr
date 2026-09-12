@@ -1838,13 +1838,15 @@ pub fn parse_model_catalog(contents: &str, source: &str) -> Result<ModelCatalog,
 /// can gate what a client is allowed to show/download/stage, so "hide" (not
 /// "show with a guessed value") is the only safe degrade.
 ///
-/// Returns one human-readable note per dropped entry for the caller to log;
+/// Returns human-readable notes for the caller to log. ABI schema mismatches
+/// are counted in one summary per load, rather than one line per historical pack;
 /// never panics. Deliberately does NOT touch `languages` -- a plain
 /// `Vec<String>`, any code (including one this build has no curated label
 /// for) is always tolerated and displayed as-is, no filtering needed. See
 /// `docs/CATALOG_COMPATIBILITY.md`.
 fn filter_forward_compatible_catalog(catalog: &mut ModelCatalog) -> Vec<String> {
     let mut notes = Vec::new();
+    let mut incompatible_abi_counts = BTreeMap::<u32, usize>::new();
     catalog.models.retain(|model| {
         if model.kind == CatalogModelKind::Unknown {
             notes.push(format!(
@@ -1887,12 +1889,7 @@ fn filter_forward_compatible_catalog(catalog: &mut ModelCatalog) -> Vec<String> 
             return false;
         }
         if backend.host_abi.schema_version != BACKEND_HOST_ABI_SCHEMA_VERSION {
-            notes.push(format!(
-                "catalog: hiding backend '{}': unsupported host ABI schema {} (this build supports {})",
-                backend.id,
-                backend.host_abi.schema_version,
-                BACKEND_HOST_ABI_SCHEMA_VERSION
-            ));
+            *incompatible_abi_counts.entry(backend.host_abi.schema_version).or_default() += 1;
             return false;
         }
         if backend
@@ -1908,6 +1905,17 @@ fn filter_forward_compatible_catalog(catalog: &mut ModelCatalog) -> Vec<String> 
         }
         true
     });
+    if !incompatible_abi_counts.is_empty() {
+        let count: usize = incompatible_abi_counts.values().sum();
+        let schemas = incompatible_abi_counts
+            .iter()
+            .map(|(schema, count)| format!("{schema}: {count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        notes.push(format!(
+            "catalog: hiding {count} backend packs with unsupported host ABI schemas ({schemas}); this build supports {BACKEND_HOST_ABI_SCHEMA_VERSION}"
+        ));
+    }
     notes
 }
 
