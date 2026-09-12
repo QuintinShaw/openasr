@@ -3164,7 +3164,7 @@ mod native_runtime_tests {
         Extension,
         extract::{FromRequest, Path as AxumPath},
         http::HeaderMap,
-        response::Response,
+        response::{IntoResponse, Response},
     };
 
     use super::{
