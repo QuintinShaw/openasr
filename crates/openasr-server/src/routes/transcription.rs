@@ -3478,7 +3478,7 @@ mod native_runtime_tests {
     async fn transcription_progress_serializes_every_rich_stage_field() {
         use openasr_core::api::backend::{NativeTranscriptionProgress, TranscriptionStage};
 
-        let value = serde_json::to_value(super::TranscriptionProgressBody::from_progress(
+        let response = Json(super::TranscriptionProgressBody::from_progress(
             NativeTranscriptionProgress::new(
                 TranscriptionStage::IdentifySpeakers,
                 Some(0.4),
@@ -3488,7 +3488,8 @@ mod native_runtime_tests {
                 Some("embedding speaker windows".to_string()),
             ),
         ))
-        .expect("a rich progress snapshot must serialize");
+        .into_response();
+        let value = response_json_body(response).await;
 
         assert_eq!(value["phase"], serde_json::json!("decode"));
         assert_eq!(value["fraction"], serde_json::json!(0.625));
