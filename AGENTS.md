@@ -184,7 +184,10 @@ updated alongside behavior; no forbidden artifacts. Commit and PR titles follow
 `ggml`, ...). Use **ASCII punctuation** in titles and code: `-` not the em-dash,
 `->` not the arrow glyph, `...` not the ellipsis glyph. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for branch naming, the full `<type>` list, the
-PR checklist, and the DCO sign-off.
+PR checklist, and contribution licensing.
+
+DCO sign-off trailers are not required. Do not request them from contributors
+or treat their absence as a review or merge blocker.
 
 ## AI usage policy
 
