@@ -3478,7 +3478,7 @@ mod native_runtime_tests {
     async fn transcription_progress_serializes_every_rich_stage_field() {
         use openasr_core::api::backend::{NativeTranscriptionProgress, TranscriptionStage};
 
-        let response = Json(super::TranscriptionProgressBody::from_progress(
+        let response = axum::Json(super::TranscriptionProgressBody::from_progress(
             NativeTranscriptionProgress::new(
                 TranscriptionStage::IdentifySpeakers,
                 Some(0.4),
