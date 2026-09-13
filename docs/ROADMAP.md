@@ -1,94 +1,45 @@
 # Roadmap
 
-This file is the source of truth for OpenASR sequencing. Implemented status is
-the [Implemented baseline](#implemented-baseline) section below.
-
-OpenASR is licensed under Apache-2.0 and maintained as the public open core.
-Versioned binary archives and SHA-256 checksums are published through
-[GitHub Releases](https://github.com/QuintinShaw/openasr/releases).
-Package-manager channels remain deferred; building from source remains
-supported.
-
-## Implemented baseline
-
-These were prior roadmap goals and are now shipped on the native runtime path:
-
-- Eleven native model families: Whisper, Cohere Transcribe, Qwen3-ASR,
-  Parakeet-CTC, Parakeet-TDT (25 European languages), wav2vec2-CTC (incl.
-  data2vec), Moonshine, Dolphin (Chinese dialects), SenseVoice
-  (zh/yue/en/ja/ko), FireRedASR-AED (Mandarin + English bilingual), and X-ASR
-  (Zipformer).
-- Data-driven architecture registry (`arch/`): composer families (Cohere, Qwen)
-  materialize from descriptors; dedicated executors (Whisper, Moonshine,
-  Parakeet-CTC/TDT, wav2vec2, Dolphin, SenseVoice, FireRedASR-AED, X-ASR) own
-  their loaders.
-- `.oasr` packs are GGUF-backed and portable, with zero-copy mmap weight binding
-  and graph buffer-reuse to bound peak RSS.
-- Quantization profiles `fp16`, `q8_0`, `q4_k` (Qwen also `q3_k`).
-- Performance harness with regression gates (`gate_peak_rss`, `gate_vs_cpp`) run
-  from `perf/suite.toml` against committed baselines, plus competitive
-  comparison vs whisper.cpp wired as gated entries.
-- Active backends are `mock` and guarded `native`; wrapper-era backends and
-  legacy command surfaces are removed.
-- Native realtime has a declared-pack true-streaming path for Qwen3-ASR,
-  Whisper, Cohere Transcribe, Moonshine, Parakeet-CTC, Parakeet-TDT, and
-  wav2vec2-CTC through family-specific streaming executors. Local temporary packs pass the ignored
-  real-runtime smoke; published release packs and product claims remain gated.
-- Desktop/server requests carry a generic native execution target
-  (`auto`/`cpu`/`accelerated`) through preferences, file transcription, remote
-  file transcription, realtime, and dictation. Internal runtime foundations now
-  resolve those coarse targets onto a typed execution route
-  (`provider` + `stable_id` + optional PCI `device_id`). Backend-handle caches,
-  streaming workers, device-owning family runtime actor pools, and serve-batch
-  engine keys now carry the concrete route through `ExecutionLaneKey`.
-  Resident runtime pools additionally use `PackContentKey` from the already-open
-  source, so same-path byte replacement misses instead of reusing stale weights;
-  adapter-bearing families add the adapter fingerprint where required.
-  Host-neutral prepared data remains content-keyed by design. Admission capacity
-  remains per-model (not per-route). Public GPU ids from `GET /v1/devices` are
-  selectable; there is still no ordinal selector such as `gpu0`. Metal Exact is
-  allowed by public/stable id (no PCI/UUID identity). Exact requests fail closed
-  rather than falling back to another card or CPU.
-- Desktop remote compute has secure HTTPS/WSS client/server plumbing with
-  approved pairing, TOFU fingerprint pinning, keychain device credentials, file
-  transcription routing, realtime routing, revocation, and server-history
-  isolation for paired device-token compute requests. The remaining release
-  gate is end-to-end multi-device Desktop UI validation evidence.
-- External transcript-guided forced alignment is a public compute path:
-  `openasr align` and `POST /v1/audio/precise-timeline` (`transcript` or
-  `transcript_json`) reuse the Qwen3-ForcedAligner pack, project dual-view
-  segments/subtitle cues, and export SRT/VTT through the shared renderer.
+Development priorities, not a second feature inventory. Current behavior is
+defined by code and tests; [Architecture](../ARCHITECTURE.md) maps the code,
+[Known Limitations](KNOWN_LIMITATIONS.md) records user-visible gaps, and
+[model cards](../model-registry/models/) describe individual packs.
 
 ## Active priorities
 
-### P1: Architecture cohesion for scale
+### Architecture cohesion
 
-- Keep module boundaries high-cohesion/low-coupling.
-- Keep public APIs minimal; keep model-family specifics under their executors /
-  arch descriptors.
-- Reduce per-family special-casing so new families onboard with minimal new code.
+- Keep public APIs small and ownership explicit across core, server, and clients.
+- Remove obsolete compatibility paths and duplicated state.
+- Keep family-specific behavior behind the shared model lifecycle and executor
+  contracts; new families must reuse the shared admission and validation gates.
 
-### P2: Quantization and performance
+### Correctness and qualification
 
-- Keep `.oasr` packs canonical and portable (no platform-specific embedded
-  compute-cache payloads).
-- Hold and tighten the committed performance gates; keep claims tied to executed
-  baselines rather than asserting any final win over open-source runtimes.
+- Close gaps in file-task control and timeline diagnostics without weakening
+  cancellation, authentication, or fail-closed behavior.
+- Broaden long-form, multilingual, timestamp, and real-device validation beyond
+  short smoke tests. Pack publication alone is not hardware qualification.
+- Keep remote-compute acceptance tied to client/server end-to-end evidence.
 
-### P3: Native quality and coverage
+### Performance
 
-- Broaden longform/timestamp validation beyond internal smoke lanes toward a
-  defensible WER/quality statement.
-- Add further model families on the same `.oasr` path as needed.
+- Keep portable GGUF-backed `.oasr` packs canonical, without embedded
+  platform-specific compute caches.
+- Improve performance against the committed regression gates. Claims must name
+  the measured pack, device, workload, and baseline.
 
-## Deferred
+## Boundaries
 
-- Package-manager integrations and additional production distribution channels
-  beyond GitHub Releases and Docker Hub.
-- Public true-streaming release guarantees, official streaming-enabled pack
-  publication, and broad multilingual feature claims.
+- Homebrew, binary archives, and Docker distribution already exist; see
+  [installation](../README.md#for-developers) and [Releasing](../RELEASING.md).
+- Broad streaming-quality and multilingual guarantees remain qualification work,
+  not promises inferred from a family being registered or a pack being public.
+- Model onboarding follows [Model Onboarding](MODEL_ONBOARDING.md), rather than
+  adding parallel runtime or packaging paths.
 
-## Validation gate
+## Validation
 
-For roadmap-impacting changes, run targeted validation first, then broader
-regressions, and keep claims tied to executed checks.
+Run targeted checks first, then the applicable regression gates. Record evidence
+with the change; retain durable contracts here, not completed implementation
+checklists or session-by-session test diaries.

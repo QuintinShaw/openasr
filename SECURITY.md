@@ -44,7 +44,9 @@ Current active behavior:
 - no silent downloads: a missing model is installed only by an explicit
   `openasr pull`, or by an interactive `transcribe`/`live` consent prompt (showing
   model, quant, size, host, and license) that fails closed when non-interactive or
-  `--offline`/`--no-pull`; the HTTP server never downloads;
+  `--offline`/`--no-pull`. HTTP compute requests never download implicitly;
+  explicit model installation through `POST /v1/models/{id}/pull` is
+  operator-only, not available to paired compute-device credentials;
 - no telemetry by default;
 - no cloud transcription by default.
 

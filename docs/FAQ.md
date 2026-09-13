@@ -1,7 +1,7 @@
 # OpenASR FAQ
 
-This FAQ answers current behavior questions. Source-of-truth status is
-[Roadmap](ROADMAP.md) (see its Implemented-baseline section).
+This FAQ answers common usage questions. See [Known Limitations](KNOWN_LIMITATIONS.md)
+for qualification boundaries and [Architecture](../ARCHITECTURE.md) for the code map.
 
 ## What is OpenASR?
 
@@ -11,7 +11,7 @@ runs native ggml-backed model packs offline.
 
 ## What native model families run today?
 
-Sixteen, dispatched by a data-driven architecture registry (`arch/`): Whisper,
+Families are dispatched by a data-driven architecture registry (`arch/`): Whisper,
 Cohere Transcribe, Qwen3-ASR, Parakeet-CTC, Parakeet-TDT (25 European
 languages), wav2vec2-CTC (incl. data2vec), Moonshine, Dolphin (Chinese
 dialects), SenseVoice (zh/yue/en/ja/ko), MiMo-V2.5-ASR (zh/en/yue; RVQ
@@ -38,8 +38,9 @@ Never silently. `openasr pull` is the explicit command for published packs. In
 addition, `transcribe`/`live` will install a missing model for you, but **only
 through a visible consent prompt** (showing model, quant, size, host, and
 license); `--offline` or any non-interactive run fails closed before touching the
-network. The shared resolve path and the HTTP server never pull -- the server
-runs only an explicit local pack.
+network. Model resolution and transcription requests never pull implicitly.
+The server also supports explicit operator-authorized installation through
+`POST /v1/models/{id}/pull`; compute-device credentials cannot invoke that operation.
 
 ## Can I download models for local experiments?
 
@@ -105,9 +106,9 @@ decode text.
 
 For runtime packs that declare the streaming feature and whose family has a
 registered streaming executor (e.g. X-ASR/Zipformer, Qwen3-ASR, Whisper),
-native frame-synchronous streaming emits incremental partials. Packs without that
-metadata fall back to final-per-utterance output. Official published streaming
-packs and public product guarantees are still pending — see
+streaming behavior depends on the family executor: partials may be append-only,
+revisable snapshots, or utterance-complete snapshots. Publication does not imply
+qualification for every language, device, or workload — see
 [Known Limitations](KNOWN_LIMITATIONS.md).
 
 ## Is diarization available?
@@ -222,8 +223,10 @@ Longer guide: [openasr.org/docs/docker](https://openasr.org/docs/docker/).
 
 ## Is ffmpeg required?
 
-Not for current mock and native paths. OpenASR does not bundle/install/manage
-ffmpeg.
+Not for formats handled by the in-process decoder. Unsupported codecs may need
+a system decoder (macOS / Windows) or an external converter. An explicitly
+configured `--ffmpeg-bin` overrides the normal decoding path. OpenASR does not
+bundle, install, or manage ffmpeg.
 
 ## Is the API fully OpenAI-compatible?
 

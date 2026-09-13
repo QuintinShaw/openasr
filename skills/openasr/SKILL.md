@@ -8,8 +8,8 @@ allowed-tools: Bash(openasr *)
 # OpenASR
 
 OpenASR is a local-first speech-to-text CLI (`openasr`) and local HTTP server.
-Everything runs on-device: no network calls unless you explicitly `pull` a
-model, no telemetry, no cloud fallback.
+This skill covers local execution: no telemetry, no silent downloads, and no
+cloud fallback. Model installation requires explicit consent.
 
 Prerequisite: the `openasr` binary must be on `PATH`. Check with
 `openasr --version`; if missing, tell the user to install it (`cargo install
@@ -45,8 +45,9 @@ openasr transcribe audio.wav --model whisper-small --format json
   for per-word timing where the model supports it.
 - `--benchmark` prints timing (elapsed, audio duration, real-time factor)
   instead of the transcript, for a single input.
-- Non-WAV input (mp3, mp4, ...) needs `ffmpeg` on `PATH`, or pass
-  `--ffmpeg-bin <path>`.
+- Common audio/video formats decode in-process. Unsupported codecs may need
+  a system decoder or external converter; `--ffmpeg-bin <path>` explicitly
+  selects ffmpeg. Do not install ffmpeg merely because input is not WAV.
 
 ## Aligning an existing transcript
 
@@ -62,8 +63,8 @@ Korean fail closed by language tag (`ja`/`jp`/`ko`/`kr`) and by script
 formats as `transcribe` (`json` default). Punctuation and casing stay in the
 returned `text`; the aligner tokenizes by keeping letters/numbers/apostrophes,
 stripping other punctuation, splitting on ASCII whitespace, and treating each
-CJK ideograph as its own token. Non-WAV input needs `ffmpeg` as for
-`transcribe`. Do not pass `--benchmark` — that flag is transcribe-only.
+CJK ideograph as its own token. Audio preparation uses the same decoder/converter
+path as `transcribe`. Do not pass `--benchmark` — that flag is transcribe-only.
 
 Common failure modes:
 
@@ -116,9 +117,12 @@ curl -s http://127.0.0.1:8080/v1/audio/transcriptions \
 
 - `--addr` defaults to `127.0.0.1:8080` (fixed, not random) so the base URL
   can be hardcoded. Loopback callers are trusted by default (no auth header).
-- The server never downloads models: a request for a model other than the
-  loaded pack fails closed with an explicit error. Install models with
-  `openasr pull` first, restart `serve` to switch models.
+- Transcription requests never download models or lazily load a different pack.
+  Install explicitly with `openasr pull` or the operator-only pull API.
+  Operators can switch the active installed model through `/v1/models/default`;
+  blocked native rebinding is queued for an activation attempt when idle.
+  Check the resulting state rather than treating 202 as a completed switch.
+  See the HTTP reference below.
 - OpenAI SDK clients work out of the box for non-streaming calls
   (`base_url="http://127.0.0.1:8080/v1"`, any placeholder `api_key`). SDK
   `stream=True` is rejected with an explicit error -- SSE streaming uses an
@@ -131,8 +135,9 @@ examples, API keys, and streaming details, read
 
 ## Guardrails
 
-- Never suggest or attempt to send audio to a cloud service; OpenASR is
-  local-only by design.
+- Do not send audio to a cloud service or enable remote compute as a fallback
+  for a local task. This skill's workflow stays local; remote compute requires
+  the user's explicit choice and the separate pairing/trust workflow.
 - Do not fabricate a transcript or model id -- if a command fails, surface
   the actual error, and for missing-model/consent cases ask the user how to
   proceed rather than guessing `-y` vs `--offline`.

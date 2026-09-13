@@ -88,8 +88,10 @@ Image publish workflows need `packages: write` to push to
 `ghcr.io/quintinshaw/...`. Forks do not receive that permission on the
 canonical package namespace, so a fork PR that only touches
 `.github/ci/linux-*` will fail the publish job. That is expected. Routine
-PR CI (`ci.yml`, `docker-smoke.yml`, `serve-batch-parity.yml`) only *pulls*
-the already-published CPU image with `packages: read` and does not publish.
+The CPU build-image consumers (`ci.yml`, `family-regression.yml`,
+`public-hf-e2e.yml`, and `serve-batch-parity.yml`) only *pull* the
+already-published image; they do not publish it. `docker-smoke.yml` builds the
+runtime Docker image without pushing it, rather than consuming this CI image.
 
 Do not point a consumer at a mutable tag such as `:latest` or `:${{ github.sha }}`
 from an unpublished fork build.

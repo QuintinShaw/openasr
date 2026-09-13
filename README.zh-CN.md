@@ -45,7 +45,7 @@
 
 **隐私。** 默认本地模式下,音频留在你的设备上。远程算力仅在你显式配对并启用后可用,详见 [SECURITY.md](SECURITY.md#local-first-security-notes)。没有遥测、没有静默上传、没有静默联网回退。引擎要么给你一份真实的转写结果,要么明确告诉你哪里出了问题。
 
-**广度。** 11 个模型家族、26 个公开模型——Whisper、Qwen3-ASR、Parakeet、SenseVoice、FireRed、Dolphin、Moonshine……选对模型比选对工具更重要,而 OpenASR 把它们统一到一个运行时里,CPU 和 Apple Metal 都能跑。
+**广度。** 支持 Whisper、Qwen3-ASR、Parakeet、SenseVoice、FireRed、Dolphin、Moonshine 等模型家族。按语言和工作负载选模型，通过同一运行时使用 CPU 或 Apple Metal。
 
 **开源。** 引擎代码 Apache-2.0。每个模型包的许可证以 registry 条目和 pack metadata 为准。每次模型下载都经过签名目录的完整性校验,装到本地的就是发布者打包的原件。
 
@@ -151,7 +151,7 @@ cargo build --release -p openasr-cli
 
 ## 模型
 
-11 个家族、26 个公开模型:从跑得比实时快几倍的小型英文模型,到覆盖 100 多种语言的大型多语言模型。在 [openasr.org/models](https://openasr.org/models/) 浏览全部模型,或在命令行里查看:
+当前公开模型、支持语言与量化档位以 catalog 为准。在 [openasr.org/models](https://openasr.org/models/) 浏览，或在命令行里查看：
 
 ```bash
 openasr search              # 浏览可用模型

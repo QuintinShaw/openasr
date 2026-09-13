@@ -35,7 +35,7 @@ which installs both files under `./.claude/skills/openasr/`. The Skill
 teaches the agent the `openasr` CLI surface: `transcribe`, `align`, `live`,
 `search`/`pull`/`list`, `serve`, and `apikey`, including expected output
 shapes and common failure modes (missing model, `--offline` fail-closed,
-non-WAV without `ffmpeg`); the reference file carries the full HTTP API
+unsupported codecs needing a converter); the reference file carries the HTTP API
 parameter matrix so it only enters the agent's context when needed
 (progressive disclosure).
 
