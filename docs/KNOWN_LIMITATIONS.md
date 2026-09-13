@@ -1,14 +1,14 @@
 # Known Limitations
 
-This page lists current user-visible limits. For implementation truth and
-sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
+This page lists current user-visible limits. See [Architecture](../ARCHITECTURE.md)
+for the code map and [Roadmap](ROADMAP.md) for development priorities.
 
 ## Current limitations
 
 - OpenASR publishes binary archives and SHA-256 checksums for macOS, Linux, and
   Windows on [GitHub Releases](https://github.com/QuintinShaw/openasr/releases).
-  There are no package-manager channels yet; building from source remains
-  supported. Public model-pack distribution is limited to catalog entries
+  Homebrew installation is available; see the [installation guide](../README.md#for-developers).
+  Building from source remains supported. Public model-pack distribution is limited to catalog entries
   explicitly marked `public:true`.
 - `GET /v1/models` and other served-identity listings verify GGUF metadata
   and the CAS path digest of the bound pack. They do not re-hash a multi-GB
@@ -19,7 +19,9 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   a visible consent prompt -- and stays fail-closed by stage.
 - The consent-gated CLI pull, the no-silent-download boundary, and pull/install
   mechanics are centralized in [Model Catalog, Registry, and Distribution](MODEL_CATALOG_ARCHITECTURE.md);
-  the HTTP server never pulls.
+  transcription and alignment requests never download models implicitly.
+  Operators can explicitly request installation through `POST /v1/models/{id}/pull`;
+  paired compute-device credentials do not grant this operator permission.
 - Realtime cadence is descriptor-driven: any pack whose family has a registered
   streaming executor gets live partials, and every built-in ASR family
   (Qwen3-ASR, Whisper, Cohere Transcribe, Moonshine, Parakeet-CTC, wav2vec2-CTC,
@@ -29,8 +31,9 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   are utterance-complete snapshots (incomplete windows may be empty; partials
   may use a short endpoint-silence hint); every other family is a revisable
   snapshot (incomplete windows should produce text, FINAL is byte-identical to
-  offline). Official published packs with public product
-  guarantees are still pending.
+  offline). Published-pack availability is not a blanket streaming-quality
+  guarantee: qualification remains specific to the pack, device, language,
+  and workload tested.
 - Universal Voice ID is currently a local **file-transcription** feature. MOSS
   supplies its own speaker turns; all other ASR families use FireRed Stream-VAD,
   a speaker segmenter, a speaker embedder, automatic clustering, and
@@ -102,7 +105,8 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   `=aligned` is explicit consent to install the pack. File Voice ID also
   requires this pack automatically for an external ASR whose catalog
   `word_timestamp_source` is `forced_aligner`: Desktop/CLI preflight the
-  dependency, while the server remains operator-gated and never downloads.
+  dependency, while HTTP compute requests require it to be installed already;
+  server-side installation is a separate operator action.
   At runtime the aligner only executes when the decoded transcript actually
   contains a coarse segment crossing multiple speaker turns. It runs before
   speaker attribution, so its anchors are used to split text exactly; the
@@ -143,8 +147,8 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   M1 CPU graph + shipped `q4_k` only; other backends and quants have not
   been re-scored. Near-miss manuscripts (a few substituted words on an
   otherwise matching script) were not in the calibration set. A theoretically
-  sharp but token-wrong timestamp head can also miss. The server
-  never downloads the pack; paired device tokens may call the endpoint (it is a
+  sharp but token-wrong timestamp head can also miss. This compute endpoint
+  never downloads the pack; paired device tokens may call it (it is a
   compute route, not operator-only). This route is not yet on the file
   FIFO / pause / cancel surface used by `/v1/audio/transcriptions`; a request
   that has entered alignment cannot be cancelled that way. The plain-transcript
@@ -221,10 +225,12 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   executed on a real Windows 11 session; Linux real playback smoke still
   needs to be executed on a Linux session. Per-process capture has no desktop
   UI wiring yet -- it is a library-level API only.
-- `serve` is single-model: it runs the one pack resolved at launch
-  (`--model-pack` / an installed `--model`). There is no per-request lazy model
-  loading or an `openasr ps`-style multi-model runner yet -- restart `serve` to
-  switch models.
+- `serve` has one active model, initially resolved at launch. Operators can
+  request an installed-model switch through `/v1/models/default`. If native
+  rebinding is blocked, the server returns 202 and retries activation when idle.
+  Activation must pass validation; a queued request is not proof of a successful
+  switch. There is no per-request lazy multi-model loading or an
+  `openasr ps`-style multi-model runner.
 - Source-language control is per-model and capability-gated (see
   `openasr show <pack>` / `/v1/capabilities`). Multilingual Whisper auto-detects an
   unset language and accepts an explicit `--language`; Cohere and the English-only
@@ -237,9 +243,10 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   Qwen3-ASR 0.6B q4 on `fixtures/en_zh_mixed.wav` (5s English + ~8s Mandarin)
   currently drops the English lead-in and truncates the Mandarin tail; the same
   clip is a single 0--13s decode (not VAD/leading-silence clipping), and the
-  family rejects `--language`. Treat this as a model code-switch limit of that
-  pack -- use Whisper, MiMo-ASR, or moss-transcribe-diarize when the English
-  half must be kept. fp16 / 1.7B were not re-measured on this host.
+  family rejects `--language`. This is an observed failure of that configuration,
+  not a confirmed model-family limitation; the cause remains unresolved.
+  fp16 / 1.7B were not re-measured on this host. Validate an alternative pack on
+  the intended mixed-language audio before relying on it.
   Dolphin is specify-only: it does not auto-detect, so an explicit `--language`
   selects one of its 14 recognition codes (`zh` plus 13 Chinese regional-dialect
   codes such as `zh-sichuan`, `zh-shanghai`, `zh-hebei`) via a decode-prompt
@@ -279,11 +286,6 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   file FIFO. JSON `POST /v1/audio/transcriptions` still queues. Desktop remote
   file transcription uses the JSON endpoint. A later change can emit a queued
   SSE event and then stream the result.
-
-## What works now
-
-See [Roadmap](ROADMAP.md) (Implemented-baseline section) for the current
-working behavior matrix.
 
 ## Related docs
 

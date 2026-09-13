@@ -1,7 +1,7 @@
 # Docs Index
 
-Source-of-truth map for active OpenASR documentation. Implementation truth and
-sequencing live in [Roadmap](ROADMAP.md) (see its Implemented-baseline section).
+Navigation for maintained OpenASR documentation. Code and tests define implemented
+behavior; [Roadmap](ROADMAP.md) records development priorities, not feature status.
 
 The repo-root [Architecture](../ARCHITECTURE.md) is the fast code map for new
 contributors -- crate relationships, the audio-to-transcript pipeline, and the
@@ -11,7 +11,7 @@ contributors -- crate relationships, the audio-to-transcript pipeline, and the
 
 | Doc | What it covers |
 | --- | --- |
-| [Roadmap](ROADMAP.md) | Implementation truth, sequencing, and active priorities; the Implemented-baseline section records what runs today (active `mock`/`native` backends, the eight native model families, the `arch/` registry, the `.oasr`-only pack contract) and what is deferred. OpenASR is Apache-2.0 open core. |
+| [Roadmap](ROADMAP.md) | Development priorities and qualification boundaries. |
 | [Quickstart](QUICKSTART.md) | Three commands to a real transcript: build, transcribe (native by default, consent-pull on first run), and pick a model. |
 | [Model Onboarding](MODEL_ONBOARDING.md) | Contributor checklist for adding or migrating a family: one descriptor inventory row, a narrow adapter, shared compute/runtime seams, pack proof, conformance gates, and the explicit core-only/staged/public-ready release handoff. |
 | [Model Release Audits](model-audits/README.md) | Per-family release audit forms (`model-audits/<family>.md`, from `model-audits/TEMPLATE.md`): ten performance/completeness dimensions, three-state status with mandatory justifications, enforced fail-closed by the publish pipeline before a family goes `public:true`. |

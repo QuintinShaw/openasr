@@ -1,6 +1,6 @@
 # Runtime ownership and atomic model activation
 
-Status: software contract implemented on the integration branch; release
+Status: software contract implemented in main; release
 acceptance remains blocked on the real-host provider matrix described below.
 
 This document defines the cross-family contract for resident runtime ownership,

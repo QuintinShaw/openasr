@@ -53,18 +53,14 @@ The two gating entries in the committed baseline are `whisper-tiny-en-q8` and
 
 ## Fixed conditions
 
-- **Clip:** a fixed LibriSpeech test-clean clip
-  (`237-134500-0000.wav`, reference
-  `"FRANK READ ENGLISH SLOWLY AND THE MORE HE READ ABOUT THIS DIVORCE CASE THE ANGRIER HE GREW"`).
-  The same clip is used across families so RTF/memory are directly comparable.
-  See `perf/suite.toml` for the per-entry `audio_path`/`reference`.
-- **Families covered by the baseline:** whisper, cohere, qwen, parakeet-ctc,
-  wav2vec2-ctc (incl. data2vec/hubert variants), moonshine, dolphin. The dolphin
-  entry uses its own Chinese-dialect clip (`clip_sichuan.wav`, reference the
-  model's golden `attention_rescoring` output `学校和底下好多那种野生枸杞`,
-  CER 0.0000), not the shared English clip.
-- **Quant per entry:** fp16 / q8_0 / q4_k (qwen also q3_k). The gating entries are
-  at q8_0; other quants ride along as non-gating + ordering-group members.
+- **Clip and reference:** each entry in `perf/suite.toml` declares its own
+  `audio_path` and `reference`. The gating entries share the LibriSpeech
+  `237-134500-0000.wav` clip; dialect and other entries can use different audio.
+  Results on different clips are not directly comparable.
+- **Families and quant:** use the suite entries and the selected committed
+  baseline, not a separate coverage list. Each entry selects one quant; the suite
+  is not a complete family-by-quant matrix. Gating and quant-ordering membership
+  are explicit per entry.
 
 ## Dolphin: CPU vs Metal (AB-measured on M1)
 

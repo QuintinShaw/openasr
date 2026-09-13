@@ -1,8 +1,8 @@
 # OpenASR local HTTP API reference
 
-Verified against `openasr serve` (core 0.1.11+). Everything here is local:
-the server never downloads models, never phones home, and fails closed on
-anything it cannot execute.
+Reference for the local `openasr serve` API. Compute routes never download models
+implicitly and fail closed on requests they cannot execute. Installation is an
+explicit operator action, separate from transcription.
 
 ## Contents
 
@@ -24,7 +24,11 @@ openasr serve --model <installed-id>   # pick one installed pack by id
 openasr serve --model-pack /path/to/model.oasr   # explicit local pack file
 ```
 
-One model per server process; restart to switch. A fresh install with no
+One active model per server process. Operators can switch an installed model
+through `POST /v1/models/default` (also `PUT`); blocked native rebinding returns
+202 and queues an activation attempt when idle. Validation and activation may
+fail; read back the active selection rather than treating 202 as success.
+A fresh install with no
 models still starts (health works) but transcription requests fail closed
 until a pack is installed (`openasr pull <id>`). `--model` accepts bare or
 quant-pinned ids (`whisper-tiny`, `whisper-tiny:q8`); it must name the same
@@ -44,6 +48,10 @@ pack that is being served.
   no `created` field).
 - `POST /v1/audio/transcriptions` -- OpenAI-compatible transcription
   (multipart form).
+- `POST /v1/models/{id}/pull` -- explicit operator-only model installation.
+  Paired compute-device tokens cannot start a pull.
+- `POST /v1/models/default` (also `PUT`) -- operator-only installed-model
+  selection; `POST /v1/models/default/idle-switch/cancel` cancels a pending switch.
 - `POST /v1/audio/precise-timeline` -- OpenASR-native forced alignment
   (multipart form). Does not run ASR. Accepts source `file` plus exactly one
   of `transcript` (plain text) or `transcript_json` (timed verbose/json body).
@@ -56,7 +64,7 @@ pack that is being served.
   alignment fail closed. Pure-kanji Japanese cannot be identified as
   Japanese: `language=ja` is 400; `language=en` tokenizes each ideograph.
   Paired device tokens may call this compute route; it is not
-  operator-only. The server never downloads the pack. Listing endpoints
+  operator-only. This compute route never downloads the pack. Listing endpoints
   verify GGUF metadata and the CAS path digest; they do not re-hash the
   whole pack. Integrity of a local file is `openasr model-pack verify`.
 - `POST /v1/audio/translations` -- OpenAI-compatible X->English speech
@@ -84,8 +92,8 @@ Behavior of each OpenAI `audio/transcriptions` request parameter:
 
 | OpenAI parameter | OpenASR behavior |
 | --- | --- |
-| `file` | Supported (multipart). Non-WAV containers need `ffmpeg` on the server's `PATH`. |
-| `model` | Required. Must name the loaded pack (quant-tag tolerant, e.g. `whisper-tiny:q8` matches a bare `whisper-tiny` pack). Anything else is a 400 -- the server never downloads. |
+| `file` | Supported (multipart). Common formats decode in-process; unsupported codecs may require a system decoder or configured ffmpeg on the server. |
+| `model` | Required. Must name the loaded pack (quant-tag tolerant, e.g. `whisper-tiny:q8` matches a bare `whisper-tiny` pack). Anything else is a 400; this request never downloads or switches models. |
 | `language` | Supported as a language hint where the model family supports one. |
 | `prompt` | Forwarded to the model; families without prompt support reject it with an explicit error instead of ignoring it. |
 | `response_format` | `json` (default), `text`, `srt`, `vtt`, `verbose_json` supported; `markdown` is an OpenASR extension. `diarized_json` is not supported (use the `diarize=true` extension field and read per-segment `speaker`). |
