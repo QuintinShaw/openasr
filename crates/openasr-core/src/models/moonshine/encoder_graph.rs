@@ -464,7 +464,7 @@ impl MoonshineEncoderGraphRuntime {
 
         // HF conv stem order (modeling_moonshine.MoonshineEncoder.forward):
         //   x = tanh(conv1(x)); x = groupnorm(x); x = gelu(conv2(x)); x = gelu(conv3(x))
-        // GroupNorm(num_groups=1) is applied right after conv1, over the 288 channels.
+        // GroupNorm(num_groups=1) reduces both time and channels per waveform.
 
         // conv1 (no bias) -> tanh. Output [conv1_len, d_model] (ne0=time, ne1=channels).
         let conv1_len = conv_out_len(n_samples, CONV1_KERNEL, CONV1_STRIDE)?;
@@ -479,36 +479,14 @@ impl MoonshineEncoderGraphRuntime {
             .map_err(build_err("conv1"))?;
         state = graph.tanh(state).map_err(build_err("conv1_tanh"))?;
 
-        // GroupNorm(1) over channels per time-step: transpose to channel-major [d_model, time],
-        // ggml_norm over ne0(channels), affine, then transpose back to [time, d_model] for conv2.
-        let mut chan = graph
-            .permute(state, 1, 0, 2, 3)
-            .map_err(build_err("ggml_permute(gn_channel_major)"))?;
-        chan = graph
-            .cont(chan)
-            .map_err(build_err("ggml_cont(gn_channel_major)"))?;
-        chan = graph
-            .reshape_2d(chan, d_model, conv1_len)
-            .map_err(build_err("ggml_reshape_2d(gn_channel_major)"))?;
-        chan = graph
-            .norm(chan, MOONSHINE_GROUP_NORM_EPSILON)
-            .map_err(build_err("ggml_norm(groupnorm)"))?;
-        chan = graph
-            .mul(chan, self.arena.graph_tensor(self.groupnorm_weight))
-            .map_err(build_err("ggml_mul(groupnorm_w)"))?;
-        chan = graph
-            .add(chan, self.arena.graph_tensor(self.groupnorm_bias))
-            .map_err(build_err("ggml_add(groupnorm_b)"))?;
-        // transpose back to [time, d_model] for conv2 data layout.
-        state = graph
-            .permute(chan, 1, 0, 2, 3)
-            .map_err(build_err("ggml_permute(gn_time_major)"))?;
-        state = graph
-            .cont(state)
-            .map_err(build_err("ggml_cont(gn_time_major)"))?;
-        state = graph
-            .reshape_2d(state, conv1_len, d_model)
-            .map_err(build_err("ggml_reshape_2d(gn_time_major)"))?;
+        state = conv_stem_group_norm(
+            &graph,
+            state,
+            self.arena.graph_tensor(self.groupnorm_weight),
+            self.arena.graph_tensor(self.groupnorm_bias),
+            conv1_len,
+            d_model,
+        )?;
 
         // conv2 + bias -> gelu (exact erf).
         state = graph
@@ -1010,4 +988,151 @@ fn upload_layer(
 
 fn build_err(step: &'static str) -> impl Fn(GgmlCpuGraphError) -> MoonshineEncoderError {
     move |source| MoonshineEncoderError::GraphBuildFailed { step, source }
+}
+
+fn conv_stem_group_norm<'a>(
+    graph: &GgmlCpuGraphBuilder<'a>,
+    input: GgmlCpuTensor<'a>,
+    weight: GgmlCpuTensor<'a>,
+    bias: GgmlCpuTensor<'a>,
+    frames: usize,
+    channels: usize,
+) -> Result<GgmlCpuTensor<'a>, MoonshineEncoderError> {
+    // ggml's GroupNorm channel axis is ne2. The conv output already stores
+    // contiguous [time, channel] values, so this view needs no transpose/copy.
+    let input = graph
+        .reshape_3d(input, frames, 1, channels)
+        .map_err(build_err("gn_shape"))?;
+    let output = graph
+        .group_norm(input, 1, MOONSHINE_GROUP_NORM_EPSILON)
+        .map_err(build_err("gn_norm"))?;
+    let output = graph
+        .reshape_2d(output, frames, channels)
+        .map_err(build_err("gn_output_shape"))?;
+    let weight = graph
+        .reshape_2d(weight, 1, channels)
+        .map_err(build_err("gn_weight_shape"))?;
+    let bias = graph
+        .reshape_2d(bias, 1, channels)
+        .map_err(build_err("gn_bias_shape"))?;
+    let output = graph.mul(output, weight).map_err(build_err("gn_weight"))?;
+    graph.add(output, bias).map_err(build_err("gn_bias"))
+}
+
+#[cfg(test)]
+mod normalization_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires offline PyTorch stem dump; set OPENASR_MOONSHINE_STEM_REFERENCE and OPENASR_MOONSHINE_STEM_BACKEND=cpu|metal"]
+    fn moonshine_conv_stem_real_reference() {
+        #[derive(serde::Deserialize)]
+        struct Reference {
+            frames: usize,
+            channels: usize,
+            input: Vec<f32>,
+            weight: Vec<f32>,
+            bias: Vec<f32>,
+            expected: Vec<f32>,
+        }
+        let reference: Reference = serde_json::from_slice(
+            &std::fs::read(
+                std::env::var("OPENASR_MOONSHINE_STEM_REFERENCE").expect("reference path"),
+            )
+            .expect("reference JSON"),
+        )
+        .expect("valid reference");
+        let backend = match std::env::var("OPENASR_MOONSHINE_STEM_BACKEND").as_deref() {
+            Ok("cpu") => crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            #[cfg(target_os = "macos")]
+            Ok("metal") => crate::ggml_runtime::GgmlCpuGraphBackend::Metal,
+            _ => panic!("explicit supported reference backend required"),
+        };
+        assert_eq!(reference.input.len(), reference.frames * reference.channels);
+        assert_eq!(reference.expected.len(), reference.input.len());
+        assert_eq!(reference.weight.len(), reference.channels);
+        assert_eq!(reference.bias.len(), reference.channels);
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig {
+            backend,
+            ..GgmlCpuGraphConfig::conservative_default()
+        })
+        .unwrap();
+        let mut graph = runner.start_graph();
+        let input = graph
+            .new_tensor_2d_f32(reference.frames, reference.channels, "input")
+            .unwrap();
+        let weight = graph
+            .new_tensor_1d_f32(reference.channels, "weight")
+            .unwrap();
+        let bias = graph.new_tensor_1d_f32(reference.channels, "bias").unwrap();
+        for tensor in [input, weight, bias] {
+            graph.set_input(tensor).unwrap();
+        }
+        let output = conv_stem_group_norm(
+            &graph,
+            input,
+            weight,
+            bias,
+            reference.frames,
+            reference.channels,
+        )
+        .unwrap();
+        graph.set_output(output).unwrap();
+        graph
+            .set_f32_slice(input, &reference.input, "input")
+            .unwrap();
+        graph
+            .set_f32_slice(weight, &reference.weight, "weight")
+            .unwrap();
+        graph.set_f32_slice(bias, &reference.bias, "bias").unwrap();
+        let actual = graph
+            .compute_output_f32(output, reference.expected.len())
+            .unwrap();
+        for (index, (actual, expected)) in actual.iter().zip(reference.expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 2.0e-4 + expected.abs() * 1.0e-5,
+                "{backend:?} index {index}: {actual} != {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn moonshine_conv_stem_group_norm_matches_channel_time_reference() {
+        let mut runner =
+            GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default()).unwrap();
+        let mut graph = runner.start_graph();
+        let input = graph.new_tensor_2d_f32(3, 2, "input").unwrap();
+        let weight = graph.new_tensor_1d_f32(2, "weight").unwrap();
+        let bias = graph.new_tensor_1d_f32(2, "bias").unwrap();
+        for tensor in [input, weight, bias] {
+            graph.set_input(tensor).unwrap();
+        }
+        let output = conv_stem_group_norm(&graph, input, weight, bias, 3, 2).unwrap();
+        graph.set_output(output).unwrap();
+        let values = [1.0_f32, 2.0, 4.0, 10.0, 20.0, 40.0];
+        let weights = [2.0_f32, 0.5];
+        let biases = [-1.0_f32, 3.0];
+        graph.set_f32_slice(input, &values, "input").unwrap();
+        graph.set_f32_slice(weight, &weights, "weight").unwrap();
+        graph.set_f32_slice(bias, &biases, "bias").unwrap();
+        let actual = graph.compute_output_f32(output, values.len()).unwrap();
+        // GroupNorm(1) reduces channels AND time for each waveform, then
+        // applies one affine pair per channel (PyTorch [batch, channel, time]).
+        let mean = values.iter().map(|&x| f64::from(x)).sum::<f64>() / values.len() as f64;
+        let variance = values
+            .iter()
+            .map(|&x| (f64::from(x) - mean).powi(2))
+            .sum::<f64>()
+            / values.len() as f64;
+        for (index, (&value, actual)) in values.iter().zip(actual).enumerate() {
+            let channel = index / 3;
+            let expected = (f64::from(value) - mean) / (variance + 1.0e-5).sqrt()
+                * f64::from(weights[channel])
+                + f64::from(biases[channel]);
+            assert!(
+                (f64::from(actual) - expected).abs() < 1.0e-5,
+                "index {index}: actual {actual}, expected {expected}"
+            );
+        }
+    }
 }
