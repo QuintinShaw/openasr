@@ -10,7 +10,6 @@ use crate::{GgufTensorIndex, GgufTensorMetadata};
 use super::tokenizer::MoonshineTokenizer;
 
 pub(crate) const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
-pub(crate) const MOONSHINE_ARCHITECTURE_VALUE: &str = "moonshine-encoder-decoder";
 
 pub(crate) const MOONSHINE_VOCAB_SIZE_KEY: &str = "moonshine.vocab_size";
 pub(crate) const MOONSHINE_D_MODEL_KEY: &str = "moonshine.d_model";
@@ -71,9 +70,16 @@ pub(crate) fn parse_moonshine_execution_metadata<M: ScalarMetadataView>(
 ) -> Result<MoonshineExecutionMetadata, MoonshineRuntimeContractError> {
     let architecture = required_string_scalar(metadata, GENERAL_ARCHITECTURE_KEY)
         .map_err(map_metadata_contract_error)?;
-    if architecture != MOONSHINE_ARCHITECTURE_VALUE {
+    let descriptor = crate::arch::OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(crate::arch::MOONSHINE_GGML_ARCHITECTURE_ID)
+        .expect("Moonshine must be registered");
+    if !descriptor
+        .identity
+        .runtime_architecture_aliases
+        .contains(&architecture)
+    {
         return Err(MoonshineRuntimeContractError::UnexpectedArchitecture {
-            expected: MOONSHINE_ARCHITECTURE_VALUE,
+            expected: crate::arch::MOONSHINE_GGML_ARCHITECTURE_ID,
             found: architecture.to_string(),
         });
     }
@@ -532,7 +538,7 @@ mod tests {
 
     fn valid_metadata() -> BTreeMap<String, String> {
         scalar_metadata(&[
-            (GENERAL_ARCHITECTURE_KEY, MOONSHINE_ARCHITECTURE_VALUE),
+            (GENERAL_ARCHITECTURE_KEY, "moonshine"),
             (MOONSHINE_VOCAB_SIZE_KEY, "4"),
             (MOONSHINE_D_MODEL_KEY, "16"),
             (MOONSHINE_ENCODER_LAYERS_KEY, "1"),
@@ -552,6 +558,21 @@ mod tests {
 
     fn execution_metadata() -> MoonshineExecutionMetadata {
         parse_moonshine_execution_metadata(&valid_metadata()).expect("metadata must parse")
+    }
+
+    #[test]
+    fn accepts_registered_architecture_aliases_and_rejects_foreign_families() {
+        for architecture in ["moonshine", crate::arch::MOONSHINE_GGML_ARCHITECTURE_ID] {
+            let mut metadata = valid_metadata();
+            metadata.insert(GENERAL_ARCHITECTURE_KEY.into(), architecture.into());
+            parse_moonshine_execution_metadata(&metadata).expect("registered Moonshine identity");
+        }
+        let mut metadata = valid_metadata();
+        metadata.insert(GENERAL_ARCHITECTURE_KEY.into(), "whisper".into());
+        assert!(matches!(
+            parse_moonshine_execution_metadata(&metadata),
+            Err(MoonshineRuntimeContractError::UnexpectedArchitecture { .. })
+        ));
     }
 
     fn tokenizer_gguf_metadata(model: &str, tokens: &[&str]) -> GgufMetadata {

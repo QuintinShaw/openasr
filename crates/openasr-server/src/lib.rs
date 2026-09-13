@@ -1856,6 +1856,24 @@ impl ServerRuntime {
         Ok(AdmittedNativeExecution { permit, activity })
     }
 
+    /// Auxiliary compute does not depend on the active ASR snapshot, but must
+    /// retain native occupancy and serialize entry against model activation.
+    pub(crate) fn acquire_native_auxiliary_execution(
+        &self,
+        identity: &str,
+        admitted_file_id: Option<&str>,
+    ) -> Result<AdmittedNativeExecution, ApiError> {
+        let _activation_gate = self.begin_native_activation()?;
+        let activity = NativeActivityGuard::enter();
+        let permit = self.try_acquire_native_execution(
+            identity,
+            None,
+            NativeAdmissionKind::File,
+            admitted_file_id,
+        )?;
+        Ok(AdmittedNativeExecution { permit, activity })
+    }
+
     fn try_acquire_native_execution(
         &self,
         verified_model_identity: &str,

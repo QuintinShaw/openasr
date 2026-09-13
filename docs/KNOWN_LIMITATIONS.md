@@ -121,8 +121,7 @@ for the code map and [Roadmap](ROADMAP.md) for development priorities.
   fail, the request still succeeds: the native approximate timeline is kept,
   `timeline_quality` stays `native_approximate`, and
   `timeline_degraded_reason` names the cause. CLI prints a warning and
-  exits 0; HTTP `json` / `verbose_json` include the field. Desktop does
-  not yet read the reason. Explicit `aligned` only
+  exits 0; HTTP `json` / `verbose_json` include the field. Explicit `aligned` only
   refines words; the automatic Voice ID path additionally consumes those
   words to assign each text run to the canonical speaker timeline.
 - External manuscript alignment (`openasr align` / `POST /v1/audio/precise-timeline`
@@ -149,9 +148,11 @@ for the code map and [Roadmap](ROADMAP.md) for development priorities.
   otherwise matching script) were not in the calibration set. A theoretically
   sharp but token-wrong timestamp head can also miss. This compute endpoint
   never downloads the pack; paired device tokens may call it (it is a
-  compute route, not operator-only). This route is not yet on the file
-  FIFO / pause / cancel surface used by `/v1/audio/transcriptions`; a request
-  that has entered alignment cannot be cancelled that way. The plain-transcript
+  compute route, not operator-only). With a `transcription_id`, this route
+  shares the file FIFO and the `/v1/audio/transcriptions/{id}` progress,
+  pause, resume, and cancel endpoints. Pause takes effect at segment boundaries;
+  cancellation is cooperative, not an immediate interruption of every native
+  operation. Requests without an id fail busy rather than queue. The plain-transcript
   path still aligns the whole recording as one Forced Aligner item: it does
   not auto-split. Inputs that would exceed decoder context or the 400 s grid
   fail closed instead of being chunked. Kanji-only Japanese with no kana, when
@@ -280,12 +281,12 @@ for the code map and [Roadmap](ROADMAP.md) for development priorities.
   are retained. See
   [Graph cancellation contract](design/graph-cancellation.md).
   Pause still only blocks at slice boundaries and never arms graph cancellation.
-- `POST /v1/audio/transcriptions?stream=true` shares owner checks, cancel
-  control, and `finish_file` cleanup with JSON file jobs, but a busy server
-  rejects the stream with HTTP 429 instead of enqueueing it on the cancelable
-  file FIFO. JSON `POST /v1/audio/transcriptions` still queues. Desktop remote
-  file transcription uses the JSON endpoint. A later change can emit a queued
-  SSE event and then stream the result.
+- `POST /v1/audio/transcriptions?stream=true` shares the file FIFO, owner
+  checks, cancellation, and cleanup with JSON file jobs. A `transcription_id`
+  is required for queueing; requests without one return HTTP 429 when busy.
+  File computation completes before SSE headers are sent, so admission and
+  compute failures retain their HTTP status. There is no queued SSE event;
+  use the request's progress endpoint while waiting.
 
 ## Related docs
 

@@ -71,6 +71,26 @@ mod tests {
     }
 
     #[test]
+    fn refine_existing_honors_cancel_before_reliable_fast_path() {
+        let services = NativeExecutionServices::for_local_process().unwrap();
+        let control = std::sync::Arc::new(crate::TranscriptionControl::new());
+        control.request_pause();
+        control.request_cancel();
+        let context = crate::RequestExecutionContext::new(Some("refine-cancel".into()), control);
+        let error = refine_existing_transcription_timeline(
+            reliable_two_speaker_transcription(),
+            &[0.0; 48_000],
+            &services,
+            ExecutionTarget::Cpu,
+            Some("en"),
+            true,
+            &context,
+        )
+        .unwrap_err();
+        assert!(matches!(error, crate::BackendError::TranscriptionCanceled));
+    }
+
+    #[test]
     fn refine_existing_noop_when_native_reliable_preserves_speakers_and_fills_cues() {
         let services = NativeExecutionServices::for_local_process()
             .expect("native execution services for test");
@@ -82,6 +102,7 @@ mod tests {
             ExecutionTarget::Cpu,
             Some("en"),
             true,
+            &crate::RequestExecutionContext::uncancellable("test has no external controller"),
         )
         .expect("native-reliable refine should no-op without the aligner pack");
         assert_eq!(
@@ -128,6 +149,9 @@ mod tests {
                     ExecutionTarget::Cpu,
                     Some("en"),
                     true,
+                    &crate::RequestExecutionContext::uncancellable(
+                        "test has no external controller",
+                    ),
                 )
                 .expect_err("missing forced-aligner pack must fail closed")
             },
@@ -157,6 +181,7 @@ mod tests {
             ExecutionTarget::Cpu,
             Some("en"),
             true,
+            &crate::RequestExecutionContext::uncancellable("test has no external controller"),
         )
         .expect_err("empty transcript must fail closed");
         assert!(
@@ -180,6 +205,7 @@ mod tests {
             ExecutionTarget::Cpu,
             Some("en"),
             true,
+            &crate::RequestExecutionContext::uncancellable("test has no external controller"),
         )
         .expect_err("punctuation-only transcript must fail closed");
         assert!(
@@ -203,6 +229,7 @@ mod tests {
             ExecutionTarget::Cpu,
             Some("ja"),
             true,
+            &crate::RequestExecutionContext::uncancellable("test has no external controller"),
         )
         .expect_err("japanese must fail closed");
         assert!(
@@ -216,6 +243,7 @@ mod tests {
             ExecutionTarget::Cpu,
             Some("en"),
             true,
+            &crate::RequestExecutionContext::uncancellable("test has no external controller"),
         )
         .expect_err("hiragana must fail closed even when tagged english");
         assert!(
@@ -246,6 +274,9 @@ mod tests {
                     ExecutionTarget::Cpu,
                     Some("en"),
                     true,
+                    &crate::RequestExecutionContext::uncancellable(
+                        "test has no external controller",
+                    ),
                 )
                 .expect_err("missing forced-aligner pack must fail closed")
             },
@@ -301,6 +332,7 @@ mod tests {
                     ExecutionTarget::Cpu,
                     Some("en"),
                     true,
+                    &crate::RequestExecutionContext::uncancellable("test has no external controller"),
                 )
                 .expect("jfk forced alignment")
             },

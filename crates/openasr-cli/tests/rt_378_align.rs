@@ -299,6 +299,7 @@ fn rt_378_kanji_only_japanese_tagged_en_or_auto_fails_closed() {
         ExecutionTarget::Cpu,
         Some("ja"),
         true,
+        &openasr_core::RequestExecutionContext::uncancellable("test has no external controller"),
     )
     .expect_err("pure kanji tagged ja must fail closed");
     assert!(
@@ -327,6 +328,7 @@ fn assert_external_manuscript_fails_closed(manuscript: &str, case: &str) {
         ExecutionTarget::Cpu,
         Some("en"),
         true,
+        &openasr_core::RequestExecutionContext::uncancellable("test has no external controller"),
     ) {
         Ok(transcription) => {
             let words: Vec<&str> = transcription

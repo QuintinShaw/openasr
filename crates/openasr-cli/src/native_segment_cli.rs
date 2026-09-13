@@ -1712,6 +1712,9 @@ pub(super) fn align_plain_transcript_command(
         execution_target,
         options.language.as_deref(),
         options.keep_word_timestamps,
+        &openasr_core::RequestExecutionContext::uncancellable(
+            "standalone alignment CLI has no external request controller",
+        ),
     )
     .map_err(|error| consent::CliExit::new(consent::ExitCode::RuntimeFailed, error.to_string()))?;
     write_rendered_formats(

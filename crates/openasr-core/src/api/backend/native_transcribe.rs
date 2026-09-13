@@ -1656,6 +1656,8 @@ fn resolve_prepared_audio_samples(
 /// timestamps and the dual-view projection change. Missing Forced Aligner pack
 /// fails closed with [`BackendError::WordTimestampAlignmentPackMissing`] (no
 /// silent download).
+/// The explicit request context supplies progress identity and cooperative
+/// pause/cancel control, including the already-precise fast path.
 pub fn refine_existing_transcription_timeline(
     transcription: Transcription,
     prepared_audio_16khz_mono: &[f32],
@@ -1663,7 +1665,13 @@ pub fn refine_existing_transcription_timeline(
     execution_target: crate::ExecutionTarget,
     language_hint: Option<&str>,
     keep_word_timestamps: bool,
+    execution_context: &crate::RequestExecutionContext,
 ) -> Result<Transcription, BackendError> {
+    if execution_context.control.wait_at_slice_boundary()
+        == super::transcription_control::SliceBoundaryControl::Canceled
+    {
+        return Err(BackendError::TranscriptionCanceled);
+    }
     if prepared_audio_16khz_mono.is_empty() {
         return Err(BackendError::WordTimestampAlignmentFailed {
             reason: "audio is empty; cannot refine timeline without PCM samples".into(),
@@ -1698,15 +1706,9 @@ pub fn refine_existing_transcription_timeline(
     let pcm = PcmBuffer::from_vec(prepared_audio_16khz_mono.to_vec());
     let request_intent = ExecutionIntent::from(execution_target);
     let backend_class = progress_backend_class(&request_intent);
-    // Post-hoc FA is an independent operation: its own progress id is not
-    // available here (caller may install one later). Report through a detached
-    // reporter unless the caller shares an id via thread-local in a follow-up;
-    // for now install under no-id (no publish) unless we invent an id. Server
-    // post-hoc path should pass progress once it has a request id -- keep the
-    // align loop progress-capable via optional reporter below.
-    let _progress_handle = ProgressRegistryHandle::new(None);
+    let _progress_handle = ProgressRegistryHandle::new(execution_context.request_id.clone());
     let progress = ProgressReporter::install(
-        None,
+        execution_context.request_id.clone(),
         ProgressPlan::post_hoc_align(audio_duration_s, backend_class),
     );
     // Align is a separate heavyweight phase; drop idle primary ASR caches so
@@ -1718,9 +1720,7 @@ pub fn refine_existing_transcription_timeline(
         language_hint,
         execution_services,
         &request_intent,
-        &crate::RequestExecutionContext::uncancellable(
-            "post-hoc timeline refinement has no external request control",
-        ),
+        execution_context,
         Some(&progress),
         crate::subtitle::ForcedAlignmentFailurePolicy::FailClosed,
     )?;
@@ -1759,6 +1759,7 @@ pub fn align_plain_transcript_to_audio(
     execution_target: crate::ExecutionTarget,
     language_hint: Option<&str>,
     keep_word_timestamps: bool,
+    execution_context: &crate::RequestExecutionContext,
 ) -> Result<Transcription, BackendError> {
     if prepared_audio_16khz_mono.is_empty() {
         return Err(BackendError::WordTimestampAlignmentFailed {
@@ -1809,6 +1810,7 @@ pub fn align_plain_transcript_to_audio(
         execution_target,
         Some(language.as_str()),
         true,
+        execution_context,
     )?;
     if keep_word_timestamps {
         Ok(refined)
@@ -1942,7 +1944,9 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
             let mut completed_align_duration_s = 0.0f64;
             let mut boundary_log_probs = Vec::new();
             for (index, segment) in refined.segments.iter_mut().enumerate() {
-                if execution_context.is_canceled() {
+                if execution_context.control.wait_at_slice_boundary()
+                    == super::transcription_control::SliceBoundaryControl::Canceled
+                {
                     return Err(BackendError::TranscriptionCanceled);
                 }
                 if segment.text.trim().is_empty() {
