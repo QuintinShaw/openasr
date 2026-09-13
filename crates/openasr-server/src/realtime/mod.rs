@@ -50,11 +50,11 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
-    ApiError, DistributionContext, PENDING_IDLE_SWITCH_MESSAGE, SERVER_BUSY_MESSAGE, ServerAuth,
-    ServerRuntime, apply_remote_compute_client_request_policy, file_slot_occupied,
-    is_remote_compute_client_request, native_hardware_target_from_execution_target,
-    parse_transcription_multipart, realtime_capabilities_for_runtime_and_distribution,
-    record_file_transcription_history, transcribe_parsed_file, transcribe_with_runtime,
+    ApiError, DistributionContext, ServerAuth, ServerRuntime,
+    apply_remote_compute_client_request_policy, is_remote_compute_client_request,
+    native_hardware_target_from_execution_target, parse_transcription_multipart,
+    realtime_capabilities_for_runtime_and_distribution, record_file_transcription_history,
+    transcribe_parsed_file, transcribe_with_runtime,
 };
 
 mod native_worker;
@@ -211,12 +211,6 @@ pub(crate) async fn stream_transcription(
         ));
     }
     let record_history = !remote_compute_client;
-    if !runtime.native_execution.remote_policy().admits_new_tasks() {
-        return Err(ApiError::Conflict(PENDING_IDLE_SWITCH_MESSAGE.to_string()));
-    }
-    if file_slot_occupied(&runtime, None) {
-        return Err(ApiError::Busy(SERVER_BUSY_MESSAGE.to_string()));
-    }
     let model_id = parsed.request.model_id.clone();
     let stream_started_at = Instant::now();
     // One-shot file jobs finish before SSE starts. Any error is already

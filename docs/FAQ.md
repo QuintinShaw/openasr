@@ -78,7 +78,10 @@ do not run inference.
 Yes. `openasr align audio.wav --transcript script.txt -f srt` force-aligns a
 plain-text manuscript onto the audio with the Qwen3-ForcedAligner pack (no ASR).
 The HTTP equivalent is `POST /v1/audio/precise-timeline` with `file` +
-`transcript`. Japanese and Korean fail closed by language tag (`ja`/`ko`)
+`transcript`. Add `transcription_id` to opt into the shared file FIFO and
+`/v1/audio/transcriptions/{id}/{progress,pause,resume,cancel}` controls.
+Pause applies at alignment segment boundaries, not within a running native
+operation. Japanese and Korean fail closed by language tag (`ja`/`ko`)
 or by kana/hangul script. Pure-kanji Japanese cannot be identified as
 Japanese: tagged `ja` it is 400; tagged `en` it follows the CJK character
 tokenizer. A missing pack, empty normalized text, a prompt past decoder

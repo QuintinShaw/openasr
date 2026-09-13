@@ -55,8 +55,11 @@ pack that is being served.
 - `POST /v1/audio/precise-timeline` -- OpenASR-native forced alignment
   (multipart form). Does not run ASR. Accepts source `file` plus exactly one
   of `transcript` (plain text) or `transcript_json` (timed verbose/json body).
-  Optional: `language`, `word_timestamps` (default true), `execution_target`,
+  Optional: `transcription_id`, `language`, `word_timestamps` (default true), `execution_target`,
   `response_format` (`verbose_json` default; `json`/`text`/`srt`/`vtt`/`markdown`).
+  With `transcription_id`, uses the shared file FIFO and transcription
+  progress/pause/resume/cancel endpoints. Pause applies at segment boundaries;
+  cancellation is cooperative. Without an id, busy requests fail with 429.
   SRT/VTT reuse the shared subtitle exporter. Missing Forced Aligner pack,
   unsupported language (tag `ja`/`jp`/`ko`/`kr` or hiragana/katakana/hangul
   in the text), empty normalized text, audio past the timestamp grid, a
@@ -72,7 +75,7 @@ pack that is being served.
   it explicitly).
 - `POST /v1/audio/transcriptions/{id}/pause|resume|cancel` -- OpenASR
   extension: control an in-flight request that supplied a `transcription_id`
-  form field.
+  form field, including precise-timeline requests.
 - `GET /v1/devices` -- OpenASR extension (0.1.13+): read-only enumeration of
   this daemon's own ggml compute devices (`{"object":"devices",
   "default_execution_target","devices":[{"id","name","meta","kind","target",

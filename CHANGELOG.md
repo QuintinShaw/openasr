@@ -57,6 +57,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Core API: `refine_existing_transcription_timeline` and
+  `align_plain_transcript_to_audio` now require a `RequestExecutionContext`
+  argument for progress and cooperative task control. Callers without an
+  external controller must pass an explicit uncancellable context.
+
 - Breaking API cleanup: removed the id-less `GET /v1/audio/transcriptions/progress`
   compatibility route and its aggregate native-progress API. Clients must use
   `GET /v1/audio/transcriptions/{id}/progress`. Removed the hidden, unsupported
@@ -161,6 +166,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Breaking:** Voice ID: the minimum accepted speech for one enrollment sample (`MIN_SAMPLE_SPEECH_SECONDS`) is raised from 5.0s to 10.0s, to sit above recognition's own naming floor (8.0s) with a margin -- an enrollment that only just cleared the old floor could already fail the very next recognition attempt, since real speech is consistently thinner evidence than an enrollment prompt's read-aloud passage for the same nominal seconds. A sample between 5 and 10 seconds of detected speech that previously enrolled now fails quality assessment with the same "too short" error, pointing the user at a longer re-record.
 
 ### Fixed
+
+- Moonshine: conv-stem GroupNorm now normalizes over both time and channels,
+  matching the reference model instead of normalizing each frame separately.
+  Runtime metadata validation also uses the architecture registry's identities,
+  accepting the canonical identity emitted by the local pack writer.
+- Server: precise-timeline requests with `transcription_id` now share file
+  queueing, ownership, pause/resume/cancel, and disconnect cleanup. SSE file
+  requests with an id also join the shared FIFO instead of returning busy.
 
 - Long-form: duplicate and isolated fragments at long-audio slice seams
   are fixed; slice windows and non-seam cue timings are unchanged.

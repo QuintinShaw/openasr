@@ -162,8 +162,9 @@ local equivalent (`temperature`, `include[]`, `chunking_strategy`,
 form field) is rejected with an actionable 400: SSE streaming is the
 OpenASR realtime protocol behind the `?stream=true` query parameter, not
 OpenAI `transcript.text.*` events. When that query-parameter stream is used
-for a file job, a busy server returns HTTP 429 instead of joining the
-cancelable JSON file FIFO; see [Known Limitations](KNOWN_LIMITATIONS.md).
+for a file job, supplying `transcription_id` enables the same cancelable FIFO
+as JSON file jobs; without an id, a busy server returns HTTP 429. Computation
+finishes before SSE headers are sent; see [Known Limitations](KNOWN_LIMITATIONS.md).
 
 ### Incomplete transcripts
 

@@ -222,7 +222,28 @@ pub(crate) async fn precise_timeline(
     let ffmpeg_bin = runtime.ffmpeg_bin.clone();
     let ffmpeg_bin_explicit = runtime.ffmpeg_bin_explicit;
     let response_format = parsed.response_format;
-    let refined = tokio::task::spawn_blocking(move || {
+    let (execution_context, mut control_cleanup) = admit_file_request(
+        &runtime,
+        &distribution,
+        &auth,
+        &headers,
+        parsed.transcription_id.as_deref(),
+    )
+    .await?;
+    // Acquire before spawning: disconnect may drop the HTTP future before the
+    // blocking worker starts. The worker must retain visible native occupancy.
+    let admission = runtime.acquire_native_auxiliary_execution(
+        "precise-timeline",
+        execution_context.request_id.as_deref(),
+    )?;
+    let worker_context = execution_context.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let _admission = admission;
+        if worker_context.is_canceled() {
+            return Err(ApiError::Backend(
+                openasr_core::BackendError::TranscriptionCanceled,
+            ));
+        }
         let prepared = prepare_audio_input(
             &parsed.audio_path,
             &AudioPreparationOptions::new(backend)
@@ -252,8 +273,6 @@ pub(crate) async fn precise_timeline(
                 "Uploaded audio decoded to zero samples; cannot refine timeline".into(),
             ));
         }
-        // Keep the activity guard so idle unload does not race the aligner.
-        let _activity_guard = NativeActivityGuard::enter();
         // Keep the upload temp path alive across prepare + load.
         let _audio_keepalive = parsed.audio_temp;
         match parsed.transcript {
@@ -265,6 +284,7 @@ pub(crate) async fn precise_timeline(
                     parsed.execution_target.unwrap_or_default(),
                     parsed.language_hint.as_deref(),
                     parsed.keep_word_timestamps,
+                    &worker_context,
                 )
                 .map_err(ApiError::Backend)
             }
@@ -275,12 +295,22 @@ pub(crate) async fn precise_timeline(
                 parsed.execution_target.unwrap_or_default(),
                 parsed.language_hint.as_deref(),
                 parsed.keep_word_timestamps,
+                &worker_context,
             )
             .map_err(ApiError::Backend),
         }
     })
     .await
-    .map_err(ApiError::BackendJoin)??;
+    .map_err(ApiError::BackendJoin)?;
+    if let Some(cleanup) = control_cleanup.as_mut() {
+        cleanup.disarm();
+    }
+    if execution_context.is_canceled() {
+        return Err(ApiError::Backend(
+            openasr_core::BackendError::TranscriptionCanceled,
+        ));
+    }
+    let refined = result?;
     let rendered = render_transcription(&refined, response_format).map_err(ApiError::Serialize)?;
     let content_type = match response_format {
         ResponseFormat::Json | ResponseFormat::VerboseJson => mime::APPLICATION_JSON.as_ref(),
@@ -296,6 +326,7 @@ pub(crate) async fn precise_timeline(
 
 #[derive(Debug)]
 struct PreciseTimelineUpload {
+    transcription_id: Option<String>,
     audio_path: PathBuf,
     /// Keeps the uploaded temp file alive until prepare/load finish.
     audio_temp: tempfile::TempPath,
@@ -354,6 +385,7 @@ async fn parse_precise_timeline_multipart(
     let mut execution_target: Option<ExecutionTarget> = None;
     let mut response_format = ResponseFormat::VerboseJson;
     let mut return_speaker_embeddings = false;
+    let mut transcription_id = None;
 
     while let Some(field) = multipart.next_field().await.map_err(ApiError::Multipart)? {
         let name = field.name().unwrap_or_default().to_string();
@@ -368,6 +400,11 @@ async fn parse_precise_timeline_multipart(
             }
             "transcript_json" => {
                 transcript_json = Some(field.text().await.map_err(ApiError::Multipart)?);
+            }
+            "transcription_id" => {
+                let value = field.text().await.map_err(ApiError::Multipart)?;
+                let trimmed = value.trim();
+                transcription_id = (!trimmed.is_empty()).then(|| trimmed.to_string());
             }
             "transcript" => {
                 transcript_plain = Some(field.text().await.map_err(ApiError::Multipart)?);
@@ -409,6 +446,7 @@ async fn parse_precise_timeline_multipart(
     let audio_path = audio_temp.to_path_buf();
 
     Ok(PreciseTimelineUpload {
+        transcription_id,
         audio_path,
         audio_temp,
         transcript,
@@ -1025,6 +1063,50 @@ pub(crate) struct FileTranscriptionOutcome {
     pub request_receipt: Option<openasr_core::NativeExecutionReceiptCollector>,
 }
 
+/// Shared ownership, FIFO admission and disconnect cleanup for file compute.
+async fn admit_file_request(
+    runtime: &ServerRuntime,
+    distribution: &DistributionContext,
+    auth: &ServerAuth,
+    headers: &HeaderMap,
+    id: Option<&str>,
+) -> Result<
+    (
+        openasr_core::RequestExecutionContext,
+        Option<ActiveTranscriptionCleanup>,
+    ),
+    ApiError,
+> {
+    let Some(id) = id else {
+        if !runtime.native_execution.remote_policy().admits_new_tasks() {
+            return Err(ApiError::Conflict(PENDING_IDLE_SWITCH_MESSAGE.to_string()));
+        }
+        if file_slot_occupied(runtime, None) {
+            return Err(ApiError::Busy(SERVER_BUSY_MESSAGE.to_string()));
+        }
+        return Ok((
+            openasr_core::RequestExecutionContext::uncancellable(
+                "client did not register a transcription id",
+            ),
+            None,
+        ));
+    };
+    let owner = auth.pairing_device_id_for_headers(headers);
+    let control = register_active_transcription(distribution, id, owner.as_deref())?;
+    let cleanup = ActiveTranscriptionCleanup::new(
+        Some(runtime.clone()),
+        distribution.clone(),
+        runtime.native_execution.remote_policy().clone(),
+        id.to_string(),
+        Arc::clone(&control),
+    );
+    wait_for_file_admission(runtime, id, &control).await?;
+    Ok((
+        openasr_core::RequestExecutionContext::new(Some(id.to_string()), control),
+        Some(cleanup),
+    ))
+}
+
 /// Shared file-job admission, cancel control, decode, and finish_file Drop
 /// guard. JSON and `?stream=true` both go through this so stream cannot skip
 /// the FIFO, owner registry, or abort cleanup.
@@ -1039,25 +1121,18 @@ pub(crate) async fn transcribe_parsed_file(
 ) -> Result<FileTranscriptionOutcome, ApiError> {
     let history_request = parsed.request.clone();
     let _uploaded_file = parsed._uploaded_file;
-    let control = if let Some(id) = parsed.transcription_id.clone() {
-        let owner = auth.pairing_device_id_for_headers(&headers);
-        let control = register_active_transcription(&distribution, &id, owner.as_deref())?;
-        Some((id, control))
-    } else {
-        None
-    };
-    let mut control_cleanup = control.as_ref().map(|(id, control)| {
-        ActiveTranscriptionCleanup::new(
-            Some(runtime.clone()),
-            distribution.clone(),
-            runtime.native_execution.remote_policy().clone(),
-            id.clone(),
-            Arc::clone(control),
-        )
-    });
     let run_started = Instant::now();
-    if let Some((id, control)) = &control {
-        if let Err(error) = wait_for_file_admission(&runtime, id, control).await {
+    let (mut execution_context, mut control_cleanup) = match admit_file_request(
+        &runtime,
+        &distribution,
+        &auth,
+        &headers,
+        parsed.transcription_id.as_deref(),
+    )
+    .await
+    {
+        Ok(admitted) => admitted,
+        Err(error) => {
             if matches!(
                 error,
                 ApiError::Backend(openasr_core::BackendError::TranscriptionCanceled)
@@ -1074,18 +1149,6 @@ pub(crate) async fn transcribe_parsed_file(
             }
             return Err(error);
         }
-    } else if !runtime.native_execution.remote_policy().admits_new_tasks() {
-        return Err(ApiError::Conflict(PENDING_IDLE_SWITCH_MESSAGE.to_string()));
-    } else if file_slot_occupied(&runtime, None) {
-        return Err(ApiError::Busy(SERVER_BUSY_MESSAGE.to_string()));
-    }
-    let mut execution_context = match &control {
-        Some((id, control)) => {
-            openasr_core::RequestExecutionContext::new(Some(id.clone()), Arc::clone(control))
-        }
-        None => openasr_core::RequestExecutionContext::uncancellable(
-            "client never registered a transcription id for this request, so it has no cancel source",
-        ),
     };
     if let Some(request_attempt_id) = request_attempt_id {
         execution_context = execution_context.with_request_attempt_id(request_attempt_id);
