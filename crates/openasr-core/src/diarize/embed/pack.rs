@@ -209,6 +209,21 @@ pub(crate) struct PreparedSelectedEmbedder {
     pub(crate) source: PreparedEmbedderSource,
 }
 
+impl PreparedSelectedEmbedder {
+    pub(crate) fn identity(&self) -> SpeakerEmbedderIdentity {
+        let fingerprint = self.source.content_id.clone();
+        let model_id = self.catalog_model_id.clone();
+        match self.family {
+            SpeakerEmbedderFamily::ReDimNet2 => {
+                SpeakerEmbedderIdentity::redimnet2(fingerprint, model_id)
+            }
+            SpeakerEmbedderFamily::WeSpeakerResNet => {
+                SpeakerEmbedderIdentity::wespeaker_resnet(fingerprint, model_id)
+            }
+        }
+    }
+}
+
 pub(crate) struct PreparedEmbedderSource {
     verified_pack: crate::models::pack_verifier::VerifiedPack,
     content_id: String,

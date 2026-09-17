@@ -90,8 +90,6 @@ pub(super) trait SpeakerPolicyFamily: Sized + Send + Sync + 'static {
     fn parsed_host_owner_kind() -> &'static str;
     fn resident_owner_kind() -> &'static str;
 
-    fn identity(pack_fingerprint: String, catalog_model_id: String) -> SpeakerEmbedderIdentity;
-
     fn from_preflight(
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
     ) -> Result<Self::Embedder, EmbedError>;
@@ -226,10 +224,6 @@ impl SpeakerPolicyFamily for RedimNetPolicy {
         "redimnet2.resident-runtime"
     }
 
-    fn identity(pack_fingerprint: String, catalog_model_id: String) -> SpeakerEmbedderIdentity {
-        SpeakerEmbedderIdentity::redimnet2(pack_fingerprint, catalog_model_id)
-    }
-
     fn from_preflight(
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
     ) -> Result<Self::Embedder, EmbedError> {
@@ -327,10 +321,6 @@ impl SpeakerPolicyFamily for WeSpeakerPolicy {
     }
     fn resident_owner_kind() -> &'static str {
         "wespeaker.resident-runtime"
-    }
-
-    fn identity(pack_fingerprint: String, catalog_model_id: String) -> SpeakerEmbedderIdentity {
-        SpeakerEmbedderIdentity::wespeaker_resnet(pack_fingerprint, catalog_model_id)
     }
 
     fn from_preflight(
@@ -676,7 +666,7 @@ pub(super) fn load_family<F: SpeakerPolicyFamily>(
     execution_intent: ExecutionIntent,
     prepared: PreparedSelectedEmbedder,
 ) -> Result<Option<(Arc<dyn SpeakerEmbedder>, SpeakerEmbedderIdentity)>, EmbedError> {
-    let catalog_model_id = prepared.catalog_model_id.clone();
+    let identity = prepared.identity();
     let (verified_pack, preflight, content_id) = prepared.source.into_parts();
     let retained_quote = F::quoted_persistent_host_commitment_bytes(&preflight.tensor_index)?;
     let peak_quote = preflight
@@ -750,7 +740,6 @@ pub(super) fn load_family<F: SpeakerPolicyFamily>(
         ),
     )
     .map_err(policy_runtime_error)?;
-    let identity = F::identity(content_id, catalog_model_id);
     let embedder: Arc<dyn SpeakerEmbedder> = Arc::new(PolicyResolvedSpeakerEmbedder::<F> {
         runtime: Mutex::new(runtime),
         identity: identity.clone(),

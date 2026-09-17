@@ -1062,18 +1062,15 @@ pub(crate) fn open_voice_id_store(
 }
 
 pub(crate) fn active_space(
-    distribution: &DistributionContext,
+    _distribution: &DistributionContext,
 ) -> Result<Option<openasr_core::diarize::voice_id::EmbeddingSpace>, ApiError> {
-    let Some(runtime) = openasr_core::diarize::embed::PolicyResolvedSpeakerRuntime::load(
-        Arc::clone(&distribution.native_execution_services),
-    )
-    .map_err(|error| ApiError::BadRequest(error.to_string()))?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(
-        openasr_core::diarize::voice_id::EmbeddingSpace::for_active_embedder(runtime.identity()),
-    ))
+    openasr_core::diarize::embed::PolicyResolvedSpeakerRuntime::resolve_selected_identity()
+        .map(|identity| {
+            identity.map(|identity| {
+                openasr_core::diarize::voice_id::EmbeddingSpace::for_active_embedder(&identity)
+            })
+        })
+        .map_err(|error| ApiError::BadRequest(error.to_string()))
 }
 
 fn active_speaker_runtime(
