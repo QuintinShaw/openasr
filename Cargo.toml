@@ -77,7 +77,7 @@ rubato = "0.15"
 # libsqlite3 -- matches the rest of this workspace's "vendor the native deps"
 # posture (see ggml git submodule in openasr-core).
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
-rustls = "0.23"
+rustls = "0.23.45"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 getrandom = "0.3"

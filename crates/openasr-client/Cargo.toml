@@ -15,7 +15,7 @@ reqwest.workspace = true
 # Mirror the desktop client's exact rustls config (ring-only, no aws-lc-rs) so
 # feature unification keeps the client dependency graph lean. Do NOT inherit the
 # workspace rustls (its default features pull aws-lc-rs).
-rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls = { version = "0.23.45", default-features = false, features = ["std", "ring"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
