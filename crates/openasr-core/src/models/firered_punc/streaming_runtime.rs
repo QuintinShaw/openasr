@@ -59,12 +59,13 @@ pub(crate) struct PolicyResolvedStreamingPunctuator {
 
 impl PolicyResolvedStreamingPunctuator {
     pub(crate) fn prepare(
+        enabled: bool,
         execution_services: Arc<crate::NativeExecutionServices>,
         model_architecture: &'static str,
         adapter_id: &'static str,
         request_intent: &ExecutionIntent,
     ) -> Result<Option<Arc<Self>>, GgmlAsrExecutionError> {
-        if !streaming_punctuation_stage_applies(model_architecture) {
+        if !enabled || !streaming_punctuation_stage_applies(model_architecture) {
             return Ok(None);
         }
         let Some(pack_path) = resolve_firered_punc_pack_path() else {
@@ -73,7 +74,7 @@ impl PolicyResolvedStreamingPunctuator {
         let verified_pack = match PackVerifier.verify_candidate(PackCandidate::new(&pack_path)) {
             Ok(verified) => verified,
             Err(error) => {
-                crate::stage_timing::log_detail_event(
+                crate::stage_timing::log_event(
                     "native_auxiliary_runtime",
                     format_args!(
                         "stage=streaming_punctuation event=disabled reason=pack-verification detail={error}"
@@ -89,7 +90,7 @@ impl PolicyResolvedStreamingPunctuator {
                 ..
             }
         ) {
-            crate::stage_timing::log_detail_event(
+            crate::stage_timing::log_event(
                 "native_auxiliary_runtime",
                 format_args!(
                     "stage=streaming_punctuation event=disabled reason=pack-route-mismatch"
@@ -164,7 +165,7 @@ impl PolicyResolvedStreamingPunctuator {
         ) {
             Ok(runtime) => runtime,
             Err(error) if optional_punctuation_failure_disables_stage(&error) => {
-                crate::stage_timing::log_detail_event(
+                crate::stage_timing::log_event(
                     "native_auxiliary_runtime",
                     format_args!("stage=streaming_punctuation event=disabled reason={error}"),
                 );
@@ -259,6 +260,7 @@ mod tests {
         text: &str,
     ) -> String {
         let punctuator = PolicyResolvedStreamingPunctuator::prepare(
+            true,
             execution_services,
             crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
             "firered-punc-policy-parity",
@@ -284,6 +286,20 @@ mod tests {
             crate::arch::QWEN3_ASR_GGML_ARCHITECTURE_ID
         ));
         assert!(!streaming_punctuation_stage_applies("no-such-architecture"));
+    }
+
+    #[test]
+    fn explicit_opt_out_prepares_no_optional_runtime() {
+        let services = Arc::new(crate::NativeExecutionServices::for_local_process().unwrap());
+        let result = PolicyResolvedStreamingPunctuator::prepare(
+            false,
+            services,
+            crate::arch::FIRERED_AED_GGML_ARCHITECTURE_ID,
+            "firered-punc-opt-out-test",
+            &ExecutionIntent::CpuOnly,
+        )
+        .unwrap();
+        assert!(result.is_none());
     }
 
     #[test]

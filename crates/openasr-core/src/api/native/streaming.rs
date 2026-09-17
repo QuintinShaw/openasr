@@ -25,6 +25,8 @@ pub struct NativeAsrStreamingSessionConfig {
     pub backpressure: NativeAsrBackpressurePolicy,
     pub partial_results: bool,
     pub word_timestamps: bool,
+    /// Apply the optional installed punctuation stage to FINAL text only.
+    pub punctuate: bool,
     /// Minimum new audio (ms) between *partial* re-decodes, throttling live-caption
     /// emission so the engine does not re-decode the whole buffer on every 20 ms
     /// frame. `None` defers to the per-family default; `Some(0)` decodes every
@@ -39,6 +41,7 @@ impl Default for NativeAsrStreamingSessionConfig {
             backpressure: NativeAsrBackpressurePolicy::default(),
             partial_results: false,
             word_timestamps: false,
+            punctuate: true,
             min_partial_interval_ms: None,
         }
     }
@@ -66,6 +69,11 @@ impl NativeAsrStreamingSessionConfig {
 
     pub fn with_word_timestamps(mut self, word_timestamps: bool) -> Self {
         self.word_timestamps = word_timestamps;
+        self
+    }
+
+    pub fn with_punctuation(mut self, punctuate: bool) -> Self {
+        self.punctuate = punctuate;
         self
     }
 

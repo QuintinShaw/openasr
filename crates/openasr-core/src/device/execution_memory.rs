@@ -23,6 +23,8 @@ use std::{
 
 use thiserror::Error;
 
+use super::pack_weight_residency::PackWeightMappingIdentity;
+
 use crate::models::native_execution_services::NativeExecutionScopeId;
 use crate::models::runtime_receipts::{
     RuntimeOwnerDescriptor, RuntimeOwnerGuard, RuntimeOwnerPlacement, RuntimeReceiptCollector,
@@ -498,9 +500,9 @@ struct DomainAccount {
     /// Ledger corruption stays sticky until process restart.
     quarantine_kind: DomainQuarantineKind,
     by_scope: HashMap<NativeExecutionScopeId, ScopedDomainAccount>,
-    /// One already-open mapping forecast per execution cohort. Activation
-    /// opens it; pack-weight residency consumes it into a committed owner.
-    mapping_envelopes: HashMap<ReservationCohortKey, MappingEnvelope>,
+    /// Distinct open mappings can participate in one activation cohort (ASR
+    /// plus auxiliary stages). Residency consumes only its exact mapping.
+    mapping_envelopes: HashMap<MappingEnvelopeKey, MappingEnvelope>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -534,6 +536,7 @@ struct PlacementDomainAccount {
 /// consumes the same receipts into Committed. GPU weight buffers never use it.
 #[derive(Debug)]
 struct MappingEnvelope {
+    _source: MappingEnvelopeSource,
     mapping_bytes: u64,
     pending_bytes: u64,
     handle_count: u32,
@@ -550,8 +553,46 @@ struct MappingEnvelope {
 pub(crate) struct MappingEnvelopeHandle {
     broker: Arc<DeviceMemoryBrokerSet>,
     domain: MemoryDomainKey,
-    cohort: ReservationCohortKey,
+    key: MappingEnvelopeKey,
     generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MappingEnvelopeKey {
+    cohort: ReservationCohortKey,
+    mapping: PackWeightMappingIdentity,
+}
+
+/// Exact mapping identity and size travel together. Retaining its owner keeps
+/// the allocation address from being reused while a forecast is outstanding.
+#[derive(Debug, Clone)]
+pub(crate) struct MappingEnvelopeSource {
+    identity: PackWeightMappingIdentity,
+    bytes: u64,
+    _mapping: Option<Arc<memmap2::Mmap>>,
+}
+
+impl MappingEnvelopeSource {
+    pub(crate) fn from_open_mapping(mapping: Arc<memmap2::Mmap>) -> Self {
+        Self {
+            identity: PackWeightMappingIdentity::from_open_mmap(&mapping),
+            bytes: mapping.len().try_into().unwrap_or(u64::MAX),
+            _mapping: Some(mapping),
+        }
+    }
+
+    pub(crate) const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(identity: usize, bytes: u64) -> Self {
+        Self {
+            identity: PackWeightMappingIdentity::from_raw_for_test(identity),
+            bytes,
+            _mapping: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -668,12 +709,13 @@ impl DeviceMemoryBrokerSet {
     pub(crate) fn open_mapping_envelope(
         self: &Arc<Self>,
         snapshot: DeviceMemorySnapshot,
-        bytes: u64,
+        source: MappingEnvelopeSource,
         cohort_id: MemoryReservationCohortId,
         resource_id: String,
         owner_scope_id: Option<NativeExecutionScopeId>,
         owner_placement: RuntimeOwnerPlacement,
     ) -> Result<MappingEnvelopeHandle, MemoryPlanningError> {
+        let bytes = source.bytes;
         if bytes == 0 || resource_id.trim().is_empty() {
             return Err(MemoryPlanningError::EmptyResourceId);
         }
@@ -684,6 +726,10 @@ impl DeviceMemoryBrokerSet {
         };
         let domain = MemoryDomainKey::SystemMemory;
         let cohort = ReservationCohortKey::Explicit(cohort_id);
+        let key = MappingEnvelopeKey {
+            cohort,
+            mapping: source.identity,
+        };
         if snapshot.confidence == MemoryObservationConfidence::Unknown {
             return Err(MemoryPlanningError::MemoryObservationUnavailable {
                 domain: domain.clone(),
@@ -708,14 +754,14 @@ impl DeviceMemoryBrokerSet {
         }
         let existing = account
             .mapping_envelopes
-            .get(&cohort)
+            .get(&key)
             .map(|envelope| (envelope.mapping_bytes, envelope.generation));
         if let Some((mapping_bytes, generation)) = existing {
             if mapping_bytes != bytes {
                 return Err(MemoryPlanningError::ReservationLedgerCorrupted { domain });
             }
             let account = accounts.entry(domain.clone()).or_default();
-            let envelope = account.mapping_envelopes.get_mut(&cohort).ok_or(
+            let envelope = account.mapping_envelopes.get_mut(&key).ok_or(
                 MemoryPlanningError::ReservationLedgerCorrupted {
                     domain: domain.clone(),
                 },
@@ -729,7 +775,7 @@ impl DeviceMemoryBrokerSet {
             return Ok(MappingEnvelopeHandle {
                 broker: Arc::clone(self),
                 domain,
-                cohort,
+                key,
                 generation,
             });
         }
@@ -744,11 +790,15 @@ impl DeviceMemoryBrokerSet {
                 exclusive_pending_children: account.exclusive_pending_children,
             });
         }
-        let occupied = policy_occupied_bytes(account, cohort, 0).ok_or(
-            MemoryPlanningError::ReservationLedgerCorrupted {
+        // A new mapping is an additional forecast even inside this cohort.
+        // Only reopening the exact mapping above can share an existing hold.
+        let occupied = account
+            .committed_bytes
+            .checked_add(account.unreclaimable_bytes)
+            .and_then(|bytes| bytes.checked_add(account.pending_bytes))
+            .ok_or(MemoryPlanningError::ReservationLedgerCorrupted {
                 domain: domain.clone(),
-            },
-        )?;
+            })?;
         let policy_remaining = policy_ceiling.saturating_sub(occupied);
         // Observed peak is zero: the mapping is already open. Policy still
         // charges `bytes` so concurrent distinct packs fail closed.
@@ -780,8 +830,9 @@ impl DeviceMemoryBrokerSet {
             owner_placement,
         )?;
         account.mapping_envelopes.insert(
-            cohort,
+            key,
             MappingEnvelope {
+                _source: source,
                 mapping_bytes: bytes,
                 pending_bytes: bytes,
                 handle_count: 1,
@@ -797,7 +848,7 @@ impl DeviceMemoryBrokerSet {
         Ok(MappingEnvelopeHandle {
             broker: Arc::clone(self),
             domain,
-            cohort,
+            key,
             generation,
         })
     }
@@ -817,7 +868,7 @@ impl DeviceMemoryBrokerSet {
         let Some(account) = accounts.get_mut(&handle.domain) else {
             return;
         };
-        let Some(envelope) = account.mapping_envelopes.get_mut(&handle.cohort) else {
+        let Some(envelope) = account.mapping_envelopes.get_mut(&handle.key) else {
             return;
         };
         if envelope.generation != handle.generation || envelope.receipt_owner.is_some() {
@@ -838,12 +889,13 @@ impl DeviceMemoryBrokerSet {
         envelope.receipt_owner = Some(owner);
     }
 
-    /// Consume a same-cohort mapping envelope into a committed residency lease.
+    /// Consume the exact same-cohort mapping into a committed residency lease.
     ///
     /// Returns `Ok(None)` when no covering envelope exists; the caller then
     /// reserves normally. GPU weight buffers must not call this.
     pub(crate) fn try_consume_mapping_envelope(
         self: &Arc<Self>,
+        mapping: PackWeightMappingIdentity,
         bytes: u64,
         cohort_id: Option<MemoryReservationCohortId>,
         resource_id: String,
@@ -856,23 +908,23 @@ impl DeviceMemoryBrokerSet {
         }
         let domain = MemoryDomainKey::SystemMemory;
         let cohort = ReservationCohortKey::Explicit(cohort_id);
+        let key = MappingEnvelopeKey { cohort, mapping };
         let mut accounts = self.lock_accounts();
         let Some(account) = accounts.get_mut(&domain) else {
             return Ok(None);
         };
-        let (owner_scope_id, owner_placement, remaining) = {
-            let Some(envelope) = account.mapping_envelopes.get_mut(&cohort) else {
+        let (owner_scope_id, owner_placement) = {
+            let Some(envelope) = account.mapping_envelopes.get_mut(&key) else {
                 return Ok(None);
             };
+            if envelope.mapping_bytes != bytes {
+                return Err(MemoryPlanningError::ReservationLedgerCorrupted { domain });
+            }
             if envelope.pending_bytes < bytes {
                 return Ok(None);
             }
             envelope.pending_bytes -= bytes;
-            (
-                envelope.owner_scope_id,
-                envelope.owner_placement,
-                envelope.pending_bytes,
-            )
+            (envelope.owner_scope_id, envelope.owner_placement)
         };
         let donor = ReservationEntry {
             domain: domain.clone(),
@@ -898,18 +950,15 @@ impl DeviceMemoryBrokerSet {
             },
         )?;
         add_scoped_committed_bytes(account, &donor, bytes);
-        let (receipt_resource, receipt_descriptor, receipt_owner) = if remaining == 0 {
-            match account.mapping_envelopes.get_mut(&cohort) {
+        let (receipt_resource, receipt_descriptor, receipt_owner) =
+            match account.mapping_envelopes.get_mut(&key) {
                 Some(envelope) => (
                     envelope.receipt_resource.take(),
                     envelope.receipt_descriptor.take(),
                     envelope.receipt_owner.take(),
                 ),
                 None => (None, None, None),
-            }
-        } else {
-            (None, None, None)
-        };
+            };
         drop(accounts);
         let mut consumed = donor;
         consumed.committed_bytes = bytes;
@@ -2663,16 +2712,16 @@ impl MappingEnvelopeHandle {
         let Some(account) = accounts.get_mut(&self.domain) else {
             return;
         };
-        let Some(mut envelope) = account.mapping_envelopes.remove(&self.cohort) else {
+        let Some(mut envelope) = account.mapping_envelopes.remove(&self.key) else {
             return;
         };
         if envelope.generation != self.generation {
-            account.mapping_envelopes.insert(self.cohort, envelope);
+            account.mapping_envelopes.insert(self.key, envelope);
             return;
         }
         envelope.handle_count = envelope.handle_count.saturating_sub(1);
         if envelope.handle_count > 0 {
-            account.mapping_envelopes.insert(self.cohort, envelope);
+            account.mapping_envelopes.insert(self.key, envelope);
             return;
         }
         if envelope.pending_bytes > 0 {
@@ -2686,7 +2735,7 @@ impl MappingEnvelopeHandle {
                 committed_bytes: 0,
                 requires_reconciliation: false,
                 holds_exclusive_gate: false,
-                cohort: self.cohort,
+                cohort: self.key.cohort,
                 owner_scope_id: envelope.owner_scope_id,
                 owner_placement: envelope.owner_placement,
                 quarantine_bytes: envelope.pending_bytes,
@@ -3295,7 +3344,7 @@ mod tests {
         let envelope = broker
             .open_mapping_envelope(
                 snap,
-                4 * GIB,
+                MappingEnvelopeSource::for_test(1, 4 * GIB),
                 MemoryReservationCohortId::new(3),
                 "candidate-activation-host-import".to_string(),
                 None,
@@ -3352,7 +3401,7 @@ mod tests {
         let _envelope = broker
             .open_mapping_envelope(
                 snap,
-                5 * GIB,
+                MappingEnvelopeSource::for_test(1, 5 * GIB),
                 cohort,
                 "candidate-activation-host-import".to_string(),
                 None,
@@ -3405,7 +3454,7 @@ mod tests {
         );
         let second = broker.open_mapping_envelope(
             snap,
-            12 * GIB,
+            MappingEnvelopeSource::for_test(2, 12 * GIB),
             MemoryReservationCohortId::new(12),
             "second-pack-host-import".to_string(),
             None,
@@ -3492,7 +3541,7 @@ mod tests {
         let _envelope = broker
             .open_mapping_envelope(
                 snap,
-                5 * GIB,
+                MappingEnvelopeSource::for_test(1, 5 * GIB),
                 cohort,
                 "candidate-activation-host-import".to_string(),
                 None,
@@ -3529,7 +3578,7 @@ mod tests {
         drop(graph);
         let second = broker.open_mapping_envelope(
             snap,
-            8 * GIB,
+            MappingEnvelopeSource::for_test(2, 8 * GIB),
             MemoryReservationCohortId::new(32),
             "second-pack-host-import".to_string(),
             None,
@@ -3556,7 +3605,7 @@ mod tests {
         let _envelope = broker
             .open_mapping_envelope(
                 snap,
-                5 * GIB,
+                MappingEnvelopeSource::for_test(1, 5 * GIB),
                 cohort,
                 "candidate-activation-host-import".to_string(),
                 None,
@@ -3596,7 +3645,7 @@ mod tests {
         let _envelope = broker
             .open_mapping_envelope(
                 snap,
-                6 * GIB,
+                MappingEnvelopeSource::for_test(1, 6 * GIB),
                 MemoryReservationCohortId::new(1),
                 "candidate-activation-host-import".to_string(),
                 None,
@@ -3641,7 +3690,7 @@ mod tests {
         let first = broker
             .open_mapping_envelope(
                 snap,
-                4 * GIB,
+                MappingEnvelopeSource::for_test(1, 4 * GIB),
                 cohort,
                 "candidate-activation-host-import".to_string(),
                 None,
@@ -3651,7 +3700,7 @@ mod tests {
         let second = broker
             .open_mapping_envelope(
                 snap,
-                4 * GIB,
+                MappingEnvelopeSource::for_test(1, 4 * GIB),
                 cohort,
                 "candidate-activation-host-import".to_string(),
                 None,
@@ -3674,6 +3723,147 @@ mod tests {
             broker.usage(&MemoryDomainKey::SystemMemory),
             DeviceMemoryUsage::default()
         );
+    }
+
+    #[test]
+    fn distinct_same_cohort_mappings_add_and_enforce_policy_capacity() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let snap = DeviceMemorySnapshot {
+            free_bytes: 16 * GIB,
+            total_bytes: 16 * GIB,
+            confidence: MemoryObservationConfidence::DeviceSnapshot,
+        };
+        let cohort = MemoryReservationCohortId::new(71);
+        let open = |identity, bytes| {
+            broker.open_mapping_envelope(
+                snap,
+                MappingEnvelopeSource::for_test(identity, bytes),
+                cohort,
+                "same-stage-independent-mapping".to_string(),
+                None,
+                RuntimeOwnerPlacement::Unknown,
+            )
+        };
+        let first = open(1, 7 * GIB).unwrap();
+        let second = open(2, 7 * GIB).unwrap();
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).pending_bytes,
+            14 * GIB
+        );
+        assert!(matches!(
+            open(3, 3 * GIB),
+            Err(MemoryPlanningError::DeviceBudgetExceeded { .. })
+        ));
+        let shared = open(1, 7 * GIB).unwrap();
+        assert!(matches!(
+            open(1, 6 * GIB),
+            Err(MemoryPlanningError::ReservationLedgerCorrupted { .. })
+        ));
+        drop(first);
+        drop(second);
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).pending_bytes,
+            7 * GIB
+        );
+        drop(shared);
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory),
+            DeviceMemoryUsage::default()
+        );
+    }
+
+    #[test]
+    fn mapping_consumption_requires_exact_identity_and_size() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let cohort = MemoryReservationCohortId::new(72);
+        let envelope = broker
+            .open_mapping_envelope(
+                snapshot(8 * GIB),
+                MappingEnvelopeSource::for_test(1, GIB),
+                cohort,
+                "mapping".into(),
+                None,
+                RuntimeOwnerPlacement::Unknown,
+            )
+            .unwrap();
+        let consume = |identity, bytes| {
+            broker.try_consume_mapping_envelope(
+                PackWeightMappingIdentity::from_raw_for_test(identity),
+                bytes,
+                Some(cohort),
+                "residency".into(),
+            )
+        };
+        assert!(consume(2, GIB).unwrap().is_none());
+        assert!(matches!(
+            consume(1, GIB / 2),
+            Err(MemoryPlanningError::ReservationLedgerCorrupted { .. })
+        ));
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).pending_bytes,
+            GIB
+        );
+        let residency = consume(1, GIB).unwrap().unwrap();
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).pending_bytes,
+            0
+        );
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).committed_bytes,
+            GIB
+        );
+        assert!(consume(1, GIB).unwrap().is_none());
+        drop(envelope);
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).committed_bytes,
+            GIB
+        );
+        drop(residency);
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory),
+            DeviceMemoryUsage::default()
+        );
+    }
+
+    #[test]
+    fn mapping_envelope_retains_real_mapping_until_last_handle_drops() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            maximum_owned_basis_points: 10_000,
+            minimum_headroom_bytes: 0,
+        }));
+        let mapping = Arc::new(
+            memmap2::MmapMut::map_anon(4096)
+                .unwrap()
+                .make_read_only()
+                .unwrap(),
+        );
+        let weak = Arc::downgrade(&mapping);
+        let source = MappingEnvelopeSource::from_open_mapping(mapping);
+        let cohort = MemoryReservationCohortId::new(73);
+        let open = |source| {
+            broker
+                .open_mapping_envelope(
+                    snapshot(8 * GIB),
+                    source,
+                    cohort,
+                    "real-mapping".into(),
+                    None,
+                    RuntimeOwnerPlacement::Unknown,
+                )
+                .unwrap()
+        };
+        let first = open(source.clone());
+        let second = open(source);
+        drop(first);
+        assert!(weak.upgrade().is_some());
+        drop(second);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]

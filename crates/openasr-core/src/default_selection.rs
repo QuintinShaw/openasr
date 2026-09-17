@@ -810,7 +810,15 @@ pub fn persist_detailed(
     pack: &InstalledPack,
     quant_preference: QuantPreference,
 ) -> Result<DefaultSelectionCommitOutcome, DefaultSelectionError> {
-    persist_detailed_with_activation_metadata(home, pack, quant_preference, None, "auto", None)
+    persist_detailed_with_activation_metadata(
+        home,
+        pack,
+        quant_preference,
+        None,
+        "auto",
+        None,
+        None,
+    )
 }
 
 /// Activation-only writer. The ordinary legacy projection API above keeps its
@@ -843,6 +851,29 @@ pub fn persist_activation_detailed_with_fault(
     execution_intent: &crate::device::execution_policy::ExecutionIntent,
     fault: Option<DefaultSelectionWriteFault>,
 ) -> Result<DefaultSelectionCommitOutcome, DefaultSelectionError> {
+    persist_activation_detailed_if_generation(
+        home,
+        pack,
+        quant_preference,
+        architecture_id,
+        execution_intent,
+        fault,
+        None,
+    )
+}
+
+/// Startup may reconcile a changed device preference only while the durable
+/// selection it observed is still current. Compare under both writer locks so
+/// another process cannot have its newer model choice overwritten by boot.
+pub(crate) fn persist_activation_detailed_if_generation(
+    home: &Path,
+    pack: &InstalledPack,
+    quant_preference: QuantPreference,
+    architecture_id: &str,
+    execution_intent: &crate::device::execution_policy::ExecutionIntent,
+    fault: Option<DefaultSelectionWriteFault>,
+    expected_generation: Option<u64>,
+) -> Result<DefaultSelectionCommitOutcome, DefaultSelectionError> {
     let execution_intent = execution_intent_to_v2_wire(execution_intent);
     persist_detailed_with_activation_metadata(
         home,
@@ -851,6 +882,7 @@ pub fn persist_activation_detailed_with_fault(
         Some(architecture_id),
         &execution_intent,
         fault,
+        expected_generation,
     )
 }
 
@@ -861,9 +893,18 @@ fn persist_detailed_with_activation_metadata(
     architecture_id: Option<&str>,
     execution_intent: &str,
     fault: Option<DefaultSelectionWriteFault>,
+    expected_generation: Option<u64>,
 ) -> Result<DefaultSelectionCommitOutcome, DefaultSelectionError> {
     let _lock = selection_write_lock();
     let _file_lock = SelectionFileLock::acquire(home)?;
+    if let Some(expected) = expected_generation
+        && read_active_model_selection_v2(home)?.map(|record| record.selection_generation)
+            != Some(expected)
+    {
+        return Ok(DefaultSelectionCommitOutcome::NotCommitted {
+            reason: "durable default selection changed during startup reconciliation".to_string(),
+        });
+    }
     if persist_commit_failpoint_enabled() {
         return Ok(DefaultSelectionCommitOutcome::NotCommitted {
             reason: "injected persist failure".to_string(),

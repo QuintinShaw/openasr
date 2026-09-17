@@ -1914,7 +1914,7 @@ impl DefaultModelActivationQuote {
 /// envelope; GPU `pack-weight-buffer` reserves separately.
 struct PackMappingQuote {
     snapshot: DeviceMemorySnapshot,
-    bytes: u64,
+    source: crate::device::execution_memory::MappingEnvelopeSource,
     resource_id: String,
     quote_confidence: QuoteConfidence,
 }
@@ -2185,10 +2185,10 @@ fn quote_pack_activation_plan(
     };
     Ok((
         vec![host],
-        mmap,
+        Arc::clone(&mmap),
         PackMappingQuote {
             snapshot: request.snapshot,
-            bytes: requested_bytes,
+            source: crate::device::execution_memory::MappingEnvelopeSource::from_open_mapping(mmap),
             resource_id: request.resource_id.clone(),
             quote_confidence: plan.quote_confidence_for_domain(&MemoryDomainKey::SystemMemory),
         },
@@ -2259,7 +2259,7 @@ fn reserve_pack_mapping(
         .memory_broker()
         .open_mapping_envelope(
             mapping.snapshot,
-            mapping.bytes,
+            mapping.source.clone(),
             cohort_id,
             mapping.resource_id.clone(),
             Some(services.scope_id),
@@ -2275,9 +2275,9 @@ fn reserve_pack_mapping(
         && let Some(resource) = collector.resource_descriptor(
             &mapping.resource_id,
             &MemoryDomainKey::SystemMemory,
-            mapping.bytes,
-            mapping.bytes,
-            mapping.bytes,
+            mapping.source.bytes(),
+            mapping.source.bytes(),
+            mapping.source.bytes(),
             mapping.quote_confidence,
             Some(mapping.snapshot.confidence),
         )
@@ -4075,7 +4075,7 @@ mod tests {
             .unwrap();
             let (_backends, _mapping, mapping) = quote_candidate_activation_plan(&pack, &topology)
                 .expect("activation footprint must be quotable");
-            let peak = mapping.bytes;
+            let peak = mapping.source.bytes();
             assert!(
                 peak > 4096,
                 "quoted activation peak must exceed a placeholder page, got {peak}"

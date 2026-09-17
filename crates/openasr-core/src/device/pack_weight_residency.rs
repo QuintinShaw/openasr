@@ -57,7 +57,7 @@ pub(crate) struct PackWeightMappingIdentity(usize);
 
 impl PackWeightMappingIdentity {
     /// Identity of the open mapping owned by `mmap`.
-    fn from_open_mmap(mmap: &Arc<memmap2::Mmap>) -> Self {
+    pub(crate) fn from_open_mmap(mmap: &Arc<memmap2::Mmap>) -> Self {
         Self(std::sync::Arc::as_ptr(mmap) as usize)
     }
 
@@ -314,7 +314,12 @@ impl DeviceMemoryBrokerSet {
             RuntimeOwnerPlacement::Unknown
         };
         let mut batch = if key.domain == MemoryDomainKey::SystemMemory {
-            match self.try_consume_mapping_envelope(bytes, cohort_id, resource_id.clone())? {
+            match self.try_consume_mapping_envelope(
+                key.mapping_identity,
+                bytes,
+                cohort_id,
+                resource_id.clone(),
+            )? {
                 Some(batch) => batch,
                 None => {
                     let mut request = super::execution_memory::DomainReservationRequest {
@@ -571,6 +576,112 @@ mod tests {
     }
 
     #[test]
+    fn distinct_mapping_consumption_keeps_receipts_equal_to_live_leases() {
+        use super::super::execution_memory::MappingEnvelopeSource;
+        use crate::models::runtime_receipts::LeaseReceiptShadow;
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _scope =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+        let broker = services.memory_broker();
+        let collector = services.runtime_receipts();
+        let snap = snapshot(16 * GIB, 16 * GIB);
+        let cohort = MemoryReservationCohortId::new(123);
+        let total = 493_553_888;
+        let remainder = 86_291_872;
+        let envelope = broker
+            .open_mapping_envelope(
+                snap,
+                MappingEnvelopeSource::for_test(0x123, total - remainder),
+                cohort,
+                "mapping".into(),
+                Some(collector.snapshot().scope_id),
+                RuntimeOwnerPlacement::HostNeutral,
+            )
+            .unwrap();
+        let owner = collector
+            .host_neutral_owner_descriptor("mapping", None, None)
+            .unwrap();
+        let resource = collector
+            .resource_descriptor(
+                "mapping",
+                &MemoryDomainKey::SystemMemory,
+                total - remainder,
+                total - remainder,
+                total - remainder,
+                crate::device::execution_memory::QuoteConfidence::CommittedUpperBound,
+                Some(MemoryObservationConfidence::DeviceSnapshot),
+            )
+            .unwrap();
+        broker.attach_mapping_envelope_receipt(&envelope, collector.clone(), owner, resource);
+        let second_envelope = broker
+            .open_mapping_envelope(
+                snap,
+                MappingEnvelopeSource::for_test(0x124, remainder),
+                cohort,
+                "second-mapping".into(),
+                Some(collector.snapshot().scope_id),
+                RuntimeOwnerPlacement::HostNeutral,
+            )
+            .unwrap();
+        let owner = collector
+            .host_neutral_owner_descriptor("second-mapping", None, None)
+            .unwrap();
+        let resource = collector
+            .resource_descriptor(
+                "second-mapping",
+                &MemoryDomainKey::SystemMemory,
+                remainder,
+                remainder,
+                remainder,
+                crate::device::execution_memory::QuoteConfidence::CommittedUpperBound,
+                Some(MemoryObservationConfidence::DeviceSnapshot),
+            )
+            .unwrap();
+        broker.attach_mapping_envelope_receipt(
+            &second_envelope,
+            collector.clone(),
+            owner,
+            resource,
+        );
+        let (first, _) = broker
+            .acquire_pack_weight_residency(key(0x123), total - remainder, snap, Some(cohort))
+            .unwrap();
+        first.attach_receipt();
+        assert_eq!(
+            collector.reconcile_live_leases_quiescent(broker),
+            LeaseReceiptShadow::Matched
+        );
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).pending_bytes,
+            remainder
+        );
+        let (second, _) = broker
+            .acquire_pack_weight_residency(key(0x124), remainder, snap, Some(cohort))
+            .unwrap();
+        second.attach_receipt();
+        assert_eq!(
+            collector.reconcile_live_leases_quiescent(broker),
+            LeaseReceiptShadow::Matched
+        );
+        drop(envelope);
+        drop(second_envelope);
+        drop(first);
+        assert_eq!(
+            collector.reconcile_live_leases_quiescent(broker),
+            LeaseReceiptShadow::Matched
+        );
+        drop(second);
+        assert_eq!(
+            collector.reconcile_live_leases_quiescent(broker),
+            LeaseReceiptShadow::Matched
+        );
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).committed_bytes,
+            0
+        );
+    }
+
+    #[test]
     fn shared_receipt_is_one_owner_until_the_last_mapping_handle_drops() {
         let services = crate::models::native_execution_services::test_native_execution_services();
         let _scope =
@@ -712,7 +823,7 @@ mod tests {
         let _activation = broker
             .open_mapping_envelope(
                 snap,
-                4 * GIB,
+                super::super::execution_memory::MappingEnvelopeSource::for_test(1, 4 * GIB),
                 cohort,
                 "candidate-activation-host-import".to_string(),
                 None,

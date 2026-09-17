@@ -55,9 +55,7 @@ pub(crate) async fn set_default_model(
     let home = distribution.openasr_home()?;
     let pack = resolve_installed_pack_for_default(&home, distribution.catalog_source(), &request)?;
     let preference = request.quant_preference_for_pack(&pack);
-    let intent = openasr_core::device::execution_policy::ExecutionIntent::from(
-        crate::realtime::realtime_execution_target_preference(&home)?,
-    );
+    let target = crate::realtime::realtime_execution_target_preference(&home)?;
     if runtime.backend == BackendKind::Native && runtime.native_rebind_blocked() {
         runtime
             .native_execution
@@ -80,7 +78,7 @@ pub(crate) async fn set_default_model(
         &home,
         &pack,
         preference,
-        intent,
+        target,
         DefaultModelActivationMode::PersistSelection,
     )?;
 
@@ -178,13 +176,12 @@ pub(crate) fn apply_pending_idle_switch_if_idle(
     let Ok(target) = crate::realtime::realtime_execution_target_preference(&home) else {
         return;
     };
-    let intent = openasr_core::device::execution_policy::ExecutionIntent::from(target);
     if activate_default_model_blocking(
         runtime,
         &home,
         &pack,
         preference,
-        intent,
+        target,
         DefaultModelActivationMode::PersistSelection,
     )
     .is_ok()
@@ -199,6 +196,7 @@ pub(crate) fn apply_pending_idle_switch_if_idle(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DefaultModelActivationMode {
     PersistSelection,
+    ReconcileDurableSelection { expected_generation: u64 },
     ReactivateDurableSelection,
     AttestLaunchPack,
 }
@@ -208,7 +206,7 @@ pub(crate) fn activate_default_model_blocking(
     home: &Path,
     pack: &InstalledPack,
     preference: QuantPreference,
-    intent: openasr_core::device::execution_policy::ExecutionIntent,
+    target: openasr_core::ExecutionTarget,
     mode: DefaultModelActivationMode,
 ) -> Result<openasr_core::DefaultModelActivationIdentity, ApiError> {
     let _activation_barrier = runtime.begin_native_activation()?;
@@ -242,7 +240,7 @@ pub(crate) fn activate_default_model_blocking(
     let resolved_activation = openasr_core::resolve_default_model_activation(
         services.as_ref(),
         &verified_pack,
-        intent,
+        openasr_core::device::execution_policy::ExecutionIntent::from(target.clone()),
         pack.pull.clone(),
         pack.path.clone(),
     )
@@ -252,6 +250,14 @@ pub(crate) fn activate_default_model_blocking(
     let facts = resolved_activation.facts().clone();
     let identity = facts.identity().clone();
     let journal = match mode {
+        DefaultModelActivationMode::ReconcileDurableSelection {
+            expected_generation,
+        } => openasr_core::DefaultModelActivationJournalFactory::reconcile_durable_selection(
+            home.to_path_buf(),
+            pack.clone(),
+            preference,
+            expected_generation,
+        ),
         DefaultModelActivationMode::PersistSelection => {
             openasr_core::DefaultModelActivationJournalFactory::persist_selection(
                 home.to_path_buf(),
@@ -275,7 +281,13 @@ pub(crate) fn activate_default_model_blocking(
         }
     };
     let journal = match runtime.model_pack_path.selection_write_fault() {
-        Some(fault) if mode == DefaultModelActivationMode::PersistSelection => {
+        Some(fault)
+            if matches!(
+                mode,
+                DefaultModelActivationMode::PersistSelection
+                    | DefaultModelActivationMode::ReconcileDurableSelection { .. }
+            ) =>
+        {
             journal.with_selection_write_fault_for_test(fault)
         }
         _ => journal,
@@ -329,6 +341,7 @@ pub(crate) fn activate_default_model_blocking(
         runtime: runtime.clone(),
         home: home.to_path_buf(),
         reservation_context,
+        execution_target: target,
     });
     debug_assert_eq!(
         pending.stage(),
@@ -428,6 +441,9 @@ struct NativeActivationAttestation {
     runtime: ServerRuntime,
     home: PathBuf,
     reservation_context: openasr_core::ActivationReservationContext,
+    // The same immutable input used to resolve the candidate. Re-reading the
+    // preferences during warmup can execute a different plan than we reserved.
+    execution_target: openasr_core::ExecutionTarget,
 }
 
 fn validate_native_activation_probe(
@@ -471,7 +487,13 @@ impl
     ) -> Result<Self::Evidence, openasr_core::AttestationFailure<Self::Error>> {
         let plan = facts.plan();
         let lane = facts.exact_lane();
-        if !plan.matches_identity(&self.identity) || lane.candidate() != self.identity.candidate() {
+        if !plan.matches_identity(&self.identity)
+            || lane.candidate() != self.identity.candidate()
+            || plan.execution_intent()
+                != &openasr_core::device::execution_policy::ExecutionIntent::from(
+                    self.execution_target.clone(),
+                )
+        {
             return Err(openasr_core::AttestationFailure::Rejected(
                 "activation facts drifted before native attestation".to_string(),
             ));
@@ -495,6 +517,7 @@ impl
             Some(crate::realtime::NativeWarmupTarget::attested(
                 self.identity.path().to_path_buf(),
                 self.identity.pack_content_id(),
+                self.execution_target.clone(),
             )),
             Some(self.home.clone()),
             Some(self.reservation_context),

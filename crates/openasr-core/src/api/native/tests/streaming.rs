@@ -3,6 +3,19 @@ use super::*;
 use crate::{BackendKind, RealtimeEvent, RealtimeTranscriptEvent};
 
 #[test]
+fn streaming_punctuation_policy_survives_executor_config_round_trip() {
+    assert!(NativeAsrStreamingSessionConfig::new().punctuate);
+    for enabled in [false, true] {
+        let native = NativeAsrStreamingSessionConfig::new().with_punctuation(enabled);
+        let executor: crate::models::ggml_asr_executor::GgmlAsrStreamingSessionConfig =
+            native.into();
+        assert_eq!(executor.punctuate, enabled);
+        let restored: NativeAsrStreamingSessionConfig = executor.into();
+        assert_eq!(restored.punctuate, enabled);
+    }
+}
+
+#[test]
 fn test_only_native_streaming_fixture_emits_mutable_partials_then_final() {
     let mut session = test_only_streaming_session(
         NativeAsrStreamingSessionConfig::new().with_partial_results(true),

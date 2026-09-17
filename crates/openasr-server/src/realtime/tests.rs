@@ -280,6 +280,22 @@ fn env_f64(name: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+#[test]
+fn realtime_start_accepts_explicit_final_punctuation_policy() {
+    for enabled in [false, true] {
+        let start: StartSession =
+            serde_json::from_value(serde_json::json!({ "punctuate": enabled })).unwrap();
+        assert_eq!(start.punctuate, Some(enabled));
+    }
+    assert_eq!(
+        serde_json::from_str::<StartSession>("{}")
+            .unwrap()
+            .punctuate,
+        None
+    );
+    assert!(serde_json::from_str::<StartSession>(r#"{"punctuate":"false"}"#).is_err());
+}
+
 fn backend_job_for_test(id: &str) -> BackendJob {
     BackendJob {
         utterance_id: TranscriptUtteranceId(format!("utt_{id}")),
@@ -294,6 +310,7 @@ fn backend_job_for_test(id: &str) -> BackendJob {
         inference_threads: None,
         execution_target: None,
         word_timestamps: false,
+        punctuate: true,
         display_name: "realtime-utterance.wav".to_string(),
         temp_wav: tempfile::NamedTempFile::new().unwrap(),
     }
@@ -437,6 +454,7 @@ async fn realtime_backend_job_canceled_before_dispatch_releases_capacity_promptl
         // never depends on GPU/CPU auto-selection.
         execution_target: Some(openasr_core::ExecutionTarget::Cpu),
         word_timestamps: false,
+        punctuate: true,
         display_name: "realtime-cancel-test.wav".to_string(),
         temp_wav,
     };
@@ -1448,6 +1466,143 @@ fn native_streaming_worker_prune_releases_only_idle_entries() {
     assert!(
         !workers.contains_key(&key),
         "idle native streaming worker should be pruned after the release threshold"
+    );
+}
+
+#[tokio::test]
+async fn admitted_workers_wait_for_shared_execution_but_not_sibling_lifetimes() {
+    let supervisor = NativeExecutionSupervisor::new(NonZeroUsize::new(2).unwrap());
+    let execution_gate = supervisor.realtime_execution_gate();
+    let occupied = execution_gate.enter(|| false).unwrap();
+    let mut sessions = Vec::new();
+    for index in 0..2 {
+        let (events, _receiver) = mpsc::channel(16);
+        let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), events);
+        session.native_streaming = Some(
+            NativeStreamingDecodeWorker::attach_admitted(
+                test_native_streaming_worker_key("shared-operation-gate"),
+                Box::new(TestServerNativeSession::new(format!("track-{index}"))),
+                Some(supervisor.try_acquire("shared-operation-model").unwrap()),
+            )
+            .await
+            .unwrap(),
+        );
+        sessions.push(session);
+    }
+    let (first, second) = sessions.split_at_mut(1);
+    let mut first_warm = Box::pin(first[0].native_streaming_command(NativeStreamingCommand::Warm));
+    let mut second_warm =
+        Box::pin(second[0].native_streaming_command(NativeStreamingCommand::Warm));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut first_warm)
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut second_warm)
+            .await
+            .is_err()
+    );
+    drop(occupied);
+    tokio::time::timeout(Duration::from_secs(2), first_warm)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), second_warm)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(supervisor.try_acquire("shared-operation-model").is_err());
+    for mut session in sessions {
+        session.native_streaming.take().unwrap().detach_cancel();
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while supervisor.has_active_sessions() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("ending both streams must release both session permits");
+}
+
+#[tokio::test]
+async fn admitted_realtime_slots_warm_without_waiting_for_a_sibling_to_close() {
+    let supervisor = NativeExecutionSupervisor::new(NonZeroUsize::new(2).unwrap());
+    let key = test_native_streaming_worker_key("parallel-admitted-slots");
+    let mut sessions = Vec::new();
+    for _ in 0..2 {
+        let (events, _receiver) = mpsc::channel(16);
+        let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), events);
+        let permit = supervisor.try_acquire("parallel-admitted-model").unwrap();
+        let worker = NativeStreamingDecodeWorker::attach_admitted(
+            key.clone(),
+            Box::new(TestServerNativeSession::new(session.session_id.0.clone())),
+            Some(permit),
+        )
+        .await
+        .unwrap();
+        session.native_streaming = Some(worker);
+        sessions.push(session);
+    }
+    let first = tokio::time::timeout(
+        Duration::from_secs(2),
+        sessions[0].native_streaming_command(NativeStreamingCommand::Warm),
+    )
+    .await;
+    let second = tokio::time::timeout(
+        Duration::from_secs(2),
+        sessions[1].native_streaming_command(NativeStreamingCommand::Warm),
+    )
+    .await;
+    assert!(supervisor.try_acquire("parallel-admitted-model").is_err());
+    if first.as_ref().is_ok_and(|result| result.is_ok())
+        && second.as_ref().is_ok_and(|result| result.is_ok())
+    {
+        let retired = sessions[1].native_streaming.take().unwrap();
+        let original_worker = Arc::clone(&retired.state);
+        retired.detach_cancel();
+        let replacement_permit = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(permit) = supervisor.try_acquire("parallel-admitted-model") {
+                    break permit;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("retired slot must release its permit");
+        assert_eq!(replacement_permit.slot_index(), 1);
+        let replacement = NativeStreamingDecodeWorker::attach_admitted(
+            key,
+            Box::new(TestServerNativeSession::new(
+                sessions[1].session_id.0.clone(),
+            )),
+            Some(replacement_permit),
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(&original_worker, &replacement.state));
+        sessions[1].native_streaming = Some(replacement);
+        for session in &mut sessions {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                session.native_streaming_command(NativeStreamingCommand::Warm),
+            )
+            .await
+            .expect("retiring one slot must not block its sibling")
+            .unwrap();
+        }
+        assert!(supervisor.try_acquire("parallel-admitted-model").is_err());
+    }
+    for mut session in sessions {
+        if let Some(worker) = session.native_streaming.take() {
+            worker.detach_cancel();
+        }
+    }
+    assert!(first.is_ok_and(|result| result.is_ok()));
+    assert!(
+        second.is_ok_and(|result| result.is_ok()),
+        "an admitted stream waited for its sibling's entire lifetime"
     );
 }
 
@@ -2523,6 +2678,110 @@ async fn native_streaming_warm_up_keeps_audio_admission_closed_until_ready() {
 }
 
 #[tokio::test]
+async fn native_session_configured_reports_the_server_anonymous_speaker_stage() {
+    let _openasr_device = isolate_openasr_device();
+    let temp = tempfile::tempdir().unwrap();
+    let model_id = "moonshine-speaker-lifecycle-test";
+    let pack_path = temp.path().join("moonshine-speaker-lifecycle-test.oasr");
+    write_moonshine_streaming_fixture_pack(&pack_path, model_id);
+    for anonymous_diarize in [false, true] {
+        let runtime = ServerRuntime {
+            backend: openasr_core::BackendKind::Native,
+            native_execution: NativeExecutionSupervisor::default(),
+            ffmpeg_bin: None,
+            ffmpeg_bin_explicit: false,
+            model_pack_path: Some(pack_path.clone()).into(),
+        };
+        let (event_sender, mut event_receiver) = mpsc::channel(16);
+        let mut session = WsSession::new(runtime, test_distribution(), event_sender);
+        session.test_native_streaming_session_factory =
+            Some(ready_native_lifecycle_session_factory(
+                session.session_id.clone(),
+                model_id,
+                true,
+                false,
+                false,
+            ));
+        session
+            .start_session(StartSession {
+                model: Some(model_id.to_string()),
+                diarize: Some(anonymous_diarize),
+                voice_id: Some(false),
+                partial_results: Some(true),
+                ..StartSession::default()
+            })
+            .await
+            .unwrap();
+        let events = collect_events(&mut event_receiver).await;
+        assert_eq!(session.streaming_diarizer.is_some(), anonymous_diarize);
+        assert!(
+            events.iter().any(|event| matches!(&event.event,
+                RealtimeEvent::Lifecycle(RealtimeLifecycleEvent::SessionConfigured(configured))
+                    if configured.diarize == anonymous_diarize
+            )),
+            "session.configured must report server-owned anonymous speakers, not ASR Voice ID: {events:?}"
+        );
+        session.finish("client_closed", true).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn session_start_honors_native_capacity_for_two_independent_tracks() {
+    let _openasr_device = isolate_openasr_device();
+    let temp = tempfile::tempdir().unwrap();
+    let model_id = "moonshine-dual-track-test";
+    let pack_path = temp.path().join("moonshine-dual-track-test.oasr");
+    write_moonshine_streaming_fixture_pack(&pack_path, model_id);
+    let runtime = ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::new(NonZeroUsize::new(2).unwrap()),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_path).into(),
+    };
+    let mut sessions = Vec::new();
+    for index in 0..3 {
+        let (event_sender, mut event_receiver) = mpsc::channel(16);
+        let mut session = WsSession::new(runtime.clone(), test_distribution(), event_sender);
+        session.test_native_streaming_session_factory =
+            Some(ready_native_lifecycle_session_factory(
+                session.session_id.clone(),
+                model_id,
+                true,
+                false,
+                false,
+            ));
+        let result = session
+            .start_session(StartSession {
+                model: Some(model_id.to_string()),
+                source_name: Some(format!("Track {index}")),
+                partial_results: Some(true),
+                ..StartSession::default()
+            })
+            .await;
+        let events = collect_events(&mut event_receiver).await;
+        if index < 2 {
+            assert!(result.is_ok(), "admitted track {index} failed: {events:?}");
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.event_type == "audio.input.started")
+            );
+            sessions.push((session, event_receiver));
+        } else {
+            assert!(result.is_err(), "third track exceeded configured capacity");
+            assert!(events.iter().any(|event| matches!(&event.event,
+                RealtimeEvent::Error(RealtimeErrorEvent { message, recoverable: true, .. })
+                    if message == crate::SERVER_BUSY_MESSAGE)));
+        }
+    }
+    for (mut session, _receiver) in sessions {
+        session.finish("client_closed", true).await.unwrap();
+    }
+    assert!(!runtime.native_execution.has_active_sessions());
+}
+
+#[tokio::test]
 async fn session_start_waits_for_native_warm_without_publishing_lifecycle() {
     let _openasr_device = isolate_openasr_device();
     let temp = tempfile::tempdir().unwrap();
@@ -3275,12 +3534,7 @@ async fn failed_native_streaming_attach_send_retires_the_activity_guard() {
     // `NativeStreamingDecodeWorker::attach` does; when the failed send's
     // returned message drops below, the token (the sole `Arc` clone here)
     // drops with it, dropping the guard and retiring the count.
-    let token = Arc::new(AttachToken {
-        cancel_requested: Arc::new(AtomicBool::new(false)),
-        activity,
-        abandoned: AtomicBool::new(false),
-        permit: Mutex::new(None),
-    });
+    let token = AttachToken::new(activity, None);
     let send_result = sender
         .send(NativeStreamingWorkerMessage::Attach {
             session: Box::new(TestServerNativeSession::new(
@@ -3943,6 +4197,7 @@ async fn websocket_session_emits_capabilities_before_start_with_monotonic_sequen
     match &events[0].event {
         RealtimeEvent::Lifecycle(RealtimeLifecycleEvent::SessionCapabilities(event)) => {
             assert!(event.capabilities.supports_realtime_sessions);
+            assert!(event.capabilities.supports_punctuation_control);
             assert!(!event.capabilities.diarization.supported);
             assert_eq!(
                 event.capabilities.diarization.reason,

@@ -2153,6 +2153,151 @@ async fn apply_pending_idle_switch_if_idle_rebounds_to_the_bound_pack() {
 }
 
 #[tokio::test]
+async fn unregistered_auxiliary_completion_drains_pending_switch_after_worker_exit() {
+    for panic_worker in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let pack_a = write_installed_pack_ref(
+            &home,
+            "whisper-tiny",
+            "whisper-tiny:q4",
+            "q4_0",
+            "q4",
+            "whisper-tiny",
+        );
+        let pack_b = write_installed_pack_ref(
+            &home,
+            "whisper-base",
+            "whisper-base:q4",
+            "q4_0",
+            "q4",
+            "whisper-base",
+        );
+        let installed = installed_pack_by_pull(&home, "whisper-tiny:q4");
+        persist_default_pack(&home, &installed, QuantPreference::pinned(&installed.quant)).unwrap();
+        let runtime = ServerRuntime {
+            backend: BackendKind::Native,
+            native_execution: NativeExecutionSupervisor::default(),
+            ffmpeg_bin: None,
+            ffmpeg_bin_explicit: false,
+            model_pack_path: Some(pack_a.clone()).into(),
+        };
+        runtime
+            .model_pack_path
+            .set_activation_probe_failpoint(Some(activation_probe_ok()));
+        let admission = runtime
+            .acquire_native_auxiliary_execution("precise-timeline", None)
+            .unwrap();
+        let completion = AuxiliaryExecutionCompletion {
+            admission: Some(admission),
+            runtime: runtime.clone(),
+            distribution: DistributionContext::new(DistributionRuntime {
+                openasr_home: Some(home),
+                catalog_url: None,
+                catalog_local_override: None,
+            }),
+        };
+        runtime
+            .native_execution
+            .remote_policy()
+            .request_idle_switch("whisper-base:q4");
+        assert!(!idle_switch_slot_is_clear(&runtime));
+        assert_eq!(
+            runtime.model_pack_path.current().as_deref(),
+            Some(pack_a.as_path())
+        );
+        let result = tokio::task::spawn_blocking(move || {
+            let _completion = completion;
+            assert!(!panic_worker, "exercise auxiliary worker unwind");
+            // Also models an early compute error: the caller does not need to
+            // perform another HTTP request to wake the queued model switch.
+            Err::<(), _>("compute failed")
+        })
+        .await;
+        assert_eq!(result.is_err(), panic_worker);
+        assert!(idle_switch_slot_is_clear(&runtime));
+        assert!(
+            runtime
+                .native_execution
+                .remote_policy()
+                .pending_idle_switch()
+                .is_none()
+        );
+        assert_eq!(
+            runtime.model_pack_path.current().as_deref(),
+            Some(pack_b.as_path())
+        );
+    }
+}
+
+#[tokio::test]
+async fn boot_completion_applies_pending_model_without_another_request() {
+    for valid_launch in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let launch = write_installed_pack_ref(
+            &home,
+            "whisper-tiny",
+            "whisper-tiny:q4",
+            "q4_0",
+            "q4",
+            "whisper-tiny",
+        );
+        let selected = write_installed_pack_ref(
+            &home,
+            "whisper-base",
+            "whisper-base:q4",
+            "q4_0",
+            "q4",
+            "whisper-base",
+        );
+        let runtime = ServerRuntime {
+            backend: BackendKind::Native,
+            native_execution: NativeExecutionSupervisor::default(),
+            ffmpeg_bin: None,
+            ffmpeg_bin_explicit: false,
+            model_pack_path: ActiveRuntimeSlot::requested(Some(if valid_launch {
+                launch
+            } else {
+                home.join("missing.oasr")
+            })),
+        };
+        runtime
+            .model_pack_path
+            .set_activation_probe_failpoint(Some(activation_probe_ok()));
+        runtime
+            .native_execution
+            .remote_policy()
+            .request_idle_switch("whisper-base:q4");
+        realtime::spawn_boot_native_warmup(runtime.clone(), home.clone())
+            .await
+            .unwrap();
+        assert!(!runtime.model_pack_path.boot_attestation_pending());
+        assert!(
+            runtime
+                .native_execution
+                .remote_policy()
+                .pending_idle_switch()
+                .is_none()
+        );
+        assert_eq!(
+            runtime.model_pack_path.current().as_deref(),
+            Some(selected.as_path())
+        );
+        assert_eq!(
+            openasr_core::default_selection::resolve_with_catalog(&home, None)
+                .unwrap()
+                .into_installed_pack()
+                .unwrap()
+                .path,
+            selected,
+        );
+    }
+}
+
+#[tokio::test]
 async fn set_default_model_http_returns_conflict_when_native_session_is_busy() {
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
@@ -2833,15 +2978,13 @@ async fn restart_reactivates_commit_that_preceded_live_pointer_exchange() {
         .model_pack_path
         .set_activation_probe_failpoint(Some(activation_probe_ok()));
     let next = installed_pack_by_pull(&home, "whisper-restart-b:q4");
-    let intent =
-        openasr_core::default_selection::execution_intent_from_v2_wire(&durable.execution_intent)
-            .unwrap();
+    let target = realtime::realtime_execution_target_preference(&home).unwrap();
     activate_default_model_blocking(
         &restarted,
         &home,
         &next,
         durable.quant_preference.clone(),
-        intent,
+        target,
         DefaultModelActivationMode::ReactivateDurableSelection,
     )
     .unwrap();
@@ -3046,6 +3189,169 @@ fn active_runtime_barrier_closes_session_admission_race() {
     assert!(runtime.native_rebind_blocked());
     drop(activation);
     drop(permit);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activation_probe_uses_frozen_execution_target_not_mutable_preferences() {
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let path = write_installed_pack_ref(
+        home,
+        "cohere-transcribe-frozen",
+        "cohere-transcribe-frozen:q4",
+        "q4_0",
+        "q4",
+        "cohere-transcribe-frozen",
+    );
+    let pack = installed_pack_by_pull(home, "cohere-transcribe-frozen:q4");
+    let mut document = openasr_core::load_config_document(home).unwrap();
+    // Deterministic on CPU-only CI too: the old probe re-read this unavailable
+    // device even though the transaction had already resolved a valid CPU plan.
+    document.preferences.execution_target =
+        openasr_core::ExecutionTarget::Device("gpu:unavailable-after-plan".to_string());
+    openasr_core::save_config_document(home, &document).unwrap();
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: ActiveRuntimeSlot::requested(Some(path.clone())),
+    };
+    // No probe failpoint: this goes through real native warmup and exact receipt
+    // validation with a small test pack, not a fabricated attestation.
+    activate_default_model_blocking(
+        &runtime,
+        home,
+        &pack,
+        QuantPreference::pinned(&pack.quant),
+        openasr_core::ExecutionTarget::Cpu,
+        DefaultModelActivationMode::PersistSelection,
+    )
+    .unwrap();
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(path.as_path())
+    );
+    assert_eq!(
+        openasr_core::default_selection::read_active_model_selection_v2(home)
+            .unwrap()
+            .unwrap()
+            .execution_intent,
+        "cpu_only"
+    );
+    assert_eq!(
+        openasr_core::load_config_document(home)
+            .unwrap()
+            .preferences
+            .execution_target,
+        document.preferences.execution_target,
+        "activation must not overwrite a newer preference"
+    );
+}
+
+#[tokio::test]
+async fn boot_reconciles_changed_execution_preference_only_after_successful_attestation() {
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
+    for (previous_intent, target, expected_intent, fail_probe) in [
+        (
+            "auto",
+            openasr_core::ExecutionTarget::Cpu,
+            "cpu_only",
+            false,
+        ),
+        (
+            "cpu_only",
+            openasr_core::ExecutionTarget::Auto,
+            "auto",
+            false,
+        ),
+        ("auto", openasr_core::ExecutionTarget::Cpu, "cpu_only", true),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let path = write_installed_pack_ref(
+            home,
+            "cohere-transcribe-boot",
+            "cohere-transcribe-boot:q4",
+            "q4_0",
+            "q4",
+            "cohere-transcribe-boot",
+        );
+        let pack = installed_pack_by_pull(home, "cohere-transcribe-boot:q4");
+        persist_default_pack(home, &pack, QuantPreference::pinned(&pack.quant)).unwrap();
+        let mut previous = openasr_core::default_selection::read_active_model_selection_v2(home)
+            .unwrap()
+            .unwrap();
+        previous.execution_intent = previous_intent.to_string();
+        openasr_core::default_selection::persist_v2_record(home, previous).unwrap();
+        let previous = openasr_core::default_selection::read_active_model_selection_v2(home)
+            .unwrap()
+            .unwrap();
+        let mut document = openasr_core::load_config_document(home).unwrap();
+        document.preferences.execution_target = target.clone();
+        openasr_core::save_config_document(home, &document).unwrap();
+        let runtime = ServerRuntime {
+            backend: BackendKind::Native,
+            native_execution: NativeExecutionSupervisor::default(),
+            ffmpeg_bin: None,
+            ffmpeg_bin_explicit: false,
+            model_pack_path: ActiveRuntimeSlot::requested(Some(path.clone())),
+        };
+        runtime
+            .model_pack_path
+            .set_activation_probe_failpoint(Some(if fail_probe {
+                Err("test: new device failed attestation".to_string())
+            } else {
+                activation_probe_ok()
+            }));
+        realtime::spawn_boot_native_warmup(runtime.clone(), home.to_path_buf())
+            .await
+            .unwrap();
+        let saved = openasr_core::default_selection::read_active_model_selection_v2(home)
+            .unwrap()
+            .unwrap();
+        if fail_probe {
+            assert_eq!(saved, previous, "failed device changes must not commit");
+            assert!(runtime.model_pack_path.current().is_none());
+            continue;
+        }
+        assert_eq!(saved.execution_intent, expected_intent);
+        assert_eq!(
+            saved.selection_generation,
+            previous.selection_generation + 1
+        );
+        assert_eq!(saved.pull, previous.pull);
+        assert_eq!(
+            runtime.model_pack_path.current().as_deref(),
+            Some(path.as_path())
+        );
+        assert_eq!(
+            openasr_core::load_config_document(home)
+                .unwrap()
+                .preferences
+                .execution_target,
+            target
+        );
+
+        // A second unchanged boot verifies rather than rewriting V2 again.
+        let restarted = ServerRuntime {
+            model_pack_path: ActiveRuntimeSlot::requested(Some(path)),
+            ..runtime
+        };
+        restarted
+            .model_pack_path
+            .set_activation_probe_failpoint(Some(activation_probe_ok()));
+        realtime::spawn_boot_native_warmup(restarted, home.to_path_buf())
+            .await
+            .unwrap();
+        assert_eq!(
+            openasr_core::default_selection::read_active_model_selection_v2(home)
+                .unwrap()
+                .unwrap(),
+            saved
+        );
+    }
 }
 
 #[test]
@@ -4005,8 +4311,13 @@ fn spawn_boot_native_warmup_uses_set_default_transaction_entry() {
     assert!(
         !spawn.contains("rebind_native_model_pack")
             && !spawn.contains("persist_detailed")
-            && !spawn.contains("PersistSelection"),
-        "boot reactivation must not write a new durable V2 generation: {spawn}"
+            && !spawn.contains("::PersistSelection"),
+        "boot reactivation must not bypass the attested transaction: {spawn}"
+    );
+    assert!(
+        spawn.contains("ReconcileDurableSelection")
+            && spawn.contains("record.selection_generation"),
+        "changed startup intent must use generation-guarded reconciliation"
     );
 }
 

@@ -6,7 +6,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
 use thiserror::Error;
@@ -400,13 +400,34 @@ pub struct NativeExecutionReceiptCollector {
     graph_lifecycle: GgmlGraphLifecycleCollector,
 }
 
+/// Persistent runners may outlive a collector or execute another attempt on
+/// the same collector. A weak allocation identity prevents address reuse from
+/// looking like the previous request without retaining its potentially large
+/// trace; the observation scope distinguishes sequential attempts.
+#[derive(Debug, Clone)]
+pub(crate) struct BackendObservationKey {
+    state: Weak<Mutex<ReceiptState>>,
+    scope: Option<u64>,
+}
+
+impl PartialEq for BackendObservationKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.state.ptr_eq(&other.state) && self.scope == other.scope
+    }
+}
+
+impl Eq for BackendObservationKey {}
+
 impl NativeExecutionReceiptCollector {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) fn identity_key(&self) -> usize {
-        Arc::as_ptr(&self.state) as usize
+    pub(crate) fn identity_key(&self) -> BackendObservationKey {
+        BackendObservationKey {
+            state: Arc::downgrade(&self.state),
+            scope: self.graph_lifecycle.observation_scope(),
+        }
     }
 
     /// Binds the request-level correlation identity once. Candidate retries
@@ -1461,6 +1482,28 @@ pub(crate) fn record_request_execution_facts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_observation_key_changes_between_sequential_attempts() {
+        let receipt = NativeExecutionReceiptCollector::new();
+        receipt.begin_candidate_attempt();
+        let first = receipt.identity_key();
+        assert_eq!(first, receipt.clone().identity_key());
+        receipt.finish_candidate_attempt(true);
+        receipt.begin_candidate_attempt();
+        assert_ne!(first, receipt.identity_key());
+        receipt.finish_candidate_attempt(true);
+    }
+
+    #[test]
+    fn backend_observation_key_does_not_retain_receipt_or_alias_new_collectors() {
+        let receipt = NativeExecutionReceiptCollector::new();
+        let key = receipt.identity_key();
+        assert_eq!(key, receipt.clone().identity_key());
+        drop(receipt);
+        assert!(key.state.upgrade().is_none());
+        assert_ne!(key, NativeExecutionReceiptCollector::new().identity_key());
+    }
 
     fn test_actual_device() -> GgmlActualDeviceFacts {
         GgmlActualDeviceFacts {

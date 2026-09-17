@@ -1,6 +1,7 @@
 mod idle_activity;
 mod model_admission;
 mod realtime;
+mod realtime_execution;
 mod remote_runtime_policy;
 mod routes;
 

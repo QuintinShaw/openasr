@@ -808,6 +808,7 @@ pub struct GgmlAsrStreamingSessionConfig {
     pub backpressure: NativeAsrBackpressurePolicy,
     pub partial_results: bool,
     pub word_timestamps: bool,
+    pub punctuate: bool,
     pub min_partial_interval_ms: Option<u32>,
 }
 
@@ -827,6 +828,7 @@ impl From<crate::NativeAsrStreamingSessionConfig> for GgmlAsrStreamingSessionCon
             backpressure: config.backpressure,
             partial_results: config.partial_results,
             word_timestamps: config.word_timestamps,
+            punctuate: config.punctuate,
             min_partial_interval_ms: config.min_partial_interval_ms,
         }
     }

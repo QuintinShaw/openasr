@@ -657,6 +657,8 @@ pub(crate) struct StartSession {
     vad: Option<ClientVadConfig>,
     partial_results: Option<bool>,
     word_timestamps: Option<bool>,
+    /// Optional installed FINAL-text punctuation stage; never changes partials.
+    punctuate: Option<bool>,
     diarize: Option<bool>,
     /// Enrolled Voice ID matching. Realtime never supports this; anonymous
     /// speaker separation is `diarize`.

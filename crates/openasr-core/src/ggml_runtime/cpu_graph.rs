@@ -2904,10 +2904,11 @@ pub(crate) struct GgmlCpuGraphBuilder<'a> {
     /// (X-ASR longform is 600+ computes). Later steps still re-check request
     /// placement and re-publish the cached identity to a new receipt.
     identity_attested: bool,
-    /// Receipt pointer last published by `record_current_execution_backend_observation`.
-    /// The same persistent builder must re-publish when a later request installs
-    /// a new collector, but not on every subsequent token of that request.
-    observation_receipt_key: Option<usize>,
+    /// Receipt allocation and attempt scope last published. A persistent
+    /// builder must re-publish for each new request or sequential attempt,
+    /// including when the allocator reuses a dropped collector's address.
+    observation_receipt_key:
+        Option<crate::models::request_execution_receipt::BackendObservationKey>,
     /// Backend memory stats after graph compute are a request-level high-water
     /// probe, not a per-token metric. X-ASR reuse is 600+ computes; querying
     /// Vulkan/HIP heaps on every joiner step only inflates RTF.

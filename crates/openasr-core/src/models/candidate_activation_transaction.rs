@@ -1569,6 +1569,9 @@ pub struct DefaultModelActivationJournalFactory {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DefaultModelActivationPublication {
     PersistSelection,
+    ReconcileDurableSelection {
+        expected_generation: u64,
+    },
     ReactivateDurableSelection,
     /// Attest the process launch pack without reading or writing durable V2.
     /// Used when `openasr serve --model` binds a pack that is not the stored
@@ -1613,6 +1616,25 @@ impl DefaultModelActivationJournalFactory {
             pack,
             preference,
             publication: DefaultModelActivationPublication::ReactivateDurableSelection,
+            write_fault: None,
+        }
+    }
+
+    /// Re-attest a changed serve-level device preference without overwriting a
+    /// newer durable selection committed while this candidate was warming up.
+    pub fn reconcile_durable_selection(
+        home: std::path::PathBuf,
+        pack: crate::InstalledPack,
+        preference: crate::QuantPreference,
+        expected_generation: u64,
+    ) -> Self {
+        Self {
+            home,
+            pack,
+            preference,
+            publication: DefaultModelActivationPublication::ReconcileDurableSelection {
+                expected_generation,
+            },
             write_fault: None,
         }
     }
@@ -1710,14 +1732,22 @@ impl
         >,
     ) -> Result<(), PublicationFailure<Self::Error>> {
         match self.publication {
-            DefaultModelActivationPublication::PersistSelection => {
-                match crate::default_selection::persist_activation_detailed_with_fault(
+            DefaultModelActivationPublication::PersistSelection
+            | DefaultModelActivationPublication::ReconcileDurableSelection { .. } => {
+                let expected_generation = match self.publication {
+                    DefaultModelActivationPublication::ReconcileDurableSelection {
+                        expected_generation,
+                    } => Some(expected_generation),
+                    _ => None,
+                };
+                match crate::default_selection::persist_activation_detailed_if_generation(
                     &self.home,
                     &self.pack,
                     self.preference.clone(),
                     &self.architecture_id,
                     &self.execution_intent,
                     self.write_fault,
+                    expected_generation,
                 ) {
                     Ok(crate::default_selection::DefaultSelectionCommitOutcome::NotCommitted {
                         reason,
