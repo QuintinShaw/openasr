@@ -80,6 +80,65 @@ fn resolve_is_unset_with_no_config_and_no_pointer() {
 }
 
 #[test]
+fn activation_reconciliation_compares_generation_before_any_selection_write() {
+    use crate::device::execution_policy::ExecutionIntent;
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let pack = write_installed_pack(home, "whisper-small", "q8_0", "q8");
+    persist(home, &pack, QuantPreference::pinned(&pack.quant)).unwrap();
+    let original = read_active_model_selection_v2(home).unwrap().unwrap();
+    let reconcile = |generation| {
+        persist_activation_detailed_if_generation(
+            home,
+            &pack,
+            QuantPreference::pinned(&pack.quant),
+            "whisper",
+            &ExecutionIntent::CpuOnly,
+            None,
+            Some(generation),
+        )
+        .unwrap()
+    };
+    assert!(matches!(
+        reconcile(original.selection_generation),
+        DefaultSelectionCommitOutcome::V2Committed
+    ));
+    let committed = read_active_model_selection_v2(home).unwrap().unwrap();
+    assert_eq!(committed.execution_intent, "cpu_only");
+    assert_eq!(
+        committed.selection_generation,
+        original.selection_generation + 1
+    );
+
+    let other = write_installed_pack(home, "whisper-base", "q4_0", "q4");
+    persist(home, &other, QuantPreference::pinned(&other.quant)).unwrap();
+    let newer = read_active_model_selection_v2(home).unwrap().unwrap();
+    let config = fs::read(config_path(home)).unwrap();
+    assert!(matches!(
+        reconcile(committed.selection_generation),
+        DefaultSelectionCommitOutcome::NotCommitted { .. }
+    ));
+    assert_eq!(
+        read_active_model_selection_v2(home).unwrap().unwrap(),
+        newer
+    );
+    assert_eq!(fs::read(config_path(home)).unwrap(), config);
+
+    // Re-selecting the original model is not permission to accept a stale
+    // generation (ABA); a concurrent user action still wins over old boot.
+    persist(home, &pack, QuantPreference::pinned(&pack.quant)).unwrap();
+    let reselected = read_active_model_selection_v2(home).unwrap().unwrap();
+    assert!(matches!(
+        reconcile(original.selection_generation),
+        DefaultSelectionCommitOutcome::NotCommitted { .. }
+    ));
+    assert_eq!(
+        read_active_model_selection_v2(home).unwrap().unwrap(),
+        reselected
+    );
+}
+
+#[test]
 fn resolve_is_installed_when_config_default_matches_an_installed_pack() {
     let temp = tempfile::tempdir().unwrap();
     let pack = write_installed_pack(temp.path(), "whisper-small", "q8_0", "q8");

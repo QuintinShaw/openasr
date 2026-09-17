@@ -184,6 +184,7 @@ pub(crate) struct WsSession {
     pub(crate) inference_threads: Option<u16>,
     pub(crate) execution_target: Option<openasr_core::ExecutionTarget>,
     pub(crate) word_timestamps: bool,
+    pub(crate) punctuate: bool,
     pub(crate) source_name: Option<String>,
     pub(crate) history_text: Vec<String>,
     pub(crate) history_duration_ms: u64,
@@ -563,6 +564,7 @@ impl WsSession {
             inference_threads: None,
             execution_target: None,
             word_timestamps: false,
+            punctuate: true,
             source_name: None,
             history_text: Vec::new(),
             history_duration_ms: 0,
@@ -920,10 +922,10 @@ impl WsSession {
             .await?;
             return Err(());
         }
-        if policy.file_running().is_some()
-            || self.runtime.native_execution.has_active_sessions()
-            || policy.has_held_realtime()
-        {
+        // Active native realtime sessions consume the configured per-model
+        // capacity below. A global any-active check here would force that
+        // capacity back to one and reject the second meeting track.
+        if policy.file_running().is_some() || policy.has_held_realtime() {
             self.emit_error(
                 RealtimeErrorCode::BackendNotReady,
                 crate::SERVER_BUSY_MESSAGE,
@@ -1006,11 +1008,6 @@ impl WsSession {
             return Err(());
         }
         self.required_stage_readiness = RequiredStageReadinessBarrier::for_session(false);
-        if anonymous_diarize && let Err(message) = self.attach_anonymous_streaming_diarizer() {
-            self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
-                .await?;
-            return Err(());
-        }
         let execution_target = match (self.remote_compute_client, session.execution_target.clone())
         {
             (false, Some(target)) => Some(target),
@@ -1134,6 +1131,7 @@ impl WsSession {
         };
         self.execution_target = execution_target;
         self.word_timestamps = word_timestamps;
+        self.punctuate = session.punctuate.unwrap_or(true);
         self.source_name = source_name;
         if use_native_streaming {
             self.controller = Some(controller);
@@ -1142,6 +1140,7 @@ impl WsSession {
                     normalized_model,
                     effective_partial_results,
                     word_timestamps,
+                    anonymous_diarize,
                 )
                 .await;
             if result.is_err() {
@@ -1171,6 +1170,11 @@ impl WsSession {
         // The mock backend owns no model weights, arenas, or graph workspace;
         // constructing its bounded dispatch worker therefore completes its ASR
         // preparation contract synchronously.
+        if anonymous_diarize && let Err(message) = self.attach_anonymous_streaming_diarizer() {
+            self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
+                .await?;
+            return Err(());
+        }
         self.spawn_backend_worker();
         if let Err(message) = self
             .required_stage_readiness
@@ -1224,6 +1228,7 @@ impl WsSession {
         model_id: String,
         partial_results: bool,
         word_timestamps: bool,
+        anonymous_diarize: bool,
     ) -> Result<(), ()> {
         // Boot attestation changes the active publication generation; capture
         // the served snapshot only after that transition, just like file ASR.
@@ -1318,9 +1323,24 @@ impl WsSession {
         // worker attach; the worker mints its own movable guard before this
         // setup guard drops, leaving no idle-unload gap.
         let (model_session_permit, _native_setup_activity) = admitted_execution.into_parts();
+        let execution_gate = model_session_permit.execution_gate();
+        let control = Arc::clone(&self.backend_control);
+        let Some(preparation) = execution_gate
+            .enter_async(move || control.is_canceled())
+            .await
+        else {
+            return Err(());
+        };
+        if anonymous_diarize && let Err(message) = self.attach_anonymous_streaming_diarizer() {
+            drop(preparation);
+            self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
+                .await?;
+            return Err(());
+        }
         let model_pack = match adapter.model_pack_ref(model_id) {
             Ok(model_pack) => model_pack,
             Err(error) => {
+                drop(preparation);
                 self.emit_error(
                     RealtimeErrorCode::StartupConfigError,
                     &error.to_string(),
@@ -1344,7 +1364,8 @@ impl WsSession {
         let session_config = NativeAsrStreamingSessionConfig::new()
             .with_audio_format(RealtimeAudioFormat::pcm16_mono_16khz())
             .with_partial_results(partial_results)
-            .with_word_timestamps(word_timestamps);
+            .with_word_timestamps(word_timestamps)
+            .with_punctuation(self.punctuate);
         let executor = NativeBackendExecutor::new(Arc::clone(
             self.runtime.native_execution.execution_services(),
         ));
@@ -1376,6 +1397,7 @@ impl WsSession {
         let mut session = match session_result {
             Ok(session) => session,
             Err(error) => {
+                drop(preparation);
                 self.emit_error(
                     RealtimeErrorCode::StartupConfigError,
                     &format!("Could not start native streaming session: {error}"),
@@ -1391,6 +1413,7 @@ impl WsSession {
         let startup_events = match session.poll_events() {
             Ok(events) => events,
             Err(error) => {
+                drop(preparation);
                 self.emit_error(
                     RealtimeErrorCode::StartupConfigError,
                     &format!("Could not poll native streaming startup events: {error}"),
@@ -1403,6 +1426,7 @@ impl WsSession {
         // The session moves onto its own decode thread; the WS task queues audio
         // and drains outcomes separately so a slow partial decode never blocks
         // socket ingest for this session.
+        drop(preparation);
         if let Err(message) = self
             .attach_native_streaming_session_admitted(
                 NativeStreamingWorkerKey::with_route_and_residency(
@@ -1708,6 +1732,14 @@ impl WsSession {
         let mut consumed_split_slot = false;
         let mut consumed_split_change_point = false;
         for mut envelope in events {
+            if let RealtimeEvent::Lifecycle(RealtimeLifecycleEvent::SessionConfigured(configured)) =
+                &mut envelope.event
+            {
+                // Native ASR never enables enrolled Voice ID in realtime.
+                // Anonymous speaker separation is owned by this server
+                // session, so report the successfully attached stage here.
+                configured.diarize = self.streaming_diarizer.is_some();
+            }
             consumed_split_slot |= self
                 .stamp_native_transcript_speaker(kind, &mut envelope)
                 .await;
@@ -2045,13 +2077,15 @@ impl WsSession {
     ) -> Option<openasr_core::diarize::enrollment::SpeakerDisplayAssignment> {
         let mut diarizer = self.streaming_diarizer.take()?;
         let control = Arc::clone(&self.backend_control);
+        let execution_gate = self.runtime.native_execution.realtime_execution_gate();
         match tokio::task::spawn_blocking(move || {
             // ReDimNet dispatches its resident runners onto a dedicated Rayon
             // pool. Arm this blocking owner thread with the session control so
             // the embedder can inherit the same per-job cancel flag onto those
             // worker threads and abort an in-flight ggml graph promptly.
             let _abort_guard = control.arm_for_native_decode();
-            let assignment = if samples.is_empty() || control.is_canceled() {
+            let execution = execution_gate.enter(|| control.is_canceled());
+            let assignment = if samples.is_empty() || execution.is_none() {
                 None
             } else {
                 diarizer.assign_with_path(&samples, 16_000, path)
@@ -2081,12 +2115,15 @@ impl WsSession {
         }
         let samples = self.native_diarize_samples.clone();
         let control = Arc::clone(&self.backend_control);
+        let execution_gate = self.runtime.native_execution.realtime_execution_gate();
         match tokio::task::spawn_blocking(move || {
             // Keep speaker-change embeddings under the same cancel scope as
             // terminal speaker assignment; both ultimately execute ReDimNet
             // graphs on its dedicated worker pool.
             let _abort_guard = control.arm_for_native_decode();
-            let change = (!control.is_canceled())
+            let execution = execution_gate.enter(|| control.is_canceled());
+            let change = execution
+                .is_some()
                 .then(|| detector.analyze(&samples))
                 .flatten();
             (detector, change)
@@ -2661,6 +2698,7 @@ impl WsSession {
             inference_threads: self.inference_threads,
             execution_target: self.execution_target.clone(),
             word_timestamps: self.word_timestamps,
+            punctuate: self.punctuate,
             display_name: "realtime-utterance.wav".to_string(),
             temp_wav,
         };

@@ -2,7 +2,11 @@
 import type { BackendFeatureCapability } from "./BackendFeatureCapability";
 import type { RealtimeBackendMode } from "./RealtimeBackendMode";
 
-export type RealtimeBackendCapabilities = { mode: RealtimeBackendMode, supports_realtime_sessions: boolean, supports_partial_results: boolean, phrase_bias: BackendFeatureCapability, word_timestamps: BackendFeatureCapability, diarization: BackendFeatureCapability, requires_vad_utterance_boundaries: boolean, is_file_per_utterance_fallback: boolean, is_true_streaming: boolean,
+export type RealtimeBackendCapabilities = { mode: RealtimeBackendMode, supports_realtime_sessions: boolean, supports_partial_results: boolean,
+/**
+ * The session protocol can control the optional FINAL-text punctuation stage.
+ */
+supports_punctuation_control: boolean, phrase_bias: BackendFeatureCapability, word_timestamps: BackendFeatureCapability, diarization: BackendFeatureCapability, requires_vad_utterance_boundaries: boolean, is_file_per_utterance_fallback: boolean, is_true_streaming: boolean,
 /**
  * True only for the frame-sync append-only streaming driver (fixed
  * low-latency chunks that are appended, never revised) -- the shape a

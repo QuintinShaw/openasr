@@ -39,7 +39,28 @@ pub const PAIRING_ADMIN_TOKEN: &str = "admin-secret";
 pub struct LoopbackTlsServer {
     pub addr: SocketAddr,
     pub certificate_fingerprint: String,
+    runtime: ServerRuntime,
     _task: task::JoinHandle<()>,
+}
+
+impl LoopbackTlsServer {
+    /// Wait for real handler admission, not an assumed upload/TLS duration.
+    /// The loopback fixture starts with no other file tasks.
+    pub async fn wait_for_running_file_job(&self) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while self
+                .runtime
+                .native_execution
+                .remote_policy()
+                .file_running()
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first loopback file request must enter the running slot");
+    }
 }
 
 impl Drop for LoopbackTlsServer {
@@ -125,8 +146,9 @@ pub async fn spawn_loopback_pairing_server_with_sans(
     let addr = listener.local_addr().unwrap();
     let certificate_fingerprint = identity.certificate_sha256.clone();
     let safety_code = pairing_safety_code_for_certificate_fingerprint(&certificate_fingerprint);
+    let runtime = ServerRuntime::default();
     let app = app_with_runtime_and_distribution_and_launch_options(
-        ServerRuntime::default(),
+        runtime.clone(),
         DistributionRuntime {
             openasr_home: Some(home.to_path_buf()),
             catalog_url: None,
@@ -143,6 +165,7 @@ pub async fn spawn_loopback_pairing_server_with_sans(
     LoopbackTlsServer {
         addr,
         certificate_fingerprint,
+        runtime,
         _task: task,
     }
 }

@@ -50,7 +50,8 @@ use crate::models::ggml_asr_executor::{
     GgmlAsrStreamingExecutor, GgmlAsrStreamingSessionRequest, GgmlAsrViewExecutor,
 };
 use crate::models::incremental_streaming_driver::{
-    STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, build_seq2seq_streaming_session,
+    STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT, StreamingPartialTuning,
+    build_seq2seq_streaming_session,
 };
 use crate::models::native_execution_services::{
     ExecutionLaneKey, current_execution_lane_key, current_execution_placement,
@@ -75,6 +76,12 @@ use super::tokenizer::FireRedTokenizer;
 
 const FIRERED_AED_EXECUTOR_ID: &str = crate::arch::FIRERED_AED_EXECUTOR_COMPONENT_ID;
 const FIRERED_AED_STREAMING_EXECUTOR_ID: &str = "firered-aed-ggml-snapshot-streaming-executor-v1";
+// A stopped stream can leave less than one snip-edges fbank frame after a
+// finalized utterance. Finish that tail without invoking an impossible decode;
+// the shared driver retains any already-emitted transcript.
+const FIRERED_AED_STREAMING_TUNING: StreamingPartialTuning =
+    STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT
+        .with_minimum_encodable_samples(super::frontend::FRAME_LENGTH_SAMPLES);
 const CMVN_NEG_MEAN_TENSOR: &str = "frontend.cmvn.neg_mean";
 const CMVN_INV_STDDEV_TENSOR: &str = "frontend.cmvn.inv_stddev";
 const TOKENIZER_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
@@ -1011,7 +1018,7 @@ impl GgmlAsrStreamingExecutor for FireRedAedGgmlExecutor {
             FIRERED_AED_GGML_ADAPTER_ID,
             "firered-aed",
             request,
-            STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT,
+            FIRERED_AED_STREAMING_TUNING,
             FireRedAedGgmlExecutor::execute_streaming_view,
         )
     }
@@ -1034,6 +1041,31 @@ mod tests {
     use crate::models::ggml_asr_executor::{GgmlAsrBackendPreference, GgmlAsrPreparedAudioView};
 
     use super::*;
+
+    #[test]
+    fn streaming_floor_matches_the_first_encodable_fbank_frame() {
+        let minimum = FIRERED_AED_STREAMING_TUNING
+            .minimum_encodable_samples()
+            .unwrap();
+        let frontend = FireRedFbankFrontend::new();
+        assert!(frontend.compute(&vec![0.0; minimum - 1]).is_err());
+        assert!(frontend.compute(&vec![0.0; minimum]).is_ok());
+        assert!(
+            super::super::capacity::firered_aed_encoder_frame_count_for_samples(
+                minimum - 1,
+                super::super::frontend::SAMPLE_RATE_HZ
+            )
+            .is_err()
+        );
+        assert!(
+            super::super::capacity::firered_aed_encoder_frame_count_for_samples(
+                minimum,
+                super::super::frontend::SAMPLE_RATE_HZ
+            )
+            .unwrap()
+                > 0
+        );
+    }
 
     // Pinned to the reference PyTorch decode captured by the dev-only
     // `tmp/firered-ref-src` harness (see the Stage 1-2 module docs); the

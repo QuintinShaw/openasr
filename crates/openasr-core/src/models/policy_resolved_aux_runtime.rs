@@ -103,6 +103,23 @@ pub(crate) fn resolved_runtime_for_auxiliary_candidate(
 type AuxiliaryRuntimeBuilder<R, E> =
     Arc<dyn Fn(&ExecutionCandidate) -> Result<R, E> + Send + Sync + 'static>;
 
+/// Auxiliary plans attest their own placement. Their graphs must not be
+/// attributed to the enclosing ASR candidate, nor replace its receipt. Each
+/// nested attempt still installs its own placement collector and policy gate.
+fn isolate_auxiliary_evidence() -> (
+    Option<crate::ggml_runtime::GgmlExecutionTelemetryGuard>,
+    super::native_execution_services::ExecutionReceiptCollectorGuard,
+) {
+    (
+        // A top-level diagnostic observer must still see auxiliary work.
+        // Only an enclosing candidate has a placement contract to isolate.
+        super::native_execution_services::current_execution_candidate_failure_sink()
+            .is_some()
+            .then(|| crate::ggml_runtime::install_execution_telemetry_collector(None)),
+        super::native_execution_services::install_execution_receipt_collector(None),
+    )
+}
+
 /// Failure at the policy seam. Ordinary model/input errors never authorize a
 /// candidate change; only the typed failure side channel can produce
 /// `CandidatesExhausted`.
@@ -240,6 +257,7 @@ impl<R, E> PolicyResolvedAuxRuntime<R, E> {
         activation_quote: &CandidateActivationQuoteSource,
         start_index: usize,
     ) -> Result<(usize, R), PolicyResolvedAuxRuntimeError<E>> {
+        let _evidence = isolate_auxiliary_evidence();
         let candidates = execution_plan.candidates();
         for (candidate_index, candidate) in candidates.iter().enumerate().skip(start_index) {
             let _quote = install_candidate_activation_quote(activation_quote.clone());
@@ -282,6 +300,7 @@ impl<R, E> PolicyResolvedAuxRuntime<R, E> {
         &mut self,
         mut operation: impl FnMut(&R) -> Result<T, E>,
     ) -> Result<T, PolicyResolvedAuxRuntimeError<E>> {
+        let _evidence = isolate_auxiliary_evidence();
         if self.runtime.is_none() {
             return Err(PolicyResolvedAuxRuntimeError::EmptyPlan { stage: self.stage });
         }
@@ -352,6 +371,7 @@ impl<R, E> PolicyResolvedAuxRuntime<R, E> {
         &mut self,
         operation: impl FnOnce(&R) -> Result<T, E>,
     ) -> Result<T, PolicyResolvedAuxRuntimeError<E>> {
+        let _evidence = isolate_auxiliary_evidence();
         if self.runtime.is_none() {
             return Err(PolicyResolvedAuxRuntimeError::EmptyPlan { stage: self.stage });
         }
@@ -833,6 +853,155 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn nested_cpu_auxiliary_does_not_contaminate_primary_gpu_placement() {
+        let services = services();
+        let gpu = candidate(ExecutionProvider::Metal, "MTL0");
+        let cpu = candidate(ExecutionProvider::Cpu, "CPU");
+        let quote = test_aux_activation_quote("nested");
+        let _quote = install_candidate_activation_quote(quote.clone());
+        let record = |backend: &str| {
+            if let Some(collector) = crate::ggml_runtime::current_execution_telemetry_collector() {
+                collector.record_graph_compute(false);
+                collector.record_observed_graph(
+                    if backend == "MTL0" { 7 } else { 8 },
+                    &std::collections::BTreeMap::from([(backend.to_string(), (3, 96))]),
+                    &std::collections::BTreeMap::from([(backend.to_string(), 2)]),
+                    &std::collections::BTreeMap::new(),
+                );
+            }
+        };
+        let outcome = run_execution_candidate_attempt(services.as_ref(), &gpu, || {
+            record("MTL0");
+            let mut auxiliary = PolicyResolvedAuxRuntime::try_new(
+                Arc::clone(&services),
+                ExecutionPlan::for_test(ExecutionIntent::CpuOnly, vec![cpu]),
+                "nested",
+                Arc::new(|_| Ok::<_, String>(())),
+                quote.clone(),
+            )
+            .unwrap();
+            auxiliary
+                .invoke_replay_safe(|_| {
+                    record("CPU");
+                    Ok(())
+                })
+                .unwrap();
+            auxiliary
+                .invoke_pinned(|_| {
+                    record("CPU");
+                    Ok(())
+                })
+                .unwrap();
+            Ok::<_, String>(())
+        });
+        assert!(outcome.result.is_ok());
+        assert!(
+            outcome.candidate_failure.is_none(),
+            "{:?}",
+            outcome.candidate_failure
+        );
+    }
+
+    #[test]
+    fn auxiliary_mapping_does_not_reopen_primary_activation_envelope() {
+        use crate::device::execution_memory::{
+            DeviceMemorySnapshot, MappingEnvelopeSource, MemoryDomainKey,
+            MemoryObservationConfidence,
+        };
+        use crate::models::native_execution_services::{
+            ActivationReservationContext, current_memory_reservation_cohort_id,
+            install_activation_reservation_context,
+        };
+        use crate::models::runtime_receipts::RuntimeOwnerPlacement;
+
+        let services = services();
+        let broker = services.memory_broker();
+        let scope_id = services.scope_id();
+        let domain = MemoryDomainKey::SystemMemory;
+        let snapshot = DeviceMemorySnapshot {
+            free_bytes: 8 * 1024 * 1024 * 1024,
+            total_bytes: 16 * 1024 * 1024 * 1024,
+            confidence: MemoryObservationConfidence::DeviceSnapshot,
+        };
+        let _primary_context =
+            install_activation_reservation_context(Some(ActivationReservationContext::mint()));
+        let primary_cohort = current_memory_reservation_cohort_id().unwrap();
+        let primary = broker
+            .open_mapping_envelope(
+                snapshot,
+                MappingEnvelopeSource::for_test(1, 1024),
+                primary_cohort,
+                "primary-mapping".to_string(),
+                Some(scope_id),
+                RuntimeOwnerPlacement::HostNeutral,
+            )
+            .unwrap();
+        let auxiliary_broker = Arc::clone(broker);
+        let mut auxiliary = PolicyResolvedAuxRuntime::try_new(
+            Arc::clone(&services),
+            ExecutionPlan::for_test(
+                ExecutionIntent::CpuOnly,
+                vec![candidate(ExecutionProvider::Cpu, "CPU")],
+            ),
+            "independent-mapping",
+            Arc::new(move |_| {
+                let envelope = auxiliary_broker
+                    .open_mapping_envelope(
+                        snapshot,
+                        MappingEnvelopeSource::for_test(2, 256),
+                        current_memory_reservation_cohort_id().unwrap(),
+                        "auxiliary-mapping".to_string(),
+                        Some(scope_id),
+                        RuntimeOwnerPlacement::HostNeutral,
+                    )
+                    .map_err(|error| error.to_string())?;
+                let host = auxiliary_broker
+                    .try_reserve_batch_for_scope_and_placement(
+                        vec![crate::device::execution_memory::DomainReservationRequest {
+                            domain: MemoryDomainKey::SystemMemory,
+                            snapshot,
+                            peak_bytes: 64,
+                            retained_bytes: 64,
+                            observed_peak_bytes: None,
+                            requires_reconciliation: true,
+                            resource_id: "auxiliary-host-state".to_string(),
+                            cohort_id: current_memory_reservation_cohort_id(),
+                        }],
+                        Some(scope_id),
+                        RuntimeOwnerPlacement::HostNeutral,
+                    )
+                    .map_err(|error| error.to_string())?;
+                drop(host);
+                Ok::<_, String>(envelope)
+            }),
+            test_aux_activation_quote("independent-mapping"),
+        )
+        .expect("auxiliary must not join the differently sized ASR mapping");
+        for pinned in [false, true] {
+            let active = if pinned {
+                auxiliary.invoke_pinned(|_| Ok(current_memory_reservation_cohort_id().unwrap()))
+            } else {
+                auxiliary
+                    .invoke_replay_safe(|_| Ok(current_memory_reservation_cohort_id().unwrap()))
+            }
+            .unwrap();
+            assert_eq!(
+                active, primary_cohort,
+                "nested allocation must join the pending activation cohort"
+            );
+            assert_eq!(current_memory_reservation_cohort_id(), Some(primary_cohort));
+        }
+        assert_eq!(broker.usage(&domain).pending_bytes, 1280);
+        assert_eq!(broker.usage(&domain).committed_bytes, 0);
+        drop(auxiliary);
+        assert_eq!(broker.usage(&domain).pending_bytes, 1024);
+        drop(primary);
+        assert_eq!(broker.usage(&domain).pending_bytes, 0);
+        assert_eq!(broker.usage(&domain).committed_bytes, 0);
+        assert!(!broker.usage(&domain).quarantined);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     num::NonZeroUsize,
     sync::{Arc, Mutex},
 };
@@ -7,6 +7,7 @@ use std::{
 use openasr_core::NativeExecutionServices;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::realtime_execution::RealtimeExecutionGate;
 use crate::remote_runtime_policy::RemoteRuntimePolicy;
 
 /// Bounds concurrent native executions for one resolved runtime model identity.
@@ -19,6 +20,7 @@ use crate::remote_runtime_policy::RemoteRuntimePolicy;
 #[derive(Clone, Debug)]
 pub(crate) struct ModelSessionAdmission {
     state: Arc<Mutex<ModelSessionAdmissionState>>,
+    execution_gate: Arc<RealtimeExecutionGate>,
 }
 
 #[derive(Debug)]
@@ -30,7 +32,7 @@ struct ModelSessionAdmissionState {
 #[derive(Debug)]
 struct ModelSessionSlot {
     semaphore: Arc<Semaphore>,
-    active: usize,
+    occupied: BTreeSet<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,7 +48,19 @@ pub(crate) struct ModelSessionAdmissionError {
 pub(crate) struct ModelSessionPermit {
     state: Arc<Mutex<ModelSessionAdmissionState>>,
     model_identity: String,
+    slot_index: usize,
     permit: Option<OwnedSemaphorePermit>,
+    execution_gate: Arc<RealtimeExecutionGate>,
+}
+
+impl ModelSessionPermit {
+    pub(crate) fn execution_gate(&self) -> Arc<RealtimeExecutionGate> {
+        Arc::clone(&self.execution_gate)
+    }
+
+    pub(crate) fn slot_index(&self) -> usize {
+        self.slot_index
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +121,10 @@ impl NativeExecutionSupervisor {
         &self.remote_policy
     }
 
+    pub(crate) fn realtime_execution_gate(&self) -> Arc<RealtimeExecutionGate> {
+        Arc::clone(&self.admission.execution_gate)
+    }
+
     pub(crate) fn try_acquire(
         &self,
         model_identity: impl Into<String>,
@@ -136,6 +154,7 @@ impl ModelSessionAdmission {
                 limit,
                 slots: HashMap::new(),
             })),
+            execution_gate: Arc::new(RealtimeExecutionGate::default()),
         }
     }
 
@@ -151,7 +170,7 @@ impl ModelSessionAdmission {
             .entry(model_identity.clone())
             .or_insert_with(|| ModelSessionSlot {
                 semaphore: Arc::new(Semaphore::new(limit.get())),
-                active: 0,
+                occupied: BTreeSet::new(),
             });
         let permit = match Arc::clone(&slot.semaphore).try_acquire_owned() {
             Ok(permit) => permit,
@@ -162,18 +181,33 @@ impl ModelSessionAdmission {
                 });
             }
         };
-        slot.active += 1;
+        // Pick the lowest free slot without allocating for the configured
+        // upper bound. Stable bounded indices let streaming workers retain
+        // their warm cache without serializing independent admitted sessions.
+        let mut slot_index = 0;
+        for &occupied in &slot.occupied {
+            if occupied != slot_index {
+                break;
+            }
+            slot_index += 1;
+        }
+        slot.occupied.insert(slot_index);
         drop(state);
 
         Ok(ModelSessionPermit {
             state: Arc::clone(&self.state),
             model_identity,
+            slot_index,
             permit: Some(permit),
+            execution_gate: Arc::clone(&self.execution_gate),
         })
     }
 
     pub(crate) fn has_active_sessions(&self) -> bool {
-        self.lock_state().slots.values().any(|slot| slot.active > 0)
+        self.lock_state()
+            .slots
+            .values()
+            .any(|slot| !slot.occupied.is_empty())
     }
 
     #[cfg(test)]
@@ -197,22 +231,22 @@ impl Drop for ModelSessionPermit {
         let Some(permit) = self.permit.take() else {
             return;
         };
-        drop(permit);
-
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let should_remove = match state.slots.get_mut(&self.model_identity) {
             Some(slot) => {
-                slot.active = slot.active.saturating_sub(1);
-                slot.active == 0
+                slot.occupied.remove(&self.slot_index);
+                slot.occupied.is_empty()
             }
             None => false,
         };
         if should_remove {
             state.slots.remove(&self.model_identity);
         }
+        // Publish the free index and permit under the same registry lock.
+        drop(permit);
     }
 }
 
@@ -226,6 +260,27 @@ mod tests {
 
     fn admission(limit: usize) -> ModelSessionAdmission {
         ModelSessionAdmission::new(NonZeroUsize::new(limit).unwrap())
+    }
+
+    #[test]
+    fn admitted_sessions_share_the_execution_gate_without_releasing_capacity() {
+        let supervisor = super::NativeExecutionSupervisor::new(NonZeroUsize::new(2).unwrap());
+        let first_session = supervisor.try_acquire("dual-track").unwrap();
+        let second_session = supervisor.try_acquire("dual-track").unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &first_session.execution_gate(),
+            &second_session.execution_gate()
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &first_session.execution_gate(),
+            &supervisor.realtime_execution_gate()
+        ));
+        drop(first_session.execution_gate().enter(|| false).unwrap());
+        drop(second_session.execution_gate().enter(|| false).unwrap());
+        assert!(
+            supervisor.try_acquire("dual-track").is_err(),
+            "finishing an operation must not release a session's admission"
+        );
     }
 
     #[test]
@@ -298,6 +353,25 @@ mod tests {
                 .try_acquire("native:whisper-small@pack-a")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn concurrent_slot_indices_are_distinct_bounded_and_reused() {
+        let admission = admission(3);
+        let first = admission.try_acquire("model").unwrap();
+        let second = admission.try_acquire("model").unwrap();
+        let third = admission.try_acquire("model").unwrap();
+        assert_eq!(
+            [first.slot_index(), second.slot_index(), third.slot_index()],
+            [0, 1, 2]
+        );
+        assert!(admission.try_acquire("model").is_err());
+        drop(second);
+        let replacement = admission.try_acquire("model").unwrap();
+        assert_eq!(replacement.slot_index(), 1);
+        drop((first, third, replacement));
+        assert_eq!(admission.active_slot_count(), 0);
+        assert_eq!(admission.try_acquire("model").unwrap().slot_index(), 0);
     }
 
     #[test]

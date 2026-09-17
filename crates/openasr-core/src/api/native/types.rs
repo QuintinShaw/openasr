@@ -414,6 +414,11 @@ impl NativeAsrRequestOptions {
 pub struct NativeAsrOfflineRequest {
     pub input_path: PathBuf,
     pub options: NativeAsrRequestOptions,
+    /// Request-specific optional postprocessing, preserved across adapter dispatch.
+    pub punctuate: bool,
+    pub timeline_precision: crate::subtitle::TimelinePrecisionPolicy,
+    pub needs_subtitle_export: bool,
+    pub adapter_path: Option<PathBuf>,
     pub longform: Option<LongFormOptions>,
     pub display_file_name: Option<String>,
     /// Which call path built this request -- carried through to
@@ -473,6 +478,10 @@ impl NativeAsrOfflineRequest {
         Self {
             input_path: input_path.into(),
             options: NativeAsrRequestOptions::default(),
+            punctuate: true,
+            timeline_precision: crate::subtitle::TimelinePrecisionPolicy::Auto,
+            needs_subtitle_export: false,
+            adapter_path: None,
             longform: None,
             display_file_name: None,
             source: RequestSource::default(),
@@ -583,6 +592,81 @@ impl NativeAsrOfflineRequest {
     pub fn with_source_container(mut self, container: Option<String>) -> Self {
         self.source_container = container;
         self
+    }
+}
+
+impl From<crate::TranscriptionRequest> for NativeAsrOfflineRequest {
+    fn from(request: crate::TranscriptionRequest) -> Self {
+        // Exhaustive transfer: adding a request field must force a decision at
+        // this boundary instead of silently restoring a constructor default.
+        let crate::TranscriptionRequest {
+            input_path,
+            model_id: _,
+            model_pack_path: _,
+            adapter_path,
+            language,
+            task,
+            prompt,
+            phrase_bias,
+            inference_threads,
+            execution_target,
+            serve_batch_max_native_sessions,
+            word_timestamps,
+            word_timestamps_refine,
+            timeline_precision,
+            needs_subtitle_export,
+            longform,
+            display_file_name,
+            voice_id,
+            anonymous_diarize,
+            return_speaker_embeddings,
+            voice_id_segmenter,
+            voice_id_embedder,
+            diarize_speakers,
+            punctuate,
+            source,
+            source_sample_rate_hz,
+            source_channels,
+            source_container,
+            prepared_samples,
+            execution_context,
+        } = request;
+        // Pack identity is deliberately supplied by the admitted model adapter,
+        // not copied from a caller-provided id or path.
+        Self {
+            input_path,
+            options: NativeAsrRequestOptions {
+                language,
+                task,
+                prompt,
+                phrase_bias,
+                inference_threads,
+                voice_id,
+                anonymous_diarize,
+                diarize_speakers,
+                return_speaker_embeddings,
+                partial_results: false,
+                word_timestamps,
+                word_timestamps_refine,
+                execution_target: execution_target.clone(),
+            },
+            punctuate,
+            timeline_precision,
+            needs_subtitle_export,
+            adapter_path,
+            longform,
+            display_file_name,
+            source,
+            source_sample_rate_hz,
+            source_channels,
+            source_container,
+            prepared_samples,
+            voice_id_segmenter,
+            voice_id_embedder,
+            execution_context,
+            serve_batch_max_native_sessions,
+            execution_target,
+        }
     }
 }
 

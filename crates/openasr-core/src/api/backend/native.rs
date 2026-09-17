@@ -530,6 +530,7 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
         )?;
         let streaming_punctuator =
             crate::models::firered_punc::streaming_runtime::PolicyResolvedStreamingPunctuator::prepare(
+                session_config.punctuate,
                 Arc::clone(&execution_services),
                 self.descriptor.model_architecture,
                 self.descriptor.adapter_id,
@@ -969,10 +970,11 @@ impl PolicyResolvedNativeStreamingSession {
             crate::models::native_execution_services::install_activation_reservation_context(
                 self.factory.activation_reservation_context(),
             );
+        // Auxiliary initialization has its own pack and candidate plan. Its
+        // retries must not replace the completed ASR activation receipt;
+        // policy validation and service-owned resource receipts remain active.
         let _receipt =
-            crate::models::native_execution_services::install_execution_receipt_collector(
-                self.factory.execution_receipt(),
-            );
+            crate::models::native_execution_services::install_execution_receipt_collector(None);
         self.factory.initialize_auxiliary_runtimes()?;
         self.auxiliary_ready = true;
         Ok(())
@@ -1083,8 +1085,8 @@ fn candidate_success_with_failure_error(
 ) -> NativeAsrError {
     NativeAsrError::SessionFailed {
         message: format!(
-            "execution candidate reported {:?} during {operation} ({}) despite returning success",
-            failure.kind, failure.operation
+            "execution candidate reported {:?} during {operation} ({}) despite returning success: {}",
+            failure.kind, failure.operation, failure.detail
         ),
     }
 }
@@ -1514,33 +1516,76 @@ fn native_offline_request_to_transcription_request(
     execution_target: ExecutionTarget,
     request: NativeAsrOfflineRequest,
 ) -> TranscriptionRequest {
-    let segmenter = request.voice_id_segmenter;
-    let embedder = request.voice_id_embedder;
-    let mut converted = TranscriptionRequest::new(request.input_path, model_pack.id.clone())
-        .with_model_pack_path(Some(model_pack.root.clone()))
-        .with_language(request.options.language)
-        .with_task(request.options.task)
-        .with_prompt(request.options.prompt)
-        .with_phrase_bias(request.options.phrase_bias)
-        .with_inference_threads(request.options.inference_threads)
-        .with_execution_target(Some(execution_target))
-        .with_word_timestamps(request.options.word_timestamps)
-        .with_word_timestamps_refine(request.options.word_timestamps_refine)
-        .with_voice_id(request.options.voice_id)
-        .with_anonymous_diarize(request.options.anonymous_diarize)
-        .with_diarize_speakers(request.options.diarize_speakers)
-        .with_return_speaker_embeddings(request.options.return_speaker_embeddings)
-        .with_longform(request.longform)
-        .with_display_file_name(request.display_file_name)
-        .with_source(request.source)
-        .with_source_audio_format(request.source_sample_rate_hz, request.source_channels)
-        .with_source_container(request.source_container)
-        .with_prepared_samples(request.prepared_samples)
-        .with_execution_context(request.execution_context)
-        .with_serve_batch_max_native_sessions(request.serve_batch_max_native_sessions);
-    converted.voice_id_segmenter = segmenter;
-    converted.voice_id_embedder = embedder;
-    converted
+    // Exhaustive in both directions: a newly added option cannot disappear
+    // behind TranscriptionRequest::new's defaults. The admitted pack and the
+    // resolved execution target remain authoritative at this boundary.
+    let NativeAsrOfflineRequest {
+        input_path,
+        options:
+            NativeAsrRequestOptions {
+                language,
+                task,
+                prompt,
+                phrase_bias,
+                inference_threads,
+                voice_id,
+                anonymous_diarize,
+                diarize_speakers,
+                return_speaker_embeddings,
+                partial_results: _,
+                word_timestamps,
+                word_timestamps_refine,
+                execution_target: _,
+            },
+        punctuate,
+        timeline_precision,
+        needs_subtitle_export,
+        adapter_path,
+        longform,
+        display_file_name,
+        source,
+        source_sample_rate_hz,
+        source_channels,
+        source_container,
+        prepared_samples,
+        voice_id_segmenter,
+        voice_id_embedder,
+        execution_context,
+        serve_batch_max_native_sessions,
+        execution_target: _,
+    } = request;
+    TranscriptionRequest {
+        input_path,
+        model_id: model_pack.id.clone(),
+        model_pack_path: Some(model_pack.root.clone()),
+        adapter_path,
+        language,
+        task,
+        prompt,
+        phrase_bias,
+        inference_threads,
+        execution_target: Some(execution_target),
+        serve_batch_max_native_sessions,
+        word_timestamps,
+        word_timestamps_refine,
+        timeline_precision,
+        needs_subtitle_export,
+        longform,
+        display_file_name,
+        voice_id,
+        anonymous_diarize,
+        return_speaker_embeddings,
+        voice_id_segmenter,
+        voice_id_embedder,
+        diarize_speakers,
+        punctuate,
+        source,
+        source_sample_rate_hz,
+        source_channels,
+        source_container,
+        prepared_samples,
+        execution_context,
+    }
 }
 
 fn native_backend_error_to_asr(error: BackendError) -> NativeAsrError {
@@ -2098,6 +2143,53 @@ mod tests {
             .join("../../fixtures/jfk.wav")
             .canonicalize()
             .expect("sample wav fixture path must exist")
+    }
+
+    #[test]
+    fn offline_request_round_trip_preserves_postprocessing_and_task() {
+        let pack = NativeAsrModelPackRef::new("moonshine-tiny", "moonshine", "/tmp/pack");
+        for punctuate in [false, true] {
+            for precision in [
+                crate::subtitle::TimelinePrecisionPolicy::Off,
+                crate::subtitle::TimelinePrecisionPolicy::Always,
+            ] {
+                let mut original = TranscriptionRequest::new("/tmp/audio.wav", pack.id.clone())
+                    .with_model_pack_path(Some(pack.root.clone()))
+                    .with_execution_target(Some(ExecutionTarget::Cpu))
+                    .with_punctuation(punctuate)
+                    .with_timeline_precision(precision)
+                    .with_needs_subtitle_export(true)
+                    .with_task(Some(crate::TranscriptionTask::Translate))
+                    .with_language(Some("zh".to_string()))
+                    .with_prompt(Some("domain terms".to_string()))
+                    .with_phrase_bias(Some(
+                        crate::PhraseBiasConfig::from_phrases([("OpenASR", 2.0)]).unwrap(),
+                    ))
+                    .with_inference_threads(Some(3))
+                    .with_serve_batch_max_native_sessions(Some(2))
+                    .with_word_timestamps(true)
+                    .with_word_timestamps_refine(true)
+                    .with_longform(Some(crate::LongFormOptions::default()))
+                    .with_display_file_name(Some("meeting.wav".to_string()))
+                    .with_anonymous_diarize(true)
+                    .with_return_speaker_embeddings(true)
+                    .with_diarize_speakers(Some(2))
+                    .with_source(crate::RequestSource::ServerTranscribe)
+                    .with_source_audio_format(Some(48000), Some(2))
+                    .with_source_container(Some("wav".to_string()))
+                    .with_prepared_samples(Some(Arc::new(vec![0.1, 0.2, 0.3])));
+                original.voice_id_segmenter =
+                    crate::config::VoiceIdSegmenterPreference::Segmentation3_0;
+                original.voice_id_embedder = crate::config::VoiceIdEmbedderPreference::WeSpeaker;
+                original.adapter_path = Some(PathBuf::from("/tmp/domain.oadp"));
+                let rebuilt = native_offline_request_to_transcription_request(
+                    &pack,
+                    ExecutionTarget::Cpu,
+                    NativeAsrOfflineRequest::from(original.clone()),
+                );
+                assert_eq!(rebuilt, original);
+            }
+        }
     }
 
     #[test]
@@ -3475,6 +3567,27 @@ mod tests {
         fn initialize_auxiliary_runtimes(&self) -> Result<(), NativeAsrError> {
             self.auxiliary_initializations
                 .fetch_add(1, Ordering::SeqCst);
+            if self.receipt.is_some() {
+                let candidate =
+                    streaming_policy_candidate(ExecutionProvider::Cpu, ExecutionPlacement::CpuOnly);
+                let attempt =
+                    crate::models::native_execution_services::run_execution_candidate_attempt(
+                        self.services.as_ref(),
+                        &candidate,
+                        || Err::<(), _>("optional auxiliary disabled"),
+                    );
+                assert!(attempt.result.is_err());
+            }
+            Ok(())
+        }
+
+        fn record_execution_facts(
+            &self,
+            _candidate: &ExecutionCandidate,
+        ) -> Result<(), NativeAsrError> {
+            if let Some(receipt) = &self.receipt {
+                receipt.record_token(0, 7, false);
+            }
             Ok(())
         }
 
@@ -3707,6 +3820,37 @@ mod tests {
             vec![ExecutionProvider::Vulkan, ExecutionProvider::Cpu]
         );
         assert_eq!(auxiliary_initializations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn streaming_warmup_preserves_receipt_when_optional_auxiliary_attempt_rolls_back() {
+        let receipt = crate::NativeExecutionReceiptCollector::new();
+        let builder: Arc<dyn NativeStreamingSessionCandidateBuilder> =
+            Arc::new(TestStreamingCandidateBuilder {
+                services: native_execution_services_for_test(),
+                builds: Arc::new(Mutex::new(Vec::new())),
+                receipt: Some(receipt.clone()),
+                control_lanes: Arc::new(Mutex::new(Vec::new())),
+                fail_build_on_accelerated: false,
+                fail_build_on_cpu_untyped: false,
+                fail_warmup_on_accelerated: false,
+                fail_push_on_accelerated: false,
+                auxiliary_initializations: Arc::new(AtomicUsize::new(0)),
+            });
+        let candidate =
+            streaming_policy_candidate(ExecutionProvider::Cpu, ExecutionPlacement::CpuOnly);
+        let mut session = PolicyResolvedNativeStreamingSession::start(
+            builder,
+            ExecutionPlan::for_test(ExecutionIntent::CpuOnly, vec![candidate]),
+        )
+        .unwrap();
+        session.warm_up().unwrap();
+        let snapshot = receipt.snapshot();
+        assert!(
+            snapshot.completed,
+            "optional auxiliary rollback must not erase ASR completion"
+        );
+        assert_eq!(snapshot.token_steps.len(), 1);
     }
 
     #[test]

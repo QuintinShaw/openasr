@@ -34,6 +34,8 @@ pub struct RealtimeBackendCapabilities {
     pub mode: RealtimeBackendMode,
     pub supports_realtime_sessions: bool,
     pub supports_partial_results: bool,
+    /// The session protocol can control the optional FINAL-text punctuation stage.
+    pub supports_punctuation_control: bool,
     pub phrase_bias: BackendFeatureCapability,
     pub word_timestamps: BackendFeatureCapability,
     pub diarization: BackendFeatureCapability,
@@ -65,6 +67,7 @@ impl RealtimeBackendCapabilities {
             mode,
             supports_realtime_sessions,
             supports_partial_results,
+            supports_punctuation_control: supports_realtime_sessions,
             phrase_bias,
             word_timestamps,
             diarization: realtime_diarization_unsupported(),

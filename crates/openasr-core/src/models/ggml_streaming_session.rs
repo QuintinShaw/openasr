@@ -196,6 +196,7 @@ impl From<GgmlAsrStreamingSessionConfig> for NativeAsrStreamingSessionConfig {
             backpressure: config.backpressure,
             partial_results: config.partial_results,
             word_timestamps: config.word_timestamps,
+            punctuate: config.punctuate,
             min_partial_interval_ms: config.min_partial_interval_ms,
         }
     }
@@ -324,14 +325,22 @@ where
     /// `emitter.finalize_pending_output_at` from anywhere else in this
     /// session, or a final can bypass the stage.
     fn punctuate_final_update(&self, update: &mut TranscriptUpdate, is_hard_boundary: bool) {
-        if let Some(processor) = &self.final_text_processor
-            && let Ok(punctuated) = processor.process(&update.text)
-        {
-            update.text = if is_hard_boundary {
-                punctuated
-            } else {
-                strip_soft_boundary_terminal(&punctuated)
-            };
+        if let Some(processor) = &self.final_text_processor {
+            match processor.process(&update.text) {
+                Ok(punctuated) => {
+                    update.text = if is_hard_boundary {
+                        punctuated
+                    } else {
+                        strip_soft_boundary_terminal(&punctuated)
+                    };
+                }
+                Err(error) => crate::stage_timing::log_event(
+                    "native_auxiliary_runtime",
+                    format_args!(
+                        "stage=streaming_punctuation event=failed action=preserve-original detail={error}"
+                    ),
+                ),
+            }
         }
     }
 

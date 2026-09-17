@@ -70,11 +70,10 @@ pub(crate) struct StreamingPartialTuning {
     partial_prompt_tail_words: Option<usize>,
     /// Fewest raw samples this family's encoder can turn into at least one
     /// output frame. `None` means every family sharing this tuning constant
-    /// already fails closed on a too-short input by itself (no separate
-    /// pre-decode floor needed); set per-session via
-    /// `with_minimum_encodable_samples` for families whose encoder aborts
-    /// instead of erroring on an under-sized input (see dolphin's
-    /// `start_streaming_session`). Below this floor the driver skips the
+    /// has no declared pre-decode floor. Set per-session via
+    /// `with_minimum_encodable_samples` whenever a sub-frame tail cannot be
+    /// decoded, whether the family would error (FireRed-AED) or abort
+    /// (Dolphin). Below this floor the driver skips the
     /// decode call entirely instead of attempting one the encoder cannot run.
     minimum_encodable_samples: Option<usize>,
 }

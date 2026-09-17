@@ -36,7 +36,12 @@ The software-side migration is complete for the current inventory:
   quarantine;
 - `ActiveRuntimeSlot` separates durable requested intent from attested process
   state, serializes activation against new sessions, publishes only after V2,
-  and startup reactivation validates V2 without minting a new generation;
+  and startup reactivation validates V2 without minting a new generation when
+  the serve-level execution preference is unchanged. If that preference has
+  changed, startup verifies and commits the new intent through the same
+  activation transaction, comparing the observed durable generation under the
+  selection writer lock, before publishing readiness. Planning and probing
+  share one immutable execution-target snapshot;
 - `default_selection` V2 stores architecture plus a reversible, path-free
   execution-intent wire value, uses the existing same-directory atomic writer,
   and has per-attempt injection at every pre-commit and replace boundary; and

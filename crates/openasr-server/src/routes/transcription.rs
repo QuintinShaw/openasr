@@ -18,10 +18,10 @@ use openasr_core::realtime::history::{
 use openasr_core::{
     AudioPreparationOptions, BackendKind, CatalogError, ExecutionTarget, LongFormMode,
     LongFormOptions, ModelResolutionError, NativeAsrError, NativeAsrExecutor,
-    NativeAsrHardwareTarget, NativeAsrOfflineRequest, NativeAsrRequestOptions,
-    NativeBackendExecutor, NativeRuntimeModelIdSource, PhraseBiasConfig, ResponseFormat,
-    RuntimeModelResolutionError, Transcription, TranscriptionRequest, TranscriptionTask,
-    add_segment_word_timestamps, align_plain_transcript_to_audio, config::MAX_INFERENCE_THREADS,
+    NativeAsrHardwareTarget, NativeAsrOfflineRequest, NativeBackendExecutor,
+    NativeRuntimeModelIdSource, PhraseBiasConfig, ResponseFormat, RuntimeModelResolutionError,
+    Transcription, TranscriptionRequest, TranscriptionTask, add_segment_word_timestamps,
+    align_plain_transcript_to_audio, config::MAX_INFERENCE_THREADS,
     load_native_wav_16khz_mono_f32_v0, native_runtime_model_adapter_for_path, parse_model_ref,
     prepare_audio_input, refine_existing_transcription_timeline, render_transcription,
     resolve_runtime_model_ref, runtime_registry,
@@ -236,9 +236,14 @@ pub(crate) async fn precise_timeline(
         "precise-timeline",
         execution_context.request_id.as_deref(),
     )?;
+    let completion = AuxiliaryExecutionCompletion {
+        admission: Some(admission),
+        runtime: runtime.clone(),
+        distribution: distribution.clone(),
+    };
     let worker_context = execution_context.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let _admission = admission;
+        let _completion = completion;
         if worker_context.is_canceled() {
             return Err(ApiError::Backend(
                 openasr_core::BackendError::TranscriptionCanceled,
@@ -322,6 +327,25 @@ pub(crate) async fn precise_timeline(
     let mut response_headers = HeaderMap::new();
     response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     Ok((response_headers, rendered).into_response())
+}
+
+/// The worker owns native occupancy, including after an HTTP disconnect.
+/// Release it before draining model switches, even for unregistered requests
+/// (no transcription_id), early errors, or a panicking blocking worker.
+pub(crate) struct AuxiliaryExecutionCompletion {
+    pub(crate) admission: Option<AdmittedNativeExecution>,
+    pub(crate) runtime: ServerRuntime,
+    pub(crate) distribution: DistributionContext,
+}
+
+impl Drop for AuxiliaryExecutionCompletion {
+    fn drop(&mut self) {
+        drop(self.admission.take());
+        schedule_apply_pending_idle_switch_when_native_idle(
+            self.runtime.clone(),
+            self.distribution.clone(),
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -2921,23 +2945,9 @@ pub(crate) async fn transcribe_with_runtime(
                         .model_pack_ref(request.model_id.clone())
                         .map_err(native_asr_error_to_backend)
                         .map_err(TranscriptionRuntimeError::Backend)?;
-                    let offline_request = NativeAsrOfflineRequest::new(request.input_path.clone())
-                        .with_options(
-                            NativeAsrRequestOptions::new()
-                                .with_language(request.language.clone())
-                                .with_prompt(request.prompt.clone())
-                                .with_phrase_bias(request.phrase_bias.clone())
-                                .with_inference_threads(request.inference_threads)
-                                .with_voice_id(request.voice_id)
-                                .with_anonymous_diarize(request.anonymous_diarize)
-                                .with_diarize_speakers(request.diarize_speakers)
-                                .with_return_speaker_embeddings(request.return_speaker_embeddings)
-                                .with_word_timestamps(request.word_timestamps)
-                                .with_word_timestamps_refine(request.word_timestamps_refine),
-                        )
-                        .with_longform(request.longform.clone())
-                        .with_display_file_name(request.display_file_name.clone())
-                        .with_source(request.source)
+                    let hardware_target =
+                        native_hardware_target_from_execution_target(request.execution_target.clone());
+                    let offline_request = NativeAsrOfflineRequest::from(request)
                         // The source audio's real format for the `stage=request_context`
                         // log line -- `prepared.original()` is the pre-normalization
                         // probe (WAV fmt chunk) or decode (other recognized formats)
@@ -2959,24 +2969,9 @@ pub(crate) async fn transcribe_with_runtime(
                         // re-reading `input_path` from disk -- see
                         // `PreparedAudioInput::shared_samples`.
                         .with_prepared_samples(prepared.shared_samples())
-                        .with_voice_id_segmenter(request.voice_id_segmenter)
-                        // NativeAsrOfflineRequest::new defaults the embedder to
-                        // ReDimNet2. Dropping this field would make a persisted
-                        // WeSpeaker preference silently load the wrong space.
-                        .with_voice_id_embedder(request.voice_id_embedder)
                         // Explicit cancel/pause/resume context for the whole
                         // synchronous decode call below -- never a thread-local.
-                        .with_execution_context(Arc::clone(&execution_context))
-                        // The operator's per-model admission width set above
-                        // (`serve_batch_max_native_sessions` from
-                        // `max_concurrent_sessions_per_model`); without carrying it
-                        // through the offline round-trip the rebuilt request would
-                        // default to a serial width of 1 and serve-batch would never
-                        // engage on the server transcription path.
-                        .with_serve_batch_max_native_sessions(
-                            request.serve_batch_max_native_sessions,
-                        )
-                        .with_execution_target(request.execution_target.clone());
+                        .with_execution_context(Arc::clone(&execution_context));
                     let executor = NativeBackendExecutor::new(Arc::clone(
                         runtime.native_execution.execution_services(),
                     ));
@@ -2984,7 +2979,7 @@ pub(crate) async fn transcribe_with_runtime(
                         &executor,
                         &adapter,
                         &model_pack,
-                        native_hardware_target_from_execution_target(request.execution_target),
+                        hardware_target,
                         offline_request,
                     )
                     .map_err(native_asr_error_to_backend)

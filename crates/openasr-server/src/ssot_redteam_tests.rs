@@ -1322,7 +1322,7 @@ async fn ssot_21_busy_file_response_omits_peer_device_identity() {
             .await
         })
     };
-    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    server.wait_for_running_file_job().await;
     let (content_type, body) = sample_multipart(None, false);
     let second_auth = bearer_auth_header(second_token);
     let busy = https_request(
@@ -1408,7 +1408,7 @@ async fn ssot_21_device_cannot_cancel_another_device_file_job() {
             .await
         })
     };
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    server.wait_for_running_file_job().await;
     let second_auth = bearer_auth_header(&second_token);
     let cancel = https_request(
         server.addr,
