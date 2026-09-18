@@ -83,9 +83,7 @@ pub fn run_loopback_capture(
                     }
                 }
             }
-            producer.flush_padded();
-            drop(producer);
-            read_error
+            (producer, read_error)
         });
         let consumer_handle = scope.spawn(|| {
             let result =
@@ -118,11 +116,16 @@ pub fn run_loopback_capture(
         let stopped_by_request = stop.load(Ordering::SeqCst);
         let _ = child.kill();
         let _ = child.wait();
-        let read_error = reader.join().unwrap_or_else(|_| {
-            Some(std::io::Error::other(
+        let read_error = match reader.join() {
+            Ok((mut producer, read_error)) => {
+                producer.flush_padded();
+                drop(producer);
+                read_error
+            }
+            Err(_) => Some(std::io::Error::other(
                 "Linux system-audio reader thread panicked.",
-            ))
-        });
+            )),
+        };
         let consume_result = join_capture_consumer(consumer_handle.join())
             .map_err(callback_error("Could not emit Linux system-audio frame."));
 

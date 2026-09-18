@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use crate::pcm::{Pcm16FrameChunker, TARGET_FRAME_DURATION_MS};
 
-/// 16 kHz mono 20 ms frames: 512 slots absorb ~10.24 s of consumer stall,
-/// matching the desktop microphone capture queue.
+/// 16 kHz mono 20 ms frames: 512 slots absorb ~10.24 s of consumer stall.
+/// Nested caller queues (CLI live is 64) are independent and may still overflow.
 pub(crate) const CAPTURE_QUEUE_FRAMES: usize = 512;
 
 pub(crate) const TRAILING_CAPTURE_WINDOW: Duration = Duration::from_millis(200);
@@ -55,13 +55,25 @@ pub(crate) fn capture_queue_with_capacity(
 }
 
 impl CaptureQueueProducer {
-    #[cfg_attr(not(any(target_os = "linux", windows, test)), allow(dead_code))]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn push_bytes(&mut self, bytes: &[u8]) {
         let Some(tx) = self.tx.as_ref() else {
             return;
         };
         let dropped = &self.dropped;
         let _ = self.chunker.push_bytes(bytes, |frame| {
+            try_push_frame(tx, dropped, frame);
+            Ok(())
+        });
+    }
+
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    pub(crate) fn push_deque(&mut self, bytes: &mut std::collections::VecDeque<u8>) {
+        let Some(tx) = self.tx.as_ref() else {
+            return;
+        };
+        let dropped = &self.dropped;
+        let _ = self.chunker.push_deque(bytes, |frame| {
             try_push_frame(tx, dropped, frame);
             Ok(())
         });
@@ -79,7 +91,7 @@ impl CaptureQueueProducer {
         });
     }
 
-    #[cfg(test)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn try_push_frame(&self, frame: Vec<i16>) {
         let Some(tx) = self.tx.as_ref() else {
             return;
@@ -87,15 +99,27 @@ impl CaptureQueueProducer {
         try_push_frame(tx, &self.dropped, frame);
     }
 
-    /// After the device has stopped, blocking send keeps the padded tail
-    /// instead of dropping it on a still-full queue.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn clone_sender(&self) -> Option<SyncSender<Vec<i16>>> {
+        self.tx.clone()
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn drop_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.dropped)
+    }
+
+    /// After the device has stopped, `try_send` the padded tail. A blocking
+    /// send would hang stop/join if `on_frame` is stuck and the queue is full.
     pub(crate) fn flush_padded(&mut self) {
         let Some(tx) = self.tx.as_ref() else {
             return;
         };
-        let _ = self
-            .chunker
-            .flush_padded(|frame| tx.send(frame).map_err(|error| error.to_string()));
+        let dropped = &self.dropped;
+        let _ = self.chunker.flush_padded(|frame| {
+            try_push_frame(tx, dropped, frame);
+            Ok(())
+        });
     }
 
     #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
@@ -170,7 +194,7 @@ pub(crate) fn run_capture_consumer(
     }
 }
 
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn forward_capture_events(
     mut on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
     mut on_diagnostic: impl FnMut(&str) -> Result<(), String>,
@@ -211,7 +235,7 @@ pub(crate) fn join_capture_consumer(
     }
 }
 
-fn try_push_frame(tx: &SyncSender<Vec<i16>>, dropped: &AtomicU64, frame: Vec<i16>) {
+pub(crate) fn try_push_frame(tx: &SyncSender<Vec<i16>>, dropped: &AtomicU64, frame: Vec<i16>) {
     match tx.try_send(frame) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
@@ -312,6 +336,19 @@ mod tests {
         assert_eq!(frames[1][0], 9);
         assert!(frames[1][40..].iter().all(|sample| *sample == 0));
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn flush_on_full_queue_counts_drop_and_keeps_queued_frames() {
+        let (mut producer, mut consumer) = capture_queue_with_capacity(1);
+        producer.try_push_frame(test_frame(1));
+        producer.push_samples(&[9]);
+        producer.flush_padded();
+
+        assert_eq!(producer.dropped_count(), 1);
+        let frames = consumer.drain();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0][0], 1);
     }
 
     #[test]

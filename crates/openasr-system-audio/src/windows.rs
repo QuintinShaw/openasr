@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -361,11 +362,11 @@ fn run_wasapi_loopback_session(
 
     thread::scope(|scope| {
         let handle = scope.spawn(|| {
-            let result =
-                run_windows_frame_consumer(consumer, &discontinuities, on_frame, on_diagnostic);
-            if result.is_err() {
-                stop.store(true, Ordering::SeqCst);
-            }
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                run_windows_frame_consumer(consumer, &discontinuities, on_frame, on_diagnostic)
+            }))
+            .unwrap_or_else(|_| Err("The capture consumer thread panicked.".to_string()));
+            stop.store(true, Ordering::SeqCst);
             result
         });
 
@@ -377,6 +378,7 @@ fn run_wasapi_loopback_session(
             &mut queue,
             &mut producer,
             &discontinuities,
+            || handle.is_finished(),
         );
 
         producer.flush_padded();
@@ -402,15 +404,19 @@ fn run_wasapi_device_loop(
     queue: &mut VecDeque<u8>,
     producer: &mut CaptureQueueProducer,
     discontinuities: &AtomicU64,
+    consumer_gone: impl Fn() -> bool,
 ) -> Result<(), CaptureBackendError> {
     let mut enqueue = || -> Result<(), CaptureBackendError> {
         enqueue_wasapi_packets(capture, queue, producer, discontinuities)
     };
 
-    while !stop.load(Ordering::SeqCst) {
+    while !stop.load(Ordering::SeqCst) && !consumer_gone() {
         enqueue()?;
+        if consumer_gone() {
+            break;
+        }
         if let Err(wait_error) = event.wait_for_event(200) {
-            if stop.load(Ordering::SeqCst) {
+            if stop.load(Ordering::SeqCst) || consumer_gone() {
                 break;
             }
             if !matches!(wait_error, WasapiError::EventTimeout) {
@@ -424,19 +430,29 @@ fn run_wasapi_device_loop(
         }
     }
 
-    let trailing_deadline = Instant::now() + TRAILING_CAPTURE_WINDOW;
-    while Instant::now() < trailing_deadline {
-        enqueue()?;
-        let remaining = trailing_deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
+    // Trailing only helps if a consumer is still draining. A dead consumer
+    // makes try_send Disconnected, and the padded tail cannot be delivered.
+    if stop.load(Ordering::SeqCst) && !consumer_gone() {
+        let trailing_deadline = Instant::now() + TRAILING_CAPTURE_WINDOW;
+        while Instant::now() < trailing_deadline && !consumer_gone() {
+            enqueue()?;
+            let remaining = trailing_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let wait_ms = u32::try_from(remaining.as_millis().min(50)).unwrap_or(50);
+            let _ = event.wait_for_event(wait_ms);
         }
-        let wait_ms = u32::try_from(remaining.as_millis().min(50)).unwrap_or(50);
-        let _ = event.wait_for_event(wait_ms);
     }
 
     let _ = client.stop_stream();
-    enqueue()
+    if consumer_gone() {
+        return Ok(());
+    }
+    match enqueue() {
+        Err(_) if stop.load(Ordering::SeqCst) => Ok(()),
+        other => other,
+    }
 }
 
 fn enqueue_wasapi_packets(
@@ -460,16 +476,15 @@ fn enqueue_wasapi_packets(
         discontinuities.fetch_add(1, Ordering::Relaxed);
     }
 
-    let mut pending: Vec<u8> = queue.drain(..).collect();
     if info.flags.silent {
         // AUDCLNT_BUFFERFLAGS_SILENT: the packet's buffer contents are
         // undefined and must be treated as silence (the memory is not
         // guaranteed to be zeroed). Zero the drained bytes so undefined data
         // never reaches the ASR pipeline and so is_silent_frame() correctly
         // advances the silence streak instead of seeing garbage.
-        pending.iter_mut().for_each(|byte| *byte = 0);
+        queue.iter_mut().for_each(|byte| *byte = 0);
     }
-    producer.push_bytes(&pending);
+    producer.push_deque(queue);
     Ok(())
 }
 
@@ -481,16 +496,15 @@ fn run_windows_frame_consumer(
 ) -> Result<(), String> {
     let mut silent_frame_streak: u32 = 0;
     let mut waiting_for_playback_noted = false;
-    run_capture_consumer(consumer, |event| match event {
+    let result = run_capture_consumer(consumer, |event| match event {
         CaptureConsumerEvent::Diagnostic(message) => on_diagnostic(message),
         CaptureConsumerEvent::Frame(frame) => {
-            if discontinuities.swap(0, Ordering::Relaxed) > 0 {
-                on_diagnostic(
-                    "Render endpoint reported an audio buffer discontinuity; continuing capture.",
-                )?;
-                silent_frame_streak = 0;
-                waiting_for_playback_noted = false;
-            }
+            report_wasapi_discontinuities(
+                discontinuities,
+                &mut silent_frame_streak,
+                &mut waiting_for_playback_noted,
+                &mut on_diagnostic,
+            )?;
             if is_silent_frame(&frame) {
                 silent_frame_streak = silent_frame_streak.saturating_add(1);
                 if silent_frame_streak >= SILENT_STREAK_DIAGNOSTIC_FRAMES
@@ -507,7 +521,29 @@ fn run_windows_frame_consumer(
             }
             on_frame(frame)
         }
-    })
+    });
+    report_wasapi_discontinuities(
+        discontinuities,
+        &mut silent_frame_streak,
+        &mut waiting_for_playback_noted,
+        &mut on_diagnostic,
+    )?;
+    result
+}
+
+fn report_wasapi_discontinuities(
+    discontinuities: &AtomicU64,
+    silent_frame_streak: &mut u32,
+    waiting_for_playback_noted: &mut bool,
+    on_diagnostic: &mut impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    if discontinuities.swap(0, Ordering::Relaxed) == 0 {
+        return Ok(());
+    }
+    on_diagnostic("Render endpoint reported an audio buffer discontinuity; continuing capture.")?;
+    *silent_frame_streak = 0;
+    *waiting_for_playback_noted = false;
+    Ok(())
 }
 
 fn callback_error(message: &'static str) -> impl FnOnce(String) -> CaptureBackendError {

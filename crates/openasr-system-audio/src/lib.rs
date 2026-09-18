@@ -90,6 +90,9 @@ pub fn support_status() -> SystemAudioSupport {
     platform::support_status()
 }
 
+/// System-audio loopback. `on_frame` and `on_diagnostic` run on a consumer
+/// thread so the device/callback thread never blocks on them; they must be
+/// `Send` (not `'static`).
 pub fn run_loopback_capture(
     stop: Arc<AtomicBool>,
     on_frame: impl FnMut(Vec<i16>) -> Result<(), String> + Send,
@@ -116,7 +119,8 @@ pub fn list_candidate_processes() -> Result<Vec<CandidateProcess>, CaptureBacken
 /// depending on `mode`, its child processes) is captured, instead of the
 /// whole system. Platforms without an implementation fail closed with a
 /// typed `unsupported` `CaptureBackendError` rather than panicking or
-/// silently falling back to all-system capture.
+/// silently falling back to all-system capture. Callbacks have the same
+/// `Send` consumer-thread contract as [`run_loopback_capture`].
 pub fn run_process_loopback_capture(
     process_id: u32,
     mode: ProcessLoopbackMode,
