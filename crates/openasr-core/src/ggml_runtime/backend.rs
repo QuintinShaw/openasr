@@ -2276,6 +2276,21 @@ mod tests {
         }
     }
 
+    // Ranking fixtures intentionally do not model a loaded optional backend
+    // pack. Exercise the historical kind/VRAM ordering directly, rather than
+    // making the Windows production wrapper appear activated.
+    fn historical_accelerated_selection(
+        devices: &[GgmlBackendDevice],
+    ) -> Option<(&GgmlBackendDevice, AcceleratedDeviceSelectionRule)> {
+        select_accelerated_device_for_provider(devices, GgmlBackendKind::is_gpu, None, false)
+    }
+
+    fn historical_preferred_accelerated_device(
+        devices: &[GgmlBackendDevice],
+    ) -> Option<&GgmlBackendDevice> {
+        historical_accelerated_selection(devices).map(|(device, _)| device)
+    }
+
     #[test]
     fn preferred_accelerated_device_picks_discrete_over_integrated() {
         // The Optimus/hybrid-graphics case (issue: "double GPU picks the
@@ -2294,8 +2309,7 @@ mod tests {
                 Some(memory_mib(8 * 1024, 12 * 1024)),
             ),
         ];
-        let picked = preferred_accelerated_device(&devices, GgmlBackendKind::is_gpu)
-            .expect("a device is picked");
+        let picked = historical_preferred_accelerated_device(&devices).expect("a device is picked");
         assert_eq!(picked.name, "Vulkan1");
         assert_eq!(picked.kind, GgmlBackendKind::Gpu);
     }
@@ -2320,8 +2334,7 @@ mod tests {
                 Some(memory_mib(128, 8 * 1024)),
             ),
         ];
-        let picked = preferred_accelerated_device(&devices, GgmlBackendKind::is_gpu)
-            .expect("a device is picked");
+        let picked = historical_preferred_accelerated_device(&devices).expect("a device is picked");
         assert_eq!(picked.name, "Vulkan0");
         assert_eq!(picked.kind, GgmlBackendKind::IntegratedGpu);
     }
@@ -2344,8 +2357,7 @@ mod tests {
                 Some(memory_mib(128, 8 * 1024)),
             ),
         ];
-        let picked = preferred_accelerated_device(&devices, GgmlBackendKind::is_gpu)
-            .expect("a device is picked");
+        let picked = historical_preferred_accelerated_device(&devices).expect("a device is picked");
         assert_eq!(picked.name, "Vulkan1");
         assert_eq!(picked.kind, GgmlBackendKind::Gpu);
     }
@@ -2363,8 +2375,7 @@ mod tests {
             ),
             test_device("Vulkan1", GgmlBackendKind::Gpu), // memory: None
         ];
-        let picked = preferred_accelerated_device(&devices, GgmlBackendKind::is_gpu)
-            .expect("a device is picked");
+        let picked = historical_preferred_accelerated_device(&devices).expect("a device is picked");
         assert_eq!(picked.name, "Vulkan1");
         assert_eq!(picked.kind, GgmlBackendKind::Gpu);
     }
@@ -2376,7 +2387,7 @@ mod tests {
             test_device("Vulkan1", GgmlBackendKind::Gpu),
         ];
         assert_eq!(
-            select_accelerated_device(&kind_only, GgmlBackendKind::is_gpu),
+            historical_accelerated_selection(&kind_only),
             Some((&kind_only[1], AcceleratedDeviceSelectionRule::KindRanking))
         );
 
@@ -2393,7 +2404,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            select_accelerated_device(&skipped, GgmlBackendKind::is_gpu),
+            historical_accelerated_selection(&skipped),
             Some((&skipped[0], AcceleratedDeviceSelectionRule::LowVramSkipped))
         );
 
@@ -2410,14 +2421,11 @@ mod tests {
             ),
         ];
         assert_eq!(
-            select_accelerated_device(&all_low, GgmlBackendKind::is_gpu),
+            historical_accelerated_selection(&all_low),
             Some((&all_low[1], AcceleratedDeviceSelectionRule::LowVramFallback))
         );
 
-        assert_eq!(
-            select_accelerated_device(&[], GgmlBackendKind::is_gpu),
-            None
-        );
+        assert_eq!(historical_accelerated_selection(&[]), None);
     }
 
     #[test]
@@ -2441,16 +2449,16 @@ mod tests {
     #[test]
     fn preferred_accelerated_device_falls_back_to_integrated_when_no_discrete_present() {
         let devices = vec![test_device("Vulkan0", GgmlBackendKind::IntegratedGpu)];
-        let picked = preferred_accelerated_device(&devices, GgmlBackendKind::is_gpu)
-            .expect("integrated GPU is picked");
+        let picked =
+            historical_preferred_accelerated_device(&devices).expect("integrated GPU is picked");
         assert_eq!(picked.name, "Vulkan0");
     }
 
     #[test]
     fn preferred_accelerated_device_picks_discrete_when_only_discrete_present() {
         let devices = vec![test_device("Vulkan0", GgmlBackendKind::Gpu)];
-        let picked = preferred_accelerated_device(&devices, GgmlBackendKind::is_gpu)
-            .expect("discrete GPU is picked");
+        let picked =
+            historical_preferred_accelerated_device(&devices).expect("discrete GPU is picked");
         assert_eq!(picked.name, "Vulkan0");
     }
 
@@ -2463,8 +2471,8 @@ mod tests {
             test_device("Vulkan0", GgmlBackendKind::Gpu),
             test_device("Vulkan1", GgmlBackendKind::Gpu),
         ];
-        let picked = preferred_accelerated_device(&devices, GgmlBackendKind::is_gpu)
-            .expect("a discrete GPU is picked");
+        let picked =
+            historical_preferred_accelerated_device(&devices).expect("a discrete GPU is picked");
         assert_eq!(picked.name, "Vulkan0");
     }
 
@@ -2545,6 +2553,9 @@ mod tests {
             test_device("Vulkan0", GgmlBackendKind::IntegratedGpu),
             test_device("Vulkan1", GgmlBackendKind::Gpu),
         ];
+        #[cfg(windows)]
+        assert_eq!(best_device_name(&devices), None);
+        #[cfg(not(windows))]
         assert_eq!(best_device_name(&devices).as_deref(), Some("Vulkan1"));
     }
 
@@ -2570,8 +2581,13 @@ mod tests {
             cpu_features: GgmlCpuFeatures::default(),
         };
         let summary = ggml_runtime_boot_summary(&hybrid);
-        assert!(summary.contains("gpu_selection={picked=\"Vulkan1\" kind=Gpu"));
-        assert!(summary.contains("rule=discrete_over_integrated"));
+        #[cfg(windows)]
+        assert!(!summary.contains("gpu_selection="));
+        #[cfg(not(windows))]
+        {
+            assert!(summary.contains("gpu_selection={picked=\"Vulkan1\" kind=Gpu"));
+            assert!(summary.contains("rule=discrete_over_integrated"));
+        }
     }
 
     #[test]
@@ -2595,8 +2611,13 @@ mod tests {
             cpu_features: GgmlCpuFeatures::default(),
         };
         let summary = ggml_runtime_boot_summary(&hybrid);
-        assert!(summary.contains("gpu_selection={picked=\"Vulkan0\" kind=IntegratedGpu"));
-        assert!(summary.contains("rule=discrete_low_vram_skipped"));
+        #[cfg(windows)]
+        assert!(!summary.contains("gpu_selection="));
+        #[cfg(not(windows))]
+        {
+            assert!(summary.contains("gpu_selection={picked=\"Vulkan0\" kind=IntegratedGpu"));
+            assert!(summary.contains("rule=discrete_low_vram_skipped"));
+        }
     }
 
     #[test]
