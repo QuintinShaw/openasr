@@ -1204,6 +1204,63 @@ fn runtime_backend_catalog_load_uses_only_the_verified_cache() {
     assert_eq!(cached.unwrap().models[0].id, "moonshine-tiny");
 }
 
+fn copy_public_catalog_into_home(home: impl AsRef<std::path::Path>) {
+    let home = home.as_ref();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry");
+    fs::create_dir_all(home).unwrap();
+    fs::copy(root.join("catalog.public.json"), home.join("catalog.json")).unwrap();
+    fs::copy(
+        root.join("catalog.public.signature.json"),
+        home.join(catalog_security::CATALOG_SIGNATURE_FILE_NAME),
+    )
+    .unwrap();
+}
+
+#[test]
+fn verified_home_catalog_loads_production_signed_cache() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    copy_public_catalog_into_home(&home);
+
+    let catalog = load_verified_home_catalog(&home)
+        .expect("production-signed home catalog must verify")
+        .expect("present catalog.json must produce Some");
+    assert!(
+        catalog
+            .models
+            .iter()
+            .any(|model| model.id == "firered-aed-l-v2"),
+        "home catalog must expose public pull ids"
+    );
+}
+
+#[test]
+fn verified_home_catalog_missing_file_is_none() {
+    let temp = tempfile::tempdir().unwrap();
+    assert!(
+        load_verified_home_catalog(temp.path())
+            .expect("missing home catalog is absence")
+            .is_none()
+    );
+}
+
+#[test]
+fn verified_home_catalog_tampered_payload_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    copy_public_catalog_into_home(&home);
+    let catalog_path = home.join("catalog.json");
+    let mut bytes = fs::read(&catalog_path).unwrap();
+    bytes.push(b'\n');
+    fs::write(&catalog_path, bytes).unwrap();
+
+    let error = load_verified_home_catalog(&home).unwrap_err().to_string();
+    assert!(
+        error.contains("Model catalog security check failed") || error.contains("rejected"),
+        "{error}"
+    );
+}
+
 #[test]
 fn catalog_loader_falls_back_to_cache_on_network_failure() {
     let temp = tempfile::tempdir().unwrap();

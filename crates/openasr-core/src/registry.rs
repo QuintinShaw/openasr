@@ -1393,11 +1393,31 @@ fn load_verified_catalog_bytes(
     Ok((contents, verified))
 }
 
+/// Loads `$OPENASR_HOME/catalog.json` when present, using the same
+/// signature/identity/epoch verification as the installed-binary offline
+/// cache fallback ([`load_model_catalog_from_verified_cache`]).
+///
+/// A missing file is `Ok(None)` so local discovery can continue without a
+/// network fetch. A present file that fails verification is `Err`
+/// (fail-closed). This never degrades to the embedded snapshot and never
+/// contacts the network.
+pub fn load_verified_home_catalog(
+    openasr_home: impl AsRef<Path>,
+) -> Result<Option<ModelCatalog>, CatalogError> {
+    let home = openasr_home.as_ref();
+    if !default_catalog_cache_path(home).is_file() {
+        return Ok(None);
+    }
+    load_model_catalog_from_verified_cache(None, home).map(Some)
+}
+
 /// Loads only the already-verified on-disk catalog cache. Runtime backend
 /// enumeration can run inside an async server handler, so it must never create
 /// a blocking HTTP client or perform network I/O. Backend installation already
 /// populated this signed cache; a missing or invalid cache therefore fails the
 /// optional activation transaction while bundled CPU remains available.
+/// CLI local discovery uses [`load_verified_home_catalog`], which wraps this
+/// and treats a missing cache file as absence rather than an error.
 pub(crate) fn load_model_catalog_from_verified_cache(
     catalog_url: Option<&str>,
     openasr_home: impl AsRef<Path>,

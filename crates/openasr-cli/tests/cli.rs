@@ -2202,6 +2202,83 @@ fn live_rejects_removed_whisper_cpp_backend_value() {
         ));
 }
 
+fn copy_verified_home_catalog(home: &Path) {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry");
+    std::fs::create_dir_all(home).expect("create OPENASR_HOME");
+    std::fs::copy(root.join("catalog.public.json"), home.join("catalog.json"))
+        .expect("copy public catalog.json");
+    std::fs::copy(
+        root.join("catalog.public.signature.json"),
+        home.join(openasr_core::CATALOG_SIGNATURE_FILE_NAME),
+    )
+    .expect("copy public catalog.signature.json");
+}
+
+#[test]
+#[allow(clippy::zombie_processes)]
+fn serve_model_pull_id_resolves_from_verified_home_catalog() {
+    // Operators run `openasr serve --model <catalog pull id>` against an
+    // installed home that already has a signed catalog.json and no
+    // OPENASR_CATALOG_* override. Resolution must not require a checkout.
+    let temp = tempfile::tempdir().unwrap();
+    copy_verified_home_catalog(temp.path());
+
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_openasr"));
+    command
+        .env("OPENASR_HOME", temp.path())
+        .env_remove("OPENASR_MODEL")
+        .env_remove("OPENASR_ADDR")
+        .env_remove("OPENASR_ASSUME_YES")
+        .env_remove("OPENASR_OFFLINE")
+        .env_remove("OPENASR_CATALOG_URL")
+        .env_remove("OPENASR_CATALOG_FILE")
+        .env_remove("OPENASR_CATALOG_IDENTITY")
+        .args([
+            "serve",
+            "--backend",
+            "mock",
+            "--model",
+            "firered-aed-l-v2:q4",
+            "--addr",
+            "127.0.0.1:0",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().expect("spawn openasr serve");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut reader = std::io::BufReader::new(stdout);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        use std::io::BufRead;
+        let mut line = String::new();
+        let bytes_read = reader.read_line(&mut line).expect("read stdout line");
+        if bytes_read == 0 {
+            let status = child.wait().expect("child exit status");
+            let mut stderr = String::new();
+            if let Some(mut handle) = child.stderr.take() {
+                use std::io::Read;
+                let _ = handle.read_to_string(&mut stderr);
+            }
+            panic!(
+                "openasr serve --model firered-aed-l-v2:q4 failed to resolve from the verified home catalog (status: {status:?}, stderr: {stderr})"
+            );
+        }
+        if line
+            .trim_end()
+            .starts_with("OpenASR server listening on http://")
+        {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("openasr serve did not report listening within 10s");
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[test]
 fn serve_rejects_removed_sensevoice_backend_value() {
     openasr()

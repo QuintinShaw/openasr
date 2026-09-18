@@ -5,14 +5,21 @@ use std::{
 
 use anyhow::{Context, Result};
 use openasr_core::{
-    ModelCatalog, OPENASR_CATALOG_FILE_ENV_VAR, default_catalog_url,
-    load_local_catalog_file_with_identity, load_model_catalog,
+    ModelCatalog, OPENASR_CATALOG_FILE_ENV_VAR, default_catalog_cache_path, default_catalog_url,
+    load_local_catalog_file_with_identity, load_model_catalog, load_verified_home_catalog,
     preview_local_catalog_file_with_identity, resolve_local_catalog_env_override,
 };
 
 const OPENASR_CATALOG_URL: &str = "OPENASR_CATALOG_URL";
 
 pub(super) fn load_cli_model_catalog(openasr_home: &Path) -> Result<Option<ModelCatalog>> {
+    load_cli_model_catalog_from_candidates(openasr_home, &local_catalog_candidates()?)
+}
+
+fn load_cli_model_catalog_from_candidates(
+    openasr_home: &Path,
+    checkout_candidates: &[PathBuf],
+) -> Result<Option<ModelCatalog>> {
     // `OPENASR_CATALOG_FILE`/`OPENASR_CATALOG_IDENTITY` (bytes from a local
     // file, verification identity declared explicitly) take precedence over
     // `OPENASR_CATALOG_URL`: this is what lets `openasr serve` load a
@@ -50,7 +57,7 @@ pub(super) fn load_cli_model_catalog(openasr_home: &Path) -> Result<Option<Model
             .with_context(|| format!("Could not load model catalog from {OPENASR_CATALOG_URL}"));
     }
 
-    for path in local_catalog_candidates()? {
+    for path in checkout_candidates {
         if path.is_file() {
             // `model-registry/catalog.json` discovered relative to the repo
             // checkout is the pre-deployment source of truth for the
@@ -75,7 +82,7 @@ pub(super) fn load_cli_model_catalog(openasr_home: &Path) -> Result<Option<Model
             // installed OpenASR binary reads as its offline fallback with
             // unreleased-model data (see `docs/CATALOG_COMPATIBILITY.md`).
             return preview_local_catalog_file_with_identity(
-                &path,
+                path,
                 default_catalog_url(),
                 openasr_home,
             )
@@ -84,7 +91,17 @@ pub(super) fn load_cli_model_catalog(openasr_home: &Path) -> Result<Option<Model
         }
     }
 
-    Ok(None)
+    // Installed homes already have a signed `$OPENASR_HOME/catalog.json`
+    // (the same cache an installed binary uses as its offline fallback).
+    // After env/url/checkout discovery miss, load that file through the
+    // verified-cache path. Missing is absence; a present but unverifiable
+    // file fails closed and must not be skipped or fetched over the network.
+    load_verified_home_catalog(openasr_home).with_context(|| {
+        format!(
+            "Could not load the signed model catalog at '{}'",
+            default_catalog_cache_path(openasr_home).display()
+        )
+    })
 }
 
 fn load_catalog(catalog_url: Option<&str>, openasr_home: &Path) -> Result<ModelCatalog> {
@@ -95,9 +112,10 @@ fn load_catalog(catalog_url: Option<&str>, openasr_home: &Path) -> Result<ModelC
 ///
 /// `--catalog-url` wins when the caller passed one. Otherwise this is the same
 /// resolver `openasr serve` uses (`OPENASR_CATALOG_FILE`/`_IDENTITY`, then
-/// `OPENASR_CATALOG_URL`, then a checkout catalog). Only when none of those
-/// exist does it fall through to the signed production default. Passing `None`
-/// must not mean "ignore the process catalog env and fetch production".
+/// `OPENASR_CATALOG_URL`, then a checkout catalog, then the signed
+/// `$OPENASR_HOME/catalog.json` cache). Only when none of those exist does it
+/// fall through to the signed production default. Passing `None` must not mean
+/// "ignore the process catalog env and fetch production".
 pub(crate) fn load_operator_model_catalog(
     catalog_url: Option<&str>,
     openasr_home: &Path,
@@ -170,6 +188,16 @@ mod tests {
             guard
         }
 
+        fn clear() -> Self {
+            let guard = Self::capture();
+            unsafe {
+                env::remove_var(OPENASR_CATALOG_URL);
+                env::remove_var(openasr_core::OPENASR_CATALOG_FILE_ENV_VAR);
+                env::remove_var(OPENASR_CATALOG_IDENTITY_ENV_VAR);
+            }
+            guard
+        }
+
         /// The NEW mechanism: bytes from `path`, verified against the
         /// separately-declared `identity`.
         fn set_local_file_override(path: &Path, identity: &str) -> Self {
@@ -215,6 +243,22 @@ mod tests {
             catalog_path.with_file_name(openasr_core::CATALOG_SIGNATURE_FILE_NAME),
         )
         .expect("copy bundled catalog.signature.json");
+        catalog_path
+    }
+
+    /// Copies the production-signed public catalog (the artifact an installed
+    /// home caches as `$OPENASR_HOME/catalog.json`) into `home`.
+    fn copy_verified_home_catalog_to(home: &Path) -> PathBuf {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry");
+        std::fs::create_dir_all(home).expect("create OPENASR_HOME");
+        let catalog_path = home.join("catalog.json");
+        std::fs::copy(root.join("catalog.public.json"), &catalog_path)
+            .expect("copy public catalog.json");
+        std::fs::copy(
+            root.join("catalog.public.signature.json"),
+            home.join(openasr_core::CATALOG_SIGNATURE_FILE_NAME),
+        )
+        .expect("copy public catalog.signature.json");
         catalog_path
     }
 
@@ -346,6 +390,72 @@ mod tests {
                 .iter()
                 .any(|model| model.id == "env-catalog-probe"),
             "operator catalog must load the env-signed local catalog, not the production default"
+        );
+    }
+
+    #[test]
+    fn load_cli_model_catalog_uses_verified_home_catalog_when_env_and_checkout_miss() {
+        let _lock = catalog_env_lock();
+        let _guard = CatalogEnvGuard::clear();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        copy_verified_home_catalog_to(&home);
+
+        let catalog = load_cli_model_catalog_from_candidates(&home, &[])
+            .expect("verified home catalog must load")
+            .expect("present signed home catalog must produce Some(catalog)");
+        assert!(
+            catalog
+                .models
+                .iter()
+                .any(|model| model.id == "firered-aed-l-v2"),
+            "home catalog must expose public pull ids"
+        );
+
+        let cards = openasr_core::runtime_registry(Some(&catalog)).expect("derive registry");
+        let resolved =
+            openasr_core::resolve_runtime_model_ref(&cards, Some(&catalog), "firered-aed-l-v2:q4")
+                .expect("pull id q4 must resolve from the verified home catalog");
+        assert_eq!(resolved.model_id, "firered-aed-l-v2");
+        assert_eq!(
+            resolved
+                .quant
+                .as_deref()
+                .map(openasr_core::canonical_quant_tag),
+            Some("q4_k")
+        );
+    }
+
+    #[test]
+    fn load_cli_model_catalog_missing_home_catalog_is_none() {
+        let _lock = catalog_env_lock();
+        let _guard = CatalogEnvGuard::clear();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let catalog = load_cli_model_catalog_from_candidates(&home, &[])
+            .expect("missing home catalog is absence, not an error");
+        assert!(catalog.is_none());
+    }
+
+    #[test]
+    fn load_cli_model_catalog_tampered_home_catalog_fails_closed() {
+        let _lock = catalog_env_lock();
+        let _guard = CatalogEnvGuard::clear();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let catalog_path = copy_verified_home_catalog_to(&home);
+        let mut bytes = std::fs::read(&catalog_path).expect("read home catalog");
+        bytes.push(b'\n');
+        std::fs::write(&catalog_path, bytes).expect("tamper home catalog");
+
+        let error = load_cli_model_catalog_from_candidates(&home, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Could not load the signed model catalog"),
+            "{error}"
         );
     }
 }

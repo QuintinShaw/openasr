@@ -1,4 +1,4 @@
-use super::{ModelCard, ModelRef, ModelResolutionError, ResolvedModel};
+use super::{ModelCard, ModelRef, ModelResolutionError, ResolvedModel, canonical_quant_tag};
 use crate::catalog_series::family_aliases_match;
 
 pub(super) fn parse_model_ref(value: &str) -> Result<ModelRef, ModelResolutionError> {
@@ -48,7 +48,7 @@ fn resolve_tagged_model_ref<'a>(
     let matches: Vec<_> = family_cards
         .iter()
         .copied()
-        .filter(|card| card.variant_tag() == Some(tag))
+        .filter(|card| card_matches_requested_tag(card, tag))
         .collect();
     resolve_match_or_error_v0(
         &matches,
@@ -125,6 +125,20 @@ fn resolve_untagged_model_ref<'a>(
                 .join(", "),
         }),
     }
+}
+
+/// Pull ids use quant aliases (`q4` vs `q4_k`). Registry cards often keep
+/// `variant.tag = "published"` and put the pack quant on
+/// `variant.quantization`. Compare both through [`canonical_quant_tag`] so
+/// `family:q4` matches `q4_k` without treating `published` as a quant alias
+/// (`canonical_quant_tag("published")` is a passthrough).
+fn card_matches_requested_tag(card: &ModelCard, requested_tag: &str) -> bool {
+    let requested = canonical_quant_tag(requested_tag);
+    card.variant_tag()
+        .is_some_and(|tag| canonical_quant_tag(tag) == requested)
+        || card
+            .variant_quantization()
+            .is_some_and(|quant| canonical_quant_tag(quant) == requested)
 }
 
 fn family_cards_v0<'a>(
