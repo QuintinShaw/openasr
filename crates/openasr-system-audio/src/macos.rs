@@ -5,9 +5,8 @@ use std::ptr::{self, NonNull};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
-    mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
 };
-use std::time::Duration;
+use std::thread;
 
 use libloading::Library;
 use objc2::AnyThread;
@@ -34,14 +33,16 @@ use objc2_foundation::{NSArray, NSException, NSNumber, NSString, NSUUID};
 use crate::{
     CandidateProcess, CaptureBackendError, ProcessLoopbackMode, ProcessLoopbackSupport,
     SystemAudioSupport,
-    pcm::{Pcm16FrameChunker, TARGET_SAMPLE_RATE_HZ},
+    capture_queue::{
+        CaptureQueueProducer, capture_queue, forward_capture_events, join_capture_consumer,
+        run_capture_consumer, wait_for_stop_with_trailing,
+    },
+    pcm::TARGET_SAMPLE_RATE_HZ,
 };
 
 type OSStatus = i32;
 
 const CORE_AUDIO_FRAMEWORK: &str = "/System/Library/Frameworks/CoreAudio.framework/CoreAudio";
-const READ_TIMEOUT_MS: u64 = 100;
-const CAPTURE_QUEUE_FRAMES: usize = 128;
 const MIN_TAP_MACOS_VERSION: MacOsVersion = MacOsVersion {
     major: 14,
     minor: 2,
@@ -70,13 +71,13 @@ pub fn support_status() -> SystemAudioSupport {
 
 pub fn run_loopback_capture(
     stop: Arc<AtomicBool>,
-    mut on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
-    mut on_diagnostic: impl FnMut(&str) -> Result<(), String>,
+    on_frame: impl FnMut(Vec<i16>) -> Result<(), String> + Send,
+    mut on_diagnostic: impl FnMut(&str) -> Result<(), String> + Send,
 ) -> Result<String, CaptureBackendError> {
     ensure_macos_process_taps_supported()?;
 
-    let (tx, rx) = mpsc::sync_channel(CAPTURE_QUEUE_FRAMES);
-    let mut session = MacOsCaptureSession::create(tx)?;
+    let (producer, consumer) = capture_queue();
+    let mut session = MacOsCaptureSession::create(producer)?;
     emit_diagnostic(
         &mut on_diagnostic,
         &format!(
@@ -89,14 +90,32 @@ pub fn run_loopback_capture(
         &format!("Core Audio tap format: {}.", session.format.describe()),
     )?;
 
-    session.start()?;
+    thread::scope(|scope| {
+        let handle = scope.spawn(|| {
+            let result =
+                run_capture_consumer(consumer, forward_capture_events(on_frame, on_diagnostic));
+            if result.is_err() {
+                stop.store(true, Ordering::SeqCst);
+            }
+            result
+        });
 
-    let mut chunker = Pcm16FrameChunker::new();
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            break;
+        if let Err(error) = session.start() {
+            session.flush_and_disconnect();
+            let _ = handle.join();
+            return Err(error);
         }
-        if session.callback_state.panicked.load(Ordering::SeqCst) {
+
+        wait_for_stop_with_trailing(&stop, || {
+            session.callback_state.panicked.load(Ordering::SeqCst) || handle.is_finished()
+        });
+        session.stop();
+        session.flush_and_disconnect();
+
+        let panicked = session.callback_state.panicked.load(Ordering::SeqCst);
+        let joined = join_capture_consumer(handle.join())
+            .map_err(callback_error("Could not emit macOS system-audio frame."));
+        if panicked {
             return Err(CaptureBackendError {
                 code: "capture_backend_failed",
                 message: "macOS system-audio capture failed.".to_string(),
@@ -104,31 +123,8 @@ pub fn run_loopback_capture(
                     .to_string(),
             });
         }
-
-        match rx.recv_timeout(Duration::from_millis(READ_TIMEOUT_MS)) {
-            Ok(samples) => {
-                chunker
-                    .push_samples(&samples, &mut on_frame)
-                    .map_err(callback_error("Could not emit macOS system-audio frame."))?;
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(CaptureBackendError {
-                    code: "device_disconnected",
-                    message: "macOS system-audio capture stream disconnected.".to_string(),
-                    diagnostic: "The Core Audio callback queue closed before capture stopped."
-                        .to_string(),
-                });
-            }
-        }
-    }
-
-    session.stop();
-    chunker.flush_padded(&mut on_frame).map_err(callback_error(
-        "Could not emit final padded macOS system-audio frame.",
-    ))?;
-
-    Ok("Capture stopped".to_string())
+        joined.map(|()| "Capture stopped".to_string())
+    })
 }
 
 /// Per-process loopback capture is not implemented on macOS: the Core Audio
@@ -160,8 +156,8 @@ pub fn run_process_loopback_capture(
     _process_id: u32,
     _mode: ProcessLoopbackMode,
     _stop: Arc<AtomicBool>,
-    _on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
-    _on_diagnostic: impl FnMut(&str) -> Result<(), String>,
+    _on_frame: impl FnMut(Vec<i16>) -> Result<(), String> + Send,
+    _on_diagnostic: impl FnMut(&str) -> Result<(), String> + Send,
 ) -> Result<String, CaptureBackendError> {
     Err(CaptureBackendError {
         code: "unsupported",
@@ -183,7 +179,7 @@ struct MacOsCaptureSession {
 }
 
 impl MacOsCaptureSession {
-    fn create(samples_tx: SyncSender<Vec<i16>>) -> Result<Self, CaptureBackendError> {
+    fn create(producer: CaptureQueueProducer) -> Result<Self, CaptureBackendError> {
         let symbols = ProcessTapSymbols::load()?;
         let (tap_uuid, tap_uid) =
             catch_foreign_exceptions("Could not create a macOS Core Audio process tap", || {
@@ -214,8 +210,10 @@ impl MacOsCaptureSession {
         };
 
         let callback_state = Box::new(MacOsAudioCallbackState {
-            samples_tx,
-            converter: Mutex::new(CoreAudioPcmConverter::new(format)),
+            inner: Mutex::new(MacOsAudioCallbackInner {
+                converter: CoreAudioPcmConverter::new(format),
+                producer,
+            }),
             panicked: AtomicBool::new(false),
         });
 
@@ -319,6 +317,16 @@ impl MacOsCaptureSession {
             self.started = false;
         }
     }
+
+    fn flush_and_disconnect(&mut self) {
+        let mut inner = self
+            .callback_state
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        inner.producer.flush_padded();
+        inner.producer.disconnect();
+    }
 }
 
 impl Drop for MacOsCaptureSession {
@@ -337,9 +345,13 @@ impl Drop for MacOsCaptureSession {
 }
 
 struct MacOsAudioCallbackState {
-    samples_tx: SyncSender<Vec<i16>>,
-    converter: Mutex<CoreAudioPcmConverter>,
+    inner: Mutex<MacOsAudioCallbackInner>,
     panicked: AtomicBool,
+}
+
+struct MacOsAudioCallbackInner {
+    converter: CoreAudioPcmConverter,
+    producer: CaptureQueueProducer,
 }
 
 unsafe extern "C-unwind" fn core_audio_io_proc(
@@ -373,19 +385,16 @@ fn core_audio_io_proc_inner(
         return kAudioHardwareNoError;
     };
 
-    let Ok(mut converter) = state.converter.try_lock() else {
+    let Ok(mut inner) = state.inner.try_lock() else {
         return kAudioHardwareNoError;
     };
 
     let process_buffers = || {
         let input_data = unsafe { input_data.as_ref() };
-        if let Ok(samples) = converter.convert_buffer_list(input_data)
+        if let Ok(samples) = inner.converter.convert_buffer_list(input_data)
             && !samples.is_empty()
         {
-            match state.samples_tx.try_send(samples) {
-                Ok(()) | Err(TrySendError::Full(_)) => {}
-                Err(TrySendError::Disconnected(_)) => {}
-            }
+            inner.producer.push_samples(&samples);
         }
         Ok(())
     };

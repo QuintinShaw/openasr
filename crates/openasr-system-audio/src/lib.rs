@@ -7,6 +7,12 @@ use serde::Serialize;
     not(any(target_os = "linux", target_os = "macos", windows)),
     allow(dead_code)
 )]
+mod capture_queue;
+#[cfg(any(target_os = "linux", target_os = "macos", windows, test))]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", windows)),
+    allow(dead_code)
+)]
 mod pcm;
 
 #[cfg(target_os = "linux")]
@@ -86,8 +92,8 @@ pub fn support_status() -> SystemAudioSupport {
 
 pub fn run_loopback_capture(
     stop: Arc<AtomicBool>,
-    on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
-    on_diagnostic: impl FnMut(&str) -> Result<(), String>,
+    on_frame: impl FnMut(Vec<i16>) -> Result<(), String> + Send,
+    on_diagnostic: impl FnMut(&str) -> Result<(), String> + Send,
 ) -> Result<String, CaptureBackendError> {
     platform::run_loopback_capture(stop, on_frame, on_diagnostic)
 }
@@ -115,8 +121,8 @@ pub fn run_process_loopback_capture(
     process_id: u32,
     mode: ProcessLoopbackMode,
     stop: Arc<AtomicBool>,
-    on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
-    on_diagnostic: impl FnMut(&str) -> Result<(), String>,
+    on_frame: impl FnMut(Vec<i16>) -> Result<(), String> + Send,
+    on_diagnostic: impl FnMut(&str) -> Result<(), String> + Send,
 ) -> Result<String, CaptureBackendError> {
     platform::run_process_loopback_capture(process_id, mode, stop, on_frame, on_diagnostic)
 }

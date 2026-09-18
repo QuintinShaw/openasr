@@ -1,11 +1,14 @@
 use std::collections::VecDeque;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::thread;
+use std::time::Instant;
 
 use wasapi::{
-    AudioClient, DeviceEnumerator, Direction, SampleType, StreamMode, WasapiError, WaveFormat,
+    AudioCaptureClient, AudioClient, DeviceEnumerator, Direction, Handle, SampleType, StreamMode,
+    WasapiError, WaveFormat,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -16,7 +19,11 @@ use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFOR
 use crate::{
     CandidateProcess, CaptureBackendError, ProcessLoopbackMode, ProcessLoopbackSupport,
     SystemAudioSupport,
-    pcm::{Pcm16FrameChunker, TARGET_CHANNELS, TARGET_FRAME_SAMPLES, TARGET_SAMPLE_RATE_HZ},
+    capture_queue::{
+        CaptureConsumerEvent, CaptureQueueConsumer, CaptureQueueProducer, TRAILING_CAPTURE_WINDOW,
+        capture_queue, join_capture_consumer, run_capture_consumer,
+    },
+    pcm::{TARGET_CHANNELS, TARGET_FRAME_SAMPLES, TARGET_SAMPLE_RATE_HZ},
 };
 
 const SILENT_STREAK_DIAGNOSTIC_FRAMES: u32 = 250;
@@ -39,8 +46,8 @@ pub fn support_status() -> SystemAudioSupport {
 
 pub fn run_loopback_capture(
     stop: Arc<AtomicBool>,
-    on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
-    on_diagnostic: impl FnMut(&str) -> Result<(), String>,
+    on_frame: impl FnMut(Vec<i16>) -> Result<(), String> + Send,
+    on_diagnostic: impl FnMut(&str) -> Result<(), String> + Send,
 ) -> Result<String, CaptureBackendError> {
     wasapi::initialize_mta()
         .ok()
@@ -101,8 +108,8 @@ pub fn run_process_loopback_capture(
     process_id: u32,
     mode: ProcessLoopbackMode,
     stop: Arc<AtomicBool>,
-    on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
-    on_diagnostic: impl FnMut(&str) -> Result<(), String>,
+    on_frame: impl FnMut(Vec<i16>) -> Result<(), String> + Send,
+    on_diagnostic: impl FnMut(&str) -> Result<(), String> + Send,
 ) -> Result<String, CaptureBackendError> {
     ensure_process_exists(process_id)?;
 
@@ -296,8 +303,8 @@ fn run_wasapi_loopback_session(
     mut client: AudioClient,
     buffer_duration_hns: i64,
     stop: Arc<AtomicBool>,
-    mut on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
-    mut on_diagnostic: impl FnMut(&str) -> Result<(), String>,
+    on_frame: impl FnMut(Vec<i16>) -> Result<(), String> + Send,
+    on_diagnostic: impl FnMut(&str) -> Result<(), String> + Send,
 ) -> Result<String, CaptureBackendError> {
     let desired = WaveFormat::new(
         16,
@@ -344,77 +351,70 @@ fn run_wasapi_loopback_session(
     }
 
     let mut queue = VecDeque::with_capacity(block_align * TARGET_FRAME_SAMPLES * 64);
-    let mut chunker = Pcm16FrameChunker::new();
-    let mut silent_frame_streak: u32 = 0;
-    let mut waiting_for_playback_noted = false;
+    let (mut producer, consumer) = capture_queue();
+    let discontinuities = AtomicU64::new(0);
 
     client.start_stream().map_err(map_wasapi_error(
         "capture_backend_failed",
         "Could not start WASAPI loopback stream",
     ))?;
 
+    thread::scope(|scope| {
+        let handle = scope.spawn(|| {
+            let result =
+                run_windows_frame_consumer(consumer, &discontinuities, on_frame, on_diagnostic);
+            if result.is_err() {
+                stop.store(true, Ordering::SeqCst);
+            }
+            result
+        });
+
+        let pump_result = run_wasapi_device_loop(
+            &client,
+            &capture,
+            &event,
+            &stop,
+            &mut queue,
+            &mut producer,
+            &discontinuities,
+        );
+
+        producer.flush_padded();
+        drop(producer);
+
+        match (
+            pump_result,
+            join_capture_consumer(handle.join()).map_err(callback_error(
+                "Could not emit system-audio frame to desktop frontend.",
+            )),
+        ) {
+            (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok("Capture stopped".to_string()),
+        }
+    })
+}
+
+fn run_wasapi_device_loop(
+    client: &AudioClient,
+    capture: &AudioCaptureClient,
+    event: &Handle,
+    stop: &AtomicBool,
+    queue: &mut VecDeque<u8>,
+    producer: &mut CaptureQueueProducer,
+    discontinuities: &AtomicU64,
+) -> Result<(), CaptureBackendError> {
+    let mut enqueue = || -> Result<(), CaptureBackendError> {
+        enqueue_wasapi_packets(capture, queue, producer, discontinuities)
+    };
+
     while !stop.load(Ordering::SeqCst) {
-        let info = capture
-            .read_from_device_to_deque(&mut queue)
-            .map_err(map_wasapi_error(
-                "capture_backend_failed",
-                "Could not read WASAPI loopback buffer",
-            ))?;
-
-        if info.flags.data_discontinuity {
-            // A shared-mode discontinuity (glitch / format renegotiation) is
-            // routine and recoverable: note it and keep capturing instead of
-            // tearing down the whole session.
-            silent_frame_streak = 0;
-            waiting_for_playback_noted = false;
-            on_diagnostic(
-                "Render endpoint reported an audio buffer discontinuity; continuing capture.",
-            )
-            .map_err(|error| CaptureBackendError {
-                code: "capture_backend_failed",
-                message: "Could not emit system-audio diagnostic to desktop frontend.".to_string(),
-                diagnostic: error,
-            })?;
-        }
-
-        let mut pending: Vec<u8> = queue.drain(..).collect();
-        if info.flags.silent {
-            // AUDCLNT_BUFFERFLAGS_SILENT: the packet's buffer contents are
-            // undefined and must be treated as silence (the memory is not
-            // guaranteed to be zeroed). Zero the drained bytes so undefined data
-            // never reaches the ASR pipeline and so is_silent_frame() correctly
-            // advances the silence streak instead of seeing garbage.
-            pending.iter_mut().for_each(|byte| *byte = 0);
-        }
-        chunker
-            .push_bytes(&pending, |frame| {
-                if is_silent_frame(&frame) {
-                    silent_frame_streak = silent_frame_streak.saturating_add(1);
-                    if silent_frame_streak >= SILENT_STREAK_DIAGNOSTIC_FRAMES
-                        && !waiting_for_playback_noted
-                    {
-                        on_diagnostic(
-                            "No active render stream detected yet. Capture remains armed; start local playback to stream system audio.",
-                        )?;
-                        waiting_for_playback_noted = true;
-                    }
-                } else {
-                    silent_frame_streak = 0;
-                    waiting_for_playback_noted = false;
-                }
-                on_frame(frame)
-            })
-            .map_err(|error| CaptureBackendError {
-                code: "capture_backend_failed",
-                message: "Could not emit system-audio frame to desktop frontend.".to_string(),
-                diagnostic: error,
-            })?;
-
+        enqueue()?;
         if let Err(wait_error) = event.wait_for_event(200) {
             if stop.load(Ordering::SeqCst) {
                 break;
             }
             if !matches!(wait_error, WasapiError::EventTimeout) {
+                let _ = client.stop_stream();
                 return Err(CaptureBackendError {
                     code: "capture_backend_failed",
                     message: "WASAPI event wait failed during loopback capture.".to_string(),
@@ -424,17 +424,98 @@ fn run_wasapi_loopback_session(
         }
     }
 
-    chunker
-        .flush_padded(on_frame)
-        .map_err(|error| CaptureBackendError {
-            code: "capture_backend_failed",
-            message: "Could not emit final padded system-audio frame.".to_string(),
-            diagnostic: error,
-        })?;
+    let trailing_deadline = Instant::now() + TRAILING_CAPTURE_WINDOW;
+    while Instant::now() < trailing_deadline {
+        enqueue()?;
+        let remaining = trailing_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let wait_ms = u32::try_from(remaining.as_millis().min(50)).unwrap_or(50);
+        let _ = event.wait_for_event(wait_ms);
+    }
 
     let _ = client.stop_stream();
+    enqueue()
+}
 
-    Ok("Capture stopped".to_string())
+fn enqueue_wasapi_packets(
+    capture: &AudioCaptureClient,
+    queue: &mut VecDeque<u8>,
+    producer: &mut CaptureQueueProducer,
+    discontinuities: &AtomicU64,
+) -> Result<(), CaptureBackendError> {
+    let info = capture
+        .read_from_device_to_deque(queue)
+        .map_err(map_wasapi_error(
+            "capture_backend_failed",
+            "Could not read WASAPI loopback buffer",
+        ))?;
+
+    if info.flags.data_discontinuity {
+        // A shared-mode discontinuity (glitch / format renegotiation) is
+        // routine and recoverable: note it and keep capturing instead of
+        // tearing down the whole session. Reported from the consumer thread
+        // so this device thread never blocks on `on_diagnostic`.
+        discontinuities.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let mut pending: Vec<u8> = queue.drain(..).collect();
+    if info.flags.silent {
+        // AUDCLNT_BUFFERFLAGS_SILENT: the packet's buffer contents are
+        // undefined and must be treated as silence (the memory is not
+        // guaranteed to be zeroed). Zero the drained bytes so undefined data
+        // never reaches the ASR pipeline and so is_silent_frame() correctly
+        // advances the silence streak instead of seeing garbage.
+        pending.iter_mut().for_each(|byte| *byte = 0);
+    }
+    producer.push_bytes(&pending);
+    Ok(())
+}
+
+fn run_windows_frame_consumer(
+    consumer: CaptureQueueConsumer,
+    discontinuities: &AtomicU64,
+    mut on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
+    mut on_diagnostic: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut silent_frame_streak: u32 = 0;
+    let mut waiting_for_playback_noted = false;
+    run_capture_consumer(consumer, |event| match event {
+        CaptureConsumerEvent::Diagnostic(message) => on_diagnostic(message),
+        CaptureConsumerEvent::Frame(frame) => {
+            if discontinuities.swap(0, Ordering::Relaxed) > 0 {
+                on_diagnostic(
+                    "Render endpoint reported an audio buffer discontinuity; continuing capture.",
+                )?;
+                silent_frame_streak = 0;
+                waiting_for_playback_noted = false;
+            }
+            if is_silent_frame(&frame) {
+                silent_frame_streak = silent_frame_streak.saturating_add(1);
+                if silent_frame_streak >= SILENT_STREAK_DIAGNOSTIC_FRAMES
+                    && !waiting_for_playback_noted
+                {
+                    on_diagnostic(
+                        "No active render stream detected yet. Capture remains armed; start local playback to stream system audio.",
+                    )?;
+                    waiting_for_playback_noted = true;
+                }
+            } else {
+                silent_frame_streak = 0;
+                waiting_for_playback_noted = false;
+            }
+            on_frame(frame)
+        }
+    })
+}
+
+fn callback_error(message: &'static str) -> impl FnOnce(String) -> CaptureBackendError {
+    move |diagnostic| CaptureBackendError {
+        code: "capture_backend_failed",
+        message: message.to_string(),
+        diagnostic,
+    }
 }
 
 /// RAII guard that calls `wasapi::deinitialize()` (CoUninitialize) on drop, so
