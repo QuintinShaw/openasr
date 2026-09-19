@@ -21,6 +21,46 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
+use tokio::{sync::watch, task::JoinHandle};
+
+#[derive(Clone)]
+pub(crate) struct IdleUnloadController {
+    policy: watch::Sender<Option<Duration>>,
+    config_write: std::sync::Arc<Mutex<()>>,
+}
+impl IdleUnloadController {
+    pub(crate) fn new(initial: Option<Duration>) -> Self {
+        let (policy, _) = watch::channel(initial);
+        Self {
+            policy,
+            config_write: std::sync::Arc::new(Mutex::new(())),
+        }
+    }
+    pub(crate) fn config_write_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.config_write
+            .lock()
+            .expect("idle policy config-write mutex poisoned")
+    }
+    pub(crate) fn publish(&self, policy: Option<Duration>) {
+        self.policy.send_if_modified(|current| {
+            if *current == policy {
+                false
+            } else {
+                *current = policy;
+                true
+            }
+        });
+    }
+    fn subscribe(&self) -> watch::Receiver<Option<Duration>> {
+        self.policy.subscribe()
+    }
+}
+pub(crate) struct IdleUnloadReaper(JoinHandle<()>);
+impl Drop for IdleUnloadReaper {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 struct NativeActivityTracker {
     state: Mutex<NativeActivityState>,
@@ -451,13 +491,29 @@ impl SharedNativeActivityGuard {
 /// spawn this when the resolved policy is not `never` (see
 /// `IdleUnloadPolicy::idle_threshold`).
 pub(crate) fn spawn_idle_unload_reaper(
-    idle_for: Duration,
+    controller: IdleUnloadController,
     execution_services: Arc<openasr_core::NativeExecutionServices>,
-) {
-    let poll_interval = (idle_for / 4).max(Duration::from_secs(1));
-    tokio::spawn(async move {
+) -> IdleUnloadReaper {
+    let mut policy = controller.subscribe();
+    IdleUnloadReaper(tokio::spawn(async move {
         loop {
-            tokio::time::sleep(poll_interval).await;
+            let configured = *policy.borrow_and_update();
+            let Some(idle_for) = configured else {
+                if policy.changed().await.is_err() {
+                    return;
+                }
+                continue;
+            };
+            let poll_interval = (idle_for / 4).max(Duration::from_secs(1));
+            tokio::select! {
+                biased;
+                changed = policy.changed() => { if changed.is_err() { return; } continue; }
+                _ = tokio::time::sleep(poll_interval) => {}
+            }
+            let current = policy.borrow_and_update();
+            if *current != Some(idle_for) {
+                continue;
+            }
             if let Some(_claim) = native_activity().try_claim_idle_unload(Instant::now(), idle_for)
             {
                 // Invalidate health/TLS state before touching runtime owners.
@@ -468,12 +524,48 @@ pub(crate) fn spawn_idle_unload_reaper(
                 execution_services.unload_idle_native_model_runtime_caches();
             }
         }
-    });
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn controller_wakes_never_policy_with_now() {
+        let controller = IdleUnloadController::new(None);
+        let mut receiver = controller.subscribe();
+        controller.publish(Some(Duration::from_secs(5)));
+        receiver
+            .changed()
+            .await
+            .expect("controller sender remains owned");
+        assert_eq!(*receiver.borrow_and_update(), Some(Duration::from_secs(5)));
+    }
+
+    #[tokio::test]
+    async fn controller_publication_replaces_pending_policy() {
+        let controller = IdleUnloadController::new(Some(Duration::from_secs(5)));
+        let mut receiver = controller.subscribe();
+        controller.publish(None);
+        receiver
+            .changed()
+            .await
+            .expect("controller sender remains owned");
+        assert_eq!(*receiver.borrow_and_update(), None);
+    }
+
+    #[tokio::test]
+    async fn unchanged_policy_does_not_notify_or_restart_reaper_wait() {
+        let controller = IdleUnloadController::new(Some(Duration::from_secs(5)));
+        let mut receiver = controller.subscribe();
+        controller.publish(Some(Duration::from_secs(5)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), receiver.changed())
+                .await
+                .is_err()
+        );
+    }
 
     // Exercises the tracker logic against a private instance (not the process
     // singleton): the singleton is shared with every other test in this crate

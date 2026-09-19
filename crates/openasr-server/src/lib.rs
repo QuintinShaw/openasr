@@ -5,7 +5,9 @@ mod realtime_execution;
 mod remote_runtime_policy;
 mod routes;
 
-pub(crate) use idle_activity::{NativeActivityGuard, spawn_idle_unload_reaper};
+pub(crate) use idle_activity::{
+    IdleUnloadController, NativeActivityGuard, spawn_idle_unload_reaper,
+};
 pub use model_admission::NativeExecutionSupervisor;
 pub(crate) use model_admission::{
     ModelSessionAdmissionError, ModelSessionPermit, NativeAdmissionKind,
@@ -138,6 +140,21 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
     runtime: ServerRuntime,
     distribution_runtime: DistributionRuntime,
     launch_options: ServerLaunchOptions,
+) -> Router {
+    let idle_policy = launch_options.idle_unload_after;
+    app_with_runtime_and_distribution_and_launch_options_and_idle_controller(
+        runtime,
+        distribution_runtime,
+        launch_options,
+        IdleUnloadController::new(idle_policy),
+    )
+}
+
+fn app_with_runtime_and_distribution_and_launch_options_and_idle_controller(
+    runtime: ServerRuntime,
+    distribution_runtime: DistributionRuntime,
+    launch_options: ServerLaunchOptions,
+    idle_controller: IdleUnloadController,
 ) -> Router {
     let distribution = DistributionContext::with_execution_services(
         distribution_runtime,
@@ -273,6 +290,7 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
         .layer(Extension(health_identity))
         .layer(Extension(start_identity))
         .layer(Extension(distribution))
+        .layer(Extension(idle_controller))
         .layer(DefaultBodyLimit::max(MAX_TRANSCRIPTION_UPLOAD_BYTES))
         .with_state(runtime)
 }
@@ -373,22 +391,21 @@ pub async fn serve_with_launch_options(
         runtime.clone(),
         home.clone(),
     ));
-    // idle_unload: only spawn the reaper when the resolved policy is not
-    // `never` (`idle_unload_after` is `None` for `never` and for every
-    // existing caller/test that does not set it, so this is a no-op there).
-    if let Some(idle_unload_after) = launch_options.idle_unload_after {
-        spawn_idle_unload_reaper(
-            idle_unload_after,
-            Arc::clone(runtime.native_execution.execution_services()),
-        );
-    }
+    // `serve` owns this task; public router builders deliberately do not spawn
+    // background work. A `never` policy waits for a later validated update.
+    let idle_controller = IdleUnloadController::new(launch_options.idle_unload_after);
+    let _idle_reaper = spawn_idle_unload_reaper(
+        idle_controller.clone(),
+        Arc::clone(runtime.native_execution.execution_services()),
+    );
     match &launch_options.tls.clone() {
         ServerTlsConfig::Disabled => {
             let stage_started = Instant::now();
-            let app = app_with_runtime_and_distribution_and_launch_options(
+            let app = app_with_runtime_and_distribution_and_launch_options_and_idle_controller(
                 runtime,
                 DistributionRuntime::default(),
                 launch_options,
+                idle_controller.clone(),
             );
             openasr_core::stage_timing::log_stage(
                 "server_boot",
@@ -422,10 +439,11 @@ pub async fn serve_with_launch_options(
                 pairing_safety_code_for_certificate_fingerprint(&identity.certificate_sha256),
             ));
             let stage_started = Instant::now();
-            let app = app_with_runtime_and_distribution_and_launch_options(
+            let app = app_with_runtime_and_distribution_and_launch_options_and_idle_controller(
                 runtime,
                 DistributionRuntime::default(),
                 launch_options,
+                idle_controller.clone(),
             );
             openasr_core::stage_timing::log_stage(
                 "server_boot",
@@ -885,9 +903,9 @@ pub struct ServerLaunchOptions {
     pub auth: ServerAuth,
     pub tls: ServerTlsConfig,
     /// Resolved `idle_unload` threshold (see
-    /// `openasr_core::config::IdleUnloadPolicy::idle_threshold`); `None`
-    /// (the default, and what `never` resolves to) never spawns the reaper,
-    /// matching every existing caller/test that does not set this.
+    /// `openasr_core::config::IdleUnloadPolicy::idle_threshold`). `None` is
+    /// the default and represents `never`; `serve` starts a dormant reaper so
+    /// a validated config update can enable it, while router builders do not.
     pub idle_unload_after: Option<Duration>,
     /// Where to persist (and load back) the self-signed TLS private key +
     /// certificate across restarts -- see

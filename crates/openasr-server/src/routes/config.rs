@@ -20,8 +20,13 @@ pub(crate) async fn get_config(
 
 pub(crate) async fn put_config(
     Extension(distribution): Extension<DistributionContext>,
+    Extension(idle_controller): Extension<IdleUnloadController>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<OpenAsrConfigDocument>, ApiError> {
+    // All read/validate/save/reload/publish work is synchronous. Keep this
+    // router-scoped lock out of await points so concurrent preference patches
+    // serialize their read-modify-write and policy publication.
+    let _write = idle_controller.config_write_lock();
     let home = distribution.openasr_home()?;
     let document = config_document_from_update_payload(&home, payload)?;
     validate_config_document(&document, &distribution)?;
@@ -31,6 +36,7 @@ pub(crate) async fn put_config(
     let mut saved = load_config_document(&home).map_err(ApiError::Config)?;
     saved.config.default_model = openasr_core::default_selection::current_default_model(&home)?;
     validate_config_document(&saved, &distribution)?;
+    idle_controller.publish(saved.preferences.idle_unload.idle_threshold());
     Ok(Json(saved))
 }
 
