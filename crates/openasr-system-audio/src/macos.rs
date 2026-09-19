@@ -1,13 +1,13 @@
+use std::cell::UnsafeCell;
 use std::ffi::{CStr, c_void};
 use std::mem::{self, MaybeUninit};
 use std::process::Command;
 use std::ptr::{self, NonNull};
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-    mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
+    Arc,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::thread;
 
 use libloading::Library;
 use objc2::AnyThread;
@@ -34,14 +34,19 @@ use objc2_foundation::{NSArray, NSException, NSNumber, NSString, NSUUID};
 use crate::{
     CandidateProcess, CaptureBackendError, ProcessLoopbackMode, ProcessLoopbackSupport,
     SystemAudioSupport,
-    pcm::{Pcm16FrameChunker, TARGET_SAMPLE_RATE_HZ},
+    capture_queue::{
+        CONSUMER_POLL, CaptureQueueProducer, capture_queue, forward_capture_events,
+        join_capture_consumer, run_capture_consumer, wait_for_stop_with_trailing,
+    },
+    pcm::{TARGET_FRAME_SAMPLES, TARGET_SAMPLE_RATE_HZ},
 };
 
 type OSStatus = i32;
 
 const CORE_AUDIO_FRAMEWORK: &str = "/System/Library/Frameworks/CoreAudio.framework/CoreAudio";
-const READ_TIMEOUT_MS: u64 = 100;
-const CAPTURE_QUEUE_FRAMES: usize = 128;
+const MAX_AUDIO_BUFFERS: usize = 16;
+const MAX_RAW_SLOT_BYTES: usize = 128 * 1024;
+const RAW_SLOT_COUNT: usize = 32;
 const MIN_TAP_MACOS_VERSION: MacOsVersion = MacOsVersion {
     major: 14,
     minor: 2,
@@ -70,13 +75,14 @@ pub fn support_status() -> SystemAudioSupport {
 
 pub fn run_loopback_capture(
     stop: Arc<AtomicBool>,
-    mut on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
-    mut on_diagnostic: impl FnMut(&str) -> Result<(), String>,
+    on_frame: impl FnMut(Vec<i16>) -> Result<(), String> + Send,
+    mut on_diagnostic: impl FnMut(&str) -> Result<(), String> + Send,
 ) -> Result<String, CaptureBackendError> {
     ensure_macos_process_taps_supported()?;
 
-    let (tx, rx) = mpsc::sync_channel(CAPTURE_QUEUE_FRAMES);
-    let mut session = MacOsCaptureSession::create(tx)?;
+    let (mut producer, consumer) = capture_queue();
+    let dropped = producer.drop_counter();
+    let mut session = MacOsCaptureSession::create(Arc::clone(&dropped))?;
     emit_diagnostic(
         &mut on_diagnostic,
         &format!(
@@ -89,14 +95,43 @@ pub fn run_loopback_capture(
         &format!("Core Audio tap format: {}.", session.format.describe()),
     )?;
 
-    session.start()?;
+    let format = session.format;
+    let ring = Arc::clone(&session.callback_state.ring);
+    let io_stopped = Arc::new(AtomicBool::new(false));
+    thread::scope(|scope| {
+        let convert = scope.spawn({
+            let io_stopped = Arc::clone(&io_stopped);
+            move || run_macos_convert_thread(format, &ring, &io_stopped, &mut producer, &dropped)
+        });
+        let handle = scope.spawn(|| {
+            let result =
+                run_capture_consumer(consumer, forward_capture_events(on_frame, on_diagnostic));
+            if result.is_err() {
+                stop.store(true, Ordering::SeqCst);
+            }
+            result
+        });
 
-    let mut chunker = Pcm16FrameChunker::new();
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            break;
+        if let Err(error) = session.start() {
+            io_stopped.store(true, Ordering::SeqCst);
+            let _ = convert.join();
+            let _ = handle.join();
+            return Err(error);
         }
-        if session.callback_state.panicked.load(Ordering::SeqCst) {
+
+        wait_for_stop_with_trailing(&stop, || {
+            session.callback_state.panicked.load(Ordering::SeqCst)
+                || handle.is_finished()
+                || convert.is_finished()
+        });
+        let stop_status = session.stop();
+        let panicked = session.callback_state.panicked.load(Ordering::SeqCst);
+        io_stopped.store(true, Ordering::SeqCst);
+
+        let convert_result = convert.join();
+        let joined = join_capture_consumer(handle.join())
+            .map_err(callback_error("Could not emit macOS system-audio frame."));
+        if panicked {
             return Err(CaptureBackendError {
                 code: "capture_backend_failed",
                 message: "macOS system-audio capture failed.".to_string(),
@@ -104,31 +139,59 @@ pub fn run_loopback_capture(
                     .to_string(),
             });
         }
+        if convert_result.is_err() {
+            return Err(CaptureBackendError {
+                code: "capture_backend_failed",
+                message: "macOS system-audio capture failed.".to_string(),
+                diagnostic: "The Core Audio convert thread panicked; capture stopped fail-closed."
+                    .to_string(),
+            });
+        }
+        stop_status?;
+        joined.map(|()| "Capture stopped".to_string())
+    })
+}
 
-        match rx.recv_timeout(Duration::from_millis(READ_TIMEOUT_MS)) {
-            Ok(samples) => {
-                chunker
-                    .push_samples(&samples, &mut on_frame)
-                    .map_err(callback_error("Could not emit macOS system-audio frame."))?;
+fn run_macos_convert_thread(
+    format: CoreAudioPcmFormat,
+    ring: &RawSlotRing,
+    io_stopped: &AtomicBool,
+    producer: &mut CaptureQueueProducer,
+    dropped: &AtomicU64,
+) {
+    let mut converter = CoreAudioPcmConverter::new(format);
+    loop {
+        if !ring.try_read(|slot| {
+            convert_and_enqueue_slot(&mut converter, slot, producer, dropped);
+        }) {
+            if io_stopped.load(Ordering::SeqCst) {
+                while ring.try_read(|slot| {
+                    convert_and_enqueue_slot(&mut converter, slot, producer, dropped);
+                }) {}
+                break;
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(CaptureBackendError {
-                    code: "device_disconnected",
-                    message: "macOS system-audio capture stream disconnected.".to_string(),
-                    diagnostic: "The Core Audio callback queue closed before capture stopped."
-                        .to_string(),
-                });
-            }
+            thread::sleep(CONSUMER_POLL);
         }
     }
+    producer.flush_padded();
+}
 
-    session.stop();
-    chunker.flush_padded(&mut on_frame).map_err(callback_error(
-        "Could not emit final padded macOS system-audio frame.",
-    ))?;
-
-    Ok("Capture stopped".to_string())
+fn convert_and_enqueue_slot(
+    converter: &mut CoreAudioPcmConverter,
+    slot: &RawAudioSlot,
+    producer: &mut CaptureQueueProducer,
+    dropped: &AtomicU64,
+) {
+    match converter.convert_raw_slot(slot) {
+        Ok(samples) if !samples.is_empty() => producer.push_samples(&samples),
+        Ok(_) => {}
+        Err(_) => {
+            dropped.fetch_add(
+                twenty_ms_frames_for_source(&converter.format, slot.source_frames()),
+                Ordering::Relaxed,
+            );
+        }
+    }
 }
 
 /// Per-process loopback capture is not implemented on macOS: the Core Audio
@@ -160,8 +223,8 @@ pub fn run_process_loopback_capture(
     _process_id: u32,
     _mode: ProcessLoopbackMode,
     _stop: Arc<AtomicBool>,
-    _on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
-    _on_diagnostic: impl FnMut(&str) -> Result<(), String>,
+    _on_frame: impl FnMut(Vec<i16>) -> Result<(), String> + Send,
+    _on_diagnostic: impl FnMut(&str) -> Result<(), String> + Send,
 ) -> Result<String, CaptureBackendError> {
     Err(CaptureBackendError {
         code: "unsupported",
@@ -183,7 +246,7 @@ struct MacOsCaptureSession {
 }
 
 impl MacOsCaptureSession {
-    fn create(samples_tx: SyncSender<Vec<i16>>) -> Result<Self, CaptureBackendError> {
+    fn create(dropped: Arc<AtomicU64>) -> Result<Self, CaptureBackendError> {
         let symbols = ProcessTapSymbols::load()?;
         let (tap_uuid, tap_uid) =
             catch_foreign_exceptions("Could not create a macOS Core Audio process tap", || {
@@ -214,8 +277,9 @@ impl MacOsCaptureSession {
         };
 
         let callback_state = Box::new(MacOsAudioCallbackState {
-            samples_tx,
-            converter: Mutex::new(CoreAudioPcmConverter::new(format)),
+            ring: Arc::new(RawSlotRing::new()),
+            dropped,
+            format,
             panicked: AtomicBool::new(false),
         });
 
@@ -309,21 +373,25 @@ impl MacOsCaptureSession {
         )
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> Result<(), CaptureBackendError> {
         if let Some(io_proc_id) = self.io_proc_id
             && self.started
         {
-            unsafe {
-                AudioDeviceStop(self.aggregate_device_id, io_proc_id);
-            }
             self.started = false;
+            let status = unsafe { AudioDeviceStop(self.aggregate_device_id, io_proc_id) };
+            check_os_status(
+                status,
+                "capture_backend_failed",
+                "Could not stop macOS Core Audio system-audio capture",
+            )?;
         }
+        Ok(())
     }
 }
 
 impl Drop for MacOsCaptureSession {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.stop();
         if let Some(io_proc_id) = self.io_proc_id.take() {
             unsafe {
                 AudioDeviceDestroyIOProcID(self.aggregate_device_id, io_proc_id);
@@ -337,9 +405,137 @@ impl Drop for MacOsCaptureSession {
 }
 
 struct MacOsAudioCallbackState {
-    samples_tx: SyncSender<Vec<i16>>,
-    converter: Mutex<CoreAudioPcmConverter>,
+    ring: Arc<RawSlotRing>,
+    dropped: Arc<AtomicU64>,
+    format: CoreAudioPcmFormat,
     panicked: AtomicBool,
+}
+
+/// SPSC ring of preallocated raw IOProc slots. The audio thread is the only
+/// writer; the convert thread is the only reader. `AudioDeviceStop` completes
+/// in-flight IOProcs before the convert thread drains remaining slots.
+struct RawSlotRing {
+    slots: Box<[UnsafeCell<RawAudioSlot>]>,
+    write: AtomicUsize,
+    read: AtomicUsize,
+}
+
+// SAFETY: the audio thread is the unique writer and the convert thread is the
+// unique reader; `AudioDeviceStop` waits for in-flight IOProcs before drain.
+unsafe impl Sync for RawSlotRing {}
+
+impl RawSlotRing {
+    fn new() -> Self {
+        Self {
+            slots: (0..RAW_SLOT_COUNT)
+                .map(|_| UnsafeCell::new(RawAudioSlot::new()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            write: AtomicUsize::new(0),
+            read: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_write(&self, fill: impl FnOnce(&mut RawAudioSlot) -> bool) -> bool {
+        let write = self.write.load(Ordering::Relaxed);
+        let read = self.read.load(Ordering::Acquire);
+        if write.wrapping_sub(read) >= self.slots.len() {
+            return false;
+        }
+        // SAFETY: this slot is between `read` and `write`, so only the writer owns it.
+        let slot = unsafe { &mut *self.slots[write % self.slots.len()].get() };
+        if !fill(slot) {
+            return false;
+        }
+        self.write.store(write.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    fn try_read(&self, consume: impl FnOnce(&RawAudioSlot)) -> bool {
+        let read = self.read.load(Ordering::Relaxed);
+        let write = self.write.load(Ordering::Acquire);
+        if read == write {
+            return false;
+        }
+        // SAFETY: this slot is between `read` and `write`, so only the reader owns it.
+        let slot = unsafe { &*self.slots[read % self.slots.len()].get() };
+        consume(slot);
+        self.read.store(read.wrapping_add(1), Ordering::Release);
+        true
+    }
+}
+
+struct RawAudioSlot {
+    bytes: Box<[u8]>,
+    buffers: [RawBufferDesc; MAX_AUDIO_BUFFERS],
+    buffer_count: u8,
+    source_frames: u32,
+}
+
+#[derive(Clone, Copy)]
+struct RawBufferDesc {
+    offset: u32,
+    length: u32,
+    channels: u32,
+}
+
+impl RawAudioSlot {
+    fn new() -> Self {
+        Self {
+            bytes: vec![0_u8; MAX_RAW_SLOT_BYTES].into_boxed_slice(),
+            buffers: [RawBufferDesc {
+                offset: 0,
+                length: 0,
+                channels: 0,
+            }; MAX_AUDIO_BUFFERS],
+            buffer_count: 0,
+            source_frames: 0,
+        }
+    }
+
+    fn copy_from(&mut self, input_data: &AudioBufferList, format: &CoreAudioPcmFormat) -> bool {
+        let buffers = audio_buffers(input_data);
+        if buffers.is_empty() || buffers.len() > MAX_AUDIO_BUFFERS {
+            return false;
+        }
+        let mut offset = 0_usize;
+        for (index, buffer) in buffers.iter().enumerate() {
+            let length = buffer.mDataByteSize as usize;
+            if length == 0 || buffer.mData.is_null() {
+                self.buffers[index] = RawBufferDesc {
+                    offset: offset as u32,
+                    length: 0,
+                    channels: buffer.mNumberChannels,
+                };
+                continue;
+            }
+            if offset.saturating_add(length) > self.bytes.len() {
+                return false;
+            }
+            let source = unsafe { std::slice::from_raw_parts(buffer.mData.cast::<u8>(), length) };
+            self.bytes[offset..offset + length].copy_from_slice(source);
+            self.buffers[index] = RawBufferDesc {
+                offset: offset as u32,
+                length: length as u32,
+                channels: buffer.mNumberChannels,
+            };
+            offset += length;
+        }
+        self.buffer_count = buffers.len() as u8;
+        self.source_frames = source_frame_count(format, input_data) as u32;
+        true
+    }
+
+    fn buffer_bytes(&self, index: usize) -> &[u8] {
+        let desc = &self.buffers[index];
+        let start = desc.offset as usize;
+        let end = start + desc.length as usize;
+        &self.bytes[start..end]
+    }
+
+    fn source_frames(&self) -> usize {
+        self.source_frames as usize
+    }
 }
 
 unsafe extern "C-unwind" fn core_audio_io_proc(
@@ -372,34 +568,47 @@ fn core_audio_io_proc_inner(
     let Some(state) = (unsafe { (client_data as *mut MacOsAudioCallbackState).as_ref() }) else {
         return kAudioHardwareNoError;
     };
-
-    let Ok(mut converter) = state.converter.try_lock() else {
-        return kAudioHardwareNoError;
-    };
-
-    let process_buffers = || {
-        let input_data = unsafe { input_data.as_ref() };
-        if let Ok(samples) = converter.convert_buffer_list(input_data)
-            && !samples.is_empty()
-        {
-            match state.samples_tx.try_send(samples) {
-                Ok(()) | Err(TrySendError::Full(_)) => {}
-                Err(TrySendError::Disconnected(_)) => {}
-            }
-        }
-        Ok(())
-    };
-
-    if catch_foreign_exceptions(
-        "macOS system-audio capture callback failed",
-        process_buffers,
-    )
-    .is_err()
+    let input_data = unsafe { input_data.as_ref() };
+    if !state
+        .ring
+        .try_write(|slot| slot.copy_from(input_data, &state.format))
     {
-        state.panicked.store(true, Ordering::SeqCst);
+        record_raw_drop(state, input_data);
     }
-
     kAudioHardwareNoError
+}
+
+fn record_raw_drop(state: &MacOsAudioCallbackState, input_data: &AudioBufferList) {
+    let frames = source_frame_count(&state.format, input_data);
+    state.dropped.fetch_add(
+        twenty_ms_frames_for_source(&state.format, frames),
+        Ordering::Relaxed,
+    );
+}
+
+fn source_frame_count(format: &CoreAudioPcmFormat, input_data: &AudioBufferList) -> usize {
+    let buffers = audio_buffers(input_data);
+    if buffers.is_empty() {
+        return 0;
+    }
+    if format.non_interleaved {
+        buffers
+            .iter()
+            .map(|buffer| buffer.mDataByteSize as usize / format.bytes_per_sample.max(1))
+            .min()
+            .unwrap_or(0)
+    } else {
+        buffers[0].mDataByteSize as usize / format.bytes_per_frame.max(1)
+    }
+}
+
+fn twenty_ms_frames_for_source(format: &CoreAudioPcmFormat, source_frames: usize) -> u64 {
+    if source_frames == 0 {
+        return 1;
+    }
+    let target_samples =
+        (source_frames as f64 * TARGET_SAMPLE_RATE_HZ as f64 / format.sample_rate_hz).ceil() as u64;
+    target_samples.div_ceil(TARGET_FRAME_SAMPLES as u64).max(1)
 }
 
 struct ProcessTapSymbols {
@@ -755,10 +964,40 @@ impl CoreAudioPcmConverter {
         Ok(output)
     }
 
+    fn convert_raw_slot(&mut self, slot: &RawAudioSlot) -> Result<Vec<i16>, CaptureBackendError> {
+        if slot.buffer_count == 0 {
+            return Ok(Vec::new());
+        }
+        let mono = if self.format.non_interleaved {
+            self.decode_non_interleaved_slot(slot)
+        } else {
+            self.decode_interleaved_bytes(slot.buffer_bytes(0), slot.buffers[0].channels as usize)
+        }?;
+        let mut output = Vec::with_capacity(
+            (mono.len() as f64 * TARGET_SAMPLE_RATE_HZ as f64 / self.format.sample_rate_hz).ceil()
+                as usize,
+        );
+        self.resampler.push(&mono, &mut output);
+        Ok(output)
+    }
+
     fn decode_interleaved(&self, buffer: &AudioBuffer) -> Result<Vec<f32>, CaptureBackendError> {
         let data = audio_buffer_bytes(buffer)?;
         let channels = if buffer.mNumberChannels > 0 {
             buffer.mNumberChannels as usize
+        } else {
+            self.format.channels
+        };
+        self.decode_interleaved_bytes(data, channels)
+    }
+
+    fn decode_interleaved_bytes(
+        &self,
+        data: &[u8],
+        channels: usize,
+    ) -> Result<Vec<f32>, CaptureBackendError> {
+        let channels = if channels > 0 {
+            channels
         } else {
             self.format.channels
         };
@@ -821,6 +1060,37 @@ impl CoreAudioPcmConverter {
                 sum += self.decode_sample(&bytes[sample_offset..sample_end])?;
             }
             mono.push(sum / channel_bytes.len() as f32);
+        }
+        Ok(mono)
+    }
+
+    fn decode_non_interleaved_slot(
+        &self,
+        slot: &RawAudioSlot,
+    ) -> Result<Vec<f32>, CaptureBackendError> {
+        let channel_count = (slot.buffer_count as usize)
+            .min(self.format.channels)
+            .max(1);
+        if self.format.bytes_per_sample == 0 {
+            return Ok(Vec::new());
+        }
+        let frames = (0..channel_count)
+            .map(|index| slot.buffer_bytes(index).len() / self.format.bytes_per_sample)
+            .min()
+            .unwrap_or(0);
+        let mut mono = Vec::with_capacity(frames);
+        for frame_index in 0..frames {
+            let mut sum = 0.0_f32;
+            for index in 0..channel_count {
+                let bytes = slot.buffer_bytes(index);
+                let sample_offset = frame_index * self.format.bytes_per_sample;
+                let sample_end = sample_offset.saturating_add(self.format.bytes_per_sample);
+                if sample_end > bytes.len() {
+                    return Ok(mono);
+                }
+                sum += self.decode_sample(&bytes[sample_offset..sample_end])?;
+            }
+            mono.push(sum / channel_count as f32);
         }
         Ok(mono)
     }
@@ -957,7 +1227,6 @@ fn audio_buffers(input_data: &AudioBufferList) -> &[AudioBuffer] {
     let count = input_data.mNumberBuffers as usize;
     // Core Audio uses a flexible array member; refuse pathological counts
     // rather than fabricating an unbounded slice from a one-element header.
-    const MAX_AUDIO_BUFFERS: usize = 16;
     if count == 0 || count > MAX_AUDIO_BUFFERS {
         return &[];
     }
@@ -1238,6 +1507,124 @@ mod tests {
             })
         );
         assert_eq!(parse_macos_version("not-a-version"), None);
+    }
+
+    #[test]
+    fn twenty_ms_frames_for_source_matches_16khz_frame_unit() {
+        let format = CoreAudioPcmFormat {
+            sample_rate_hz: 48_000.0,
+            channels: 2,
+            bytes_per_frame: 8,
+            bytes_per_sample: 4,
+            non_interleaved: false,
+            big_endian: false,
+            encoding: SampleEncoding::Float32,
+        };
+        // 480 source frames @ 48 kHz = 10 ms = 160 samples @ 16 kHz -> 1 × 20 ms.
+        assert_eq!(twenty_ms_frames_for_source(&format, 480), 1);
+        // 960 source frames = 20 ms = 320 samples @ 16 kHz -> 1 frame.
+        assert_eq!(twenty_ms_frames_for_source(&format, 960), 1);
+        // 1920 source frames = 40 ms -> 2 frames.
+        assert_eq!(twenty_ms_frames_for_source(&format, 1920), 2);
+    }
+
+    #[test]
+    fn raw_slot_ring_rejects_writes_when_full_without_overwriting() {
+        let format = CoreAudioPcmFormat {
+            sample_rate_hz: 16_000.0,
+            channels: 1,
+            bytes_per_frame: 4,
+            bytes_per_sample: 4,
+            non_interleaved: false,
+            big_endian: false,
+            encoding: SampleEncoding::Float32,
+        };
+        let mut raw = 0.5_f32.to_le_bytes().to_vec();
+        let buffer = AudioBuffer {
+            mNumberChannels: 1,
+            mDataByteSize: raw.len() as u32,
+            mData: raw.as_mut_ptr().cast(),
+        };
+        let list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer],
+        };
+        let ring = RawSlotRing::new();
+        let mut filled = 0_usize;
+        while ring.try_write(|slot| slot.copy_from(&list, &format)) {
+            filled += 1;
+        }
+        assert_eq!(filled, RAW_SLOT_COUNT);
+        assert!(!ring.try_write(|slot| slot.copy_from(&list, &format)));
+
+        let mut read = 0_usize;
+        while ring.try_read(|_| {
+            read += 1;
+        }) {}
+        assert_eq!(read, RAW_SLOT_COUNT);
+        assert!(!ring.try_read(|_| unreachable!("empty ring")));
+    }
+
+    #[test]
+    fn raw_slot_copy_rejects_overflow_without_allocating() {
+        let format = CoreAudioPcmFormat {
+            sample_rate_hz: 16_000.0,
+            channels: 1,
+            bytes_per_frame: 4,
+            bytes_per_sample: 4,
+            non_interleaved: false,
+            big_endian: false,
+            encoding: SampleEncoding::Float32,
+        };
+        let mut raw = vec![0_u8; MAX_RAW_SLOT_BYTES + 4];
+        let buffer = AudioBuffer {
+            mNumberChannels: 1,
+            mDataByteSize: raw.len() as u32,
+            mData: raw.as_mut_ptr().cast(),
+        };
+        let list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer],
+        };
+        let mut slot = RawAudioSlot::new();
+        assert!(!slot.copy_from(&list, &format));
+    }
+
+    #[test]
+    fn convert_raw_slot_matches_buffer_list_path() {
+        let format = CoreAudioPcmFormat {
+            sample_rate_hz: 16_000.0,
+            channels: 2,
+            bytes_per_frame: 8,
+            bytes_per_sample: 4,
+            non_interleaved: false,
+            big_endian: false,
+            encoding: SampleEncoding::Float32,
+        };
+        let mut raw = Vec::new();
+        for sample in [1.0_f32, -1.0, 0.5, 0.5] {
+            raw.extend_from_slice(&sample.to_le_bytes());
+        }
+        let buffer = AudioBuffer {
+            mNumberChannels: 2,
+            mDataByteSize: raw.len() as u32,
+            mData: raw.as_mut_ptr().cast(),
+        };
+        let list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [buffer],
+        };
+        let mut slot = RawAudioSlot::new();
+        assert!(slot.copy_from(&list, &format));
+
+        let from_list = CoreAudioPcmConverter::new(format)
+            .convert_buffer_list(&list)
+            .expect("list");
+        let from_slot = CoreAudioPcmConverter::new(format)
+            .convert_raw_slot(&slot)
+            .expect("slot");
+        assert_eq!(from_list, from_slot);
+        assert_eq!(from_slot, vec![0, 16384]);
     }
 
     #[test]

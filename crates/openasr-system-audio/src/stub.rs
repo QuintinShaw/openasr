@@ -16,8 +16,8 @@ pub fn support_status() -> SystemAudioSupport {
 
 pub fn run_loopback_capture(
     _stop: Arc<AtomicBool>,
-    _on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
-    _on_diagnostic: impl FnMut(&str) -> Result<(), String>,
+    _on_frame: impl FnMut(Vec<i16>) -> Result<(), String> + Send,
+    _on_diagnostic: impl FnMut(&str) -> Result<(), String> + Send,
 ) -> Result<String, CaptureBackendError> {
     Err(CaptureBackendError {
         code: "unsupported",
@@ -46,8 +46,8 @@ pub fn run_process_loopback_capture(
     _process_id: u32,
     _mode: ProcessLoopbackMode,
     _stop: Arc<AtomicBool>,
-    _on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
-    _on_diagnostic: impl FnMut(&str) -> Result<(), String>,
+    _on_frame: impl FnMut(Vec<i16>) -> Result<(), String> + Send,
+    _on_diagnostic: impl FnMut(&str) -> Result<(), String> + Send,
 ) -> Result<String, CaptureBackendError> {
     Err(CaptureBackendError {
         code: "unsupported",

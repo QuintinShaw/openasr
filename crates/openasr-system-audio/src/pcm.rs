@@ -18,7 +18,7 @@ impl Pcm16FrameChunker {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
     pub(super) fn push_bytes(
         &mut self,
         bytes: &[u8],
@@ -28,7 +28,17 @@ impl Pcm16FrameChunker {
         self.emit_complete_frames(&mut on_frame)
     }
 
-    // Used by the macOS CoreAudio backend (macos.rs) and the unit test; not part of
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    pub(super) fn push_deque(
+        &mut self,
+        bytes: &mut VecDeque<u8>,
+        mut on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.pending.append(bytes);
+        self.emit_complete_frames(&mut on_frame)
+    }
+
+    // Used by the macOS CoreAudio consumer (macos.rs) and the unit test; not part of
     // the Linux/Windows lib build graph, so allow dead_code only there.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(super) fn push_samples(
