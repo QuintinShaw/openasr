@@ -94,10 +94,11 @@ use crate::realtime::audio::{RealtimeAudioEncoding, RealtimeAudioFormat};
 use crate::realtime::backend::{RealtimeBackendCapabilities, RealtimeBackendMode};
 use crate::realtime::events::{
     AudioInputStartedEvent, AudioInputStoppedEvent, RealtimeErrorCode, RealtimeErrorEvent,
-    RealtimeEventId, RealtimeSessionId, RealtimeTranscriptFinal, RealtimeTranscriptPartial,
-    RealtimeTranscriptRevision, RealtimeTranscriptWord, SessionCapabilitiesEvent,
-    SessionClosedEvent, SessionConfiguredEvent, SessionCreatedEvent, SessionVadSummary,
-    TranscriptSegmentId, TranscriptUtteranceId, VadSpeechStartedEvent, VadSpeechStoppedEvent,
+    RealtimeEventId, RealtimeHistoryRecordedEvent, RealtimeSessionId, RealtimeTranscriptFinal,
+    RealtimeTranscriptPartial, RealtimeTranscriptRevision, RealtimeTranscriptWord,
+    SessionCapabilitiesEvent, SessionClosedEvent, SessionConfiguredEvent, SessionCreatedEvent,
+    SessionVadSummary, TranscriptSegmentId, TranscriptUtteranceId, VadSpeechStartedEvent,
+    VadSpeechStoppedEvent,
 };
 
 const COMMITTED_RELATIVE_DIR: &str = "generated/realtime-wire";
@@ -127,6 +128,7 @@ fn export_realtime_wire_bindings(cfg: &Config) {
         RealtimeBackendCapabilities,
         RealtimeSessionId,
         RealtimeEventId,
+        RealtimeHistoryRecordedEvent,
         TranscriptUtteranceId,
         TranscriptSegmentId,
         SessionCreatedEvent,
