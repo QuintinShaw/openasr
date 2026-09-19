@@ -51,7 +51,7 @@ impl IdleUnloadController {
             }
         });
     }
-    fn subscribe(&self) -> watch::Receiver<Option<Duration>> {
+    pub(crate) fn subscribe(&self) -> watch::Receiver<Option<Duration>> {
         self.policy.subscribe()
     }
 }
@@ -487,9 +487,9 @@ impl SharedNativeActivityGuard {
 /// Spawns the background `idle_unload` reaper. Polls at a fraction of
 /// `idle_for` so the actual unload lands within roughly one tick of crossing
 /// the threshold, without spinning for a short threshold (the `now` policy's
-/// 5s floor) or over-polling for the common 10m/1h thresholds. Callers only
-/// spawn this when the resolved policy is not `never` (see
-/// `IdleUnloadPolicy::idle_threshold`).
+/// 5s floor) or over-polling for the common 10m/1h thresholds. The task stays
+/// dormant while the policy is `never`, so a later validated config
+/// update can enable unloading without restarting the server.
 pub(crate) fn spawn_idle_unload_reaper(
     controller: IdleUnloadController,
     execution_services: Arc<openasr_core::NativeExecutionServices>,
@@ -644,6 +644,50 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert_eq!(count.load(Ordering::SeqCst), 0);
         tracker.exit();
+        task.abort();
+    }
+
+    #[test]
+    fn disabling_policy_waits_for_claimed_unload_and_prevents_later_unloads() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()
+            .unwrap();
+        let controller = IdleUnloadController::new(Some(Duration::from_secs(1)));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let task = runtime.spawn(run_idle_unload_reaper(
+            controller.subscribe(),
+            private_tracker(),
+            move || {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            },
+        ));
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let publisher = std::thread::spawn(move || {
+            controller.publish(None);
+            published_tx.send(()).unwrap();
+            controller
+        });
+        assert!(matches!(
+            published_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_tx.send(()).unwrap();
+        published_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let _controller = publisher.join().unwrap();
+        assert!(matches!(
+            entered_rx.recv_timeout(Duration::from_millis(1100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
         task.abort();
     }
 
