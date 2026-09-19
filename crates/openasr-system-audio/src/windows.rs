@@ -305,7 +305,7 @@ fn run_wasapi_loopback_session(
     buffer_duration_hns: i64,
     stop: Arc<AtomicBool>,
     on_frame: impl FnMut(Vec<i16>) -> Result<(), String> + Send,
-    on_diagnostic: impl FnMut(&str) -> Result<(), String> + Send,
+    mut on_diagnostic: impl FnMut(&str) -> Result<(), String> + Send,
 ) -> Result<String, CaptureBackendError> {
     let desired = WaveFormat::new(
         16,
@@ -359,6 +359,11 @@ fn run_wasapi_loopback_session(
         "capture_backend_failed",
         "Could not start WASAPI loopback stream",
     ))?;
+    on_diagnostic(crate::STREAM_STARTED_DIAGNOSTIC).map_err(|message| CaptureBackendError {
+        code: "capture_backend_failed",
+        message: "Could not emit the system-audio start diagnostic.".to_string(),
+        diagnostic: message,
+    })?;
 
     thread::scope(|scope| {
         let handle = scope.spawn(|| {

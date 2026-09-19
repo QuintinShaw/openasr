@@ -60,6 +60,8 @@ pub fn run_loopback_capture(
             diagnostic: error.to_string(),
         })?;
 
+    emit_diagnostic(&mut on_diagnostic, crate::STREAM_STARTED_DIAGNOSTIC)?;
+
     let mut stderr = child.stderr.take();
     let stdout = child.stdout.take().ok_or_else(|| CaptureBackendError {
         code: "capture_backend_failed",

@@ -90,6 +90,11 @@ pub fn support_status() -> SystemAudioSupport {
     platform::support_status()
 }
 
+/// Emitted after the platform stream is actually running, before the first
+/// audio frame. Desktop start waits on this (or a frame) so WASAPI loopback
+/// can return success while the render graph is still silent.
+pub const STREAM_STARTED_DIAGNOSTIC: &str = "system-audio stream started";
+
 /// System-audio loopback. `on_frame` and `on_diagnostic` run on a consumer
 /// thread so the device/callback thread never blocks on them; they must be
 /// `Send` (not `'static`).
