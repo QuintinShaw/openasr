@@ -100,11 +100,6 @@ impl CaptureQueueProducer {
     }
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub(crate) fn clone_sender(&self) -> Option<SyncSender<Vec<i16>>> {
-        self.tx.clone()
-    }
-
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn drop_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.dropped)
     }
@@ -194,7 +189,7 @@ pub(crate) fn run_capture_consumer(
     }
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn forward_capture_events(
     mut on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
     mut on_diagnostic: impl FnMut(&str) -> Result<(), String>,
