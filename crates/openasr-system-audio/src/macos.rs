@@ -98,6 +98,12 @@ pub fn run_loopback_capture(
     let format = session.format;
     let ring = Arc::clone(&session.callback_state.ring);
     let io_stopped = Arc::new(AtomicBool::new(false));
+    // A silent render graph need not produce an IOProc frame. Acknowledge the
+    // actual device start before forwarding frames, as the other backends do.
+    // Starting before spawning workers also lets session Drop stop the device
+    // if either startup or the diagnostic callback fails.
+    session.start()?;
+    emit_diagnostic(&mut on_diagnostic, crate::STREAM_STARTED_DIAGNOSTIC)?;
     thread::scope(|scope| {
         let convert = scope.spawn({
             let io_stopped = Arc::clone(&io_stopped);
@@ -111,13 +117,6 @@ pub fn run_loopback_capture(
             }
             result
         });
-
-        if let Err(error) = session.start() {
-            io_stopped.store(true, Ordering::SeqCst);
-            let _ = convert.join();
-            let _ = handle.join();
-            return Err(error);
-        }
 
         wait_for_stop_with_trailing(&stop, || {
             session.callback_state.panicked.load(Ordering::SeqCst)
@@ -1705,6 +1704,46 @@ mod tests {
             .convert_raw_slot(&slot)
             .expect("convert");
         assert!(output.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires macOS system-audio permission and a quiet local output device"]
+    fn macos_core_audio_reports_started_without_waiting_for_audio() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let deadline_stop = Arc::clone(&stop);
+        let deadline = thread::spawn(move || {
+            let _ = finished_rx.recv_timeout(Duration::from_secs(5));
+            deadline_stop.store(true, Ordering::SeqCst);
+        });
+        let started = AtomicUsize::new(0);
+        let result = run_loopback_capture(
+            Arc::clone(&stop),
+            |_| {
+                assert_eq!(
+                    started.load(Ordering::SeqCst),
+                    1,
+                    "stream startup must be reported before any audio frames"
+                );
+                Ok(())
+            },
+            |message| {
+                eprintln!("{message}");
+                if message == crate::STREAM_STARTED_DIAGNOSTIC {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    stop.store(true, Ordering::SeqCst);
+                }
+                Ok(())
+            },
+        );
+        let _ = finished_tx.send(());
+        deadline.join().expect("join startup deadline");
+        result.expect("capture should start and stop without local playback");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "capture must report startup exactly once without waiting for a first frame"
+        );
     }
 
     #[test]

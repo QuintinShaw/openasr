@@ -91,13 +91,13 @@ pub fn support_status() -> SystemAudioSupport {
 }
 
 /// Emitted after the platform stream is actually running, before the first
-/// audio frame. Desktop start waits on this (or a frame) so WASAPI loopback
-/// can return success while the render graph is still silent.
+/// audio frame. Desktop start waits on this (or a frame) so capture can return
+/// success while the render graph is still silent.
 pub const STREAM_STARTED_DIAGNOSTIC: &str = "system-audio stream started";
 
-/// System-audio loopback. `on_frame` and `on_diagnostic` run on a consumer
-/// thread so the device/callback thread never blocks on them; they must be
-/// `Send` (not `'static`).
+/// System-audio loopback. Frames and ongoing diagnostics run on a consumer
+/// thread; startup diagnostics may run on the caller's thread. Neither callback
+/// runs on the real-time device callback thread. Both must be `Send` (not `'static`).
 pub fn run_loopback_capture(
     stop: Arc<AtomicBool>,
     on_frame: impl FnMut(Vec<i16>) -> Result<(), String> + Send,
