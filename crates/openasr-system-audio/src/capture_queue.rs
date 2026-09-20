@@ -276,6 +276,40 @@ mod tests {
     }
 
     #[test]
+    fn deque_capture_preserves_split_samples_frames_and_tail() {
+        let (mut producer, mut consumer) = capture_queue_with_capacity(4);
+        let samples: Vec<i16> = (0..TARGET_FRAME_SAMPLES * 2 + 1)
+            .map(|index| index as i16 - 400)
+            .collect();
+        let mut bytes: std::collections::VecDeque<u8> = samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        let mut first_byte = std::collections::VecDeque::from([bytes.pop_front().unwrap()]);
+        producer.push_deque(&mut first_byte);
+        assert!(first_byte.is_empty());
+        assert!(consumer.drain().is_empty());
+
+        producer.push_deque(&mut bytes);
+        assert!(bytes.is_empty());
+        let frames = consumer.drain();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0], samples[..TARGET_FRAME_SAMPLES]);
+        assert_eq!(
+            frames[1],
+            samples[TARGET_FRAME_SAMPLES..TARGET_FRAME_SAMPLES * 2]
+        );
+
+        producer.flush_padded();
+        let tail = consumer.drain();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].len(), TARGET_FRAME_SAMPLES);
+        assert_eq!(tail[0][0], samples[TARGET_FRAME_SAMPLES * 2]);
+        assert!(tail[0][1..].iter().all(|sample| *sample == 0));
+        assert_eq!(producer.dropped_count(), 0);
+    }
+
+    #[test]
     fn full_queue_increments_drop_count_without_evicting() {
         let (producer, mut consumer) = capture_queue_with_capacity(2);
         producer.try_push_frame(test_frame(1));
