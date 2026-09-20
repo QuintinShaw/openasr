@@ -4,7 +4,11 @@
 //! `lib.rs`. Other tests in this file are SSOT falsifiers: they stay ignored
 //! when live code currently violates the contract.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, header};
@@ -14,6 +18,7 @@ use super::*;
 use crate::testing::{
     PAIRING_ADMIN_TOKEN, approve_loopback_pairing, bearer_auth_header, https_request,
     https_request_status, spawn_loopback_pairing_server,
+    spawn_loopback_pairing_server_with_catalog_url,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -118,8 +123,8 @@ const EXPECTED_ROUTE_MATRIX: &[RouteExpect] = &[
         method: "GET",
         path: "/v1/catalog",
         none: 401,
-        device: 400,
-        operator: 400,
+        device: 200,
+        operator: 200,
     },
     RouteExpect {
         method: "GET",
@@ -307,15 +312,15 @@ const EXPECTED_ROUTE_MATRIX: &[RouteExpect] = &[
         method: "POST",
         path: "/v1/capabilities/requests",
         none: 401,
-        device: 202,
-        operator: 202,
+        device: 400,
+        operator: 400,
     },
     RouteExpect {
         method: "POST",
         path: "/v1/capabilities/requests/approve",
         none: 401,
         device: 403,
-        operator: 400,
+        operator: 404, // Empty matrix fixture leaves no request to approve.
     },
     RouteExpect {
         method: "POST",
@@ -593,7 +598,9 @@ fn request_payload(method: &str, path: &str) -> (Vec<(&'static str, String)>, Ve
     let json = if path == "/v1/pairing/requests" && method == "POST" {
         br#"{"device_name":"MatrixProbe"}"#.to_vec()
     } else if path == "/v1/capabilities/requests" && method == "POST" {
-        br#"{"features":["speakers"]}"#.to_vec()
+        // The matrix exercises authorization only. An empty feature set is a
+        // synchronous 400 and cannot enqueue an operator-approved public pull.
+        br#"{"features":[]}"#.to_vec()
     } else if path == "/v1/models/default" {
         br#"{"pull":"whisper-tiny:q4"}"#.to_vec()
     } else {
@@ -611,6 +618,16 @@ fn dump_matrix(rows: &[(String, String, u16, u16, u16)]) -> String {
     }
     dump.push_str("];\n");
     dump
+}
+
+fn signed_local_catalog_url_for_matrix(dir: &Path) -> String {
+    fs::create_dir_all(dir).expect("create matrix catalog directory");
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../model-registry/catalog.json");
+    let contents = fs::read_to_string(source).expect("read bundled catalog fixture");
+    let catalog_path = dir.join("matrix-catalog.json");
+    openasr_core::testing::write_local_dev_signed_catalog(&catalog_path, &contents, 1);
+    format!("file://{}", catalog_path.display())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -632,7 +649,8 @@ async fn ssot_route_permission_matrix_covers_every_registered_route() {
         std::env::remove_var("OPENASR_WESPEAKER_PACK");
         std::env::remove_var("OPENASR_MODELS_DIR");
     }
-    let server = spawn_loopback_pairing_server(temp.path()).await;
+    let catalog_url = signed_local_catalog_url_for_matrix(temp.path());
+    let server = spawn_loopback_pairing_server_with_catalog_url(temp.path(), catalog_url).await;
     let credential = approve_loopback_pairing(&server).await;
     let device_auth = bearer_auth_header(&credential.bearer_token);
     let operator_auth = bearer_auth_header(PAIRING_ADMIN_TOKEN);
@@ -662,6 +680,21 @@ async fn ssot_route_permission_matrix_covers_every_registered_route() {
         .await;
         live.push((method.clone(), path.clone(), none, device, operator));
     }
+
+    let pulls = https_request(
+        server.addr,
+        "GET",
+        "/v1/models/pulls",
+        &[("Authorization", operator_auth.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(pulls.status, 200);
+    let pulls: serde_json::Value = serde_json::from_slice(&pulls.body).expect("pull list JSON");
+    assert!(
+        pulls["jobs"].as_array().is_some_and(Vec::is_empty),
+        "authorization matrix must not create a background pull: {pulls}"
+    );
 
     let expected_keys: BTreeSet<(String, String)> = EXPECTED_ROUTE_MATRIX
         .iter()

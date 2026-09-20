@@ -20,8 +20,13 @@ pub(crate) async fn get_config(
 
 pub(crate) async fn put_config(
     Extension(distribution): Extension<DistributionContext>,
+    Extension(idle_controller): Extension<IdleUnloadController>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<OpenAsrConfigDocument>, ApiError> {
+    // All read/validate/save/reload/publish work is synchronous. Keep this
+    // router-scoped lock out of await points so concurrent preference patches
+    // serialize their read-modify-write and policy publication.
+    let _write = idle_controller.config_write_lock();
     let home = distribution.openasr_home()?;
     let document = config_document_from_update_payload(&home, payload)?;
     validate_config_document(&document, &distribution)?;
@@ -31,6 +36,7 @@ pub(crate) async fn put_config(
     let mut saved = load_config_document(&home).map_err(ApiError::Config)?;
     saved.config.default_model = openasr_core::default_selection::current_default_model(&home)?;
     validate_config_document(&saved, &distribution)?;
+    idle_controller.publish(saved.preferences.idle_unload.idle_threshold());
     Ok(Json(saved))
 }
 
@@ -143,6 +149,104 @@ pub(crate) fn validate_config_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn isolated_distribution(home: &std::path::Path) -> DistributionContext {
+        DistributionContext::new(DistributionRuntime {
+            openasr_home: Some(home.to_path_buf()),
+            catalog_url: None,
+            catalog_local_override: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn idle_policy_validation_failure_preserves_config_and_live_policy() {
+        let home = tempfile::tempdir().unwrap();
+        let distribution = isolated_distribution(home.path());
+        let controller = IdleUnloadController::new(None);
+        let receiver = controller.subscribe();
+        let before = load_config_document(home.path()).unwrap();
+        let result = put_config(
+            Extension(distribution),
+            Extension(controller.clone()),
+            Json(serde_json::json!({"preferences": {"idle_unload": "now", "language": " "}})),
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("language"));
+        assert_eq!(*receiver.borrow(), None);
+        assert!(!receiver.has_changed().unwrap());
+        assert_eq!(load_config_document(home.path()).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn idle_policy_save_failure_does_not_publish_unpersisted_policy() {
+        let home = tempfile::tempdir().unwrap();
+        let distribution = isolated_distribution(home.path());
+        let controller = IdleUnloadController::new(None);
+        let receiver = controller.subscribe();
+        let payload = serde_json::json!({"preferences": {"idle_unload": "now"}});
+        let document = config_document_from_update_payload(home.path(), payload.clone()).unwrap();
+        validate_config_document(&document, &distribution).unwrap();
+        // A directory at the lock-file path makes the real persistence operation
+        // fail on every platform, without mutating global permissions or hooks.
+        std::fs::create_dir(home.path().join(".openasr-default-selection.lock")).unwrap();
+        let result = put_config(
+            Extension(distribution),
+            Extension(controller.clone()),
+            Json(payload),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!home.path().join("config.json").exists());
+        assert_eq!(*receiver.borrow(), None);
+        assert!(!receiver.has_changed().unwrap());
+    }
+
+    #[test]
+    fn idle_policy_concurrent_patches_preserve_fields_and_persisted_policy() {
+        let home = tempfile::tempdir().unwrap();
+        let distribution = isolated_distribution(home.path());
+        let controller = IdleUnloadController::new(None);
+        let receiver = controller.subscribe();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        std::thread::scope(|scope| {
+            for payload in [
+                serde_json::json!({"preferences": {"idle_unload": "now"}}),
+                serde_json::json!({"preferences": {"language": "en", "history_retention": "forever"}}),
+            ] {
+                let distribution = distribution.clone();
+                let controller = controller.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    barrier.wait();
+                    let _ = runtime
+                        .block_on(put_config(
+                            Extension(distribution),
+                            Extension(controller),
+                            Json(payload),
+                        ))
+                        .unwrap();
+                });
+            }
+            barrier.wait();
+        });
+        let saved = load_config_document(home.path()).unwrap();
+        assert_eq!(saved.preferences.language.as_deref(), Some("en"));
+        assert_eq!(
+            saved.preferences.history_retention,
+            openasr_core::config::HistoryRetentionPolicy::Forever
+        );
+        assert_eq!(
+            saved.preferences.idle_unload,
+            openasr_core::config::IdleUnloadPolicy::Now
+        );
+        assert_eq!(
+            *receiver.borrow(),
+            saved.preferences.idle_unload.idle_threshold()
+        );
+    }
 
     #[test]
     fn generic_config_writer_echoes_current_active_default_without_rewriting_it() {

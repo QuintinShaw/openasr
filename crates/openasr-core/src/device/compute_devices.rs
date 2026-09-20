@@ -246,10 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_runtime_adds_accelerated_and_auto_resolves_to_it() {
-        // An Activated Vulkan provider in a neutral Windows host reports both
-        // a CPU and a GPU device. The picker must surface the accelerated entry
-        // and make Auto resolve to it.
+    fn gpu_runtime_exposes_physical_gpu_but_requires_activation_for_accelerated() {
         let runtime = runtime_with(
             vec![
                 GgmlBackendDevice::for_test("CPU", "Intel Core", GgmlBackendKind::Cpu, None),
@@ -267,31 +264,35 @@ mod tests {
         );
         let devices = compute_devices_from_runtime(&runtime);
         let ids: Vec<_> = devices.iter().map(|d| d.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            [
-                "auto",
-                "cpu",
-                "accelerated",
-                "vulkan:nvidia-geforce-rtx-4070"
-            ]
-        );
-        assert_eq!(default_execution_target(&devices), "accelerated");
-        let accelerated = devices.iter().find(|d| d.id == "accelerated").unwrap();
-        assert_eq!(accelerated.name, "NVIDIA GeForce RTX 4070");
-        assert_eq!(accelerated.meta, "GPU backend");
-        assert_eq!(accelerated.memory.as_deref(), Some("12 GB"));
-        // Auto mirrors the accelerated device's label so the picker's default
-        // reads as the GPU, not a bare "CPU".
-        assert_eq!(devices[0].name, "NVIDIA GeForce RTX 4070");
+        #[cfg(windows)]
+        {
+            assert_eq!(ids, ["auto", "cpu", "vulkan:nvidia-geforce-rtx-4070"]);
+            assert_eq!(default_execution_target(&devices), "cpu");
+            assert!(devices.iter().all(|device| device.id != "accelerated"));
+            assert_eq!(devices[0].name, "Intel Core");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                ids,
+                [
+                    "auto",
+                    "cpu",
+                    "accelerated",
+                    "vulkan:nvidia-geforce-rtx-4070"
+                ]
+            );
+            assert_eq!(default_execution_target(&devices), "accelerated");
+            let accelerated = devices.iter().find(|d| d.id == "accelerated").unwrap();
+            assert_eq!(accelerated.name, "NVIDIA GeForce RTX 4070");
+            assert_eq!(accelerated.meta, "GPU backend");
+            assert_eq!(accelerated.memory.as_deref(), Some("12 GB"));
+            assert_eq!(devices[0].name, "NVIDIA GeForce RTX 4070");
+        }
     }
 
     #[test]
-    fn hybrid_graphics_runtime_surfaces_discrete_gpu_not_integrated() {
-        // Optimus-style laptop: Intel UHD (integrated) enumerates before the
-        // NVIDIA discrete GPU. The picker's "accelerated" entry (and Auto,
-        // which mirrors it) must still be the discrete GPU, not whichever
-        // device the registry happened to list first.
+    fn hybrid_graphics_runtime_requires_activation_for_accelerated() {
         let runtime = runtime_with(
             vec![
                 GgmlBackendDevice::for_test("CPU", "Intel Core i7", GgmlBackendKind::Cpu, None),
@@ -314,13 +315,19 @@ mod tests {
             "Intel Core i7",
         );
         let devices = compute_devices_from_runtime(&runtime);
-        let accelerated = devices.iter().find(|d| d.id == "accelerated").unwrap();
-        assert_eq!(accelerated.name, "NVIDIA GeForce RTX 4070");
-        assert_eq!(accelerated.meta, "GPU backend");
-        assert_eq!(
-            devices[0].name, "NVIDIA GeForce RTX 4070",
-            "Auto mirrors it"
-        );
+        #[cfg(windows)]
+        {
+            assert!(devices.iter().all(|device| device.id != "accelerated"));
+            assert_eq!(default_execution_target(&devices), "cpu");
+            assert_eq!(devices[0].name, "Intel Core i7");
+        }
+        #[cfg(not(windows))]
+        {
+            let accelerated = devices.iter().find(|d| d.id == "accelerated").unwrap();
+            assert_eq!(accelerated.name, "NVIDIA GeForce RTX 4070");
+            assert_eq!(accelerated.meta, "GPU backend");
+            assert_eq!(devices[0].name, "NVIDIA GeForce RTX 4070");
+        }
     }
 
     #[test]
@@ -415,18 +422,27 @@ mod tests {
         assert_eq!(gpu_rows[0].memory_free_bytes, Some(gib(6) as u64));
         assert_eq!(gpu_rows[1].memory_total_bytes, Some(gib(24) as u64));
         let ids: Vec<_> = first.iter().map(|device| device.id.as_str()).collect();
-        assert_eq!(
-            &ids[..3],
-            ["auto", "cpu", "accelerated"],
-            "coarse rows stay first and unchanged in identity"
-        );
-        let accelerated = first
-            .iter()
-            .find(|device| device.id == "accelerated")
-            .unwrap();
-        assert_eq!(accelerated.name, "NVIDIA GeForce RTX 2070 SUPER");
-        assert_eq!(accelerated.kind, "accelerated");
-        assert_eq!(default_execution_target(&first), "accelerated");
+        #[cfg(windows)]
+        {
+            assert_eq!(&ids[..2], ["auto", "cpu"]);
+            assert!(first.iter().all(|device| device.id != "accelerated"));
+            assert_eq!(default_execution_target(&first), "cpu");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                &ids[..3],
+                ["auto", "cpu", "accelerated"],
+                "coarse rows stay first and unchanged in identity"
+            );
+            let accelerated = first
+                .iter()
+                .find(|device| device.id == "accelerated")
+                .unwrap();
+            assert_eq!(accelerated.name, "NVIDIA GeForce RTX 2070 SUPER");
+            assert_eq!(accelerated.kind, "accelerated");
+            assert_eq!(default_execution_target(&first), "accelerated");
+        }
     }
 
     #[test]
@@ -510,6 +526,12 @@ mod tests {
         );
         let devices = compute_devices_from_runtime(&runtime);
         let coarse = coarse_rows(&devices);
+        #[cfg(windows)]
+        assert_eq!(
+            coarse.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            ["auto", "cpu"]
+        );
+        #[cfg(not(windows))]
         assert_eq!(
             coarse.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
             ["auto", "cpu", "accelerated"]

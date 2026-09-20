@@ -853,18 +853,26 @@ mod tests {
         let path = dir.path().join("malformed.webm");
         std::fs::write(&path, malformed_webm_vint_zero_bytes()).unwrap();
 
-        // Before the `catch_unwind` guard, this call panicked (verified via a
-        // standalone repro against symphonia-format-mkv 0.5.5 directly); it
-        // must now report `ParserPanicked` and let the caller fall back to
-        // the external converter chain instead of crashing the process.
-        assert!(matches!(
-            try_decode_to_pcm16_mono_16k(&path, Some("webm")),
-            SymphoniaOutcome::ParserPanicked
-        ));
-        assert!(matches!(
-            probe_codec_label(&path, Some("webm")),
-            ProbeOutcome::ParserPanicked
-        ));
+        // Debug builds of symphonia-format-mkv 0.5.5 panic here; optimized
+        // builds can instead reject the malformed VINT normally. Both must
+        // stay non-success outcomes so callers take the typed fallback path.
+        let decode = try_decode_to_pcm16_mono_16k(&path, Some("webm"));
+        let parser_panicked = matches!(&decode, SymphoniaOutcome::ParserPanicked);
+        assert!(
+            matches!(
+                &decode,
+                SymphoniaOutcome::ParserPanicked | SymphoniaOutcome::Unsupported { .. }
+            ),
+            "malformed webm must not decode successfully"
+        );
+        let probe = probe_codec_label(&path, Some("webm"));
+        assert!(
+            matches!(&probe, ProbeOutcome::ParserPanicked | ProbeOutcome::Unknown),
+            "malformed webm must not yield a usable codec label"
+        );
+        if parser_panicked {
+            assert!(matches!(&probe, ProbeOutcome::ParserPanicked));
+        }
     }
 
     fn opus_tone_fixture() -> PathBuf {

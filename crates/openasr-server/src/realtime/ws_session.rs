@@ -409,6 +409,17 @@ fn is_terminal_transcript_envelope(envelope: &RealtimeEventEnvelope) -> bool {
     }
 }
 
+/// The native worker produces these lifecycle envelopes as part of Finish.
+/// Keep them at the tail of the connection sequence so a successful history
+/// receipt is observable before clients treat the realtime session as ended.
+fn is_native_finish_terminal_envelope(envelope: &RealtimeEventEnvelope) -> bool {
+    matches!(
+        &envelope.event,
+        RealtimeEvent::AudioInput(RealtimeAudioInputEvent::Stopped(_))
+            | RealtimeEvent::Lifecycle(RealtimeLifecycleEvent::SessionClosed(_))
+    )
+}
+
 /// Snapshot of a non-empty transcript FINAL for retroactive speaker
 /// attribution bookkeeping; `None` for everything else.
 fn snapshot_final_transcript(envelope: &RealtimeEventEnvelope) -> Option<FinalTranscriptSnapshot> {
@@ -3052,7 +3063,11 @@ impl WsSession {
             NativeStreamingCommand::Finish { close }
         };
         let (kind, events) = self.native_streaming_command(command).await?;
-        self.forward_native_streaming_events(kind, events).await?;
+        let (nonterminal, terminal): (Vec<_>, Vec<_>) = events
+            .into_iter()
+            .partition(|event| !is_native_finish_terminal_envelope(event));
+        self.forward_native_streaming_events(kind, nonterminal)
+            .await?;
         // The worker exited after the terminal command; join it so the session
         // (and its decoder cache) is dropped before we report the session closed.
         if let Some(worker) = self.native_streaming.take() {
@@ -3061,6 +3076,7 @@ impl WsSession {
         if !self.backend_failed && !transport_closed && self.record_history {
             self.record_history_entry().await?;
         }
+        self.forward_native_streaming_events(kind, terminal).await?;
         self.closed = true;
         self.observe_idle_for_pending_switch();
         Ok(())
@@ -3167,7 +3183,7 @@ impl WsSession {
         };
         let model = controller.config().model_id.clone();
         let store = DaemonHistoryStore::open(&home);
-        if let Err(error) = store.record(DaemonHistoryRecord {
+        let entry = match store.record(DaemonHistoryRecord {
             kind: DaemonHistoryKind::Live,
             model,
             source_name: self
@@ -3187,15 +3203,25 @@ impl WsSession {
             timeline_degraded_reason: None,
             text,
         }) {
-            self.emit_error(
-                RealtimeErrorCode::BackendCrashed,
-                &format!("Could not write realtime transcription history: {error}"),
-                false,
-            )
-            .await?;
-            return Err(());
-        }
+            Ok(entry) => entry,
+            Err(error) => {
+                self.emit_error(
+                    RealtimeErrorCode::BackendCrashed,
+                    &format!("Could not write realtime transcription history: {error}"),
+                    false,
+                )
+                .await?;
+                return Err(());
+            }
+        };
         self.history_recorded = true;
+        self.emit_event(RealtimeEvent::History(RealtimeHistoryEvent::Recorded(
+            RealtimeHistoryRecordedEvent {
+                history_id: entry.id,
+                history_revision: entry.revision,
+            },
+        )))
+        .await?;
         // Mirror the file-transcription path: best-effort prune after recording so live
         // history honors the retention policy on write, not only on the next
         // /v1/history read.

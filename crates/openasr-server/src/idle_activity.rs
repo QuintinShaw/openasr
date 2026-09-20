@@ -21,6 +21,46 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
+use tokio::{sync::watch, task::JoinHandle};
+
+#[derive(Clone)]
+pub(crate) struct IdleUnloadController {
+    policy: watch::Sender<Option<Duration>>,
+    config_write: std::sync::Arc<Mutex<()>>,
+}
+impl IdleUnloadController {
+    pub(crate) fn new(initial: Option<Duration>) -> Self {
+        let (policy, _) = watch::channel(initial);
+        Self {
+            policy,
+            config_write: std::sync::Arc::new(Mutex::new(())),
+        }
+    }
+    pub(crate) fn config_write_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.config_write
+            .lock()
+            .expect("idle policy config-write mutex poisoned")
+    }
+    pub(crate) fn publish(&self, policy: Option<Duration>) {
+        self.policy.send_if_modified(|current| {
+            if *current == policy {
+                false
+            } else {
+                *current = policy;
+                true
+            }
+        });
+    }
+    pub(crate) fn subscribe(&self) -> watch::Receiver<Option<Duration>> {
+        self.policy.subscribe()
+    }
+}
+pub(crate) struct IdleUnloadReaper(JoinHandle<()>);
+impl Drop for IdleUnloadReaper {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 struct NativeActivityTracker {
     state: Mutex<NativeActivityState>,
@@ -447,33 +487,209 @@ impl SharedNativeActivityGuard {
 /// Spawns the background `idle_unload` reaper. Polls at a fraction of
 /// `idle_for` so the actual unload lands within roughly one tick of crossing
 /// the threshold, without spinning for a short threshold (the `now` policy's
-/// 5s floor) or over-polling for the common 10m/1h thresholds. Callers only
-/// spawn this when the resolved policy is not `never` (see
-/// `IdleUnloadPolicy::idle_threshold`).
+/// 5s floor) or over-polling for the common 10m/1h thresholds. The task stays
+/// dormant while the policy is `never`, so a later validated config
+/// update can enable unloading without restarting the server.
 pub(crate) fn spawn_idle_unload_reaper(
-    idle_for: Duration,
+    controller: IdleUnloadController,
     execution_services: Arc<openasr_core::NativeExecutionServices>,
-) {
-    let poll_interval = (idle_for / 4).max(Duration::from_secs(1));
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(poll_interval).await;
-            if let Some(_claim) = native_activity().try_claim_idle_unload(Instant::now(), idle_for)
-            {
-                // Invalidate health/TLS state before touching runtime owners.
-                // New activity cannot enter until `_claim` drops, so no caller
-                // can observe the advanced generation and start rebuilding
-                // while the prior generation is still being torn down.
-                bump_native_unload_generation();
-                execution_services.unload_idle_native_model_runtime_caches();
+) -> IdleUnloadReaper {
+    let policy = controller.subscribe();
+    let tracker = native_activity();
+    IdleUnloadReaper(tokio::spawn(async move {
+        run_idle_unload_reaper(policy, tracker, move || {
+            bump_native_unload_generation();
+            execution_services.unload_idle_native_model_runtime_caches();
+        })
+        .await;
+    }))
+}
+
+async fn run_idle_unload_reaper<F>(
+    mut policy: watch::Receiver<Option<Duration>>,
+    tracker: &'static NativeActivityTracker,
+    unload: F,
+) where
+    F: Fn() + Send + Sync + 'static,
+{
+    loop {
+        let configured = *policy.borrow_and_update();
+        let Some(idle_for) = configured else {
+            if policy.changed().await.is_err() {
+                return;
             }
+            continue;
+        };
+        let poll_interval = (idle_for / 4).max(Duration::from_secs(1));
+        tokio::select! {
+            biased;
+            changed = policy.changed() => { if changed.is_err() { return; } continue; }
+            _ = tokio::time::sleep(poll_interval) => {}
         }
-    });
+        let current = policy.borrow_and_update();
+        if *current != Some(idle_for) {
+            continue;
+        }
+        if let Some(_claim) = tracker.try_claim_idle_unload(Instant::now(), idle_for) {
+            // Invalidate health/TLS state before touching runtime owners.
+            // New activity cannot enter until `_claim` drops, so no caller
+            // can observe the advanced generation and start rebuilding
+            // while the prior generation is still being torn down.
+            unload();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn controller_wakes_never_policy_with_now() {
+        let controller = IdleUnloadController::new(None);
+        let mut receiver = controller.subscribe();
+        controller.publish(Some(Duration::from_secs(5)));
+        receiver
+            .changed()
+            .await
+            .expect("controller sender remains owned");
+        assert_eq!(*receiver.borrow_and_update(), Some(Duration::from_secs(5)));
+    }
+
+    #[tokio::test]
+    async fn controller_publication_replaces_pending_policy() {
+        let controller = IdleUnloadController::new(Some(Duration::from_secs(5)));
+        let mut receiver = controller.subscribe();
+        controller.publish(None);
+        receiver
+            .changed()
+            .await
+            .expect("controller sender remains owned");
+        assert_eq!(*receiver.borrow_and_update(), None);
+    }
+
+    #[tokio::test]
+    async fn unchanged_policy_does_not_notify_or_restart_reaper_wait() {
+        let controller = IdleUnloadController::new(Some(Duration::from_secs(5)));
+        let mut receiver = controller.subscribe();
+        controller.publish(Some(Duration::from_secs(5)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), receiver.changed())
+                .await
+                .is_err()
+        );
+    }
+
+    fn private_tracker() -> &'static NativeActivityTracker {
+        Box::leak(Box::new(NativeActivityTracker::new()))
+    }
+
+    #[tokio::test]
+    async fn reaper_wakes_from_never_when_policy_becomes_now() {
+        let controller = IdleUnloadController::new(None);
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = std::sync::Arc::clone(&count);
+        let task = tokio::spawn(run_idle_unload_reaper(
+            controller.subscribe(),
+            private_tracker(),
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+        controller.publish(Some(Duration::from_secs(1)));
+        tokio::time::timeout(Duration::from_millis(1500), async {
+            while count.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reaper did not wake from never");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn reaper_never_update_blocks_old_timer_and_active_tracker() {
+        let controller = IdleUnloadController::new(Some(Duration::from_secs(1)));
+        let tracker = private_tracker();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = std::sync::Arc::clone(&count);
+        let task = tokio::spawn(run_idle_unload_reaper(
+            controller.subscribe(),
+            tracker,
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        controller.publish(None);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn active_tracker_blocks_reaper_unload() {
+        let controller = IdleUnloadController::new(Some(Duration::from_secs(1)));
+        let tracker = private_tracker();
+        tracker.enter();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = std::sync::Arc::clone(&count);
+        let task = tokio::spawn(run_idle_unload_reaper(
+            controller.subscribe(),
+            tracker,
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        tracker.exit();
+        task.abort();
+    }
+
+    #[test]
+    fn disabling_policy_waits_for_claimed_unload_and_prevents_later_unloads() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()
+            .unwrap();
+        let controller = IdleUnloadController::new(Some(Duration::from_secs(1)));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let task = runtime.spawn(run_idle_unload_reaper(
+            controller.subscribe(),
+            private_tracker(),
+            move || {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            },
+        ));
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let publisher = std::thread::spawn(move || {
+            controller.publish(None);
+            published_tx.send(()).unwrap();
+            controller
+        });
+        assert!(matches!(
+            published_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_tx.send(()).unwrap();
+        published_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let _controller = publisher.join().unwrap();
+        assert!(matches!(
+            entered_rx.recv_timeout(Duration::from_millis(1100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        task.abort();
+    }
 
     // Exercises the tracker logic against a private instance (not the process
     // singleton): the singleton is shared with every other test in this crate

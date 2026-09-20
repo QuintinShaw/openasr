@@ -508,6 +508,16 @@ fn prepare_native_conversion(path: &Path) -> Result<PreparedAudioInput, AudioPre
     )
 }
 
+fn malformed_webm_inspection_panicked() -> bool {
+    matches!(
+        super::symphonia_decode::try_decode_to_pcm16_mono_16k(
+            &crate_fixture("malformed_vint_zero.webm"),
+            Some("webm"),
+        ),
+        super::symphonia_decode::SymphoniaOutcome::ParserPanicked
+    )
+}
+
 /// Asserts `prepared` is a converted, non-empty 16 kHz mono decode,
 /// regardless of which conversion path produced it: the in-process symphonia
 /// path hands back samples already resident in memory
@@ -732,16 +742,19 @@ fn malformed_webm_falls_back_to_typed_error_instead_of_panicking() {
     // upload webm is a reachable surface for, so the panic-free trust-
     // boundary invariant in AGENTS.md requires it be caught and turned into a
     // typed error, not crash the process or be misreported as a corrupt file.
+    let parser_panicked = malformed_webm_inspection_panicked();
     let error = prepare_native_conversion(&crate_fixture("malformed_vint_zero.webm")).unwrap_err();
 
     let message = error.to_string();
     assert!(
         matches!(error, AudioPreparationError::ConversionFailed { tool, .. } if tool == "afconvert")
     );
-    assert!(
-        message.contains("internal error while inspecting this file"),
-        "error should report a parser-internal-error, not a bare tool failure: {message}"
-    );
+    if parser_panicked {
+        assert!(
+            message.contains("internal error while inspecting this file"),
+            "a caught parser panic must remain diagnosable: {message}"
+        );
+    }
 }
 
 #[test]
@@ -751,29 +764,35 @@ fn malformed_webm_falls_back_to_typed_error_instead_of_panicking() {
     // guards against. Without ffmpeg configured and no afconvert fallback,
     // this must land on `MissingFfmpeg` (not a panic), with the hint naming
     // the parser-internal-error condition.
+    let parser_panicked = malformed_webm_inspection_panicked();
     let error = prepare_native_conversion(&crate_fixture("malformed_vint_zero.webm")).unwrap_err();
 
     let message = error.to_string();
     assert!(matches!(error, AudioPreparationError::MissingFfmpeg { .. }));
-    assert!(
-        message.contains("malformed or corrupted"),
-        "missing-ffmpeg hint should report the parser-internal-error condition: {message}"
-    );
+    if parser_panicked {
+        assert!(
+            message.contains("malformed or corrupted"),
+            "a caught parser panic must remain diagnosable: {message}"
+        );
+    }
 }
 
 #[test]
 #[cfg(windows)]
 fn malformed_webm_falls_back_to_typed_error_instead_of_panicking() {
+    let parser_panicked = malformed_webm_inspection_panicked();
     let error = prepare_native_conversion(&crate_fixture("malformed_vint_zero.webm")).unwrap_err();
     let message = error.to_string();
     assert!(
         matches!(&error, AudioPreparationError::ConversionFailed { tool, .. } if tool == "mediafoundation"),
         "malformed webm must fail closed through Media Foundation, not panic: {error}"
     );
-    assert!(
-        message.contains("internal error while inspecting this file"),
-        "error should report a parser-internal-error, not a bare tool failure: {message}"
-    );
+    if parser_panicked {
+        assert!(
+            message.contains("internal error while inspecting this file"),
+            "a caught parser panic must remain diagnosable: {message}"
+        );
+    }
 }
 
 #[test]

@@ -1255,7 +1255,7 @@ mod tests {
 
     #[test]
     fn ggml_device_inventory_reads_device_id() {
-        let devices = vec![
+        let devices = [
             GgmlBackendDevice::for_test("CPU", "CPU", GgmlBackendKind::Cpu, None),
             GgmlBackendDevice::for_test_with_device_id(
                 "CUDA0",
@@ -1268,11 +1268,10 @@ mod tests {
                 Some("0000:C1:00.0"),
             ),
         ];
-        let inventory = enumerate_compute_devices_from_ggml(&devices);
-        assert_eq!(inventory[1].provider, ExecutionProvider::Cuda);
+        let gpu = enumerated_from_ggml_device(1, &devices[1]);
+        assert_eq!(gpu.provider, ExecutionProvider::Cuda);
         assert_eq!(
-            inventory[1]
-                .addressability
+            gpu.addressability
                 .physical_key()
                 .map(PhysicalResourceKey::as_str),
             Some("0000:c1:00.0")
@@ -1297,12 +1296,10 @@ mod tests {
             Some("0000:02:00.0"),
             None,
         );
-        let inventory = enumerate_compute_devices_from_ggml(&[proven, unknown]);
-        assert_eq!(
-            inventory[0].hardware_vendor,
-            Some(ExecutionHardwareVendor::Amd)
-        );
-        assert_eq!(inventory[1].hardware_vendor, None);
+        let proven = enumerated_from_ggml_device(0, &proven);
+        let unknown = enumerated_from_ggml_device(1, &unknown);
+        assert_eq!(proven.hardware_vendor, Some(ExecutionHardwareVendor::Amd));
+        assert_eq!(unknown.hardware_vendor, None);
     }
 
     #[test]

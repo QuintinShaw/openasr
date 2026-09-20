@@ -29,10 +29,10 @@ pub use capture::{
 pub use events::{
     RealtimeAudioInputEvent, RealtimeErrorCode, RealtimeErrorEvent, RealtimeEvent,
     RealtimeEventEnvelope, RealtimeEventId, RealtimeEventSeq, RealtimeEventSequencer,
-    RealtimeLifecycleEvent, RealtimeSessionId, RealtimeTranscriptEvent, RealtimeTranscriptFinal,
-    RealtimeTranscriptPartial, RealtimeTranscriptRevision, RealtimeTranscriptWord,
-    RealtimeVadEvent, SessionCapabilitiesEvent, TranscriptSegmentId, TranscriptUtteranceId,
-    VadSpeechStartedEvent, VadSpeechStoppedEvent,
+    RealtimeHistoryEvent, RealtimeHistoryRecordedEvent, RealtimeLifecycleEvent, RealtimeSessionId,
+    RealtimeTranscriptEvent, RealtimeTranscriptFinal, RealtimeTranscriptPartial,
+    RealtimeTranscriptRevision, RealtimeTranscriptWord, RealtimeVadEvent, SessionCapabilitiesEvent,
+    TranscriptSegmentId, TranscriptUtteranceId, VadSpeechStartedEvent, VadSpeechStoppedEvent,
 };
 pub use history::{
     RealtimeExportFormat, RealtimeHistoryApplyResult, RealtimeHistoryEntry,

@@ -3,17 +3,18 @@ use std::process::{ChildStderr, Command, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
-    mpsc::{self, RecvTimeoutError},
 };
-use std::time::Duration;
+use std::thread;
 
 use crate::{
     CandidateProcess, CaptureBackendError, ProcessLoopbackMode, ProcessLoopbackSupport,
     SystemAudioSupport,
-    pcm::{Pcm16FrameChunker, TARGET_CHANNELS, TARGET_SAMPLE_RATE_HZ},
+    capture_queue::{
+        capture_queue, forward_capture_events, join_capture_consumer, run_capture_consumer,
+        wait_for_stop_with_trailing,
+    },
+    pcm::{TARGET_CHANNELS, TARGET_SAMPLE_RATE_HZ},
 };
-
-const READ_TIMEOUT_MS: u64 = 100;
 
 pub fn support_status() -> SystemAudioSupport {
     let has_pactl = command_available("pactl");
@@ -35,8 +36,8 @@ pub fn support_status() -> SystemAudioSupport {
 
 pub fn run_loopback_capture(
     stop: Arc<AtomicBool>,
-    mut on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
-    mut on_diagnostic: impl FnMut(&str) -> Result<(), String>,
+    on_frame: impl FnMut(Vec<i16>) -> Result<(), String> + Send,
+    mut on_diagnostic: impl FnMut(&str) -> Result<(), String> + Send,
 ) -> Result<String, CaptureBackendError> {
     ensure_linux_tools()?;
     let monitor_source = default_monitor_source()?;
@@ -59,6 +60,8 @@ pub fn run_loopback_capture(
             diagnostic: error.to_string(),
         })?;
 
+    emit_diagnostic(&mut on_diagnostic, crate::STREAM_STARTED_DIAGNOSTIC)?;
+
     let mut stderr = child.stderr.take();
     let stdout = child.stdout.take().ok_or_else(|| CaptureBackendError {
         code: "capture_backend_failed",
@@ -66,80 +69,96 @@ pub fn run_loopback_capture(
         diagnostic: "parec did not provide a stdout pipe.".to_string(),
     })?;
 
-    let (tx, rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        let mut stdout = stdout;
-        let mut buffer = [0_u8; 4096];
-        loop {
-            match stdout.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(count) => {
-                    if tx.send(Ok(buffer[..count].to_vec())).is_err() {
+    let (mut producer, consumer) = capture_queue();
+    thread::scope(|scope| {
+        let reader = scope.spawn(move || {
+            let mut stdout = stdout;
+            let mut buffer = [0_u8; 4096];
+            let mut read_error = None;
+            loop {
+                match stdout.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => producer.push_bytes(&buffer[..count]),
+                    Err(error) => {
+                        read_error = Some(error);
                         break;
                     }
                 }
+            }
+            (producer, read_error)
+        });
+        let consumer_handle = scope.spawn(|| {
+            let result =
+                run_capture_consumer(consumer, forward_capture_events(on_frame, on_diagnostic));
+            if result.is_err() {
+                stop.store(true, Ordering::SeqCst);
+            }
+            result
+        });
+
+        let mut child_wait_error = None;
+        let mut child_exit = None;
+        wait_for_stop_with_trailing(&stop, || {
+            if consumer_handle.is_finished() || reader.is_finished() {
+                return true;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    child_exit = Some(status);
+                    true
+                }
+                Ok(None) => false,
                 Err(error) => {
-                    let _ = tx.send(Err(error));
-                    break;
+                    child_wait_error = Some(error);
+                    true
                 }
             }
-        }
-    });
+        });
 
-    let mut chunker = Pcm16FrameChunker::new();
-    let mut stopped_by_request = false;
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            stopped_by_request = true;
-            let _ = child.kill();
-            break;
-        }
-
-        match rx.recv_timeout(Duration::from_millis(READ_TIMEOUT_MS)) {
-            Ok(Ok(bytes)) => chunker
-                .push_bytes(&bytes, &mut on_frame)
-                .map_err(callback_error("Could not emit Linux system-audio frame."))?,
-            Ok(Err(error)) => {
-                let _ = child.kill();
-                return Err(CaptureBackendError {
-                    code: "capture_backend_failed",
-                    message: "Linux system-audio capture stream failed.".to_string(),
-                    diagnostic: error.to_string(),
-                });
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                if let Some(status) = child.try_wait().map_err(|error| CaptureBackendError {
-                    code: "capture_backend_failed",
-                    message: "Could not inspect Linux system-audio capture process.".to_string(),
-                    diagnostic: error.to_string(),
-                })? {
-                    if status.success() {
-                        break;
-                    }
-                    return Err(CaptureBackendError {
-                        code: "capture_backend_failed",
-                        message: "Linux system-audio capture process exited unexpectedly."
-                            .to_string(),
-                        diagnostic: child_stderr(&mut stderr),
-                    });
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                break;
-            }
-        }
-    }
-
-    if stopped_by_request {
+        let stopped_by_request = stop.load(Ordering::SeqCst);
         let _ = child.kill();
-    }
-    let _ = child.wait();
-    let _ = reader.join();
-    chunker.flush_padded(&mut on_frame).map_err(callback_error(
-        "Could not emit final padded Linux system-audio frame.",
-    ))?;
+        let _ = child.wait();
+        let read_error = match reader.join() {
+            Ok((mut producer, read_error)) => {
+                producer.flush_padded();
+                drop(producer);
+                read_error
+            }
+            Err(_) => Some(std::io::Error::other(
+                "Linux system-audio reader thread panicked.",
+            )),
+        };
+        let consume_result = join_capture_consumer(consumer_handle.join())
+            .map_err(callback_error("Could not emit Linux system-audio frame."));
 
-    Ok("Capture stopped".to_string())
+        if let Some(error) = child_wait_error {
+            return Err(CaptureBackendError {
+                code: "capture_backend_failed",
+                message: "Could not inspect Linux system-audio capture process.".to_string(),
+                diagnostic: error.to_string(),
+            });
+        }
+        if let Some(error) = read_error
+            && !stopped_by_request
+        {
+            return Err(CaptureBackendError {
+                code: "capture_backend_failed",
+                message: "Linux system-audio capture stream failed.".to_string(),
+                diagnostic: error.to_string(),
+            });
+        }
+        if let Some(status) = child_exit
+            && !status.success()
+            && !stopped_by_request
+        {
+            return Err(CaptureBackendError {
+                code: "capture_backend_failed",
+                message: "Linux system-audio capture process exited unexpectedly.".to_string(),
+                diagnostic: child_stderr(&mut stderr),
+            });
+        }
+        consume_result.map(|()| "Capture stopped".to_string())
+    })
 }
 
 /// Per-process loopback capture is not implemented on Linux: PulseAudio/
@@ -170,8 +189,8 @@ pub fn run_process_loopback_capture(
     _process_id: u32,
     _mode: ProcessLoopbackMode,
     _stop: Arc<AtomicBool>,
-    _on_frame: impl FnMut(Vec<i16>) -> Result<(), String>,
-    _on_diagnostic: impl FnMut(&str) -> Result<(), String>,
+    _on_frame: impl FnMut(Vec<i16>) -> Result<(), String> + Send,
+    _on_diagnostic: impl FnMut(&str) -> Result<(), String> + Send,
 ) -> Result<String, CaptureBackendError> {
     Err(CaptureBackendError {
         code: "unsupported",

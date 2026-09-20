@@ -133,6 +133,21 @@ pub async fn spawn_loopback_pairing_server(home: &Path) -> LoopbackTlsServer {
     spawn_loopback_pairing_server_with_sans(home, &["127.0.0.1".to_string()]).await
 }
 
+/// Pairing fixture variant whose catalog source is supplied by the caller.
+/// Test callers use a local signed catalog so route coverage cannot reach the
+/// production catalog or a model artifact host.
+pub async fn spawn_loopback_pairing_server_with_catalog_url(
+    home: &Path,
+    catalog_url: String,
+) -> LoopbackTlsServer {
+    spawn_loopback_pairing_server_with_sans_and_catalog_url(
+        home,
+        &["127.0.0.1".to_string()],
+        Some(catalog_url),
+    )
+    .await
+}
+
 /// Same as [`spawn_loopback_pairing_server`], but with an explicit certificate
 /// SAN list. Used to prove TOFU pinning does not treat hostname mismatch as a
 /// hard failure (LAN clients connect by IP to a cert that may only name
@@ -140,6 +155,14 @@ pub async fn spawn_loopback_pairing_server(home: &Path) -> LoopbackTlsServer {
 pub async fn spawn_loopback_pairing_server_with_sans(
     home: &Path,
     subject_alt_names: &[String],
+) -> LoopbackTlsServer {
+    spawn_loopback_pairing_server_with_sans_and_catalog_url(home, subject_alt_names, None).await
+}
+
+async fn spawn_loopback_pairing_server_with_sans_and_catalog_url(
+    home: &Path,
+    subject_alt_names: &[String],
+    catalog_url: Option<String>,
 ) -> LoopbackTlsServer {
     let identity = self_signed_tls_identity(subject_alt_names).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -151,7 +174,7 @@ pub async fn spawn_loopback_pairing_server_with_sans(
         runtime.clone(),
         DistributionRuntime {
             openasr_home: Some(home.to_path_buf()),
-            catalog_url: None,
+            catalog_url,
             catalog_local_override: None,
         },
         ServerLaunchOptions {

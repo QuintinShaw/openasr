@@ -60,6 +60,58 @@ fn resolves_explicit_tag_to_matching_variant() {
 }
 
 #[test]
+fn resolves_quant_alias_to_canonical_variant_tag() {
+    let cards = vec![
+        variant_card("whisper-tiny", "whisper-tiny", "q4_k", Some("q4_k")),
+        variant_card("whisper-tiny-q8", "whisper-tiny", "q8_0", Some("q4_k")),
+    ];
+
+    let resolved = resolve_registry_model_ref(&cards, "whisper-tiny:q4").unwrap();
+    assert_eq!(resolved.card.id, "whisper-tiny");
+    assert_eq!(resolved.tag.as_deref(), Some("q4"));
+
+    let resolved = resolve_registry_model_ref(&cards, "whisper-tiny:q8").unwrap();
+    assert_eq!(resolved.card.id, "whisper-tiny-q8");
+    assert_eq!(resolved.tag.as_deref(), Some("q8"));
+}
+
+#[test]
+fn resolves_quant_alias_against_published_card_pack_quant() {
+    let mut card = variant_card(
+        "firered-aed-l-v2",
+        "firered-aed-l-v2",
+        "published",
+        Some("published"),
+    );
+    card.variant.as_mut().unwrap().quantization = Some("q4_k".to_string());
+    let cards = vec![card];
+
+    let resolved = resolve_registry_model_ref(&cards, "firered-aed-l-v2:q4").unwrap();
+    assert_eq!(resolved.card.id, "firered-aed-l-v2");
+    assert_eq!(resolved.card.variant_tag(), Some("published"));
+    assert_eq!(resolved.card.variant_quantization(), Some("q4_k"));
+
+    let published = resolve_registry_model_ref(&cards, "firered-aed-l-v2:published").unwrap();
+    assert_eq!(published.card.id, "firered-aed-l-v2");
+}
+
+#[test]
+fn published_tag_does_not_match_quant_alias() {
+    let cards = vec![variant_card(
+        "firered-aed-l-v2",
+        "firered-aed-l-v2",
+        "q4_k",
+        Some("q4_k"),
+    )];
+
+    let error = resolve_registry_model_ref(&cards, "firered-aed-l-v2:published")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("does not have variant tag 'published'"));
+    assert!(error.contains("Available tags: q4_k"));
+}
+
+#[test]
 fn ambiguous_family_without_default_fails_friendly() {
     let cards = vec![
         variant_card("tiny-q4", "whisper-tiny", "q4_0", None),

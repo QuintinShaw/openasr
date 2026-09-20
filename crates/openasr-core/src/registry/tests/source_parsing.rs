@@ -46,12 +46,22 @@ fn cohere_model_card_resolves_by_family_and_tag() {
 fn whisper_unknown_tag_lists_available_tags() {
     let cards = load_registry(test_model_registry_dir()).unwrap();
 
-    let error = resolve_registry_model_ref(&cards, "whisper-small:q8_0")
+    let error = resolve_registry_model_ref(&cards, "whisper-small:q4")
         .unwrap_err()
         .to_string();
 
-    assert!(error.contains("Model family 'whisper-small' does not have variant tag 'q8_0'"));
+    assert!(error.contains("Model family 'whisper-small' does not have variant tag 'q4'"));
     assert!(error.contains("Available tags: published"));
+}
+
+#[test]
+fn whisper_quant_alias_resolves_published_pack() {
+    let cards = load_registry(test_model_registry_dir()).unwrap();
+
+    let resolved = resolve_registry_model_ref(&cards, "whisper-small:q8").unwrap();
+    assert_eq!(resolved.card.id, "whisper-small");
+    assert_eq!(resolved.card.variant_tag(), Some("published"));
+    assert_eq!(resolved.card.variant_quantization(), Some("q8_0"));
 }
 
 #[test]

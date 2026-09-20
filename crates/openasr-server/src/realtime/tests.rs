@@ -529,6 +529,7 @@ fn started_controller(session_id: &str, model_id: &str) -> RealtimeSessionContro
 struct TestServerNativeSession {
     session_id: String,
     next_seq: u64,
+    terminal_events_on_finish: bool,
 }
 
 impl TestServerNativeSession {
@@ -536,11 +537,21 @@ impl TestServerNativeSession {
         Self {
             session_id: session_id.into(),
             next_seq: 1,
+            terminal_events_on_finish: false,
         }
     }
 
+    fn with_terminal_events(session_id: impl Into<String>) -> Self {
+        let mut session = Self::new(session_id);
+        session.terminal_events_on_finish = true;
+        session
+    }
+
     fn transcript(&mut self, event: RealtimeTranscriptEvent) -> Vec<RealtimeEventEnvelope> {
-        let event = RealtimeEvent::Transcript(event);
+        self.envelope(RealtimeEvent::Transcript(event))
+    }
+
+    fn envelope(&mut self, event: RealtimeEvent) -> Vec<RealtimeEventEnvelope> {
         let envelope = RealtimeEventEnvelope {
             event_type: event.event_type(),
             session_id: RealtimeSessionId(self.session_id.clone()),
@@ -589,7 +600,7 @@ impl NativeAsrSession for TestServerNativeSession {
     }
 
     fn finish(&mut self) -> Result<Vec<RealtimeEventEnvelope>, openasr_core::NativeAsrError> {
-        Ok(self.transcript(RealtimeTranscriptEvent::Final(
+        let mut events = self.transcript(RealtimeTranscriptEvent::Final(
             openasr_core::RealtimeTranscriptFinal {
                 utterance_id: TranscriptUtteranceId("utt_native_000001".to_string()),
                 segment_id: TranscriptSegmentId("seg_native_000001".to_string()),
@@ -605,7 +616,24 @@ impl NativeAsrSession for TestServerNativeSession {
                 speaker_person_id: None,
                 speaker_snapshot_label: None,
             },
-        )))
+        ));
+        if self.terminal_events_on_finish {
+            events.extend(self.envelope(RealtimeEvent::AudioInput(
+                RealtimeAudioInputEvent::Stopped(
+                    openasr_core::realtime::events::AudioInputStoppedEvent {
+                        reason: "client_closed".into(),
+                    },
+                ),
+            )));
+            events.extend(self.envelope(RealtimeEvent::Lifecycle(
+                RealtimeLifecycleEvent::SessionClosed(
+                    openasr_core::realtime::events::SessionClosedEvent {
+                        reason: "client_closed".into(),
+                    },
+                ),
+            )));
+        }
+        Ok(events)
     }
 
     fn cancel(&mut self) -> Result<Vec<RealtimeEventEnvelope>, openasr_core::NativeAsrError> {
@@ -1328,7 +1356,7 @@ async fn native_streaming_decode_worker_death_fails_closed() {
 
 #[tokio::test]
 async fn native_streaming_cancel_on_transport_close_detaches_worker() {
-    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
     session
         .attach_native_streaming_session(
@@ -1347,6 +1375,12 @@ async fn native_streaming_cancel_on_transport_close_detaches_worker() {
 
     assert!(session.native_streaming.is_none());
     assert!(session.closed);
+    assert!(
+        collect_events(&mut event_receiver)
+            .await
+            .iter()
+            .all(|event| event.event_type != "history.recorded")
+    );
 }
 
 #[tokio::test]
@@ -1395,6 +1429,11 @@ async fn native_streaming_cancel_emits_closed_without_waiting_for_blocked_decode
         events
             .iter()
             .any(|event| event.event_type == "session.closed")
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event_type != "history.recorded")
     );
 
     release_sender.send(()).expect("release blocked decode");
@@ -4117,7 +4156,9 @@ async fn native_streaming_finish_forwards_final_and_records_history() {
     session
         .attach_native_streaming_session(
             test_native_streaming_worker_key("finish-final"),
-            Box::new(TestServerNativeSession::new(session.session_id.0.clone())),
+            Box::new(TestServerNativeSession::with_terminal_events(
+                session.session_id.0.clone(),
+            )),
         )
         .await
         .unwrap();
@@ -4131,11 +4172,25 @@ async fn native_streaming_finish_forwards_final_and_records_history() {
     assert!(session.native_streaming.is_none());
     assert!(session.closed);
 
-    let event = event_receiver
-        .try_recv()
-        .expect("native streaming finish emits a final transcript event");
-    assert_eq!(event.event_type, "transcript.final");
-    match event.event {
+    let events = collect_events(&mut event_receiver).await;
+    let event_types = events
+        .iter()
+        .map(|event| event.event_type)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        event_types,
+        vec![
+            "transcript.final",
+            "history.recorded",
+            "audio.input.stopped",
+            "session.closed"
+        ]
+    );
+    assert_eq!(
+        events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+    match &events[0].event {
         RealtimeEvent::Transcript(RealtimeTranscriptEvent::Final(final_event)) => {
             assert_eq!(final_event.text, "native final");
             assert_eq!(final_event.start_ms, 0);
@@ -4143,7 +4198,13 @@ async fn native_streaming_finish_forwards_final_and_records_history() {
         }
         other => panic!("expected transcript.final, got {other:?}"),
     }
-    assert!(event_receiver.try_recv().is_err());
+    match &events[1].event {
+        RealtimeEvent::History(RealtimeHistoryEvent::Recorded(receipt)) => {
+            assert!(receipt.history_id.starts_with("hist-"));
+            assert_eq!(receipt.history_revision, 0);
+        }
+        other => panic!("expected history.recorded, got {other:?}"),
+    }
 
     let history = DaemonHistoryStore::open(&openasr_home)
         .list()
@@ -5253,7 +5314,7 @@ async fn finish_records_completed_websocket_session_history() {
         .to_string(),
     )
     .unwrap();
-    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), distribution, event_sender);
     let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
         "test_session",
@@ -5273,6 +5334,28 @@ async fn finish_records_completed_websocket_session_history() {
     session.history_duration_ms = 1_240;
 
     session.finish("client_closed", true).await.unwrap();
+
+    let events = collect_events(&mut event_receiver).await;
+    let receipt_index = events
+        .iter()
+        .position(|event| event.event_type == "history.recorded")
+        .expect("completed local history emits an identity receipt");
+    let stopped_index = events
+        .iter()
+        .position(|event| event.event_type == "audio.input.stopped")
+        .expect("session emits audio.input.stopped");
+    let closed_index = events
+        .iter()
+        .position(|event| event.event_type == "session.closed")
+        .expect("session emits session.closed");
+    assert!(receipt_index < stopped_index && stopped_index < closed_index);
+    match &events[receipt_index].event {
+        RealtimeEvent::History(RealtimeHistoryEvent::Recorded(receipt)) => {
+            assert!(receipt.history_id.starts_with("hist-"));
+            assert_eq!(receipt.history_revision, 0);
+        }
+        other => panic!("expected history receipt, got {other:?}"),
+    }
 
     let store = DaemonHistoryStore::open(temp.path());
     let entries = store.list().unwrap();
@@ -5314,7 +5397,7 @@ async fn finish_skips_websocket_session_history_when_retention_off() {
         .to_string(),
     )
     .unwrap();
-    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new(ServerRuntime::default(), distribution, event_sender);
     let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
         "test_session",
@@ -5335,6 +5418,13 @@ async fn finish_skips_websocket_session_history_when_retention_off() {
 
     session.finish("client_closed", true).await.unwrap();
 
+    assert!(
+        collect_events(&mut event_receiver)
+            .await
+            .iter()
+            .all(|event| event.event_type != "history.recorded")
+    );
+
     let store = DaemonHistoryStore::open(temp.path());
     assert!(store.list().unwrap().is_empty());
 }
@@ -5347,7 +5437,7 @@ async fn remote_compute_websocket_session_does_not_record_server_history() {
         catalog_url: None,
         catalog_local_override: None,
     });
-    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session =
         WsSession::new_with_history(ServerRuntime::default(), distribution, event_sender, false);
     let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
@@ -5368,6 +5458,13 @@ async fn remote_compute_websocket_session_does_not_record_server_history() {
     session.history_duration_ms = 1_240;
 
     session.finish("client_closed", true).await.unwrap();
+
+    assert!(
+        collect_events(&mut event_receiver)
+            .await
+            .iter()
+            .all(|event| event.event_type != "history.recorded")
+    );
 
     let store = DaemonHistoryStore::open(temp.path());
     let entries = store.list().unwrap();

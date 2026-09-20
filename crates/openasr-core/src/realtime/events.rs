@@ -62,6 +62,7 @@ pub enum RealtimeEvent {
     AudioInput(RealtimeAudioInputEvent),
     Vad(RealtimeVadEvent),
     Transcript(RealtimeTranscriptEvent),
+    History(RealtimeHistoryEvent),
     Error(RealtimeErrorEvent),
 }
 
@@ -72,6 +73,7 @@ impl RealtimeEvent {
             Self::AudioInput(event) => event.event_type(),
             Self::Vad(event) => event.event_type(),
             Self::Transcript(event) => event.event_type(),
+            Self::History(event) => event.event_type(),
             Self::Error(_) => "error",
         }
     }
@@ -138,6 +140,31 @@ pub struct SessionVadSummary {
 #[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
 pub struct SessionClosedEvent {
     pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum RealtimeHistoryEvent {
+    Recorded(RealtimeHistoryRecordedEvent),
+}
+
+impl RealtimeHistoryEvent {
+    fn event_type(&self) -> &'static str {
+        match self {
+            Self::Recorded(_) => "history.recorded",
+        }
+    }
+}
+
+/// Receipt issued only after this realtime session's daemon-history row was
+/// committed. Clients must use this identity rather than matching transcript
+/// text or timestamps to associate derived content with saved history.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/realtime-wire/"))]
+pub struct RealtimeHistoryRecordedEvent {
+    pub history_id: String,
+    pub history_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
