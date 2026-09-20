@@ -552,69 +552,46 @@ async fn handle_websocket(
     let _ = writer.await;
 }
 
-fn held_native_realtime() -> &'static Mutex<HashMap<String, NativeStreamingDecodeWorker>> {
-    static HELD: OnceLock<Mutex<HashMap<String, NativeStreamingDecodeWorker>>> = OnceLock::new();
-    HELD.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
+/// Owned by the server's reconnect policy, never a process-global registry.
 pub(crate) struct ParkedRealtimeControl {
+    pub(crate) native_streaming: Option<NativeStreamingDecodeWorker>,
     pub(crate) controller: Option<RealtimeSessionController>,
     pub(crate) streaming_diarizer: Option<openasr_core::diarize::streaming::StreamingDiarizer>,
     pub(crate) native_speaker_change_detector:
         Option<openasr_core::diarize::streaming::StreamingSpeakerChangeDetector>,
 }
 
-fn parked_realtime_control() -> &'static Mutex<HashMap<String, ParkedRealtimeControl>> {
-    static HELD: OnceLock<Mutex<HashMap<String, ParkedRealtimeControl>>> = OnceLock::new();
-    HELD.get_or_init(|| Mutex::new(HashMap::new()))
+impl std::fmt::Debug for ParkedRealtimeControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParkedRealtimeControl")
+            .field("native_streaming", &self.native_streaming.is_some())
+            .field("controller", &self.controller.is_some())
+            .field("streaming_diarizer", &self.streaming_diarizer.is_some())
+            .field(
+                "native_speaker_change_detector",
+                &self.native_speaker_change_detector.is_some(),
+            )
+            .finish()
+    }
 }
 
-pub(crate) fn park_realtime_control(session_id: String, parked: ParkedRealtimeControl) {
-    parked_realtime_control()
-        .lock()
-        .expect("parked realtime control mutex poisoned")
-        .insert(session_id, parked);
-}
-
-pub(crate) fn take_parked_realtime_control(session_id: &str) -> Option<ParkedRealtimeControl> {
-    parked_realtime_control()
-        .lock()
-        .expect("parked realtime control mutex poisoned")
-        .remove(session_id)
-}
-
-pub(crate) fn park_native_realtime_worker(session_id: String, worker: NativeStreamingDecodeWorker) {
-    held_native_realtime()
-        .lock()
-        .expect("held native realtime registry mutex poisoned")
-        .insert(session_id, worker);
-}
-
-pub(crate) fn take_parked_native_realtime_worker(
-    session_id: &str,
-) -> Option<NativeStreamingDecodeWorker> {
-    held_native_realtime()
-        .lock()
-        .expect("held native realtime registry mutex poisoned")
-        .remove(session_id)
+impl Drop for ParkedRealtimeControl {
+    fn drop(&mut self) {
+        if let Some(worker) = self.native_streaming.take() {
+            worker.detach_cancel();
+        }
+    }
 }
 
 pub(crate) fn spawn_held_realtime_expiry(
     policy: crate::RemoteRuntimePolicy,
     runtime: ServerRuntime,
     distribution: DistributionContext,
-    _session_id: String,
 ) {
     let grace = policy.reconnect_grace();
     tokio::spawn(async move {
         tokio::time::sleep(grace).await;
-        for (id, control) in policy.expire_held_realtime(SystemTime::now()) {
-            control.request_cancel();
-            if let Some(worker) = take_parked_native_realtime_worker(&id) {
-                worker.detach_cancel();
-            }
-            let _ = take_parked_realtime_control(&id);
-        }
+        policy.expire_held_realtime(SystemTime::now());
         crate::schedule_apply_pending_idle_switch_when_native_idle(runtime, distribution);
     });
 }

@@ -854,6 +854,39 @@ struct BlockingPushPollNativeSession {
     poll_calls: Arc<AtomicUsize>,
 }
 
+struct ShutdownNativeSession {
+    inner: TestServerNativeSession,
+    _resource: Arc<AtomicUsize>,
+}
+
+impl Drop for ShutdownNativeSession {
+    fn drop(&mut self) {
+        // Make premature process teardown deterministic instead of scheduler-dependent.
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+impl NativeAsrSession for ShutdownNativeSession {
+    fn session_id(&self) -> &str {
+        self.inner.session_id()
+    }
+    fn push_audio(
+        &mut self,
+        frame: RealtimeAudioFrame,
+    ) -> Result<Vec<RealtimeEventEnvelope>, openasr_core::NativeAsrError> {
+        self.inner.push_audio(frame)
+    }
+    fn poll_events(&mut self) -> Result<Vec<RealtimeEventEnvelope>, openasr_core::NativeAsrError> {
+        self.inner.poll_events()
+    }
+    fn finish(&mut self) -> Result<Vec<RealtimeEventEnvelope>, openasr_core::NativeAsrError> {
+        self.inner.finish()
+    }
+    fn cancel(&mut self) -> Result<Vec<RealtimeEventEnvelope>, openasr_core::NativeAsrError> {
+        self.inner.cancel()
+    }
+}
+
 impl NativeAsrSession for BlockingPushPollNativeSession {
     fn session_id(&self) -> &str {
         &self.session_id
@@ -3583,6 +3616,7 @@ async fn failed_native_streaming_attach_send_retires_the_activity_guard() {
             outcomes: outcome_tx,
             finalize_requested: Arc::new(AtomicBool::new(false)),
             token,
+            completion: NativeStreamingCompletion::new().1,
         })
         .await;
     assert!(
@@ -4580,6 +4614,187 @@ async fn fallback_capacity_rejection_is_backend_not_ready_and_recoverable() {
         })
     ));
     drop(occupied_slot);
+}
+
+#[test]
+fn runtime_shutdown_drops_parked_native_resources_before_grace_expires() {
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let resource = Arc::new(AtomicUsize::new(0));
+    let weak = Arc::downgrade(&resource);
+    let temp = tempfile::tempdir().unwrap();
+    let control = executor.block_on(async move {
+        let (sender, _receiver) = mpsc::channel(8);
+        let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), sender);
+        session.controller = Some(started_controller("parked-at-shutdown", "test-model"));
+        session.native_streaming = Some(
+            NativeStreamingDecodeWorker::attach(
+                NativeStreamingWorkerKey::new(
+                    temp.path().join("shutdown.oasr"),
+                    openasr_core::NativeAsrHardwareTarget::Cpu,
+                    None,
+                ),
+                Box::new(ShutdownNativeSession {
+                    inner: TestServerNativeSession::new(session.session_id.0.clone()),
+                    _resource: resource,
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let control = Arc::clone(&session.backend_control);
+        session.finish("transport_closed", true).await.unwrap();
+        control
+    });
+    assert!(
+        weak.upgrade().is_some(),
+        "the reconnect window owns native resources"
+    );
+    assert!(!control.is_canceled());
+    drop(executor); // Cancels the expiry task before its 30-second sleep completes.
+    assert!(
+        weak.upgrade().is_none(),
+        "shutdown must release native resources"
+    );
+    assert!(control.is_canceled());
+}
+
+#[test]
+fn expired_held_native_session_waits_for_resource_drop_before_policy_shutdown() {
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let resource = Arc::new(AtomicUsize::new(0));
+    let weak = Arc::downgrade(&resource);
+    let temp = tempfile::tempdir().unwrap();
+    let control = executor.block_on(async move {
+        let runtime = ServerRuntime::default();
+        let policy = runtime.native_execution.remote_policy().clone();
+        let (sender, _receiver) = mpsc::channel(8);
+        let mut session = WsSession::new(runtime, test_distribution(), sender);
+        session.controller = Some(started_controller("expired-native", "test-model"));
+        session.native_streaming = Some(
+            NativeStreamingDecodeWorker::attach(
+                NativeStreamingWorkerKey::new(
+                    temp.path().join("expired.oasr"),
+                    openasr_core::NativeAsrHardwareTarget::Cpu,
+                    None,
+                ),
+                Box::new(ShutdownNativeSession {
+                    inner: TestServerNativeSession::new(session.session_id.0.clone()),
+                    _resource: resource,
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let control = Arc::clone(&session.backend_control);
+        let session_id = session.session_id.0.clone();
+        session.finish("transport_closed", true).await.unwrap();
+
+        let expired =
+            policy.expire_held_realtime(std::time::SystemTime::now() + Duration::from_secs(31));
+        assert_eq!(expired.len(), 1, "the parked native session must expire");
+        assert!(control.is_canceled(), "expiry must cancel the held session");
+        assert_eq!(expired[0].0, session_id);
+        control
+    });
+    drop(executor);
+    assert!(
+        weak.upgrade().is_none(),
+        "the final policy owner must wait for the native session resource to drop"
+    );
+    assert!(control.is_canceled());
+}
+
+#[tokio::test]
+async fn held_realtime_resume_restores_all_native_session_resources() {
+    static EMBEDDER: FixedSpeakerEmbedder = FixedSpeakerEmbedder;
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = ServerRuntime::default();
+    let (sender, _receiver) = mpsc::channel(8);
+    let mut parked = WsSession::new(runtime.clone(), test_distribution(), sender);
+    parked.controller = Some(started_controller(
+        &parked.session_id.0,
+        "whisper-large-v3-turbo",
+    ));
+    parked.streaming_diarizer =
+        Some(openasr_core::diarize::streaming::StreamingDiarizer::with_embedder(&EMBEDDER, 16_000));
+    parked.native_speaker_change_detector = Some(
+        openasr_core::diarize::streaming::StreamingSpeakerChangeDetector::with_embedder(
+            &EMBEDDER, 16_000,
+        ),
+    );
+    parked.native_streaming = Some(
+        NativeStreamingDecodeWorker::attach(
+            NativeStreamingWorkerKey::new(
+                temp.path().join("resume.oasr"),
+                openasr_core::NativeAsrHardwareTarget::Cpu,
+                None,
+            ),
+            Box::new(TestServerNativeSession::new(parked.session_id.0.clone())),
+        )
+        .await
+        .unwrap(),
+    );
+    let session_id = parked.session_id.0.clone();
+    let control = Arc::clone(&parked.backend_control);
+    let cancel_requested = Arc::clone(
+        &parked
+            .native_streaming
+            .as_ref()
+            .expect("native worker")
+            .token
+            .cancel_requested,
+    );
+
+    parked.finish("transport_closed", true).await.unwrap();
+    assert!(parked.native_streaming.is_none());
+    assert!(parked.controller.is_none());
+    assert!(parked.streaming_diarizer.is_none());
+    assert!(parked.native_speaker_change_detector.is_none());
+
+    let (sender, mut receiver) = mpsc::channel(8);
+    let mut resumed = WsSession::new(runtime, test_distribution(), sender);
+    resumed
+        .start_session(StartSession {
+            session_id: Some(session_id),
+            ..StartSession::default()
+        })
+        .await
+        .expect("the held session must resume");
+    assert!(resumed.native_streaming.is_some());
+    assert!(resumed.controller.is_some());
+    assert!(resumed.streaming_diarizer.is_some());
+    assert!(resumed.native_speaker_change_detector.is_some());
+    assert!(!control.is_canceled());
+    assert!(!cancel_requested.load(Ordering::Acquire));
+    assert_eq!(
+        receiver.recv().await.unwrap().event_type,
+        "audio.input.started"
+    );
+
+    assert!(resumed.cancel("client_cancelled").await.is_err());
+    assert!(resumed.closed);
+    assert!(resumed.native_streaming.is_none());
+    assert!(cancel_requested.load(Ordering::Acquire));
+}
+
+#[test]
+fn native_streaming_completion_deadline_requires_guard_drop() {
+    let (completion, guard) = NativeStreamingCompletion::new();
+    assert!(
+        !completion.wait_until(Instant::now()),
+        "an undropped completion guard must not report completion after its deadline"
+    );
+    drop(guard);
+    assert!(
+        completion.wait_until(Instant::now()),
+        "dropping the completion guard must make completion immediately observable"
+    );
 }
 
 #[tokio::test]

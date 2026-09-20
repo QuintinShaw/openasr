@@ -791,30 +791,28 @@ impl WsSession {
 
     fn park_for_reconnect(&mut self) {
         let policy = self.runtime.native_execution.remote_policy();
-        policy.hold_realtime(
+        policy.hold_realtime_at(
             self.session_id.0.clone(),
             Arc::clone(&self.backend_control),
             self.pairing_device_id.clone(),
-        );
-        super::park_realtime_control(
-            self.session_id.0.clone(),
-            super::ParkedRealtimeControl {
+            SystemTime::now(),
+            Some(super::ParkedRealtimeControl {
+                native_streaming: self.native_streaming.take(),
                 controller: self.controller.take(),
                 streaming_diarizer: self.streaming_diarizer.take(),
                 native_speaker_change_detector: self.native_speaker_change_detector.take(),
-            },
+            }),
         );
         super::spawn_held_realtime_expiry(
             policy.clone(),
             self.runtime.clone(),
             self.distribution.clone(),
-            self.session_id.0.clone(),
         );
     }
 
     async fn resume_held_realtime(&mut self, resume_id: &str) -> Result<(), ()> {
         let policy = self.runtime.native_execution.remote_policy();
-        let Some(control) = policy.resume_realtime(
+        let Some(held) = policy.resume_realtime(
             resume_id,
             SystemTime::now(),
             self.pairing_device_id.as_deref(),
@@ -830,15 +828,13 @@ impl WsSession {
         };
         self.session_id = RealtimeSessionId(resume_id.to_string());
         self.sequencer = RealtimeEventSequencer::new(self.session_id.clone());
-        self.backend_control = control;
+        self.backend_control = held.control;
         self.closed = false;
-        if let Some(worker) = super::take_parked_native_realtime_worker(resume_id) {
-            self.native_streaming = Some(worker);
-        }
-        if let Some(parked) = super::take_parked_realtime_control(resume_id) {
-            self.controller = parked.controller;
-            self.streaming_diarizer = parked.streaming_diarizer;
-            self.native_speaker_change_detector = parked.native_speaker_change_detector;
+        if let Some(mut parked) = held.resources {
+            self.native_streaming = parked.native_streaming.take();
+            self.controller = parked.controller.take();
+            self.streaming_diarizer = parked.streaming_diarizer.take();
+            self.native_speaker_change_detector = parked.native_speaker_change_detector.take();
         }
         // A resumed Running session must emit audio.input.started so the
         // client handshake can complete.
@@ -3030,9 +3026,6 @@ impl WsSession {
                 self.closed = true;
                 self.observe_idle_for_pending_switch();
                 return Ok(());
-            }
-            if let Some(worker) = self.native_streaming.take() {
-                super::park_native_realtime_worker(self.session_id.0.clone(), worker);
             }
             self.park_for_reconnect();
             self.closed = true;

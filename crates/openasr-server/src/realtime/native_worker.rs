@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -427,6 +427,59 @@ impl NativeStreamingOutcome {
     }
 }
 
+/// Signals destruction of an attached session, not merely delivery of its last event.
+#[derive(Debug, Default)]
+pub(crate) struct NativeStreamingCompletion {
+    finished: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl NativeStreamingCompletion {
+    pub(crate) fn new() -> (Arc<Self>, NativeStreamingCompletionGuard) {
+        let completion = Arc::new(Self::default());
+        (
+            Arc::clone(&completion),
+            NativeStreamingCompletionGuard(completion),
+        )
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        *self
+            .finished
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub(crate) fn wait_until(&self, deadline: Instant) -> bool {
+        let finished = self
+            .finished
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (finished, _) = self
+            .changed
+            .wait_timeout_while(
+                finished,
+                deadline.saturating_duration_since(Instant::now()),
+                |done| !*done,
+            )
+            .unwrap_or_else(|error| error.into_inner());
+        *finished
+    }
+}
+
+pub(crate) struct NativeStreamingCompletionGuard(Arc<NativeStreamingCompletion>);
+
+impl Drop for NativeStreamingCompletionGuard {
+    fn drop(&mut self) {
+        *self
+            .0
+            .finished
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+        self.0.changed.notify_all();
+    }
+}
+
 pub(crate) enum NativeStreamingWorkerMessage {
     Attach {
         session: Box<dyn NativeAsrSession>,
@@ -449,6 +502,8 @@ pub(crate) enum NativeStreamingWorkerMessage {
         /// blocking decode cannot be overlapped -- only a decode watchdog or a
         /// same-key preemption may reclaim it earlier, via `AttachToken::abandon`.
         token: Arc<AttachToken>,
+        // Last field: a never-received message drops the native session first.
+        completion: NativeStreamingCompletionGuard,
     },
 }
 
@@ -459,6 +514,7 @@ pub(crate) enum NativeStreamingWorkerMessage {
 /// time (bounded by the existing watchdog), so frame order and emitted events
 /// remain deterministic.
 pub(crate) struct NativeStreamingDecodeWorker {
+    completion: Arc<NativeStreamingCompletion>,
     pub(crate) commands: mpsc::Sender<NativeStreamingCommandEnvelope>,
     pub(crate) outcomes: mpsc::Receiver<NativeStreamingOutcome>,
     pub(crate) finalize_requested: Arc<AtomicBool>,
@@ -509,6 +565,7 @@ impl NativeStreamingDecodeWorker {
         // itself when it actually begins processing this attach, so a queued
         // attach never stomps the occupant record of the one still running.
         let token = AttachToken::new(worker.activity, model_session_permit);
+        let (completion, completion_guard) = NativeStreamingCompletion::new();
         // On success the worker thread owns retiring the guard and the permit
         // (once, after it finishes this session, or earlier if a
         // watchdog/preemption trigger releases them first -- both releases are
@@ -524,6 +581,7 @@ impl NativeStreamingDecodeWorker {
                 outcomes: outcome_tx,
                 finalize_requested: Arc::clone(&finalize_requested),
                 token: Arc::clone(&token),
+                completion: completion_guard,
             })
             .await
         {
@@ -534,6 +592,7 @@ impl NativeStreamingDecodeWorker {
             return Err("native streaming worker stopped before session attach".to_string());
         }
         Ok(Self {
+            completion,
             commands: command_tx,
             outcomes: outcome_rx,
             finalize_requested,
@@ -571,6 +630,14 @@ impl NativeStreamingDecodeWorker {
         // path releases the guard, not the big-budget watchdog").
         self.token.activity.release();
         drop(self.commands);
+    }
+
+    pub(crate) fn begin_shutdown(self) -> Arc<NativeStreamingCompletion> {
+        let completion = Arc::clone(&self.completion);
+        // Also drops the outcome receiver, so the worker cannot remain blocked
+        // sending an event to a client that no longer exists.
+        self.detach_cancel();
+        completion
     }
 }
 
@@ -874,6 +941,7 @@ pub(crate) fn spawn_native_streaming_worker(
                         outcomes,
                         finalize_requested,
                         token,
+                        completion,
                     } => {
                         // Record this attach as the current occupant only now,
                         // as the thread actually begins driving it -- so
@@ -910,6 +978,7 @@ pub(crate) fn spawn_native_streaming_worker(
                         state.release();
                         token.activity.release();
                         drop(token.take_permit());
+                        drop(completion);
                     }
                 }
             }
