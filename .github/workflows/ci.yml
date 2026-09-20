@@ -159,6 +159,8 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       # The Linux gate (job `test`) compiles the Linux backend natively and
       # cross-checks Windows, but the macOS CoreAudio backend (the largest
@@ -166,8 +168,9 @@ jobs:
       # macOS runner so a CoreAudio-backend break fails CI.
       - name: macOS system-audio backend gate
         run: |
-          cargo check --manifest-path tooling/system-audio-check/Cargo.toml
-          cargo test --manifest-path tooling/system-audio-check/Cargo.toml -- --nocapture
+          cargo clippy --locked -p openasr-system-audio --all-targets -- -D warnings
+          cargo test --locked -p openasr-system-audio -- --nocapture
+          cargo test --locked --manifest-path tooling/system-audio-check/Cargo.toml -- --nocapture
 
   ios-compile:
     name: iOS compile gate (aarch64-apple-ios)

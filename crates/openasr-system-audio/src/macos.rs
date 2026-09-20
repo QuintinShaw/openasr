@@ -943,27 +943,6 @@ impl CoreAudioPcmConverter {
         }
     }
 
-    fn convert_buffer_list(
-        &mut self,
-        input_data: &AudioBufferList,
-    ) -> Result<Vec<i16>, CaptureBackendError> {
-        let buffers = audio_buffers(input_data);
-        if buffers.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mono = if self.format.non_interleaved {
-            self.decode_non_interleaved(buffers)
-        } else {
-            self.decode_interleaved(&buffers[0])
-        }?;
-        let mut output = Vec::with_capacity(
-            (mono.len() as f64 * TARGET_SAMPLE_RATE_HZ as f64 / self.format.sample_rate_hz).ceil()
-                as usize,
-        );
-        self.resampler.push(&mono, &mut output);
-        Ok(output)
-    }
-
     fn convert_raw_slot(&mut self, slot: &RawAudioSlot) -> Result<Vec<i16>, CaptureBackendError> {
         if slot.buffer_count == 0 {
             return Ok(Vec::new());
@@ -979,16 +958,6 @@ impl CoreAudioPcmConverter {
         );
         self.resampler.push(&mono, &mut output);
         Ok(output)
-    }
-
-    fn decode_interleaved(&self, buffer: &AudioBuffer) -> Result<Vec<f32>, CaptureBackendError> {
-        let data = audio_buffer_bytes(buffer)?;
-        let channels = if buffer.mNumberChannels > 0 {
-            buffer.mNumberChannels as usize
-        } else {
-            self.format.channels
-        };
-        self.decode_interleaved_bytes(data, channels)
     }
 
     fn decode_interleaved_bytes(
@@ -1026,40 +995,6 @@ impl CoreAudioPcmConverter {
             if count > 0 {
                 mono.push(sum / count as f32);
             }
-        }
-        Ok(mono)
-    }
-
-    fn decode_non_interleaved(
-        &self,
-        buffers: &[AudioBuffer],
-    ) -> Result<Vec<f32>, CaptureBackendError> {
-        let channel_count = buffers.len().min(self.format.channels).max(1);
-        let mut channel_bytes = Vec::with_capacity(channel_count);
-        for buffer in buffers.iter().take(channel_count) {
-            channel_bytes.push(audio_buffer_bytes(buffer)?);
-        }
-        if self.format.bytes_per_sample == 0 {
-            return Ok(Vec::new());
-        }
-        let frames = channel_bytes
-            .iter()
-            .map(|bytes| bytes.len() / self.format.bytes_per_sample)
-            .min()
-            .unwrap_or(0);
-
-        let mut mono = Vec::with_capacity(frames);
-        for frame_index in 0..frames {
-            let mut sum = 0.0_f32;
-            for bytes in &channel_bytes {
-                let sample_offset = frame_index * self.format.bytes_per_sample;
-                let sample_end = sample_offset.saturating_add(self.format.bytes_per_sample);
-                if sample_end > bytes.len() {
-                    return Ok(mono);
-                }
-                sum += self.decode_sample(&bytes[sample_offset..sample_end])?;
-            }
-            mono.push(sum / channel_bytes.len() as f32);
         }
         Ok(mono)
     }
@@ -1231,15 +1166,6 @@ fn audio_buffers(input_data: &AudioBufferList) -> &[AudioBuffer] {
         return &[];
     }
     unsafe { std::slice::from_raw_parts(input_data.mBuffers.as_ptr(), count) }
-}
-
-fn audio_buffer_bytes(buffer: &AudioBuffer) -> Result<&[u8], CaptureBackendError> {
-    if buffer.mDataByteSize == 0 || buffer.mData.is_null() {
-        return Ok(&[]);
-    }
-    Ok(unsafe {
-        std::slice::from_raw_parts(buffer.mData.cast::<u8>(), buffer.mDataByteSize as usize)
-    })
 }
 
 fn float_to_i16(value: f32) -> i16 {
@@ -1591,7 +1517,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_raw_slot_matches_buffer_list_path() {
+    fn convert_raw_slot_from_copied_slot_preserves_expected_mix() {
         let format = CoreAudioPcmFormat {
             sample_rate_hz: 16_000.0,
             channels: 2,
@@ -1617,13 +1543,9 @@ mod tests {
         let mut slot = RawAudioSlot::new();
         assert!(slot.copy_from(&list, &format));
 
-        let from_list = CoreAudioPcmConverter::new(format)
-            .convert_buffer_list(&list)
-            .expect("list");
         let from_slot = CoreAudioPcmConverter::new(format)
             .convert_raw_slot(&slot)
             .expect("slot");
-        assert_eq!(from_list, from_slot);
         assert_eq!(from_slot, vec![0, 16384]);
     }
 
@@ -1661,7 +1583,7 @@ mod tests {
     }
 
     #[test]
-    fn mixes_interleaved_stereo_float_samples() {
+    fn mixes_copied_interleaved_stereo_float_samples() {
         let format = CoreAudioPcmFormat {
             sample_rate_hz: 16_000.0,
             channels: 2,
@@ -1671,7 +1593,6 @@ mod tests {
             big_endian: false,
             encoding: SampleEncoding::Float32,
         };
-        let mut converter = CoreAudioPcmConverter::new(format);
         let mut raw = Vec::new();
         for sample in [1.0_f32, -1.0, 0.5, 0.5] {
             raw.extend_from_slice(&sample.to_le_bytes());
@@ -1685,8 +1606,12 @@ mod tests {
             mNumberBuffers: 1,
             mBuffers: [buffer],
         };
+        let mut slot = RawAudioSlot::new();
+        assert!(slot.copy_from(&list, &format));
 
-        let output = converter.convert_buffer_list(&list).expect("convert");
+        let output = CoreAudioPcmConverter::new(format)
+            .convert_raw_slot(&slot)
+            .expect("convert");
 
         assert_eq!(output, vec![0, 16384]);
     }
@@ -1727,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_buffer_list_returns_empty_on_zero_buffers() {
+    fn copied_zero_buffers_convert_to_empty() {
         let format = CoreAudioPcmFormat {
             sample_rate_hz: 16_000.0,
             channels: 1,
@@ -1737,7 +1662,6 @@ mod tests {
             big_endian: false,
             encoding: SampleEncoding::Float32,
         };
-        let mut converter = CoreAudioPcmConverter::new(format);
         let list = AudioBufferList {
             mNumberBuffers: 0,
             mBuffers: [AudioBuffer {
@@ -1746,12 +1670,16 @@ mod tests {
                 mData: ptr::null_mut(),
             }],
         };
-        let output = converter.convert_buffer_list(&list).expect("convert");
+        let mut slot = RawAudioSlot::new();
+        assert!(!slot.copy_from(&list, &format));
+        let output = CoreAudioPcmConverter::new(format)
+            .convert_raw_slot(&slot)
+            .expect("convert");
         assert!(output.is_empty());
     }
 
     #[test]
-    fn convert_buffer_list_rejects_truncated_sample() {
+    fn copied_truncated_sample_converts_to_empty() {
         let format = CoreAudioPcmFormat {
             sample_rate_hz: 16_000.0,
             channels: 1,
@@ -1761,7 +1689,6 @@ mod tests {
             big_endian: false,
             encoding: SampleEncoding::Float32,
         };
-        let mut converter = CoreAudioPcmConverter::new(format);
         let mut raw = vec![0_u8; 3];
         let buffer = AudioBuffer {
             mNumberChannels: 1,
@@ -1772,7 +1699,11 @@ mod tests {
             mNumberBuffers: 1,
             mBuffers: [buffer],
         };
-        let output = converter.convert_buffer_list(&list).expect("convert");
+        let mut slot = RawAudioSlot::new();
+        assert!(slot.copy_from(&list, &format));
+        let output = CoreAudioPcmConverter::new(format)
+            .convert_raw_slot(&slot)
+            .expect("convert");
         assert!(output.is_empty());
     }
 
