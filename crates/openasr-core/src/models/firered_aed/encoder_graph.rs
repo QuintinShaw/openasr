@@ -66,6 +66,9 @@ const FIRERED_ENCODER_LAYER_NORM_EPSILON: f32 = 1.0e-5;
 /// encoder pads the time axis by `context - 1` zero frames before the stem
 /// (`fireredasr` `ConformerEncoder.forward(..., pad=True)`).
 const SUBSAMPLE_CONTEXT_PAD_FRAMES: usize = 6;
+/// Two valid convolutions (kernel 3, stride 2) need seven original frames
+/// for one unmasked encoder position: (1 - 1) * 2 + 3, then (3 - 1) * 2 + 3.
+pub(crate) const MIN_ENCODER_INPUT_FRAMES: usize = 7;
 
 /// Starts a diagnostic component owner for a FireRed graph runtime. The receipt
 /// is deliberately independent of admission and carries only the keyed content
@@ -289,6 +292,10 @@ pub(crate) fn predicted_encoder_time_frames(n_frames: usize) -> Result<usize, Fi
     conv_out_dim(conv1_time, 3, 2)
 }
 
+pub(crate) fn valid_encoder_time_frames(n_frames: usize) -> Result<usize, FireRedEncoderError> {
+    conv_out_dim(conv_out_dim(n_frames, 3, 2)?, 3, 2)
+}
+
 /// Run the full encoder forward pass in a single ggml graph (no incremental
 /// reuse -- matches cohere's/parakeet's single-shot encoder shape) against an
 /// already-loaded runner/weights pair.
@@ -329,7 +336,7 @@ fn encode_firered_aed_audio_embeddings(
     // at/after this index are context-pad artifacts and must be masked out of
     // every layer's self-attention (upstream `src_mask`), or the last couple of
     // encoder frames leak zero-padded conv output into every frame's context.
-    let valid_frame_count = conv_out_dim(conv_out_dim(n_frames, 3, 2)?, 3, 2)?.min(frame_count);
+    let valid_frame_count = valid_encoder_time_frames(n_frames)?.min(frame_count);
 
     let mut graph = runner.start_graph();
     let mel = graph
@@ -1412,7 +1419,7 @@ pub(crate) fn encode_with_layer_taps(
         return Err(FireRedEncoderError::ShapeOverflow);
     }
     let frame_count = predicted_encoder_time_frames(n_frames)?;
-    let valid_frame_count = conv_out_dim(conv_out_dim(n_frames, 3, 2)?, 3, 2)?.min(frame_count);
+    let valid_frame_count = valid_encoder_time_frames(n_frames)?.min(frame_count);
 
     let mut graph = runner.start_graph();
     let mel = graph
