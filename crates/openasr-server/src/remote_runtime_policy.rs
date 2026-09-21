@@ -538,7 +538,10 @@ impl RemoteRuntimePolicy {
         !self.lock().held_realtime.is_empty()
     }
 
-    fn track_retired(&self, completion: Option<Arc<crate::realtime::NativeStreamingCompletion>>) {
+    pub(crate) fn track_retired(
+        &self,
+        completion: Option<Arc<crate::realtime::NativeStreamingCompletion>>,
+    ) {
         let mut inner = self.lock();
         inner
             .retired_native

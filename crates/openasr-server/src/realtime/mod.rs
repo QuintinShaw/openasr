@@ -548,7 +548,7 @@ async fn handle_websocket(
 
     let _ = session.finish("transport_closed", true).await;
     session.observe_idle_for_pending_switch();
-    drop(session.event_sender);
+    drop(session);
     let _ = writer.await;
 }
 

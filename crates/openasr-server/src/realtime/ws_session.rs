@@ -169,6 +169,9 @@ pub(crate) struct WsSession {
     /// checkpoint, instead of only suppressing the result after it finishes
     /// on its own. See [`openasr_core::RequestExecutionContext`].
     pub(crate) backend_control: Arc<openasr_core::TranscriptionControl>,
+    /// A parked connection handed this control and its resources to the
+    /// reconnect policy. Dropping the old socket must not cancel that owner.
+    backend_control_parked: bool,
     pub(crate) pending_backend_jobs: usize,
     pub(crate) audio_frames: mpsc::Sender<RealtimeAudioFrame>,
     pub(crate) audio_frame_receiver: mpsc::Receiver<RealtimeAudioFrame>,
@@ -263,6 +266,17 @@ pub(crate) struct WsSession {
 #[cfg(test)]
 pub(crate) type NativeStreamingSessionFactory =
     Arc<dyn Fn() -> Result<Box<dyn NativeAsrSession>, openasr_core::NativeAsrError> + Send + Sync>;
+
+impl Drop for WsSession {
+    fn drop(&mut self) {
+        if !self.backend_control_parked {
+            // Runtime shutdown can drop this future while it awaits a blocking
+            // speaker task, before the normal transport-close handler runs.
+            self.cancel_backend_jobs();
+        }
+        self.retire_native_streaming();
+    }
+}
 
 pub(crate) enum NativePendingSpeakerSlot {
     DeferredSamples(Vec<f32>),
@@ -557,6 +571,7 @@ impl WsSession {
             backend_result_sender: None,
             backend_cancelled: Arc::new(AtomicBool::new(false)),
             backend_control: Arc::new(openasr_core::TranscriptionControl::new()),
+            backend_control_parked: false,
             pending_backend_jobs: 0,
             audio_frames,
             audio_frame_receiver,
@@ -803,6 +818,7 @@ impl WsSession {
                 native_speaker_change_detector: self.native_speaker_change_detector.take(),
             }),
         );
+        self.backend_control_parked = true;
         super::spawn_held_realtime_expiry(
             policy.clone(),
             self.runtime.clone(),
@@ -829,6 +845,7 @@ impl WsSession {
         self.session_id = RealtimeSessionId(resume_id.to_string());
         self.sequencer = RealtimeEventSequencer::new(self.session_id.clone());
         self.backend_control = held.control;
+        self.backend_control_parked = false;
         self.closed = false;
         if let Some(mut parked) = held.resources {
             self.native_streaming = parked.native_streaming.take();
@@ -855,9 +872,10 @@ impl WsSession {
     }
 
     fn attach_anonymous_streaming_diarizer(&mut self) -> Result<(), String> {
-        match openasr_core::diarize::embed::PolicyResolvedSpeakerRuntime::load(Arc::clone(
-            self.runtime.native_execution.execution_services(),
-        )) {
+        match openasr_core::diarize::embed::PolicyResolvedSpeakerRuntime::load_with_inference_threads(
+            Arc::clone(self.runtime.native_execution.execution_services()),
+            self.inference_threads.and_then(std::num::NonZeroU16::new),
+        ) {
             Ok(Some(runtime)) => {
                 self.streaming_diarizer = Some(runtime.anonymous_diarizer(16_000));
                 self.native_speaker_change_detector = Some(runtime.speaker_change_detector(16_000));
@@ -1155,9 +1173,7 @@ impl WsSession {
                     RequiredStage::Asr,
                     "native streaming session preparation or warm-up failed",
                 );
-                if let Some(worker) = self.native_streaming.take() {
-                    worker.detach_cancel();
-                }
+                self.retire_native_streaming();
                 self.controller = None;
             }
             return result;
@@ -3020,9 +3036,7 @@ impl WsSession {
         if transport_closed {
             self.carry.clear();
             if self.backend_failed {
-                if let Some(worker) = self.native_streaming.take() {
-                    worker.detach_cancel();
-                }
+                self.retire_native_streaming();
                 self.closed = true;
                 self.observe_idle_for_pending_switch();
                 return Ok(());
@@ -3061,10 +3075,13 @@ impl WsSession {
             .partition(|event| !is_native_finish_terminal_envelope(event));
         self.forward_native_streaming_events(kind, nonterminal)
             .await?;
-        // The worker exited after the terminal command; join it so the session
-        // (and its decoder cache) is dropped before we report the session closed.
+        // The terminal result can precede native session destruction. Release
+        // this attach now and retain its completion for final server teardown.
         if let Some(worker) = self.native_streaming.take() {
-            worker.join();
+            self.runtime
+                .native_execution
+                .remote_policy()
+                .track_retired(Some(worker.join()));
         }
         if !self.backend_failed && !transport_closed && self.record_history {
             self.record_history_entry().await?;
@@ -3077,9 +3094,7 @@ impl WsSession {
 
     pub(crate) async fn cancel(&mut self, reason: &str) -> Result<(), ()> {
         if self.is_native_streaming() {
-            if let Some(worker) = self.native_streaming.take() {
-                worker.detach_cancel();
-            }
+            self.retire_native_streaming();
             self.emit_error(RealtimeErrorCode::Cancelled, reason, false)
                 .await?;
             if let Some(controller) = self.controller.as_mut() {
@@ -3104,6 +3119,15 @@ impl WsSession {
         self.closed = true;
         self.observe_idle_for_pending_switch();
         Err(())
+    }
+
+    fn retire_native_streaming(&mut self) {
+        if let Some(worker) = self.native_streaming.take() {
+            self.runtime
+                .native_execution
+                .remote_policy()
+                .track_retired(Some(worker.begin_shutdown()));
+        }
     }
 
     pub(crate) fn cancel_backend_jobs(&mut self) {

@@ -4,7 +4,7 @@
 //! `policy_family`. This module is the public load and diarizer facade and
 //! type-erases at `Arc<dyn SpeakerEmbedder>`.
 
-use std::sync::Arc;
+use std::{num::NonZeroU16, sync::Arc};
 
 use crate::{NativeExecutionServices, device::execution_policy::ExecutionIntent};
 
@@ -38,6 +38,21 @@ impl PolicyResolvedSpeakerRuntime {
         Self::load_with_intent(execution_services, ExecutionIntent::Auto)
     }
 
+    /// Carry the admitted session's CPU budget into speaker inference too.
+    /// Keep it on this runtime, not in process-global or thread-local state:
+    /// embedding work moves between the connection, blocking and actor threads.
+    pub fn load_with_inference_threads(
+        execution_services: Arc<NativeExecutionServices>,
+        inference_threads: Option<NonZeroU16>,
+    ) -> Result<Option<Self>, EmbedError> {
+        Self::load_with_settings(
+            execution_services,
+            ExecutionIntent::Auto,
+            persisted_embedder_preference(),
+            inference_threads,
+        )
+    }
+
     pub(crate) fn load_with_intent(
         execution_services: Arc<NativeExecutionServices>,
         execution_intent: ExecutionIntent,
@@ -54,6 +69,15 @@ impl PolicyResolvedSpeakerRuntime {
         execution_intent: ExecutionIntent,
         preference: VoiceIdEmbedderPreference,
     ) -> Result<Option<Self>, EmbedError> {
+        Self::load_with_settings(execution_services, execution_intent, preference, None)
+    }
+
+    fn load_with_settings(
+        execution_services: Arc<NativeExecutionServices>,
+        execution_intent: ExecutionIntent,
+        preference: VoiceIdEmbedderPreference,
+        inference_threads: Option<NonZeroU16>,
+    ) -> Result<Option<Self>, EmbedError> {
         let Some(prepared) = prepare_embedder(preference)? else {
             return Ok(None);
         };
@@ -62,12 +86,14 @@ impl PolicyResolvedSpeakerRuntime {
                 execution_services,
                 execution_intent,
                 prepared,
+                inference_threads,
             )?,
             SpeakerEmbedderFamily::WeSpeakerResNet => {
                 policy_family::load_family::<WeSpeakerPolicy>(
                     execution_services,
                     execution_intent,
                     prepared,
+                    inference_threads,
                 )?
             }
         };

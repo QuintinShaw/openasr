@@ -4617,6 +4617,64 @@ async fn fallback_capacity_rejection_is_backend_not_ready_and_recoverable() {
 }
 
 #[test]
+fn dropping_unparked_session_cancels_inflight_auxiliary_work() {
+    let (sender, _receiver) = mpsc::channel(8);
+    let session = WsSession::new(ServerRuntime::default(), test_distribution(), sender);
+    let control = Arc::clone(&session.backend_control);
+    drop(session);
+    assert!(
+        control.is_canceled(),
+        "dropping an active connection must cancel its outstanding auxiliary work"
+    );
+}
+
+#[test]
+fn runtime_shutdown_drops_active_native_resources_before_returning() {
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let resource = Arc::new(AtomicUsize::new(0));
+    let weak = Arc::downgrade(&resource);
+    let temp = tempfile::tempdir().unwrap();
+    let control = executor.block_on(async move {
+        let (sender, _receiver) = mpsc::channel(8);
+        let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), sender);
+        session.controller = Some(started_controller("active-at-shutdown", "test-model"));
+        session.native_streaming = Some(
+            NativeStreamingDecodeWorker::attach(
+                NativeStreamingWorkerKey::new(
+                    temp.path().join("active-shutdown.oasr"),
+                    openasr_core::NativeAsrHardwareTarget::Cpu,
+                    None,
+                ),
+                Box::new(ShutdownNativeSession {
+                    inner: TestServerNativeSession::new(session.session_id.0.clone()),
+                    _resource: resource,
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let control = Arc::clone(&session.backend_control);
+        tokio::spawn(async move {
+            let _active_session = session;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        control
+    });
+    assert!(weak.upgrade().is_some());
+    assert!(!control.is_canceled());
+    drop(executor);
+    assert!(
+        weak.upgrade().is_none(),
+        "shutdown must await destruction of the active native session"
+    );
+    assert!(control.is_canceled());
+}
+
+#[test]
 fn runtime_shutdown_drops_parked_native_resources_before_grace_expires() {
     let executor = tokio::runtime::Builder::new_current_thread()
         .enable_all()

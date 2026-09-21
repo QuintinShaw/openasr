@@ -616,9 +616,11 @@ impl NativeStreamingDecodeWorker {
     /// keeps `idle_unload` from staying pinned on an OS thread that cannot be
     /// interrupted -- releasing only *this* attach's guard, which tokenization
     /// makes safe (see `AttachToken`).
-    pub(crate) fn join(self) {
+    pub(crate) fn join(self) -> Arc<NativeStreamingCompletion> {
+        let completion = Arc::clone(&self.completion);
         self.token.activity.release();
         drop(self.commands);
+        completion
     }
 
     pub(crate) fn detach_cancel(self) {
