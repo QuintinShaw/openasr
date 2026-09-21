@@ -76,12 +76,18 @@ use super::tokenizer::FireRedTokenizer;
 
 const FIRERED_AED_EXECUTOR_ID: &str = crate::arch::FIRERED_AED_EXECUTOR_COMPONENT_ID;
 const FIRERED_AED_STREAMING_EXECUTOR_ID: &str = "firered-aed-ggml-snapshot-streaming-executor-v1";
-// A stopped stream can leave less than one snip-edges fbank frame after a
+// A stopped stream can leave less than the encoder's receptive field after a
 // finalized utterance. Finish that tail without invoking an impossible decode;
 // the shared driver retains any already-emitted transcript.
 const FIRERED_AED_STREAMING_TUNING: StreamingPartialTuning =
     STREAMING_PARTIAL_TUNING_HEAVY_SNAPSHOT
-        .with_minimum_encodable_samples(super::frontend::FRAME_LENGTH_SAMPLES);
+        // The frontend can emit a frame at 25 ms, but the encoder needs seven
+        // original frames for one unmasked position after both convolutions.
+        .with_minimum_encodable_samples(
+            super::frontend::FRAME_LENGTH_SAMPLES
+                + (super::encoder_graph::MIN_ENCODER_INPUT_FRAMES - 1)
+                    * super::frontend::FRAME_SHIFT_SAMPLES,
+        );
 const CMVN_NEG_MEAN_TENSOR: &str = "frontend.cmvn.neg_mean";
 const CMVN_INV_STDDEV_TENSOR: &str = "frontend.cmvn.inv_stddev";
 const TOKENIZER_TOKENS_KEY: &str = "tokenizer.ggml.tokens";
@@ -1043,20 +1049,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn streaming_floor_matches_the_first_encodable_fbank_frame() {
+    fn streaming_floor_matches_the_first_unmasked_encoder_frame() {
         let minimum = FIRERED_AED_STREAMING_TUNING
             .minimum_encodable_samples()
             .unwrap();
         let frontend = FireRedFbankFrontend::new();
-        assert!(frontend.compute(&vec![0.0; minimum - 1]).is_err());
-        assert!(frontend.compute(&vec![0.0; minimum]).is_ok());
-        assert!(
-            super::super::capacity::firered_aed_encoder_frame_count_for_samples(
-                minimum - 1,
-                super::super::frontend::SAMPLE_RATE_HZ
-            )
-            .is_err()
+        let features = frontend.compute(&vec![0.0; minimum]).unwrap();
+        assert_eq!(
+            super::super::encoder_graph::valid_encoder_time_frames(features.n_frames).unwrap(),
+            1
         );
+        let below = frontend.compute(&vec![0.0; minimum - 1]).unwrap();
+        assert!(super::super::encoder_graph::valid_encoder_time_frames(below.n_frames).is_err());
         assert!(
             super::super::capacity::firered_aed_encoder_frame_count_for_samples(
                 minimum,
@@ -1065,6 +1069,74 @@ mod tests {
             .unwrap()
                 > 0
         );
+    }
+
+    #[test]
+    fn streaming_short_tail_skips_decode_until_the_encoder_can_accept_it() {
+        use crate::models::ggml_streaming_session::GgmlAsrStreamingTranscriptDriver;
+        use crate::models::incremental_streaming_driver::IncrementalStreamingTranscriptDriver;
+        use crate::{RealtimeAudioFormat, RealtimeAudioFrame};
+
+        // Real capture delivers 20 ms frames. One through four frames cannot
+        // produce an unmasked encoder position; five frames can. Use the
+        // production family policy, not a duplicate test-only minimum.
+        for frame_count in 1..=5 {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            let mut driver = IncrementalStreamingTranscriptDriver::new(
+                FIRERED_AED_STREAMING_EXECUTOR_ID,
+                FIRERED_AED_GGML_ADAPTER_ID,
+                "short-tail-utterance",
+                "short-tail-segment",
+                0,
+                Box::new(move |audio, _, _| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    let features = FireRedFbankFrontend::new()
+                        .compute(&audio.samples_f32)
+                        .unwrap();
+                    super::super::encoder_graph::valid_encoder_time_frames(features.n_frames)
+                        .expect("the streaming policy must keep invalid tails out of the encoder");
+                    Err(GgmlAsrExecutionError::ExecutorFailed {
+                        executor_id: FIRERED_AED_STREAMING_EXECUTOR_ID,
+                        adapter_id: FIRERED_AED_GGML_ADAPTER_ID,
+                        reason: "encodable input reached decoder".into(),
+                    })
+                }),
+            )
+            .with_partial_results(false)
+            .with_minimum_encodable_samples(
+                FIRERED_AED_STREAMING_TUNING
+                    .minimum_encodable_samples()
+                    .unwrap(),
+            );
+            for index in 0..frame_count {
+                driver
+                    .push_audio(
+                        RealtimeAudioFrame::new(
+                            index,
+                            index * 20,
+                            RealtimeAudioFormat::pcm16_mono_16khz(),
+                            vec![1; 320],
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+            let finished = driver.finish_updates();
+            if frame_count < 5 {
+                assert!(
+                    finished
+                        .expect("short capture tail must finish cleanly")
+                        .is_empty()
+                );
+            } else {
+                assert!(
+                    matches!(finished, Err(GgmlAsrExecutionError::ExecutorFailed { reason, .. })
+                    if reason == "encodable input reached decoder")
+                );
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(frame_count == 5));
+        }
     }
 
     // Pinned to the reference PyTorch decode captured by the dev-only

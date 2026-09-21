@@ -117,11 +117,6 @@ impl CaptureQueueProducer {
         });
     }
 
-    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
-    pub(crate) fn disconnect(&mut self) {
-        self.tx.take();
-    }
-
     #[cfg(test)]
     pub(crate) fn dropped_count(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
@@ -345,7 +340,7 @@ mod tests {
         samples.extend(std::iter::repeat_n(9_i16, 40));
         producer.push_samples(&samples);
         producer.flush_padded();
-        producer.disconnect();
+        drop(producer);
 
         let mut frames = Vec::new();
         let mut diagnostics = Vec::new();

@@ -4,7 +4,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use tokio::sync::Notify;
@@ -243,10 +243,11 @@ pub fn recommended_catalog_id_for_feature(feature: &str) -> Option<&'static str>
 }
 
 #[derive(Debug)]
-struct HeldRealtimeSession {
+pub(crate) struct HeldRealtimeSession {
     disconnected_at: SystemTime,
-    control: Arc<openasr_core::TranscriptionControl>,
+    pub(crate) control: Arc<openasr_core::TranscriptionControl>,
     owner_device_id: Option<String>,
+    pub(crate) resources: Option<crate::realtime::ParkedRealtimeControl>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,6 +262,7 @@ struct RemoteRuntimePolicyInner {
     runs: OperatorRunLog,
     capabilities: CapabilityRequestQueue,
     held_realtime: HashMap<String, HeldRealtimeSession>,
+    retired_native: Vec<Arc<crate::realtime::NativeStreamingCompletion>>,
     reconnect_grace: Duration,
 }
 
@@ -272,6 +274,7 @@ impl Default for RemoteRuntimePolicyInner {
             runs: OperatorRunLog::default(),
             capabilities: CapabilityRequestQueue::default(),
             held_realtime: HashMap::new(),
+            retired_native: Vec::new(),
             reconnect_grace: REMOTE_RECONNECT_GRACE,
         }
     }
@@ -281,6 +284,33 @@ impl Default for RemoteRuntimePolicyInner {
 struct RemoteRuntimePolicyShared {
     state: Mutex<RemoteRuntimePolicyInner>,
     notify: Notify,
+}
+
+impl Drop for RemoteRuntimePolicyShared {
+    fn drop(&mut self) {
+        // Tokio shutdown cancels expiry tasks. Held sessions must still release
+        // their native resources before process-wide backend teardown.
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        for (_, held) in state.held_realtime.drain() {
+            if let Some(completion) = held.retire() {
+                state.retired_native.push(completion);
+            }
+        }
+        // One total budget, not one budget per session. Native cancellation is
+        // cooperative; a wedged device must not hang process shutdown forever.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for completion in &state.retired_native {
+            if !completion.wait_until(deadline) {
+                openasr_core::stage_timing::log_event(
+                    "realtime_shutdown",
+                    "stage=native_cleanup_timeout",
+                );
+            }
+        }
+    }
 }
 
 /// Process-wide remote admission controller shared by HTTP file jobs and
@@ -441,41 +471,54 @@ impl RemoteRuntimePolicy {
         self.lock().reconnect_grace = grace;
     }
 
+    #[cfg(test)]
     pub fn hold_realtime(
         &self,
         session_id: impl Into<String>,
         control: Arc<openasr_core::TranscriptionControl>,
         owner_device_id: Option<String>,
     ) {
-        self.hold_realtime_at(session_id, control, owner_device_id, SystemTime::now());
+        self.hold_realtime_at(
+            session_id,
+            control,
+            owner_device_id,
+            SystemTime::now(),
+            None,
+        );
     }
 
-    pub fn hold_realtime_at(
+    pub(crate) fn hold_realtime_at(
         &self,
         session_id: impl Into<String>,
         control: Arc<openasr_core::TranscriptionControl>,
         owner_device_id: Option<String>,
         now: SystemTime,
+        resources: Option<crate::realtime::ParkedRealtimeControl>,
     ) {
-        let mut inner = self.lock();
-        inner.held_realtime.insert(
+        // Publish authorization and resources atomically. Cleanup happens after
+        // releasing the policy lock, including when replacing a stale hold.
+        let previous = self.lock().held_realtime.insert(
             session_id.into(),
             HeldRealtimeSession {
                 disconnected_at: now,
                 control,
                 owner_device_id,
+                resources,
             },
         );
+        if let Some(previous) = previous {
+            self.track_retired(previous.retire());
+        }
         self.inner.notify.notify_waiters();
     }
 
-    pub fn resume_realtime(
+    pub(crate) fn resume_realtime(
         &self,
         session_id: &str,
         now: SystemTime,
         caller_device_id: Option<&str>,
         caller_is_operator: bool,
-    ) -> Option<Arc<openasr_core::TranscriptionControl>> {
+    ) -> Option<HeldRealtimeSession> {
         let mut inner = self.lock();
         let held = inner.held_realtime.get(session_id)?;
         if reconnect_expired_after(held.disconnected_at, now, inner.reconnect_grace) {
@@ -488,14 +531,24 @@ impl RemoteRuntimePolicy {
         ) {
             return None;
         }
-        inner
-            .held_realtime
-            .remove(session_id)
-            .map(|held| held.control)
+        inner.held_realtime.remove(session_id)
     }
 
     pub fn has_held_realtime(&self) -> bool {
         !self.lock().held_realtime.is_empty()
+    }
+
+    pub(crate) fn track_retired(
+        &self,
+        completion: Option<Arc<crate::realtime::NativeStreamingCompletion>>,
+    ) {
+        let mut inner = self.lock();
+        inner
+            .retired_native
+            .retain(|pending| !pending.is_finished());
+        if let Some(completion) = completion {
+            inner.retired_native.push(completion);
+        }
     }
 
     pub fn expire_held_realtime(
@@ -516,21 +569,68 @@ impl RemoteRuntimePolicy {
             })
             .map(|(id, _)| id.clone())
             .collect();
-        expired
+        let retired: Vec<_> = expired
             .into_iter()
-            .filter_map(|id| {
-                inner
-                    .held_realtime
-                    .remove(&id)
-                    .map(|held| (id, held.control))
+            .filter_map(|id| inner.held_realtime.remove(&id).map(|held| (id, held)))
+            .collect();
+        drop(inner);
+        retired
+            .into_iter()
+            .map(|(id, held)| {
+                let control = Arc::clone(&held.control);
+                self.track_retired(held.retire());
+                (id, control)
             })
             .collect()
+    }
+}
+
+impl HeldRealtimeSession {
+    fn retire(mut self) -> Option<Arc<crate::realtime::NativeStreamingCompletion>> {
+        self.control.request_cancel();
+        self.resources
+            .as_mut()
+            .and_then(|resources| resources.native_streaming.take())
+            .map(|worker| worker.begin_shutdown())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_last_policy_owner_cancels_held_sessions() {
+        let policy = RemoteRuntimePolicy::new();
+        let clone = policy.clone();
+        let control = Arc::new(openasr_core::TranscriptionControl::default());
+        policy.hold_realtime("held-at-shutdown", Arc::clone(&control), None);
+        drop(policy);
+        assert!(!control.is_canceled(), "another server owner still exists");
+        drop(clone);
+        assert!(control.is_canceled(), "shutdown must retire held sessions");
+    }
+
+    #[test]
+    fn dropping_policy_does_not_cancel_another_servers_held_session() {
+        let first = RemoteRuntimePolicy::new();
+        let second = RemoteRuntimePolicy::new();
+        let first_control = Arc::new(openasr_core::TranscriptionControl::default());
+        let second_control = Arc::new(openasr_core::TranscriptionControl::default());
+        first.hold_realtime("same-session-id", Arc::clone(&first_control), None);
+        second.hold_realtime("same-session-id", Arc::clone(&second_control), None);
+        drop(first);
+        assert!(first_control.is_canceled());
+        assert!(!second_control.is_canceled());
+        let resumed = second
+            .resume_realtime("same-session-id", SystemTime::now(), None, true)
+            .unwrap();
+        drop(second);
+        assert!(
+            !resumed.control.is_canceled(),
+            "resumed sessions belong to their caller"
+        );
+    }
 
     #[test]
     fn file_fifo_runs_first_and_queues_the_rest() {
@@ -676,6 +776,7 @@ mod tests {
             Arc::clone(&control),
             Some("device-a".to_string()),
             start,
+            None,
         );
         assert!(policy.has_held_realtime());
         assert!(
@@ -696,6 +797,7 @@ mod tests {
             Arc::clone(&control),
             Some("device-a".to_string()),
             start,
+            None,
         );
         let expired = policy.expire_held_realtime(start + Duration::from_secs(30));
         assert_eq!(expired.len(), 1);
@@ -722,6 +824,7 @@ mod tests {
             Arc::clone(&control),
             Some("device-a".to_string()),
             start,
+            None,
         );
         assert!(
             policy

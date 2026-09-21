@@ -1366,11 +1366,12 @@ fn resolve_instance_token(launch_option: Option<String>) -> Option<String> {
 #[derive(Clone)]
 pub struct ActiveRuntimeSlot {
     inner: Arc<RwLock<ActiveRuntimeSlotState>>,
-    /// Serializes activation against new session admission. Existing sessions
-    /// are checked after acquiring this gate; new sessions take the same gate
-    /// briefly while obtaining their model permit, closing the durable-commit
-    /// versus live-publication race.
-    activation_barrier: Arc<Mutex<()>>,
+    /// Excludes activation from new session admission. Activation takes the
+    /// write side before checking existing sessions; admissions share the read
+    /// side while obtaining their model permits. Readers must not reject each
+    /// other as a model switch (for example, the two tracks of a meeting).
+    /// Both sides still close the durable-commit versus live-publication race.
+    activation_barrier: Arc<RwLock<()>>,
     /// Test-only failpoint honored inside the shipped
     /// [`crate::realtime::probe_native_activation`]. Production leaves this
     /// unset so live warmup runs.
@@ -1533,7 +1534,7 @@ impl From<Option<PathBuf>> for ActiveRuntimeSlot {
                 active,
                 generation: 0,
             })),
-            activation_barrier: Arc::new(Mutex::new(())),
+            activation_barrier: Arc::new(RwLock::new(())),
             activation_probe_failpoint: Arc::new(RwLock::new(None)),
             activation_failpoint: Arc::new(RwLock::new(None)),
             launch_attestation_failed: Arc::new(AtomicBool::new(false)),
@@ -1556,7 +1557,7 @@ impl ActiveRuntimeSlot {
                 active: None,
                 generation: 0,
             })),
-            activation_barrier: Arc::new(Mutex::new(())),
+            activation_barrier: Arc::new(RwLock::new(())),
             activation_probe_failpoint: Arc::new(RwLock::new(None)),
             activation_failpoint: Arc::new(RwLock::new(None)),
             launch_attestation_failed: Arc::new(AtomicBool::new(false)),
@@ -1812,15 +1813,7 @@ impl ServerRuntime {
         verified_model_identity: &str,
         route: Option<&openasr_core::ResolvedExecutionRoute>,
     ) -> Result<ModelSessionPermit, ApiError> {
-        let _activation_gate = match self.model_pack_path.activation_barrier.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                return Err(ApiError::Conflict(
-                    "Cannot start a native session while the active model is changing.".to_string(),
-                ));
-            }
-        };
+        let _activation_gate = self.begin_native_admission()?;
         self.try_acquire_native_execution(
             verified_model_identity,
             route,
@@ -1841,15 +1834,7 @@ impl ServerRuntime {
         kind: NativeAdmissionKind,
         admitted_file_id: Option<&str>,
     ) -> Result<AdmittedNativeExecution, ApiError> {
-        let _activation_gate = match self.model_pack_path.activation_barrier.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                return Err(ApiError::Conflict(
-                    "Cannot start a native session while the active model is changing.".to_string(),
-                ));
-            }
-        };
+        let _activation_gate = self.begin_native_admission()?;
         if self.model_pack_path.boot_attestation_pending() {
             return Err(ApiError::Conflict(
                 "The server is still preparing its startup model; retry the request.".to_string(),
@@ -1882,7 +1867,7 @@ impl ServerRuntime {
         identity: &str,
         admitted_file_id: Option<&str>,
     ) -> Result<AdmittedNativeExecution, ApiError> {
-        let _activation_gate = self.begin_native_activation()?;
+        let _activation_gate = self.begin_native_admission()?;
         let activity = NativeActivityGuard::enter();
         let permit = self.try_acquire_native_execution(
             identity,
@@ -1920,14 +1905,24 @@ impl ServerRuntime {
             })
     }
 
-    pub(crate) fn begin_native_activation(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, ()>, ApiError> {
-        match self.model_pack_path.activation_barrier.try_lock() {
+    fn begin_native_admission(&self) -> Result<std::sync::RwLockReadGuard<'_, ()>, ApiError> {
+        match self.model_pack_path.activation_barrier.try_read() {
             Ok(guard) => Ok(guard),
             Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
             Err(std::sync::TryLockError::WouldBlock) => Err(ApiError::Conflict(
-                "Another native model activation is already running.".to_string(),
+                "Cannot start a native session while the active model is changing.".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn begin_native_activation(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, ()>, ApiError> {
+        match self.model_pack_path.activation_barrier.try_write() {
+            Ok(guard) => Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => Err(ApiError::Conflict(
+                "A native model activation or request admission is already running.".to_string(),
             )),
         }
     }

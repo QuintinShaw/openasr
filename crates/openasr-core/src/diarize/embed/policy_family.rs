@@ -422,6 +422,26 @@ struct PolicySpeakerCandidate<F: SpeakerPolicyFamily> {
     placement: crate::device::execution_policy::ExecutionPlacement,
     provider: ExecutionProvider,
     stable_device_id: String,
+    inference_threads: Option<std::num::NonZeroU16>,
+}
+
+fn speaker_inference_threads(requested: Option<std::num::NonZeroU16>, available: usize) -> usize {
+    requested.map_or(available.max(1), |threads| usize::from(threads.get()))
+}
+
+fn speaker_execution_plan(
+    clips: usize,
+    available: usize,
+    max_workers: usize,
+    requested: Option<std::num::NonZeroU16>,
+) -> SpeakerEmbeddingExecutionPlan {
+    let threads = speaker_inference_threads(requested, available);
+    let workers = if requested.is_some() {
+        max_workers.min(threads)
+    } else {
+        max_workers
+    };
+    SpeakerEmbeddingExecutionPlan::for_clips(clips, threads, workers)
 }
 
 impl<F: SpeakerPolicyFamily> PolicySpeakerCandidate<F> {
@@ -457,9 +477,14 @@ impl<F: SpeakerPolicyFamily> PolicySpeakerCandidate<F> {
 
     fn embed(&self, samples: &[f32], sample_rate_hz: u32) -> Result<SpeakerEmbedding, EmbedError> {
         let (features, frames) = F::prepare_embedding_input(&self.parsed, samples, sample_rate_hz)?;
-        let threads = std::thread::available_parallelism()
+        let available = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1);
+        let threads = speaker_inference_threads(self.inference_threads, available);
+        crate::stage_timing::log_detail_event(
+            "speaker_embedding",
+            format_args!("stage=forward threads={threads} frames={frames}"),
+        );
         let actor = self.checkout_actor(threads, None)?;
         actor
             .call_mut_fallible(move |runtime| {
@@ -492,7 +517,8 @@ impl<F: SpeakerPolicyFamily> PolicySpeakerCandidate<F> {
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1);
         let max_workers = embedder_resident_worker_limit(self.backend, pool.current_num_threads());
-        let plan = SpeakerEmbeddingExecutionPlan::for_clips(clips.len(), available, max_workers);
+        let plan =
+            speaker_execution_plan(clips.len(), available, max_workers, self.inference_threads);
         let inherited_cancel = crate::ggml_runtime::thread_job_cancel_flag();
         let prepared = pool.install(|| {
             clips
@@ -665,6 +691,7 @@ pub(super) fn load_family<F: SpeakerPolicyFamily>(
     execution_services: Arc<NativeExecutionServices>,
     execution_intent: ExecutionIntent,
     prepared: PreparedSelectedEmbedder,
+    inference_threads: Option<std::num::NonZeroU16>,
 ) -> Result<Option<(Arc<dyn SpeakerEmbedder>, SpeakerEmbedderIdentity)>, EmbedError> {
     let identity = prepared.identity();
     let (verified_pack, preflight, content_id) = prepared.source.into_parts();
@@ -716,6 +743,7 @@ pub(super) fn load_family<F: SpeakerPolicyFamily>(
                 placement: execution_candidate.placement,
                 provider: execution_candidate.device.route.provider,
                 stable_device_id: execution_candidate.device.route.stable_id.clone(),
+                inference_threads,
             };
             let warmup = deterministic_warmup_audio();
             let warmup =
@@ -822,6 +850,47 @@ fn policy_runtime_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speaker_inference_preserves_the_explicit_session_thread_budget() {
+        for requested in [1, 2, 4, 8, 16] {
+            assert_eq!(
+                speaker_inference_threads(std::num::NonZeroU16::new(requested), 8),
+                usize::from(requested)
+            );
+        }
+        assert_eq!(speaker_inference_threads(None, 8), 8);
+        assert_eq!(speaker_inference_threads(None, 0), 1);
+    }
+
+    #[test]
+    fn speaker_batch_workers_respect_explicit_session_budget() {
+        for requested in 1..=16 {
+            for clips in 1..=32 {
+                let plan =
+                    speaker_execution_plan(clips, 8, 4, std::num::NonZeroU16::new(requested));
+                assert!(plan.workers * plan.threads_per_runner <= usize::from(requested));
+                assert_eq!(
+                    (0..plan.workers)
+                        .flat_map(|worker| plan.worker_range(worker, clips))
+                        .collect::<Vec<_>>(),
+                    (0..clips).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn speaker_batch_without_session_budget_preserves_default_plan() {
+        for available in 0..=16 {
+            for clips in 1..=32 {
+                assert_eq!(
+                    speaker_execution_plan(clips, available, 4, None),
+                    SpeakerEmbeddingExecutionPlan::for_clips(clips, available, 4)
+                );
+            }
+        }
+    }
 
     #[test]
     fn redimnet_host_receipt_releases_without_leaking_across_cache_lifecycle() {

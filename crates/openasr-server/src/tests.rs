@@ -3191,6 +3191,101 @@ fn active_runtime_barrier_closes_session_admission_race() {
     drop(permit);
 }
 
+#[test]
+fn native_admissions_can_overlap_without_reporting_model_activation() {
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::new(std::num::NonZeroUsize::new(2).unwrap()),
+        model_pack_path: Some(PathBuf::from("concurrent-admission.oasr")).into(),
+        ..ServerRuntime::default()
+    };
+    let snapshot = runtime.model_pack_path.current_snapshot().unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+    let (realtime, auxiliary, over_capacity) = std::thread::scope(|scope| {
+        // Hold the exact admission critical section on another request thread.
+        // No sleep or scheduling luck is required to force the overlap.
+        let shared_runtime = &runtime;
+        scope.spawn(move || {
+            let _admission = shared_runtime.begin_native_admission().unwrap();
+            let _permit = shared_runtime
+                .try_acquire_native_execution(
+                    "overlapping-realtime",
+                    None,
+                    NativeAdmissionKind::Realtime,
+                    None,
+                )
+                .unwrap();
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        entered_rx.recv().unwrap();
+        let realtime = runtime.acquire_native_execution_for_snapshot(
+            &snapshot,
+            "overlapping-realtime",
+            None,
+            NativeAdmissionKind::Realtime,
+            None,
+        );
+        let auxiliary = runtime.acquire_native_auxiliary_execution("overlapping-auxiliary", None);
+        let over_capacity = runtime.acquire_native_execution_for_snapshot(
+            &snapshot,
+            "overlapping-realtime",
+            None,
+            NativeAdmissionKind::Realtime,
+            None,
+        );
+        let activation = runtime.begin_native_activation();
+        release_tx.send(()).unwrap();
+        assert!(matches!(activation, Err(ApiError::Conflict(_))));
+        (realtime, auxiliary, over_capacity)
+    });
+    assert!(
+        realtime.is_ok(),
+        "concurrent realtime admission failed: {:?}",
+        realtime.err()
+    );
+    assert!(
+        auxiliary.is_ok(),
+        "concurrent auxiliary admission failed: {:?}",
+        auxiliary.err()
+    );
+    assert!(matches!(over_capacity, Err(ApiError::Busy(_))));
+    assert!(runtime.native_rebind_blocked());
+    assert!(runtime.begin_native_activation().is_ok());
+}
+
+#[test]
+fn native_activation_excludes_snapshot_and_auxiliary_admission() {
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        model_pack_path: Some(PathBuf::from("exclusive-activation.oasr")).into(),
+        ..ServerRuntime::default()
+    };
+    let snapshot = runtime.model_pack_path.current_snapshot().unwrap();
+    let _activation = runtime.begin_native_activation().unwrap();
+    assert!(matches!(
+        runtime.acquire_native_execution_for_snapshot(
+            &snapshot,
+            "activation-realtime",
+            None,
+            NativeAdmissionKind::Realtime,
+            None,
+        ),
+        Err(ApiError::Conflict(_))
+    ));
+    assert!(matches!(
+        runtime.acquire_native_auxiliary_execution("activation-auxiliary", None),
+        Err(ApiError::Conflict(_))
+    ));
+    assert!(matches!(
+        runtime.begin_native_activation(),
+        Err(ApiError::Conflict(_))
+    ));
+    assert!(!runtime.native_execution.has_active_sessions());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn activation_probe_uses_frozen_execution_target_not_mutable_preferences() {
     let _openasr_device = OpenasrDeviceEnvGuard::unset();
