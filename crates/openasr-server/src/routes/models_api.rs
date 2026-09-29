@@ -32,19 +32,35 @@ pub(crate) async fn default_model(
     Extension(distribution): Extension<DistributionContext>,
 ) -> Result<Json<DefaultModelResponse>, ApiError> {
     let home = distribution.openasr_home()?;
-    let mut response = match runtime.resolve_served_native_pack()? {
-        Some(served) => default_model_response_from_served(&home, &served)?,
-        None => default_model_response(
-            &home,
-            distribution.catalog_source(),
-            runtime.model_pack_path.served_pack_path().as_deref(),
-        )?,
-    };
-    response.idle_switch_pending = runtime
+    let response = default_model_response_with_pending_snapshot(&runtime, || {
+        match runtime.resolve_served_native_pack()? {
+            Some(served) => default_model_response_from_served(&home, &served),
+            None => default_model_response(
+                &home,
+                distribution.catalog_source(),
+                runtime.model_pack_path.served_pack_path().as_deref(),
+            ),
+        }
+    })?;
+    Ok(Json(response))
+}
+
+pub(crate) fn default_model_response_with_pending_snapshot(
+    runtime: &ServerRuntime,
+    resolve: impl FnOnce() -> Result<DefaultModelResponse, ApiError>,
+) -> Result<DefaultModelResponse, ApiError> {
+    // Idle activation publishes the new binding before clearing pending. Read
+    // progress first: resolving/verifying a pack may overlap that publication.
+    // Reading progress afterwards could pair the old pack with cleared pending
+    // and falsely report that the requested switch has finished on the old model.
+    // A stale pending marker is safe: the client polls again for the receipt.
+    let pending = runtime
         .native_execution
         .remote_policy()
         .pending_idle_switch();
-    Ok(Json(response))
+    let mut response = resolve()?;
+    response.idle_switch_pending = pending;
+    Ok(response)
 }
 
 pub(crate) async fn set_default_model(
