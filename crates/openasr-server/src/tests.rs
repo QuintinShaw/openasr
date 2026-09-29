@@ -2389,6 +2389,69 @@ async fn set_default_model_http_returns_conflict_when_native_session_is_busy() {
     );
 }
 
+#[test]
+fn default_model_poll_preserves_pending_when_activation_finishes_during_resolution() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let previous_path = write_installed_pack_ref(
+        home,
+        "whisper-tiny",
+        "whisper-tiny:q4",
+        "q4_0",
+        "q4",
+        "whisper-tiny",
+    );
+    write_installed_pack_ref(
+        home,
+        "whisper-base",
+        "whisper-base:q4",
+        "q4_0",
+        "q4",
+        "whisper-base",
+    );
+    let previous = installed_pack_by_pull(home, "whisper-tiny:q4");
+    let next = installed_pack_by_pull(home, "whisper-base:q4");
+    persist_default_pack(home, &previous, QuantPreference::pinned(&previous.quant)).unwrap();
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        model_pack_path: Some(previous_path.clone()).into(),
+        ..ServerRuntime::default()
+    };
+    let policy = runtime.native_execution.remote_policy();
+    policy.request_idle_switch(next.pull.clone());
+    let response =
+        crate::routes::models_api::default_model_response_with_pending_snapshot(&runtime, || {
+            // A poll has read the old binding. Activation finishes while its
+            // response is resolving pack metadata, before progress is attached.
+            let old = default_model_response(home, None, Some(&previous_path))?;
+            persist_default_pack(home, &next, QuantPreference::pinned(&next.quant)).unwrap();
+            runtime
+                .model_pack_path
+                .set_legacy_binding(Some(next.path.clone()));
+            policy.cancel_idle_switch();
+            Ok(old)
+        })
+        .unwrap();
+    assert_eq!(response.default_pull.as_deref(), Some("whisper-tiny:q4"));
+    assert_eq!(
+        response.idle_switch_pending.as_deref(),
+        Some("whisper-base:q4")
+    );
+    assert!(policy.pending_idle_switch().is_none());
+
+    let response =
+        crate::routes::models_api::default_model_response_with_pending_snapshot(&runtime, || {
+            default_model_response(
+                home,
+                None,
+                runtime.model_pack_path.served_pack_path().as_deref(),
+            )
+        })
+        .unwrap();
+    assert_eq!(response.default_pull.as_deref(), Some("whisper-base:q4"));
+    assert!(response.idle_switch_pending.is_none());
+}
+
 fn activation_probe_ok() -> Result<(), String> {
     Ok(())
 }
