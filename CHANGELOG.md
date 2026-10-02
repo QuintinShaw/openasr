@@ -167,6 +167,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- CLI: native model-source resolution preserves the quant tag of an
+  automatically selected installed pack, or a unique matching installed pack
+  supplied with a bare model name, instead of replacing it with the catalog's
+  recommended quant. Explicit quant requests retain their existing behavior.
 - Moonshine: conv-stem GroupNorm now normalizes over both time and channels,
   matching the reference model instead of normalizing each frame separately.
   Runtime metadata validation also uses the architecture registry's identities,

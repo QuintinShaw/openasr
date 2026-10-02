@@ -359,18 +359,44 @@ pub(super) fn resolve_model_source_for_backend(
     // resolve an installed pack by model id. This path NEVER pulls -- the CLI
     // transcribe/live handlers run the consent-pull before reaching here, while
     // the server stays fail-closed (a missing model is an error, not a download).
-    let model_pack_root = match model_pack {
-        Some(path) => validate_local_native_model_pack_path(path)
+    let model_pack_root = match (model_pack, model) {
+        (Some(path), _) => validate_local_native_model_pack_path(path)
             .map_err(|error| anyhow!("Native model-pack path rejected: {error}"))?,
-        None => resolve_installed_native_pack(model, config, catalog.as_ref())?,
+        (None, Some(model_ref)) => {
+            let selection = resolve_launch_pack_selection(&home, model_ref, catalog.as_ref())?
+                .ok_or_else(|| native_pack_not_installed(model_ref))?;
+            return Ok(ResolvedModelSource {
+                model_id: selection.runtime_model_id,
+                model_pack_path: Some(selection.pack.path),
+            });
+        }
+        (None, None) => resolve_installed_native_pack(None, config, catalog.as_ref())?,
     };
     let model_id = if let Some(model_ref) = model {
         let normalized_model_ref = model_ref.trim();
-        parse_model_ref(normalized_model_ref).map_err(|error| {
+        let requested = parse_model_ref(normalized_model_ref).map_err(|error| {
             anyhow::anyhow!(
                 "Model '{model_ref}' is not a valid model id for native GGUF local-source {command_label}: {error}"
             )
         })?;
+        if requested.tag.is_none()
+            && let Some(pack) = resolve_explicit_installed_pack(
+                &home,
+                &model_pack_root,
+                normalized_model_ref,
+                catalog.as_ref(),
+            )
+        {
+            return Ok(ResolvedModelSource {
+                model_id: format!(
+                    "{}:{}",
+                    pack.model_id,
+                    openasr_core::canonical_quant_tag(&pack.quant),
+                ),
+                model_pack_path: Some(model_pack_root),
+            });
+        }
+
         // Resolve catalog aliases (e.g. `qwen:q8`) to the canonical runtime id so
         // the alias-blind native matcher accepts the request. The reported
         // identity still derives from pack metadata downstream.
@@ -428,11 +454,11 @@ fn resolve_installed_native_pack_opt(
     }
 }
 
-fn resolve_launch_pack_path(
+fn resolve_launch_pack_selection(
     home: &Path,
     model_ref: &str,
     catalog: Option<&openasr_core::ModelCatalog>,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<openasr_core::LaunchPackSelection>> {
     let packs = openasr_core::list_installed_packs(home)?;
     let request = openasr_core::LaunchPackRequest {
         model_ref,
@@ -441,9 +467,47 @@ fn resolve_launch_pack_path(
         host_profile: openasr_core::host_quant_recommendation_profile(),
     };
     match openasr_core::resolve_launch_pack(&packs, &request) {
-        Ok(selection) => Ok(Some(selection.pack.path)),
+        Ok(selection) => Ok(Some(selection)),
         Err(_) => Ok(None),
     }
+}
+
+fn resolve_launch_pack_path(
+    home: &Path,
+    model_ref: &str,
+    catalog: Option<&openasr_core::ModelCatalog>,
+) -> Result<Option<PathBuf>> {
+    Ok(resolve_launch_pack_selection(home, model_ref, catalog)?
+        .map(|selection| selection.pack.path))
+}
+
+fn resolve_explicit_installed_pack(
+    home: &Path,
+    validated_path: &Path,
+    model_ref: &str,
+    catalog: Option<&openasr_core::ModelCatalog>,
+) -> Option<openasr_core::InstalledPack> {
+    let wanted_path = fs::canonicalize(validated_path).ok()?;
+    let packs = openasr_core::list_installed_packs(home).ok()?;
+
+    let mut candidates = openasr_core::installed_packs_for_model(&packs, model_ref, catalog)
+        .into_iter()
+        .filter(|pack| {
+            fs::canonicalize(&pack.path)
+                .ok()
+                .is_some_and(|path| path == wanted_path)
+        });
+
+    match (candidates.next(), candidates.next()) {
+        (Some(pack), None) => Some(pack),
+        _ => None,
+    }
+}
+
+fn native_pack_not_installed(model_ref: &str) -> anyhow::Error {
+    anyhow!(
+        "Model '{model_ref}' is not installed.\nRun: openasr pull {model_ref}\n(Or pass --model-pack <local.oasr> to run a specific local pack file.)"
+    )
 }
 
 /// Resolves the installed `.oasr` pack for a model id (the resolved default when
@@ -457,11 +521,8 @@ pub(super) fn resolve_installed_native_pack(
 ) -> Result<PathBuf> {
     let home = openasr_home()?;
     let model_ref = selected_model_ref(model, &home)?;
-    resolve_installed_native_pack_opt(model, config, catalog)?.ok_or_else(|| {
-        anyhow!(
-            "Model '{model_ref}' is not installed.\nRun: openasr pull {model_ref}\n(Or pass --model-pack <local.oasr> to run a specific local pack file.)"
-        )
-    })
+    resolve_installed_native_pack_opt(model, config, catalog)?
+        .ok_or_else(|| native_pack_not_installed(&model_ref))
 }
 
 pub(super) fn prepare_backend_run(
@@ -1947,6 +2008,119 @@ mod tests {
     fn with_env_lock<T>(run: impl FnOnce() -> T) -> T {
         let _guard = env_lock();
         run()
+    }
+
+    fn install_fp16_quant_label_fixture(home: &Path) -> openasr_core::InstalledPack {
+        use sha2::Digest as _;
+
+        const MODEL_ID: &str = "moonshine-tiny";
+
+        // This fixture tests install-record labels, not physical precision.
+        let source = home.join("quant-label-fixture.oasr");
+        let spec = TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer(MODEL_ID);
+
+        openasr_core::testing::write_tiny_gguf_runtime_source(&source, &spec).unwrap();
+
+        let bytes = fs::read(&source).unwrap();
+        fs::remove_file(&source).unwrap();
+
+        let sha256 = format!("{:x}", sha2::Sha256::digest(&bytes));
+        let object = home
+            .join("models/objects/sha256")
+            .join(&sha256)
+            .join("content");
+
+        fs::create_dir_all(object.parent().unwrap()).unwrap();
+        fs::write(&object, &bytes).unwrap();
+
+        let pack = openasr_core::InstalledPack {
+            model_id: MODEL_ID.to_string(),
+            display_name: "Moonshine Tiny".to_string(),
+            quant: "fp16".to_string(),
+            suffix: "fp16".to_string(),
+            pull: format!("{MODEL_ID}:fp16"),
+            filename: format!("{MODEL_ID}-fp16.oasr"),
+            path: object,
+            url: format!("https://example.invalid/{MODEL_ID}-fp16.oasr"),
+            hf_revision: "test".to_string(),
+            sha256,
+            size_bytes: bytes.len() as u64,
+            installed_at_unix_seconds: 1,
+            source: None,
+        };
+
+        let reference = home.join("models/refs/moonshine-tiny/fp16.json");
+        fs::create_dir_all(reference.parent().unwrap()).unwrap();
+        fs::write(reference, serde_json::to_vec(&pack).unwrap()).unwrap();
+
+        pack
+    }
+
+    fn assert_native_installed_quant_resolution(
+        model_ref: &str,
+        explicit_pack: bool,
+        expected_model_id: &str,
+    ) {
+        with_env_lock(|| {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path();
+
+            let _home = EnvVarRestore::set_os("OPENASR_HOME", home);
+            let _models_dir = EnvVarRestore::remove("OPENASR_MODELS_DIR");
+            let _catalog_file = EnvVarRestore::remove("OPENASR_CATALOG_FILE");
+            let _catalog_identity = EnvVarRestore::remove("OPENASR_CATALOG_IDENTITY");
+            let _catalog_url = EnvVarRestore::remove("OPENASR_CATALOG_URL");
+
+            let catalog = load_cli_model_catalog(home)
+                .expect("repository catalog must load")
+                .expect("repository catalog must be available");
+
+            let recommended = openasr_core::resolve_catalog_pull(
+                &catalog,
+                &openasr_core::CatalogPullRequest {
+                    reference: "moonshine-tiny".to_string(),
+                    quant: None,
+                    size: None,
+                },
+            )
+            .unwrap();
+
+            assert_ne!(
+                openasr_core::canonical_quant_tag(&recommended.quant),
+                "fp16",
+                "catalog recommendation changed; review the test premise",
+            );
+
+            let pack = install_fp16_quant_label_fixture(home);
+            let model_pack = explicit_pack.then_some(pack.path.as_path());
+
+            let source = resolve_model_source_for_backend(
+                "transcription",
+                Some(model_ref),
+                BackendKind::Native,
+                model_pack,
+                &OpenAsrConfig::default(),
+            )
+            .expect("installed native model source must resolve");
+
+            assert_eq!(source.model_id, expected_model_id);
+            assert_eq!(source.model_pack_path, Some(pack.path));
+        });
+    }
+
+    #[test]
+    fn native_bare_model_keeps_automatically_selected_installed_quant() {
+        assert_native_installed_quant_resolution("moonshine-tiny", false, "moonshine-tiny:fp16");
+    }
+
+    #[test]
+    fn native_bare_model_keeps_explicit_installed_pack_quant() {
+        assert_native_installed_quant_resolution("moonshine-tiny", true, "moonshine-tiny:fp16");
+    }
+
+    #[test]
+    fn native_explicit_quant_alias_preserves_requested_quant() {
+        assert_native_installed_quant_resolution("moonshine-tiny:q8", true, "moonshine-tiny:q8_0");
     }
 
     #[test]
