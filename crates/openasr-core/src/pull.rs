@@ -7910,18 +7910,25 @@ fn extract_backend_archive_with_expected_size(
                     path: zip_path.to_path_buf(),
                     reason: format!("could not read zip entry {index}: {error}"),
                 })?;
+        let entry_name = entry
+            .name()
+            .map_err(|error| PullError::BackendFilePreflight {
+                path: zip_path.to_path_buf(),
+                reason: format!("could not decode zip entry {index} name: {error}"),
+            })?
+            .into_owned();
         // enclosed_name() is None for any absolute / `..`-traversal path.
         let Some(relative) = entry.enclosed_name().map(|path| path.to_path_buf()) else {
             return Err(PullError::BackendFilePreflight {
                 path: zip_path.to_path_buf(),
-                reason: format!("zip entry '{}' escapes the extraction dir", entry.name()),
+                reason: format!("zip entry '{entry_name}' escapes the extraction dir"),
             });
         };
         let relative_text = relative
             .to_str()
             .ok_or_else(|| PullError::BackendFilePreflight {
                 path: zip_path.to_path_buf(),
-                reason: format!("zip entry '{}' has a non-UTF-8 path", entry.name()),
+                reason: format!("zip entry '{entry_name}' has a non-UTF-8 path"),
             })?;
         validate_safe_relative_path("backend archive entry", relative_text).map_err(|reason| {
             PullError::BackendFilePreflight {
@@ -7933,8 +7940,7 @@ fn extract_backend_archive_with_expected_size(
             return Err(PullError::BackendFilePreflight {
                 path: zip_path.to_path_buf(),
                 reason: format!(
-                    "zip entry '{}' collides case-insensitively with another entry",
-                    entry.name()
+                    "zip entry '{entry_name}' collides case-insensitively with another entry"
                 ),
             });
         }
@@ -7944,10 +7950,7 @@ fn extract_backend_archive_with_expected_size(
         }) {
             return Err(PullError::BackendFilePreflight {
                 path: zip_path.to_path_buf(),
-                reason: format!(
-                    "zip entry '{}' is not a regular file or directory",
-                    entry.name()
-                ),
+                reason: format!("zip entry '{entry_name}' is not a regular file or directory"),
             });
         }
         let out_path = dest_root.join(&relative);

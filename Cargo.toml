@@ -77,7 +77,7 @@ rubato = "0.15"
 # libsqlite3 -- matches the rest of this workspace's "vendor the native deps"
 # posture (see ggml git submodule in openasr-core).
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
-rustls = "0.23.45"
+rustls = "0.23.46"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 getrandom = "0.3"
@@ -89,11 +89,11 @@ thiserror = "2.0"
 # bounded validity window on generated self-signed TLS identities (see
 # `openasr-server`'s `generate_self_signed_tls_material`).
 time = "0.3"
-tokio = { version = "1.37", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.53.3", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
 tokio-rustls = "0.26"
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 toml = "1"
 tower = "0.5"
 unicode-general-category = "1.1"
-zip = { version = "0.6", default-features = false, features = ["deflate"] }
+zip = { version = "9.1.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
