@@ -402,6 +402,9 @@ pub(super) fn resolve_model_source_for_backend(
         // identity still derives from pack metadata downstream.
         let cards = runtime_registry(catalog.as_ref()).context("Could not load model registry")?;
         match resolve_runtime_model_ref(&cards, catalog.as_ref(), normalized_model_ref) {
+            // An explicit pack can be independent of installation records. A
+            // catalog recommendation resolves its family alias, not its quant.
+            Ok(resolved) if requested.tag.is_none() => resolved.model_id,
             Ok(resolved) => resolved.runtime_model_id,
             Err(error) if runtime_resolution_unknown_model(&error) => {
                 normalized_model_ref.to_owned()
@@ -2116,6 +2119,33 @@ mod tests {
     #[test]
     fn native_bare_model_keeps_explicit_installed_pack_quant() {
         assert_native_installed_quant_resolution("moonshine-tiny", true, "moonshine-tiny:fp16");
+    }
+
+    #[test]
+    fn native_bare_model_does_not_invent_quant_for_an_unregistered_explicit_pack() {
+        with_env_lock(|| {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path();
+            let _home = EnvVarRestore::set_os("OPENASR_HOME", home);
+            let _models_dir = EnvVarRestore::remove("OPENASR_MODELS_DIR");
+            let _catalog_file = EnvVarRestore::remove("OPENASR_CATALOG_FILE");
+            let _catalog_identity = EnvVarRestore::remove("OPENASR_CATALOG_IDENTITY");
+            let _catalog_url = EnvVarRestore::remove("OPENASR_CATALOG_URL");
+            let pack = install_fp16_quant_label_fixture(home);
+            fs::remove_file(home.join("models/refs/moonshine-tiny/fp16.json")).unwrap();
+
+            let source = resolve_model_source_for_backend(
+                "transcription",
+                Some("moonshine-tiny"),
+                BackendKind::Native,
+                Some(&pack.path),
+                &OpenAsrConfig::default(),
+            )
+            .expect("explicit packs must work independently of installation records");
+
+            assert_eq!(source.model_id, "moonshine-tiny");
+            assert_eq!(source.model_pack_path, Some(pack.path));
+        });
     }
 
     #[test]
