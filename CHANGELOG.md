@@ -5,6 +5,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Security
+
+- Update the QUIC, TLS/certificate, Tokio, ZIP and Windows audio dependencies
+  to patched releases. ZIP extraction retains the existing path, file-type
+  and signed unpacked-size checks.
+
 ### Added
 
 - API: `POST /v1/audio/transcriptions` and `/v1/audio/translations` accept
