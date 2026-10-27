@@ -21,7 +21,7 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSException", "NSObject", "NSObjCRuntime", "NSString", "NSUUID", "NSValue"] }
 
 [target.'cfg(windows)'.dependencies]
-wasapi = "0.23.0"
+wasapi = "0.25.0"
 # Only for the process-enumeration and OpenProcess existence checks that back
 # per-process loopback capture; the loopback activation itself goes through
 # wasapi::AudioClient::new_application_loopback_client, which already wraps

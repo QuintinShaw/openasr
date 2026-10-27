@@ -3184,7 +3184,7 @@ fn tensile_zip_bytes() -> Vec<u8> {
         writer
             .start_file(
                 "Kernels.so-000-gfx1200.hsaco",
-                zip::write::FileOptions::default(),
+                zip::write::SimpleFileOptions::default(),
             )
             .unwrap();
         writer.write_all(b"fake tensile kernel object").unwrap();
@@ -3199,7 +3199,7 @@ fn backend_zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
         for (name, bytes) in entries {
             writer
-                .start_file(*name, zip::write::FileOptions::default())
+                .start_file(*name, zip::write::SimpleFileOptions::default())
                 .unwrap();
             writer.write_all(bytes).unwrap();
         }
