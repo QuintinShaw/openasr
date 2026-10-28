@@ -2469,6 +2469,146 @@ fn installed_pack_by_pull(home: &std::path::Path, pull: &str) -> InstalledPack {
 }
 
 #[tokio::test]
+async fn default_activation_releases_idle_residency_before_quote_and_preserves_selection() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let _generation_lock = idle_activity::native_unload_generation_test_lock().await;
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut config = openasr_core::load_config_document(&home).unwrap();
+    config.preferences.execution_target = openasr_core::ExecutionTarget::Cpu;
+    openasr_core::save_config_document(&home, &config).unwrap();
+    let previous_path = write_installed_pack_ref(
+        &home,
+        "whisper-idle-a",
+        "whisper-idle-a:q4",
+        "q4_0",
+        "q4",
+        "whisper-idle-a",
+    );
+    write_installed_pack_ref(
+        &home,
+        "whisper-idle-b",
+        "whisper-idle-b:q4",
+        "q4_0",
+        "q4",
+        "whisper-idle-b",
+    );
+    let previous = installed_pack_by_pull(&home, "whisper-idle-a:q4");
+    persist_default_pack(&home, &previous, QuantPreference::pinned(&previous.quant)).unwrap();
+    let durable_before =
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap();
+    for (pull, failpoint, busy, remains_resident) in [
+        (
+            "whisper-idle-b:q4",
+            ModelActivationFailpoint::QuoteObservation,
+            false,
+            false,
+        ),
+        (
+            "whisper-idle-a:q4",
+            ModelActivationFailpoint::QuoteObservation,
+            false,
+            true,
+        ),
+        (
+            "whisper-idle-b:q4",
+            ModelActivationFailpoint::PackVerification,
+            false,
+            true,
+        ),
+        (
+            "whisper-idle-b:q4",
+            ModelActivationFailpoint::CandidateResolution,
+            false,
+            true,
+        ),
+        (
+            "whisper-idle-b:q4",
+            ModelActivationFailpoint::QuoteObservation,
+            true,
+            true,
+        ),
+    ] {
+        let runtime = ServerRuntime {
+            backend: BackendKind::Native,
+            native_execution: NativeExecutionSupervisor::default(),
+            ffmpeg_bin: None,
+            ffmpeg_bin_explicit: false,
+            model_pack_path: Some(previous_path.clone()).into(),
+        };
+        let verified = openasr_core::PackVerifier
+            .verify_candidate(openasr_core::PackCandidate::new(previous_path.clone()))
+            .unwrap();
+        let resolved = openasr_core::resolve_default_model_activation(
+            runtime.native_execution.execution_services().as_ref(),
+            &verified,
+            openasr_core::device::execution_policy::ExecutionIntent::from(
+                openasr_core::ExecutionTarget::Cpu,
+            ),
+            previous.pull.clone(),
+            previous_path.clone(),
+        )
+        .unwrap();
+        runtime.publish_attested_native_model(resolved.facts().identity().clone());
+        let previous_snapshot = runtime.model_pack_path.served_snapshot().unwrap();
+        idle_activity::mark_native_model_warm(previous_snapshot.residency_key());
+        assert!(runtime.model_is_resident());
+        runtime
+            .model_pack_path
+            .set_activation_failpoint_for_test(Some(failpoint));
+        let _busy = busy.then(|| {
+            runtime
+                .acquire_native_execution("idle-activation-test", None)
+                .unwrap()
+        });
+        let app = app_with_runtime_and_distribution(
+            runtime.clone(),
+            DistributionRuntime {
+                openasr_home: Some(home.clone()),
+                catalog_url: None,
+                catalog_local_override: None,
+            },
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/models/default")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::json!({"pull":pull}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if busy {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::BAD_REQUEST
+            }
+        );
+        assert_eq!(
+            runtime.model_is_resident(),
+            remains_resident,
+            "unexpected residency for {pull} / {failpoint:?} / busy={busy}"
+        );
+        assert_eq!(
+            runtime.model_pack_path.current().as_deref(),
+            Some(previous_path.as_path())
+        );
+        assert_eq!(
+            openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap(),
+            durable_before
+        );
+    }
+}
+
+#[tokio::test]
 async fn set_default_model_http_keeps_previous_selection_when_activation_probe_fails() {
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;

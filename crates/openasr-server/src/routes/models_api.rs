@@ -253,6 +253,31 @@ pub(crate) fn activate_default_model_blocking(
         .model_pack_path
         .inject_activation_failure(ModelActivationFailpoint::CandidateResolution)?;
     let services = runtime.native_execution.execution_services();
+    // The activation barrier and busy check above make the previous runtime
+    // quiescent. Keep its served/durable identity for rollback, but release
+    // idle allocations before planning and reserving a different pack: both
+    // resident models need not fit simultaneously in the physical budget.
+    let previous = runtime.model_pack_path.active_identity();
+    if runtime.backend == BackendKind::Native
+        && runtime.model_pack_path.served_snapshot().is_some()
+        && previous
+            .as_ref()
+            .is_none_or(|active| active.pack_content_id() != verified_pack.content_id())
+    {
+        crate::idle_activity::bump_native_unload_generation();
+        match previous {
+            Some(previous) => {
+                services.evict_prepared_runtime_content_id(previous.pack_content_id())
+            }
+            // A legacy binding has no attested content identity to target.
+            None => services.unload_idle_native_model_runtime_caches(),
+        }
+        invalidate_cached_native_realtime_capabilities();
+        openasr_core::stage_timing::log_detail_event(
+            "default_activation",
+            "stage=release_previous_idle_runtime",
+        );
+    }
     let mut resolved_activation = openasr_core::resolve_default_model_activation(
         services.as_ref(),
         &verified_pack,
@@ -356,6 +381,14 @@ impl NativeActivationContext<'_> {
         let services = runtime.native_execution.execution_services();
         let facts = resolved_activation.facts().clone();
         let identity = facts.identity().clone();
+        openasr_core::stage_timing::log_detail_event(
+            "default_activation",
+            format_args!(
+                "stage=candidate provider={:?} placement={:?} pinned_lane={pin_lane}",
+                facts.exact_lane().candidate().device.route.provider,
+                facts.exact_lane().candidate().placement,
+            ),
+        );
         let journal = match mode {
             DefaultModelActivationMode::ReconcileDurableSelection {
                 expected_generation,
@@ -581,9 +614,15 @@ fn validate_native_activation_probe(
         Err(
             openasr_core::NativeExecutionAttestationError::RuntimePlanMismatch
             | openasr_core::NativeExecutionAttestationError::LaneMismatch,
-        ) => Err(NativeActivationAttemptError::ObservedFallback(Box::new(
-            snapshot,
-        ))),
+        ) => {
+            openasr_core::stage_timing::log_detail_event(
+                "default_activation",
+                "stage=probe result=observed_fallback",
+            );
+            Err(NativeActivationAttemptError::ObservedFallback(Box::new(
+                snapshot,
+            )))
+        }
         Err(error) => Err(error.to_string().into()),
     }
 }
