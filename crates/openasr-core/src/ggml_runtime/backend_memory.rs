@@ -507,6 +507,16 @@ impl BackendMemoryAbi {
         self.backend
     }
 
+    pub(crate) fn device_kind(&self) -> Option<super::GgmlBackendKind> {
+        if self.device.is_null() {
+            return None;
+        }
+        // SAFETY: ABI construction requires a live registry device; registry
+        // devices remain resident for the lifetime of the process.
+        let kind = unsafe { ffi::ggml_backend_dev_type(self.device) };
+        Some(super::backend::backend_kind(kind))
+    }
+
     pub(crate) fn provider(&self) -> ExecutionProvider {
         if self.device.is_null() {
             return ExecutionProvider::Unknown;

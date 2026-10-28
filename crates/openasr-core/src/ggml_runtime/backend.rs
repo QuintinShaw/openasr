@@ -2087,7 +2087,7 @@ fn metal_device_name(_devices: &[GgmlBackendDevice]) -> Option<String> {
     None
 }
 
-fn backend_kind(kind: c_int) -> GgmlBackendKind {
+pub(super) fn backend_kind(kind: c_int) -> GgmlBackendKind {
     match kind {
         ffi::GGML_BACKEND_DEVICE_TYPE_CPU => GgmlBackendKind::Cpu,
         ffi::GGML_BACKEND_DEVICE_TYPE_GPU => GgmlBackendKind::Gpu,
