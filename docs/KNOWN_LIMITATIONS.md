@@ -82,6 +82,12 @@ for the code map and [Roadmap](ROADMAP.md) for development priorities.
   generation still runs over the un-biased encoder output (only the
   attention-rescoring decoder input is biased), matching the upstream
   reference decode.
+- Granite Speech 4.1 can omit a repeated utterance inside one decode window.
+  A 30-second English recording containing two identical utterances produced
+  only one in the upstream Transformers bf16/fp16 references and native CPU Q4/Q8.
+  Keeping one utterance per shorter window preserved both. Backend and
+  quantization choices can change the greedy transcript; successful execution
+  does not guarantee that repetitions were recognized correctly.
 - Word-level timestamp requests are accepted and exported in JSON/VTT. Whisper
   uses native decoder cross-attention frame probabilities and the CTC families
   (parakeet-ctc, wav2vec2-ctc) use decoder frame spans; Qwen, Cohere, and
