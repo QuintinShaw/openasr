@@ -168,7 +168,19 @@ pub(crate) struct NativeMemoryAdmissionPlan {
 
 fn runtime_receipt_backend(
     provider: crate::device::execution_route::ExecutionProvider,
+    device_kind: Option<crate::ggml_runtime::GgmlBackendKind>,
 ) -> crate::ggml_runtime::GgmlCpuGraphBackend {
+    // BLAS/Accelerate is a CPU-graph accelerator, not a GPU graph backend.
+    // Use the concrete registry type rather than guessing from its name.
+    if matches!(
+        device_kind,
+        Some(
+            crate::ggml_runtime::GgmlBackendKind::Cpu
+                | crate::ggml_runtime::GgmlBackendKind::Accelerator
+        )
+    ) {
+        return crate::ggml_runtime::GgmlCpuGraphBackend::Cpu;
+    }
     match provider {
         crate::device::execution_route::ExecutionProvider::Cpu => {
             crate::ggml_runtime::GgmlCpuGraphBackend::Cpu
@@ -194,12 +206,15 @@ fn runtime_owner_placement(groups: &[NativeQuotedBackendGroup]) -> RuntimeOwnerP
     let Some(first_group) = groups.first() else {
         return RuntimeOwnerPlacement::Unknown;
     };
-    current_execution_lane_key(runtime_receipt_backend(first_group.provider))
-        .receipt_projection(&collector)
-        .map_or(
-            RuntimeOwnerPlacement::Unknown,
-            RuntimeOwnerPlacement::LaneBound,
-        )
+    current_execution_lane_key(runtime_receipt_backend(
+        first_group.provider,
+        first_group.abi.device_kind(),
+    ))
+    .receipt_projection(&collector)
+    .map_or(
+        RuntimeOwnerPlacement::Unknown,
+        RuntimeOwnerPlacement::LaneBound,
+    )
 }
 
 impl NativeMemoryAdmissionPlan {
@@ -616,7 +631,7 @@ impl NativeMemoryAllocationTransaction {
         let Some(first_group) = self.groups.first() else {
             return;
         };
-        let backend = runtime_receipt_backend(first_group.provider);
+        let backend = runtime_receipt_backend(first_group.provider, first_group.abi.device_kind());
         let lane = current_execution_lane_key(backend).receipt_projection(&collector);
         let Some(owner_descriptor) = collector.owner_descriptor(
             "native-memory-owner",
@@ -2436,6 +2451,73 @@ mod tests {
     use crate::device::execution_memory::{DeviceMemoryPolicy, ExecutionPhase};
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn memory_receipt_backend_keeps_cpu_class_and_gpu_provider_identity() {
+        use crate::device::execution_route::ExecutionProvider;
+        use crate::ggml_runtime::{GgmlBackendKind, GgmlCpuGraphBackend};
+
+        for provider in [ExecutionProvider::Cpu, ExecutionProvider::Accelerator] {
+            for kind in [GgmlBackendKind::Cpu, GgmlBackendKind::Accelerator] {
+                assert_eq!(
+                    runtime_receipt_backend(provider, Some(kind)),
+                    GgmlCpuGraphBackend::Cpu
+                );
+            }
+        }
+        assert_eq!(
+            runtime_receipt_backend(ExecutionProvider::Metal, Some(GgmlBackendKind::Gpu)),
+            GgmlCpuGraphBackend::Metal
+        );
+        for provider in [
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Vulkan,
+        ] {
+            assert_eq!(
+                runtime_receipt_backend(provider, Some(GgmlBackendKind::Gpu)),
+                GgmlCpuGraphBackend::Gpu
+            );
+        }
+        for provider in [ExecutionProvider::Accelerator, ExecutionProvider::Unknown] {
+            assert_eq!(
+                runtime_receipt_backend(provider, None),
+                GgmlCpuGraphBackend::Gpu
+            );
+            assert_eq!(
+                runtime_receipt_backend(provider, Some(GgmlBackendKind::Unknown(255))),
+                GgmlCpuGraphBackend::Gpu
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn cpu_class_memory_receipts_report_cpu_for_blas() {
+        crate::ggml_runtime::ensure_backends_loaded();
+        let mut cpu_class_devices = 0;
+        // Registry devices remain alive for the process lifetime. Exercise
+        // the real memory ABI lookup used by native buffer admission.
+        for index in 0..unsafe { ffi::ggml_backend_dev_count() } {
+            let device = unsafe { ffi::ggml_backend_dev_get(index) };
+            let kind = unsafe { ffi::ggml_backend_dev_type(device) };
+            if !matches!(
+                kind,
+                ffi::GGML_BACKEND_DEVICE_TYPE_CPU | ffi::GGML_BACKEND_DEVICE_TYPE_ACCEL
+            ) {
+                continue;
+            }
+            let abi = unsafe { BackendMemoryAbi::from_device(device) }
+                .expect("CPU-class devices expose the native memory ABI");
+            assert_eq!(
+                runtime_receipt_backend(abi.provider(), abi.device_kind()),
+                crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+                "CPU-class native memory must not be reported as a GPU backend"
+            );
+            cpu_class_devices += 1;
+        }
+        assert!(cpu_class_devices >= 2, "macOS must expose CPU and BLAS");
+    }
 
     #[cfg(target_os = "macos")]
     fn live_buffer_admission_plan(
