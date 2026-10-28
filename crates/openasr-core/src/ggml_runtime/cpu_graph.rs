@@ -5131,10 +5131,37 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         tensor: GgmlCpuTensor<'a>,
     ) -> Result<(), GgmlCpuGraphError> {
         self.ensure_can_extend_graph("ggml_set_output")?;
-        unsafe { ffi::ggml_set_output(tensor.raw.as_ptr()) };
+        self.preserve_output_storage(tensor);
         self.declared_output_tensors
             .insert(tensor.raw.as_ptr() as usize);
         Ok(())
+    }
+
+    fn preserve_output_storage(&self, tensor: GgmlCpuTensor<'a>) {
+        // External arenas/loaded weights are pinned by their Rust owners and
+        // may be shared across graph threads. Do not mutate their metadata.
+        if tensor.owner_context != Some(self.context) {
+            return;
+        }
+        let mut raw = tensor.raw.as_ptr();
+        while !raw.is_null() {
+            // ggml's liveness allocator frees a consumed view's storage owner
+            // independently of the view's OUTPUT flag. Keep that allocation
+            // alive through readback too, without copying the output payload.
+            // These pointers belong to the live graph; ggml view chains are
+            // acyclic and terminate at the owning tensor.
+            unsafe {
+                let layout = raw.cast::<ffi::GgmlTensorAllocPrefix>();
+                if raw != tensor.raw.as_ptr()
+                    && (!(*layout).buffer.is_null() || !(*layout).data.is_null())
+                {
+                    break;
+                }
+                let view_src = (*layout).view_src;
+                ffi::ggml_set_output(raw);
+                raw = view_src;
+            }
+        }
     }
 
     pub(crate) fn add(
@@ -8818,12 +8845,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             graph
         } else {
             self.ensure_backend_buffer()?;
-            let graph = self.allocate_forward_graph("ggml_new_graph_custom")?;
-            for root in &self.side_effect_roots {
-                unsafe { ffi::ggml_build_forward_expand(graph.as_ptr(), root.as_ptr()) };
-            }
-            unsafe { ffi::ggml_build_forward_expand(graph.as_ptr(), output.raw.as_ptr()) };
-            graph
+            self.build_forward_graph(&[output])?
         };
 
         if self.scheduler.is_some() && !graph_prepared {
@@ -9124,6 +9146,9 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             unsafe { ffi::ggml_build_forward_expand(graph.as_ptr(), root.as_ptr()) };
         }
         for output in outputs {
+            // Compatibility readback paths can supply roots without a prior
+            // set_output call. They need the same storage lifetime guarantee.
+            self.preserve_output_storage(output);
             unsafe { ffi::ggml_build_forward_expand(graph.as_ptr(), output.raw.as_ptr()) };
         }
         Ok(graph)
@@ -13718,6 +13743,98 @@ mod tests {
                 .expect("no override installed -> real compute succeeds"),
             vec![4.0, 6.0]
         );
+    }
+
+    #[test]
+    fn output_views_do_not_mutate_external_weight_metadata() {
+        let mut runner =
+            GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default()).unwrap();
+        let mut arena = runner.start_static_tensor_arena(1024 * 1024).unwrap();
+        let weight = arena.new_tensor_1d_f32(2, "shared_weight").unwrap();
+        arena
+            .set_f32_slice(weight, &[2.0, 3.0], "shared_weight")
+            .unwrap();
+        let external = arena.graph_tensor(weight);
+        let flags =
+            || unsafe { (*external.raw.as_ptr().cast::<ffi::GgmlTensorAllocPrefix>()).flags };
+        let before = flags();
+        let mut graph = runner.start_graph();
+        let view = graph.reshape_3d(external, 1, 2, 1).unwrap();
+        let output = graph.scale(view, 3.0).unwrap();
+        graph.set_output(view).unwrap();
+        assert_eq!(
+            flags(),
+            before,
+            "declaring a graph view changed its shared weight owner"
+        );
+        graph
+            .prepare_one_shot_outputs_for_upload(&[output, view, external])
+            .unwrap();
+        let mut result = [0.0; 2];
+        let mut view_result = [0.0; 2];
+        let mut external_result = [0.0; 2];
+        graph
+            .compute_outputs_into_f32(&mut [
+                (output, result.as_mut_slice()),
+                (view, view_result.as_mut_slice()),
+                (external, external_result.as_mut_slice()),
+            ])
+            .unwrap();
+        assert_eq!(result, [6.0, 9.0]);
+        assert_eq!(view_result, [2.0, 3.0]);
+        assert_eq!(external_result, [2.0, 3.0]);
+        assert_eq!(
+            flags(),
+            before,
+            "compatibility readback changed shared metadata"
+        );
+    }
+
+    #[test]
+    fn output_views_keep_their_storage_alive_after_consumption() {
+        for explicitly_declared in [false, true] {
+            let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+                .expect("CPU runner");
+            let mut graph = runner.start_graph();
+            let input = graph.new_tensor_2d_f32(512, 1, "input").unwrap();
+            let matrix = graph.new_tensor_2d_f32(512, 512, "matrix").unwrap();
+            graph.set_input(input).unwrap();
+            graph.set_input(matrix).unwrap();
+            let owner = graph.scale(input, 2.0).unwrap();
+            let view = graph.reshape_3d(owner, 128, 1, 4).unwrap();
+            let consumed = graph.scale(view, 3.0).unwrap();
+            let consumed_flat = graph.reshape_2d(consumed, 512, 1).unwrap();
+            let final_output = graph.mul_mat(matrix, consumed_flat).unwrap();
+            if explicitly_declared {
+                graph.set_output(view).unwrap();
+                graph.set_output(final_output).unwrap();
+            }
+            graph
+                .prepare_one_shot_outputs_for_upload(&[final_output, view])
+                .unwrap();
+            assert!(
+                graph.graph_allocator.is_some(),
+                "exercise liveness reuse, not the CPU step pool"
+            );
+            graph.set_f32_slice(input, &[1.0; 512], "input").unwrap();
+            let matrix_values = vec![1.0; 512 * 512];
+            graph
+                .set_f32_slice(matrix, &matrix_values, "matrix")
+                .unwrap();
+            let mut final_values = [0.0; 512];
+            let mut view_values = [0.0; 512];
+            graph
+                .compute_outputs_into_f32(&mut [
+                    (final_output, final_values.as_mut_slice()),
+                    (view, view_values.as_mut_slice()),
+                ])
+                .unwrap();
+            assert_eq!(final_values, [3072.0; 512]);
+            assert_eq!(
+                view_values, [2.0; 512],
+                "consumed output storage was recycled before readback"
+            );
+        }
     }
 
     #[test]
