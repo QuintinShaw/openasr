@@ -106,6 +106,14 @@ impl TranscriptAssembler {
         // slice's own span is folded into the boundary afterwards so the next
         // slice trims against it (even if this slice is silent / emits nothing).
         let trim_boundary = self.committed_end_original;
+        let slice_start_original = self.timeline.map_processed_to_original_seconds(
+            transcript.slice.content_start_sample as f32 / 16_000.0,
+        );
+        // Matching text proves a re-read only when both decodes include the
+        // same audio. Adjacent windows and same-slice cues may contain genuine
+        // repeated speech, even when their text and estimated times match.
+        let overlaps_prior_audio =
+            trim_boundary.is_some_and(|boundary| slice_start_original < boundary);
         let slice_committed_end = self.slice_content_end_original(&transcript.slice);
         self.committed_end_original = Some(match self.committed_end_original {
             Some(previous) => previous.max(slice_committed_end),
@@ -152,7 +160,8 @@ impl TranscriptAssembler {
             // words make a midpoint trim eat the textual re-read prefix and
             // would skip stitch if we required `words.is_empty()`. Same-slice
             // adjacent cues still skip stitch via `cross_slice_seam`.
-            if cross_slice_seam && self.try_stitch_seam_overlap(&mut mapped) {
+            if cross_slice_seam && overlaps_prior_audio && self.try_stitch_seam_overlap(&mut mapped)
+            {
                 self.stats.duplicate_merge_count += 1;
                 if mapped.text.trim().is_empty() {
                     continue;
@@ -172,7 +181,8 @@ impl TranscriptAssembler {
                 self.stats.duplicate_merge_count += 1;
                 continue;
             }
-            if self.try_drop_redundant_segment(&mapped) {
+            if cross_slice_seam && overlaps_prior_audio && self.try_drop_redundant_segment(&mapped)
+            {
                 self.stats.duplicate_merge_count += 1;
                 continue;
             }
@@ -990,6 +1000,53 @@ mod tests {
         });
         let transcription = assembler.into_transcription();
         assert_eq!(transcription.segments.len(), 1);
+    }
+
+    #[test]
+    fn assembler_keeps_repeated_speech_in_nonoverlapping_slices() {
+        let text = "ask not what your country can do for you";
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        for index in 0..3 {
+            assembler.push_slice_result(SliceTranscript {
+                slice: slice(index * 16_000, (index + 1) * 16_000),
+                text: text.to_string(),
+                segments: Vec::new(),
+                time_domain: SegmentTimeDomain::RelativeToSliceContent,
+            });
+        }
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(transcription.segments.len(), 3);
+        assert_eq!(transcription.text.matches(text).count(), 3);
+        assert_eq!(stats.duplicate_merge_count, 0);
+    }
+
+    #[test]
+    fn assembler_keeps_repeated_cues_within_one_slice() {
+        let text = "ask not what your country can do for you";
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 48_000),
+            text: std::iter::repeat_n(text, 3).collect::<Vec<_>>().join(" "),
+            segments: (0..3)
+                .map(|index| Segment {
+                    start: index as f32,
+                    end: (index + 1) as f32,
+                    text: text.to_string(),
+                    speaker: None,
+                    speaker_label: None,
+                    speaker_person_id: None,
+                    speaker_snapshot_label: None,
+                    words: Vec::new(),
+                })
+                .collect(),
+            time_domain: SegmentTimeDomain::RelativeToSliceContent,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(transcription.segments.len(), 3);
+        assert_eq!(transcription.text.matches(text).count(), 3);
+        assert_eq!(stats.duplicate_merge_count, 0);
     }
 
     #[test]
@@ -1831,7 +1888,7 @@ mod tests {
     #[test]
     fn assembler_keeps_short_abutting_repetition_without_time_overlap() {
         // Two-unit prefix shared by abutting complete slices must not stitch.
-        // Exact duplicates still drop via text-equality; this pair differs.
+        // Distinct audio must preserve both utterances.
         let mut assembler =
             TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
         assembler.push_slice_result(SliceTranscript {

@@ -930,18 +930,51 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav")
     }
 
-    fn longform_en_zh_wav_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/longform_en_zh.wav")
+    fn english_longform_fixture() -> (tempfile::TempDir, PathBuf) {
+        // Granite's catalog does not advertise Chinese. Exercise longform with
+        // supported speech, keeping each committed JFK clip whole inside a
+        // 15-second window. The upstream model can omit a repeated utterance
+        // inside one longer window; this gate isolates cross-window assembly.
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            jfk_wav_path(),
+            "Granite longform fixture",
+            "Granite longform fixture",
+        )
+        .unwrap();
+        let block_len = 15 * 16000;
+        assert!(samples.len() < block_len);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jfk-three-clips.wav");
+        let data_bytes = u32::try_from(3 * block_len * 2).unwrap();
+        let mut bytes = Vec::with_capacity(data_bytes as usize + 44);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(data_bytes + 36).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&16000u32.to_le_bytes());
+        bytes.extend_from_slice(&32000u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_bytes.to_le_bytes());
+        for _ in 0..3 {
+            for sample in samples
+                .iter()
+                .copied()
+                .chain(std::iter::repeat_n(0.0, block_len - samples.len()))
+            {
+                bytes.extend_from_slice(&((sample * 32768.0) as i16).to_le_bytes());
+            }
+        }
+        std::fs::write(&path, bytes).unwrap();
+        (directory, path)
     }
 
     const JFK_REFERENCE_TRANSCRIPT: &str = "and so my fellow americans ask not what your country can do for you ask what you can do for your country";
-    /// Anchor phrase that appears three times in `fixtures/longform_en_zh.wav`
-    /// (EN/ZH/EN/ZH/EN concat of committed short fixtures). Used to detect both
-    /// under-coverage (pathological truncation dropping later EN clips) and
-    /// runaway repetition (the same phrase looping past the fixture's real
-    /// count).
+    /// Each complete English fixture clip contains this anchor once.
     const JFK_ANCHOR_PHRASE: &str = "ask not what your country can do for you";
-    const ZH_ANCHOR_PHRASE: &str = "今天天气";
 
     /// Generation budget backstop the executor hands the shared greedy driver.
     /// Multi-minute audio is NOT served by raising this -- it is served by the
@@ -1155,7 +1188,7 @@ mod tests {
     }
 
     /// Full native longform path (not the low-level single-buffer executor): the
-    /// SharedWindow slicer must split `fixtures/longform_en_zh.wav` (~69s) into
+    /// SharedWindow slicer must split three complete JFK clips (45s) into
     /// multiple chunks, assemble a multi-clip transcript without pathological
     /// repetition, and never claim success while a slice hit the 256-token
     /// budget or the degenerate-loop guard without recording it on
@@ -1163,23 +1196,20 @@ mod tests {
     #[test]
     #[ignore = "requires a private multi-GB granite-speech .oasr pack via \
                 OPENASR_GRANITE_SPEECH_PACK; runs the real native longform path on \
-                fixtures/longform_en_zh.wav (multi-slice, CPU)"]
+                three committed JFK clips (multi-slice, CPU)"]
     fn longform_multi_slice_avoids_repetition_and_silent_truncation() {
         let Some(pack_path) = dev_pack_path() else {
             return;
         };
-        let audio = longform_en_zh_wav_path();
-        assert!(
-            audio.is_file(),
-            "committed longform fixture missing at {}",
-            audio.display()
-        );
+        let (_fixture_directory, audio) = english_longform_fixture();
 
-        // Fixed 30s window forces a deterministic multi-slice plan independent of
-        // VAD availability, matching the SharedWindow default chunk length.
+        // Keep one complete utterance per window to isolate assembly from the
+        // upstream model's within-window repeated-speech accuracy limitation.
         let longform = LongFormOptions {
             mode: LongFormMode::Fixed,
-            chunk_seconds: 30.0,
+            chunk_seconds: 15.0,
+            overlap_seconds: 0.0,
+            padding_seconds: 0.0,
             // Granite has no token-history producer. Deliberately request carry
             // here so the architecture policy must normalize it off on the
             // production path.
@@ -1201,8 +1231,8 @@ mod tests {
             .as_ref()
             .expect("longform metadata must be present on a multi-slice run");
         assert!(
-            longform_meta.chunk_count >= 2,
-            "69s fixture must slice under the 30s SharedWindow, got chunk_count={}",
+            longform_meta.chunk_count == 3,
+            "45s fixture must have three 15s windows, got chunk_count={}",
             longform_meta.chunk_count
         );
 
@@ -1240,7 +1270,7 @@ mod tests {
             // while this fixture trips the budget/guard.
             panic!(
                 "longform fixture truncated on one or more slices: {:?}; \
-                 multi-slice path must finish this ~69s recording without hitting \
+                 multi-slice path must finish this 45s recording without hitting \
                  the 256-token backstop or the degenerate-loop guard",
                 transcription.truncated_decodes
             );
@@ -1251,18 +1281,11 @@ mod tests {
             "pathological consecutive n-gram run in longform transcript: {text:?}"
         );
 
-        // Coverage anchors: fixture is EN/ZH/EN/ZH/EN. Expect the JFK anchor on
-        // the order of the three EN clips (allow seam duplication up to 2x) and
-        // at least one Chinese weather phrase from the ZH clips.
+        // All three utterances must survive, without omission or duplication.
         let jfk_hits = count_phrase_occurrences(text, JFK_ANCHOR_PHRASE);
         assert!(
-            (2..=6).contains(&jfk_hits),
-            "JFK anchor should appear ~3 times (fixture has 3 EN clips); got {jfk_hits} in {text:?}"
-        );
-        let zh_hits = count_phrase_occurrences(text, ZH_ANCHOR_PHRASE);
-        assert!(
-            zh_hits >= 1,
-            "Chinese anchor missing from multi-slice transcript (possible mid-recording drop): {text:?}"
+            jfk_hits == 3,
+            "JFK anchor should appear exactly 3 times; got {jfk_hits} in {text:?}"
         );
     }
 
@@ -1273,17 +1296,18 @@ mod tests {
     #[test]
     #[ignore = "requires a private multi-GB granite-speech .oasr pack via \
                 OPENASR_GRANITE_SPEECH_PACK and a GPU-class host; runs CPU + \
-                Accelerated native longform on fixtures/longform_en_zh.wav"]
+                Accelerated native longform on three committed JFK clips"]
     fn longform_cpu_vs_accelerated_transcript_parity() {
         let Some(pack_path) = dev_pack_path() else {
             return;
         };
-        let audio = longform_en_zh_wav_path();
-        assert!(audio.is_file(), "fixture missing at {}", audio.display());
+        let (_fixture_directory, audio) = english_longform_fixture();
 
         let longform = LongFormOptions {
             mode: LongFormMode::Fixed,
-            chunk_seconds: 30.0,
+            chunk_seconds: 15.0,
+            overlap_seconds: 0.0,
+            padding_seconds: 0.0,
             carry_prompt_across_slices: true,
             ..LongFormOptions::default()
         };
@@ -1335,10 +1359,9 @@ mod tests {
     /// executor-owned actor on the second call and still
     /// produce a byte-identical transcript to the first (cache-miss/build)
     /// call. This is the load-bearing correctness gate for the resident cache:
-    /// the second decode reuses a logically reset session. CPU host K/V was
-    /// released; GPU resident K/V remained allocated but must be overwritten
-    /// or masked. Any visible leak of prior-request state would diverge the two
-    /// transcripts here.
+    /// the second decode reuses a logically reset session. The selected backend
+    /// plan owns graph/KV reuse policy; this gate checks observable text across
+    /// both cold and warm prepared runtimes.
     ///
     /// Transcript-vs-reference correctness (that the decode produces the RIGHT
     /// text) is covered separately by the llama.cpp-reference goldens in
@@ -1348,7 +1371,7 @@ mod tests {
     #[test]
     #[ignore = "requires a private multi-GB granite-speech .oasr pack via \
                 OPENASR_GRANITE_SPEECH_PACK and a Metal-capable host; skips when unset"]
-    fn metal_resident_reusable_graph_matches_reference_cold_and_warm() {
+    fn metal_prepared_runtime_matches_reference_cold_and_warm() {
         let Some(pack_path) = dev_pack_path() else {
             return;
         };
