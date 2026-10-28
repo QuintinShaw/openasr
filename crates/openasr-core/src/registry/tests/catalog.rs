@@ -1191,6 +1191,48 @@ fn catalog_loader_caches_file_source_and_falls_back_to_cache() {
 }
 
 #[test]
+fn request_local_catalog_transport_preserves_signed_local_load_and_cache() {
+    for preference in [
+        transport::CatalogTransportPreference::Global,
+        transport::CatalogTransportPreference::China,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source-catalog.json");
+        let home = temp.path().join("home");
+        crate::testing::write_local_dev_signed_catalog(&source_path, &catalog_json(), 1);
+        let source = format!("file://{}", source_path.display());
+        let catalog = load_model_catalog_with_transport(Some(&source), &home, preference).unwrap();
+        assert_eq!(catalog.models.len(), 2);
+        assert!(default_catalog_cache_path(&home).exists());
+        fs::remove_file(&source_path).unwrap();
+        let cached = load_model_catalog_with_transport(Some(&source), &home, preference).unwrap();
+        assert_eq!(cached.models[0].id, "moonshine-tiny");
+    }
+}
+
+#[test]
+fn request_local_catalog_transport_rejects_unsigned_source() {
+    for preference in [
+        transport::CatalogTransportPreference::Global,
+        transport::CatalogTransportPreference::China,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source-catalog.json");
+        let home = temp.path().join("home");
+        fs::write(&source_path, catalog_json()).unwrap();
+        let source = format!("file://{}", source_path.display());
+        let error = load_model_catalog_with_transport(Some(&source), &home, preference)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Model catalog security check failed"),
+            "{error}"
+        );
+        assert!(!default_catalog_cache_path(&home).exists());
+    }
+}
+
+#[test]
 fn runtime_backend_catalog_load_uses_only_the_verified_cache() {
     let temp = tempfile::tempdir().unwrap();
     let source_path = temp.path().join("source-catalog.json");

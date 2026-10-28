@@ -501,15 +501,15 @@ pub use registry::{
     RuntimeRegistryError, canonical_quant_tag, current_cli_version, default_catalog_cache_path,
     default_catalog_url, default_registry_dir, embedded_catalog_fingerprint,
     load_embedded_signed_catalog, load_local_catalog_file_with_identity, load_model_catalog,
-    load_registry, load_verified_home_catalog, model_cards_from_catalog,
-    model_install_license_decision, model_reference_matches_resolved_source,
-    model_refs_match_with_optional_tag_alias, parse_model_catalog, parse_model_ref,
-    preview_local_catalog_file_with_identity, recommend_catalog_quant,
-    resolve_catalog_backend_pull, resolve_catalog_backend_pull_for_host, resolve_catalog_pull,
-    resolve_catalog_pull_with_profile, resolve_compatible_catalog_backend_pull,
-    resolve_compatible_catalog_backend_pull_for_driver, resolve_local_catalog_env_override,
-    resolve_registry_model_ref, resolve_runtime_catalog, resolve_runtime_model_ref,
-    runtime_registry,
+    load_model_catalog_with_transport, load_registry, load_verified_home_catalog,
+    model_cards_from_catalog, model_install_license_decision,
+    model_reference_matches_resolved_source, model_refs_match_with_optional_tag_alias,
+    parse_model_catalog, parse_model_ref, preview_local_catalog_file_with_identity,
+    recommend_catalog_quant, resolve_catalog_backend_pull, resolve_catalog_backend_pull_for_host,
+    resolve_catalog_pull, resolve_catalog_pull_with_profile,
+    resolve_compatible_catalog_backend_pull, resolve_compatible_catalog_backend_pull_for_driver,
+    resolve_local_catalog_env_override, resolve_registry_model_ref, resolve_runtime_catalog,
+    resolve_runtime_model_ref, runtime_registry,
 };
 pub use remote_compute::{
     certificate_fingerprint_sha256, pairing_safety_code_for_certificate_fingerprint,
@@ -520,6 +520,6 @@ pub use safety::{
 };
 pub use transport::{
     CANONICAL_CATALOG_ENDPOINT, CANONICAL_DL_ENDPOINT, CATALOG_ENDPOINT_ENV,
-    CHINA_CATALOG_ENDPOINT, CHINA_DL_ENDPOINT, DL_ENDPOINT_ENV, MODELSCOPE_DEFAULT_REVISION,
-    MODELSCOPE_ORIGIN, MODELSCOPE_OWNER, prefer_china_transport,
+    CHINA_CATALOG_ENDPOINT, CHINA_DL_ENDPOINT, CatalogTransportPreference, DL_ENDPOINT_ENV,
+    MODELSCOPE_DEFAULT_REVISION, MODELSCOPE_ORIGIN, MODELSCOPE_OWNER, prefer_china_transport,
 };

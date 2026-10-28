@@ -200,10 +200,16 @@ only, and the HF catalog repo is no longer required to serve clients. Only the
 entries are never exposed. Public capability packs remain in that projection
 because `public` is the download/import gate, not the ASR market-list gate. The
 catalog's URLs stay pinned to `huggingface.co` as
-the signed, canonical *identity*; the client rewrites only the transport *host*
-via `http::apply_catalog_endpoint`, controlled by `OPENASR_CATALOG_ENDPOINT`
-(allowlist: `https://catalog.openasr.org` — a no-op — and
-`https://catalog.bug.im`, the Aliyun ESA byte-identical replica). The signed
+the signed, canonical *identity*; `transport::catalog_transport_urls` chooses
+only the fetch *host* from `https://catalog.openasr.org` and
+`https://catalog.bug.im` (the Aliyun ESA byte-identical replica). Environment
+mode honors `OPENASR_CATALOG_ENDPOINT` as a single-host pin; otherwise both
+hosts are raced, with region preference determining order. Threaded consumers
+can use `load_model_catalog_with_transport` with a request-local
+`CatalogTransportPreference::{Global, China}` instead of changing process
+environment variables. These explicit preferences race both allowlisted hosts
+and leave catalog identity, signature verification, epoch enforcement, and
+cache/fallback behavior unchanged. The signed
 `catalog_url` is always `https://catalog.openasr.org/v1/catalog.json`; swapping
 the fetch host needs no re-sign. This is independent of `HF_ENDPOINT`, which
 routes weight downloads only. Deploys push the same two JSON files to Cloudflare

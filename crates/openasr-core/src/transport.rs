@@ -40,22 +40,46 @@ pub(crate) fn apply_catalog_endpoint(url: &str) -> String {
     rewrite_catalog_identity(url, &resolved_catalog_endpoint())
 }
 
+/// Request-local catalog host preference. This changes fetch ordering only;
+/// signature identity, allowed hosts, and verification remain unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CatalogTransportPreference {
+    /// Use the process's startup environment and locale, including a pinned host.
+    #[default]
+    Environment,
+    /// Race both production hosts, preferring the global endpoint.
+    Global,
+    /// Race both production hosts, preferring the China endpoint.
+    China,
+}
+
 /// Transport URLs for one catalog identity. An explicit allowlisted
-/// `OPENASR_CATALOG_ENDPOINT` pins a single host. Otherwise Cloudflare and
-/// Aliyun ESA are both listed (preferred first) so the caller can race them.
-pub(crate) fn catalog_transport_urls(identity_url: &str) -> Vec<String> {
+/// `OPENASR_CATALOG_ENDPOINT` pins a single host in environment mode. An
+/// explicit request preference races both hosts without consulting that pin.
+/// Non-catalog identities pass through unchanged in every mode.
+pub(crate) fn catalog_transport_urls(
+    identity_url: &str,
+    preference: CatalogTransportPreference,
+) -> Vec<String> {
     let canonical = rewrite_catalog_identity(identity_url, CANONICAL_CATALOG_ENDPOINT);
     let china = rewrite_catalog_identity(identity_url, CHINA_CATALOG_ENDPOINT);
     if canonical == china {
         return vec![identity_url.to_string()];
     }
-    if let Some(pinned) = endpoint_from_env(CATALOG_ENDPOINT_ENV) {
-        if is_allowed_https_endpoint(&pinned, ALLOWED_CATALOG_ENDPOINTS) {
-            return vec![rewrite_catalog_identity(identity_url, &pinned)];
+    let prefer_china = match preference {
+        CatalogTransportPreference::Environment => {
+            if let Some(pinned) = endpoint_from_env(CATALOG_ENDPOINT_ENV) {
+                if is_allowed_https_endpoint(&pinned, ALLOWED_CATALOG_ENDPOINTS) {
+                    return vec![rewrite_catalog_identity(identity_url, &pinned)];
+                }
+                return vec![canonical];
+            }
+            prefer_china_transport_without_catalog_env()
         }
-        return vec![canonical];
-    }
-    if prefer_china_transport_without_catalog_env() {
+        CatalogTransportPreference::Global => false,
+        CatalogTransportPreference::China => true,
+    };
+    if prefer_china {
         vec![china, canonical]
     } else {
         vec![canonical, china]
@@ -225,8 +249,9 @@ pub(crate) fn hf_endpoint_is_set() -> bool {
 }
 
 /// Locale / TZ / `OPENASR_DOWNLOAD_SOURCE=china|global` / explicit catalog
-/// endpoint. Desktop should set the env knobs from its one China toggle so
-/// this process and the sidecar daemon agree.
+/// endpoint. Read startup configuration only; threaded callers must not mutate
+/// the process environment to change routing. Catalog callers can pass a
+/// request-local [`CatalogTransportPreference`] instead.
 pub fn prefer_china_transport() -> bool {
     if let Some(endpoint) = endpoint_from_env(CATALOG_ENDPOINT_ENV)
         && is_allowed_https_endpoint(&endpoint, ALLOWED_CATALOG_ENDPOINTS)
@@ -595,7 +620,7 @@ mod tests {
             ],
             || {
                 assert_eq!(
-                    catalog_transport_urls(IDENTITY),
+                    catalog_transport_urls(IDENTITY, CatalogTransportPreference::Environment),
                     vec![
                         IDENTITY.to_string(),
                         "https://catalog.bug.im/v1/catalog.json".to_string(),
@@ -610,7 +635,7 @@ mod tests {
             ],
             || {
                 assert_eq!(
-                    catalog_transport_urls(IDENTITY),
+                    catalog_transport_urls(IDENTITY, CatalogTransportPreference::Environment),
                     vec![
                         "https://catalog.bug.im/v1/catalog.json".to_string(),
                         IDENTITY.to_string(),
@@ -628,12 +653,91 @@ mod tests {
             ],
             || {
                 assert_eq!(
-                    catalog_transport_urls(IDENTITY),
+                    catalog_transport_urls(IDENTITY, CatalogTransportPreference::Environment),
                     vec!["https://catalog.bug.im/v1/catalog.json".to_string()]
                 );
             },
         );
-        assert_eq!(catalog_transport_urls(HF_PACK), vec![HF_PACK.to_string()]);
+        assert_eq!(
+            catalog_transport_urls(HF_PACK, CatalogTransportPreference::Environment),
+            vec![HF_PACK.to_string()]
+        );
+    }
+
+    #[test]
+    fn request_local_catalog_preferences_ignore_env_and_keep_identity_pairs() {
+        use std::ffi::OsString;
+        crate::test_process_env::with_test_process_env(
+            [
+                (
+                    CATALOG_ENDPOINT_ENV,
+                    Some(OsString::from("https://untrusted.invalid")),
+                ),
+                ("OPENASR_DOWNLOAD_SOURCE", Some(OsString::from("china"))),
+            ],
+            || {
+                for (preference, expected) in [
+                    (
+                        CatalogTransportPreference::Global,
+                        vec![CANONICAL_CATALOG_ENDPOINT, CHINA_CATALOG_ENDPOINT],
+                    ),
+                    (
+                        CatalogTransportPreference::China,
+                        vec![CHINA_CATALOG_ENDPOINT, CANONICAL_CATALOG_ENDPOINT],
+                    ),
+                ] {
+                    let catalogs = catalog_transport_urls(IDENTITY, preference);
+                    let signatures = catalog_transport_urls(
+                        "https://catalog.openasr.org/v1/catalog.signature.json",
+                        preference,
+                    );
+                    assert_eq!(
+                        catalogs,
+                        expected
+                            .iter()
+                            .map(|host| format!("{host}/v1/catalog.json"))
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        signatures,
+                        expected
+                            .iter()
+                            .map(|host| format!("{host}/v1/catalog.signature.json"))
+                            .collect::<Vec<_>>()
+                    );
+                    for passthrough in [
+                        HF_PACK,
+                        "https://example.invalid/catalog.json",
+                        "file:///catalog.json",
+                    ] {
+                        assert_eq!(
+                            catalog_transport_urls(passthrough, preference),
+                            vec![passthrough.to_string()]
+                        );
+                    }
+                }
+                assert_eq!(
+                    std::env::var(CATALOG_ENDPOINT_ENV).unwrap(),
+                    "https://untrusted.invalid"
+                );
+                assert_eq!(std::env::var("OPENASR_DOWNLOAD_SOURCE").unwrap(), "china");
+            },
+        );
+    }
+
+    #[test]
+    fn request_local_catalog_preferences_are_independent_between_threads() {
+        std::thread::scope(|scope| {
+            let global = scope
+                .spawn(|| catalog_transport_urls(IDENTITY, CatalogTransportPreference::Global));
+            let china =
+                scope.spawn(|| catalog_transport_urls(IDENTITY, CatalogTransportPreference::China));
+            let global = global.join().unwrap();
+            let china = china.join().unwrap();
+            assert_eq!(global[0], IDENTITY);
+            assert_eq!(china[0], "https://catalog.bug.im/v1/catalog.json");
+            assert_eq!(global, china.into_iter().rev().collect::<Vec<_>>());
+        });
     }
 
     #[test]
