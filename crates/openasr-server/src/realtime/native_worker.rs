@@ -1399,21 +1399,25 @@ fn log_default_reactivation_failed(home: &Path, requested_path: &Path, reason: &
 #[derive(Clone)]
 pub(crate) struct NativeWarmupTarget {
     path: PathBuf,
+    verified_pack: Option<openasr_core::VerifiedPack>,
+    pinned_lane: Option<openasr_core::DefaultModelActivationLane>,
     residency_key: crate::idle_activity::NativeRuntimeResidencyKey,
     execution_target: openasr_core::ExecutionTarget,
 }
 
 impl NativeWarmupTarget {
     pub(crate) fn attested(
-        path: PathBuf,
-        pack_content_id: &str,
+        verified_pack: openasr_core::VerifiedPack,
         execution_target: openasr_core::ExecutionTarget,
+        pinned_lane: Option<openasr_core::DefaultModelActivationLane>,
     ) -> Self {
         Self {
-            path,
+            path: verified_pack.path().to_path_buf(),
             residency_key: crate::idle_activity::NativeRuntimeResidencyKey::attested(
-                pack_content_id,
+                verified_pack.content_id(),
             ),
+            verified_pack: Some(verified_pack),
+            pinned_lane,
             execution_target,
         }
     }
@@ -1534,6 +1538,8 @@ async fn warm_up_native_pack(
                 (
                     NativeWarmupTarget {
                         path: active_model.path().to_path_buf(),
+                        verified_pack: None,
+                        pinned_lane: None,
                         residency_key: active_model.residency_key().clone(),
                         execution_target: match preferences_home.as_deref() {
                             Some(home) => realtime_execution_target_preference(home),
@@ -1555,8 +1561,11 @@ async fn warm_up_native_pack(
         execution_target_preference.clone(),
     ))
     .map_err(|error| error.to_string())?;
-    let Some(adapter) = openasr_core::native_runtime_model_adapter_for_path(&model_pack_path)
-    else {
+    let adapter = match target.verified_pack {
+        Some(proof) => openasr_core::native_runtime_model_adapter_for_verified_pack(proof),
+        None => openasr_core::native_runtime_model_adapter_for_path(&model_pack_path),
+    };
+    let Some(adapter) = adapter else {
         return Err("no native runtime adapter for selected model pack".to_string());
     };
     let model_pack = adapter
@@ -1569,6 +1578,10 @@ async fn warm_up_native_pack(
         Some(reservation_context) => {
             context.with_activation_reservation_context(reservation_context)
         }
+        None => context,
+    };
+    let context = match target.pinned_lane {
+        Some(lane) => context.with_activation_lane(lane),
         None => context,
     };
     // Warm the same worker key an unscoped WS attach will use.

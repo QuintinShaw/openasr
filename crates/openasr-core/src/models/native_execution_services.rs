@@ -1836,6 +1836,18 @@ pub fn resolve_candidate_activation_lane(
     pack: &VerifiedPack,
     intent: ExecutionIntent,
 ) -> Result<ExecutionCandidate, String> {
+    let plan = resolve_candidate_activation_plan(services, pack, intent)?;
+    plan.candidates()
+        .first()
+        .cloned()
+        .ok_or_else(|| "execution policy produced no activation candidate".to_string())
+}
+
+fn resolve_candidate_activation_plan(
+    services: &NativeExecutionServices,
+    pack: &VerifiedPack,
+    intent: ExecutionIntent,
+) -> Result<crate::device::execution_policy::ExecutionPlan, String> {
     let architecture_id = architecture_id_from_pack(pack)?;
     let descriptor = crate::arch::OpenAsrArchitectureRegistry::with_builtins()
         .find_by_model_architecture(architecture_id)
@@ -1843,7 +1855,7 @@ pub fn resolve_candidate_activation_lane(
             format!("candidate activation has no architecture descriptor for {architecture_id}")
         })?;
     let inventory = enumerate_compute_devices_from_ggml(&ggml_available_devices());
-    let plan = services
+    services
         .policy_resolver()
         .resolve(
             intent,
@@ -1851,11 +1863,7 @@ pub fn resolve_candidate_activation_lane(
             descriptor.execution_contract.execution_capabilities,
             &inventory,
         )
-        .map_err(|error| error.to_string())?;
-    plan.candidates()
-        .first()
-        .cloned()
-        .ok_or_else(|| format!("execution policy produced no candidate lane for {architecture_id}"))
+        .map_err(|error| error.to_string())
 }
 
 /// Fully resolved default-model activation facts. The server consumes this
@@ -1870,6 +1878,51 @@ pub struct ResolvedDefaultModelActivation {
 impl ResolvedDefaultModelActivation {
     pub const fn facts(&self) -> &DefaultModelActivationFacts {
         &self.facts
+    }
+
+    /// A successful fallback probe is only a hint: it cannot attest this
+    /// transaction's different lane. Resolve an allowed replacement plan for
+    /// a new reservation/transaction; the caller must probe it again.
+    pub fn resolve_observed_policy_fallback(
+        &self,
+        services: &NativeExecutionServices,
+        probe: &super::request_execution_receipt::NativeExecutionReceiptSnapshot,
+    ) -> Result<Option<Self>, String> {
+        let plan = self.facts.plan();
+        let candidates = resolve_candidate_activation_plan(
+            services,
+            &self.verified_pack,
+            plan.execution_intent().clone(),
+        )?;
+        for candidate in candidates.candidates() {
+            if candidate.placement == self.facts.exact_lane().candidate().placement
+                && candidate.device.route.cache_key()
+                    == self.facts.exact_lane().candidate().device.route.cache_key()
+            {
+                continue;
+            }
+            let replacement = resolve_default_model_activation_for_candidate(
+                &self.verified_pack,
+                plan.execution_intent().clone(),
+                self.facts.identity().pull().to_string(),
+                plan.path().to_path_buf(),
+                candidate.clone(),
+            )?;
+            let facts = replacement.facts();
+            if probe
+                .attest_activation(
+                    facts.plan().pack_content_id(),
+                    facts.plan().resolved_runtime(),
+                    candidate.device.route.provider,
+                    &candidate.device.route.stable_id,
+                    candidate.placement,
+                )
+                .is_ok()
+            {
+                return Ok(Some(replacement));
+            }
+        }
+        Ok(None)
     }
 
     pub fn quote(&self) -> Result<DefaultModelActivationQuote, String> {
@@ -1963,6 +2016,17 @@ pub fn resolve_default_model_activation(
     pull: String,
     path: std::path::PathBuf,
 ) -> Result<ResolvedDefaultModelActivation, String> {
+    let candidate = resolve_candidate_activation_lane(services, pack, intent.clone())?;
+    resolve_default_model_activation_for_candidate(pack, intent, pull, path, candidate)
+}
+
+fn resolve_default_model_activation_for_candidate(
+    pack: &VerifiedPack,
+    intent: ExecutionIntent,
+    pull: String,
+    path: std::path::PathBuf,
+    candidate: ExecutionCandidate,
+) -> Result<ResolvedDefaultModelActivation, String> {
     if pack.preflight().runtime_source().path() != path {
         return Err("default-model activation path does not match the verified source".to_string());
     }
@@ -1972,7 +2036,6 @@ pub fn resolve_default_model_activation(
         .ok_or_else(|| {
             format!("candidate activation has no architecture descriptor for {architecture_id}")
         })?;
-    let candidate = resolve_candidate_activation_lane(services, pack, intent.clone())?;
     let resident_topology =
         resolve_resident_topology_plan(descriptor, pack, &candidate, &intent, true)?;
     let logits_consumers = super::device_greedy_token::decode_logits_consumers_for_request(
@@ -3027,6 +3090,172 @@ mod tests {
             },
             placement,
         }
+    }
+
+    #[test]
+    fn activation_lane_restriction_preserves_policy_and_physical_identity() {
+        use crate::device::execution_policy::ExecutionPlan;
+        let gpu = gpu_candidate(
+            ExecutionProvider::Cuda,
+            "CUDA0",
+            "0000:00:02.0",
+            ExecutionPlacement::FullDevice,
+        );
+        let cpu = cpu_candidate();
+        let plan = ExecutionPlan::for_test(ExecutionIntent::Auto, vec![gpu.clone(), cpu.clone()]);
+        let selected = plan.clone().restrict_to_candidate(&cpu).unwrap();
+        assert_eq!(selected.intent(), &ExecutionIntent::Auto);
+        assert_eq!(selected.candidates(), std::slice::from_ref(&cpu));
+        let mut refreshed = gpu.clone();
+        refreshed.device.memory = None;
+        refreshed.device.route.registry_ordinal = 5;
+        assert!(
+            plan.clone().restrict_to_candidate(&refreshed).is_ok(),
+            "diagnostic snapshots and registry order do not change a physical lane"
+        );
+        let mut other_device = gpu.clone();
+        other_device.device.route.addressability = DeviceAddressability::ExactlyAddressable {
+            physical_key: PhysicalResourceKey::new("0000:00:03.0").unwrap(),
+        };
+        assert!(plan.clone().restrict_to_candidate(&other_device).is_err());
+        let mut other_placement = gpu.clone();
+        other_placement.placement = ExecutionPlacement::Hybrid;
+        assert!(plan.restrict_to_candidate(&other_placement).is_err());
+        assert!(
+            ExecutionPlan::for_test(ExecutionIntent::AcceleratedOnly, vec![gpu])
+                .restrict_to_candidate(&cpu)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn activation_fallback_requires_an_allowed_fully_attested_probe() {
+        struct FixedPolicy;
+        impl ExecutionPolicyResolver for FixedPolicy {
+            fn resolve(
+                &self,
+                intent: ExecutionIntent,
+                _: crate::ggml_runtime::AutoGpuPolicy,
+                _: crate::device::execution_policy::ExecutionCapabilities,
+                _: &[crate::device::execution_route::EnumeratedComputeDevice],
+            ) -> Result<
+                crate::device::execution_policy::ExecutionPlan,
+                crate::device::execution_policy::ExecutionPolicyError,
+            > {
+                let gpu = gpu_candidate(
+                    ExecutionProvider::Cuda,
+                    "CUDA0",
+                    "0000:00:02.0",
+                    ExecutionPlacement::FullDevice,
+                );
+                let candidates = match intent {
+                    ExecutionIntent::Auto => vec![gpu, cpu_candidate()],
+                    ExecutionIntent::CpuOnly => vec![cpu_candidate()],
+                    _ => vec![gpu],
+                };
+                Ok(crate::device::execution_policy::ExecutionPlan::for_test(
+                    intent, candidates,
+                ))
+            }
+        }
+        let services = NativeExecutionServices::new_with_broker(
+            Arc::new(FixedPolicy),
+            Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy::default())),
+        )
+        .unwrap();
+        let pack = shipped_activation_verified_pack();
+        let resolve = |intent| {
+            resolve_default_model_activation(
+                &services,
+                &pack,
+                intent,
+                "whisper-tiny:q4".to_string(),
+                pack.path().to_path_buf(),
+            )
+            .unwrap()
+        };
+        let gpu = resolve(ExecutionIntent::Auto);
+        let cpu = resolve(ExecutionIntent::CpuOnly);
+        let collector = crate::NativeExecutionReceiptCollector::new();
+        collector.begin_candidate_attempt();
+        super::super::request_execution_receipt::record_request_execution_facts(
+            Some(&collector),
+            &pack,
+            &crate::arch::builtin_adapter_descriptor(crate::WHISPER_GGML_ARCHITECTURE_ID),
+            cpu.facts().plan().resolved_runtime(),
+            &ExecutionLaneKey::from_candidate(
+                &cpu_candidate(),
+                crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        collector.record_backend_observation(
+            1,
+            ExecutionProvider::Cpu,
+            "CPU",
+            &GgmlActualDeviceFacts {
+                device_type: "cpu".to_string(),
+                name: "CPU".to_string(),
+                description: "test CPU".to_string(),
+                provider_device_id: None,
+                pci_vendor_id: None,
+            },
+            false,
+        );
+        collector.finish_candidate_attempt(true);
+        let snapshot = collector.snapshot();
+        let fallback = gpu
+            .resolve_observed_policy_fallback(&services, &snapshot)
+            .unwrap()
+            .expect("Auto permits CPU fallback");
+        assert_eq!(
+            fallback.facts().plan().execution_intent(),
+            &ExecutionIntent::Auto
+        );
+        assert_eq!(
+            fallback
+                .facts()
+                .exact_lane()
+                .candidate()
+                .device
+                .route
+                .provider,
+            ExecutionProvider::Cpu
+        );
+        assert!(
+            resolve(ExecutionIntent::AcceleratedOnly)
+                .resolve_observed_policy_fallback(&services, &snapshot)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cpu.resolve_observed_policy_fallback(&services, &snapshot)
+                .unwrap()
+                .is_none(),
+            "already selected lane is not a fallback"
+        );
+        let mut incomplete = snapshot.clone();
+        incomplete.completed = false;
+        assert!(
+            gpu.resolve_observed_policy_fallback(&services, &incomplete)
+                .unwrap()
+                .is_none()
+        );
+        let mut wrong_pack = snapshot.clone();
+        wrong_pack.facts.as_mut().unwrap().pack_content_id = "another-pack".to_string();
+        assert!(
+            gpu.resolve_observed_policy_fallback(&services, &wrong_pack)
+                .unwrap()
+                .is_none()
+        );
+        let mut unobserved = snapshot;
+        unobserved.facts.as_mut().unwrap().actual_provider = None;
+        assert!(
+            gpu.resolve_observed_policy_fallback(&services, &unobserved)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
