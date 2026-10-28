@@ -1552,6 +1552,7 @@ async fn warm_up_native_pack(
             }
         }
     };
+    let pinned_lane = target.pinned_lane.is_some();
     let model_pack_path = target.path;
     let inference_threads = preferences_home
         .as_deref()
@@ -1594,6 +1595,10 @@ async fn warm_up_native_pack(
         NativeBackendExecutor::new(Arc::clone(runtime.native_execution.execution_services()));
     let hardware_target =
         native_hardware_target_from_execution_target(Some(execution_target_preference));
+    openasr_core::stage_timing::log_detail_event(
+        "realtime_warmup",
+        format_args!("stage=request hardware_target={hardware_target} pinned_lane={pinned_lane}"),
+    );
     let session = match NativeAsrExecutor::start_streaming_session(
         &executor,
         &adapter,
