@@ -1339,11 +1339,27 @@ pub fn load_model_catalog(
     catalog_url: Option<&str>,
     openasr_home: impl AsRef<Path>,
 ) -> Result<ModelCatalog, CatalogError> {
+    load_model_catalog_with_transport(
+        catalog_url,
+        openasr_home,
+        transport::CatalogTransportPreference::Environment,
+    )
+}
+
+/// Loads and verifies a catalog with an explicit, request-local transport
+/// preference. The preference affects only the allowlisted fetch hosts;
+/// catalog identity, signature checks, epoch enforcement, and fallback tiers
+/// are identical to [`load_model_catalog`]. No process environment is modified.
+pub fn load_model_catalog_with_transport(
+    catalog_url: Option<&str>,
+    openasr_home: impl AsRef<Path>,
+    preference: transport::CatalogTransportPreference,
+) -> Result<ModelCatalog, CatalogError> {
     let home = openasr_home.as_ref();
     let cache_path = default_catalog_cache_path(home);
     let source = catalog_url.unwrap_or(DEFAULT_CATALOG_URL);
 
-    match load_verified_catalog_bytes(source, home) {
+    match load_verified_catalog_bytes(source, home, preference) {
         Ok((contents, verified)) => {
             match parse_and_check_production_catalog(source, &contents, &verified.signature) {
                 Ok(catalog) => {
@@ -1382,11 +1398,12 @@ pub fn load_model_catalog(
 fn load_verified_catalog_bytes(
     source: &str,
     home: &Path,
+    preference: transport::CatalogTransportPreference,
 ) -> Result<(String, VerifiedCatalogManifestContents), CatalogError> {
     if catalog_security::classify_catalog_identity(source)
         == catalog_security::CatalogSourceKind::Remote
     {
-        return fetch_verified_remote_catalog(source, home);
+        return fetch_verified_remote_catalog(source, home, preference);
     }
     let contents = read_catalog_source(source)?;
     let verified = read_and_verify_catalog_manifest(source, home, &contents)?;
@@ -2508,10 +2525,11 @@ fn fetch_and_verify_catalog_pair(
 fn fetch_verified_remote_catalog(
     source: &str,
     home: &Path,
+    preference: transport::CatalogTransportPreference,
 ) -> Result<(String, VerifiedCatalogManifestContents), CatalogError> {
-    let catalog_urls = transport::catalog_transport_urls(source);
+    let catalog_urls = transport::catalog_transport_urls(source, preference);
     let signature_source = catalog_security::catalog_signature_source(source);
-    let signature_urls = transport::catalog_transport_urls(&signature_source);
+    let signature_urls = transport::catalog_transport_urls(&signature_source, preference);
     let pairs: Vec<(String, String)> = catalog_urls.into_iter().zip(signature_urls).collect();
     let client = http::blocking_client(CATALOG_HTTP_CONNECT_TIMEOUT, CATALOG_HTTP_TIMEOUT)
         .map_err(|error| CatalogError::ReadCatalog {
