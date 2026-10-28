@@ -943,7 +943,7 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
                     slice: item.slice,
                     text: decoded.text,
                     segments: decoded.segments,
-                    time_domain: SegmentTimeDomain::RelativeToSliceContent,
+                    time_domain: SegmentTimeDomain::RelativeToSliceInput,
                 };
                 if speaker_plan == SpeakerPlan::InDecoder {
                     let scope = *speaker_scope_count;
@@ -3054,8 +3054,12 @@ fn run_native_transcription_impl(
                     crate::stage_timing::log_detail_event(
                         "native_transcribe",
                         format_args!(
-                            "stage=longform_slice_decode index={slice_index} samples={slice_samples} duration_ms={:.3}",
-                            slice_decode_started.elapsed().as_secs_f64() * 1000.0
+                            "stage=longform_slice_decode index={slice_index} samples={slice_samples} duration_ms={:.3} input_start_sample={} input_end_sample={} content_start_sample={} content_end_sample={}",
+                            slice_decode_started.elapsed().as_secs_f64() * 1000.0,
+                            slice.start_sample,
+                            slice.end_sample,
+                            slice.content_start_sample,
+                            slice.content_end_sample
                         ),
                     );
                     // Destructure instead of `result.clone().into_transcription()`:
@@ -3106,7 +3110,7 @@ fn run_native_transcription_impl(
                         slice,
                         text: transcription.text,
                         segments: transcription.segments,
-                        time_domain: SegmentTimeDomain::RelativeToSliceContent,
+                        time_domain: SegmentTimeDomain::RelativeToSliceInput,
                     };
                     if speaker_plan == SpeakerPlan::InDecoder {
                         let scope = speaker_scope_count;

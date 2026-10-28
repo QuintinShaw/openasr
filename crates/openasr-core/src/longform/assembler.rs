@@ -6,6 +6,8 @@ use super::timeline::TimelineMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentTimeDomain {
     RelativeToSliceContent,
+    /// Executor timestamps start at the full input, including context padding.
+    RelativeToSliceInput,
     AbsoluteOriginal,
 }
 
@@ -114,6 +116,15 @@ impl TranscriptAssembler {
         // repeated speech, even when their text and estimated times match.
         let overlaps_prior_audio =
             trim_boundary.is_some_and(|boundary| slice_start_original < boundary);
+        // Content windows may abut while their executor inputs share context
+        // padding. Only synthetic/wordless alignment may repair that short
+        // seam; native word anchors remain authoritative.
+        let input_start_original = self
+            .timeline
+            .map_processed_to_original_seconds(transcript.slice.start_sample as f32 / 16_000.0);
+        let padded_wordless_seam = self.approximate_word_timestamps
+            && !overlaps_prior_audio
+            && trim_boundary.is_some_and(|boundary| input_start_original < boundary);
         let slice_committed_end = self.slice_content_end_original(&transcript.slice);
         self.committed_end_original = Some(match self.committed_end_original {
             Some(previous) => previous.max(slice_committed_end),
@@ -160,7 +171,9 @@ impl TranscriptAssembler {
             // words make a midpoint trim eat the textual re-read prefix and
             // would skip stitch if we required `words.is_empty()`. Same-slice
             // adjacent cues still skip stitch via `cross_slice_seam`.
-            if cross_slice_seam && overlaps_prior_audio && self.try_stitch_seam_overlap(&mut mapped)
+            if cross_slice_seam
+                && (overlaps_prior_audio || padded_wordless_seam)
+                && self.try_stitch_seam_overlap(&mut mapped, padded_wordless_seam)
             {
                 self.stats.duplicate_merge_count += 1;
                 if mapped.text.trim().is_empty() {
@@ -250,12 +263,14 @@ impl TranscriptAssembler {
         let sample_rate = 16_000.0_f32;
         let mut start = segment.start.max(0.0);
         let mut end = segment.end.max(start);
-        let mut content_offset = 0.0_f32;
-        if time_domain == SegmentTimeDomain::RelativeToSliceContent {
-            content_offset = slice.content_start_sample as f32 / sample_rate;
-            start += content_offset;
-            end += content_offset;
-        }
+        let relative_offset = match time_domain {
+            SegmentTimeDomain::RelativeToSliceContent => slice.content_start_sample,
+            SegmentTimeDomain::RelativeToSliceInput => slice.start_sample,
+            SegmentTimeDomain::AbsoluteOriginal => 0,
+        } as f32
+            / sample_rate;
+        start += relative_offset;
+        end += relative_offset;
         let original_start = self.timeline.map_processed_to_original_seconds(start);
         let original_end = self
             .timeline
@@ -267,7 +282,7 @@ impl TranscriptAssembler {
             .filter_map(|word| {
                 map_word_time_to_original(
                     word,
-                    content_offset,
+                    relative_offset,
                     time_domain,
                     &self.timeline,
                     original_start,
@@ -349,7 +364,7 @@ impl TranscriptAssembler {
     ///
     /// The stitch rewrites text only. `previous.end` is left alone so a
     /// later slice cannot swallow the earlier segment's boundary.
-    fn try_stitch_seam_overlap(&mut self, current: &mut Segment) -> bool {
+    fn try_stitch_seam_overlap(&mut self, current: &mut Segment, padding_only: bool) -> bool {
         let Some(previous) = self.segments.last_mut() else {
             return false;
         };
@@ -360,7 +375,12 @@ impl TranscriptAssembler {
             return false;
         }
         let min_units = if time_overlaps { 2 } else { 3 };
-        let stitched = apply_suffix_prefix_stitch(previous, current, min_units, time_overlap);
+        // Padding does not prove that a repeated phrase is redundant. Limit
+        // this case to the existing duration-gated single CJK character rule;
+        // a longer suffix/prefix match must remain intact.
+        let max_units = if padding_only { 1 } else { usize::MAX };
+        let stitched =
+            apply_suffix_prefix_stitch(previous, current, min_units, time_overlap, max_units);
         if stitched && self.approximate_word_timestamps {
             // A prior seam may already have advanced these estimates beyond
             // the original audio window. Preserve that committed boundary
@@ -403,6 +423,7 @@ fn apply_suffix_prefix_stitch(
     current: &mut Segment,
     min_units: usize,
     time_overlap_seconds: f32,
+    max_units: usize,
 ) -> bool {
     let Some(overlap) = suffix_prefix_overlap(
         &previous.text,
@@ -412,6 +433,9 @@ fn apply_suffix_prefix_stitch(
     ) else {
         return false;
     };
+    if overlap.units > max_units {
+        return false;
+    }
     let consume_end = extend_consumed_current_end(&current.text, overlap.curr_end);
     let prev_prefix = char_prefix(&previous.text, overlap.prev_start);
     let consumed = current
@@ -456,7 +480,7 @@ fn apply_suffix_prefix_stitch(
 
 fn map_word_time_to_original(
     word: &WordTimestamp,
-    content_offset: f32,
+    relative_offset: f32,
     time_domain: SegmentTimeDomain,
     timeline: &TimelineMap,
     segment_start: f32,
@@ -468,9 +492,9 @@ fn map_word_time_to_original(
     }
     let mut start = word.start.max(0.0);
     let mut end = word.end.max(start);
-    if time_domain == SegmentTimeDomain::RelativeToSliceContent {
-        start += content_offset;
-        end += content_offset;
+    if time_domain != SegmentTimeDomain::AbsoluteOriginal {
+        start += relative_offset;
+        end += relative_offset;
     }
     let original_start = timeline
         .map_processed_to_original_seconds(start)
@@ -626,6 +650,7 @@ struct OverlapUnit {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SuffixPrefixOverlap {
+    units: usize,
     prev_start: usize,
     prev_end: usize,
     curr_start: usize,
@@ -758,6 +783,7 @@ fn suffix_prefix_overlap(
             continue;
         }
         return Some(SuffixPrefixOverlap {
+            units: n,
             prev_start: previous_suffix[0].start,
             prev_end: previous_suffix[n - 1].end,
             curr_start: current_prefix[0].start,
@@ -922,6 +948,37 @@ mod tests {
     }
 
     #[test]
+    fn assembler_maps_padded_input_words_without_content_offset_drift() {
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        let mut window = slice(400_000, 853_600);
+        window.content_start_sample = 404_000;
+        window.content_end_sample = 849_600;
+        assembler.push_slice_result(SliceTranscript {
+            slice: window,
+            text: "speech".to_string(),
+            segments: vec![absolute_segment(
+                "speech",
+                0.1,
+                28.35,
+                vec![WordTimestamp {
+                    word: "speech".to_string(),
+                    start: 0.1,
+                    end: 0.5,
+                    confidence: None,
+                }],
+            )],
+            time_domain: SegmentTimeDomain::RelativeToSliceInput,
+        });
+        let transcription = assembler.into_transcription();
+        let segment = &transcription.segments[0];
+        assert!((segment.start - 25.1).abs() < 1.0e-4);
+        assert!((segment.end - 53.35).abs() < 1.0e-4);
+        assert!((segment.words[0].start - 25.1).abs() < 1.0e-4);
+        assert!((segment.words[0].end - 25.5).abs() < 1.0e-4);
+    }
+
+    #[test]
     fn assembler_keeps_exact_scope_provenance_across_slice_overlap() {
         fn labeled_segment(start: f32, end: f32, text: &str) -> Segment {
             Segment {
@@ -1019,6 +1076,80 @@ mod tests {
         assert_eq!(transcription.segments.len(), 3);
         assert_eq!(transcription.text.matches(text).count(), 3);
         assert_eq!(stats.duplicate_merge_count, 0);
+    }
+
+    #[test]
+    fn assembler_stitches_wordless_reread_in_padded_abutting_content() {
+        // Actual FireRed AED plan: the content meets at 25.25s, while the
+        // executor inputs overlap from 25.0s to 25.5s. No word timestamps
+        // exist until forced alignment runs after assembly.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default())
+                .with_approximate_word_timestamps(true);
+        for (input_start, input_end, content_start, content_end, text) in [
+            (0, 408_000, 0, 404_000, "周末的时候我"),
+            (400_000, 853_600, 404_000, 849_600, "我通常会读书"),
+        ] {
+            let mut window = slice(input_start, input_end);
+            window.content_start_sample = content_start;
+            window.content_end_sample = content_end;
+            assembler.push_slice_result(SliceTranscript {
+                slice: window,
+                text: text.to_string(),
+                segments: vec![absolute_segment(
+                    text,
+                    0.0,
+                    (input_end - input_start) as f32 / 16_000.0,
+                    Vec::new(),
+                )],
+                time_domain: SegmentTimeDomain::RelativeToSliceInput,
+            });
+        }
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(transcription.text, "周末的时候我通常会读书");
+        assert_eq!(stats.duplicate_merge_count, 1);
+        assert_eq!(transcription.segments[0].end, 25.5);
+        assert_eq!(transcription.segments[1].start, 25.0);
+    }
+
+    #[test]
+    fn assembler_preserves_speech_outside_padded_single_char_reread() {
+        for (previous, current, padding, approximate) in [
+            ("hello world", "hello world again", 4_000, true),
+            ("周末的时候", "周末的时候我们读书", 4_000, true),
+            ("周末的时候我", "我通常会读书", 0, true),
+            ("周末的时候我", "我通常会读书", 1_000, true),
+            ("周末的时候我", "我通常会读书", 4_000, false),
+            ("数字八", "八个人", 4_000, true),
+            ("谢谢", "谢谢大家", 4_000, true),
+        ] {
+            let mut assembler =
+                TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default())
+                    .with_approximate_word_timestamps(approximate);
+            for (start, end, text) in [(0_usize, 404_000, previous), (404_000, 849_600, current)] {
+                let input_start = start.saturating_sub(padding);
+                let input_end = end + padding;
+                let mut window = slice(input_start, input_end);
+                window.content_start_sample = start;
+                window.content_end_sample = end;
+                assembler.push_slice_result(SliceTranscript {
+                    slice: window,
+                    text: text.to_string(),
+                    segments: vec![absolute_segment(
+                        text,
+                        0.0,
+                        (input_end - input_start) as f32 / 16_000.0,
+                        Vec::new(),
+                    )],
+                    time_domain: SegmentTimeDomain::RelativeToSliceInput,
+                });
+            }
+            let (transcription, stats) = assembler.into_parts();
+            assert_eq!(transcription.segments.len(), 2, "{previous} / {current}");
+            assert_eq!(transcription.segments[0].text, previous);
+            assert_eq!(transcription.segments[1].text, current);
+            assert_eq!(stats.duplicate_merge_count, 0);
+        }
     }
 
     #[test]
@@ -1624,7 +1755,7 @@ mod tests {
                 )
                 .with_approximate_word_timestamps(true);
                 resumed.segments = out.segments.clone();
-                assert!(resumed.try_stitch_seam_overlap(&mut next));
+                assert!(resumed.try_stitch_seam_overlap(&mut next, false));
                 assert_eq!(resumed.segments[1].words[0].start, 25.5);
             } else {
                 let native_first = original_words
