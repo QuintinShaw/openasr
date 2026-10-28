@@ -300,6 +300,25 @@ impl ExecutionPlan {
         &self.candidates
     }
 
+    pub(crate) fn restrict_to_candidate(
+        mut self,
+        expected: &ExecutionCandidate,
+    ) -> Result<Self, String> {
+        let selected = self
+            .candidates
+            .iter()
+            .find(|candidate| {
+                candidate.placement == expected.placement
+                    && candidate.device.route.cache_key() == expected.device.route.cache_key()
+            })
+            .cloned()
+            .ok_or_else(|| {
+                "activation lane is not permitted by the request execution policy".to_string()
+            })?;
+        self.candidates = vec![selected];
+        Ok(self)
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(intent: ExecutionIntent, candidates: Vec<ExecutionCandidate>) -> Self {
         assert!(

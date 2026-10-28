@@ -678,6 +678,7 @@ pub struct NativeAsrSessionContext {
     request_attempt_id: Option<crate::RequestAttemptId>,
     native_execution_receipt: Option<crate::NativeExecutionReceiptCollector>,
     activation_reservation_context: Option<crate::ActivationReservationContext>,
+    activation_lane: Option<crate::DefaultModelActivationLane>,
 }
 
 impl NativeAsrSessionContext {
@@ -689,6 +690,7 @@ impl NativeAsrSessionContext {
             request_attempt_id: None,
             native_execution_receipt: None,
             activation_reservation_context: None,
+            activation_lane: None,
         }
     }
 
@@ -700,6 +702,7 @@ impl NativeAsrSessionContext {
             request_attempt_id: None,
             native_execution_receipt: None,
             activation_reservation_context: None,
+            activation_lane: None,
         }
     }
 
@@ -756,6 +759,17 @@ impl NativeAsrSessionContext {
         &self,
     ) -> Option<crate::ActivationReservationContext> {
         self.activation_reservation_context
+    }
+
+    /// Restrict an activation retry to its freshly frozen policy lane. The
+    /// session factory revalidates membership in the request's allowed plan.
+    pub fn with_activation_lane(mut self, lane: crate::DefaultModelActivationLane) -> Self {
+        self.activation_lane = Some(lane);
+        self
+    }
+
+    pub(crate) fn activation_lane(&self) -> Option<&crate::DefaultModelActivationLane> {
+        self.activation_lane.as_ref()
     }
 }
 

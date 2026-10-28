@@ -528,6 +528,12 @@ impl NativeAsrModelAdapter for NativeRuntimeModelAdapter {
             request_intent.clone(),
             target,
         )?;
+        let execution_plan = match context.activation_lane() {
+            Some(lane) => execution_plan
+                .restrict_to_candidate(lane.candidate())
+                .map_err(|message| NativeAsrError::SessionFailed { message })?,
+            None => execution_plan,
+        };
         let streaming_punctuator =
             crate::models::firered_punc::streaming_runtime::PolicyResolvedStreamingPunctuator::prepare(
                 session_config.punctuate,
@@ -1829,6 +1835,14 @@ pub fn native_runtime_model_adapter_for_path(path: &Path) -> Option<NativeRuntim
     let verified_pack = crate::models::pack_verifier::PackVerifier
         .verify_candidate(crate::models::pack_verifier::PackCandidate::new(path))
         .ok()?;
+    native_runtime_model_adapter_for_verified_pack(verified_pack)
+}
+
+/// Project an already verified source without reopening its path. Activation
+/// reservation and session construction must share this exact mapped generation.
+pub fn native_runtime_model_adapter_for_verified_pack(
+    verified_pack: crate::models::pack_verifier::VerifiedPack,
+) -> Option<NativeRuntimeModelAdapter> {
     if !matches!(
         verified_pack.route(),
         crate::models::pack_verifier::PackRoute::Asr { .. }
@@ -3352,6 +3366,55 @@ mod tests {
             adapter.adapter_id(),
             crate::COHERE_TRANSCRIBE_GGML_ADAPTER_ID
         );
+    }
+
+    #[test]
+    fn native_runtime_model_adapter_preserves_verified_mapping_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("activation.oasr");
+        write_tiny_gguf_runtime_source(
+            &path,
+            &TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready("activation-proof"),
+        )
+        .unwrap();
+        let proof = crate::PackVerifier
+            .verify_candidate(crate::PackCandidate::new(&path))
+            .unwrap();
+        let mapping = proof.preflight().runtime_source().backing_mmap();
+        let adapter = native_runtime_model_adapter_for_verified_pack(proof.clone())
+            .expect("verified adapter");
+        let bound = adapter
+            .model_pack_ref("native-default")
+            .expect("verified session reference");
+        assert!(
+            Arc::ptr_eq(
+                &mapping,
+                &bound
+                    .verified_pack()
+                    .unwrap()
+                    .preflight()
+                    .runtime_source()
+                    .backing_mmap()
+            ),
+            "activation and session must reserve the same open mapping"
+        );
+        // A path replacement must neither change this proof nor be silently
+        // adopted by the verified adapter constructor.
+        let replacement = temp.path().join("invalid.oasr");
+        fs::write(&replacement, b"invalid replacement").unwrap();
+        fs::rename(replacement, &path).unwrap();
+        assert!(native_runtime_model_adapter_for_path(&path).is_none());
+        let retained = native_runtime_model_adapter_for_verified_pack(proof)
+            .expect("retained open generation");
+        assert!(Arc::ptr_eq(
+            &mapping,
+            &retained
+                .verified_pack()
+                .unwrap()
+                .preflight()
+                .runtime_source()
+                .backing_mmap()
+        ));
     }
 
     #[test]
