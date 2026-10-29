@@ -8526,6 +8526,9 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         Ok(self.compute_outputs_f32_with_evidence(outputs)?.value)
     }
 
+    /// The first output is the primary buffer bound by the returned witness.
+    /// Later outputs are auxiliary state/attention: checked readbacks, never
+    /// additional selection buffers under that same compute identity.
     pub(crate) fn compute_outputs_f32_with_evidence(
         &mut self,
         outputs: &[(GgmlCpuTensor<'a>, usize)],
@@ -8573,7 +8576,9 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
 
         let mut results = Vec::with_capacity(outputs.len());
         let mut compute_evidence = None;
-        for ((output, expected_len), output_nbytes) in outputs.iter().zip(output_nbytes) {
+        for (index, ((output, expected_len), output_nbytes)) in
+            outputs.iter().zip(output_nbytes).enumerate()
+        {
             let mut values = vec![0.0f32; *expected_len];
             let status = unsafe {
                 read_tensor_bytes(
@@ -8583,20 +8588,16 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     output_nbytes,
                 )
             };
-            let output_evidence = self.finish_output_read(status, output_nbytes)?;
-            if self.lifecycle.is_some() && output_evidence.is_none() {
-                return Err(self.fail_output_evidence(
-                    "successful output readback did not produce a compute evidence ref",
-                ));
+            if index == 0 {
+                compute_evidence = self.finish_output_read(status, output_nbytes)?;
+                if self.lifecycle.is_some() && compute_evidence.is_none() {
+                    return Err(self.fail_output_evidence(
+                        "successful primary readback did not produce a compute evidence ref",
+                    ));
+                }
+            } else {
+                self.finish_readback_status(status)?;
             }
-            if let (Some(expected), Some(actual)) = (compute_evidence, output_evidence)
-                && expected != actual
-            {
-                return Err(self.fail_output_evidence(
-                    "one graph compute produced inconsistent output evidence refs",
-                ));
-            }
-            compute_evidence = compute_evidence.or(output_evidence);
             results.push(values);
         }
         Ok(GgmlComputeOutput {
@@ -8622,7 +8623,10 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
     }
 
     /// Same direct-into-caller-storage readback as [`Self::compute_outputs_into_f32`],
-    /// but keeps the compute witness minted by a successful output read.
+    /// but keeps the compute witness minted by reading the first output.
+    /// That primary buffer contains the selection logits; later buffers are
+    /// auxiliary state and cannot borrow its selection witness. Any failed
+    /// auxiliary read still poisons the graph and fails the entire operation.
     /// Seq2seq token-step receipts must use this; dropping the ref is how
     /// growing-KV Granite steps recorded tokens with `compute: None`.
     pub(crate) fn compute_outputs_into_f32_with_evidence(
@@ -8668,7 +8672,7 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.compute_graph_with_memory_gate(graph)?;
 
         let mut compute_evidence = None;
-        for (output, target) in outputs.iter_mut() {
+        for (index, (output, target)) in outputs.iter_mut().enumerate() {
             let nbytes = target.len() * F32_WIDTH_BYTES;
             let status = unsafe {
                 read_tensor_bytes(
@@ -8678,20 +8682,16 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
                     nbytes,
                 )
             };
-            let output_evidence = self.finish_output_read(status, nbytes)?;
-            if self.lifecycle.is_some() && output_evidence.is_none() {
-                return Err(self.fail_output_evidence(
-                    "successful output readback did not produce a compute evidence ref",
-                ));
+            if index == 0 {
+                compute_evidence = self.finish_output_read(status, nbytes)?;
+                if self.lifecycle.is_some() && compute_evidence.is_none() {
+                    return Err(self.fail_output_evidence(
+                        "successful primary readback did not produce a compute evidence ref",
+                    ));
+                }
+            } else {
+                self.finish_readback_status(status)?;
             }
-            if let (Some(expected), Some(actual)) = (compute_evidence, output_evidence)
-                && expected != actual
-            {
-                return Err(self.fail_output_evidence(
-                    "one graph compute produced inconsistent output evidence refs",
-                ));
-            }
-            compute_evidence = compute_evidence.or(output_evidence);
         }
         Ok(compute_evidence.and_then(|evidence| evidence.selection(0, 1)))
     }
@@ -10536,6 +10536,7 @@ thread_local! {
     /// Test-only seam: substitutes the next tensor-get completion status after
     /// a graph has computed successfully. Cleared after one use.
     static TEST_TENSOR_READBACK_STATUS_OVERRIDE: RefCell<Option<c_int>> = const { RefCell::new(None) };
+    static TEST_TENSOR_READBACK_STATUS_DELAY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -10576,11 +10577,19 @@ pub(crate) fn reset_test_tensor_readback_count() {
 
 #[cfg(test)]
 fn take_test_tensor_readback_status_override() -> Option<c_int> {
+    if TEST_TENSOR_READBACK_STATUS_DELAY.with(|delay| {
+        let remaining = delay.get();
+        delay.set(remaining.saturating_sub(1));
+        remaining > 0
+    }) {
+        return None;
+    }
     TEST_TENSOR_READBACK_STATUS_OVERRIDE.with(|cell| cell.borrow_mut().take())
 }
 
 #[cfg(test)]
 pub(crate) fn install_test_tensor_readback_status_override(status: c_int) {
+    TEST_TENSOR_READBACK_STATUS_DELAY.with(|delay| delay.set(0));
     TEST_TENSOR_READBACK_STATUS_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(status));
 }
 
@@ -13914,6 +13923,125 @@ mod tests {
             evidence.is_some(),
             "growing-KV seq2seq logits must keep a compute witness"
         );
+    }
+
+    fn multi_output_primary_evidence_case(in_place: bool, fail_auxiliary: bool) {
+        reset_test_tensor_readback_count();
+        reset_test_compute_gate_attempt_count();
+        let collector = GgmlGraphLifecycleCollector::new();
+        let _guard = collector.install();
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
+            .expect("cpu graph runner");
+        let mut graph = runner.start_graph();
+        let input = graph.new_tensor_1d_f32(3, "primary input").unwrap();
+        let state = graph.new_tensor_1d_f32(2, "auxiliary input").unwrap();
+        graph.set_input(input).unwrap();
+        graph.set_input(state).unwrap();
+        let primary = graph.add(input, input).unwrap();
+        let auxiliary = graph.add(state, state).unwrap();
+        graph
+            .set_f32_slice(input, &[1.0, 2.0, 3.0], "primary")
+            .unwrap();
+        graph
+            .set_f32_slice(state, &[4.0, 5.0], "auxiliary")
+            .unwrap();
+        if fail_auxiliary {
+            install_test_tensor_readback_status_override(ffi::GGML_STATUS_EXECUTION_FAILED);
+            super::TEST_TENSOR_READBACK_STATUS_DELAY.with(|delay| delay.set(1));
+        }
+        let result = if in_place {
+            let mut primary_target = [-1.0; 3];
+            let mut auxiliary_target = [-1.0; 2];
+            let result = graph.compute_outputs_into_f32_with_evidence(&mut [
+                (primary, primary_target.as_mut_slice()),
+                (auxiliary, auxiliary_target.as_mut_slice()),
+            ]);
+            if result.is_ok() {
+                assert_eq!(primary_target, [2.0, 4.0, 6.0]);
+                assert_eq!(auxiliary_target, [8.0, 10.0]);
+            }
+            result
+        } else {
+            graph
+                .compute_outputs_f32_with_evidence(&[(primary, 3), (auxiliary, 2)])
+                .map(|output| {
+                    let (values, evidence) = output.into_parts();
+                    assert_eq!(values, vec![vec![2.0, 4.0, 6.0], vec![8.0, 10.0]]);
+                    evidence
+                })
+        };
+        assert_eq!(
+            test_tensor_readback_count(),
+            2,
+            "both readbacks were attempted"
+        );
+        let snapshot = collector.snapshot();
+        let reads = snapshot
+            .events
+            .iter()
+            .filter_map(|event| match event.kind {
+                GgmlGraphLifecycleEventKind::OutputRead {
+                    bytes,
+                    compute_sequence,
+                    output_generation_consumed,
+                } => Some((
+                    bytes,
+                    (
+                        event.graph_instance,
+                        event.graph_generation,
+                        compute_sequence,
+                        output_generation_consumed,
+                    ),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reads.len(),
+            1,
+            "auxiliary state must not mint a selection read"
+        );
+        assert_eq!(
+            reads[0].0, 12,
+            "read size must describe only the primary logits"
+        );
+        if fail_auxiliary {
+            assert!(matches!(result, Err(GgmlCpuGraphError::ExecutionFailed)));
+            assert!(snapshot.events.iter().any(|event| matches!(
+                event.kind,
+                GgmlGraphLifecycleEventKind::Poisoned {
+                    reason: super::super::GgmlGraphPoisonReason::ReadbackFailed
+                }
+            )));
+            assert!(matches!(
+                graph.compute_output_f32_with_evidence(primary, 3),
+                Err(GgmlCpuGraphError::GraphSessionPoisoned)
+            ));
+            assert_eq!(test_tensor_readback_count(), 2);
+            assert_eq!(test_compute_gate_attempt_count(), 1);
+        } else {
+            assert_eq!(result.unwrap().unwrap().compute_identity(), reads[0].1);
+        }
+    }
+
+    #[test]
+    fn allocated_multi_output_witness_binds_only_primary_logits() {
+        multi_output_primary_evidence_case(false, false);
+    }
+
+    #[test]
+    fn caller_storage_multi_output_witness_binds_only_primary_logits() {
+        multi_output_primary_evidence_case(true, false);
+    }
+
+    #[test]
+    fn allocated_auxiliary_read_failure_poisons_after_primary_read() {
+        multi_output_primary_evidence_case(false, true);
+    }
+
+    #[test]
+    fn caller_storage_auxiliary_read_failure_poisons_after_primary_read() {
+        multi_output_primary_evidence_case(true, true);
     }
 
     #[test]
