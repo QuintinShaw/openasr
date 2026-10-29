@@ -4,6 +4,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -1657,6 +1658,62 @@ class GpuCorrectnessGateTests(unittest.TestCase):
             path.write_text("".join(json.dumps(event) + "\n" for event in events), newline="")
             with self.assertRaisesRegex(GATE.MatrixError, "strict compute reference"):
                 GATE.parse_trace_artifact(path)
+
+    def test_f32_trace_accepts_short_json_but_rejects_one_ulp_inconsistency(self) -> None:
+        def f32(value):
+            return struct.unpack("<f", struct.pack("<f", value))[0]
+
+        def next_f32(value):
+            bits = struct.unpack("<I", struct.pack("<f", value))[0]
+            return struct.unpack("<f", struct.pack("<I", bits + 1))[0]
+        first, second = f32(1.2345679), f32(0.2345679)
+        margin = f32(first - second)
+        self.assertNotEqual(first, 1.2345679)
+        self.assertNotEqual(first - second, margin)
+        cell = next(cell for cell in self.project()["cells"] if cell["provider"] == "cuda")
+        for mutation in (None, "topk", "margin", "summary"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                receipt = self.receipt(cell, "token_transcript", "cold")
+                paths = self.write_token_traces(root, receipt)
+                summary = {"top_k": [{"token_id": 7, "value": first}], "top1_top2_margin": margin}
+                if mutation == "summary":
+                    summary["top_k"][0]["value"] = next_f32(first)
+                parsed = {}
+                for path in paths:
+                    events = [json.loads(line) for line in path.read_text().splitlines()]
+                    for event in events:
+                        if event["event"] == "logits":
+                            event["values"][7:9] = [1.2345679, 0.2345679]
+                        elif event["event"] == "top_k":
+                            event["items"] = [{"token_id": 7, "value": first}, {"token_id": 8, "value": second}]
+                            event["top1_top2_margin"] = margin
+                            if mutation == "topk":
+                                event["items"][0]["value"] = next_f32(first)
+                            elif mutation == "margin":
+                                event["top1_top2_margin"] = next_f32(margin)
+                    path.write_text("".join(json.dumps(event) + "\n" for event in events), newline="")
+                    if path.name.startswith("logits-"):
+                        parsed["logits"] = GATE.parse_full_logits_artifact(path)
+                    else:
+                        parsed["tokens"] = GATE.parse_trace_artifact(path)
+                def validate():
+                    GATE._require_full_logits_match(root / "receipt.json", parsed["tokens"], parsed["logits"], "first_maximum", summary)
+                if mutation is None:
+                    validate()
+                else:
+                    with self.assertRaisesRegex(GATE.MatrixError, "top-k"):
+                        validate()
+
+    def test_full_logits_rejects_nonfinite_or_unrepresentable_f32_values(self) -> None:
+        for value in (1e40, float("inf"), float("nan"), True):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temp:
+                events = [json.loads(line) for line in logits_content("cuda", "test-cuda", "cold").splitlines()]
+                events[1]["values"][0] = value
+                path = Path(temp) / "invalid-f32.jsonl"
+                path.write_text("".join(json.dumps(event) + "\n" for event in events), newline="")
+                with self.assertRaises(GATE.MatrixError):
+                    GATE.parse_full_logits_artifact(path)
 
     def test_full_logits_rejects_empty_arbitrary_and_incomplete_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

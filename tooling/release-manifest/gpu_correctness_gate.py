@@ -12,6 +12,7 @@ import copy
 import hashlib
 import json
 import math
+import struct
 import subprocess
 import tempfile
 from pathlib import Path
@@ -1216,13 +1217,17 @@ def parse_full_logits_artifact(path: Path) -> dict[str, Any]:
             or not 0 < row_vocab <= MAX_LOGITS_VOCAB
             or not isinstance(values, list)
             or len(values) != row_vocab
-            or any(not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) for value in values)
+            or any(not isinstance(value, (int, float)) or isinstance(value, bool) for value in values)
             or selection_ref is None
             or selection_ref in used_selection_refs
         ):
             raise MatrixError(f"{path} contains an invalid or incomplete full logits row")
         if vocab_size is not None and row_vocab != vocab_size:
             raise MatrixError(f"{path} changes vocab_size across full logits rows")
+        try:
+            values = [_finite_f32(value) for value in values]
+        except MatrixError as error:
+            raise MatrixError(f"{path} contains an invalid or incomplete full logits row: {error}") from error
         vocab_size = row_vocab
         used_selection_refs.add(selection_ref)
         rows[step] = {"compute": selection_ref, "values": values}
@@ -1247,6 +1252,38 @@ def parse_full_logits_artifact(path: Path) -> dict[str, Any]:
         "rows": rows,
         "vocab_size": vocab_size,
     }
+
+
+def _finite_f32(value: Any) -> float:
+    # JSON has no binary32 type. serde may emit either a shortest f32 decimal
+    # or the exact f32 promoted to f64. Recover the declared dtype before
+    # comparing; this does not introduce a numeric tolerance.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MatrixError("expected a finite f32 number")
+    try:
+        converted = struct.unpack("<f", struct.pack("<f", value))[0]
+    except (OverflowError, struct.error) as error:
+        raise MatrixError("number is not representable as finite f32") from error
+    if not math.isfinite(converted):
+        raise MatrixError("number is not representable as finite f32")
+    return converted
+
+
+def _f32_top_k(items: Any) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        raise MatrixError("invalid f32 top-k items")
+    result = []
+    for item in items:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"token_id", "value"}
+            or not isinstance(item["token_id"], int)
+            or isinstance(item["token_id"], bool)
+            or item["token_id"] < 0
+        ):
+            raise MatrixError("invalid f32 top-k item")
+        result.append({"token_id": item["token_id"], "value": _finite_f32(item["value"])})
+    return result
 
 
 def _require_full_logits_match(
@@ -1293,10 +1330,10 @@ def _require_full_logits_match(
             {"token_id": index, "value": values[index]}
             for index in order[: len(topk["items"])]
         ]
-        if topk["items"] != expected_top:
+        if _f32_top_k(topk["items"]) != expected_top:
             raise MatrixError(f"{receipt_path} top-k trace does not match complete logits")
-        expected_margin = values[order[0]] - values[order[1]]
-        if topk["margin"] != expected_margin:
+        expected_margin = _finite_f32(values[order[0]] - values[order[1]])
+        if _finite_f32(topk["margin"]) != expected_margin:
             raise MatrixError(f"{receipt_path} top-k margin does not match complete logits")
         expected_summaries[step] = (expected_top, expected_margin)
 
@@ -1308,8 +1345,8 @@ def _require_full_logits_match(
         not isinstance(summary_top, list)
         or not summary_top
         or len(summary_top) > len(expected_summary_top)
-        or summary_top != expected_summary_top[: len(summary_top)]
-        or summary_margin != expected_summary_margin
+        or _f32_top_k(summary_top) != expected_summary_top[: len(summary_top)]
+        or _finite_f32(summary_margin) != expected_summary_margin
     ):
         raise MatrixError(f"{receipt_path} receipt top-k summary does not match complete logits")
 
