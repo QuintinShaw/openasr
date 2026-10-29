@@ -146,6 +146,14 @@ fn write_bound_pair(
         top_k: parse_top_k(token_jsonl)?,
         top1_top2_margin: parse_margin(token_jsonl),
     };
+    if binding.output_plan.kind == openasr_core::ShortAudioOutputPlanKind::FullLogits {
+        let logits = collected
+            .logits_jsonl
+            .as_deref()
+            .context("complete logits artifact is missing")?;
+        crate::bench_receipt_cli::validate_full_logits_trace(logits, token_jsonl)
+            .context("real-family complete logits do not cover the runtime token trace")?;
+    }
     let bound = bind_real_family_evidence(collected.receipt.clone(), binding, &traces).map_err(
         |error| {
             anyhow::anyhow!(

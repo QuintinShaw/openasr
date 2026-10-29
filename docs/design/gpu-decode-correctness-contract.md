@@ -31,6 +31,12 @@ The shared software migration is in place:
   This projection is not live device admission or successful hardware evidence;
   complete logits, observed placement, graph lifecycle, capture/scheduler and
   same-process cold/reuse evidence remain independent requirements;
+- Windows strict receipt/trace output pins local-volume directory objects and
+  uses root-relative native IO, same-handle publication and failure cleanup.
+  Final symlink/reparse changes and sibling case aliases fail closed. Network
+  paths without local-volume identity remain unsupported. Windows flushes the
+  staged file before and after publication; these tests do not claim Unix
+  directory-fsync semantics or power-loss qualification;
 - the signed-artifact qualification child now runs one backend-neutral,
   exact-route Layer-1/Layer-2/production-width four-quadrant suite and its
   parent strictly revalidates the typed result against the prepared artifacts;

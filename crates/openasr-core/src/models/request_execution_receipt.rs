@@ -847,6 +847,7 @@ impl NativeExecutionReceiptCollector {
                     crate::ggml_runtime::GgmlDecodeOutputPlan::FullLogits
                 )
             });
+            capture_full_logits_step(&mut state, step_index, compute, logits);
             let Some(active) = state.active_decode_step.take() else {
                 state.trace_binding_invalid = true;
                 return;
@@ -1160,37 +1161,7 @@ impl NativeExecutionReceiptCollector {
                     None
                 }
             };
-            let requires_complete_output = state.facts.as_ref().is_some_and(|facts| {
-                matches!(
-                    facts.resolved_runtime.output_plan(),
-                    crate::ggml_runtime::GgmlDecodeOutputPlan::FullLogits
-                )
-            });
-            if state.capture_full_logits && requires_complete_output {
-                let Some(compute) = compute else {
-                    state.trace_binding_invalid = true;
-                    return;
-                };
-                let Some(next_elements) = state.full_logits_elements.checked_add(logits.len())
-                else {
-                    state.trace_overflowed = true;
-                    return;
-                };
-                if logits.is_empty()
-                    || logits.len() > GPU_FULL_LOGITS_MAX_VOCAB
-                    || logits.iter().any(|value| !value.is_finite())
-                    || next_elements > MAX_FULL_LOGITS_ELEMENTS
-                {
-                    state.trace_overflowed = true;
-                    return;
-                }
-                state.full_logits_elements = next_elements;
-                state.full_logits_steps.push(FullLogitsStep {
-                    step_index,
-                    compute,
-                    values: logits.to_vec(),
-                });
-            }
+            capture_full_logits_step(&mut state, step_index, compute, logits);
             compute
         };
         let items = top
@@ -1387,6 +1358,45 @@ impl NativeExecutionReceiptCollector {
             completed: state.completed,
         }
     }
+}
+
+fn capture_full_logits_step(
+    state: &mut ReceiptState,
+    step_index: usize,
+    compute: Option<GgmlSelectionEvidenceRef>,
+    logits: &[f32],
+) {
+    let requires_complete_output = state.facts.as_ref().is_some_and(|facts| {
+        matches!(
+            facts.resolved_runtime.output_plan(),
+            crate::ggml_runtime::GgmlDecodeOutputPlan::FullLogits
+        )
+    });
+    if !state.capture_full_logits || !requires_complete_output {
+        return;
+    }
+    let Some(compute) = compute else {
+        state.trace_binding_invalid = true;
+        return;
+    };
+    let Some(next_elements) = state.full_logits_elements.checked_add(logits.len()) else {
+        state.trace_overflowed = true;
+        return;
+    };
+    if logits.is_empty()
+        || logits.len() > GPU_FULL_LOGITS_MAX_VOCAB
+        || logits.iter().any(|value| !value.is_finite())
+        || next_elements > MAX_FULL_LOGITS_ELEMENTS
+    {
+        state.trace_overflowed = true;
+        return;
+    }
+    state.full_logits_elements = next_elements;
+    state.full_logits_steps.push(FullLogitsStep {
+        step_index,
+        compute,
+        values: logits.to_vec(),
+    });
 }
 
 impl PartialEq for NativeExecutionReceiptCollector {
@@ -1755,6 +1765,12 @@ mod tests {
 
     #[test]
     fn complete_logits_trace_binds_runtime_row_to_successful_output_read() {
+        for atomic_commit in [false, true] {
+            assert_complete_logits_trace(atomic_commit);
+        }
+    }
+
+    fn assert_complete_logits_trace(atomic_commit: bool) {
         let receipt = NativeExecutionReceiptCollector::new();
         receipt.set_trace_mode(NativeExecutionTraceMode::Cold);
         receipt.enable_full_logits_trace();
@@ -1781,7 +1797,12 @@ mod tests {
         let mut runner = crate::ggml_runtime::GgmlCpuGraphRunner::new(
             crate::ggml_runtime::GgmlCpuGraphConfig::conservative_default(),
         )
-        .expect("CPU graph runner");
+        .unwrap_or_else(|error| {
+            panic!(
+                "CPU graph runner: {error:?}; bundled={:?}",
+                crate::ggml_runtime::bundled_backend_activation_status()
+            )
+        });
         let mut graph = runner.start_graph();
         let input = graph.new_tensor_1d_f32(3, "trace_input").expect("input");
         graph.set_input(input).expect("set input");
@@ -1795,10 +1816,14 @@ mod tests {
         let (logits, compute) = output.into_parts();
         drop(graph);
 
-        receipt.begin_decode_step(0, compute);
-        receipt.record_top_k(0, &logits);
-        receipt.record_token(0, 1, false);
-        receipt.finish_decode_step(0);
+        if atomic_commit {
+            receipt.commit_decode_step(compute, 1, false, &logits);
+        } else {
+            receipt.begin_decode_step(0, compute);
+            receipt.record_top_k(0, &logits);
+            receipt.record_token(0, 1, false);
+            receipt.finish_decode_step(0);
+        }
         receipt.finish_candidate_attempt(true);
         let snapshot = receipt.snapshot();
         assert!(!snapshot.trace.invalid_binding);

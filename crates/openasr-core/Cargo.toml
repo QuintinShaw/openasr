@@ -103,7 +103,7 @@ objc.workspace = true
 # Probe whether a pull-lock's owning pid is still alive (Win32 OpenProcess), so a
 # crashed/killed download's stale lock is reclaimed immediately instead of waiting
 # out the 6h mtime timeout. The unix path uses libc::kill; this is its Windows peer.
-windows-sys.workspace = true
+windows-sys = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Globalization"] }
 # System AAC (including HE-AAC SBR/PS) via Media Foundation. Same role as
 # macOS `/usr/bin/afconvert`: no FDK, not linked into the public ABI.
 windows = { version = "0.62", default-features = false, features = [

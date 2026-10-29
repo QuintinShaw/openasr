@@ -14,7 +14,9 @@ Run with PowerShell 7 and Python 3. `OPENASR_HOME` and the qualification scope
 must identify an isolated home already prepared by the native CLI. The runner
 discovers the actual device through a native request, then uses `qualify-family`
 for cold and warm requests in one process. It binds both against independent
-CPU oracles. The projected graph mode and evidence revision come from the
+CPU oracles, explicitly requesting full CPU logits so their strict token traces
+contain every selection's top-k evidence. CPU logits remain in the raw folder.
+The projected graph mode and evidence revision come from the
 shared runtime inventory; they do not authorize capture or product activation.
 
 All raw inputs, receipts and failed evidence remain in a unique `raw-*` child of

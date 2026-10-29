@@ -122,6 +122,7 @@ try {
         $scope = "gpu-correctness/$nonce"
         $cpuReceipt = Join-Path $scratch "cpu-$Mode.json"
         $cpuTrace = Join-Path $scratch "cpu-$Mode.jsonl"
+        $cpuLogits = Join-Path $scratch "cpu-$Mode-logits.jsonl"
         $gpuReceipt = Join-Path $scratch "diagnostic-$Mode.json"
         $traceName = "gpu-correctness-trace-$Provider-$cellKey-$Mode.jsonl"
         $gpuTrace = Join-Path $OutputDir $traceName
@@ -132,7 +133,7 @@ try {
         [Environment]::SetEnvironmentVariable("OPENASR_GGML_BACKEND", "cpu", "Process")
         & $Exe bench-receipt short-audio --model "$ModelId`:$Quant" `
             --model-pack $PackPath --audio $AudioPath --backend native --device cpu `
-            --out $cpuReceipt --trace-out $cpuTrace --runs 1 --warmup-runs $warmups `
+            --out $cpuReceipt --trace-out $cpuTrace --logits-out $cpuLogits --runs 1 --warmup-runs $warmups `
             --scope $scope --core-commit $CoreCommit
         if ($LASTEXITCODE -ne 0) { Fail "CPU oracle receipt failed for $Mode" }
 
