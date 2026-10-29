@@ -303,8 +303,8 @@ fn split_segment_at_turn_boundaries(
 }
 
 /// Byte offset in `text` where each word starts, located sequentially.
-/// `None` when any word cannot be found in order (defensive: words are derived
-/// from the text by the decoders, so this only trips on a contract drift).
+/// Cleaned forced-aligner words may omit internal punctuation. Offsets still
+/// refer to the original manuscript; an actual word mismatch fails closed.
 fn locate_words_in_text(text: &str, words: &[WordTimestamp]) -> Option<Vec<usize>> {
     locate_word_starts(text, words.iter().map(|word| word.word.as_str()))
 }
@@ -318,9 +318,10 @@ fn locate_word_starts<'a>(text: &str, words: impl Iterator<Item = &'a str>) -> O
             starts.push(cursor);
             continue;
         }
-        let found = text.get(cursor..)?.find(needle)?;
-        starts.push(cursor + found);
-        cursor = cursor + found + needle.len();
+        let (start, end) =
+            crate::transcript_text::find_transcript_word(text.get(cursor..)?, needle)?;
+        starts.push(cursor + start);
+        cursor += end;
     }
     Some(starts)
 }
@@ -1061,5 +1062,109 @@ mod tests {
             split_transcript_tail_at_change("具体的过程。那现在。", &words, 26_600, 3_000),
             None
         );
+    }
+
+    #[test]
+    fn aligned_french_words_preserve_original_text_and_speaker_boundaries() {
+        let text = "Alors peut-être aujourd\u{2019}hui, est-ce idéal ? Oui, c'est-à-dire demain.";
+        let tokens = [
+            "Alors",
+            "peutêtre",
+            "aujourdhui",
+            "estce",
+            "idéal",
+            "Oui",
+            "c'estàdire",
+            "demain",
+        ];
+        let words = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, token)| word(token, i as f32, i as f32 + 0.8))
+            .collect();
+        let segments = assign_speakers(
+            &[turn(0.0, 5.0, 0), turn(5.0, 8.0, 1)],
+            vec![worded_seg(0.0, 8.0, text, words)],
+            &BTreeMap::new(),
+        )
+        .expect("cleaned aligner words must locate the original manuscript");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(
+            segments[0].text,
+            "Alors peut-être aujourd\u{2019}hui, est-ce idéal ?"
+        );
+        assert_eq!(segments[1].text, "Oui, c'est-à-dire demain.");
+        assert_eq!(segments[0].speaker.as_deref(), Some("SPEAKER_00"));
+        assert_eq!(segments[1].speaker.as_deref(), Some("SPEAKER_01"));
+        assert_eq!(format!("{} {}", segments[0].text, segments[1].text), text);
+    }
+
+    #[test]
+    fn cleaned_word_matching_uses_first_occurrence_and_original_utf8_offsets() {
+        let text = "中文 peut-être peutêtre aujourd\u{2019}hui";
+        let starts = locate_word_starts(
+            text,
+            ["中文", "peutêtre", "peutêtre", "aujourdhui"].into_iter(),
+        );
+        assert_eq!(
+            starts,
+            Some(vec![
+                0,
+                text.find("peut-être").unwrap(),
+                text.find("peutêtre").unwrap(),
+                text.find("aujourd").unwrap()
+            ])
+        );
+    }
+
+    #[test]
+    fn cleaned_word_matching_does_not_hide_real_mismatches() {
+        for (text, token) in [
+            ("peut être", "peutêtre"),
+            ("peut\u{a0}être", "peutêtre"),
+            ("peut-être", "peutautre"),
+            ("c'est", "cest"),
+            ("hello-world", "hello+world"),
+            ("Été", "été"),
+        ] {
+            assert_eq!(
+                locate_word_starts(text, [token].into_iter()),
+                None,
+                "{text:?} / {token:?}"
+            );
+        }
+        let error = assign_speakers(
+            &[turn(0.0, 1.0, 0), turn(1.0, 2.0, 1)],
+            vec![worded_seg(
+                0.0,
+                2.0,
+                "peut être demain",
+                vec![word("peutêtre", 0.0, 0.8), word("demain", 1.0, 1.8)],
+            )],
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SpeakerAttributionError::AlignedWordTextMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn tail_split_preserves_french_punctuation_with_cleaned_anchors() {
+        let split = split_transcript_tail_at_change(
+            "peut-être aujourd\u{2019}hui, demain.",
+            &[
+                rt_word("peutêtre", 0, 800),
+                rt_word("aujourdhui", 1000, 1800),
+                rt_word("demain", 2000, 2800),
+            ],
+            1900,
+            3000,
+        )
+        .expect("shared text matching also applies to realtime tail splits");
+        assert_eq!(split.kept_text, "peut-être aujourd\u{2019}hui,");
+        assert_eq!(split.moved_text, "demain.");
+        assert_eq!(split.moved_from_word, 2);
     }
 }
