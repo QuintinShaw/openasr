@@ -80,6 +80,12 @@ class FailClosedEvidenceTests(unittest.TestCase):
                 }
             ],
         }
+        # This synthetic inventory declares its policy explicitly; the real
+        # planner policy is supplied by the Rust-generated inventory.
+        for provider in inventory["families"][0]["execution"]["execution_capabilities"]["providers"]:
+            provider["decode_reuse_policy"] = {
+                "graph_mode": "fresh_graph", "capability_evidence_revision": 1
+            }
         catalog = {
             "models": [
                 {

@@ -14711,10 +14711,11 @@ mod tests {
                 let flag = Arc::new(AtomicBool::new(canceled));
                 let previous =
                     crate::ggml_runtime::arm_thread_job_cancel_flag(Some(Arc::clone(&flag)));
-                let mut runner =
-                    GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())
-                        .expect("cpu graph runner");
+                // Release every participant even when backend initialization fails.
+                // Otherwise a useful initialization error leaves the test hung.
+                let runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default());
                 barrier.wait();
+                let mut runner = runner.expect("cpu graph runner");
                 let result = runner.compute_add_f32(&[1.0, 2.0], &[3.0, 4.0]);
                 assert!(
                     crate::ggml_runtime::disarm_thread_job_cancel_flag_if_current(&flag, previous)
