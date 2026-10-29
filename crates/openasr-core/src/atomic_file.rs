@@ -393,10 +393,22 @@ impl AtomicFileSystem for RealAtomicFileSystem {
     }
 
     fn sync_parent_dir(&self, path: &Path) -> io::Result<()> {
-        let Some(parent) = path.parent() else {
-            return Ok(());
-        };
-        fs::File::open(parent).and_then(|file| file.sync_all())
+        #[cfg(windows)]
+        {
+            // Windows has no supported directory-fsync equivalent. Staged
+            // contents were flushed before MoveFileExW(MOVEFILE_WRITE_THROUGH).
+            // Opening the directory as an ordinary file only produces a
+            // spurious access-denied warning after a committed replacement.
+            let _ = path;
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            let Some(parent) = path.parent() else {
+                return Ok(());
+            };
+            fs::File::open(parent).and_then(|file| file.sync_all())
+        }
     }
 }
 
@@ -464,6 +476,21 @@ pub(crate) fn sync_parent_dir_best_effort(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_write_through_replacement_has_no_directory_open_warning() {
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("record.json");
+        for bytes in [b"old".as_slice(), b"new".as_slice()] {
+            assert!(matches!(
+                write_file_atomically_detailed(&target, bytes, AtomicFileMode::Default).unwrap(),
+                AtomicWriteOutcome::Written
+            ));
+            assert_eq!(fs::read(&target).unwrap(), bytes);
+        }
+        assert_eq!(fs::read_dir(home.path()).unwrap().count(), 1);
+    }
     use std::{
         cell::{Cell, RefCell},
         collections::BTreeMap,

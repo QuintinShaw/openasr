@@ -821,9 +821,9 @@ pub(crate) enum BackendPluginCommand {
         #[arg(value_parser = ["cuda", "hip"])]
         provider: String,
     },
-    /// Import an official CUDA/HIP pack from a local file or folder. Does not activate.
+    /// Import an official GPU pack from a local file or folder. Does not activate.
     Import {
-        #[arg(value_parser = ["cuda", "hip"])]
+        #[arg(value_parser = ["cuda", "hip", "vulkan"])]
         provider: String,
         path: PathBuf,
     },
