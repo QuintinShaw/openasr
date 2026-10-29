@@ -758,6 +758,16 @@ def verify_catalog_cdn(
     }
 
 
+def _optional_fingerprint_string(value: Any) -> str:
+    # Match Rust Option<String>::as_deref().unwrap_or("") exactly. JSON null
+    # and an omitted optional field identify the same native artifact.
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise BackendCatalogError("backend fingerprint optional fields must be strings or null")
+    return value
+
+
 def artifact_fingerprint(entry: dict[str, Any]) -> str:
     digest = hashlib.sha256()
     role_tags = {"runtime": 0, "plugin": 1, "archive": 2}
@@ -766,7 +776,7 @@ def artifact_fingerprint(entry: dict[str, Any]) -> str:
         entry.get("vendor", ""),
         entry.get("version", ""),
         entry.get("host_abi", {}).get("fingerprint", ""),
-        entry.get("min_driver_api", ""),
+        _optional_fingerprint_string(entry.get("min_driver_api")),
     ):
         encoded = str(value).encode("utf-8")
         digest.update(struct.pack("<Q", len(encoded)))
@@ -779,8 +789,8 @@ def artifact_fingerprint(entry: dict[str, Any]) -> str:
         for value in (
             file.get("filename", ""),
             file.get("sha256", ""),
-            file.get("extract_subdir", ""),
-            file.get("extracted_tree_sha256", ""),
+            _optional_fingerprint_string(file.get("extract_subdir")),
+            _optional_fingerprint_string(file.get("extracted_tree_sha256")),
         ):
             encoded = str(value).encode("utf-8")
             digest.update(struct.pack("<Q", len(encoded)))

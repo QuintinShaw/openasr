@@ -3374,6 +3374,55 @@ fn backend_archive_rejects_windows_unsafe_and_case_colliding_entries_before_mate
     }
 }
 
+#[test]
+fn backend_artifact_fingerprint_matches_shared_optional_metadata_fixture() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../tests/fixtures/backend_artifact_fingerprint.json"
+    ))
+    .unwrap();
+    for omit in [false, true] {
+        let mut entry = fixture["entry"].clone();
+        if omit {
+            entry.as_object_mut().unwrap().remove("min_driver_api");
+        } else {
+            entry["min_driver_api"] = serde_json::Value::Null;
+        }
+        for file in entry["files"].as_array_mut().unwrap() {
+            for key in ["extract_subdir", "extracted_tree_sha256"] {
+                if file.get(key).is_none_or(serde_json::Value::is_null) {
+                    if omit {
+                        file.as_object_mut().unwrap().remove(key);
+                    } else {
+                        file[key] = serde_json::Value::Null;
+                    }
+                }
+            }
+        }
+        let backend: crate::registry::CatalogBackend = serde_json::from_value(entry).unwrap();
+        let mut resolved = ResolvedCatalogBackendPull {
+            backend_id: backend.id,
+            vendor: backend.vendor,
+            version: backend.version,
+            display_name: backend.display_name,
+            min_cli_version: backend.min_cli_version,
+            host_abi: backend.host_abi,
+            targets: backend.targets,
+            min_driver_api: backend.min_driver_api,
+            activation: backend.activation,
+            files: backend.files,
+        };
+        assert_eq!(
+            backend_artifact_fingerprint(&resolved),
+            fixture["fingerprint"].as_str().unwrap()
+        );
+        resolved.min_driver_api = Some("1.3.0".to_string());
+        assert_ne!(
+            backend_artifact_fingerprint(&resolved),
+            fixture["fingerprint"].as_str().unwrap()
+        );
+    }
+}
+
 fn hip_pack_resolved(plugin: &[u8], archive: &[u8]) -> ResolvedCatalogBackendPull {
     let extracted_tree_sha256 = materialized_tree_sha256(&[InstalledBackendMaterializedFile {
         relative_path: "rocblas/library/Kernels.so-000-gfx1200.hsaco".to_string(),
