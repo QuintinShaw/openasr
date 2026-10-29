@@ -1480,7 +1480,9 @@ fn migrated_owner_shapes_cannot_reintroduce_unpriced_live_resources() {
         "qwen/batched_decode.rs",
         "qwen/forced_aligner_runtime.rs",
     ] {
-        let source = std::fs::read_to_string(root.join(relative)).expect("read owner source");
+        let source = std::fs::read_to_string(root.join(relative))
+            .expect("read owner source")
+            .replace("\r\n", "\n");
         let production = source
             .split("#[cfg(test)]\nmod tests")
             .next()

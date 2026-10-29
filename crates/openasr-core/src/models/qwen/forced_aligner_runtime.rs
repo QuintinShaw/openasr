@@ -1568,7 +1568,7 @@ mod tests {
         drop(owner);
         assert_eq!(services.runtime_receipts().summary().live_owner_count, 0);
 
-        let source = include_str!("forced_aligner_runtime.rs");
+        let source = include_str!("forced_aligner_runtime.rs").replace("\r\n", "\n");
         let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
         assert!(!production.contains("unpriced_resource_descriptor"));
     }

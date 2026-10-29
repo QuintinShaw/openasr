@@ -35,13 +35,10 @@ pub(crate) enum Qwen3ForcedAlignerTextError {
 /// letters, numbers, and the ASCII apostrophe (kept for contractions such as
 /// "don't") survive punctuation stripping; everything else is discarded.
 fn is_kept_char(ch: char) -> bool {
-    if ch == '\'' {
-        return true;
-    }
     // Python's unicodedata category groups: "L*" (letters) and "N*" (numbers).
     // Rust's char::is_alphanumeric() covers exactly the Unicode "Letter" and
     // "Number" major categories, matching `cat.startswith("L")` / `("N")`.
-    ch.is_alphanumeric()
+    crate::transcript_text::is_alignment_word_char(ch)
 }
 
 fn clean_token(token: &str) -> String {
@@ -285,6 +282,33 @@ pub(crate) fn fix_timestamp(data: &[i64]) -> Result<Vec<i64>, Qwen3ForcedAligner
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn french_cleaned_tokens_locate_original_manuscript_in_order() {
+        let text = "Alors peut-être aujourd\u{2019}hui, est-ce idéal ? Oui, c'est-à-dire demain.";
+        let words = word_list_for_language(text, "fr").expect("French word list");
+        assert_eq!(
+            words,
+            [
+                "Alors",
+                "peutêtre",
+                "aujourdhui",
+                "estce",
+                "idéal",
+                "Oui",
+                "c'estàdire",
+                "demain"
+            ]
+        );
+        let mut cursor = 0;
+        for word in words {
+            let (start, end) = crate::transcript_text::find_transcript_word(&text[cursor..], &word)
+                .expect("every forced-alignment token must map to the original text");
+            assert!(end > start);
+            cursor += end;
+        }
+        assert_eq!(&text[cursor..], ".");
+    }
 
     #[test]
     fn word_list_tokenizes_english_like_space_lang_reference() {
