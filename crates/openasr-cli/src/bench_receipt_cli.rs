@@ -450,6 +450,9 @@ pub(crate) fn bench_receipt_short_audio(
             } else {
                 NativeExecutionTraceMode::Reuse
             });
+            if options.trace_out.is_some() {
+                receipt.enable_full_graph_trace();
+            }
             if (options.logits_out.is_some() || !options.write_outputs) && !is_warmup {
                 receipt.enable_full_logits_trace();
             }

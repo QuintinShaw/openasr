@@ -640,6 +640,12 @@ impl NativeExecutionReceiptCollector {
         state.trace_process_id = Some(std::process::id());
     }
 
+    /// Opt into complete native graph events without storing vocabulary rows.
+    /// Call before execution; previously omitted operations are never rebuilt.
+    pub fn enable_full_graph_trace(&self) {
+        self.graph_lifecycle.enable_full_compute_trace();
+    }
+
     pub fn enable_full_logits_trace(&self) {
         let mut state = self
             .state
@@ -650,6 +656,7 @@ impl NativeExecutionReceiptCollector {
             return;
         }
         state.capture_full_logits = true;
+        self.enable_full_graph_trace();
     }
 
     pub(crate) fn captures_full_logits(&self) -> bool {
@@ -1793,6 +1800,7 @@ mod tests {
         );
 
         let lifecycle = receipt.graph_lifecycle_collector();
+        assert!(lifecycle.full_compute_trace_enabled());
         let _guard = lifecycle.install();
         let mut runner = crate::ggml_runtime::GgmlCpuGraphRunner::new(
             crate::ggml_runtime::GgmlCpuGraphConfig::conservative_default(),
@@ -1969,6 +1977,20 @@ mod tests {
             error,
             crate::ShortAudioReceiptError::NativeSeq2SeqTokenStepsMissing
         );
+    }
+
+    #[test]
+    fn full_graph_trace_does_not_enable_vocabulary_row_storage() {
+        let receipt = NativeExecutionReceiptCollector::new();
+        receipt.enable_full_graph_trace();
+        assert!(
+            receipt
+                .graph_lifecycle_collector()
+                .full_compute_trace_enabled()
+        );
+        assert!(!receipt.captures_full_logits());
+        assert_eq!(receipt.snapshot().trace.full_logits_step_count, 0);
+        assert!(receipt.snapshot().trace.full_logits_jsonl.is_none());
     }
 
     #[test]

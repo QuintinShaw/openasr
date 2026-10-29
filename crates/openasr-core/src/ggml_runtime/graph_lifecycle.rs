@@ -426,6 +426,7 @@ pub struct GgmlGraphLifecycleCollector {
     /// the live scope without a second lock on the hot graph-compute path.
     scope_id: Arc<AtomicU64>,
     scope_open: Arc<AtomicBool>,
+    full_compute_trace: Arc<AtomicBool>,
 }
 
 impl Default for GgmlGraphLifecycleCollector {
@@ -437,6 +438,7 @@ impl Default for GgmlGraphLifecycleCollector {
             })),
             scope_id: Arc::new(AtomicU64::new(0)),
             scope_open: Arc::new(AtomicBool::new(true)),
+            full_compute_trace: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -460,6 +462,14 @@ impl GgmlGraphLifecycleGeneration {
 }
 
 impl GgmlGraphLifecycleCollector {
+    pub(crate) fn enable_full_compute_trace(&self) {
+        self.full_compute_trace.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn full_compute_trace_enabled(&self) -> bool {
+        self.full_compute_trace.load(Ordering::Acquire)
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

@@ -2211,9 +2211,15 @@ impl GgmlGraphLifecycleState {
     fn input_written(&mut self, bytes: usize) {
         let input_generation = super::mint_opaque_graph_id();
         self.latest_input_generation = Some(input_generation);
-        let _ = bytes;
-        // InputWrite events are not consulted by graph_rebuilt binding and
-        // dominated HIP/Vulkan longform receipts (thousands per request).
+        // Ordinary graph-reuse receipts omit these high-volume events.
+        // Strict diagnostics need the actual completed upload, never a
+        // reconstructed write inferred from the next compute generation.
+        if self.collector.full_compute_trace_enabled() {
+            self.record(super::GgmlGraphLifecycleEventKind::InputWrite {
+                input_generation,
+                bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+            });
+        }
     }
 
     fn compute_started(&mut self) -> u64 {
@@ -2239,7 +2245,9 @@ impl GgmlGraphLifecycleState {
         // Keep the first few computes so decode-conformance (2-step Layer-2,
         // 4-step reusable quadrant) still sees a complete event chain. Zipformer
         // decode then stops appending (hundreds of steps per request).
-        compute_sequence <= 4 || !self.skip_further_native_capture_observe()
+        self.collector.full_compute_trace_enabled()
+            || compute_sequence <= 4
+            || !self.skip_further_native_capture_observe()
     }
 
     fn capture_is_settled_unsupported(&self) -> bool {
@@ -2248,7 +2256,8 @@ impl GgmlGraphLifecycleState {
     }
 
     fn skip_further_native_capture_observe(&self) -> bool {
-        self.skip_further_native_capture || self.capture_is_settled_unsupported()
+        !self.collector.full_compute_trace_enabled()
+            && (self.skip_further_native_capture || self.capture_is_settled_unsupported())
     }
 
     fn observe_native_capture(
@@ -8030,7 +8039,12 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         let capture_unsupported = THREAD_CAPTURE_UNSUPPORTED_BACKEND_ADDRS
             .try_with(|addrs| addrs.borrow().contains(&backend_addr))
             .unwrap_or(false);
-        if capture_unsupported {
+        if capture_unsupported
+            && !self
+                .lifecycle
+                .as_ref()
+                .is_some_and(|lifecycle| lifecycle.collector.full_compute_trace_enabled())
+        {
             return Ok(());
         }
         let Some(observation) = self.backend_graph_lifecycle.observe(self.backend, graph)? else {
@@ -16562,6 +16576,102 @@ mod tests {
             Some(true),
             "persistent sessions must opt the owned cgraph into native capture"
         );
+    }
+
+    #[test]
+    fn full_graph_trace_survives_warmup_and_records_every_native_compute() {
+        use super::super::backend_graph_lifecycle::BackendGraphLifecycleBinding;
+        let ordinary = GgmlGraphLifecycleCollector::new();
+        let ordinary_guard = ordinary.install();
+        let mut runner =
+            GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default()).unwrap();
+        let mut session = runner.start_persistent_graph_session(1024 * 1024).unwrap();
+        let graph = session.builder();
+        let input = graph.new_tensor_1d_f32(1, "trace input").unwrap();
+        graph.set_input(input).unwrap();
+        let output = graph.mul(input, input).unwrap();
+        graph.set_output(output).unwrap();
+        graph.prepare_outputs_for_upload(&[output]).unwrap();
+        graph.set_f32_slice(input, &[2.0], "warmup").unwrap();
+        assert_eq!(graph.compute_output_f32(output, 1).unwrap(), [4.0]);
+        assert!(
+            !ordinary
+                .snapshot()
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, GgmlGraphLifecycleEventKind::InputWrite { .. }))
+        );
+        drop(ordinary_guard);
+
+        // Simulate the performance cache left by a prior unsupported probe.
+        // A complete diagnostic must query the binding despite that cache.
+        let backend_addr = graph.backend.as_ptr() as usize;
+        super::THREAD_CAPTURE_UNSUPPORTED_BACKEND_ADDRS.with(|cache| {
+            cache.borrow_mut().insert(backend_addr);
+        });
+        let full = GgmlGraphLifecycleCollector::new();
+        full.enable_full_compute_trace();
+        let _full_guard = full.install();
+        let native_observer_available = matches!(
+            graph.backend_graph_lifecycle,
+            BackendGraphLifecycleBinding::Available { .. }
+        );
+        for value in 1..=9 {
+            let value = value as f32;
+            graph
+                .set_f32_slice(input, &[value], "diagnostic input")
+                .unwrap();
+            assert_eq!(
+                graph.compute_output_f32(output, 1).unwrap(),
+                [value * value]
+            );
+        }
+        let events = full.snapshot().events;
+        let mut latest_input = None;
+        let mut counts = [0_usize; 5];
+        for event in events {
+            match event.kind {
+                GgmlGraphLifecycleEventKind::InputWrite {
+                    input_generation,
+                    bytes,
+                } => {
+                    assert_eq!(bytes, 4);
+                    latest_input = Some(input_generation);
+                    counts[0] += 1;
+                }
+                GgmlGraphLifecycleEventKind::ComputeStarted {
+                    input_generation_consumed,
+                    ..
+                } => {
+                    assert_eq!(input_generation_consumed, latest_input);
+                    assert!(latest_input.is_some());
+                    counts[1] += 1;
+                }
+                GgmlGraphLifecycleEventKind::ComputeCompleted { .. } => counts[2] += 1,
+                GgmlGraphLifecycleEventKind::OutputRead { .. } => counts[3] += 1,
+                GgmlGraphLifecycleEventKind::CaptureStateObserved { .. } => counts[4] += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(&counts[..4], &[9, 9, 9, 9]);
+        assert_eq!(counts[4], if native_observer_available { 18 } else { 0 });
+
+        // A cached unsupported result must not hide a malformed live binding.
+        graph.backend_graph_lifecycle = BackendGraphLifecycleBinding::Incompatible;
+        graph
+            .set_f32_slice(input, &[3.0], "failing diagnostic")
+            .unwrap();
+        assert!(matches!(
+            graph.compute_output_f32(output, 1),
+            Err(GgmlCpuGraphError::GraphLifecycleEvidenceFailed { .. })
+        ));
+        assert!(matches!(
+            graph.compute_output_f32(output, 1),
+            Err(GgmlCpuGraphError::GraphSessionPoisoned)
+        ));
+        super::THREAD_CAPTURE_UNSUPPORTED_BACKEND_ADDRS.with(|cache| {
+            cache.borrow_mut().remove(&backend_addr);
+        });
     }
 
     #[test]
