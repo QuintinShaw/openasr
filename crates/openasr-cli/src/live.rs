@@ -394,7 +394,7 @@ fn run_live_from_input_file(
             frame_seq as u64,
             start_ms,
             RealtimeAudioFormat::pcm16_mono_16khz(),
-            chunk.to_vec(),
+            padded_live_input_file_frame(chunk, frame_sample_count),
         )?;
         pipeline.process_frame(frame, &mut transcription_worker)?;
         pipeline.drain_finished_transcriptions(&mut transcription_worker)?;
@@ -407,6 +407,14 @@ fn run_live_from_input_file(
         }
     }
     pipeline.shutdown(start_ms, &mut transcription_worker, true)
+}
+
+fn padded_live_input_file_frame(chunk: &[i16], frame_sample_count: usize) -> Vec<i16> {
+    // File durations need not end on a millisecond or fixed-frame boundary.
+    // Keep every sample and pad only the final partial frame with silence.
+    let mut samples = chunk.to_vec();
+    samples.resize(frame_sample_count, 0);
+    samples
 }
 
 fn pace_live_input_file_frame(replay_started_at: Instant, frame_start_ms: u64) {
@@ -2799,6 +2807,19 @@ mod tests {
                 .to_string()
                 .contains("--max-utterances")
         );
+    }
+
+    #[test]
+    fn input_file_tail_preserves_samples_and_has_a_fixed_valid_duration() {
+        let tail = (1..=237).collect::<Vec<i16>>();
+        let padded = padded_live_input_file_frame(&tail, 320);
+        assert_eq!(&padded[..tail.len()], tail.as_slice());
+        assert!(padded[tail.len()..].iter().all(|sample| *sample == 0));
+        let frame = RealtimeAudioFrame::new(0, 0, RealtimeAudioFormat::pcm16_mono_16khz(), padded)
+            .expect("a non-millisecond file tail must become a valid 20ms frame");
+        assert_eq!(frame.duration_ms().unwrap(), 20);
+        let full = vec![7; 320];
+        assert_eq!(padded_live_input_file_frame(&full, 320), full);
     }
 
     #[test]
