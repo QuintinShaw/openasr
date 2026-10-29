@@ -1590,6 +1590,33 @@ mod tests {
             .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
     }
 
+    #[test]
+    fn local_provider_import_accepts_every_optional_gpu_provider() {
+        for requested in ["cuda", "hip", "vulkan"] {
+            let cli = parse_cli([
+                "openasr",
+                "__openasr-backend-plugin",
+                "import",
+                requested,
+                "candidate.zip",
+            ])
+            .expect("provider must reach the core import policy");
+            assert!(matches!(cli.command, Command::BackendPlugin {
+                command: BackendPluginCommand::Import { provider, .. }
+            } if provider == requested));
+        }
+        assert!(
+            parse_cli([
+                "openasr",
+                "__openasr-backend-plugin",
+                "import",
+                "cpu",
+                "candidate.zip"
+            ])
+            .is_err()
+        );
+    }
+
     fn test_card(id: &str) -> ModelCard {
         ModelCard {
             id: id.to_string(),

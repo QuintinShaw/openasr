@@ -17,6 +17,13 @@ probes the real exported backend API before committing the selected provider.
 Prepared or published-inert bytes are not executable providers: ordinary Auto
 and explicit runtime selection are Activated-only.
 
+The local `__openasr-backend-plugin import <provider> <path>` protocol accepts
+CUDA, HIP and Vulkan. It verifies the same signed catalog and complete file
+identities as network installation; local import never makes an inert pack
+eligible for product execution. CUDA discovers the live target through the
+Windows driver before choosing a target-specific vendor runtime. HIP still
+requires one common signed discovery runtime across its compatible targets.
+
 Historical whole, statically linked GPU sidecars are a legacy rollback format,
 not an alternative build or runtime switch. Current neutral hosts reject them,
 and legacy-static hosts must never load an optional provider pack.

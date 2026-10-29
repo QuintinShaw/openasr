@@ -593,6 +593,12 @@ fn optional_shared_runtime_bootstrap(
     vendor: CatalogBackendVendor,
     host_abi: &BackendHostAbi,
 ) -> Result<Option<crate::ResolvedCatalogBackendPull>, BackendActivationError> {
+    // CUDA discovery queries nvcuda.dll from Windows. Its target packs may
+    // legitimately carry different runtime generations (e.g. sm_120); those
+    // bytes are resolved only after the live target and driver are known.
+    if vendor == CatalogBackendVendor::Cuda {
+        return Ok(None);
+    }
     shared_provider_runtime_bootstrap(catalog, vendor, host_abi)
 }
 
@@ -672,7 +678,7 @@ pub fn install_backend_pack_from_catalog(
         .map_err(|error| BackendActivationError::Install(error.to_string()))
 }
 
-/// Import an official CUDA/HIP pack from a local file or folder. Uses the
+/// Import an official GPU pack from a local file or folder. Uses the
 /// same signed-catalog verification as a download. Does not change the
 /// activation selector.
 pub fn import_backend_provider_from_local_path(
@@ -682,16 +688,8 @@ pub fn import_backend_provider_from_local_path(
     home: &Path,
     mut progress: impl FnMut(crate::PullProgress),
 ) -> Result<PreparedBackendPack, BackendActivationError> {
-    if !matches!(
-        vendor,
-        CatalogBackendVendor::Cuda | CatalogBackendVendor::Hip
-    ) {
-        return Err(BackendActivationError::ImportRejected {
-            reason: "Vulkan is built-in and cannot be imported".to_string(),
-        });
-    }
     let host_abi = BackendHostAbi::current();
-    let (resolved, device_target, driver_version) = match vendor {
+    let (resolved, device_target, mut driver_version) = match vendor {
         CatalogBackendVendor::Cuda | CatalogBackendVendor::Hip => {
             let runtime =
                 prepare_discovery_runtime(catalog, vendor, home, Some(source), &mut progress)?;
@@ -714,11 +712,22 @@ pub fn import_backend_provider_from_local_path(
             })?;
             (resolved, device.target, device.driver_api_version)
         }
-        CatalogBackendVendor::Vulkan
-        | CatalogBackendVendor::Cpu
-        | CatalogBackendVendor::Unknown => {
+        CatalogBackendVendor::Vulkan => {
+            let resolved = resolve_compatible_catalog_backend_pull_for_driver(
+                catalog, vendor, &host_abi, None, None,
+            )
+            .map_err(|error| BackendActivationError::Resolution(error.to_string()))?;
+            require_catalog_backend_activated(&resolved)?;
+            let target = resolved
+                .activation
+                .qualified_device_target
+                .clone()
+                .expect("activated catalog entry was checked above");
+            (resolved, target, String::new())
+        }
+        CatalogBackendVendor::Cpu | CatalogBackendVendor::Unknown => {
             return Err(BackendActivationError::ImportRejected {
-                reason: "Vulkan is built-in and cannot be imported".to_string(),
+                reason: "only optional GPU providers support local import".to_string(),
             });
         }
     };
@@ -726,6 +735,19 @@ pub fn import_backend_provider_from_local_path(
     let installed =
         crate::install_backend_pack_from_local_path(&resolved, source, home, &mut progress)
             .map_err(map_import_pull_error)?;
+    let _store_lock = BackendStoreMutationLock::acquire(home)
+        .map_err(|error| BackendActivationError::Store(error.to_string()))?;
+    if vendor == CatalogBackendVendor::Vulkan {
+        let proven = prove_installed_backend_pack_locked(catalog, &resolved, &device_target, home)?;
+        if resolved.activation.qualified_driver_version.as_deref()
+            != Some(proven.driver_version.as_str())
+        {
+            return Err(BackendActivationError::Resolution(
+                "live Vulkan driver does not match the signed qualification binding".to_string(),
+            ));
+        }
+        driver_version = proven.driver_version;
+    }
     let size_bytes: u64 = resolved.files.iter().map(|file| file.size_bytes).sum();
     let plugin_size_bytes: u64 = resolved
         .files
@@ -1361,6 +1383,82 @@ mod tests {
     use super::*;
     use crate::test_process_env::with_test_process_env;
     use std::ffi::OsString;
+
+    fn provider_catalog(vendor: CatalogBackendVendor) -> ModelCatalog {
+        let mut catalog: ModelCatalog =
+            serde_json::from_str(include_str!("../../../model-registry/catalog.json"))
+                .expect("bundled catalog fixture");
+        let mut backend = catalog
+            .backends
+            .iter()
+            .find(|entry| entry.vendor == vendor)
+            .expect("provider fixture")
+            .clone();
+        backend.host_abi = BackendHostAbi::current();
+        backend.min_cli_version = crate::current_cli_version().to_string();
+        backend.activation = crate::CatalogBackendActivation::default();
+        catalog.backends = vec![backend];
+        catalog
+    }
+
+    #[test]
+    fn cuda_description_accepts_distinct_target_runtime_generations() {
+        let mut catalog = provider_catalog(CatalogBackendVendor::Cuda);
+        catalog.backends[0].targets = vec!["sm_86".to_string()];
+        let mut second = catalog.backends[0].clone();
+        second.id.push_str("-next");
+        second.targets = vec!["sm_120".to_string()];
+        second
+            .files
+            .iter_mut()
+            .find(|file| file.role != CatalogBackendFileRole::Plugin)
+            .expect("vendor runtime")
+            .sha256 = "a".repeat(64);
+        catalog.backends.push(second);
+        let home = tempfile::tempdir().unwrap();
+        let description =
+            describe_backend_provider(&catalog, CatalogBackendVendor::Cuda, home.path())
+                .expect("CUDA driver discovery does not need a shared vendor runtime");
+        assert_eq!(description.target_pack_count, 2);
+        assert!(
+            optional_shared_runtime_bootstrap(
+                &catalog,
+                CatalogBackendVendor::Cuda,
+                &BackendHostAbi::current()
+            )
+            .unwrap()
+            .is_none()
+        );
+        for entry in &mut catalog.backends {
+            entry.vendor = CatalogBackendVendor::Hip;
+        }
+        assert!(
+            optional_shared_runtime_bootstrap(
+                &catalog,
+                CatalogBackendVendor::Hip,
+                &BackendHostAbi::current()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn vulkan_import_rejects_inert_catalog_before_reading_local_source() {
+        let catalog = provider_catalog(CatalogBackendVendor::Vulkan);
+        let home = tempfile::tempdir().unwrap();
+        let error = import_backend_provider_from_local_path(
+            &catalog,
+            CatalogBackendVendor::Vulkan,
+            &home.path().join("missing.zip"),
+            home.path(),
+            |_| {},
+        )
+        .expect_err("local import must not bypass activation");
+        assert!(
+            matches!(error, BackendActivationError::NotActivated { state, .. } if state == "published-inert")
+        );
+        assert!(!home.path().join("backends").exists());
+    }
 
     fn resolved_with_files(
         files: Vec<crate::CatalogBackendFile>,
